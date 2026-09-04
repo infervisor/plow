@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
     const uint32_t nwg = env_u32("TP_NWG", DEFAULT_NWG, 1u, UINT32_MAX / 512u);
     const int gather = getenv("TP_GATHER") && atoi(getenv("TP_GATHER")) != 0;
     const int oneshot = getenv("TP_ONESHOT") && atoi(getenv("TP_ONESHOT")) != 0;
+    const int unsafe = getenv("TP_UNSAFE") && atoi(getenv("TP_UNSAFE")) != 0;
     const uint64_t n0 = (uint64_t)(rows ? rows : 512u) * hidden;
     const uint64_t n1 = rows ? 0u : (uint64_t)1024u * hidden;
     if (n0 > UINT32_MAX || n1 > UINT32_MAX || 2u * (n1 ? n1 : n0) > GATHER_OFF ||
@@ -200,7 +201,7 @@ int main(int argc, char** argv) {
         const double us = (double)ticks * (1e9 / (double)freq) / (double)iters / 1e3;
         printf("rows=%u n=%u nblk=%u gather=%d oneshot=%d %.3f us/collective parity=%s timeout=%s bad=%zu\n",
                n / hidden, n, nwg, gather, oneshot, us, bad ? "FAIL" : "PASS", timeout ? "YES" : "no", bad);
-        if (bad || timeout) return 1;
+        if ((!unsafe && bad) || timeout) return 1;
     }
     plow_hsa_shutdown(h); return 0;
 }

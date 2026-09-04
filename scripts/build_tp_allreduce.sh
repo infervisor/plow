@@ -24,6 +24,8 @@ XR_DEF=()
 [ "${PLOW_XR_AGG:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_AGG=1")
 [ "${PLOW_XR_WAVE_RS:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_WAVE_RS=1")
 [ "${PLOW_XR_TRACE_PHASES:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_TRACE_PHASES=1")
+[ "${PLOW_XR_NOWAIT:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_NOWAIT=1")
+[ "${PLOW_XR_NOSIG:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_NOSIG=1")
 hipcc --offload-arch="$ARCH" -O3 -w "${XR_DEF[@]}" --genco \
     "$R/tests/tp_allreduce_kernels.hip" -o tp_allreduce.co
 "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \

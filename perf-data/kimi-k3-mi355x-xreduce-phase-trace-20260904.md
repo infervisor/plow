@@ -151,6 +151,27 @@ folded-gather all-gather while retaining the current scalar-width/stagger contro
 no-signal/no-wait full-network ceiling remains useful to price how much of gate2's 39.4 ms is
 maintenance versus observation before implementing another sound hierarchy.
 
+### Isolated protocol ceiling
+
+Three alternating exact-shape screens at 256 workgroups used the existing unsafe diagnostic
+axes. `NOWAIT` retains all signals but skips both observations; `NOSIG` also removes the signal
+maintenance. These variants are numerically wrong by construction and are ceilings only.
+
+| class | calls | production | no-wait | no-signal | observation | signal maintenance |
+|---|---:|---:|---:|---:|---:|---:|
+| half | 92 | 38.473 us | 32.594 us | 30.567 us | 5.879 us | 2.027 us |
+| full | 94 | 72.798 us | 63.431 us | 61.078 us | 9.367 us | 2.353 us |
+| gather | 92 | 96.710 us | 93.052 us | 90.274 us | 3.658 us | 2.778 us |
+| weighted | 278 | 19.280 ms | 17.522 ms | 16.859 ms | 1.758 ms | 0.663 ms |
+
+Even deleting the entire protocol saves only 2.421 ms across the network's 278 calls. A
+corresponding-workgroup specialist would add about 464 segment launches (~3.03 ms) before its
+ready storage/reset or remaining sound release/acquire cost. It therefore cannot break even as
+the primary lever and is rejected before implementation. The v2 integrated gate2 max-sum is
+not an independently removable 39.4 ms: most of that interval co-varies with ongoing data work
+and other workgroups. The next isolated experiments target strict-order reduce-scatter and
+folded-gather data motion directly.
+
 ## Pinned vLLM/AITER comparison
 
 vLLM 0.28 pins AITER 0.1.19. Its default custom-all-reduce cutoff is 64 MiB even though the
