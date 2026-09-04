@@ -273,6 +273,9 @@ struct Shapes {
     /// tagged publish (PLOW_XR_COMBINE_FOLD). An object without the arm publishes the unwritten
     /// plain slot: finite, stale, wrong.
     xr_combine_fold: bool,
+    /// Any `KdaStateStepG` with flags bit 2 — the f_b GEMV folded into the step's prologue
+    /// (PLOW_KDA_FB_FOLD). An object without the arm reads `f_a` as the gate logits.
+    kda_fb_fold: bool,
     /// Any prefill DOWN with `i[4]!=0` — the fused 86->87 decomposition (PLOW_MOE_PF_ATOMIC):
     /// t[0] is a [T,H] f32 accumulator the DOWN epilogue atomically adds into, NOT the
     /// [T*k,H] `part` scatter. An object without the arm would overrun it k-fold.
@@ -338,6 +341,7 @@ fn shapes(m: &Model) -> Shapes {
             s.ops_present.insert(op_name(op));
             match op {
                 DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
+                DevOp::KdaStateStepG if inst.i[4] & 4 != 0 => s.kda_fb_fold = true,
                 // `i0=n_batch i1=n_head i2=n_kv_head … i6=hd`
                 DevOp::FlashDecode | DevOp::FlashDecodeFp8 => {
                     let (hd, nh, kvh, nb) = (inst.i[6], inst.i[1], inst.i[2], inst.i[0]);
@@ -692,6 +696,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_pf_det".into(), json!(s.moe_pf_det));
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
     f.insert("xr_combine_fold".into(), json!(s.xr_combine_fold));
+    f.insert("kda_fb_fold".into(), json!(s.kda_fb_fold));
     f.insert("moe_prefill_ep".into(), json!(!s.moe_prefill_ep.is_empty()));
     f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
@@ -927,6 +932,10 @@ fn backend_amd(
     // L4 combine fold: a BUILD axis of the tagged decode object (`#if PLOW_XR_COMBINE_FOLD`).
     if on("xr_combine_fold") {
         req.push("PLOW_XR_COMBINE_FOLD=1".into());
+    }
+    // L3 f_b fold: a BUILD axis of the decode object (`#if PLOW_KDA_FB_FOLD`).
+    if on("kda_fb_fold") {
+        req.push("PLOW_KDA_FB_FOLD=1".into());
     }
     // The fused 86->87 decomposition. Unlike the two above this is a BUILD axis (the atomic
     // branch is `#if PLOW_MOE_PF_ATOMIC`), so an object may genuinely not have it.
@@ -1784,6 +1793,14 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD {0}\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD {0}\n#endif\n",
         if xr_combine_fold { 1 } else { 0 }
     ));
+    let kda_fb_fold = manifest
+        .pointer("/features/kda_fb_fold")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_FB_FOLD {0}\n#ifndef PLOW_KDA_FB_FOLD\n#define PLOW_KDA_FB_FOLD {0}\n#endif\n",
+        if kda_fb_fold { 1 } else { 0 }
+    ));
 
     // Head dims the flash family is instantiated at.
     out.push_str("\n/* --- flash head dims present --- */\n");
@@ -1977,6 +1994,41 @@ mod tests {
             .collect();
         assert!(!req.contains(&"PLOW_XR_COMBINE_FOLD=1"));
         assert!(config_header(&ordinary).contains("#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD 0\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD 0\n#endif\n"));
+    }
+
+    /// L3: a `KdaStateStepG` with flags bit 2 (the folded f_b GEMV) is a build axis of the
+    /// decode object; the ordinary model must not carry it.
+    #[test]
+    fn kda_fb_fold_is_a_decode_object_requirement() {
+        let mut m = model();
+        m.progs[1]
+            .insts
+            .push(inst(DevOp::KdaStateStepG, [1, 12, 128, 16, 5, 0, 1, 0]));
+        let man = build(&m, "gfx950");
+        assert_eq!(man["features"]["kda_fb_fold"], true);
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(req.contains(&"PLOW_KDA_FB_FOLD=1"), "{req:?}");
+        assert!(config_header(&man).contains("#define PLOW_PACKET_REQUIRES_KDA_FB_FOLD 1\n#ifndef PLOW_KDA_FB_FOLD\n#define PLOW_KDA_FB_FOLD 1\n#endif\n"));
+
+        let mut plain = model();
+        plain.progs[1]
+            .insts
+            .push(inst(DevOp::KdaStateStepG, [1, 12, 128, 16, 1, 0, 1, 0]));
+        let man = build(&plain, "gfx950");
+        assert_eq!(man["features"]["kda_fb_fold"], false);
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!req.contains(&"PLOW_KDA_FB_FOLD=1"));
+        assert!(config_header(&man).contains("#define PLOW_PACKET_REQUIRES_KDA_FB_FOLD 0\n#ifndef PLOW_KDA_FB_FOLD\n#define PLOW_KDA_FB_FOLD 0\n#endif\n"));
     }
 
     /// One opcode, two bodies: hd is an instruction field, so hd256 and hd512

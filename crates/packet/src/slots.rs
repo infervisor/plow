@@ -222,7 +222,7 @@ const DOC: &[S] = &[
     // `KdaStateStep` with `KdaGate` inlined: `t4`/`t5` are the RAW projections, not the gate's
     // f32 output, and `i5` is the `dt_bias` handle. There is no slot for a precomputed `g`, which
     // is deliberate — this op cannot silently degrade to the unfused reading of the packet.
-    S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode", "parked"], f: &["scale", "lower_bound"], j: &[] },
+    S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode", "parked"], f: &["scale", "lower_bound"], j: &["", "w_fb"] },
     S { op: DevOp::KdaConvStateStepG, t: &["o", "q_raw", "k_raw", "v_raw", "g_raw", "beta_raw", "state", "descriptor"], i: &["T", "H", "D", "BV", "flags", "W", "gate_mode"], f: &["scale", "lower_bound"], j: &[] },
     S { op: DevOp::KdaDecodeFused, t: &["y", "q_raw", "k_raw", "v_raw", "forget_raw", "beta_raw", "state", "descriptor"], i: &["rows", "H", "D", "BV", "W", "flags", "gate_mode", "descriptor_version"], f: &["scale", "lower_bound"], j: &["", "norm_eps_bits"] },
     S { op: DevOp::MlaMaterializePack, t: &["K", "V", "KV", "K_rope"], i: &["T", "H", "qk_nope", "qk_rope", "v_head"], f: &[], j: &[] },

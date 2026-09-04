@@ -2769,7 +2769,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                 * leaves i[7] at 0 there. */
                                (in->i[4] & PLOW_KDA_F_SEQ_ROWS)
                                    ? (const unsigned*)T[in->i[7]]
-                                   : nullptr);
+                                   : nullptr
+#if PLOW_KDA_FB_FOLD
+                               /* L3 fold: t4 = f_a, j1 = W_fb; read only under the flag bit,
+                                * so a non-folded packet's zero j1 is never dereferenced. */
+                               , (in->i[4] & PLOW_KDA_F_FB_FOLD)
+                                   ? (const bf16*)T[in->fj[2].u]
+                                   : nullptr
+#endif
+                               );
             break;
         }
 #endif /* PLOW_HAS_KDA_STATE_STEP_G */

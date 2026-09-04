@@ -3094,6 +3094,10 @@ const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     // i7 = k). An object without the arm publishes the plain partial slot, which no packet
     // wrote — stale data, no trap. A BUILD axis (`#if PLOW_XR_COMBINE_FOLD`).
     ("PLOW_XR_COMBINE_FOLD", &["plow_xr_combine_fold_1"]),
+    // The K3 f_b GEMV folded into KdaStateStepG's prologue (flags bit 2, t4 = f_a, j1 = W_fb).
+    // An object without the arm reads f_a's 128 values as the head's gate logits — finite,
+    // no trap, wrong. A BUILD axis (`#if PLOW_KDA_FB_FOLD`).
+    ("PLOW_KDA_FB_FOLD", &["plow_kda_fb_fold_1"]),
 ];
 
 fn required_moe_pf_accum(progs: &[DevProg], field: usize) -> bool {
