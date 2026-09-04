@@ -3419,6 +3419,14 @@ const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     // An object without the arm reads f_a's 128 values as the head's gate logits — finite,
     // no trap, wrong. A BUILD axis (`#if PLOW_KDA_FB_FOLD`).
     ("PLOW_KDA_FB_FOLD", &["plow_kda_fb_fold_1"]),
+    // The K3 Conv3+StepG+GatedNorm chain as one KdaStateStepG packet (flags bit 3, t0 = y,
+    // t1..t3 raw q/k/v, t7 = descriptor). An object without the arm runs the recurrence on the
+    // raw projections with the descriptor as A_log — finite, no trap, wrong. A BUILD axis
+    // (`#if PLOW_KDA_DECODE_FUSED_ARM`).
+    (
+        "PLOW_KDA_DECODE_FUSED_ARM",
+        &["plow_kda_decode_fused_arm_1"],
+    ),
 ];
 
 fn required_moe_pf_accum(progs: &[DevProg], field: usize) -> bool {

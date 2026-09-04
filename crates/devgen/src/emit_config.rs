@@ -544,6 +544,18 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_KDA_FB_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_fb_fold: bool,
 
+    /// Run the K3 decode KDA chain (Conv3 -> StateStepG -> GatedNorm) as ONE dataflow-gated
+    /// `KdaStateStepG` packet (L7): flags bit 3, `t0 = y`, `t1..t3` raw q/k/v, `t7` = operand
+    /// descriptor. Needs a `PLOW_KDA_DECODE_FUSED_ARM=1` decode object. Opt-in candidate.
+    #[arg(long, env = "PLOW_KDA_DECODE_FUSED_ARM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_decode_fused_arm: bool,
+
+    /// Decode objects prefetch a claimed `Gemv` slice's weight rows to L2 before polling its
+    /// gate (L8). Packet-inert (loads only); recorded in the manifest so the paired
+    /// `plow_config.h` defaults `PLOW_GEMV_PREFETCH` for the decode object. Opt-in candidate.
+    #[arg(long, env = "PLOW_GEMV_PREFETCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub gemv_prefetch: bool,
+
     /// Isolate compatible MXFP4 grouped-MoE Down+Combine prefill boundaries for the standalone
     /// deterministic stage-2 object. Default on; `=0` is the rollback to the interpreter route.
     #[arg(long, env = "PLOW_MOE_STAGE2_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -805,6 +817,8 @@ impl EmitConfig {
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             xr_combine_fold: env_opt_out("PLOW_XR_COMBINE_FOLD"),
             kda_fb_fold: env_bool("PLOW_KDA_FB_FOLD"),
+            kda_decode_fused_arm: env_bool("PLOW_KDA_DECODE_FUSED_ARM"),
+            gemv_prefetch: env_bool("PLOW_GEMV_PREFETCH"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
             seq_par_seams: env_opt_out("PLOW_SEQ_PAR_SEAMS"),

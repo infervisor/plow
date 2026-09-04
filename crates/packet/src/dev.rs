@@ -1245,6 +1245,12 @@ pub enum DevOp {
     /// its head's `D` gate logits in its prologue with the GEMV's own column routine, and the
     /// standalone `f_b` GEMV is not emitted.
     ///
+    /// `flags` bit 3 (`PLOW_KDA_F_FUSED_ARM`, decode objects built with
+    /// `PLOW_KDA_DECODE_FUSED_ARM=1`): the whole Conv3 -> StepG -> GatedNorm chain as this one
+    /// packet on the step's slices. `t0` is `y`, `t1..t3` the RAW q/k/v projections and `t7` a
+    /// u32 descriptor `[wq, wk, wv, csq, csk, csv, A_log, dt_bias, norm_w, g_raw, scratch,
+    /// eps_bits, W]`; the tiles of a head rendezvous through `scratch` inside the packet.
+    ///
     /// `t0=o t1=q t2=k t3=v t4=g_raw t5=beta_raw t6=state t7=A_log` ·
     /// `i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode i7=parked` · `f0=scale f1=lower_bound j1=w_fb`.
     KdaStateStepG = 112,

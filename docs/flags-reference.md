@@ -313,6 +313,8 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | env | flag | default | effect |
 |---|---|---|---|
 | `PLOW_KDA_FB_FOLD` | `--kda-fb-fold` | false | Fold the K3 decode `f_b` forget-gate GEMV into `KdaStateStepG`'s prologue (L3): the step packet carries `t4 = f_a`, `j1 = W_fb`, flags bit 2, and the GEMV packet is not emitted. Needs a `PLOW_KDA_FB_FOLD=1` decode object. Opt-in candidate (default off). |
+| `PLOW_KDA_DECODE_FUSED_ARM` | `--kda-decode-fused-arm` | false | Run the K3 decode KDA chain (Conv3 -> StateStepG -> GatedNorm) as ONE dataflow-gated `KdaStateStepG` packet on the step's slices (L7): flags bit 3, `t0 = y`, `t1..t3` raw q/k/v, `t7` = operand descriptor; the tiles of a head rendezvous through a loader-zeroed scratch. Composes with `PLOW_KDA_FB_FOLD`. Needs a `PLOW_KDA_DECODE_FUSED_ARM=1` decode object. Opt-in candidate (default off). |
+| `PLOW_GEMV_PREFETCH` | `--gemv-prefetch` | false | Decode objects prefetch a claimed `Gemv` slice's weight rows to L2 (LDS-DMA, no VGPRs) before polling its gate (L8). Packet-inert; recorded in the manifest so the paired `plow_config.h` defaults the object's `PLOW_GEMV_PREFETCH`. Opt-in candidate (default off). |
 | `PLOW_KDA_CHUNK` | `--kda-chunk` | unset | Emit the BT64 chunk-KDA prefill pipeline. Default on for gfx950; unsupported shapes keep the serial recurrence. `=0` forces the serial oracle (rollback). |
 | `PLOW_KDA_CHUNK_QPRE` | `--kda-chunk-qpre` | true | Precompute the V-independent scaled/gated query in chunk W/U. Default on; `=0` rollback. |
 | `PLOW_KDA_INTRA_WAVE_ITEMS` | `--kda-intra-wave-items` | true | Isolate exact BT64/D128 chunk-KDA intra packets for the wave-item gfx950 object. Default on; `=0` is the rollback to the interpreter path. |
