@@ -208,43 +208,16 @@ const GEMMA4_MOE: &str = r#"{
 }"#;
 
 #[test]
-fn fuse_gemma4_moe() {
-    let g = build_from_config_json(GEMMA4_MOE).expect("build gemma4 moe");
-    let (fused, stats) = rewrite::rewrite_graph(&g).expect("rewrite");
-
-    // Norm→Linear fusions still fire on q_proj, kv_proj (per block) + lm_head.
+fn gemma4_moe_fails_closed_before_rewrite() {
+    let error = build_from_config_json(GEMMA4_MOE)
+        .expect_err("Gemma4 MoE must not use a dense or representative-expert fallback")
+        .to_string();
+    assert!(error.contains("Gemma 4 MoE"), "{error}");
     assert!(
-        fused.contains("FusedNormLinear"),
-        "rmsnorm→linear fusion did not fire in MoE variant"
+        error.contains("exhaustive expert checkpoint binding"),
+        "{error}"
     );
-    // MoE experts still use GeGLU ⇒ SwiGLU fires on expert FFN.
-    assert!(
-        fused.contains("SwiGLU"),
-        "act·mul fusion did not fire in MoE expert"
-    );
-    // Norm→Rope fusions on qk_norm paths; Gemma 4 has no extra Q scale.
-    assert!(
-        fused.contains("FusedNormRope"),
-        "norm→rope fusion did not fire on Q/K paths"
-    );
-    // Fusion reduced ops.
-    assert!(
-        stats.ops_after < stats.ops_before,
-        "fusion did not reduce ops: {} -> {}",
-        stats.ops_before,
-        stats.ops_after
-    );
-    // Weight-manifest completeness (excluding MoE router weights: the router's
-    // output is not on the extracted dataflow path — it's scheduling metadata).
-    let fw = fused_weights(&fused);
-    let gw: BTreeSet<String> = graph_weights(&g)
-        .into_iter()
-        .filter(|w| !w.ends_with(".mlp.gate.weight"))
-        .collect();
-    assert_eq!(
-        fw, gw,
-        "fusion dropped or duplicated weight leaves in Gemma4 MoE"
-    );
+    assert!(error.contains("refusing"), "{error}");
 }
 
 // --- DeepSeek (MLA + MoE) ---
@@ -607,10 +580,20 @@ fn fuse_glm() {
     // carried by packet metadata rather than the extracted compute dataflow.
     // The base-model final norm is dead when the fixture's MTP output is used.
     let fw = fused_weights(&fused);
+    assert!(
+        graph_weights(&g).contains("model.norm.weight"),
+        "the input graph must still declare the base-head final norm"
+    );
+    assert!(
+        !fw.contains("model.norm.weight"),
+        "rewrite extracts the last (MTP) output, where the base-head final norm is dead"
+    );
     let gw: BTreeSet<String> = graph_weights(&g)
         .into_iter()
         .filter(|w| {
-            !w.ends_with(".weight_scale_inv") && !w.contains(".mlp.experts.") && w != "norm.weight"
+            !w.ends_with(".weight_scale_inv")
+                && !w.contains(".mlp.experts.")
+                && w != "model.norm.weight"
         })
         .collect();
     assert_eq!(

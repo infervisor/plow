@@ -152,9 +152,9 @@ fn gemma4_full_attention_reuses_k_projection_for_v() {
     let g3_weights = graph_weights(&g3);
     let g4_weights = graph_weights(&g4);
 
-    assert!(g3_weights.contains("layers.0.self_attn.v_proj.weight"));
-    assert!(g4_weights.contains("layers.0.self_attn.k_proj.weight"));
-    assert!(!g4_weights.contains("layers.0.self_attn.v_proj.weight"));
+    assert!(g3_weights.contains("model.layers.0.self_attn.v_proj.weight"));
+    assert!(g4_weights.contains("model.layers.0.self_attn.k_proj.weight"));
+    assert!(!g4_weights.contains("model.layers.0.self_attn.v_proj.weight"));
     assert!(!g4_weights.iter().any(|name| name.contains("kv_proj")));
 }
 
