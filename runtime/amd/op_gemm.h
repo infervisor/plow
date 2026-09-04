@@ -4407,6 +4407,11 @@ __device__ void d_gemv_glu(bf16* C, const bf16* x, const bf16* Wg, const bf16* W
 #endif
     if (K == 4096)
         gemv_glu_rows<PLOW_GEMV_MM, PLOW_GLU_K4096_UN>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+    else if (K == 7168)
+        /* 14 chunks: UN=7 is two clean passes where UN=6 runs three with four dead loads, the
+         * same rung d_gemv_qkvg already takes at K=7168. Per-lane accumulation order is
+         * unchanged (chunks still visit k in order), so the output is bit-identical. */
+        gemv_glu_rows<PLOW_GEMV_MM, 7>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
     else
         gemv_glu_rows<PLOW_GEMV_MM>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
     /* Re-staging next block into the SAME arena: every wave must be done reading it. */
