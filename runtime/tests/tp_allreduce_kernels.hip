@@ -71,6 +71,32 @@ extern "C" __global__ void tp_allreduce_twoshot_gather(
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
 
+#if PLOW_SEQ_PAR_SEAMS
+/* Sequence-parallel seam halves (ops 25/26), for tp_seqpar_smoke.c: the reduce-scatter with
+ * the FFN-seam gather fold and the local band copy, then the all-gather of up to three
+ * arrays. Same bodies the interpreter dispatches. */
+extern "C" __global__ void tp_seqpar_rs(const void* const* peer_scratch, uint32_t nranks,
+                                        uint32_t rank, uint32_t n, uint32_t slot_bytes,
+                                        uint64_t xctr_byte_off, uint32_t gate,
+                                        uint64_t deadline, uint32_t* status,
+                                        uint32_t gslot_bytes, uint32_t gcols,
+                                        bf16* band_copy) {
+    d_xreduce_scatter_mega(peer_scratch, nranks, rank, n, slot_bytes, (size_t)xctr_byte_off,
+                           gate, deadline, status, blockIdx.x, gridDim.x, gslot_bytes, gcols,
+                           band_copy);
+}
+extern "C" __global__ void tp_seqpar_ag(const void* const* peer_scratch, uint32_t nranks,
+                                        uint32_t rank, uint64_t xctr_byte_off, uint32_t gate,
+                                        uint64_t deadline, uint32_t* status, bf16* dst0,
+                                        uint32_t n0, uint32_t slot0, bf16* dst1, uint32_t n1,
+                                        uint32_t slot1, bf16* dst2, uint32_t n2,
+                                        uint32_t slot2) {
+    d_xall_gather_mega(peer_scratch, nranks, rank, (size_t)xctr_byte_off, gate, deadline,
+                       status, blockIdx.x, gridDim.x, dst0, n0, slot0, dst1, n1, slot1, dst2,
+                       n2, slot2);
+}
+#endif
+
 extern "C" __global__ void tp_allreduce_oneshot_gather(
     bf16* out, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
     uint32_t n, uint32_t slot_bytes, uint64_t xctr_byte_off, uint32_t iters,

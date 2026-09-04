@@ -2158,6 +2158,8 @@ mod kimi_k3_tests {
     /// immediate makes decode reduce unrelated memory whenever a prefill ladder is present.
     #[test]
     fn k3_tp_peer_slot_is_program_invariant() {
+        // The TP8 collective set depends on `PLOW_SEQ_PAR_SEAMS`.
+        let _guard = crate::test_env::env_guard();
         let d = k3_dir("tp_slot");
         let m = k3_build_model(&d, 4096, 256, 2, &[128, 512], None);
         let hidden = cfg_kimi_k3(&d).hidden;

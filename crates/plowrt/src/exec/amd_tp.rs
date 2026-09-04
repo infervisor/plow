@@ -181,11 +181,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::asset::devblob::DevBlob;
+use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::HsaBackend;
 use crate::device::Backend;
 use crate::exec::amd::{AmdEngine, ChunkStep, TpBind};
-use crate::exec::tp::{PeerLayout, TpGroup, XctrReset};
+use crate::exec::tp::{PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS};
 use crate::{Result, RuntimeError};
 use packet::dev::PrefillSpan;
 
@@ -422,12 +422,14 @@ impl AmdTpGroup {
             );
         }
         let gate_expect = gate_expectations(&blob, n_gpu, n_xctr);
-        let layout = PeerLayout::new(tp.hidden, max_tokens, n_xctr).ok_or_else(|| {
-            RuntimeError::Device(format!(
-                "peer layout for hidden={} x {max_tokens} tokens is not 128 B-aligned",
-                tp.hidden
-            ))
-        })?;
+        let slots = check_seq_par_seams(&blob, n_gpu)?;
+        let layout =
+            PeerLayout::with_slots(tp.hidden, max_tokens, n_xctr, slots).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "peer layout for hidden={} x {max_tokens} tokens is not 128 B-aligned",
+                    tp.hidden
+                ))
+            })?;
         tracing::info!(
             n_gpu,
             hidden = tp.hidden,
@@ -1708,6 +1710,59 @@ fn check_xr_tagged_insts(pi: usize, insts: &[packet::dev::DevInst64], hidden: u3
     Ok(())
 }
 
+/// Sequence-parallel seams (ops 25/26): what the packet may carry, and how many partial slots
+/// the peer region needs for it.
+///
+/// The band packets between the two halves address `<base>@band<t>` views at
+/// `rank * t/tp` rows, so a program carrying the ops must be a PREFILL bucket whose flat
+/// reduce-scatter slices end on row boundaries (`t % tp == 0`, `t > 1`); a decode rung
+/// (single or batched — independent sequences have no owned band) must not carry them. The
+/// results travel through `act.{h2,xe,rt}_tp`, so the blob must declare all three and the
+/// region grows to [`PeerLayout::SEQ_PAR_SLOTS`].
+fn check_seq_par_seams(blob: &DevBlob, n_gpu: u32) -> Result<u64> {
+    use packet::dev::DevOp;
+    let carries = |p: &DevProg| {
+        p.insts
+            .iter()
+            .any(|d| d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16)
+    };
+    let dec_lo = blob.decode_rung_lo();
+    let mut any = false;
+    for (pi, p) in blob.progs.iter().enumerate() {
+        if !carries(p) {
+            continue;
+        }
+        any = true;
+        if pi >= dec_lo {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} (T={}) is a decode rung but carries sequence-parallel seam \
+                 collectives (XReduceScatter/XAllGather); those are prefill-only",
+                p.t
+            )));
+        }
+        if p.t < 2 || p.t % n_gpu != 0 {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} (T={}) carries sequence-parallel seam collectives but its row \
+                 count is not a multiple of tp={n_gpu} (> 1): the owned bands would not end on \
+                 row boundaries",
+                p.t
+            )));
+        }
+    }
+    if !any {
+        return Ok(PARTIAL_SLOTS);
+    }
+    for name in ["act.h2_tp", "act.xe_tp", "act.rt_tp"] {
+        if !blob.tensors.iter().any(|t| t.name == name) {
+            return Err(RuntimeError::Device(format!(
+                "packet carries sequence-parallel seam collectives but declares no `{name}` \
+                 result slot"
+            )));
+        }
+    }
+    Ok(PeerLayout::SEQ_PAR_SLOTS)
+}
+
 fn count_xgates(blob: &DevBlob) -> u32 {
     use packet::dev::DevOp;
     let mut top = 0u32;
@@ -1718,6 +1773,9 @@ fn count_xgates(blob: &DevBlob) -> u32 {
             } else if d.op == DevOp::XReduceTwoShot as u16 {
                 // two-shot: reduce-scatter (i3) and all-gather (i4)
                 top = top.max(d.i[3] + 1).max(d.i[4] + 1);
+            } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
+                // split seams: one gate each (i3)
+                top = top.max(d.i[3] + 1);
             } else if d.op == DevOp::XArgmaxFin as u16 {
                 // sharded-head fold: arrival gate (i3), then consecutive value lines at i4
                 top = top
@@ -1782,6 +1840,10 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                 } else if d.op == DevOp::XReduceTwoShot as u16 {
                     set(d.i[3], Some(n_gpu));
                     set(d.i[4], Some(n_gpu * d.blocks as u32));
+                } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
+                    // Both announce with ONE workgroup per rank: their producers are earlier
+                    // packets, the gate_rs argument.
+                    set(d.i[3], Some(n_gpu));
                 } else if d.op == DevOp::XArgmaxFin as u16 {
                     set(d.i[3], Some(n_gpu));
                     for line in 0..xargmax_value_lines(d.i[1]) {

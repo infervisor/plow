@@ -898,6 +898,11 @@ fn backend_amd(
     if has("KdaChunkPrepare") || has("KdaChunkIntra") || has("KdaChunkWu") || has("KdaChunkCarry") {
         req.push("PLOW_KDA_CHUNK=1".into());
     }
+    // Sequence-parallel seams: the split collective arms (ops 25/26) and the host's band-view
+    // binding. An object without them would run the packet as a silent no-op.
+    if has("XReduceScatter") || has("XAllGather") {
+        req.push("PLOW_SEQ_PAR_SEAMS=1".into());
+    }
     if union.iter().any(|a| {
         matches!(a.op.as_str(), "KdaChunkWu" | "KdaChunkCarry")
             && a.variant.as_deref().is_some_and(|v| v.ends_with("_qpre"))
@@ -1255,7 +1260,10 @@ fn opcode_family(op: &str) -> &'static str {
         "linear"
     } else if op.contains("Norm") || matches!(op, "Residual" | "AttnRes") {
         "norm_residual"
-    } else if matches!(op, "XReduce" | "XReduceTwoShot") {
+    } else if matches!(
+        op,
+        "XReduce" | "XReduceTwoShot" | "XReduceScatter" | "XAllGather"
+    ) {
         "collective"
     } else {
         "elementwise"
@@ -2478,6 +2486,8 @@ mod tests {
             ("GemvQkvg", "linear"),
             ("NormResidual", "norm_residual"),
             ("XReduceTwoShot", "collective"),
+            ("XReduceScatter", "collective"),
+            ("XAllGather", "collective"),
             ("Argmax", "elementwise"),
         ] {
             assert_eq!(opcode_family(op), family, "{op}");

@@ -159,6 +159,8 @@ const DOC: &[S] = &[
     S { op: DevOp::XReduce, t: &["out"], i: &["H", "n_gpu", "slot", "gate", "gslot?", "gcols?", "row_w?"], f: &[], j: &[] },
     S { op: DevOp::XArgmaxFin, t: &["ids", "local_part"], i: &["n_gpu", "", "slot"], f: &[], j: &[] },
     S { op: DevOp::XReduceTwoShot, t: &["out", "resid?", "attnres_out?", "attnres_ring?", "attnres_score?", "attnres_gamma?", "prefix_out?"], i: &["n", "n_gpu", "slot", "gate_rs", "gate_ag", "e0_or_H", "gslot_or_nb", "gcols_or_nbcap"], f: &["attnres_eps?"], j: &[] },
+    S { op: DevOp::XReduceScatter, t: &["slot_tensor", "band_copy?"], i: &["n", "n_gpu", "slot", "gate_rs", "", "", "gslot?", "gcols?"], f: &[], j: &[] },
+    S { op: DevOp::XAllGather, t: &["dst0?", "dst1?", "dst2?"], i: &["n0?", "n1?", "n2?", "gate", "n_gpu", "src_slot0?", "src_slot1?", "src_slot2?"], f: &[], j: &[] },
     S { op: DevOp::XReduceAddNorm, t: &["out2", "xmid_out", "x", "gamma"], i: &["feat", "n_gpu", "slot", "gate"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRopeFp8, t: &["out", "", "", "", "", "", "scale"], i: &[], f: &[], j: &[] },
     S { op: DevOp::MoeRouter, t: &[], i: &["H", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
@@ -306,8 +308,6 @@ const NONE: S = S {
 /// oversight" rather than "probably fine".
 const RESERVED: &[DevOp] = &[
     DevOp::Nop,
-    DevOp::XReduceScatter,
-    DevOp::XAllGather,
     DevOp::FlashMlaPrefill,
     DevOp::AttnSelect,
     DevOp::FlashGatherPrefill,

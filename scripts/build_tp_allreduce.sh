@@ -34,6 +34,8 @@ if [ -z "$XR_RS_U" ]; then
 fi
 case "$XR_RS_U" in 1|2) ;; *) echo "PLOW_XR_RS_U must be 1 or 2" >&2; exit 2;; esac
 XR_DEF+=("-DPLOW_XR_RS_U=$XR_RS_U")
+# The sequence-parallel seam halves (ops 25/26) ride the same object for tp_seqpar_smoke.
+XR_DEF+=("-DPLOW_SEQ_PAR_SEAMS=1")
 hipcc --offload-arch="$ARCH" -O3 -w "${XR_DEF[@]}" --genco \
     "$R/tests/tp_allreduce_kernels.hip" -o tp_allreduce.co
 "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
@@ -47,8 +49,13 @@ hipcc --offload-arch="$ARCH" -O3 -w "${XR_DEF[@]}" --genco \
     -o tp_allreduce_prefill_bench \
     "$R/tests/tp_allreduce_prefill_bench.c" "$R/amd/hsa_backend.c" \
     -I/opt/rocm/include -L/opt/rocm/lib -lhsa-runtime64 -lm
+/usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" /usr/bin/gcc -O2 -std=gnu11 \
+    -o tp_seqpar_smoke \
+    "$R/tests/tp_seqpar_smoke.c" "$R/amd/hsa_backend.c" \
+    -I/opt/rocm/include -L/opt/rocm/lib -lhsa-runtime64 -lm
 readelf -d tp_allreduce_bench | grep -qi runpath && { echo "FAIL: RUNPATH leaked"; exit 1; }
 readelf -d tp_allreduce_prefill_bench | grep -qi runpath && { echo "FAIL: RUNPATH leaked"; exit 1; }
+readelf -d tp_seqpar_smoke | grep -qi runpath && { echo "FAIL: RUNPATH leaked"; exit 1; }
 
 ls -l --time-style=+%H:%M:%S tp_allreduce_kernels.elf tp_allreduce_bench \
     tp_allreduce_prefill_bench \
