@@ -96,3 +96,29 @@ it must keep combine/router/collective order unchanged.
 Network evidence is under `/tmp/k3-moe-decode-network`. Packet SHA256 is `f1bf783d...` control and
 `a1f7f6f7...` candidate; runtime SHA256 is `b1c4feb4...`; standalone object SHA256 is
 `836c3baa...`.
+
+## Cooperative GLU-to-DOWN handoff rejection
+
+A follow-up isolated object put both grouped bodies in one kernel and used the sound hierarchy:
+the hardware XCD id is read once, every follower publishes locally with a relaxed arrival, the
+last workgroup on each XCD performs one release/writeback, all eight leaders wait for the unchanged
+global threshold and acquire, then followers observe an XCD-local flag and invalidate only L1.
+The one-workgroup-per-CU grid has 32 arrivals per XCD. Its complete counter census was exact.
+
+| gfx950 B1 hot-shape arm | endpoint (us) | `fu` / partial / sync differences |
+|---|---:|---:|
+| selected two-launch, grid 768 | **16.807321** | 0 / 0 / - |
+| two-launch residency control, grid 256 | 25.182393 | 0 / 0 / - |
+| empty sound per-XCD handoff, grid 256 | 7.627928 | - / - / 0 |
+| cooperative pair, grid 256 | 54.276973 | 0 / 0 / 0 |
+
+The fused object is wave64, 94 VGPR / 63 SGPR, occupancy 5 waves/SIMD, with zero private memory
+and zero VGPR/SGPR spills. It fails the selected endpoint by 3.23x. A 512-workgroup arm sits at the
+two-workgroups-per-CU residency edge: one campaign completed at 105.164587 us, then two independent
+campaigns stalled at the device barrier with 100% GPU activity until their owning process was
+terminated. HSA AQL has no cooperative-launch residency refusal, so resource metadata cannot turn
+that scheduling assumption into a safe runtime gate. Grids above one workgroup per CU are rejected.
+
+**Decision:** keep this as an isolated negative benchmark only. Do not add a runtime route. The
+sound grid-256 phase interpreter cannot beat either the isolated two-launch endpoint or the measured
+network transition budget, while the faster-grid premise is not deadlock-safe on this runtime.

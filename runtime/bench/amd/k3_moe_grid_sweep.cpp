@@ -42,6 +42,7 @@ struct Device {
     unsigned char* tables{};
     unsigned long long* weights{};
     unsigned long long* scales{};
+    unsigned* control{};
 };
 
 void launch_glu(hipFunction_t kernel, Device& d, unsigned grid, unsigned rotation) {
@@ -57,6 +58,19 @@ void launch_down(hipFunction_t kernel, Device& d, unsigned grid, unsigned rotati
     unsigned topk = kTopK, hidden = kHidden, intermediate = kIntermediate, experts = kExperts;
     void* args[] = {&d.partial, &d.fu, &table, &d.weights, &d.scales, &topk,
                     &hidden, &intermediate, &experts};
+    CK(hipModuleLaunchKernel(kernel, grid, 1, 1, kThreads, 1, 1, 0, nullptr, args, nullptr));
+}
+
+void launch_pair(hipFunction_t kernel, Device& d, unsigned grid, unsigned rotation) {
+    unsigned char* table = d.tables + static_cast<size_t>(rotation % kRotations) * kTopK * 8;
+    unsigned topk = kTopK, intermediate = kIntermediate, hidden = kHidden, experts = kExperts;
+    void* args[] = {&d.partial, &d.fu, &d.x, &table, &d.weights, &d.scales, &topk,
+                    &intermediate, &hidden, &experts, &d.control};
+    CK(hipModuleLaunchKernel(kernel, grid, 1, 1, kThreads, 1, 1, 0, nullptr, args, nullptr));
+}
+
+void launch_handoff(hipFunction_t kernel, Device& d, unsigned grid) {
+    void* args[] = {&d.control};
     CK(hipModuleLaunchKernel(kernel, grid, 1, 1, kThreads, 1, 1, 0, nullptr, args, nullptr));
 }
 
@@ -106,9 +120,11 @@ int main(int argc, char** argv) {
     CK(hipInit(0));
     hipModule_t module;
     CK(hipModuleLoad(&module, object));
-    hipFunction_t glu, down, stream;
+    hipFunction_t glu, down, pair, handoff, stream;
     CK(hipModuleGetFunction(&glu, module, "k3_moe_group_glu"));
     CK(hipModuleGetFunction(&down, module, "k3_moe_group_down"));
+    CK(hipModuleGetFunction(&pair, module, "k3_moe_group_pair_xcd"));
+    CK(hipModuleGetFunction(&handoff, module, "k3_moe_xcd_handoff"));
     CK(hipModuleGetFunction(&stream, module, "k3_moe_stream"));
 
     Device d;
@@ -118,6 +134,8 @@ int main(int argc, char** argv) {
     CK(hipMemset(d.x, 0x3c, static_cast<size_t>(kHidden) * sizeof(uint16_t)));
     CK(hipMalloc(&d.fu, fu_bytes));
     CK(hipMalloc(&d.partial, partial_bytes));
+    CK(hipMalloc(&d.control, 25 * sizeof(unsigned)));
+    CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
 
     std::vector<unsigned long long> weights(kExperts * 3), scales(kExperts * 3);
     for (unsigned expert = 0; expert < kExperts; ++expert) {
@@ -169,8 +187,10 @@ int main(int argc, char** argv) {
     const auto reference_fu = copy_bytes(d.fu, fu_bytes);
     const auto reference_partial = copy_bytes(d.partial, partial_bytes);
 
-    std::puts("grid,glu_us,down_us,chain_us,glu_gbps,down_gbps,chain_ms_x92,fu_diff,partial_diff");
+    std::puts("grid,glu_us,down_us,chain_us,pair_us,handoff_us,glu_gbps,down_gbps,chain_ms_x92,fu_diff,partial_diff,pair_fu_diff,pair_partial_diff,sync_diff");
     for (unsigned grid : {1u, 64u, 128u, 192u, 256u, 384u, 512u, 768u}) {
+        std::fprintf(stderr, "grid=%u control\n", grid);
+        std::fflush(stderr);
         const double glu_us = time_us([&](unsigned rotation) {
             launch_glu(glu, d, grid, rotation);
         });
@@ -181,6 +201,15 @@ int main(int argc, char** argv) {
             launch_glu(glu, d, grid, rotation);
             launch_down(down, d, grid, rotation);
         });
+        double pair_us = 0.0, handoff_us = 0.0;
+        if (grid == 256) {
+            std::fprintf(stderr, "grid=%u pair\n", grid);
+            std::fflush(stderr);
+            pair_us = time_us([&](unsigned rotation) { launch_pair(pair, d, grid, rotation); });
+            std::fprintf(stderr, "grid=%u handoff\n", grid);
+            std::fflush(stderr);
+            handoff_us = time_us([&](unsigned) { launch_handoff(handoff, d, grid); });
+        }
 
         CK(hipMemset(d.fu, 0, fu_bytes));
         CK(hipMemset(d.partial, 0, partial_bytes));
@@ -196,10 +225,37 @@ int main(int argc, char** argv) {
             partial_diff += got_partial[i] != reference_partial[i];
         }
 
-        std::printf("%u,%.6f,%.6f,%.6f,%.3f,%.3f,%.6f,%zu,%zu\n", grid,
-                    glu_us, down_us, chain_us, glu_bytes / (glu_us * 1e-6) / 1e9,
+        size_t pair_fu_diff = 0, pair_partial_diff = 0, sync_diff = 0;
+        if (grid == 256) {
+            CK(hipMemset(d.fu, 0, fu_bytes));
+            CK(hipMemset(d.partial, 0, partial_bytes));
+            CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+            launch_pair(pair, d, grid, 0);
+            CK(hipDeviceSynchronize());
+            const auto pair_fu = copy_bytes(d.fu, fu_bytes);
+            const auto pair_partial = copy_bytes(d.partial, partial_bytes);
+            std::vector<unsigned> sync(25);
+            CK(hipMemcpy(sync.data(), d.control, sync.size() * sizeof(sync[0]),
+                         hipMemcpyDeviceToHost));
+            for (size_t i = 0; i < pair_fu.size(); ++i)
+                pair_fu_diff += pair_fu[i] != reference_fu[i];
+            for (size_t i = 0; i < pair_partial.size(); ++i)
+                pair_partial_diff += pair_partial[i] != reference_partial[i];
+            for (unsigned domain = 0; domain < 8; ++domain) {
+                sync_diff += sync[domain] != 32;
+                sync_diff += sync[8 + domain] != 32;
+                sync_diff += sync[16 + domain] != 32;
+            }
+            sync_diff += sync[24] != 256;
+        }
+
+        std::printf("%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f,%.3f,%.6f,%zu,%zu,%zu,%zu,%zu\n", grid,
+                    glu_us, down_us, chain_us, pair_us, handoff_us,
+                    glu_bytes / (glu_us * 1e-6) / 1e9,
                     down_bytes / (down_us * 1e-6) / 1e9,
-                    chain_us * 92.0 / 1000.0, fu_diff, partial_diff);
+                    chain_us * 92.0 / 1000.0, fu_diff, partial_diff,
+                    pair_fu_diff, pair_partial_diff, sync_diff);
+        std::fflush(stdout);
     }
 
     CK(hipModuleUnload(module));
