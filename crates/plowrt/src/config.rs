@@ -403,7 +403,7 @@ pub struct AmdRuntimeConfig {
     pub seg_window: bool,
 
     /// Enqueue prefill segments in segment-major rank order and drain once per chunk.
-    #[arg(long = "amd-tp-prefill-segment-major", env = "PLOW_TP_PREFILL_SEGMENT_MAJOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "amd-tp-prefill-segment-major", env = "PLOW_TP_PREFILL_SEGMENT_MAJOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_prefill_segment_major: bool,
 
     /// VMM-backed KV on ROCr (opt-in, requires hsa_amd_vmem_*).
@@ -725,6 +725,24 @@ mod tests {
             .expect("explicit state-clear rollback");
         let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
         assert!(!config.state_clear_device);
+    }
+
+    #[test]
+    fn tp_prefill_segment_major_defaults_on_and_has_a_false_rollback() {
+        use clap::{Args, FromArgMatches};
+
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "tp_prefill_segment_major")
+            .expect("TP prefill segment-major argument");
+        assert_eq!(arg.get_default_values(), ["true"]);
+
+        let matches = command
+            .try_get_matches_from(["test", "--amd-tp-prefill-segment-major=false"])
+            .expect("explicit TP prefill segment-major rollback");
+        let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
+        assert!(!config.tp_prefill_segment_major);
     }
 
     /// A `RuntimeConfig` field that nothing reads is a CLI flag that silently does nothing.

@@ -23,8 +23,8 @@
 //! ranks, and every rank's queue preserves that identical order. The raw segment has no local or
 //! cross-rank counter obligations; interpreter collectives retain distinct cross-rank gates, and
 //! the exact cross-rank counter audit remains mandatory every token. A 64-step TP8 stress run on
-//! 2026-09-03 passed that audit and all-rank token agreement. This exception does not generalise
-//! to wave-class prefill, where letting each rank enqueue all segments before draining is wrong.
+//! 2026-09-03 passed that audit and all-rank token agreement. This does not permit per-rank
+//! submission, where one rank can run ahead of its peers.
 //! `runtime/tests/tp_decode.c` records the failure verbatim:
 //!
 //! > Per-rank-all-segments let the ranks desync — a lagging rank made peers time
@@ -33,12 +33,12 @@
 //! A class-8 segment holds both of a layer's all-reduces. The inline gate
 //! rendezvouses in ~0.3 µs only if every rank is inside that segment at the same
 //! time; if one rank is three segments behind, its peers spin to the
-//! `PLOW_XCTR_DEADLINE_TICKS` deadline (1 s) and give up. Production therefore
-//! runs per-segment, all-ranks, with a host barrier between segments. The
-//! default-off segment-major experiment instead submits each segment to all
-//! ranks before the next segment, relies on every rank's AQL barrier packets to
-//! preserve local order, and drains once. The exact counter audit remains
-//! mandatory. L2-domain placement is not wave-class segmentation: every domain
+//! `PLOW_XCTR_DEADLINE_TICKS` deadline (1 s) and give up. Production submits each
+//! segment to all ranks before the next segment, relies on every rank's AQL
+//! barrier packets to preserve local order, and drains once. The exact counter
+//! audit remains mandatory. `PLOW_TP_PREFILL_SEGMENT_MAJOR=0` restores a host
+//! drain after every segment for diagnosis and intermediate tensor capture uses
+//! that path automatically. L2-domain placement is not wave-class segmentation: every domain
 //! drains concurrently inside one launch, so a placed prefill program uses
 //! launch-all/drain-all exactly once.
 //!

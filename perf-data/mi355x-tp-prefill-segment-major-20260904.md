@@ -2,14 +2,14 @@
 
 ## Status
 
-Default-off experiment. `PLOW_TP_PREFILL_SEGMENT_MAJOR=1` (or
+Production default. `PLOW_TP_PREFILL_SEGMENT_MAJOR=1` (or
 `--amd-tp-prefill-segment-major=true`) submits `(segment, rank)` in segment-major order and drains
 all ranks once after the chunk. Every rank owns one ordered AQL queue and every dispatch packet
 has the barrier bit, so local segment order remains identical. Cross-rank counters are zeroed once
 before submission and the existing exact counter audit runs after the final drain.
 
-The production per-segment drain path is unchanged by default. A configured tensor capture retains
-that path because later queued segments may overwrite the requested intermediate boundary.
+`PLOW_TP_PREFILL_SEGMENT_MAJOR=0` restores the per-segment drain path. A configured tensor capture
+retains that path because later queued segments may overwrite the requested intermediate boundary.
 
 Prototype commit: `7731f5a`. Release HSA binary SHA256:
 `a0525cf0bc6ec75ced224242428b6e0b516e9ce258632218bdf4ca269cf53b88`.
@@ -63,9 +63,30 @@ before model load because `--parity-report` requires one request; it touched no 
 
 ## Decision gate
 
-The 10.96 ms TTFT gain is material and repeatable, but this is not production-qualified yet.
-Audit/all-rank agreement, counter reuse, T128, T1024, and T2048 now pass. A matched raw trace must
-still show how much external segment residual the removed host drains recover before default-on.
+The 10.96 ms TTFT gain is material and repeatable. Audit/all-rank agreement, counter reuse, T128,
+T1024, and T2048 pass. A matched raw trace also localizes the gain to the removed host/drain
+residual:
+
+| metric | control | segment-major | delta |
+|---|---:|---:|---:|
+| endpoint TTFT ms | 1420.763 | 1405.520 | **-15.243** |
+| traced chain span ms | 1404.400 | 1390.551 | **-13.849** |
+| traced gate ms | 5.779 | 5.746 | -0.033 |
+| traced body ms | 1017.175 | 1024.334 | +7.159 |
+| external residual ms | 381.446 | 360.471 | **-20.975** |
+| convergence ms | 56.218 | 47.208 | **-9.010** |
+
+Both arms emitted token `6896`; their token files have the same SHA256
+`7202693c9fb5709db526cf3511e86ace6055786c338a6693440ddbc5e672c2e4`. The exclusive lease
+`tp-prefill-seg-major-trace` returned 0. Control/candidate raw trace SHA256 values are
+`b434e2c2881d384caf181982ad069d1342fa2e851ad8e5504f326671e507803f` and
+`6d37203c82974e3270cfa4bbd5eabd7f9b635de6b5bb6b3fa35bb0e885a92469`; report SHA256 values are
+`6667f590f356a1f85dbe71a47dfd5aa5f7ef76ceb58e9b316378a552c505f2c7` and
+`f443eaefa7aee45955d6cd5c92d7e0aa586d0a23b6499ccb7ac00cb15141b461`.
+
+The default is promoted. The trace shows the expected residual/convergence reduction despite a
+7.16 ms adverse body-noise sample, while the three production-timing folds consistently recover
+10.05–11.46 ms TTFT. Rollback is explicit with `PLOW_TP_PREFILL_SEGMENT_MAJOR=0`.
 
 Any rung failure, counter timeout, output mismatch, or loss of the TTFT gain rejects the experiment.
 
