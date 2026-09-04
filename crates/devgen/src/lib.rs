@@ -1130,6 +1130,24 @@ pub(crate) fn select_amd_moe_decode_route(
             selected.route,
             selected.projected_gain_ns / 1000.0
         );
+    } else if !records.is_empty() {
+        // Same shape as the GEMM tuner's STALE report: records exist, none serve this cell.
+        let same_cell = records.iter().filter(|r| r.cell == cell).count();
+        let stale: Vec<String> = records
+            .iter()
+            .filter(|r| r.cell == cell)
+            .map(|r| format!("{:?}:{}", r.route, r.digests.stale_against(&want).join("+")))
+            .collect();
+        eprintln!(
+            "  grouped-MoE decode route: {} record(s), {} for cell {}, none usable (stale fields per route: {:?}; want {}/{}/{}) -- interpreter route kept",
+            records.len(),
+            same_cell,
+            cell.key(),
+            stale,
+            want.implementation,
+            want.toolchain,
+            want.oracle
+        );
     }
     selected
 }

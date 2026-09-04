@@ -1248,7 +1248,11 @@ fn k3_build_model(
                         c.moe_latent,
                         c.moe_inter / tp.max(1),
                         c.n_exp,
-                        if emit_config::active().mxfp4 { "mxfp4" } else { "bf16" },
+                        match mcfg.moe.enc {
+                            e if e == MoeEnc::Mxfp4 as u32 => "mxfp4",
+                            e if e == MoeEnc::Fp8Blk as u32 => "fp8blk",
+                            _ => "bf16",
+                        },
                     )
                     .route
                         == tunedb::MoeDecodeRoute::Standalone
