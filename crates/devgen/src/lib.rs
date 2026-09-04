@@ -529,6 +529,32 @@ fn select_gemm_over(
     n_cu: u32,
     quant: kernelcaps::QuantScheme,
 ) -> (DevOp, kernelcaps::CalibrationTier) {
+    let measured = gfx950_gemm_measurements().for_shape(m as i64, n as i64, k as i64, quant);
+    select_gemm_with(inv, m, n, k, n_cu, quant, measured)
+}
+
+/// The analytical tier alone: the answer with no qualified record for the shape.
+#[cfg(test)]
+fn select_gemm_analytical(
+    inv: &kernelcaps::Inventory,
+    m: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+) -> DevOp {
+    select_gemm_with(inv, m, n, k, n_cu, quant, &ShapeCosts(None)).0
+}
+
+fn select_gemm_with(
+    inv: &kernelcaps::Inventory,
+    m: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+    measured: &dyn kernelcaps::MeasuredCosts,
+) -> (DevOp, kernelcaps::CalibrationTier) {
     let (spec, _isa) = amd_target::active();
     let hw = kernelcaps::HardwareFingerprint::from_spec(spec)
         .unwrap_or_else(|| panic!("no hardware fingerprint for {}", spec.name));
@@ -545,7 +571,7 @@ fn select_gemm_over(
         &op,
         &hw,
         kernelcaps::ProfileId::PrefillDense,
-        gfx950_gemm_measurements().for_shape(m as i64, n as i64, k as i64, quant),
+        measured,
         |kernel| tile_cost(spec, kernel, m as i64, n as i64, k as i64, n_cu),
     )
     .unwrap_or_else(|e| {

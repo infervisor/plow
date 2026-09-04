@@ -3579,10 +3579,14 @@ mod tests {
     fn snapshot_layers_restart_the_prefix_instead_of_adding() {
         let p = build_layer1();
         // Layer 1 is NOT a snapshot layer: it adds.
+        // 91a6d24 fuses the prefix add into its AttnRes consumer (t6/t7) by default.
         let res = p
             .insts
             .iter()
-            .filter(|i| i.op == DevOp::Residual as u16)
+            .filter(|i| {
+                i.op == DevOp::Residual as u16
+                    || (i.op == DevOp::AttnRes as u16 && i.t[6] != packet::dev::TENSOR_NONE)
+            })
             .count();
         assert!(res >= 2, "layer 1 needs the prefix add and the block out");
         assert_eq!(k3().blocks_at(0), 0, "layer 0 enters with an empty ring");

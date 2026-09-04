@@ -363,9 +363,10 @@ pub enum DevOp {
     /// rendezvous bracket the phases. Fabric ≈ 2(N−1)/N·msg/rank vs one-shot's (N−1)·msg.
     /// Bit-identical result to one-shot (same f32-acc, r=0..N−1 order). DECODE keeps the
     /// one-shot (its tiny [1,hidden] message is latency-, not bandwidth-, bound).
-    /// `t0=out` · `i0=n(=t·hidden) i1=n_gpu i2=slot(byte offset) i3=gate_rs i4=gate_ag
-    /// i5=e0 i6=gslot? i7=gcols?`. With a graph-selected fused AttnRes consumer, `t1=resid?`,
-    /// `t2=attnres_out`, `t3=ring`, `t4=score`, `t5=gamma`, `t6=prefix_out`, and
+    /// `t0=out t1=resid? t2=attnres_out? t3=attnres_ring? t4=attnres_score? t5=attnres_gamma?
+    /// t6=prefix_out?` · `i0=n(=t·hidden) i1=n_gpu i2=slot(byte offset) i3=gate_rs i4=gate_ag
+    /// i5=e0_or_H i6=gslot_or_nb i7=gcols_or_nbcap` · `f0=attnres_eps?`. Plain: `i5=e0
+    /// i6=gslot? i7=gcols?`. With a graph-selected fused AttnRes consumer `t1..t6` are set and
     /// `i5=H i6=nb i7=nb_cap f0=eps`. Phase 2 preserves `out`, materializes the rounded prefix,
     /// then runs AttnRes+RMSNorm on the same token-owned workgroups.
     XReduceTwoShot = 29,
