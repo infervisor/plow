@@ -133,3 +133,59 @@ python3 scripts/k3_xr_decode_report.py /tmp/k3-xr-phase-gate/trace-xr.rk{0,1,2,3
 Gate for a production route: TP8 strict-order oracle exact at 7168 and 3584, tagged_cold
 < cold by >= 5 us at 14 KiB, and the all-rank trace floor >= 8 us (otherwise the body is
 last-rank wait and no collective redesign reaches it).
+
+## 7. TP8 results and production integration (parent-run microbench + all-rank trace)
+
+TP8, 4000 iterations, strict-order oracle bit-exact in every mode (`/tmp/k3-xr-phase-gate/xr-*.log`):
+
+| arm | 7168 (14 WGs) | 3584 (7 WGs) |
+|---|---:|---:|
+| oneshot hot (control, corrected units) | 9.766 us | — |
+| cold (producer rewrite + local gate) | 11.361 us | 11.026 us |
+| tagged hot | 3.716 us | 3.693 us |
+| tagged_cold | 4.747 us | 4.235 us |
+
+All-rank decode trace (control objects, `xr-decode-report.txt`): protocol floor (min over
+ranks) 14.50 us mean for b=14 / 12.91 us for b=7; rank-0 wait for the last rank 1.00 /
+0.94 us mean (p90 ~2.5). The body is the serialised protocol; projected saving ~9 us per
+collective, ~2.5 ms/token.
+
+Integration (`-DPLOW_XR_TAGGED=1`, cmake `PLOW_XR_TAGGED`, decode objects only, default OFF):
+
+- `d_xreduce_tagged_mega` (op_collective.h) is the decode `XREDUCE` arm under the flag: publish
+  by copy into the tagged slot (partial and, when `gcols`, the compact gather partial), spin
+  on eight peer words (+ the owner's gather word per element) at system scope, strict
+  rank-0..7 f32 accumulate, gather added after the bf16 round exactly as `d_xreduce`, then a
+  RELAXED xctr bump per peer (workgroup s -> peer s, s+nblk, ...) so `gate_expectations` and
+  the per-token gate audit are unchanged. Deadline bails still latch status; `gcols` with
+  `row_w != n` bails with `0xBAD0....`. The object exports `plow_xr_tagged_1`.
+- Layout: `PeerLayout` appends four `PLOW_XR_TAG_SLOT_BYTES` = 20480 B slots (partial parity
+  0/1, gather parity 0/1; holds hidden <= 7680 at three bf16 per word) directly after the
+  compact-audit status line, inside the per-token `zero_xctr` pass (copy-engine `Host`
+  reset: 12 KiB -> 92 KiB per rank; `HostDirect` would be ~2.5 us). The device derives the
+  region from the status id the TP loader patches into every collective's `fj[2]` plus the
+  constant, so `PlowProgram` is unchanged (168 B): flag-off objects are byte-identical and
+  the campaign plowrt still serves them; the tagged object needs a plowrt from this tree
+  (layout + loader contract).
+- Slot = gate id & 1, tag = gate id + 1. Loader contract (`check_xr_tagged_blob`, run when a
+  decode object carries the marker): consecutive `XReduce` packets alternate gate parity
+  (K3 B1: gates 0..277 sequential), `n <= hidden`, `gcols <= hidden`, `row_w == n` when
+  gathered, gate < 0xffff; a tagged object without a TP tagged region is refused. Unit tests:
+  `exec::tp::tests::{twelve_b_decode_peer_footprint_stays_tiny, tagged_slot_matches_dev_isa}`,
+  `exec::amd_tp::tests::tagged_xreduce_contract_is_enforced`, `packet` `dev_abi`.
+- Producer-side publish was NOT moved into the GEMV/Combine epilogues: the tagged word
+  groups three columns owned by different threads and would break every decode GEMV's
+  vector store path at 248 VGPR; the copy costs ~0.9 us and is priced in the 4.7 us cell.
+- Decode object `interp_decode_k3_gq` (packet-paired, HIER on): tagged 248 VGPR / occ 2 /
+  0 VGPR spill / **110 SGPR spill (control 84, +26)** / 216 B private / LDS 147504
+  (control 147512); flag-off `.text` byte-identical to the campaign `hsaco-control` object
+  (decode and prefill). Harness kernels: `tp_allreduce_tagged` 64 VGPR / 5 SGPR spill /
+  occ 7, `tp_allreduce_tagged_x` (gather) 100 VGPR / 4 SGPR spill / occ 4, no scratch.
+
+A/B object sets (built from `worktree-agent-a3db1e5a3e4fae120`, same cmake row as
+`cmake-control`): control `/tmp/xr-tag-hsaco/control-set` (decode `.text` identical to
+`hsaco-control`), candidate `/tmp/xr-tag-hsaco/tagged-set`; runtime `target/release/plowrt`
+of that worktree for both arms. Packet: `assets-control` unchanged.
+Isolated gather oracle (needs 8 GPUs): `TP_TAGGED=1 TP_ONESHOT=1 TP_GATHER=1 TP_ROWS=1
+TP_HIDDEN=7168 TP_NWG=14 ./tp_allreduce_prefill_bench 0 1 2 3 4 5 6 7` (and `TP_GATHER=0`),
+against the same lines with `TP_TAGGED=0`.

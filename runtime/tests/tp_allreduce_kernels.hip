@@ -140,23 +140,42 @@ extern "C" __global__ void tp_allreduce_cold(bf16* out, const void* const* peer_
     const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
-/* Tagged one-shot. Iteration i is the tag; the tagged slot alternates by parity. */
+/* Tagged one-shot, the production body. Gate id = i & 1023 (parity alternates, the audit
+ * bump lands on 1024 xctr lines at `xctr_off`); tag = gate + 1 differs between any two
+ * consecutive uses of a slot, which is all the loop needs without the host's per-token
+ * zeroing. `tag_off`/`tag_slot` are the four-slot region exactly as PlowProgram carries it. */
 extern "C" __global__ void tp_allreduce_tagged(bf16* out, const void* const* peer_scratch,
                                                uint32_t nranks, uint32_t rank, uint32_t n,
-                                               uint32_t slot_bytes, uint32_t tslot_bytes,
+                                               uint32_t slot_bytes, uint32_t tag_off,
                                                uint32_t iters, uint64_t deadline,
                                                uint64_t* cycles, uint32_t* status,
                                                uint32_t* lctr, uint32_t order, uint32_t cold,
-                                               uint32_t tstride) {
+                                               uint32_t tag_slot, uint32_t xctr_off) {
     const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
     for (uint32_t i = 1; i <= iters; i++) {
         const uint32_t sb = slot_bytes * (i & 1u);
         if (cold)
             tp_local_produce((bf16*)((char*)peer_scratch[rank] + sb), n, rank, i, order, lctr);
         d_xreduce_tagged_mega(out, peer_scratch, nranks, rank, n, cold ? sb : 0u,
-                              tslot_bytes + tstride * (i & 1u), i, deadline, status,
-                              blockIdx.x, gridDim.x);
+                              (size_t)xctr_off, i & 1023u, deadline, status, blockIdx.x,
+                              gridDim.x, 0u, 0u, 0u, tag_off, tag_slot);
     }
+    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
+}
+/* tp_allreduce_prefill_bench TP_TAGGED=1: the tagged body on the production one-shot
+ * operands (plain or folded-gather), gate id = iteration exactly like the one-shot arm. */
+extern "C" __global__ void tp_allreduce_tagged_x(
+    bf16* out, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
+    uint32_t n, uint32_t slot_bytes, uint64_t xctr_byte_off, uint32_t iters,
+    uint64_t deadline, uint64_t* cycles, uint32_t* status,
+    uint32_t gslot_bytes, uint32_t gcols, uint32_t tag_off, uint32_t tag_slot) {
+    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    for (uint32_t i = 0; i < iters; i++)
+        d_xreduce_tagged_mega(out, peer_scratch, nranks, rank, n, slot_bytes,
+                              (size_t)xctr_byte_off, i, deadline, status, blockIdx.x,
+                              gridDim.x, gslot_bytes, gcols, gcols ? n : 0u, tag_off,
+                              tag_slot);
     const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }

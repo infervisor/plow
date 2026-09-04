@@ -38,6 +38,14 @@ typedef struct {
     uint64_t xctr_byte_off; uint32_t iters; uint64_t deadline;
     void* cycles; void* status; uint32_t gslot_bytes, gcols;
 } arg_xr2g;
+/* TP_TAGGED=1: tp_allreduce_tagged_x, the tagged one-shot on the same operands. Its four
+ * tagged slots sit 512 KiB past the counters, inside REGION_BYTES. */
+typedef struct {
+    void* out; const void* peers; uint32_t nranks, rank, n, slot_bytes;
+    uint64_t xctr_byte_off; uint32_t iters; uint64_t deadline;
+    void* cycles; void* status; uint32_t gslot_bytes, gcols, tag_off, tag_slot;
+} arg_tagx;
+#define TAG_OFF (XCTR_OFF + 524288u)
 
 static void* slurp(const char* path, size_t* len) {
     FILE* f = fopen(path, "rb"); if (!f) return NULL;
@@ -74,7 +82,14 @@ int main(int argc, char** argv) {
     const uint32_t nwg = env_u32("TP_NWG", DEFAULT_NWG, 1u, UINT32_MAX / 512u);
     const int gather = getenv("TP_GATHER") && atoi(getenv("TP_GATHER")) != 0;
     const int oneshot = getenv("TP_ONESHOT") && atoi(getenv("TP_ONESHOT")) != 0;
+    const int taggedx = getenv("TP_TAGGED") && atoi(getenv("TP_TAGGED")) != 0;
     const int unsafe = getenv("TP_UNSAFE") && atoi(getenv("TP_UNSAFE")) != 0;
+    const uint32_t tag_slot = (((hidden + 2u) / 3u) * 8u + 255u) & ~255u;
+    if (taggedx && (rows > 1 || TAG_OFF + 4u * tag_slot > REGION_BYTES || iters >= 0xffff)) {
+        fprintf(stderr, "TP_TAGGED needs rows<=1, hidden<=%u, iters<0xffff\n",
+                (REGION_BYTES - TAG_OFF) / 8u * 3u / 4u);
+        return 2;
+    }
     const uint64_t n0 = (uint64_t)(rows ? rows : 512u) * hidden;
     const uint64_t n1 = rows ? 0u : (uint64_t)1024u * hidden;
     if (n0 > UINT32_MAX || n1 > UINT32_MAX || 2u * (n1 ? n1 : n0) > GATHER_OFF ||
@@ -105,9 +120,11 @@ int main(int argc, char** argv) {
     for (int r = 0; r < NR; r++) {
         if (plow_hsa_load_code_object(h, dev[r], elf, elf_len) ||
             plow_hsa_get_kernel(h, dev[r], "tp_fill_partial", &fill[r]) ||
-            plow_hsa_get_kernel(h, dev[r], gather ? (oneshot ? "tp_allreduce_oneshot_gather"
-                                                             : "tp_allreduce_twoshot_gather")
-                                                  : "tp_allreduce_twoshot", &xr2[r])) {
+            plow_hsa_get_kernel(h, dev[r],
+                                taggedx ? "tp_allreduce_tagged_x"
+                                : gather ? (oneshot ? "tp_allreduce_oneshot_gather"
+                                                    : "tp_allreduce_twoshot_gather")
+                                         : "tp_allreduce_twoshot", &xr2[r])) {
             fprintf(stderr, "load: %s\n", plow_hsa_last_error()); return 2;
         }
         scratch[r] = plow_hsa_alloc_peer(h, dev[r], REGION_BYTES);
@@ -131,6 +148,9 @@ int main(int argc, char** argv) {
         const uint32_t n = shape[si]; uint8_t zero[128 * 64] = {0};
         for (int r = 0; r < NR; r++) {
             plow_hsa_upload(h, dev[r], (char*)scratch[r] + XCTR_OFF, zero, sizeof zero);
+            for (uint32_t s = 0; taggedx && s < 4u * tag_slot; s += sizeof zero)
+                plow_hsa_upload(h, dev[r], (char*)scratch[r] + TAG_OFF + s, zero,
+                                4u * tag_slot - s < sizeof zero ? 4u * tag_slot - s : sizeof zero);
             plow_hsa_upload(h, dev[r], status[r], zero, 4);
             arg_fill a = {scratch[r], n, (uint32_t)r};
             plow_hsa_launch(h, dev[r], &fill[r], 4096, 1, 1, 256, 1, 1, 0, &a, sizeof a);
@@ -143,14 +163,19 @@ int main(int argc, char** argv) {
         }
         arg_xr2 a[NR];
         arg_xr2g ag[NR];
+        arg_tagx at[NR];
         for (int r = NR - 1; r >= 0; r--) {
             a[r] = (arg_xr2){out[r], table[r], NR, (uint32_t)r, n, 0, XCTR_OFF,
                               iters, deadline, r ? NULL : cycles, status[r]};
             ag[r] = (arg_xr2g){out[r], table[r], NR, (uint32_t)r, n, 0, XCTR_OFF,
                                 iters, deadline, r ? NULL : cycles, status[r],
                                 GATHER_OFF, hidden / NR};
-            void* ka = gather ? (void*)&ag[r] : (void*)&a[r];
-            size_t kaz = gather ? sizeof ag[r] : sizeof a[r];
+            at[r] = (arg_tagx){out[r], table[r], NR, (uint32_t)r, n, 0, XCTR_OFF,
+                               iters, deadline, r ? NULL : cycles, status[r],
+                               gather ? GATHER_OFF : 0u, gather ? hidden / NR : 0u,
+                               TAG_OFF, tag_slot};
+            void* ka = taggedx ? (void*)&at[r] : gather ? (void*)&ag[r] : (void*)&a[r];
+            size_t kaz = taggedx ? sizeof at[r] : gather ? sizeof ag[r] : sizeof a[r];
             plow_hsa_launch(h, dev[r], &xr2[r], nwg * 512, 1, 1, 512, 1, 1, 0, ka, kaz);
         }
         for (int r = 0; r < NR; r++) plow_hsa_wait(h, dev[r]);
@@ -171,13 +196,18 @@ int main(int argc, char** argv) {
                 plow_hsa_launch(h, dev[r], &fill[r], 4096, 1, 1, 256, 1, 1, 0,
                                 &g, sizeof g);
             }
+            /* Tagged slots restart at gate 0 / tag 1: clear the timing run's words. */
+            for (uint32_t s = 0; taggedx && s < 4u * tag_slot; s += sizeof zero)
+                plow_hsa_upload(h, dev[r], (char*)scratch[r] + TAG_OFF + s, zero,
+                                4u * tag_slot - s < sizeof zero ? 4u * tag_slot - s : sizeof zero);
             plow_hsa_wait(h, dev[r]);
             a[r].iters = 1; a[r].cycles = NULL;
             ag[r].iters = 1; ag[r].cycles = NULL;
+            at[r].iters = 1; at[r].cycles = NULL;
         }
         for (int r = NR - 1; r >= 0; r--) {
-            void* ka = gather ? (void*)&ag[r] : (void*)&a[r];
-            size_t kaz = gather ? sizeof ag[r] : sizeof a[r];
+            void* ka = taggedx ? (void*)&at[r] : gather ? (void*)&ag[r] : (void*)&a[r];
+            size_t kaz = taggedx ? sizeof at[r] : gather ? sizeof ag[r] : sizeof a[r];
             plow_hsa_launch(h, dev[r], &xr2[r], nwg * 512, 1, 1, 512, 1, 1, 0,
                             ka, kaz);
         }
@@ -202,8 +232,9 @@ int main(int argc, char** argv) {
          * timestamp clock `freq`; scaling by `freq` printed 10x-too-small numbers until
          * 2026-09-04 (tp_allreduce_bench.c has the wall-clock check). */
         const double us = (double)ticks * 10.0 / (double)iters / 1e3;
-        printf("rows=%u n=%u nblk=%u gather=%d oneshot=%d %.3f us/collective parity=%s timeout=%s bad=%zu\n",
-               n / hidden, n, nwg, gather, oneshot, us, bad ? "FAIL" : "PASS", timeout ? "YES" : "no", bad);
+        printf("rows=%u n=%u nblk=%u gather=%d oneshot=%d tagged=%d %.3f us/collective parity=%s timeout=%s bad=%zu\n",
+               n / hidden, n, nwg, gather, oneshot, taggedx, us, bad ? "FAIL" : "PASS",
+               timeout ? "YES" : "no", bad);
         if ((!unsafe && bad) || timeout) return 1;
     }
     plow_hsa_shutdown(h); return 0;

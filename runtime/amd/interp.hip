@@ -4499,6 +4499,25 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
             uint32_t* const xaudit = plow_xaudit_status(prog, in);
+#if PLOW_XR_TAGGED
+            /* Tagged one-shot (op_collective.h): the arrival signal rides in the data. The
+             * region sits right after the compact-audit status line, whose id the TP loader
+             * patches into fj[2] of every collective; a zero here is a host that bypassed
+             * the loader — stop rather than spin on nothing. */
+            if (in->fj[2].u == 0u) __builtin_trap();
+            const uint32_t xr_tag_off =
+                (uint32_t)((const char*)PLOW_CTR(prog.xctr, in->fj[2].u) -
+                           (const char*)prog.peer_scratch[prog.rank]);
+            d_xreduce_tagged_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu,
+                                  prog.rank, in->i[0], in->i[2], xoff, in->i[3],
+                                  PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
+                                  in->i[4], in->i[5], in->i[6], xr_tag_off,
+                                  PLOW_XR_TAG_SLOT_BYTES
+#if PLOW_XR_TRACE_PHASES
+                                  , prog.trace ? &prog.trace[base + ix] : nullptr
+#endif
+                                  );
+#else
             d_xreduce_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu, prog.rank,
                            in->i[0], in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS,
                            xaudit, e.slice, in->blocks, in->i[4], in->i[5], in->i[6]
@@ -4506,6 +4525,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                            , prog.trace ? &prog.trace[base + ix] : nullptr
 #endif
                            );
+#endif
         } else if (in->op == PLOW_DOP_XREDUCE_ADD_NORM) {
             /* Fused all-reduce + residual + RMSNorm (op 116, one workgroup):
              *   t0=out t1=resid t2=a t3=gamma  i0=feat i1=n_gpu i2=slot i3=gate  f0=eps */

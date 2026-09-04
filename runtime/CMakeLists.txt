@@ -702,6 +702,8 @@ option(PLOW_XR_WAVE_RS
        "Use experimental TP8 wave-per-peer prefill reduce-scatter on gfx950" OFF)
 option(PLOW_XR_TRACE_PHASES
        "Record diagnostic XReduceTwoShot internal phases in packet traces" OFF)
+option(PLOW_XR_TAGGED
+       "Decode one-shot XReduce spins on tagged data words instead of the xctr gate" OFF)
 option(PLOW_KDA_PF_STATE_RESIDENT
        "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
 option(PLOW_K3_KDA_CONV_STEP_DB
@@ -909,6 +911,9 @@ if(PLOW_GFX950_HSACO)
     endif()
     if(PLOW_XR_TRACE_PHASES)
         list(APPEND _hs_ax_decode -DPLOW_XR_TRACE_PHASES=1)
+    endif()
+    if(PLOW_XR_TAGGED)
+        list(APPEND _hs_ax_decode -DPLOW_XR_TAGGED=1)
     endif()
     set(_hs_ax_decode_mla ${_hs_ax_decode} -DPLOW_BUCKET_DECODE_MLA=1)
     if(PLOW_GEMV_WALK)

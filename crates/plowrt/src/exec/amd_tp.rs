@@ -1658,6 +1658,56 @@ fn xargmax_value_lines(n_batch: u32) -> u32 {
         .expect("AmdEngine rejects XArgmaxFin batches above the packet limit")
 }
 
+/// The blob contract of the tagged one-shot XReduce (`plow_xr_tagged_1` decode objects,
+/// `d_xreduce_tagged_mega`): every `XReduce` message fits the layout's slot (`i0 <= hidden`,
+/// `gcols <= hidden`), the folded gather is the decode `[1, row_w == n]` form, gate ids fit
+/// the 16-bit tag, and CONSECUTIVE XReduce packets of a program use gates of opposite
+/// parity — the tagged slot is chosen by `gate & 1`, and a rank may only rewrite a slot
+/// after every peer has finished reading it, which program order guarantees only one
+/// collective later. Prefill programs (two-shot) are untouched by the arm and skipped.
+pub fn check_xr_tagged_blob(progs: &[crate::asset::devblob::DevProg], hidden: u32) -> Result<()> {
+    for (pi, p) in progs.iter().enumerate() {
+        check_xr_tagged_insts(pi, &p.insts, hidden)?;
+    }
+    Ok(())
+}
+
+fn check_xr_tagged_insts(pi: usize, insts: &[packet::dev::DevInst64], hidden: u32) -> Result<()> {
+    use packet::dev::DevOp;
+    {
+        let mut prev: Option<u32> = None;
+        for d in insts {
+            if d.op != DevOp::XReduce as u16 {
+                continue;
+            }
+            let (n, gate, gcols, row_w) = (d.i[0], d.i[3], d.i[5], d.i[6]);
+            let bad = n == 0
+                || n > hidden
+                || hidden > PeerLayout::XR_TAG_MAX_WIDTH
+                || gcols > hidden
+                || (gcols != 0 && row_w != n)
+                || gate >= 0xffff;
+            if bad {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi}: XReduce n={n} gate={gate} gcols={gcols} row_w={row_w} is \
+                     outside the tagged one-shot contract (hidden={hidden}, slot holds {})",
+                    PeerLayout::XR_TAG_MAX_WIDTH
+                )));
+            }
+            if let Some(g) = prev {
+                if (g ^ gate) & 1 == 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "program {pi}: consecutive XReduce gates {g} and {gate} share parity; \
+                         the tagged one-shot double-buffers by gate parity"
+                    )));
+                }
+            }
+            prev = Some(gate);
+        }
+    }
+    Ok(())
+}
+
 fn count_xgates(blob: &DevBlob) -> u32 {
     use packet::dev::DevOp;
     let mut top = 0u32;
@@ -1747,6 +1797,31 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tagged one-shot's blob contract (`check_xr_tagged_blob`): the decode program's
+    /// XReduce packets alternate gate parity, fit the layout, and use the decode gather form.
+    #[test]
+    fn tagged_xreduce_contract_is_enforced() {
+        use packet::dev::{DevInst64, DevOp};
+        let xr = |n: u32, gate: u32, gcols: u32, row_w: u32| DevInst64 {
+            op: DevOp::XReduce as u16,
+            blocks: 14,
+            i: [n, 8, 0, gate, 0, gcols, row_w, 0],
+            ..Default::default()
+        };
+        let other = DevInst64 { op: DevOp::Gemv as u16, ..Default::default() };
+        // The K3 decode shape: 7168 / 3584 / 7168+gather, sequential gates.
+        let good = vec![xr(7168, 0, 0, 0), other, xr(3584, 1, 0, 0), xr(7168, 2, 896, 7168)];
+        assert!(check_xr_tagged_insts(0, &good, 7168).is_ok());
+        assert!(check_xr_tagged_insts(0, &[], 7168).is_ok(), "no collectives is fine");
+        // Same parity twice in a row: the second would overwrite the slot peers still read.
+        let bad = vec![xr(7168, 0, 0, 0), xr(3584, 2, 0, 0)];
+        assert!(check_xr_tagged_insts(0, &bad, 7168).is_err());
+        // Wider than the slot, a prefill-shaped gather, and a tag that does not fit.
+        assert!(check_xr_tagged_insts(0, &[xr(7169, 0, 0, 0)], 7168).is_err());
+        assert!(check_xr_tagged_insts(0, &[xr(7168, 0, 896, 14336)], 7168).is_err());
+        assert!(check_xr_tagged_insts(0, &[xr(7168, 0xffff, 0, 0)], 7168).is_err());
+    }
 
     #[test]
     fn prefill_capture_is_exact_one_shot_selection() {

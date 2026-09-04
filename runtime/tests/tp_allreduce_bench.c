@@ -77,9 +77,9 @@ typedef struct {
 } arg_cold;
 typedef struct {
     void* out; const void* peer_scratch;
-    uint32_t nranks; uint32_t rank; uint32_t n; uint32_t slot_bytes; uint32_t tslot_bytes;
+    uint32_t nranks; uint32_t rank; uint32_t n; uint32_t slot_bytes; uint32_t tag_off;
     uint32_t iters; uint64_t deadline; void* cycles; void* status; void* lctr;
-    uint32_t order; uint32_t cold; uint32_t tstride;
+    uint32_t order; uint32_t cold; uint32_t tag_slot; uint32_t xctr_off;
 } arg_tag;
 typedef struct {
     const void* peer_scratch; const void* peer_gate; uint32_t rank; uint32_t peer; uint32_t hops;
@@ -162,13 +162,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* Peer region per rank: two plain slots (iteration parity), two tagged slots, then the
-     * probe window. Every offset is a multiple of 256 B. */
+    /* Peer region per rank: two plain slots (iteration parity), the four tagged slots
+     * (PlowProgram's xr_tag layout), the probe window, then 1024 xctr lines for the tagged
+     * arm's audit bumps. Every offset is a multiple of 256 B. */
     const uint32_t NMAX = HID * BATCH[NB - 1];
     const uint32_t SLOT = (NMAX * 2u + 255u) & ~255u;
     const uint32_t TSLOT = (((NMAX + 2u) / 3u) * 8u + 255u) & ~255u;
-    const uint32_t PROBE_OFF = 2u * SLOT + 2u * TSLOT;
-    const size_t REGION = (size_t)PROBE_OFF + PROBE_BYTES;
+    const uint32_t PROBE_OFF = 2u * SLOT + 4u * TSLOT;
+    const uint32_t XCTR_OFF = PROBE_OFF + PROBE_BYTES;
+    const size_t REGION = (size_t)XCTR_OFF + 1024u * 128u;
     void *scratch[TP_MAXR], *gate[TP_MAXR], *out[TP_MAXR], *scr_tbl[TP_MAXR], *gate_tbl[TP_MAXR];
     void *lctr[TP_MAXR], *dirty[TP_MAXR];
     uint32_t* stat[TP_MAXR];
@@ -234,10 +236,12 @@ int main(int argc, char** argv) {
             plow_hsa_upload(h, dev[i], gate[i], z, 256);
             plow_hsa_upload(h, dev[i], stat[i], z, 4);
             plow_hsa_upload(h, dev[i], lctr[i], z, 128);
-            for (uint32_t s = 0; tagged && s < 2u * TSLOT; s += PROBE_BYTES) {
-                const size_t len = 2u * TSLOT - s < PROBE_BYTES ? 2u * TSLOT - s : PROBE_BYTES;
+            for (uint32_t s = 0; tagged && s < 4u * TSLOT; s += PROBE_BYTES) {
+                const size_t len = 4u * TSLOT - s < PROBE_BYTES ? 4u * TSLOT - s : PROBE_BYTES;
                 plow_hsa_upload(h, dev[i], (char*)scratch[i] + 2u * SLOT + s, zero_page, len);
             }
+            for (uint32_t s = 0; tagged && s < 1024u * 128u; s += PROBE_BYTES)
+                plow_hsa_upload(h, dev[i], (char*)scratch[i] + XCTR_OFF + s, zero_page, PROBE_BYTES);
             /* Hot arms read slot 0 filled here with the final iteration's values; cold arms
              * overwrite both slots and finish on iteration ITERS. */
             for (uint32_t s = 0; s < 2u; s++) {
@@ -262,9 +266,10 @@ int main(int argc, char** argv) {
                                     stat[i], lctr[i], (uint32_t)order };
                 ka = &ac[i]; kz = sizeof ac[i];
             } else {
-                /* Tagged slots sit at 2*SLOT + parity*TSLOT. */
+                /* The four tagged slots start at 2*SLOT. */
                 at[i] = (arg_tag){ out[i], scr_tbl[i], NR, i, N, SLOT, 2u * SLOT, ITERS, deadline, c,
-                                   stat[i], lctr[i], (uint32_t)order, (uint32_t)cold, TSLOT };
+                                   stat[i], lctr[i], (uint32_t)order, (uint32_t)cold, TSLOT,
+                                   XCTR_OFF };
                 ka = &at[i]; kz = sizeof at[i];
             }
             plow_hsa_launch(h, dev[i], &k_ar[i], NWG * 512, 1, 1, 512, 1, 1, 0, ka, kz);

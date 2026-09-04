@@ -2857,6 +2857,11 @@ fn check_materialized_residual_input(syms: &[&str], path: &Path, progs: &[DevPro
     Ok(())
 }
 
+/// `op_collective.h` exports this from a `PLOW_XR_TAGGED=1` decode object: its one-shot
+/// XReduce arm is the tagged form, which needs `PlowProgram::xr_tag_off` and the blob
+/// contract [`super::amd_tp::check_xr_tagged_blob`] enforces.
+const XR_TAGGED_SYM: &str = "plow_xr_tagged_1";
+
 const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
     ("PLOW_MOE_PF_ATOMIC", &["plow_moe_pf_atomic_arm"]),
@@ -7592,6 +7597,19 @@ impl AmdEngine {
                         need_moe_pf_atomic_decode,
                         need_moe_pf_det_decode,
                     )?;
+                }
+                if phase == Phase::Decode && syms.contains(&XR_TAGGED_SYM) && tp.is_some() {
+                    // A tagged one-shot object spins on data tags instead of the xctr gate;
+                    // it finds its region from the status id every collective carries and
+                    // needs a blob whose XReduce packets keep the parity/width contract.
+                    // Refuse here rather than trap on the device.
+                    super::amd_tp::check_xr_tagged_blob(
+                        &blob.progs,
+                        blob.tp.map_or(0, |b| b.hidden),
+                    )
+                    .map_err(|e| {
+                        RuntimeError::Device(format!("{} ({XR_TAGGED_SYM}): {e}", path.display()))
+                    })?;
                 }
                 // The W_ofold fusion's arm lives in the FLASH object (the V2 MLA-prefill arm's
                 // ofold epilogue), and it additionally needs the V2 routing itself: without
