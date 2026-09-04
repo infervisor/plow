@@ -119,6 +119,35 @@ near-tie class flip; (2) `Q0_PASS` for the materialized arm and not worse than t
 −100..−115 ms, TPOT neutral. The 256-token checksum is *expected* to differ from
 `fnv1a64:71a28c1449921c95` (formulation change) — the oracle, not the checksum, is the gate.
 
+## 5b. TP8 results so far (lease owner, 2026-09-04 21:00)
+
+TTFT gate 829.5/830.6/829.1 vs 953.8/954.9 ms (−125 ms), TPOT neutral. Token probe + rank-0
+logit rows (`k3_q0_oracle.py diff`, materialized vs absorbed, `/tmp/k3-q0`):
+
+| prompt | chunks | greedy divergence | margin at the flip (mat / abs) | row max\|Δ\| there | prefill-row relL2 | matching-history rows relL2 |
+|---:|---|---|---:|---:|---:|---|
+| 300 | `[512]` clen 300 | none / 17 | — | — | 0.158 | 0.056–0.171 |
+| 1024 | `[1024]` exact | step 0 (276 vs 11) | 0.750 / 0.500 | 1.51 | 0.127 | 0.109 (only one shared row) |
+| 8192 | `[8192]` exact | none / 17 | — | — | 0.179 | 0.055–0.167 |
+| 8400 | `[8192, 512]` clen 208 | step 6 (32 vs 7683) | 0.500 / 0.500 | 1.64 | 0.133 | 0.076–0.195 |
+| 9000 | `[8192, 1024]` clen 808 | both arms NaN | — | — | NaN | NaN |
+
+Verdict: the two flips are near-tie flips (gap < the row's max|Δ|), and every shared-history row —
+flipping or not, exact bucket or continuation — carries the same arm-vs-arm error (centered relL2
+0.06–0.2, max|Δ| 1–3.5 logits). That is the 1-ULP attention difference amplified through 24 MLA
+layers of the whole model, the same order as vLLM's own repeat floor (full-row max 0.099), not the
+1e-3 class and not a route error: the 8400 continuation rows (0.08–0.19) sit exactly where the
+exact-bucket rows sit, and a broken chunk would read ~1.0 (as the post-flip, different-history rows
+do). Whether 0.06–0.2 is inside 2× vLLM's floor is the Q0 `compare` stage's call.
+
+9000 tokens: NaN on **both** arms, i.e. on the byte-identical served packet, through the 1024
+bucket as a continuation chunk. On the truncated TP1 diagnostic blob the same program NaN'd as a
+ragged initial chunk (1000 tokens) and as a continuation with `PLOW_RAGGED_CHUNK=0`; the exact
+1024 bucket is fine on TP8. Pre-existing and independent of this branch (the 0b04dd2 regstate
+probe passed 9000 through `plowrt bench` before the seams merged at 8b2555d). GPU bisection for
+the lease owner, control bundle only: `amd-bench --prompt <9000 ids>` on an emit with
+`PLOW_SEQ_PAR_SEAMS=0`, then `PLOW_KDA_CARRY_REGSTATE=0`, then `PLOW_RAGGED_CHUNK=0` at runtime.
+
 ## 6. Follow-ups / risks
 
 - tunedb: re-qualify the 12 materialized projection shapes (`{128..8192}×2304×1536`,
