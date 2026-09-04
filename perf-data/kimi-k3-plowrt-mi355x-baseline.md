@@ -84,6 +84,11 @@ row (1284.84 / 27.54 / 34.76), the `k3-showdown-c1-fe871e6-final` row
 (1271.86 / 28.53 / 33.63), and the 2026-09-03 three-fold row (3762.81 / 63.17 /
 14.97) are superseded by this campaign.
 
+Post-publication engine gate (not yet a served cell): the lean KDA Wu object and the
+key-fed register-state carry (default on) measured 903.5 / 902.5 / 901.9 ms TTFT
+against 955.9 / 956.1 / 955.0 on this packet's 8192→256 gate, exact, TPOT neutral.
+The next served cell should read ~925 ms TTFT.
+
 Raw data: `perf-data/kimi-k3-plowrt-mi355x-c1.json`.
 Comparator: `perf-data/kimi-k3-vllm-mi355x-c1.json`.
 

@@ -409,13 +409,14 @@ pub struct EmitConfig {
     pub kda_key_factor: bool,
 
     /// Mark exact qpre BT64/D128 chunk-KDA Wu segments for the lean four-wave gfx950 Wu object.
-    /// Opt-in candidate (TP8 gate pending); the marked packet requires its paired object.
-    #[arg(long, env = "PLOW_KDA_WU_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Default on (TP8 gate 2026-09-04 with the key feed: -52 ms TTFT, bit-exact); the marked
+    /// packet requires its paired object. `=0` rolls back to the interpreter Wu.
+    #[arg(long, env = "PLOW_KDA_WU_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_wu_lean: bool,
 
     /// Feed the lean Wu's scaled-key hi/lo pair into the register-state carry (implies the lean
-    /// Wu; needs `PLOW_KDA_CARRY_REGSTATE`). Opt-in candidate (TP8 gate pending).
-    #[arg(long, env = "PLOW_KDA_CARRY_KEYFEED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Wu; needs `PLOW_KDA_CARRY_REGSTATE`). Default on (same gate); `=0` rolls back.
+    #[arg(long, env = "PLOW_KDA_CARRY_KEYFEED", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_carry_keyfeed: bool,
 
     /// Vocab-column-parallel K3 `lm_head` with an `XArgmaxFin` handoff. Rejected for serving
@@ -774,8 +775,8 @@ impl EmitConfig {
             kda_intra_wave_items: env_opt_out("PLOW_KDA_INTRA_WAVE_ITEMS"),
             kda_carry_regstate: env_opt_out("PLOW_KDA_CARRY_REGSTATE"),
             kda_key_factor: env_opt_out("PLOW_KDA_KEY_FACTOR"),
-            kda_wu_lean: env_bool("PLOW_KDA_WU_LEAN"),
-            kda_carry_keyfeed: env_bool("PLOW_KDA_CARRY_KEYFEED"),
+            kda_wu_lean: env_opt_out("PLOW_KDA_WU_LEAN"),
+            kda_carry_keyfeed: env_opt_out("PLOW_KDA_CARRY_KEYFEED"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),
             k3_seq_rows: std::env::var_os("PLOW_K3_SEQ_ROWS").is_some(),
             gemv_mm: env_u32("PLOW_GEMV_MM"),
