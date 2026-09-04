@@ -7821,197 +7821,197 @@ impl AmdEngine {
             .clone()
             .filter(|d| !d.is_empty());
         type LK = (HsaKernel, bool);
-        let mut load_one_in =
-            |phase: Phase, sched: Sched, dir: &Path, gemv_need: Option<u32>| -> Result<LK> {
-                let name = object_name(phase, variant, prefill_arm, sched);
-                let path = dir.join(&name);
-                // WHICH OBJECT, BY NAME, AT INFO — and this line is not cosmetic.
-                //
-                // `variant` and `prefill_arm` are DETECTED from the packet's opcodes
-                // ([`Variant::detect`]), so which object a run opens is a DERIVED fact, not a build
-                // choice, and nothing printed it. `Variant::detect` matches `GemvFp8` and the three
-                // fp8-KV flash ops; it does NOT match the block-scaled `*Fp8Blk` family, so a
-                // GLM-5.2 packet — every one of whose fp8 kernels is block-scaled — detects as
-                // `Bf16` and runs on `interp_decode_gq.elf`. That is correct (the `*Fp8Blk` cases in
-                // interp.hip are outside `#if PLOW_FP8`, deliberately), but it is the opposite of
-                // what the object names suggest, and a whole campaign of decode-kernel arms was
-                // built into `interp_decode_fp8_gq.elf` and measured against a run that never
-                // opened it. Its ablation — delete the kernel entirely — read as "the packet costs
-                // the same", which was taken as evidence for a protocol floor that does not exist.
-                // Rebuilt into the object this line names, the same ablation moves the token by
-                // 11.8% (perf-data/plow-gfx942/glm52-packet-protocol-xcd.md).
-                tracing::info!(object = %name, ?phase, ?variant, ?prefill_arm, ?sched,
+        let mut load_one_in = |phase: Phase,
+                               sched: Sched,
+                               dir: &Path,
+                               gemv_need: Option<u32>|
+         -> Result<LK> {
+            let name = object_name(phase, variant, prefill_arm, sched);
+            let path = dir.join(&name);
+            // WHICH OBJECT, BY NAME, AT INFO — and this line is not cosmetic.
+            //
+            // `variant` and `prefill_arm` are DETECTED from the packet's opcodes
+            // ([`Variant::detect`]), so which object a run opens is a DERIVED fact, not a build
+            // choice, and nothing printed it. `Variant::detect` matches `GemvFp8` and the three
+            // fp8-KV flash ops; it does NOT match the block-scaled `*Fp8Blk` family, so a
+            // GLM-5.2 packet — every one of whose fp8 kernels is block-scaled — detects as
+            // `Bf16` and runs on `interp_decode_gq.elf`. That is correct (the `*Fp8Blk` cases in
+            // interp.hip are outside `#if PLOW_FP8`, deliberately), but it is the opposite of
+            // what the object names suggest, and a whole campaign of decode-kernel arms was
+            // built into `interp_decode_fp8_gq.elf` and measured against a run that never
+            // opened it. Its ablation — delete the kernel entirely — read as "the packet costs
+            // the same", which was taken as evidence for a protocol floor that does not exist.
+            // Rebuilt into the object this line names, the same ablation moves the token by
+            // 11.8% (perf-data/plow-gfx942/glm52-packet-protocol-xcd.md).
+            tracing::info!(object = %name, ?phase, ?variant, ?prefill_arm, ?sched,
                            "code object");
-                let image = std::fs::read(&path).map_err(|e| {
-                    if phase == Phase::Prefill && prefill_arm != PrefillArm::None {
-                        RuntimeError::Device(format!(
-                            "code object {}: {e} — this packet's prefill programs contain {} \
+            let image = std::fs::read(&path).map_err(|e| {
+                if phase == Phase::Prefill && prefill_arm != PrefillArm::None {
+                    RuntimeError::Device(format!(
+                        "code object {}: {e} — this packet's prefill programs contain {} \
                          opcodes, which requires {name} in {}, and it is not there. Build it \
                          (scripts/build_gfx950.sh with {}), or serve a packet that does not \
                          need it; falling back to an object without the arms is the AMD \
                          `default:`-does-not-trap bug this check exists to prevent.",
-                            path.display(),
-                            match prefill_arm {
-                                PrefillArm::MlaMoe => "MLA+MoE prefill",
-                                PrefillArm::Mla => "MLA prefill",
-                                PrefillArm::K3 => "Kimi-K3 block",
-                                PrefillArm::K3Moe => "Kimi-K3 block + grouped MoE prefill",
-                                PrefillArm::K3MoeA4w4 => "Kimi-K3 block + grouped A4W4 MoE prefill",
-                                PrefillArm::None => unreachable!(),
-                            },
-                            hsaco_dir.display(),
-                            match prefill_arm {
-                                PrefillArm::MlaMoe => "PLOW_MOE_PREFILL=1",
-                                PrefillArm::Mla => "PLOW_MLA_PREFILL=1",
-                                PrefillArm::K3 => "PLOW_K3=1 PLOW_MLA_PREFILL=1",
-                                PrefillArm::K3Moe => {
-                                    "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1"
-                                }
-                                PrefillArm::K3MoeA4w4 => {
-                                    "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1 \
+                        path.display(),
+                        match prefill_arm {
+                            PrefillArm::MlaMoe => "MLA+MoE prefill",
+                            PrefillArm::Mla => "MLA prefill",
+                            PrefillArm::K3 => "Kimi-K3 block",
+                            PrefillArm::K3Moe => "Kimi-K3 block + grouped MoE prefill",
+                            PrefillArm::K3MoeA4w4 => "Kimi-K3 block + grouped A4W4 MoE prefill",
+                            PrefillArm::None => unreachable!(),
+                        },
+                        hsaco_dir.display(),
+                        match prefill_arm {
+                            PrefillArm::MlaMoe => "PLOW_MOE_PREFILL=1",
+                            PrefillArm::Mla => "PLOW_MLA_PREFILL=1",
+                            PrefillArm::K3 => "PLOW_K3=1 PLOW_MLA_PREFILL=1",
+                            PrefillArm::K3Moe => {
+                                "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1"
+                            }
+                            PrefillArm::K3MoeA4w4 => {
+                                "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1 \
                                  PLOW_MOE_PF_A4W4=1 PLOW_MXFP4=1"
-                                }
-                                PrefillArm::None => unreachable!(),
-                            },
-                        ))
-                    } else {
-                        RuntimeError::Device(format!("code object {}: {e}", path.display()))
-                    }
-                })?;
-                let syms = elf_symbol_names(&image);
-                if phase == Phase::Prefill {
-                    prefill_moe_align_bm64 = syms.contains(&"plow_moe_align_bm64_1");
+                            }
+                            PrefillArm::None => unreachable!(),
+                        },
+                    ))
+                } else {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
                 }
-                check_gate_hier_object(&syms, &path, phase, sched)?;
-                let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
-                if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
-                    check_prefill_object(&syms, &path, req)?;
-                }
-                if let (Phase::Decode, Some(req)) = (phase, requires.as_ref()) {
-                    check_decode_object(
-                        &syms,
-                        &path,
-                        req,
-                        need_moe_pf_atomic_decode,
-                        need_moe_pf_det_decode,
-                    )?;
-                }
-                if phase == Phase::Decode && syms.contains(&XR_TAGGED_SYM) && tp.is_some() {
-                    // A tagged one-shot object spins on data tags instead of the xctr gate;
-                    // it finds its region from the status id every collective carries and
-                    // needs a blob whose XReduce packets keep the parity/width contract.
-                    // Refuse here rather than trap on the device.
-                    super::amd_tp::check_xr_tagged_blob(
-                        &blob.progs,
-                        blob.tp.map_or(0, |b| b.hidden),
-                    )
+            })?;
+            let syms = elf_symbol_names(&image);
+            if phase == Phase::Prefill {
+                prefill_moe_align_bm64 = syms.contains(&"plow_moe_align_bm64_1");
+            }
+            check_gate_hier_object(&syms, &path, phase, sched)?;
+            let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
+            if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
+                check_prefill_object(&syms, &path, req)?;
+            }
+            if let (Phase::Decode, Some(req)) = (phase, requires.as_ref()) {
+                check_decode_object(
+                    &syms,
+                    &path,
+                    req,
+                    need_moe_pf_atomic_decode,
+                    need_moe_pf_det_decode,
+                )?;
+            }
+            if phase == Phase::Decode && syms.contains(&XR_TAGGED_SYM) && tp.is_some() {
+                // A tagged one-shot object spins on data tags instead of the xctr gate;
+                // it finds its region from the status id every collective carries and
+                // needs a blob whose XReduce packets keep the parity/width contract.
+                // Refuse here rather than trap on the device.
+                super::amd_tp::check_xr_tagged_blob(&blob.progs, blob.tp.map_or(0, |b| b.hidden))
                     .map_err(|e| {
-                        RuntimeError::Device(format!("{} ({XR_TAGGED_SYM}): {e}", path.display()))
-                    })?;
-                }
-                // The W_ofold fusion's arm lives in the FLASH object (the V2 MLA-prefill arm's
-                // ofold epilogue), and it additionally needs the V2 routing itself: without
-                // PLOW_MLA_PF_V2=1 the MLA segments run on the 8-wave prefill kernel, which
-                // ignores packet i[6] and leaves unnormalized f32 partials for the fused GEMM
-                // to read as bf16 — finite, fluent, wrong. Both must hold to serve this blob.
-                if let (Phase::Flash, Some(req)) = (phase, requires.as_ref()) {
-                    if req.iter().any(|r| r == "PLOW_GLM_OFOLD=1") {
-                        if !crate::config::RuntimeConfig::get().amd.mla_pf_v2 {
-                            return Err(RuntimeError::Device(
-                                "this packet fuses MlaMergeFold+o_proj (W_ofold) and REQUIRES the \
+                    RuntimeError::Device(format!("{} ({XR_TAGGED_SYM}): {e}", path.display()))
+                })?;
+            }
+            // The W_ofold fusion's arm lives in the FLASH object (the V2 MLA-prefill arm's
+            // ofold epilogue), and it additionally needs the V2 routing itself: without
+            // PLOW_MLA_PF_V2=1 the MLA segments run on the 8-wave prefill kernel, which
+            // ignores packet i[6] and leaves unnormalized f32 partials for the fused GEMM
+            // to read as bf16 — finite, fluent, wrong. Both must hold to serve this blob.
+            if let (Phase::Flash, Some(req)) = (phase, requires.as_ref()) {
+                if req.iter().any(|r| r == "PLOW_GLM_OFOLD=1") {
+                    if !crate::config::RuntimeConfig::get().amd.mla_pf_v2 {
+                        return Err(RuntimeError::Device(
+                            "this packet fuses MlaMergeFold+o_proj (W_ofold) and REQUIRES the \
                              V2 MLA-prefill routing: serve with PLOW_MLA_PF_V2=1, or emit \
                              without PLOW_GLM_OFOLD"
-                                    .into(),
-                            ));
-                        }
-                        if !syms.iter().any(|s| s.contains("plow_glm_ofold_arm")) {
-                            return Err(RuntimeError::Device(format!(
-                                "packet/object MISMATCH: this packet requires PLOW_GLM_OFOLD=1 \
+                                .into(),
+                        ));
+                    }
+                    if !syms.iter().any(|s| s.contains("plow_glm_ofold_arm")) {
+                        return Err(RuntimeError::Device(format!(
+                            "packet/object MISMATCH: this packet requires PLOW_GLM_OFOLD=1 \
                              but {} lacks the ofold-aware V2 arm (plow_glm_ofold_arm) — its \
                              flash would write unnormalized f32 partials that the fused \
                              o-GEMM reads as bf16 garbage. Rebuild the flash object from a \
                              tree that carries the arm.",
-                                path.display()
-                            )));
-                        }
+                            path.display()
+                        )));
                     }
                 }
-                // The standalone flash object contains only flash-prefill arms. Model and
-                // GEMV capability checks belong to the general prefill/decode objects; applying
-                // them here rejects the intentionally model-neutral flash object.
-                if phase != Phase::Flash {
-                    let need = match phase {
-                        Phase::Decode => gemv_need.unwrap_or(need_m_decode),
-                        Phase::Prefill => need_m_prefill,
-                        Phase::Flash => unreachable!(),
-                    };
-                    check_gemv_capacity(&syms, &path, need)?;
-                }
-                if phase == Phase::Decode {
-                    check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;
-                }
-                // Whether this object carries the PLOW_K3 arms the packet dispatches. Refused here
-                // rather than tolerated, because AMD's dispatch default is a silent NOP: the run
-                // would otherwise complete on untouched buffers instead of failing.
-                let need_k3 = match phase {
-                    Phase::Decode => need_k3_decode,
-                    Phase::Prefill => need_k3_prefill,
-                    Phase::Flash => None,
+            }
+            // The standalone flash object contains only flash-prefill arms. Model and
+            // GEMV capability checks belong to the general prefill/decode objects; applying
+            // them here rejects the intentionally model-neutral flash object.
+            if phase != Phase::Flash {
+                let need = match phase {
+                    Phase::Decode => gemv_need.unwrap_or(need_m_decode),
+                    Phase::Prefill => need_m_prefill,
+                    Phase::Flash => unreachable!(),
                 };
-                check_k3_arms(&syms, &path, need_k3)?;
-                if phase != Phase::Flash {
-                    let phase_progs = if phase == Phase::Decode {
-                        &blob.progs[dec_ix..]
-                    } else {
-                        &blob.progs[..dec_ix]
-                    };
-                    check_compiled_opcode_markers(&syms, &path, phase_progs)?;
-                    check_materialized_residual_input(&syms, &path, phase_progs)?;
-                }
-                let need_chunk = match phase {
-                    Phase::Decode => need_kda_chunk_decode,
-                    Phase::Prefill => need_kda_chunk_prefill,
-                    Phase::Flash => None,
+                check_gemv_capacity(&syms, &path, need)?;
+            }
+            if phase == Phase::Decode {
+                check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;
+            }
+            // Whether this object carries the PLOW_K3 arms the packet dispatches. Refused here
+            // rather than tolerated, because AMD's dispatch default is a silent NOP: the run
+            // would otherwise complete on untouched buffers instead of failing.
+            let need_k3 = match phase {
+                Phase::Decode => need_k3_decode,
+                Phase::Prefill => need_k3_prefill,
+                Phase::Flash => None,
+            };
+            check_k3_arms(&syms, &path, need_k3)?;
+            if phase != Phase::Flash {
+                let phase_progs = if phase == Phase::Decode {
+                    &blob.progs[dec_ix..]
+                } else {
+                    &blob.progs[..dec_ix]
                 };
-                check_kda_chunk(&syms, &path, need_chunk)?;
-                if phase == Phase::Decode {
-                    check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
-                    check_kda_conv_step_db(&syms, &path, need_kda_conv_step_db, legacy_kda_decode)?;
-                }
-                let (need_gm, need_gmpf) = match phase {
-                    Phase::Decode => (need_gm_decode, need_gmpf_decode),
-                    Phase::Prefill => (need_gm_prefill, need_gmpf_prefill),
-                    Phase::Flash => (None, None),
-                };
-                check_moe_gemma_arms(&syms, &path, need_gm, need_gmpf)?;
-                if phase == Phase::Flash && need_mla_v2 && !syms.contains(&MLA_PF_V2_SYM) {
-                    return Err(RuntimeError::Device(format!(
-                        "PLOW_MLA_PF_V2=1 routes FlashMlaPrefill segments to {}, but it was \
+                check_compiled_opcode_markers(&syms, &path, phase_progs)?;
+                check_materialized_residual_input(&syms, &path, phase_progs)?;
+            }
+            let need_chunk = match phase {
+                Phase::Decode => need_kda_chunk_decode,
+                Phase::Prefill => need_kda_chunk_prefill,
+                Phase::Flash => None,
+            };
+            check_kda_chunk(&syms, &path, need_chunk)?;
+            if phase == Phase::Decode {
+                check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
+                check_kda_conv_step_db(&syms, &path, need_kda_conv_step_db, legacy_kda_decode)?;
+            }
+            let (need_gm, need_gmpf) = match phase {
+                Phase::Decode => (need_gm_decode, need_gmpf_decode),
+                Phase::Prefill => (need_gm_prefill, need_gmpf_prefill),
+                Phase::Flash => (None, None),
+            };
+            check_moe_gemma_arms(&syms, &path, need_gm, need_gmpf)?;
+            if phase == Phase::Flash && need_mla_v2 && !syms.contains(&MLA_PF_V2_SYM) {
+                return Err(RuntimeError::Device(format!(
+                    "PLOW_MLA_PF_V2=1 routes FlashMlaPrefill segments to {}, but it was \
                      compiled without the V2 arm (no `{MLA_PF_V2_SYM}`). The dispatch default \
                      writes NOTHING, so those packets would silently skip. Rebuild the flash \
                      object (`-DPLOW_MLA_PF_V2_ARM=ON` in runtime/CMakeLists.txt; \
                      scripts/build_gfx942.sh enables it) or unset PLOW_MLA_PF_V2.",
-                        path.display()
-                    )));
-                }
-                if phase == Phase::Flash && need_mla_v2_fp8 && !syms.contains(&MLA_PF_V2_FP8_SYM) {
-                    return Err(RuntimeError::Device(format!(
-                        "PLOW_MLA_PF_V2=1 routes FlashMlaPrefillFp8 segments to {}, but it was \
+                    path.display()
+                )));
+            }
+            if phase == Phase::Flash && need_mla_v2_fp8 && !syms.contains(&MLA_PF_V2_FP8_SYM) {
+                return Err(RuntimeError::Device(format!(
+                    "PLOW_MLA_PF_V2=1 routes FlashMlaPrefillFp8 segments to {}, but it was \
                      compiled without the fp8 V2 arm (no `{MLA_PF_V2_FP8_SYM}`). Rebuild the \
                      fp8-KV flash object or unset PLOW_MLA_PF_V2.",
-                        path.display()
-                    )));
-                }
-                // L2-PLACED BLOB vs OBJECT. This is the guard the PLOW_L2_PLACE_DISPATCH env var used
-                // to stand in for, moved to where it can be VERIFIED. A placed program's `seg` is an
-                // L2 domain, not a wave class, so an object built without the axis would run every
-                // packet on the wrong domain -- plausible output, inverted locality, no error.
-                let phase_l2_placed = match phase {
-                    Phase::Decode => decode_l2_placed,
-                    Phase::Prefill | Phase::Flash => prefill_l2_placed,
-                };
-                if phase_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
-                    return Err(RuntimeError::Device(format!(
+                    path.display()
+                )));
+            }
+            // L2-PLACED BLOB vs OBJECT. This is the guard the PLOW_L2_PLACE_DISPATCH env var used
+            // to stand in for, moved to where it can be VERIFIED. A placed program's `seg` is an
+            // L2 domain, not a wave class, so an object built without the axis would run every
+            // packet on the wrong domain -- plausible output, inverted locality, no error.
+            let phase_l2_placed = match phase {
+                Phase::Decode => decode_l2_placed,
+                Phase::Prefill | Phase::Flash => prefill_l2_placed,
+            };
+            if phase_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
+                return Err(RuntimeError::Device(format!(
                     "{}: blob uses L2-domain packet placement (PLOW_L2_PLACE) but this object was \
                      built WITHOUT -DPLOW_L2_PLACE_DISPATCH — its `seg` would be read as a \
                      wave class and every packet would land on the wrong domain. Rebuild the \
@@ -8019,81 +8019,80 @@ impl AmdEngine {
                      model with PLOW_L2_PLACE=0.",
                     path.display()
                 )));
-                }
-                // Whether this object's KV ENCODING matches the packet's. Both directions — the axis
-                // is a swap, so each object is missing an arm the other has.
-                let (need_fp8, need_bf16) = match phase {
-                    Phase::Decode => (need_fp8kv_decode, need_bf16kv_decode),
-                    Phase::Prefill | Phase::Flash => (need_fp8kv_prefill, need_bf16kv_prefill),
-                };
-                check_kv_encoding(&syms, &path, need_fp8, need_bf16)?;
-                check_packet_pairing_stamp(&image, blob_path, &path)?;
-                let m = EngineDevice::module_load(&*be, &image).map_err(|e| {
-                    RuntimeError::Device(format!(
-                        "{name}: {e} — a BUNDLED object gives exactly this; was it \
+            }
+            // Whether this object's KV ENCODING matches the packet's. Both directions — the axis
+            // is a swap, so each object is missing an arm the other has.
+            let (need_fp8, need_bf16) = match phase {
+                Phase::Decode => (need_fp8kv_decode, need_bf16kv_decode),
+                Phase::Prefill | Phase::Flash => (need_fp8kv_prefill, need_bf16kv_prefill),
+            };
+            check_kv_encoding(&syms, &path, need_fp8, need_bf16)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let m = EngineDevice::module_load(&*be, &image).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "{name}: {e} — a BUNDLED object gives exactly this; was it \
                      run through clang-offload-bundler --unbundle?"
-                    ))
-                })?;
-                let sym = symbol_name(phase, sched, &arch);
-                let k = EngineDevice::get_function(&*be, &m, &sym)
-                    .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {sym}: {e}")))?;
-                if phase == Phase::Decode && tp_audit_compact && k_xaudit.is_none() {
-                    k_xaudit = Some(
-                        EngineDevice::get_function(&*be, &m, "plow_xctr_audit").map_err(|e| {
-                            RuntimeError::Device(format!(
+                ))
+            })?;
+            let sym = symbol_name(phase, sched, &arch);
+            let k = EngineDevice::get_function(&*be, &m, &sym)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {sym}: {e}")))?;
+            if phase == Phase::Decode && tp_audit_compact && k_xaudit.is_none() {
+                k_xaudit = Some(
+                    EngineDevice::get_function(&*be, &m, "plow_xctr_audit").map_err(|e| {
+                        RuntimeError::Device(format!(
                             "{name}: compact TP audit requested but plow_xctr_audit is absent: {e}"
                         ))
-                        })?,
-                    );
-                }
-                if phase == Phase::Decode && state_clear_device && k_state_clear.is_none() {
-                    k_state_clear = Some(
-                        EngineDevice::get_function(&*be, &m, "plow_state_clear").map_err(|e| {
-                            RuntimeError::Device(format!(
-                                "{name}: device recurrent-state clear requested but \
+                    })?,
+                );
+            }
+            if phase == Phase::Decode && state_clear_device && k_state_clear.is_none() {
+                k_state_clear = Some(
+                    EngineDevice::get_function(&*be, &m, "plow_state_clear").map_err(|e| {
+                        RuntimeError::Device(format!(
+                            "{name}: device recurrent-state clear requested but \
                                  plow_state_clear is absent: {e}. Rebuild the decode object"
-                            ))
-                        })?,
-                    );
-                }
-                if phase == Phase::Decode
-                    && k_token_capture.is_none()
-                    && syms.contains(&"plow_token_capture")
-                {
-                    k_token_capture =
-                        Some(EngineDevice::get_function(&*be, &m, "plow_token_capture")?);
-                }
-                // STALE-OBJECT REFUSAL. An object's kernarg segment is its explicit
-                // args, 8-aligned, plus the COv5 implicit block — a FIXED 256 B tail
-                // that hipcc emits only when the kernel uses a hidden arg (the flash
-                // object does not, and reports the bare struct size; prefill and
-                // decode do, and report that + 256). Those are the only two legal
-                // values for a kernel whose one argument is `PlowProgram`, and both
-                // are DERIVED from `size_of::<DevProgram>()` below rather than
-                // written as literals — the struct has grown twice already
-                // (128 -> 136 with `seg_ofs`, 136 -> 144 with `l2_domains`), and a
-                // literal here goes stale exactly when it is most needed.
-                //
-                // This matters because the launcher writes that implicit block at
-                // OUR `size_of::<DevProgram>()`. An object built against a different
-                // struct loads and resolves happily, then reads its own fields, or
-                // its block/grid dimensions, from the wrong offsets and faults
-                // somewhere unrelated. Refuse it by name here instead.
-                const IMPLICIT: u32 = 256;
-                let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
-                let got = k.kernarg_size();
-                if got != want && got != want + IMPLICIT {
-                    return Err(RuntimeError::Device(format!(
+                        ))
+                    })?,
+                );
+            }
+            if phase == Phase::Decode
+                && k_token_capture.is_none()
+                && syms.contains(&"plow_token_capture")
+            {
+                k_token_capture = Some(EngineDevice::get_function(&*be, &m, "plow_token_capture")?);
+            }
+            // STALE-OBJECT REFUSAL. An object's kernarg segment is its explicit
+            // args, 8-aligned, plus the COv5 implicit block — a FIXED 256 B tail
+            // that hipcc emits only when the kernel uses a hidden arg (the flash
+            // object does not, and reports the bare struct size; prefill and
+            // decode do, and report that + 256). Those are the only two legal
+            // values for a kernel whose one argument is `PlowProgram`, and both
+            // are DERIVED from `size_of::<DevProgram>()` below rather than
+            // written as literals — the struct has grown twice already
+            // (128 -> 136 with `seg_ofs`, 136 -> 144 with `l2_domains`), and a
+            // literal here goes stale exactly when it is most needed.
+            //
+            // This matters because the launcher writes that implicit block at
+            // OUR `size_of::<DevProgram>()`. An object built against a different
+            // struct loads and resolves happily, then reads its own fields, or
+            // its block/grid dimensions, from the wrong offsets and faults
+            // somewhere unrelated. Refuse it by name here instead.
+            const IMPLICIT: u32 = 256;
+            let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+            let got = k.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
                     "{name}: kernarg segment is {got} B; this build's PlowProgram needs {want} \
                      (or {} with the COv5 implicit block) — the code object is STALE. Rebuild it \
                      with scripts/build_gfx950.sh. A mismatched object does not fail to load; it \
                      faults mid-run.",
                     want + IMPLICIT
                 )));
-                }
-                modules.push(m);
-                Ok((k, packed_prefill_abi))
-            };
+            }
+            modules.push(m);
+            Ok((k, packed_prefill_abi))
+        };
 
         let (k_prefill, packed_prefill_prefill_abi) =
             load_one_in(Phase::Prefill, sched_prefill, hsaco_dir, None)?;

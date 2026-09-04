@@ -56,7 +56,7 @@ while IFS=$'\t' read -r class path binding disposition; do
       echo "FAIL: synthetic consumer still invokes amd-bench: $path" >&2; exit 1;
     }
   else
-    rg -q -- '--checkpoint' "$ROOT/$path" || {
+    grep -q -- '--checkpoint' "$ROOT/$path" || {
       echo "FAIL: checkpoint-bound amd-bench consumer lacks --checkpoint: $path" >&2; exit 1;
     }
   fi
@@ -75,7 +75,7 @@ while IFS= read -r file; do
       exit 1
     }
   fi
-done < <(rg --files "$ROOT/scripts" -g '*.sh')
+done < <(find "$ROOT/scripts" -type f -name '*.sh' | sort)
 
 for path in "${!classified[@]}"; do
   [[ -n "${observed[$path]+x}" ]] || {
@@ -86,7 +86,7 @@ done
 
 for path in "${!migrated_device_ceiling[@]}"; do
   for flag in bench --prompt-rows --token-audit --engine-diagnostics --multistep; do
-    rg -q -- "$flag" "$ROOT/$path" || {
+    grep -q -- "$flag" "$ROOT/$path" || {
       echo "FAIL: migrated device-ceiling gate lost '$flag': $path" >&2
       exit 1
     }
@@ -106,7 +106,7 @@ done
 
 for path in "${!migrated_batch_gates[@]}"; do
   for flag in bench --prompt-rows --token-audit --engine-diagnostics; do
-    rg -q -- "$flag" "$ROOT/$path" || {
+    grep -q -- "$flag" "$ROOT/$path" || {
       echo "FAIL: migrated production batch gate lost '$flag': $path" >&2
       exit 1
     }
@@ -119,7 +119,7 @@ done
 
 for path in "${!migrated_tp_gates[@]}"; do
   for flag in bench --token-audit --engine-diagnostics --amd-tp-agree-every; do
-    rg -q -- "$flag" "$ROOT/$path" || {
+    grep -q -- "$flag" "$ROOT/$path" || {
       echo "FAIL: migrated production TP gate lost '$flag': $path" >&2
       exit 1
     }

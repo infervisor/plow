@@ -220,7 +220,9 @@ impl TuneStore {
     }
 
     fn moe_decode_path(&self, hardware: &str) -> PathBuf {
-        self.root.join(hardware).join("moe_decode_measurement.jsonl")
+        self.root
+            .join(hardware)
+            .join("moe_decode_measurement.jsonl")
     }
 
     /// Grouped-MoE decode route records for one hardware key; empty when the

@@ -1919,8 +1919,7 @@ impl Builder {
                 pair[0].inst.op == DevOp::MoeGroupGluFp8Blk as u16
                     && pair[1].inst.op == DevOp::MoeGroupDownFp8Blk as u16
             });
-        let graph_phase_objects =
-            std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1");
+        let graph_phase_objects = std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1");
         let xreduce_wave_rs = !uniseg
             && self.place_l2.is_some()
             && (self.xreduce_wave_rs_segments
@@ -3954,10 +3953,16 @@ mod l2_placement_tests {
             let win = &p.gq_stream[p.gq_seg_ofs[w] as usize..p.gq_seg_ofs[w + 1] as usize];
             let pos = |inst: u32| win.iter().position(|e| e.inst == inst);
             if let (Some(a), Some(g)) = (pos(sh_glu), pos(glu)) {
-                assert!(a < g, "window {w}: shared GemvGlu must precede the gated MoeGroupGlu");
+                assert!(
+                    a < g,
+                    "window {w}: shared GemvGlu must precede the gated MoeGroupGlu"
+                );
             }
             if let (Some(a), Some(g)) = (pos(sh_down), pos(glu)) {
-                assert!(a < g, "window {w}: shared down Gemv must precede the gated MoeGroupGlu");
+                assert!(
+                    a < g,
+                    "window {w}: shared down Gemv must precede the gated MoeGroupGlu"
+                );
             }
             if let (Some(a), Some(g)) = (pos(sh_glu), pos(sh_down)) {
                 assert!(a < g, "window {w}: producer before consumer");
@@ -4938,8 +4943,8 @@ mod kda_carry_regstate_tests {
         });
         let carry = b.emit(DevOp::KdaChunkCarry, all.clone(), &[wu], |d| {
             d.t = [
-                tensors[1], tensors[2], tensors[7], tensors[3], tensors[0], tensors[1],
-                tensors[4], tensors[5],
+                tensors[1], tensors[2], tensors[7], tensors[3], tensors[0], tensors[1], tensors[4],
+                tensors[5],
             ];
             d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
             d.f[0] = 1.0 / (128.0f32).sqrt();

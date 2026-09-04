@@ -1809,11 +1809,22 @@ mod tests {
             i: [n, 8, 0, gate, 0, gcols, row_w, 0],
             ..Default::default()
         };
-        let other = DevInst64 { op: DevOp::Gemv as u16, ..Default::default() };
+        let other = DevInst64 {
+            op: DevOp::Gemv as u16,
+            ..Default::default()
+        };
         // The K3 decode shape: 7168 / 3584 / 7168+gather, sequential gates.
-        let good = vec![xr(7168, 0, 0, 0), other, xr(3584, 1, 0, 0), xr(7168, 2, 896, 7168)];
+        let good = vec![
+            xr(7168, 0, 0, 0),
+            other,
+            xr(3584, 1, 0, 0),
+            xr(7168, 2, 896, 7168),
+        ];
         assert!(check_xr_tagged_insts(0, &good, 7168).is_ok());
-        assert!(check_xr_tagged_insts(0, &[], 7168).is_ok(), "no collectives is fine");
+        assert!(
+            check_xr_tagged_insts(0, &[], 7168).is_ok(),
+            "no collectives is fine"
+        );
         // Same parity twice in a row: the second would overwrite the slot peers still read.
         let bad = vec![xr(7168, 0, 0, 0), xr(3584, 2, 0, 0)];
         assert!(check_xr_tagged_insts(0, &bad, 7168).is_err());

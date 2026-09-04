@@ -659,6 +659,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 fn require_synthetic_probe(
     has_checkpoint: bool,
     synthetic_probe: bool,
@@ -676,6 +677,7 @@ fn require_synthetic_probe(
     Ok(false)
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 fn validate_amd_probe_steps(
     steps: u32,
     has_prefill_sweep: bool,
@@ -686,6 +688,7 @@ fn validate_amd_probe_steps(
     Ok(())
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 fn synthetic_timing_prefix(synthetic_probe: bool) -> &'static str {
     if synthetic_probe {
         "SYNTHETIC DIAGNOSTIC: "

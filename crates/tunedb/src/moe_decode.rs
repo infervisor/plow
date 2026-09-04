@@ -267,6 +267,9 @@ mod tests {
 
     #[test]
     fn cell_key_is_geometry_only() {
-        assert_eq!(cell().key(), "amd/gfx950/mi350x|ncu256|b1|k16/h3584/i384/e896/mxfp4");
+        assert_eq!(
+            cell().key(),
+            "amd/gfx950/mi350x|ncu256|b1|k16/h3584/i384/e896/mxfp4"
+        );
     }
 }
