@@ -3603,8 +3603,8 @@ impl GpuEngine {
 
     /// Decode-loop prompt consumption: one T=1 launch per token, D2H + stream
     /// sync only after the last. Token-identical to calling [`Self::step_slots`]
-    /// once per id. NVIDIA Qwen has no hd=128 prefill object — this is the
-    /// TTFT path (Agent 3 P3). Pinned staging is reused; an H2D-complete event
+    /// once per id. This is the TTFT fallback when no compatible prefill
+    /// object is available. Pinned staging is reused; an H2D-complete event
     /// (not a kernel wait) gates overwrite so kernels stay overlapped.
     pub fn consume_prompt(
         &mut self,
