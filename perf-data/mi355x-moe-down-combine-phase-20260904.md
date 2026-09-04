@@ -77,6 +77,32 @@ safe at grid768, hidden-stripe ownership destroys the production flattened `(slo
 weight-stream locality. It is also far beyond the grouped standalone route's measured 0.94–0.96
 ms/token segment-handoff tax. No TP8 network run is warranted.
 
+### Flattened-owner ready queues
+
+The final prototype preserves the ordinary flattened producer map exactly. For WG512/grid768,
+fragment `f` executes on physical XCD `floor(f/8) % 8`. The narrow MXFP4 body has one fragment per
+eight hidden rows and `ng=ceil(H/8)=448`; `ng % 64 == 0` proves that changing routed slot does not
+change the fragment's owner XCD. Unsupported geometry fails closed.
+
+There are exactly `ng/8=56` XCD-local ready counters. Producers never wait and issue no global
+atomic. After all writes in their workgroup retire, each wave increments its row group's local
+counter. The 16th fragment invalidates its own L1, reloads all 16 partials from the shared XCD L2,
+and combines the eight rows in original slot order. Kernel completion is the only global release.
+
+The object is wave64/WG512, 60 VGPR / 53 SGPR, occupancy 8, zero LDS/private/spills. The full-shape
+output is byte-exact.
+
+| arm | complete boundary | BF16 output differences |
+|---|---:|---:|
+| ordinary grid768 DOWN + combine | 14.093 us | — |
+| flattened-owner ready phase | 58.116 us | 0 |
+| phase - control | **+44.023 us (+312.4%)** | 0 |
+
+The projection is +4.050 ms/token. Preserving weight locality fixes the prior ownership defect,
+but 16 serialized arrivals for each of 448 row groups create 7,168 local atomics per layer. This
+is much worse than both the 0.526 ms packet ceiling and the measured 0.94–0.96 ms standalone
+segment-handoff loss. Stop this line; do not runtime-route or TP8-gate it.
+
 ## Consequence
 
 One cross-XCD rendezvous costs more than one ordinary dependency boundary. A useful phase must
@@ -90,6 +116,17 @@ The XCD-owned follow-up further narrows that recommendation: do not partition th
 stream by output rows merely to make the consumer local. A credible redesign needs persistent
 expert/slot ownership and a consumer layout compatible with it, or a device scheduler that lets the
 existing flattened producer tiles enqueue ready row fragments without a global phase barrier.
+
+The ready-queue result closes the latter option at row-fragment granularity. Any queue protocol
+must publish a coarse tile at most once per XCD, not once per routed-slot fragment. That requires
+producer tiles to accumulate several slots before publication or changes the DOWN kernel's work
+decomposition; it is no longer a small phase-packet adaptation.
+
+These gates close phase-packet scheduling for the exact-order grouped-MoE seams. The next credible
+decode architecture changes the output accumulation/layout contract: for example, a compiler-
+defined deterministic reduction tree with a matching oracle, or a higher-level quality tolerance
+that permits reassociation. Another exact fixed-slot rendezvous schedule cannot recover its own
+coordination cost.
 
 The audit also found a measurement defect in the older, already rejected GLU→DOWN cooperative
 probe: its local-block census increments once per thread, producing 16,384 rather than 32 arrivals

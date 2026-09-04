@@ -279,6 +279,83 @@ void k3_moe_down_combine_xcd_owned(
 extern "C" __device__ unsigned plow_moe_down_combine_xcd_owned_abi_1 = 1;
 extern "C" __device__ unsigned plow_moe_down_combine_xcd_owned_no_global_wait_1 = 1;
 
+/* Preserve the production flattened (slot,row-octet) ownership. At grid768/WG512 the owner XCD
+ * of fragment f is floor(f/8)%8. When row-octets are a multiple of 64, changing slot leaves that
+ * XCD unchanged, so all top-k fragments for one eight-row group meet in one L2 without remapping
+ * the weight stream. The ready queue has one monotonic counter per row group. No producer waits;
+ * the last local fragment combines the row in exact slot order. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2)
+void k3_moe_down_combine_ready(
+    bf16* out, float* part, const bf16* fu, const unsigned char* table,
+    const unsigned long long* weights, const unsigned long long* scales,
+    unsigned topk, unsigned hidden, unsigned intermediate, unsigned experts,
+    unsigned* ready) {
+    constexpr unsigned domains = 8, rg = 4, lpg = PLOW_WAVE / rg;
+    const unsigned ng = (hidden + 2u * rg - 1u) / (2u * rg);
+    if (blockDim.x != PLOW_THREADS || gridDim.x != 768 || topk == 0 ||
+        intermediate > 512u || (intermediate & 31u) || (ng & 63u))
+        __builtin_trap();
+    const unsigned xcd =
+        __builtin_amdgcn_s_getreg((20 /* HW_REG_XCC_ID */) | ((32 - 1) << 11)) & 0xf;
+    if (xcd >= domains) __builtin_trap();
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned wstride = gridDim.x * PLOW_WAVES;
+    const unsigned total = topk * ng;
+    const unsigned wstr = intermediate >> 1, sstr = intermediate >> 5;
+
+    for (unsigned f = blockIdx.x * PLOW_WAVES + wave; f < total; f += wstride) {
+        const unsigned slot = f / ng, group = f - slot * ng;
+        const unsigned h = group * 2u * rg;
+        const unsigned ra = h + lane / lpg, rb = h + rg + lane / lpg;
+        const unsigned eid = moe_slot_expert(table, slot);
+        float* ps = part + (size_t)slot * hidden;
+        if (eid >= experts || weights[(size_t)eid * 3 + 2] == 0ull) {
+            if ((lane % lpg) == 0) {
+                if (ra < hidden) ps[ra] = 0.0f;
+                if (rb < hidden) ps[rb] = 0.0f;
+            }
+            continue;
+        }
+        const float gate = moe_slot_gate(table, slot);
+        const unsigned char* wd =
+            (const unsigned char*)(size_t)weights[(size_t)eid * 3 + 2];
+        const unsigned char* sd =
+            (const unsigned char*)(size_t)scales[(size_t)eid * 3 + 2];
+        const unsigned ca = ra < hidden ? ra : h, cb = rb < hidden ? rb : ca;
+        float y0, y1;
+        wave_dot_mxfp4_lg2<rg>(fu + (size_t)slot * intermediate, wd, sd, wstr, sstr,
+                               ca, cb, intermediate, lane, y0, y1);
+        if ((lane % lpg) == 0) {
+            if (ra < hidden) ps[ra] = gate * y0;
+            if (rb < hidden) ps[rb] = gate * y1;
+        }
+    }
+    __syncthreads();
+
+    for (unsigned f = blockIdx.x * PLOW_WAVES + wave; f < total; f += wstride) {
+        const unsigned group = f % ng;
+        const unsigned owner = (group >> 3) & 7u;
+        if (owner != xcd) __builtin_trap();
+        if (lane != 0) continue;
+        const unsigned local_group = group >> 6;
+        unsigned* counter = ready + xcd * (ng / 64u) + local_group;
+        const unsigned old = __hip_atomic_fetch_add(counter, 1u, __ATOMIC_RELAXED,
+                                                     __HIP_MEMORY_SCOPE_AGENT);
+        if ((old % topk) + 1u != topk) continue;
+        asm volatile("buffer_inv" ::: "memory");
+        const unsigned h0 = group * 2u * rg;
+        for (unsigned j = 0; j < 2u * rg && h0 + j < hidden; ++j) {
+            float acc = 0.0f;
+            for (unsigned slot = 0; slot < topk; ++slot)
+                acc += part[(size_t)slot * hidden + h0 + j];
+            out[h0 + j] = f2bf(acc);
+        }
+    }
+}
+
+extern "C" __device__ unsigned plow_moe_down_combine_ready_abi_1 = 1;
+extern "C" __device__ unsigned plow_moe_down_combine_ready_no_global_wait_1 = 1;
+
 extern "C" __global__ void k3_moe_xcd_map(unsigned* out) {
     if (threadIdx.x == 0)
         out[blockIdx.x] =

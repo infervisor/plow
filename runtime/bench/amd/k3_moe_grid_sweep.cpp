@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
     hipModule_t module;
     CK(hipModuleLoad(&module, object));
     hipFunction_t glu, down, combine, pair, down_combine, down_combine_owned,
-                  xcd_map, handoff, stream;
+                  down_combine_ready, xcd_map, handoff, stream;
     CK(hipModuleGetFunction(&glu, module, "k3_moe_group_glu"));
     CK(hipModuleGetFunction(&down, module, "k3_moe_group_down"));
     CK(hipModuleGetFunction(&combine, module, "k3_moe_combine"));
@@ -160,6 +160,8 @@ int main(int argc, char** argv) {
     CK(hipModuleGetFunction(&down_combine, module, "k3_moe_down_combine_xcd"));
     CK(hipModuleGetFunction(&down_combine_owned, module,
                             "k3_moe_down_combine_xcd_owned"));
+    CK(hipModuleGetFunction(&down_combine_ready, module,
+                            "k3_moe_down_combine_ready"));
     CK(hipModuleGetFunction(&xcd_map, module, "k3_moe_xcd_map"));
     CK(hipModuleGetFunction(&handoff, module, "k3_moe_xcd_handoff"));
     CK(hipModuleGetFunction(&stream, module, "k3_moe_stream"));
@@ -194,8 +196,8 @@ int main(int argc, char** argv) {
     CK(hipMalloc(&d.fu, fu_bytes));
     CK(hipMalloc(&d.out, static_cast<size_t>(kHidden) * sizeof(uint16_t)));
     CK(hipMalloc(&d.partial, partial_bytes));
-    CK(hipMalloc(&d.control, 25 * sizeof(unsigned)));
-    CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+    CK(hipMalloc(&d.control, 56 * sizeof(unsigned)));
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
 
     std::vector<unsigned long long> weights(kExperts * 3), scales(kExperts * 3);
     for (unsigned expert = 0; expert < kExperts; ++expert) {
@@ -250,25 +252,29 @@ int main(int argc, char** argv) {
     CK(hipDeviceSynchronize());
     const auto reference_out = copy_bytes(d.out, static_cast<size_t>(kHidden) * sizeof(uint16_t));
 
-    CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
     const double down_combine_control_us = time_us([&](unsigned rotation) {
         launch_down(down, d, 256, rotation);
         launch_combine(combine, d);
     });
-    CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
     const double down_combine_phase_us = time_us([&](unsigned rotation) {
         launch_down_combine(down_combine, d, rotation);
     });
-    CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
     const double down_combine_768_control_us = time_us([&](unsigned rotation) {
         launch_down(down, d, 768, rotation);
         launch_combine(combine, d);
     });
-    CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
     const double down_combine_owned_us = time_us([&](unsigned rotation) {
         launch_down_combine_owned(down_combine_owned, d, 768, rotation);
     });
-    CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
+    const double down_combine_ready_us = time_us([&](unsigned rotation) {
+        launch_down_combine_owned(down_combine_ready, d, 768, rotation);
+    });
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
     launch_down_combine(down_combine, d, 0);
     CK(hipDeviceSynchronize());
     const auto phase_out = copy_bytes(d.out, static_cast<size_t>(kHidden) * sizeof(uint16_t));
@@ -281,7 +287,7 @@ int main(int argc, char** argv) {
                 down_combine_phase_us - down_combine_control_us,
                 (down_combine_phase_us - down_combine_control_us) * 92.0 / 1000.0,
                 phase_out_diff);
-    CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
     launch_down_combine_owned(down_combine_owned, d, 768, 0);
     CK(hipDeviceSynchronize());
     const auto owned_out = copy_bytes(d.out, static_cast<size_t>(kHidden) * sizeof(uint16_t));
@@ -295,7 +301,21 @@ int main(int argc, char** argv) {
                 down_combine_owned_us - down_combine_control_us,
                 (down_combine_owned_us - down_combine_768_control_us) * 92.0 / 1000.0,
                 owned_out_diff);
-    CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
+    launch_down_combine_owned(down_combine_ready, d, 768, 0);
+    CK(hipDeviceSynchronize());
+    const auto ready_out = copy_bytes(d.out, static_cast<size_t>(kHidden) * sizeof(uint16_t));
+    size_t ready_out_diff = 0;
+    for (size_t i = 0; i < ready_out.size(); ++i)
+        ready_out_diff += ready_out[i] != reference_out[i];
+    std::printf("down_combine_ready,control768_us=%.6f,ready768_us=%.6f,delta_us=%+.6f,"
+                "vs_control256_us=%+.6f,projected_92_delta_ms=%+.6f,out_diff=%zu\n",
+                down_combine_768_control_us, down_combine_ready_us,
+                down_combine_ready_us - down_combine_768_control_us,
+                down_combine_ready_us - down_combine_control_us,
+                (down_combine_ready_us - down_combine_768_control_us) * 92.0 / 1000.0,
+                ready_out_diff);
+    CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
 
     std::puts("grid,glu_us,down_us,chain_us,pair_us,handoff_us,glu_gbps,down_gbps,chain_ms_x92,fu_diff,partial_diff,pair_fu_diff,pair_partial_diff,sync_diff");
     for (unsigned grid : {1u, 64u, 128u, 192u, 256u, 384u, 512u, 768u}) {
@@ -339,7 +359,7 @@ int main(int argc, char** argv) {
         if (grid == 256) {
             CK(hipMemset(d.fu, 0, fu_bytes));
             CK(hipMemset(d.partial, 0, partial_bytes));
-            CK(hipMemset(d.control, 0, 25 * sizeof(unsigned)));
+            CK(hipMemset(d.control, 0, 56 * sizeof(unsigned)));
             launch_pair(pair, d, grid, 0);
             CK(hipDeviceSynchronize());
             const auto pair_fu = copy_bytes(d.fu, fu_bytes);
