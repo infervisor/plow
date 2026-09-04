@@ -1177,6 +1177,38 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
         }
     }
 #endif
+#if PLOW_MLA_FOLD_DVT > 0
+    /* SPLIT-TILE DECODE ARM (-DPLOW_MLA_FOLD_DVT=<VT>; op_attention.h d_mla_merge_fold_split).
+     * Same fold tree and merge order as the VT=32 arm below, so it may only take shapes that arm
+     * would have taken (bh*8 <= nblk, V a multiple of 32 so no ragged tile existed), and only
+     * where the finer tile still fits the grid in ONE round: at DVT=8 Kimi-K3 TP8 decode is
+     * 12*16 = 192 work items on 256 workgroups instead of 48; TP4 / batch 2 (bh=24) take the
+     * DVT*2 tile (192) rather than two rounds of 384. V < 256 keeps GLM (V=256) off the arm
+     * entirely: its packets are narrowed to bh*8 workgroups, so no finer tile could fit, and a
+     * PLOW_GLM_WGFIT=0 control must not silently change map. */
+    if (bh && bh * 8u <= nblk && V < 256u && (V % (unsigned)PLOW_MLA_FOLD_VT) == 0u &&
+        (V % (unsigned)PLOW_MLA_FOLD_VEC) == 0u) {
+        /* DVT=32 is the split body at the reference tile itself: the same 48 work items as the
+         * arm below with only the merge rewrite — the A/B that separates fill from merge. */
+        constexpr unsigned DVT = PLOW_MLA_FOLD_DVT;
+        static_assert(DVT >= PLOW_MLA_FOLD_VEC && DVT <= PLOW_MLA_FOLD_VT, "DVT range");
+        if ((V % DVT) == 0u && bh * (V / DVT) <= nblk) {
+            d_mla_merge_fold_split<512, (int)DVT, PLOW_MLA_FOLD_VT>(
+                (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
+                in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk, raw);
+            return;
+        }
+        if constexpr (DVT * 2 <= PLOW_MLA_FOLD_VT) {
+            if ((V % (DVT * 2)) == 0u && bh * (V / (DVT * 2)) <= nblk) {
+                d_mla_merge_fold_split<512, (int)(DVT * 2), PLOW_MLA_FOLD_VT>(
+                    (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
+                    (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk,
+                    raw);
+                return;
+            }
+        }
+    }
+#endif
     if (bh && bh * 8u <= nblk) {
         d_mla_merge_fold<512, PLOW_MLA_FOLD_VT>(
             (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
