@@ -42,14 +42,30 @@ All six token arrays are byte-identical, 256 IDs each, SHA256
 `7607b7fe2bf9f7fa89405d35cda5dec64bebc6fb21131a694d2a4add4cf14902`. Exclusive TP8 lease
 `tp-prefill-seg-major` returned 0 after 626 seconds with no overlapping lease.
 
+## Repeated-prefill and rung safety gate
+
+Each arm below ran two sequential requests on one loaded engine, eight generated tokens per
+request. This exercises prefill counter re-arm/reuse rather than rebuilding the engine between
+requests. Counter audit and all-rank agreement ran on every request/step. `plowrt bench` permits
+full token serialization only at `requests=1`, so this gate compares its exact aggregate FNV
+checksum; the preceding three 256-token folds provide byte-for-byte token arrays.
+
+| rung | checksum, both arms | TTFT delta ms | TPOT delta ms | E2E delta ms |
+|---:|---|---:|---:|---:|
+| 128 | `fnv1a64:a9a5506762aa74e9` | -4.404 | +0.0302 | -4.192 |
+| 1024 | `fnv1a64:f859e6e9c711d91f` | -5.848 | +0.0577 | -5.444 |
+| 2048 | `fnv1a64:ff971827d59d000e` | -8.126 | -0.0328 | -8.355 |
+
+All six processes completed both requests with zero failures. Safety summary SHA256:
+`68bcf58d809ad25fa5ec8b7d7b309a8a0635b32e00579f2bc04bfcd9ccf2a927`. Exclusive TP8 lease
+`tp-prefill-seg-major-safety-r2` returned 0 after 569 seconds. The initial attempt was rejected
+before model load because `--parity-report` requires one request; it touched no GPU work.
+
 ## Decision gate
 
 The 10.96 ms TTFT gain is material and repeatable, but this is not production-qualified yet.
-Before considering default-on:
-
-1. Audit and all-rank agreement must pass repeated prefills that reuse/re-arm counters.
-2. Exact small and intermediate compiled rungs (at least T128 and T1024 or T2048) must pass.
-3. A matched raw trace must show how much external segment residual the removed host drains recover.
+Audit/all-rank agreement, counter reuse, T128, T1024, and T2048 now pass. A matched raw trace must
+still show how much external segment residual the removed host drains recover before default-on.
 
 Any rung failure, counter timeout, output mismatch, or loss of the TTFT gain rejects the experiment.
 
