@@ -79,3 +79,25 @@ is nevertheless rejected: +1.715132 ms, or +80.65%, versus shipping. Its spill-f
 does not recover the overlap lost when low-register staging synchronously converts and commits
 one cell at a time. This object remains an isolated harness experiment; it is not a production
 route or default.
+
+## Reusable-A4 boundary
+
+`build_reuse.sh` builds a gfx950 candidate that quantizes the sorted BF16 activation once, then
+reuses its MXFP4 payload and E8M0 scales across 128-column N tiles. The four-wave WG256 GEMM keeps
+only A in LDS and reads existing row-major expert tables into registers; it does not allocate a
+second copy of expert weights. Eligibility is based on the MXFP4 contract, 128-aligned K, and at
+least two shipping 256-column N tiles. The runtime owns one max-live scratch allocation shared by
+sequential prefill segments, with rollback at `PLOW_MOE_STAGE1_A4_REUSE=0`.
+
+```sh
+nix develop -c runtime/bench/amd/lean_moe_stage1_ref/build_reuse.sh /tmp/plow-moe1-reuse
+GPU_LEASE_DIR=/tmp/gpulease perf-data/tools/gpulease -n 1 moe1-a4-reuse \
+  /tmp/plow-moe1-reuse/reuse_compare /tmp/plow-moe1-reuse/shipping.elf \
+  /tmp/plow-moe1-reuse/reuse.elf --run
+```
+
+The comparator includes quant/sort and GEMM, alternates order over 31 compute-cache-flushed
+samples, and requires byte-exact payload and scales. At T8192/H3584/I384/E896/top-k16 it measured
+2.122398 ms shipping vs 1.728507 ms reusable A4 (means, -18.55%), with zero differences over
+29,036,544 payload and 1,814,784 scale bytes. The candidate is wave64, four waves/WG, 182 VGPR,
+44 SGPR, occupancy 2, private0, and VGPR/SGPR spill0.

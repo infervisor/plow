@@ -732,6 +732,42 @@ const _: () = assert!(std::mem::size_of::<MoeStage1Mxfp4Args>() == 96);
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
+struct MoeStage1A4QuantArgs {
+    out: u64,
+    out_scale: u64,
+    activation: u64,
+    row_token: u64,
+    meta: u64,
+    row_capacity: u32,
+    experts: u32,
+    hidden: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeStage1A4QuantArgs>() == 56);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeStage1A4ReuseArgs {
+    out: u64,
+    activation: u64,
+    weight_table: u64,
+    activation_scale: u64,
+    weight_scale_table: u64,
+    meta: u64,
+    row_partidx: u64,
+    out_scale: u64,
+    inter: u32,
+    hidden: u32,
+    experts: u32,
+    act: u32,
+    beta: f32,
+    linear_beta: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeStage1A4ReuseArgs>() == 88);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
 struct MoeCombineArgs {
     out: u64,
     residual: u64,
@@ -808,6 +844,14 @@ struct MoeStage1Mxfp4Route {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct MoeStage1A4ReuseRoute {
+    quant_args: MoeStage1A4QuantArgs,
+    args: MoeStage1A4ReuseArgs,
+    quant_grid: u32,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct MoeStage2Mxfp4Route {
     args: MoeStage2Mxfp4Args,
     grid: u32,
@@ -845,6 +889,7 @@ enum PrefillSegmentRoute {
         grid: u32,
     },
     MoeStage1Mxfp4(MoeStage1Mxfp4Route),
+    MoeStage1A4Reuse(MoeStage1A4ReuseRoute),
     MoeStage2Mxfp4(MoeStage2Mxfp4Route),
     MoeCombine(MoeCombineRoute),
     MlaMaterializePack {
@@ -1077,15 +1122,21 @@ fn xreduce_attnres_inst(d: &DevInst64) -> bool {
 
 fn moe_stage1_mxfp4_inst(d: &DevInst64) -> bool {
     d.op == DevOp::MoeGroupGluPf as u16
-        && d.i[0] == 384
-        && d.i[1] == 3584
-        && d.i[2] == 896
+        && d.i[0] >= 256
+        && d.i[0].is_multiple_of(32)
+        && d.i[1] != 0
+        && d.i[1].is_multiple_of(128)
+        && d.i[2] != 0
         && d.i[3] == MOE_ENC_MXFP4
         && d.i[4] == 0
         && d.i[5] <= 2
         && d.i[6] == 0
         && d.i[7] == 0
         && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+}
+
+fn moe_stage1_a4_reuse_inst(d: &DevInst64) -> bool {
+    moe_stage1_mxfp4_inst(d) && d.i[0].div_ceil(256) >= 2
 }
 
 fn moe_stage2_mxfp4_inst(d: &DevInst64) -> bool {
@@ -1366,6 +1417,47 @@ fn has_moe_stage1_mxfp4_segment(prog: &DevProg) -> bool {
         .any(|set| set.len() == 1 && moe_stage1_mxfp4_inst(&prog.insts[*set.first().unwrap()]))
 }
 
+fn moe_stage1_a4_scratch_bytes(
+    progs: &[DevProg],
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<(u64, u64)> {
+    let mut payload = 0u64;
+    let mut scales = 0u64;
+    for prog in progs {
+        for d in &prog.insts {
+            if !moe_stage1_a4_reuse_inst(d) {
+                continue;
+            }
+            let row_bytes = tensors
+                .get(d.t[5] as usize)
+                .ok_or_else(|| {
+                    RuntimeError::Device("lean MoE stage-1 row-token handle is invalid".into())
+                })?
+                .bytes;
+            if !row_bytes.is_multiple_of(4) {
+                return Err(RuntimeError::Device(
+                    "lean MoE stage-1 row-token bytes are not u32-aligned".into(),
+                ));
+            }
+            let rows = row_bytes / 4;
+            let next_payload = rows.checked_mul(u64::from(d.i[1] / 2)).ok_or_else(|| {
+                RuntimeError::Device("lean MoE stage-1 A4 scratch size overflows".into())
+            })?;
+            let next_scales = rows.checked_mul(u64::from(d.i[1] / 32)).ok_or_else(|| {
+                RuntimeError::Device("lean MoE stage-1 scale scratch size overflows".into())
+            })?;
+            let next_total = next_payload.checked_add(next_scales).ok_or_else(|| {
+                RuntimeError::Device("lean MoE stage-1 total scratch size overflows".into())
+            })?;
+            if next_total > payload + scales {
+                payload = next_payload;
+                scales = next_scales;
+            }
+        }
+    }
+    Ok((payload, scales))
+}
+
 fn has_moe_combine_segment(prog: &DevProg) -> bool {
     let mut members = std::collections::BTreeMap::<u16, std::collections::BTreeSet<usize>>::new();
     for entry in &prog.stream {
@@ -1379,10 +1471,11 @@ fn has_moe_combine_segment(prog: &DevProg) -> bool {
         .any(|set| set.len() == 1 && moe_combine_inst(&prog.insts[*set.first().unwrap()]))
 }
 
-fn moe_mxfp4_routes(
+fn moe_mxfp4_routes_with_scratch(
     prog: &DevProg,
     tensors: &[crate::asset::devblob::DevTensor],
     devp: &[DeviceMem],
+    stage1_a4_scratch: Option<(u64, u64)>,
 ) -> Result<Vec<PrefillSegmentRoute>> {
     let n_seg = prog
         .stream
@@ -1591,6 +1684,69 @@ fn moe_mxfp4_routes(
                     "segment {seg} has a zero-grid MoE stage-1 packet"
                 )));
             }
+            if moe_stage1_a4_reuse_inst(d)
+                && crate::config::RuntimeConfig::get().amd.moe_stage1_a4_reuse
+            {
+                if let Some((a4, a4_scale)) = stage1_a4_scratch {
+                    let row_bytes = tensors
+                        .get(d.t[5] as usize)
+                        .ok_or_else(|| {
+                            RuntimeError::Device(
+                                "lean MoE stage-1 row-token handle is invalid".into(),
+                            )
+                        })?
+                        .bytes;
+                    if !row_bytes.is_multiple_of(4) {
+                        return Err(RuntimeError::Device(
+                            "lean MoE stage-1 row-token bytes are not u32-aligned".into(),
+                        ));
+                    }
+                    let row_capacity = u32::try_from(row_bytes / 4).map_err(|_| {
+                        RuntimeError::Device("lean MoE stage-1 row capacity exceeds u32".into())
+                    })?;
+                    let weight_table = addr(d.t[2], "expert_weight_table")?;
+                    let weight_scale_table = addr(d.t[3], "expert_scale_table")?;
+                    let grid = row_capacity
+                        .div_ceil(64)
+                        .checked_mul(d.i[0].div_ceil(128))
+                        .ok_or_else(|| {
+                            RuntimeError::Device("lean MoE stage-1 A4 reuse grid overflows".into())
+                        })?;
+                    routes.push(PrefillSegmentRoute::MoeStage1A4Reuse(
+                        MoeStage1A4ReuseRoute {
+                            quant_args: MoeStage1A4QuantArgs {
+                                out: a4,
+                                out_scale: a4_scale,
+                                activation: addr(d.t[1], "activation")?,
+                                row_token: addr(d.t[5], "row_token")?,
+                                meta: addr(d.t[4], "meta")?,
+                                row_capacity,
+                                experts: d.i[2],
+                                hidden: d.i[1],
+                            },
+                            args: MoeStage1A4ReuseArgs {
+                                out: addr(d.t[0], "out")?,
+                                activation: a4,
+                                weight_table,
+                                activation_scale: a4_scale,
+                                weight_scale_table,
+                                meta: addr(d.t[4], "meta")?,
+                                row_partidx: addr(d.t[6], "row_partidx")?,
+                                out_scale: addr(d.t[7], "out_scale")?,
+                                inter: d.i[0],
+                                hidden: d.i[1],
+                                experts: d.i[2],
+                                act: d.i[5],
+                                beta: f32::from_bits(d.fj[0]),
+                                linear_beta: f32::from_bits(d.fj[1]),
+                            },
+                            quant_grid: 1024,
+                            grid,
+                        },
+                    ));
+                    continue;
+                }
+            }
             routes.push(PrefillSegmentRoute::MoeStage1Mxfp4(MoeStage1Mxfp4Route {
                 args: MoeStage1Mxfp4Args {
                     out: addr(d.t[0], "out")?,
@@ -1617,6 +1773,15 @@ fn moe_mxfp4_routes(
         routes.push(PrefillSegmentRoute::Interpreter);
     }
     Ok(routes)
+}
+
+#[cfg(test)]
+fn moe_mxfp4_routes(
+    prog: &DevProg,
+    tensors: &[crate::asset::devblob::DevTensor],
+    devp: &[DeviceMem],
+) -> Result<Vec<PrefillSegmentRoute>> {
+    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5962,6 +6127,9 @@ pub struct AmdEngine {
     /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
     _kda_key_factor_scratch: Option<DeviceMem>,
     k_moe_stage1_mxfp4: Option<HsaKernel>,
+    k_moe_stage1_a4_quant: Option<HsaKernel>,
+    k_moe_stage1_a4_reuse: Option<HsaKernel>,
+    _moe_stage1_a4_scratch: Option<DeviceMem>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
     /// Spill-free interpreter containing only marked XReduceTwoShot segments.
@@ -7590,7 +7758,9 @@ impl AmdEngine {
             (None, None)
         };
 
-        let k_moe_stage1_mxfp4 = if arch == "gfx950" && need_moe_stage1_lean {
+        let (k_moe_stage1_mxfp4, k_moe_stage1_a4_quant, k_moe_stage1_a4_reuse) = if arch == "gfx950"
+            && need_moe_stage1_lean
+        {
             const NAME: &str = "moe_stage1_mxfp4_gfx950.elf";
             const SYMBOL: &str = "plow_moe1_mxfp4_bk256_gfx950";
             const MARKERS: [&str; 6] = [
@@ -7603,7 +7773,7 @@ impl AmdEngine {
             ];
             let path = hsaco_dir.join(NAME);
             if !path.exists() {
-                None
+                (None, None, None)
             } else {
                 if !prefill_moe_align_bm64 {
                     return Err(RuntimeError::Device(format!(
@@ -7642,11 +7812,54 @@ impl AmdEngine {
                     )));
                 }
                 EngineDevice::set_max_dynamic_smem(&*be, kernel, 119_808)?;
+                let reuse_markers = [
+                    "plow_moe1_a4_reuse_abi_1",
+                    "plow_moe1_a4_reuse_wave64_1",
+                    "plow_moe1_a4_reuse_four_wave_1",
+                    "plow_moe1_a4_reuse_a_only_lds_8192",
+                    "plow_moe1_a4_reuse_register_b_1",
+                ];
+                let (quant, reuse) = if crate::config::RuntimeConfig::get().amd.moe_stage1_a4_reuse
+                    && reuse_markers.iter().all(|m| syms.contains(m))
+                {
+                    let quant =
+                        EngineDevice::get_function(&*be, &module, "plow_moe1_quant_sort_a4_gfx950")
+                            .map_err(|e| {
+                                RuntimeError::Device(format!(
+                                    "{NAME}: no A4 quant/sort symbol: {e}"
+                                ))
+                            })?;
+                    let reuse = EngineDevice::get_function(
+                        &*be,
+                        &module,
+                        "plow_moe1_a4_reuse_16x16x128_gfx950",
+                    )
+                    .map_err(|e| {
+                        RuntimeError::Device(format!("{NAME}: no A4 reuse symbol: {e}"))
+                    })?;
+                    let qwant = std::mem::size_of::<MoeStage1A4QuantArgs>() as u32;
+                    let rwant = std::mem::size_of::<MoeStage1A4ReuseArgs>() as u32;
+                    if ![qwant, qwant + 256].contains(&quant.kernarg_size())
+                        || ![rwant, rwant + 256].contains(&reuse.kernarg_size())
+                        || quant.private_segment_size() != 0
+                        || reuse.private_segment_size() != 0
+                    {
+                        return Err(RuntimeError::Device(format!(
+                            "{NAME}: A4 reuse resource/ABI gate failed (quant args={}, private={}; reuse args={}, private={})",
+                            quant.kernarg_size(), quant.private_segment_size(),
+                            reuse.kernarg_size(), reuse.private_segment_size()
+                        )));
+                    }
+                    EngineDevice::set_max_dynamic_smem(&*be, reuse, 32_768)?;
+                    (Some(quant), Some(reuse))
+                } else {
+                    (None, None)
+                };
                 modules.push(module);
-                Some(kernel)
+                (Some(kernel), quant, reuse)
             }
         } else {
-            None
+            (None, None, None)
         };
 
         let k_moe_stage2_mxfp4 = if arch == "gfx950" && need_moe_stage2_lean {
@@ -8331,6 +8544,26 @@ impl AmdEngine {
         let kda_key_factor_scratch = d_kda_key_factor_scratch
             .as_ref()
             .map(|m| (m.base, kda_key_factor_half));
+        let (stage1_a4_payload, stage1_a4_scales) =
+            if k_moe_stage1_a4_quant.is_some() && k_moe_stage1_a4_reuse.is_some() {
+                moe_stage1_a4_scratch_bytes(&blob.progs[..dec_ix], &blob.tensors)?
+            } else {
+                (0, 0)
+            };
+        let d_moe_stage1_a4_scratch = if stage1_a4_payload != 0 {
+            let bytes = stage1_a4_payload
+                .checked_add(stage1_a4_scales)
+                .ok_or_else(|| {
+                    RuntimeError::Device("lean MoE stage-1 scratch size overflows".into())
+                })?;
+            tracing::info!(bytes, "allocating reusable sorted A4 MoE stage-1 scratch");
+            Some(EngineDevice::alloc(&*be, bytes)?)
+        } else {
+            None
+        };
+        let stage1_a4_scratch = d_moe_stage1_a4_scratch
+            .as_ref()
+            .map(|m| (m.base, m.base + stage1_a4_payload));
 
         // OPTIONAL, because a BLOCK asset is not a model. A block takes
         // `act.x` in and gives `act.x` out — it has no embedding, no lm_head,
@@ -8358,7 +8591,7 @@ impl AmdEngine {
                 vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
             };
             let mut prefill_routes = if prog_ix < dec_ix {
-                moe_mxfp4_routes(p, &blob.tensors, &devp)?
+                moe_mxfp4_routes_with_scratch(p, &blob.tensors, &devp, stage1_a4_scratch)?
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
             };
@@ -8922,6 +9155,9 @@ impl AmdEngine {
             k_kda_key_factor_carry,
             _kda_key_factor_scratch: d_kda_key_factor_scratch,
             k_moe_stage1_mxfp4,
+            k_moe_stage1_a4_quant,
+            k_moe_stage1_a4_reuse,
+            _moe_stage1_a4_scratch: d_moe_stage1_a4_scratch,
             k_moe_stage2_mxfp4,
             k_moe_combine,
             k_xreduce_wave_rs,
@@ -9448,6 +9684,11 @@ impl AmdEngine {
                 PrefillSegmentRoute::MoeStage1Mxfp4(_) if self.k_moe_stage1_mxfp4.is_some() => {
                     return "moe_stage1_mxfp4";
                 }
+                PrefillSegmentRoute::MoeStage1A4Reuse(_)
+                    if self.k_moe_stage1_a4_reuse.is_some() =>
+                {
+                    return "moe_stage1_a4_reuse";
+                }
                 PrefillSegmentRoute::MoeStage2Mxfp4(_) if self.k_moe_stage2_mxfp4.is_some() => {
                     return "moe_stage2_mxfp4";
                 }
@@ -9679,6 +9920,32 @@ impl AmdEngine {
                     None,
                 )?;
                 self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(quant), Some(kernel), Some(PrefillSegmentRoute::MoeStage1A4Reuse(route))) = (
+                self.k_moe_stage1_a4_quant,
+                self.k_moe_stage1_a4_reuse,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    quant,
+                    route.quant_grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&route.quant_args)),
+                    None,
+                )?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    256,
+                    32_768,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 2;
                 return Ok(());
             }
             if let (Some(kernel), Some(PrefillSegmentRoute::MoeStage2Mxfp4(route))) = (
@@ -12415,9 +12682,66 @@ mod tests {
         assert_eq!((route.args.inter_dim, route.args.model_dim), (384, 3584));
         assert_eq!((route.args.beta, route.args.linear_beta), (4.0, 25.0));
 
-        prog.insts[1].i[0] = 512;
+        prog.insts[1].i[0] = 224;
         let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
         assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
+        let mut prog = segmented_prog(&[DevOp::MoeAlignPf, DevOp::MoeGroupGluPf], &[0, 1]);
+        prog.t = 8192;
+        prog.insts[0].t[0] = 4;
+        prog.insts[0].i = [8192, 896, 16, 0, 0, 0, 0, 0];
+        prog.insts[1].blocks = 256;
+        prog.insts[1].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        prog.insts[1].i = [384, 3584, 896, MOE_ENC_MXFP4, 0, 2, 0, 0];
+        prog.insts[1].fj = [4.0f32.to_bits(), 25.0f32.to_bits(), 0];
+        let rows = 151_232u64;
+        let mut tensors: Vec<_> = (0..8)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        tensors[2].name = "moe.x.expert_weight_table".into();
+        tensors[3].name = "moe.x.expert_scale_table".into();
+        tensors[5].bytes = rows * 4;
+        tensors[6].bytes = rows * 4;
+        let devp: Vec<_> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DeviceMem::view(0x1000 + i as u64 * 0x10_0000, t.bytes))
+            .collect();
+        let (payload, scales) =
+            moe_stage1_a4_scratch_bytes(std::slice::from_ref(&prog), &tensors).unwrap();
+        assert_eq!((payload, scales), (rows * 3584 / 2, rows * 3584 / 32));
+        let routes =
+            moe_mxfp4_routes_with_scratch(&prog, &tensors, &devp, Some((0x8000_0000, 0x9000_0000)))
+                .unwrap();
+        let PrefillSegmentRoute::MoeStage1A4Reuse(route) = routes[1] else {
+            panic!("profitable three-N-tile shape must select A4 reuse")
+        };
+        assert_eq!(route.quant_args.row_capacity, rows as u32);
+        assert_eq!(
+            (route.quant_args.out, route.quant_args.out_scale),
+            (0x8000_0000, 0x9000_0000)
+        );
+        assert_eq!(
+            (route.args.weight_table, route.args.weight_scale_table),
+            (0x201000, 0x301000)
+        );
+        assert_eq!(route.grid, rows.div_ceil(64) as u32 * 3);
+
+        prog.insts[1].i[0] = 256;
+        let fallback =
+            moe_mxfp4_routes_with_scratch(&prog, &tensors, &devp, Some((0x8000_0000, 0x9000_0000)))
+                .unwrap();
+        assert!(matches!(
+            fallback[1],
+            PrefillSegmentRoute::MoeStage1Mxfp4(_)
+        ));
     }
 
     #[test]

@@ -1449,14 +1449,14 @@ if(PLOW_GFX950_HSACO)
 
     if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_STAGE1_LEAN)
         set(_hs_moe1_src
-            "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/lean_moe_stage1_ref/native_kernel.hip")
+            "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/lean_moe_stage1_ref/reuse_kernel.hip")
         set(_hs_moe1_out "${PLOW_HSACO_DIR}/moe_stage1_mxfp4_gfx950.elf")
         add_custom_command(OUTPUT "${_hs_moe1_out}"
             COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
                     "${PLOW_HSACO_ARCH}" "${_hs_moe1_out}"
-                    plow_moe1_mxfp4_bk256_gfx950 192 2
+                    plow_moe1_a4_reuse_16x16x128_gfx950 192 2
                     ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
-                    -DPLOW_REQUIRED_MARKER=plow_moe1_mxfp4_stage1_abi_1
+                    -DPLOW_REQUIRED_MARKER=plow_moe1_a4_reuse_abi_1
                     "${_hs_moe1_src}"
             DEPENDS "${_hs_moe1_src}" "${_hs_run}" ${_hs_hdrs}
             COMMENT "hipcc moe_stage1_mxfp4_gfx950.elf"

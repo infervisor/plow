@@ -602,6 +602,10 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-mla-pf-v2", env = "PLOW_MLA_PF_V2", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_v2: bool,
 
+    /// Prequantize sorted MXFP4 MoE stage-1 activations once and reuse them across N tiles.
+    #[arg(long = "amd-moe-stage1-a4-reuse", env = "PLOW_MOE_STAGE1_A4_REUSE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_stage1_a4_reuse: bool,
+
     /// Download rank 0's copy of act tensors after the prefill/step:
     /// `name:path[,name:path...]`. A measurement instrument, not a serving path.
     #[arg(long = "amd-dump-act", env = "PLOW_DUMP_ACT", global = true)]
@@ -743,6 +747,24 @@ mod tests {
             .expect("explicit TP prefill segment-major rollback");
         let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
         assert!(!config.tp_prefill_segment_major);
+    }
+
+    #[test]
+    fn moe_stage1_a4_reuse_defaults_on_and_has_a_false_rollback() {
+        use clap::{Args, FromArgMatches};
+
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "moe_stage1_a4_reuse")
+            .expect("MoE stage-1 A4 reuse argument");
+        assert_eq!(arg.get_default_values(), ["true"]);
+
+        let matches = command
+            .try_get_matches_from(["test", "--amd-moe-stage1-a4-reuse=false"])
+            .expect("explicit MoE stage-1 A4 reuse rollback");
+        let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
+        assert!(!config.moe_stage1_a4_reuse);
     }
 
     /// A `RuntimeConfig` field that nothing reads is a CLI flag that silently does nothing.
