@@ -1372,10 +1372,12 @@ impl AmdTpGroup {
         let dispatch = self.ranks[0].prog_dispatch(step.prog);
         let launches = dispatch.launches();
         ttft::PF_SEGMENTS.tally(launches as u64);
+        let segment_timing = std::env::var_os("PLOW_PREFILL_SEG_TIMING").is_some();
         let segment_major = crate::config::RuntimeConfig::get()
             .amd
             .tp_prefill_segment_major
-            && self.prefill_capture.is_none();
+            && self.prefill_capture.is_none()
+            && !segment_timing;
         if segment_major {
             let t = std::time::Instant::now();
             let n_ranks = self.ranks.len();
@@ -1414,20 +1416,36 @@ impl AmdTpGroup {
             return Ok(());
         }
         for seg in 0..launches {
-            let t = std::time::Instant::now();
+            let submit_begin = std::time::Instant::now();
+            let family =
+                segment_timing.then(|| self.ranks[0].prefill_segment_family(step.prog, seg));
             for e in &mut self.ranks {
                 e.enqueue_segment(step.prog, seg)?;
             }
-            ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+            let enqueued = std::time::Instant::now();
+            ttft::PF_ENQUEUE.add((enqueued - submit_begin).as_nanos() as u64);
             // For WaveSegments this is THE BARRIER. Without it the ranks drift
             // apart across segments and collectives in a later segment miss
             // each other. L2Domains has one iteration and this is its final
             // all-rank drain.
-            let t = std::time::Instant::now();
+            let drain_begin = std::time::Instant::now();
             for e in &self.ranks {
                 e.drain()?;
             }
-            let ns = t.elapsed().as_nanos() as u64;
+            let drain_ns = drain_begin.elapsed().as_nanos() as u64;
+            if let Some(family) = family {
+                eprintln!(
+                    "PLOW_PREFILL_SEG_TIMING program={} bucket={} c0={} clen={} segment={} family={} enqueue_us={:.3} critical_us={:.3}",
+                    step.prog,
+                    self.ranks[0].prog_t(step.prog),
+                    step.c0,
+                    step.clen,
+                    seg,
+                    family,
+                    (enqueued - submit_begin).as_secs_f64() * 1e6,
+                    submit_begin.elapsed().as_secs_f64() * 1e6,
+                );
+            }
             if prefill_capture_due(self.prefill_capture.as_ref(), step.prog, seg) {
                 let capture = self.prefill_capture.take().expect("capture was due");
                 for (tensor, path) in capture.targets {
@@ -1445,7 +1463,7 @@ impl AmdTpGroup {
                         })?;
                 }
             }
-            ttft::PF_DRAIN.add(ns);
+            ttft::PF_DRAIN.add(drain_ns);
             // Per-CHUNK, because the aggregate cannot separate a full bucket
             // from a padded one and that is the bucket-ladder question.
             if ttft::on() {
@@ -1460,9 +1478,9 @@ impl AmdTpGroup {
                      ({:.0} tok/s over the bucket, {:.0} over the real rows)",
                     step.c0,
                     step.clen,
-                    ns as f64 / 1e6,
-                    bucket as f64 / (ns as f64 / 1e9),
-                    step.clen as f64 / (ns as f64 / 1e9),
+                    drain_ns as f64 / 1e6,
+                    bucket as f64 / (drain_ns as f64 / 1e9),
+                    step.clen as f64 / (drain_ns as f64 / 1e9),
                 );
             }
         }

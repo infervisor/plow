@@ -9182,6 +9182,81 @@ impl AmdEngine {
         self.progs[p].seg_class[seg]
     }
 
+    /// Diagnostic label for the kernel object that will execute one prefill segment.
+    /// Kept out of the launch path unless segment timing is explicitly enabled.
+    pub(crate) fn prefill_segment_family(&self, p: usize, seg: usize) -> &'static str {
+        let route = self.progs[p]
+            .prefill_routes
+            .get(seg)
+            .copied()
+            .unwrap_or(PrefillSegmentRoute::Interpreter);
+        match route {
+            PrefillSegmentRoute::XReduceAttnRes { .. } => return "xreduce_attnres",
+            PrefillSegmentRoute::XReduceWaveRs => return "xreduce_wave_rs",
+            _ => {}
+        }
+        if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
+            return "interpreter";
+        }
+        let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        if !active {
+            match route {
+                PrefillSegmentRoute::MlaMaterializePack { .. } => return "mla_materialize_pack",
+                PrefillSegmentRoute::MlaMaterializedPrefill { .. } => {
+                    return "mla_materialized_prefill";
+                }
+                PrefillSegmentRoute::KdaChunkIntraCached { .. }
+                    if self.k_kda_chunk_intra_cached.is_some() =>
+                {
+                    return "kda_intra_cached";
+                }
+                PrefillSegmentRoute::KdaChunkIntraWaveItems { .. } => {
+                    return "kda_intra_wave_items";
+                }
+                PrefillSegmentRoute::KdaChunkKeyFactorWu { .. }
+                    if self.k_kda_key_factor_wu.is_some() =>
+                {
+                    return "kda_key_factor_wu";
+                }
+                PrefillSegmentRoute::KdaChunkKeyFactorCarry { .. }
+                    if self.k_kda_key_factor_carry.is_some() =>
+                {
+                    return "kda_key_factor_carry";
+                }
+                PrefillSegmentRoute::MoeStage1Mxfp4(_) if self.k_moe_stage1_mxfp4.is_some() => {
+                    return "moe_stage1_mxfp4";
+                }
+                PrefillSegmentRoute::MoeStage2Mxfp4(_) if self.k_moe_stage2_mxfp4.is_some() => {
+                    return "moe_stage2_mxfp4";
+                }
+                PrefillSegmentRoute::MoeCombine(_) if self.k_moe_combine.is_some() => {
+                    return "moe_combine";
+                }
+                _ => {}
+            }
+        }
+        match packed_segment_route(
+            active,
+            self.progs[p].packed_seg_family[seg],
+            self.k_packed_mla_norm.is_some(),
+            self.k_packed_mla_flash.is_some(),
+            self.k_packed_kda.is_some(),
+        ) {
+            Ok(PackedSegmentRoute::MlaNorm) => "packed_mla_norm",
+            Ok(PackedSegmentRoute::MlaFlash) => "packed_mla_flash",
+            Ok(PackedSegmentRoute::Kda) => "kda_family_raw",
+            Ok(PackedSegmentRoute::Primary) | Err(_) => {
+                if self.progs[p].raw_mla_v2_segment[seg] && self.k_mla_v2_sv_raw.is_some() {
+                    "mla_v2_raw"
+                } else if self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4 {
+                    "flash_interpreter"
+                } else {
+                    "interpreter"
+                }
+            }
+        }
+    }
+
     /// Enqueue ONE segment of program `p`. No re-arm, no drain.
     ///
     /// The building block of both the single-GPU segmented run and the TP

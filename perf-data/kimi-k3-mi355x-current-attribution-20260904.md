@@ -50,6 +50,42 @@ Largest traced op families are `XReduce2` 210.216 ms, `KdaChunkCarry` 150.043 ms
 83.066 ms. The wave-item specialist removes `KdaChunkIntra` from the primary trace; the prior
 122 ms interpreter charge is therefore absent rather than silently zero-cost.
 
+### External-segment attribution
+
+`PLOW_PREFILL_SEG_TIMING=1` is a default-off diagnostic that labels the object route and measures
+the all-rank critical interval for every ordered prefill segment. It deliberately disables
+segment-major enqueue and uses the exact per-segment/all-rank barrier route, so no neighboring
+interpreter packet can absorb a standalone object's time. This changes dispatch timing; these
+numbers are attribution values, not production endpoint-additive timings.
+
+One uncontended, audited BF16-KV TP8 `8192->1` run covered all 693 segments exactly once. The
+segment intervals sum to 1351.516 ms of its 1370.556 ms endpoint (98.61%); the remaining
+19.040 ms is preparation, counter reset/audit, sampling, and host work outside the timed segment
+windows. Enqueueing eight ranks accounts for 2.577 ms of the segment sum.
+
+| actual route | segments | critical ms | enqueue ms | mean us/segment |
+|---|---:|---:|---:|---:|
+| primary interpreter | 186 | 699.501 | 0.693 | 3760.758 |
+| lean MoE stage-1 | 92 | 213.543 | 0.347 | 2321.122 |
+| raw KDA family | 138 | 194.538 | 0.511 | 1409.695 |
+| raw MLA V2 | 24 | 92.441 | 0.093 | 3851.703 |
+| lean MoE stage-2 | 92 | 70.918 | 0.347 | 770.847 |
+| KDA intra wave-item | 69 | 41.536 | 0.243 | 601.976 |
+| lean MoE combine | 92 | 39.038 | 0.344 | 424.331 |
+
+The raw KDA segments occur as the compiler's dependency-ordered `Wu -> Carry` pair. Splitting each
+adjacent pair gives Wu 42.650 ms and Carry 151.888 ms across 69 layers. Thus the largest next raw
+kernel lever is MoE stage-1 at 213.543 ms, followed by KDA carry at 151.888 ms and MLA V2 at
+92.441 ms. The six standalone routes total 652.014 ms. This also disproves treating the old
+378.151 ms subtraction residual as an external-kernel total: the raw packet report sums
+overlapping per-workgroup category envelopes, while this diagnostic partitions ordered wall time.
+
+The run produced token 6896 and checksum `fnv1a64:7d749e3b002fafa7`; compact all-rank counter audit
+and prefill-completion audit both passed. Exclusive lease `prefill-segment-attribution-final`
+returned rc=0 after 95 s. Artifact SHA256: runtime `4b88e1a2...`, packet `f1bf783d...`, active
+prefill object `fb621847...`, raw output `43f21195...`, timing log `798d6ea3...`, JSON
+`112ad938...`.
+
 ## Decode critical envelope
 
 The reporter accounts for 27.8444 ms of the 28.0914 ms device span; its residual is 0.2470 ms.
@@ -76,9 +112,9 @@ The single largest decoded family is 468 `b=256` GEMVs at 5.905 ms, followed by 
 2. `KdaChunkCarry`: 150.043 ms across 69 calls (2.174 ms/call) is the next largest exact traced
    kernel. Preserve FP32 recurrence/order and prove state plus 256-token equality before routing.
 
-Before optimizing the 378.151 ms external bucket, add per-segment device timestamps so lean MoE,
-KDA-Intra body, launch gaps, and overlap are separately measured. Its size alone is not evidence
-for which external object to change.
+The external bucket is now resolved by exact per-segment barriers. Optimize the measured
+stage-1, KDA-carry, and MLA routes in that order; use the diagnostic only for attribution and the
+normal segment-major route for endpoint gates.
 
 ## Artifacts
 
