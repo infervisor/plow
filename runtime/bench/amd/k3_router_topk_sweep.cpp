@@ -111,10 +111,24 @@ int main(int argc, char** argv) {
     for (unsigned expert = 0; expert < kExperts; ++expert) {
         host_bias[expert] = std::cos(static_cast<float>(expert) * 0.071f) * 0.2f;
     }
+    // Rotation 0 is the oracle row; the rest alternate smooth, uniform-random, heavily tied
+    // (8 distinct bf16 values) and near-constant with a few spikes, so the byte diff covers
+    // ties at every rank boundary and the lowest-id rule.
+    uint32_t lcg = 0x9e3779b9u;
     for (unsigned rotation = 0; rotation < kRotations; ++rotation) {
         for (unsigned expert = 0; expert < kExperts; ++expert) {
-            const float value = std::sin(static_cast<float>(expert) * 0.173f +
-                                         static_cast<float>(rotation) * 0.317f) * 3.0f;
+            lcg = lcg * 1664525u + 1013904223u;
+            const float uni = static_cast<float>(lcg >> 8) * (1.0f / 16777216.0f);
+            float value;
+            switch (rotation % 4) {
+                case 0:
+                    value = std::sin(static_cast<float>(expert) * 0.173f +
+                                     static_cast<float>(rotation) * 0.317f) * 3.0f;
+                    break;
+                case 1: value = (uni - 0.5f) * 8.0f; break;
+                case 2: value = static_cast<float>(lcg % 8u) * 0.25f - 1.0f; break;
+                default: value = (lcg % 97u == 0) ? 2.0f + uni : 0.5f; break;
+            }
             host_logits[static_cast<size_t>(rotation) * kExperts + expert] = to_bf16(value);
         }
     }
