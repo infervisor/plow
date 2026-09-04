@@ -196,6 +196,89 @@ extern "C" __device__ unsigned plow_moe_down_combine_phase_abi_1 = 1;
 extern "C" __device__ unsigned plow_moe_down_combine_phase_grid_256 = 256;
 extern "C" __device__ unsigned plow_moe_down_combine_phase_domains_8 = 8;
 
+/* Grid-768-safe XCD-owned phase. Workgroups never wait: each physical XCD computes disjoint
+ * eight-row hidden stripes, publishes locally, and exits. Only the last producer on that XCD
+ * performs the fixed-order combine for its own stripes. Kernel completion is the sole global
+ * release, so safety does not depend on all 768 workgroups being simultaneously resident. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2)
+void k3_moe_down_combine_xcd_owned(
+    bf16* out, float* part, const bf16* fu, const unsigned char* table,
+    const unsigned long long* weights, const unsigned long long* scales,
+    unsigned topk, unsigned hidden, unsigned intermediate, unsigned experts,
+    unsigned* control) {
+    constexpr unsigned domains = 8, rg = 4, lpg = PLOW_WAVE / rg;
+    if (blockDim.x != PLOW_THREADS || gridDim.x % domains || topk == 0 || hidden == 0 ||
+        intermediate > 512u || (intermediate & 31u))
+        __builtin_trap();
+    const unsigned xcd =
+        __builtin_amdgcn_s_getreg((20 /* HW_REG_XCC_ID */) | ((32 - 1) << 11)) & 0xf;
+    if (xcd >= domains) __builtin_trap();
+    const unsigned local_blocks = gridDim.x / domains;
+    __shared__ unsigned local_slice;
+    if (threadIdx.x == 0)
+        local_slice = __hip_atomic_fetch_add(&control[xcd], 1u, __ATOMIC_RELAXED,
+                                              __HIP_MEMORY_SCOPE_AGENT) % local_blocks;
+    __syncthreads();
+
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned ng = (hidden + 2u * rg - 1u) / (2u * rg);
+    const unsigned local_ng = (ng + domains - 1u - xcd) / domains;
+    const unsigned local_total = topk * local_ng;
+    const unsigned wstr = intermediate >> 1, sstr = intermediate >> 5;
+    for (unsigned lf = local_slice * PLOW_WAVES + wave; lf < local_total;
+         lf += local_blocks * PLOW_WAVES) {
+        const unsigned slot = lf / local_ng;
+        const unsigned local_group = lf - slot * local_ng;
+        const unsigned group = local_group * domains + xcd;
+        const unsigned h = group * 2u * rg;
+        if (group >= ng) continue;
+        const unsigned ra = h + lane / lpg, rb = h + rg + lane / lpg;
+        const unsigned eid = moe_slot_expert(table, slot);
+        float* ps = part + (size_t)slot * hidden;
+        if (eid >= experts || weights[(size_t)eid * 3 + 2] == 0ull) {
+            if ((lane % lpg) == 0) {
+                if (ra < hidden) ps[ra] = 0.0f;
+                if (rb < hidden) ps[rb] = 0.0f;
+            }
+            continue;
+        }
+        const float gate = moe_slot_gate(table, slot);
+        const unsigned char* wd =
+            (const unsigned char*)(size_t)weights[(size_t)eid * 3 + 2];
+        const unsigned char* sd =
+            (const unsigned char*)(size_t)scales[(size_t)eid * 3 + 2];
+        const unsigned ca = ra < hidden ? ra : h, cb = rb < hidden ? rb : ca;
+        float y0, y1;
+        wave_dot_mxfp4_lg2<rg>(fu + (size_t)slot * intermediate, wd, sd, wstr, sstr,
+                               ca, cb, intermediate, lane, y0, y1);
+        if ((lane % lpg) == 0) {
+            if (ra < hidden) ps[ra] = gate * y0;
+            if (rb < hidden) ps[rb] = gate * y1;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add(
+            &control[domains + xcd], 1u, __ATOMIC_RELAXED,
+            __HIP_MEMORY_SCOPE_AGENT);
+        local_slice = old + 1u == ((old / local_blocks) + 1u) * local_blocks;
+    }
+    __syncthreads();
+    if (!local_slice) return;
+    asm volatile("buffer_inv" ::: "memory");
+    for (unsigned h = threadIdx.x; h < hidden; h += PLOW_THREADS) {
+        if (((h / (2u * rg)) % domains) != xcd) continue;
+        float acc = 0.0f;
+        for (unsigned slot = 0; slot < topk; ++slot)
+            acc += part[(size_t)slot * hidden + h];
+        out[h] = f2bf(acc);
+    }
+}
+
+extern "C" __device__ unsigned plow_moe_down_combine_xcd_owned_abi_1 = 1;
+extern "C" __device__ unsigned plow_moe_down_combine_xcd_owned_no_global_wait_1 = 1;
+
 extern "C" __global__ void k3_moe_xcd_map(unsigned* out) {
     if (threadIdx.x == 0)
         out[blockIdx.x] =

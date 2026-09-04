@@ -36,6 +36,13 @@ ROCm 7.14/gfx950 metadata:
 
 The candidate does not reduce occupancy and adds no private memory or register spills.
 
+The follow-up XCD-owned object is 58 VGPR / 57 SGPR, occupancy 8 waves/SIMD, 4 B LDS, and zero
+private memory or spills. A WG512 consumes eight waves, so metadata admits four workgroups/CU and
+the grid768 launch requires three. Correctness does not depend on that admission: producer
+workgroups never wait. Each exits after its local relaxed arrival; whichever workgroup arrives
+96th on an XCD becomes the combine leader. Thus an arbitrary scheduling order still makes forward
+progress. The host separately observes 96/96 workgroups on all eight physical XCD IDs.
+
 ## Hardware gate
 
 Full emitted decode geometry: top-16, H=3584, I=384, E=896, MXFP4. Fifty-six rotating expert
@@ -52,6 +59,24 @@ Projected over 92 graph sites, the phase regresses TPOT by 0.832 ms. An earlier 
 also regressed by 6.471 us/site (+0.595 ms/token), so this is not promoted and no TP8 network gate
 is justified.
 
+### XCD-owned grid768 follow-up
+
+The second prototype remaps every eight-row hidden stripe to one physical XCD. Its 96 local
+workgroups compute that stripe for every routed slot; followers retire, and the last local producer
+combines only its disjoint rows in fixed slot order. No workgroup polls a global counter. Kernel/AQL
+completion is the only global publication.
+
+| arm | complete boundary | BF16 output differences |
+|---|---:|---:|
+| ordinary grid768 DOWN + combine | 14.126 us | — |
+| XCD-owned grid768 phase | 46.467 us | 0 |
+| phase - control | **+32.341 us (+229.0%)** | 0 |
+
+The projected regression is +2.975 ms/token. Although it eliminates the global rendezvous and is
+safe at grid768, hidden-stripe ownership destroys the production flattened `(slot,row)` schedule's
+weight-stream locality. It is also far beyond the grouped standalone route's measured 0.94–0.96
+ms/token segment-handoff tax. No TP8 network run is warranted.
+
 ## Consequence
 
 One cross-XCD rendezvous costs more than one ordinary dependency boundary. A useful phase must
@@ -60,6 +85,11 @@ the grid-256 body penalty. The next architecture should assign tensor/expert str
 XCD-local workers across several ops, keep local producer/consumer handoffs inside one L2, and
 reconcile globally only at semantic reductions or collectives. Repackaging one edge at a time
 cannot close the 7.72 ms/token vLLM gap.
+
+The XCD-owned follow-up further narrows that recommendation: do not partition the expert weight
+stream by output rows merely to make the consumer local. A credible redesign needs persistent
+expert/slot ownership and a consumer layout compatible with it, or a device scheduler that lets the
+existing flattened producer tiles enqueue ready row fragments without a global phase barrier.
 
 The audit also found a measurement defect in the older, already rejected GLU→DOWN cooperative
 probe: its local-block census increments once per thread, producing 16,384 rather than 32 arrivals
