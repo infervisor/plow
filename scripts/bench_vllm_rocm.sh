@@ -89,6 +89,11 @@ mkdir -p "$OUTDIR"
 ENV_FLAGS=""
 for kv in ${EXTRA_ENV:-}; do ENV_FLAGS="$ENV_FLAGS -e $kv"; done
 
+# EXTRA_MOUNTS="/host/path:/container/path:ro /host/path2:/container/path2:ro"
+# for serving a local checkpoint directory that isn't in the HF cache.
+MOUNT_FLAGS=""
+for m in ${EXTRA_MOUNTS:-}; do MOUNT_FLAGS="$MOUNT_FLAGS -v $m"; done
+
 # The ROCm images have no `render`/`video` group in /etc/group, so --group-add
 # by NAME fails outright ("Unable to find group render"). Pass host GIDs.
 RGID="$(getent group render | cut -d: -f3)"; RGID="${RGID:-109}"
@@ -104,6 +109,7 @@ serve() {
     --device=/dev/kfd --device=/dev/dri \
     --group-add "$VGID" --group-add "$RGID" \
     --security-opt seccomp=unconfined \
+    ${PRIVILEGED:+--privileged} \
     --ipc=host --shm-size=32g \
     -e HIP_VISIBLE_DEVICES="$GPUS" \
     -e HF_HUB_OFFLINE=1 \
@@ -112,6 +118,7 @@ serve() {
     $ENV_FLAGS \
     -v "$HF_CACHE":/hf:ro \
     -v "$COMPILE_CACHE":/root/.cache \
+    $MOUNT_FLAGS \
     -p "$PORT":8000 \
     --entrypoint vllm \
     "$IMAGE" \
@@ -187,6 +194,7 @@ bench_point() {
   $DOCKER run --rm --network host \
     -e HF_HUB_OFFLINE=1 -e HF_HOME=/hf -e HF_MODULES_CACHE=/tmp/hf_modules \
     -v "$HF_CACHE":/hf:ro \
+    $MOUNT_FLAGS \
     --entrypoint vllm "$IMAGE" \
     bench serve \
     --model "$MODEL_ID" --dataset-name random \

@@ -150,12 +150,14 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #include "op_collective.h"
 #include "op_elementwise.h"
 #include "op_gemm.h"
+#include "op_norm.h" /* block_max — needed by op_dsa_pool.h below */
+#include "op_dsa_pool.h"
+#include "op_hyperconn.h"
 #if PLOW_K3
 #include "op_k3.h"
 #include "op_kda.h"
 #endif
 #include "op_moe.h"
-#include "op_norm.h"
 
 #if MPF_BM == 64
 extern "C" __device__ unsigned plow_moe_align_bm64_1 = 1;
@@ -1323,26 +1325,48 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
     // this arm, i.e. the two pressures are not additive, they saturate). So the next arm added
     // here buys scratch traffic, not an INVALID_ISA — check `spill`, not just `occ`.
     const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
+    const bool nope = (in->i[3] & 0x80000000u) != 0;
+    const unsigned window = in->i[3] & 0x7fffffffu;
     if (in->op == PLOW_DOP_FLASH_GATHER_DECODE) {
-        if (gf == 2)
+        if (nope && gf == 2)
+            d_flash_mla_decode<512, 0, 2, /*GATHER=*/true>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
+                (const int*)TEN(7), in->i[6]);
+#if PLOW_GLM_GF8_ARM
+        else if (nope && gf == 8)
+            d_flash_mla_decode<512, 0, 8, /*GATHER=*/true>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
+                (const int*)TEN(7), in->i[6]);
+#endif
+        else if (nope)
+            d_flash_mla_decode<512, 0, 4, /*GATHER=*/true>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
+                (const int*)TEN(7), in->i[6]);
+        else if (gf == 2)
             d_flash_mla_decode<512, 64, 2, /*GATHER=*/true>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
-                in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
                 (const int*)TEN(7), in->i[6]);
 #if PLOW_GLM_GF8_ARM
         else if (gf == 8)
             d_flash_mla_decode<512, 64, 8, /*GATHER=*/true>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
-                in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
                 (const int*)TEN(7), in->i[6]);
 #endif
         else
             d_flash_mla_decode<512, 64, 4, /*GATHER=*/true>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
-                in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds,
                 (const int*)TEN(7), in->i[6]);
     } else {
         /* [HNR-FOLD] Q-ROPE FOLD, dense bf16 arm only (emit knob PLOW_GLM_FUSE_ROPE).
@@ -1364,25 +1388,42 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
         const float* qrc = (const float*)TEN(7);
         const float* qrs = qrc ? (const float*)IEN(6) : nullptr;
         if (qrc && !qrs) __builtin_trap();
-        if (gf == 2)
+        if (nope && gf == 2)
+            d_flash_mla_decode<512, 0, 2>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds);
+#if PLOW_GLM_GF8_ARM
+        else if (nope && gf == 8)
+            d_flash_mla_decode<512, 0, 8>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds);
+#endif
+        else if (nope)
+            d_flash_mla_decode<512, 0, 4>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds);
+        else if (gf == 2)
             d_flash_mla_decode<512, 64, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
-                in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
                 1, nullptr, 0, qrc, qrs);
 #if PLOW_GLM_GF8_ARM
         else if (gf == 8)
             d_flash_mla_decode<512, 64, 8>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
-                in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
                 1, nullptr, 0, qrc, qrs);
 #endif
         else
             d_flash_mla_decode<512, 64, 4>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
-                in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
+                in->i[2], window, in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
                 1, nullptr, 0, qrc, qrs);
     }
 #undef IEN
@@ -1519,6 +1560,8 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
                                                        const PlowProgram* prog) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
+    const bool nope = (in->i[3] & 0x80000000u) != 0;
+    const unsigned window = in->i[3] & 0x7fffffffu;
 #if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
     if (plow_packed_prefill_enabled(prog)) {
         if (in->op == PLOW_DOP_FLASH_GATHER_PREFILL || in->t[7] != PLOW_TENSOR_NONE)
@@ -1553,7 +1596,19 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
     }
 #endif
     if (in->op == PLOW_DOP_FLASH_GATHER_PREFILL) {
-        if (gf == 2)
+        if (nope && gf == 2)
+            d_flash_gather_prefill<512, 0, 2>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
+                in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
+                nblk, lds);
+        else if (nope)
+            d_flash_gather_prefill<512, 0, 4>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
+                in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
+                nblk, lds);
+        else if (gf == 2)
             d_flash_gather_prefill<512, 64, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
@@ -1569,25 +1624,35 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
 #if PLOW_MLA_PF_MFMA
         /* Dense only. The gathered arm above keeps the scalar body: its top_k set is per
          * QUERY, so a tile of query rows shares no KV range to stage. */
-        if (mla_pf_tiled_fills(in->i[0], in->i[4], in->i[1], nblk)) {
+        if (!nope && mla_pf_tiled_fills(in->i[0], in->i[4], in->i[1], nblk)) {
             d_flash_mla_prefill_mfma<512, 64, /*FP8=*/false>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
-                in->i[4], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
+                in->i[4], in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk,
                 lds, nullptr, 0);
             return;
         }
 #endif
-        if (gf == 2)
+        if (nope && gf == 2)
+            d_flash_mla_prefill<512, 0, 2>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
+                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds);
+        else if (nope)
+            d_flash_mla_prefill<512, 0, 4>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
+                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds);
+        else if (gf == 2)
             d_flash_mla_prefill<512, 64, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
-                in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds);
+                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds);
         else
             d_flash_mla_prefill<512, 64, 4>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
-                in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds);
+                in->i[1], in->i[2], window, in->fj[0].f, in->i[5], slice, nblk, lds);
     }
 #undef TEN
 }
@@ -2682,6 +2747,50 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              nblk);
             break;
 #endif /* PLOW_HAS_KDA_GATED_NORM */
+        case PLOW_DOP_HYPER_CONN_PRE:
+            d_hyperconn_pre((float*)TEN(0), (float*)TEN(1), (bf16*)TEN(2), (const float*)TEN(3),
+                            (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6),
+                            in->i[0], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice,
+                            nblk, sm->part);
+            break;
+        case PLOW_DOP_HYPER_CONN_POST:
+            d_hyperconn_post((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                             (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],
+                             in->i[2], in->i[3], slice, nblk);
+            break;
+        case PLOW_DOP_DSA_POOL_COMPRESS:
+            d_dsa_pool_compress((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                                (const bf16*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],
+                                in->i[2], slice, nblk, (float*)sm->raw, sm->part,
+                                (const int*)TEN(5), in->i[3]);
+            break;
+        case PLOW_DOP_DSA_POOL_EXPAND:
+            d_dsa_pool_expand((int32_t*)TEN(0), (const int32_t*)TEN(1), (const int32_t*)TEN(2),
+                              in->i[0], in->i[1], in->i[2], slice, nblk);
+            break;
+        case PLOW_DOP_DSA_POOL_STASH:
+            d_dsa_pool_stash((bf16*)TEN(0), (bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                             (const int*)TEN(4), in->i[0], in->i[1], in->i[2]);
+            break;
+        case PLOW_DOP_DSA_Q_QUANT:
+            d_dsa_q_quant((uint8_t*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), in->i[0], in->i[1],
+                          slice, nblk, (float*)sm->raw, sm->part);
+            break;
+        case PLOW_DOP_INDEX_SCORE_KPOOL:
+            /* t6/kv_len is TOKEN-granular (i4=pool_size divides internally) — see
+             * d_index_score_kpool's header comment for why this cannot be pool-granular
+             * at the packet level (the runtime patches kv_len once per decode step, the
+             * same tensor n.kvlen every other GLM decode op already reads). */
+            d_index_score_kpool<128>((float*)TEN(0), (const uint8_t*)TEN(1), (const float*)TEN(2),
+                                     (const uint8_t*)TEN(3), (const float*)TEN(4),
+                                     (const float*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                                     in->i[2], in->i[4], in->i[5] != 0, in->fj[0].f, slice, nblk,
+                                     (uint8_t*)sm->raw);
+            break;
+        case PLOW_DOP_GEMV_F32:
+            d_gemv_f32((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), in->i[0], in->i[1],
+                       in->i[2], slice, nblk);
+            break;
 #if !PLOW_KDA_CONV_STEP_DB
         /* FUSED KDA — ops 88x3 -> 109 and 89+102 -> 110. Six packets per layer become three, 207
          * per token over 69 KDA layers, against a measured ~12 us per packet.
@@ -3193,14 +3302,18 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         } break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SELECT_PF
-        case PLOW_DOP_INDEX_SELECT_PF:
+        case PLOW_DOP_INDEX_SELECT_PF: {
             /* The fewer-passes early-out is EXACT (it fires only when the index bits cannot
              * change the emitted set), so it rides the same default-on/kill-switch axis. */
+            /* i[3]=pool_size: zero-means-1 guard, same reasoning as PLOW_DOP_INDEX_SELECT above
+             * — every existing emitter writes i[3]==0, so this must not divide by it directly. */
+            const unsigned pool_size = in->i[3] ? in->i[3] : 1u;
             d_index_select_pf<PLOW_DSA_IDX_ROW != 0>(
                 (int*)TEN(0), (const float*)TEN(1), (const int*)TEN(2), in->i[0],
                               in->i[1], in->i[2], slice, nblk, (unsigned*)sm->raw,
-                              (unsigned*)sm->raw + 256);
+                              (unsigned*)sm->raw + 256, pool_size);
             break;
+        }
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_UNION_PF
         case PLOW_DOP_INDEX_UNION_PF:
@@ -3443,9 +3556,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SELECT
         case PLOW_DOP_INDEX_SELECT: {
             unsigned* lh = (unsigned*)sm->raw;
+            /* i[2]=pool_size: zero-means-1 guard, NOT a plain pass-through. Every emitter this
+             * tree ships today writes i[2]==0 (the field didn't exist when those blobs were
+             * built) — dividing by that directly would be a divide-by-zero fault on every
+             * existing GLM-5.2 blob. Only GLM-5.3-Flash's (not-yet-written) kpool emission is
+             * expected to ever write a nonzero value here. */
+            const unsigned pool_size = in->i[2] ? in->i[2] : 1u;
             d_index_select_coop((int*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1],
                                 (unsigned*)TEN(2), (unsigned*)TEN(3), slice, nblk, lh, lh + 256,
-                                (const int*)TEN(4));
+                                (const int*)TEN(4), pool_size);
             break;
         }
 #endif

@@ -4645,6 +4645,56 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
   });
 }
 
+/* fp32-OUTPUT GEMV — a small, separate, correctness-first op. NOT a variant of `d_gemv`/
+ * `d_gemv_t` above and must never be folded into that machinery: this codebase's decode
+ * hot path runs at a razor-thin register budget (`d_gemv`'s own header: `check decode`
+ * FAILS above 256 VGPR; the register allocator is "chaotic at this size"), and this op's
+ * one caller (GLM-5.3-Flash's DSA indexer, `index_kpool_compress_gate` projection) is a
+ * `[index_heads]`=32-wide output computed once per indexer token — nowhere near that
+ * path, and not worth threading through its UN/chunk/LDS-staging tuning.
+ *
+ * WHY fp32 output at all, when every other GEMV in this file rounds to bf16: the
+ * reference computes this exact weight in fp32 throughout (`_wp_fp32 = ...weight...
+ * .float()`, `weights = torch.mm(hidden_states.float(), self._wp_fp32)`,
+ * `glm5next_ref/nvidia/attention.py:327-336`) with an explicit comment that a bf16
+ * version "introduce[s] ~1e-2 logit error that flips near-tie pool rankings on hard
+ * long-context tasks" — i.e. this is a documented ACCURACY requirement of the reference
+ * model, not an implementation convenience to optimize away. `IndexScoreKpool` (op 127,
+ * op_attention.h) reads this op's output directly as `const float* W`.
+ *
+ * One wave per output column (grid-strided over N if N > PLOW_WAVES, and over M for a
+ * batched/prefill caller), lanes reduce over K via `wave_sum` — the same "one wave, one
+ * output, `wave_sum`-reduced" shape several other ops in this tree already use for a
+ * narrow N. No LDS staging: x is only ~4096 halves (8 KB) and this op does not run often
+ * enough for the extra vector-load slot to matter the way it does in `d_gemv_t`'s hot
+ * loop.
+ *
+ * VERIFIED on gfx950 hardware (2026-09-01) against an independently-written f64 CPU
+ * reference (no vLLM oracle needed — this is a plain dot product, not a quantization or
+ * exotic-reference algorithm): `runtime/tests/gemv_f32_gfx950_test.hip`, M=3/N=32/K=300
+ * random inputs, **0 mismatches** under a combined absolute+relative tolerance
+ * (atol=2e-4, rtol=1e-4 — a pure-relative check false-positives near zero, where ~3e-6 of
+ * legitimate fp32-vs-f64 reduction-order noise reads as a large relative error against a
+ * true value close to zero from ~300-term cancellation; the absolute differences across
+ * every output stayed under 4e-6). */
+__device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
+                           const float* __restrict__ W, unsigned M, unsigned N, unsigned K,
+                           unsigned slice, unsigned nblk) {
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    for (unsigned m = 0; m < M; m++) {
+        const bf16* const xm = x + (size_t)m * K;
+        float* const cm = C + (size_t)m * N;
+        for (unsigned n = slice * PLOW_WAVES + wave; n < N; n += nblk * PLOW_WAVES) {
+            const float* const wn = W + (size_t)n * K;
+            float acc = 0.0f;
+            for (unsigned k = lane; k < K; k += PLOW_WAVE) acc += bf2f(xm[k]) * wn[k];
+            acc = wave_sum(acc);
+            if (lane == 0) cm[n] = acc;
+        }
+    }
+}
+
 /* FP8 decode GEMV. x is staged in LDS when M*K fits (always true at decode M=1), leaving the whole
  * vector-memory path to the fp8 weight stream — exactly as the bf16 d_gemv_t does. */
 __device__ void d_gemv_fp8(bf16* C, const bf16* x, const unsigned char* W, const float* wscale,

@@ -339,7 +339,7 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_NV_GEMMA 0
 #endif
 
-/* ---- GEMMA/QWEN PREFILL build (PLOW_NV_PREFILL=1, implies PLOW_NV_GEMMA=1) ---------------
+/* ---- GEMMA/QWEN PREFILL build (PLOW_NV_PREFILL=1) ----------------------------------------
  * The prefill bucket runs a different op family than decode: tiled mma.sync GEMM (q/k/v/o/down/
  * lm_head, plus the gate|up GEMM_GLU) and the multi-query FLASH_PREFILL (hd 128 Qwen / 256 sliding /
  * 512 full), with FLASH_MERGE folding the split-KV partials on the short buckets. Those arms are
@@ -347,14 +347,13 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * rtx-06 register warning — they build as a SEPARATE object from decode rather than stacking onto
  * the decode megakernel's 150-reg / hd512-flash-decode footprint. The DECODE-only arms (GEMV family,
  * FLASH_DECODE) compile OUT here; the prefill-only arms compile out of the decode object. Exported
- * symbols are suffixed `_pf` so both objects link into one harness. The default Qwen3 object and the
- * Gemma DECODE object are byte-identical to before (PLOW_NV_PREFILL=0). */
+ * symbols are suffixed `_pf` so both objects link into one harness. The default Qwen3 DECODE object
+ * and the Gemma DECODE object are byte-identical to before (PLOW_NV_PREFILL=0). */
 #ifndef PLOW_NV_PREFILL
 #define PLOW_NV_PREFILL 0
 #endif
-#if PLOW_NV_PREFILL && !PLOW_NV_GEMMA
-#error "PLOW_NV_PREFILL requires PLOW_NV_GEMMA (hd 256/512 dispatch lives behind the Gemma gate)"
-#endif
+/* PLOW_NV_PREFILL without PLOW_NV_GEMMA is the hd=128-only (Qwen) prefill
+ * object: tiled GEMM + flash_prefill<128> + norms, no hd=256/512 arms. */
 
 /* ---- w8a8 fp8 prefill GEMM (PLOW_NV_W8A8=1, rtx-07 T7 L2) --------------------------------
  * The compute-bound fix: the GEMM_FP8 opcodes dispatch to the true w8a8 mma.sync.m16n8k32.e4m3
@@ -599,7 +598,17 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * fully consumes its arena before the next instruction's gate. Sized by the largest claim,
  * which is flash-decode's Ssm+hmax+hsum+qsm+osm. The Gemma build covers both its fixed hd256/GF2
  * sliding arm and the independently selected hd512/full-GF arm. */
-#if PLOW_NV_PREFILL
+#if PLOW_NV_PREFILL && !PLOW_NV_GEMMA
+/* hd=128-only prefill (Qwen): flash<128,64,BKV> tile and the tiled GEMM arena. Much smaller
+ * than the Gemma prefill because the hd=256/512 flash arms are compiled out. */
+#ifndef PLOW_NV_FA128_BKV
+#define PLOW_NV_FA128_BKV 64
+#endif
+#define PLOW_NV_PRE_A128 FA_PRE_SMEM_FLOATS(128, 64, PLOW_NV_FA128_BKV)
+#define PLOW_NV_PRE_B ((PGM_ARENA_BF16 + 1) / 2)
+#define PLOW_NV_FA_ARENA                                                                       \
+    (PLOW_NV_PRE_A128 > PLOW_NV_PRE_B ? PLOW_NV_PRE_A128 : PLOW_NV_PRE_B)
+#elif PLOW_NV_PREFILL
 /* Prefill union: max over flash-prefill (256/512 tilings), the tiled GEMM, and FLASH_MERGE. The
  * hd=256 flash tile (BQ64,BKV32: Qs+KsT+Vs bf16 + Ss f32) dominates at 19840 floats (77.5 KiB)
  * — opt-in past 48 KiB. The KsT transpose + Ss score tile are the mma.sync QK^T additions (T1). */
@@ -1050,7 +1059,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * packed chunk's request table — see d_flash_prefill_mux. */
 #if !PLOW_NV_SEG_GEMM && !PLOW_NV_FATLITE /* lean GEMM + FATLITE objects never run flash */
     case PLOW_DOP_FLASH_PREFILL:
-#if !PLOW_NV_FA_ONLY /* lean dedicated FA object does not carry the Qwen arm */
+#if !PLOW_NV_FA_ONLY /* lean hd512-only FA object does not carry the Qwen arm */
         if (in->i[6] == 128)
             d_flash_prefill_mux<128, 64, PLOW_NV_FA128_BKV>(
                 (const int*)TEN(6), (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
@@ -1059,6 +1068,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
         else
 #endif
+#if PLOW_NV_GEMMA
 #if !PLOW_NV_FA_ONLY || PLOW_NV_FA_ONLY_HD256 /* FA object: hd256 opt-in (PLOW_SEG_FA512=all) */
         if (in->i[6] == 256)
             /* t7 (sm_90a TMA only): GEN_TMAP_KV_PAIR blob for the wgmma arm's K/V stager;
@@ -1090,6 +1100,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
         else
             __trap();
+#else
+        __trap();
+#endif
         break;
 
 #if PLOW_FP8_KV
@@ -1098,6 +1111,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * convert fp8 inline), so the fp8-KV prefill object MUST be built -DPLOW_NV_FA_PIPE=0. No batched
      * (PX-1) prefill for fp8 (t6/t7 are the scales, not the request table). */
     case PLOW_DOP_FLASH_PREFILL_FP8:
+#if PLOW_NV_GEMMA
 #if PLOW_NV_FA_PIPE
 #if PLOW_NV_FA_FP8MMA && PLOW_FP8_KV
         /* beat-fp8-mma: the PIPE=1 fp8 prefill is the px4/px8 fp8-mma arm at hd512 (FULL layers)
@@ -1148,6 +1162,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         else
             __trap();
 #endif
+#else
+        __trap();
+#endif /* PLOW_NV_GEMMA */
         break;
 #endif /* PLOW_FP8_KV */
 #endif /* !PLOW_NV_SEG_GEMM */
@@ -1173,8 +1190,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         /* GLM/Kimi MLA decoupled RoPE: hd=64 partial-rope slice is ALWAYS interleaved
          * (GPT-J), i[5] ignored — GLM is the only hd=64 user, matching runtime/amd/
          * interp.hip. GLM DSA indexer q_idx/k_idx: hd=128 interleaved (i[5]==1). Qwen
-         * GQA: hd=128 non-interleaved (i[5]==0). Gemma full/sliding attention:
-         * hd=256/512 non-interleaved (i[5]==0). */
+         * GQA: hd=128 non-interleaved (i[5]==0) — required in the PREFILL object, which
+         * is a Gemma build and would otherwise trap Qwen buckets. Gemma full/sliding
+         * attention: hd=256/512 non-interleaved (i[5]==0). */
         if (in->i[2] == 64)
             d_headnorm_rope<64, /*INTERLEAVE=*/true>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
@@ -1209,14 +1227,20 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             __trap();
 #undef PLOW_HNR_SLOT
 #else
+#if PLOW_NV_PREFILL
+#define PLOW_HNR_SLOT , (const int*)TEN(6)
+#else
+#define PLOW_HNR_SLOT
+#endif
         if (in->i[2] == PLOW_NV_FA_HD && in->i[5] == 0)
             d_headnorm_rope<PLOW_NV_FA_HD>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                in->i[4], slice, nblk, in->i[6]);
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
         else
             __trap();
+#undef PLOW_HNR_SLOT
 #endif
         break;
 

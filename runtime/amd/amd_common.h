@@ -1065,6 +1065,13 @@ __device__ __forceinline__ float wave_max(float v) {
  * largest element uses the full e4m3 range; the reciprocal is what the write multiplies by. */
 #define PLOW_FP8_E4M3_MAX 448.0f
 
+/* One e4m3 OCP byte -> f32, portable (identical on CDNA3/CDNA4 — `plow_fp8_ocp_to_bf16` is the
+ * exact software table both archs already share for anything that must be bit-faithful, see
+ * amd_arch.h). Exact: e4m3 has 3 mantissa bits, bf16/f32 have more, so no rounding either step. */
+__device__ __forceinline__ float dequant_fp8(unsigned char b) {
+    return bf2f(plow_fp8_ocp_to_bf16((unsigned)b));
+}
+
 /* Wave is 64 lanes on CDNA. __shfl_sync/warpSize-32 assumptions from CUDA code
  * do not port — this is the reason the NVIDIA RoPE reference cannot be
  * transliterated (it pairs lane i with lane i+32). */

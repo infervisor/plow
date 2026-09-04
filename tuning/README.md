@@ -16,6 +16,8 @@ toolchain.
 
 ```
 tuning/<vendor>/<isa>/<sku>/kernel_measurement.jsonl
+tuning/<vendor>/<isa>/<sku>/decode_measurement.jsonl
+tuning/<vendor>/<isa>/<sku>/object_measurement.jsonl
 tuning/<vendor>/<isa>/<sku>/attention_measurement.jsonl
 ```
 
@@ -91,10 +93,27 @@ says so itself: all three dense-GEMM opcodes alias to one body, so "the real
 tuning axis here is which object is built, not which opcode is emitted". A
 `KernelMeasurement` is keyed by `op_case` + `kernel_id` and has no field that can
 distinguish `BN=128` from `BN=64` — the two are the *same* kernel id in *different*
-objects. Until that entity grows a build-identity column, a prefill-tile record
-cannot be expressed in it, and this cell is therefore **not** loadable by
-`TuneStore::load_kernels`. `plowc tune --status` will still report "no kernel
-measurements for this cell", correctly.
+objects.
+
+**Update, iteration 8 of the sm120-beat-vllm campaign
+(`perf-data/sm120-beat-vllm-baseline.md`).** `tunedb::object` / `ObjectMeasurement`
+now is that build-identity column — a typed record keyed on architecture, SM
+count, toolchain, model, dtype, KV dtype, batch, M bucket, N, K, head dim, and
+window class, carrying `object_hash` plus tile/warp-split/pipeline-depth/
+raster-order/split-K/BQ-BKV/buffer-depth/registers/stack/spills/shared-mem, and
+ranked *strictly* by `end_to_end` (never `isolated` or `complete_object`, which
+this schema also carries but only as evidence — same discipline as the
+microbench caveat below). `TuneStore::load_objects`/`publish_object`/
+`best_object_for` are the loader/writer/query, mirroring the decode-knob store
+exactly. **This row's own data has not yet been migrated** —
+`prefill_tile_measurement.jsonl` still exists as written by
+`perf-data/px13_emit_tuning.py` and is still not loadable by
+`TuneStore::load_kernels` (nor, yet, by `load_objects`; the file's `kind` field
+predates the new schema and a migration script has not been written). A future
+campaign should either migrate this file's 13 rows into `object_measurement.jsonl`
+under the new schema, or simply start writing new prefill-tile sweeps there
+directly — `plowc tune --status` will still report "no kernel measurements for
+this cell" either way, correctly, since that CLI reads `KernelMeasurement` only.
 
 Two things this cell exists to stop the next person rediscovering:
 

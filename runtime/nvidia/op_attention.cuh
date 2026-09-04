@@ -1167,7 +1167,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     static_assert(WPV_M * WPV_N == (int)PLOW_NV_WARPS, "P.V grid must use all warps");
     static_assert(HD % WPV_N == 0 && HDW % 8 == 0, "hd slice must be a multiple of 8");
     /* Softmax phase: each warp owns RPW_S query rows. BKV <= 32: one lane per kv column.
-     * BKV > 32: each lane owns BKV/32 columns and reduces those locally first. */
+     * BKV > 32: each lane owns BKV/32 columns spaced by 32, reduced locally before the warp op. */
     constexpr int RPW_S = BQ / (int)PLOW_NV_WARPS;
     constexpr int SOFT_COLS = BKV > 32 ? BKV / 32 : 1;
     static_assert(BKV <= 64, "softmax reduction supports at most 2 kv cols per lane");
@@ -1318,8 +1318,9 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 
             const unsigned rmax = (hi - kv0 < (unsigned)BKV) ? (hi - kv0) : (unsigned)BKV;
 
-            /* SOFTMAX phase: each warp owns RPW_S query rows. At BKV=64 each lane owns two
-             * columns (lane and lane+32), reduced locally before the warp max/sum. */
+            /* SOFTMAX phase: each warp owns RPW_S query rows. When BKV <= 32, lane == kv column
+             * (original path). When BKV == 64, each lane owns 2 kv columns (lane and lane+32),
+             * reduced locally before the warp max/sum. */
 #pragma unroll
             for (int rr = 0; rr < RPW_S; rr++) {
                 const int row = warp * RPW_S + rr;

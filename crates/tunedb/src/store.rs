@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use crate::attention::AttentionMeasurement;
 use crate::decode::{rank_by_cell, CellRanking, DecodeMeasurement};
 use crate::moe_decode::MoeDecodeMeasurement;
+use crate::object::{rank_by_cell as rank_objects_by_cell, ObjectMeasurement, ObjectRanking};
 use crate::record::{Correctness, Digests, KernelMeasurement, RecordState};
 
 #[derive(Debug)]
@@ -355,6 +356,96 @@ impl TuneStore {
             }
         }
         Ok((rank_by_cell(usable), stale))
+    }
+
+    fn object_path(&self, hardware: &str) -> PathBuf {
+        self.root.join(hardware).join("object_measurement.jsonl")
+    }
+
+    /// Every complete-object measurement stored for one hardware cell.
+    pub fn load_objects(&self, hardware: &str) -> Result<Vec<ObjectMeasurement>, StoreError> {
+        let path = self.object_path(hardware);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for line in BufReader::new(File::open(&path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            out.push(serde_json::from_str(&line)?);
+        }
+        Ok(out)
+    }
+
+    /// Publish complete-object records as one unit, under the same gate as
+    /// every other record kind: unchecked or under-sampled aborts the whole
+    /// publication. The ad hoc `prefill_tile_measurement.jsonl` precedent this
+    /// module formalizes shipped `"correctness":"unchecked"` rows as
+    /// `"state":"qualified"` — this is the gate that stops that happening again.
+    pub fn publish_object(
+        &self,
+        hardware: &str,
+        mut records: Vec<ObjectMeasurement>,
+    ) -> Result<usize, StoreError> {
+        for r in &records {
+            let blockers = r.qualification_blockers();
+            if !blockers.is_empty() {
+                return Err(StoreError::NotQualifiable {
+                    kernel: r.config.label(),
+                    blockers,
+                });
+            }
+        }
+        for r in &mut records {
+            r.state = RecordState::Qualified;
+        }
+        self.append_jsonl(&self.object_path(hardware), &records)?;
+        Ok(records.len())
+    }
+
+    /// Store object records that did not pass a gate — a screening run whose
+    /// reps are below the publishable minimum, or a configuration that lost.
+    /// Kept so the next campaign does not re-measure the same dead point.
+    pub fn record_object_unqualified(
+        &self,
+        hardware: &str,
+        mut records: Vec<ObjectMeasurement>,
+        state: RecordState,
+    ) -> Result<usize, StoreError> {
+        for r in &mut records {
+            r.state = state.clone();
+        }
+        self.append_jsonl(&self.object_path(hardware), &records)?;
+        Ok(records.len())
+    }
+
+    /// Qualified object records whose digests still match, ranked per cell by
+    /// end-to-end time only — see `object::rank_by_cell`.
+    pub fn best_object_for(
+        &self,
+        hardware: &str,
+        want: &Digests,
+    ) -> Result<(Vec<ObjectRanking>, Vec<StaleNote>), StoreError> {
+        let mut usable = Vec::new();
+        let mut stale = Vec::new();
+        for rec in self.load_objects(hardware)? {
+            if !rec.state.is_selectable() {
+                continue;
+            }
+            let changed = rec.digests.stale_against(want);
+            if changed.is_empty() {
+                usable.push(rec);
+            } else {
+                stale.push(StaleNote {
+                    op_case: rec.cell.key(),
+                    kernel_name: rec.config.label(),
+                    changed: changed.iter().map(|s| s.to_string()).collect(),
+                });
+            }
+        }
+        Ok((rank_objects_by_cell(usable), stale))
     }
 
     /// Read-modify-rename. Appending in place would leave a half-line behind if
@@ -789,6 +880,136 @@ mod tests {
         let mut want = digests();
         want.interpreter = "some-other-cubin".into();
         let (best, stale) = s.best_decode_for(HW, &want).unwrap();
+        assert!(best.is_empty());
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].changed, vec!["interpreter"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn object_meas(m_bucket: u32, tile: &str, ms: f64) -> ObjectMeasurement {
+        let ns = ms * 1.0e6;
+        ObjectMeasurement {
+            cell: crate::object::ObjectCell {
+                hardware: HW.into(),
+                sm_count: 170,
+                toolchain: "cuda-13.0".into(),
+                model: "gemma-4-12B-it".into(),
+                dtype: "fp8_w8a8".into(),
+                kv_dtype: "bf16".into(),
+                batch: 1,
+                m_bucket,
+                n: 15360,
+                k: 3840,
+                head_dim: 0,
+                window: crate::object::WindowClass::NotApplicable,
+            },
+            config: crate::object::ObjectConfig {
+                tile: tile.into(),
+                warp_split: "uniform_4x2".into(),
+                pipeline_depth: 3,
+                raster_order: "row_major".into(),
+                split_k: 1,
+                bq: 0,
+                bkv: 0,
+                buffer_depth: 3,
+                extra_defines: Default::default(),
+            },
+            object_hash: "sha256:deadbeef".into(),
+            digests: digests(),
+            registers: Some(242),
+            stack_bytes: Some(1024),
+            spill_bytes: Some(0),
+            shared_mem_bytes: Some(81664),
+            isolated: None,
+            complete_object: None,
+            end_to_end: Stats::from_samples(vec![ns - 5.0, ns, ns, ns, ns + 5.0]).unwrap(),
+            correctness: Correctness::Pass,
+            state: RecordState::Provisional,
+            campaign: "c1".into(),
+        }
+    }
+
+    /// Object records live in their own file, separate from kernel and decode
+    /// records — three different populations that must never be each other's
+    /// noise.
+    #[test]
+    fn object_records_do_not_share_a_file_with_other_kinds() {
+        let dir = tmpdir("objfile");
+        let s = TuneStore::new(&dir);
+        s.publish(HW, vec![meas("case-a", 8, 100.0)]).unwrap();
+        s.publish_decode(HW, vec![decode_meas(132, 1024, 8, 6.04, 5)])
+            .unwrap();
+        s.publish_object(HW, vec![object_meas(1024, "128x128x64", 959.0)])
+            .unwrap();
+
+        assert_eq!(s.load_kernels(HW).unwrap().len(), 1);
+        assert_eq!(s.load_decode(HW).unwrap().len(), 1);
+        assert_eq!(s.load_objects(HW).unwrap().len(), 1);
+        assert_eq!(s.load_objects(HW).unwrap()[0].state, RecordState::Qualified);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The gate the ad hoc PX-13 JSONL schema did not have: unchecked
+    /// correctness cannot be published as qualified, even though the schema
+    /// this module formalizes came from a file that did exactly that.
+    #[test]
+    fn an_unchecked_object_record_cannot_be_published() {
+        let dir = tmpdir("objunchecked");
+        let s = TuneStore::new(&dir);
+        let mut m = object_meas(1024, "128x128x64", 959.0);
+        m.correctness = Correctness::Unchecked;
+
+        let err = s.publish_object(HW, vec![m.clone()]).unwrap_err();
+        assert!(matches!(err, StoreError::NotQualifiable { .. }));
+        assert!(s.load_objects(HW).unwrap().is_empty(), "nothing landed");
+
+        s.record_object_unqualified(HW, vec![m], RecordState::Provisional)
+            .unwrap();
+        let held = s.load_objects(HW).unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(!held[0].state.is_selectable());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One winner per cell, ranked strictly by end-to-end time.
+    #[test]
+    fn best_object_returns_a_winner_per_cell_by_end_to_end() {
+        let dir = tmpdir("objbest");
+        let s = TuneStore::new(&dir);
+        s.publish_object(
+            HW,
+            vec![
+                object_meas(1024, "128x128x64", 959.0),
+                object_meas(1024, "128x64x64", 940.0),
+                object_meas(8192, "128x128x64", 6500.0),
+            ],
+        )
+        .unwrap();
+
+        let (best, stale) = s.best_object_for(HW, &digests()).unwrap();
+        assert!(stale.is_empty());
+        assert_eq!(best.len(), 2, "one cell per m_bucket");
+        let bucket_1024 = best
+            .iter()
+            .find(|r| r.cell.m_bucket == 1024)
+            .expect("1024 cell present");
+        assert_eq!(bucket_1024.winner().unwrap().config.tile, "128x64x64");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A record measured against a different compiled object is not evidence
+    /// about this one — `object_hash`/`Digests::interpreter` is exactly what a
+    /// tile/warp-split sweep varies.
+    #[test]
+    fn an_object_record_from_another_build_is_stale_and_reportable() {
+        let dir = tmpdir("objstale");
+        let s = TuneStore::new(&dir);
+        s.publish_object(HW, vec![object_meas(1024, "128x128x64", 959.0)])
+            .unwrap();
+
+        let mut want = digests();
+        want.interpreter = "some-other-cubin".into();
+        let (best, stale) = s.best_object_for(HW, &want).unwrap();
         assert!(best.is_empty());
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].changed, vec!["interpreter"]);

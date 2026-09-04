@@ -779,9 +779,15 @@ pub enum Backend {
 /// like a driver bug.
 ///
 /// `recommends` = PERFORMANCE. Wrong here costs throughput, not correctness.
-fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>) -> Value {
+fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> Value {
     let on = |k: &str| f.get(k).and_then(Value::as_bool).unwrap_or(false);
-    let mut req = vec!["PLOW_NV_GEMMA=1".to_string()];
+    // PLOW_NV_GEMMA=1 only when the packet uses head dims > 128 (Gemma-family
+    // hd256/512). A Qwen-only (hd=128) packet must NOT carry this flag — the
+    // Gemma build drops the hd=128 arm entirely.
+    let mut req = Vec::new();
+    if s.hd.iter().any(|&h| h > 128) {
+        req.push("PLOW_NV_GEMMA=1".to_string());
+    }
     if on("w8a8") {
         req.push("PLOW_NV_W8A8=1".into());
     }
@@ -823,7 +829,7 @@ fn backends(
     };
     let gf_full = t.get("gf_full").and_then(Value::as_u64);
     json!({
-        "nvcc": backend_nvcc(f, t),
+        "nvcc": backend_nvcc(f, t, s),
         amd_key: backend_amd(amd_key, f, s, union, gf_full),
     })
 }

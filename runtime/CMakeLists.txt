@@ -252,16 +252,19 @@ if(PLOW_CUDA)
                 message(FATAL_ERROR "PLOW_NV_FA_FP8PV needs PLOW_FP8_KV_FASTPF=ON (it replaces "
                                     "the px4 fp8-mma arm's P.V, and FASTPF=OFF has no such arm)")
             endif()
-            # Not an error — all-layer fp8-KV packets REQUIRE this path — but it is the slow one
-            # and the cost is invisible at runtime, so say it at configure time. FASTPF cannot be
-            # defaulted ON: legality depends on the PACKET (emit-time PLOW_FP8_KV_FULL=1 keeps
-            # e4m3 to the hd512 layers), which this build cannot see. Measured: 13843 -> 10947 ms,
-            # -21% total prefill at 67k (perf-data/px8-flash-fp8-pv.md).
+            # Not an error — this is a valid, just slower, path — but the cost is invisible at
+            # runtime, so say it at configure time. FASTPF is not defaulted ON here because a raw
+            # CMake build cannot see which packet it will load (the served nix package defaults
+            # it ON instead, flake.nix:292). Since PX-23 (op_attention.cuh:2443) FASTPF=ON is safe
+            # for BOTH mixed (PLOW_FP8_KV_FULL=1) and all-layer fp8-KV packets — both head dims
+            # have a fast PIPE=1 arm (hd256 px23, hd512 px4/px8); it no longer traps on all-layer
+            # packets. Live-verified perf-data/sm120-iter1-fastpf-routing-2026-08-26.md. Measured:
+            # 13843 -> 10947 ms, -21% total prefill at 67k (perf-data/px8-flash-fp8-pv.md).
             message(WARNING
                 "PLOW_FP8_KV=ON with PLOW_FP8_KV_FASTPF=OFF: the prefill objects fall back to "
                 "PLOW_NV_FA_PIPE=0, losing the cp.async flash pipeline for prefill (-21% at 67k). "
-                "If you emit MIXED fp8-KV packets (PLOW_FP8_KV_FULL=1), set PLOW_FP8_KV_FASTPF=ON. "
-                "Keep it OFF only for legacy all-layer fp8-KV packets, which trap under PIPE=1.")
+                "Since PX-23, FASTPF=ON is safe for both mixed AND all-layer fp8-KV packets -- "
+                "turn it on unless you have a specific reason not to.")
         endif()
     endif()
 
@@ -426,8 +429,7 @@ option(PLOW_SM120_CUBIN "Emit the sm_120a .cubin artifacts `plowrt serve` loads"
 # (PLOW_BUILD_SEG etc.); the two DEFAULT served objects come from here.
 option(PLOW_SM90A_CUBIN "Emit the sm_90a .cubin artifacts `plowrt serve` loads" OFF)
 option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants (all enabled arches)" OFF)
-option(PLOW_SM120_CUBIN_SEG
-       "Also emit the bf16-KV _pfseg (fat) and _pfgemm (lean) segmented prefill cubins" OFF)
+option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2) segmented prefill cubins" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -468,7 +470,14 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     set(_cubin_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nvcc_cubin.sh")
 
     # THE ONE BASE. Every interp object below starts from exactly this.
-    set(_cubin_base -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1)
+    # PLOW_NV_GEMMA: only Gemma-family models (hd>128) need this. Default ON
+    # for backward compat; plowc passes -DPLOW_CUBIN_GEMMA=OFF for hd=128-only
+    # models (Qwen, etc.) so the decode cubin keeps the hd=128 arm.
+    option(PLOW_CUBIN_GEMMA "Build cubins with PLOW_NV_GEMMA=1 (hd256/512 arms)" ON)
+    set(_cubin_base -DPLOW_NV_EMBED_SMEM=1)
+    if(PLOW_CUBIN_GEMMA)
+        list(APPEND _cubin_base -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2)
+    endif()
     if(PLOW_NV_W8A8)
         list(APPEND _cubin_base -DPLOW_NV_W8A8=1)
     endif()
@@ -484,10 +493,18 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # AXIS 1 — decode vs prefill. Decode carries the full-attn GF instantiation;
     # prefill carries the tiled-GEMM + FLASH_PREFILL arms.
     set(_ax_decode -DPLOW_NV_FA_GF_FULL=${PLOW_NV_FA_GF_FULL})
+    # PLOW_NV_PREFILL=1 on both Gemma (hd256/512) and non-Gemma (hd128-only)
+    # prefill objects. The GEMMA define comes from _cubin_base when
+    # PLOW_CUBIN_GEMMA is ON; the hd128 prefill object gets PREFILL alone.
     set(_ax_prefill -DPLOW_NV_PREFILL=1)
+    if(PLOW_NV_TRACE_PF)
+        list(APPEND _ax_prefill -DPLOW_NV_TRACE=1)
+    endif()
+    # Segmented prefill axes (PLOW_SM120_CUBIN_SEG). The fat object carries all
+    # arms at occ-1; the lean GEMM object compiles out flash arms and caps at
+    # __maxnreg__(128) for occ-2 (2 blocks/SM).
     set(_ax_seg_fat -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1)
-    set(_ax_seg_gemm
-        -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1)
+    set(_ax_seg_gemm -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1)
     # AXIS 2 — bf16 KV vs fp8 (e4m3) KV. On the PREFILL side fp8-KV also fixes the
     # staging arm, and it comes from the OPTION, never a literal: FLASH_PREFILL_FP8
     # dequants at the smem stage (cp.async cannot convert fp8 inline), so PIPE=0 is
