@@ -737,6 +737,7 @@ struct MoeCombineRoute {
 #[derive(Clone, Copy, Debug)]
 enum PrefillSegmentRoute {
     Interpreter,
+    XReduceWaveRs,
     XReduceAttnRes {
         args: XReduceAttnResArgs,
         device_args: u64,
@@ -3214,6 +3215,8 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     let mut mla_pure = vec![v2; n_seg as usize];
     let mut needs_v2: Vec<(usize, u32)> = Vec::new();
     let mut mla_any = vec![false; n_seg as usize];
+    let mut xr_wave_any = vec![false; n_seg as usize];
+    let mut xr_wave_pure = vec![true; n_seg as usize];
     for e in &prog.stream {
         let op = prog
             .insts
@@ -3226,6 +3229,10 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
                 ))
             })?
             .op;
+        let seg = e.seg as usize;
+        let xr_marked = e.flags & packet::dev::SE_XR_WAVE_RS != 0;
+        xr_wave_any[seg] |= xr_marked;
+        xr_wave_pure[seg] &= xr_marked && op == DevOp::XReduceTwoShot as u16;
         if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
             class[e.seg as usize] = 4;
         } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
@@ -3257,6 +3264,14 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     for s in 0..n_seg as usize {
         if mla_any[s] && mla_pure[s] {
             class[s] = 4;
+        }
+        if xr_wave_any[s] {
+            if !xr_wave_pure[s] {
+                return Err(RuntimeError::Device(format!(
+                    "segment {s} carries SE_XR_WAVE_RS but is not pure XReduceTwoShot"
+                )));
+            }
+            class[s] = 19;
         }
     }
     for &(seg, ns) in &needs_v2 {
@@ -5707,6 +5722,8 @@ pub struct AmdEngine {
     k_moe_stage1_mxfp4: Option<HsaKernel>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
+    /// Spill-free interpreter containing only marked XReduceTwoShot segments.
+    k_xreduce_wave_rs: Option<HsaKernel>,
     k_mla_materialize_pack: Option<HsaKernel>,
     k_mla_materialized_prefill: Option<HsaKernel>,
     k_xaudit: Option<HsaKernel>,
@@ -6260,6 +6277,11 @@ impl AmdEngine {
                     .any(|kind| matches!(kind, DecodeSegmentKind::MlaAttention)),
             )
         })?;
+        let need_xreduce_wave_rs = blob.progs[..dec_ix].iter().any(|p| {
+            p.stream
+                .iter()
+                .any(|e| e.flags & packet::dev::SE_XR_WAVE_RS != 0)
+        });
         if let Some(p) = blob.progs[..dec_ix]
             .iter()
             .find(|p| p.insts.iter().any(|i| i.op == DevOp::KdaDecodeFused as u16))
@@ -6714,6 +6736,60 @@ impl AmdEngine {
                 return Err(RuntimeError::Device(format!(
                     "{name}: kernarg segment is {got} B; decode MLA interpreter needs {want} (or {} with implicit args)",
                     want + IMPLICIT
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let k_xreduce_wave_rs = if need_xreduce_wave_rs {
+            const MARKER: &str = "plow_xreduce_wave_rs_segments_1";
+            let name = format!("interp_xreduce{}.elf", sched_prefill.suffix());
+            let path = hsaco_dir.join(&name);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "marked XReduceTwoShot segments require {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&MARKER)
+                || !syms.contains(&"plow_packet_hash_lo")
+                || !syms.contains(&"plow_packet_hash_hi")
+            {
+                return Err(RuntimeError::Device(format!(
+                    "{} is not a packet-paired XReduce wave-RS segment object",
+                    path.display()
+                )));
+            }
+            if prefill_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
+                return Err(RuntimeError::Device(format!(
+                    "{} lacks `{L2_DISPATCH_SYM}` for an L2-placed packet",
+                    path.display()
+                )));
+            }
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let symbol = format!("plow_interp_xreduce_{arch}{}", sched_prefill.suffix());
+            let kernel = EngineDevice::get_function(&*be, &module, &symbol)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            const MAX_LDS: u32 = 16 * 1024;
+            let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: kernarg segment is {got} B; XReduce interpreter needs {want} (or {} with implicit args)",
+                    want + IMPLICIT
+                )));
+            }
+            let lds = HsaBackend::kernel_lds_bytes(&kernel);
+            if lds > MAX_LDS || kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: XReduce specialist resource gate failed: lds={lds}, private={} B",
+                    kernel.private_segment_size()
                 )));
             }
             modules.push(module);
@@ -7935,6 +8011,20 @@ impl AmdEngine {
             if prog_ix < dec_ix {
                 add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
+                for (seg, &class) in seg_class.iter().enumerate() {
+                    if class == 19 {
+                        if !matches!(
+                            prefill_routes[seg],
+                            PrefillSegmentRoute::Interpreter
+                                | PrefillSegmentRoute::XReduceAttnRes { .. }
+                        ) {
+                            return Err(RuntimeError::Device(format!(
+                                "XReduce wave-RS segment {seg} overlaps another specialist route"
+                            )));
+                        }
+                        prefill_routes[seg] = PrefillSegmentRoute::XReduceWaveRs;
+                    }
+                }
                 let has_materialized = prefill_routes.iter().any(|r| {
                     matches!(
                         r,
@@ -8476,6 +8566,7 @@ impl AmdEngine {
             k_moe_stage1_mxfp4,
             k_moe_stage2_mxfp4,
             k_moe_combine,
+            k_xreduce_wave_rs,
             k_mla_materialize_pack,
             k_mla_materialized_prefill,
             k_xaudit,
@@ -8987,6 +9078,28 @@ impl AmdEngine {
                 WG_THREADS_8,
                 0,
                 as_bytes(std::slice::from_ref(&device_args)),
+                None,
+            )?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
+        if matches!(
+            self.progs[p].prefill_routes.get(seg),
+            Some(PrefillSegmentRoute::XReduceWaveRs)
+        ) {
+            let kernel = self.k_xreduce_wave_rs.ok_or_else(|| {
+                RuntimeError::Device(
+                    "marked XReduceTwoShot segment has no packet-paired wave-RS object".into(),
+                )
+            })?;
+            let arg = self.kernarg(p, seg as u32);
+            EngineDevice::launch_cooperative(
+                &*self.be,
+                kernel,
+                self.n_cu,
+                WG_THREADS_8,
+                0,
+                kernarg_bytes(&arg),
                 None,
             )?;
             self.seg_launches += 1;
@@ -12114,6 +12227,26 @@ mod tests {
 
         let mixed = segmented_prog(&[DevOp::FlashMlaPrefillFp8, DevOp::Gemv], &[0, 0]);
         assert_eq!(derive_segments_for(&mixed, true).unwrap(), [8]);
+    }
+
+    #[test]
+    fn xreduce_wave_rs_routes_only_a_marked_pure_segment() {
+        let mut pure = segmented_prog(&[DevOp::XReduceTwoShot], &[0]);
+        pure.stream[0].flags |= packet::dev::SE_XR_WAVE_RS;
+        assert_eq!(derive_segments_for(&pure, false).unwrap(), [19]);
+
+        let mut mixed = segmented_prog(&[DevOp::XReduceTwoShot, DevOp::RmsNorm], &[0, 0]);
+        for e in &mut mixed.stream {
+            e.flags |= packet::dev::SE_XR_WAVE_RS;
+        }
+        let err = derive_segments_for(&mixed, false)
+            .expect_err("a marked mixed segment must not reach the specialist object");
+        assert!(err.to_string().contains("not pure XReduceTwoShot"));
+
+        mixed.stream[1].flags &= !packet::dev::SE_XR_WAVE_RS;
+        let err = derive_segments_for(&mixed, false)
+            .expect_err("an incompletely marked segment must not reach the specialist object");
+        assert!(err.to_string().contains("not pure XReduceTwoShot"));
     }
 
     #[test]

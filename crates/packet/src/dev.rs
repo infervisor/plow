@@ -1913,6 +1913,10 @@ pub const SE_FINE: u16 = 1;
 /// successor is a cross-GPU "partial ready" bump. See the design notes.
 pub const SE_XCTR: u16 = 2;
 
+/// This entry belongs to an opt-in pure `XReduceTwoShot` specialist segment.
+/// Older runtimes ignore the bit and safely execute the segment on the primary interpreter.
+pub const SE_XR_WAVE_RS: u16 = 4;
+
 /// Shift of the per-(packet, L2 domain) slice count packed into [`StreamEnt::flags`].
 ///
 /// Mirrors `PLOW_SE_NPER_SHIFT` in `runtime/common/dev_isa.h`; read the note there for why the

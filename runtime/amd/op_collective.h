@@ -135,6 +135,15 @@
  * body's instruction mix while rotating the read index, so it must not also change the mix. */
 #define PLOW_XR_MLP_ON (PLOW_XR_MLP && !PLOW_XR_SHUFFLE)
 
+/* Experimental TP8 reduce-scatter schedule. Eight waves load one 16-byte pack per
+ * lane from distinct peers into LDS; wave 0 then accumulates logical ranks 0..7 in
+ * the shipping order. Gates and all-gather are unchanged. Misaligned or partial
+ * slices retain the scalar body. */
+#ifndef PLOW_XR_WAVE_RS
+#define PLOW_XR_WAVE_RS 0
+#endif
+#define PLOW_XR_WAVE_RS_ON (PLOW_XR_WAVE_RS && !PLOW_XR_SHUFFLE)
+
 /* PLOW_XR_AGG -- DEVICE-LOCAL AGGREGATION OF THE TWO-SHOT'S `gate_ag` SIGNAL
  * (default in gfx942/gfx950 prefill objects; objects-only, no blob or emitter change).
  *
@@ -604,6 +613,9 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
 #endif
     ) {
     __shared__ int bailed;
+#if PLOW_XR_WAVE_RS_ON
+    __shared__ __align__(16) bf16 xr_peer_tile[8u * PLOW_THREADS];
+#endif
     const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
     const unsigned stride = nblk * PLOW_THREADS;
 
@@ -645,6 +657,37 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     const uint32_t my_lo = (uint32_t)(((uint64_t)n * rank) / nranks);
     const uint32_t my_hi = (uint32_t)(((uint64_t)n * (rank + 1)) / nranks);
     bf16* my_part = (bf16*)((char*)peer_scratch[rank] + slot_bytes);
+#if PLOW_XR_WAVE_RS_ON
+    const bool wave_rs = nranks == 8u && PLOW_THREADS == 512u &&
+                         (slot_bytes & 15u) == 0u && (my_lo & 7u) == 0u &&
+                         ((my_hi - my_lo) % PLOW_THREADS) == 0u;
+    if (wave_rs) {
+        const uint32_t wave = threadIdx.x >> 6;
+        const uint32_t lane = threadIdx.x & 63u;
+        for (uint32_t base = my_lo + slice * PLOW_THREADS; base < my_hi;
+             base += stride) {
+            const bf16* part =
+                (const bf16*)((const char*)peer_scratch[wave] + slot_bytes);
+            const bf16v8 packed = ld_glob8(as_glob(part) + base + lane * 8u);
+            *(bf16v8*)&xr_peer_tile[wave * PLOW_THREADS + lane * 8u] = packed;
+            __syncthreads();
+            if (wave == 0u) {
+                float acc[8] = {};
+#pragma unroll
+                for (uint32_t r = 0; r < 8u; r++) {
+                    const bf16v8 v = ld_lds8(&xr_peer_tile[r * PLOW_THREADS + lane * 8u]);
+#pragma unroll
+                    for (uint32_t k = 0; k < 8u; k++) acc[k] += bf2f(v[k]);
+                }
+                bf16v8 reduced;
+#pragma unroll
+                for (uint32_t k = 0; k < 8u; k++) reduced[k] = f2bf(acc[k]);
+                st_glob8(as_glob(my_part) + base + lane * 8u, reduced);
+            }
+            __syncthreads();
+        }
+    } else
+#endif
 #if PLOW_XR_MLP_ON
     if (nranks == PLOW_XR_MLP_N) {
         /* PEER-BATCHED reduce-scatter (see PLOW_XR_MLP). This phase is HALF the two-shot's

@@ -72,6 +72,9 @@
 #if defined(PLOW_BUCKET_DECODE_MLA)
 extern "C" __device__ unsigned plow_decode_mla_segment_object_1 = 1;
 #endif
+#if defined(PLOW_BUCKET_XREDUCE) && defined(PLOW_XR_WAVE_RS) && PLOW_XR_WAVE_RS
+extern "C" __device__ unsigned plow_xreduce_wave_rs_segments_1 = 1;
+#endif
 #ifndef PLOW_HAS_HEADNORM_HD64
 #define PLOW_HAS_HEADNORM_HD64 1
 #endif
@@ -4033,6 +4036,8 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_packed_mla_norm_, PLOW_ARCH_SUFFIX)
 #elif defined(PLOW_BUCKET_PACKED_KDA)
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_packed_kda_, PLOW_ARCH_SUFFIX)
+#elif defined(PLOW_BUCKET_XREDUCE)
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_xreduce_, PLOW_ARCH_SUFFIX)
 #elif defined(PLOW_BUCKET_FLASH)
 /* Segmented-dispatch flash object: prefill op set, but built at 4 waves / FA_DC=256 so the flash
  * segments get the 512-register budget. Distinct symbol; one HSA executable holds all three. */
@@ -4366,6 +4371,24 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
 
         const uint64_t t_ready = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
 
+#if defined(PLOW_BUCKET_XREDUCE)
+        if (in->op != PLOW_DOP_XREDUCE2) __builtin_trap();
+        {
+            const size_t xoff =
+                (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
+            const bf16* xr_res = in->t[1] == PLOW_TENSOR_NONE
+                                     ? nullptr
+                                     : (const bf16*)tens[in->t[1]] + in->i[5];
+            bf16* xr_o2 =
+                in->t[2] == PLOW_TENSOR_NONE ? nullptr : (bf16*)tens[in->t[2]] + in->i[5];
+            d_xreduce_twoshot_mega((bf16*)tens[in->t[0]] + in->i[5], prog.peer_scratch,
+                                   prog.n_gpu, prog.rank, in->i[0],
+                                   in->i[2] + in->i[5] * 2u, xoff, in->i[3], in->i[4],
+                                   PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
+                                   xr_res, xr_o2, in->i[6], in->i[7]);
+        }
+#else
 #if !defined(PLOW_BUCKET_FLASH)  /* collectives in the DECODE and 8-wave PREFILL interpreters —
          * TP PREFILL needs XReduce in the prefill interpreter too, not just decode
          * Excluded from the 4-wave flash object (class-4 flash segments
@@ -4473,6 +4496,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         __asm__ __volatile__("s_icache_inv" ::: "memory");
 #endif
         plow_exec(in, e.slice, tens, &sm, &prog);
+#endif
 
         __syncthreads();
 #if PLOW_TRACE_PHASE

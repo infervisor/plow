@@ -1149,6 +1149,7 @@ typedef struct {
  * the producing GEMV whose successor is a cross-GPU "partial ready" bump. See
  * the design notes §6a. Coarse xctr programs leave this clear and cost nothing. */
 #define PLOW_SE_XCTR 2u /* wait/succ counters are cross-GPU (xctr, system scope)   */
+#define PLOW_SE_XR_WAVE_RS 4u /* pure XREDUCE2 segment may use the wave-RS object */
 
 /* HOW MANY SLICES OF THIS PACKET LANDED ON THIS ENTRY'S L2 DOMAIN — the count the two-level
  * cache-maintenance rendezvous (PLOW_GATE_HIER, interp.hip) needs, packed into the spare high

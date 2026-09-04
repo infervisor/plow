@@ -335,6 +335,8 @@ pub struct Builder {
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
     decode_mla_segments: bool,
+    /// Isolate XReduceTwoShot packets for the gfx950 wave-RS interpreter object.
+    xreduce_wave_rs_segments: bool,
     /// Fold an eligible materialized Residual into its AttnRes consumer.
     fuse_materialized_residual_inputs: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
@@ -495,6 +497,7 @@ impl Builder {
             lean_kda_intra_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
+            xreduce_wave_rs_segments: false,
             fuse_materialized_residual_inputs: true,
             gemv_split: 1,
             tensor_dedup: false,
@@ -564,6 +567,10 @@ impl Builder {
 
     pub fn set_decode_mla_segments(&mut self, enabled: bool) {
         self.decode_mla_segments = enabled;
+    }
+
+    pub fn set_xreduce_wave_rs_segments(&mut self, enabled: bool) {
+        self.xreduce_wave_rs_segments = enabled;
     }
 
     pub fn set_fuse_materialized_residual_inputs(&mut self, enabled: bool) {
@@ -1578,6 +1585,14 @@ impl Builder {
                 pair[0].inst.op == DevOp::FlashMlaDecode as u16
                     && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
+        let xreduce_wave_rs = !uniseg
+            && self.place_l2.is_some()
+            && (self.xreduce_wave_rs_segments
+                || std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1"))
+            && self
+                .ops
+                .iter()
+                .any(|op| op.inst.op == DevOp::XReduceTwoShot as u16);
         // This encoding is understood only by its dedicated interpreter object. As with the
         // raw KDA boundary, keep it isolated even when PLOW_UNISEG was requested; otherwise the
         // ordinary XReduce arm would silently interpret the fused operand slots as its legacy
@@ -1684,6 +1699,8 @@ impl Builder {
                         && self.ops[i - 1].inst.op == DevOp::FlashMlaDecode as u16))
             {
                 18
+            } else if xreduce_wave_rs && op == DevOp::XReduceTwoShot as u16 {
+                19
             } else if uniseg {
                 8
             } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
@@ -1798,7 +1815,8 @@ impl Builder {
             || lean_kda_key_factor
             || xr_attnres
             || mla_materialized
-            || decode_mla_segments;
+            || decode_mla_segments
+            || xreduce_wave_rs;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]
         };
@@ -2097,6 +2115,9 @@ impl Builder {
                     );
                     let domain = l.domain_of(cu) as u16;
                     e.flags |= domain << crate::dev::SE_DOMAIN_SHIFT;
+                }
+                if xreduce_wave_rs && inst.op == DevOp::XReduceTwoShot as u16 {
+                    e.flags |= crate::dev::SE_XR_WAVE_RS;
                 }
                 streams[cu as usize].push(e);
                 gq_stream.push(e); // op-major: outer loop is op order, inner is slice order
@@ -3906,6 +3927,67 @@ mod seg_window_tests {
         let stream = vec![e(0), e(1), e(0)];
         let err = static_seg_ofs(&stream, &[0], &[3], 2).unwrap_err();
         assert!(err.contains("not monotonic"), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod xreduce_wave_rs_segment_tests {
+    use super::*;
+
+    fn program(enabled: bool) -> Program {
+        let mut b = Builder::new(8);
+        b.deny_uniseg();
+        b.set_l2_placement(Some(L2Layout {
+            sms: 1,
+            domains: 8,
+            map: L2Map::RoundRobin,
+        }));
+        b.set_xreduce_wave_rs_segments(enabled);
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let xr = b.emit(DevOp::XReduceTwoShot, all.clone(), &[before], |d| {
+            d.i[0] = 8192 * 7168;
+            d.i[1] = 8;
+        });
+        b.emit(DevOp::Nop, all, &[xr], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn opt_in_marks_one_pure_xreduce_segment() {
+        let p = program(true);
+        let xr_seg = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.seg == xr_seg)
+            .all(|e| e.inst == 1 && e.flags & crate::dev::SE_XR_WAVE_RS != 0));
+        assert_eq!(
+            p.stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+    }
+
+    #[test]
+    fn default_does_not_mark_or_split_xreduce() {
+        let p = program(false);
+        assert!(p
+            .stream
+            .iter()
+            .all(|e| e.flags & crate::dev::SE_XR_WAVE_RS == 0));
+        assert_eq!(
+            p.stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
     }
 }
 

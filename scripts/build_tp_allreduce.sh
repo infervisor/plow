@@ -20,9 +20,10 @@ mkdir -p "$OUT"; cd "$OUT"
 rm -f tp_allreduce.co tp_allreduce_kernels.elf tp_allreduce_bench tp_allreduce_prefill_bench
 
 # Device code object -> unbundled raw ELF (the form hsa_backend.c loads).
-XR_DEF=""
-[ "${PLOW_XR_AGG:-0}" = 1 ] && XR_DEF="-DPLOW_XR_AGG=1"
-hipcc --offload-arch="$ARCH" -O3 -w $XR_DEF --genco \
+XR_DEF=()
+[ "${PLOW_XR_AGG:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_AGG=1")
+[ "${PLOW_XR_WAVE_RS:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_WAVE_RS=1")
+hipcc --offload-arch="$ARCH" -O3 -w "${XR_DEF[@]}" --genco \
     "$R/tests/tp_allreduce_kernels.hip" -o tp_allreduce.co
 "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
        --input=tp_allreduce.co --output=tp_allreduce_kernels.elf
@@ -44,6 +45,7 @@ ls -l --time-style=+%H:%M:%S tp_allreduce_kernels.elf tp_allreduce_bench \
 echo "run:  (cd $OUT && /usr/bin/env -i PATH=/usr/bin:/bin HOME=\$HOME LD_LIBRARY_PATH=/opt/rocm/lib ./tp_allreduce_bench 1 2 3)"
 echo "      rank count = number of device ids; env TP_HIDDEN (default 7168) TP_ITERS TP_ELF"
 echo "prefill: (cd $OUT && ./tp_allreduce_prefill_bench 0 1 2 3 4 5 6 7)  PLOW_XR_AGG=${PLOW_XR_AGG:-0}"
+echo "         PLOW_XR_WAVE_RS=${PLOW_XR_WAVE_RS:-0}"
 echo "         env TP_ROWS TP_HIDDEN TP_NWG (default 256) TP_GATHER TP_ONESHOT"
 echo "config:  (cd $OUT && TP_ROWS=8192 TP_HIDDEN=7168 TP_NWG=80 ./tp_allreduce_prefill_bench --check-config)"
 echo "sweep:   scripts/run_tp_allreduce_prefill_sweep.sh $OUT gpu0 gpu1 gpu2 gpu3 gpu4 gpu5 gpu6 gpu7"

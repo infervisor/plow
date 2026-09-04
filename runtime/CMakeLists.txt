@@ -692,6 +692,8 @@ option(PLOW_K3_DECODE_XR_AGG
        "Aggregate batched K3 decode two-shot all-gather signals per rank" ON)
 option(PLOW_XR_AGG
        "Aggregate prefill two-shot all-gather signals per rank" ON)
+option(PLOW_XR_WAVE_RS
+       "Use experimental TP8 wave-per-peer prefill reduce-scatter on gfx950" OFF)
 option(PLOW_KDA_PF_STATE_RESIDENT
        "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
 option(PLOW_K3_KDA_CONV_STEP_DB
@@ -1246,6 +1248,30 @@ if(PLOW_GFX950_HSACO)
             list(APPEND _hs_outs "${_out}")
         endforeach()
     endforeach()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_XR_WAVE_RS)
+        foreach(_kind static gq)
+            set(_sfx "")
+            set(_gq "")
+            if(_kind STREQUAL "gq")
+                set(_sfx "_gq")
+                set(_gq ${_hs_ax_gq})
+            endif()
+            set(_out "${PLOW_HSACO_DIR}/interp_xreduce${_sfx}.elf")
+            add_custom_command(OUTPUT "${_out}"
+                COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                        "${PLOW_HSACO_ARCH}" "${_out}"
+                        "plow_interp_xreduce_${PLOW_HSACO_ARCH}${_sfx}" 256 2
+                        ${_hs_inc} ${_hs_arch_def} -DPLOW_BUCKET_XREDUCE=1
+                        -DPLOW_XR_AGG=1 -DPLOW_XR_WAVE_RS=1 ${_gq} ${_hs_extra}
+                        -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                        -DPLOW_REQUIRED_MARKER=plow_xreduce_wave_rs_segments_1 "${_hs_src}"
+                DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+                COMMENT "hipcc interp_xreduce${_sfx}.elf"
+                VERBATIM)
+            list(APPEND _hs_outs "${_out}")
+        endforeach()
+    endif()
 
     if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND _hs_need_kda_fused)
         set(_hs_kda_fused_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_decode_fused.hip")
