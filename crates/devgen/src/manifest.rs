@@ -1261,6 +1261,7 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
                 "wavefront_size": 64,
                 "max_private_segment_bytes_delta": 0,
                 "max_vgpr_spill_delta": 0,
+                "max_sgpr_spill_delta": 0,
                 "policy": "refuse",
             })
         } else {
