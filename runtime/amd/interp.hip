@@ -1124,17 +1124,16 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
 #if PLOW_MLA_FOLD_TB > 1
     /* TOKEN-BLOCKED PREFILL ARM (-DPLOW_MLA_FOLD_TB=<G>; op_attention.h d_mla_merge_fold_tb).
      *
-     * The V>=256 arm below gives one workgroup one (token, head) row and streams the whole
-     * 256 KiB W_uv[h] panel for it, so at GLM-5.2 TP8 T=8192 the packet pulls 16.8 GB out of L2
-     * per layer to do 8.6 GMAC. This arm gives it TB rows of ONE head instead and divides that
-     * stream by TB. Measured standalone at that shape (runtime/bench/amd/glm52_kbench_fold_pf):
-     * 1626 -> 616 us/packet at TB=8, output BIT-IDENTICAL.
+     * The scalar arms below give one workgroup one (token, head) row and repeatedly stream the
+     * whole W_uv[h] panel. This arm gives it TB rows of ONE head and divides that stream by TB.
+     * Measured standalone at V=256 (runtime/bench/amd/glm52_kbench_fold_pf): 1626 -> 616
+     * us/packet at TB=8. V=128 uses the same structural transform with VT=128.
      *
      * EVERY guard here is a correctness precondition of the TB body, not a heuristic:
      *   !(bh*8 <= nblk)   leave the VT=32 decode map exactly where it is — a different VT is a
      *                     different fold map and therefore different arithmetic.
-     *   V >= 256, V%VT==0 the TB body carries only the fast map; a ragged last V-tile has no
-     *                     scalar arm to fall into.
+     *   V >= 128, V%VT==0 the TB body carries only the fast map; a ragged last V-tile has no
+     *                     scalar arm to fall into. VT is selected structurally as 128 or 256.
      *   V % VEC == 0      the vector load's own precondition, as in the scalar body.
      *   n_batch % TB == 0 whole token groups; the body has no tail.
      *   nsplit < 8        the scalar body's MS=8 block is then unreachable in BOTH, so both run
@@ -1143,11 +1142,20 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
      *                     TB=8 grouping would leave 128 of 304 workgroups with no work.
      * The arena is TB*DK + RB*PLOW_WAVES*VT floats — asserted against `raw` at the call site. */
     {
-        constexpr unsigned TB = PLOW_MLA_FOLD_TB, VT = 256;
-        if (!(bh && bh * 8u <= nblk) && V >= VT && (V % VT) == 0u &&
-            (V % (unsigned)PLOW_MLA_FOLD_VEC) == 0u && in->i[0] && in->i[0] % TB == 0u &&
-            in->i[4] < 8u && (in->i[0] / TB) * in->i[1] * (V / VT) >= nblk) {
-            d_mla_merge_fold_tb<512, (int)VT, (int)TB>(
+        constexpr unsigned TB = PLOW_MLA_FOLD_TB;
+        const bool common = !(bh && bh * 8u <= nblk) &&
+                            (V % (unsigned)PLOW_MLA_FOLD_VEC) == 0u && in->i[0] &&
+                            in->i[0] % TB == 0u && in->i[4] < 8u;
+        if (common && V >= 256u && (V % 256u) == 0u &&
+            (in->i[0] / TB) * in->i[1] * (V / 256u) >= nblk) {
+            d_mla_merge_fold_tb<512, 256, (int)TB>(
+                (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
+                in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk, raw);
+            return;
+        }
+        if (common && V >= 128u && V < 256u && (V % 128u) == 0u &&
+            (in->i[0] / TB) * in->i[1] * (V / 128u) >= nblk) {
+            d_mla_merge_fold_tb<512, 128, (int)TB>(
                 (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
                 in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk, raw);
             return;
