@@ -96,25 +96,49 @@ impl FusionCoverage {
             .progs
             .last()
             .ok_or_else(|| "emitted model has no decode program".to_string())?;
-        self.validate_decode_insts(&decode.insts)
+        // The egg graph is built from the full checkpoint config, while an
+        // intentional PLOW_K3_LAYERS truncation emits only a prefix.  Count the
+        // emitted KDA layers from their unique checkpoint tensor instead of
+        // imposing the full graph's obligation on a diagnostic artifact.
+        let emitted_kda = model
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.name.ends_with(".self_attn.dt_bias"))
+            .count();
+        if emitted_kda > self.kda_gate {
+            return Err(format!(
+                "emitted {emitted_kda} KDA layers but whole-graph extraction found only {}",
+                self.kda_gate
+            ));
+        }
+        self.validate_decode_insts_for(&decode.insts, emitted_kda)
     }
 
+    #[cfg(test)]
     fn validate_decode_insts(&self, insts: &[DevInst]) -> Result<CoverageReport, String> {
+        self.validate_decode_insts_for(insts, self.kda_gate)
+    }
+
+    fn validate_decode_insts_for(
+        &self,
+        insts: &[DevInst],
+        expected_kda: usize,
+    ) -> Result<CoverageReport, String> {
         let count = |op: DevOp| insts.iter().filter(|i| i.op == op as u16).count();
         let qkvg = count(DevOp::GemvQkvg);
         // KdaDecodeFused subsumes the conv/state/gated-norm half, but the gate
         // projection still rides GemvQkvg. Either spelling covers the egg
         // target exactly; neither opcode covers it alone.
         let gated_norm = count(DevOp::KdaGatedNorm) + count(DevOp::KdaDecodeFused);
-        if qkvg < self.kda_gate || gated_norm < self.kda_gate {
+        if qkvg < expected_kda || gated_norm < expected_kda {
             return Err(format!(
-                "{KDA_GATE}: extracted {}, but decode carries GemvQkvg={qkvg} and \
+                "{KDA_GATE}: expected {expected_kda} of {} extracted, but decode carries GemvQkvg={qkvg} and \
                  KdaGatedNorm-or-KdaDecodeFused={gated_norm}; exact semantic coverage requires both",
                 self.kda_gate
             ));
         }
         Ok(CoverageReport {
-            gpu_equivalent_covered: self.kda_gate,
+            gpu_equivalent_covered: expected_kda,
             not_opcode_equivalent: self.extracted - self.kda_gate,
         })
     }
@@ -245,6 +269,15 @@ mod tests {
             ])
             .unwrap_err();
         assert!(err.contains("exact semantic coverage requires both"));
+    }
+
+    #[test]
+    fn truncated_kda_bundle_checks_only_emitted_prefix() {
+        let c = coverage(69, 0);
+        let report = c
+            .validate_decode_insts_for(&[inst(DevOp::GemvQkvg), inst(DevOp::KdaGatedNorm)], 1)
+            .unwrap();
+        assert_eq!(report.gpu_equivalent_covered, 1);
     }
 
     #[test]

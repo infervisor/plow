@@ -25,6 +25,7 @@ def parse_args():
     p.add_argument("--max-num-batched-tokens", type=int, default=4096)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--trust-remote-code", action="store_true")
+    p.add_argument("--enforce-eager", action="store_true")
     return p.parse_args()
 
 
@@ -102,6 +103,7 @@ def main():
         max_num_seqs=1,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=False,
+        enforce_eager=args.enforce_eager,
         max_logprobs=-1,
         logprobs_mode="raw_logits",
     )
