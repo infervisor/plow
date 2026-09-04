@@ -47,16 +47,17 @@
 typedef unsigned short bf16;
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+1e-9*t.tv_nsec;}
 static plow_hsa* H; static plow_hsa_kernel K; static unsigned NCU;
-static double TR_G,TR_E,TR_L; static int HIER=0;
+static double TR_G,TR_E,TR_L; static int HIER=0, RMS=0;
 
 /* P packets, each RESIDUAL over ELEMS elements. gated: 0 = independent, 1 = counter-chained. */
 static double run(unsigned P, unsigned ELEMS, int gated, void** tens4) {
     PlowDevInst* insts = calloc(P, sizeof(PlowDevInst));
     for (unsigned k=0;k<P;k++){
         for (unsigned j=0;j<8;j++) insts[k].t[j]=PLOW_TENSOR_NONE;
-        insts[k].op=PLOW_DOP_RESIDUAL; insts[k].blocks=NCU;
+        insts[k].op=RMS?PLOW_DOP_RMSNORM:PLOW_DOP_RESIDUAL; insts[k].blocks=NCU;
         insts[k].t[0]=0; insts[k].t[1]=1; insts[k].t[2]=2;
-        insts[k].i[0]=ELEMS; insts[k].fj[0].f=1.0f;
+        if(RMS){insts[k].i[0]=ELEMS/7168;insts[k].i[1]=7168;insts[k].fj[0].f=1e-6f;}
+        else {insts[k].i[0]=ELEMS;insts[k].fj[0].f=1.0f;}
     }
     PlowStreamEnt* st = calloc((size_t)NCU*P, sizeof(PlowStreamEnt));
     uint32_t* sofs=malloc(4*NCU); uint32_t* slen=malloc(4*NCU);
@@ -128,12 +129,15 @@ int main(int argc,char**argv){
     char sym[96]; snprintf(sym,sizeof(sym),"plow_interp_dec_%s",nm);
     if(plow_hsa_get_kernel(H,0,sym,&K)){snprintf(sym,sizeof(sym),"plow_interp_%s",nm);
         if(plow_hsa_get_kernel(H,0,sym,&K)){fprintf(stderr,"no symbol\n");return 1;}}
-    const unsigned TOTAL = 1u<<28;  /* 268M elems -> 1.6 GB of traffic; enough to hold boost clocks */
+    RMS = getenv("PLOW_BENCH_RMSNORM") ? atoi(getenv("PLOW_BENCH_RMSNORM")) : 0;
+    /* RMS mode uses 32768 rows, divisible by every packet count in the sweep. */
+    const unsigned TOTAL = RMS ? 32768u*7168u : 1u<<28;
     void* da=plow_hsa_alloc(H,0,(size_t)TOTAL*2);
     void* db=plow_hsa_alloc(H,0,(size_t)TOTAL*2);
     void* dc=plow_hsa_alloc(H,0,(size_t)TOTAL*2);
     void* tens[3]={dc,da,db};
-    printf("\nFIXED TOTAL WORK (%u elems of RESIDUAL), split into P packets.\n", TOTAL);
+    printf("\nFIXED TOTAL WORK (%u elems of %s), split into P packets.\n",
+           TOTAL,RMS?"RMSNORM":"RESIDUAL");
     printf("Slope in P is the per-packet protocol cost, measured while the GPU is busy.\n\n");
     HIER = getenv("PLOW_HIER") ? atoi(getenv("PLOW_HIER")) : 0;
     printf("  hierarchical gate: %s\n", HIER?"ON (PLOW_GATE_HIER, 8 L2 domains)":"off");

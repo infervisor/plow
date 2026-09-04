@@ -1092,7 +1092,7 @@ fn lean_block(lean: &crate::LeanReport) -> Value {
     })
 }
 
-fn object_inventory(progs: &[ProgramArms]) -> Value {
+fn object_inventory(progs: &[ProgramArms], arch: &str) -> Value {
     let phase = |kind: &str| -> BTreeSet<Arm> {
         progs
             .iter()
@@ -1124,6 +1124,32 @@ fn object_inventory(progs: &[ProgramArms]) -> Value {
         .collect();
     let flash_family = |arm: &&Arm| arm.op.starts_with("Flash") || arm.op == "MlaMergeFold";
     let keys = |arms: &BTreeSet<Arm>| arms.iter().map(Arm::key).collect::<Vec<_>>();
+    let families = |arms: &BTreeSet<Arm>| {
+        arms.iter()
+            .map(|a| opcode_family(&a.op))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    let excluded = |arms: &BTreeSet<Arm>| {
+        DevOp::ALL
+            .iter()
+            .map(|op| op_name(*op))
+            .filter(|name| !arms.iter().any(|a| a.op == *name))
+            .collect::<Vec<_>>()
+    };
+    let resource_contract = |flash: bool| {
+        if arch.starts_with("gfx") {
+            json!({
+                "max_total_registers": if flash { 512 } else { 256 },
+                "min_occupancy_waves_per_simd": if flash { 1 } else { 2 },
+                "wavefront_size": 64,
+                "policy": "refuse",
+            })
+        } else {
+            Value::Null
+        }
+    };
     let flash: BTreeSet<Arm> = prefill.iter().filter(flash_family).cloned().collect();
     let packed_kda_names = ["KdaStateStep", "KdaConv3", "KdaStateStepG"];
     let packed_kda: BTreeSet<Arm> = prefill
@@ -1153,10 +1179,31 @@ fn object_inventory(progs: &[ProgramArms]) -> Value {
     let key_factor_pair = !key_factor_wu.is_empty() && !key_factor_carry.is_empty();
     json!({
         "ordinary": {
-            "prefill": { "arms": keys(&prefill) },
-            "decode": { "arms": keys(&decode) },
-            "decode_mla": { "required": !decode_mla.is_empty(), "arms": keys(&decode_mla) },
-            "flash": { "arms": keys(&flash) },
+            "prefill": {
+                "arms": keys(&prefill),
+                "families": families(&prefill),
+                "excluded_opcodes": excluded(&prefill),
+                "resource_contract": resource_contract(false),
+                "inventory_prune_capable": true,
+            },
+            "decode": {
+                "arms": keys(&decode),
+                "families": families(&decode),
+                "excluded_opcodes": excluded(&decode),
+                "resource_contract": resource_contract(false),
+                "inventory_prune_capable": true,
+            },
+            "decode_mla": {
+                "required": !decode_mla.is_empty(),
+                "arms": keys(&decode_mla),
+                "families": families(&decode_mla),
+                "resource_contract": resource_contract(false),
+            },
+            "flash": {
+                "arms": keys(&flash),
+                "families": families(&flash),
+                "resource_contract": resource_contract(true),
+            },
         },
         "lean": {
             "packed_kda_prefill": { "required": !packed_kda.is_empty(), "arms": keys(&packed_kda) },
@@ -1170,10 +1217,36 @@ fn object_inventory(progs: &[ProgramArms]) -> Value {
     })
 }
 
+/// Stable, model-neutral family labels for object partitioning and reports.
+/// They are derived only from emitted opcodes. They do not decide correctness;
+/// the exact arm list above remains the executable inventory.
+fn opcode_family(op: &str) -> &'static str {
+    if op.starts_with("Kda") {
+        "kda"
+    } else if op.starts_with("Moe") {
+        "moe"
+    } else if op.starts_with("FlashMla")
+        || op.starts_with("FlashGather")
+        || matches!(op, "MlaMergeFold" | "MlaOutGate" | "MlaMaterializePack")
+    {
+        "mla"
+    } else if op.starts_with("Flash") || op == "AttnSelect" {
+        "attention"
+    } else if op.starts_with("Gemm") || op.starts_with("Gemv") {
+        "linear"
+    } else if op.contains("Norm") || matches!(op, "Residual" | "AttnRes") {
+        "norm_residual"
+    } else if matches!(op, "XReduce" | "XReduceTwoShot") {
+        "collective"
+    } else {
+        "elementwise"
+    }
+}
+
 fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     let progs = program_arms(m);
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
-    let mut objects = object_inventory(&progs);
+    let mut objects = object_inventory(&progs, arch);
     let kda_intra_wave_items_required = m.progs.iter().any(|p| {
         p.stream
             .iter()
@@ -2004,6 +2077,46 @@ mod tests {
     }
 
     #[test]
+    fn every_prunable_prefill_dispatch_is_presence_gated() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("runtime/amd/interp.hip");
+        let src = std::fs::read_to_string(path).unwrap();
+        for op in [
+            DevOp::Gemv,
+            DevOp::Gemm,
+            DevOp::GemmSmall,
+            DevOp::GemmMed,
+            DevOp::GemmWide,
+            DevOp::GemmC5,
+            DevOp::GemmFp8Blk,
+            DevOp::GemmMxfp4,
+            DevOp::GemmMedMxfp4,
+            DevOp::GemmSmallMxfp4,
+            DevOp::GemmWideMxfp4,
+            DevOp::GemmC5Mxfp4,
+            DevOp::IndexScorePf,
+            DevOp::IndexSelectPf,
+            DevOp::IndexUnionPf,
+            DevOp::OUvFold,
+            DevOp::FlashMerge,
+        ] {
+            let case = format!("        case {}:", op.c_name());
+            let guard = format!(
+                "#if !PLOW_DECODE_INVENTORY_PRUNE || {}\n{case}",
+                op.c_name().replace("PLOW_DOP_", "PLOW_HAS_")
+            );
+            assert!(
+                src.contains(&guard),
+                "{} is not inventory-gated",
+                op.c_name()
+            );
+        }
+    }
+
+    #[test]
     fn k3_object_inventory_covers_every_ordinary_and_lean_arm() {
         let ordinary = [
             DevOp::KdaConv,
@@ -2063,6 +2176,53 @@ mod tests {
         let h = config_header(&man);
         assert!(h.contains("#define PLOW_PACKET_HAS_KDA_DECODE_FUSED 1"));
         assert!(h.contains("#if defined(PLOW_BUCKET_FLASH)\n#define PLOW_HAS_ATTN_RES 0"));
+
+        let decode = &man["objects"]["ordinary"]["decode"];
+        assert_eq!(decode["inventory_prune_capable"], true);
+        assert_eq!(decode["resource_contract"]["max_total_registers"], 256);
+        assert_eq!(
+            decode["resource_contract"]["min_occupancy_waves_per_simd"],
+            2
+        );
+        assert!(decode["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "kda"));
+        assert!(decode["excluded_opcodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "FlashPrefill"));
+    }
+
+    #[test]
+    fn opcode_family_partition_is_model_neutral_and_stable() {
+        for (op, family) in [
+            ("KdaChunkCarry", "kda"),
+            ("MoeGroupDownPf", "moe"),
+            ("FlashMlaDecode", "mla"),
+            ("FlashDecode", "attention"),
+            ("GemvQkvg", "linear"),
+            ("NormResidual", "norm_residual"),
+            ("XReduceTwoShot", "collective"),
+            ("Argmax", "elementwise"),
+        ] {
+            assert_eq!(opcode_family(op), family, "{op}");
+        }
+        let p = prog(vec![inst(DevOp::Gemv, [0; 8])]);
+        let m = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: vec![],
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
+        };
+        assert!(
+            build(&m, "sm_120a")["objects"]["ordinary"]["decode"]["resource_contract"].is_null()
+        );
     }
 
     #[test]
@@ -2083,9 +2243,9 @@ mod tests {
         let wu = segment("KdaChunkWu");
         let carry = segment("KdaChunkCarry");
 
-        let incomplete = object_inventory(std::slice::from_ref(&wu));
+        let incomplete = object_inventory(std::slice::from_ref(&wu), "gfx950");
         assert_eq!(incomplete["lean"]["kda_key_factor_pair"]["required"], false);
-        let paired = object_inventory(&[wu, carry]);
+        let paired = object_inventory(&[wu, carry], "gfx950");
         assert_eq!(paired["lean"]["kda_key_factor_pair"]["required"], true);
         assert_eq!(
             paired["lean"]["kda_key_factor_pair"]["wu_arms"][0],
@@ -2114,7 +2274,7 @@ mod tests {
             insts,
         };
         let pure = segment(2, &["FlashMlaDecode", "MlaMergeFold"]);
-        let inv = object_inventory(std::slice::from_ref(&pure));
+        let inv = object_inventory(std::slice::from_ref(&pure), "gfx950");
         assert_eq!(inv["ordinary"]["decode_mla"]["required"], true);
         let manifest = json!({"union": [], "objects": inv});
         assert!(config_header(&manifest).contains("#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS 1"));
@@ -2124,7 +2284,7 @@ mod tests {
             segment(3, &["FlashMlaDecode", "MlaMergeFold", "Gemv"]),
         ] {
             assert_eq!(
-                object_inventory(&[rejected])["ordinary"]["decode_mla"]["required"],
+                object_inventory(&[rejected], "gfx950")["ordinary"]["decode_mla"]["required"],
                 false
             );
         }

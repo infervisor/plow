@@ -37,19 +37,20 @@ MINOCC="${7:?min occupancy}"
 shift 7
 
 CO="${OUT%.elf}.co"
+CERT="${OUT}.resources.json"
 READELF="$(dirname "$BUNDLER")/llvm-readelf"
 
 fail() {
     # A build that dies must leave NOTHING behind to run by mistake: a stale
     # artifact that outlives its failed compile is how a test prints CORRECT
     # against a binary that never built.
-    rm -f "$OUT" "$CO"
+    rm -f "$OUT" "$CO" "$CERT" "${CERT}.tmp"
     echo "FATAL: $*" >&2
     exit 1
 }
 
 mkdir -p "$(dirname "$OUT")"
-rm -f "$OUT" "$CO"
+rm -f "$OUT" "$CO" "$CERT" "${CERT}.tmp"
 
 # ONE compile. The resource-usage remarks ride the REAL build, so the numbers
 # gated on below are the numbers of the object that ships — build_gfx950.sh
@@ -233,6 +234,11 @@ elif grep -qE "OBJECT .* plow_packed_prefill_kda_chunk_segments_1\$" <<<"$SYMS";
 fi
 
 rm -f "$CO"
+printf '{\n  "schema": 1,\n  "arch": "%s",\n  "kernel": "%s",\n  "object_bytes": %s,\n  "vgpr": %s,\n  "agpr": %s,\n  "total_registers": %s,\n  "sgpr": %s,\n  "occupancy_waves_per_simd": %s,\n  "vgpr_spill": %s,\n  "sgpr_spill": %s,\n  "private_segment_bytes": %s,\n  "group_segment_bytes": %s,\n  "wavefront_size": %s,\n  "max_workgroup_size": %s,\n  "contract": {"max_total_registers": %s, "min_occupancy_waves_per_simd": %s},\n  "accepted": true\n}\n' \
+    "$ARCH" "$SYM" "$(stat -c%s "$OUT")" "$MV" "$MA" "$((MV + MA))" "$MSG" \
+    "$O" "$S" "$MSP" "$MP" "$MLDS" "$MW" "$MWG" "$MAXREG" "$MINOCC" \
+    >"${CERT}.tmp"
+mv "${CERT}.tmp" "$CERT"
 printf "built %s (%s B), %s VGPR=%s AGPR=%s total=%s occ=%s vgpr_spill=%s metadata=[vgpr=%s agpr=%s sgpr=%s sgpr_spill=%s private=%sB lds=%sB wave=%s wgmax=%s waves=%s]\n" \
     "$OUT" "$(stat -c%s "$OUT")" "$SYM" "$V" "$A" "$((V + A))" "$O" "$S" \
     "$MV" "$MA" "$MSG" "$MSP" "$MP" "$MLDS" "$MW" "$MWG" "$((MWG / MW))"

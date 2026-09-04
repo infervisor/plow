@@ -64,8 +64,9 @@
 #define PLOW_HAS_KDA_CHUNK_CARRY 1
 #endif
 
-/* Opt-in decode-only pruning.  A generated PLOW_CONFIG supplies the exact
- * PLOW_HAS_* set; ordinary developer objects retain the historical union. */
+/* Opt-in packet-inventory pruning. A generated PLOW_CONFIG supplies the exact
+ * per-bucket PLOW_HAS_* set; ordinary developer objects retain the historical
+ * union. The legacy name is retained because build manifests already use it. */
 #ifndef PLOW_DECODE_INVENTORY_PRUNE
 #define PLOW_DECODE_INVENTORY_PRUNE 0
 #endif
@@ -2826,6 +2827,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          *
          * QUANT_FP8 produces the per-row-quantized activation these consume, so it is only ever
          * needed in the object that has them. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_QUANT_FP8
         case PLOW_DOP_QUANT_FP8:
             /* t0=xq(fp8) t1=x(bf16) t2=a_scale(f32[M])   i0=M i1=K
              * T11 GLU FOLD: t3=gate t4=up i2=act (NONE/0 on every legacy packet). With them set
@@ -2837,22 +2839,33 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                         in->i[0], in->i[1], slice, nblk, (const bf16*)TEN(3),
                         (const bf16*)TEN(4), in->i[2]);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_FP8
         case PLOW_DOP_GEMM_FP8:
             exec_gemm_fp8(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_MED_FP8
         case PLOW_DOP_GEMM_MED_FP8:
             exec_gemm_med_fp8(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_SMALL_FP8
         case PLOW_DOP_GEMM_SMALL_FP8:
             exec_gemm_small_fp8(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_WIDE_FP8
         case PLOW_DOP_GEMM_WIDE_FP8:
             exec_gemm_wide_fp8(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_C5_FP8
         case PLOW_DOP_GEMM_C5_FP8:
             exec_gemm_c5_fp8(in, T, slice, nblk, sm->gm);
             break;
-#if PLOW_WAVES == 8
+#endif
+#if PLOW_WAVES == 8 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_GLU_FP8)
         /* Twin of the bf16 GEMM_GLU arm below, and prefill-only for the same reason.
          * t0=fu t1=A(fp8) t2=Wg t5=Wu t3=a_scale t4=g_scale t6=u_scale  i0=M i1=N i2=K i5=act */
         case PLOW_DOP_GEMM_GLU_FP8:
@@ -2879,9 +2892,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * Measured: 256 VGPR / 0 AGPR / occ 2 / spill 20 with and without, in both the bf16 and
          * the fp8 prefill objects. d_gemv's MM<=PLOW_GEMV_MAXM instantiation is bandwidth-bound
          * scalar code; it adds no accumulator tile to the worst case the GEMM already sets. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV
         case PLOW_DOP_GEMV:
             exec_gemv(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM
         case PLOW_DOP_GEMM:
             /* ONE tile config, fixed at compile time — deliberately not a runtime
              * switch over the variants. The interpreter inlines every op, so its
@@ -2896,36 +2912,47 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * pick that tile. */
             exec_gemm(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_SMALL
         case PLOW_DOP_GEMM_SMALL:
             exec_gemm_small(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_MED
         case PLOW_DOP_GEMM_MED:
             exec_gemm_med(in, T, slice, nblk, sm->gm);
             break;
+#endif
         /* The two rungs added by the tile-inventory campaign. Their accumulators (64 and 96
          * registers) are both SMALLER than the 256x256 arm above (128), and their LDS (108
          * and 126 KiB) smaller than its 144 KiB arena, so they do not move the worst case a
          * `case` in this switch sets. Measured, prefill object: 256 VGPR / 0 AGPR / occ 2 /
          * spill 2 -- byte-for-byte the budget before they were added. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_WIDE
         case PLOW_DOP_GEMM_WIDE:
             exec_gemm_wide(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_C5
         case PLOW_DOP_GEMM_C5:
             exec_gemm_c5(in, T, slice, nblk, sm->gm);
             break;
+#endif
         /* DENSE block-fp8 (w8a16), the T-row twin of GEMV_FP8_BLK. Its accumulator is 32 registers
          * plus a 32-register PROMOTION set = 64, strictly under the 256x256 arm's 128, so it cannot
          * move the worst case this switch already sets; its LDS (2*(128+128)*64 halves = 64 KiB) is
          * likewise under the 144 KiB arena. Unconditional in the prefill bucket for the reason the
          * exec wrapper documents: the encoding is additive, not a precision SWAP. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_FP8_BLK
         case PLOW_DOP_GEMM_FP8_BLK:
             exec_gemm_fp8_blk(in, T, slice, nblk, sm->gm);
             break;
+#endif
         /* PREFILL-ONLY, and it has to be: d_gemm_glu is a full 256x256 MFMA GEMM, so inlining
          * it into the DECODE interpreter drags 128 AGPRs in and drops that kernel from 2
          * waves/SIMD to 1 (measured: 159 + 128 = 287, over the 256 cliff). Register allocation
          * is the worst case over all inlined code -- the same trap the tile switch has. */
-#if PLOW_WAVES == 8
+#if PLOW_WAVES == 8 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_GLU)
         case PLOW_DOP_GEMM_GLU:
             d_gemm_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                        (const bf16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk,
@@ -2944,10 +2971,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * ADDITIVE, not a swap, unlike the fp8 GEMM arms: mxfp4 here is w4a16, so the A operand is
          * still bf16 and a packet may legitimately mix a bf16 GEMM with an fp4-weight one. Measured
          * cost of adding it to the prefill bucket: 256 VGPR / 0 AGPR / occ 2 -> unchanged. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_MXFP4
         case PLOW_DOP_GEMM_MXFP4:
             exec_gemm_mxfp4(in, T, slice, nblk, sm->gm);
             break;
-#if PLOW_WAVES == 8
+#endif
+#if PLOW_WAVES == 8 && (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_GLU_MXFP4)
         /* The fp4 twin of the bf16 GEMM_GLU arm below, prefill-only for the same reason (a full
          * 256x256 MFMA GEMM has no business in the decode object) and PLOW_WAVES==8 for the same
          * reason (the epilogue's wave->column remap needs SN == 2). It is `d_gemm_mxfp4`'s tile and
@@ -2961,29 +2990,41 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * selection the bf16 family has had since GEMM_MED/GEMM_SMALL landed. Without these
          * `pick_tile` had exactly one fp4 rung to choose from and every mxfp4 prefill GEMM
          * ran 256x256 — three tiles on 256 CUs at Kimi's N=576. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_MED_MXFP4
         case PLOW_DOP_GEMM_MED_MXFP4:
             exec_gemm_med_mxfp4(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_SMALL_MXFP4
         case PLOW_DOP_GEMM_SMALL_MXFP4:
             exec_gemm_small_mxfp4(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_WIDE_MXFP4
         case PLOW_DOP_GEMM_WIDE_MXFP4:
             exec_gemm_wide_mxfp4(in, T, slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_C5_MXFP4
         case PLOW_DOP_GEMM_C5_MXFP4:
             exec_gemm_c5_mxfp4(in, T, slice, nblk, sm->gm);
             break;
 #endif
+#endif
 #if PLOW_FP8_KV
         /* fp8-KV prefill object: only the fp8 flash is compiled, so the bf16 flash_prefill does
          * not weigh on the prefill register budget (SWAP, mirroring the fp8 GEMV arms). */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_PREFILL_FP8
         case PLOW_DOP_FLASH_PREFILL_FP8:
             exec_flash_prefill_fp8(in, T, slice, nblk, sm->fa);
             break;
+#endif
 #else
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_PREFILL
         case PLOW_DOP_FLASH_PREFILL:
             exec_flash_prefill(in, T, slice, nblk, sm->fa);
             break;
+#endif
 #endif
 #if PLOW_MLA_PREFILL
         /* MLA / gathered-MLA prefill — the arms whose absence meant Kimi K2.7, DeepSeek and
@@ -2991,17 +3032,27 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if PLOW_FP8_KV
         /* Same swap as the decode bucket: the DENSE MLA prefill goes e4m3, the gathered one keeps
          * its bf16 arm (its `t7` is `idx`, not a scale array). */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MLA_PREFILL_FP8
         case PLOW_DOP_FLASH_MLA_PREFILL_FP8:
             exec_flash_mla_prefill_fp8(in, T, slice, nblk, sm->fmpf, prog_meta);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_GATHER_PREFILL
         case PLOW_DOP_FLASH_GATHER_PREFILL:
             exec_flash_mla_prefill(in, T, slice, nblk, sm->fmpf, prog_meta);
             break;
+#endif
 #else
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MLA_PREFILL
         case PLOW_DOP_FLASH_MLA_PREFILL:
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_GATHER_PREFILL
         case PLOW_DOP_FLASH_GATHER_PREFILL:
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MLA_PREFILL || PLOW_HAS_FLASH_GATHER_PREFILL
             exec_flash_mla_prefill(in, T, slice, nblk, sm->fmpf, prog_meta);
             break;
+#endif
 #endif
         /* ===== DSA sparse-prefill selection chain (ops 117-119). [GLM52-DSA-PF]
          * Produces the per-query top-k + per-64-query-tile union table the GATHER arm of the
@@ -3009,6 +3060,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * itself rides the FLASH_MLA_PREFILL packet (t7 = the union table) on the 4-wave
          * flash object — if THIS object sees such a packet (no V2 routing), the dense arm
          * above simply ignores t7 and attends the full causal range: degrade, not corrupt. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SCORE_PF
         case PLOW_DOP_INDEX_SCORE_PF: {
             constexpr int DI_ = 128, HI_ = 32; /* same baked geometry as INDEX_SCORE */
 #if PLOW_DSA_IDX_ROW
@@ -3027,6 +3079,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                        in->i[2], in->fj[0].f, slice, nblk);
 #endif
         } break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SELECT_PF
         case PLOW_DOP_INDEX_SELECT_PF:
             /* The fewer-passes early-out is EXACT (it fires only when the index bits cannot
              * change the emitted set), so it rides the same default-on/kill-switch axis. */
@@ -3035,6 +3089,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                               in->i[1], in->i[2], slice, nblk, (unsigned*)sm->raw,
                               (unsigned*)sm->raw + 256);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_UNION_PF
         case PLOW_DOP_INDEX_UNION_PF:
             /* i4 = queries per union tile (0 = legacy 64; the B2 head-batched walk emits 8).
              * The umask scratch is SLICE-indexed inside the kernel, so its size is bound by
@@ -3043,17 +3099,23 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              (const int*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
                              in->i[2], in->i[3], in->i[4], slice, nblk, (unsigned*)sm->raw);
             break;
+#endif
         /* The latent epilogue has to be in the SAME object as the prefill that produces the
          * partials, or the packet has no way to finish a token. Decode carries its own copy. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MLA_MERGE_FOLD
         case PLOW_DOP_MLA_MERGE_FOLD:
             exec_mla_merge_fold(in, T, slice, nblk, (float*)sm->raw);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_O_UV_FOLD
         case PLOW_DOP_O_UV_FOLD:
             d_o_uv_fold<512>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                              in->i[1], in->i[2], slice, nblk, sm->raw);
             break;
 #endif
+#endif
         /* split-KV prefill ALWAYS needs the merge, so it lives in this bucket too */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MERGE
         case PLOW_DOP_FLASH_MERGE:
             if (in->i[3] == 128)
                 d_flash_merge<128>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
@@ -3065,6 +3127,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 d_flash_merge<512>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
                                    in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
+#endif
 #else
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV
         case PLOW_DOP_GEMV:

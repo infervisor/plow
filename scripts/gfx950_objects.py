@@ -46,8 +46,9 @@ HIPCC = os.environ.get("PLOW_HSACO_HIPCC", "/opt/rocm/bin/hipcc")
 
 
 def parse_cmake(path):
-    """-> (axes: name -> [defines], rows: [(stem, symbol, axis1, axis2)])"""
-    src = open(path).read()
+    """-> (axes, rows: [(stem, symbol, axis1, axis2, max_regs, min_occ)])"""
+    with open(path) as f:
+        src = f.read()
     axes, rows = {}, []
     for m in re.finditer(r"set\((_hs_ax_\w+)\s+([^)]*)\)", src):
         toks = m.group(2).split()
@@ -59,13 +60,21 @@ def parse_cmake(path):
             elif t.startswith("-D"):
                 out.append(t)
         axes[m.group(1)] = out
-    for m in re.finditer(r'"(\w+)\|\$\{(\w+)\}\|(\w+)\|(\w+)\|', src):
-        rows.append((m.group(1), m.group(2), m.group(3), m.group(4)))
+    for m in re.finditer(
+            r'"(\w+)\|\$\{(\w+)\}\|(\w+)\|(\w+)\|(\d+)\|(\d+)"', src):
+        rows.append((m.group(1), m.group(2), m.group(3), m.group(4),
+                     int(m.group(5)), int(m.group(6))))
     return axes, rows
 
 
 def defines_for(axes, a1, a2):
     return axes.get(a1, []) + axes.get(a2, [])
+
+
+def resource_row_accepts(max_regs, min_occ, contract):
+    """Whether a CMake row is no weaker than the graph-emitted resource cliff."""
+    return max_regs <= contract.get("max_total_registers", max_regs) and \
+        min_occ >= contract.get("min_occupancy_waves_per_simd", min_occ)
 
 
 def arms_in(defines):
@@ -114,18 +123,35 @@ def stems_from_requires(axes, rows, req, opcodes):
     wins. That is the same "most specific wins" the old ladder encoded, derived rather than
     written down."""
     want = {r.lstrip("-D") for r in req}
+    # These values size/codegen an already-selected recipe. They are not packet feature axes and
+    # therefore do not appear in `backends.gfx950.requires`. Treating them as requirements made
+    # every decode row ineligible (`PLOW_GEMV_MM=${_hs_gvmm}`), leaving a manifest with no decode
+    # object at all. Correctness axes remain subset-checked below.
+    tuning_keys = {
+        "PLOW_GEMV_MM", "PLOW_GEMV_WALK", "GV_UNROLL", "PLOW_MXFP4_DEC_NT",
+        "PLOW_MOE_TILE_BINSEARCH", "PLOW_MOE_ALIGN_PAR_PREFIX",
+        "PLOW_MOE_ROUTER_SELECT_LOCAL", "PLOW_XR_AGG", "PLOW_KDA_PF_STATE_RESIDENT",
+    }
     def pick(bucket):
-        best, best_n = None, -1
-        for stem, sym, a1, a2 in rows:
+        candidates = []
+        for stem, sym, a1, a2, max_regs, min_occ in rows:
             d = {x.lstrip("-D") for x in defines_for(axes, a1, a2)}
             if f"PLOW_BUCKET_DECODE={bucket}" not in d or any("BUCKET_FLASH" in x for x in d):
                 continue
-            rest = d - {f"PLOW_BUCKET_DECODE={bucket}"}
-            if not rest <= want:          # carries an arm this packet did not ask for
+            rest = {
+                flag for flag in d - {f"PLOW_BUCKET_DECODE={bucket}"}
+                if flag.split("=", 1)[0] not in tuning_keys
+            }
+            # FP8 and FP8-KV swap operand interpretation; extra additive families are safe and
+            # common in configured rows (for example a KDA row may also carry grouped-MoE arms).
+            # Requiring exact subset rejected the only KDA-capable decode row and silently chose
+            # the generic object. Rank additive supersets by how many packet requirements they
+            # satisfy, but never cross a precision swap.
+            if any(flag in rest and flag not in want for flag in ("PLOW_FP8=1", "PLOW_FP8_KV=1")):
                 continue
-            if len(rest) > best_n:
-                best, best_n = stem, len(rest)
-        return [best] if best else []
+            candidates.append((-len(rest & want), len(rest - want), stem))
+        # Specificity first, then stem. The answer cannot depend on CMake row order.
+        return [min(candidates)[2]] if candidates else []
     # A packet with no prefill buckets emits no `PLOW_BUCKET_DECODE=0` and needs no prefill object.
     out = (pick(0) if "PLOW_BUCKET_DECODE=0" in want else []) + pick(1)
     # CLASS-4 FLASH object, keyed on the OPCODE — never on a precision flag. That rule is not a
@@ -212,7 +238,8 @@ def stems_by_phase(features, opcodes, req=None):
 def main():
     args = sys.argv[1:]
     cover = "--cover" in args
-    args = [a for a in args if a != "--cover"]
+    recipes = "--recipes" in args
+    args = [a for a in args if a not in ("--cover", "--recipes")]
     axes, rows = parse_cmake(CMAKE)
     by_stem = {r[0]: r for r in rows}
     man = None
@@ -229,8 +256,21 @@ def main():
         if s not in by_stem:
             print(f"{s:36s}  ** NO CMAKE ROW — object cannot be built **")
             continue
-        stem, sym, a1, a2 = by_stem[s]
+        stem, sym, a1, a2, max_regs, min_occ = by_stem[s]
         print(f"{stem:36s} {' '.join(defines_for(axes, a1, a2))}")
+        if recipes:
+            phase = "flash" if stem.startswith("interp_flash") else \
+                    "prefill" if stem.startswith("interp_prefill") else "decode"
+            contract = man.get("objects", {}).get("ordinary", {}).get(phase, {}) \
+                .get("resource_contract", {}) if man else {}
+            if contract:
+                if not resource_row_accepts(max_regs, min_occ, contract):
+                    raise SystemExit(
+                        f"{stem}: CMake resource row {max_regs}/{min_occ} exceeds manifest "
+                        f"contract {contract}")
+                print(f"  recipe phase={phase} max_total_registers={max_regs} "
+                      f"min_occupancy={min_occ} families="
+                      f"{','.join(man['objects']['ordinary'][phase].get('families', []))}")
         print(f"{'  (+ global-queue twin ' + stem + '_gq)':36s} "
               f"{' '.join(defines_for(axes, a1, a2) + axes.get('_hs_ax_gq', []))}")
     if not cover:
@@ -264,7 +304,7 @@ def main():
         for s in ss:
             if s not in by_stem:
                 continue
-            _, _, a1, a2 = by_stem[s]
+            _, _, a1, a2, _, _ = by_stem[s]
             d = tuple(defines_for(axes, a1, a2))
             if d not in cache:
                 cache[d] = arms_in(list(d))
