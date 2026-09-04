@@ -548,6 +548,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_XR_COMBINE_FOLD", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub xr_combine_fold: bool,
 
+    /// Fold the K3 decode `f_b` forget-gate GEMV into `KdaStateStepG`'s prologue (L3): the step
+    /// packet carries `t4 = f_a`, `j1 = W_fb`, flags bit 2, and the GEMV packet is not emitted.
+    /// Needs a `PLOW_KDA_FB_FOLD=1` decode object. Default off.
+    #[arg(long, env = "PLOW_KDA_FB_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_fb_fold: bool,
+
     /// Isolate compatible MXFP4 grouped-MoE Down+Combine boundaries for a standalone object.
     #[arg(long, env = "PLOW_MOE_STAGE2_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_stage2_lean: bool,
@@ -858,6 +864,7 @@ impl EmitConfig {
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             moe_pf_a8: env_bool("PLOW_MOE_PF_A8"),
             xr_combine_fold: env_opt_out("PLOW_XR_COMBINE_FOLD"),
+            kda_fb_fold: env_bool("PLOW_KDA_FB_FOLD"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
             seq_par_seams: env_opt_out("PLOW_SEQ_PAR_SEAMS"),

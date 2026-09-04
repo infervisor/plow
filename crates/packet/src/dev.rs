@@ -1240,8 +1240,13 @@ pub enum DevOp {
     /// gate operands this op cannot fall back to reading a precomputed `g`, because it has no
     /// slot naming one.
     ///
+    /// `flags` bit 2 (`PLOW_KDA_F_FB_FOLD`, decode objects built with `PLOW_KDA_FB_FOLD=1`):
+    /// `t4` is `f_a` (`[T, D]`) and `j1` the `f_b_proj` weight (`[H*D, D]`); the step computes
+    /// its head's `D` gate logits in its prologue with the GEMV's own column routine, and the
+    /// standalone `f_b` GEMV is not emitted.
+    ///
     /// `t0=o t1=q t2=k t3=v t4=g_raw t5=beta_raw t6=state t7=A_log` ·
-    /// `i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode i7=parked` · `f0=scale f1=lower_bound`.
+    /// `i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode i7=parked` · `f0=scale f1=lower_bound j1=w_fb`.
     KdaStateStepG = 112,
     /// `t0=fu t1=A t2=Wg(fp4) t5=Wu(fp4) t3=Sg(e8m0) t4=Su(e8m0)` · `i0=M i1=N i2=K i5=act`,
     /// computing `fu = act(Wg @ A) * (Wu @ A)` — the MXFP4 twin of [`DevOp::GemmGlu`] and the T-row

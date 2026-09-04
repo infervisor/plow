@@ -4545,6 +4545,62 @@ mod tests {
         );
     }
 
+    /// L3 (`PLOW_KDA_FB_FOLD`): every KDA decode layer loses its `f_b` GEMV (N=1536, K=128 at
+    /// TP8) and its `KdaStateStepG` carries flags bit 2, `t4 = f_a`, `j1 = W_fb`. Off, no step
+    /// carries the bit and every layer has the GEMV.
+    #[test]
+    fn kda_fb_fold_removes_one_gemv_per_kda_layer() {
+        let _guard = crate::test_env::env_guard();
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        let f_b = |p: &packet::devbuild::Program| {
+            p.insts
+                .iter()
+                .filter(|i| i.op == DevOp::Gemv as u16 && i.i[1] == 1536 && i.i[2] == 128)
+                .count()
+        };
+        let base = {
+            let _off = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "0")]);
+            build_full(8)
+        };
+        assert_eq!(n(&base, DevOp::KdaStateStepG), 69);
+        assert_eq!(f_b(&base), 69, "one f_b GEMV per KDA layer");
+        assert!(base
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::KdaStateStepG as u16)
+            .all(|i| i.i[4] & 4 == 0 && i.j[1] == 0));
+
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "1")]);
+        let p = build_full(8);
+        assert_eq!(
+            p.insts.len(),
+            base.insts.len() - 69,
+            "exactly one packet per KDA layer"
+        );
+        assert_eq!(n(&p, DevOp::Gemv), n(&base, DevOp::Gemv) - 69);
+        assert_eq!(f_b(&p), 0, "no f_b GEMV survives");
+        let steps: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::KdaStateStepG as u16)
+            .collect();
+        assert_eq!(steps.len(), 69);
+        for s in &steps {
+            assert_eq!(s.i[4], 1 | 4, "l2norm + fold");
+            assert!(
+                p.tensors[s.t[4] as usize].name.ends_with("f_a"),
+                "t4 is f_a"
+            );
+            assert!(
+                p.tensors[s.j[1] as usize].name.ends_with("f_b_proj.weight"),
+                "j1 is W_fb: {}",
+                p.tensors[s.j[1] as usize].name
+            );
+        }
+    }
+
     /// L4 (`PLOW_XR_COMBINE_FOLD`): the latent `MoeCombine` folds into the tagged one-shot
     /// publish. Opted out, the packet carries no fold field at all, so a pre-L4 object
     /// reads it exactly as before. On, every MoE layer loses its combine packet,

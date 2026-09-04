@@ -2418,6 +2418,48 @@ __device__ __forceinline__ void gemv_rows_rs(bf16* __restrict__ C, const bf16* _
         gemv_rows_r<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
 }
 
+/* Guarded so the prefill build digest (`kernelcaps::build::preprocessed_digest`, the tune
+ * store's staleness key) is untouched by a decode-only arm. */
+#ifndef PLOW_KDA_FB_FOLD
+#define PLOW_KDA_FB_FOLD 0
+#endif
+#if PLOW_KDA_FB_FOLD && PLOW_BUCKET_DECODE
+/* CB output columns `n0 + c*nstride` of one bf16 GEMV, each computed EXACTLY as `gemv_rows` /
+ * `gemv_rows_r` compute a column at M=1 — lane L holds the halves at k = chunk*512 + 8L, the
+ * buffer descriptor returns zero past K, `dot8` is seeded at +0.0f, chunks accumulate in order,
+ * then `wave_sum` — with the store left to the caller. The `x` row is read from global rather
+ * than the staged LDS copy; the bits are the same. Callers round with `f2bf` as the GEMV does.
+ * Used by the KDA f_b fold (op_kda.h, PLOW_KDA_FB_FOLD). */
+template <int CB>
+__device__ __forceinline__ void gemv_cols_wave(const bf16* __restrict__ x_,
+                                               const bf16* __restrict__ W_, unsigned K,
+                                               unsigned n0, unsigned nstride, unsigned lane,
+                                               float acc[CB]) {
+    const unsigned step = PLOW_WAVE * 8;
+    const unsigned nchunk = (K + step - 1) / step;
+    const auto* const x = as_glob(x_);
+    const auto* const W = as_glob(W_);
+    __amdgpu_buffer_rsrc_t wr[CB];
+#pragma unroll
+    for (int c = 0; c < CB; c++)
+        wr[c] = PLOW_GV_RSRC(W + (size_t)(n0 + (unsigned)c * nstride) * K, K);
+#pragma unroll
+    for (int c = 0; c < CB; c++) acc[c] = 0.0f;
+    for (unsigned ch = 0; ch < nchunk; ch++) {
+        bf16v8 wv[CB];
+#pragma unroll
+        for (int c = 0; c < CB; c++) wv[c] = buf_ld8(wr[c], (ch * step + lane * 8) * 2u);
+        const unsigned k = ch * step + lane * 8;
+        const unsigned kx = (k < K) ? k : 0u;
+        const bf16v8 xv = ld_glob8(x + kx);
+#pragma unroll
+        for (int c = 0; c < CB; c++) acc[c] += dot8(wv[c], xv, 0.0f);
+    }
+#pragma unroll
+    for (int c = 0; c < CB; c++) acc[c] = wave_sum(acc[c]);
+}
+#endif /* PLOW_KDA_FB_FOLD */
+
 /* ---- OPT-IN (PLOW_GEMV_LG=1): NARROW-K LANE-GROUP bf16 GEMV ----------- [BF16-GEMV-NARROWK-LG]
  *
  * THE SHAPE THIS FIXES, and it is the bf16 twin of `moe_down_lg_fp8_blk` (op_moe.h) one kernel
