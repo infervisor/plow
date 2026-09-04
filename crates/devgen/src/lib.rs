@@ -6729,6 +6729,10 @@ fn emit_dense_gqa(
         b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
         b.set_lean_moe_combine_segments(amd && emit_config::active().moe_combine_lean);
         b.set_lean_kda_intra_segments(amd && emit_config::active().kda_intra_cached);
+        b.set_kda_intra_wave_items_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().kda_intra_wave_items,
+        );
         b.set_lean_kda_key_factor_segments(
             amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
                 && emit_config::active().kda_key_factor,

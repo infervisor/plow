@@ -1917,6 +1917,10 @@ pub const SE_XCTR: u16 = 2;
 /// Older runtimes ignore the bit and safely execute the segment on the primary interpreter.
 pub const SE_XR_WAVE_RS: u16 = 4;
 
+/// This entry belongs to an opt-in pure `KdaChunkIntra` wave-item segment.
+/// Older runtimes ignore the bit and execute the unchanged instruction normally.
+pub const SE_KDA_INTRA_WAVE_ITEMS: u16 = 8;
+
 /// Shift of the per-(packet, L2 domain) slice count packed into [`StreamEnt::flags`].
 ///
 /// Mirrors `PLOW_SE_NPER_SHIFT` in `runtime/common/dev_isa.h`; read the note there for why the

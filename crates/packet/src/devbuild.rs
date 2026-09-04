@@ -331,6 +331,8 @@ pub struct Builder {
     lean_moe_combine_segments: bool,
     /// Isolate BT64/D128 chunk-KDA intra packets for a standalone gfx950 object.
     lean_kda_intra_segments: bool,
+    /// Mark isolated BT64/D128 chunk-KDA intra packets for the wave-item object.
+    kda_intra_wave_items_segments: bool,
     /// Isolate exact qpre BT64/D128 Wu->carry pairs for standalone gfx950 objects.
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
@@ -495,6 +497,7 @@ impl Builder {
             lean_moe_stage1_segments: false,
             lean_moe_combine_segments: false,
             lean_kda_intra_segments: false,
+            kda_intra_wave_items_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
             xreduce_wave_rs_segments: false,
@@ -559,6 +562,10 @@ impl Builder {
 
     pub fn set_lean_kda_intra_segments(&mut self, enabled: bool) {
         self.lean_kda_intra_segments = enabled;
+    }
+
+    pub fn set_kda_intra_wave_items_segments(&mut self, enabled: bool) {
+        self.kda_intra_wave_items_segments = enabled;
     }
 
     pub fn set_lean_kda_key_factor_segments(&mut self, enabled: bool) {
@@ -1568,8 +1575,9 @@ impl Builder {
         let lean_moe_combine = !uniseg
             && self.lean_moe_combine_segments
             && self.ops.iter().any(|op| lean_moe_combine_inst(&op.inst));
+        let kda_intra_wave_items = !uniseg && self.kda_intra_wave_items_segments;
         let lean_kda_intra = !uniseg
-            && self.lean_kda_intra_segments
+            && (self.lean_kda_intra_segments || kda_intra_wave_items)
             && self.ops.iter().any(|op| {
                 op.inst.op == DevOp::KdaChunkIntra as u16
                     && op.inst.i[0] >= 512
@@ -2118,6 +2126,14 @@ impl Builder {
                 }
                 if xreduce_wave_rs && inst.op == DevOp::XReduceTwoShot as u16 {
                     e.flags |= crate::dev::SE_XR_WAVE_RS;
+                }
+                if kda_intra_wave_items
+                    && inst.op == DevOp::KdaChunkIntra as u16
+                    && inst.i[0] >= 512
+                    && inst.i[1] != 0
+                    && inst.i[2] == 128
+                {
+                    e.flags |= crate::dev::SE_KDA_INTRA_WAVE_ITEMS;
                 }
                 streams[cu as usize].push(e);
                 gq_stream.push(e); // op-major: outer loop is op order, inner is slice order
@@ -4180,6 +4196,35 @@ mod lean_kda_intra_tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn wave_items_marks_only_the_eligible_pure_segment() {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_kda_intra_wave_items_segments(true);
+        let tensors: Vec<_> = (0..6).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let intra = b.emit(DevOp::KdaChunkIntra, all.clone(), &[before], |d| {
+            d.t[..6].copy_from_slice(&tensors);
+            d.i = [8192, 12, 128, 0, 0, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[intra], |_| {});
+        let p = b.finish();
+        let marked: Vec<_> = p
+            .stream
+            .iter()
+            .filter(|e| e.flags & crate::dev::SE_KDA_INTRA_WAVE_ITEMS != 0)
+            .collect();
+        assert!(!marked.is_empty());
+        assert!(marked.iter().all(|e| e.inst == 1));
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.inst != 1)
+            .all(|e| e.flags & crate::dev::SE_KDA_INTRA_WAVE_ITEMS == 0));
     }
 }
 

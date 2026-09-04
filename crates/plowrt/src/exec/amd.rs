@@ -747,6 +747,10 @@ enum PrefillSegmentRoute {
         args: KdaChunkIntraCachedArgs,
         grid: u32,
     },
+    KdaChunkIntraWaveItems {
+        args: KdaChunkIntraCachedArgs,
+        grid: u32,
+    },
     KdaChunkKeyFactorWu {
         args: KdaChunkKeyFactorWuArgs,
         grid: u32,
@@ -1210,6 +1214,39 @@ fn rebase_kda_key_factor_routes(routes: &mut [PrefillSegmentRoute], t: u32) {
             _ => {}
         }
     }
+}
+
+fn promote_kda_intra_wave_items_routes(
+    prog: &DevProg,
+    classes: &[u8],
+    routes: &mut [PrefillSegmentRoute],
+) -> Result<()> {
+    for (seg, &class) in classes.iter().enumerate() {
+        if class != 20 {
+            continue;
+        }
+        if prog.stream.iter().any(|e| {
+            e.seg as usize == seg
+                && (e.wait_len != 0
+                    || e.succ_len != 0
+                    || e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS == 0)
+        }) {
+            return Err(RuntimeError::Device(format!(
+                "KDA-intra wave-item segment {seg} has counter obligations or an unmarked entry"
+            )));
+        }
+        routes[seg] = match routes[seg] {
+            PrefillSegmentRoute::KdaChunkIntraCached { args, grid } => {
+                PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid }
+            }
+            _ => {
+                return Err(RuntimeError::Device(format!(
+                    "KDA-intra wave-item segment {seg} is not an exact BT64/D128 singleton"
+                )))
+            }
+        };
+    }
+    Ok(())
 }
 
 fn has_moe_stage2_mxfp4_segment(prog: &DevProg) -> bool {
@@ -2253,6 +2290,42 @@ fn check_packet_pairing_stamp(image: &[u8], blob_path: &Path, object: &Path) -> 
     validate_packet_pairing_stamp(lo, hi, expected, object)
 }
 
+const KDA_INTRA_WAVE_ITEMS_MARKERS: [&str; 6] = [
+    "plow_kda_intra_wave_items_abi_1",
+    "plow_kda_intra_wave_items_bt64_d128_1",
+    "plow_kda_intra_wave_items_wave64_1",
+    "plow_kda_intra_wave_items_no_spill_1",
+    "plow_kda_intra_wave_items_static_lds_131072",
+    "plow_kda_intra_wave_items_vgpr_le_96",
+];
+
+fn read_kda_intra_wave_items_object(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| {
+        RuntimeError::Device(format!(
+            "marked KDA-intra wave-item segments require {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn check_kda_intra_wave_items_symbols<'a>(syms: &[&'a str], path: &Path) -> Result<()> {
+    for marker in KDA_INTRA_WAVE_ITEMS_MARKERS {
+        if !syms.contains(&marker) {
+            return Err(RuntimeError::Device(format!(
+                "KDA-intra wave-item object {} lacks required ABI/resource marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    if !syms.contains(&"plow_packet_hash_lo") || !syms.contains(&"plow_packet_hash_hi") {
+        return Err(RuntimeError::Device(format!(
+            "KDA-intra wave-item object {} has no packet-pairing stamp",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
     let mpath = blob_path.with_file_name("build.json");
     let Ok(raw) = std::fs::read(&mpath) else {
@@ -3217,6 +3290,8 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     let mut mla_any = vec![false; n_seg as usize];
     let mut xr_wave_any = vec![false; n_seg as usize];
     let mut xr_wave_pure = vec![true; n_seg as usize];
+    let mut kda_wave_any = vec![false; n_seg as usize];
+    let mut kda_wave_pure = vec![true; n_seg as usize];
     for e in &prog.stream {
         let op = prog
             .insts
@@ -3233,6 +3308,9 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
         let xr_marked = e.flags & packet::dev::SE_XR_WAVE_RS != 0;
         xr_wave_any[seg] |= xr_marked;
         xr_wave_pure[seg] &= xr_marked && op == DevOp::XReduceTwoShot as u16;
+        let kda_wave_marked = e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0;
+        kda_wave_any[seg] |= kda_wave_marked;
+        kda_wave_pure[seg] &= kda_wave_marked && op == DevOp::KdaChunkIntra as u16;
         if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
             class[e.seg as usize] = 4;
         } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
@@ -3272,6 +3350,14 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
                 )));
             }
             class[s] = 19;
+        }
+        if kda_wave_any[s] {
+            if !kda_wave_pure[s] {
+                return Err(RuntimeError::Device(format!(
+                    "segment {s} carries SE_KDA_INTRA_WAVE_ITEMS but is not pure KdaChunkIntra"
+                )));
+            }
+            class[s] = 20;
         }
     }
     for &(seg, ns) in &needs_v2 {
@@ -5715,6 +5801,7 @@ pub struct AmdEngine {
     k_decode_mla: Option<HsaKernel>,
     k_kda_decode_fused: Option<HsaKernel>,
     k_kda_chunk_intra_cached: Option<HsaKernel>,
+    k_kda_chunk_intra_wave_items: Option<HsaKernel>,
     k_kda_key_factor_wu: Option<HsaKernel>,
     k_kda_key_factor_carry: Option<HsaKernel>,
     /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
@@ -6281,6 +6368,11 @@ impl AmdEngine {
             p.stream
                 .iter()
                 .any(|e| e.flags & packet::dev::SE_XR_WAVE_RS != 0)
+        });
+        let need_kda_intra_wave_items = blob.progs[..dec_ix].iter().any(|p| {
+            p.stream
+                .iter()
+                .any(|e| e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0)
         });
         if let Some(p) = blob.progs[..dec_ix]
             .iter()
@@ -7136,6 +7228,48 @@ impl AmdEngine {
                     }
                 }
             }
+        } else {
+            None
+        };
+
+        let k_kda_chunk_intra_wave_items = if need_kda_intra_wave_items {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "marked KDA-intra wave-item segments require gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "kda_chunk_intra_wave_items_gfx950.elf";
+            const SYMBOL: &str = "plow_kda_chunk_intra_wave_items_gfx950";
+            let path = hsaco_dir.join(NAME);
+            let image = read_kda_intra_wave_items_object(&path)?;
+            let syms = elf_symbol_names(&image);
+            check_kda_intra_wave_items_symbols(&syms, &path)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            let want = std::mem::size_of::<KdaChunkIntraCachedArgs>() as u32;
+            let got = kernel.kernarg_size();
+            let lds = HsaBackend::kernel_lds_bytes(&kernel);
+            let private = kernel.private_segment_size();
+            if got != want && got != want + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; wave-item KDA-intra ABI needs {want} (or {} with COv5 implicit args)",
+                    want + 256
+                )));
+            }
+            if lds != 131_072 || private != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: resource gate failed: LDS={lds} (required 131072), private={private} (required 0)"
+                )));
+            }
+            tracing::info!(
+                object = %path.display(),
+                symbol = SYMBOL,
+                "KDA-intra wave-item object accepted"
+            );
+            modules.push(module);
+            Some(kernel)
         } else {
             None
         };
@@ -8011,6 +8145,7 @@ impl AmdEngine {
             if prog_ix < dec_ix {
                 add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
+                promote_kda_intra_wave_items_routes(p, &seg_class, &mut prefill_routes)?;
                 for (seg, &class) in seg_class.iter().enumerate() {
                     if class == 19 {
                         if !matches!(
@@ -8560,6 +8695,7 @@ impl AmdEngine {
             k_decode_mla,
             k_kda_decode_fused,
             k_kda_chunk_intra_cached,
+            k_kda_chunk_intra_wave_items,
             k_kda_key_factor_wu,
             k_kda_key_factor_carry,
             _kda_key_factor_scratch: d_kda_key_factor_scratch,
@@ -9165,6 +9301,26 @@ impl AmdEngine {
                 self.k_kda_chunk_intra_cached,
                 self.progs[p].prefill_routes.get(seg).copied(),
             ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.k_kda_chunk_intra_wave_items.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "marked KDA-intra wave-item segment has no validated object".into(),
+                    )
+                })?;
                 EngineDevice::launch_kernel(
                     &*self.be,
                     kernel,
@@ -11103,6 +11259,35 @@ mod tests {
     }
 
     #[test]
+    fn marked_kda_wave_items_requires_its_object() {
+        let path = std::env::temp_dir().join(format!(
+            "plow-kda-wave-items-missing-{}-{}.elf",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let err = read_kda_intra_wave_items_object(&path)
+            .expect_err("a marked packet must not silently use the interpreter")
+            .to_string();
+        assert!(err.contains("marked KDA-intra wave-item segments require"));
+    }
+
+    #[test]
+    fn marked_kda_wave_items_rejects_missing_markers_and_pairing() {
+        let path = Path::new("kda_chunk_intra_wave_items_gfx950.elf");
+        let mut syms = KDA_INTRA_WAVE_ITEMS_MARKERS.to_vec();
+        syms.pop();
+        let err = check_kda_intra_wave_items_symbols(&syms, path)
+            .expect_err("a stale resource contract must be rejected")
+            .to_string();
+        assert!(err.contains("lacks required ABI/resource marker"));
+
+        let err = check_kda_intra_wave_items_symbols(&KDA_INTRA_WAVE_ITEMS_MARKERS, path)
+            .expect_err("an unstamped object must be rejected")
+            .to_string();
+        assert!(err.contains("no packet-pairing stamp"));
+    }
+
+    #[test]
     fn pairing_stamp_is_read_from_elf_data() {
         let mut elf = vec![0u8; 0x304];
         elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
@@ -11952,6 +12137,17 @@ mod tests {
         assert_eq!((args.t, args.heads, args.dim, grid), (8192, 12, 128, 256));
         assert_eq!((args.aqk, args.beta), (0x1000, 0x1500));
 
+        for e in prog.stream.iter_mut().filter(|e| e.seg == 1) {
+            e.flags |= packet::dev::SE_KDA_INTRA_WAVE_ITEMS;
+        }
+        let classes = derive_segments_for(&prog, false).unwrap();
+        let mut routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        promote_kda_intra_wave_items_routes(&prog, &classes, &mut routes).unwrap();
+        assert!(matches!(
+            routes[1],
+            PrefillSegmentRoute::KdaChunkIntraWaveItems { grid: 256, .. }
+        ));
+
         prog.insts[1].i[2] = 64;
         let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
         assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
@@ -12247,6 +12443,26 @@ mod tests {
         let err = derive_segments_for(&mixed, false)
             .expect_err("an incompletely marked segment must not reach the specialist object");
         assert!(err.to_string().contains("not pure XReduceTwoShot"));
+    }
+
+    #[test]
+    fn kda_wave_items_routes_only_a_marked_pure_segment() {
+        let mut pure = segmented_prog(&[DevOp::KdaChunkIntra], &[0]);
+        pure.stream[0].flags |= packet::dev::SE_KDA_INTRA_WAVE_ITEMS;
+        assert_eq!(derive_segments_for(&pure, false).unwrap(), [20]);
+
+        let mut mixed = segmented_prog(&[DevOp::KdaChunkIntra, DevOp::RmsNorm], &[0, 0]);
+        for e in &mut mixed.stream {
+            e.flags |= packet::dev::SE_KDA_INTRA_WAVE_ITEMS;
+        }
+        let err = derive_segments_for(&mixed, false)
+            .expect_err("a marked mixed segment must not reach the wave-item object");
+        assert!(err.to_string().contains("not pure KdaChunkIntra"));
+
+        mixed.stream[1].flags &= !packet::dev::SE_KDA_INTRA_WAVE_ITEMS;
+        let err = derive_segments_for(&mixed, false)
+            .expect_err("an incompletely marked segment must not reach the wave-item object");
+        assert!(err.to_string().contains("not pure KdaChunkIntra"));
     }
 
     #[test]

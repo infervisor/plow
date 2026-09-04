@@ -655,6 +655,8 @@ option(PLOW_HSACO_PACKED_PREFILL_CONSUMERS
 option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF)
 option(PLOW_HSACO_KDA_INTRA_CACHED
        "Build the standalone cached BT64/D128 KDA-intra segment" OFF)
+option(PLOW_HSACO_KDA_INTRA_WAVE_ITEMS
+       "Build the packet-paired wave-item BT64/D128 KDA-intra segment" OFF)
 option(PLOW_HSACO_KDA_KEY_FACTOR
        "Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair" OFF)
 option(PLOW_HSACO_XR_ATTNRES
@@ -804,6 +806,10 @@ if(PLOW_GFX950_HSACO)
     if(PLOW_HSACO_DECODE_INVENTORY_PRUNE AND NOT PLOW_HSACO_CONFIG)
         message(FATAL_ERROR
             "PLOW_HSACO_DECODE_INVENTORY_PRUNE requires PLOW_HSACO_CONFIG")
+    endif()
+    if(PLOW_HSACO_KDA_INTRA_WAVE_ITEMS AND NOT PLOW_HSACO_CONFIG)
+        message(FATAL_ERROR
+            "PLOW_HSACO_KDA_INTRA_WAVE_ITEMS requires PLOW_HSACO_CONFIG for packet pairing")
     endif()
     if(_hs_need_decode_mla AND
        (NOT PLOW_HSACO_DECODE_INVENTORY_PRUNE OR NOT PLOW_HSACO_CONFIG))
@@ -1306,6 +1312,24 @@ if(PLOW_GFX950_HSACO)
             VERBATIM)
         add_custom_target(kda_chunk_intra_cached_gfx950 DEPENDS "${_hs_kda_intra_out}")
         list(APPEND _hs_outs "${_hs_kda_intra_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_INTRA_WAVE_ITEMS)
+        set(_hs_kda_intra_wave_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_intra_wave_items.hip")
+        set(_hs_kda_intra_wave_out "${PLOW_HSACO_DIR}/kda_chunk_intra_wave_items_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_intra_wave_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_intra_wave_out}"
+                    plow_kda_chunk_intra_wave_items_gfx950 96 2
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_intra_wave_items_abi_1
+                    "${_hs_kda_intra_wave_src}"
+            DEPENDS "${_hs_kda_intra_wave_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_intra_wave_items_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_intra_wave_items_gfx950 DEPENDS "${_hs_kda_intra_wave_out}")
+        list(APPEND _hs_outs "${_hs_kda_intra_wave_out}")
     endif()
 
     if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_KEY_FACTOR)

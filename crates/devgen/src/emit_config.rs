@@ -383,6 +383,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_KDA_INTRA_CACHED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_intra_cached: bool,
 
+    /// Route exact BT64/D128 chunk-KDA intra work through the wave-item gfx950 object.
+    #[arg(long, env = "PLOW_KDA_INTRA_WAVE_ITEMS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_intra_wave_items: bool,
+
     /// Route exact qpre BT64/D128 Wu->carry pairs through spill-free gfx950 objects.
     /// Defaults on; set false to retain the interpreter path.
     #[arg(long, env = "PLOW_KDA_KEY_FACTOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -749,6 +753,7 @@ impl EmitConfig {
             kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
             kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
             kda_intra_cached: env_bool("PLOW_KDA_INTRA_CACHED"),
+            kda_intra_wave_items: env_bool("PLOW_KDA_INTRA_WAVE_ITEMS"),
             kda_key_factor: env_opt_out("PLOW_KDA_KEY_FACTOR"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
