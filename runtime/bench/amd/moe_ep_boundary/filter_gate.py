@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
+import argparse
 import ctypes
 import struct
 import sys
 
 import torch
 
-T, TOPK, E, RANKS, BM = 8192, 16, 896, 8, 64
-BEGIN, END = 0, E // RANKS
+T, TOPK, E, BM = 8192, 16, 896, 64
 NPART = 64
 CAPACITY = T * TOPK + E * (BM - 1)
 
@@ -18,11 +18,16 @@ def call(lib, name, *args):
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: filter_gate.py filter.elf")
+    p = argparse.ArgumentParser()
+    p.add_argument("object")
+    p.add_argument("--ep-degree", type=int, default=8)
+    args = p.parse_args()
+    if args.ep_degree <= 0 or E % args.ep_degree:
+        raise SystemExit("--ep-degree must divide the expert count")
+    expert_begin, expert_end = 0, E // args.ep_degree
     lib = ctypes.CDLL("libamdhip64.so")
     module, function = ctypes.c_void_p(), ctypes.c_void_p()
-    call(lib, "hipModuleLoad", ctypes.byref(module), sys.argv[1].encode())
+    call(lib, "hipModuleLoad", ctypes.byref(module), args.object.encode())
     call(lib, "hipModuleGetFunction", ctypes.byref(function), module,
          b"plow_moe_ep_filter_align_gfx950")
 
@@ -46,7 +51,7 @@ def main():
     holders = [ctypes.c_void_p(x.data_ptr()) for x in
                (packed, meta, partial, row_token, row_partidx, row_gate)]
     holders += [ctypes.c_uint32(x) for x in
-                (T, TOPK, E, BEGIN, END, CAPACITY)]
+                (T, TOPK, E, expert_begin, expert_end, CAPACITY)]
 
     def launch():
         for phase, blocks in ((1, NPART), (2, 1), (3, NPART), (4, NPART)):
@@ -65,7 +70,7 @@ def main():
     rows = int(mh[3 * E]) * BM
     expected = [[] for _ in range(E)]
     for p, e in enumerate(experts):
-        if BEGIN <= e < END:
+        if expert_begin <= e < expert_end:
             expected[e].append(p)
     expected_idx = []
     for bucket in expected:
@@ -86,7 +91,7 @@ def main():
         begin.record(); launch(); end.record(); end.synchronize()
         samples.append(begin.elapsed_time(end))
     samples.sort()
-    print(f"exact T={T} topk={TOPK} E={E} owned={END-BEGIN} rows={rows} "
+    print(f"exact T={T} topk={TOPK} E={E} owned={expert_end-expert_begin} rows={rows} "
           f"median_ms={samples[len(samples)//2]:.6f} errors=0")
 
 

@@ -42,6 +42,9 @@ def main():
         raise SystemExit("usage: native_manifest.py OBJECT MANIFEST LLVM_READELF LLVM_OBJCOPY")
     obj, output, readelf, objcopy = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
     ep_full_i = os.environ.get("PLOW_MOE2_EP_FULL_I") == "1"
+    ep_inter_dim = int(os.environ.get("PLOW_MOE2_EP_INTER_DIM", "3072"))
+    ep_experts = int(os.environ.get("PLOW_MOE2_EP_EXPERTS", "112"))
+    ep_topk = int(os.environ.get("PLOW_MOE2_EP_TOPK", "2"))
     symbol = "plow_moe2_ep_full_i_16x16x128_gfx950" if ep_full_i else SYMBOL
     digest = hashlib.sha256(obj.read_bytes()).hexdigest()
     with tempfile.NamedTemporaryFile() as text, tempfile.NamedTemporaryFile() as copied:
@@ -57,7 +60,9 @@ def main():
     if f".name:           {symbol}" not in notes or "amdgcn-amd-amdhsa--gfx950" not in notes:
         raise SystemExit("native object symbol/target gate failed")
     symbols = subprocess.check_output([readelf, "-sW", str(obj)], text=True)
-    markers = (MARKERS[:-1] + ("plow_moe2_ep_full_i_3072", "plow_moe2_ep_full_i_vgpr_le_128")) if ep_full_i else MARKERS
+    markers = (MARKERS[:-1] + ("plow_moe2_ep_compile_time_i_1", "plow_moe2_ep_full_i_vgpr_le_128")) if ep_full_i else MARKERS
+    if ep_full_i and ep_inter_dim == 3072:
+        markers += ("plow_moe2_ep_full_i_3072",)
     for marker in markers:
         if not re.search(rf"OBJECT .* {re.escape(marker)}$", symbols, re.MULTILINE):
             raise SystemExit(f"native object lacks required marker {marker}")
@@ -72,8 +77,11 @@ def main():
         "vgpr_spills": field(knotes, "vgpr_spill_count"),
         "sgpr_spills": field(knotes, "sgpr_spill_count"),
     }
+    ep_vgpr = {768: 120, 1536: 118, 3072: 120}.get(ep_inter_dim)
+    if ep_full_i and ep_vgpr is None:
+        raise SystemExit(f"no audited resource contract for EP inter_dim={ep_inter_dim}")
     expected = {
-        "vgpr": 120 if ep_full_i else 98, "sgpr": 40, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 4352,
+        "vgpr": ep_vgpr if ep_full_i else 98, "sgpr": 40, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 4352,
         "lds_bytes": 4352, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0,
     }
     if resources != expected:
@@ -91,9 +99,9 @@ def main():
         },
         "capability": {"arch": "gfx950", "wavefront": 64, "workgroup": 256},
         "geometry": {
-            "tokens": 1024, "topk": 2 if ep_full_i else 16, "model_dim": 3584,
-            "inter_dim": 3072 if ep_full_i else 384,
-            "experts": 112 if ep_full_i else 896, "tile_m": 32, "tile_n": 256, "tile_k": 128,
+            "tokens": 1024, "topk": ep_topk if ep_full_i else 16, "model_dim": 3584,
+            "inter_dim": ep_inter_dim if ep_full_i else 384,
+            "experts": ep_experts if ep_full_i else 896, "tile_m": 32, "tile_n": 256, "tile_k": 128,
             "sort_block_m": 64,
         },
         "encoding": {

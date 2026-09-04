@@ -71,8 +71,14 @@ extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_f32_scatter_1 = 1;
 extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_dynamic_lds_4352 = 1;
 extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_vgpr_le_100 = 1;
 #ifdef PLOW_MOE2_EP_FULL_I
-extern "C" __device__ unsigned plow_moe2_ep_full_i_3072 = 1;
+#ifndef PLOW_MOE2_EP_INTER_DIM
+#define PLOW_MOE2_EP_INTER_DIM 3072
+#endif
+extern "C" __device__ unsigned plow_moe2_ep_compile_time_i_1 = PLOW_MOE2_EP_INTER_DIM;
 extern "C" __device__ unsigned plow_moe2_ep_full_i_vgpr_le_128 = 1;
+#if PLOW_MOE2_EP_INTER_DIM == 3072
+extern "C" __device__ unsigned plow_moe2_ep_full_i_3072 = 1;
+#endif
 #endif
 
 extern "C" __global__ __launch_bounds__(256, 2)
@@ -114,8 +120,9 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
     const unsigned kbytes = static_cast<unsigned>(inter_dim) / 2;
     const unsigned scale_stride = static_cast<unsigned>(inter_dim) / 32u;
 #ifdef PLOW_MOE2_EP_FULL_I
-    constexpr unsigned NTK = 24;
-    if (inter_dim != 3072 || experts <= 0)
+    constexpr unsigned NTK = PLOW_MOE2_EP_INTER_DIM / TK;
+    static_assert(PLOW_MOE2_EP_INTER_DIM >= TK && PLOW_MOE2_EP_INTER_DIM % TK == 0);
+    if (inter_dim != PLOW_MOE2_EP_INTER_DIM || experts <= 0)
 #else
     constexpr unsigned NTK = 3;
     if (inter_dim != 384 || experts <= 0)

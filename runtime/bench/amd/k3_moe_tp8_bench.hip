@@ -82,12 +82,20 @@ int main(int argc, char** argv) {
     const unsigned K = 16, NE = 896, NROT = 56;
     const unsigned NBLK = argc > 1 ? (unsigned)atoi(argv[1]) : 256;
     const unsigned REPS = argc > 2 ? (unsigned)atoi(argv[2]) : 112;
+    const unsigned LOCAL = argc > 5 ? (unsigned)atoi(argv[5]) : K;
+    const unsigned EP = argc > 6 ? (unsigned)atoi(argv[6]) : 1;
+    if (LOCAL > K) { printf("local routes must be <= %u\n", K); return 2; }
+    if (EP == 0 || NE % EP || 8 % EP) { printf("EP must divide both %u and 8\n", NE); return 2; }
+    /* EP>1 is the canonical 2D decode probe. One rank-group owns E/EP experts and the
+     * other route slots name remote experts whose pointer-table entries stay null. This runs the
+     * shipping null-owner semantics and intra-expert I kernel body without a second layout. */
+    const unsigned OWNED = NE / EP;
     const size_t wsz = (size_t)IM * H / 2, ssz = (size_t)IM * H / 32, per = 3 * (wsz + ssz);
     unsigned char* arena;
-    HC(hipMalloc(&arena, per * NE));
-    HC(hipMemset(arena, 0x42, per * NE));
+    HC(hipMalloc(&arena, per * OWNED));
+    HC(hipMemset(arena, 0x42, per * OWNED));
     std::vector<unsigned long long> wt(NE * 3), st(NE * 3);
-    for (unsigned e = 0; e < NE; e++) {
+    for (unsigned e = 0; e < OWNED; e++) {
         unsigned char* b = arena + per * e;
         for (int j = 0; j < 3; j++) {
             wt[e * 3 + j] = (unsigned long long)(size_t)(b + (size_t)j * wsz);
@@ -97,7 +105,10 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> tab((size_t)NROT * K * 8);
     for (unsigned r = 0; r < NROT; r++)
         for (unsigned s = 0; s < K; s++) {
-            *(unsigned*)&tab[((size_t)r * K + s) * 8] = (r * K + s) % NE;
+            /* Rotate through all resident experts so the body cannot benchmark an LLC-sized set.
+             * Remote slots use valid expert ids with null table entries, exactly as the loader. */
+            *(unsigned*)&tab[((size_t)r * K + s) * 8] =
+                s < LOCAL ? (r * LOCAL + s) % OWNED : OWNED + (r * K + s) % (NE - OWNED);
             *(float*)&tab[((size_t)r * K + s) * 8 + 4] = 0.05f;
         }
     bf16 *dx, *dfu; float* dpart; unsigned char* dtab;
@@ -109,8 +120,8 @@ int main(int argc, char** argv) {
     HC(hipMemcpy(dtab, tab.data(), tab.size(), hipMemcpyHostToDevice));
     HC(hipMalloc(&dwt, NE * 24)); HC(hipMemcpy(dwt, wt.data(), NE * 24, hipMemcpyHostToDevice));
     HC(hipMalloc(&dst, NE * 24)); HC(hipMemcpy(dst, st.data(), NE * 24, hipMemcpyHostToDevice));
-    const double gb = (double)K * 2.0 * IM * H / 2.0 + (double)K * 2.0 * IM * H / 32.0;
-    const double db = (double)K * H * IM / 2.0 + (double)K * H * IM / 32.0;
+    const double gb = (double)LOCAL * 2.0 * IM * H / 2.0 + (double)LOCAL * 2.0 * IM * H / 32.0;
+    const double db = (double)LOCAL * H * IM / 2.0 + (double)LOCAL * H * IM / 32.0;
     hipEvent_t e0, e1; HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
     {
         const size_t sb = 512ull << 20;
@@ -142,8 +153,9 @@ int main(int argc, char** argv) {
         printf("  %-20s %8.2f us %7.0f GB/s   x92 layers = %6.3f ms/token\n", nm, us,
                bytes / (us * 1e-6) / 1e9, us * 92 / 1000.0);
     };
-    printf("K3 TP8 decode experts: K(H)=%u I_moe=%u top-%u of %u  arena=%.2f GB nblk=%u\n", H, IM,
-           K, NE, per * (double)NE / 1e9, NBLK);
+    printf("K3 %s decode experts: K(H)=%u I_moe=%u local-routes=%u/top-%u of %u  arena=%.2f GB nblk=%u\n",
+           EP > 1 ? "canonical-2D" : "TP8", H, IM, LOCAL, K, NE,
+           per * (double)OWNED / 1e9, NBLK);
     for (int pass = 0; pass < 2; pass++) {
         run("GLU  OLD slot-outer", 0, gb);
         run("GLU  NEW flat+x2", 1, gb);
@@ -154,6 +166,7 @@ int main(int argc, char** argv) {
     {
         const size_t fub = (size_t)K * IM * 2, pab = (size_t)K * H * 4;
         std::vector<unsigned char> a(fub), b(fub), c(pab), d(pab);
+        HC(hipMemset(dfu, 0, fub));
         hipLaunchKernelGGL(b_glu_old, dim3(NBLK), dim3(PLOW_THREADS), 0, 0, dfu, dx, dtab, dwt, dst, K, IM, H, NE);
         HC(hipDeviceSynchronize()); HC(hipMemcpy(a.data(), dfu, fub, hipMemcpyDeviceToHost));
         HC(hipMemset(dfu, 0, fub));

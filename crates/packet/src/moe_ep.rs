@@ -14,6 +14,117 @@ pub const MOE_EP_ABI_VERSION: u32 = 1;
 pub const MOE_EP_INPUT_REPLICATED: u32 = 1 << 0;
 pub const MOE_EP_FIXED_SLOT_COMBINE: u32 = 1 << 1;
 
+/// One-resident 2D expert layout. Expert groups partition experts; ranks within
+/// a group partition each expert's intermediate dimension. `expert_degree *
+/// intra_expert_tp == world_size`, so every checkpoint byte is resident once
+/// per rank-equivalent, independent of the factorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Moe2dLayout {
+    pub world_size: u32,
+    pub expert_degree: u32,
+}
+
+impl Moe2dLayout {
+    pub fn validate(self, experts: u32, full_intermediate: u32) -> Result<(), &'static str> {
+        if self.world_size == 0
+            || self.expert_degree == 0
+            || !self.world_size.is_multiple_of(self.expert_degree)
+        {
+            return Err("expert degree must divide world size");
+        }
+        if experts < self.expert_degree {
+            return Err("experts must cover every expert group");
+        }
+        if !full_intermediate.is_multiple_of(self.intra_expert_tp()) {
+            return Err("intermediate width must divide intra-expert TP");
+        }
+        Ok(())
+    }
+
+    pub const fn intra_expert_tp(self) -> u32 {
+        self.world_size / self.expert_degree
+    }
+
+    pub fn expert_group(self, rank: u32) -> u32 {
+        assert!(rank < self.world_size);
+        rank / self.intra_expert_tp()
+    }
+
+    pub fn intra_rank(self, rank: u32) -> u32 {
+        assert!(rank < self.world_size);
+        rank % self.intra_expert_tp()
+    }
+
+    pub fn expert_range(self, experts: u32, rank: u32) -> core::ops::Range<u32> {
+        balanced_expert_range(experts, self.expert_degree, self.expert_group(rank))
+    }
+
+    pub fn local_intermediate(self, full_intermediate: u32) -> u32 {
+        assert!(full_intermediate.is_multiple_of(self.intra_expert_tp()));
+        full_intermediate / self.intra_expert_tp()
+    }
+
+    /// Resident MXFP4 bytes for one rank. Payload is two values/byte and E8M0
+    /// scales are one byte per block of 32 along K. The optional stage-2 view
+    /// has the same down payload plus its pad256x8 scale slab.
+    pub fn mxfp4_resident_bytes(
+        self,
+        experts: u32,
+        hidden: u32,
+        full_intermediate: u32,
+        layers: u32,
+        stage2_view: bool,
+    ) -> Result<Moe2dResidentBytes, &'static str> {
+        self.validate(experts, full_intermediate)?;
+        if hidden == 0 || layers == 0 || !full_intermediate.is_multiple_of(32) {
+            return Err("MXFP4 geometry must have non-zero H/layers and I divisible by 32");
+        }
+        let local_experts = self.expert_range(experts, 0).len() as u64;
+        let local_i = u64::from(self.local_intermediate(full_intermediate));
+        let h = u64::from(hidden);
+        let matrix_payload = h
+            .checked_mul(local_i)
+            .and_then(|n| n.checked_div(2))
+            .ok_or("payload bytes overflow")?;
+        let matrix_scales = h.checked_mul(local_i / 32).ok_or("scale bytes overflow")?;
+        let primary_per_layer = local_experts
+            .checked_mul(
+                3u64.checked_mul(matrix_payload + matrix_scales)
+                    .ok_or("primary bytes overflow")?,
+            )
+            .ok_or("primary bytes overflow")?;
+        let stage2_per_layer = if stage2_view {
+            let padded_scales = h.div_ceil(256) * 256 * ((local_i / 32).div_ceil(8) * 8);
+            local_experts
+                .checked_mul(matrix_payload + padded_scales)
+                .ok_or("stage-2 bytes overflow")?
+        } else {
+            0
+        };
+        let layers = u64::from(layers);
+        Ok(Moe2dResidentBytes {
+            primary: primary_per_layer
+                .checked_mul(layers)
+                .ok_or("primary bytes overflow")?,
+            stage2_view: stage2_per_layer
+                .checked_mul(layers)
+                .ok_or("stage-2 bytes overflow")?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Moe2dResidentBytes {
+    pub primary: u64,
+    pub stage2_view: u64,
+}
+
+impl Moe2dResidentBytes {
+    pub const fn total(self) -> u64 {
+        self.primary + self.stage2_view
+    }
+}
+
 pub fn balanced_expert_range(experts: u32, ranks: u32, rank: u32) -> core::ops::Range<u32> {
     assert!(ranks > 0 && rank < ranks && experts >= ranks);
     let q = experts / ranks;
@@ -338,5 +449,46 @@ mod tests {
         assert_eq!(core::mem::size_of::<MoeEpBoundaryDesc>(), 64);
         assert_eq!(core::mem::size_of::<MoeEpPeerWindow>(), 40);
         assert_eq!(core::mem::size_of::<MoeEpRouteRecord>(), 16);
+    }
+
+    #[test]
+    fn two_dimensional_layout_is_single_resident_for_every_factorization() {
+        let mut totals = Vec::new();
+        for expert_degree in [1, 2, 4, 8] {
+            let layout = Moe2dLayout {
+                world_size: 8,
+                expert_degree,
+            };
+            assert_eq!(layout.local_intermediate(3072), 384 * expert_degree);
+            let resident = layout
+                .mxfp4_resident_bytes(896, 3584, 3072, 92, true)
+                .unwrap();
+            assert_eq!(resident.primary, 180_807_008_256);
+            assert_eq!(
+                resident.stage2_view,
+                if expert_degree == 1 {
+                    61_450_747_904
+                } else {
+                    60_269_002_752
+                }
+            );
+            totals.push(resident.total());
+        }
+        assert!(totals[1..].windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(totals[1], 241_076_011_008);
+    }
+
+    #[test]
+    fn two_dimensional_rank_mapping_repeats_owners_across_intra_tp() {
+        let layout = Moe2dLayout {
+            world_size: 8,
+            expert_degree: 4,
+        };
+        assert_eq!(layout.intra_expert_tp(), 2);
+        assert_eq!(layout.expert_range(896, 0), 0..224);
+        assert_eq!(layout.expert_range(896, 1), 0..224);
+        assert_eq!(layout.expert_range(896, 2), 224..448);
+        assert_eq!(layout.intra_rank(0), 0);
+        assert_eq!(layout.intra_rank(1), 1);
     }
 }

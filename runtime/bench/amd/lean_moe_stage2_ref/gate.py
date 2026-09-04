@@ -44,6 +44,7 @@ def unpack_fp4(src):
 
 
 def check_manifest(obj, manifest, ep_full_i=False):
+    geometry = manifest["geometry"]
     required = {
         "status": "production-capability-routed",
         "capability.arch": "gfx950",
@@ -54,10 +55,10 @@ def check_manifest(obj, manifest, ep_full_i=False):
         "geometry.tile_k": 128,
         "geometry.sort_block_m": 64,
         "geometry.tokens": 1024,
-        "geometry.topk": 2 if ep_full_i else 16,
+        "geometry.topk": geometry["topk"] if ep_full_i else 16,
         "geometry.model_dim": 3584,
-        "geometry.inter_dim": 3072 if ep_full_i else 384,
-        "geometry.experts": 112 if ep_full_i else 896,
+        "geometry.inter_dim": geometry["inter_dim"] if ep_full_i else 384,
+        "geometry.experts": geometry["experts"] if ep_full_i else 896,
         "abi.kernarg_bytes": 80,
         "encoding.activation": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
         "encoding.weight": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
@@ -110,7 +111,9 @@ def check_manifest(obj, manifest, ep_full_i=False):
         "plow_moe2_mxfp4_stage2_dynamic_lds_4352",
     ]
     if ep_full_i:
-        markers.extend(("plow_moe2_ep_full_i_3072", "plow_moe2_ep_full_i_vgpr_le_128"))
+        markers.extend(("plow_moe2_ep_compile_time_i_1", "plow_moe2_ep_full_i_vgpr_le_128"))
+        if manifest["geometry"]["inter_dim"] == 3072:
+            markers.append("plow_moe2_ep_full_i_3072")
     else:
         markers.append("plow_moe2_mxfp4_stage2_vgpr_le_100")
     for marker in markers:

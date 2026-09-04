@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import ctypes
 import struct
 import sys
@@ -6,7 +7,6 @@ import sys
 import torch
 
 T, H, TOPK, E = 8192, 3584, 16, 896
-BEGIN, END = 0, E // 8
 
 
 def call(lib, name, *args):
@@ -16,11 +16,16 @@ def call(lib, name, *args):
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: combine_gate.py combine.elf")
+    p = argparse.ArgumentParser()
+    p.add_argument("object")
+    p.add_argument("--ep-degree", type=int, default=8)
+    args = p.parse_args()
+    if args.ep_degree <= 0 or E % args.ep_degree:
+        raise SystemExit("--ep-degree must divide the expert count")
+    expert_begin, expert_end = 0, E // args.ep_degree
     lib = ctypes.CDLL("libamdhip64.so")
     module, function = ctypes.c_void_p(), ctypes.c_void_p()
-    call(lib, "hipModuleLoad", ctypes.byref(module), sys.argv[1].encode())
+    call(lib, "hipModuleLoad", ctypes.byref(module), args.object.encode())
     call(lib, "hipModuleGetFunction", ctypes.byref(function), module,
          b"plow_moe_ep_combine_gfx950")
 
@@ -36,12 +41,12 @@ def main():
     routes = torch.tensor([e | (gate_bits << 32) for e in experts],
                           dtype=torch.int64, device="cuda")
     part = torch.empty((T * TOPK, H), dtype=torch.float32, device="cuda")
-    selected = torch.tensor([p for p, e in enumerate(experts) if BEGIN <= e < END],
+    selected = torch.tensor([p for p, e in enumerate(experts) if expert_begin <= e < expert_end],
                             dtype=torch.int64, device="cuda")
     part.index_fill_(0, selected, 0.25)
     out = torch.empty((T, H), dtype=torch.bfloat16, device="cuda")
     holders = [ctypes.c_void_p(x.data_ptr()) for x in (out, part, routes)]
-    holders += [ctypes.c_uint32(x) for x in (T, H, TOPK, BEGIN, END)]
+    holders += [ctypes.c_uint32(x) for x in (T, H, TOPK, expert_begin, expert_end)]
     params = (ctypes.c_void_p * len(holders))(*[
         ctypes.cast(ctypes.byref(x), ctypes.c_void_p) for x in holders
     ])
@@ -55,7 +60,7 @@ def main():
 
     launch(); torch.cuda.synchronize()
     counts = torch.tensor([
-        sum(BEGIN <= experts[t * TOPK + s] < END for s in range(TOPK))
+        sum(expert_begin <= experts[t * TOPK + s] < expert_end for s in range(TOPK))
         for t in range(T)
     ], dtype=torch.float32)
     got = out[:, 0].float().cpu()
@@ -73,7 +78,7 @@ def main():
         begin.record(); launch(); end.record(); end.synchronize()
         samples.append(begin.elapsed_time(end))
     samples.sort()
-    print(f"exact T={T} H={H} topk={TOPK} owned={END-BEGIN} selected={selected.numel()} "
+    print(f"exact T={T} H={H} topk={TOPK} owned={expert_end-expert_begin} selected={selected.numel()} "
           f"median_ms={samples[len(samples)//2]:.6f} errors=0")
 
 

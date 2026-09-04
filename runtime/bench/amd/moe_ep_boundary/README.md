@@ -41,3 +41,17 @@ GPU_LEASE_DIR=/tmp/gpulease perf-data/tools/gpulease -n 1 moe-ep-full-i-stage1 \
 ROCm PyTorch environment. They verify stable expert/token/slot ordering,
 fixed-slot combine, and the full-I matrix result before timing. All four
 specialists are wave64 and the build rejects private memory or spills.
+
+## Single-resident 2D factorization probe
+
+`layout_tradeoff.py --stage2-view` reports exact route-tail probabilities and resident bytes for
+every `EP * TPexpert = world` factorization. The decode body probe accepts
+`NBLK REPS H I LOCAL_ROUTES EP`; for example EP2 x TP4 at its median critical-group load is:
+
+```bash
+/tmp/k3moe-layout 256 80 3584 768 9 2
+```
+
+The stage-2 experiment accepts compile-time `PLOW_MOE2_EP_INTER_DIM` and manifest-time
+`PLOW_MOE2_EP_{INTER_DIM,EXPERTS,TOPK}`. Only I in `{768,1536,3072}` has an audited spill/resource
+contract. See `perf-data/gfx950-moe-2d-layout-20260904.md`.
