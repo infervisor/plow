@@ -1610,7 +1610,8 @@ impl Builder {
         let xreduce_wave_rs = !uniseg
             && self.place_l2.is_some()
             && (self.xreduce_wave_rs_segments
-                || std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1"))
+                || std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1")
+                || std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1"))
             && self
                 .ops
                 .iter()
