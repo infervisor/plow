@@ -406,6 +406,32 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-tp-prefill-segment-major", env = "PLOW_TP_PREFILL_SEGMENT_MAJOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_prefill_segment_major: bool,
 
+    /// Per-segment all-rank barrier timing for prefill (diagnostic; disables segment-major).
+    #[arg(long = "amd-prefill-seg-timing", env = "PLOW_PREFILL_SEG_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefill_seg_timing: bool,
+
+    /// Write `--trace-raw` output for every TP rank (`<path>.rk<N>`), not only rank 0.
+    #[arg(long = "amd-trace-allranks", env = "PLOW_TRACE_ALLRANKS", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub trace_allranks: bool,
+
+    /// Persistent workgroup count for the f32-mix AttnRes object (sweep override).
+    #[arg(
+        long = "amd-attnres-f32mix-grid",
+        env = "PLOW_ATTNRES_F32MIX_GRID",
+        hide = true,
+        global = true
+    )]
+    pub attnres_f32mix_grid: Option<u32>,
+
+    /// Audited extra resident bytes per rank a replicated-input MoE EP packet may claim.
+    #[arg(
+        long = "amd-moe-prefill-ep-max-extra-bytes",
+        env = "PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES",
+        hide = true,
+        global = true
+    )]
+    pub moe_prefill_ep_max_extra_bytes: Option<u64>,
+
     /// Graph-derived spill-isolated prefill phase objects with one prebuilt AQL replay per rank.
     /// Default off until an exact full-network gate demonstrates a device-time win.
     #[arg(long = "amd-phase-objects", env = "PLOW_PHASE_OBJECTS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]

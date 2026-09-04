@@ -645,9 +645,9 @@ const _: () = assert!(std::mem::size_of::<AttnResF32MixArgs>() == 104);
 /// measured 0.260 ms at T8192 against 0.279 (512) and 0.283 (1024); `PLOW_ATTNRES_F32MIX_GRID`
 /// overrides for a sweep.
 fn attn_res_f32mix_grid(t: u32) -> u32 {
-    let grid = std::env::var("PLOW_ATTNRES_F32MIX_GRID")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+    let grid = crate::config::RuntimeConfig::get()
+        .amd
+        .attnres_f32mix_grid
         .filter(|&g| g != 0)
         .unwrap_or(768);
     grid.min(t).max(1)
@@ -7763,9 +7763,9 @@ impl AmdEngine {
             }
             let extra =
                 moe_prefill_ep_extra_bytes(&blob.progs[..dec_ix], &blob.tensors, bind.n_gpu)?;
-            let allowed = std::env::var("PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
+            let allowed = crate::config::RuntimeConfig::get()
+                .amd
+                .moe_prefill_ep_max_extra_bytes
                 .ok_or_else(|| RuntimeError::Device(format!(
                     "replicated-input MoE EP requires {extra} additional resident bytes per rank for decode-safe companion weights; set PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES to an audited capacity >= that value"
                 )))?;

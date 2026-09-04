@@ -1372,7 +1372,7 @@ impl AmdTpGroup {
         let dispatch = self.ranks[0].prog_dispatch(step.prog);
         let launches = dispatch.launches();
         ttft::PF_SEGMENTS.tally(launches as u64);
-        let segment_timing = std::env::var_os("PLOW_PREFILL_SEG_TIMING").is_some();
+        let segment_timing = crate::config::RuntimeConfig::get().amd.prefill_seg_timing;
         let segment_major = crate::config::RuntimeConfig::get()
             .amd
             .tp_prefill_segment_major

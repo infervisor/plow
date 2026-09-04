@@ -1245,7 +1245,7 @@ mod amd_serve {
             match &self.ranks {
                 Ranks::One(e) => e.trace_write(path),
                 Ranks::Tp(g) => {
-                    let all = std::env::var_os("PLOW_TRACE_ALLRANKS").is_some_and(|v| v != "0");
+                    let all = crate::config::RuntimeConfig::get().amd.trace_allranks;
                     for (rank, out) in Self::packet_trace_paths(path, g.n_gpu(), all)
                         .iter()
                         .enumerate()
