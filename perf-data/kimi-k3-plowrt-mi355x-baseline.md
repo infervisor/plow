@@ -1,9 +1,9 @@
 # Kimi-K3 Plow baseline on MI355X
 
 Measured 2026-09-04 on one 8×AMD Instinct MI355X node. The current C1 result is
-the predeclared median-of-folds reading from the two alternating exact cells in
-campaign `k3-showdown-c1-stack4-20260904` (the full 2026-09-04 stack: prefill
-seams and decode promotions on top of the earlier stacks). All older C1
+the reading from the single alternating exact round in
+campaign `k3-showdown-c1-stack5-20260904` (the full 2026-09-04 stack with the
+segment-relative window order and the combine-into-publish fold). All older C1
 publication and candidate rows are superseded.
 
 ## Contract
@@ -11,16 +11,18 @@ publication and candidate rows are superseded.
 - TP8, native MXFP4 weights, BF16 KV, MTP/speculation and prefix caching off.
 - Raw `/v1/completions`, random exact 8192-token inputs and exact 1024-token
   outputs, greedy sampling, `--ignore-eos`, infinite request rate, C1.
-- Each fold used one discarded warmup and ten measured requests. All 20
+- The fold used one discarded warmup and ten measured requests. All 10
   measured requests completed, with exactly 81,920 input and 10,240 output
-  tokens per fold. The harness ran three alternating rounds; it was stopped
-  after round 2 by request, so two Plow and two vLLM folds are recorded.
+  tokens. The harness ran alternating whole-server rounds; it was stopped after
+  round 1 by request, so one Plow and one vLLM fold are recorded.
 - Current final-default packet/runtime, all default-on with no flags set:
   sequence-parallel TP seams, register-resident KDA carry (interpreter fallback
   below 512 rows), f32-mix AttnRes, align-parallel MoE, GemmWide c8 tile at
   `8192x1536x7168`, ASAP global-queue window order, standalone grouped-MoE
   decode route (measured TuneDB rule), tagged one-shot decode XReduce,
-  split-tile decode MLA merge-fold, wave-parallel router top-k select, GLU GEMV
+  split-tile decode MLA merge-fold, wave-parallel router top-k select,
+  segment-relative ASAP window order, MoE combine folded into the tagged
+  publish, GLU GEMV
   K=7168 UN=7 rung, MLA PF v2, strict-order KDA intra specialist, RS-U2, sorted-A4
   stage-1 scratch, HSA queue 4096 with exact AQL chain reservation. Materialized
   MLA and packed prefill were off.
@@ -32,42 +34,41 @@ publication and candidate rows are superseded.
   GSM8K (n=200: 122 correct vs 124 for the BF16-seam control).
 - Exact packet verification: Lean ordering certificate for every program,
   oracle run; 7,650/7,650 TuneDB selections were measured. Packet/object
-  pairing hash `0x6892b68e52f0e447`, packet `c896deb6…`, 62 paired objects,
-  source head `4886f7e` (runtime/perf head `3ee9ac5`).
+  pairing hash `0x49a0fe9bd3262c04`, packet `31808e16…`, 62 paired objects,
+  source head `7e900b7` (runtime/perf head `e26daf3`).
 - Artifact-set digest:
-  `d3cffd6131a493bce320dea12f520625f55d2dcb9cecb918894731b95537f25b`.
+  `b30c286bed61d37f08f80739b09af15ee44cac5416f828a8af05541960b63a13`.
 
-## Two-fold result
+## Single-round result
 
 | metric | Plow | vLLM 0.28 (same campaign) | gap |
 |---|---:|---:|---:|
-| duration | 265.65 s | 219.23 s | Plow 1.21× longer |
-| output throughput | 38.55 tok/s | 46.71 tok/s | vLLM 1.21× higher |
-| total token throughput | 346.93 tok/s | 420.39 tok/s | vLLM 1.21× higher |
-| median TTFT | 985.22 ms | 567.30 ms | Plow 1.74× longer |
-| P90 / P99 TTFT | 988.69 / 991.82 ms | 571.18 / 573.37 ms | Plow 1.73× / 1.73× longer |
-| median TPOT | 25.00 ms | 20.88 ms | Plow 1.20× longer |
-| median / P90 / P99 ITL | 25.00 / 25.05 / 25.12 ms | 20.88 / 20.95 / 21.06 ms | Plow 1.20× / 1.20× / 1.19× longer |
-| median E2E | 26.564 s | 21.925 s | Plow 1.21× longer |
+| duration | 257.33 s | 218.65 s | Plow 1.18× longer |
+| output throughput | 39.79 tok/s | 46.83 tok/s | vLLM 1.18× higher |
+| total token throughput | 358.14 tok/s | 421.50 tok/s | vLLM 1.18× higher |
+| median TTFT | 978.55 ms | 569.36 ms | Plow 1.72× longer |
+| P90 / P99 TTFT | 980.63 / 987.46 ms | 574.05 / 575.30 ms | Plow 1.71× / 1.72× longer |
+| median TPOT | 24.20 ms | 20.82 ms | Plow 1.16× longer |
+| median / P90 / P99 ITL | 24.19 / 24.25 / 24.35 ms | 20.81 / 20.91 / 21.02 ms | Plow 1.16× / 1.16× / 1.16× longer |
+| median E2E | 25.732 s | 21.864 s | Plow 1.18× longer |
 
 This is endpoint performance, not an isolated-kernel measurement. Against the
 morning publication (1271.86 ms / 28.53 ms / 33.63 tok/s) the day's stack moves
-TTFT −287 ms (-22.5%), TPOT −3.53 ms/token
-(-12.4%), and output throughput +14.6%; the vLLM cells
+TTFT −293 ms (-23.1%), TPOT −4.33 ms/token
+(-15.2%), and output throughput +18.3%; the vLLM cells
 reproduced the published vLLM baseline (567.74 / 20.81 / 46.86) within 2 ms and
 that JSON is unchanged. Plow still trails vLLM on every metric; the remaining
-gap is 418 ms TTFT and 4.12 ms/token.
+gap is 409 ms TTFT and 3.38 ms/token.
 
 ## Exact fold provenance
 
 | fold | mean / median / P99 TTFT (ms) | mean / median / P99 TPOT (ms) | output tok/s | mean / median / P99 E2E (ms) |
 |---|---:|---:|---:|---:|
-| showdown-1 | 982.37 / 981.92 / 984.55 | 25.01 / 25.00 / 25.01 | 38.55 | 26563.40 / 26562.52 / 26570.00 |
-| showdown-2 | 987.59 / 988.53 / 999.08 | 25.00 / 25.00 / 25.02 | 38.55 | 26565.87 / 26565.97 / 26580.55 |
+| showdown-1 | 977.98 / 978.55 / 987.46 | 24.20 / 24.20 / 24.21 | 39.79 | 25732.41 / 25731.74 / 25752.75 |
 
 The JSON preserves every `cells.tsv` field, source log basename, artifact
-digest, and config/tokenizer hashes. Headline values, including P90 and
-duration, are medians of the two fold statistics. The served model id is
+digest, and config/tokenizer hashes. Headline values are the single
+fold's statistics. The served model id is
 `kimi-k3` (the packet slug); the harness accepts it via `MODEL_ID`.
 
 Known like-for-like caveat: every campaign today logs "KDA key-factor segments
@@ -76,19 +77,12 @@ family has no lean object yet in any bundle.
 
 ## Superseded results
 
-The 2026-09-04 `k3-showdown-c1-stack2-20260904` row (1113.26 ms median TTFT,
-25.25 ms median TPOT, 38.01 output tok/s), the `k3-showdown-c1-stack-20260904d`
+The 2026-09-04 `k3-showdown-c1-stack4-20260904` row (985.22 ms median TTFT,
+25.00 ms median TPOT, 38.55 output tok/s), the `k3-showdown-c1-stack2-20260904`
+row (1113.26 / 25.25 / 38.01), the `k3-showdown-c1-stack-20260904d`
 row (1284.84 / 27.54 / 34.76), the `k3-showdown-c1-fe871e6-final` row
 (1271.86 / 28.53 / 33.63), and the 2026-09-03 three-fold row (3762.81 / 63.17 /
 14.97) are superseded by this campaign.
-
-Post-publication engine gate (not yet a served cell): the segment-relative ASAP
-window order (default on, commit "packet: segment-relative ASAP window order by
-default") measured 955.2 / 956.2 ms TTFT and 24.23 / 24.31 ms TPOT against
-962.4 / 25.06 on this packet's 8192→256 gate, exact. The next served cell should
-read ~980 ms TTFT and ~24.3 ms TPOT. The combine-into-tagged-publish fold (default on)
-then measured 24.00 / 24.02 / 24.07 vs 24.23 / 24.24 / 24.30 ms TPOT on the same gate,
-exact; the next served cell should read ~24.1 ms TPOT.
 
 Raw data: `perf-data/kimi-k3-plowrt-mi355x-c1.json`.
 Comparator: `perf-data/kimi-k3-vllm-mi355x-c1.json`.
