@@ -252,6 +252,20 @@ mod tests {
     }
 
     #[test]
+    fn published_jsonl_line_round_trips() {
+        // Exactly what scripts/tune_moe_decode_publish.py writes.
+        let line = r#"{"cell":{"hardware":"amd/gfx950/mi350x","n_cu":256,"decode_rung":1,"topk":16,"hidden":3584,"inter_local":384,"experts":896,"weight_enc":"mxfp4"},"route":"standalone","digests":{"implementation":"gfx950-870078e93f2c92f0","interpreter":"gfx950-870078e93f2c92f0","toolchain":"rocm-7.14.0-nix","oracle":"moe-decode-pair-bitexact-v1"},"stats":{"median_ns":16800.0,"p10_ns":16700.0,"p90_ns":16900.0,"min_ns":16700.0,"samples":5},"correctness":"pass","state":{"state":"qualified"},"campaign":"k3-moe-decode-20260904"}"#;
+        let rec: MoeDecodeMeasurement = serde_json::from_str(line).unwrap();
+        assert_eq!(rec.route, MoeDecodeRoute::Standalone);
+        assert_eq!(rec.cell, cell());
+        assert!(rec.state.is_selectable());
+        assert!(rec.qualification_blockers().is_empty());
+        let back: MoeDecodeMeasurement =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(back, rec);
+    }
+
+    #[test]
     fn cell_key_is_geometry_only() {
         assert_eq!(cell().key(), "amd/gfx950/mi350x|ncu256|b1|k16/h3584/i384/e896/mxfp4");
     }
