@@ -593,6 +593,17 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_PF_DET", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_det: bool,
 
+    /// Build the lean gfx950 MoE stage-1 A4-reuse object with the K256 register-B body
+    /// (`-DPLOW_MOE1_BODY=1`, bit-identical output). Opt-in; packets are unchanged, the
+    /// manifest config header carries the object request.
+    #[arg(long, env = "PLOW_MOE_STAGE1_BODY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_stage1_body: bool,
+
+    /// Build the lean gfx950 MoE stage-2 object with the 64x128 tile body
+    /// (`-DPLOW_MOE2_BODY=1`, bit-identical part tensor). Opt-in; same launch contract.
+    #[arg(long, env = "PLOW_MOE_STAGE2_BODY", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_stage2_body: bool,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Pre-campaign knobs swept in by the same migration
     //
@@ -813,6 +824,8 @@ impl EmitConfig {
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
             attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
+            moe_stage1_body: env_bool("PLOW_MOE_STAGE1_BODY"),
+            moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),
             tma_gemm: env_bool("PLOW_TMA_GEMM"),
             pf_gfuse: env_bool("PLOW_PF_GFUSE"),

@@ -130,6 +130,280 @@ static __device__ __forceinline__ unsigned reuse_expert_for_tile(
     return lo;
 }
 
+#ifndef PLOW_MOE1_BODY
+#define PLOW_MOE1_BODY 0
+#endif
+#if PLOW_MOE1_BODY
+#ifndef PLOW_MOE1_XCD
+#define PLOW_MOE1_XCD 1
+#endif
+extern "C" __device__ unsigned plow_moe1_a4_reuse_body_k256_1 = 1;
+
+/* Two-k-step (K256) iteration body. Same MFMA sequence per accumulator as the K128 body below
+ * (k-steps issued in the same order with the same operands), so the output is bit-identical;
+ * only data movement changes: full 128-byte B row lines per iteration, A tile rows of 128 B,
+ * E8M0 scales staged through LDS in packed lane order, one barrier per two k-steps.
+ * LDS: A 2x8192, B scales 2x2048, A scales 2x512 = 21,504 B < the 32,768 B bridge alias. */
+struct BodyBStage {
+    i32x8 gate[2][2];
+    i32x8 up[2][2];
+};
+
+static __device__ __forceinline__ BodyBStage body_load_b(
+    const unsigned char* gate, const unsigned char* up, unsigned kt0, bool has_k1,
+    unsigned n0, unsigned wave, unsigned lane_k, unsigned lane_n, unsigned hidden,
+    unsigned inter) {
+    BodyBStage stage;
+    const unsigned kbytes = hidden / 2u;
+    const i32x8 zero{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (unsigned ni = 0; ni < 2; ++ni) {
+        const unsigned n = n0 + wave * 32u + ni * 16u + lane_n;
+        const size_t offset = static_cast<size_t>(n) * kbytes
+            + static_cast<size_t>(kt0) * 64u + lane_k * 16u;
+        stage.gate[0][ni] = n < inter ? reuse_fp4_operand(gate + offset) : zero;
+        stage.up[0][ni] = n < inter ? reuse_fp4_operand(up + offset) : zero;
+        stage.gate[1][ni] = has_k1 && n < inter ? reuse_fp4_operand(gate + offset + 64u) : zero;
+        stage.up[1][ni] = has_k1 && n < inter ? reuse_fp4_operand(up + offset + 64u) : zero;
+    }
+    return stage;
+}
+
+#ifndef PLOW_MOE1_WAVES
+#define PLOW_MOE1_WAVES 2
+#endif
+extern "C" __global__ __launch_bounds__(256, PLOW_MOE1_WAVES)
+void plow_moe1_a4_reuse_16x16x128_gfx950(
+    unsigned char* __restrict__ out,
+    const unsigned char* __restrict__ activation,
+    const unsigned long long* __restrict__ weight_table,
+    const unsigned char* __restrict__ activation_scale,
+    const unsigned long long* __restrict__ weight_scale_table,
+    const int* __restrict__ meta,
+    const unsigned* __restrict__ row_partidx,
+    unsigned char* __restrict__ out_scale,
+    unsigned inter,
+    unsigned hidden,
+    unsigned experts,
+    unsigned act,
+    float beta,
+    float linear_beta) {
+    constexpr unsigned TM = 64, TN = 128, TK = 128, ROWB = 128, A_SLOT = TM * ROWB;
+    constexpr unsigned BS_OFF = 2 * A_SLOT, BS_SLOT = 2048, AS_OFF = BS_OFF + 2 * BS_SLOT,
+                       AS_SLOT = 512;
+    extern __shared__ __align__(16) unsigned char a_lds[];
+    const unsigned tid = threadIdx.x;
+    const unsigned wave = tid / 64u;
+    const unsigned lane = tid % 64u;
+    const unsigned lane_k = lane / 16u;
+    const unsigned lane_n = lane % 16u;
+    const unsigned n_tiles = (inter + TN - 1u) / TN;
+    unsigned bid = blockIdx.x;
+#if PLOW_MOE1_XCD
+    /* Hardware places consecutive workgroups on consecutive XCDs; fold the grid so that
+     * consecutive tiles (same expert, shared B rows) land on one XCD's L2. Bijective. */
+    {
+        const unsigned per = gridDim.x / 8u;
+        if (bid < per * 8u) bid = (bid % 8u) * per + bid / 8u;
+    }
+#endif
+    const unsigned mt = bid / n_tiles;
+    const unsigned nt = bid - mt * n_tiles;
+    const int* tile_prefix = meta + 2 * experts;
+    const unsigned total_tiles = static_cast<unsigned>(tile_prefix[experts]);
+    if (mt >= total_tiles || hidden % TK != 0 || inter == 0) return;
+    const unsigned expert = reuse_expert_for_tile(tile_prefix, mt, experts);
+    const unsigned rowbase = static_cast<unsigned>(meta[expert])
+        + (mt - static_cast<unsigned>(tile_prefix[expert])) * TM;
+    const unsigned n0 = nt * TN;
+    const auto gate = reinterpret_cast<const unsigned char*>(
+        static_cast<size_t>(weight_table[static_cast<size_t>(expert) * 3u]));
+    const auto up = reinterpret_cast<const unsigned char*>(
+        static_cast<size_t>(weight_table[static_cast<size_t>(expert) * 3u + 1u]));
+    const auto gate_scale = reinterpret_cast<const unsigned char*>(
+        static_cast<size_t>(weight_scale_table[static_cast<size_t>(expert) * 3u]));
+    const auto up_scale = reinterpret_cast<const unsigned char*>(
+        static_cast<size_t>(weight_scale_table[static_cast<size_t>(expert) * 3u + 1u]));
+    if (!gate || !up || !gate_scale || !up_scale) return;
+    const unsigned a_stride = hidden / 2u;
+    const unsigned groups = hidden / 32u;
+    const unsigned ntk = hidden / TK;
+    const unsigned niter = (ntk + 1u) / 2u;
+
+    f32x4 acc[4][4];
+#pragma unroll
+    for (unsigned mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (unsigned bi = 0; bi < 4; ++bi)
+            acc[mi][bi] = f32x4{0, 0, 0, 0};
+
+    /* A tile: 64 rows x 128 B per iteration; thread -> row tid/4, 32 B at chunk pair (tid%4)*2. */
+    const unsigned a_row = tid / 4u;
+    const unsigned a_chunk = (tid % 4u) * 2u;
+    auto load_a = [&](unsigned it, bool has_k1, u32x4* v) {
+        const unsigned char* src = activation + static_cast<size_t>(rowbase + a_row) * a_stride
+            + it * ROWB + a_chunk * 16u;
+        const bool valid = has_k1 || a_chunk < 4u;
+        v[0] = valid ? *reinterpret_cast<const u32x4*>(src) : u32x4{0, 0, 0, 0};
+        v[1] = valid ? *reinterpret_cast<const u32x4*>(src + 16u) : u32x4{0, 0, 0, 0};
+    };
+    auto store_a = [&](const u32x4* v, unsigned slot) {
+        unsigned char* dst = a_lds + slot * A_SLOT + a_row * ROWB;
+        *reinterpret_cast<u32x4*>(dst + ((a_chunk ^ (a_row & 7u)) * 16u)) = v[0];
+        *reinterpret_cast<u32x4*>(dst + (((a_chunk + 1u) ^ (a_row & 7u)) * 16u)) = v[1];
+    };
+    /* B scales: thread -> (branch tid>>7, column tid&127); 8 groups per iteration as 2 dwords.
+     * Stored as [branch][group][wave][lane_n][ni] so a lane reads its packed pair with one u16. */
+    const unsigned bs_branch = tid >> 7;
+    const unsigned bs_col = tid & 127u;
+    const unsigned char* bs_src = (bs_branch ? up_scale : gate_scale)
+        + static_cast<size_t>(n0 + bs_col) * groups;
+    auto load_bs = [&](unsigned it, bool has_k1, unsigned* w) {
+        if (n0 + bs_col < inter) {
+            w[0] = *reinterpret_cast<const unsigned*>(bs_src + it * 8u);
+            w[1] = has_k1 ? *reinterpret_cast<const unsigned*>(bs_src + it * 8u + 4u) : 0u;
+        } else {
+            w[0] = 0u;
+            w[1] = 0u;
+        }
+    };
+    auto store_bs = [&](const unsigned* w, unsigned slot) {
+        unsigned char* dst = a_lds + BS_OFF + slot * BS_SLOT + bs_branch * 1024u
+            + (bs_col / 32u) * 32u + (bs_col & 15u) * 2u + ((bs_col / 16u) & 1u);
+#pragma unroll
+        for (unsigned g = 0; g < 8; ++g)
+            dst[g * 128u] = static_cast<unsigned char>(w[g / 4u] >> ((g % 4u) * 8u));
+    };
+    /* A scales: threads < 64 -> row; stored as [group][lane_n][mi] so a lane reads one dword. */
+    auto load_as = [&](unsigned it, bool has_k1, unsigned* w) {
+        if (tid < TM) {
+            const unsigned char* src = activation_scale
+                + static_cast<size_t>(rowbase + tid) * groups + it * 8u;
+            w[0] = *reinterpret_cast<const unsigned*>(src);
+            w[1] = has_k1 ? *reinterpret_cast<const unsigned*>(src + 4u) : 0u;
+        }
+    };
+    auto store_as = [&](const unsigned* w, unsigned slot) {
+        if (tid < TM) {
+            unsigned char* dst = a_lds + AS_OFF + slot * AS_SLOT + (tid & 15u) * 4u + tid / 16u;
+#pragma unroll
+            for (unsigned g = 0; g < 8; ++g)
+                dst[g * 64u] = static_cast<unsigned char>(w[g / 4u] >> ((g % 4u) * 8u));
+        }
+    };
+
+    auto mfma_step = [&](const i32x8* bg, const i32x8* bu, unsigned slot, unsigned s) {
+        const unsigned char* a_slot = a_lds + slot * A_SLOT;
+        const unsigned chunk = s * 4u + lane_k;
+        const int a_scale_word = *reinterpret_cast<const int*>(
+            a_lds + AS_OFF + slot * AS_SLOT + (chunk * 16u + lane_n) * 4u);
+        const unsigned char* bs = a_lds + BS_OFF + slot * BS_SLOT + chunk * 128u
+            + wave * 32u + lane_n * 2u;
+        const int gate_scale_word = *reinterpret_cast<const unsigned short*>(bs);
+        const int up_scale_word = *reinterpret_cast<const unsigned short*>(bs + 1024u);
+        i32x8 a_frag[4];
+#pragma unroll
+        for (unsigned mi = 0; mi < 4; ++mi) {
+            const unsigned row = lane_n + mi * 16u;
+            a_frag[mi] = reuse_fp4_operand(
+                a_slot + row * ROWB + ((chunk ^ (row & 7u)) * 16u));
+        }
+        __builtin_amdgcn_s_setprio(1);
+#define BODY_MFMA_ROW(MI)                                                                     \
+        acc[MI][0] = reuse_mfma<MI, 0>(a_frag[MI], bg[0], acc[MI][0],                         \
+                                        a_scale_word, gate_scale_word);                        \
+        acc[MI][1] = reuse_mfma<MI, 1>(a_frag[MI], bg[1], acc[MI][1],                         \
+                                        a_scale_word, gate_scale_word);                        \
+        acc[MI][2] = reuse_mfma<MI, 0>(a_frag[MI], bu[0], acc[MI][2],                         \
+                                        a_scale_word, up_scale_word);                          \
+        acc[MI][3] = reuse_mfma<MI, 1>(a_frag[MI], bu[1], acc[MI][3],                          \
+                                        a_scale_word, up_scale_word)
+        BODY_MFMA_ROW(0);
+        BODY_MFMA_ROW(1);
+        BODY_MFMA_ROW(2);
+        BODY_MFMA_ROW(3);
+#undef BODY_MFMA_ROW
+        __builtin_amdgcn_s_setprio(0);
+    };
+
+    {
+        u32x4 a0[2];
+        unsigned bs0[2], as0[2] = {0u, 0u};
+        const bool has_k1 = ntk > 1u;
+        load_a(0, has_k1, a0);
+        load_bs(0, has_k1, bs0);
+        load_as(0, has_k1, as0);
+        store_a(a0, 0);
+        store_bs(bs0, 0);
+        store_as(as0, 0);
+    }
+    BodyBStage b_cur = body_load_b(gate, up, 0, ntk > 1u, n0, wave, lane_k, lane_n, hidden, inter);
+    __syncthreads();
+    for (unsigned it = 0; it < niter; ++it) {
+        const unsigned slot = it & 1u;
+        const bool has_k1 = 2u * it + 1u < ntk;
+        const bool has_next = it + 1u < niter;
+        BodyBStage b_next;
+        u32x4 a_next[2];
+        unsigned bs_next[2], as_next[2] = {0u, 0u};
+        if (has_next) {
+            const bool next_k1 = 2u * it + 3u < ntk;
+            b_next = body_load_b(gate, up, 2u * it + 2u, next_k1, n0, wave, lane_k, lane_n,
+                                 hidden, inter);
+            load_a(it + 1u, next_k1, a_next);
+            load_bs(it + 1u, next_k1, bs_next);
+            load_as(it + 1u, next_k1, as_next);
+        }
+        mfma_step(b_cur.gate[0], b_cur.up[0], slot, 0);
+        if (has_k1) mfma_step(b_cur.gate[1], b_cur.up[1], slot, 1);
+        if (has_next) {
+            store_a(a_next, slot ^ 1u);
+            store_bs(bs_next, slot ^ 1u);
+            store_as(as_next, slot ^ 1u);
+            b_cur = b_next;
+        }
+        __syncthreads();
+    }
+
+    float* bridge = reinterpret_cast<float*>(a_lds);
+#pragma unroll
+    for (unsigned mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (unsigned ni = 0; ni < 2; ++ni)
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                const unsigned row = mi * 16u + lane_k * 4u + i;
+                const unsigned col = wave * 32u + ni * 16u + lane_n;
+                if (n0 + col < inter)
+                    bridge[row * TN + col] = mpf4_glu(
+                        acc[mi][ni][i], acc[mi][2u + ni][i], act, beta, linear_beta);
+            }
+    __syncthreads();
+    const unsigned row = tid / 4u;
+    const unsigned block = tid % 4u;
+    if (row_partidx[rowbase + row] != ~0u && n0 + block * 32u < inter) {
+        const float* src = bridge + row * TN + block * 32u;
+        float amax = 0.0f;
+#pragma unroll
+        for (unsigned i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(src[i]));
+        const unsigned char sb = e8m0_for_amax(amax);
+        const float inv = e8m0_inv_f32(sb);
+        u32x4 q;
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) {
+            unsigned word = 0;
+#pragma unroll
+            for (unsigned j = 0; j < 8; ++j)
+                word |= quant_fp4(src[i * 8u + j] * inv) << (j * 4u);
+            q[i] = word;
+        }
+        *reinterpret_cast<u32x4*>(out + static_cast<size_t>(rowbase + row) * (inter / 2u)
+                                 + (n0 + block * 32u) / 2u) = q;
+        out_scale[static_cast<size_t>(rowbase + row) * (inter / 32u)
+                  + (n0 + block * 32u) / 32u] = sb;
+    }
+}
+#else
 extern "C" __global__ __launch_bounds__(256, 2)
 void plow_moe1_a4_reuse_16x16x128_gfx950(
     unsigned char* __restrict__ out,
@@ -283,3 +557,4 @@ void plow_moe1_a4_reuse_16x16x128_gfx950(
                   + (n0 + block * 32u) / 32u] = sb;
     }
 }
+#endif

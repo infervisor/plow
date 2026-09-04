@@ -233,12 +233,23 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
   KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf"
 fi
 
+# Opt-in lean MoE body variants requested at emit (PLOW_MOE_STAGE1_BODY / PLOW_MOE_STAGE2_BODY).
+MOE1_BODY_DEFS=""; MOE1_MAXREG=192; MOE2_BODY_DEFS=""
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_OBJECT_MOE_STAGE1_BODY 1' "$PLOW_HSACO_CONFIG"; then
+  MOE1_BODY_DEFS="-DPLOW_MOE1_BODY=1"; MOE1_MAXREG=256
+fi
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_OBJECT_MOE_STAGE2_BODY 1' "$PLOW_HSACO_CONFIG"; then
+  MOE2_BODY_DEFS="-DPLOW_MOE2_BODY=1"
+fi
+
 MOE_STAGE2_ELFS=""
 if [ "$ARCH" = gfx950 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
     "$OUT/moe_stage2_mxfp4_gfx950.elf" plow_moe2_mxfp4_16x16x128_gfx950 100 2 \
     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_3 \
+    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_3 $MOE2_BODY_DEFS \
     "$R/bench/amd/lean_moe_stage2_ref/native_kernel.hip"
   MOE_STAGE2_ELFS="moe_stage2_mxfp4_gfx950.elf"
 fi
@@ -246,9 +257,9 @@ fi
 MOE_STAGE1_ELFS=""
 if [ "$ARCH" = gfx950 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
-    "$OUT/moe_stage1_mxfp4_gfx950.elf" plow_moe1_a4_reuse_16x16x128_gfx950 192 2 \
+    "$OUT/moe_stage1_mxfp4_gfx950.elf" plow_moe1_a4_reuse_16x16x128_gfx950 "$MOE1_MAXREG" 2 \
     $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_moe1_a4_reuse_abi_1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe1_a4_reuse_abi_1 $MOE1_BODY_DEFS \
     "$R/bench/amd/lean_moe_stage1_ref/reuse_kernel.hip"
   MOE_STAGE1_ELFS="moe_stage1_mxfp4_gfx950.elf"
 fi
