@@ -1398,6 +1398,18 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     objects["lean"]["kda_carry_regstate"] = json!({
         "required": kda_carry_regstate_required,
     });
+    let marked_wu = |keys: bool| {
+        m.progs.iter().any(|p| {
+            p.stream.iter().any(|e| {
+                e.flags & packet::dev::SE_KDA_WU_LEAN != 0
+                    && p.insts
+                        .get(e.inst as usize)
+                        .is_some_and(|d| d.op == DevOp::KdaChunkWu as u16 && (d.i[5] == 1) == keys)
+            })
+        })
+    };
+    objects["lean"]["kda_wu_lean"] = json!({ "required": marked_wu(false) });
+    objects["lean"]["kda_carry_keyfeed"] = json!({ "required": marked_wu(true) });
     let s = shapes(m);
     let mut ep_tables = BTreeSet::new();
     let ep_extra_resident_bytes_per_rank = m
@@ -1692,6 +1704,14 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/lean/kda_carry_regstate/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let kda_wu_lean_required = manifest
+        .pointer("/objects/lean/kda_wu_lean/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let kda_carry_keyfeed_required = manifest
+        .pointer("/objects/lean/kda_carry_keyfeed/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let moe_prefill_ep_required = manifest
         .pointer("/objects/lean/moe_prefill_ep/required")
         .and_then(Value::as_bool)
@@ -1719,6 +1739,14 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_KDA_CARRY_REGSTATE {}\n",
         if kda_carry_regstate_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_WU_LEAN {}\n",
+        if kda_wu_lean_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_CARRY_KEYFEED {}\n",
+        if kda_carry_keyfeed_required { 1 } else { 0 }
     ));
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",

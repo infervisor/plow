@@ -663,6 +663,10 @@ option(PLOW_HSACO_KDA_KEY_FACTOR
        "Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair" OFF)
 option(PLOW_HSACO_KDA_CARRY_REGSTATE
        "Also build the packet-paired register-resident BT64/D128 KDA carry segment" OFF)
+option(PLOW_HSACO_KDA_WU_LEAN
+       "Also build the packet-paired lean four-wave BT64/D128 KDA Wu segment" OFF)
+option(PLOW_HSACO_KDA_CARRY_KEYFEED
+       "Also build the packet-paired key-fed lean Wu + register-state carry pair" OFF)
 option(PLOW_HSACO_XR_ATTNRES
        "Build the standalone two-shot XReduce+AttnRes segment object" OFF)
 option(PLOW_HSACO_MOE_STAGE2_LEAN
@@ -811,6 +815,8 @@ if(PLOW_GFX950_HSACO)
     set(_hs_need_kda_intra_wave_items OFF)
     set(_hs_need_attn_res_f32mix OFF)
     set(_hs_need_kda_carry_regstate OFF)
+    set(_hs_need_kda_wu_lean OFF)
+    set(_hs_need_kda_carry_keyfeed OFF)
     set(_hs_need_decode_mla ${PLOW_HSACO_DECODE_MLA_SEGMENTS})
     if(PLOW_HSACO_CONFIG)
         get_filename_component(_hs_cfg_dir "${PLOW_HSACO_CONFIG}" DIRECTORY)
@@ -858,6 +864,24 @@ if(PLOW_GFX950_HSACO)
         if(_hs_kda_carry_regstate_presence)
             set(_hs_need_kda_carry_regstate ON)
         endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_wu_lean_presence
+             REGEX "^#define PLOW_PACKET_REQUIRES_KDA_WU_LEAN 1$")
+        if(_hs_kda_wu_lean_presence)
+            set(_hs_need_kda_wu_lean ON)
+        endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_carry_keyfeed_presence
+             REGEX "^#define PLOW_PACKET_REQUIRES_KDA_CARRY_KEYFEED 1$")
+        if(_hs_kda_carry_keyfeed_presence)
+            set(_hs_need_kda_carry_keyfeed ON)
+        endif()
+    endif()
+    if((PLOW_HSACO_KDA_WU_LEAN OR PLOW_HSACO_KDA_CARRY_KEYFEED) AND NOT PLOW_HSACO_CONFIG)
+        message(FATAL_ERROR
+            "PLOW_HSACO_KDA_WU_LEAN / PLOW_HSACO_KDA_CARRY_KEYFEED require PLOW_HSACO_CONFIG for packet pairing")
+    endif()
+    if((_hs_need_kda_wu_lean OR _hs_need_kda_carry_keyfeed) AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR
+            "manifest-required lean KDA Wu / keyfeed objects are supported only on gfx950")
     endif()
     if(PLOW_HSACO_DECODE_INVENTORY_PRUNE AND NOT PLOW_HSACO_CONFIG)
         message(FATAL_ERROR
@@ -1459,6 +1483,61 @@ if(PLOW_GFX950_HSACO)
             VERBATIM)
         add_custom_target(kda_chunk_carry_regstate_gfx950 DEPENDS "${_hs_kda_carry_reg_out}")
         list(APPEND _hs_outs "${_hs_kda_carry_reg_out}")
+    endif()
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND
+       (PLOW_HSACO_KDA_WU_LEAN OR _hs_need_kda_wu_lean))
+        set(_hs_kda_wu_lean_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_wu_lean.hip")
+        set(_hs_kda_wu_lean_out "${PLOW_HSACO_DIR}/kda_chunk_wu_lean_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_wu_lean_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_wu_lean_out}"
+                    plow_kda_chunk_wu_lean_gfx950 256 2
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1
+                    "${_hs_kda_wu_lean_src}"
+            DEPENDS "${_hs_kda_wu_lean_src}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_wu_lean_common.h"
+                    "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_wu_lean_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_wu_lean_gfx950 DEPENDS "${_hs_kda_wu_lean_out}")
+        list(APPEND _hs_outs "${_hs_kda_wu_lean_out}")
+    endif()
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND
+       (PLOW_HSACO_KDA_CARRY_KEYFEED OR _hs_need_kda_carry_keyfeed))
+        set(_hs_kda_wu_keys_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_wu_lean_keys.hip")
+        set(_hs_kda_wu_keys_out "${PLOW_HSACO_DIR}/kda_chunk_wu_lean_keys_gfx950.elf")
+        set(_hs_kda_keyfeed_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_carry_regstate_keyfeed.hip")
+        set(_hs_kda_keyfeed_out "${PLOW_HSACO_DIR}/kda_chunk_carry_regstate_keyfeed_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_wu_keys_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_wu_keys_out}"
+                    plow_kda_chunk_wu_lean_keys_gfx950 256 2
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1
+                    "${_hs_kda_wu_keys_src}"
+            DEPENDS "${_hs_kda_wu_keys_src}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_wu_lean_common.h"
+                    "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_wu_lean_keys_gfx950.elf"
+            VERBATIM)
+        add_custom_command(OUTPUT "${_hs_kda_keyfeed_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_keyfeed_out}"
+                    plow_kda_chunk_carry_regstate_keyfeed_gfx950 256 1
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1
+                    "${_hs_kda_keyfeed_src}"
+            DEPENDS "${_hs_kda_keyfeed_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_carry_regstate_keyfeed_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_carry_keyfeed_gfx950
+            DEPENDS "${_hs_kda_wu_keys_out}" "${_hs_kda_keyfeed_out}")
+        list(APPEND _hs_outs "${_hs_kda_wu_keys_out}" "${_hs_kda_keyfeed_out}")
     endif()
 
     if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_KEY_FACTOR)

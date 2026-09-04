@@ -21,7 +21,11 @@
  * MFMA reads them transposed with immediate-offset 16-bit LDS loads. Every other chunk factor for
  * chunk c+1 is loaded during chunk c from clamped addresses and masked after the load, so the chunk
  * loop carries no bounds branch around a global load. Recurrence, MFMA order, and rounding points
- * are those of d_kda_chunk_carry_bt64<true>. */
+ * are those of d_kda_chunk_carry_bt64<true>.
+ *
+ * KEYFEED consumes the precomputed hi/lo pair (the kda_chunk_key_factor formula, rows beyond the
+ * chunk's valid rows ignored) instead of rebuilding it from k and g each chunk: the same tiles,
+ * loaded one chunk ahead in row layout. */
 namespace plow_kda_regstate {
 constexpr unsigned D = 128u, V = 128u, BT = 64u;
 constexpr unsigned SST = D + 8u;   /* [v][d] bf16 state snapshot row stride */
@@ -53,10 +57,11 @@ struct Factors {
     bf16x8 w[4], q[4];
     bf16 u[4];
     f32x4 aqk[2][2];
-    u32x4 kn[4];       /* k[row0 + lane][32w .. 32w+32), bf16 pairs */
+    u32x4 kn[4];       /* k[row0 + lane][32w .. 32w+32), bf16 pairs (key_hi under KEYFEED) */
     f32x4 gn[8];       /* g at the same positions */
     const float* glp;  /* g_last[32w ..], same chunk as kn/gn */
     f32x4 gl4[2];      /* g_last[32w + 16b + 4kg .. +4], one chunk ahead */
+    u32x4 kl[4];       /* key_lo at kn's positions (KEYFEED only) */
 };
 
 __device__ __forceinline__ void load_rows(
@@ -117,6 +122,35 @@ __device__ __forceinline__ void load_keys(
     f.glp = g + (last * H + h) * D + 32u * wave;
 }
 
+__device__ __forceinline__ void load_keys_fed(
+    Factors& f, const bf16* __restrict__ key_hi, const bf16* __restrict__ key_lo, unsigned T,
+    unsigned H, unsigned h, unsigned row0, unsigned wave, unsigned lane) {
+    const size_t row = min(row0 + lane, T - 1u);
+    const size_t base = (row * H + h) * D + 32u * wave;
+#pragma unroll
+    for (unsigned t = 0; t < 4u; ++t) {
+        f.kn[t] = *reinterpret_cast<const u32x4*>(key_hi + base + 8u * t);
+        f.kl[t] = *reinterpret_cast<const u32x4*>(key_lo + base + 8u * t);
+    }
+}
+
+/* KEYFEED tile build: the loaded rows, zeroed at rows >= valid. */
+__device__ __forceinline__ void make_key_tiles_fed(
+    const Factors& f, bf16* __restrict__ khi, bf16* __restrict__ klo, unsigned valid,
+    unsigned lane) {
+    bf16* hp = khi + lane * KST;
+    bf16* lp = klo + lane * KST;
+#pragma unroll
+    for (unsigned t = 0; t < 4u; ++t) {
+        const u32x4 hv = lane < valid ? f.kn[t] : (u32x4)(0u);
+        const u32x4 lv = lane < valid ? f.kl[t] : (u32x4)(0u);
+        *reinterpret_cast<u32x2*>(hp + 8u * t) = u32x2{hv[0], hv[1]};
+        *reinterpret_cast<u32x2*>(hp + 8u * t + 4u) = u32x2{hv[2], hv[3]};
+        *reinterpret_cast<u32x2*>(lp + 8u * t) = u32x2{lv[0], lv[1]};
+        *reinterpret_cast<u32x2*>(lp + 8u * t + 4u) = u32x2{lv[2], lv[3]};
+    }
+}
+
 /* Row `lane` of the chunk's key factors into this wave's hi/lo tiles; rows >= valid are zero. */
 template <bool HW>
 __device__ __forceinline__ void make_key_tiles(
@@ -163,14 +197,16 @@ __device__ __forceinline__ u16x4 pack_bf16x4(f32x4 v) {
 
 /* `n_chunks` dense BT64 chunks; `lds` is LDS_BYTES of 16-byte aligned scratch.
  * Must be launched with exactly four waves per workgroup. TIMED accumulates wave-0 s_memtime
- * phase cycles into timers[slice * 8 + 0..6] (bench instrumentation only). */
-template <bool TIMED = false, bool HW_CVT = false>
+ * phase cycles into timers[slice * 8 + 0..6] (bench instrumentation only). KEYFEED reads the
+ * scaled-key pair from key_hi/key_lo ([T][H][D] bf16 each) instead of k and g. */
+template <bool TIMED = false, bool HW_CVT = false, bool KEYFEED = false>
 __device__ void d_kda_chunk_carry_bt64_regstate(
     bf16* __restrict__ out, float* __restrict__ state, const bf16* __restrict__ q,
     const bf16* __restrict__ k, const bf16* __restrict__ W, const bf16* __restrict__ U,
     const float* __restrict__ Aqk, const float* __restrict__ g, unsigned n_chunks,
     unsigned T, unsigned H, unsigned slice, unsigned nblk, bf16* __restrict__ lds,
-    unsigned long long* __restrict__ timers = nullptr) {
+    unsigned long long* __restrict__ timers = nullptr,
+    const bf16* __restrict__ key_hi = nullptr, const bf16* __restrict__ key_lo = nullptr) {
     using namespace plow_kda_regstate;
     unsigned long long acc[7] = {0, 0, 0, 0, 0, 0, 0};
     const unsigned long long t_begin = TIMED ? __builtin_amdgcn_s_memtime() : 0ull;
@@ -198,11 +234,18 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
         load_rows(F, q, W, U, T, H, h, v0, 0u, wave, token, kg);
         load_aqk(F, Aqk, T, H, h, 0u, wave, token, kg);
         load_decay(F, g, H, h, 0u, min(BT, T), wave, kg);
-        load_keys(F, k, g, T, H, h, 0u, min(BT, T), wave, lane);
-        make_key_tiles<HW_CVT>(F, khi, klo, min(BT, T), lane);
-        {
+        if constexpr (KEYFEED) {
+            load_keys_fed(F, key_hi, key_lo, T, H, h, 0u, wave, lane);
+            make_key_tiles_fed(F, khi, klo, min(BT, T), lane);
             const unsigned c1 = min(1u, n_chunks - 1u);
-            load_keys(F, k, g, T, H, h, c1 * BT, min(BT, T - c1 * BT), wave, lane);
+            load_keys_fed(F, key_hi, key_lo, T, H, h, c1 * BT, wave, lane);
+        } else {
+            load_keys(F, k, g, T, H, h, 0u, min(BT, T), wave, lane);
+            make_key_tiles<HW_CVT>(F, khi, klo, min(BT, T), lane);
+            {
+                const unsigned c1 = min(1u, n_chunks - 1u);
+                load_keys(F, k, g, T, H, h, c1 * BT, min(BT, T - c1 * BT), wave, lane);
+            }
         }
         __syncthreads();
 
@@ -282,8 +325,13 @@ __device__ void d_kda_chunk_carry_bt64_regstate(
             }
             PLOW_RS_STAMP(t4);
             load_decay(F, g, H, h, row0n, validn, wave, kg);
-            make_key_tiles<HW_CVT>(F, khi, klo, validn, lane);
-            load_keys(F, k, g, T, H, h, cnn * BT, min(BT, T - cnn * BT), wave, lane);
+            if constexpr (KEYFEED) {
+                make_key_tiles_fed(F, khi, klo, validn, lane);
+                load_keys_fed(F, key_hi, key_lo, T, H, h, cnn * BT, wave, lane);
+            } else {
+                make_key_tiles<HW_CVT>(F, khi, klo, validn, lane);
+                load_keys(F, k, g, T, H, h, cnn * BT, min(BT, T - cnn * BT), wave, lane);
+            }
             PLOW_RS_STAMP(t5);
             __syncthreads();
             if constexpr (TIMED) {

@@ -409,6 +409,16 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_KDA_KEY_FACTOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_key_factor: bool,
 
+    /// Mark exact qpre BT64/D128 chunk-KDA Wu segments for the lean four-wave gfx950 Wu object.
+    /// Default off; the marked packet then requires its packet-paired object at load.
+    #[arg(long, env = "PLOW_KDA_WU_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_wu_lean: bool,
+
+    /// Feed the lean Wu's scaled-key hi/lo pair into the register-state carry (implies the lean
+    /// Wu; needs `PLOW_KDA_CARRY_REGSTATE`). Default off.
+    #[arg(long, env = "PLOW_KDA_CARRY_KEYFEED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_carry_keyfeed: bool,
+
     /// K3 up-projection no-gather mode (diagnostic).
     #[arg(long, env = "PLOW_K3_UP_NOGATHER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_up_nogather: bool,
@@ -804,6 +814,8 @@ impl EmitConfig {
             kda_intra_wave_items: env_opt_out("PLOW_KDA_INTRA_WAVE_ITEMS"),
             kda_carry_regstate: env_opt_out("PLOW_KDA_CARRY_REGSTATE"),
             kda_key_factor: env_opt_out("PLOW_KDA_KEY_FACTOR"),
+            kda_wu_lean: env_bool("PLOW_KDA_WU_LEAN"),
+            kda_carry_keyfeed: env_bool("PLOW_KDA_CARRY_KEYFEED"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),

@@ -6926,6 +6926,12 @@ fn emit_dense_gqa(
                 && emit_config::active().kda_chunk_qpre
                 && emit_config::active().kda_carry_regstate,
         );
+        b.set_kda_wu_lean_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().kda_chunk_qpre
+                && (emit_config::active().kda_wu_lean || emit_config::active().kda_carry_keyfeed),
+        );
+        b.set_kda_carry_keyfeed_segments(emit_config::active().kda_carry_keyfeed);
         if amd {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }

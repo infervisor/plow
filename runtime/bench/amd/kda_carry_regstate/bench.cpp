@@ -17,12 +17,58 @@ extern "C" void k_carry_control_timed();
 extern "C" void k_carry_regstate();
 extern "C" void k_carry_regstate_timed();
 extern "C" void k_carry_regstate_hwcvt();
+extern "C" void k_key_precompute();
+extern "C" void k_carry_regstate_keyfeed();
+extern "C" void k_carry_regstate_keyfeed_timed();
 
 static uint16_t bf16(float x) {
     uint32_t u;
     std::memcpy(&u, &x, 4);
     u += 0x7fffu + ((u >> 16) & 1u);
     return uint16_t(u >> 16);
+}
+
+/* MODE 0: the structured screen inputs. MODE 1: LCG uniform in [-1, 1) (g in [-0.5, 0)).
+ * MODE 2: adversarial — NaN/Inf/denormal/RNE-tie sprinkles in every bf16 operand, gates spanning
+ * exp2 overflow and underflow, zero rows. */
+static uint32_t lcg_state = 0x9e3779b9u;
+static float lcg() {
+    lcg_state = lcg_state * 1664525u + 1013904223u;
+    return float(lcg_state >> 8) * (1.0f / 16777216.0f) * 2.0f - 1.0f;
+}
+static uint16_t adv_bf16(float base) {
+    const uint32_t r = (lcg_state = lcg_state * 1664525u + 1013904223u) >> 8;
+    switch (r % 61u) {
+        case 0: return 0x7fc0u;             /* qNaN */
+        case 1: return 0xffc1u;             /* -qNaN, payload */
+        case 2: return 0x7f80u;             /* +Inf */
+        case 3: return 0xff80u;             /* -Inf */
+        case 4: return 0x0001u;             /* bf16 denormal */
+        case 5: return 0x8000u;             /* -0 */
+        case 6: return 0x7f7fu;             /* bf16 max */
+        default: return bf16(base * ((r & 1u) ? 1.0f : 64.0f));
+    }
+}
+static float adv_gate(float base) {
+    const uint32_t r = (lcg_state = lcg_state * 1664525u + 1013904223u) >> 8;
+    switch (r % 53u) {
+        case 0: return -200.0f;             /* exp2 underflow */
+        case 1: return 150.0f;              /* exp2 overflow */
+        case 2: return 0.0f;
+        case 3: return -1.0e-40f;           /* f32 denormal */
+        default: return base;
+    }
+}
+static float adv_f32(float base) {
+    const uint32_t r = (lcg_state = lcg_state * 1664525u + 1013904223u) >> 8;
+    switch (r % 47u) {
+        case 0: return __builtin_nanf("");
+        case 1: return __builtin_inff();
+        case 2: return 1.0e-39f;
+        case 3: return 3.0e38f;
+        case 4: return 1.00390625f;         /* bf16 RNE tie */
+        default: return base;
+    }
 }
 
 template<class T> static T* upload(const std::vector<T>& h) {
@@ -70,7 +116,8 @@ int main(int argc, char** argv) {
     const unsigned H = argc > 2 ? std::strtoul(argv[2], nullptr, 0) : 12u;
     const unsigned nsample = argc > 3 ? std::strtoul(argv[3], nullptr, 0) : 21u;
     const bool timers_on = argc > 4 && std::strtoul(argv[4], nullptr, 0);
-    if (!T || !H || !nsample) return 2;
+    const unsigned mode = argc > 5 ? std::strtoul(argv[5], nullptr, 0) : 0u;
+    if (!T || !H || !nsample || mode > 2u) return 2;
 
     constexpr unsigned D = 128u, V = 128u;
     constexpr size_t control_lds = 14336u;
@@ -96,6 +143,27 @@ int main(int argc, char** argv) {
     }
     for (size_t i = 0; i < sn; ++i)
         state0[i] = float(int((i * 59u) % 53u) - 26) * 0.0001f;
+    if (mode == 1u) {
+        for (size_t i = 0; i < qn; ++i) {
+            q[i] = bf16(lcg()); k[i] = bf16(lcg()); w[i] = bf16(lcg());
+            g[i] = 0.25f * (lcg() - 1.0f);
+        }
+        for (size_t i = 0; i < vn; ++i) u[i] = bf16(lcg());
+        for (size_t i = 0; i < an; ++i)
+            aqk[i] = (i % 64u) <= ((i / 64u) % 64u) ? 0.01f * lcg() : 0.0f;
+        for (size_t i = 0; i < sn; ++i) state0[i] = 0.1f * lcg();
+    } else if (mode == 2u) {
+        for (size_t i = 0; i < qn; ++i) {
+            q[i] = adv_bf16(lcg()); k[i] = adv_bf16(lcg()); w[i] = adv_bf16(lcg());
+            g[i] = adv_gate(4.0f * (lcg() - 1.0f));
+        }
+        for (size_t i = 0; i < vn; ++i) u[i] = adv_bf16(lcg());
+        for (size_t i = 0; i < an; ++i)
+            aqk[i] = (i % 64u) <= ((i / 64u) % 64u) ? adv_f32(lcg()) : 0.0f;
+        for (size_t i = 0; i < sn; ++i) state0[i] = adv_f32(lcg());
+        for (size_t r = 5; r < T; r += 97) /* zero rows */
+            for (size_t j = 0; j < (size_t)H * D; ++j) { k[r * H * D + j] = 0; w[r * H * D + j] = 0; }
+    }
 
     uint16_t* dq = upload(q);
     uint16_t* dk = upload(k);
@@ -104,6 +172,14 @@ int main(int argc, char** argv) {
     float* da = upload(aqk);
     float* da_ref = upload(aqk);
     float* dg = upload(g);
+    uint16_t* dkh = allocate<uint16_t>(qn);
+    uint16_t* dkl = allocate<uint16_t>(qn);
+    {
+        void* args[] = {&dkh, &dkl, &dk, &dg, (void*)&T, (void*)&H};
+        CHECK(hipLaunchKernel((const void*)k_key_precompute, dim3(1024), dim3(256), args, 0,
+                              nullptr));
+        CHECK(hipDeviceSynchronize());
+    }
 
     Arm arms[] = {
         {"control_v16_wg512", (const void*)k_carry_control, dim3(H * 8u), dim3(512),
@@ -112,12 +188,14 @@ int main(int argc, char** argv) {
          0, allocate<uint16_t>(vn), upload(state0), {}},
         {"regstate_hwcvt_v16_wg256", (const void*)k_carry_regstate_hwcvt, dim3(H * 8u),
          dim3(256), 0, allocate<uint16_t>(vn), upload(state0), {}},
+        {"regstate_keyfeed_v16_wg256", (const void*)k_carry_regstate_keyfeed, dim3(H * 8u),
+         dim3(256), 0, allocate<uint16_t>(vn), upload(state0), {}},
     };
     constexpr unsigned narms = sizeof(arms) / sizeof(arms[0]);
 
     auto launch = [&](Arm& arm) {
         void* args[] = {&arm.out, &arm.state, &dq, &dk, &dw, &du, &da, &dg,
-                        (void*)&T, (void*)&H};
+                        (void*)&T, (void*)&H, &dkh, &dkl};
         CHECK(hipLaunchKernel(arm.kernel, arm.grid, arm.block, args, arm.lds, nullptr));
     };
 
@@ -158,13 +236,16 @@ int main(int argc, char** argv) {
             {"regstate", (const void*)k_carry_regstate_timed, 256, 0,
              {"p1_pred_vsm", "loads+bar1", "p2_out", "p3_upd_state", "keys+loads", "bar2",
               "total"}},
+            {"keyfeed", (const void*)k_carry_regstate_keyfeed_timed, 256, 0,
+             {"p1_pred_vsm", "loads+bar1", "p2_out", "p3_upd_state", "keys+loads", "bar2",
+              "total"}},
         };
         for (const Timed& tk : timed) {
             unsigned long long* dt = allocate<unsigned long long>((size_t)nblk * 8u);
             uint16_t* tout = allocate<uint16_t>(vn);
             float* tstate = upload(state0);
             void* args[] = {&tout, &tstate, &dq, &dk, &dw, &du, &da, &dg,
-                            (void*)&T, (void*)&H, &dt};
+                            (void*)&T, (void*)&H, &dt, &dkh, &dkl};
             for (unsigned rep = 0; rep < 3u; ++rep)
                 CHECK(hipLaunchKernel(tk.kernel, dim3(nblk), dim3(tk.block), args, tk.lds,
                                       nullptr));
@@ -198,7 +279,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("shape T=%u H=%u D=%u V=%u BT=64 samples=%u\n", T, H, D, V, nsample);
+    std::printf("shape T=%u H=%u D=%u V=%u BT=64 samples=%u mode=%u\n", T, H, D, V, nsample,
+                mode);
     const float base = median(arms[0].samples);
     for (Arm& arm : arms) {
         const float m = median(arm.samples);
