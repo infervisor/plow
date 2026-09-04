@@ -212,6 +212,13 @@ except the active prefill GQ object; runtime, packet, config/TuneDB, checkpoint,
 mode, and segment-major dispatch were held fixed. Promotion still requires an exact 256-token
 continuation with neutral TPOT and a matched raw trace showing the reduce-scatter reduction.
 
+The paired 8192→256 continuation gate passed with all 256 output IDs exact
+(`sha256=ae45c1ca8beb25651b4cc103900d7c3001d015530fff1b5241b0c04882f7a4b0`), every-dispatch
+counter audit, and all-rank completion. Control/U2 TTFT was 1405.525/1371.488 ms, a 34.036 ms
+saving. TPOT was 29.937729/29.921618 ms, so U2 was neutral at −0.016111 ms. The same BF16,
+segment-major, 37-object pairing and rollback contract were used. A matched phase trace remains
+the final attribution gate before promotion.
+
 ## Pinned vLLM/AITER comparison
 
 vLLM 0.28 pins AITER 0.1.19. Its default custom-all-reduce cutoff is 64 MiB even though the
