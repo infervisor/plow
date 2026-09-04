@@ -26,7 +26,7 @@
  * Built by scripts/build_tp_allreduce.sh. Run on >= 2 idle gfx950:
  *   ./tp_allreduce_bench 1 2 3            # rank count = number of device ids given
  *   TP_HIDDEN=7168 TP_ITERS=4000 ./tp_allreduce_bench 1 2
- * env: TP_HIDDEN (default 7168, Kimi K2.7), TP_ITERS, TP_ELF.
+ * env: TP_HIDDEN (default 7168), TP_NWG (default 64), TP_ITERS, TP_ELF.
  */
 #include "../amd/hsa_backend.h"
 
@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc && NR < TP_MAXR; i++) dev[NR++] = atoi(argv[i]);
     if (NR == 0) { dev[0] = 0; dev[1] = 1; NR = 2; }
     const uint32_t HID = (uint32_t)(getenv("TP_HIDDEN") ? atoi(getenv("TP_HIDDEN")) : 7168);
+    const uint32_t NWG = (uint32_t)(getenv("TP_NWG") ? atoi(getenv("TP_NWG")) : 64);
     const uint32_t ITERS = (uint32_t)(getenv("TP_ITERS") ? atoi(getenv("TP_ITERS")) : 4000);
     const char* elf_path = getenv("TP_ELF") ? getenv("TP_ELF") : "tp_allreduce_kernels.elf";
     /* batch points: dense at the low end where a launched engine needs one-stage, then the
@@ -85,8 +86,9 @@ int main(int argc, char** argv) {
     printf("== plow one-shot all-reduce — %u ranks, batch sweep (gfx950 / XGMI) ==\n", NR);
     printf("GPUs discovered: %d   ranks:", ndev);
     for (uint32_t i = 0; i < NR; i++) printf(" GPU%d", dev[i]);
-    printf("   hidden=%u  iters=%u\n\n", HID, ITERS);
+    printf("   hidden=%u  nblk=%u  iters=%u\n\n", HID, NWG, ITERS);
     if (NR < 2) { printf("need >= 2 ranks\n"); return 2; }
+    if (NWG == 0) { printf("TP_NWG must be positive\n"); return 2; }
     for (uint32_t i = 0; i < NR; i++) {
         if (dev[i] >= ndev) { printf("device %d out of range (have %d)\n", dev[i], ndev); return 2; }
         for (uint32_t j = 0; j < i; j++)
@@ -150,10 +152,10 @@ int main(int argc, char** argv) {
         arg_ar a[TP_MAXR];
         for (uint32_t i = NR - 1; i >= 1; i--) {
             a[i] = (arg_ar){ out[i], scr_tbl[i], gate_tbl[i], NR, i, N, 0, ITERS, deadline, NULL, stat[i] };
-            plow_hsa_launch(h, dev[i], &k_ar[i], 64 * 512, 1, 1, 512, 1, 1, 0, &a[i], sizeof a[i]);
+            plow_hsa_launch(h, dev[i], &k_ar[i], NWG * 512, 1, 1, 512, 1, 1, 0, &a[i], sizeof a[i]);
         }
         a[0] = (arg_ar){ out[0], scr_tbl[0], gate_tbl[0], NR, 0, N, 0, ITERS, deadline, cyc, stat[0] };
-        plow_hsa_launch(h, dev[0], &k_ar[0], 64 * 512, 1, 1, 512, 1, 1, 0, &a[0], sizeof a[0]);
+        plow_hsa_launch(h, dev[0], &k_ar[0], NWG * 512, 1, 1, 512, 1, 1, 0, &a[0], sizeof a[0]);
         for (uint32_t i = 0; i < NR; i++) plow_hsa_wait(h, dev[i]);
 
         int timeout = 0;
