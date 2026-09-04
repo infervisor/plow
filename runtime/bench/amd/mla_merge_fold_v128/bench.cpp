@@ -47,6 +47,21 @@ static double median(std::vector<double> values) {
     return values[values.size() / 2];
 }
 
+static uint64_t hash_output(const std::vector<uint16_t>& output) {
+    uint64_t hash = 1469598103934665603ull;
+    for (uint16_t value : output) {
+        hash ^= value & 0xffu;
+        hash *= 1099511628211ull;
+        hash ^= value >> 8;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static unsigned ordered_bf16(uint16_t value) {
+    return value & 0x8000u ? 0x8000u - (value & 0x7fffu) : 0x8000u + value;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s <kernel.co> [odd-samples]\n", argv[0]);
@@ -105,7 +120,8 @@ int main(int argc, char** argv) {
     bool failed = false;
     std::printf("shape T=%u H=%u DK=%u V=%u nsplit=%u grid=%u WG=%u wave=64\n", TOKENS,
                 HEADS, DK, DV, NSPLIT, GRID, THREADS);
-    std::printf("%-20s %12s %12s %12s\n", "variant", "median_us", "vs_tb1", "bitcmp");
+    std::printf("%-20s %12s %12s %12s %18s\n", "variant", "median_us", "vs_tb1", "bitcmp",
+                "fnv1a64");
     double control_us = 0.0;
     for (unsigned kernel = 0; kernel < 4; ++kernel) {
         CK(hipMemset(out, 0, out_count * sizeof(*out)));
@@ -142,8 +158,28 @@ int main(int argc, char** argv) {
                                                out_count * sizeof(*out)) == 0;
             failed |= !identical;
             bitcmp = identical ? "IDENTICAL" : "DIFFERS";
+            if (!identical) {
+                size_t mismatch_count = 0, first = out_count;
+                unsigned max_ulp = 0;
+                for (size_t i = 0; i < out_count; ++i) {
+                    if (reference[i] == current[i]) continue;
+                    if (first == out_count) first = i;
+                    ++mismatch_count;
+                    const unsigned a = ordered_bf16(reference[i]);
+                    const unsigned b = ordered_bf16(current[i]);
+                    max_ulp = std::max(max_ulp, a > b ? a - b : b - a);
+                }
+                std::fprintf(stderr,
+                             "%s mismatch count=%zu first=%zu (t=%zu h=%zu v=%zu) "
+                             "ref=0x%04x got=0x%04x max_bf16_ulp=%u\n",
+                             names[kernel], mismatch_count, first, first / (HEADS * DV),
+                             first / DV % HEADS, first % DV, reference[first], current[first],
+                             max_ulp);
+            }
         }
-        std::printf("%-20s %12.3f %11.3fx %12s\n", names[kernel], us, control_us / us, bitcmp);
+        std::printf("%-20s %12.3f %11.3fx %12s %016llx\n", names[kernel], us,
+                    control_us / us, bitcmp,
+                    static_cast<unsigned long long>(hash_output(current)));
     }
     return failed ? 1 : 0;
 }
