@@ -66,3 +66,11 @@ Promote by rule: with the two records present the K3 emit selects the standalone
 without any model predicate; any other geometry keeps the interpreter route until both of its
 routes are measured and published with `scripts/tune_moe_decode_publish.py`. Rollback:
 `PLOW_SEG_DECODE_GROUPED_MOE=0` (explicit) or removing the records.
+
+## Stacked with the GLU UN=7 rung
+
+Same control; candidate = the rule-selected standalone packet with objects built from the source
+carrying the GLU rung (`perf-data/mi355x-gemv-glu-un7-20260904.md`), grouped object ON. Three
+alternating exact 8192→256 folds: control 28.568 / 28.605 / 28.574 ms vs stacked
+27.822 / 27.712 / 27.711 ms TPOT p50 → **−0.834 ms/token (−2.92%)**, checksum
+`fnv1a64:b7682a38c151ac99` on every fold, TTFT unchanged. Artifacts `bench-stack-*.log`.
