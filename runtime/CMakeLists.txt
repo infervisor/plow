@@ -739,6 +739,16 @@ set(PLOW_XR_RS_U "${_PLOW_XR_RS_U_DEFAULT}" CACHE STRING
 if(NOT PLOW_XR_RS_U MATCHES "^(1|2)$")
     message(FATAL_ERROR "PLOW_XR_RS_U must be 1 or 2")
 endif()
+# Prefill collective data-movement schedule (op_collective.h PLOW_XR_SCHED_AITER): `off` keeps
+# the shipping loops; `aiter` moves the reduce-scatter and all-gather bytes as AITER's gfx950
+# two-stage kernel does (16-byte packs, eight peers in flight, wave-per-peer gather) under the
+# same strict rank order. Prefill objects only; every other object is untouched. The 16-byte
+# form wants 40-56 collective workgroups, not 256: pair it with a packet emitted under
+# `PLOW_XR_CUS=48` (op_collective.h has the sweep).
+set(PLOW_XR_SCHED "off" CACHE STRING "Prefill collective data schedule: off or aiter (pair with PLOW_XR_CUS=48)")
+if(NOT PLOW_XR_SCHED MATCHES "^(off|aiter)$")
+    message(FATAL_ERROR "PLOW_XR_SCHED must be off or aiter")
+endif()
 
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
 # Discovered from the INSTALLED ROCm rather than pinned: this path was pinned to
@@ -939,6 +949,9 @@ if(PLOW_GFX950_HSACO)
     endif()
     if(PLOW_XR_RS_U STREQUAL "2")
         list(APPEND _hs_ax_prefill -DPLOW_XR_RS_U=2)
+    endif()
+    if(PLOW_XR_SCHED STREQUAL "aiter")
+        list(APPEND _hs_ax_prefill -DPLOW_XR_SCHED_AITER=1)
     endif()
     # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). Wide gfx950 objects use
     # MM=8 with the walk: the B128 production A/B retained occupancy 2 and improved output

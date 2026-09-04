@@ -71,7 +71,57 @@ extern "C" __global__ void tp_allreduce_twoshot_gather(
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
 
+/* Random bf16 partials for the strict-order oracle (tp_allreduce_prefill_bench TP_RANDOM=1):
+ * exponents span 2^-8..2^7 so the f32 sum depends on the rank order and a mis-rounded or
+ * reordered element is caught; the host computes the same words. */
+__device__ __forceinline__ uint32_t tp_hash(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+extern "C" __global__ void tp_fill_random(bf16* part, uint32_t n, uint32_t rank, uint32_t seed) {
+    const uint32_t rs = tp_hash(rank * 0x9E3779B9u + seed);
+    for (uint32_t e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += gridDim.x * blockDim.x) {
+        const uint32_t h = tp_hash(e ^ rs);
+        part[e] = (bf16)(((h >> 31) << 15) | ((120u + ((h >> 20) & 15u)) << 7) | (h & 0x7fu));
+    }
+}
+
 #if PLOW_SEQ_PAR_SEAMS
+/* PER-PHASE timing (tp_allreduce_prefill_bench TP_PHASES=1): op 25 then op 26 on the same
+ * operands, so the reduce-scatter and the all-gather are priced separately, each with its own
+ * rendezvous. The packet boundary between them is stood in for by a device-local barrier
+ * (system-scope release arrival, acquire on exit), which is what makes op 26's one-workgroup
+ * announcement legal. cycles[0] = reduce-scatter + barrier, cycles[1] = all-gather. */
+extern "C" __global__ void tp_seams_timed(bf16* out, const void* const* peer_scratch,
+                                          uint32_t nranks, uint32_t rank, uint32_t n,
+                                          uint32_t slot_bytes, uint64_t xctr_byte_off,
+                                          uint32_t iters, uint64_t deadline, uint64_t* cycles,
+                                          uint32_t* status, uint32_t* lctr) {
+    uint64_t rs = 0, ag = 0;
+    for (uint32_t i = 0; i < iters; i++) {
+        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        d_xreduce_scatter_mega(peer_scratch, nranks, rank, n, slot_bytes, (size_t)xctr_byte_off,
+                               2u * i, deadline, status, blockIdx.x, gridDim.x, 0u, 0u, nullptr);
+        if (threadIdx.x == 0) {
+            __hip_atomic_fetch_add(lctr, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            while (__hip_atomic_load(lctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) <
+                   (i + 1u) * gridDim.x)
+                __builtin_amdgcn_s_sleep(2);
+            xctr_acquire();
+        }
+        __syncthreads();
+        const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+        d_xall_gather_mega(peer_scratch, nranks, rank, (size_t)xctr_byte_off, 2u * i + 1u,
+                           deadline, status, blockIdx.x, gridDim.x, out, n, slot_bytes, nullptr,
+                           0u, 0u, nullptr, 0u, 0u);
+        __syncthreads();
+        const uint64_t t2 = __builtin_amdgcn_s_memrealtime();
+        rs += t1 - t0;
+        ag += t2 - t1;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) { cycles[0] = rs; cycles[1] = ag; }
+}
+
 /* Sequence-parallel seam halves (ops 25/26), for tp_seqpar_smoke.c: the reduce-scatter with
  * the FFN-seam gather fold and the local band copy, then the all-gather of up to three
  * arrays. Same bodies the interpreter dispatches. */

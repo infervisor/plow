@@ -168,6 +168,57 @@ extern "C" __device__ unsigned plow_xr_rs_u2 = 1;
 #endif
 #define PLOW_XR_WAVE_RS_ON (PLOW_XR_WAVE_RS && !PLOW_XR_SHUFFLE)
 
+/* PLOW_XR_SCHED_AITER=1 (CMake -DPLOW_XR_SCHED=aiter; default OFF, flag-off objects byte-identical):
+ * AITER's prefill DATA-MOVEMENT schedule under Plow's protocol and STRICT rank order.
+ *
+ * AITER's gfx950 `cross_device_reduce_2stage<bf16, 8>` (vLLM 0.28 pin, 80 WG x 512, 48 VGPR)
+ * moves 112 MiB in 500 us where the shipped two-shot takes 634-705 us (both TP8 MI355X,
+ * corrected 10 ns tick). Its schedule: 16-byte packs per lane, eight peers in flight per
+ * workgroup (one per wave through LDS) in the reduce-scatter, and a wave-per-peer 16-byte copy
+ * in the all-gather. Its accumulate is rank-ROTATED, which is why porting the kernel was rejected.
+ *
+ * This arm keeps the protocol (gates, signals, aggregation, workgroup count, element ownership)
+ * and only changes how the bytes move: each lane loads one 16-byte pack from ALL eight peers
+ * before the first add (the same eight links busy as AITER's wave-per-peer form, without the
+ * LDS round trip that idles seven waves during the sum), accumulates r = 0..N-1 in f32 with the
+ * one f2bf the scalar loop performs, and the all-gather runs wave w on peer (w + rank) % N with
+ * 16-byte loads and stores, two packs in flight per lane. Per element the arithmetic is the
+ * shipping loop's; only the (thread, element) map and the load width change, so every output is
+ * bit-identical (random-data strict-order oracle, identical checksums on all ranks, 09-04).
+ * Ranges whose 16-byte lines are misaligned (slot, band, gather or residual base, or a pack
+ * that straddles a slice) take the scalar loop element by element; TP != 8 takes the scalar
+ * reduce-scatter and the workgroup-staggered 16-byte gather.
+ *
+ * THE WORKGROUP COUNT IS PART OF THE SCHEDULE. The fabric wants ~256-512 KiB in flight per
+ * link; the 2-byte loop reaches that with 256 workgroups and collapses below (80 WGs: +84%),
+ * the 16-byte form reaches it with 32-56 and collapses above (256 WGs: +43%). Measured 112 MiB
+ * two-shot, 8x MI355X, us: 2 B @256 = 705; 16 B @16/24/32/40/48/64/128/256 = 825/622/560/524/
+ * 535/575/775/1001. Per phase at 48 WGs: reduce-scatter 312 -> 275, all-gather 326 -> 254.
+ * So the packet that runs this arm must be emitted with `PLOW_XR_CUS=48` (the collective's CU
+ * set; every other packet is unchanged) — the arm on a 256-workgroup packet is a regression.
+ * AITER's exact one-load-per-lane walk (dependency-chained) was 4-9% slower than the hoisted
+ * eight; 8-byte packs 2-3% slower than 16; two reduce-scatter packs per lane no better. */
+#ifndef PLOW_XR_SCHED_AITER
+#define PLOW_XR_SCHED_AITER 0
+#endif
+#if PLOW_XR_SCHED_AITER
+extern "C" __device__ unsigned plow_xr_sched_aiter_1 = 1;
+#endif
+#define PLOW_XR_SCHED_ON (PLOW_XR_SCHED_AITER && !PLOW_XR_SHUFFLE)
+/* Packs in flight per lane (reduce-scatter: per peer; all-gather: per slice) and the all-gather
+ * form (1 = wave-per-peer, 0 = workgroup-staggered peer walk). Screen knobs; the defaults are
+ * the measured form. */
+#ifndef PLOW_XR_SCHED_RS_U
+#define PLOW_XR_SCHED_RS_U 1
+#endif
+#ifndef PLOW_XR_SCHED_AG_U
+#define PLOW_XR_SCHED_AG_U 2
+#endif
+#ifndef PLOW_XR_SCHED_AG_WAVE
+#define PLOW_XR_SCHED_AG_WAVE 1
+#endif
+#define PLOW_XR_SCHED_NR 8u
+
 /* PLOW_XR_AGG -- DEVICE-LOCAL AGGREGATION OF THE TWO-SHOT'S `gate_ag` SIGNAL
  * (default in gfx942/gfx950 prefill objects; objects-only, no blob or emitter change).
  *
@@ -896,6 +947,170 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
     }
 }
 
+#if PLOW_XR_SCHED_ON
+#define XR_PK 8u
+#define XR_PKB 16u
+typedef bf16v8 xr_pack_t;
+__device__ __forceinline__ bool xr_alp(const void* p) { return ((uintptr_t)p & (XR_PKB - 1u)) == 0u; }
+__device__ __forceinline__ xr_pack_t xr_ld(const bf16* p) { return ld_glob8(as_glob(p)); }
+__device__ __forceinline__ void xr_st(bf16* p, xr_pack_t v) { st_glob8(p, v); }
+/* [lo, hi) as scalar head [lo, vlo), packs [vlo, vhi), scalar tail [vhi, hi). */
+__device__ __forceinline__ void xr_vrange(uint32_t lo, uint32_t hi, bool ok, uint32_t* vlo,
+                                          uint32_t* vhi) {
+    const uint32_t a = (lo + XR_PK - 1u) & ~(XR_PK - 1u), b = hi & ~(XR_PK - 1u);
+    const bool v = ok && a < b;
+    *vlo = v ? a : lo;
+    *vhi = v ? b : lo;
+}
+/* Strict-order sum of eight packs, then the scalar loop's single rounding. */
+__device__ __forceinline__ xr_pack_t xr_sum8(const xr_pack_t (&v)[PLOW_XR_SCHED_NR]) {
+    float acc[XR_PK] = {};
+#pragma unroll
+    for (uint32_t r = 0; r < PLOW_XR_SCHED_NR; r++)
+#pragma unroll
+        for (uint32_t k = 0; k < XR_PK; k++) acc[k] += bf2f(v[r][k]);
+    xr_pack_t o;
+#pragma unroll
+    for (uint32_t k = 0; k < XR_PK; k++) o[k] = f2bf(acc[k]);
+    return o;
+}
+/* Reduce-scatter body: [my_lo, my_hi) of the flat partial at `slot_bytes`, in place into
+ * `my_part`, with the FFN-seam fold (`gcols`) and the local band copy of op 25. */
+__device__ __forceinline__ void xr_rs_sched(const void* const* peer_scratch, uint32_t nranks,
+                                            uint32_t slot_bytes, bf16* my_part, uint32_t my_lo,
+                                            uint32_t my_hi, unsigned tid, unsigned stride,
+                                            uint32_t gslot_bytes, uint32_t gcols,
+                                            bf16* band_copy) {
+    const uint32_t row_w = nranks * gcols;
+    auto gptr = [&](uint32_t e) -> const bf16* {
+        const uint32_t c = e % row_w, m = e / row_w, owner = c / gcols;
+        return (const bf16*)((const char*)peer_scratch[owner] + gslot_bytes) + m * gcols +
+               (c - owner * gcols);
+    };
+    auto scalar = [&](uint32_t e) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < nranks; r++) {
+            const bf16* part = (const bf16*)((const char*)peer_scratch[r] + slot_bytes);
+            acc += bf2f(as_glob(part)[e]);
+        }
+        bf16 v = f2bf(acc);
+        if (gcols) v = f2bf(bf2f(v) + bf2f(*as_glob(gptr(e))));
+        st_act1(&as_glob(my_part)[e], v);
+        if (band_copy) st_act1(&as_glob(band_copy)[e - my_lo], v);
+    };
+    bool ok = nranks == PLOW_XR_SCHED_NR && (my_lo & (XR_PK - 1u)) == 0u &&
+              (slot_bytes & (XR_PKB - 1u)) == 0u &&
+              (gcols == 0u || ((gcols & (XR_PK - 1u)) == 0u && (gslot_bytes & (XR_PKB - 1u)) == 0u)) &&
+              (band_copy == nullptr || xr_alp(band_copy));
+    const bf16* p[PLOW_XR_SCHED_NR];
+#pragma unroll
+    for (uint32_t r = 0; r < PLOW_XR_SCHED_NR; r++) {
+        p[r] = (const bf16*)((const char*)peer_scratch[r < nranks ? r : 0u] + slot_bytes);
+        ok = ok && xr_alp(p[r]);
+    }
+    uint32_t vlo, vhi;
+    xr_vrange(my_lo, my_hi, ok, &vlo, &vhi);
+    auto finish = [&](uint32_t e, xr_pack_t o) {
+        if (gcols) {
+            const xr_pack_t g = xr_ld(gptr(e));
+#pragma unroll
+            for (uint32_t k = 0; k < XR_PK; k++) o[k] = f2bf(bf2f(o[k]) + bf2f(g[k]));
+        }
+        xr_st(my_part + e, o);
+        if (band_copy) xr_st(band_copy + (e - my_lo), o);
+    };
+    for (uint32_t e = my_lo + tid; e < vlo; e += stride) scalar(e);
+    const uint32_t step = stride * XR_PK;
+    uint32_t e = vlo + tid * XR_PK;
+    constexpr uint32_t U = PLOW_XR_SCHED_RS_U;
+    for (; e + (U - 1) * step < vhi; e += U * step) {
+        xr_pack_t v[U][PLOW_XR_SCHED_NR];
+#pragma unroll
+        for (uint32_t u = 0; u < U; u++)
+#pragma unroll
+            for (uint32_t r = 0; r < PLOW_XR_SCHED_NR; r++) v[u][r] = xr_ld(p[r] + e + u * step);
+#pragma unroll
+        for (uint32_t u = 0; u < U; u++) finish(e + u * step, xr_sum8(v[u]));
+    }
+    for (; e < vhi; e += step) {
+        xr_pack_t v[PLOW_XR_SCHED_NR];
+#pragma unroll
+        for (uint32_t r = 0; r < PLOW_XR_SCHED_NR; r++) v[r] = xr_ld(p[r] + e);
+        finish(e, xr_sum8(v));
+    }
+    for (uint32_t e2 = vhi + tid; e2 < my_hi; e2 += stride) scalar(e2);
+}
+/* All-gather body: slice s of the reduced [n] at `slot_bytes` from peer s into `out`, or
+ * `out2 = bf16(resid + v)` (fused residual), or `out = bf16(v + gathered)` (`gcols` fold) —
+ * the two-shot's three phase-2 forms, each with the shipping loop's arithmetic. */
+__device__ __forceinline__ void xr_ag_sched(const void* const* peer_scratch, uint32_t nranks,
+                                            uint32_t rank, uint32_t n, uint32_t slot_bytes,
+                                            unsigned slice, unsigned nblk, bf16* out,
+                                            const bf16* resid, bf16* out2, uint32_t gslot_bytes,
+                                            uint32_t gcols) {
+    const uint32_t row_w = nranks * gcols;
+    auto gptr = [&](uint32_t e) -> const bf16* {
+        const uint32_t c = e % row_w, m = e / row_w, owner = c / gcols;
+        return (const bf16*)((const char*)peer_scratch[owner] + gslot_bytes) + m * gcols +
+               (c - owner * gcols);
+    };
+    bf16* dst = out2 ? out2 : out;
+    bool ok = (slot_bytes & (XR_PKB - 1u)) == 0u && xr_alp(dst) &&
+              (resid == nullptr || xr_alp(resid)) &&
+              (gcols == 0u || ((gcols & (XR_PK - 1u)) == 0u && (gslot_bytes & (XR_PKB - 1u)) == 0u));
+    for (uint32_t r = 0; r < nranks; r++) ok = ok && xr_alp(peer_scratch[r]);
+    const bool wave_form = PLOW_XR_SCHED_AG_WAVE && nranks == PLOW_XR_SCHED_NR &&
+                           PLOW_THREADS == 512u;
+    const uint32_t t0 = wave_form ? slice * 64u + (threadIdx.x & 63u)
+                                  : slice * PLOW_THREADS + threadIdx.x;
+    const uint32_t tstep = wave_form ? nblk * 64u : nblk * PLOW_THREADS;
+    const uint32_t niter = wave_form ? 1u : nranks;
+    for (uint32_t i = 0; i < niter; i++) {
+        const uint32_t s = wave_form ? ((threadIdx.x >> 6) + rank) % nranks
+                                     : (slice + rank + i) % nranks;
+        const uint32_t lo = (uint32_t)(((uint64_t)n * s) / nranks);
+        const uint32_t hi = (uint32_t)(((uint64_t)n * (s + 1)) / nranks);
+        const bf16* src = (const bf16*)((const char*)peer_scratch[s] + slot_bytes);
+        auto scalar = [&](uint32_t e) {
+            if (gcols)
+                st_act1(&as_glob(out)[e],
+                        f2bf(bf2f(as_glob(src)[e]) + bf2f(*as_glob(gptr(e)))));
+            else if (out2)
+                st_act1(&as_glob(out2)[e], f2bf(bf2f(as_glob(resid)[e]) + bf2f(as_glob(src)[e])));
+            else
+                st_act1(&as_glob(out)[e], as_glob(src)[e]);
+        };
+        auto pack = [&](uint32_t e, xr_pack_t v) {
+            if (gcols) {
+                const xr_pack_t g = xr_ld(gptr(e));
+#pragma unroll
+                for (uint32_t k = 0; k < XR_PK; k++) v[k] = f2bf(bf2f(v[k]) + bf2f(g[k]));
+            } else if (out2) {
+                const xr_pack_t rv = xr_ld(resid + e);
+#pragma unroll
+                for (uint32_t k = 0; k < XR_PK; k++) v[k] = f2bf(bf2f(rv[k]) + bf2f(v[k]));
+            }
+            xr_st(dst + e, v);
+        };
+        uint32_t vlo, vhi;
+        xr_vrange(lo, hi, ok, &vlo, &vhi);
+        for (uint32_t e = lo + t0; e < vlo; e += tstep) scalar(e);
+        constexpr uint32_t U = PLOW_XR_SCHED_AG_U;
+        const uint32_t step = tstep * XR_PK;
+        uint32_t e = vlo + t0 * XR_PK;
+        for (; e + (U - 1) * step < vhi; e += U * step) {
+            xr_pack_t v[U];
+#pragma unroll
+            for (uint32_t u = 0; u < U; u++) v[u] = xr_ld(src + e + u * step);
+#pragma unroll
+            for (uint32_t u = 0; u < U; u++) pack(e + u * step, v[u]);
+        }
+        for (; e < vhi; e += step) pack(e, xr_ld(src + e));
+        for (uint32_t e2 = vhi + t0; e2 < hi; e2 += tstep) scalar(e2);
+    }
+}
+#endif /* PLOW_XR_SCHED_ON */
+
 /* ---- TWO-SHOT all-reduce for the LARGE prefill [T,hidden] message ----------------
  * The one-shot d_xreduce_mega has EVERY rank read ALL N peers' FULL partial: ~(N-1)*msg
  * of fabric traffic per rank. That is optimal for decode's tiny [1,hidden] latency-bound
@@ -997,6 +1212,10 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     const uint32_t my_lo = (uint32_t)(((uint64_t)n * rank) / nranks);
     const uint32_t my_hi = (uint32_t)(((uint64_t)n * (rank + 1)) / nranks);
     bf16* my_part = (bf16*)((char*)peer_scratch[rank] + slot_bytes);
+#if PLOW_XR_SCHED_ON
+    xr_rs_sched(peer_scratch, nranks, slot_bytes, my_part, my_lo, my_hi, tid, stride, 0u, 0u,
+                nullptr);
+#else
 #if PLOW_XR_WAVE_RS_ON
     const bool wave_rs = nranks == 8u && PLOW_THREADS == 512u &&
                          (slot_bytes & 15u) == 0u && (my_lo & 7u) == 0u &&
@@ -1088,6 +1307,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         st_act1(&as_glob(my_part)[e], f2bf(acc));
     }
 #endif
+#endif /* PLOW_XR_SCHED_ON */
     __syncthreads();
 #if PLOW_XR_TRACE_PHASES
     if (threadIdx.x == 0 && xr_trace) {
@@ -1230,6 +1450,10 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
      * BIT-IDENTICAL: the (workgroup, element) -> value map is unchanged; only the ORDER
      * a workgroup visits the slices rotates. `+ rank` also decorrelates the ranks so no
      * two ranks start on the same peer. */
+#if PLOW_XR_SCHED_ON
+    xr_ag_sched(peer_scratch, nranks, rank, n, slot_bytes, slice, nblk, out, resid, out2,
+                gslot_bytes, gcols);
+#else
     for (uint32_t i = 0; i < nranks; i++) {
         const uint32_t s = (slice + rank + i) % nranks;
         const uint32_t lo = (uint32_t)(((uint64_t)n * s) / nranks);
@@ -1286,6 +1510,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         for (uint32_t e = lo + tid; e < hi; e += stride) st_act1(&as_glob(out)[e], as_glob(src)[e]);
 #endif
     }
+#endif /* PLOW_XR_SCHED_ON */
 #if PLOW_XR_TRACE_PHASES
     __syncthreads();
     if (threadIdx.x == 0 && xr_trace)
@@ -1368,6 +1593,10 @@ __device__ __forceinline__ void d_xreduce_scatter_mega(
     const uint32_t my_lo = (uint32_t)(((uint64_t)n * rank) / nranks);
     const uint32_t my_hi = (uint32_t)(((uint64_t)n * (rank + 1)) / nranks);
     bf16* my_part = (bf16*)((char*)peer_scratch[rank] + slot_bytes);
+#if PLOW_XR_SCHED_ON
+    xr_rs_sched(peer_scratch, nranks, slot_bytes, my_part, my_lo, my_hi, tid, stride, gslot_bytes,
+                gcols, band_copy);
+#else
     const uint32_t row_w = nranks * gcols;
     auto finish = [&](uint32_t e, float acc) {
         bf16 v = f2bf(acc);
@@ -1404,6 +1633,7 @@ __device__ __forceinline__ void d_xreduce_scatter_mega(
         }
         finish(e, acc);
     }
+#endif /* PLOW_XR_SCHED_ON */
     __syncthreads();
 }
 
@@ -1426,6 +1656,12 @@ __device__ __forceinline__ void d_xall_gather_mega(
         return;
     auto gather = [&](bf16* __restrict__ dst, uint32_t n, uint32_t slot) {
         if (dst == nullptr || n == 0) return;
+#if PLOW_XR_SCHED_ON
+        xr_ag_sched(peer_scratch, nranks, rank, n, slot, slice, nblk, dst, nullptr, nullptr, 0u,
+                    0u);
+        (void)tid;
+        (void)stride;
+#else
         for (uint32_t i = 0; i < nranks; i++) {
             const uint32_t s = (slice + rank + i) % nranks;
             const uint32_t lo = (uint32_t)(((uint64_t)n * s) / nranks);
@@ -1434,6 +1670,7 @@ __device__ __forceinline__ void d_xall_gather_mega(
             for (uint32_t e = lo + tid; e < hi; e += stride)
                 st_act1(&as_glob(dst)[e], as_glob(src)[e]);
         }
+#endif /* PLOW_XR_SCHED_ON */
     };
     gather(dst0, n0, slot0);
     gather(dst1, n1, slot1);
