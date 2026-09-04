@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::attention::AttentionMeasurement;
 use crate::decode::{rank_by_cell, CellRanking, DecodeMeasurement};
+use crate::moe_decode::MoeDecodeMeasurement;
 use crate::record::{Correctness, Digests, KernelMeasurement, RecordState};
 
 #[derive(Debug)]
@@ -215,6 +216,51 @@ impl TuneStore {
             };
         }
         self.append_atomic(hardware, &records)?;
+        Ok(records.len())
+    }
+
+    fn moe_decode_path(&self, hardware: &str) -> PathBuf {
+        self.root.join(hardware).join("moe_decode_measurement.jsonl")
+    }
+
+    /// Grouped-MoE decode route records for one hardware key; empty when the
+    /// campaign has never run here.
+    pub fn load_moe_decode(&self, hardware: &str) -> Result<Vec<MoeDecodeMeasurement>, StoreError> {
+        let path = self.moe_decode_path(hardware);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for line in BufReader::new(File::open(&path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            out.push(serde_json::from_str(&line)?);
+        }
+        Ok(out)
+    }
+
+    /// Publish grouped-MoE decode route records under the shared gates: an
+    /// unchecked or under-sampled route aborts the whole publication.
+    pub fn publish_moe_decode(
+        &self,
+        hardware: &str,
+        mut records: Vec<MoeDecodeMeasurement>,
+    ) -> Result<usize, StoreError> {
+        for r in &records {
+            let blockers = r.qualification_blockers();
+            if !blockers.is_empty() {
+                return Err(StoreError::NotQualifiable {
+                    kernel: format!("{}/{:?}", r.cell.key(), r.route),
+                    blockers,
+                });
+            }
+        }
+        for r in &mut records {
+            r.state = RecordState::Qualified;
+        }
+        self.append_jsonl(&self.moe_decode_path(hardware), &records)?;
         Ok(records.len())
     }
 

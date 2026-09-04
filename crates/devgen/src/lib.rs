@@ -1071,6 +1071,69 @@ fn attention_decisions() -> Vec<AttentionDecisionReport> {
 /// Exact-cell attention selection. This is compile-time packet policy, not an
 /// online tuner: only qualified records for this arch/CU/rung/KV bucket and
 /// operator geometry can replace the fixed fallback.
+/// Grouped-MoE decode route for one exact geometry, from qualified measurements
+/// of BOTH routes only. The standalone pair is charged the measured segment
+/// handoff; missing or stale evidence keeps the interpreter route.
+pub(crate) fn select_amd_moe_decode_route(
+    n_cu: u32,
+    decode_rung: u32,
+    topk: u32,
+    hidden: u32,
+    inter_local: u32,
+    experts: u32,
+    weight_enc: &str,
+) -> tunedb::MoeDecodeSelection {
+    let hardware = amd_tuning_cell();
+    let records = emit_config::active()
+        .tunedb_root()
+        .and_then(|root| {
+            tunedb::TuneStore::new(std::path::PathBuf::from(root))
+                .load_moe_decode(&hardware)
+                .ok()
+        })
+        .unwrap_or_default();
+    let cell = tunedb::MoeDecodeCell {
+        hardware,
+        n_cu,
+        decode_rung,
+        topk,
+        hidden,
+        inter_local,
+        experts,
+        weight_enc: weight_enc.into(),
+    };
+    #[cfg(test)]
+    let want = tunedb::Digests {
+        implementation: "test-unprobed".into(),
+        interpreter: "test-unprobed".into(),
+        toolchain: "test-unprobed".into(),
+        oracle: tunedb::MOE_DECODE_ORACLE.into(),
+    };
+    #[cfg(not(test))]
+    let want = tunedb::Digests {
+        implementation: gfx950_gemm_inventory().build().label(),
+        interpreter: gfx950_gemm_inventory().build().label(),
+        toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
+        oracle: tunedb::MOE_DECODE_ORACLE.into(),
+    };
+    let selected = tunedb::select_moe_decode_route(
+        &records,
+        &cell,
+        &want,
+        tunedb::GFX950_SEGMENT_HANDOFF_NS,
+        tunedb::MIN_GAIN_FRACTION,
+    );
+    if selected.source == tunedb::MoeDecodeSource::Qualified {
+        eprintln!(
+            "  grouped-MoE decode route: {} -> {:?} (projected {:+.2} us/layer after handoff)",
+            cell.key(),
+            selected.route,
+            selected.projected_gain_ns / 1000.0
+        );
+    }
+    selected
+}
+
 fn select_amd_attention(
     n_cu: u32,
     decode_rung: u32,

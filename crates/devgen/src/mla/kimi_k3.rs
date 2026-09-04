@@ -1234,6 +1234,27 @@ fn k3_build_model(
                 && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
                 && emit_config::active().decode_mla_segments,
         );
+        // Grouped GLU+DOWN decode pairs: explicit flag wins; otherwise only a qualified,
+        // current measurement of BOTH routes for this exact geometry may reroute it.
+        let grouped_moe_segments = match emit_config::active().decode_grouped_moe_segments {
+            Some(explicit) => explicit,
+            None => {
+                crate::emit_is_amd()
+                    && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                    && crate::select_amd_moe_decode_route(
+                        n_cu,
+                        t,
+                        c.top_k,
+                        c.moe_latent,
+                        c.moe_inter / tp.max(1),
+                        c.n_exp,
+                        if emit_config::active().mxfp4 { "mxfp4" } else { "bf16" },
+                    )
+                    .route
+                        == tunedb::MoeDecodeRoute::Standalone
+            }
+        };
+        b.set_decode_grouped_moe_segments(grouped_moe_segments);
         // PLOW_L2_PLACE: `None` => byte-identical. Until this line the flag reached the dense-GQA
         // builders only, and `kimi_k3` is absent from the arch list that warns about being
         // ignored (`lib.rs:4327`), so setting it on K3 was a silent no-op.

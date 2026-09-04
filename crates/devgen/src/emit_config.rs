@@ -99,6 +99,13 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-mla-segments", env = "PLOW_SEG_DECODE_MLA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_mla_segments: bool,
 
+    /// Isolate adjacent grouped MXFP4 GLU+DOWN decode pairs into ordered raw launches.
+    /// Unset = decide from qualified per-geometry route measurements
+    /// (`moe_decode_measurement.jsonl`, both routes, current digests); missing evidence keeps
+    /// the interpreter route. `PLOW_MOE_DECODE_STANDALONE=1` remains the packet-level override.
+    #[arg(long = "emit-decode-grouped-moe-segments", env = "PLOW_SEG_DECODE_GROUPED_MOE", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_grouped_moe_segments: Option<bool>,
+
     /// Batched decode dispatch width (sequences per launch).
     #[arg(
         long = "emit-decode-batch",
@@ -685,6 +692,7 @@ impl EmitConfig {
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
             // value; direct legacy callers must name the feature explicitly.
             decode_mla_segments: env_bool("PLOW_SEG_DECODE_MLA"),
+            decode_grouped_moe_segments: env_bool_opt("PLOW_SEG_DECODE_GROUPED_MOE"),
             decode_batch: env_u32("PLOW_DECODE_BATCH").unwrap_or(1),
             decode_ladder: env_str("PLOW_DECODE_BATCH_LADDER"),
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
@@ -1095,6 +1103,39 @@ mod tests {
                 .unwrap()
                 .emit
                 .kda_intra_wave_items
+        );
+    }
+
+    #[test]
+    fn decode_grouped_moe_segments_is_unset_by_default_and_explicit_when_given() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_SEG_DECODE_GROUPED_MOE", "0")]);
+        std::env::remove_var("PLOW_SEG_DECODE_GROUPED_MOE");
+        assert_eq!(EmitConfig::from_env().decode_grouped_moe_segments, None);
+        std::env::set_var("PLOW_SEG_DECODE_GROUPED_MOE", "1");
+        assert_eq!(EmitConfig::from_env().decode_grouped_moe_segments, Some(true));
+        std::env::remove_var("PLOW_SEG_DECODE_GROUPED_MOE");
+
+        assert_eq!(
+            TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .decode_grouped_moe_segments,
+            None
+        );
+        assert_eq!(
+            TestArgs::try_parse_from(["test", "--emit-decode-grouped-moe-segments=false"])
+                .unwrap()
+                .emit
+                .decode_grouped_moe_segments,
+            Some(false)
+        );
+        assert_eq!(
+            TestArgs::try_parse_from(["test", "--emit-decode-grouped-moe-segments"])
+                .unwrap()
+                .emit
+                .decode_grouped_moe_segments,
+            Some(true)
         );
     }
 

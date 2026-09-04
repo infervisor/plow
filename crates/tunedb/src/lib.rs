@@ -29,6 +29,7 @@ pub mod attention;
 pub mod decode;
 pub mod gemm;
 pub mod gemv;
+pub mod moe_decode;
 pub mod record;
 pub mod sample;
 pub mod store;
@@ -45,6 +46,11 @@ pub use attention::{
 };
 pub use decode::{
     rank_by_cell, CellRanking, CtxBucket, DecodeCell, DecodeKnobs, DecodeMeasurement,
+};
+pub use moe_decode::{
+    select_moe_decode_route, MoeDecodeCell, MoeDecodeMeasurement, MoeDecodeRoute,
+    MoeDecodeSelection, MoeDecodeSource, GFX950_SEGMENT_HANDOFF_NS, MIN_GAIN_FRACTION,
+    MOE_DECODE_ORACLE,
 };
 pub use record::{
     blockers_for, BlockDefinition, BlockMeasurement, Correctness, Digests, KernelMeasurement,
