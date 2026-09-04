@@ -71,6 +71,11 @@
 #ifndef PLOW_XR_TRACE_PHASES
 #define PLOW_XR_TRACE_PHASES 0
 #endif
+#if PLOW_XR_TRACE_PHASES
+/* Trace schema v2 keeps the 40-byte ABI: cu/pc are saturated entry-relative timestamps
+ * for reduce-scatter completion and gate_ag completion. slice bits 15:14 identify v2. */
+extern "C" __device__ unsigned plow_xr_trace_phases_v2 = 1;
+#endif
 
 /* PLOW_XR_MLP=1: PEER-BATCHED REDUCE. Opt-in build axis, BIT-IDENTICAL, default OFF.
  *
@@ -745,6 +750,12 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         st_act1(&as_glob(my_part)[e], f2bf(acc));
     }
     __syncthreads();
+#if PLOW_XR_TRACE_PHASES
+    if (threadIdx.x == 0 && xr_trace) {
+        const uint64_t d = __builtin_amdgcn_s_memrealtime() - xr_entry;
+        xr_trace->cu = (uint32_t)(d > 0xffffffffull ? 0xffffffffull : d);
+    }
+#endif
 
     /* ---- RENDEZVOUS 2 (gate_ag): every rank's reduced slice is written + visible.
      *
@@ -824,6 +835,12 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     }
     __syncthreads();
     if (bailed) return;
+#if PLOW_XR_TRACE_PHASES
+    if (threadIdx.x == 0 && xr_trace) {
+        const uint64_t d = __builtin_amdgcn_s_memrealtime() - xr_entry;
+        xr_trace->pc = (uint32_t)(d > 0xffffffffull ? 0xffffffffull : d);
+    }
+#endif
 
 #if PLOW_XR_ATTNRES
     /* A graph-selected AttnRes consumer needs one complete row per workgroup. Preserve the

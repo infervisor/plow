@@ -104,6 +104,23 @@ not producer arrival or a late global-queue workgroup. The next gate should spli
 at reduce-scatter completion and use the existing no-wait/no-signal controls to price the second
 handoff before changing production routing.
 
+## Phase-v2 discriminator
+
+The next default-off diagnostic keeps the 40-byte trace ABI and the three 64-bit timestamps.
+For `XReduceTwoShot`, `cu` and `pc` become saturated 32-bit deltas from `t_arrive` to
+reduce-scatter completion and second-rendezvous completion. The marker is upgraded from slice
+bit 15 to bits 15:14 (`0xc000`), and the object exports `plow_xr_trace_phases_v2`; the analyzer
+rejects v1 records, saturated deltas, and non-monotonic phases. This yields same-workgroup
+gate1/local, reduce-scatter, gate2 signal/wait/acquire, and all-gather durations without growing
+the trace or changing values, gates, counters, or reduction order.
+
+The focused gfx950 object is spill-free: plain two-shot is 22 VGPR / 66 SGPR and folded gather
+is 26 VGPR / 72 SGPR, both wave64 with 16 B LDS and zero private memory. The full prefill GQ
+interpreter retains the v1 diagnostic envelope exactly: 256 VGPR / 108 SGPR, occupancy 2,
+1332 B private, and 147512 B LDS. The flag-off focused `.text` hash remains
+`89a18f3168f772cd2b7be8d6b2b213477db0caaafdb7495b381525eb7a83c961`, byte-identical to the
+pre-v2 control. No production object or route enables this schema.
+
 ## Pinned vLLM/AITER comparison
 
 vLLM 0.28 pins AITER 0.1.19. Its default custom-all-reduce cutoff is 64 MiB even though the

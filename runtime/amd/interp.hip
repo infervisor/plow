@@ -4589,10 +4589,9 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
 #if PLOW_XR_TRACE_PHASES
                 if (in->op == PLOW_DOP_XREDUCE2) {
                     PlowTraceRec* xr = &prog.trace[base + ix];
-                    xr->cu = cu;
                     xr->inst = e.inst;
                     xr->op = in->op;
-                    xr->slice = (uint16_t)e.slice | 0x8000u;
+                    xr->slice = (uint16_t)e.slice | 0xc000u;
                     continue;
                 }
 #endif

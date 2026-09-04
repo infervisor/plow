@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rank TP XReduceTwoShot producer skew from PLOW_XR_TRACE_PHASES traces."""
+"""Split TP XReduceTwoShot gate1/RS/gate2/AG phase traces."""
 
 import argparse
 import json
@@ -19,11 +19,15 @@ def load_rank(path, xr_op):
         raise ValueError(f"{path}: size is not a multiple of {REC.size}")
     out = defaultdict(list)
     for rec in REC.iter_unpack(data):
-        cu, delta, inst, op, sl, entry, ready, done = rec
+        rs_delta, gate2_delta, inst, op, sl, entry, ready, done = rec
         if op == xr_op and done:
-            if not sl & 0x8000:
-                raise ValueError(f"{path}: XReduceTwoShot record lacks phase-trace marker")
-            out[inst].append((cu, sl & 0x7fff, entry, entry + delta, ready, done))
+            if sl & 0xc000 != 0xc000:
+                raise ValueError(f"{path}: XReduceTwoShot record lacks v2 phase-trace marker")
+            if rs_delta == 0xffffffff or gate2_delta == 0xffffffff:
+                raise ValueError(f"{path}: XReduceTwoShot phase delta saturated")
+            out[inst].append(
+                (sl & 0x3fff, entry, ready, entry + rs_delta, entry + gate2_delta, done)
+            )
     return out
 
 
@@ -74,68 +78,63 @@ def main():
         producer = by_inst.get(inst - 1, {})
         family = producer.get("op_name", "START")
         producer_dims = "x".join(str(v) for v in producer.get("raw", {}).get("i", [])[:3])
-        rank_phase = []
-        ready_spreads = []
-        wg_durations = []
-        envelopes = []
+        phases = {name: [] for name in ("gate1", "rs", "gate2", "ag", "envelope")}
         for rank, records in enumerate(ranks):
-            slice0 = [r for r in records[inst] if r[1] == 0]
+            slice0 = [r for r in records[inst] if r[0] == 0]
             if len(slice0) != 1:
                 raise ValueError(f"inst {inst} rank {rank}: expected one slice-0 record")
-            _, _, entry, publish, ready, _ = slice0[0]
-            done = max(r[5] for r in records[inst])
-            rank_phase.append(
-                ((publish - entry) / TPUS, (ready - publish) / TPUS,
-                 (done - ready) / TPUS)
-            )
-            readies = [r[4] for r in records[inst]]
-            dones = [r[5] for r in records[inst]]
-            ready_spreads.append((max(readies) - min(readies)) / TPUS)
-            wg_durations.extend((r[5] - r[4]) / TPUS for r in records[inst])
-            envelopes.append((max(dones) - min(readies)) / TPUS)
-        waits = [p[1] for p in rank_phase]
-        latest = min(range(len(waits)), key=waits.__getitem__)
-        skew = max(waits) - min(waits)
+            for _, entry, ready, rs_done, gate2_ready, done in records[inst]:
+                if not entry <= ready <= rs_done <= gate2_ready <= done:
+                    raise ValueError(f"inst {inst} rank {rank}: non-monotonic phase timestamps")
+                phases["gate1"].append((ready - entry) / TPUS)
+                phases["rs"].append((rs_done - ready) / TPUS)
+                phases["gate2"].append((gate2_ready - rs_done) / TPUS)
+                phases["ag"].append((done - gate2_ready) / TPUS)
+                phases["envelope"].append((done - entry) / TPUS)
         row = {
             "inst": inst,
             "family": family,
             "producer_dims": producer_dims,
             "shape": shape,
             "mib": nbytes / (1 << 20),
-            "rank0_wait": waits[0],
-            "skew": skew,
-            "latest": latest,
-            "publish": median([p[0] for p in rank_phase]),
-            "rest": max(p[2] for p in rank_phase),
-            "ready_spread": max(ready_spreads),
-            "wg_durations": wg_durations,
-            "envelope": max(envelopes),
+            "phases": phases,
         }
         rows.append(row)
         families[(family, shape)].append(row)
 
     print(f"ranks={len(ranks)} collectives={len(rows)} tick/us={TPUS:g}")
-    print("skew=max(publish->ready)-min(publish->ready); latest=min wait (same-rank deltas only)")
-    print(f"{'inst':>5} {'producer':<20} {'producer i0:i2':<22} {'shape':<7} {'MiB':>7} {'r0wait':>9} "
-          f"{'skew':>9} {'latest':>7} {'publish':>9} {'ready-spr':>9} {'wg-p90':>9} {'wg-max':>9} {'envelope':>9}")
-    for r in sorted(rows, key=lambda x: -x["skew"])[: args.top]:
+    print("all phase durations are same-workgroup deltas; values below are microseconds")
+    print(f"{'inst':>5} {'producer':<20} {'producer i0:i2':<22} {'shape':<7} {'MiB':>7} "
+          f"{'gate1p90':>9} {'RSp90':>9} {'gate2p90':>9} {'AGp90':>9} {'env-max':>9}")
+    for r in sorted(rows, key=lambda x: -max(x["phases"]["envelope"]))[: args.top]:
+        p = r["phases"]
         print(f"{r['inst']:5d} {r['family']:<20.20} {r['producer_dims']:<22.22} "
               f"{r['shape']:<7} {r['mib']:7.1f} "
-              f"{r['rank0_wait']:9.2f} {r['skew']:9.2f} {r['latest']:7d} "
-              f"{r['publish']:9.2f} {r['ready_spread']:9.2f} "
-              f"{percentile(r['wg_durations'], 0.90):9.2f} {max(r['wg_durations']):9.2f} "
-              f"{r['envelope']:9.2f}")
+              f"{percentile(p['gate1'], 0.90):9.2f} {percentile(p['rs'], 0.90):9.2f} "
+              f"{percentile(p['gate2'], 0.90):9.2f} {percentile(p['ag'], 0.90):9.2f} "
+              f"{max(p['envelope']):9.2f}")
 
     print("\nproducer-family summary")
-    print(f"{'producer':<20} {'shape':<7} {'n':>4} {'skew-sum':>10} {'skew-med':>10} "
-          f"{'ready-sum':>10} {'wg-p50':>9} {'wg-p90':>9} {'wg-max':>9} {'env-sum':>10}")
-    for (family, shape), rs in sorted(families.items(), key=lambda x: -sum(r["skew"] for r in x[1])):
-        skews = [r["skew"] for r in rs]
-        durations = [d for r in rs for d in r["wg_durations"]]
-        print(f"{family:<20.20} {shape:<7} {len(rs):4d} {sum(skews):10.2f} "
-              f"{median(skews):10.2f} {sum(r['ready_spread'] for r in rs):10.2f} "
-              f"{median(durations):9.2f} {percentile(durations, 0.90):9.2f} "
-              f"{max(durations):9.2f} {sum(r['envelope'] for r in rs):10.2f}")
+    print(f"{'producer':<20} {'shape':<7} {'n':>4} {'gate1-maxΣ':>11} {'RS-maxΣ':>10} "
+          f"{'gate2-maxΣ':>11} {'AG-maxΣ':>10} {'env-maxΣ':>10}")
+    for (family, shape), rs in sorted(
+        families.items(), key=lambda x: -sum(max(r["phases"]["envelope"]) for r in x[1])
+    ):
+        sums = {
+            phase: sum(max(r["phases"][phase]) for r in rs)
+            for phase in ("gate1", "rs", "gate2", "ag", "envelope")
+        }
+        print(f"{family:<20.20} {shape:<7} {len(rs):4d} {sums['gate1']:11.2f} "
+              f"{sums['rs']:10.2f} {sums['gate2']:11.2f} {sums['ag']:10.2f} "
+              f"{sums['envelope']:10.2f}")
+
+    print("\npooled workgroup phase percentiles")
+    print(f"{'producer':<20} {'shape':<7} {'phase':<9} {'p50':>9} {'p90':>9} {'max':>9}")
+    for (family, shape), rs in sorted(families.items()):
+        for phase in ("gate1", "rs", "gate2", "ag"):
+            values = [value for r in rs for value in r["phases"][phase]]
+            print(f"{family:<20.20} {shape:<7} {phase:<9} {median(values):9.2f} "
+                  f"{percentile(values, 0.90):9.2f} {max(values):9.2f}")
 
 
 if __name__ == "__main__":
