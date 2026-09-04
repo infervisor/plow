@@ -196,6 +196,22 @@ is `790122b960030c28e49cf4dbcc11cef03609c168d22d45d44a5f67db31c8111c`, identical
 pre-axis production control. All other screened data axes were removed from the production
 header.
 
+The inline whole-network T8192→1 gate is exact and positive in all three order-alternated
+folds (control/U2, U2/control, control/U2):
+
+| fold | control TTFT | RS-U2 TTFT | saving |
+|---:|---:|---:|---:|
+| 1 | 1403.837 ms | 1370.499 ms | 33.338 ms |
+| 2 | 1406.975 ms | 1371.845 ms | 35.130 ms |
+| 3 | 1406.457 ms | 1369.440 ms | 37.018 ms |
+
+Median saving is 35.130 ms. Every pair used the same prompt checksum
+`a65599fc8a00c9146bd0c6fbed7ab8ce12dbd20911011cb6589e356457bfcdd4` and exact output token
+`6896`, with counter audit and all-rank completion. Both 37-object directories were byte-identical
+except the active prefill GQ object; runtime, packet, config/TuneDB, checkpoint, BF16 variant/KV
+mode, and segment-major dispatch were held fixed. Promotion still requires an exact 256-token
+continuation with neutral TPOT and a matched raw trace showing the reduce-scatter reduction.
+
 ## Pinned vLLM/AITER comparison
 
 vLLM 0.28 pins AITER 0.1.19. Its default custom-all-reduce cutoff is 64 MiB even though the
