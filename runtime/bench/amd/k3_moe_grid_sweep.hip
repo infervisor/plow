@@ -356,6 +356,110 @@ void k3_moe_down_combine_ready(
 extern "C" __device__ unsigned plow_moe_down_combine_ready_abi_1 = 1;
 extern "C" __device__ unsigned plow_moe_down_combine_ready_no_global_wait_1 = 1;
 
+#ifndef PLOW_MOE_TREE_SLOTS_PER_LEAF
+#define PLOW_MOE_TREE_SLOTS_PER_LEAF 4
+#endif
+#ifndef PLOW_MOE_TREE_THREADS
+#define PLOW_MOE_TREE_THREADS PLOW_THREADS
+#endif
+
+/* Compiler-defined balanced tree for top-16 DOWN accumulation. Several producer workgroups own
+ * one 64-row tile and consecutive slot groups. The block placement contract keeps those
+ * workgroups on one physical XCD; only the last producer reads the ordered subtree
+ * leaves and publishes the final BF16 tile. Arrival order never enters the arithmetic order.
+ *
+ * Layout contract: part[q][h] contains the balanced sum of the consecutive slot group q;
+ * the root is the balanced sum of those leaves. The isolated sweep compiles leaf widths 2/4/8. */
+extern "C" __global__ __launch_bounds__(PLOW_MOE_TREE_THREADS, 2)
+void k3_moe_down_combine_tree(
+    bf16* out, float* part, const bf16* fu, const unsigned char* table,
+    const unsigned long long* weights, const unsigned long long* scales,
+    unsigned topk, unsigned hidden, unsigned intermediate, unsigned experts,
+    unsigned* ready) {
+    constexpr unsigned domains = 8, slots_per_leaf = PLOW_MOE_TREE_SLOTS_PER_LEAF;
+    constexpr unsigned leaves = 16 / slots_per_leaf;
+    constexpr unsigned rg = 4, lpg = PLOW_WAVE / rg;
+    constexpr unsigned rows_per_block = (PLOW_MOE_TREE_THREADS / PLOW_WAVE) * 2 * rg;
+    const unsigned tiles = (hidden + rows_per_block - 1u) / rows_per_block;
+    if (blockDim.x != PLOW_MOE_TREE_THREADS || topk != leaves * slots_per_leaf ||
+        gridDim.x != tiles * leaves || intermediate > 512u ||
+        (intermediate & 31u))
+        __builtin_trap();
+
+    const unsigned xcd =
+        __builtin_amdgcn_s_getreg((20 /* HW_REG_XCC_ID */) | ((32 - 1) << 11)) & 0xf;
+    if (xcd >= domains || tiles % domains || (blockIdx.x & 7u) != xcd)
+        __builtin_trap();
+    const unsigned local = blockIdx.x >> 3;
+    const unsigned leaf = local % leaves;
+    const unsigned tile = (local / leaves) * domains + xcd;
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned h0 = tile * rows_per_block + wave * 2u * rg;
+    const unsigned ra = h0 + lane / lpg, rb = h0 + rg + lane / lpg;
+    const unsigned ca = ra < hidden ? ra : h0, cb = rb < hidden ? rb : ca;
+    const unsigned wstr = intermediate >> 1, sstr = intermediate >> 5;
+    float va[slots_per_leaf], vb[slots_per_leaf];
+#pragma unroll
+    for (unsigned i = 0; i < slots_per_leaf; ++i) {
+        const unsigned slot = leaf * slots_per_leaf + i;
+        const unsigned eid = moe_slot_expert(table, slot);
+        va[i] = vb[i] = 0.0f;
+        if (eid >= experts || weights[(size_t)eid * 3 + 2] == 0ull) continue;
+        const unsigned char* wd =
+            (const unsigned char*)(size_t)weights[(size_t)eid * 3 + 2];
+        const unsigned char* sd =
+            (const unsigned char*)(size_t)scales[(size_t)eid * 3 + 2];
+        wave_dot_mxfp4_lg2<rg>(fu + (size_t)slot * intermediate, wd, sd, wstr,
+                               sstr, ca, cb, intermediate, lane, va[i], vb[i]);
+        const float gate = moe_slot_gate(table, slot);
+        va[i] *= gate;
+        vb[i] *= gate;
+    }
+    if ((lane % lpg) == 0) {
+        float* leaf_part = part + (size_t)leaf * hidden;
+        for (unsigned stride = 1; stride < slots_per_leaf; stride <<= 1) {
+            for (unsigned i = 0; i < slots_per_leaf; i += 2 * stride) {
+                va[i] += va[i + stride];
+                vb[i] += vb[i + stride];
+            }
+        }
+        if (ra < hidden) leaf_part[ra] = va[0];
+        if (rb < hidden) leaf_part[rb] = vb[0];
+    }
+    __syncthreads();
+
+    __shared__ unsigned combine;
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add(
+            ready + tile, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        combine = (old % leaves) + 1u == leaves;
+    }
+    __syncthreads();
+    if (!combine) return;
+    asm volatile("buffer_inv" ::: "memory");
+    for (unsigned h = tile * rows_per_block + threadIdx.x;
+         h < min(hidden, (tile + 1u) * rows_per_block); h += blockDim.x) {
+        float root[leaves];
+#pragma unroll
+        for (unsigned q = 0; q < leaves; ++q)
+            root[q] = part[(size_t)q * hidden + h];
+#pragma unroll
+        for (unsigned stride = 1; stride < leaves; stride <<= 1)
+#pragma unroll
+            for (unsigned q = 0; q < leaves; q += 2 * stride)
+                root[q] += root[q + stride];
+        out[h] = f2bf(root[0]);
+    }
+}
+
+extern "C" __device__ unsigned plow_moe_down_combine_tree_abi_1 = 1;
+extern "C" __device__ unsigned plow_moe_down_combine_tree_slots_per_leaf =
+    PLOW_MOE_TREE_SLOTS_PER_LEAF;
+extern "C" __device__ unsigned plow_moe_down_combine_tree_rows_per_block =
+    (PLOW_MOE_TREE_THREADS / PLOW_WAVE) * 8;
+extern "C" __device__ unsigned plow_moe_down_combine_tree_xcd_local_1 = 1;
+extern "C" __device__ unsigned plow_moe_down_combine_tree_no_global_wait_1 = 1;
+
 extern "C" __global__ void k3_moe_xcd_map(unsigned* out) {
     if (threadIdx.x == 0)
         out[blockIdx.x] =
