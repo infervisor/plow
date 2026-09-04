@@ -699,6 +699,27 @@ struct KdaChunkKeyFactorCarryArgs {
 
 const _: () = assert!(std::mem::size_of::<KdaChunkKeyFactorCarryArgs>() == 104);
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaChunkCarryRegstateArgs {
+    out: u64,
+    state: u64,
+    q: u64,
+    k: u64,
+    w: u64,
+    u: u64,
+    aqk: u64,
+    g: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    value_dim: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkCarryRegstateArgs>() == 88);
+
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 struct XReduceAttnResArgs {
@@ -976,6 +997,10 @@ enum PrefillSegmentRoute {
     },
     KdaChunkKeyFactorCarry {
         args: KdaChunkKeyFactorCarryArgs,
+        grid: u32,
+    },
+    KdaChunkCarryRegstate {
+        args: KdaChunkCarryRegstateArgs,
         grid: u32,
     },
     MoeStage1Mxfp4(MoeStage1Mxfp4Route),
@@ -1492,6 +1517,7 @@ fn rebase_kda_key_factor_routes(routes: &mut [PrefillSegmentRoute], t: u32) {
         match route {
             PrefillSegmentRoute::KdaChunkKeyFactorWu { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkKeyFactorCarry { args, .. } => args.t = t,
+            PrefillSegmentRoute::KdaChunkCarryRegstate { args, .. } => args.t = t,
             _ => {}
         }
     }
@@ -1525,6 +1551,87 @@ fn promote_kda_intra_wave_items_routes(
                     "KDA-intra wave-item segment {seg} is not an exact BT64/D128 singleton"
                 )))
             }
+        };
+    }
+    Ok(())
+}
+
+fn kda_carry_regstate_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::KdaChunkCarry as u16
+        && d.blocks != 0
+        && d.i[0] >= 512
+        && d.i[1] != 0
+        && d.i[2] == 128
+        && d.i[3] == 128
+        && d.i[4] == 1
+        && d.i[5..].iter().all(|&v| v == 0)
+        && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && f32::from_bits(d.fj[0]).is_finite()
+        && f32::from_bits(d.fj[0]) > 0.0
+        && d.fj[1..].iter().all(|&v| v == 0)
+}
+
+/// One workgroup per (head, V16) state tile.
+fn kda_carry_regstate_grid(heads: u32) -> u32 {
+    heads * 8
+}
+
+fn promote_kda_carry_regstate_routes(
+    prog: &DevProg,
+    classes: &[u8],
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+) -> Result<()> {
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KDA carry regstate operand `{what}` handle {h} is invalid"
+            ))
+        })
+    };
+    for (seg, &class) in classes.iter().enumerate() {
+        if class != 23 {
+            continue;
+        }
+        let mut inst = None;
+        for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
+            if e.wait_len != 0
+                || e.succ_len != 0
+                || e.flags & packet::dev::SE_KDA_CARRY_REGSTATE == 0
+                || inst.is_some_and(|i| i != e.inst as usize)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "KDA carry regstate segment {seg} has counter obligations or is not a singleton"
+                )));
+            }
+            inst = Some(e.inst as usize);
+        }
+        let d = inst
+            .and_then(|i| prog.insts.get(i))
+            .filter(|d| kda_carry_regstate_inst(d));
+        let Some(d) = d else {
+            return Err(RuntimeError::Device(format!(
+                "KDA carry regstate segment {seg} is not an exact qpre BT64/D128/V128 carry"
+            )));
+        };
+        routes[seg] = PrefillSegmentRoute::KdaChunkCarryRegstate {
+            args: KdaChunkCarryRegstateArgs {
+                out: addr(d.t[0], "out")?,
+                state: addr(d.t[1], "state")?,
+                q: addr(d.t[2], "q")?,
+                k: addr(d.t[3], "k")?,
+                w: addr(d.t[4], "W")?,
+                u: addr(d.t[5], "U")?,
+                aqk: addr(d.t[6], "Aqk")?,
+                g: addr(d.t[7], "g")?,
+                t: d.i[0],
+                heads: d.i[1],
+                dim: d.i[2],
+                value_dim: d.i[3],
+                scale: f32::from_bits(d.fj[0]),
+                _pad: 0,
+            },
+            grid: kda_carry_regstate_grid(d.i[1]),
         };
     }
     Ok(())
@@ -3111,6 +3218,43 @@ const KDA_INTRA_WAVE_ITEMS_MARKERS: [&str; 6] = [
     "plow_kda_intra_wave_items_vgpr_le_96",
 ];
 
+const KDA_CARRY_REGSTATE_MARKERS: [&str; 6] = [
+    "plow_kda_carry_regstate_abi_1",
+    "plow_kda_carry_regstate_bt64_d128_v128_qpre_1",
+    "plow_kda_carry_regstate_wave64_1",
+    "plow_kda_carry_regstate_no_spill_1",
+    "plow_kda_carry_regstate_static_lds_43520",
+    "plow_kda_carry_regstate_vgpr_le_256",
+];
+const KDA_CARRY_REGSTATE_LDS: u32 = 43_520;
+
+fn read_kda_carry_regstate_object(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| {
+        RuntimeError::Device(format!(
+            "marked KDA carry regstate segments require {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn check_kda_carry_regstate_symbols<'a>(syms: &[&'a str], path: &Path) -> Result<()> {
+    for marker in KDA_CARRY_REGSTATE_MARKERS {
+        if !syms.contains(&marker) {
+            return Err(RuntimeError::Device(format!(
+                "KDA carry regstate object {} lacks required ABI/resource marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    if !syms.contains(&"plow_packet_hash_lo") || !syms.contains(&"plow_packet_hash_hi") {
+        return Err(RuntimeError::Device(format!(
+            "KDA carry regstate object {} has no packet-pairing stamp",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn read_kda_intra_wave_items_object(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| {
         RuntimeError::Device(format!(
@@ -4368,6 +4512,7 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     let mut xr_wave_pure = vec![true; n_seg as usize];
     let mut kda_wave_any = vec![false; n_seg as usize];
     let mut kda_wave_pure = vec![true; n_seg as usize];
+    let mut kda_carry_pure = vec![true; n_seg as usize];
     for e in &prog.stream {
         let op = prog
             .insts
@@ -4387,6 +4532,7 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
         let kda_wave_marked = e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0;
         kda_wave_any[seg] |= kda_wave_marked;
         kda_wave_pure[seg] &= kda_wave_marked && op == DevOp::KdaChunkIntra as u16;
+        kda_carry_pure[seg] &= kda_wave_marked && op == DevOp::KdaChunkCarry as u16;
         if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
             class[e.seg as usize] = 4;
         } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
@@ -4428,12 +4574,16 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
             class[s] = 19;
         }
         if kda_wave_any[s] {
-            if !kda_wave_pure[s] {
+            if kda_wave_pure[s] {
+                class[s] = 20;
+            } else if kda_carry_pure[s] {
+                class[s] = 23;
+            } else {
                 return Err(RuntimeError::Device(format!(
-                    "segment {s} carries SE_KDA_INTRA_WAVE_ITEMS but is not pure KdaChunkIntra"
+                    "segment {s} carries SE_KDA_INTRA_WAVE_ITEMS but is not pure KdaChunkIntra \
+                     (nor SE_KDA_CARRY_REGSTATE on pure KdaChunkCarry)"
                 )));
             }
-            class[s] = 20;
         }
     }
     for &(seg, ns) in &needs_v2 {
@@ -6906,6 +7056,7 @@ pub struct AmdEngine {
     k_grouped_moe_down: Option<HsaKernel>,
     k_kda_chunk_intra_cached: Option<HsaKernel>,
     k_kda_chunk_intra_wave_items: Option<HsaKernel>,
+    k_kda_chunk_carry_regstate: Option<HsaKernel>,
     k_kda_key_factor_wu: Option<HsaKernel>,
     k_kda_key_factor_carry: Option<HsaKernel>,
     /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
@@ -7496,11 +7647,18 @@ impl AmdEngine {
                     .iter()
                     .any(|e| e.flags & packet::dev::SE_XR_WAVE_RS != 0)
             });
-        let need_kda_intra_wave_items = blob.progs[..dec_ix].iter().any(|p| {
-            p.stream
-                .iter()
-                .any(|e| e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0)
-        });
+        let marked_op = |p: &DevProg, op: DevOp| {
+            p.stream.iter().any(|e| {
+                e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0
+                    && p.insts.get(e.inst as usize).map(|d| d.op) == Some(op as u16)
+            })
+        };
+        let need_kda_intra_wave_items = blob.progs[..dec_ix]
+            .iter()
+            .any(|p| marked_op(p, DevOp::KdaChunkIntra));
+        let need_kda_carry_regstate = blob.progs[..dec_ix]
+            .iter()
+            .any(|p| marked_op(p, DevOp::KdaChunkCarry));
         if let Some(p) = blob.progs[..dec_ix]
             .iter()
             .find(|p| p.insts.iter().any(|i| i.op == DevOp::KdaDecodeFused as u16))
@@ -8511,6 +8669,48 @@ impl AmdEngine {
                 object = %path.display(),
                 symbol = SYMBOL,
                 "KDA-intra wave-item object accepted"
+            );
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let k_kda_chunk_carry_regstate = if need_kda_carry_regstate {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "marked KDA carry regstate segments require gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "kda_chunk_carry_regstate_gfx950.elf";
+            const SYMBOL: &str = "plow_kda_chunk_carry_regstate_gfx950";
+            let path = hsaco_dir.join(NAME);
+            let image = read_kda_carry_regstate_object(&path)?;
+            let syms = elf_symbol_names(&image);
+            check_kda_carry_regstate_symbols(&syms, &path)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            let want = std::mem::size_of::<KdaChunkCarryRegstateArgs>() as u32;
+            let got = kernel.kernarg_size();
+            let lds = HsaBackend::kernel_lds_bytes(&kernel);
+            let private = kernel.private_segment_size();
+            if got != want && got != want + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; KDA carry regstate ABI needs {want} (or {} with COv5 implicit args)",
+                    want + 256
+                )));
+            }
+            if lds != KDA_CARRY_REGSTATE_LDS || private != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: resource gate failed: LDS={lds} (required {KDA_CARRY_REGSTATE_LDS}), private={private} (required 0)"
+                )));
+            }
+            tracing::info!(
+                object = %path.display(),
+                symbol = SYMBOL,
+                "KDA carry regstate object accepted"
             );
             modules.push(module);
             Some(kernel)
@@ -9590,6 +9790,7 @@ impl AmdEngine {
                 add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
                 promote_kda_intra_wave_items_routes(p, &seg_class, &mut prefill_routes)?;
+                promote_kda_carry_regstate_routes(p, &seg_class, &devp, &mut prefill_routes)?;
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let graph_phase = graph_phase_segments[prog_ix].contains(&seg);
                     if class == 19 || graph_phase {
@@ -10172,6 +10373,7 @@ impl AmdEngine {
             k_grouped_moe_down,
             k_kda_chunk_intra_cached,
             k_kda_chunk_intra_wave_items,
+            k_kda_chunk_carry_regstate,
             k_kda_key_factor_wu,
             k_kda_key_factor_carry,
             _kda_key_factor_scratch: d_kda_key_factor_scratch,
@@ -10698,6 +10900,9 @@ impl AmdEngine {
                     return "kda_intra_wave_items";
                 }
                 PrefillSegmentRoute::AttnResF32Mix { .. } => return "attn_res_f32mix",
+                PrefillSegmentRoute::KdaChunkCarryRegstate { .. } => {
+                    return "kda_carry_regstate";
+                }
                 PrefillSegmentRoute::KdaChunkKeyFactorWu { .. }
                     if self.k_kda_key_factor_wu.is_some() =>
                 {
@@ -10900,6 +11105,26 @@ impl AmdEngine {
                     kernel,
                     grid,
                     WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.k_kda_chunk_carry_regstate.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "marked KDA carry regstate segment has no validated object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
                     0,
                     as_bytes(std::slice::from_ref(&args)),
                     None,
@@ -13192,6 +13417,31 @@ mod tests {
     }
 
     #[test]
+    fn marked_kda_carry_regstate_requires_its_object() {
+        let path = std::env::temp_dir().join(format!(
+            "plow-kda-carry-regstate-missing-{}-{}.elf",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let err = read_kda_carry_regstate_object(&path)
+            .expect_err("a marked packet must not silently use the interpreter")
+            .to_string();
+        assert!(err.contains("marked KDA carry regstate segments require"));
+
+        let path = Path::new("kda_chunk_carry_regstate_gfx950.elf");
+        let mut syms = KDA_CARRY_REGSTATE_MARKERS.to_vec();
+        syms.pop();
+        let err = check_kda_carry_regstate_symbols(&syms, path)
+            .expect_err("a stale resource contract must be rejected")
+            .to_string();
+        assert!(err.contains("lacks required ABI/resource marker"));
+        let err = check_kda_carry_regstate_symbols(&KDA_CARRY_REGSTATE_MARKERS, path)
+            .expect_err("an unstamped object must be rejected")
+            .to_string();
+        assert!(err.contains("no packet-pairing stamp"));
+    }
+
+    #[test]
     fn expert_parallel_loader_requires_every_abi_and_resource_marker() {
         let required = [
             "plow_moe_ep_filter_align_abi_1",
@@ -14655,6 +14905,45 @@ mod tests {
         let err = derive_segments_for(&mixed, false)
             .expect_err("an incompletely marked segment must not reach the wave-item object");
         assert!(err.to_string().contains("not pure KdaChunkIntra"));
+    }
+
+    #[test]
+    fn kda_carry_regstate_routes_only_a_marked_exact_singleton() {
+        let mut prog = segmented_prog(&[DevOp::KdaChunkWu, DevOp::KdaChunkCarry], &[0, 1]);
+        prog.t = 8192;
+        prog.insts[1].blocks = 256;
+        prog.insts[1].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        prog.insts[1].i = [8192, 12, 128, 128, 1, 0, 0, 0];
+        prog.insts[1].fj[0] = (1.0 / 128.0f32.sqrt()).to_bits();
+        prog.stream[1].flags |= packet::dev::SE_KDA_CARRY_REGSTATE;
+        let devp: Vec<_> = (0..8)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let classes = derive_segments_for(&prog, false).unwrap();
+        assert_eq!(classes, [8, 23]);
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        promote_kda_carry_regstate_routes(&prog, &classes, &devp, &mut routes).unwrap();
+        let PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid } = routes[1] else {
+            panic!("a marked exact carry must select the regstate object")
+        };
+        assert_eq!(
+            (args.t, args.heads, args.dim, args.value_dim, grid),
+            (8192, 12, 128, 128, 96)
+        );
+        assert_eq!((args.out, args.g), (0x1000, 0x1700));
+        assert!(matches!(routes[0], PrefillSegmentRoute::Interpreter));
+
+        prog.insts[1].i[4] = 0;
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        let err = promote_kda_carry_regstate_routes(&prog, &classes, &devp, &mut routes)
+            .expect_err("a non-qpre carry must not reach the regstate object");
+        assert!(err.to_string().contains("not an exact qpre"));
+
+        let mut mixed = segmented_prog(&[DevOp::KdaChunkCarry, DevOp::RmsNorm], &[0, 0]);
+        for e in &mut mixed.stream {
+            e.flags |= packet::dev::SE_KDA_CARRY_REGSTATE;
+        }
+        assert!(derive_segments_for(&mixed, false).is_err());
     }
 
     #[test]

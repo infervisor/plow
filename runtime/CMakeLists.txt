@@ -661,6 +661,8 @@ option(PLOW_HSACO_ATTN_RES_F32MIX
        "Also build the packet-paired f32-mix AttnRes prefill object (PLOW_ATTNRES_F32MIX=1 packets)" OFF)
 option(PLOW_HSACO_KDA_KEY_FACTOR
        "Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair" OFF)
+option(PLOW_HSACO_KDA_CARRY_REGSTATE
+       "Also build the packet-paired register-resident BT64/D128 KDA carry segment" OFF)
 option(PLOW_HSACO_XR_ATTNRES
        "Build the standalone two-shot XReduce+AttnRes segment object" OFF)
 option(PLOW_HSACO_MOE_STAGE2_LEAN
@@ -806,6 +808,7 @@ if(PLOW_GFX950_HSACO)
     set(_hs_need_kda_fused ON)
     set(_hs_need_kda_intra_wave_items OFF)
     set(_hs_need_attn_res_f32mix OFF)
+    set(_hs_need_kda_carry_regstate OFF)
     set(_hs_need_decode_mla ${PLOW_HSACO_DECODE_MLA_SEGMENTS})
     if(PLOW_HSACO_CONFIG)
         get_filename_component(_hs_cfg_dir "${PLOW_HSACO_CONFIG}" DIRECTORY)
@@ -847,6 +850,13 @@ if(PLOW_GFX950_HSACO)
         message(FATAL_ERROR
             "manifest-required f32-mix AttnRes object is supported only on gfx950")
     endif()
+    if(PLOW_HSACO_CONFIG)
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_carry_regstate_presence
+             REGEX "^#define PLOW_PACKET_REQUIRES_KDA_CARRY_REGSTATE 1$")
+        if(_hs_kda_carry_regstate_presence)
+            set(_hs_need_kda_carry_regstate ON)
+        endif()
+    endif()
     if(PLOW_HSACO_DECODE_INVENTORY_PRUNE AND NOT PLOW_HSACO_CONFIG)
         message(FATAL_ERROR
             "PLOW_HSACO_DECODE_INVENTORY_PRUNE requires PLOW_HSACO_CONFIG")
@@ -858,6 +868,14 @@ if(PLOW_GFX950_HSACO)
     if(_hs_need_kda_intra_wave_items AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
         message(FATAL_ERROR
             "manifest-required KDA intra wave-item object is supported only on gfx950")
+    endif()
+    if(PLOW_HSACO_KDA_CARRY_REGSTATE AND NOT PLOW_HSACO_CONFIG)
+        message(FATAL_ERROR
+            "PLOW_HSACO_KDA_CARRY_REGSTATE requires PLOW_HSACO_CONFIG for packet pairing")
+    endif()
+    if(_hs_need_kda_carry_regstate AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR
+            "manifest-required KDA carry regstate object is supported only on gfx950")
     endif()
     if(_hs_need_decode_mla AND
        (NOT PLOW_HSACO_DECODE_INVENTORY_PRUNE OR NOT PLOW_HSACO_CONFIG))
@@ -1415,6 +1433,24 @@ if(PLOW_GFX950_HSACO)
             VERBATIM)
         add_custom_target(attn_res_f32mix_gfx950 DEPENDS "${_hs_attn_res_f32mix_out}")
         list(APPEND _hs_outs "${_hs_attn_res_f32mix_out}")
+    endif()
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND
+       (PLOW_HSACO_KDA_CARRY_REGSTATE OR _hs_need_kda_carry_regstate))
+        set(_hs_kda_carry_reg_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_carry_regstate.hip")
+        set(_hs_kda_carry_reg_out "${PLOW_HSACO_DIR}/kda_chunk_carry_regstate_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_carry_reg_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_carry_reg_out}"
+                    plow_kda_chunk_carry_regstate_gfx950 256 1
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1
+                    "${_hs_kda_carry_reg_src}"
+            DEPENDS "${_hs_kda_carry_reg_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_carry_regstate_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_carry_regstate_gfx950 DEPENDS "${_hs_kda_carry_reg_out}")
+        list(APPEND _hs_outs "${_hs_kda_carry_reg_out}")
     endif()
 
     if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_KEY_FACTOR)
