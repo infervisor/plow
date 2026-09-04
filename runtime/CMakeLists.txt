@@ -709,10 +709,15 @@ option(PLOW_K3_KDA_CONV_STEP_DB
        "Fuse K3 B1 Conv3 into StateStepG with ping-pong convolution windows" OFF)
 option(PLOW_MLA_PF_SV
        "Use the V2 MLA-prefill LDS swizzle and fragment staging" ON)
-option(PLOW_MLA_PF_TR16
-       "Use gfx950 transpose LDS reads in the V2 MLA-prefill PV stage" OFF)
-
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
+set(_PLOW_MLA_PF_TR16_DEFAULT OFF)
+if(PLOW_HSACO_ARCH STREQUAL "gfx950")
+    set(_PLOW_MLA_PF_TR16_DEFAULT ON)
+endif()
+option(PLOW_MLA_PF_TR16
+       "Use gfx950 transpose LDS reads in the V2 MLA-prefill PV stage"
+       ${_PLOW_MLA_PF_TR16_DEFAULT})
+
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
 # Discovered from the INSTALLED ROCm rather than pinned: this path was pinned to
 # 7.0.2 once and the build died on the first box that had 7.2.4.

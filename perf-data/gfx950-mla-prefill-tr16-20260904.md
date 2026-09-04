@@ -2,9 +2,10 @@
 
 ## Decision
 
-Keep `PLOW_MLA_PF_TR16` default-off pending the full-network gate. At the K3 trace
-geometry it is bit-exact to the current V2 body and reduces the isolated body by
-16.62% without changing occupancy or introducing scratch/spills.
+Enable `PLOW_MLA_PF_TR16` by default for gfx950 HSACO builds, with
+`-DPLOW_MLA_PF_TR16=OFF` as the rollback. At the K3 trace geometry it is bit-exact
+to the current V2 body, reduces the isolated body by 16.62%, and reduces the matched
+TP8 traced body by 16.34% without changing occupancy or introducing scratch/spills.
 
 The change is model-independent. It is selected by gfx950 capability and the generic
 `DK`/`DR` V2 template, not by a model name. Candidate objects export
@@ -66,16 +67,6 @@ Matched production CMake raw objects also build successfully:
 The SGPR spill count is unchanged and spills into VGPRs; both metadata records report
 zero private bytes and zero VGPR spill.
 
-Harness object SHA256:
-
-- current: `d50fc57d124f7058c588046f3430f6c85d8371eb187a46d089596024c40ab710`
-- TR16: `e7932734caae2c02df2e08d0c1b40a6ba1382b781d6251bf54e5aa3265dde63d`
-
-Production raw-object SHA256:
-
-- current: `0c39462d3033325421bf54dde354f61f0c9c5a3994dfcf9f4ca0d6439afa4322`
-- TR16: `b2f848f7eea007eb7ce13cc82453bde87316eb1d64d6fdf235509b80704d3f30`
-
 ## TuneDB/profile scope
 
 The gfx950 attention TuneDB selects decode `nsplit` for exact cells such as
@@ -84,6 +75,71 @@ TuneDB likewise does not cover `FlashMlaPrefill`. TR16 is therefore an isolated
 object build knob and does not change packet shape, TuneDB lookup, scratch extent,
 or merge policy.
 
-Next gate: hash-stamped current/TR16 object sets with one identical measured-TuneDB
-packet, three order-alternated TP8 `8192->256` folds, exact tokens/checksums and
-all-rank counters, neutral TPOT, plus a matched raw-trace attribution.
+## TP8 network qualification
+
+Both arms used packet
+`f1bf783dac96791b7116ffb549862c8206ba33351310c7c113504916611e8921`,
+the same checkpoint and TuneDB, BF16 KV (`fp8_dir: None`), and the default
+segment-major TP prefill schedule. The HSA runtime was built from this isolated tree
+and has SHA256
+`754ee0fbc51374f32c87b649ecc370868fa2397e838926a465573eeddf69682b`.
+Every measured request enabled per-dispatch TP audit and reported completion on all
+eight ranks.
+
+The complete object directories contain 37 objects each. Only
+`interp_mla_v2_sv{,_gq}.elf` differ. Static-object SHA256:
+
+- current: `040a9f2a52d821445dee20a7d9a05265d998fe2eacd0ba2e4894c5b6b85a65bb`
+- TR16: `ce1fc55bdfbb4e6cf0d0ce5343e9d97a150e099c7f2b64e042e5782a41bd53f6`
+
+The current object has 256 `ds_read_u16`, 128 `v_perm_b32`, and no transpose
+reads. The candidate has 64 `ds_read_b64_tr_b16`, no old reads/packs, and alone
+exports `plow_mla_pf_tr16_arm_1`.
+
+### Exact single-request folds
+
+Three order-alternated `8192->256`, warmup-zero processes produced byte-identical
+256-token arrays and checksum `fnv1a64:6bdfaa7b84ee4e7e` in every arm. They also
+exposed process-start/tail instability and are retained here rather than filtered:
+
+| fold/order | current TTFT/TPOT/E2E ms | TR16 TTFT/TPOT/E2E ms | TR16 delta ms |
+|---|---:|---:|---:|
+| 1 C/T | 1403.295 / 29.978 / 9047.652 | 1386.743 / 30.599 / 9189.428 | -16.552 / +0.621 / +141.776 |
+| 2 T/C | 3088.215 / 29.934 / 10721.358 | 2834.663 / 29.936 / 10468.231 | -253.552 / +0.002 / -253.127 |
+| 3 C/T | 1403.693 / 29.962 / 9044.120 | 1888.796 / 29.925 / 9519.698 | +485.103 / -0.037 / +475.578 |
+
+Fold 1's TPOT increase is one 199.648 ms inter-token stall; its TR16 median/p90
+are 29.931/29.959 ms versus current 29.975/30.005 ms. The unfiltered three-fold
+mean deltas are TTFT `+71.666`, TPOT `+0.195`, E2E `+121.409` ms, so this noisy
+warmup-zero gate alone does not qualify the change.
+
+### Persistent-engine gate
+
+Two order-balanced processes per arm used one warmup plus five measured sequential
+C1 `8192->256` requests. Aggregate checksum `fnv1a64:7b56ea918df2c0ba` matched.
+
+| pair/order | TTFT delta mean | TPOT delta mean | E2E delta mean |
+|---|---:|---:|---:|
+| 1 C/T | -18.719 ms | -0.0130 ms | -22.023 ms |
+| 2 T/C | -19.005 ms | +0.0189 ms | -14.179 ms |
+| balanced mean | **-18.862 ms** | **+0.0030 ms** | **-18.101 ms** |
+
+TPOT changes by 0.010%, while TTFT and served E2E improve in both orders. This is
+the production qualification used for the default decision.
+
+### Matched trace
+
+The exact one-token trace pair attributes the network delta directly to the changed
+body:
+
+| metric | current | TR16 | delta |
+|---|---:|---:|---:|
+| TTFT | 1403.875 ms | 1385.977 ms | -17.897 ms |
+| `FLASH_MLA_PREFILL` body, 24 packets | 108.045 ms | 90.390 ms | -17.656 ms (-16.34%) |
+| total traced body | 1025.275 ms | 1006.925 ms | -18.350 ms |
+| wide-packet straggler spread | 211.562 ms | 203.532 ms | -8.030 ms |
+| wide-packet convergence | 46.906 ms | 47.011 ms | +0.105 ms |
+
+The collective convergence term is neutral; the improvement is in the MLA body and
+reduced workgroup spread. Raw evidence is in
+`/tmp/plow-mla-tr16-network/segment-major`.
