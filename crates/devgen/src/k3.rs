@@ -4556,6 +4556,80 @@ mod tests {
         }
     }
 
+    /// L7 (`PLOW_KDA_DECODE_FUSED_ARM`): every KDA decode layer's Conv3 and GatedNorm fold
+    /// into its step packet — two packets fewer per layer, the step's slice map unchanged.
+    #[test]
+    fn kda_decode_fused_arm_removes_two_packets_per_kda_layer() {
+        let _guard = crate::test_env::env_guard();
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        // The served TP8 shape: BV = 8 (`mla/kimi_k3.rs`), one value column per wave.
+        let build = || {
+            let mut c = model_cfg();
+            c.tp = 8;
+            c.kda.bv = 8;
+            let mut mla: std::collections::BTreeSet<u32> =
+                (0..93).filter(|l| l % 4 == 3).take(24).collect();
+            mla.insert(92);
+            let layers: Vec<u32> = (0..93).collect();
+            let mut b = Builder::new(256);
+            emit_k3_model(
+                &mut b,
+                &c,
+                &|l| !mla.contains(&l),
+                &layers,
+                4096,
+                1,
+                1,
+                1,
+                256,
+                RowKind::Tokens,
+            );
+            b.finish()
+        };
+        let base = {
+            let _off = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_FUSED_ARM", "0")]);
+            build()
+        };
+        assert_eq!(n(&base, DevOp::KdaStateStepG), 69);
+        assert_eq!(n(&base, DevOp::KdaConv3), 69);
+        assert_eq!(n(&base, DevOp::KdaGatedNorm), 69);
+
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_FUSED_ARM", "1")]);
+        let p = build();
+        assert_eq!(
+            p.insts.len(),
+            base.insts.len() - 2 * 69,
+            "exactly two packets per KDA layer"
+        );
+        assert_eq!(n(&p, DevOp::KdaConv3), 0);
+        assert_eq!(n(&p, DevOp::KdaGatedNorm), 0);
+        let steps: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::KdaStateStepG as u16)
+            .collect();
+        assert_eq!(steps.len(), 69);
+        for s in &steps {
+            assert_eq!(s.i[4], 1 | 8, "l2norm + fused arm");
+            assert_eq!(s.blocks, 192);
+            assert!(p.tensors[s.t[0] as usize].name.ends_with(".y"), "t0 is y");
+            assert!(
+                p.tensors[s.t[7] as usize].name.ends_with("kda.fused.desc"),
+                "t7 is the descriptor"
+            );
+        }
+        assert_eq!(
+            p.tensors
+                .iter()
+                .filter(|t| t.name.ends_with("kda.fused.scratch"))
+                .count(),
+            69,
+            "one rendezvous scratch per layer"
+        );
+    }
+
     /// L4 (`PLOW_XR_COMBINE_FOLD`): the latent `MoeCombine` folds into the tagged one-shot
     /// publish. Opted out, the packet carries no fold field at all, so a pre-L4 object
     /// reads it exactly as before. On, every MoE layer loses its combine packet,

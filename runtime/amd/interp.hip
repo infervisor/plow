@@ -2742,6 +2742,36 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             const float* dtb = (in->i[5] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[5]];
             if (dtb == nullptr || TEN(7) == nullptr || TEN(4) == nullptr || TEN(5) == nullptr)
                 __builtin_trap();
+#if PLOW_KDA_DECODE_FUSED_ARM
+            /* L7: flags bit 3 = the Conv3+StepG+GatedNorm chain as ONE packet. t0 = y,
+             * t1..t3 = raw q/k/v, t7 = the u32 operand descriptor (op_kda.h). Only a flag-on
+             * object reads the bit; the loader refuses the packet on any other. */
+            if (in->i[4] & PLOW_KDA_F_FUSED_ARM) {
+                const unsigned* desc = (const unsigned*)TEN(7);
+                if (in->i[0] != 1u || (in->i[4] & PLOW_KDA_F_SEQ_ROWS)) __builtin_trap();
+#pragma unroll
+                for (unsigned i = 0; i <= PLOW_KDA_FUSED_DESC_SCRATCH; ++i)
+                    if (desc[i] == PLOW_TENSOR_NONE) __builtin_trap();
+                d_kda_decode_fused_arm(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                    (float*)TEN(6), (const float*)T[desc[PLOW_KDA_FUSED_DESC_WQ]],
+                    (const float*)T[desc[PLOW_KDA_FUSED_DESC_WK]],
+                    (const float*)T[desc[PLOW_KDA_FUSED_DESC_WV]],
+                    (float*)T[desc[PLOW_KDA_FUSED_DESC_CSQ]],
+                    (float*)T[desc[PLOW_KDA_FUSED_DESC_CSK]],
+                    (float*)T[desc[PLOW_KDA_FUSED_DESC_CSV]],
+                    (const float*)T[desc[PLOW_KDA_FUSED_DESC_ALOG]], dtb,
+                    (const float*)T[desc[PLOW_KDA_FUSED_DESC_NORMW]],
+                    (const bf16*)T[desc[PLOW_KDA_FUSED_DESC_GRAW]],
+                    (uint64_t*)T[desc[PLOW_KDA_FUSED_DESC_SCRATCH]], in->i[1], in->i[2],
+                    in->i[3], desc[PLOW_KDA_FUSED_DESC_W], in->i[4], in->i[6], in->fj[0].f,
+                    in->fj[1].f, __uint_as_float(desc[PLOW_KDA_FUSED_DESC_EPS]), slice, nblk,
+                    (float*)sm->raw,
+                    (in->i[4] & PLOW_KDA_F_FB_FOLD) ? (const bf16*)T[in->fj[2].u] : nullptr);
+                break;
+            }
+#endif
 #if PLOW_PACKED_PREFILL_KDA_CONSUMERS
             if (plow_packed_prefill_enabled(prog_meta))
                 d_kda_state_step_packed</*GATED=*/true>(
@@ -4456,6 +4486,16 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             asm volatile("" ::"s"(pf_), "s"(pf2_));
         }
 #endif
+#if PLOW_GEMV_PREFETCH
+        /* L8: this slice's weight rows go to L2 while the gate is still closed (op_gemm.h
+         * `gemv_prefetch_slice`). Above the GATE_HIER leader guard for the reason PLOW_INST_PF
+         * gives. `pf_live` is wave-uniform (it descends from the instruction), and the matching
+         * vmcnt(0) sits after the gate, before the arena is reused. */
+        const bool pf_live = (in->op == PLOW_DOP_GEMV) && (in->t[2] != PLOW_TENSOR_NONE);
+        if (pf_live)
+            gemv_prefetch_slice((const bf16*)tens[in->t[2]], in->i[1], in->i[2], e.slice,
+                                in->blocks, sm.raw);
+#endif
 #if PLOW_GATE_HIER
         if (!h_on || h_lead)
 #endif
@@ -4476,6 +4516,10 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             }
         }
         __syncthreads(); /* every counter in the list is now satisfied */
+#if PLOW_GEMV_PREFETCH
+        /* Every wave's LDS-DMA prefetch has landed before any op writes the arena. */
+        if (pf_live) cp_async_wait();
+#endif
 #if PLOW_TRACE_PHASE
         /* T1: the dependency is met; nothing below here is waiting for a producer. */
         const uint64_t t_p1 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;

@@ -276,6 +276,10 @@ struct Shapes {
     /// Any `KdaStateStepG` with flags bit 2 — the f_b GEMV folded into the step's prologue
     /// (PLOW_KDA_FB_FOLD). An object without the arm reads `f_a` as the gate logits.
     kda_fb_fold: bool,
+    /// Any `KdaStateStepG` with flags bit 3 — the Conv3+StepG+GatedNorm chain as one packet
+    /// (PLOW_KDA_DECODE_FUSED_ARM). An object without the arm runs the recurrence on the RAW
+    /// projections and reads the descriptor as `A_log`.
+    kda_decode_fused_arm: bool,
     /// Any prefill DOWN with `i[4]!=0` — the fused 86->87 decomposition (PLOW_MOE_PF_ATOMIC):
     /// t[0] is a [T,H] f32 accumulator the DOWN epilogue atomically adds into, NOT the
     /// [T*k,H] `part` scatter. An object without the arm would overrun it k-fold.
@@ -341,7 +345,10 @@ fn shapes(m: &Model) -> Shapes {
             s.ops_present.insert(op_name(op));
             match op {
                 DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
-                DevOp::KdaStateStepG if inst.i[4] & 4 != 0 => s.kda_fb_fold = true,
+                DevOp::KdaStateStepG if inst.i[4] & 12 != 0 => {
+                    s.kda_fb_fold |= inst.i[4] & 4 != 0;
+                    s.kda_decode_fused_arm |= inst.i[4] & 8 != 0;
+                }
                 // `i0=n_batch i1=n_head i2=n_kv_head … i6=hd`
                 DevOp::FlashDecode | DevOp::FlashDecodeFp8 => {
                     let (hd, nh, kvh, nb) = (inst.i[6], inst.i[1], inst.i[2], inst.i[0]);
@@ -697,6 +704,13 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
     f.insert("xr_combine_fold".into(), json!(s.xr_combine_fold));
     f.insert("kda_fb_fold".into(), json!(s.kda_fb_fold));
+    f.insert("kda_decode_fused_arm".into(), json!(s.kda_decode_fused_arm));
+    // L8 is packet-inert (loads only), so it is an EMIT setting surfaced here for the paired
+    // `plow_config.h`, not an instruction signature.
+    f.insert(
+        "gemv_prefetch".into(),
+        json!(crate::emit_config::active().gemv_prefetch),
+    );
     f.insert("moe_prefill_ep".into(), json!(!s.moe_prefill_ep.is_empty()));
     f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
@@ -939,6 +953,10 @@ fn backend_amd(
     // L3 f_b fold: a BUILD axis of the decode object (`#if PLOW_KDA_FB_FOLD`).
     if on("kda_fb_fold") {
         req.push("PLOW_KDA_FB_FOLD=1".into());
+    }
+    // L7 fused decode arm: a BUILD axis of the decode object (`#if PLOW_KDA_DECODE_FUSED_ARM`).
+    if on("kda_decode_fused_arm") {
+        req.push("PLOW_KDA_DECODE_FUSED_ARM=1".into());
     }
     // The fused 86->87 decomposition. Unlike the two above this is a BUILD axis (the atomic
     // branch is `#if PLOW_MOE_PF_ATOMIC`), so an object may genuinely not have it.
@@ -1869,6 +1887,22 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_KDA_FB_FOLD {0}\n#ifndef PLOW_KDA_FB_FOLD\n#define PLOW_KDA_FB_FOLD {0}\n#endif\n",
         if kda_fb_fold { 1 } else { 0 }
     ));
+    let kda_decode_fused_arm = manifest
+        .pointer("/features/kda_decode_fused_arm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_DECODE_FUSED_ARM {0}\n#ifndef PLOW_KDA_DECODE_FUSED_ARM\n#define PLOW_KDA_DECODE_FUSED_ARM {0}\n#endif\n",
+        if kda_decode_fused_arm { 1 } else { 0 }
+    ));
+    let gemv_prefetch = manifest
+        .pointer("/features/gemv_prefetch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#ifndef PLOW_GEMV_PREFETCH\n#define PLOW_GEMV_PREFETCH {}\n#endif\n",
+        if gemv_prefetch { 1 } else { 0 }
+    ));
 
     // Head dims the flash family is instantiated at.
     out.push_str("\n/* --- flash head dims present --- */\n");
@@ -2119,6 +2153,43 @@ mod tests {
             .collect();
         assert!(!req.contains(&"PLOW_KDA_FB_FOLD=1"));
         assert!(config_header(&man).contains("#define PLOW_PACKET_REQUIRES_KDA_FB_FOLD 0\n#ifndef PLOW_KDA_FB_FOLD\n#define PLOW_KDA_FB_FOLD 0\n#endif\n"));
+    }
+
+    #[test]
+    fn kda_decode_fused_arm_is_a_decode_object_requirement() {
+        let mut m = model();
+        m.progs[1]
+            .insts
+            .push(inst(DevOp::KdaStateStepG, [1, 12, 128, 8, 9, 0, 1, 0]));
+        let man = build(&m, "gfx950");
+        assert_eq!(man["features"]["kda_decode_fused_arm"], true);
+        assert_eq!(man["features"]["kda_fb_fold"], false);
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(req.contains(&"PLOW_KDA_DECODE_FUSED_ARM=1"), "{req:?}");
+        assert!(!req.contains(&"PLOW_KDA_FB_FOLD=1"));
+        let h = config_header(&man);
+        assert!(h.contains("#define PLOW_PACKET_REQUIRES_KDA_DECODE_FUSED_ARM 1\n#ifndef PLOW_KDA_DECODE_FUSED_ARM\n#define PLOW_KDA_DECODE_FUSED_ARM 1\n#endif\n"));
+        // L8 is packet-inert and defaults off in the header unless the emit asked for it.
+        assert_eq!(man["features"]["gemv_prefetch"], false);
+        assert!(h.contains("#ifndef PLOW_GEMV_PREFETCH\n#define PLOW_GEMV_PREFETCH 0\n#endif\n"));
+
+        let mut both = model();
+        both.progs[1]
+            .insts
+            .push(inst(DevOp::KdaStateStepG, [1, 12, 128, 8, 13, 0, 1, 0]));
+        let man = build(&both, "gfx950");
+        assert_eq!(man["features"]["kda_decode_fused_arm"], true);
+        assert_eq!(man["features"]["kda_fb_fold"], true);
+
+        let plain = model();
+        let man = build(&plain, "gfx950");
+        assert_eq!(man["features"]["kda_decode_fused_arm"], false);
+        assert!(config_header(&man).contains("#define PLOW_PACKET_REQUIRES_KDA_DECODE_FUSED_ARM 0\n#ifndef PLOW_KDA_DECODE_FUSED_ARM\n#define PLOW_KDA_DECODE_FUSED_ARM 0\n#endif\n"));
     }
 
     /// One opcode, two bodies: hd is an instruction field, so hd256 and hd512

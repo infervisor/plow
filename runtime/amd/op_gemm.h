@@ -3981,6 +3981,57 @@ __device__ __forceinline__ void gemv_qkvg_rows(bf16* __restrict__ Cq_, bf16* __r
 #endif
 #define GV_CHUNK (PLOW_WAVE * 8) /* halves moved by ONE cp_async16: 64 lanes x 8 */
 
+/* ---- CLAIM-AHEAD WEIGHT PREFETCH (-DPLOW_GEMV_PREFETCH=1, decode objects; default OFF) ----
+ * Lever L8. Different from the DMA engine above, and from the three gate-prefetch attempts it
+ * autopsies: nothing here changes how the BODY loads. A workgroup that has claimed a `Gemv`
+ * packet issues that slice's weight rows as `global_load_lds` (no VGPRs, vmcnt-tracked) into a
+ * dead 1 KB slot per wave BEFORE it polls the packet's gate, so the rows are L2-resident when
+ * the body streams them and the per-packet fixed latency (descriptor + first HBM round trip)
+ * is paid under the gate wait instead of after it. Loads only: the body's arithmetic, order
+ * and bytes are untouched, so the result is exact by construction. The interpreter waits
+ * vmcnt(0) after the gate, before any op touches the arena the slots live in.
+ *
+ * `GV_BLOCKED` row ownership (`[slice*per, ...)`) — the same map every bf16 GEMV body uses. */
+#ifndef PLOW_GEMV_PREFETCH
+#define PLOW_GEMV_PREFETCH 0
+#endif
+#if PLOW_GEMV_PREFETCH && !PLOW_BUCKET_DECODE
+#undef PLOW_GEMV_PREFETCH
+#define PLOW_GEMV_PREFETCH 0
+#endif
+#if PLOW_GEMV_PREFETCH
+extern "C" __device__ unsigned plow_gemv_prefetch_1 = 1;
+/* Halves the dead slots occupy at the arena base (one GV_CHUNK per wave). */
+#define GV_PF_HALVES (PLOW_WAVES * GV_CHUNK)
+/* Largest slice (bytes per workgroup) that is prefetched; larger ones run as before. MEASURED
+ * (`runtime/bench/amd/gemv_prefetch_bench.hip`, K3 TP8 shapes): every slice <= 84 KB wins
+ * (o_proj 84 KB: body 9.8 -> 4.9 us; N=7168 K=768 42 KB: 7.7 -> 4.6), the 196 KB latent-up slice
+ * (32 workgroups x 196 KB = 6.3 MB per 4 MB XCD L2) loses even when only its first 96 KB are
+ * issued, so the cut is by slice bytes, not by a per-wave chunk count. 0 = no cap. */
+#ifndef PLOW_GEMV_PF_MAX_BYTES
+#define PLOW_GEMV_PF_MAX_BYTES (128u * 1024u)
+#endif
+__device__ __forceinline__ void gemv_prefetch_slice(const bf16* __restrict__ W_, unsigned N,
+                                                    unsigned K, unsigned slice, unsigned nblk,
+                                                    bf16* __restrict__ dead) {
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned n0 = slice * gv_per;
+    const unsigned n1 = (n0 + gv_per < N) ? (n0 + gv_per) : N;
+    if (n0 >= n1 || (K & 7u)) return;
+    if (PLOW_GEMV_PF_MAX_BYTES && (n1 - n0) * (size_t)K * 2u > (size_t)PLOW_GEMV_PF_MAX_BYTES)
+        return;
+    const auto* const W = as_glob(W_);
+    const unsigned lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
+    bf16* const slot = dead + wave * GV_CHUNK;
+    const unsigned nchunk = (K + GV_CHUNK - 1) / GV_CHUNK;
+    const unsigned total = (n1 - n0) * nchunk; /* (row, chunk) pairs, flattened */
+    for (unsigned g = wave; g < total; g += PLOW_WAVES) {
+        const unsigned row = n0 + g / nchunk, k = (g % nchunk) * GV_CHUNK + lane * 8;
+        if (k < K) cp_async16(W + (size_t)row * K + k, slot);
+    }
+}
+#endif /* PLOW_GEMV_PREFETCH */
+
 #if GV_DMA
 /* LDS the ring needs, in halves. Sits after the staged activation in the GEMM arena. */
 #define GV_RING_HALVES (PLOW_WAVES * GV_RING * GV_CHUNK)

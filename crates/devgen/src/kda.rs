@@ -146,6 +146,26 @@ impl KdaCfg {
             && self.eps > 0.0
     }
 
+    /// Whether the in-interpreter fused decode arm (L7, `PLOW_KDA_DECODE_FUSED_ARM`) carries
+    /// this shape: the one D rung the arm instantiates, one value column per wave, a
+    /// register-bounded conv width, and EVERY (head, tile) slice on its own workgroup — the
+    /// tiles of a head rendezvous inside the packet, so a workgroup walking two of them would
+    /// wait on itself.
+    pub fn supports_decode_fused_arm(&self, n_cu: u32) -> bool {
+        self.heads > 0
+            && self.head_dim == 128
+            && self.bv == WG_WAVES
+            && (1..=8).contains(&self.conv_w)
+            && self.proj() / self.bv <= n_cu
+            && self.eps.is_finite()
+    }
+
+    /// Bytes of the fused arm's per-layer rendezvous scratch: per head one counter word plus
+    /// q, k, g and o words (`PLOW_KDA_FUSED_SCRATCH_WORDS`, op_kda.h), 8 bytes each.
+    pub fn fused_arm_scratch_bytes(&self) -> u64 {
+        self.heads as u64 * (1 + 4 * self.head_dim as u64) * 8
+    }
+
     /// Workgroups for [`DevOp::KdaStateStep`] — `H * D / BV` work items, capped at the CU count.
     ///
     /// `docs/kimi-k3-kda.md` §7.3 requires every proposal to be checked against 256 explicitly,
@@ -650,6 +670,16 @@ fn emit_kda_mixer_ex(
         && !decode_fused
         && st.conv_state_alt.is_none()
         && crate::emit_config::active().kda_fb_fold;
+    // L7 (`PLOW_KDA_DECODE_FUSED_ARM`): the same chain as ONE packet on the step's slice map.
+    // Composes with the f_b fold (bit 2 + bit 3); everything else the fold excludes, it excludes.
+    let fused_arm = t == 1
+        && !seq_rows
+        && fuse
+        && !chunk
+        && !decode_fused
+        && st.conv_state_alt.is_none()
+        && crate::emit_config::active().kda_decode_fused_arm
+        && c.supports_decode_fused_arm(n_cu);
 
     // Activations. q, k and v stay three separate [T, H*D] buffers all the way through: the three
     // projections are independent packets, the three convs are independent packets, and the state
@@ -805,6 +835,71 @@ fn emit_kda_mixer_ex(
     let parked = seq_rows.then(|| b.tensor("in.parked", 4 * t as u64));
     // scale = D^-0.5, applied to q AFTER the L2 norm; k is NOT scaled.
     let scale = (c.head_dim as f32).powf(-0.5);
+
+    if fused_arm {
+        // One op-112 packet on the step's own slices: tile 0 of each head convs q/k, every tile
+        // its v columns, the tiles exchange through the loader-zeroed scratch and the last one
+        // to finish runs the gated norm (op_kda.h `d_kda_decode_fused_arm`). `mix` and `o` are
+        // declared above and never written: the exchange carries them.
+        let scratch = b.tensor(
+            &format!("{a}kda.fused.scratch"),
+            c.fused_arm_scratch_bytes(),
+        );
+        let handles = [
+            w.conv_w[0],
+            w.conv_w[1],
+            w.conv_w[2],
+            st.conv_state[0],
+            st.conv_state[1],
+            st.conv_state[2],
+            w.a_log,
+            w.dt_bias,
+            w.o_norm,
+            g_raw,
+            scratch,
+            c.eps.to_bits(),
+            c.conv_w,
+        ];
+        let mut descriptor = Vec::with_capacity(handles.len() * 4);
+        for word in handles {
+            descriptor.extend_from_slice(&word.to_le_bytes());
+        }
+        let desc = b.tensor_init(&format!("{a}kda.fused.desc"), descriptor);
+        let mut fused_deps = vec![c_q, c_k, c_v, c_g, c_fb, c_bb];
+        fused_deps.sort_unstable();
+        fused_deps.dedup();
+        assert_eq!(
+            nb,
+            c.proj() / c.bv,
+            "every (head, tile) on its own workgroup"
+        );
+        let c_fused = b.emit(DevOp::KdaStateStepG, cus, &fused_deps, |d| {
+            d.t[0] = y;
+            d.t[1] = raw[0];
+            d.t[2] = raw[1];
+            d.t[3] = raw[2];
+            d.t[4] = f_raw;
+            d.t[5] = b_raw;
+            d.t[6] = st.state;
+            d.t[7] = desc;
+            d.i[0] = t;
+            d.i[1] = nh;
+            d.i[2] = hd;
+            d.i[3] = c.bv;
+            // bit0 l2norm, bit2 (PLOW_KDA_F_FB_FOLD) t4 = f_a / j1 = W_fb, bit3
+            // (PLOW_KDA_F_FUSED_ARM) the fused chain with t7 = the descriptor.
+            d.i[4] = 1 | if fb_fold { 4 } else { 0 } | 8;
+            d.i[5] = w.dt_bias;
+            d.i[6] = gate_mode;
+            d.f[0] = scale;
+            d.f[1] = lower_bound;
+            if fb_fold {
+                d.j[1] = w.f_b_proj;
+            }
+        });
+        let c_o = gemv(b, attn, y, w.o_proj, hi, p, c_fused);
+        return (c_o, attn);
+    }
 
     if decode_fused {
         let handles = [
@@ -1614,6 +1709,131 @@ mod tests {
         let (pf, _) = build(128);
         let (pf_off, _) = {
             let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "0")]);
+            build(128)
+        };
+        assert_eq!(packed(&pf), packed(&pf_off));
+    }
+
+    /// L7 (`PLOW_KDA_DECODE_FUSED_ARM`): Conv3 + StepG + GatedNorm become one op-112 packet
+    /// on the step's slices, flags bit 3, `t7` the descriptor; composes with the f_b fold.
+    #[test]
+    fn fused_arm_replaces_the_chain_and_leaves_the_default_packet_byte_identical() {
+        let _guard = crate::test_env::env_guard();
+        let build = |t: u32| {
+            let c = KdaCfg {
+                heads: 12,
+                bv: 8,
+                ..k3()
+            };
+            let mut b = Builder::new(256);
+            let hidden = b.tensor("in.hidden", t as u64 * c.hidden as u64 * 2);
+            let w = declare_kda_weights(&mut b, &c, "p.", "l.");
+            let st = declare_kda_state(&mut b, &c, "kv.0.", 1);
+            let seed = b.emit(DevOp::Nop, (0..256).collect(), &[], |_| {});
+            emit_kda_mixer_ex(
+                &mut b,
+                &c,
+                &w,
+                &st,
+                "act.",
+                t,
+                hidden,
+                None,
+                256,
+                false,
+                &[seed],
+                true,
+                false,
+                false,
+                false,
+            );
+            (b.finish(), w)
+        };
+        let packed = |p: &packet::devbuild::Program| -> Vec<packet::dev::DevInst64> {
+            p.insts.iter().map(|i| i.pack()).collect()
+        };
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        let (unset, _) = build(1);
+        let (off, _) = {
+            let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_FUSED_ARM", "0")]);
+            build(1)
+        };
+        assert_eq!(packed(&unset), packed(&off), "unset == off, byte for byte");
+        assert_eq!(n(&off, DevOp::KdaConv3), 1);
+        assert_eq!(n(&off, DevOp::KdaGatedNorm), 1);
+        let step_off = off
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step_off.i[4] & 8, 0);
+
+        let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_FUSED_ARM", "1")]);
+        let (on, w_on) = build(1);
+        assert_eq!(on.insts.len(), off.insts.len() - 2, "Conv3 and GatedNorm");
+        assert_eq!(n(&on, DevOp::KdaConv3), 0);
+        assert_eq!(n(&on, DevOp::KdaGatedNorm), 0);
+        assert_eq!(n(&on, DevOp::KdaStateStepG), 1);
+        let step = on
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step.i[4], 1 | 8, "l2norm + fused arm");
+        assert_eq!(step.blocks, step_off.blocks, "the step's own slice map");
+        assert_eq!(step.blocks, 192, "every (head, tile) on its own workgroup");
+        assert_eq!(on.tensors[step.t[0] as usize].name, "act.y");
+        assert_eq!(on.tensors[step.t[1] as usize].name, "act.q_raw");
+        assert_eq!(on.tensors[step.t[3] as usize].name, "act.v_raw");
+        assert_eq!(on.tensors[step.t[4] as usize].name, "act.f_raw");
+        let desc = &on.tensors[step.t[7] as usize];
+        assert_eq!(desc.name, "act.kda.fused.desc");
+        let words: Vec<u32> = desc
+            .init
+            .as_ref()
+            .unwrap()
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words.len(), 13);
+        assert_eq!(&words[..3], &w_on.conv_w);
+        assert_eq!(words[6], w_on.a_log);
+        assert_eq!(words[7], w_on.dt_bias);
+        assert_eq!(words[8], w_on.o_norm);
+        assert_eq!(on.tensors[words[9] as usize].name, "act.g_raw");
+        let scratch = &on.tensors[words[10] as usize];
+        assert_eq!(scratch.name, "act.kda.fused.scratch");
+        assert_eq!(scratch.bytes, 12 * (1 + 4 * 128) * 8);
+        assert!(scratch.init.is_none(), "loader-zeroed, not carried");
+        assert_eq!(words[11], k3().eps.to_bits(), "norm eps bits");
+        assert_eq!(words[12], 4, "conv width");
+        // The o_proj GEMV reads y and gates on the fused packet.
+        assert!(on
+            .insts
+            .iter()
+            .any(|i| i.op == DevOp::Gemv as u16 && i.t[1] == step.t[0]));
+
+        // With the f_b fold: bit 2 + bit 3, t4 = f_a, j1 = W_fb, one packet fewer again.
+        let (both, w_both) = {
+            let _f = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "1")]);
+            build(1)
+        };
+        assert_eq!(both.insts.len(), on.insts.len() - 1);
+        let step = both
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step.i[4], 1 | 4 | 8);
+        assert_eq!(both.tensors[step.t[4] as usize].name, "act.f_a");
+        assert_eq!(step.j[1], w_both.f_b_proj);
+
+        // Prefill rows keep the chain untouched.
+        let (pf, _) = build(128);
+        let (pf_off, _) = {
+            let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_FUSED_ARM", "0")]);
             build(128)
         };
         assert_eq!(packed(&pf), packed(&pf_off));

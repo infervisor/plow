@@ -129,7 +129,12 @@ impl FusionCoverage {
         // KdaDecodeFused subsumes the conv/state/gated-norm half, but the gate
         // projection still rides GemvQkvg. Either spelling covers the egg
         // target exactly; neither opcode covers it alone.
-        let gated_norm = count(DevOp::KdaGatedNorm) + count(DevOp::KdaDecodeFused);
+        // A KdaStateStepG with flags bit 3 (the L7 fused arm) carries the gated norm too.
+        let fused_arm = insts
+            .iter()
+            .filter(|i| i.op == DevOp::KdaStateStepG as u16 && i.i[4] & 8 != 0)
+            .count();
+        let gated_norm = count(DevOp::KdaGatedNorm) + count(DevOp::KdaDecodeFused) + fused_arm;
         if qkvg < expected_kda || gated_norm < expected_kda {
             return Err(format!(
                 "{KDA_GATE}: expected {expected_kda} of {} extracted, but decode carries GemvQkvg={qkvg} and \
