@@ -343,6 +343,10 @@ pub struct Builder {
     /// Mark isolated BT64/D128 chunk-KDA intra packets for the wave-item object.
     kda_intra_wave_items_segments: bool,
     kda_carry_regstate_segments: bool,
+    /// Mark the Wu of an exact qpre pair for the lean four-wave gfx950 Wu object.
+    kda_wu_lean_segments: bool,
+    /// Also have that Wu emit the scaled-key pair the register-state carry consumes.
+    kda_carry_keyfeed_segments: bool,
     /// Isolate exact qpre BT64/D128 Wu->carry pairs for standalone gfx950 objects.
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
@@ -571,6 +575,8 @@ impl Builder {
             lean_kda_intra_segments: false,
             kda_intra_wave_items_segments: false,
             kda_carry_regstate_segments: false,
+            kda_wu_lean_segments: false,
+            kda_carry_keyfeed_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
             decode_grouped_moe_segments: false,
@@ -718,6 +724,14 @@ impl Builder {
     /// register-resident gfx950 carry object (isolated like the key-factor pair).
     pub fn set_kda_carry_regstate_segments(&mut self, enabled: bool) {
         self.kda_carry_regstate_segments = enabled;
+    }
+
+    pub fn set_kda_wu_lean_segments(&mut self, enabled: bool) {
+        self.kda_wu_lean_segments = enabled;
+    }
+
+    pub fn set_kda_carry_keyfeed_segments(&mut self, enabled: bool) {
+        self.kda_carry_keyfeed_segments = enabled;
     }
 
     pub fn set_lean_kda_key_factor_segments(&mut self, enabled: bool) {
@@ -1938,8 +1952,11 @@ impl Builder {
                     && op.inst.i[2] == 128
             });
         let kda_carry_regstate = !uniseg && self.kda_carry_regstate_segments;
+        let kda_wu_lean = !uniseg && self.kda_wu_lean_segments;
+        let kda_carry_keyfeed =
+            kda_wu_lean && kda_carry_regstate && self.kda_carry_keyfeed_segments;
         let lean_kda_key_factor = !uniseg
-            && (self.lean_kda_key_factor_segments || kda_carry_regstate)
+            && (self.lean_kda_key_factor_segments || kda_carry_regstate || kda_wu_lean)
             && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
         let decode_mla_segments = !uniseg
             && self.decode_mla_segments
@@ -2411,6 +2428,12 @@ impl Builder {
 
         for (idx, op) in self.ops.iter().enumerate() {
             let mut inst = op.inst;
+            if kda_carry_keyfeed
+                && inst.op == DevOp::KdaChunkWu as u16
+                && lean_kda_key_factor_pair(&self.ops, idx)
+            {
+                inst.i[5] = 1;
+            }
 
             // The op's COARSE lists, on the instruction. A dep's threshold is how the
             // PRODUCER was sliced — deriving it here is the whole reason the builder owns the
@@ -2549,6 +2572,12 @@ impl Builder {
                     && lean_kda_key_factor_pair(&self.ops, idx - 1)
                 {
                     e.flags |= crate::dev::SE_KDA_CARRY_REGSTATE;
+                }
+                if kda_wu_lean
+                    && inst.op == DevOp::KdaChunkWu as u16
+                    && lean_kda_key_factor_pair(&self.ops, idx)
+                {
+                    e.flags |= crate::dev::SE_KDA_WU_LEAN;
                 }
                 streams[cu as usize].push(e);
                 gq_stream.push(e); // op-major: outer loop is op order, inner is slice order
@@ -5061,6 +5090,64 @@ mod kda_carry_regstate_tests {
             .iter()
             .filter(|e| e.inst != 2)
             .all(|e| e.flags & crate::dev::SE_KDA_CARRY_REGSTATE == 0));
+    }
+}
+
+#[cfg(test)]
+mod kda_wu_lean_tests {
+    use super::*;
+
+    fn program(lean: bool, keyfeed: bool, regstate: bool) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_kda_carry_regstate_segments(regstate);
+        b.set_kda_wu_lean_segments(lean);
+        b.set_kda_carry_keyfeed_segments(keyfeed);
+        let tensors: Vec<_> = (0..8).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let wu = b.emit(DevOp::KdaChunkWu, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        let carry = b.emit(DevOp::KdaChunkCarry, all.clone(), &[wu], |d| {
+            d.t = [
+                tensors[1], tensors[2], tensors[7], tensors[3], tensors[0], tensors[1], tensors[4],
+                tensors[5],
+            ];
+            d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[carry], |_| {});
+        b.finish()
+    }
+
+    fn marked(p: &Program, inst: u32) -> bool {
+        let entries: Vec<_> = p.stream.iter().filter(|e| e.inst == inst).collect();
+        assert!(!entries.is_empty());
+        entries
+            .iter()
+            .all(|e| e.flags & crate::dev::SE_KDA_WU_LEAN != 0)
+    }
+
+    #[test]
+    fn lean_marks_the_wu_of_an_exact_pair_in_its_own_segment() {
+        let p = program(true, false, true);
+        assert!(marked(&p, 1));
+        assert!(!marked(&p, 0) && !marked(&p, 3));
+        let wu_seg = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+        assert!(p.stream.iter().all(|e| (e.seg == wu_seg) == (e.inst == 1)));
+        assert_eq!(p.insts[1].i[5], 0);
+        assert!(marked(&p, 2), "the carry keeps its regstate mark");
+    }
+
+    #[test]
+    fn keyfeed_tags_the_wu_only_under_lean_and_regstate() {
+        assert_eq!(program(true, true, true).insts[1].i[5], 1);
+        assert_eq!(program(true, true, false).insts[1].i[5], 0);
+        assert_eq!(program(false, true, true).insts[1].i[5], 0);
+        assert!(!marked(&program(false, false, true), 1));
     }
 }
 

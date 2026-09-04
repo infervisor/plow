@@ -1942,6 +1942,12 @@ pub const SE_KDA_INTRA_WAVE_ITEMS: u16 = 8;
 /// packet as an impure wave-item segment rather than running it.
 pub const SE_KDA_CARRY_REGSTATE: u16 = SE_KDA_INTRA_WAVE_ITEMS;
 
+/// The same bit on a pure `KdaChunkWu` segment selects the lean four-wave gfx950 Wu object
+/// (opcode-disambiguated like [`SE_KDA_CARRY_REGSTATE`]). A marked Wu whose `i[5]` is 1 also
+/// emits the scaled-key hi/lo pair that the following register-state carry consumes (keyfeed);
+/// the interpreter ignores `i[5]`, so the fallback stays exact.
+pub const SE_KDA_WU_LEAN: u16 = SE_KDA_INTRA_WAVE_ITEMS;
+
 /// Shift of the per-(packet, L2 domain) slice count packed into [`StreamEnt::flags`].
 ///
 /// Mirrors `PLOW_SE_NPER_SHIFT` in `runtime/common/dev_isa.h`; read the note there for why the
