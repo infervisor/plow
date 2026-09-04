@@ -10937,8 +10937,31 @@ impl AmdEngine {
                 "program {p} has no graph-derived phase-object route"
             )));
         }
-        self.be
-            .begin_dispatch_chain(self.prog_dispatch(p).launches())
+        let packets = (0..self.prog_dispatch(p).launches())
+            .map(|seg| self.prefill_segment_launches(p, seg))
+            .sum();
+        self.be.begin_dispatch_chain(packets)
+    }
+
+    /// Exact AQL packets `enqueue_segment` emits for one prefill segment. A phase
+    /// chain reserves this many before ringing, so the count must track the
+    /// multi-launch route branches in `enqueue_segment`; the commit check refuses
+    /// a chain whose emission disagrees, so a drift fails closed rather than
+    /// overrunning the queue.
+    fn prefill_segment_launches(&self, p: usize, seg: usize) -> usize {
+        let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        if active || !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
+            return 1;
+        }
+        match self.progs[p].prefill_routes.get(seg) {
+            Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
+            Some(PrefillSegmentRoute::MoeStage1A4Reuse(_))
+                if self.k_moe_stage1_a4_quant.is_some() && self.k_moe_stage1_a4_reuse.is_some() =>
+            {
+                2
+            }
+            _ => 1,
+        }
     }
 
     pub(crate) fn commit_graph_phase_replay(&self) -> Result<()> {
