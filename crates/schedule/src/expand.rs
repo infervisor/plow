@@ -719,6 +719,10 @@ fn compute_cycles(
             let bytes = (t.br.max(1) * r.feat.max(1)) as u64 * r.operands.max(1) as u64 * elem;
             machine.hbm_cycles(info.unit, bytes)
         }
+        (OpKind::Model(m), Compute::Row(t)) => {
+            let bytes = (t.br.max(1) * m.feat.max(1)) as u64 * m.operands.max(1) as u64 * elem;
+            machine.hbm_cycles(info.unit, bytes)
+        }
         (OpKind::Layout(s), _) => machine.hbm_cycles(
             info.unit,
             s.bytes / machine.unit(info.unit).sm_count.max(1) as u64,
@@ -754,6 +758,13 @@ fn slice_bytes(s: &TensorSlice, elem: u64) -> Option<u64> {
 fn op_elem_for_input(kind: &OpKind, idx: usize, activation_elem: u64, weight_elem: u64) -> u64 {
     match kind {
         OpKind::Gemm(_) if idx >= 1 => weight_elem,
+        OpKind::Model(m) if m.kind == rewrite::ModelOpKind::Embedding && idx == 0 => {
+            m.input_bytes[0] / m.rows.max(1) as u64
+        }
+        OpKind::Model(m) if m.kind == rewrite::ModelOpKind::Embedding && idx == 1 => {
+            let table_elems = (m.args[0] as u64).saturating_mul(m.feat.max(1) as u64);
+            m.input_bytes[1] / table_elems.max(1)
+        }
         _ => activation_elem,
     }
 }
@@ -767,9 +778,10 @@ fn op_in_bytes(kind: &OpKind, idx: usize, elem: u64) -> u64 {
             _ => g.n.max(0) as u64 * elem,  // bias-ish
         },
         OpKind::Row(r) => (r.rows * r.feat) as u64 * elem,
+        OpKind::Model(m) => m.input_bytes.get(idx).copied().unwrap_or(0),
         OpKind::Flash(a) => match idx {
             0 => (a.heads * a.seq_q * a.head_dim) as u64 * elem,
-            _ => (a.heads * a.seq_kv * a.head_dim) as u64 * elem,
+            _ => (a.kv_heads * a.seq_kv * a.head_dim) as u64 * elem,
         },
         OpKind::Layout(s) => s.bytes,
     }
@@ -779,6 +791,7 @@ fn op_out_bytes(kind: &OpKind, elem: u64) -> u64 {
     match kind {
         OpKind::Gemm(g) => (g.m * g.n) as u64 * elem,
         OpKind::Row(r) => (r.rows * r.feat) as u64 * elem,
+        OpKind::Model(m) => (m.rows * m.feat) as u64 * elem,
         OpKind::Flash(a) => (a.heads * a.seq_q * a.head_dim) as u64 * elem,
         OpKind::Layout(s) => s.bytes,
     }

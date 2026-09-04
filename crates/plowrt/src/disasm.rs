@@ -749,9 +749,11 @@ pub mod sched {
                 br,
                 out,
                 variant,
+                args,
             } => json!({
                 "reduce": reduce, "coord": coord, "rows": rows, "feat": feat,
-                "operands": operands, "br": br, "out": out, "variant": variant
+                "operands": operands, "br": br, "out": out, "variant": variant,
+                "args": args
             }),
             Body::Layout {
                 kind,

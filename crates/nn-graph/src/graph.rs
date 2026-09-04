@@ -9,6 +9,7 @@ use crate::dim::SymbolTable;
 use crate::dtype::DType;
 use crate::op::Op;
 use crate::shape::Shape;
+use std::collections::BTreeSet;
 
 /// Index of a tensor (graph value).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -60,6 +61,9 @@ pub struct Graph {
     /// Graph-level inputs and outputs, in declaration order.
     pub inputs: Vec<TensorId>,
     pub outputs: Vec<TensorId>,
+    /// Storage metadata needed to dequantize blockwise FP8 weights. These are
+    /// checkpoint/load bindings, not extra logical operands of `Op::Linear`.
+    pub fp8_scale_bindings: Vec<Fp8ScaleBinding>,
 }
 
 impl Graph {
@@ -109,6 +113,25 @@ impl Graph {
         }
         out
     }
+
+    /// Every tensor that must be present in the checkpoint, including
+    /// quantization metadata that is loaded alongside an operator's weight but
+    /// is not a logical graph operand.
+    pub fn checkpoint_manifest(&self) -> Vec<CheckpointWeightSpec<'_>> {
+        let mut seen = BTreeSet::new();
+        self.tensors
+            .iter()
+            .filter(|t| matches!(t.origin, Origin::Weight))
+            .filter_map(|t| {
+                let name = t.name.as_deref()?;
+                seen.insert(name).then_some(CheckpointWeightSpec {
+                    name,
+                    dtype: t.dtype,
+                    shape: t.shape.as_ref(),
+                })
+            })
+            .collect()
+    }
 }
 
 impl Graph {
@@ -137,6 +160,20 @@ pub struct WeightSpec<'a> {
     pub shape: Option<&'a Shape>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CheckpointWeightSpec<'a> {
+    pub name: &'a str,
+    pub dtype: DType,
+    pub shape: Option<&'a Shape>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fp8ScaleBinding {
+    pub weight: String,
+    pub scale: String,
+    pub block_shape: [i64; 2],
+}
+
 /// Mutable builder for an operator graph. The architecture builders in
 /// [`crate::models`] drive this through [`crate::Nn`]'s ergonomic helpers; the
 /// IR stays minimal.
@@ -148,6 +185,7 @@ pub struct GraphBuilder {
     current_block: Option<u32>,
     inputs: Vec<TensorId>,
     outputs: Vec<TensorId>,
+    fp8_scale_bindings: Vec<Fp8ScaleBinding>,
 }
 
 impl GraphBuilder {
@@ -160,6 +198,7 @@ impl GraphBuilder {
             current_block: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            fp8_scale_bindings: Vec::new(),
         }
     }
 
@@ -209,6 +248,22 @@ impl GraphBuilder {
         })
     }
 
+    pub fn fp8_scale_binding(
+        &mut self,
+        weight: &str,
+        scale: &str,
+        scale_shape: Shape,
+        block_shape: [i64; 2],
+    ) -> TensorId {
+        let id = self.weight(scale, scale_shape, DType::F32);
+        self.fp8_scale_bindings.push(Fp8ScaleBinding {
+            weight: weight.to_string(),
+            scale: scale.to_string(),
+            block_shape,
+        });
+        id
+    }
+
     /// Add an operation node. The result tensor's shape is left `None` for the
     /// inference pass to fill. `out_dtype` is the declared output element type.
     pub fn op(&mut self, op: Op, inputs: Vec<TensorId>, out_dtype: DType) -> TensorId {
@@ -249,6 +304,7 @@ impl GraphBuilder {
             blocks: self.blocks,
             inputs: self.inputs,
             outputs: self.outputs,
+            fp8_scale_bindings: self.fp8_scale_bindings,
         }
     }
 }

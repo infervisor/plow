@@ -163,7 +163,7 @@ pub fn compile_buckets_tuned(
             let kv = plan.ops.iter().find_map(|o| match o.kind {
                 OpKind::Flash(a) => Some(KvLayout {
                     block_seq: DEFAULT_KV_BLOCK_SEQ,
-                    kv_heads: a.heads,
+                    kv_heads: a.kv_heads,
                     head_dim: a.head_dim,
                 }),
                 _ => None,

@@ -296,6 +296,7 @@ fn output_bytes(kind: &OpKind) -> u64 {
     let elems = match kind {
         OpKind::Gemm(g) => g.m * g.n,
         OpKind::Row(r) => r.rows * r.feat,
+        OpKind::Model(m) => m.rows * m.feat,
         OpKind::Flash(a) => a.heads * a.seq_q * a.head_dim,
         OpKind::Layout(s) => return s.bytes,
     };
@@ -309,6 +310,7 @@ fn op_cycles(soc: &Soc, unit: UnitId, kind: &OpKind, tile: Compute) -> Cycles {
         (OpKind::Gemm(g), Compute::Gemm(t)) => cm.gemm_cost(*g, t),
         (OpKind::Flash(a), Compute::Flash(t)) => cm.flash_cost(*a, t),
         (OpKind::Row(r), _) => cm.row_cost(*r),
+        (OpKind::Model(m), _) => cm.row_cost(m.row_shape()),
         (OpKind::Layout(s), _) => cm.layout_cost(s.bytes, false),
         _ => cost::macs_cycles(cm.spec, 1, costmodel::MmaDtype::Bf16),
     }

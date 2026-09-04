@@ -14,6 +14,7 @@ mod kimi;
 mod kimi_k3;
 mod llama;
 mod qwen3;
+mod qwen3_5;
 mod qwen_image_dit;
 mod qwen_image_vae;
 mod qwen_vl;
@@ -27,6 +28,7 @@ pub use kimi::KimiConfig;
 pub use kimi_k3::{K3Layer, KimiK3Config, KimiK3TextConfig, LinearAttnConfig};
 pub use llama::LlamaConfig;
 pub use qwen3::Qwen3Config;
+pub use qwen3_5::Qwen35Config;
 pub use qwen_image_dit::QwenImageDitConfig;
 pub use qwen_image_vae::QwenImageVaeConfig;
 pub use qwen_vl::QwenVlVisionConfig;
@@ -59,6 +61,8 @@ pub enum ModelConfig {
     Llama(LlamaConfig),
     /// Qwen3 / Qwen2.5: GQA + SwiGLU (dense).
     Qwen3(Qwen3Config),
+    /// Qwen3.5/Qwen3.8 hybrid full-attention + gated-delta text decoder.
+    Qwen35(Qwen35Config),
     DeepSeek(DeepSeekConfig),
     Siglip(SiglipConfig),
     QwenVl(QwenVlVisionConfig),
@@ -127,10 +131,42 @@ impl ModelConfig {
                 vision_config: None,
             })),
             "qwen3" | "qwen2_5" => Ok(ModelConfig::Qwen3(serde_json::from_value(v)?)),
+            "qwen3_5" => {
+                if v.get("vision_config").is_some() {
+                    return Err(ConfigError::Unsupported(
+                        "qwen3_5 multimodal graph (use the text-generation graph for its language_model)"
+                            .to_string(),
+                    ));
+                }
+                let mut sub = sub_config(&v, "text_config");
+                if let serde_json::Value::Object(fields) = &mut sub {
+                    fields.insert(
+                        "_plow_weight_prefix".to_string(),
+                        serde_json::Value::String("model.language_model".to_string()),
+                    );
+                }
+                parse_qwen35(sub)
+            }
+            "qwen3_5_text" => parse_qwen35(v),
             "deepseek" | "deepseek_v2" | "deepseek_v3" => {
                 Ok(ModelConfig::DeepSeek(serde_json::from_value(v)?))
             }
+            "deepseek_v4" => Err(ConfigError::Unsupported(
+                "deepseek_v4 (CSA/HCA hybrid attention, mHC residuals, mixed FP4/FP8 \
+                 experts, and the attached DSpark speculative module are not implemented; \
+                 refusing DeepSeek-V3 MLA fallback)"
+                    .to_string(),
+            )),
             "glm_moe_dsa" | "glm" | "glm4" => Ok(ModelConfig::Glm(serde_json::from_value(v)?)),
+            "minimax_m2" => Err(ConfigError::Unsupported(
+                "minimax_m2 (MiniMax-M2 hybrid linear-attention MoE is not implemented; \
+                 refusing generic attention/MoE lowering)"
+                    .to_string(),
+            )),
+            "nemotron_h" | "nemotron3" | "nemotron" => Err(ConfigError::Unsupported(format!(
+                "{mt} (Nemotron Mamba-2 hybrid is not implemented in the nn-graph packet path; \
+                 the devblob backend currently supports only explicit single-block emission)"
+            ))),
             "siglip" | "siglip_vision_model" => {
                 let sub = sub_config(&v, "vision_config");
                 Ok(ModelConfig::Siglip(serde_json::from_value(sub)?))
@@ -148,6 +184,12 @@ impl ModelConfig {
             other => Err(ConfigError::Unsupported(other.to_string())),
         }
     }
+}
+
+fn parse_qwen35(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
+    let cfg: Qwen35Config = serde_json::from_value(v)?;
+    cfg.validate().map_err(ConfigError::Unsupported)?;
+    Ok(ModelConfig::Qwen35(cfg))
 }
 
 /// Determine the model_type, falling back to mapping known `architectures`.
@@ -174,6 +216,7 @@ fn model_type(v: &serde_json::Value) -> Option<String> {
         // `devgen`, which does not go through this crate at all.
         a if a.starts_with("KimiLinear") || a.starts_with("KimiK3") => "kimi_k3",
         a if a.starts_with("Kimi") || a.starts_with("Moonshot") => "kimi",
+        a if a.starts_with("Qwen3_5") => "qwen3_5",
         a if a.starts_with("Qwen3") => "qwen3",
         a if a.starts_with("Qwen2.5") => "qwen2_5",
         a if a.starts_with("Siglip") => "siglip",
@@ -196,6 +239,11 @@ fn sub_config(v: &serde_json::Value, key: &str) -> serde_json::Value {
                     map.insert("torch_dtype".to_string(), dt.clone());
                     break;
                 }
+            }
+        }
+        if !map.contains_key("quantization_config") {
+            if let Some(quant) = v.get("quantization_config") {
+                map.insert("quantization_config".to_string(), quant.clone());
             }
         }
     }

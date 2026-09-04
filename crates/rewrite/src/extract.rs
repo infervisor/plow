@@ -56,6 +56,7 @@ pub(crate) fn is_fused(op: &str) -> bool {
     matches!(
         op,
         "FusedNormLinear"
+            | "FusedZeroCenteredNormLinear"
             | "FusedNormLinearBias"
             | "FusedLayerNormLinear"
             | "FusedLayerNormLinearBias"
@@ -64,8 +65,10 @@ pub(crate) fn is_fused(op: &str) -> bool {
             | "FusedAdaLN"
             | "FusedGatedResidual"
             | "FusedNormRope"
+            | "FusedZeroCenteredNormRope"
             | "FusedNormRopeScale"
             | "FusedResidualNorm"
+            | "FusedResidualZeroCenteredNorm"
             | "FusedResidualLayerNorm"
             | "FusedGroupNormActConv3d"
             | "FusedGroupNormActConv3dBias"
@@ -74,6 +77,8 @@ pub(crate) fn is_fused(op: &str) -> bool {
             | "FusedEmbeddingScale"
             | "FusedKdaGatedNorm"
             | "FusedMlaOutGate"
+            | "FusedRmsNormSiluGate"
+            | "FusedPackedAttnGate"
             | "FusedMaterializedResidualBlock"
             | "FusedMaterializedResidual3Block"
     )

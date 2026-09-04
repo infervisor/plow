@@ -100,6 +100,9 @@ impl Source {
     pub fn name(&self) -> String {
         match self {
             Source::Net(n) => n.name.clone(),
+            Source::Model(id) if std::path::Path::new(id).is_dir() => {
+                hf_config::dir_slug(std::path::Path::new(id))
+            }
             Source::Model(id) => id.clone(),
             Source::HfDir(p) => hf_config::dir_slug(p),
         }
@@ -356,6 +359,11 @@ pub struct OnDiskAssets {
     pub footprint_json: u64,
     pub footprint_csv: u64,
     pub static_tensors_bin: u64,
+    /// FP8 weight-to-scale bindings emitted for quantized `--model` inputs.
+    pub fp8_weights_json: u64,
+    /// Output-local HF config/index/tokenizer/chat files plus
+    /// `hf_metadata.json`; zero for non-metadata compiles.
+    pub hf_metadata_total: u64,
     pub grand_total: u64,
 }
 
@@ -426,7 +434,7 @@ fn refine_request_io_kinds(mem: &mut MemoryReport, request_io: &RequestIo) {
 fn build_memory_report(
     m: &schedule::AddressMap,
     kv_paging: Option<KvPagingReport>,
-    weight_shapes: &std::collections::HashMap<String, (i64, i64)>,
+    weight_shapes: &std::collections::HashMap<String, (i64, i64, nn_graph::DType)>,
 ) -> MemoryReport {
     MemoryReport {
         arena_bytes: m.arena_bytes,
@@ -439,7 +447,7 @@ fn build_memory_report(
                 let (logical_shape, dtype) = if e.class == BufClass::Persistent {
                     weight_shapes
                         .get(&e.name)
-                        .map(|&(n, k)| (Some(vec![n, k]), Some("bf16".to_string())))
+                        .map(|&(n, k, dtype)| (Some(vec![n, k]), Some(dtype.to_string())))
                         .unwrap_or((None, None))
                 } else {
                     (None, None)
@@ -533,6 +541,31 @@ fn phase_name(p: Phase) -> &'static str {
     }
 }
 
+fn fp8_scale_storage_bytes(graph: &nn_graph::Graph) -> u64 {
+    let scales = graph
+        .checkpoint_manifest()
+        .into_iter()
+        .map(|weight| (weight.name, weight))
+        .collect::<std::collections::HashMap<_, _>>();
+    graph
+        .fp8_scale_bindings
+        .iter()
+        .filter_map(|binding| scales.get(binding.scale.as_str()))
+        .filter_map(|scale| {
+            let dims = scale
+                .shape?
+                .dims()
+                .iter()
+                .map(|dim| dim.as_static())
+                .collect::<Option<Vec<_>>>()?;
+            let elements = dims
+                .iter()
+                .fold(1u64, |count, &dim| count.saturating_mul(dim.max(0) as u64));
+            Some(scale.dtype.tile_bytes(elements))
+        })
+        .sum()
+}
+
 /// Compile `src` for `opts`, writing one `.pkt` stream per bucket plus a
 /// `weights.json` manifest into `opts.out`, and return the [`Report`].
 pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
@@ -542,22 +575,69 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         "compilation started"
     );
     debug!(stage = "frontend", "resolving and validating source");
+    // Resolve Hub metadata once. This downloads only the compiler allowlist
+    // (config, safetensors index, tokenizer/chat assets), never weight shards.
+    // Every bucket builds from this same local snapshot.
+    let model_metadata = match src {
+        Source::Model(id) => {
+            info!(
+                stage = "model-resolution", model = %id,
+                "resolving Hugging Face compiler metadata"
+            );
+            Some(nn_graph::hub::resolve_model_metadata(id)?)
+        }
+        // An indexed local directory contains the same compiler metadata as a
+        // Hub snapshot. Lower it through the same frontend so source access
+        // (`--model` vs `--hf-dir`) cannot change the emitted program.
+        Source::HfDir(dir) if dir.join("model.safetensors.index.json").is_file() => {
+            info!(
+                stage = "model-resolution", path = %dir.display(),
+                "resolving indexed Hugging Face compiler metadata"
+            );
+            Some(nn_graph::hub::resolve_model_metadata(
+                dir.to_string_lossy().as_ref(),
+            )?)
+        }
+        Source::Net(_) | Source::HfDir(_) => None,
+    };
+    if let Some(metadata) = &model_metadata {
+        ensure_model_packet_path_supported(metadata)?;
+    }
+    let model_checkpoint_graph = model_metadata
+        .as_ref()
+        .map(|metadata| {
+            nn_graph::hub::build_from_metadata(metadata, &nn_graph::models::ShapeBucket::default())
+        })
+        .transpose()?;
+    if let (Some(metadata), Some(graph)) = (&model_metadata, &model_checkpoint_graph) {
+        metadata.validate_checkpoint_manifest(graph)?;
+        info!(
+            stage = "checkpoint-validation",
+            tensors = graph.checkpoint_manifest().len(),
+            "safetensors index matches the compiled text graph"
+        );
+    }
+    let fp8_scale_bytes = model_checkpoint_graph
+        .as_ref()
+        .map(fp8_scale_storage_bytes)
+        .unwrap_or(0);
     // For HfDir sources, synthesize the full model metadata once (cheap JSON
     // parse) and cache it for all downstream functions. No resolution to
     // Source::Net — we use `build_full_model_plan()` directly.
-    let hf_synth: Option<hf_config::HfSynthesis> = if let Source::HfDir(p) = src {
-        info!(
-            stage = "model-resolution", path = %p.display(),
-            "resolving model from HuggingFace directory"
-        );
-        let mut synth = hf_config::synthesize_from_hf_dir(p).map_err(PlowcError::InvalidDim)?;
-        // CLI --weight-dtype override takes precedence over config.json auto-detection.
-        if let Some(dt) = opts.weight_dtype_override {
-            synth.weight_dtype = dt;
+    let hf_synth: Option<hf_config::HfSynthesis> = match src {
+        Source::HfDir(p) if model_metadata.is_none() => {
+            info!(
+                stage = "model-resolution", path = %p.display(),
+                "resolving model from HuggingFace directory"
+            );
+            let mut synth = hf_config::synthesize_from_hf_dir(p).map_err(PlowcError::InvalidDim)?;
+            // CLI --weight-dtype override takes precedence over config.json auto-detection.
+            if let Some(dt) = opts.weight_dtype_override {
+                synth.weight_dtype = dt;
+            }
+            Some(synth)
         }
-        Some(synth)
-    } else {
-        None
+        Source::Net(_) | Source::Model(_) | Source::HfDir(_) => None,
     };
 
     let spec = hwspec::registry::lookup(&opts.gpu)
@@ -585,6 +665,7 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
     }
     // Validate the synthesized net for HfDir too
     if let Some(synth) = &hf_synth {
+        hf_config::ensure_layer_plan_supported(synth).map_err(PlowcError::InvalidDim)?;
         synth.net.validate().map_err(PlowcError::InvalidDim)?;
     }
     info!(
@@ -612,7 +693,13 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         // Egg exploration only for the first bucket: the report keeps only the
         // first bucket's stats (below), and the saturation result is otherwise
         // unused — re-running it per bucket multiplied peak memory for nothing.
-        let (plan, st) = build_plan(src, b, hf_synth.as_ref(), fusion.is_none())?;
+        let (plan, st) = build_plan(
+            src,
+            b,
+            hf_synth.as_ref(),
+            model_metadata.as_ref(),
+            fusion.is_none(),
+        )?;
         trace!(
             stage = "planning",
             ops = plan.ops.len(),
@@ -743,7 +830,47 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
 
     info!(stage = "emission", output = %opts.out.display(), "writing compiled artifacts");
     std::fs::create_dir_all(&opts.out)?;
-    let (buckets, footprints, lean) = emit_streams(&compiled, &soc, &cfg, opts, src, &plans)?;
+    if let Some(metadata) = &model_metadata {
+        metadata.copy_to(&opts.out)?;
+        let graph = model_checkpoint_graph
+            .as_ref()
+            .expect("resolved model metadata has a checkpoint graph");
+        if !graph.fp8_scale_bindings.is_empty() {
+            let bindings = graph
+                .fp8_scale_bindings
+                .iter()
+                .map(|binding| {
+                    serde_json::json!({
+                        "weight": binding.weight,
+                        "scale": binding.scale,
+                        "block_shape": binding.block_shape,
+                    })
+                })
+                .collect::<Vec<_>>();
+            std::fs::write(
+                opts.out.join("fp8_weights.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "format": "e4m3",
+                    "activation_scheme": "dynamic",
+                    "scale_dtype": "f32",
+                    "total_scale_bytes": fp8_scale_bytes,
+                    "bindings": bindings,
+                }))?,
+            )?;
+        } else {
+            let stale = opts.out.join("fp8_weights.json");
+            if stale.is_file() {
+                std::fs::remove_file(stale)?;
+            }
+        }
+        info!(
+            stage = "model-metadata",
+            files = metadata.filenames().count(),
+            "copied Hugging Face metadata beside packet output"
+        );
+    }
+    let (buckets, footprints, lean) =
+        emit_streams(&compiled, &soc, &cfg, opts, src, &plans, fp8_scale_bytes)?;
 
     // Static tensors: compile-time constants (RoPE freq tables, static
     // masks). Phase 4 emits the plumbing with an empty manifest — Phase 5
@@ -755,17 +882,31 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         std::fs::write(opts.out.join("static_tensors.bin"), &static_bin)?;
     }
 
+    let gemm_weight_dtypes: std::collections::HashSet<_> = plans
+        .iter()
+        .flat_map(|(_, plan)| &plan.ops)
+        .filter(|op| matches!(op.kind, rewrite::OpKind::Gemm(_)))
+        .map(|op| op.weight_dtype)
+        .collect();
+    let homogeneous_weight_dtype = if gemm_weight_dtypes.len() == 1 {
+        gemm_weight_dtypes.iter().next().copied()
+    } else {
+        None
+    };
     let weight_tiling = compiled
         .weight
         .filter(|_| compiled.weight_shared)
-        .map(|w| WeightTiling {
-            bn: w.bn,
-            bk: w.bk,
-            element_dtype: "bf16".into(),
-            elem_bytes: 2,
-            block_iteration: "n_major_k_inner".into(),
-            within_block_layout: "n_outer_k_inner".into(),
-            padding_policy: "zero_extend".into(),
+        .zip(homogeneous_weight_dtype)
+        .and_then(|(w, dtype)| {
+            dtype.byte_size().map(|elem_bytes| WeightTiling {
+                bn: w.bn,
+                bk: w.bk,
+                element_dtype: dtype.to_string(),
+                elem_bytes,
+                block_iteration: "n_major_k_inner".into(),
+                within_block_layout: "n_outer_k_inner".into(),
+                padding_policy: "zero_extend".into(),
+            })
         });
 
     let mut report = Report {
@@ -818,6 +959,21 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         "compilation completed"
     );
     Ok(report)
+}
+
+fn ensure_model_packet_path_supported(
+    metadata: &nn_graph::hub::ModelMetadata,
+) -> Result<(), PlowcError> {
+    let config: serde_json::Value = serde_json::from_str(metadata.config_json())?;
+    match config.get("model_type").and_then(serde_json::Value::as_str) {
+        Some("kimi_k3" | "kimi_linear") => Err(PlowcError::InvalidDim(
+            "Kimi-K3 is supported by the dedicated MI355X devblob emitter, but the \
+             metadata-only `--model` scheduled-packet path does not yet lower its AttnRes \
+             block-residual state; use the existing Kimi HF-directory/devblob path"
+                .into(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn build_assets(
@@ -893,6 +1049,12 @@ fn build_assets(
     let footprint_json = file_size("footprint.json");
     let footprint_csv = file_size("footprint.csv");
     let static_tensors_bin = file_size("static_tensors.bin");
+    let fp8_weights_json = file_size("fp8_weights.json");
+    let hf_metadata_total = nn_graph::hub::METADATA_FILES
+        .iter()
+        .map(|name| file_size(name))
+        .sum::<u64>()
+        .saturating_add(file_size("hf_metadata.json"));
     // Excludes assets.json itself: this total is serialized into that file,
     // so its own size isn't known yet.
     let grand_total = packets_total
@@ -905,7 +1067,9 @@ fn build_assets(
         + weights_json
         + footprint_json
         + footprint_csv
-        + static_tensors_bin;
+        + static_tensors_bin
+        + fp8_weights_json
+        + hf_metadata_total;
 
     let phase_str = |p: Phase| match p {
         Phase::Prefill => "prefill".to_string(),
@@ -951,6 +1115,8 @@ fn build_assets(
             footprint_json,
             footprint_csv,
             static_tensors_bin,
+            fp8_weights_json,
+            hf_metadata_total,
             grand_total,
         },
     }
@@ -968,11 +1134,37 @@ fn collect_static_tensors() -> (Vec<StaticTensorEntry>, Vec<u8>) {
 /// into every routed layer's runtime contract via `experts.json`.
 pub const EXPERT_UNUSED_SENTINEL: u32 = u32::MAX;
 
+/// Unique Flash operations in graph order, with their source-layer id.
+/// Classification comes from the lowered semantic kind, never display names.
+fn flash_ops(tasks: &schedule::TaskGraph, cons: &rewrite::ConstraintSet) -> Vec<(String, u32)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for task in &tasks.tasks {
+        if task.kind != schedule::TaskKind::Compute
+            || !matches!(
+                cons.op_io.get(&task.node).map(|d| d.kind),
+                Some(rewrite::OpKind::Flash(_))
+            )
+            || !seen.insert(task.op.clone())
+        {
+            continue;
+        }
+        let layer = task
+            .op
+            .rsplit_once("_L")
+            .and_then(|(_, suffix)| suffix.parse::<u32>().ok())
+            .unwrap_or(out.len() as u32);
+        out.push((task.op.clone(), layer));
+    }
+    out
+}
+
 /// Build the decode-phase KV read address sidecar. Returns `None` for
 /// non-decode buckets. See the design notes.
 fn build_decode_kv_schema(
     bucket: &ShapeBucket,
     tasks: &schedule::TaskGraph,
+    cons: &rewrite::ConstraintSet,
     kv_paging: Option<&KvPagingReport>,
 ) -> Option<DecodeKvSchema> {
     use schedule::Phase;
@@ -985,23 +1177,8 @@ fn build_decode_kv_schema(
     // the op name; use that when available, else fall back to scan-order.
     // Dedupe by op name — a single Flash op tiles into many tasks; we emit
     // one sidecar entry per op, not per tile.
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut flash_ops = Vec::new();
-    for task in &tasks.tasks {
-        if !task.op.starts_with("flash") {
-            continue;
-        }
-        if !seen.insert(task.op.clone()) {
-            continue;
-        }
-        // Prefer the `_L{i}` suffix when present.
-        let layer_from_suffix = task
-            .op
-            .rsplit("_L")
-            .next()
-            .and_then(|s| s.parse::<u32>().ok());
-        // Scan-order fallback when no `_L{i}` suffix.
-        let layer_idx = layer_from_suffix.unwrap_or_else(|| (seen.len() - 1) as u32);
+    for (op_name, layer_idx) in self::flash_ops(tasks, cons) {
         let buffer_name = kv
             .per_layer
             .iter()
@@ -1009,7 +1186,7 @@ fn build_decode_kv_schema(
             .map(|p| p.buffer_name.clone())
             .unwrap_or_else(|| format!("kv_cache_L{layer_idx}"));
         flash_ops.push(DecodeFlashOp {
-            op_name: task.op.clone(),
+            op_name,
             layer_idx,
             kv_buffer_name: buffer_name,
             // `FlashBody { coord0: u32, coord1: u32, seq_q: u32, seq_kv: u32, ... }`
@@ -1317,7 +1494,7 @@ fn inject_tokenize_packet(prog: &mut packet::Program) {
 
 /// Logit width (vocab / final feature count) for a source, for the SAMPLE body.
 /// `--net`: the running feature width after the last width-changing op. HF
-/// models: 0 (the runtime reads the width from the RequestIo `logits` shape).
+/// HF models: the final lm_head width.
 fn logits_width(src: &Source, plans: &[(ShapeBucket, LayerPlan)]) -> i64 {
     match src {
         Source::Net(n) => {
@@ -1334,7 +1511,7 @@ fn logits_width(src: &Source, plans: &[(ShapeBucket, LayerPlan)]) -> i64 {
         // HfDir: the plan's last op is the lm_head GEMM, whose N is
         // vocab_size. A 0 here would emit a SAMPLE packet with vocab=0 —
         // an argmax over nothing.
-        Source::HfDir(_) => plans
+        Source::Model(_) | Source::HfDir(_) => plans
             .first()
             .and_then(|(_, p)| p.ops.last())
             .and_then(|op| match &op.kind {
@@ -1342,7 +1519,6 @@ fn logits_width(src: &Source, plans: &[(ShapeBucket, LayerPlan)]) -> i64 {
                 _ => None,
             })
             .unwrap_or(0),
-        Source::Model(_) => 0,
     }
 }
 
@@ -1354,6 +1530,7 @@ fn emit_streams(
     opts: &Options,
     src: &Source,
     plans: &[(ShapeBucket, LayerPlan)],
+    fp8_scale_bytes: u64,
 ) -> Result<(Vec<BucketReport>, Vec<Footprint>, LeanStatus), PlowcError> {
     let hbm_capacity = soc.unit(0).cm.spec.mem.capacity.0;
     let mut out = Vec::with_capacity(compiled.streams.len());
@@ -1504,30 +1681,28 @@ fn emit_streams(
         // initial block count sized to cover this bucket's prefill; the
         // runtime allocates further blocks past `offset + reserved` as
         // sequences extend.
-        let kv_paging =
-            inject_kv_growable_entry(&mut amap, kv_layout, &bs.bucket, &opts.kv, &bs.sched.tasks);
+        let kv_paging = inject_kv_growable_entry(
+            &mut amap,
+            kv_layout,
+            &bs.bucket,
+            &opts.kv,
+            &bs.sched.tasks,
+            &bs.cons,
+        );
         // Attribute flash tasks to the injected KV entries so the Lean
         // checkpoints (D/F) verify them against real writer/reader sets —
         // a Growable entry with empty sets passes reclamation vacuously.
-        // Layer order mirrors `inject_kv_growable_entry`: sorted unique
-        // flash op names ↔ `kv_cache_L{i}`.
+        // Layer ids mirror `inject_kv_growable_entry` and preserve sparse
+        // hybrid-model ids (Qwen full attention at layers 3, 7, ...).
         if kv_paging.is_some() {
-            let flash_ops: std::collections::BTreeSet<&str> = bs
-                .sched
-                .tasks
-                .tasks
-                .iter()
-                .filter(|t| t.op.starts_with("flash"))
-                .map(|t| t.op.as_str())
-                .collect();
-            for (layer_idx, op) in flash_ops.iter().enumerate() {
+            for (op, layer_idx) in flash_ops(&bs.sched.tasks, &bs.cons) {
                 let ids: Vec<schedule::TaskId> = bs
                     .sched
                     .tasks
                     .tasks
                     .iter()
                     .enumerate()
-                    .filter(|(_, t)| t.op == *op)
+                    .filter(|(_, t)| t.op == op)
                     .map(|(tid, _)| tid)
                     .collect();
                 // Flash both appends to and reads the layer's KV region.
@@ -1538,13 +1713,13 @@ fn emit_streams(
         // Runtime pairs this with `weight_tiling` in `weights.json` to
         // arrange safetensor bytes into the tiled layout. See
         // the design notes.
-        let mut weight_shapes: std::collections::HashMap<String, (i64, i64)> =
+        let mut weight_shapes: std::collections::HashMap<String, (i64, i64, nn_graph::DType)> =
             std::collections::HashMap::new();
         for (_, desc) in bs.cons.op_io.iter() {
             if let rewrite::OpKind::Gemm(g) = &desc.kind {
                 // Convention: `inputs[0]` is the activation, `inputs[1]` the weight.
                 if let Some(weight_name) = desc.inputs.get(1) {
-                    weight_shapes.insert(weight_name.clone(), (g.n, g.k));
+                    weight_shapes.insert(weight_name.clone(), (g.n, g.k, desc.weight_dtype));
                 }
             }
         }
@@ -1552,17 +1727,14 @@ fn emit_streams(
         // + KV growth + weights) exceeds the target GPU's capacity. `amap`
         // segments track activations + KV; weights live in a distinct region
         // the runtime loads from safetensors, so add their bytes here.
-        // Element size follows the `weight_tiling.elem_bytes` convention (2
-        // for bf16 today). Assumes homogeneous devices.
-        let weight_elem_bytes: u64 = 2;
         let total_weight_bytes: u64 = weight_shapes
             .values()
-            .map(|(n, k)| {
-                ((*n).max(0) as u64)
-                    .saturating_mul((*k).max(0) as u64)
-                    .saturating_mul(weight_elem_bytes)
+            .map(|(n, k, dtype)| {
+                let elements = ((*n).max(0) as u64).saturating_mul((*k).max(0) as u64);
+                dtype.tile_bytes(elements)
             })
-            .sum();
+            .sum::<u64>()
+            .saturating_add(fp8_scale_bytes);
         // Under tensor parallelism (the only multi-GPU strategy) GEMM weights
         // are sharded along N across units, so each device holds ~1/Nth of the
         // total — charging the full model to every segment would over-count
@@ -1618,7 +1790,9 @@ fn emit_streams(
         // Decode KV sidecar — only emitted for `phase == Decode` buckets.
         // Runtime patches `seq_kv` + KV base per step. See
         // the design notes.
-        if let Some(dk) = build_decode_kv_schema(&bs.bucket, &bs.sched.tasks, kv_paging.as_ref()) {
+        if let Some(dk) =
+            build_decode_kv_schema(&bs.bucket, &bs.sched.tasks, &bs.cons, kv_paging.as_ref())
+        {
             let dk_file = format!("{stem}.decode_kv.json");
             std::fs::write(opts.out.join(&dk_file), serde_json::to_string_pretty(&dk)?)?;
         }
@@ -2214,6 +2388,7 @@ fn inject_kv_growable_entry(
     bucket: &ShapeBucket,
     kv_cfg: &KvConfig,
     tasks: &schedule::TaskGraph,
+    cons: &rewrite::ConstraintSet,
 ) -> Option<KvPagingReport> {
     use schedule::{memory::MEM_ALIGN, AddrEntry, BufClass};
     let layout = kv_layout?;
@@ -2230,16 +2405,7 @@ fn inject_kv_growable_entry(
     if block_bytes == 0 {
         return None;
     }
-    // Count attention layers — one per Flash op in the bucket. Real Llama-3
-    // has 32; --net examples typically 1. Use every unique flash op name.
-    let num_layers = tasks
-        .tasks
-        .iter()
-        .filter(|t| t.op.starts_with("flash"))
-        .map(|t| t.op.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        .max(1) as u32;
+    let layers = flash_ops(tasks, cons);
     // Per-layer initial block count: caller override, else enough to cover
     // this bucket's prefill seq. Both prefill and decode use the same reserve.
     let per_layer_blocks = if kv_cfg.initial_blocks > 0 {
@@ -2268,10 +2434,10 @@ fn inject_kv_growable_entry(
         .saturating_mul(max_seqs.max(0) as u64)
         .saturating_mul(head_slot_bytes);
 
-    let mut per_layer = Vec::with_capacity(num_layers as usize);
+    let mut per_layer = Vec::with_capacity(layers.len());
     let mut slot = amap.entries.iter().map(|e| e.slot).max().unwrap_or(0);
     let mut cursor = amap.arena_bytes;
-    for layer_idx in 0..num_layers {
+    for (_, layer_idx) in layers {
         cursor = ((cursor + MEM_ALIGN - 1) / MEM_ALIGN) * MEM_ALIGN;
         slot += 1;
         let name = format!("kv_cache_L{layer_idx}");
@@ -2357,18 +2523,18 @@ fn make_buckets(opts: &Options) -> Vec<ShapeBucket> {
 
 /// Lower one bucket to a plan; the model path also returns fusion stats.
 ///
-/// For `Source::HfDir`, if `hf_synth` is provided (it should be — the caller
-/// pre-synthesized it), the function builds a **full N-layer model plan** with
-/// safetensor-matching weight names. This is Option A: compile-time unroll.
+/// Indexed HF directories and Hub models share the nn-graph frontend. An
+/// unindexed `Source::HfDir` retains the legacy full-model synthesis path.
 fn build_plan(
     src: &Source,
     b: &ShapeBucket,
     hf_synth: Option<&hf_config::HfSynthesis>,
+    model_metadata: Option<&nn_graph::hub::ModelMetadata>,
     explore: bool,
 ) -> Result<(LayerPlan, Option<RewriteStats>), PlowcError> {
     match src {
         Source::Net(n) => Ok((n.build_plan(b), None)),
-        Source::HfDir(_) => {
+        Source::HfDir(_) if model_metadata.is_none() => {
             // Option A: build the full N-layer plan with per-layer weight names.
             let synth = hf_synth.expect("HfDir source requires pre-synthesized HfSynthesis");
             let plan = hf_config::build_full_model_plan(b, synth);
@@ -2379,13 +2545,15 @@ fn build_plan(
             );
             Ok((plan, None))
         }
-        Source::Model(id) => {
+        Source::Model(_) | Source::HfDir(_) => {
+            let model = src.name();
             info!(
-                stage = "nn-graph", model = %id, batch = b.batch, seq = b.seq,
+                stage = "nn-graph", model = %model, batch = b.batch, seq = b.seq,
                 "building nn_graph from pretrained model"
             );
-            let mut g = nn_graph::hub::build_from_pretrained(
-                id,
+            let metadata = model_metadata.expect("Model source requires resolved metadata");
+            let mut g = nn_graph::hub::build_from_metadata(
+                metadata,
                 &nn_graph::models::ShapeBucket::default(),
             )?;
             g.bind(&nn_graph::Bindings::new().set("B", b.batch).set("S", b.seq));
@@ -2397,7 +2565,7 @@ fn build_plan(
             // bucket); every later bucket skips straight to the plan.
             let stats = if explore {
                 info!(
-                    stage = "egg-exploration", model = %id, nodes = g.nodes.len(),
+                    stage = "egg-exploration", model = %model, nodes = g.nodes.len(),
                     "running egg rewrite exploration on nn_graph"
                 );
                 let (_fused, stats) = rewrite::rewrite_graph(&g)?;

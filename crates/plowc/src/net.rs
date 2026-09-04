@@ -140,9 +140,12 @@ impl NetConfig {
                     vec![prev.clone()],
                     OpKind::Flash(AttnShape {
                         heads: *heads,
+                        kv_heads: *heads,
                         seq_q: seq,
                         seq_kv: seq,
                         head_dim: *head_dim,
+                        causal: true,
+                        sliding_window: 0,
                     }),
                 ),
             };

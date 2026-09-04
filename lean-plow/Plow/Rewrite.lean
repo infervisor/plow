@@ -31,6 +31,7 @@ inductive Op
   -- Base ops.
   | Var        (name : String)
   | RmsNorm    (x w : Op) (eps : Nat)
+  | ZeroCenteredRmsNorm (x w : Op) (eps : Nat)
   | LayerNorm  (x w b : Op) (eps : Nat)
   | GroupNorm  (x w b : Op) (g : Nat) (eps : Nat)
   | Linear     (x w : Op)
@@ -39,6 +40,7 @@ inductive Op
   | Rope       (x : Op) (dim theta : Nat)
   | Scale      (x : Op) (factor : Nat)
   | Reshape    (x : Op) (shape : String)
+  | Slice      (x : Op) (axis : Int) (start len : String)
   | Ew         (kind : String) (x y : Op)
   | Conv3d     (x w : Op) (stride pad : Nat)
   | Conv3dBias (x w b : Op) (stride pad : Nat)
@@ -51,6 +53,7 @@ inductive Op
   | Attention  (q k v : Op)
   -- Fused variants (definitionally = the unfused composition via `expand`).
   | FusedNormLinear         (x w wl : Op) (eps : Nat)
+  | FusedZeroCenteredNormLinear (x w wl : Op) (eps : Nat)
   | FusedNormLinearBias     (x w wl bl : Op) (eps : Nat)
   | FusedLayerNormLinear    (x w b wl : Op) (eps : Nat)
   | FusedLayerNormLinearBias (x w b wl bl : Op) (eps : Nat)
@@ -58,11 +61,13 @@ inductive Op
   | FusedLinearBiasAct      (x w b : Op) (kind : String)
   | SwiGLU                  (gate up : Op) (kind : String)
   | FusedResidualNorm       (a b w : Op) (eps : Nat)
+  | FusedResidualZeroCenteredNorm (a b w : Op) (eps : Nat)
   | FusedResidualLayerNorm  (a b w bias : Op) (eps : Nat)
   | FusedGroupNormAct       (x w b : Op) (g eps : Nat) (kind : String)
   | FusedAdaLN              (x scale shift : Op)
   | FusedGatedResidual      (x y gate : Op)
   | FusedNormRope           (x w : Op) (eps dim theta : Nat)
+  | FusedZeroCenteredNormRope (x w : Op) (eps dim theta : Nat)
   | FusedNormRopeScale      (x w : Op) (eps dim theta factor : Nat)
   | FusedGroupNormActConv3d (x w b cw : Op) (g eps : Nat) (kind : String)
       (stride pad : Nat)
@@ -73,11 +78,14 @@ inductive Op
   | FusedKdaGatedNorm       (o nw x gw : Op) (eps : Nat) (shape : String)
   /-- Kimi-K3 MLA output gate: `attn * sigmoid(g_proj(x))`. -/
   | FusedMlaOutGate         (attn x gw : Op)
+  | FusedRmsNormSiluGate    (x nw gate : Op) (eps : Nat) (shape : String)
+  | FusedPackedAttnGate     (mixer x qw : Op) (qout : Nat)
+      (packedShape : String) (axis : Int) (start len gateShape : String)
   | FusedMaterializedResidualBlock
       (a b snapshots normWeight projWeight : Op) (maxSnapshots : Nat)
   | FusedMaterializedResidual3Block
       (pre a b snapshots normWeight projWeight : Op) (maxSnapshots : Nat)
-  deriving Repr, DecidableEq
+  deriving Repr
 
 /-! ## Denotational lens — every fused op unfolds to its unfused composition. -/
 
@@ -85,6 +93,8 @@ def expand : Op → Op
   -- Fused ops → their unfused equivalent.
   | Op.FusedNormLinear x w wl eps =>
       Op.Linear (Op.RmsNorm (expand x) (expand w) eps) (expand wl)
+  | Op.FusedZeroCenteredNormLinear x w wl eps =>
+      Op.Linear (Op.ZeroCenteredRmsNorm (expand x) (expand w) eps) (expand wl)
   | Op.FusedNormLinearBias x w wl bl eps =>
       Op.LinearBias (Op.RmsNorm (expand x) (expand w) eps) (expand wl) (expand bl)
   | Op.FusedLayerNormLinear x w b wl eps =>
@@ -99,6 +109,8 @@ def expand : Op → Op
       Op.Ew "mul" (Op.Act kind (expand g)) (expand u)
   | Op.FusedResidualNorm a b w eps =>
       Op.RmsNorm (Op.Ew "add" (expand a) (expand b)) (expand w) eps
+  | Op.FusedResidualZeroCenteredNorm a b w eps =>
+      Op.ZeroCenteredRmsNorm (Op.Ew "add" (expand a) (expand b)) (expand w) eps
   | Op.FusedResidualLayerNorm a b w bias eps =>
       Op.LayerNorm (Op.Ew "add" (expand a) (expand b)) (expand w) (expand bias) eps
   | Op.FusedGroupNormAct x w b g eps kind =>
@@ -110,6 +122,8 @@ def expand : Op → Op
       Op.Ew "add" (expand x) (Op.Ew "mul" (expand y) (expand gate))
   | Op.FusedNormRope x w eps dim theta =>
       Op.Rope (Op.RmsNorm (expand x) (expand w) eps) dim theta
+  | Op.FusedZeroCenteredNormRope x w eps dim theta =>
+      Op.Rope (Op.ZeroCenteredRmsNorm (expand x) (expand w) eps) dim theta
   | Op.FusedNormRopeScale x w eps dim theta factor =>
       Op.Scale (Op.Rope (Op.RmsNorm (expand x) (expand w) eps) dim theta) factor
   | Op.FusedGroupNormActConv3d x w b cw g eps kind stride pad =>
@@ -125,6 +139,16 @@ def expand : Op → Op
         (Op.Act "sigmoid" (Op.Reshape (Op.Linear (expand x) (expand gw)) shape))
   | Op.FusedMlaOutGate attn x gw =>
       Op.Ew "mul" (expand attn) (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw)))
+  | Op.FusedRmsNormSiluGate x nw gate eps shape =>
+      Op.Ew "mul" (Op.RmsNorm (expand x) (expand nw) eps)
+        (Op.Act "silu" (Op.Reshape (expand gate) shape))
+  | Op.FusedPackedAttnGate mixer x qw _ packedShape axis start len gateShape =>
+      Op.Ew "mul" (expand mixer)
+        (Op.Act "sigmoid"
+          (Op.Reshape
+            (Op.Slice (Op.Reshape (Op.Linear (expand x) (expand qw)) packedShape)
+              axis start len)
+            gateShape))
   | Op.FusedMaterializedResidualBlock a b snapshots nw pw maxSnapshots =>
       Op.BlockResidual (Op.Ew "add" (expand a) (expand b))
         (expand snapshots) (expand nw) (expand pw) maxSnapshots
@@ -134,6 +158,7 @@ def expand : Op → Op
         (expand snapshots) (expand nw) (expand pw) maxSnapshots
   -- Base ops → structural recursion.
   | Op.RmsNorm x w eps => Op.RmsNorm (expand x) (expand w) eps
+  | Op.ZeroCenteredRmsNorm x w eps => Op.ZeroCenteredRmsNorm (expand x) (expand w) eps
   | Op.LayerNorm x w b eps => Op.LayerNorm (expand x) (expand w) (expand b) eps
   | Op.GroupNorm x w b g eps => Op.GroupNorm (expand x) (expand w) (expand b) g eps
   | Op.Linear x w => Op.Linear (expand x) (expand w)
@@ -142,6 +167,7 @@ def expand : Op → Op
   | Op.Rope x d t => Op.Rope (expand x) d t
   | Op.Scale x f => Op.Scale (expand x) f
   | Op.Reshape x shape => Op.Reshape (expand x) shape
+  | Op.Slice x axis start len => Op.Slice (expand x) axis start len
   | Op.Ew k x y => Op.Ew k (expand x) (expand y)
   | Op.Conv3d x w s p => Op.Conv3d (expand x) (expand w) s p
   | Op.Conv3dBias x w b s p => Op.Conv3dBias (expand x) (expand w) (expand b) s p
@@ -159,6 +185,11 @@ def expand : Op → Op
 theorem rule_rmsnorm_linear_fuse (x w wl : Op) (eps : Nat) :
     expand (Op.FusedNormLinear x w wl eps) =
       Op.Linear (Op.RmsNorm (expand x) (expand w) eps) (expand wl) := rfl
+
+/-- `zero-centered-rmsnorm-linear-fuse` -/
+theorem rule_zero_centered_rmsnorm_linear_fuse (x w wl : Op) (eps : Nat) :
+    expand (Op.FusedZeroCenteredNormLinear x w wl eps) =
+      Op.Linear (Op.ZeroCenteredRmsNorm (expand x) (expand w) eps) (expand wl) := rfl
 
 /-- `rmsnorm-linearbias-fuse` -/
 theorem rule_rmsnorm_linearbias_fuse (x w wl bl : Op) (eps : Nat) :
@@ -196,6 +227,11 @@ theorem rule_residual_rmsnorm_fuse (a b w : Op) (eps : Nat) :
     expand (Op.FusedResidualNorm a b w eps) =
       Op.RmsNorm (Op.Ew "add" (expand a) (expand b)) (expand w) eps := rfl
 
+/-- `residual-zero-centered-rmsnorm-fuse` -/
+theorem rule_residual_zero_centered_rmsnorm_fuse (a b w : Op) (eps : Nat) :
+    expand (Op.FusedResidualZeroCenteredNorm a b w eps) =
+      Op.ZeroCenteredRmsNorm (Op.Ew "add" (expand a) (expand b)) (expand w) eps := rfl
+
 /-- `residual-layernorm-fuse` -/
 theorem rule_residual_layernorm_fuse (a b w bias : Op) (eps : Nat) :
     expand (Op.FusedResidualLayerNorm a b w bias eps) =
@@ -222,6 +258,11 @@ theorem rule_gated_residual_fuse (x y gate : Op) :
 theorem rule_rmsnorm_rope_fuse (x w : Op) (eps dim theta : Nat) :
     expand (Op.FusedNormRope x w eps dim theta) =
       Op.Rope (Op.RmsNorm (expand x) (expand w) eps) dim theta := rfl
+
+/-- `zero-centered-rmsnorm-rope-fuse` -/
+theorem rule_zero_centered_rmsnorm_rope_fuse (x w : Op) (eps dim theta : Nat) :
+    expand (Op.FusedZeroCenteredNormRope x w eps dim theta) =
+      Op.Rope (Op.ZeroCenteredRmsNorm (expand x) (expand w) eps) dim theta := rfl
 
 /-- `rmsnorm-rope-scale-fuse` -/
 theorem rule_rmsnorm_rope_scale_fuse (x w : Op) (eps dim theta factor : Nat) :
@@ -259,6 +300,24 @@ theorem rule_mla_out_gate_fuse (attn x gw : Op) :
     expand (Op.FusedMlaOutGate attn x gw) =
       Op.Ew "mul" (expand attn)
         (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw))) := rfl
+
+/-- `rmsnorm-silu-gate-fuse` -/
+theorem rule_rmsnorm_silu_gate_fuse
+    (x nw gate : Op) (eps : Nat) (shape : String) :
+    expand (Op.FusedRmsNormSiluGate x nw gate eps shape) =
+      Op.Ew "mul" (Op.RmsNorm (expand x) (expand nw) eps)
+        (Op.Act "silu" (Op.Reshape (expand gate) shape)) := rfl
+
+/-- `packed-attn-gate-fuse` -/
+theorem rule_packed_attn_gate_fuse
+    (mixer x qw : Op) (qout axis : Nat) (packedShape start len gateShape : String) :
+    expand (Op.FusedPackedAttnGate mixer x qw qout packedShape axis start len gateShape) =
+      Op.Ew "mul" (expand mixer)
+        (Op.Act "sigmoid"
+          (Op.Reshape
+            (Op.Slice (Op.Reshape (Op.Linear (expand x) (expand qw)) packedShape)
+              axis start len)
+            gateShape)) := rfl
 
 /-- `materialized-residual-block-fuse`; the consumer result is unchanged. -/
 theorem rule_materialized_residual_block_fuse
@@ -303,6 +362,7 @@ theorem materialized_residual3_block_preserved
     via `checkA`. -/
 def soundRules : List String :=
   ["rmsnorm-linear-fuse",
+   "zero-centered-rmsnorm-linear-fuse",
    "rmsnorm-linearbias-fuse",
    "layernorm-linear-fuse",
    "layernorm-linearbias-fuse",
@@ -310,17 +370,21 @@ def soundRules : List String :=
    "linearbias-act-fuse",
    "gated-mlp-fuse",
    "residual-rmsnorm-fuse",
+   "residual-zero-centered-rmsnorm-fuse",
    "residual-layernorm-fuse",
    "groupnorm-act-fuse",
    "adaln-modulate-fuse",
    "gated-residual-fuse",
    "rmsnorm-rope-fuse",
+   "zero-centered-rmsnorm-rope-fuse",
    "rmsnorm-rope-scale-fuse",
    "groupnorm-act-conv3d-fuse",
    "groupnorm-act-conv3d-bias-fuse",
    "embedding-scale-fuse",
    "kda-gated-norm-fuse",
    "mla-out-gate-fuse",
+   "rmsnorm-silu-gate-fuse",
+   "packed-attn-gate-fuse",
    "materialized-residual-block-fuse",
    "materialized-residual3-block-fuse"]
 

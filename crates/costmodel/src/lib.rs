@@ -496,9 +496,12 @@ mod tests {
         // Decode: one query row, long KV cache.
         let a = AttnShape {
             heads: 32,
+            kv_heads: 32,
             seq_q: 1,
             seq_kv: 4096,
             head_dim: 128,
+            causal: true,
+            sliding_window: 0,
         };
         let cands = cm.flash_candidates(a, SramPolicy::Stream);
         assert!(!cands.is_empty());
@@ -515,9 +518,12 @@ mod tests {
         let cm = CostModel::new(h100(), DEFAULT_PAGE_BYTES);
         let a = AttnShape {
             heads: 32,
+            kv_heads: 32,
             seq_q: 4096,
             seq_kv: 4096,
             head_dim: 128,
+            causal: true,
+            sliding_window: 0,
         };
         let cands = cm.flash_candidates(a, SramPolicy::Stream);
         assert!(cands.iter().any(|t| t.bq == 128), "prefill keeps square BQ");

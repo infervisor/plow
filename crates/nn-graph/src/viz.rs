@@ -115,6 +115,7 @@ fn op_detail(op: &Op) -> serde_json::Value {
         }),
         Op::MatMul => json!({}),
         Op::RmsNorm { eps } => json!({ "eps": eps }),
+        Op::RmsNormZeroCentered { eps } => json!({ "eps": eps }),
         Op::LayerNorm { eps } => json!({ "eps": eps }),
         Op::Rope {
             dim,

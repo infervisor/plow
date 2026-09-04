@@ -231,6 +231,7 @@ mod tests {
                 blocks: vec![],
                 inputs: vec![],
                 outputs: vec![],
+                fp8_scale_bindings: vec![],
             },
             &fused,
             0,

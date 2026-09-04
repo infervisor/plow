@@ -22,6 +22,7 @@
   (Embedding Expr Expr)                ; ids, table
   (Scale Expr f64)                     ; x, factor
   (RmsNorm Expr Expr f64)              ; x, weight, eps
+  (ZeroCenteredRmsNorm Expr Expr f64)  ; x, offset-from-one weight, eps
   (LayerNorm Expr Expr Expr f64)       ; x, weight, bias, eps
   (Linear Expr Expr i64)              ; x, weight, out_features
   (LinearBias Expr Expr Expr i64)     ; x, weight, bias, out_features
@@ -79,6 +80,7 @@
   ; Norm→Linear fusions keep EVERY weight leaf (norm bias, linear bias) so the
   ; fused kernel reproduces the math and the weight manifest stays complete.
   (FusedNormLinear Expr Expr Expr f64 i64)             ; x, normw, linw, eps, out  (RMSNorm + biasless Linear)
+  (FusedZeroCenteredNormLinear Expr Expr Expr f64 i64) ; x, normw, linw, eps, out
   (FusedNormLinearBias Expr Expr Expr Expr f64 i64)    ; x, normw, linw, linb, eps, out  (RMSNorm + biased Linear)
   (FusedLayerNormLinear Expr Expr Expr Expr f64 i64)   ; x, normw, normb, linw, eps, out
   (FusedLayerNormLinearBias Expr Expr Expr Expr Expr f64 i64) ; x, normw, normb, linw, linb, eps, out
@@ -89,10 +91,12 @@
 
   ; Norm→Rope fusions (Gemma3/4 qk_norm: RmsNorm immediately before RoPE).
   (FusedNormRope Expr Expr f64 i64 f64)       ; x, normw, eps, rotary_dim, theta
+  (FusedZeroCenteredNormRope Expr Expr f64 i64 f64)
   (FusedNormRopeScale Expr Expr f64 i64 f64 f64) ; x, normw, eps, rotary_dim, theta, scale_factor
 
   ; Residual-add + Norm fusion (fires at every block boundary in LLMs).
   (FusedResidualNorm Expr Expr Expr f64)             ; a, b, normw, eps  (add(a,b) then RMSNorm)
+  (FusedResidualZeroCenteredNorm Expr Expr Expr f64) ; add(a,b) then zero-centered RMSNorm
   (FusedResidualLayerNorm Expr Expr Expr Expr f64)   ; a, b, normw, normb, eps
 
   ; GroupNorm + Activation + Conv3d fusion (VAE resnet inner loop).
@@ -115,6 +119,13 @@
   (FusedKdaGatedNorm Expr Expr f64 Expr Expr i64 String)
       ; o, o_normw, eps, x, gatew, gate_out, gate-shape
   (FusedMlaOutGate Expr Expr Expr i64)             ; attn, x, gatew, gate_out
+
+  ; Qwen3.5/3.8 output gates. Keep the packed q_proj slice attributes so this
+  ; cannot alias Kimi's independently projected sigmoid gate.
+  (FusedRmsNormSiluGate Expr Expr f64 Expr String)
+      ; x, normw, eps, gate, gate-shape
+  (FusedPackedAttnGate Expr Expr Expr i64 String i64 String String String)
+      ; mixer, q-input, q-weight, q-out, packed-shape, axis, start, len, gate-shape
 
   ; A compatible block-residual consumer may compute its immediately preceding residual
   ; in-kernel, but must still write that BF16 tensor for its other users. The three-input form is

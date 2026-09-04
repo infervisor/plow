@@ -1021,6 +1021,9 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         .clone()
         .ok_or("--emit devblob requires --hf-dir <checkpoint>")?;
 
+    let config_json = std::fs::read_to_string(dir.join("config.json"))?;
+    ensure_devblob_arch_supported(&config_json)?;
+
     let slug = plowc::hf_config::dir_slug(&dir);
 
     // Two output shapes:
@@ -1306,6 +1309,23 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         "devblob written"
     );
     Ok(pkt)
+}
+
+fn ensure_devblob_arch_supported(config_json: &str) -> Result<(), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(config_json).map_err(|e| format!("invalid config.json: {e}"))?;
+    if v["model_type"].as_str() == Some("qwen3_5") {
+        return Err(
+            "qwen3_5 frontend/rewrite support is available, but devblob emission is not yet \
+             faithful: Qwen Gated DeltaNet has unequal Q/K and V head geometry, one shared \
+             qkv+depthwise-conv stream, and recurrent state; its full-attention layers pack \
+             a sigmoid output gate into q_proj. The current device packet ABI/interpreter \
+             cannot represent those semantics, so plowc refuses emission instead of producing \
+             a silently-wrong dense-Qwen blob."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// `--emit devblob+cubin`: drive the Phase-A CMake target with the defines the
@@ -2060,6 +2080,15 @@ mod cli_tests {
         let mut argv = vec!["plowc", "--hf-dir", "/tmp/x", "--emit", "devblob"];
         argv.extend_from_slice(extra);
         Cli::try_parse_from(argv).expect("parse")
+    }
+
+    #[test]
+    fn qwen35_devblob_is_rejected_before_dense_dispatch() {
+        let err = ensure_devblob_arch_supported(r#"{"model_type":"qwen3_5"}"#).unwrap_err();
+        assert!(err.contains("Gated DeltaNet"), "{err}");
+        assert!(err.contains("output gate into q_proj"), "{err}");
+        assert!(err.contains("refuses emission"), "{err}");
+        ensure_devblob_arch_supported(r#"{"model_type":"qwen3"}"#).unwrap();
     }
 
     /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be

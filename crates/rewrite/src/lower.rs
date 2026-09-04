@@ -70,6 +70,9 @@ fn term_for(
         Op::Embedding => format!("(Embedding {} {})", e(0)?, e(1)?),
         Op::Scale(f) => format!("(Scale {} {})", e(0)?, f64lit(*f)),
         Op::RmsNorm { eps } => format!("(RmsNorm {} {} {})", e(0)?, e(1)?, f64lit(*eps)),
+        Op::RmsNormZeroCentered { eps } => {
+            format!("(ZeroCenteredRmsNorm {} {} {})", e(0)?, e(1)?, f64lit(*eps))
+        }
         Op::LayerNorm { eps } => {
             format!("(LayerNorm {} {} {} {})", e(0)?, e(1)?, e(2)?, f64lit(*eps))
         }
@@ -243,6 +246,7 @@ fn term_for(
             // a token so a future second recurrence stays a distinct e-node.
             let k = match kind {
                 nn_graph::op::LinearAttnKind::KimiDelta => "kimi_delta",
+                nn_graph::op::LinearAttnKind::QwenGatedDelta => "qwen_gated_delta",
             };
             format!(
                 "(LinearAttention {} {} {} {} {} {} {} {} {} {})",

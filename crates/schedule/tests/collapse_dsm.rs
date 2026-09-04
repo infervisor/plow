@@ -172,6 +172,7 @@ fn relax_demotes_oversized_colocation() {
             kind: OpKind::Layout(rewrite::LayoutSpec::copy(4096)),
             inputs: vec![],
             output: "y".into(),
+            weight_dtype: nn_graph::DType::BF16,
             activation_elem: 2,
             weight_elem: 2,
             block_quant: false,

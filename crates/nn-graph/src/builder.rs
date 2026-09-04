@@ -62,6 +62,17 @@ impl Nn {
         self.g.weight(name, Shape::new(dims), dtype)
     }
 
+    pub fn fp8_scale_binding(
+        &mut self,
+        weight: &str,
+        scale: &str,
+        scale_dims: impl IntoIterator<Item = Dim>,
+        block_shape: [i64; 2],
+    ) -> TensorId {
+        self.g
+            .fp8_scale_binding(weight, scale, Shape::new(scale_dims), block_shape)
+    }
+
     fn emit(&mut self, op: Op, inputs: Vec<TensorId>) -> TensorId {
         self.g.op(op, inputs, self.act_dtype)
     }
@@ -106,9 +117,47 @@ impl Nn {
         )
     }
 
+    pub fn linear_dtype(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        in_f: i64,
+        out_f: i64,
+        bias: bool,
+        weight_dtype: DType,
+    ) -> TensorId {
+        let w = self.param_dtype(
+            &format!("{name}.weight"),
+            [Dim::stat(out_f), Dim::stat(in_f)],
+            weight_dtype,
+        );
+        let mut inputs = vec![x, w];
+        if bias {
+            inputs.push(self.param(&format!("{name}.bias"), [Dim::stat(out_f)]));
+        }
+        self.emit(
+            Op::Linear {
+                out_features: out_f,
+                bias,
+            },
+            inputs,
+        )
+    }
+
     pub fn rmsnorm(&mut self, name: &str, x: TensorId, hidden: i64, eps: f32) -> TensorId {
         let w = self.param(&format!("{name}.weight"), [Dim::stat(hidden)]);
         self.emit(Op::RmsNorm { eps }, vec![x, w])
+    }
+
+    pub fn rmsnorm_zero_centered(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hidden: i64,
+        eps: f32,
+    ) -> TensorId {
+        let w = self.param(&format!("{name}.weight"), [Dim::stat(hidden)]);
+        self.emit(Op::RmsNormZeroCentered { eps }, vec![x, w])
     }
 
     pub fn rmsnorm_dtype(
@@ -411,7 +460,7 @@ impl Nn {
         self.emit(Op::Conv1dDepthwise { kernel }, vec![x, w])
     }
 
-    /// Linear attention with a carried recurrent state (Kimi delta rule).
+    /// Linear attention with a carried recurrent state.
     ///
     /// `beta` is `[B, S, heads]` — one write-strength scalar per token and head.
     pub fn linear_attention(

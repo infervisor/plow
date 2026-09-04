@@ -27,14 +27,19 @@ use hwspec::{Arch, GpuSpec, MmaDtype};
 /// Attention problem with dims bound by the shape bucket.
 #[derive(Clone, Copy, Debug)]
 pub struct AttnShape {
-    /// Parallel dim: `batch × num_heads` (each tile-stream is independent).
+    /// Query heads. Each tile stream is independent.
     pub heads: i64,
+    /// Key/value heads. Kept distinct for GQA packet lowering.
+    pub kv_heads: i64,
     /// Query rows.
     pub seq_q: i64,
     /// Key/value rows attended over.
     pub seq_kv: i64,
     /// Per-head feature width.
     pub head_dim: i64,
+    pub causal: bool,
+    /// Zero means full attention; otherwise the causal sliding-window width.
+    pub sliding_window: u32,
 }
 
 /// FlashAttention tiling: `BQ` query rows resident, `BKV` key/value rows streamed.

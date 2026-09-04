@@ -3,7 +3,8 @@
 //! and the program round-trips through the compact wire format.
 
 use costmodel::{hwspec, GemmShape, RowShape, Soc, SramPolicy, DEFAULT_PAGE_BYTES};
-use rewrite::{assemble, LayerPlan, OpKind, OpSpec};
+use nn_graph::Bindings;
+use rewrite::{assemble, plan_from_all_blocks, LayerPlan, ModelOpKind, OpKind, OpSpec};
 use schedule::packet::{Body, Opcode, Program};
 use schedule::{emit_program, schedule, Config};
 
@@ -132,4 +133,130 @@ fn stream_header_carries_metadata() {
     let decoded = Program::decode(&p2.to_bytes()).unwrap();
     assert_eq!(decoded.bucket_id, 123);
     assert_eq!(decoded.plan_gen, 42);
+}
+
+fn qwen_plan() -> LayerPlan {
+    let json = r#"{
+      "model_type":"qwen3_5",
+      "dtype":"bfloat16",
+      "text_config": {
+        "model_type":"qwen3_5_text",
+        "vocab_size":256,
+        "hidden_size":64,
+        "intermediate_size":128,
+        "num_hidden_layers":4,
+        "num_attention_heads":24,
+        "num_key_value_heads":4,
+        "head_dim":16,
+        "layer_types":["linear_attention","linear_attention","linear_attention","full_attention"],
+        "linear_conv_kernel_dim":4,
+        "linear_key_head_dim":8,
+        "linear_num_key_heads":2,
+        "linear_num_value_heads":4,
+        "linear_value_head_dim":8,
+        "rms_norm_eps":0.000001,
+        "rope_parameters":{"rope_theta":10000000.0,"partial_rotary_factor":0.25,"rope_type":"default","mrope_interleaved":true},
+        "attention_bias":false,
+        "attn_output_gate":true,
+        "hidden_act":"silu",
+        "mamba_ssm_dtype":"float32",
+        "output_gate_type":"swish",
+        "tie_word_embeddings":false
+      }
+    }"#;
+    let mut graph = nn_graph::models::build_text_generation_from_config_json_at(
+        json,
+        &nn_graph::models::ShapeBucket::default(),
+    )
+    .unwrap();
+    graph.bind(&Bindings::new().set("B", 1).set("S", 8));
+    plan_from_all_blocks(&graph).unwrap()
+}
+
+#[test]
+fn qwen_plan_is_complete_and_emits_semantic_packets_for_both_nvidia_targets() {
+    let plan = qwen_plan();
+    assert!(matches!(
+        plan.ops.first().map(|o| o.kind),
+        Some(OpKind::Model(m)) if m.kind == ModelOpKind::Embedding
+            && m.input_bytes[1] == 256 * 64 * 2
+    ));
+    assert!(matches!(
+        plan.ops.get(plan.ops.len() - 2).map(|o| o.kind),
+        Some(OpKind::Model(m)) if m.kind == ModelOpKind::RmsNormZeroCentered
+    ));
+    assert!(matches!(
+        plan.ops.last().map(|o| o.kind),
+        Some(OpKind::Gemm(g)) if g.n == 256 && g.k == 64
+    ));
+    let attn = plan
+        .ops
+        .iter()
+        .find_map(|o| match o.kind {
+            OpKind::Flash(a) => Some(a),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!((attn.heads, attn.kv_heads), (24, 4));
+    assert!(attn.causal);
+    assert_eq!(attn.sliding_window, 0);
+
+    for target in ["H100 SXM5", "rtx6000"] {
+        let spec = hwspec::registry::lookup(target).unwrap();
+        let soc = Soc::single(spec, DEFAULT_PAGE_BYTES);
+        let (graph, cons) = assemble(&soc, &plan, SramPolicy::Stream, None).unwrap();
+        let scheduled = schedule(&soc, &graph, &cons, &Config::default());
+        let embedding_load = scheduled
+            .tasks
+            .tasks
+            .iter()
+            .find(|task| task.tensor.as_deref() == Some("model.language_model.embed_tokens.weight"))
+            .unwrap();
+        assert_eq!(embedding_load.tensor_bytes, 256 * 64 * 2);
+        assert_eq!(embedding_load.bytes, 8 * 64 * 2);
+        let program = emit_program(&graph, &cons, &scheduled.tasks, &scheduled.schedule);
+        let decoded = Program::decode(&program.to_bytes()).unwrap();
+
+        let variants: Vec<_> = decoded
+            .insts
+            .iter()
+            .filter_map(|i| match i.body {
+                Body::Row { variant, args, .. } => Some((variant, args)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            variants.iter().any(|(v, args)| {
+                *v == Opcode::VARIANT_MODEL_QWEN_GATED_DELTA && *args == [4, 8, 1, 0]
+            }),
+            "{target}: missing Qwen GDN packet"
+        );
+        assert!(
+            variants.iter().any(|(v, args)| {
+                *v == Opcode::VARIANT_MODEL_CAUSAL_DEPTHWISE_CONV1D && args[0] == 4
+            }),
+            "{target}: missing causal depthwise-conv packet"
+        );
+        for required in [
+            Opcode::VARIANT_MODEL_EMBEDDING,
+            Opcode::VARIANT_MODEL_RMSNORM,
+            Opcode::VARIANT_MODEL_RMSNORM_ZERO_CENTERED,
+            Opcode::VARIANT_MODEL_ROPE,
+            Opcode::VARIANT_MODEL_SILU,
+            Opcode::VARIANT_MODEL_SIGMOID,
+            Opcode::VARIANT_MODEL_ADD,
+            Opcode::VARIANT_MODEL_MUL,
+        ] {
+            assert!(
+                variants.iter().any(|(variant, _)| *variant == required),
+                "{target}: missing semantic row variant {required:#04x}"
+            );
+        }
+        let flash = decoded.insts.iter().find_map(|i| match i.body {
+            Body::Flash { heads, variant, .. } => Some((heads, variant)),
+            _ => None,
+        });
+        assert_eq!(flash, Some((24, Opcode::flash_causal_gqa_variant(4))));
+        assert!(decoded.insts.iter().all(|i| i.unit < spec.sm_count as u8));
+    }
 }

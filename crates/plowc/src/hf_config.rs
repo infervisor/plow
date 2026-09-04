@@ -55,6 +55,9 @@ pub enum HfArch {
     Gemma4,
     Llama,
     Qwen3,
+    /// Qwen3.5/3.8 dense hybrid: Gated DeltaNet layers interleaved with
+    /// output-gated full attention.
+    Qwen35,
     /// Kimi K2 (Moonshot): MLA + MoE. Same family as DeepSeek-V2 attention.
     Kimi,
     /// DeepSeek V2/V3: MLA + DeepSeekMoE. Same block structure as Kimi K2.
@@ -83,6 +86,36 @@ pub enum AttnKind {
     /// short depthwise convs on q/k/v and a low-rank forget gate. Not softmax
     /// attention and not expressible with any current plow DevOp.
     Kda,
+    /// Qwen3.5 Gated DeltaNet. Unlike KDA, Q/K and V have different head
+    /// counts and the QKV channels share one projection and one convolution.
+    GatedDeltaNet,
+}
+
+/// Geometry unique to the Qwen3.5/3.8 hybrid mixer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Qwen35Geometry {
+    pub linear_num_key_heads: i64,
+    pub linear_num_value_heads: i64,
+    pub linear_key_head_dim: i64,
+    pub linear_value_head_dim: i64,
+    pub linear_conv_kernel_dim: u32,
+    pub partial_rotary_factor: f64,
+    pub rope_theta: f64,
+    pub attn_output_gate: bool,
+    /// Official fine-grained FP8 checkpoint block geometry. `None` for BF16.
+    pub fp8_weight_block_size: Option<[i64; 2]>,
+    pub fp8_dynamic_activations: bool,
+}
+
+impl Qwen35Geometry {
+    pub fn qkv_width(self) -> i64 {
+        2 * self.linear_num_key_heads * self.linear_key_head_dim
+            + self.linear_num_value_heads * self.linear_value_head_dim
+    }
+
+    pub fn value_width(self) -> i64 {
+        self.linear_num_value_heads * self.linear_value_head_dim
+    }
 }
 
 /// Resolved model description — every field verified present (or an
@@ -149,6 +182,8 @@ pub struct HfSynthesis {
     /// `experts.{e}.w1.weight_packed` is `[3072, 1792]` = `[moe_inter, 3584/2]`,
     /// so `moe_latent`, NOT `moe_inter`, is the routed-expert GEMM's K.
     pub moe_latent: i64,
+    /// Present only for Qwen3.5/3.8 hybrid text towers.
+    pub qwen35: Option<Qwen35Geometry>,
     /// Weight dtype for GEMM projections. BF16 by default; F8E4M3 for FP8
     /// quantized checkpoints; F4 for MX microscaling. Norms/embed/activations
     /// always stay BF16 regardless of this setting.
@@ -182,6 +217,9 @@ pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> 
     if v["model_type"].as_str() == Some("kimi_k3") {
         return synth_kimi_k3(&v, name);
     }
+    if v["model_type"].as_str() == Some("qwen3_5") {
+        return synth_qwen35(&v, name);
+    }
     if v.get("text_config").is_some() {
         return synth_gemma(&v["text_config"], name, "model.language_model.");
     }
@@ -194,7 +232,7 @@ pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> 
         "glm_moe_dsa" | "glm4" => synth_mla_moe(&v, name, HfArch::Glm),
         other => Err(format!(
             "unsupported model_type {other:?}: --hf-dir implements gemma4 (nested \
-             text_config or gemma4_text), llama, qwen3, kimi, kimi_k3, \
+             text_config or gemma4_text), llama, qwen3, qwen3_5, kimi, kimi_k3, \
              deepseek_v2/v3, and glm_moe_dsa. Compiling an unknown architecture \
              from defaults would produce a silently-wrong model."
         )),
@@ -237,7 +275,11 @@ fn parse_weight_dtype(v: &Value) -> nn_graph::DType {
         }
     }
     // Check torch_dtype string
-    if let Some(dt) = v.get("torch_dtype").and_then(|d| d.as_str()) {
+    if let Some(dt) = v
+        .get("torch_dtype")
+        .or_else(|| v.get("dtype"))
+        .and_then(|d| d.as_str())
+    {
         match dt {
             "float8_e4m3fn" | "float8_e4m3" | "fp8" => return nn_graph::DType::F8E4M3,
             "float8_e5m2" => return nn_graph::DType::F8E5M2,
@@ -334,6 +376,7 @@ fn synth_gemma(t: &Value, name: String, prefix: &str) -> Result<HfSynthesis, Str
         first_k_dense: 0,
         n_shared_experts: 0,
         moe_latent: 0,
+        qwen35: None,
         weight_dtype: parse_weight_dtype(t),
         net: NetConfig {
             name: String::new(),
@@ -396,6 +439,7 @@ fn synth_llama_qwen(v: &Value, name: String, mt: &str) -> Result<HfSynthesis, St
         first_k_dense: 0,
         n_shared_experts: 0,
         moe_latent: 0,
+        qwen35: None,
         weight_dtype: parse_weight_dtype(v),
         net: NetConfig {
             name: String::new(),
@@ -405,6 +449,204 @@ fn synth_llama_qwen(v: &Value, name: String, mt: &str) -> Result<HfSynthesis, St
     };
     s.net = build_net_config(&s);
     Ok(s)
+}
+
+fn synth_qwen35(v: &Value, name: String) -> Result<HfSynthesis, String> {
+    let t = v
+        .get("text_config")
+        .filter(|c| c.is_object())
+        .ok_or("qwen3_5 config.json has no `text_config` object")?;
+    let sub = t["model_type"].as_str().unwrap_or("<missing>");
+    if sub != "qwen3_5_text" {
+        return Err(format!(
+            "qwen3_5 text_config.model_type is {sub:?}, expected \"qwen3_5_text\""
+        ));
+    }
+
+    let hidden = req_i64(t, "hidden_size")?;
+    let heads = req_i64(t, "num_attention_heads")?;
+    let kvh = req_i64(t, "num_key_value_heads")?;
+    let hd = req_i64(t, "head_dim")?;
+    let layers = req_i64(t, "num_hidden_layers")?;
+    let layer_types = t["layer_types"]
+        .as_array()
+        .ok_or("qwen3_5 text_config.layer_types is missing or not an array")?;
+    if layer_types.len() != layers as usize {
+        return Err(format!(
+            "qwen3_5 layer_types has {} entries but num_hidden_layers is {layers}",
+            layer_types.len()
+        ));
+    }
+    let attn_kind: Vec<AttnKind> = layer_types
+        .iter()
+        .enumerate()
+        .map(|(l, kind)| match kind.as_str() {
+            Some("full_attention") => Ok(AttnKind::Full),
+            Some("linear_attention") => Ok(AttnKind::GatedDeltaNet),
+            other => Err(format!(
+                "qwen3_5 layer_types[{l}] is {other:?}; expected \"full_attention\" or \
+                 \"linear_attention\""
+            )),
+        })
+        .collect::<Result<_, _>>()?;
+    let is_full = attn_kind
+        .iter()
+        .map(|&kind| kind == AttnKind::Full)
+        .collect();
+
+    let conv_kernel = req_i64(t, "linear_conv_kernel_dim")?;
+    let linear_conv_kernel_dim = u32::try_from(conv_kernel)
+        .ok()
+        .filter(|&v| v > 0)
+        .ok_or_else(|| {
+            format!("linear_conv_kernel_dim must fit u32 and be > 0, got {conv_kernel}")
+        })?;
+    let rope = t
+        .get("rope_parameters")
+        .filter(|r| r.is_object())
+        .ok_or("qwen3_5 text_config.rope_parameters is missing or not an object")?;
+    let partial_rotary_factor = rope["partial_rotary_factor"]
+        .as_f64()
+        .ok_or("qwen3_5 rope_parameters.partial_rotary_factor is required")?;
+    let rope_theta = rope["rope_theta"]
+        .as_f64()
+        .ok_or("qwen3_5 rope_parameters.rope_theta is required")?;
+    let attn_output_gate = t["attn_output_gate"]
+        .as_bool()
+        .ok_or("qwen3_5 text_config.attn_output_gate is required")?;
+    for (field, expected) in [
+        ("hidden_act", "silu"),
+        ("mamba_ssm_dtype", "float32"),
+        ("output_gate_type", "swish"),
+    ] {
+        let actual = t[field]
+            .as_str()
+            .ok_or_else(|| format!("qwen3_5 text_config.{field} is required"))?;
+        if actual != expected {
+            return Err(format!(
+                "qwen3_5 text_config.{field} is {actual:?}, expected {expected:?}"
+            ));
+        }
+    }
+    if rope["rope_type"].as_str() != Some("default")
+        || rope["mrope_interleaved"].as_bool() != Some(true)
+    {
+        return Err("qwen3_5 requires rope_type=default with mrope_interleaved=true".to_string());
+    }
+    if !attn_output_gate {
+        return Err("qwen3_5 requires attn_output_gate=true".to_string());
+    }
+    if t["attention_bias"].as_bool() != Some(false) {
+        return Err("qwen3_5 requires attention_bias=false".to_string());
+    }
+
+    let (fp8_weight_block_size, fp8_dynamic_activations) = match v.get("quantization_config") {
+        None => (None, false),
+        Some(q) => {
+            let block = q["weight_block_size"]
+                .as_array()
+                .filter(|a| a.len() == 2)
+                .and_then(|a| Some([a[0].as_i64()?, a[1].as_i64()?]))
+                .ok_or("qwen3_5 FP8 weight_block_size must contain two integers")?;
+            if q["quant_method"].as_str() != Some("fp8")
+                || q["fmt"].as_str() != Some("e4m3")
+                || q["activation_scheme"].as_str() != Some("dynamic")
+                || block != [128, 128]
+            {
+                return Err(format!(
+                    "qwen3_5 unsupported quantization_config: expected dynamic fp8/e4m3 \
+                         with weight_block_size=[128,128], got method={:?} fmt={:?} \
+                         activation={:?} block={block:?}",
+                    q["quant_method"], q["fmt"], q["activation_scheme"]
+                ));
+            }
+            (Some(block), true)
+        }
+    };
+
+    let qwen35 = Qwen35Geometry {
+        linear_num_key_heads: req_i64(t, "linear_num_key_heads")?,
+        linear_num_value_heads: req_i64(t, "linear_num_value_heads")?,
+        linear_key_head_dim: req_i64(t, "linear_key_head_dim")?,
+        linear_value_head_dim: req_i64(t, "linear_value_head_dim")?,
+        linear_conv_kernel_dim,
+        partial_rotary_factor,
+        rope_theta,
+        attn_output_gate,
+        fp8_weight_block_size,
+        fp8_dynamic_activations,
+    };
+    if qwen35.linear_num_key_heads <= 0
+        || qwen35.linear_num_value_heads <= 0
+        || qwen35.linear_key_head_dim <= 0
+        || qwen35.linear_value_head_dim <= 0
+    {
+        return Err("qwen3_5 linear-attention head counts and dimensions must be > 0".into());
+    }
+    if qwen35.linear_num_value_heads % qwen35.linear_num_key_heads != 0 {
+        return Err(format!(
+            "qwen3_5 linear_num_value_heads={} is not divisible by linear_num_key_heads={}",
+            qwen35.linear_num_value_heads, qwen35.linear_num_key_heads
+        ));
+    }
+
+    Ok(HfSynthesis {
+        name: name.clone(),
+        arch: HfArch::Qwen35,
+        hidden_size: hidden,
+        num_attention_heads: heads,
+        kvh_slide: kvh,
+        kvh_full: kvh,
+        hd_slide: hd,
+        hd_full: hd,
+        intermediate_size: req_i64(t, "intermediate_size")?,
+        num_layers: layers as u32,
+        vocab_size: req_i64(t, "vocab_size")?,
+        is_full,
+        attn_kind,
+        k_eq_v: false,
+        tied_embed: t["tie_word_embeddings"].as_bool().unwrap_or(false),
+        prefix: "model.language_model.".to_string(),
+        has_qk_norm: true,
+        has_v_norm: false,
+        moe: false,
+        n_exp: 0,
+        top_k: 0,
+        moe_inter: 0,
+        q_lora_rank: 0,
+        kv_lora_rank: 0,
+        qk_rope_head_dim: 0,
+        qk_nope_head_dim: 0,
+        v_head_dim: 0,
+        first_k_dense: 0,
+        n_shared_experts: 0,
+        moe_latent: 0,
+        qwen35: Some(qwen35),
+        weight_dtype: parse_weight_dtype(v),
+        net: NetConfig {
+            name,
+            hidden,
+            ops: vec![],
+        },
+    })
+}
+
+pub fn ensure_layer_plan_supported(synth: &HfSynthesis) -> Result<(), String> {
+    let Some(q) = synth.qwen35 else {
+        return Ok(());
+    };
+    let full_q_width = synth.num_attention_heads * synth.hd_full * 2;
+    Err(format!(
+        "qwen3_5 frontend parsed the hybrid text tower, but LayerPlan emission is not yet \
+         faithful: Gated DeltaNet requires shared qkv+conv width {}, value width {}, and \
+         unequal key/value heads ({}/{}); full attention requires packed query+gate width \
+         {full_q_width} plus an output gate. The current plan IR has no recurrent-state, \
+         causal-depthwise-conv, or attention-output-gate op, so emission is refused.",
+        q.qkv_width(),
+        q.value_width(),
+        q.linear_num_key_heads,
+        q.linear_num_value_heads,
+    ))
 }
 
 /// MLA + MoE architecture (Kimi K2 / DeepSeek V2/V3). Parses DeepSeek-V2-style
@@ -467,6 +709,7 @@ fn synth_mla_moe(v: &Value, name: String, arch: HfArch) -> Result<HfSynthesis, S
         first_k_dense,
         n_shared_experts,
         moe_latent: 0,
+        qwen35: None,
         weight_dtype: parse_weight_dtype(v),
         net: NetConfig {
             name: String::new(),
@@ -583,6 +826,7 @@ fn synth_kimi_k3(v: &Value, name: String) -> Result<HfSynthesis, String> {
         first_k_dense,
         n_shared_experts,
         moe_latent,
+        qwen35: None,
         // `quantization_config` lives under text_config for kimi_k3, and its
         // `format` is "mxfp4-pack-quantized" (compressed-tensors), which
         // parse_weight_dtype's `quant_method` probe does not spell.
@@ -680,6 +924,10 @@ fn kimi_k3_attn_kinds(t: &Value, layers: i64) -> Result<Vec<AttnKind>, String> {
 ///
 /// Plus: embed lookup (first), final norm + lm_head (last, tied or not).
 pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> LayerPlan {
+    assert!(
+        synth.qwen35.is_none(),
+        "qwen3_5 has no faithful LayerPlan; call ensure_layer_plan_supported before planning"
+    );
     // Kimi-K3 config is ACCEPTED (see synth_kimi_k3) but not emittable: the
     // block below models a uniform softmax-attention layer with a hidden-space
     // MoE, and K3 is neither on 69 of its 93 layers. Emitting it anyway would
@@ -882,9 +1130,12 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
                 vec![q_out, kv_out.clone(), kv_out],
                 OpKind::Flash(AttnShape {
                     heads,
+                    kv_heads: heads,
                     seq_q: seq,
                     seq_kv: seq,
-                    head_dim: full_qk_hd
+                    head_dim: full_qk_hd,
+                    causal: true,
+                    sliding_window: 0,
                 })
             );
 
@@ -1131,9 +1382,15 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             vec![q_out, k_out, v_out],
             OpKind::Flash(AttnShape {
                 heads,
+                kv_heads: kvh,
                 seq_q: seq,
                 seq_kv: seq,
-                head_dim: hd
+                head_dim: hd,
+                causal: true,
+                // The legacy HfDir synthesis does not retain the window width.
+                // Keep zero rather than inventing a value; Source::Model carries
+                // the exact config through nn_graph.
+                sliding_window: 0,
             })
         );
 
@@ -1547,6 +1804,177 @@ mod tests {
                 assert_eq!(*k, Some(3840));
             }
             _ => panic!("expected Gemm"),
+        }
+    }
+
+    fn qwen35_json() -> &'static str {
+        r#"{
+          "model_type": "qwen3_5",
+          "text_config": {
+            "model_type": "qwen3_5_text",
+            "dtype": "bfloat16",
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "tie_word_embeddings": false,
+            "attention_bias": false,
+            "attn_output_gate": true,
+            "hidden_act": "silu",
+            "mamba_ssm_dtype": "float32",
+            "output_gate_type": "swish",
+            "layer_types": ["linear_attention", "linear_attention",
+                            "linear_attention", "full_attention"],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "rope_parameters": {
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default",
+              "mrope_interleaved": true
+            }
+          },
+          "vision_config": {"model_type": "qwen3_5"}
+        }"#
+    }
+
+    #[test]
+    fn qwen35_hybrid_geometry_is_parsed_without_dense_fallback() {
+        let s = synthesize_full(qwen35_json(), "qwen3.8-27b".into()).unwrap();
+        assert_eq!(s.arch, HfArch::Qwen35);
+        assert_eq!(s.prefix, "model.language_model.");
+        assert_eq!(
+            s.attn_kind,
+            vec![
+                AttnKind::GatedDeltaNet,
+                AttnKind::GatedDeltaNet,
+                AttnKind::GatedDeltaNet,
+                AttnKind::Full
+            ]
+        );
+        assert_eq!(s.is_full, vec![false, false, false, true]);
+        assert_eq!((s.num_attention_heads, s.kvh_full, s.hd_full), (24, 4, 256));
+
+        let q = s.qwen35.unwrap();
+        assert_eq!(q.qkv_width(), 10_240);
+        assert_eq!(q.value_width(), 6_144);
+        assert_eq!(q.linear_conv_kernel_dim, 4);
+        assert_eq!(q.partial_rotary_factor, 0.25);
+        assert_eq!(q.rope_theta, 10_000_000.0);
+        assert!(q.attn_output_gate);
+        assert_eq!(s.num_attention_heads * s.hd_full * 2, 12_288);
+
+        let err = ensure_layer_plan_supported(&s).unwrap_err();
+        assert!(err.contains("qkv+conv width 10240"), "{err}");
+        assert!(err.contains("query+gate width 12288"), "{err}");
+        assert!(err.contains("refused"), "{err}");
+    }
+
+    #[test]
+    fn qwen35_fp8_outer_quantization_is_preserved() {
+        let json = qwen35_json().replace(
+            r#""vision_config""#,
+            r#""quantization_config": {
+              "activation_scheme": "dynamic",
+              "fmt": "e4m3",
+              "quant_method": "fp8",
+              "modules_to_not_convert": ["lm_head"],
+              "weight_block_size": [128, 128]
+            },
+            "vision_config""#,
+        );
+        let s = synthesize_full(&json, "qwen38-27b-fp8".into()).unwrap();
+        assert_eq!(s.weight_dtype, nn_graph::DType::F8E4M3);
+        let q = s.qwen35.unwrap();
+        assert_eq!(q.fp8_weight_block_size, Some([128, 128]));
+        assert!(q.fp8_dynamic_activations);
+    }
+
+    #[test]
+    fn qwen35_unknown_fp8_geometry_is_rejected() {
+        let json = qwen35_json().replace(
+            r#""vision_config""#,
+            r#""quantization_config": {
+              "activation_scheme": "dynamic",
+              "fmt": "e4m3",
+              "quant_method": "fp8",
+              "modules_to_not_convert": ["lm_head"],
+              "weight_block_size": [64, 128]
+            },
+            "vision_config""#,
+        );
+        let err = synthesize_full(&json, "qwen38-27b-fp8".into()).unwrap_err();
+        assert!(err.contains("weight_block_size=[128,128]"), "{err}");
+    }
+
+    #[test]
+    fn qwen35_layer_types_are_required_and_checked() {
+        let short = qwen35_json().replace(
+            "\"linear_attention\", \"linear_attention\",\n                            \"linear_attention\", \"full_attention\"",
+            "\"linear_attention\", \"full_attention\"",
+        );
+        let err = synthesize_full(&short, "qwen".into()).unwrap_err();
+        assert!(
+            err.contains("2 entries") && err.contains("num_hidden_layers is 4"),
+            "{err}"
+        );
+
+        let unknown = qwen35_json().replacen("\"linear_attention\"", "\"sliding_attention\"", 1);
+        let err = synthesize_full(&unknown, "qwen".into()).unwrap_err();
+        assert!(
+            err.contains("layer_types[0]") && err.contains("sliding_attention"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn qwen35_execution_semantics_are_checked() {
+        for (from, to, expected) in [
+            (
+                "\"attention_bias\": false",
+                "\"attention_bias\": true",
+                "attention_bias=false",
+            ),
+            (
+                "\"attn_output_gate\": true",
+                "\"attn_output_gate\": false",
+                "attn_output_gate=true",
+            ),
+            (
+                "\"hidden_act\": \"silu\"",
+                "\"hidden_act\": \"gelu\"",
+                "hidden_act",
+            ),
+            (
+                "\"mamba_ssm_dtype\": \"float32\"",
+                "\"mamba_ssm_dtype\": \"bfloat16\"",
+                "mamba_ssm_dtype",
+            ),
+            (
+                "\"output_gate_type\": \"swish\"",
+                "\"output_gate_type\": \"sigmoid\"",
+                "output_gate_type",
+            ),
+            (
+                "\"rope_type\": \"default\"",
+                "\"rope_type\": \"linear\"",
+                "rope_type=default",
+            ),
+            (
+                "\"mrope_interleaved\": true",
+                "\"mrope_interleaved\": false",
+                "mrope_interleaved=true",
+            ),
+        ] {
+            let json = qwen35_json().replacen(from, to, 1);
+            let err = synthesize_full(&json, "qwen".into()).unwrap_err();
+            assert!(err.contains(expected), "{err}");
         }
     }
 

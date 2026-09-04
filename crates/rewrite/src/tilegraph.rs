@@ -99,7 +99,60 @@ pub enum OpKind {
     Gemm(GemmShape),
     Flash(AttnShape),
     Row(RowShape),
+    /// A model operation whose mathematical identity must survive packet
+    /// emission.  It is tiled like a row op, but is never emitted as the
+    /// generic ROW opcode: `kind` and `args` are part of the packet ABI.
+    Model(ModelOp),
     Layout(LayoutSpec),
+}
+
+/// Compiler-side metadata for operations which cannot be represented by the
+/// generic GEMM/FLASH/ROW/LAYOUT families without losing model semantics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelOp {
+    pub kind: ModelOpKind,
+    pub rows: i64,
+    pub feat: i64,
+    pub operands: i64,
+    /// Kind-specific integer payload. Floating-point attributes travel as
+    /// their IEEE-754 bit pattern.
+    pub args: [u32; 4],
+    /// Exact whole-tensor input sizes. Model ops include irregular operands
+    /// (embedding tables, depthwise kernels, scalar/head parameters) that
+    /// cannot be inferred from the output row shape.
+    pub input_bytes: [u64; 8],
+}
+
+impl ModelOp {
+    pub fn row_shape(self) -> RowShape {
+        RowShape {
+            rows: self.rows,
+            feat: self.feat,
+            operands: self.operands,
+            reduce: matches!(
+                self.kind,
+                ModelOpKind::RmsNorm | ModelOpKind::RmsNormZeroCentered
+            ),
+        }
+    }
+}
+
+/// Stable offsets from `packet::Opcode::VARIANT_MODEL_BASE`.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelOpKind {
+    Embedding = 1,
+    RmsNormZeroCentered = 2,
+    Rope = 3,
+    Silu = 4,
+    Sigmoid = 5,
+    Add = 6,
+    Sub = 7,
+    Mul = 8,
+    Div = 9,
+    CausalDepthwiseConv1d = 10,
+    QwenGatedDelta = 11,
+    RmsNorm = 12,
 }
 
 /// One op of the layer. Convention: `inputs[0]` is the activation (shared, read
@@ -315,6 +368,9 @@ pub struct OpDesc {
     pub kind: OpKind,
     pub inputs: Vec<String>,
     pub output: String,
+    /// Original checkpoint weight dtype; retained for manifest bindings such
+    /// as FP8 weight→scale associations.
+    pub weight_dtype: nn_graph::DType,
     /// Bytes per activation element (compute precision).
     pub activation_elem: u64,
     /// Bytes per weight element (possibly block-quant amortized).
@@ -348,6 +404,7 @@ enum TaskShape {
     Gemm(GemmShape),
     Flash(AttnShape),
     Row(RowShape),
+    Model(ModelOp),
     Layout,
 }
 
@@ -365,6 +422,7 @@ struct Task {
     weight_elem: u64,
     block_quant: bool,
     native_fp4: bool,
+    weight_dtype: nn_graph::DType,
 }
 
 /// The tile-coordinate domain of a task once its compute tile is chosen.
@@ -378,6 +436,10 @@ fn domain_of(shape: &TaskShape, kind: &Compute) -> TileDomain {
         },
         (TaskShape::Row(r), Compute::Row(t)) => TileDomain::Row {
             rows: r.rows,
+            br: t.br,
+        },
+        (TaskShape::Model(m), Compute::Row(t)) => TileDomain::Row {
+            rows: m.rows,
             br: t.br,
         },
         (TaskShape::Flash(a), Compute::Flash(t)) => TileDomain::Flash {
@@ -395,7 +457,7 @@ impl TaskShape {
     fn couples_input(&self, idx: usize) -> bool {
         match self {
             TaskShape::Gemm(_) | TaskShape::Flash(_) => idx == 0, // the activation / query
-            TaskShape::Row(_) => true,                            // every input is row-aligned
+            TaskShape::Row(_) | TaskShape::Model(_) => true,      // every input is row-aligned
             TaskShape::Layout => false,
         }
     }
@@ -477,6 +539,7 @@ pub fn assemble_tuned(
                         weight_elem: cost_params.weight_elem,
                         block_quant: cost_params.block_quant,
                         native_fp4: cost_params.native_fp4,
+                        weight_dtype: op.weight_dtype,
                     });
                 }
                 if split {
@@ -501,6 +564,7 @@ pub fn assemble_tuned(
                         weight_elem: cost_params.weight_elem,
                         block_quant: false, // joins are always in compute precision
                         native_fp4: false,
+                        weight_dtype: nn_graph::DType::BF16,
                     });
                 }
             }
@@ -519,6 +583,7 @@ pub fn assemble_tuned(
                     weight_elem: cost_params.weight_elem,
                     block_quant: cost_params.block_quant,
                     native_fp4: cost_params.native_fp4,
+                    weight_dtype: op.weight_dtype,
                 });
             }
             OpKind::Row(r) => {
@@ -536,6 +601,25 @@ pub fn assemble_tuned(
                     weight_elem: cost_params.weight_elem,
                     block_quant: cost_params.block_quant,
                     native_fp4: cost_params.native_fp4,
+                    weight_dtype: op.weight_dtype,
+                });
+            }
+            OpKind::Model(m) => {
+                let cm = &soc.unit(0).cm;
+                let choice = push_choice(row_cands(cm, m.row_shape(), policy));
+                tasks.push(Task {
+                    op: op.name.clone(),
+                    unit: 0,
+                    inputs: op.inputs.clone(),
+                    output: op.output.clone(),
+                    choice,
+                    shape: TaskShape::Model(m),
+                    kind: OpKind::Model(m),
+                    activation_elem: cost_params.activation_elem,
+                    weight_elem: cost_params.weight_elem,
+                    block_quant: cost_params.block_quant,
+                    native_fp4: cost_params.native_fp4,
+                    weight_dtype: op.weight_dtype,
                 });
             }
             OpKind::Layout(spec) => {
@@ -558,6 +642,7 @@ pub fn assemble_tuned(
                     weight_elem: cost_params.weight_elem,
                     block_quant: cost_params.block_quant,
                     native_fp4: cost_params.native_fp4,
+                    weight_dtype: op.weight_dtype,
                 });
             }
         }
@@ -686,6 +771,7 @@ pub fn assemble_tuned(
                 kind: task.kind,
                 inputs: task.inputs.clone(),
                 output: task.output.clone(),
+                weight_dtype: task.weight_dtype,
                 activation_elem: task.activation_elem,
                 weight_elem: task.weight_elem,
                 block_quant: task.block_quant,

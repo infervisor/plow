@@ -754,3 +754,68 @@ fn fuse_qwen3() {
         "fusion dropped or duplicated weight leaves in Qwen3"
     );
 }
+
+// --- Qwen3.5/3.8: hybrid Gated DeltaNet + gated full attention ---
+
+const QWEN35: &str = r#"{
+    "model_type": "qwen3_5",
+    "text_config": {
+        "model_type": "qwen3_5_text",
+        "vocab_size": 1000,
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 32,
+        "layer_types": ["linear_attention", "linear_attention",
+                        "linear_attention", "full_attention"],
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 16,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 6,
+        "linear_value_head_dim": 16,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "rope_theta": 10000000.0,
+            "partial_rotary_factor": 0.25,
+            "rope_type": "default",
+            "mrope_interleaved": true
+        },
+        "attention_bias": false,
+        "attn_output_gate": true,
+        "hidden_act": "silu",
+        "mamba_ssm_dtype": "float32",
+        "output_gate_type": "swish",
+        "tie_word_embeddings": false,
+        "dtype": "bfloat16"
+    }
+}"#;
+
+#[test]
+fn fuse_qwen35() {
+    let g = build_from_config_json(QWEN35).expect("build qwen3.5 hybrid");
+    let (fused, stats) = rewrite::rewrite_graph(&g).expect("rewrite qwen3.5 hybrid");
+
+    for op in [
+        "FusedZeroCenteredNormLinear",
+        "FusedZeroCenteredNormRope",
+        "FusedResidualZeroCenteredNorm",
+        "FusedRmsNormSiluGate",
+        "FusedPackedAttnGate",
+        "SwiGLU",
+    ] {
+        assert!(fused.contains(op), "{op} did not fire in Qwen3.5/3.8");
+    }
+    assert!(
+        stats.ops_after < stats.ops_before,
+        "fusion did not reduce Qwen3.5 ops: {} -> {}",
+        stats.ops_before,
+        stats.ops_after
+    );
+    assert_eq!(
+        fused_weights(&fused),
+        graph_weights(&g),
+        "Qwen3.5 fusion dropped or duplicated weight leaves"
+    );
+}

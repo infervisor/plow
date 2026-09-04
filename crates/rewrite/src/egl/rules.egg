@@ -26,6 +26,12 @@
 (rewrite (Linear (RmsNorm ?x ?w ?eps) ?wl ?out)
          (FusedNormLinear ?x ?w ?wl ?eps ?out))
 
+; Qwen3.5/3.8 RMSNorm weights are offsets from one. Keep the distinct base op
+; through fusion; treating it as ordinary RMSNorm changes every decoder block.
+; rule: zero-centered-rmsnorm-linear-fuse
+(rewrite (Linear (ZeroCenteredRmsNorm ?x ?w ?eps) ?wl ?out)
+         (FusedZeroCenteredNormLinear ?x ?w ?wl ?eps ?out))
+
 ; rule: rmsnorm-linearbias-fuse
 (rewrite (LinearBias (RmsNorm ?x ?w ?eps) ?wl ?bl ?out)
          (FusedNormLinearBias ?x ?w ?wl ?bl ?eps ?out))
@@ -78,6 +84,10 @@
 (rewrite (Rope (RmsNorm ?x ?w ?eps) ?dim ?theta)
          (FusedNormRope ?x ?w ?eps ?dim ?theta))
 
+; rule: zero-centered-rmsnorm-rope-fuse
+(rewrite (Rope (ZeroCenteredRmsNorm ?x ?w ?eps) ?dim ?theta)
+         (FusedZeroCenteredNormRope ?x ?w ?eps ?dim ?theta))
+
 ; rmsnorm-rope-scale-fuse: the Q path has an additional Scale after RoPE.
 ; Fuses norm + rope + scale into one kernel (3→1), eliminating two round-trips.
 ; rule: rmsnorm-rope-scale-fuse
@@ -91,6 +101,10 @@
 ; rule: residual-rmsnorm-fuse
 (rewrite (RmsNorm (Ew "add" ?a ?b) ?w ?eps)
          (FusedResidualNorm ?a ?b ?w ?eps))
+
+; rule: residual-zero-centered-rmsnorm-fuse
+(rewrite (ZeroCenteredRmsNorm (Ew "add" ?a ?b) ?w ?eps)
+         (FusedResidualZeroCenteredNorm ?a ?b ?w ?eps))
 
 ; residual-layernorm-fuse: same for LayerNorm (DiT, SigLIP).
 ; rule: residual-layernorm-fuse
@@ -152,6 +166,25 @@
 ; rule: mla-out-gate-fuse
 (rewrite (Ew "mul" ?attn (Act "sigmoid" (Linear ?x ?gw ?gout)))
          (FusedMlaOutGate ?attn ?x ?gw ?gout))
+
+; Qwen Gated DeltaNet applies ordinary RMSNorm(core) * silu(reshape(z)).
+; Pinning silu keeps this distinct from Kimi KDA's sigmoid gated norm.
+; rule: rmsnorm-silu-gate-fuse
+(rewrite (Ew "mul" (RmsNorm ?x ?nw ?eps)
+                    (Act "silu" (Reshape ?gate ?shape)))
+         (FusedRmsNormSiluGate ?x ?nw ?eps ?gate ?shape))
+
+; Qwen gated full attention takes its gate from a slice of packed q_proj.
+; Match the complete chain so Kimi's independently projected gate cannot alias.
+; rule: packed-attn-gate-fuse
+(rewrite (Ew "mul" ?mixer
+             (Act "sigmoid"
+               (Reshape
+                 (Slice (Reshape (Linear ?x ?qw ?qout) ?packed_shape)
+                        ?axis ?start ?len)
+                 ?gate_shape)))
+         (FusedPackedAttnGate ?mixer ?x ?qw ?qout ?packed_shape
+                              ?axis ?start ?len ?gate_shape))
 
 ; === Cross-block residual materialization ===
 ;

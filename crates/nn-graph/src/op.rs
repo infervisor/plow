@@ -49,6 +49,10 @@ pub enum Op {
     /// RMSNorm over the last axis. Inputs `[x, weight]`. Shape-preserving.
     RmsNorm { eps: f32 },
 
+    /// RMSNorm with a zero-centered scale: `norm(x) * (1 + weight)`.
+    /// Inputs `[x, weight]`. Shape-preserving.
+    RmsNormZeroCentered { eps: f32 },
+
     /// LayerNorm over the last axis. Inputs `[x, weight, bias]`. Shape-preserving.
     LayerNorm { eps: f32 },
 
@@ -182,9 +186,11 @@ pub enum Op {
 
     /// Linear (sub-quadratic) attention with a carried recurrent state.
     ///
-    /// Inputs `[q, k, v, gate, beta, A_log, dt_bias]`: q/k/v/gate are rank-4
-    /// `[B, S, heads, head_dim]`, beta is `[B, S, heads]`, A_log is `[heads]`,
-    /// and dt_bias is `[heads * head_dim]`. Output has q's shape.
+    /// Inputs `[q, k, v, gate, beta, A_log, dt_bias]`: q/k/v are rank-4
+    /// `[B, S, heads, head_dim]`, beta and A_log are per-head, and output has
+    /// v's last dimension. Gate and dt_bias shapes depend on `kind`: Kimi uses
+    /// a rank-4 gate and `[heads * head_dim]` dt_bias; Qwen uses per-head gate
+    /// and dt_bias tensors.
     ///
     /// # Why the state is not an input, and why this is not [`Op::Attention`]
     ///
@@ -266,6 +272,9 @@ pub enum LinearAttnKind {
     /// Kimi Delta Attention: a gated delta rule with a low-rank forget gate.
     /// `state <- state * decay(gate) + beta * (v - state·k) ⊗ k`.
     KimiDelta,
+    /// Qwen3.5 gated delta rule with L2-normalized q/k, per-value-head decay,
+    /// scalar A/dt parameters, and fp32 recurrence/state math.
+    QwenGatedDelta,
 }
 
 impl Op {
@@ -275,6 +284,7 @@ impl Op {
             Op::Linear { .. } => "linear",
             Op::MatMul => "matmul",
             Op::RmsNorm { .. } => "rmsnorm",
+            Op::RmsNormZeroCentered { .. } => "rmsnorm_zero_centered",
             Op::LayerNorm { .. } => "layernorm",
             Op::Rope { .. } => "rope",
             Op::Act(_) => "act",
