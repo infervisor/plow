@@ -29,6 +29,21 @@ untraced fold 1, disabling the compact audit changes TTFT by -10.666 ms, TPOT by
 (-4.95%), and E2E by -388.653 ms. Counter audit is therefore a correctness/debug mode, not the
 production performance baseline.
 
+### Current combined defaults after RS-U2 and MLA TR16
+
+An uncontended no-audit sizing cell combines segment-major TP prefill, gfx950 strict-order
+XReduce RS-U2, and gfx950 MLA TR16. It retained per-step all-rank agreement and generated the
+exact 256-token checksum `fnv1a64:6bdfaa7b84ee4e7e`:
+
+| TTFT | TPOT | E2E, 8192→256 | output throughput |
+|---:|---:|---:|---:|
+| 1340.797 ms | 28.5777 ms | 8628.100 ms | 29.670 tok/s |
+
+The full gfx950 object build contains both `plow_xr_rs_u2` and
+`plow_mla_pf_tr16_arm_1`. The stable shared lease `k3-combined-default-e2e-clean2` returned zero
+after 109 seconds with no foreign process. This is one exact internal sizing cell, not the
+required order-balanced `vllm bench serve` 8192→1024 publication replacement.
+
 ## Prefill critical envelope
 
 The primary interpreter accounts for 1,021.926 ms. The 378.151 ms residual is time between its
