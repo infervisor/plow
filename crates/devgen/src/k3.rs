@@ -279,9 +279,8 @@ fn fuse_mla_a(t: u32, hidden: u32) -> bool {
 ///
 /// `PLOW_K3_FUSE_ARNORM=0` restores the two-packet form from the SAME binary, which is what makes
 /// the A/B a control rather than a rebuild.
-/// Always fuse attnres+norm (hardcoded — was `PLOW_K3_FUSE_ARNORM`, never disabled).
 pub(crate) fn fuse_attnres_norm() -> bool {
-    true
+    crate::emit_config::active().k3_fuse_arnorm
 }
 
 /// May the LatentMoE tail's residual add absorb the BLOCK-OUTPUT residual that follows it?

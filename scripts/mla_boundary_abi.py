@@ -289,6 +289,30 @@ def replay_absorbed(manifest, binary, object_, gpulease, output_dir):
     return manifests
 
 
+def attach_tensor(manifest, output, semantic, payload_path, dtype, shape, layer, rank):
+    data = json.loads(manifest.read_text())
+    tensors, _, _ = validate(data, manifest)
+    item = checked_tensor(
+        Path.cwd(),
+        {
+            "semantic": semantic,
+            "layer": layer,
+            "rank": rank,
+            "dtype": dtype,
+            "source_dtype": dtype,
+            "shape": [int(x) for x in shape.split(",") if x],
+            "file": str(payload_path.resolve()),
+        },
+    )
+    key = (semantic, layer, rank)
+    data["tensors"] = [
+        x for x in tensors if (x["semantic"], x.get("layer", 0), x.get("rank", 0)) != key
+    ] + [item]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(data, indent=2) + "\n")
+    validate(data, output)
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -315,6 +339,15 @@ def main():
     absorbed.add_argument("--object", type=Path, required=True)
     absorbed.add_argument("--gpulease", type=Path, required=True)
     absorbed.add_argument("--output-dir", type=Path, required=True)
+    attach = sub.add_parser("attach-tensor")
+    attach.add_argument("--manifest", type=Path, required=True)
+    attach.add_argument("--output", type=Path, required=True)
+    attach.add_argument("--semantic", required=True)
+    attach.add_argument("--file", type=Path, required=True)
+    attach.add_argument("--dtype", choices=sorted(DTYPE_BYTES), required=True)
+    attach.add_argument("--shape", required=True)
+    attach.add_argument("--layer", type=int, default=0)
+    attach.add_argument("--rank", type=int, default=0)
     args = parser.parse_args()
     if args.command == "seal":
         write_manifest(args.spec, args.output, args.require_source)
@@ -329,11 +362,16 @@ def main():
             args.manifest, args.binary, args.object, args.gpulease, args.output_dir
         ):
             print(path)
-    else:
+    elif args.command == "replay-absorbed":
         for path in replay_absorbed(
             args.manifest, args.binary, args.object, args.gpulease, args.output_dir
         ):
             print(path)
+    else:
+        attach_tensor(
+            args.manifest, args.output, args.semantic, args.file, args.dtype,
+            args.shape, args.layer, args.rank
+        )
 
 
 if __name__ == "__main__":

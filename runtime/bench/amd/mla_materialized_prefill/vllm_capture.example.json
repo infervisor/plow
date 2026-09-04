@@ -79,6 +79,13 @@
       "extract": {"source": "module", "path": ["weight"]},
       "storage_dtype": "bf16",
       "row": "all"
+    },
+    {
+      "module_regex": ".*layers\\.(?P<layer>[0-9]+)\\.post_attention_layernorm$",
+      "semantic": "residual.output",
+      "extract": {"source": "output", "path": [1]},
+      "storage_dtype": "bf16",
+      "row": "all"
     }
   ]
 }

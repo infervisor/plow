@@ -24,6 +24,12 @@ ABI_SOURCE_SEMANTICS = {
     "weight.kv_projection",
     "weight.output_projection",
 }
+ABI_OPTIONAL_SEAM_INPUTS = {
+    "residual.input",
+    "residual.ring",
+    "weight.residual_score",
+    "weight.post_attention_norm",
+}
 
 
 def load_manifest(path):
@@ -138,6 +144,12 @@ def main():
     inputs = parse_semantics(args.input_semantic)
     if all(x.get("schema") == "plow.mla-boundary.v1" for x in metas):
         inputs |= ABI_SOURCE_SEMANTICS
+        inputs |= {
+            semantic
+            for _, rows in ref_loaded + [(absorbed_meta, absorbed), (materialized_meta, materialized)]
+            for semantic, _, _ in rows
+            if semantic in ABI_OPTIONAL_SEAM_INPUTS
+        }
     outputs = parse_semantics(args.output_semantic)
     all_rows = [x[1] for x in ref_loaded] + [absorbed, materialized]
     input_hashes = {}

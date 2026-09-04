@@ -219,7 +219,32 @@ The absorbed replay derives its absorbed Q, Q-RoPE, and value-fold weights once
 from the same sealed factor weights and latent tensors, also outside timing.
 The materialized replay records the object hash and median kernel time. Input capture, hashing,
 packing, uploads, and downloads are outside the event interval. It deliberately
-does not synthesize `residual.output`: that tensor must be captured after the
-real output projection/residual seam so the quality gate measures the runtime's
-actual BF16 GEMM reduction order. Until pinned-vLLM and both Plow arms provide
-that seam tensor from the same sealed source, TP8 promotion remains blocked.
+does not synthesize `residual.output`: that tensor must come from each runtime's
+real output projection/residual seam. The vLLM capture template reads the second
+output of `post_attention_layernorm`, which is the BF16 residual produced after
+the attention projection. Plow normally fuses the corresponding AttnRes and
+following RMSNorm in place, so a capture asset must be emitted with
+`PLOW_K3_FUSE_ARNORM=0 PLOW_SEG_PER_OP=1`; this materializes
+`act.l<layer>.h2` and gives it its own segment. Capture that segment with
+`PLOW_PF_CAPTURE=T:SEG:act.l<layer>.h2=/tmp/mla/residual.output.bf16`.
+The opt-out is diagnostic; production remains fused. Seal both tensors under
+`residual.output` with the same prompt history before running the gate. TP8
+promotion remains blocked until this real seam and the attention output pass.
+
+Attach an actual captured seam without rewriting any other manifest field:
+
+```sh
+nix develop -c python3 scripts/mla_boundary_abi.py attach-tensor \
+  --manifest /tmp/mla/plow-materialized/manifest.repeat-0.json \
+  --semantic residual.output --file /tmp/mla/residual.output.bf16 \
+  --dtype bf16 --shape 8192,7168 --layer 0 --rank 0 \
+  --output /tmp/mla/plow-materialized/qualified.repeat-0.json
+```
+
+This preserves and revalidates the original prompt, contract, latent, weight,
+and Q/K/V hashes. For a full K3 seam, byte-identical MLA inputs are not alone
+sufficient: AttnRes also consumes the current prefix, its saved-residual ring,
+and learned score weights. Those inputs must either hash identically in the
+manifest or be injected from the same capture. Comparing residuals from two
+ordinary whole-model runs does not meet this gate when an earlier layer already
+differs.

@@ -75,3 +75,32 @@ def test_validate_rejects_modified_payload(tmp_path):
                             capture_output=True, text=True)
     assert result.returncode != 0
     assert "stale payload hash" in result.stderr
+
+
+def test_attach_tensor_preserves_history_and_seals_payload(tmp_path):
+    tokens = tmp_path / "tokens"
+    tokens.write_bytes(struct.pack("<I", 1))
+    q = tmp_path / "q.bf16"
+    q.write_bytes(b"\0\0")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "schema": "plow.mla-boundary.v1",
+        "contract": {"dimensions": {"tokens": 1, "heads": 1, "qk_nope": 1,
+                                      "qk_rope": 1, "v_head": 1},
+                     "layout": "token-head-dense", "causal": True},
+        "prompt_sha256_u32le": hashlib.sha256(tokens.read_bytes()).hexdigest(),
+        "prompt": {"u32le_file": str(tokens),
+                   "sha256": hashlib.sha256(tokens.read_bytes()).hexdigest()},
+        "tensors": [{"semantic": "q", "dtype": "bf16", "shape": [1],
+                     "file": str(q), "sha256": hashlib.sha256(q.read_bytes()).hexdigest()}],
+    }))
+    residual = tmp_path / "residual.bf16"
+    residual.write_bytes(struct.pack("<2H", 7, 8))
+    output = tmp_path / "attached.json"
+    subprocess.run([sys.executable, SCRIPT, "attach-tensor", "--manifest", str(manifest),
+                    "--semantic", "residual.output", "--file", str(residual),
+                    "--dtype", "bf16", "--shape", "1,2", "--output", str(output)], check=True)
+    result = json.loads(output.read_text())
+    assert result["prompt_sha256_u32le"] == hashlib.sha256(tokens.read_bytes()).hexdigest()
+    item = next(x for x in result["tensors"] if x["semantic"] == "residual.output")
+    assert item["sha256"] == hashlib.sha256(residual.read_bytes()).hexdigest()

@@ -425,6 +425,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FUSE_RESIDUAL_INPUT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fuse_residual_input: bool,
 
+    /// Fuse AttnRes with its sole following RMSNorm. Disable only to materialize the raw
+    /// residual seam for a boundary capture; the production default remains fused.
+    #[arg(long, env = "PLOW_K3_FUSE_ARNORM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub k3_fuse_arnorm: bool,
+
     // ──────────────────────────────────────────────────────────────────────────
     // GLM-5.2 / gfx942 campaign knobs
     //
@@ -763,6 +768,7 @@ impl EmitConfig {
             gemv_mm: env_u32("PLOW_GEMV_MM"),
             gemv_walk: env_bool("PLOW_GEMV_WALK"),
             fuse_residual_input: env_opt_out("PLOW_FUSE_RESIDUAL_INPUT"),
+            k3_fuse_arnorm: env_opt_out("PLOW_K3_FUSE_ARNORM"),
             // GLM-5.2 / gfx942 campaign knobs. `env_opt_out` is NOT `!env_bool`: the
             // original call sites tested `!= Some("0")`, so any value other than "0"
             // (including an empty string) enables. Preserved verbatim.
@@ -1103,6 +1109,16 @@ mod tests {
 
         std::env::set_var("PLOW_FUSE_RESIDUAL_INPUT", "0");
         assert!(!EmitConfig::from_env().fuse_residual_input);
+    }
+
+    #[test]
+    fn attnres_norm_fusion_defaults_on_and_allows_capture_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_K3_FUSE_ARNORM", "1")]);
+        std::env::remove_var("PLOW_K3_FUSE_ARNORM");
+        assert!(EmitConfig::from_env().k3_fuse_arnorm);
+        std::env::set_var("PLOW_K3_FUSE_ARNORM", "0");
+        assert!(!EmitConfig::from_env().k3_fuse_arnorm);
     }
 
     #[test]
