@@ -1718,6 +1718,9 @@ fn count_xgates(blob: &DevBlob) -> u32 {
             } else if d.op == DevOp::XReduceTwoShot as u16 {
                 // two-shot: reduce-scatter (i3) and all-gather (i4)
                 top = top.max(d.i[3] + 1).max(d.i[4] + 1);
+            } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
+                // split seams: one gate each (i3)
+                top = top.max(d.i[3] + 1);
             } else if d.op == DevOp::XArgmaxFin as u16 {
                 // sharded-head fold: arrival gate (i3), then consecutive value lines at i4
                 top = top
@@ -1782,6 +1785,10 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                 } else if d.op == DevOp::XReduceTwoShot as u16 {
                     set(d.i[3], Some(n_gpu));
                     set(d.i[4], Some(n_gpu * d.blocks as u32));
+                } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
+                    // Both announce with ONE workgroup per rank: their producers are earlier
+                    // packets, the gate_rs argument.
+                    set(d.i[3], Some(n_gpu));
                 } else if d.op == DevOp::XArgmaxFin as u16 {
                     set(d.i[3], Some(n_gpu));
                     for line in 0..xargmax_value_lines(d.i[1]) {

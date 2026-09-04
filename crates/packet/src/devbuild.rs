@@ -771,6 +771,11 @@ impl Builder {
         (self.tensors.len() - 1) as u32
     }
 
+    /// The declared name of handle `h`.
+    pub fn tensor_name(&self, h: u32) -> &str {
+        &self.tensors[h as usize].name
+    }
+
     /// Declare a tensor whose contents the compiler already knows (e.g. RoPE tables).
     pub fn tensor_init(&mut self, name: &str, init: Vec<u8>) -> u32 {
         self.tensors.push(TensorDecl {

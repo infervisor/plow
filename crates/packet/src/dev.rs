@@ -329,20 +329,30 @@ pub enum DevOp {
     /// `t0=out` · `i0=H i1=n_gpu i2=slot(byte offset into peer_scratch) i3=gate i4=gslot?
     /// i5=gcols? i6=row_w?`.
     XReduce = 24,
-    /// Reduce-scatter half of the symmetric all-reduce decomposition. Kept defined for
-    /// CP / larger worlds; not emitted on the N<=8 decode path (one-shot `XReduce` wins).
+    /// Reduce-scatter half of the two-shot, ON ITS OWN: rendezvous `gate_rs`, then phase 1 of
+    /// [`DevOp::XReduceTwoShot`] — this rank's owned slice `[n*rank/N, n*(rank+1)/N)` of the
+    /// flat `[n]` partial is reduced (f32 acc, r = 0..N-1) and written IN PLACE into its own
+    /// peer slot. Nothing is gathered; the packets that follow read the owned slice as a
+    /// rank-relative band view. Emitted by the sequence-parallel seams (`PLOW_SEQ_PAR_SEAMS`).
+    /// `t0=slot_tensor t1=band_copy?` · `i0=n i1=n_gpu i2=slot i3=gate_rs i6=gslot? i7=gcols?`.
+    /// `slot_tensor` is the peer slot reduced in place, `slot` its byte offset. With `gcols`,
+    /// the owned slice also folds the column-parallel partial at `gslot` for its own rows —
+    /// rounded to bf16 BEFORE the add, exactly as the two-shot's phase 2 does. `band_copy` (a
+    /// LOCAL `[n/N]` tensor) receives the same owned slice for a reader that outlives the
+    /// slot's next writer.
     ///
-    /// UNIMPLEMENTED, not merely unselected. No kernel arm in any interpreter and no emitter
-    /// anywhere — these two numbers appear only in this enum, `dev_isa.h`, `ALL`, and the
-    /// `RESERVED` list in [`crate::slots`]. A packet carrying one would hit the AMD dispatch's
-    /// `default:` and silently do nothing. The decomposition that exists is the two-phase body
-    /// INSIDE [`DevOp::XReduceTwoShot`], which is one packet, not two.
-    ///
-    /// Kept rather than removed because the numbers are ABI: every blob on disk was built
-    /// against this enum, and reusing 25/26 would make an old blob run a new op.
+    /// The kernel arm is not built yet (`op_collective.h`); a packet carrying one on an object
+    /// without it must be refused at load, which is what the manifest requirement
+    /// `PLOW_SEQ_PAR_SEAMS=1` is for. The number is ABI: it was reserved since the enum was
+    /// written, and no blob on disk carries it.
     XReduceScatter = 25,
-    /// All-gather half of the symmetric decomposition. Unimplemented on every backend — see
-    /// [`DevOp::XReduceScatter`] for what that means and why the number is kept.
+    /// All-gather ON ITS OWN, of up to THREE row-banded arrays under ONE rendezvous: every
+    /// rank has written its band of each array into a peer slot (earlier packets), one
+    /// workgroup announces the rank on `gate`, all wait `n_gpu` arrivals, then each rank copies
+    /// slice `s` of each array from peer `s`'s slot into the local full tensor (the two-shot's
+    /// phase-2 loop, unchanged). A `dst` of `TENSOR_NONE` (with `n = 0`) leaves that pair unused.
+    /// `t0=dst0? t1=dst1? t2=dst2?` · `i0=n0? i1=n1? i2=n2? i3=gate i4=n_gpu i5=src_slot0?
+    /// i6=src_slot1? i7=src_slot2?`.
     XAllGather = 26,
     /// Context-parallel cross-GPU flash LSE-merge (tp-design §8c, §9). Folds N peers'
     /// `(O_partial,m,l)` over their KV-position shards into the replicated attention

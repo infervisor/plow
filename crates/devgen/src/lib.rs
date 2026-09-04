@@ -2698,6 +2698,78 @@ fn emit_xreduce_twoshot_band(
     })
 }
 
+/// Reduce-scatter ONLY (sequence-parallel seam, [`DevOp::XReduceScatter`]): rendezvous, then
+/// this rank's owned row band of the `[elems]` partial at byte offset `slot` is reduced in
+/// place into its own peer slot. `slot_tensor` is that slot's handle, so the band consumers
+/// that read it as a rank-relative view depend on this packet. `gather = (gslot, gcols)` folds
+/// the column-parallel partial for the owned rows (rounded-then-added, as the two-shot's AG).
+/// `copy` is a LOCAL band tensor the owned band is also stored to — for a reader that outlives
+/// the slot's next writer (a snapshot layer's restarted prefix). One xctr gate. Bit-identical
+/// to the two-shot's phase 1 (same body).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_xreduce_scatter(
+    b: &mut Builder,
+    xgate: &mut u32,
+    xr_cus: &[u32],
+    deps: &[u32],
+    slot_tensor: u32,
+    elems: u32,
+    tp: u32,
+    slot: u32,
+    gather: Option<(u32, u32)>,
+    copy: Option<u32>,
+) -> u32 {
+    // Phase 1 saturates at `elems / tp / 512` workgroups.
+    let need = ((elems / tp.max(1)).div_ceil(512).max(1) as usize).min(xr_cus.len());
+    let xr_cus = &xr_cus[..need];
+    let gate_rs = *xgate;
+    *xgate += 1;
+    b.emit(DevOp::XReduceScatter, xr_cus.to_vec(), deps, |d| {
+        d.t[0] = slot_tensor;
+        d.t[1] = copy.unwrap_or(packet::dev::TENSOR_NONE);
+        d.i[0] = elems;
+        d.i[1] = tp;
+        d.i[2] = slot;
+        d.i[3] = gate_rs;
+        if let Some((gslot, gcols)) = gather {
+            d.i[6] = gslot;
+            d.i[7] = gcols;
+        }
+    })
+}
+
+/// All-gather ONLY ([`DevOp::XAllGather`]) of up to three row-banded arrays under one
+/// rendezvous: `pairs = (dst full tensor, elems, src slot byte offset)`. Every rank's band of
+/// each array was written into the peer slot by earlier packets (the `deps`); slice `s` of each
+/// is copied from peer `s`. One xctr gate.
+pub(crate) fn emit_xall_gather(
+    b: &mut Builder,
+    xgate: &mut u32,
+    xr_cus: &[u32],
+    deps: &[u32],
+    pairs: &[(u32, u32, u32)],
+    tp: u32,
+) -> u32 {
+    assert!(
+        !pairs.is_empty() && pairs.len() <= 3,
+        "XAllGather carries 1..3 arrays"
+    );
+    let total: u32 = pairs.iter().map(|p| p.1).sum();
+    let need = (total.div_ceil(512).max(1) as usize).min(xr_cus.len());
+    let xr_cus = &xr_cus[..need];
+    let gate = *xgate;
+    *xgate += 1;
+    b.emit(DevOp::XAllGather, xr_cus.to_vec(), deps, |d| {
+        for (k, &(dst, n, src_slot)) in pairs.iter().enumerate() {
+            d.t[k] = dst;
+            d.i[k] = n;
+            d.i[5 + k] = src_slot;
+        }
+        d.i[3] = gate;
+        d.i[4] = tp;
+    })
+}
+
 /// [`emit_xreduce`], plus an ALL-GATHER of a column-parallel partial folded into the same
 /// packet: `out = sum_r reduced_r + concat_r gathered_r`.
 ///

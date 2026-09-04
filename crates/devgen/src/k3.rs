@@ -754,6 +754,29 @@ pub fn emit_k3_linear_norm(
     fold: Option<(u32, f32)>,
     deps: &[u32],
 ) -> u32 {
+    emit_k3_linear_rows(b, out, x, wt, t, t, n, k, n_cu, seq_rows, fold, deps)
+}
+
+/// [`emit_k3_linear_norm`] over `rows` rows of a program emitted for `t`: the GEMM family is
+/// picked at the FULL `t` and the packet carries `M = rows`. The sequence-parallel seams use it
+/// for the band (`rows = t/tp`): the per-element K accumulation of `d_gemm_t` does not depend
+/// on the tile's position, so the SAME family at fewer rows is bit-identical to the replicated
+/// emit — re-picking at `M = rows` could select a different tile (or the c8 arm) and is not.
+#[allow(clippy::too_many_arguments)]
+fn emit_k3_linear_rows(
+    b: &mut Builder,
+    out: u32,
+    x: u32,
+    wt: u32,
+    t: u32,
+    rows: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    seq_rows: bool,
+    fold: Option<(u32, f32)>,
+    deps: &[u32],
+) -> u32 {
     let all: Vec<u32> = (0..n_cu).collect();
     // A BATCHED DECODE TAKES THE GEMV ARM, and `t == 1` alone does not say so.
     //
@@ -791,7 +814,7 @@ pub fn emit_k3_linear_norm(
         d.t[0] = out;
         d.t[1] = x;
         d.t[2] = wt;
-        d.i[0] = t;
+        d.i[0] = rows;
         d.i[1] = n;
         d.i[2] = k;
         d.i[7] = gemm_variant;
@@ -1011,6 +1034,11 @@ pub fn emit_k3_latent_moe(
     // layer output `p + (up_latent + shared_down)` and there is no `{a}ffn` buffer and no second
     // packet. See [`fuse_block_resid`].
     resid_in: Option<u32>,
+    // `Some(x_band)` is the SEQUENCE-PARALLEL form (`K3Tp::sp`): `x` is the FULL hidden that the
+    // all-gather below fills, `x_band` the owned band of it (peer slot 3). The router, the latent
+    // xe projection and the top-k run on the band; one `XAllGather` then publishes `x`, `xe` and
+    // the route table for the all-T consumers (align, stage-1, shared experts).
+    sp_x: Option<u32>,
     deps: &[u32],
 ) -> u32 {
     assert!(
@@ -1080,11 +1108,59 @@ pub fn emit_k3_latent_moe(
 
     // Router — scores the HIDDEN state. `logit` is [T, n_exp] on both phases; only the top-k TAIL
     // differs, and the prefill one is literally the decode kernel under a token loop.
-    let c_rl = gemv(b, logit, x, w.router, c.n_exp, hid, deps[0]);
-
+    //
     // The DOWN projection is what makes this a LatentMoE. Independent of the
     // router, so it overlaps the rank pass.
-    let c_xe = gemv(b, xe, x, w.down_latent, lat, hid, deps[0]);
+    //
+    // Sequence-parallel: both run on the owned band, reading the band of `x` and writing the
+    // band of peer slots 4 (xe) and the local logit band. Same GEMM family as the all-T emit
+    // (`emit_k3_linear_rows`), so every row's dot products are bit-identical.
+    let t_b = tp.band_rows(t);
+    let (logit_rd, tab_wr, t_rows, c_rl, c_xe) = if let Some(xb) = sp_x {
+        assert!(
+            pf_fuse == crate::mla::MoePfFuse::None,
+            "sequence-parallel seams: the atomic/deterministic router arms zero the [T, latent] \
+             accumulator with the packet's T and would zero only the band"
+        );
+        let logit_b = tp.band(b, logit, t, c.n_exp as u64 * 2);
+        let xe_b = tp.band(b, tp.xes, t, lat as u64 * 2);
+        let tab_b = tp.band(b, tp.rts, t, c.top_k as u64 * 8);
+        let c_rl = emit_k3_linear_rows(
+            b,
+            logit_b,
+            xb,
+            w.router,
+            t,
+            t_b,
+            c.n_exp,
+            hid,
+            n_cu,
+            seq_rows,
+            None,
+            &[deps[0]],
+        );
+        let c_xe = emit_k3_linear_rows(
+            b,
+            xe_b,
+            xb,
+            w.down_latent,
+            t,
+            t_b,
+            lat,
+            hid,
+            n_cu,
+            seq_rows,
+            None,
+            &[deps[0]],
+        );
+        (logit_b, tab_b, t_b, c_rl, c_xe)
+    } else {
+        let c_rl = gemv(b, logit, x, w.router, c.n_exp, hid, deps[0]);
+        let c_xe = gemv(b, xe, x, w.down_latent, lat, hid, deps[0]);
+        (logit, tab, t, c_rl, c_xe)
+    };
+    // When the FULL `x` becomes readable: immediately, or after the seam's all-gather.
+    let mut x_dep = deps[0];
 
     let si_l = tp.local(c.shared_inter);
     // Only independent decode sequences take this overlap. Prefill token rows keep their proven
@@ -1242,10 +1318,10 @@ pub fn emit_k3_latent_moe(
         // have made for the same row — which is what makes the two phases the same model.
         // One workgroup owns one token at a time. Launching more than T only creates empty
         // interpreter entries; launching fewer keeps the kernel's existing strided token loop.
-        let router_blocks: Vec<u32> = (0..t.min(n_cu)).collect();
+        let router_blocks: Vec<u32> = (0..t_rows.min(n_cu)).collect();
         let c_rt = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_rl], |d| {
-            d.t[0] = tab;
-            d.t[1] = logit;
+            d.t[0] = tab_wr;
+            d.t[1] = logit_rd;
             d.t[3] = w.router_bias;
             if atom || det {
                 d.t[2] = part;
@@ -1254,11 +1330,34 @@ pub fn emit_k3_latent_moe(
             d.i[1] = c.n_exp;
             d.i[2] = c.top_k;
             d.i[3] = c.route_flags;
-            d.i[4] = t;
+            d.i[4] = t_rows;
             d.i[6] = c.n_group;
             d.i[7] = c.topk_group;
             d.f[0] = c.route_scale;
         });
+        // THE SEAM'S ALL-GATHER: the band results of `x` (slot 3), `xe` (slot 4) and the route
+        // table (slot 5) become the full tensors under ONE rendezvous. Everything below that
+        // reads any of the three hangs off it.
+        let c_rt = if sp_x.is_some() {
+            let (s_h2, s_xe, s_rt) = (tp.slot_h2(), tp.slot_xe(), tp.slot_rt());
+            let c = crate::emit_xall_gather(
+                b,
+                &mut tp.xgate,
+                &tp.xr_cus,
+                &[c_rt, c_xe],
+                &[
+                    (x, t * hid, s_h2),
+                    (xe, t * lat, s_xe),
+                    // f32 [T][k][2] in bf16 units
+                    (tab, t * c.top_k * 4, s_rt),
+                ],
+                tp.tp,
+            );
+            x_dep = c;
+            c
+        } else {
+            c_rt
+        };
         let align = |b: &mut Builder, blocks: Vec<u32>, deps: &[u32], phase: u32| {
             b.emit(DevOp::MoeAlignPf, blocks, deps, |d| {
                 d.t[0] = meta;
@@ -1473,8 +1572,8 @@ pub fn emit_k3_latent_moe(
             pair
         } else {
             (
-                gemv(b, shg, x, w.shared_gate, si_l, hid, deps[0]),
-                gemv(b, shu, x, w.shared_up, si_l, hid, deps[0]),
+                gemv(b, shg, x, w.shared_gate, si_l, hid, x_dep),
+                gemv(b, shu, x, w.shared_up, si_l, hid, x_dep),
             )
         };
         emit_situ_glu(b, cb, sha, shg, shu, t * si_l, n_cu, &[c_sg, c_su])
@@ -1560,6 +1659,35 @@ pub fn emit_k3_latent_moe(
     // (`perf-data/archive/k3/kimi-k3-tp-peer-slots.md`): a peer signals the NEXT layer's attention
     // reduce only after leaving this one, and two collectives separate the two writes.
     if shard_up {
+        // SEQUENCE-PARALLEL block output: reduce-scatter the shared-expert partial with the
+        // up-projection's columns folded in for the OWNED rows (12.8 MB of remote reads instead
+        // of 103), then the band's block-output add `out = ffn + prefix` over the owned rows.
+        // The next layer's pre-attention AttnRes reads `out` as a band and publishes `h_a`.
+        if sp_x.is_some() {
+            let p = resid_in.expect("sequence-parallel seams need the folded block residual");
+            let gather = (!up_nogather()).then_some((tp.slot_c(), hid_l));
+            let c_rs = crate::emit_xreduce_scatter(
+                b,
+                &mut tp.xgate,
+                &tp.xr_cus,
+                &[c_sd, c_up],
+                tp.og,
+                t * hid,
+                tp.tp,
+                0,
+                gather,
+                None,
+            );
+            let out_b = tp.band(b, out, t, hid as u64 * 2);
+            let ffn_b = tp.band(b, tp.og, t, hid as u64 * 2);
+            return b.emit(DevOp::Residual, vec8_cus(&all, t_b * hid), &[c_rs], |d| {
+                d.t[0] = out_b;
+                d.t[1] = ffn_b;
+                d.t[2] = p;
+                d.i[0] = t_b * hid;
+                d.f[0] = 1.0;
+            });
+        }
         // With the outer residual folded in, one add is still owed (`out = ffn + prefix`) and
         // the collective lands in `shd`. Without it, the collective already IS the answer and
         // writes `out` directly — one packet fewer than the replicated emit, not one more.
@@ -2216,6 +2344,16 @@ pub struct K3Tp {
     pub xgate: u32,
     /// CUs the collective may use.
     pub xr_cus: Vec<u32>,
+    /// Sequence-parallel seams (`PLOW_SEQ_PAR_SEAMS`): the post-attention and block-output
+    /// seams reduce-scatter only, run AttnRes / router / latent xe / top-k on the owned `t/tp`
+    /// row band, and all-gather the RESULTS out of three more peer slots. Prefill only.
+    pub seq_par: bool,
+    /// Peer slot 3: the band's normed hidden (`h2`, then `h_a`, then the final `xn`).
+    pub h2s: u32,
+    /// Peer slot 4: the band's latent expert input `xe`.
+    pub xes: u32,
+    /// Peer slot 5: the band's route table.
+    pub rts: u32,
 }
 
 impl K3Tp {
@@ -2229,10 +2367,41 @@ impl K3Tp {
             slot_b: 0,
             xgate: 0,
             xr_cus: Vec::new(),
+            seq_par: false,
+            h2s: 0,
+            xes: 0,
+            rts: 0,
         }
     }
     pub fn on(&self) -> bool {
         self.tp > 1
+    }
+    /// Sequence-parallel seams are live for this program.
+    pub fn sp(&self) -> bool {
+        self.on() && self.seq_par
+    }
+    /// Rows of the owned band.
+    pub fn band_rows(&self, t: u32) -> u32 {
+        t / self.tp
+    }
+    /// Byte offsets of the three result slots. The host binds `act.h2_tp` / `act.xe_tp` /
+    /// `act.rt_tp` at `scratch_base + {3,4,5} * slot_b`.
+    pub fn slot_h2(&self) -> u32 {
+        3 * self.slot_b
+    }
+    pub fn slot_xe(&self) -> u32 {
+        4 * self.slot_b
+    }
+    pub fn slot_rt(&self) -> u32 {
+        5 * self.slot_b
+    }
+    /// A RANK-RELATIVE band view of `base`: rows `[rank*t/tp, (rank+1)*t/tp)` of a `[t][row]`
+    /// tensor. One blob serves every rank, so the view is a NAME CONTRACT with the host:
+    /// `<base>@band<t>` binds at `base + rank * bytes`, `bytes = (t/tp) * row_bytes`. Per `t`
+    /// because the base is sized by the widest bucket, not by this program.
+    pub fn band(&self, b: &mut Builder, base: u32, t: u32, row_bytes: u64) -> u32 {
+        let name = format!("{}@band{t}", b.tensor_name(base));
+        b.tensor(&name, self.band_rows(t) as u64 * row_bytes)
     }
     /// Byte offset of the GATHER slot (partial slot 2). The host binds `act.ug_tp` at
     /// `scratch_base + 2 * slot_b` (`plowrt::exec::amd`, `PARTIAL_SLOTS`), so this
@@ -2326,6 +2495,22 @@ pub fn emit_k3_dense_mlp(
     let c_a = emit_situ_glu(b, cb, act, g, u, t * inter, n_cu, &[c_g, c_u]);
     let dst = if tp.on() { tp.dg } else { out };
     let c_d = gemv(b, dst, act, down_w, cb.hidden, inter, &[c_a]);
+    // Sequence-parallel: reduce-scatter in place; the caller's band block-output add reads the
+    // owned band of slot B.
+    if tp.sp() {
+        return crate::emit_xreduce_scatter(
+            b,
+            &mut tp.xgate,
+            &tp.xr_cus,
+            &[c_d],
+            tp.dg,
+            t * cb.hidden,
+            tp.tp,
+            tp.slot_b,
+            None,
+            None,
+        );
+    }
     if tp.on() {
         return crate::emit_xreduce(
             b,
@@ -2425,25 +2610,69 @@ pub fn emit_k3_block(
     };
     let push = cb.snapshots(layer).then_some(prefix_in);
     let fuse_pre = fuse_attnres_norm() && (nb_in > 0 || push.is_some()) && mixer_eps == cb.eps;
+    // SEQUENCE-PARALLEL SEAMS (`K3Tp::sp`). The residual stream (`prefix_in`, `out`, the
+    // `blkres` ring) is only ever read by AttnRes at the token that owns it, so under TP each
+    // rank keeps it for its OWN reduce-scatter band and both mixes run on `t/tp` rows. What the
+    // all-T consumers need — the normed hidden — is all-gathered out of peer slot 3 instead of
+    // the raw attention output. Same kernels, one rank per row: bit-identical to the
+    // replicated emit.
+    let sp = tp.sp();
+    let t_b = tp.band_rows(t);
+    let rowb = hid as u64 * 2;
     let (h_a, mut dep) = if nb_in > 0 || push.is_some() {
         let h = bft(b, format!("{a}h_a"));
-        let c = emit_attn_res(
-            b,
-            cb,
-            h,
-            prefix_in,
-            blkres,
-            w.sa_score_w,
-            t,
-            nb_in,
-            nb_cap,
-            n_cu,
-            push,
-            fuse_pre.then_some(mixer_ln),
-            deps,
-        );
-        (h, c)
+        if sp {
+            let h_b = tp.band(b, tp.h2s, t, rowb);
+            let p_b = tp.band(b, prefix_in, t, rowb);
+            let r_b = tp.band(b, blkres, t, nb_cap as u64 * rowb);
+            let c = emit_attn_res(
+                b,
+                cb,
+                h_b,
+                p_b,
+                r_b,
+                w.sa_score_w,
+                t_b,
+                nb_in,
+                nb_cap,
+                n_cu,
+                push.map(|_| p_b),
+                fuse_pre.then_some(mixer_ln),
+                deps,
+            );
+            let s_h2 = tp.slot_h2();
+            let c = crate::emit_xall_gather(
+                b,
+                &mut tp.xgate,
+                &tp.xr_cus,
+                &[c],
+                &[(h, t * hid, s_h2)],
+                tp.tp,
+            );
+            (h, c)
+        } else {
+            let c = emit_attn_res(
+                b,
+                cb,
+                h,
+                prefix_in,
+                blkres,
+                w.sa_score_w,
+                t,
+                nb_in,
+                nb_cap,
+                n_cu,
+                push,
+                fuse_pre.then_some(mixer_ln),
+                deps,
+            );
+            (h, c)
+        }
     } else {
+        assert!(
+            !sp,
+            "sequence-parallel seams: a layer without a pre-attention mix"
+        );
         (prefix_in, deps[0])
     };
 
@@ -2480,7 +2709,34 @@ pub fn emit_k3_block(
             seq_rows,
         ),
     };
-    let (c_o, attn) = if tp.on() {
+    let (c_o, attn) = if sp {
+        // Reduce-scatter only: the owned band of the attention output sits in slot A. At a
+        // snapshot layer that band IS the restarted prefix and must outlive slot A's next
+        // writer (the shared-expert down projection), so it is also copied to a local band.
+        let copy = if cb.snapshots(layer) {
+            let full = bft(b, format!("{a}attn_full"));
+            Some(tp.band(b, full, t, rowb))
+        } else {
+            None
+        };
+        let c = crate::emit_xreduce_scatter(
+            b,
+            &mut tp.xgate,
+            &tp.xr_cus,
+            &[c_o],
+            tp.og,
+            t * hid,
+            tp.tp,
+            0,
+            None,
+            copy,
+        );
+        let attn = match copy {
+            Some(x) => x,
+            None => tp.band(b, tp.og, t, rowb),
+        };
+        (c, attn)
+    } else if tp.on() {
         let full = bft(b, format!("{a}attn_full"));
         (
             crate::emit_xreduce(
@@ -2506,14 +2762,23 @@ pub fn emit_k3_block(
         attn
     } else {
         let p = bft(b, format!("{a}prefix"));
-        dep = b.emit(DevOp::Residual, vec8_cus(&all, t * hid), &[c_o], |d| {
-            d.t[0] = p;
-            d.t[1] = prefix_in;
+        let (p_out, p_in, n) = if sp {
+            (
+                tp.band(b, p, t, rowb),
+                tp.band(b, prefix_in, t, rowb),
+                t_b * hid,
+            )
+        } else {
+            (p, prefix_in, t * hid)
+        };
+        dep = b.emit(DevOp::Residual, vec8_cus(&all, n), &[c_o], |d| {
+            d.t[0] = p_out;
+            d.t[1] = p_in;
             d.t[2] = attn;
-            d.i[0] = t * hid;
+            d.i[0] = n;
             d.f[0] = 1.0;
         });
-        p
+        p_out
     };
 
     // A2 — the MLP-side mix, with the OTHER fold, at the POST-push count. `post_attention_layernorm`
@@ -2521,16 +2786,25 @@ pub fn emit_k3_block(
     // normed activation. At `nb_out == 0` there is no mix to fuse into and the norm stays its own
     // packet.
     let fuse_post = fuse_attnres_norm() && nb_out > 0;
+    // Sequence-parallel: the band of the normed hidden goes to peer slot 3; `h2` is the FULL
+    // tensor the FFN seam's all-gather fills.
+    let mut h2_b = packet::dev::TENSOR_NONE;
     let h2 = if nb_out > 0 {
         let h = bft(b, format!("{a}h2"));
+        let (h_out, ring, rows) = if sp {
+            h2_b = tp.band(b, tp.h2s, t, rowb);
+            (h2_b, tp.band(b, blkres, t, nb_cap as u64 * rowb), t_b)
+        } else {
+            (h, blkres, t)
+        };
         dep = emit_attn_res(
             b,
             cb,
-            h,
+            h_out,
             prefix,
-            blkres,
+            ring,
             w.mlp_score_w,
-            t,
+            rows,
             nb_out,
             nb_cap,
             n_cu,
@@ -2540,8 +2814,16 @@ pub fn emit_k3_block(
         );
         h
     } else {
+        assert!(
+            !sp,
+            "sequence-parallel seams: a layer without a post-attention mix"
+        );
         prefix
     };
+    assert!(
+        !sp || fuse_post,
+        "sequence-parallel seams need the post-attention norm fused into the mix"
+    );
 
     let h3 = if fuse_post {
         h2
@@ -2580,6 +2862,7 @@ pub fn emit_k3_block(
             n_cu,
             tp,
             fuse_bo.then_some(prefix),
+            sp.then_some(h2_b),
             &[dep],
         ),
         K3Ffn::Dense {
@@ -2587,25 +2870,46 @@ pub fn emit_k3_block(
             up,
             down,
             inter,
-        } => emit_k3_dense_mlp(
-            b,
-            cb,
-            a,
-            ffn,
-            h3,
-            *gate,
-            *up,
-            *down,
-            *inter,
-            t,
-            seq_rows,
-            n_cu,
-            tp,
-            &[dep],
-        ),
+        } => {
+            // The dense FFN's gate/up are column-parallel over all T: publish the band first.
+            let dep = if sp {
+                let s_h2 = tp.slot_h2();
+                crate::emit_xall_gather(
+                    b,
+                    &mut tp.xgate,
+                    &tp.xr_cus,
+                    &[dep],
+                    &[(h3, t * hid, s_h2)],
+                    tp.tp,
+                )
+            } else {
+                dep
+            };
+            emit_k3_dense_mlp(
+                b,
+                cb,
+                a,
+                ffn,
+                h3,
+                *gate,
+                *up,
+                *down,
+                *inter,
+                t,
+                seq_rows,
+                n_cu,
+                tp,
+                &[dep],
+            )
+        }
     };
     if fuse_bo {
         c_ffn
+    } else if sp {
+        // The dense down partial was reduce-scattered in place in slot B; add the band.
+        let out_b = tp.band(b, out, t, rowb);
+        let ffn_b = tp.band(b, tp.dg, t, rowb);
+        emit_k3_block_out(b, out_b, prefix, ffn_b, t_b * hid, n_cu, &[c_ffn])
     } else {
         emit_k3_block_out(b, out, prefix, ffn, t * hid, n_cu, &[c_ffn])
     }
@@ -2802,6 +3106,20 @@ pub fn emit_k3_model(
             "K3: peer slot has {scratch_rows} rows but program needs {t}"
         );
         let slot_b = scratch_rows * hid * 2;
+        // Sequence-parallel seams: prefill token rows only, and the flat reduce-scatter slices
+        // must end on row boundaries (`t % tp == 0`). Three more peer slots hold the band
+        // results the seams all-gather; the host binds them at slots 3/4/5.
+        let seq_par =
+            crate::emit_config::active().seq_par_seams && t > 1 && !seq_rows && t % c.tp == 0;
+        let (h2s, xes, rts) = if seq_par {
+            (
+                b.tensor("act.h2_tp", slot_b as u64),
+                b.tensor("act.xe_tp", slot_b as u64),
+                b.tensor("act.rt_tp", slot_b as u64),
+            )
+        } else {
+            (0, 0, 0)
+        };
         K3Tp {
             tp: c.tp,
             og: b.tensor("act.og_tp", slot_b as u64),
@@ -2814,6 +3132,10 @@ pub fn emit_k3_model(
                 .unwrap_or(n_cu)
                 .clamp(1, n_cu))
                 .collect(),
+            seq_par,
+            h2s,
+            xes,
+            rts,
         }
     } else {
         K3Tp::none()
@@ -3002,21 +3324,58 @@ pub fn emit_k3_model(
         } else {
             b.tensor("act.xres", t as u64 * hid as u64 * 2)
         };
-        dep = emit_attn_res(
-            b,
-            cb,
-            dst,
-            cur,
-            blkres,
-            ores,
-            t,
-            nb_fin,
-            nb_max,
-            n_cu,
-            None,
-            fuse_fin.then_some(fin),
-            &[dep],
-        );
+        if tp.sp() {
+            // The residual stream is band-resident; mix the band, then publish `xn` so every
+            // rank samples the same last row.
+            assert!(
+                fuse_fin,
+                "sequence-parallel seams need the final norm fused into the mix"
+            );
+            let rowb = hid as u64 * 2;
+            let d_b = tp.band(b, tp.h2s, t, rowb);
+            let c_b = tp.band(b, cur, t, rowb);
+            let r_b = tp.band(b, blkres, t, nb_max as u64 * rowb);
+            let c = emit_attn_res(
+                b,
+                cb,
+                d_b,
+                c_b,
+                r_b,
+                ores,
+                tp.band_rows(t),
+                nb_fin,
+                nb_max,
+                n_cu,
+                None,
+                Some(fin),
+                &[dep],
+            );
+            let s_h2 = tp.slot_h2();
+            dep = crate::emit_xall_gather(
+                b,
+                &mut tp.xgate,
+                &tp.xr_cus,
+                &[c],
+                &[(dst, t * hid, s_h2)],
+                tp.tp,
+            );
+        } else {
+            dep = emit_attn_res(
+                b,
+                cb,
+                dst,
+                cur,
+                blkres,
+                ores,
+                t,
+                nb_fin,
+                nb_max,
+                n_cu,
+                None,
+                fuse_fin.then_some(fin),
+                &[dep],
+            );
+        }
         cur = dst;
     }
 
@@ -3977,6 +4336,128 @@ mod tests {
             widths.contains(&3584),
             "the expert combine reduces at LATENT width"
         );
+    }
+
+    /// `PLOW_SEQ_PAR_SEAMS=1`: the two hidden-width seams of every layer reduce-scatter only,
+    /// AttnRes / router / latent xe / top-k run on the owned `t/tp` band, and the results are
+    /// all-gathered out of three more peer slots. The latent seam keeps its two-shot; the
+    /// all-T consumers (align, stage-1, shared experts, the mixers) are unchanged; the xctr
+    /// gate count is unchanged.
+    #[test]
+    fn seq_par_seams_move_the_row_work_onto_the_owned_band() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_SEQ_PAR_SEAMS", "1")]);
+        let t = 2048u32;
+        let band = t / 8;
+        let p = build_full_t(8, t);
+        let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
+        assert_eq!(
+            n(DevOp::XReduceTwoShot),
+            92,
+            "only the latent seam keeps the two-shot"
+        );
+        assert_eq!(
+            n(DevOp::XReduceScatter),
+            186,
+            "93 attention + 92 shared + 1 dense"
+        );
+        assert_eq!(
+            n(DevOp::XAllGather),
+            187,
+            "93 post-attention + 93 pre-attention h_a + 1 final xn"
+        );
+        assert_eq!(n(DevOp::XReduce), 0);
+        // Gates: one per split half, two per two-shot — 557 (the final xn gather is new), all
+        // distinct.
+        let mut gates = Vec::new();
+        for i in &p.insts {
+            if i.op == DevOp::XReduceTwoShot as u16 {
+                gates.push(i.i[3]);
+                gates.push(i.i[4]);
+            } else if i.op == DevOp::XReduceScatter as u16 {
+                gates.push(i.i[3]);
+                assert_eq!(i.i[1], 8, "world size");
+            } else if i.op == DevOp::XAllGather as u16 {
+                gates.push(i.i[3]);
+                assert_eq!(i.i[4], 8, "world size");
+            }
+        }
+        assert_eq!(gates.len(), 557);
+        let uniq: std::collections::BTreeSet<u32> = gates.iter().copied().collect();
+        assert_eq!(uniq.len(), gates.len(), "xctr gate ids must not collide");
+        // Every mix runs on the band; every align/stage-1 on the full table.
+        for i in p.insts.iter().filter(|i| i.op == DevOp::AttnRes as u16) {
+            assert_eq!(i.i[0], band);
+        }
+        assert_eq!(n(DevOp::AttnRes), 187);
+        for i in p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+        {
+            assert_eq!(i.i[4], band);
+        }
+        for i in p.insts.iter().filter(|i| i.op == DevOp::MoeAlignPf as u16) {
+            assert_eq!(i.i[0], t);
+        }
+        // The router and latent xe GEMMs read the band of `h2` and carry M = band; every other
+        // GEMM still carries M = t (the mixers, the shared experts, the up-projection).
+        let fam = crate::gemm_family_ops();
+        let is_band = |h: u32| p.tensors[h as usize].name.ends_with("@band2048");
+        let (mut on_band, mut off_band) = (0, 0);
+        for g in p.insts.iter().filter(|i| fam.contains(&i.op)) {
+            if is_band(g.t[1]) {
+                assert_eq!(g.i[0], band);
+                assert!(is_band(g.t[0]), "a band GEMM writes a band");
+                on_band += 1;
+            } else {
+                assert_eq!(g.i[0], t);
+                off_band += 1;
+            }
+        }
+        assert_eq!(on_band, 184, "router + xe on 92 MoE layers");
+        assert!(off_band > 500);
+        // The 3-way all-gather publishes h2 (slot 3), xe (slot 4) and the route table (slot 5).
+        let slot_b = t * 7168 * 2;
+        let three: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::XAllGather as u16 && i.t[2] != packet::dev::TENSOR_NONE)
+            .collect();
+        assert_eq!(three.len(), 92);
+        for i in &three {
+            assert_eq!(
+                [i.i[5], i.i[6], i.i[7]],
+                [3 * slot_b, 4 * slot_b, 5 * slot_b]
+            );
+            assert_eq!([i.i[0], i.i[1], i.i[2]], [t * 7168, t * 3584, t * 16 * 4]);
+        }
+        // The FFN seam folds the up-projection's column gather into the reduce-scatter.
+        let folded = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::XReduceScatter as u16 && i.i[7] != 0)
+            .count();
+        assert_eq!(folded, 92);
+        // Band views are rank-relative eighths of their `t`-row base (peer slots are sized by
+        // the widest bucket, so only the arena bases are checked).
+        for td in &p.tensors {
+            let Some(base) = td.name.strip_suffix("@band2048") else {
+                continue;
+            };
+            if base.ends_with("_tp") {
+                continue;
+            }
+            let bt = p
+                .tensors
+                .iter()
+                .find(|x| x.name == base)
+                .expect("band base");
+            assert_eq!(bt.bytes, 8 * td.bytes, "{}", td.name);
+        }
+        for name in ["act.h2_tp", "act.xe_tp", "act.rt_tp"] {
+            assert!(p.tensors.iter().any(|x| x.name == name), "{name} missing");
+        }
     }
 
     /// TP1 emits NO collective at all — the identity, so a TP1 blob is
@@ -5184,6 +5665,8 @@ mod tests {
 
     #[test]
     fn grouped_router_uses_one_block_per_token_up_to_the_cu_count() {
+        // The TP8 shape depends on `PLOW_SEQ_PAR_SEAMS` (band-row router).
+        let _guard = crate::test_env::env_guard();
         for (t, want) in [(32, 32), (128, 128), (512, 256)] {
             let rows = if t == 32 {
                 RowKind::Sequences
