@@ -1002,6 +1002,9 @@ enum PrefillSegmentRoute {
     KdaChunkCarryRegstate {
         args: KdaChunkCarryRegstateArgs,
         grid: u32,
+        /// Packet tensor ids of the eight operands, in args order, so a launch can rebase the
+        /// KV-slot-strided ones (the recurrent `state`) to the active slot.
+        tens: [u16; 8],
     },
     MoeStage1Mxfp4(MoeStage1Mxfp4Route),
     MoeStage1A4Reuse(MoeStage1A4ReuseRoute),
@@ -1632,6 +1635,7 @@ fn promote_kda_carry_regstate_routes(
                 _pad: 0,
             },
             grid: kda_carry_regstate_grid(d.i[1]),
+            tens: d.t,
         };
     }
     Ok(())
@@ -11129,14 +11133,42 @@ impl AmdEngine {
                 self.seg_launches += 1;
                 return Ok(());
             }
-            if let Some(PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid }) =
-                self.progs[p].prefill_routes.get(seg).copied()
+            // The regstate object only covers full BT64 rungs (`t >= 512`, mirrored by the
+            // kernel's early return); a shorter ragged tail chunk stays on the interpreter.
+            if let Some(PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, tens }) = self
+                .progs[p]
+                .prefill_routes
+                .get(seg)
+                .copied()
+                .filter(|r| {
+                    matches!(r, PrefillSegmentRoute::KdaChunkCarryRegstate { args, .. } if args.t >= 512)
+                })
             {
                 let kernel = self.k_kda_chunk_carry_regstate.ok_or_else(|| {
                     RuntimeError::Device(
                         "marked KDA carry regstate segment has no validated object".into(),
                     )
                 })?;
+                let mut args = args;
+                if self.kv_slot != 0 {
+                    let fields: [&mut u64; 8] = [
+                        &mut args.out,
+                        &mut args.state,
+                        &mut args.q,
+                        &mut args.k,
+                        &mut args.w,
+                        &mut args.u,
+                        &mut args.aqk,
+                        &mut args.g,
+                    ];
+                    for (id, field) in tens.iter().zip(fields) {
+                        if let Some(&(_, stride)) =
+                            self.kv_slot_stride.iter().find(|(i, _)| *i == *id as usize)
+                        {
+                            *field += stride * self.kv_slot as u64;
+                        }
+                    }
+                }
                 EngineDevice::launch_kernel(
                     &*self.be,
                     kernel,
@@ -14945,7 +14977,7 @@ mod tests {
         assert_eq!(classes, [8, 23]);
         let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
         promote_kda_carry_regstate_routes(&prog, &classes, &devp, &mut routes).unwrap();
-        let PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid } = routes[1] else {
+        let PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, .. } = routes[1] else {
             panic!("a marked exact carry must select the regstate object")
         };
         assert_eq!(
