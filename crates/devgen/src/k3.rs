@@ -4502,13 +4502,16 @@ mod tests {
     }
 
     /// L4 (`PLOW_XR_COMBINE_FOLD`): the latent `MoeCombine` folds into the tagged one-shot
-    /// publish. Off by default — and the default packet carries no fold field at all, so a
-    /// pre-L4 object reads it exactly as before. On, every MoE layer loses its combine packet,
+    /// publish. Opted out, the packet carries no fold field at all, so a pre-L4 object
+    /// reads it exactly as before. On, every MoE layer loses its combine packet,
     /// the latent XReduce carries `t1 = part`, `i7 = top_k`, and no other packet changes.
     #[test]
-    fn xr_combine_fold_is_off_by_default_and_folds_the_latent_combine() {
+    fn xr_combine_fold_opts_out_to_the_pre_l4_packet_and_folds_the_latent_combine() {
         let _guard = crate::test_env::env_guard();
-        let base = build_full(8);
+        let base = {
+            let _off = crate::test_env::EnvScope::set(&[("PLOW_XR_COMBINE_FOLD", "0")]);
+            build_full(8)
+        };
         let n = |p: &packet::devbuild::Program, op: DevOp| {
             p.insts.iter().filter(|i| i.op == op as u16).count()
         };

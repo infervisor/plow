@@ -86,7 +86,9 @@ Post-publication engine gate (not yet a served cell): the segment-relative ASAP
 window order (default on, commit "packet: segment-relative ASAP window order by
 default") measured 955.2 / 956.2 ms TTFT and 24.23 / 24.31 ms TPOT against
 962.4 / 25.06 on this packet's 8192→256 gate, exact. The next served cell should
-read ~980 ms TTFT and ~24.3 ms TPOT.
+read ~980 ms TTFT and ~24.3 ms TPOT. The combine-into-tagged-publish fold (default on)
+then measured 24.00 / 24.02 / 24.07 vs 24.23 / 24.24 / 24.30 ms TPOT on the same gate,
+exact; the next served cell should read ~24.1 ms TPOT.
 
 Raw data: `perf-data/kimi-k3-plowrt-mi355x-c1.json`.
 Comparator: `perf-data/kimi-k3-vllm-mi355x-c1.json`.

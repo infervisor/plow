@@ -528,9 +528,9 @@ pub struct EmitConfig {
 
     /// Fold the K3 decode latent `MoeCombine` into the tagged one-shot `XReduce` publish (L4):
     /// the XReduce packet carries `t1 = part`, `i7 = top_k` and the combine packet is not
-    /// emitted. Needs a `PLOW_XR_COMBINE_FOLD=1` decode object. Default off; the default packet
-    /// is byte-identical.
-    #[arg(long, env = "PLOW_XR_COMBINE_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// emitted. Needs a `PLOW_XR_COMBINE_FOLD=1` decode object. Default on (TP8 gate
+    /// 2026-09-04: -0.22 ms/token, exact); set false for the pre-L4 packet.
+    #[arg(long, env = "PLOW_XR_COMBINE_FOLD", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub xr_combine_fold: bool,
 
     /// Isolate compatible MXFP4 grouped-MoE Down+Combine boundaries for a standalone object.
@@ -839,7 +839,7 @@ impl EmitConfig {
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             moe_pf_a8: env_bool("PLOW_MOE_PF_A8"),
-            xr_combine_fold: env_bool("PLOW_XR_COMBINE_FOLD"),
+            xr_combine_fold: env_opt_out("PLOW_XR_COMBINE_FOLD"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
             seq_par_seams: env_opt_out("PLOW_SEQ_PAR_SEAMS"),
