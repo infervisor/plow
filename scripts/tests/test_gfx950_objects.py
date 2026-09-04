@@ -37,6 +37,35 @@ class ObjectRecipeTests(unittest.TestCase):
         self.assertFalse(MOD.resource_row_accepts(257, 2, contract))
         self.assertFalse(MOD.resource_row_accepts(256, 1, contract))
 
+    def test_resource_certificate_refuses_phase_regressions(self):
+        contract = {
+            "max_total_registers": 256,
+            "min_occupancy_waves_per_simd": 2,
+            "wavefront_size": 64,
+        }
+        baseline = {
+            "vgpr_spill": 8,
+            "sgpr_spill": 78,
+            "private_segment_bytes": 1348,
+        }
+        candidate = {
+            "total_registers": 256,
+            "occupancy_waves_per_simd": 2,
+            "wavefront_size": 64,
+            "vgpr_spill": 2,
+            "sgpr_spill": 78,
+            "private_segment_bytes": 752,
+        }
+        self.assertEqual(
+            MOD.resource_certificate_violations(candidate, baseline, contract), []
+        )
+        candidate["private_segment_bytes"] = 1352
+        candidate["sgpr_spill"] = 80
+        self.assertEqual(
+            MOD.resource_certificate_violations(candidate, baseline, contract),
+            ["sgpr_spill 80 > 78", "private_segment_bytes 1352 > 1348"],
+        )
+
     def test_real_cmake_rows_carry_resource_contracts(self):
         _, rows = MOD.parse_cmake(MOD.CMAKE)
         self.assertGreater(len(rows), 10)

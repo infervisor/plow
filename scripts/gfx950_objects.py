@@ -77,6 +77,34 @@ def resource_row_accepts(max_regs, min_occ, contract):
         min_occ >= contract.get("min_occupancy_waves_per_simd", min_occ)
 
 
+def resource_certificate_violations(candidate, baseline, contract):
+    """Reject an object that crosses a hardware cliff or regresses its phase baseline.
+
+    Spill-free is not a valid universal contract for the ordinary interpreter: shipping
+    objects can already have a non-zero private segment.  The baseline must be the same
+    phase/object recipe, so this gate permits an existing cost but never silently increases it.
+    """
+    failures = []
+    ceilings = {
+        "total_registers": contract.get("max_total_registers"),
+        "vgpr_spill": baseline.get("vgpr_spill"),
+        "sgpr_spill": baseline.get("sgpr_spill"),
+        "private_segment_bytes": baseline.get("private_segment_bytes"),
+    }
+    for field, limit in ceilings.items():
+        if limit is not None and candidate.get(field, 0) > limit:
+            failures.append(f"{field} {candidate.get(field, 0)} > {limit}")
+    min_occ = contract.get("min_occupancy_waves_per_simd")
+    if min_occ is not None and candidate.get("occupancy_waves_per_simd", 0) < min_occ:
+        failures.append(
+            f"occupancy_waves_per_simd {candidate.get('occupancy_waves_per_simd', 0)} < {min_occ}"
+        )
+    wave = contract.get("wavefront_size")
+    if wave is not None and candidate.get("wavefront_size") != wave:
+        failures.append(f"wavefront_size {candidate.get('wavefront_size')} != {wave}")
+    return failures
+
+
 def arms_in(defines):
     """The PLOW_DOP_* arms that SURVIVE the preprocessor under `defines`.
 
@@ -237,6 +265,30 @@ def stems_by_phase(features, opcodes, req=None):
 
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "--check-resource":
+        if len(args) != 5:
+            raise SystemExit(
+                "usage: gfx950_objects.py --check-resource PHASE CANDIDATE.json "
+                "BASELINE.json build.json"
+            )
+        phase, candidate_path, baseline_path, manifest_path = args[1:]
+        candidate = json.load(open(candidate_path))
+        baseline = json.load(open(baseline_path))
+        manifest = json.load(open(manifest_path))
+        contract = manifest.get("objects", {}).get("ordinary", {}).get(phase, {}) \
+            .get("resource_contract")
+        if not contract:
+            raise SystemExit(f"{phase}: manifest has no gfx950 resource contract")
+        failures = resource_certificate_violations(candidate, baseline, contract)
+        if failures:
+            raise SystemExit(f"{phase}: resource certificate refused: {'; '.join(failures)}")
+        print(
+            f"{phase}: resource certificate accepted "
+            f"(private={candidate.get('private_segment_bytes', 0)}B, "
+            f"vgpr_spill={candidate.get('vgpr_spill', 0)}, "
+            f"sgpr_spill={candidate.get('sgpr_spill', 0)})"
+        )
+        return 0
     cover = "--cover" in args
     recipes = "--recipes" in args
     args = [a for a in args if a not in ("--cover", "--recipes")]
