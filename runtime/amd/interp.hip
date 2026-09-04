@@ -4501,7 +4501,11 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             uint32_t* const xaudit = plow_xaudit_status(prog, in);
             d_xreduce_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu, prog.rank,
                            in->i[0], in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS,
-                           xaudit, e.slice, in->blocks, in->i[4], in->i[5], in->i[6]);
+                           xaudit, e.slice, in->blocks, in->i[4], in->i[5], in->i[6]
+#if PLOW_XR_TRACE_PHASES
+                           , prog.trace ? &prog.trace[base + ix] : nullptr
+#endif
+                           );
         } else if (in->op == PLOW_DOP_XREDUCE_ADD_NORM) {
             /* Fused all-reduce + residual + RMSNorm (op 116, one workgroup):
              *   t0=out t1=resid t2=a t3=gamma  i0=feat i1=n_gpu i2=slot i3=gate  f0=eps */
@@ -4664,11 +4668,13 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                 PlowTraceRec r;
                 r.cu = cu;
 #if PLOW_XR_TRACE_PHASES
-                if (in->op == PLOW_DOP_XREDUCE2) {
+                if (in->op == PLOW_DOP_XREDUCE2 || in->op == PLOW_DOP_XREDUCE) {
+                    /* Two-shot v2 marker 0b11; one-shot phase marker 0b10 (op_collective.h). */
                     PlowTraceRec* xr = &prog.trace[base + ix];
                     xr->inst = e.inst;
                     xr->op = in->op;
-                    xr->slice = (uint16_t)e.slice | 0xc000u;
+                    xr->slice = (uint16_t)e.slice |
+                                (in->op == PLOW_DOP_XREDUCE2 ? 0xc000u : 0x8000u);
                     continue;
                 }
 #endif

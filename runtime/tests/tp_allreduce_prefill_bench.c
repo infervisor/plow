@@ -198,7 +198,10 @@ int main(int argc, char** argv) {
                 bad += host[e] != want;
             }
         }
-        const double us = (double)ticks * (1e9 / (double)freq) / (double)iters / 1e3;
+        /* s_memrealtime is the 100 MHz REFCLK (10 ns/tick), not the runtime's 1 GHz HSA
+         * timestamp clock `freq`; scaling by `freq` printed 10x-too-small numbers until
+         * 2026-09-04 (tp_allreduce_bench.c has the wall-clock check). */
+        const double us = (double)ticks * 10.0 / (double)iters / 1e3;
         printf("rows=%u n=%u nblk=%u gather=%d oneshot=%d %.3f us/collective parity=%s timeout=%s bad=%zu\n",
                n / hidden, n, nwg, gather, oneshot, us, bad ? "FAIL" : "PASS", timeout ? "YES" : "no", bad);
         if ((!unsafe && bad) || timeout) return 1;

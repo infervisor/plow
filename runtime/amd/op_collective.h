@@ -75,6 +75,9 @@
 /* Trace schema v2 keeps the 40-byte ABI: cu/pc are saturated entry-relative timestamps
  * for reduce-scatter completion and gate_ag completion. slice bits 15:14 identify v2. */
 extern "C" __device__ unsigned plow_xr_trace_phases_v2 = 1;
+__device__ __forceinline__ uint32_t xr_sat32(uint64_t d) {
+    return d > 0xffffffffull ? 0xffffffffu : (uint32_t)d;
+}
 #endif
 
 /* PLOW_XR_MLP=1: PEER-BATCHED REDUCE. Opt-in build axis, BIT-IDENTICAL, default OFF.
@@ -441,8 +444,24 @@ __device__ __forceinline__ void d_xreduce_mega(
     bf16* out, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
     uint32_t n, uint32_t slot_bytes, size_t xctr_byte_off, uint32_t gate_id,
     uint64_t deadline_ticks, uint32_t* status, unsigned slice, unsigned nblk,
-    uint32_t gslot_bytes = 0, uint32_t gcols = 0, uint32_t row_w = 0) {
+    uint32_t gslot_bytes = 0, uint32_t gcols = 0, uint32_t row_w = 0
+#if PLOW_XR_TRACE_PHASES
+    , PlowTraceRec* xr_trace = nullptr
+#endif
+    ) {
     __shared__ int bailed;
+#if PLOW_XR_TRACE_PHASES
+    /* ONE-SHOT PHASE SCHEMA (slice bits 15:14 = 0b10, set by the interpreter): t_arrive =
+     * body entry, cu = peer signal loop issued (slice 0; 0 elsewhere), pc = arrival gate
+     * cleared, t_ready = system acquire done, t_end = reduce done. cu/pc are entry-relative
+     * deltas saturated at 32 bits. The interpreter's own gate timestamps are not recorded
+     * for this opcode under the schema; scripts/k3_xr_decode_report.py reads it. */
+    __shared__ uint64_t xr_entry;
+    if (threadIdx.x == 0) {
+        xr_entry = __builtin_amdgcn_s_memrealtime();
+        if (xr_trace) { xr_trace->t_arrive = xr_entry; xr_trace->cu = 0u; }
+    }
+#endif
     if (threadIdx.x == 0) bailed = 0;
     __syncthreads();
 
@@ -454,6 +473,9 @@ __device__ __forceinline__ void d_xreduce_mega(
             uint32_t* base = (uint32_t*)((char*)peer_scratch[r] + xctr_byte_off);
             xctr_signal(PLOW_CTR(base, gate_id));
         }
+#if PLOW_XR_TRACE_PHASES
+        if (xr_trace) xr_trace->cu = xr_sat32(__builtin_amdgcn_s_memrealtime() - xr_entry);
+#endif
     }
 #endif
 #if PLOW_XR_NOWAIT || PLOW_XR_NOSIG
@@ -481,15 +503,122 @@ __device__ __forceinline__ void d_xreduce_mega(
             }
             __builtin_amdgcn_s_sleep(2);
         }
+#if PLOW_XR_TRACE_PHASES
+        if (xr_trace) xr_trace->pc = xr_sat32(__builtin_amdgcn_s_memrealtime() - xr_entry);
+#endif
         if (!bailed) xctr_acquire();
 #if PLOW_XR_ACQ_N > 1
         PLOW_XR_EXTRA_ACQ(lg); /* marginal-acquire instrument; see the knob's comment */
 #endif
     }
     __syncthreads();
+#if PLOW_XR_TRACE_PHASES
+    if (threadIdx.x == 0 && xr_trace) xr_trace->t_ready = __builtin_amdgcn_s_memrealtime();
+#endif
     if (bailed) return;
 
     d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk, gslot_bytes, gcols, row_w);
+#if PLOW_XR_TRACE_PHASES
+    __syncthreads();
+    if (threadIdx.x == 0 && xr_trace) xr_trace->t_end = __builtin_amdgcn_s_memrealtime();
+#endif
+}
+
+/* ---- TAGGED ONE-SHOT: decode-latency PROTOTYPE (harness-only; no packet, emitter or
+ * interpreter route uses it yet) ---------------------------------------------------------
+ *
+ * The shipped one-shot pays, per collective, on the last-arriving rank: `nranks` serialised
+ * system-scope release RMWs (each a buffer_wbl2 + a remote atomic whose completion the next
+ * release's s_waitcnt vmcnt(0) waits for), the peers' relaxed poll, one system acquire, and
+ * then `nranks` SERIALISED remote loads per element (pointer load + data load + waitcnt,
+ * see the PLOW_XR_MLP note). That is ~9-10 dependent fabric round trips before the first
+ * reduced value exists, for a 7-14 KiB message whose bytes are irrelevant.
+ *
+ * This form folds the arrival signal INTO the data. A rank publishes its partial as 8-byte
+ * words: three bf16 values plus a 16-bit sequence TAG that is unique per (collective, token).
+ * Each word is one aligned 8-byte system-scope store, so it is single-copy atomic on the
+ * fabric: a reader that observes the tag observes those three values. The reader issues all
+ * `nranks` word loads at once (system scope, so they bypass the stale local L2 and no
+ * acquire fence is needed), re-issues only the words whose tag has not arrived, and reduces
+ * in strict rank 0..N-1 f32 order exactly as d_xreduce does. No counter, no wbl2, no inv:
+ * the critical path after the last producer's store lands is ONE remote read round trip.
+ *
+ * The tag must never match a stale word: the slot is rewritten every collective that uses
+ * it and 16 bits cover 65536 consecutive collectives, so tag = low 16 bits of a per-token
+ * epoch times the gate count plus the gate id (the harness uses the iteration index).
+ * Tag 0 is reserved (freshly zeroed memory).
+ *
+ * Folded all-gather (gcols) is not covered by the prototype; a production route would tag
+ * that slot the same way. The producer would write the tagged layout directly from its
+ * epilogue; the prototype publishes by copying the plain partial so the control and the
+ * candidate consume the same producer output. */
+#define PLOW_XRT_MAXR 8u
+#define PLOW_XRT_PER_WORD 3u
+__device__ __forceinline__ uint32_t xrt_words(uint32_t n) {
+    return (n + PLOW_XRT_PER_WORD - 1u) / PLOW_XRT_PER_WORD;
+}
+__device__ __forceinline__ uint64_t xrt_load(const uint64_t* p) {
+    return __hip_atomic_load(as_glob(p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ void d_xreduce_tag_publish(const bf16* part, void* tslot, uint32_t n,
+                                                      uint32_t tag, unsigned slice,
+                                                      unsigned nblk) {
+    const uint32_t nw = xrt_words(n);
+    uint64_t* dst = (uint64_t*)tslot;
+    for (uint32_t w = slice * PLOW_THREADS + threadIdx.x; w < nw; w += nblk * PLOW_THREADS) {
+        const uint32_t e = w * PLOW_XRT_PER_WORD;
+        uint64_t v = (uint64_t)(tag & 0xffffu) << 48;
+        v |= (uint64_t)as_glob(part)[e];
+        if (e + 1u < n) v |= (uint64_t)as_glob(part)[e + 1u] << 16;
+        if (e + 2u < n) v |= (uint64_t)as_glob(part)[e + 2u] << 32;
+        __hip_atomic_store(as_glob(dst) + w, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+__device__ __forceinline__ void d_xreduce_tagged_mega(
+    bf16* out, const void* const* peer_scratch, uint32_t nranks, uint32_t rank, uint32_t n,
+    uint32_t slot_bytes, uint32_t tslot_bytes, uint32_t tag, uint64_t deadline_ticks,
+    uint32_t* status, unsigned slice, unsigned nblk) {
+    d_xreduce_tag_publish((const bf16*)((const char*)peer_scratch[rank] + slot_bytes),
+                          (char*)peer_scratch[rank] + tslot_bytes, n, tag, slice, nblk);
+    const uint32_t nw = xrt_words(n);
+    const uint32_t want = tag & 0xffffu;
+    const uint64_t* p[PLOW_XRT_MAXR];
+#pragma unroll
+    for (uint32_t r = 0; r < PLOW_XRT_MAXR; r++)
+        p[r] = (const uint64_t*)((const char*)peer_scratch[r < nranks ? r : 0u] + tslot_bytes);
+    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    /* Slots r >= nranks alias peer 0, so every load is unconditional (eight in flight, no
+     * per-peer exec masks) and only the accumulate is predicated. At TP8 nothing aliases. */
+    for (uint32_t w = slice * PLOW_THREADS + threadIdx.x; w < nw; w += nblk * PLOW_THREADS) {
+        uint64_t v[PLOW_XRT_MAXR];
+#pragma unroll
+        for (uint32_t r = 0; r < PLOW_XRT_MAXR; r++) v[r] = xrt_load(p[r] + w);
+        for (;;) {
+            bool pending = false;
+#pragma unroll
+            for (uint32_t r = 0; r < PLOW_XRT_MAXR; r++)
+                if ((uint32_t)(v[r] >> 48) != want) {
+                    v[r] = xrt_load(p[r] + w);
+                    pending = true;
+                }
+            if (!pending) break;
+            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+                if (status) *status = 0xDEAD0000u | rank;
+                return;
+            }
+            __builtin_amdgcn_s_sleep(1);
+        }
+        const uint32_t e = w * PLOW_XRT_PER_WORD;
+#pragma unroll
+        for (uint32_t j = 0; j < PLOW_XRT_PER_WORD; j++) {
+            if (e + j >= n) break;
+            float acc = 0.0f;
+#pragma unroll
+            for (uint32_t r = 0; r < PLOW_XRT_MAXR; r++)
+                if (r < nranks) acc += bf2f((bf16)((v[r] >> (16u * j)) & 0xffffu));
+            st_act1(&as_glob(out)[e + j], f2bf(acc));
+        }
+    }
 }
 
 /* ---- XARGMAX_FIN: the cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head ---------
