@@ -693,7 +693,7 @@ pub fn emit_attn_res(
         _ => 0,
     };
     let scratch = (mwg > 0).then(|| {
-        let name = format!("attnres.mwg.{}", b.n_tensors());
+        let name = format!("act.attnres.mwg.{}", b.n_tensors());
         let h = b.tensor(&name, K3_ATTNRES_MWG_SCRATCH_BYTES);
         assert!(h != 0, "handle 0 is the arm's off sentinel");
         h
