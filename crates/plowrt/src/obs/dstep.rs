@@ -40,7 +40,9 @@
 //! * `GPU `  — the drain. Not host work at all.
 //! * `post`  — after the dispatch. Hideable: it feeds the client, not the device.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 pub use crate::obs::ttft::Phase;
 
@@ -89,6 +91,11 @@ pub static AGREE: Phase = Phase::new("post agree (cross-rank compare)");
 /// Detokenise + stop check + SSE frame + channel send, per produced token.
 pub static STREAM: Phase = Phase::new("post detok + stop + SSE send");
 
+/// Wall time after one decode tick returned and before the next began on the
+/// same dedicated engine thread. This is scheduler/lock/engine-thread idle,
+/// measured directly rather than inferred as the attribution remainder.
+pub static IDLE: Phase = Phase::new("idle between mux decode ticks");
+
 /// The whole tick as the mux sees it, drain included. The denominator.
 pub static TOKEN: Phase = Phase::new("TOKEN TOTAL");
 
@@ -99,10 +106,49 @@ const PHASES: &[&Phase] = &[
 /// Tokens counted into the current window.
 static WINDOW: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    /// Decode ticks for one model execute on one dedicated engine thread. Keep
+    /// the boundary there so instrumentation adds no lock to the measured path.
+    static LAST_TOKEN_END: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Timer for a whole mux decode tick and its independently measured preceding
+/// idle interval.
+pub struct TokenTimer {
+    started: Instant,
+    idle_ns: u64,
+}
+
+/// Start one mux decode tick.
+#[inline]
+pub fn begin_token() -> Option<TokenTimer> {
+    if !on() {
+        return None;
+    }
+    let started = Instant::now();
+    let idle_ns = LAST_TOKEN_END.with(|last| {
+        last.get()
+            .map(|end| started.duration_since(end).as_nanos() as u64)
+            .unwrap_or(0)
+    });
+    IDLE.add(idle_ns);
+    Some(TokenTimer { started, idle_ns })
+}
+
 /// Close out one decode token: add its total and dump the window if it is full.
 ///
 /// Called from the ONE place that owns a whole tick, so `TOKEN` is a real total
 /// and not a sum of parts that would hide whatever is between them.
+#[inline]
+pub fn finish_token(timer: Option<TokenTimer>) {
+    let Some(timer) = timer else { return };
+    let ended = Instant::now();
+    LAST_TOKEN_END.with(|last| last.set(Some(ended)));
+    token((ended - timer.started).as_nanos() as u64 + timer.idle_ns);
+}
+
+/// Close a decode token whose owner already measured its complete wall time.
+/// Standalone bench paths use this form because they have no mux idle interval.
 #[inline]
 pub fn token(total_ns: u64) {
     if !on() {
@@ -155,6 +201,14 @@ fn dump() {
             100.0 * ns as f64 / tot_ns.max(1) as f64,
         ));
     }
+    let (idle_ns, idle_calls) = IDLE.read();
+    out.push_str(&format!(
+        "{:<46} {:>10.2} {:>8.1} {:>6.1}%\n",
+        IDLE.label,
+        per(idle_ns),
+        idle_calls as f64 / n as f64,
+        100.0 * idle_ns as f64 / tot_ns.max(1) as f64,
+    ));
     // The line the pipelining decision is made on.
     out.push_str(&format!(
         "{:<46} {:>10.2} {:>8} {:>6.1}%\n",
@@ -163,16 +217,33 @@ fn dump() {
         "",
         100.0 * host as f64 / tot_ns.max(1) as f64,
     ));
+    let remainder_ns = unattributed_ns(tot_ns, host, DRAIN.read().0, idle_ns);
     out.push_str(&format!(
         "{:<46} {:>10.2} {:>8} {:>6.1}%\n",
         "UNATTRIBUTED (mux tick, locks, scheduler)",
-        per(tot_ns.saturating_sub(host + DRAIN.read().0)),
+        per(remainder_ns),
         "",
-        100.0 * tot_ns.saturating_sub(host + DRAIN.read().0) as f64 / tot_ns.max(1) as f64,
+        100.0 * remainder_ns as f64 / tot_ns.max(1) as f64,
     ));
     eprint!("{out}");
     for p in PHASES {
         p.reset();
     }
+    IDLE.reset();
     TOKEN.reset();
+}
+
+fn unattributed_ns(total: u64, host: u64, drain: u64, idle: u64) -> u64 {
+    total.saturating_sub(host.saturating_add(drain).saturating_add(idle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unattributed_ns;
+
+    #[test]
+    fn idle_is_an_independent_attribution_component() {
+        assert_eq!(unattributed_ns(100, 20, 60, 15), 5);
+        assert_eq!(unattributed_ns(100, 20, 60, 30), 0);
+    }
 }

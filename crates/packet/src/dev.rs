@@ -44,6 +44,10 @@ pub const WG_THREADS: u32 = WG_WAVES * 64;
 
 pub const TENSOR_NONE: u32 = 0xFFFF_FFFF;
 
+/// `GemmWide.i[7]` tag selecting the gfx950 128x384x64 implementation.
+/// Zero remains the 128x256x64 body, preserving existing packet bytes.
+pub const GEMM_WIDE_C8_TAG: u32 = (128 << 16) | 384;
+
 /// Sentinel for an ABSENT tensor handle carried in a [`DevInst::i`] slot.
 ///
 /// A handful of ops demote a pointer into `i[]` because ten operands do not fit
@@ -97,7 +101,8 @@ pub enum DevOp {
     /// `cos = TENSOR_NONE` skips RoPE. `out_row0` lets K/V land directly at a row
     /// offset of the KV cache, so the cache write is not a separate copy.
     HeadNormRope = 3,
-    /// `t0=out t1=a t2=b` · `i0=n` · `f0=scale`, computing `(a + b) * scale`.
+    /// `t0=out t1=a t2=b t3=pre?` · `i0=n` · `f0=scale`, computing
+    /// `(a + b) * scale`, or `(pre + bf16(a + b)) * scale` when `pre` is present.
     /// `scale` absorbs Gemma's per-layer `layer_scalar` on the SECOND residual
     /// add; pass 1.0 for the first.
     Residual = 4,
@@ -324,20 +329,30 @@ pub enum DevOp {
     /// `t0=out` · `i0=H i1=n_gpu i2=slot(byte offset into peer_scratch) i3=gate i4=gslot?
     /// i5=gcols? i6=row_w?`.
     XReduce = 24,
-    /// Reduce-scatter half of the symmetric all-reduce decomposition. Kept defined for
-    /// CP / larger worlds; not emitted on the N<=8 decode path (one-shot `XReduce` wins).
+    /// Reduce-scatter half of the two-shot, ON ITS OWN: rendezvous `gate_rs`, then phase 1 of
+    /// [`DevOp::XReduceTwoShot`] — this rank's owned slice `[n*rank/N, n*(rank+1)/N)` of the
+    /// flat `[n]` partial is reduced (f32 acc, r = 0..N-1) and written IN PLACE into its own
+    /// peer slot. Nothing is gathered; the packets that follow read the owned slice as a
+    /// rank-relative band view. Emitted by the sequence-parallel seams (`PLOW_SEQ_PAR_SEAMS`).
+    /// `t0=slot_tensor t1=band_copy?` · `i0=n i1=n_gpu i2=slot i3=gate_rs i6=gslot? i7=gcols?`.
+    /// `slot_tensor` is the peer slot reduced in place, `slot` its byte offset. With `gcols`,
+    /// the owned slice also folds the column-parallel partial at `gslot` for its own rows —
+    /// rounded to bf16 BEFORE the add, exactly as the two-shot's phase 2 does. `band_copy` (a
+    /// LOCAL `[n/N]` tensor) receives the same owned slice for a reader that outlives the
+    /// slot's next writer.
     ///
-    /// UNIMPLEMENTED, not merely unselected. No kernel arm in any interpreter and no emitter
-    /// anywhere — these two numbers appear only in this enum, `dev_isa.h`, `ALL`, and the
-    /// `RESERVED` list in [`crate::slots`]. A packet carrying one would hit the AMD dispatch's
-    /// `default:` and silently do nothing. The decomposition that exists is the two-phase body
-    /// INSIDE [`DevOp::XReduceTwoShot`], which is one packet, not two.
-    ///
-    /// Kept rather than removed because the numbers are ABI: every blob on disk was built
-    /// against this enum, and reusing 25/26 would make an old blob run a new op.
+    /// The kernel arm is not built yet (`op_collective.h`); a packet carrying one on an object
+    /// without it must be refused at load, which is what the manifest requirement
+    /// `PLOW_SEQ_PAR_SEAMS=1` is for. The number is ABI: it was reserved since the enum was
+    /// written, and no blob on disk carries it.
     XReduceScatter = 25,
-    /// All-gather half of the symmetric decomposition. Unimplemented on every backend — see
-    /// [`DevOp::XReduceScatter`] for what that means and why the number is kept.
+    /// All-gather ON ITS OWN, of up to THREE row-banded arrays under ONE rendezvous: every
+    /// rank has written its band of each array into a peer slot (earlier packets), one
+    /// workgroup announces the rank on `gate`, all wait `n_gpu` arrivals, then each rank copies
+    /// slice `s` of each array from peer `s`'s slot into the local full tensor (the two-shot's
+    /// phase-2 loop, unchanged). A `dst` of `TENSOR_NONE` (with `n = 0`) leaves that pair unused.
+    /// `t0=dst0? t1=dst1? t2=dst2?` · `i0=n0? i1=n1? i2=n2? i3=gate i4=n_gpu i5=src_slot0?
+    /// i6=src_slot1? i7=src_slot2?`.
     XAllGather = 26,
     /// Context-parallel cross-GPU flash LSE-merge (tp-design §8c, §9). Folds N peers'
     /// `(O_partial,m,l)` over their KV-position shards into the replicated attention
@@ -358,7 +373,12 @@ pub enum DevOp {
     /// rendezvous bracket the phases. Fabric ≈ 2(N−1)/N·msg/rank vs one-shot's (N−1)·msg.
     /// Bit-identical result to one-shot (same f32-acc, r=0..N−1 order). DECODE keeps the
     /// one-shot (its tiny [1,hidden] message is latency-, not bandwidth-, bound).
-    /// `t0=out` · `i0=n(=t·hidden) i1=n_gpu i2=slot(byte offset) i3=gate_rs i4=gate_ag`.
+    /// `t0=out t1=resid? t2=attnres_out? t3=attnres_ring? t4=attnres_score? t5=attnres_gamma?
+    /// t6=prefix_out?` · `i0=n(=t·hidden) i1=n_gpu i2=slot(byte offset) i3=gate_rs i4=gate_ag
+    /// i5=e0_or_H i6=gslot_or_nb i7=gcols_or_nbcap` · `f0=attnres_eps?`. Plain: `i5=e0
+    /// i6=gslot? i7=gcols?`. With a graph-selected fused AttnRes consumer `t1..t6` are set and
+    /// `i5=H i6=nb i7=nb_cap f0=eps`. Phase 2 preserves `out`, materializes the rounded prefix,
+    /// then runs AttnRes+RMSNorm on the same token-owned workgroups.
     XReduceTwoShot = 29,
     /// FP8 (e4m3) KV-cache twin of [`DevOp::HeadNormRope`]: writes K/V as `uint8[...]` e4m3 with a
     /// per-(token,kv_head) f32 dequant scale, halving the KV footprint and the decode KV stream.
@@ -875,6 +895,8 @@ pub enum DevOp {
     GemmMxfp4 = 93,
 
     /// As [`DevOp::Gemm`], 128×256 tile — the rung that owns the M=1024–2048 serving chunk.
+    /// `i7=tile_variant`: zero selects 128×256×64; [`GEMM_WIDE_C8_TAG`] selects the
+    /// default-off gfx950 128×384×64 exact-grid experiment.
     ///
     /// Added by the tile-inventory campaign. Between `Gemm` (256×256) and [`DevOp::GemmMed`]
     /// (128×128) the inventory had nothing that both fills 256 CUs and keeps BN=256's A-reuse,
@@ -992,8 +1014,8 @@ pub enum DevOp {
     /// obvious fix of splitting the reduction across blocks and finishing it in a second packet.
     ///
     /// `t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb_cap,H] bf16)
-    /// t3=score_w([H] f32) t4=push_src? t5=gamma?` · `i0=T i1=H i2=nb i3=push_row i4=nb_cap` ·
-    /// `f0=eps`.
+    /// t3=score_w([H] f32) t4=push_src? t5=gamma? t6=res_a? t7=res_b?` ·
+    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre?` · `f0=eps`.
     ///
     /// `gamma` is the FUSED POST-NORM, `[H] bf16`, and it is what makes the slice map above
     /// affordable. Every AttnRes in a K3 program is read by exactly one consumer and that consumer
@@ -1017,6 +1039,10 @@ pub enum DevOp {
     /// reads rows `[0, nb)` while the push writes row `nb` — one past — so no workgroup reads
     /// another's pushed row inside the packet, and the readers that follow are gated by the
     /// counter DAG (`Dep::Coarse` waits on every producer slice).
+    ///
+    /// `res_a`/`res_b` optionally materialize `prefix_sum = bf16(res_a + res_b)` inside this
+    /// packet. `res_pre` selects `prefix_sum = bf16(res_pre + bf16(res_a + res_b))`, retaining
+    /// the intermediate BF16 rounding and the materialized tensor for all other consumers.
     AttnRes = 104,
     /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
     /// experts, routed experts).
@@ -1372,6 +1398,43 @@ pub enum DevOp {
     /// `t0=o t1=q_raw t2=k_raw t3=v_raw t4=g_raw t5=beta_raw t6=state t7=descriptor` ·
     /// `i0=T(1) i1=H i2=D i3=BV i4=flags i5=W i6=gate_mode` · `f0=scale f1=lower_bound`.
     KdaConvStateStepG = 120,
+    /// Dense single-sequence BT64 chunk-KDA preparation. Normalizes q/k in place and produces
+    /// chunk-local log2 gate prefixes plus beta. Emitted for compiled `T>=512`; runtime ragged
+    /// rebasing may shorten `T`. `D in {64,128}`.
+    /// `t0=q(in/out) t1=k(in/out) t2=g_prefix t3=beta t4=g_raw t5=beta_raw t6=A_log
+    /// t7=dt_bias` · `i0=T i1=H i2=D i3=gate_mode` · `f0=lower_bound`.
+    KdaChunkPrepare = 121,
+    /// Dense BT64 chunk-local QK/KK products and triangular solve.
+    /// `t0=Aqk t1=Ainv t2=q t3=k t4=g_prefix t5=beta` · `i0=T i1=H i2=D` · `f0=scale`.
+    KdaChunkIntra = 122,
+    /// Transform a BT64 inverse into W/U factors.
+    /// `t0=W t1=U t2=Ainv t3=k t4=v t5=g_prefix t6=beta t7=q?` ·
+    /// `i0=T i1=H i2=D i3=V i4=qpre` · `f0=scale`.
+    KdaChunkWu = 123,
+    /// Ordered dense single-sequence chunk carry, with V-first f32 recurrent state.
+    /// `t0=o t1=state t2=q t3=k t4=W t5=U t6=Aqk t7=g_prefix` ·
+    /// `i0=T i1=H i2=D i3=V i4=qpre` · `f0=scale`.
+    KdaChunkCarry = 124,
+    /// Standalone fused KDA decode boundary: Conv3 + gated recurrent state step + gated RMSNorm.
+    /// The raw-argument kernel is selected by opcode capability rather than model identity.
+    /// `t7` is a u32 tensor-handle descriptor:
+    /// `[wq,wk,wv,csq,csk,csv,A_log,dt_bias,norm_w,output_gate_raw,parked]`.
+    /// `t0=y t1=q_raw t2=k_raw t3=v_raw t4=forget_raw t5=beta_raw t6=state t7=descriptor` ·
+    /// `i0=rows i1=H i2=D i3=BV i4=W i5=flags i6=gate_mode i7=descriptor_version(2)` ·
+    /// `f0=scale f1=lower_bound j1=norm_eps_bits`.
+    KdaDecodeFused = 125,
+    /// Standalone layout boundary for materialized MLA prefill.
+    /// `t0=K[B,T,H,192] t1=V[B,T,H,128] t2=KV[B,T,H,256] t3=K_rope[B,T,64]` ·
+    /// `i0=T i1=H i2=qk_nope(128) i3=qk_rope(64) i4=v_head(128)`.
+    /// Selected by dimensions, not model identity. The raw kernel copies the first 128 values
+    /// of each KV head to K, broadcasts the shared 64-value rope row into every K head, and
+    /// copies the final 128 values to V.
+    MlaMaterializePack = 126,
+    /// Standalone causal bf16 materialized MLA prefill.
+    /// `t0=O[B,T,H,128] t1=Q[B,T,H,192] t2=K[B,T,H,192] t3=V[B,T,H,128]` ·
+    /// `i0=T i1=H i2=H_KV i3=D_QK(192) i4=D_V(128) i5=abi(1)` · `f0=scale`.
+    /// The only production implementation is a capability-checked gfx950 raw object.
+    FlashMlaMaterializedPrefill = 127,
     /// GLM5-Next's hyper-connections (mHC) pre-block. Ported from vLLM's real reference
     /// math (`vllm.model_executor.kernels.mhc.torch::mhc_pre_torch` — not a guess;
     /// extracted and numerically verified against a hand oracle before this opcode was
@@ -1405,7 +1468,7 @@ pub enum DevOp {
     /// projection's raw output) t4=residual(in,[T,n,hidden]bf16) t5=hc_scale(in,[3]f32)
     /// t6=hc_base(in,[n3]f32)` · `i0=T i1=n i2=hidden i3=sinkhorn_repeat` ·
     /// `f0=rms_eps f1=hc_eps`.
-    HyperConnPre = 121,
+    HyperConnPre = 128,
     /// GLM5-Next's hyper-connections (mHC) post-block — the companion to
     /// [`DevOp::HyperConnPre`], ported the same way from `mhc_post_torch`.
     /// `new_residual[j] = Σ_i comb_mix[i][j] * residual[i]  +  post_mix[j] * x_out`: an
@@ -1420,7 +1483,7 @@ pub enum DevOp {
     /// residual streams at `t0`; `mode=2` mean-contracts the streams at `t2` into
     /// `[T,hidden]` at `t0`. The latter modes implement GLM5Next's entry/exit
     /// `hc_expand`/`hc_contract`; their unused tensor operands are `TENSOR_NONE`.
-    HyperConnPost = 122,
+    HyperConnPost = 129,
     /// GLM5-Next DSA indexer key-pooling compress (`index_kpool`). Ported from vLLM's
     /// real reference Triton kernel (`kpool_compress.py::_kpool_softmax_rotate_write_
     /// cache_kernel`, the AMD variant), not derived from prose — verified against a
@@ -1468,7 +1531,7 @@ pub enum DevOp {
     /// [n_pools,pool_size,head_dim]bf16) t4=ape(in,[pool_size,head_dim]f32) t5=pos(in,
     /// OPTIONAL — decode-mode gate, see above; TENSOR_NONE = always run)` ·
     /// `i0=n_pools i1=pool_size i2=head_dim i3=chunk_base`.
-    DsaPoolCompress = 123,
+    DsaPoolCompress = 130,
     /// GLM5-Next DSA indexer pool-select expand + tail-append, fused. Ported from vLLM's
     /// `kpool_compress.py::expand_pools_to_tokens` + `append_tail_to_topk` (the identity-
     /// path composition the reference's own `_expand_pools_and_append_tail_kernel`
@@ -1491,7 +1554,7 @@ pub enum DevOp {
     /// `t0=out(out,[rows,topk+pool_size-1]i32, -1 for an unused slot) t1=pool_ids(in,
     /// [rows,n_groups]i32) t2=kv_len(in,scalar i32, token-granular, chunk-end)` ·
     /// `i0=rows i1=n_groups i2=pool_size`.
-    DsaPoolExpand = 124,
+    DsaPoolExpand = 131,
     /// GLM5-Next DSA indexer key-pooling, DECODE side: unconditional per-step ring stash.
     /// Ported from vLLM's real reference (`kpool_compress.py::
     /// _kpool_decode_update_batched_kernel`'s stash half), verified against a numerical
@@ -1511,7 +1574,7 @@ pub enum DevOp {
     /// bf16) t2=cur_k(in,[rows,head_dim]bf16) t3=cur_score(in,[rows,head_dim]bf16)
     /// t4=pos(in,[rows])` · `i0=pool_size i1=head_dim i2=row` (decode uses row 0;
     /// prefill uses this to seed trailing rows into the same ring).
-    DsaPoolStash = 125,
+    DsaPoolStash = 132,
     /// GLM5-Next DSA indexer QUERY-side fp8 quant (`index_kpool`'s q half). Ported from
     /// vLLM's real reference (`kpool_compress.py::fwht128_quant_fp8`/`_fwht_quant_kernel`),
     /// verified against a numerical oracle GENERATED BY RUNNING THAT REAL FUNCTION on this
@@ -1527,7 +1590,7 @@ pub enum DevOp {
     ///
     /// `t0=q_fp8(out,fp8_e4m3[n_rows][head_dim]) t1=q_scale(out,f32[n_rows])
     /// t2=q_raw(in,bf16[n_rows][head_dim])` · `i0=n_rows i1=head_dim`.
-    DsaQQuant = 126,
+    DsaQQuant = 133,
     /// GLM5-Next DSA indexer score, KPOOL fp8 variant — the pooled-indexer twin of
     /// [`DevOp::IndexScore`], consuming fp8 q/k (from [`DevOp::DsaQQuant`] /
     /// [`DevOp::DsaPoolCompress`]) instead of plain bf16. `IndexScore`/`IndexScorePf`
@@ -1576,7 +1639,7 @@ pub enum DevOp {
     /// t4=Kscale(in,f32[n_batch][pool_stride]) t5=W(in,f32[n_batch][index_heads])
     /// t6=kv_len(in,i32[n_batch], TOKEN-granular)` · `i0=n_batch i1=index_heads
     /// i2=pool_stride i3=index_head_dim i4=pool_size i5=prefill` · `f0=scale`.
-    IndexScoreKpool = 127,
+    IndexScoreKpool = 134,
     /// fp32-OUTPUT GEMV. A small, separate op from [`DevOp::Gemv`] — NOT a variant of it,
     /// and must never be folded into `d_gemv`/`d_gemv_t`'s tuned decode-hot-path machinery
     /// (see that function's own header comment, `op_gemm.h`: register budget is razor-thin,
@@ -1598,7 +1661,7 @@ pub enum DevOp {
     /// an implementation shortcut to optimize away.
     ///
     /// `t0=C(out,f32[M][N]) t1=x(in,bf16[M][K]) t2=W(in,f32[N][K])` · `i0=M i1=N i2=K`.
-    GemvF32 = 128,
+    GemvF32 = 135,
 }
 
 impl DevOp {
@@ -1729,6 +1792,13 @@ impl DevOp {
         DevOp::IndexSelectPf,
         DevOp::IndexUnionPf,
         DevOp::KdaConvStateStepG,
+        DevOp::KdaChunkPrepare,
+        DevOp::KdaChunkIntra,
+        DevOp::KdaChunkWu,
+        DevOp::KdaChunkCarry,
+        DevOp::KdaDecodeFused,
+        DevOp::MlaMaterializePack,
+        DevOp::FlashMlaMaterializedPrefill,
         DevOp::HyperConnPre,
         DevOp::HyperConnPost,
         DevOp::DsaPoolCompress,
@@ -1878,6 +1948,13 @@ impl DevOp {
             DevOp::IndexSelectPf => "PLOW_DOP_INDEX_SELECT_PF",
             DevOp::IndexUnionPf => "PLOW_DOP_INDEX_UNION_PF",
             DevOp::KdaConvStateStepG => "PLOW_DOP_KDA_CONV_STATE_STEP_G",
+            DevOp::KdaChunkPrepare => "PLOW_DOP_KDA_CHUNK_PREPARE",
+            DevOp::KdaChunkIntra => "PLOW_DOP_KDA_CHUNK_INTRA",
+            DevOp::KdaChunkWu => "PLOW_DOP_KDA_CHUNK_WU",
+            DevOp::KdaChunkCarry => "PLOW_DOP_KDA_CHUNK_CARRY",
+            DevOp::KdaDecodeFused => "PLOW_DOP_KDA_DECODE_FUSED",
+            DevOp::MlaMaterializePack => "PLOW_DOP_MLA_MATERIALIZE_PACK",
+            DevOp::FlashMlaMaterializedPrefill => "PLOW_DOP_FLASH_MLA_MATERIALIZED_PREFILL",
             DevOp::HyperConnPre => "PLOW_DOP_HYPER_CONN_PRE",
             DevOp::HyperConnPost => "PLOW_DOP_HYPER_CONN_POST",
             DevOp::DsaPoolCompress => "PLOW_DOP_DSA_POOL_COMPRESS",
@@ -1915,18 +1992,14 @@ impl DevOp {
     /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
     /// by two whether or not the range has holes.
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
-    /// 121 -> 123 for `HyperConnPre = 121` / `HyperConnPost = 122` (GLM-5.3-Flash's
-    /// hyper-connections). Two variants, one bump — the same rule as 111 -> 113 above.
-    /// 123 -> 125 for `DsaPoolCompress = 123` / `DsaPoolExpand = 124` (the DSA indexer's
-    /// `index_kpool` key-pooling, also GLM-5.3-Flash).
-    /// 125 -> 126 for `DsaPoolStash = 125` (the decode-side ring stash `DsaPoolCompress`'s
-    /// decode-mode gate reads from).
-    /// 126 -> 128 for `DsaQQuant = 126` / `IndexScoreKpool = 127` (the query-side fp8 quant
-    /// and the fp8 scoring kernel `index_kpool`'s pooled indexer needs — two variants, one
-    /// bump, same rule as 121 -> 123 above).
-    /// 128 -> 129 for `GemvF32 = 128` (fp32-output GEMV, `IndexScoreKpool`'s `W` operand —
-    /// a documented accuracy requirement of the reference, not `Gemv` with a wider output).
-    pub const COUNT: u16 = 129;
+    /// 117 -> 128 for `KdaChunkPrepare = 121` .. `FlashMlaMaterializedPrefill = 127` (the
+    /// dense chunk-KDA pipeline and standalone materialized-MLA-prefill layout ops).
+    /// 128 -> 136 for `HyperConnPre = 128` .. `GemvF32 = 135` (GLM-5.3-Flash's
+    /// hyper-connections, DSA indexer key-pooling, and its fp32 GEMV). Originally authored
+    /// as 121-128 in parallel with the KdaChunk/Mla pair above, which claimed the same
+    /// range independently — the collision surfaced only at merge, same as 111 -> 113
+    /// above; renumbering the later-merged pair (this one) was the resolution.
+    pub const COUNT: u16 = 136;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -2115,6 +2188,20 @@ pub const SE_FINE: u16 = 1;
 /// successor is a cross-GPU "partial ready" bump. See the design notes.
 pub const SE_XCTR: u16 = 2;
 
+/// This entry belongs to an opt-in pure `XReduceTwoShot` specialist segment.
+/// Older runtimes ignore the bit and safely execute the segment on the primary interpreter.
+pub const SE_XR_WAVE_RS: u16 = 4;
+
+/// This entry belongs to an opt-in pure `KdaChunkIntra` wave-item segment.
+/// Older runtimes ignore the bit and execute the unchanged instruction normally.
+pub const SE_KDA_INTRA_WAVE_ITEMS: u16 = 8;
+
+/// The same bit on a pure `KdaChunkCarry` segment selects the register-resident gfx950 carry
+/// object. `flags` has no free bit left (4..12 hold [`SE_NPER_MASK`], 13..15 the domain), so
+/// the opcode of the entry disambiguates; a runtime that predates this route refuses such a
+/// packet as an impure wave-item segment rather than running it.
+pub const SE_KDA_CARRY_REGSTATE: u16 = SE_KDA_INTRA_WAVE_ITEMS;
+
 /// Shift of the per-(packet, L2 domain) slice count packed into [`StreamEnt::flags`].
 ///
 /// Mirrors `PLOW_SE_NPER_SHIFT` in `runtime/common/dev_isa.h`; read the note there for why the
@@ -2124,6 +2211,13 @@ pub const SE_XCTR: u16 = 2;
 pub const SE_NPER_SHIFT: u16 = 4;
 /// Mask of the field at [`SE_NPER_SHIFT`] — bits 4..12.
 pub const SE_NPER_MASK: u16 = 0x1FF0;
+
+/// L2 locality domain carried independently from [`StreamEnt::seg`]. Bits
+/// 13..15 hold the eight gfx94x/gfx95x XCDs while `seg` remains the ordered
+/// ordered kernel-family segment. This lets a pure lean segment retain dynamic per-XCD GQ
+/// windows instead of choosing between segmentation and locality.
+pub const SE_DOMAIN_SHIFT: u16 = 13;
+pub const SE_DOMAIN_MASK: u16 = 0xE000;
 
 /// One entry in a CU's stream: run `inst`, taking share `slice` of its work.
 ///
@@ -2170,6 +2264,35 @@ pub struct StreamEnt {
     pub seg: u16,
 }
 
+/// One request span in a ragged prefill pack.
+///
+/// Rows are dense in activation scratch (`row0..row0+n_rows`) but retain their
+/// request-local KV coordinates and carried-state slot. The descriptor is model
+/// independent; consumers that cannot honor it must execute the span through
+/// the isolated prefill path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct PrefillSpan {
+    /// First row in the packed activation tensors.
+    pub row0: u32,
+    /// Real rows contributed by this request.
+    pub n_rows: u32,
+    /// Decode/KV slot that owns the request.
+    pub slot: u32,
+    /// [`PREFILL_SPAN_RESET_STATE`] when this is the request's first span.
+    pub flags: u32,
+    /// Request-local absolute KV row of `row0`.
+    pub kv_row0: u32,
+    /// Request-local KV length after this span.
+    pub kv_len: u32,
+    /// Slot used for recurrent state; explicit so KV and state layouts may diverge.
+    pub state_slot: u32,
+    /// Compiled prefill program/rung selected for the span.
+    pub program: u32,
+}
+
+pub const PREFILL_SPAN_RESET_STATE: u32 = 1;
+
 /// Everything the interpreter needs, passed once as the kernel's args. The
 /// pointers are **device** addresses, so this is only meaningful as the kernarg
 /// block handed to `plow_interp_*`.
@@ -2192,11 +2315,10 @@ pub struct DevProgram {
     pub trace: u64,
     /// Segmented dispatch: interp runs only this segment's entries.
     pub cur_seg: u32,
-    /// L2-domain placement (`PLOW_L2_PLACE`): the number of L2 domains `gq_seg_ofs` is windowed
-    /// by, `0` when the program is not placed. An interpreter built with
-    /// `-DPLOW_L2_PLACE_DISPATCH` picks its window from the domain it is PHYSICALLY running on
-    /// (`HW_REG_XCC_ID` on gfx9xx) rather than from `cur_seg`, so every domain drains
-    /// concurrently in ONE launch.
+    /// L2-domain placement (`PLOW_L2_PLACE`): number of physical domains per
+    /// ordered kernel-family segment, or `0`. A placed interpreter selects window
+    /// `cur_seg * l2_domains + physical_domain`, so all domains drain concurrently
+    /// inside each lean or ordinary segment launch.
     pub l2_domains: u32,
     /// Segments [`Self::seg_ofs`] is built for; the row stride there is `n_seg + 1`.
     /// Only read when `seg_ofs != 0`.
@@ -2235,6 +2357,14 @@ pub struct DevProgram {
     /// Built by [`crate::devbuild::static_seg_ofs`] at load time, NOT carried in
     /// the blob — see the field comment in `runtime/common/dev_isa.h` for why.
     pub seg_ofs: u64,
+    /// Device `[n_prefill_spans]` ragged packed-prefill metadata, or 0 for the
+    /// single-request path.
+    pub prefill_spans: u64,
+    /// Device `[n_prefill_rows]` parked-row mask, including the compiled rung's padded tail.
+    pub prefill_parked: u64,
+    pub n_prefill_spans: u32,
+    /// Launched compiled row count `T`, including parked padding after the dense real spans.
+    pub n_prefill_rows: u32,
 }
 
 /// One packet boundary, timestamped by the interpreter.
@@ -2264,5 +2394,6 @@ pub struct TraceRec {
 const _: () = assert!(size_of::<Wait>() == 8);
 const _: () = assert!(size_of::<DevInst64>() == 64);
 const _: () = assert!(size_of::<StreamEnt>() == 24);
+const _: () = assert!(size_of::<PrefillSpan>() == 32);
 const _: () = assert!(size_of::<TraceRec>() == 40);
-const _: () = assert!(size_of::<DevProgram>() == 144);
+const _: () = assert!(size_of::<DevProgram>() == 168);

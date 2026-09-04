@@ -1,0 +1,402 @@
+{
+  "schema": "plow.kernel-comparison.v1",
+  "date": "2026-09-03",
+  "device": {
+    "isa": "gfx950",
+    "part": "MI355X",
+    "lease": "exclusive_one_gpu"
+  },
+  "sources": {
+    "plow_base_commit": "e914f39420062138fdd72a4bf9da2e3bfd3265c4",
+    "vllm_source_commit": "ad127d9a0fb16c92de563e674e3737463e7f8688",
+    "aiter_source_commit": "90e91d5e275216da17f306e35e9b5519c621dbe3",
+    "vllm_image": "sha256:e0a3b2bd3fe7ec563916c3a5d949898d133458c18d6b2f460c906885cfb32032",
+    "rocm": "7.14.0"
+  },
+  "kda_decode": {
+    "shape": {
+      "heads": 12,
+      "head_dim": 128,
+      "conv_width": 4
+    },
+    "boundary": "conv_update+recurrent_state+gated_rmsnorm",
+    "strict_dtype_match": false,
+    "dtype_caveat": "Plow convolution state is fp32; vLLM convolution state is bf16",
+    "rows": [
+      {
+        "batch": 1,
+        "vllm_fused_us": 8.4,
+        "plow_control_us": 9.826,
+        "plow_candidate_us": 17.829,
+        "candidate_promoted": false
+      },
+      {
+        "batch": 8,
+        "vllm_fused_us": 9.24,
+        "plow_control_us": 21.294,
+        "plow_candidate_us": 18.434,
+        "candidate_promoted": false,
+        "plow_control_1024_step_workgroups_us": 14.409
+      }
+    ],
+    "oracle": {
+      "batch": [1, 8],
+      "bf16_output_exact": true,
+      "fp32_conv_state_exact": true,
+      "recurrent_state_rel_l2": 1.2e-8
+    },
+    "candidate_resources": {
+      "vgpr": 34,
+      "sgpr": 51,
+      "lds_bytes": 1888,
+      "scratch_bytes": 0
+    },
+    "rsqrt_candidate": {
+      "promoted": true,
+      "batch8_grid256": {
+        "sqrt_div_step_us": [12.62, 12.647],
+        "rsqrt_step_us": [11.977, 11.984],
+        "speedup_range_pct": [5.1, 5.3]
+      },
+      "batch8_grid1024": {
+        "sqrt_div_step_us": 7.24,
+        "rsqrt_step_us": 7.065,
+        "speedup_pct": 2.4
+      },
+      "bf16_output_exact": true,
+      "recurrent_state_rel_l2": 1.46e-8
+    },
+    "bv8x16_candidate": {
+      "production_integrated": false,
+      "compiler_rocm": "7.14.0",
+      "workgroup_threads": 128,
+      "vgpr": 49,
+      "sgpr": 35,
+      "lds_bytes": 1584,
+      "scratch_bytes": 0,
+      "batch1": {
+        "control_step_us": 3.94,
+        "candidate_step_us": 2.884,
+        "control_chain_us": 10.346,
+        "candidate_chain_us": 9.632,
+        "vllm_fused_us": 8.4,
+        "candidate_final_output_exact": true
+      },
+      "batch8": {
+        "control_step_grid1024_us": 7.064,
+        "candidate_step_us": 4.041,
+        "control_chain_us": 14.399,
+        "candidate_chain_us": 11.489,
+        "vllm_fused_us": 9.24,
+        "candidate_final_rel_l2": 4.205e-6,
+        "candidate_final_max_abs": 3.052e-5
+      },
+      "verdict": "isolated kernel win; production and fused-block gates remain open"
+    },
+    "fused_bv8x16_candidate": {
+      "production_integrated": false,
+      "workgroup_threads": 128,
+      "vgpr": 65,
+      "sgpr": 45,
+      "lds_bytes": 1840,
+      "scratch_bytes": 0,
+      "batch1_us": 13.669,
+      "batch8_us": 15.022,
+      "batch1_vs_vector_chain_regression_pct": 40.5,
+      "batch8_vs_vector_chain_regression_pct": 30.9,
+      "oracle": {
+        "conv_exact": true,
+        "batch1_final_exact": true,
+        "batch8_final_rel_l2": 4.205e-6
+      },
+      "promoted": false
+    },
+    "fused_256x16_candidate": {
+      "production_integrated": "explicit_opt_in_default_off",
+      "abi_version": 2,
+      "workgroup_threads": 256,
+      "vgpr": 128,
+      "sgpr": 45,
+      "lds_bytes": 2336,
+      "scratch_bytes": 0,
+      "batch1_us": 6.902,
+      "batch8_us": 7.347,
+      "standalone_object": {
+        "batch1_us": 6.902,
+        "batch8_us": 7.347,
+        "batch1_vs_vllm_speedup_pct": 17.8,
+        "batch8_vs_vllm_speedup_pct": 20.5,
+        "object_sha256": "25520beb01cb6ba6262a7be9f88cab47ae33c31eca66e1dc5597a26006155d85",
+        "source_sha256": "855125bab77ef9134d0a966e509215f655ae2ebc06d2ec406d6c77b1d43c6d94",
+        "marker": "plow_kda_decode_fused_256x16_2",
+        "symbol": "plow_kda_decode_fused_256x16_v2",
+        "explicit_kernarg_bytes": 184,
+        "occupancy": 4
+      },
+      "vllm_batch1_us": 8.4,
+      "vllm_batch8_us": 9.24,
+      "vs_vllm_speedup_pct": {
+        "batch1": 17.8,
+        "batch8": 20.5
+      },
+      "oracle": {
+        "conv_exact": true,
+        "batch1_final_exact": true,
+        "batch8_final_exact": true,
+        "recurrent_state_rel_l2": 1.41e-8,
+        "distinct_forget_and_output_gates": true
+      },
+      "tp8_stress": {
+        "steps": 64,
+        "all_rank_tokens_identical": true,
+        "xctr_audit_exact": true,
+        "ms_per_token": 14.173
+      },
+      "fused_block_gate": {
+        "order": "F-L-L-F",
+        "steps_per_run": 64,
+        "fused_ms_per_token": [14.268, 13.930],
+        "legacy_ms_per_token": [13.920, 14.140],
+        "fused_median_ms": 14.099,
+        "legacy_median_ms": 14.030,
+        "fused_regression_pct": 0.49,
+        "all_token_chains_identical": true,
+        "promoted": false
+      },
+      "verdict": "standalone kernel wins; segmented fused block is neutral/slower, so route remains explicit opt-in and default-off"
+    },
+    "source_sha256": {
+      "device": "855125bab77ef9134d0a966e509215f655ae2ebc06d2ec406d6c77b1d43c6d94",
+      "host": "34b3cdbf435557048f07d19cfc599862e92782add1aa6c6c1e15cf5abc220fc2",
+      "vllm_benchmark": "fc614f10c54a8ed5490a07bab1efb7faa645f45c3cf93a7eeadf5db7053e0523"
+    }
+  },
+  "mla_decode": {
+    "shape": {
+      "heads": 12,
+      "latent_dim": 512,
+      "rope_dim": 64,
+      "value_dim": 128,
+      "context": 8192,
+      "nsplit": 64,
+      "kv_stride": 32768,
+      "scale": 0.07216878364870322
+    },
+    "attention_core_us": {
+      "plow_batch1": 46.72,
+      "plow_batch8": 113.397,
+      "vllm_aiter_batch1": 43.232,
+      "vllm_aiter_batch8": 42.441
+    },
+    "wuv_us": {
+      "plow_bf16_batch1": 10.756,
+      "plow_bf16_batch8": 10.832,
+      "torch_bf16_batch1": 13.895,
+      "torch_bf16_batch8": 13.949,
+      "vllm_mxfp4_batch1": 34.565,
+      "vllm_mxfp4_batch8": 34.808
+    },
+    "plow_emitted_fused_merge_fold_us": {
+      "batch1": 30.936,
+      "batch8": 99.189
+    },
+    "cross_path_rel_l2": {
+      "batch1": 0.0010085,
+      "batch8": 0.0014282
+    },
+    "independent_oracle": true,
+    "oracle_note": "ns32 and ns64 merged latent outputs were checked before WUV against an independently regenerated FP32 softmax attention-chain reference",
+    "independent_oracle_result": {
+      "name": "attention-chain-v1",
+      "tolerance": {"rel_l2": 0.005, "max_abs": 0.000016, "finite": true},
+      "batch1": {
+        "ns32_rel_l2": 0.00183705542,
+        "ns32_max_abs": 0.0000076291617,
+        "ns32_dump_sha256": "d2a16ef56750efa49f93d892848af36c4328961b0aba7557a2c886c53a2647de",
+        "reference_f32_sha256": "6d70cf6540765aa893eaddcb9a9c10705c3dd33370a2a196d7798e03d6d81aeb"
+      },
+      "batch8": {
+        "ns32_rel_l2": 0.00180339596,
+        "ns32_max_abs": 0.0000076291617,
+        "ns32_dump_sha256": "5d717bb2d4471fa4047b3db2e6f29de7a4d4469c4ebb7647778cf31e17777bbc",
+        "reference_f32_sha256": "838e47ab0c1f9a4d7583fb931db9a7ba251675c29d12d253e00cf389c8489637"
+      },
+      "raw_samples": "perf-data/probes/gfx950-mla-attention-raw-20260903.jsonl",
+      "raw_samples_sha256": "c7ddde60be8fa9d8184d9f327a5b3361c25c8921fb10f6a1a120484eaacf92ff",
+      "raw_run_sha256": "444cf92db0a546652bd6ef466c1aa122c1a7087ae3cbf9e8e1c8fa50d115cd7a",
+      "oracle_run_sha256": "d9e59478c436372d79b9b608d53c609f4412e1632dbdf6abe8c7a8b205c02bdf",
+      "tunedb_build_digest": "gfx950-af87731eb53b7f9f",
+      "tunedb_record_sha256": "c0c5e3a7bf0c537ffd57687e1f2efbf847ea145ef841069aadc513da669b2c96"
+    },
+    "priority": "batch8_flash_attention",
+    "aiter_mapping": {
+      "context_splits": "min(context/196, ceil(256/batch), kernel_limit)",
+      "batch1_splits": 41,
+      "batch8_splits": 32,
+      "batch8_work_units": 256,
+      "padded_heads": 16
+    },
+    "candidates": {
+      "compact_merge_grid96": {
+        "promoted": false,
+        "reason": "neutral within 0.1% at B1 and B8"
+      },
+      "gf6_flash": {
+        "production_integrated": false,
+        "batch1_us": 19.032,
+        "batch8_us": 75.681,
+        "batch8_speedup_pct": 7.0,
+        "batch1_regression_pct": 31.4,
+        "cross_path_rel_l2": {
+          "batch1": 0.0010085,
+          "batch8": 0.0014282
+        },
+        "resources": {
+          "vgpr": 256,
+          "vgpr_spill_count": 4,
+          "scratch_bytes": 20,
+          "sgpr": 56,
+          "lds_bytes": 35648
+        },
+        "control_resources": {
+          "vgpr": 236,
+          "vgpr_spill_count": 0,
+          "scratch_bytes": 0,
+          "sgpr": 57,
+          "lds_bytes": 29248
+        },
+        "verdict": "retain as benchmark-only batch-concurrent screen; independent oracle and production tuning required"
+      },
+      "batch_aware_nsplit": {
+        "production_integrated": "qualified_exact_tunedb_cells",
+        "formula": "min(context-derived split cap, ceil(CUs / (batch * ceil(heads / GF))))",
+        "reason": "Plow B8 GF4/ns64 creates 1536 logical head-group splits over 256 workgroups; AITER maps B8 to 256 work units",
+        "runs": 2,
+        "batch1": [
+          {"nsplit": 32, "grid": 96, "flash_us": [21.428, 21.456], "attention_core_us": [38.532, 38.612], "rel_l2_vs_ns64": 0.0},
+          {"nsplit": 41, "grid": 123, "flash_us": [19.104, 19.112], "attention_core_us": [39.884, 39.972], "rel_l2_vs_ns64": 0.0},
+          {"nsplit": 64, "grid": 192, "flash_us": [14.136, 14.2], "attention_core_us": [46.6, 46.708], "rel_l2_vs_ns64": 0.0}
+        ],
+        "batch8": [
+          {"nsplit": 16, "grid": 256, "flash_us": [89.757, 90.001], "attention_core_us": [97.537, 97.769], "rel_l2_vs_ns64": 0.0},
+          {"nsplit": 24, "grid": 256, "flash_us": [94.289, 94.393], "attention_core_us": [106.261, 106.465], "rel_l2_vs_ns64": 0.000034981},
+          {"nsplit": 32, "grid": 256, "flash_us": [69.129, 69.133], "attention_core_us": [85.913, 86.097], "rel_l2_vs_ns64": 0.0},
+          {"nsplit": 64, "grid": 256, "flash_us": [81.049, 81.301], "attention_core_us": [113.281, 113.341], "rel_l2_vs_ns64": 0.0}
+        ],
+        "winner": {
+          "batch1_nsplit": 32,
+          "batch1_attention_core_speedup_pct": 17.3,
+          "batch8_nsplit": 32,
+          "batch8_attention_core_speedup_pct": 24.1
+        },
+        "resources": {
+          "vgpr": 236,
+          "vgpr_spill_count": 0,
+          "scratch_bytes": 0,
+          "sgpr": 57,
+          "lds_bytes": 29248
+        },
+        "oracle": "attention-chain-v1 independent FP32 softmax reference passes B1/B8 ns32; cross-path ns64 comparison remains a secondary check"
+      }
+    },
+    "rejected_gf6_packaged_gate": {
+      "boundary": "independently loaded standalone flash plus the same standalone merge",
+      "object_sha256": "7857aeb1fb9f29019011b924b7892d31a68391fbe1b8c2bcfd57b76185c43e41",
+      "object_bytes": 25352,
+      "resources": {"vgpr": 256, "agpr": 0, "occupancy": 2, "wrapper_spill_audit": 43},
+      "batch1": {"gf4_us": 38.784, "gf6_us": 46.260, "gf6_wins": 0, "rounds": 21},
+      "batch8": {"gf4_us": 85.913, "gf6_us": 83.377, "gf6_wins": 21, "rounds": 21, "speedup": 1.0304},
+      "oracle_batch8": {"rel_l2": 0.00180339596, "max_abs": 0.0000076291617, "dump_sha256": "5d717bb2d4471fa4047b3db2e6f29de7a4d4469c4ebb7647778cf31e17777bbc"},
+      "promoted": false,
+      "reason": "Only 2.95% remains before the production-only extra AQL boundary; insufficient margin. GF6 production route, schema, source, and packaging were removed."
+    },
+    "source_refs": [
+      "runtime/amd/op_attention.h:1840-1879",
+      "runtime/amd/interp.hip:1071-1121",
+      "vllm/model_executor/layers/attention/mla_attention.py:946-1004,1185-1202,1296-1315",
+      "aiter/mla.py:361-420,565-595,809-823",
+      "aiter/csrc/kernels/mla/metadata/v1_0_device.cuh:8-18,45-96,119-125"
+    ],
+    "source_sha256": {
+      "plow_device": "c801159e1572d110bbf73852664f23755693b7a24af5b411c5dc89b7393d4d0c",
+      "plow_host": "b1f87d300e82d78c1d9e632b64ea6b9428002930fa004f90654d4d07c56b9218",
+      "plow_oracle": "6124d98a2edf35ded1b1470f11b94f1ef6242d33ac94f5ac7fddf057ea8f7618",
+      "plow_object": "c54d690447ca434c91ccc36bc6169617100fc08d0089b74d37a9085ced1ea289",
+      "production_attention": "6948f671fbe9653e9aa661f77b3e7a602d4d02cddc10e523649a99f11769c10d",
+      "production_interpreter": "009c45846485047e33b91b7917a14a368fb4d9771425046b3458c9da029a143a",
+      "vllm_wuv_probe": "bdfe9b692dc571abfbde40bda2d06d6e37b9c12e1dd82a291c8e806f5263da98",
+      "vllm_attention_result": "c58ddb8fddcc19e240512caba6b111ce9269fd91ee847938e1f7e876a6a14bb4"
+    }
+  },
+  "routed_moe": {
+    "shape": {
+      "tokens": 1024,
+      "hidden": 3584,
+      "local_intermediate": 384,
+      "experts": 896,
+      "topk": 16,
+      "activation": "situ_v2"
+    },
+    "strict_dtype_match": false,
+    "dtype_caveat": "Plow uses A4W4; selected vLLM AITER path uses A8W4",
+    "plow_subset": {
+      "boundary": "grouped_glu+bridge+grouped_down+fp32_scatter",
+      "stage1_us": [1000.0, 1001.0],
+      "stage2_us": [1151.0, 1152.0],
+      "total_us": [2151.0, 2153.0],
+      "live_rows": 16384,
+      "padded_rows": 57728
+    },
+    "stage2_candidates": {
+      "workgroup_threads": 512,
+      "bm64_wnc4": {
+        "padded_rows": 57728,
+        "scatter_us": 1153.0,
+        "scatter_reduce_us": 1225.0,
+        "direct_atomic_with_zero_us": 1289.0
+      },
+      "bm32_wnc8": {
+        "padded_rows": 32448,
+        "scatter_us": 1134.0,
+        "scatter_reduce_us": 1203.0,
+        "direct_atomic_with_zero_us": 1212.0
+      },
+      "oracle_values": 3670016,
+      "oracle_bad": 0,
+      "promoted": false,
+      "reason": "BM32 gains only 1.8% on the complete stage-2 boundary; direct atomic loses after required accumulator zero"
+    },
+    "cache_policy_screen": {
+      "payload_nt_scale_nt_pair_us": {
+        "0_0": [2151.0, 2153.0],
+        "0_1": [2250.0, 2248.0],
+        "1_0": [2241.0, 2241.0],
+        "1_1": [2289.0, 2289.0]
+      },
+      "weight_scale_nt_promoted": false,
+      "weight_scale_nt_code_retained": false,
+      "payload_nt_promoted": false
+    },
+    "aiter": {
+      "exact_a4w4_stage1_us": 205.3733,
+      "exact_a4w4_stage2_us": 144.5268,
+      "exact_a4w4_pair_us": 349.9001,
+      "selected_a8w4_stage1_us": 199.5691,
+      "selected_a8w4_stage2_us": 139.6053,
+      "selected_a8w4_pair_us": 339.1744,
+      "live_fused_moe_us": 575.825,
+      "live_router_plus_fused_moe_us": 640.586
+    },
+    "boundary_caveat": "Plow subset excludes router, sort/align, input quantization and combine; it is already slower than the larger AITER boundaries",
+    "oracle": {
+      "production_shape": false,
+      "synthetic_shape": "H256/I256/E3",
+      "stage2_values": 14208,
+      "stage2_unwritten": 0,
+      "stage2_worst_relative_error": 5.43e-8,
+      "stage1_values": 28416,
+      "stage1_worst_fp4_ulp": 0.4837
+    },
+    "source_sha256": "37292401bf40cb316ee8afee128613e833795f5daa435910a2974445ce7d3fc0"
+  }
+}

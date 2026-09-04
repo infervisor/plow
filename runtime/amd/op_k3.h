@@ -163,12 +163,52 @@ enum { PLOW_ATTNRES_PART = PLOW_WAVES * 2 * (PLOW_ATTNRES_MAXB + 1) };
  *
  * `gamma == nullptr` keeps the raw-mix arm BYTE-IDENTICAL, which is what makes the emitter knob an
  * A/B out of one binary. */
+/* Materialize a graph-selected residual seam before its consumer runs. Keeping this helper
+ * separate leaves the consumer ABI and live ranges unchanged. The operation is
+ * consumer-independent; the packet graph decides where it is legal and dispatch invokes it before
+ * the selected consumer. */
+#if PLOW_MATERIALIZED_RESIDUAL_INPUT
+__device__ __forceinline__ void d_materialize_residual(
+    bf16* __restrict__ out, const bf16* __restrict__ a, const bf16* __restrict__ b,
+    const bf16* __restrict__ pre, unsigned T, unsigned HID, unsigned slice, unsigned nblk) {
+    const auto* ag = as_glob(a);
+    const auto* bg = as_glob(b);
+    const auto* pg = as_glob(pre);
+    auto* og = as_glob(out);
+    for (unsigned t = slice; t < T; t += nblk) {
+        const size_t base = (size_t)t * HID;
+        for (unsigned d = threadIdx.x * 8u; d < HID; d += PLOW_THREADS * 8u) {
+            if (d + 8u <= HID) {
+                const bf16v8 va = ld_glob8(ag + base + d), vb = ld_glob8(bg + base + d);
+                const bf16v8 vp = pre ? ld_glob8(pg + base + d) : bf16v8_zero();
+                bf16v8 vo;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const bf16 inner = f2bf(bf2f(va[j]) + bf2f(vb[j]));
+                    vo[j] = pre ? f2bf(bf2f(vp[j]) + bf2f(inner)) : inner;
+                }
+                st_glob8(og + base + d, vo);
+            } else {
+                for (unsigned j = d; j < HID; ++j) {
+                    const bf16 inner = f2bf(bf2f(a[base + j]) + bf2f(b[base + j]));
+                    st_act1(out + base + j,
+                            pre ? f2bf(bf2f(pre[base + j]) + bf2f(inner)) : inner);
+                }
+            }
+        }
+    }
+    __syncthreads();
+}
+#endif
+
+template <bool F32_MIX_NORM = false>
 __device__ void d_attn_res(bf16* __restrict__ out, const bf16* __restrict__ prefix,
                            const bf16* __restrict__ blkres, const float* __restrict__ score_w,
                            unsigned T, unsigned HID, unsigned NB, unsigned NBCAP, float eps,
                            unsigned slice, unsigned nblk, float* __restrict__ lds,
                            const bf16* __restrict__ push_src, unsigned push_row,
-                           const bf16* __restrict__ gamma = nullptr) {
+                           const bf16* __restrict__ gamma = nullptr,
+                           float output_norm_eps = 0.0f) {
     /* THE RING IS `[T][NBCAP][HID]`, AND `NBCAP` IS NOT `NB`. `NB` is the number of rows LIVE at
      * this layer, which grows 0 -> 8 with depth; `NBCAP` is the allocated row count, constant for
      * the whole program. At T = 1 `t` is 0 and the stride never multiplies, so the two coincide
@@ -312,6 +352,60 @@ __device__ void d_attn_res(bf16* __restrict__ out, const bf16* __restrict__ pref
             if (lane <= NB) sco[lane] = e / z;
         }
         __syncthreads();
+
+        /* The pinned vLLM ordering keeps the complete mixed vector in f32 until the following
+         * output RMSNorm.  That is a distinct numerical contract from the exact Plow fusion
+         * below, which deliberately rounds the mix to bf16 before reducing it.  Instantiate this
+         * arm only for a graph-adjacent AttnRes + RMSNorm with HID <= 8192. Four statically
+         * bounded vector slots keep the live mix out of private memory; the geometry guard,
+         * rather than this storage capacity, is the eligibility contract.
+         *
+         * This is model-independent eligibility: operation semantics, sole post-norm consumer,
+         * vector alignment and the register-bounded row width.  A caller must supply gamma and
+         * the post-norm epsilon separately. */
+        if constexpr (F32_MIX_NORM) {
+            constexpr unsigned NVI = 4;
+            if (gamma == nullptr || NV > PLOW_THREADS * NVI || NV * 8u != HID) {
+                for (unsigned d = threadIdx.x; d < HID; d += PLOW_THREADS)
+                    st_act1(&out[pofs + d], (bf16)0x7fc1u);
+                return;
+            }
+            float mixed[NVI][8];
+            float ss = 0.0f;
+#pragma unroll
+            for (unsigned q = 0; q < NVI; ++q) {
+#pragma unroll
+                for (unsigned j = 0; j < 8; ++j) mixed[q][j] = 0.0f;
+                const unsigned i = threadIdx.x + q * PLOW_THREADS;
+                if (i >= NV) continue;
+                for (unsigned r = 0; r <= NB; ++r) {
+                    const bf16* __restrict__ vr =
+                        (r < NB) ? blkres + bofs + (size_t)r * HID : prefix + pofs;
+                    const bf16v8 v = ld_glob8(vr + i * 8);
+                    const float p = sco[r];
+#pragma unroll
+                    for (unsigned j = 0; j < 8; ++j) mixed[q][j] += p * bf2f(v[j]);
+                }
+#pragma unroll
+                for (unsigned j = 0; j < 8; ++j) ss += mixed[q][j] * mixed[q][j];
+            }
+            const float inv = rsqrtf(block_sum(ss, part) / (float)HID + output_norm_eps);
+            const auto* gg = as_glob(gamma);
+            auto* og = as_glob(out);
+#pragma unroll
+            for (unsigned q = 0; q < NVI; ++q) {
+                const unsigned i = threadIdx.x + q * PLOW_THREADS;
+                if (i >= NV) continue;
+                const bf16v8 g = ld_glob8(gg + i * 8);
+                bf16v8 n;
+#pragma unroll
+                for (unsigned j = 0; j < 8; ++j)
+                    n[j] = f2bf(mixed[q][j] * inv * bf2f(g[j]));
+                st_glob8(og + pofs + i * 8, n);
+            }
+            __syncthreads();
+            continue;
+        }
 
         /* The mix, over the RAW rows. Eight lanes' worth of f32 accumulator per thread so the
          * (nb+1) rows are walked once per 16-byte chunk instead of once per element.

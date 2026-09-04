@@ -167,6 +167,39 @@ pub fn preprocessed_digest(text: &str) -> String {
     digest(buf.as_bytes())
 }
 
+/// Content digest of the portions of preprocessed output originating in a
+/// selected source-file set.
+///
+/// Macro expansion has already happened when this runs. A constant defined in
+/// an omitted header therefore still changes the selected caller's text when
+/// it affects generated code, while an unrelated declaration in that header
+/// does not invalidate the result.
+pub fn preprocessed_digest_for_files(text: &str, suffixes: &[&str]) -> String {
+    let mut buf = String::with_capacity(text.len() / 4);
+    let mut selected = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("# ") {
+            selected = marker_path(t).is_some_and(|path| {
+                let path = path.replace('\\', "/");
+                suffixes.iter().any(|suffix| path.ends_with(suffix))
+            });
+            continue;
+        }
+        if selected && !t.starts_with("#pragma") && !line.trim().is_empty() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    digest(buf.as_bytes())
+}
+
+fn marker_path(line: &str) -> Option<&str> {
+    let start = line.find('"')? + 1;
+    let end = line[start..].find('"')? + start;
+    Some(&line[start..end])
+}
+
 /// A cheap content digest. FNV-1a over the bytes — enough to notice that a file
 /// changed, which is all staleness needs.
 pub fn digest(bytes: &[u8]) -> String {
@@ -251,5 +284,32 @@ mod tests {
     fn digest_notices_an_edit() {
         assert_eq!(digest(b"hello"), digest(b"hello"));
         assert_ne!(digest(b"hello"), digest(b"hellp"));
+    }
+
+    #[test]
+    fn selective_preprocessed_digest_ignores_unrelated_files() {
+        let a = "# 1 \"/repo/runtime/amd/op_gemm.h\"\nint tile = 128;\n\
+# 1 \"/repo/runtime/amd/op_collective.h\"\nint queue = 1;\n";
+        let b = a.replace("queue = 1", "queue = 2");
+        let files = ["runtime/amd/op_gemm.h"];
+        assert_eq!(
+            preprocessed_digest_for_files(a, &files),
+            preprocessed_digest_for_files(&b, &files)
+        );
+        assert_ne!(
+            preprocessed_digest_for_files(a, &files),
+            preprocessed_digest_for_files(&a.replace("tile = 128", "tile = 256"), &files)
+        );
+    }
+
+    #[test]
+    fn selective_preprocessed_digest_accepts_windows_markers() {
+        let unix = "# 1 \"/repo/runtime/amd/op_gemm.h\"\nint tile = 128;\n";
+        let windows = "# 1 \"C:\\repo\\runtime\\amd\\op_gemm.h\"\nint tile = 128;\n";
+        let files = ["runtime/amd/op_gemm.h"];
+        assert_eq!(
+            preprocessed_digest_for_files(unix, &files),
+            preprocessed_digest_for_files(windows, &files)
+        );
     }
 }

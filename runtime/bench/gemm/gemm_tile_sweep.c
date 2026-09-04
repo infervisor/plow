@@ -149,6 +149,12 @@ int main(int argc, char** argv) {
     unsigned char* hW = mx ? plow_hsa_alloc_host(H, nW) : NULL;
     unsigned char* hS = mx ? plow_hsa_alloc_host(H, nS) : NULL;
     bf16* hC = plow_hsa_alloc_host(H, nC * 2);
+    bf16* hC2 = mx ? NULL : malloc(nC * sizeof(*hC2));
+    int have_c2 = 0;
+    if (!hA || (!mx && (!hB || !hC2)) || (mx && (!hW || !hS)) || !hC) {
+        fprintf(stderr, "host allocation failed\n");
+        return 1;
+    }
     srand(5);
     for (size_t i = 0; i < nA; i++) hA[i] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
     if (mx) {
@@ -241,6 +247,12 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < nC; i++) {
             if (!isfinite(bf2f(hC[i]))) { bad++; break; }
         }
+        if (!mx && strcmp(sym, "gemm_c2") == 0) {
+            memcpy(hC2, hC, nC * sizeof(*hC2));
+            have_c2 = 1;
+        } else if (!mx && strcmp(sym, "gemm_c8") == 0) {
+            if (!have_c2 || memcmp(hC2, hC, nC * sizeof(*hC2)) != 0) bad++;
+        }
         for (int s = 0; s < 24; s++) {
             unsigned m = (unsigned)(rand() % (int)M), nn = (unsigned)(rand() % (int)N);
             double acc = 0;
@@ -290,5 +302,6 @@ int main(int argc, char** argv) {
     plow_hsa_free(H, dB);
     if (dS) plow_hsa_free(H, dS);
     plow_hsa_free(H, dC);
+    free(hC2);
     return 0;
 }

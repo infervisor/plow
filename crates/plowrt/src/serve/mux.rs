@@ -1718,11 +1718,137 @@ fn run_one_tick(
             // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
             // prefill-only tick.
             let mut did_prefill = false;
-            let no_interleave = crate::config::RuntimeConfig::get().nv.pf_no_interleave;
-            let pending = (0..b.min(slots.len()))
-                .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
-                .min_by_key(|&i| slots[i].as_ref().map(|s| s.arrived));
+            let nv = &crate::config::RuntimeConfig::get().nv;
+            let no_interleave = nv.pf_no_interleave;
+            let has_decode = slots[..b.min(slots.len())]
+                .iter()
+                .any(|s| s.as_ref().is_some_and(|s| s.step > 0));
+            let tick_max = amd_prefill_tick_cap(
+                has_decode,
+                no_interleave,
+                nv.pf_defer_decode,
+                nv.pf_interleave,
+            );
+            let isolated = amd_prefill_pick(
+                (0..b.min(slots.len())).filter_map(|i| {
+                    let slot = slots[i].as_ref()?;
+                    (slot.step == 0 && !slot.respond.is_closed()).then_some((i, slot.arrived))
+                }),
+                nv.pf_batch,
+                e.prefill_turn(),
+                b.min(slots.len()),
+            );
+            if nv.pf_batch {
+                let packed = amd_prefill_pack(
+                    (0..b.min(slots.len())).filter_map(|i| {
+                        slots[i]
+                            .as_ref()
+                            .filter(|s| s.step == 0 && !s.respond.is_closed())?;
+                        e.packable_prefill_span(i, tick_max)
+                    }),
+                    tick_max,
+                    e.prefill_turn(),
+                    b.min(slots.len()),
+                    |program| e.prefill_prog_t(program as usize),
+                );
+                if packed.len() >= 2 {
+                    let pk_t = packlog::on().then(Instant::now);
+                    for span in &packed {
+                        let slot = slots[span.slot as usize]
+                            .as_ref()
+                            .expect("packed candidate still occupies its slot");
+                        crate::obs::ttft::QUEUE.add(slot.arrived.elapsed().as_nanos() as u64);
+                    }
+                    let t_pf = Instant::now();
+                    let mut result = {
+                        let members: Vec<_> = packed
+                            .iter()
+                            .map(|span| {
+                                let i = span.slot as usize;
+                                (
+                                    i,
+                                    slots[i]
+                                        .as_ref()
+                                        .expect("packed candidate still occupies its slot")
+                                        .prompt_ids
+                                        .as_slice(),
+                                )
+                            })
+                            .collect();
+                        e.advance_packed_prefill(&members)
+                    };
+                    crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
+                    if result.is_ok() {
+                        match amd_packed_frontier_updates(
+                            packed.iter().map(|span| span.slot as usize),
+                            |i| e.prefill_frontier(i),
+                        ) {
+                            Ok(updates) => {
+                                for (i, frontier) in updates {
+                                    slots[i]
+                                        .as_mut()
+                                        .expect("packed member still occupies its slot")
+                                        .pf_pos = frontier;
+                                }
+                            }
+                            Err(i) => {
+                                result = Err(crate::RuntimeError::Device(format!(
+                                    "packed prefill slot {i} lost its cursor after dispatch"
+                                )));
+                            }
+                        }
+                    }
+                    e.advance_prefill_turn(packed.last().expect("pack has members").slot as usize);
+                    match result {
+                        Ok(()) => {
+                            tracing::debug!(spans = packed.len(), "AMD packed prefill advanced")
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                error_code = ?err.device_code(),
+                                fatal = err.is_fatal(),
+                                members = packed.len(),
+                                model = bundle.network(),
+                                "AMD packed prefill failed"
+                            );
+                            note_fault(&mut tick_fault, &err);
+                            let msg = err.to_string();
+                            for span in &packed {
+                                let i = span.slot as usize;
+                                if let Some(taken) = slots[i].take() {
+                                    release_kv(&arena, taken.kv);
+                                    let _ = taken
+                                        .respond
+                                        .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                }
+                                e.release(i);
+                            }
+                        }
+                    }
+                    if let Some(t) = pk_t {
+                        packlog::record(t.elapsed().as_nanos() as u64, 0, true, false, 0);
+                    }
+                    did_prefill = true;
+                }
+            }
+            if did_prefill && no_interleave {
+                return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+            }
+            if did_prefill {
+                let prefill_remains = slots[..b.min(slots.len())]
+                    .iter()
+                    .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
+                if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
+                    tracing::debug!("amd: decode deferred while prefill remains");
+                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+                }
+            }
+            let pending = amd_prefill_isolated_fallback(isolated, did_prefill);
             if let Some(i) = pending {
+                if nv.pf_batch {
+                    e.advance_prefill_turn(i);
+                }
                 // §DISAGG phase-0. The AMD tick is EITHER a prefill OR a decode
                 // (this arm returns before the decode launch below), so unlike
                 // the CUDA arm there is no fused launch and `mixed_decode_ns`
@@ -1732,19 +1858,23 @@ fn run_one_tick(
                 // decode_ns)` is the ceiling, not the mixed ratio.
                 let pk_t = packlog::on().then(Instant::now);
                 let slot_ref = slots[i].as_ref().expect("found above");
-                let prompt = slot_ref.prompt_ids.clone();
                 // §TTFT: everything between `mux.submit` and this line — the
                 // dispatcher wake, the formation hold, admission, and the
                 // engine-thread handoff.
                 crate::obs::ttft::QUEUE.add(slot_ref.arrived.elapsed().as_nanos() as u64);
                 let t_pf = std::time::Instant::now();
                 // ONE CHUNK, not the whole prompt. `Ok(None)` means this slot has more chunks to
-                // go; it stays `step == 0`, so the next tick finds it again and advances it —
-                // and in between, the decode below runs for every other slot.
-                let pf = e.prefill_chunked(i, &prompt);
+                // go; it stays `step == 0` for a later tick. The default keeps the oldest prompt
+                // active, while `PLOW_PF_BATCH=1` rotates fairly across pending AMD slots.
+                let pf = e.prefill_chunked_at_most(i, &slot_ref.prompt_ids, tick_max);
+                let frontier = e.prefill_frontier(i).unwrap_or(slot_ref.prompt_ids.len());
                 crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                 match pf {
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if let Some(slot) = slots[i].as_mut() {
+                            slot.pf_pos = frontier;
+                        }
+                    }
                     Ok(Some(token)) => {
                         if let Some(s) = slots[i].as_mut() {
                             s.pf_pos = s.prompt_ids.len();
@@ -1789,6 +1919,13 @@ fn run_one_tick(
                 if no_interleave {
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
                 }
+                let prefill_remains = slots[..b.min(slots.len())]
+                    .iter()
+                    .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
+                if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
+                    tracing::debug!("amd: decode deferred while prefill remains");
+                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+                }
             }
 
             // Decode: every live slot feeds the token it last produced.
@@ -1806,9 +1943,48 @@ fn run_one_tick(
             // §DSTEP owns the whole tick from here, so `TOKEN` is a real total
             // and not a sum of parts. One tick is one token on the TP path,
             // which is the only shape `PLOW_DECODE_BATCH=1` admits.
-            let t_tick = crate::obs::dstep::on().then(Instant::now);
-            match e.step_batch(&feeds) {
-                Ok(out) => {
+            let t_tick = crate::obs::dstep::begin_token();
+            let remaining = feeds
+                .iter()
+                .filter_map(|&(i, _)| slots[i].as_ref())
+                .map(|slot| slot.gen.max_tokens.saturating_sub(slot.out_ids.len()))
+                .min()
+                .unwrap_or(1);
+            let requested = amd_multistep_requested(
+                remaining,
+                steps as usize,
+                crate::config::RuntimeConfig::get().nv.multistep,
+            );
+            let multi = e.multistep_quantum(&feeds, requested);
+            let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
+            let step_result = if let Some(quantum) = multi {
+                e.multi_step(&feeds, quantum, &mut deferred)
+                    .and_then(|quantum| {
+                        for &(i, _) in &feeds {
+                            for step in 0..quantum {
+                                if slots[i].is_none() {
+                                    break;
+                                }
+                                let token = deferred_token(&deferred, i, step, quantum)?;
+                                tracing::debug!(token, slot = i, "amd: token (deferred read)");
+                                handle_produced_token(
+                                    &mut slots[i],
+                                    &arena,
+                                    bundle,
+                                    token,
+                                    1,
+                                    &mut tokens_this_tick,
+                                    Some(stop.as_slice()),
+                                );
+                            }
+                            if slots[i].is_none() {
+                                e.release(i);
+                            }
+                        }
+                        Ok(())
+                    })
+            } else {
+                e.step_batch(&feeds).map(|out| {
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
@@ -1828,6 +2004,12 @@ fn run_one_tick(
                             e.release(i);
                         }
                     }
+                })
+            };
+            obs.host.slot_tokens = deferred;
+            match step_result {
+                Ok(out) => {
+                    let _ = out;
                 }
                 Err(err) => {
                     // The batched launch failed — every fed slot loses.
@@ -1852,9 +2034,7 @@ fn run_one_tick(
                     }
                 }
             }
-            if let Some(t) = t_tick {
-                crate::obs::dstep::token(t.elapsed().as_nanos() as u64);
-            }
+            crate::obs::dstep::finish_token(t_tick);
             if let Some(t) = pk_t {
                 packlog::record(0, t.elapsed().as_nanos() as u64, false, true, pk_rows);
             }
@@ -2042,6 +2222,18 @@ fn run_one_tick(
     (slots, bufs, obs, tokens_this_tick, false, tick_fault)
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
+fn deferred_token(tokens: &[u32], slot: usize, step: usize, quantum: usize) -> Result<u32> {
+    tokens
+        .get(slot.saturating_mul(quantum).saturating_add(step))
+        .copied()
+        .ok_or_else(|| {
+            crate::RuntimeError::Device(format!(
+                "deferred token ring missing slot {slot} step {step} at quantum {quantum}"
+            ))
+        })
+}
+
 /// Whether a tick's wall time is a valid **decode** service sample. Prefill
 /// ticks are excluded: a chunk-interleaved prefill tick is bounded by design
 /// (`PLOW_PF_INTERLEAVE` rows) and a long prompt runs MANY of them — feeding
@@ -2095,6 +2287,119 @@ fn pf_interleave_rows() -> usize {
 #[cfg(feature = "cuda")]
 fn pf_defer_decode() -> bool {
     crate::config::RuntimeConfig::get().nv.pf_defer_decode
+}
+
+#[cfg(feature = "hsa")]
+fn amd_prefill_tick_cap(
+    has_decode: bool,
+    no_interleave: bool,
+    defer_decode: bool,
+    interleave: u32,
+) -> u32 {
+    if !has_decode || no_interleave || defer_decode || interleave == 0 {
+        u32::MAX
+    } else {
+        interleave
+    }
+}
+
+#[cfg(feature = "hsa")]
+fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
+    enabled && prefill_remains
+}
+
+#[cfg(feature = "hsa")]
+fn amd_multistep_requested(remaining: usize, scheduler_steps: usize, configured: u32) -> usize {
+    remaining
+        .min(scheduler_steps)
+        .min(configured.max(1) as usize)
+}
+
+#[cfg(feature = "hsa")]
+fn amd_prefill_pick(
+    candidates: impl IntoIterator<Item = (usize, Instant)>,
+    fair: bool,
+    start: usize,
+    cap: usize,
+) -> Option<usize> {
+    let cap = cap.max(1);
+    let start = start % cap;
+    candidates
+        .into_iter()
+        .min_by(|&(slot_a, arrived_a), &(slot_b, arrived_b)| {
+            if fair {
+                ((slot_a + cap - start) % cap).cmp(&((slot_b + cap - start) % cap))
+            } else {
+                (arrived_a, slot_a).cmp(&(arrived_b, slot_b))
+            }
+        })
+        .map(|(slot, _)| slot)
+}
+
+/// Form one ragged AMD prefill pack from already-planned request spans.
+///
+/// All members use the first selected span's compiled program. Rows are packed
+/// densely under `row_budget`; KV and recurrent coordinates remain request-local.
+/// Invalid descriptors are excluded so the caller can retain the isolated path.
+#[cfg(feature = "hsa")]
+fn amd_prefill_pack(
+    candidates: impl IntoIterator<Item = packet::dev::PrefillSpan>,
+    row_budget: u32,
+    start: usize,
+    cap: usize,
+    program_rows: impl Fn(u32) -> Option<u32>,
+) -> Vec<packet::dev::PrefillSpan> {
+    if row_budget == 0 {
+        return Vec::new();
+    }
+    let cap = cap.max(1);
+    let mut candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|s| {
+            s.n_rows != 0
+                && s.n_rows <= row_budget
+                && s.slot < cap as u32
+                && s.state_slot == s.slot
+                && s.kv_row0.checked_add(s.n_rows) == Some(s.kv_len)
+        })
+        .collect();
+    candidates.sort_unstable_by_key(|s| ((s.slot as usize + cap - start % cap) % cap, s.slot));
+    let Some(program) = candidates.first().map(|s| s.program) else {
+        return Vec::new();
+    };
+    let Some(row_budget) = program_rows(program).map(|rows| rows.min(row_budget)) else {
+        return Vec::new();
+    };
+    let mut rows = 0u32;
+    let mut out = Vec::new();
+    for mut span in candidates.into_iter().filter(|s| s.program == program) {
+        let Some(next) = rows.checked_add(span.n_rows) else {
+            break;
+        };
+        if next > row_budget {
+            continue;
+        }
+        span.row0 = rows;
+        rows = next;
+        out.push(span);
+    }
+    out
+}
+
+#[cfg(feature = "hsa")]
+fn amd_packed_frontier_updates(
+    members: impl IntoIterator<Item = usize>,
+    mut frontier: impl FnMut(usize) -> Option<usize>,
+) -> std::result::Result<Vec<(usize, usize)>, usize> {
+    members
+        .into_iter()
+        .map(|slot| frontier(slot).map(|value| (slot, value)).ok_or(slot))
+        .collect()
+}
+
+#[cfg(feature = "hsa")]
+fn amd_prefill_isolated_fallback(isolated: Option<usize>, packed: bool) -> Option<usize> {
+    (!packed).then_some(isolated).flatten()
 }
 
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
@@ -2512,6 +2817,21 @@ mod tests {
     }
 
     #[test]
+    fn deferred_token_ring_is_row_major_and_bounds_checked() {
+        let ring = [10, 11, 12, 20, 21, 22];
+        assert_eq!(deferred_token(&ring, 1, 2, 3).unwrap(), 22);
+        assert!(deferred_token(&ring, 2, 0, 3).is_err());
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn amd_multistep_honors_the_runtime_cap() {
+        assert_eq!(amd_multistep_requested(16, 8, 4), 4);
+        assert_eq!(amd_multistep_requested(16, 8, 1), 1);
+        assert_eq!(amd_multistep_requested(3, 8, 4), 3);
+    }
+
+    #[test]
     fn bounded_ingress_reports_full_closed_and_depth() {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = mpsc::channel(1);
@@ -2644,6 +2964,143 @@ mod tests {
             poisoned.update(420.0);
         }
         assert!(poisoned.get() > 250.0, "control: unfiltered EWMA sheds");
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn amd_prefill_scheduler_controls_are_bounded() {
+        assert_eq!(amd_prefill_tick_cap(false, false, false, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, true, false, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, false, 0), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, true, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, false, 2048), 2048);
+        assert!(amd_defer_decode(true, true));
+        assert!(!amd_defer_decode(true, false));
+        assert!(!amd_defer_decode(false, true));
+
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(1);
+        let candidates = || [(0, t0), (1, t1), (2, t1)];
+        assert_eq!(amd_prefill_pick(candidates(), false, 2, 3), Some(0));
+        assert_eq!(amd_prefill_pick(candidates(), true, 1, 3), Some(1));
+        assert_eq!(amd_prefill_pick(candidates(), true, 2, 3), Some(2));
+        assert_eq!(amd_prefill_pick(candidates(), true, 3, 3), Some(0));
+        assert_eq!(amd_prefill_pick([(3, t0), (2, t0)], false, 0, 4), Some(2));
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn amd_prefill_pack_rotates_filters_and_respects_budget() {
+        use packet::dev::{PrefillSpan, PREFILL_SPAN_RESET_STATE};
+
+        let span = |slot, rows, program| PrefillSpan {
+            row0: 99,
+            n_rows: rows,
+            slot,
+            flags: if slot == 0 {
+                PREFILL_SPAN_RESET_STATE
+            } else {
+                0
+            },
+            kv_row0: slot * 10,
+            kv_len: slot * 10 + rows,
+            state_slot: slot,
+            program,
+        };
+
+        // Fair rotation starts at slot 2. Its program defines compatibility;
+        // program 4 is excluded and the remaining rows are densely rebased.
+        let pack = amd_prefill_pack(
+            [span(0, 4, 3), span(1, 2, 4), span(2, 3, 3), span(3, 2, 3)],
+            7,
+            2,
+            4,
+            |_| Some(7),
+        );
+        assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(pack.iter().map(|s| s.row0).collect::<Vec<_>>(), [0, 3]);
+        assert!(pack.iter().all(|s| s.program == 3));
+
+        // A candidate that does not fit is skipped rather than exceeding the
+        // token budget, allowing a later compatible short span to fill it.
+        let pack = amd_prefill_pack(
+            [span(0, 5, 7), span(1, 2, 7), span(2, 1, 7)],
+            3,
+            0,
+            3,
+            |_| Some(3),
+        );
+        assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(pack.iter().map(|s| s.row0).collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(pack.iter().map(|s| s.n_rows).sum::<u32>(), 3);
+
+        let pack = amd_prefill_pack(
+            [span(0, 3, 7), span(1, 3, 7), span(2, 1, 7)],
+            8,
+            0,
+            3,
+            |_| Some(4),
+        );
+        assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(pack.iter().map(|s| s.n_rows).sum::<u32>(), 4);
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn amd_prefill_pack_rejects_invalid_descriptors() {
+        use packet::dev::PrefillSpan;
+
+        let valid = PrefillSpan {
+            row0: 0,
+            n_rows: 2,
+            slot: 1,
+            flags: 0,
+            kv_row0: 8,
+            kv_len: 10,
+            state_slot: 1,
+            program: 5,
+        };
+        let mut zero = valid;
+        zero.n_rows = 0;
+        let mut wrong_state = valid;
+        wrong_state.state_slot = 0;
+        let mut wrong_len = valid;
+        wrong_len.kv_len = 11;
+        let mut past_capacity = valid;
+        past_capacity.slot = 4;
+        past_capacity.state_slot = 4;
+
+        assert_eq!(
+            amd_prefill_pack(
+                [zero, wrong_state, wrong_len, past_capacity],
+                8,
+                0,
+                4,
+                |_| Some(8),
+            ),
+            []
+        );
+        assert_eq!(amd_prefill_pack([valid], 0, 0, 4, |_| Some(8)), []);
+        assert_eq!(amd_prefill_pack([valid], 8, 0, 4, |_| None), []);
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn packed_prefill_frontiers_are_all_or_error_in_member_order() {
+        let updates = amd_packed_frontier_updates([2, 0, 3], |slot| Some(slot + 10)).unwrap();
+        assert_eq!(updates, [(2, 12), (0, 10), (3, 13)]);
+        assert_eq!(
+            amd_packed_frontier_updates([2, 0, 3], |slot| (slot != 0).then_some(slot + 10)),
+            Err(0)
+        );
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn unsupported_or_single_member_pack_retains_isolated_fallback() {
+        assert_eq!(amd_prefill_isolated_fallback(Some(3), false), Some(3));
+        assert_eq!(amd_prefill_isolated_fallback(Some(3), true), None);
+        assert_eq!(amd_prefill_isolated_fallback(None, false), None);
     }
 
     /// The batched-engine admission model: a decode tick advances every live

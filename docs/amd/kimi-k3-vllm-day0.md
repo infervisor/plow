@@ -1,5 +1,9 @@
 # vLLM's Kimi-K3 day-0 post — targets, and five ideas that apply to GLM-5.2 today
 
+> Deprecated performance reference (2026-09-02). The figures below are historical,
+> cross-hardware research and must not be used as the Kimi-K3 vLLM baseline. The
+> same-box 8×MI355X baseline is `perf-data/kimi-k3-vllm-mi355x-baseline.md`.
+
 Source: <https://vllm.ai/blog/2026-07-27-k3> — "Kimi K3 Is Here: Efficient Day-0 Support on vLLM",
 2026-07-27, vLLM Team and Inferact. Fetched 2026-07-28.
 

@@ -64,18 +64,18 @@ int main(int argc, char** argv) {
         const char* name;
         unsigned N, K, blk, inst;
     } shapes[] = {
-        {"moe_down_latent", 3584, 7168, 128, 92}, {"routed_up", 896, 3584, 128, 92},
-        {"o_proj", 7168, 1536, 128, 93},          {"router_gate", 896, 7168, 128, 92},
-        {"shared_down", 7168, 768, 128, 92},      {"q_a", 1536, 7168, 128, 48},
-        {"q_absorb", 6144, 1536, 128, 24},        {"kv_a", 512, 7168, 128, 24},
-        {"f_a", 128, 7168, 128, 69},              {"q_rope", 768, 1536, 128, 24},
-        {"f_b", 1536, 128, 128, 69},              {"k_rope_d", 64, 7168, 64, 24},
-        {"b_proj", 12, 7168, 12, 69},             {"final_gate", 4224, 7168, 128, 2},
-        {"final_proj", 7168, 4224, 128, 1},        {"lm_head/10", 16384, 7168, 304, 10},
+        {"moe_down_latent", 3584, 7168, 256, 92}, {"routed_up", 896, 3584, 224, 92},
+        {"o_proj", 7168, 1536, 256, 93},          {"router_gate", 896, 7168, 224, 92},
+        {"shared_down", 7168, 768, 256, 92},      {"q_a", 1536, 7168, 256, 48},
+        {"q_absorb", 6144, 1536, 256, 24},        {"kv_a", 512, 7168, 256, 24},
+        {"f_a", 128, 7168, 128, 69},              {"q_rope", 768, 1536, 256, 24},
+        {"f_b", 1536, 128, 256, 69},              {"k_rope_d", 64, 7168, 64, 24},
+        {"b_proj", 12, 7168, 12, 69},             {"final_gate", 4224, 7168, 249, 2},
+        {"final_proj", 7168, 4224, 256, 1},        {"lm_head", 163840, 7168, 256, 1},
     };
     const int NS = (int)(sizeof(shapes) / sizeof(shapes[0]));
 
-    const size_t ARENA = 1500ull << 20;
+    const size_t ARENA = 3ull << 30;
     unsigned short *W, *C1, *C2, *xb;
     CK(hipMalloc(&W, ARENA));
     CK(hipMalloc(&C1, 1u << 22));
@@ -124,14 +124,14 @@ int main(int argc, char** argv) {
             CK(hipMemset(C1, 0, 1u << 22));
             CK(hipMemset(C2, 0, 1u << 22));
             CK(hipModuleLaunchKernel(fn[1], (int)S.blk, 1, 1, T, 1, 1, 0, 0, b1, nullptr));
-            CK(hipModuleLaunchKernel(fn[10], (int)S.blk, 1, 1, T, 1, 1, 0, 0, b2, nullptr));
+            CK(hipModuleLaunchKernel(fn[9], (int)S.blk, 1, 1, T, 1, 1, 0, 0, b2, nullptr));
             CK(hipDeviceSynchronize());
             std::vector<unsigned short> h1(S.N), h2(S.N);
             CK(hipMemcpy(h1.data(), C1, S.N * 2, hipMemcpyDeviceToHost));
             CK(hipMemcpy(h2.data(), C2, S.N * 2, hipMemcpyDeviceToHost));
             size_t bad = 0;
             for (unsigned i = 0; i < S.N; i++) bad += (h1[i] != h2[i]);
-            if (bad) printf("!! %s: %zu/%u outputs DIFFER (rF vs packet)\n", S.name, bad, S.N);
+            if (bad) printf("!! %s: %zu/%u outputs DIFFER (rL vs packet)\n", S.name, bad, S.N);
         }
         const double gb = (double)slab / 1e9;
         const double aa = us[2] / us[1];
@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
         tot_rf += us[10] * S.inst / 1e3;
     }
     printf("\nA/A control (pkt_aa / packet): %.4f .. %.4f\n", aa_lo, aa_hi);
-    printf("per-token totals over the tabulated instance counts (lm_head scaled x10 by hand):\n");
+    printf("per-token totals over the tabulated instance counts:\n");
     printf("  steady %.3f  packet %.3f  r2 %.3f  wstage %.3f  noldsx %.3f  COMB %.3f  rA %.3f  rL %.3f  rF %.3f ms\n",
            tot_stdy, tot_pkt, tot_r2, tot_ws, tot_nl, tot_cb, tot_ra, tot_rl, tot_rf);
     return 0;

@@ -29,6 +29,39 @@ BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offloa
         "${ROCM_PATH:-/opt/rocm}"/llvm/bin/clang-offload-bundler \
         /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1)}"
 INC="-I$R/amd -I$R/common"
+if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
+  [ -f "$PLOW_HSACO_CONFIG" ] || { echo "missing PLOW_HSACO_CONFIG: $PLOW_HSACO_CONFIG" >&2; exit 2; }
+  cfg_dir="$(dirname -- "$PLOW_HSACO_CONFIG")"
+  cfg_name="$(basename -- "$PLOW_HSACO_CONFIG")"
+  INC="$INC -I$cfg_dir -DPLOW_CONFIG=\"$cfg_name\""
+fi
+decode_inventory_prune="${PLOW_HSACO_DECODE_INVENTORY_PRUNE:-auto}"
+case "${decode_inventory_prune,,}" in
+  auto) [ -n "${PLOW_HSACO_CONFIG:-}" ] && decode_inventory_prune=1 || decode_inventory_prune=0 ;;
+  1|on|true|yes) decode_inventory_prune=1 ;;
+  0|off|false|no) decode_inventory_prune=0 ;;
+  *) echo "PLOW_HSACO_DECODE_INVENTORY_PRUNE must be ON or OFF" >&2; exit 2 ;;
+esac
+if [ "$decode_inventory_prune" = 1 ] && [ -z "${PLOW_HSACO_CONFIG:-}" ]; then
+  echo "PLOW_HSACO_DECODE_INVENTORY_PRUNE requires PLOW_HSACO_CONFIG" >&2
+  exit 2
+fi
+need_decode_mla=0
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS 1' "$PLOW_HSACO_CONFIG"; then
+  [ "$ARCH" = gfx950 ] || {
+    echo "decode MLA segment objects are supported only on gfx950" >&2; exit 2; }
+  [ "$decode_inventory_prune" = 1 ] || {
+    echo "decode MLA segment objects require packet-paired inventory pruning" >&2; exit 2; }
+  need_decode_mla=1
+fi
+need_moe_prefill_ep=0
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP 1' "$PLOW_HSACO_CONFIG"; then
+  [ "$ARCH" = gfx950 ] || {
+    echo "prefill expert-parallel objects are supported only on gfx950" >&2; exit 2; }
+  need_moe_prefill_ep=1
+fi
 mkdir -p "$OUT"; cd "$OUT"
 
 # Delete FIRST. A build that fails must leave nothing behind to run.
@@ -36,10 +69,29 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf \
       i_prefill_gq.co i_decode_gq.co i_flash_gq.co \
       interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf \
+      i_decode_mla.co i_decode_mla_gq.co \
+      interp_decode_mla.elf interp_decode_mla_gq.elf \
       i_decode_fp8.co i_decode_fp8_gq.co interp_decode_fp8.elf interp_decode_fp8_gq.elf \
       i_decode_fp8kv.co i_decode_fp8kv_gq.co interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
-      interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf
+      interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
+      kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
+      kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
+      kda_chunk_intra_wave_items_gfx950.co kda_chunk_intra_wave_items_gfx950.elf \
+      attn_res_f32mix_gfx950.co attn_res_f32mix_gfx950.elf \
+      kda_chunk_carry_regstate_gfx950.co kda_chunk_carry_regstate_gfx950.elf \
+      kda_chunk_key_factor_wu_gfx950.co kda_chunk_key_factor_wu_gfx950.elf \
+      kda_chunk_key_factor_carry_gfx950.co kda_chunk_key_factor_carry_gfx950.elf \
+      xreduce_attnres_gfx950.co xreduce_attnres_gfx950.elf \
+      moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
+      moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf \
+      moe_combine_gfx950.co moe_combine_gfx950.elf \
+      moe_ep_align_gfx950.co moe_ep_align_gfx950.elf \
+      moe_ep_stage2_gfx950.co moe_ep_stage2_gfx950.elf \
+      moe_ep_combine_gfx950.co moe_ep_combine_gfx950.elf \
+      moe_decode_grouped_mxfp4_gfx950.co moe_decode_grouped_mxfp4_gfx950.elf \
+      mla_materialized_hd192_v128_gfx950.co mla_materialized_hd192_v128_gfx950.elf \
+      mla_materialize_pack_gfx950.co mla_materialize_pack_gfx950.elf
 
 genco() { # <extra-defs> <out.co>
   hipcc --offload-arch="$ARCH" -O3 -w $1 --genco "$R/amd/interp.hip" -o "$2" $INC
@@ -47,6 +99,219 @@ genco() { # <extra-defs> <out.co>
 unbundle() { # <in.co> <out.elf>
   "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" --input="$1" --output="$2"
 }
+
+KDA_FUSED_ELFS=""
+need_kda_fused=1
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   ! grep -qx '#define PLOW_PACKET_HAS_KDA_DECODE_FUSED 1' "$PLOW_HSACO_CONFIG"; then
+  need_kda_fused=0
+fi
+
+KDA_INTRA_CACHED_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_CACHED:-0}" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_intra_cached_gfx950.elf" plow_kda_chunk_intra_cached_gfx950 96 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_intra_cached_abi_1 \
+    "$R/amd/kda_chunk_intra_cached.hip"
+  KDA_INTRA_CACHED_ELFS="kda_chunk_intra_cached_gfx950.elf"
+fi
+
+KDA_INTRA_WAVE_ITEMS_ELFS=""
+case "${PLOW_KDA_INTRA_WAVE_ITEMS:-0}" in
+  0|1) ;;
+  *) echo "PLOW_KDA_INTRA_WAVE_ITEMS must be 0 or 1" >&2; exit 2 ;;
+esac
+need_kda_intra_wave_items=${PLOW_KDA_INTRA_WAVE_ITEMS:-0}
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS 1' "$PLOW_HSACO_CONFIG"; then
+  need_kda_intra_wave_items=1
+fi
+if [ "$need_kda_intra_wave_items" = 1 ] && [ "$ARCH" != gfx950 ]; then
+  echo "manifest-required KDA intra wave-item object is supported only on gfx950" >&2
+  exit 2
+fi
+if [ "$ARCH" = gfx950 ] && [ "$need_kda_intra_wave_items" = 1 ]; then
+  [ -n "${PLOW_HSACO_CONFIG:-}" ] || {
+    echo "PLOW_KDA_INTRA_WAVE_ITEMS=1 requires PLOW_HSACO_CONFIG for packet pairing" >&2
+    exit 2
+  }
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_intra_wave_items_gfx950.elf" \
+    plow_kda_chunk_intra_wave_items_gfx950 96 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_intra_wave_items_abi_1 \
+    "$R/amd/kda_chunk_intra_wave_items.hip"
+  KDA_INTRA_WAVE_ITEMS_ELFS="kda_chunk_intra_wave_items_gfx950.elf"
+fi
+
+ATTN_RES_F32MIX_ELFS=""
+need_attn_res_f32mix=${PLOW_ATTNRES_F32MIX:-0}
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_ATTN_RES_F32MIX 1' "$PLOW_HSACO_CONFIG"; then
+  need_attn_res_f32mix=1
+fi
+if [ "$need_attn_res_f32mix" = 1 ] && [ "$ARCH" != gfx950 ]; then
+  echo "manifest-required f32-mix AttnRes object is supported only on gfx950" >&2
+  exit 2
+fi
+if [ "$ARCH" = gfx950 ] && [ "$need_attn_res_f32mix" = 1 ]; then
+  [ -n "${PLOW_HSACO_CONFIG:-}" ] || {
+    echo "PLOW_ATTNRES_F32MIX=1 requires PLOW_HSACO_CONFIG for packet pairing" >&2
+    exit 2
+  }
+  # -fno-slp-vectorize: packed-f32 FMA formation costs ~30 VGPRs here (see the source header).
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/attn_res_f32mix_gfx950.elf" \
+    plow_attn_res_f32mix_gfx950 168 3 \
+    $INC -fno-slp-vectorize -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_attn_res_f32mix_abi_1 \
+    "$R/amd/attn_res_f32mix_gfx950.hip"
+  ATTN_RES_F32MIX_ELFS="attn_res_f32mix_gfx950.elf"
+KDA_CARRY_REGSTATE_ELFS=""
+case "${PLOW_KDA_CARRY_REGSTATE:-0}" in
+  0|1) ;;
+  *) echo "PLOW_KDA_CARRY_REGSTATE must be 0 or 1" >&2; exit 2 ;;
+esac
+need_kda_carry_regstate=${PLOW_KDA_CARRY_REGSTATE:-0}
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_KDA_CARRY_REGSTATE 1' "$PLOW_HSACO_CONFIG"; then
+  need_kda_carry_regstate=1
+fi
+if [ "$need_kda_carry_regstate" = 1 ] && [ "$ARCH" != gfx950 ]; then
+  echo "manifest-required KDA carry regstate object is supported only on gfx950" >&2
+  exit 2
+fi
+if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_regstate" = 1 ]; then
+  [ -n "${PLOW_HSACO_CONFIG:-}" ] || {
+    echo "PLOW_KDA_CARRY_REGSTATE=1 requires PLOW_HSACO_CONFIG for packet pairing" >&2
+    exit 2
+  }
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_carry_regstate_gfx950.elf" \
+    plow_kda_chunk_carry_regstate_gfx950 256 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 \
+    "$R/amd/kda_chunk_carry_regstate.hip"
+  KDA_CARRY_REGSTATE_ELFS="kda_chunk_carry_regstate_gfx950.elf"
+fi
+
+KDA_KEY_FACTOR_ELFS=""
+case "${PLOW_KDA_KEY_FACTOR:-0}" in
+  0|1) ;;
+  *) echo "PLOW_KDA_KEY_FACTOR must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_KEY_FACTOR:-0}" = 1 ]; then
+  for role in wu carry; do
+    bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+      "$OUT/kda_chunk_key_factor_${role}_gfx950.elf" \
+      "plow_kda_chunk_key_factor_${role}_gfx950" 160 3 \
+      $INC \
+      -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+      -DPLOW_REQUIRED_MARKER="plow_kda_key_factor_${role}_1" \
+      "$R/amd/kda_chunk_key_factor_${role}.hip"
+  done
+  KDA_KEY_FACTOR_ELFS="kda_chunk_key_factor_wu_gfx950.elf kda_chunk_key_factor_carry_gfx950.elf"
+fi
+
+XR_ATTNRES_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_XR_ATTNRES:-0}" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/xreduce_attnres_gfx950.elf" plow_xreduce_attnres_gfx950 256 2 \
+    $INC -DPLOW_K3=1 -DPLOW_XR_ATTNRES=1 -DPLOW_LEAN_OBJECT=1 \
+    -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_xr_attnres_wave64_nospill_1 \
+    "$R/amd/xreduce_attnres_fused.hip"
+  XR_ATTNRES_ELFS="xreduce_attnres_gfx950.elf"
+fi
+if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_decode_fused_gfx950.elf" plow_kda_decode_fused_256x16_v2 128 4 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_decode_fused_256x16_2 \
+    "$R/amd/kda_decode_fused.hip"
+  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf"
+fi
+
+MOE_STAGE2_ELFS=""
+if [ "$ARCH" = gfx950 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_stage2_mxfp4_gfx950.elf" plow_moe2_mxfp4_16x16x128_gfx950 100 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_3 \
+    "$R/bench/amd/lean_moe_stage2_ref/native_kernel.hip"
+  MOE_STAGE2_ELFS="moe_stage2_mxfp4_gfx950.elf"
+fi
+
+MOE_STAGE1_ELFS=""
+if [ "$ARCH" = gfx950 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_stage1_mxfp4_gfx950.elf" plow_moe1_a4_reuse_16x16x128_gfx950 192 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe1_a4_reuse_abi_1 \
+    "$R/bench/amd/lean_moe_stage1_ref/reuse_kernel.hip"
+  MOE_STAGE1_ELFS="moe_stage1_mxfp4_gfx950.elf"
+fi
+
+MOE_COMBINE_ELFS=""
+if [ "$ARCH" = gfx950 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_combine_gfx950.elf" plow_moe_combine_fixed_order_gfx950 64 4 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_combine_fixed_order_abi_1 \
+    "$R/bench/amd/lean_moe_combine_ref/kernel.hip"
+  MOE_COMBINE_ELFS="moe_combine_gfx950.elf"
+fi
+
+MOE_EP_ELFS=""
+if [ "$need_moe_prefill_ep" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_ep_align_gfx950.elf" plow_moe_ep_filter_align_gfx950 64 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_ep_filter_align_no_spill_1 \
+    "$R/bench/amd/moe_ep_boundary/filter_align.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_ep_stage2_gfx950.elf" plow_moe2_ep_full_i_16x16x128_gfx950 128 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe2_ep_full_i_vgpr_le_128 \
+    "$R/bench/amd/moe_ep_boundary/stage2_full_i.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_ep_combine_gfx950.elf" plow_moe_ep_combine_gfx950 64 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_ep_combine_no_spill_1 \
+    "$R/bench/amd/moe_ep_boundary/combine.hip"
+  MOE_EP_ELFS="moe_ep_align_gfx950.elf moe_ep_stage2_gfx950.elf moe_ep_combine_gfx950.elf"
+fi
+
+MOE_DECODE_GROUPED_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_MOE_DECODE_STANDALONE:-0}" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_decode_grouped_mxfp4_gfx950.elf" \
+    plow_moe_decode_grouped_glu_mxfp4_gfx950 96 5 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_decode_grouped_mxfp4_abi_1 \
+    "$R/amd/moe_decode_grouped_mxfp4.hip"
+  MOE_DECODE_GROUPED_ELFS="moe_decode_grouped_mxfp4_gfx950.elf"
+fi
+
+MLA_MATERIALIZED_ELFS=""
+if [ "$ARCH" = gfx950 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/mla_materialized_hd192_v128_gfx950.elf" \
+    plow_mla_materialized_hd192_v128_gfx950 256 2 \
+    -std=c++20 -I"$R/amd/third_party/aiter_opus" \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_mla_materialized_opus_abi_1 \
+    "$R/amd/mla_materialized_opus.hip"
+  MLA_MATERIALIZED_ELFS="mla_materialized_hd192_v128_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/mla_materialize_pack_gfx950.elf" \
+    plow_mla_materialize_pack_gfx950 64 4 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_mla_materialize_pack_abi_1 \
+    "$R/amd/mla_materialize_pack.hip"
+  MLA_MATERIALIZED_ELFS="$MLA_MATERIALIZED_ELFS mla_materialize_pack_gfx950.elf"
+fi
 
 # DECODE BATCH BUCKET -> PLOW_GEMV_MM. THIS ROUTE WAS MISSING, and it is why batched decode
 # produced exactly one non-zero logits row on AMD while devgen emitted a fully batch-aware
@@ -127,7 +392,10 @@ WALK="${PLOW_GEMV_WALK:-0}"
 # Every DECODE object AND its register check must carry the same bucket, or the cliff gate
 # validates an object that is not the one that ships.
 DEC="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM -DPLOW_GEMV_WALK=$WALK"
-echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
+if [ "$decode_inventory_prune" = 1 ]; then
+  DEC="$DEC -DPLOW_DECODE_INVENTORY_PRUNE=1"
+fi
+echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK inventory_prune=$decode_inventory_prune (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
 
 for B in 0 1; do
   N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
@@ -136,10 +404,17 @@ for B in 0 1; do
   unbundle "i_$N.co" "interp_$N.elf"
 done
 
+DECODE_MLA_ELFS=""
+if [ "$need_decode_mla" = 1 ]; then
+  genco "$DEC -DPLOW_BUCKET_DECODE_MLA=1" i_decode_mla.co
+  unbundle i_decode_mla.co interp_decode_mla.elf
+  DECODE_MLA_ELFS="interp_decode_mla.elf"
+fi
+
 # SEGMENTED-DISPATCH flash object: prefill op set at 4 waves / FA_DC=256, compiling ONLY the class-4
 # flash_prefill segment (PLOW_BUCKET_FLASH). 1 wave/SIMD => 512-reg budget; the Q-hoist spills Q to
 # on-chip scratch by design (cheaper than the L2 re-read it replaces).
-genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1" i_flash.co
+genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1" i_flash.co
 unbundle i_flash.co interp_flash.elf
 
 # GLOBAL-QUEUE variant (Experiment E1). Same op set / tiles / wave count as the static prefill+decode
@@ -213,14 +488,17 @@ BUILD_MOE=0; [ "${PLOW_MOE_PREFILL:-0}" = 1 ] && { BUILD_MOE=1; BUILD_MLA=1; }
 # spill 0 — IDENTICAL to the plain GQ decode object. The XCC id lands in a scalar register, so
 # the hottest loop in the interpreter pays nothing for it.
 L2D=""
-if [ "${PLOW_L2_PLACE:-0}" = 1 ]; then
+HIERD=""
+HIER_STATUS="off"
+if [ "${PLOW_L2_PLACE:-1}" = 1 ]; then
   L2D="-DPLOW_L2_PLACE_DISPATCH"
-  echo "   PLOW_L2_PLACE=1: decode GQ object built with L2-domain dispatch (XCC_ID window select)"
+  if [ "${PLOW_GATE_HIER:-1}" = 1 ]; then HIERD="-DPLOW_GATE_HIER=1"; HIER_STATUS="on"; fi
+  echo "   per-XCD packet queues: prefill+decode L2 dispatch; decode hierarchy=$HIER_STATUS"
 fi
 if [ "$BUILD_GQ" = 1 ]; then
   for B in 0 1; do
     N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
-    D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0" || echo "$DEC $L2D")
+    D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0 $L2D" || echo "$DEC $L2D $HIERD")
     genco "$D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" "i_${N}_gq.co"
     unbundle "i_${N}_gq.co" "interp_${N}_gq.elf"
   done
@@ -228,8 +506,13 @@ if [ "$BUILD_GQ" = 1 ]; then
   # one — it is the SAME object with one extra scalar read, and if that ever costs occupancy the
   # build must fail rather than ship a decode kernel at occ 1.
   # GQ flash object (Gemma's segmented 4-wave flash segment under the global queue).
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_flash_gq.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_flash_gq.co
   unbundle i_flash_gq.co interp_flash_gq.elf
+  if [ "$need_decode_mla" = 1 ]; then
+    genco "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mla_gq.co
+    unbundle i_decode_mla_gq.co interp_decode_mla_gq.elf
+    DECODE_MLA_ELFS="$DECODE_MLA_ELFS interp_decode_mla_gq.elf"
+  fi
 fi
 
 # FP8 decode objects (static + GQ), each swapping the bf16 GEMV_GLU/QKV arms for the fp8 ones. Same
@@ -409,7 +692,10 @@ check() { # <name> <defs> <max-total> <min-occ>
 }
 check prefill "-DPLOW_BUCKET_DECODE=0" 256 2
 check decode  "$DEC" 256 2
-check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1" 512 1
+check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1" 512 1
+if [ "$need_decode_mla" = 1 ]; then
+  check decode_mla "$DEC -DPLOW_BUCKET_DECODE_MLA=1" 256 2
+fi
 # The GQ loop adds a shared cursor + claim broadcast; it must NOT push prefill past 256/occ-2. If it
 # does and no minimal-live-set fix recovers it, that is itself a recordable E1 finding (GQ incompatible
 # with occ-2 prefill). These run only when the GQ objects were built.
@@ -417,7 +703,10 @@ GQ_ELFS=""
 if [ "$BUILD_GQ" = 1 ]; then
   check prefill_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   check decode_gq  "$DEC $L2D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-  check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 512 1
+  check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 512 1
+  if [ "$need_decode_mla" = 1 ]; then
+    check decode_mla_gq "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  fi
   GQ_ELFS="interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf"
 fi
 # The fp8 arms swap (not add) against the bf16 GEMV_GLU/QKV arms, so they must stay under the same
@@ -489,7 +778,40 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+
+# Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
+# marker, not a claim that descriptor-consuming math arms are enabled.
+for e in $ALL_ELFS; do
+  case "$e" in
+    interp_*.elf)
+      symbols=$("${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-nm "$e")
+      grep -q plow_packed_prefill_abi_1 <<<"$symbols" || {
+        echo "FAIL: $e does not advertise plow_packed_prefill_abi_1"; exit 1; }
+      if grep -qE 'plow_packed_prefill_(mla|kda)_consumers_1' <<<"$symbols"; then
+        echo "FAIL: default $e unexpectedly enables packed-prefill consumers"; exit 1
+      fi
+      ;;
+  esac
+done
+
+for e in $DECODE_MLA_ELFS; do
+  symbols=$("${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-nm "$e")
+  grep -q plow_decode_mla_segment_object_1 <<<"$symbols" || {
+    echo "FAIL: $e omits the decode MLA segment marker"; exit 1; }
+  grep -q plow_packet_hash_lo <<<"$symbols" && grep -q plow_packet_hash_hi <<<"$symbols" || {
+    echo "FAIL: $e omits the packet pairing stamp"; exit 1; }
+done
+
+for e in interp_flash.elf ${BUILD_GQ:+interp_flash_gq.elf}; do
+  [ -f "$e" ] || continue
+  symbols=$("${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-nm "$e")
+  grep -q plow_mla_pf_v2_arm_1 <<<"$symbols" || {
+    echo "FAIL: $e omits the gfx950 default MLA-prefill V2 arm"; exit 1; }
+done
+
+# Packed consumers are a separate opt-in object axis. Default production objects retain the
+# ABI tail but no descriptor-consuming arms or resource cost.
 
 # INSTRUCTION-SELECTION gate. The register check above catches a kernel that will not launch; it
 # does NOT catch one that launches, is correct, and is silently 4x slow because the backend picked

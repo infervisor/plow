@@ -136,7 +136,7 @@ pub struct RuntimeConfig {
 
 /// NVIDIA / sm_120 runtime knobs.
 #[derive(Args, Debug, Clone)]
-#[command(next_help_heading = "NVIDIA runtime")]
+#[command(next_help_heading = "Scheduling and NVIDIA runtime")]
 pub struct NvidiaRuntimeConfig {
     /// Bounded device multi-step decode (steps per launch, 2..64). 0/1 = single-step.
     #[arg(
@@ -177,7 +177,8 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub upload_direct: bool,
 
-    /// Cross-request batched prefill (packs waiting requests' chunks into one launch).
+    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD TP packs only
+    /// exact-capability programs; unsupported programs retain fair isolated scheduling.
     #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_batch: bool,
 
@@ -368,9 +369,18 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-ctr-dbuf", env = "PLOW_CTR_DBUF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ctr_dbuf: bool,
 
-    /// Clear per-slot recurrent state with one device kernel per rank.
-    #[arg(long = "amd-state-clear-device", env = "PLOW_STATE_CLEAR_DEVICE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Clear per-slot recurrent state with one device kernel per rank (default ON).
+    #[arg(long = "amd-state-clear-device", env = "PLOW_STATE_CLEAR_DEVICE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub state_clear_device: bool,
+
+    /// Load exact-capability packed-prefill operator-family objects. Mux co-packing additionally
+    /// requires --pf-batch, a TP engine, and a compatibly segmented packet.
+    #[arg(long = "amd-packed-prefill-route", env = "PLOW_PACKED_PREFILL_ROUTE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_prefill_route: bool,
+
+    /// Spill-isolated KDA-family object for ordinary prefill segments. Set false to disable.
+    #[arg(long = "amd-kda-family-route", env = "PLOW_KDA_FAMILY_ROUTE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kda_family_route: bool,
 
     /// Global-queue scheduler. "0" = static per-block-stream, "1" = GQ.
     #[arg(long = "amd-global-queue", env = "PLOW_GLOBAL_QUEUE", global = true)]
@@ -391,6 +401,41 @@ pub struct AmdRuntimeConfig {
     /// Segment enqueue/drain windowing. --no-amd-seg-window to disable.
     #[arg(long = "amd-seg-window", env = "PLOW_SEG_WINDOW", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub seg_window: bool,
+
+    /// Enqueue prefill segments in segment-major rank order and drain once per chunk.
+    #[arg(long = "amd-tp-prefill-segment-major", env = "PLOW_TP_PREFILL_SEGMENT_MAJOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_prefill_segment_major: bool,
+
+    /// Per-segment all-rank barrier timing for prefill (diagnostic; disables segment-major).
+    #[arg(long = "amd-prefill-seg-timing", env = "PLOW_PREFILL_SEG_TIMING", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub prefill_seg_timing: bool,
+
+    /// Write `--trace-raw` output for every TP rank (`<path>.rk<N>`), not only rank 0.
+    #[arg(long = "amd-trace-allranks", env = "PLOW_TRACE_ALLRANKS", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub trace_allranks: bool,
+
+    /// Persistent workgroup count for the f32-mix AttnRes object (sweep override).
+    #[arg(
+        long = "amd-attnres-f32mix-grid",
+        env = "PLOW_ATTNRES_F32MIX_GRID",
+        hide = true,
+        global = true
+    )]
+    pub attnres_f32mix_grid: Option<u32>,
+
+    /// Audited extra resident bytes per rank a replicated-input MoE EP packet may claim.
+    #[arg(
+        long = "amd-moe-prefill-ep-max-extra-bytes",
+        env = "PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES",
+        hide = true,
+        global = true
+    )]
+    pub moe_prefill_ep_max_extra_bytes: Option<u64>,
+
+    /// Graph-derived spill-isolated prefill phase objects with one prebuilt AQL replay per rank.
+    /// Default off until an exact full-network gate demonstrates a device-time win.
+    #[arg(long = "amd-phase-objects", env = "PLOW_PHASE_OBJECTS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub phase_objects: bool,
 
     /// VMM-backed KV on ROCr (opt-in, requires hsa_amd_vmem_*).
     #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -414,11 +459,12 @@ pub struct AmdRuntimeConfig {
     #[arg(id = "amd_weight_vmm", long = "amd-weight-vmm", env = "PLOW_WEIGHT_VMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_vmm: bool,
 
-    /// Upload-ring pipeline depth.
+    /// Upload-ring pipeline depth. Values above one are experimental on ROCm:
+    /// concurrent copies into one large allocation fault on current gfx950 drivers.
     #[arg(
         long = "amd-upload-slots",
         env = "PLOW_UPLOAD_SLOTS",
-        default_value_t = 4,
+        default_value_t = 1,
         global = true
     )]
     pub upload_slots: u32,
@@ -453,7 +499,7 @@ pub struct AmdRuntimeConfig {
     pub tp_audit_direct: bool,
 
     /// Compact the exact TP counter audit on device, then read one status word per rank.
-    #[arg(long = "amd-tp-audit-compact", env = "PLOW_TP_AUDIT_COMPACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "amd-tp-audit-compact", env = "PLOW_TP_AUDIT_COMPACT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_audit_compact: bool,
 
     /// Override prefill pad/launch-rows tradeoff.
@@ -531,6 +577,15 @@ pub struct AmdRuntimeConfig {
     )]
     pub tens_snap: Option<String>,
 
+    /// Comma-separated named tensors captured by `--amd-tens-snap`.
+    #[arg(
+        long = "amd-snap-tensors",
+        env = "PLOW_SNAP_TENSORS",
+        hide = true,
+        global = true
+    )]
+    pub snap_tensors: Option<String>,
+
     /// Sequence slot captured by `--amd-tens-snap`.
     #[arg(
         long = "amd-snap-slot",
@@ -540,6 +595,15 @@ pub struct AmdRuntimeConfig {
         global = true
     )]
     pub snap_slot: usize,
+
+    /// One-shot rank-0 tensor capture after an exact TP prefill segment drain.
+    #[arg(
+        long = "amd-pf-capture",
+        env = "PLOW_PF_CAPTURE",
+        hide = true,
+        global = true
+    )]
+    pub pf_capture: Option<String>,
 
     /// Additional decode-object tiers: `dir:max[,dir:max]`, or one legacy dir.
     #[arg(long = "amd-hsaco-lowrung", env = "PLOW_HSACO_LOWRUNG", global = true)]
@@ -558,16 +622,20 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-lm-row0", env = "PLOW_LM_ROW0", default_value_t = false, hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lm_row0: bool,
 
-    /// Route `FlashMlaPrefill` segments onto the 4-wave flash object (the V2 MLA
-    /// prefill kernel, which needs a 512-register budget the 8-wave interpreter
-    /// cannot give). The flash object must advertise `plow_mla_pf_v2_arm_1`.
+    /// Route `FlashMlaPrefill` segments onto a 4-wave V2 object. On gfx950 a pure dense
+    /// bf16 segment prefers the dedicated scratch-free V2+SV object; the general flash
+    /// object is the capability-checked fallback. Set false only to run legacy blobs.
     ///
     /// SERVE-TIME AND LOAD-BEARING, not a tuning knob: a `PLOW_GLM_OFOLD=1` blob
     /// is REFUSED without it, because on the 8-wave kernel that blob leaves
     /// unnormalized f32 partials for the fused GEMM to read as bf16 — finite,
-    /// fluent, and wrong. The canonical gfx942 recipe carries it.
-    #[arg(long = "amd-mla-pf-v2", env = "PLOW_MLA_PF_V2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// fluent, and wrong. Enabled by default for production AMD packets.
+    #[arg(long = "amd-mla-pf-v2", env = "PLOW_MLA_PF_V2", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_v2: bool,
+
+    /// Prequantize sorted MXFP4 MoE stage-1 activations once and reuse them across N tiles.
+    #[arg(long = "amd-moe-stage1-a4-reuse", env = "PLOW_MOE_STAGE1_A4_REUSE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub moe_stage1_a4_reuse: bool,
 
     /// Download rank 0's copy of act tensors after the prefill/step:
     /// `name:path[,name:path...]`. A measurement instrument, not a serving path.
@@ -676,6 +744,78 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_state_clear_defaults_on_and_has_a_false_rollback() {
+        use clap::{Args, FromArgMatches};
+
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "state_clear_device")
+            .expect("state-clear argument");
+        assert_eq!(arg.get_default_values(), ["true"]);
+
+        let matches = command
+            .try_get_matches_from(["test", "--amd-state-clear-device=false"])
+            .expect("explicit state-clear rollback");
+        let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
+        assert!(!config.state_clear_device);
+    }
+
+    #[test]
+    fn tp_prefill_segment_major_defaults_on_and_has_a_false_rollback() {
+        use clap::{Args, FromArgMatches};
+
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "tp_prefill_segment_major")
+            .expect("TP prefill segment-major argument");
+        assert_eq!(arg.get_default_values(), ["true"]);
+
+        let matches = command
+            .try_get_matches_from(["test", "--amd-tp-prefill-segment-major=false"])
+            .expect("explicit TP prefill segment-major rollback");
+        let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
+        assert!(!config.tp_prefill_segment_major);
+    }
+
+    #[test]
+    fn phase_objects_default_off_and_have_an_explicit_opt_in() {
+        use clap::{Args, FromArgMatches};
+
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "phase_objects")
+            .expect("phase-object argument");
+        assert_eq!(arg.get_default_values(), ["false"]);
+
+        let matches = command
+            .try_get_matches_from(["test", "--amd-phase-objects=true"])
+            .expect("explicit phase-object opt-in");
+        let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
+        assert!(config.phase_objects);
+    }
+
+    #[test]
+    fn moe_stage1_a4_reuse_defaults_on_and_has_a_false_rollback() {
+        use clap::{Args, FromArgMatches};
+
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "moe_stage1_a4_reuse")
+            .expect("MoE stage-1 A4 reuse argument");
+        assert_eq!(arg.get_default_values(), ["true"]);
+
+        let matches = command
+            .try_get_matches_from(["test", "--amd-moe-stage1-a4-reuse=false"])
+            .expect("explicit MoE stage-1 A4 reuse rollback");
+        let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
+        assert!(!config.moe_stage1_a4_reuse);
+    }
+
     /// A `RuntimeConfig` field that nothing reads is a CLI flag that silently does nothing.
     ///
     /// This is not hypothetical and it is why the test exists: `amd.trace_raw` was parsed here,

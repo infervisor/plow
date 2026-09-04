@@ -122,6 +122,31 @@ pub fn build_from_config_json_at(json: &str, bucket: &ShapeBucket) -> Result<Gra
     build_graph(&cfg, bucket)
 }
 
+/// Build the complete graph executed by a text-generation endpoint. A multimodal checkpoint may
+/// wrap that network in `text_config`; selecting it is endpoint semantics, not an architecture
+/// special case. Plain text checkpoints pass through unchanged.
+pub fn build_text_generation_from_config_json_at(
+    json: &str,
+    bucket: &ShapeBucket,
+) -> Result<Graph, BuildError> {
+    let mut outer: serde_json::Value = serde_json::from_str(json).map_err(ConfigError::from)?;
+    if let Some(mut text) = outer.get_mut("text_config").map(serde_json::Value::take) {
+        if let serde_json::Value::Object(fields) = &mut text {
+            if !fields.contains_key("dtype") && !fields.contains_key("torch_dtype") {
+                for key in ["dtype", "torch_dtype"] {
+                    if let Some(dtype) = outer.get(key) {
+                        fields.insert(key.into(), dtype.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        outer = text;
+    }
+    let cfg = ModelConfig::from_json(&outer.to_string())?;
+    build_graph(&cfg, bucket)
+}
+
 /// One sub-network of a multi-network pipeline checkpoint.
 #[derive(Debug, Clone)]
 pub struct PipelineNetwork {

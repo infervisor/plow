@@ -44,6 +44,8 @@ int main(void) {{
     printf("StreamEnt.size %zu\n", sizeof(PlowStreamEnt));
     printf("DevProgram.size %zu\n", sizeof(PlowProgram));
     printf("DevProgram.trace %zu\n", offsetof(PlowProgram, trace));
+    printf("DevProgram.prefill_spans %zu\n", offsetof(PlowProgram, prefill_spans));
+    printf("DevProgram.n_prefill_rows %zu\n", offsetof(PlowProgram, n_prefill_rows));
     printf("TraceRec.size %zu\n", sizeof(PlowTraceRec));
     printf("TraceRec.cu %zu\n", offsetof(PlowTraceRec, cu));
     printf("TraceRec.pc %zu\n", offsetof(PlowTraceRec, pc));
@@ -162,6 +164,16 @@ fn rust_and_c_agree_on_the_device_isa() {
         offset_of!(DevProgram, trace),
         get("DevProgram.trace"),
         "DevProgram.trace"
+    );
+    assert_eq!(
+        offset_of!(DevProgram, prefill_spans),
+        get("DevProgram.prefill_spans"),
+        "DevProgram.prefill_spans"
+    );
+    assert_eq!(
+        offset_of!(DevProgram, n_prefill_rows),
+        get("DevProgram.n_prefill_rows"),
+        "DevProgram.n_prefill_rows"
     );
     assert_eq!(
         size_of::<TraceRec>(),

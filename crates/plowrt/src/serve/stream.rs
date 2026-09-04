@@ -14,7 +14,6 @@
 
 use tokio::sync::mpsc;
 
-use crate::serve::openai::ChatChunk;
 use crate::RuntimeError;
 
 /// The OpenAI stream terminator.
@@ -81,6 +80,6 @@ pub fn channel() -> (ChunkSender, ChunkReceiver) {
 }
 
 /// Serialize a chunk to its SSE `data:` payload.
-pub fn chunk_data(chunk: &ChatChunk) -> String {
+pub fn chunk_data(chunk: &impl serde::Serialize) -> String {
     serde_json::to_string(chunk).unwrap_or_default()
 }

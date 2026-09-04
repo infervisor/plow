@@ -117,15 +117,17 @@ impl CompilerOracle {
         let mut records = 0usize;
         if let Some(dbp) = db {
             let store = TuneStore::new(dbp.clone());
-            let want = build_digests(inv.build());
-            if let Ok((best, _stale)) = store.best_for(&hw.tuning_path(), &want) {
-                for (case, rec) in best {
-                    // The case key already carries shape + variant + tile; store
-                    // it verbatim so lookup uses the same string the campaign
-                    // wrote. A mismatch here means measurements are silently
-                    // never found.
-                    measured.insert(case, rec.stats.median_ns.round().max(1.0) as u64);
-                    records += 1;
+            if let Ok(build) = kernelcaps::dense_gemm_tuning_build(root, hw.isa) {
+                let want = build_digests(&build);
+                if let Ok((best, _stale)) = store.best_for(&hw.tuning_path(), &want) {
+                    for (case, rec) in best {
+                        // The case key already carries shape + variant + tile; store
+                        // it verbatim so lookup uses the same string the campaign
+                        // wrote. A mismatch here means measurements are silently
+                        // never found.
+                        measured.insert(case, rec.stats.median_ns.round().max(1.0) as u64);
+                        records += 1;
+                    }
                 }
             }
         }
@@ -171,9 +173,9 @@ pub const GEMM_ORACLE: &str = "gemm-cpu-ref-v1";
 /// The digests a GEMM measurement for `build` must carry to be selectable.
 ///
 /// Public so a campaign constructs the *same* digests it will be looked up by.
-/// implementation and interpreter are both the build content hash: for a
-/// probed interpreter object the kernel body and the object are the same
-/// artifact, so one digest identifies both.
+/// implementation and interpreter are both the measured dense-GEMM-family
+/// build. The sweep uses separate kernels, so this is deliberately not the
+/// persistent interpreter's whole-translation-unit identity.
 pub fn build_digests(build: &kernelcaps::BuildId) -> Digests {
     Digests {
         implementation: build.label(),

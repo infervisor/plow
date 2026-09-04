@@ -30,6 +30,11 @@ commands, and pitfalls. This prompt is the executable checklist.
 
 ## Preconditions (from Stages 1–4)
 
+* Every hot production kernel has a recorded exact-shape same-session comparison
+  against the kernel actually dispatched by the reference framework. Any loss
+  remains in Stage 4; Stage 5 is not a substitute for isolated kernel work.
+* Every fused candidate beats the exact unfused semantic sequence it replaces.
+
 * The model's config + geometry are understood (hidden, head counts, head_dim,
   intermediate size, expert layout, which family: Gemma-dense / Gemma-MoE / GLM
   MLA+MoE / Kimi-K3 / DeepSeek / Nemotron).
@@ -108,6 +113,13 @@ only for a same-precision same-weight A/B.
 
 **Do not proceed to timing until correctness passes.** A fast wrong block is
 worthless.
+
+For a new AMD precision, split-K, attention or grouped-MoE arm, the oracle grid
+must cover ragged M/K, empty experts and maximum top-k, batch 1 and the widest
+decode rung, context immediately below/at/above tile and KV-ring boundaries,
+and repeated deterministic runs. For TP, compare TP1 with the target rank count
+and require rank token identity. Use `AMD_SERIALIZE_KERNEL=3` or
+`HIP_LAUNCH_BLOCKING=1` only to localize a fault, never for timing.
 
 ### 4. Latency — bench and sweep
 

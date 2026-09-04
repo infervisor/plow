@@ -17,10 +17,14 @@
 //!
 //! # Decode and prefill do NOT have the same shape
 //!
-//! Decode is one dispatch per rank, so "launch all, drain all" is the whole
-//! story. Wave-class prefill is SEGMENTED, and there the obvious
-//! generalisation — let each rank enqueue all of its segments, then drain
-//! everyone — is wrong.
+//! Decode normally is one dispatch per rank, so "launch all, drain all" is the whole story.
+//! The narrow standalone-raw decode path is segmented: its first segment is launched on every
+//! rank before any later segment is submitted, later launches are enqueued segment-major across
+//! ranks, and every rank's queue preserves that identical order. The raw segment has no local or
+//! cross-rank counter obligations; interpreter collectives retain distinct cross-rank gates, and
+//! the exact cross-rank counter audit remains mandatory every token. A 64-step TP8 stress run on
+//! 2026-09-03 passed that audit and all-rank token agreement. This does not permit per-rank
+//! submission, where one rank can run ahead of its peers.
 //! `runtime/tests/tp_decode.c` records the failure verbatim:
 //!
 //! > Per-rank-all-segments let the ranks desync — a lagging rank made peers time
@@ -29,13 +33,14 @@
 //! A class-8 segment holds both of a layer's all-reduces. The inline gate
 //! rendezvouses in ~0.3 µs only if every rank is inside that segment at the same
 //! time; if one rank is three segments behind, its peers spin to the
-//! `PLOW_XCTR_DEADLINE_TICKS` deadline (1 s) and give up. So prefill goes
-//! **per-segment, all-ranks, with a host barrier between segments** — see
-//! [`AmdTpGroup::prefill`]. The barrier costs one drain per segment and buys the
-//! rendezvous; it is not a conservatism that could be relaxed. L2-domain
-//! placement is not wave-class segmentation: every domain drains concurrently
-//! inside one launch, so a placed prefill program uses launch-all/drain-all
-//! exactly once.
+//! `PLOW_XCTR_DEADLINE_TICKS` deadline (1 s) and give up. Production submits each
+//! segment to all ranks before the next segment, relies on every rank's AQL
+//! barrier packets to preserve local order, and drains once. The exact counter
+//! audit remains mandatory. `PLOW_TP_PREFILL_SEGMENT_MAJOR=0` restores a host
+//! drain after every segment for diagnosis and intermediate tensor capture uses
+//! that path automatically. L2-domain placement is not wave-class segmentation: every domain
+//! drains concurrently inside one launch, so a placed prefill program uses
+//! launch-all/drain-all exactly once.
 //!
 //! # Status, measured on this node (Gemma-4 31B bf16, gfx950 x8, 2026-07-27)
 //!
@@ -171,15 +176,18 @@
 //! Concurrency 1 at 1k context is the hardest case for plow and the least
 //! representative, so it is the wrong place to judge this module.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::asset::devblob::DevBlob;
+use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::HsaBackend;
 use crate::device::Backend;
 use crate::exec::amd::{AmdEngine, ChunkStep, TpBind};
-use crate::exec::tp::{PeerLayout, TpGroup, XctrReset};
+use crate::exec::tp::{PeerLayout, TpGroup, XctrReset, PARTIAL_SLOTS};
 use crate::{Result, RuntimeError};
+use packet::dev::PrefillSpan;
 
 /// Tokens between full all-rank readbacks — see [`AmdTpGroup::complete_decode`]
 /// for why a cadence is sound at all.
@@ -202,6 +210,100 @@ use crate::{Result, RuntimeError};
 /// token (submission overhead, not work), so on a model that decodes in ~1.5 ms
 /// rather than ~23 the same microseconds are worth cadencing. Measure first.
 const DEFAULT_AGREE_EVERY: u32 = 1;
+const MAX_PREFILL_CAPTURE_TARGETS: usize = 8;
+const MAX_PREFILL_CAPTURE_BYTES: u64 = 256 << 20;
+
+#[derive(Debug, Eq, PartialEq)]
+struct PrefillCaptureRequest {
+    program_t: u32,
+    segment: usize,
+    targets: Vec<(String, PathBuf)>,
+}
+
+#[derive(Debug)]
+struct PrefillCapture {
+    program: usize,
+    segment: usize,
+    targets: Vec<(String, PathBuf)>,
+}
+
+fn parse_prefill_capture(spec: &str) -> Result<PrefillCaptureRequest> {
+    let (program_t, rest) = spec.split_once(':').ok_or_else(|| {
+        RuntimeError::Device("PLOW_PF_CAPTURE must be T:SEG:tensor=path[,tensor=path...]".into())
+    })?;
+    let (segment, targets) = rest.split_once(':').ok_or_else(|| {
+        RuntimeError::Device("PLOW_PF_CAPTURE must be T:SEG:tensor=path[,tensor=path...]".into())
+    })?;
+    let program_t = program_t
+        .parse::<u32>()
+        .map_err(|_| RuntimeError::Device("PLOW_PF_CAPTURE has an invalid program T".into()))?;
+    let segment = segment
+        .parse::<usize>()
+        .map_err(|_| RuntimeError::Device("PLOW_PF_CAPTURE has an invalid segment".into()))?;
+    if program_t == 0 {
+        return Err(RuntimeError::Device(
+            "PLOW_PF_CAPTURE program T must be nonzero".into(),
+        ));
+    }
+
+    let mut parsed = Vec::new();
+    let mut tensors = HashSet::new();
+    let mut paths = HashSet::new();
+    for target in targets.split(',') {
+        let (tensor, path) = target.split_once('=').ok_or_else(|| {
+            RuntimeError::Device("PLOW_PF_CAPTURE target must be tensor=path".into())
+        })?;
+        let tensor = tensor.trim();
+        let path = path.trim();
+        if tensor.is_empty() || path.is_empty() {
+            return Err(RuntimeError::Device(
+                "PLOW_PF_CAPTURE tensor and path must be nonempty".into(),
+            ));
+        }
+        if !tensors.insert(tensor.to_owned()) {
+            return Err(RuntimeError::Device(format!(
+                "PLOW_PF_CAPTURE duplicates tensor {tensor:?}"
+            )));
+        }
+        let path = PathBuf::from(path);
+        if !paths.insert(path.clone()) {
+            return Err(RuntimeError::Device(format!(
+                "PLOW_PF_CAPTURE output path {} is used twice",
+                path.display()
+            )));
+        }
+        parsed.push((tensor.to_owned(), path));
+    }
+    if parsed.is_empty() || parsed.len() > MAX_PREFILL_CAPTURE_TARGETS {
+        return Err(RuntimeError::Device(format!(
+            "PLOW_PF_CAPTURE has {} targets; expected 1..={MAX_PREFILL_CAPTURE_TARGETS}",
+            parsed.len()
+        )));
+    }
+    Ok(PrefillCaptureRequest {
+        program_t,
+        segment,
+        targets: parsed,
+    })
+}
+
+fn prefill_capture_due(capture: Option<&PrefillCapture>, program: usize, segment: usize) -> bool {
+    capture.is_some_and(|capture| capture.program == program && capture.segment == segment)
+}
+
+fn agreement_due(tick: &mut u32, every: u32) -> bool {
+    let all = *tick >= every;
+    *tick = if all { 1 } else { *tick + 1 };
+    all
+}
+
+fn deferred_capture_saves_readback(agree_every: u32) -> bool {
+    agree_every > 1
+}
+
+fn segment_major_order(n_segments: usize, n_ranks: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..n_segments).flat_map(move |seg| (0..n_ranks).map(move |rank| (seg, rank)))
+}
 
 /// N co-resident ranks of one sharded model.
 pub struct AmdTpGroup {
@@ -235,6 +337,8 @@ pub struct AmdTpGroup {
     /// the program that actually ran, and submit/complete are separate calls by design (the
     /// split is what lets the host do nothing between launch and drain).
     cur_dp: usize,
+    /// Hidden one-shot diagnostic. `None` is the production state and performs no readback.
+    prefill_capture: Option<PrefillCapture>,
 }
 
 impl AmdTpGroup {
@@ -305,26 +409,27 @@ impl AmdTpGroup {
         }
         let max_tokens = (tp.slot_bytes / msg) as u32;
         let n_xctr = count_xgates(&blob);
-        let audit_compact = crate::config::RuntimeConfig::get().amd.tp_audit_compact;
-        if audit_compact
-            && blob
-                .progs
-                .iter()
-                .flat_map(|p| &p.stream)
-                .any(|e| e.flags & packet::dev::SE_XCTR != 0)
-        {
-            return Err(RuntimeError::Device(
-                "compact TP audit does not support SE_XCTR fine-gate programs; use the direct or copy audit"
-                    .into(),
-            ));
+        let audit_compact_requested = crate::config::RuntimeConfig::get().amd.tp_audit_compact;
+        let has_fine_xctr = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.stream)
+            .any(|e| e.flags & packet::dev::SE_XCTR != 0);
+        let audit_compact = audit_compact_requested && !has_fine_xctr;
+        if audit_compact_requested && has_fine_xctr {
+            tracing::warn!(
+                "compact TP audit does not support SE_XCTR fine gates; using the exact copy audit"
+            );
         }
         let gate_expect = gate_expectations(&blob, n_gpu, n_xctr);
-        let layout = PeerLayout::new(tp.hidden, max_tokens, n_xctr).ok_or_else(|| {
-            RuntimeError::Device(format!(
-                "peer layout for hidden={} x {max_tokens} tokens is not 128 B-aligned",
-                tp.hidden
-            ))
-        })?;
+        let slots = check_seq_par_seams(&blob, n_gpu)?;
+        let layout =
+            PeerLayout::with_slots(tp.hidden, max_tokens, n_xctr, slots).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "peer layout for hidden={} x {max_tokens} tokens is not 128 B-aligned",
+                    tp.hidden
+                ))
+            })?;
         tracing::info!(
             n_gpu,
             hidden = tp.hidden,
@@ -475,6 +580,55 @@ impl AmdTpGroup {
             0 => DEFAULT_AGREE_EVERY,
             n => n,
         };
+        let prefill_capture = crate::config::RuntimeConfig::get()
+            .amd
+            .pf_capture
+            .as_deref()
+            .map(parse_prefill_capture)
+            .transpose()?
+            .map(|request| {
+                let programs = (0..ranks[0].n_programs())
+                    .filter(|&p| ranks[0].prefill_prog_t(p) == Some(request.program_t))
+                    .collect::<Vec<_>>();
+                if programs.len() != 1 {
+                    return Err(RuntimeError::Device(format!(
+                        "PLOW_PF_CAPTURE T={} matched {} prefill programs, expected exactly one",
+                        request.program_t,
+                        programs.len()
+                    )));
+                }
+                let program = programs[0];
+                let segments = ranks[0].prog_dispatch(program).launches();
+                if request.segment >= segments {
+                    return Err(RuntimeError::Device(format!(
+                        "PLOW_PF_CAPTURE segment {} is outside T={} program's {segments} segments",
+                        request.segment, request.program_t
+                    )));
+                }
+                let mut total = 0u64;
+                for (tensor, _) in &request.targets {
+                    let bytes = ranks[0].tensor_bytes(tensor).ok_or_else(|| {
+                        RuntimeError::Device(format!(
+                            "PLOW_PF_CAPTURE tensor {tensor:?} is not declared"
+                        ))
+                    })?;
+                    total = total.checked_add(bytes).ok_or_else(|| {
+                        RuntimeError::Device("PLOW_PF_CAPTURE byte count overflow".into())
+                    })?;
+                }
+                if total > MAX_PREFILL_CAPTURE_BYTES {
+                    return Err(RuntimeError::Device(format!(
+                        "PLOW_PF_CAPTURE selects {total} bytes; maximum is {MAX_PREFILL_CAPTURE_BYTES}"
+                    )));
+                }
+                Ok(PrefillCapture {
+                    program,
+                    segment: request.segment,
+                    targets: request.targets,
+                })
+            })
+            .transpose()?;
+
         Ok(AmdTpGroup {
             group,
             ranks,
@@ -487,6 +641,7 @@ impl AmdTpGroup {
             agree_tick: agree_every,
             // Overwritten by the first submit; the widest rung is the safe pre-first-step value.
             cur_dp: 0,
+            prefill_capture,
         })
     }
 
@@ -505,21 +660,29 @@ impl AmdTpGroup {
         self.ranks.len()
     }
 
+    pub fn agreement_cadence(&self) -> u32 {
+        self.agree_every
+    }
+
+    pub fn counter_audit_enabled(&self) -> bool {
+        self.audit
+    }
+
     /// Task-9 differential counter audit: rank 0's end-state counters for `dp`.
     pub fn ctr_snapshot(&mut self, dp: usize) -> Result<Vec<u32>> {
         self.ranks[0].ctr_word0_snapshot(dp)
     }
 
-    /// Task-9 round-7 data audit: rank 0's layer-0 KV slot head + named act tensors.
+    /// Rank 0's layer-0 KV slot head plus explicitly selected named tensors.
     pub fn data_snapshot(
         &mut self,
         slot: usize,
         kv_bytes: usize,
-        acts: &[&str],
+        tensors: &[String],
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let mut out = self.ranks[0].snapshot_kv_slot(slot, kv_bytes)?;
-        for a in acts {
-            out.push(((*a).to_string(), self.ranks[0].snapshot_tensor(a)?));
+        for name in tensors {
+            out.push((name.clone(), self.ranks[0].snapshot_tensor(name)?));
         }
         Ok(out)
     }
@@ -559,10 +722,10 @@ impl AmdTpGroup {
     /// One batched decode step across every rank: submit, drain, return the `pos.len()` sampled
     /// ids.
     ///
-    /// AGREEMENT IS CHECKED ON THE WHOLE B-VECTOR, not on slot 0. Every rank samples from its own
-    /// shard of the logits, so a broken all-reduce still yields fluent ids — agreement is the only
-    /// signal that distinguishes it from a working one. Checking slot 0 alone would test one of B
-    /// sequences and report green while the rest diverged, which is the same mistake
+    /// On an agreement sample the WHOLE B-VECTOR is checked, not only slot 0. Every rank samples
+    /// from its own shard of the logits, so a broken all-reduce still yields fluent ids — agreement
+    /// is the only signal that distinguishes it from a working one. Checking slot 0 alone would
+    /// test one of B sequences and report green while the rest diverged, which is the same mistake
     /// `amd_bench`'s B=16 batched arm made (it compared every slot against slot 0 rather than
     /// against the first slot carrying its own prompt).
     pub fn decode_step_batched(&mut self, pos: &[u32], kvlen: &[u32]) -> Result<Vec<u32>> {
@@ -578,28 +741,89 @@ impl AmdTpGroup {
         dp: usize,
     ) -> Result<Vec<u32>> {
         self.submit_decode_batched_at(pos, kvlen, dp)?;
+        self.complete_decode_batched(pos.len())
+    }
+
+    /// Complete a batched decode and return one sampled id per host slot.
+    ///
+    /// The same agreement cadence as scalar decode applies here. Counter
+    /// auditing still runs every token; on agreement tokens every sampled row
+    /// is compared across ranks, while other tokens copy only rank 0's rows.
+    pub fn complete_decode_batched(&mut self, batch: usize) -> Result<Vec<u32>> {
+        use crate::obs::dstep;
         self.drain_and_audit()?;
-        // Only the rung's rows sampled; the reply still comes back `pos.len()` long so callers
-        // can index it BY SLOT, with the uncovered tail zeroed.
-        let b = pos.len();
-        let rows = (self.ranks[0].prog_t(dp) as usize).min(b);
-        let per_rank: Vec<Vec<u32>> = self
-            .ranks
-            .iter_mut()
-            .map(|e| e.read_sampled_batched(rows))
-            .collect::<Result<_>>()?;
-        for (r, ids) in per_rank.iter().enumerate().skip(1) {
-            if ids != &per_rank[0] {
-                return Err(RuntimeError::Device(format!(
-                    "TP ranks disagree on a batched decode step: rank 0 sampled {:?}, rank {r} \
-                     sampled {ids:?} — the all-reduce is wrong",
-                    per_rank[0]
-                )));
+        let all = agreement_due(&mut self.agree_tick, self.agree_every);
+        let rows = (self.ranks[0].prog_t(self.cur_dp) as usize).min(batch);
+        dstep::timed(&dstep::READ, || {
+            let mut ids = self.ranks[0].read_sampled_batched(rows)?;
+            if all {
+                for (r, rank) in self.ranks.iter_mut().enumerate().skip(1) {
+                    let peer = rank.read_sampled_batched(rows)?;
+                    if peer != ids {
+                        return Err(RuntimeError::Device(format!(
+                            "TP ranks disagree on a batched decode step: rank 0 sampled \
+                             {ids:?}, rank {r} sampled {peer:?} — the all-reduce is wrong"
+                        )));
+                    }
+                }
             }
+            // Only the rung's rows sampled; the reply still comes back `batch` long so callers
+            // can index it BY SLOT, with the uncovered tail zeroed.
+            ids.resize(batch, 0);
+            Ok(ids)
+        })
+    }
+
+    pub(crate) fn deferred_token_capture_available(&self) -> bool {
+        // At cadence 1 the mandatory agreement already reads every rank every
+        // token; adding a capture launch and final ring read cannot remove a
+        // host readback and would only add work.
+        deferred_capture_saves_readback(self.agree_every)
+            && self
+                .ranks
+                .first()
+                .is_some_and(AmdEngine::deferred_token_capture_available)
+    }
+
+    /// Capture rank 0's sampled rows on-device, then retain the ordinary
+    /// per-token drain, counter audit, and configured cross-rank agreement.
+    pub(crate) fn complete_decode_batched_deferred(
+        &mut self,
+        batch: usize,
+        step: usize,
+        quantum: usize,
+    ) -> Result<()> {
+        use crate::obs::dstep;
+        let rows = (self.ranks[0].prog_t(self.cur_dp) as usize).min(batch);
+        self.ranks[0].enqueue_token_capture(step, quantum, rows)?;
+        self.drain_and_audit()?;
+        if agreement_due(&mut self.agree_tick, self.agree_every) {
+            dstep::timed(&dstep::READ, || {
+                let ids = self.ranks[0].read_sampled_batched(rows)?;
+                for (r, rank) in self.ranks.iter_mut().enumerate().skip(1) {
+                    let peer = rank.read_sampled_batched(rows)?;
+                    if peer != ids {
+                        return Err(RuntimeError::Device(format!(
+                            "TP ranks disagree on deferred batched decode step: rank 0 sampled \
+                             {ids:?}, rank {r} sampled {peer:?}"
+                        )));
+                    }
+                }
+                Ok(())
+            })?;
         }
-        let mut ids = per_rank.into_iter().next().expect(">=1 rank");
-        ids.resize(b, 0);
-        Ok(ids)
+        Ok(())
+    }
+
+    pub(crate) fn read_deferred_tokens(
+        &mut self,
+        batch: usize,
+        quantum: usize,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        crate::obs::dstep::timed(&crate::obs::dstep::READ, || {
+            self.ranks[0].read_token_capture(batch, quantum, out)
+        })
     }
 
     /// Dispatch one decode token on every rank and RETURN — no wait.
@@ -677,6 +901,17 @@ impl AmdTpGroup {
         // dates the boundary exactly and leaves the ordering discipline in the
         // one place that owns it.
         let ranks = &mut self.ranks;
+        let n_ranks = ranks.len();
+        let n_segments = ranks[0].decode_launches(dp);
+        if let Some(rank) = ranks
+            .iter()
+            .position(|e| e.decode_launches(dp) != n_segments)
+        {
+            return Err(RuntimeError::Device(format!(
+                "rank {rank} program {dp} has {} decode segments, rank 0 has {n_segments}",
+                ranks[rank].decode_launches(dp)
+            )));
+        }
         let mut i = 0usize;
         let t0 = dstep::on().then(std::time::Instant::now);
         let mut launched_at: Option<std::time::Instant> = None;
@@ -689,8 +924,17 @@ impl AmdTpGroup {
             let e = &mut ranks[i];
             let k = e.decode_kernel_for(dp);
             i += 1;
-            e.enqueue(dp, k)
+            e.enqueue_decode_segment(dp, 0, k)
         })?;
+        // Segment-major, all ranks, with no intermediate drain. `launch_token` submitted segment
+        // zero on every rank first; then each rank's AQL barrier packets preserve the same local
+        // segment order. Raw routes have no counter obligations, interpreter collectives retain
+        // distinct xctr gates, and the mandatory per-token audit detects a deadline bail.
+        for (seg, rank) in segment_major_order(n_segments, n_ranks).skip(n_ranks) {
+            let e = &mut ranks[rank];
+            let k = e.decode_kernel_for(dp);
+            e.enqueue_decode_segment(dp, seg, k)?;
+        }
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
         }
@@ -745,8 +989,7 @@ impl AmdTpGroup {
     pub fn complete_decode(&mut self) -> Result<Vec<u32>> {
         use crate::obs::dstep;
         self.drain_and_audit()?;
-        let all = self.agree_tick >= self.agree_every;
-        self.agree_tick = if all { 1 } else { self.agree_tick + 1 };
+        let all = agreement_due(&mut self.agree_tick, self.agree_every);
         dstep::timed(&dstep::READ, || {
             if all {
                 self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
@@ -950,6 +1193,48 @@ impl AmdTpGroup {
         Ok(())
     }
 
+    /// Stage the same packed-prefill metadata on every rank. Any partial failure clears all
+    /// bindings so a later dispatch cannot mix staged and legacy kernargs across ranks.
+    pub fn stage_packed_prefill(
+        &mut self,
+        prog: usize,
+        spans: &[PrefillSpan],
+        parked: &[u32],
+    ) -> Result<()> {
+        for r in 0..self.ranks.len() {
+            if let Err(err) = self.ranks[r].stage_packed_prefill(prog, spans, parked) {
+                for rank in &mut self.ranks {
+                    rank.clear_packed_prefill();
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn clear_packed_prefill(&mut self) {
+        for rank in &mut self.ranks {
+            rank.clear_packed_prefill();
+        }
+    }
+
+    pub fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
+        let t = self.ranks.first()?.prefill_prog_t(prog)?;
+        self.ranks
+            .iter()
+            .all(|rank| rank.prefill_prog_t(prog) == Some(t))
+            .then_some(t)
+    }
+
+    /// True only when every rank can route this exact program through packed prefill.
+    pub fn packed_prefill_prog_capable(&self, prog: usize) -> bool {
+        self.prefill_prog_t(prog).is_some()
+            && self
+                .ranks
+                .iter()
+                .all(|rank| rank.packed_prefill_prog_capable(prog))
+    }
+
     pub fn has_snapshot(&self, slot: usize) -> bool {
         self.ranks.iter().all(|e| e.has_snapshot(slot))
     }
@@ -968,10 +1253,15 @@ impl AmdTpGroup {
 
     /// The chunk plan covering `[from, to)` — the cursor a chunked server steps through.
     pub fn plan_span(&self, from: u32, to: u32) -> Result<Vec<ChunkStep>> {
+        self.plan_span_at_most(from, to, u32::MAX)
+    }
+
+    /// The span plan using only compiled rungs no wider than `max_bucket`.
+    pub fn plan_span_at_most(&self, from: u32, to: u32, max_bucket: u32) -> Result<Vec<ChunkStep>> {
         if from >= to {
             return Ok(Vec::new());
         }
-        let chunks = self.ranks[0].plan_for(to - from)?;
+        let chunks = self.ranks[0].plan_for_at_most(to - from, max_bucket)?;
         self.ranks[0].chunk_steps_from(&chunks, from, to)
     }
 
@@ -1084,39 +1374,235 @@ impl AmdTpGroup {
         let dispatch = self.ranks[0].prog_dispatch(step.prog);
         let launches = dispatch.launches();
         ttft::PF_SEGMENTS.tally(launches as u64);
-        for seg in 0..launches {
+        let segment_timing = crate::config::RuntimeConfig::get().amd.prefill_seg_timing;
+        let segment_major = crate::config::RuntimeConfig::get()
+            .amd
+            .tp_prefill_segment_major
+            && self.prefill_capture.is_none()
+            && !segment_timing;
+        if segment_major {
             let t = std::time::Instant::now();
-            for e in &mut self.ranks {
-                e.enqueue_segment(step.prog, seg)?;
+            let n_ranks = self.ranks.len();
+            let phase_replay = self.ranks[0].graph_phase_replay(step.prog);
+            if self
+                .ranks
+                .iter()
+                .any(|rank| rank.graph_phase_replay(step.prog) != phase_replay)
+            {
+                return Err(RuntimeError::Device(
+                    "graph phase-object selection differs across TP ranks".into(),
+                ));
+            }
+            if phase_replay {
+                // Reserve every rank before publishing any doorbell. Rank-first
+                // chain commit recreates the measured TP desynchronization bug.
+                for rank in &self.ranks {
+                    rank.begin_graph_phase_replay(step.prog)?;
+                }
+            }
+            for (seg, rank) in segment_major_order(launches, n_ranks) {
+                self.ranks[rank].enqueue_segment(step.prog, seg)?;
+            }
+            if phase_replay {
+                for rank in &self.ranks {
+                    rank.commit_graph_phase_replay()?;
+                }
             }
             ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
-            // For WaveSegments this is THE BARRIER. Without it the ranks drift
-            // apart across segments and collectives in a later segment miss
-            // each other. L2Domains has one iteration and this is its final
-            // all-rank drain.
+
             let t = std::time::Instant::now();
             for e in &self.ranks {
                 e.drain()?;
             }
             let ns = t.elapsed().as_nanos() as u64;
             ttft::PF_DRAIN.add(ns);
-            // Per-CHUNK, because the aggregate cannot separate a full bucket
-            // from a padded one and that is the bucket-ladder question.
             if ttft::on() {
                 let bucket = self.ranks[0].prog_t(step.prog);
+                let timing = if self.weights_bound() {
+                    ""
+                } else {
+                    "SYNTHETIC DIAGNOSTIC: "
+                };
                 eprintln!(
-                    "PF CHUNK T={bucket} c0={} clen={} seg={seg} drain={:.3} ms \
-                     ({:.0} tok/s over the bucket, {:.0} over the real rows)",
+                    "{timing}PF CHUNK T={bucket} c0={} clen={} segment-major launches={} \
+                     drain={:.3} ms ({:.0} tok/s over the bucket, {:.0} over the real rows)",
                     step.c0,
                     step.clen,
+                    launches,
                     ns as f64 / 1e6,
                     bucket as f64 / (ns as f64 / 1e9),
                     step.clen as f64 / (ns as f64 / 1e9),
                 );
             }
+            if self.audit {
+                self.group.audit_xctr(&self.gate_expect[step.prog])?;
+            }
+            return Ok(());
+        }
+        for seg in 0..launches {
+            let submit_begin = std::time::Instant::now();
+            let family =
+                segment_timing.then(|| self.ranks[0].prefill_segment_family(step.prog, seg));
+            for e in &mut self.ranks {
+                e.enqueue_segment(step.prog, seg)?;
+            }
+            let enqueued = std::time::Instant::now();
+            ttft::PF_ENQUEUE.add((enqueued - submit_begin).as_nanos() as u64);
+            // For WaveSegments this is THE BARRIER. Without it the ranks drift
+            // apart across segments and collectives in a later segment miss
+            // each other. L2Domains has one iteration and this is its final
+            // all-rank drain.
+            let drain_begin = std::time::Instant::now();
+            for e in &self.ranks {
+                e.drain()?;
+            }
+            let drain_ns = drain_begin.elapsed().as_nanos() as u64;
+            if let Some(family) = family {
+                eprintln!(
+                    "PLOW_PREFILL_SEG_TIMING program={} bucket={} c0={} clen={} segment={} family={} enqueue_us={:.3} critical_us={:.3}",
+                    step.prog,
+                    self.ranks[0].prog_t(step.prog),
+                    step.c0,
+                    step.clen,
+                    seg,
+                    family,
+                    (enqueued - submit_begin).as_secs_f64() * 1e6,
+                    submit_begin.elapsed().as_secs_f64() * 1e6,
+                );
+            }
+            if prefill_capture_due(self.prefill_capture.as_ref(), step.prog, seg) {
+                let capture = self.prefill_capture.take().expect("capture was due");
+                for (tensor, path) in capture.targets {
+                    let bytes = self.ranks[0].snapshot_tensor(&tensor)?;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .and_then(|mut file| file.write_all(&bytes))
+                        .map_err(|e| {
+                            RuntimeError::Device(format!(
+                                "PLOW_PF_CAPTURE write {}: {e}",
+                                path.display()
+                            ))
+                        })?;
+                }
+            }
+            ttft::PF_DRAIN.add(drain_ns);
+            // Per-CHUNK, because the aggregate cannot separate a full bucket
+            // from a padded one and that is the bucket-ladder question.
+            if ttft::on() {
+                let bucket = self.ranks[0].prog_t(step.prog);
+                let timing = if self.weights_bound() {
+                    ""
+                } else {
+                    "SYNTHETIC DIAGNOSTIC: "
+                };
+                eprintln!(
+                    "{timing}PF CHUNK T={bucket} c0={} clen={} seg={seg} drain={:.3} ms \
+                     ({:.0} tok/s over the bucket, {:.0} over the real rows)",
+                    step.c0,
+                    step.clen,
+                    drain_ns as f64 / 1e6,
+                    bucket as f64 / (drain_ns as f64 / 1e9),
+                    step.clen as f64 / (drain_ns as f64 / 1e9),
+                );
+            }
         }
         if self.audit {
             self.group.audit_xctr(&self.gate_expect[step.prog])?;
+        }
+        Ok(())
+    }
+
+    /// Execute one packed prefill chunk as an all-rank transaction. No rank launches until all
+    /// ranks have staged the same dense rows and ABI binding. The binding is cleared after every
+    /// outcome so a later legacy dispatch can never inherit packed metadata.
+    pub fn prefill_packed_chunk(
+        &mut self,
+        spans: &[PrefillSpan],
+        prompt_slices: &[&[u32]],
+        parked: &[u32],
+    ) -> Result<()> {
+        self.clear_packed_prefill();
+        let result = self.prefill_packed_chunk_inner(spans, prompt_slices, parked);
+        self.clear_packed_prefill();
+        result
+    }
+
+    fn prefill_packed_chunk_inner(
+        &mut self,
+        spans: &[PrefillSpan],
+        prompt_slices: &[&[u32]],
+        parked: &[u32],
+    ) -> Result<()> {
+        use crate::obs::ttft;
+
+        let first = spans.first().ok_or_else(|| {
+            RuntimeError::Device("packed prefill requires at least one span".into())
+        })?;
+        if spans.iter().any(|span| span.program != first.program) {
+            return Err(RuntimeError::Device(
+                "packed prefill spans do not share one compiled program".into(),
+            ));
+        }
+        let requested_prog = first.program as usize;
+        let rung = self.prefill_prog_t(requested_prog).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "packed prefill program {requested_prog} is absent or differs across ranks"
+            ))
+        })?;
+        let prog = self.ranks[0]
+            .packed_prefill_prog_for(requested_prog)
+            .filter(|&candidate| {
+                self.ranks
+                    .iter()
+                    .all(|rank| rank.packed_prefill_prog_for(requested_prog) == Some(candidate))
+            })
+            .ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "packed prefill program {requested_prog} has no common packed topology"
+                ))
+            })?;
+        if parked.len() != rung as usize {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill parked mask has {} rows for rung {rung}",
+                parked.len()
+            )));
+        }
+
+        let mut routed_spans = spans.to_vec();
+        for span in &mut routed_spans {
+            span.program = prog as u32;
+        }
+        for e in &mut self.ranks {
+            let t = std::time::Instant::now();
+            e.packed_prefill_prepare(prog, &routed_spans, prompt_slices, parked)?;
+            ttft::PF_PREPARE.add(t.elapsed().as_nanos() as u64);
+            let t = std::time::Instant::now();
+            e.rearm_prog(prog)?;
+            ttft::PF_REARM.add(t.elapsed().as_nanos() as u64);
+        }
+
+        let t = std::time::Instant::now();
+        self.group.zero_xctr()?;
+        ttft::PF_XCTR.add(t.elapsed().as_nanos() as u64);
+
+        let launches = self.ranks[0].prog_dispatch(prog).launches();
+        ttft::PF_SEGMENTS.tally(launches as u64);
+        for seg in 0..launches {
+            let t = std::time::Instant::now();
+            for e in &mut self.ranks {
+                e.enqueue_segment(prog, seg)?;
+            }
+            ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+            let t = std::time::Instant::now();
+            for e in &self.ranks {
+                e.drain()?;
+            }
+            ttft::PF_DRAIN.add(t.elapsed().as_nanos() as u64);
+        }
+        if self.audit {
+            self.group.audit_xctr(&self.gate_expect[prog])?;
         }
         Ok(())
     }
@@ -1170,11 +1656,111 @@ impl AmdTpGroup {
 /// slots. Measured on the GLM-5.2 TP4 stacked blob: `n_xctr = 312`, prefill fold
 /// at 312/313, and the ranks sampled `[99419, 785, 99419, 785]`.
 fn xargmax_value_lines(n_batch: u32) -> u32 {
-    if n_batch > 16 {
-        2
-    } else {
-        1
+    packet::devbuild::xargmax_value_lines(n_batch)
+        .expect("AmdEngine rejects XArgmaxFin batches above the packet limit")
+}
+
+/// The blob contract of the tagged one-shot XReduce (`plow_xr_tagged_1` decode objects,
+/// `d_xreduce_tagged_mega`): every `XReduce` message fits the layout's slot (`i0 <= hidden`,
+/// `gcols <= hidden`), the folded gather is the decode `[1, row_w == n]` form, gate ids fit
+/// the 16-bit tag, and CONSECUTIVE XReduce packets of a program use gates of opposite
+/// parity — the tagged slot is chosen by `gate & 1`, and a rank may only rewrite a slot
+/// after every peer has finished reading it, which program order guarantees only one
+/// collective later. Prefill programs (two-shot) are untouched by the arm and skipped.
+pub fn check_xr_tagged_blob(progs: &[crate::asset::devblob::DevProg], hidden: u32) -> Result<()> {
+    for (pi, p) in progs.iter().enumerate() {
+        check_xr_tagged_insts(pi, &p.insts, hidden)?;
     }
+    Ok(())
+}
+
+fn check_xr_tagged_insts(pi: usize, insts: &[packet::dev::DevInst64], hidden: u32) -> Result<()> {
+    use packet::dev::DevOp;
+    {
+        let mut prev: Option<u32> = None;
+        for d in insts {
+            if d.op != DevOp::XReduce as u16 {
+                continue;
+            }
+            let (n, gate, gcols, row_w) = (d.i[0], d.i[3], d.i[5], d.i[6]);
+            let bad = n == 0
+                || n > hidden
+                || hidden > PeerLayout::XR_TAG_MAX_WIDTH
+                || gcols > hidden
+                || (gcols != 0 && row_w != n)
+                || gate >= 0xffff;
+            if bad {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi}: XReduce n={n} gate={gate} gcols={gcols} row_w={row_w} is \
+                     outside the tagged one-shot contract (hidden={hidden}, slot holds {})",
+                    PeerLayout::XR_TAG_MAX_WIDTH
+                )));
+            }
+            if let Some(g) = prev {
+                if (g ^ gate) & 1 == 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "program {pi}: consecutive XReduce gates {g} and {gate} share parity; \
+                         the tagged one-shot double-buffers by gate parity"
+                    )));
+                }
+            }
+            prev = Some(gate);
+        }
+    }
+    Ok(())
+}
+
+/// Sequence-parallel seams (ops 25/26): what the packet may carry, and how many partial slots
+/// the peer region needs for it.
+///
+/// The band packets between the two halves address `<base>@band<t>` views at
+/// `rank * t/tp` rows, so a program carrying the ops must be a PREFILL bucket whose flat
+/// reduce-scatter slices end on row boundaries (`t % tp == 0`, `t > 1`); a decode rung
+/// (single or batched — independent sequences have no owned band) must not carry them. The
+/// results travel through `act.{h2,xe,rt}_tp`, so the blob must declare all three and the
+/// region grows to [`PeerLayout::SEQ_PAR_SLOTS`].
+fn check_seq_par_seams(blob: &DevBlob, n_gpu: u32) -> Result<u64> {
+    use packet::dev::DevOp;
+    let carries = |p: &DevProg| {
+        p.insts
+            .iter()
+            .any(|d| d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16)
+    };
+    let dec_lo = blob.decode_rung_lo();
+    let mut any = false;
+    for (pi, p) in blob.progs.iter().enumerate() {
+        if !carries(p) {
+            continue;
+        }
+        any = true;
+        if pi >= dec_lo {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} (T={}) is a decode rung but carries sequence-parallel seam \
+                 collectives (XReduceScatter/XAllGather); those are prefill-only",
+                p.t
+            )));
+        }
+        if p.t < 2 || p.t % n_gpu != 0 {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} (T={}) carries sequence-parallel seam collectives but its row \
+                 count is not a multiple of tp={n_gpu} (> 1): the owned bands would not end on \
+                 row boundaries",
+                p.t
+            )));
+        }
+    }
+    if !any {
+        return Ok(PARTIAL_SLOTS);
+    }
+    for name in ["act.h2_tp", "act.xe_tp", "act.rt_tp"] {
+        if !blob.tensors.iter().any(|t| t.name == name) {
+            return Err(RuntimeError::Device(format!(
+                "packet carries sequence-parallel seam collectives but declares no `{name}` \
+                 result slot"
+            )));
+        }
+    }
+    Ok(PeerLayout::SEQ_PAR_SLOTS)
 }
 
 fn count_xgates(blob: &DevBlob) -> u32 {
@@ -1187,8 +1773,11 @@ fn count_xgates(blob: &DevBlob) -> u32 {
             } else if d.op == DevOp::XReduceTwoShot as u16 {
                 // two-shot: reduce-scatter (i3) and all-gather (i4)
                 top = top.max(d.i[3] + 1).max(d.i[4] + 1);
+            } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
+                // split seams: one gate each (i3)
+                top = top.max(d.i[3] + 1);
             } else if d.op == DevOp::XArgmaxFin as u16 {
-                // sharded-head fold: arrival gate (i3), then one or two value lines at i4
+                // sharded-head fold: arrival gate (i3), then consecutive value lines at i4
                 top = top
                     .max(d.i[3] + 1)
                     .max(d.i[4] + xargmax_value_lines(d.i[1]));
@@ -1225,7 +1814,7 @@ fn count_xgates(blob: &DevBlob) -> u32 {
 /// equality check rather than a range test — it then also catches a stale count
 /// that survived a missing `zero_xctr`.
 ///
-/// `None` means NOT A COUNTER. `XArgmaxFin`'s `i[4]` names one or two peer-visible u64 data
+/// `None` means NOT A COUNTER. `XArgmaxFin`'s `i[4]` names consecutive peer-visible u64 data
 /// lines that happen to live in the counter region because a counter line is 128
 /// aligned peer-visible bytes the host already zeroes; its low word is the
 /// complement of the winning global vocab index, i.e. an arbitrary value. Auditing
@@ -1251,6 +1840,10 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                 } else if d.op == DevOp::XReduceTwoShot as u16 {
                     set(d.i[3], Some(n_gpu));
                     set(d.i[4], Some(n_gpu * d.blocks as u32));
+                } else if d.op == DevOp::XReduceScatter as u16 || d.op == DevOp::XAllGather as u16 {
+                    // Both announce with ONE workgroup per rank: their producers are earlier
+                    // packets, the gate_rs argument.
+                    set(d.i[3], Some(n_gpu));
                 } else if d.op == DevOp::XArgmaxFin as u16 {
                     set(d.i[3], Some(n_gpu));
                     for line in 0..xargmax_value_lines(d.i[1]) {
@@ -1267,19 +1860,133 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
 mod tests {
     use super::*;
 
+    /// The tagged one-shot's blob contract (`check_xr_tagged_blob`): the decode program's
+    /// XReduce packets alternate gate parity, fit the layout, and use the decode gather form.
+    #[test]
+    fn tagged_xreduce_contract_is_enforced() {
+        use packet::dev::{DevInst64, DevOp};
+        let xr = |n: u32, gate: u32, gcols: u32, row_w: u32| DevInst64 {
+            op: DevOp::XReduce as u16,
+            blocks: 14,
+            i: [n, 8, 0, gate, 0, gcols, row_w, 0],
+            ..Default::default()
+        };
+        let other = DevInst64 {
+            op: DevOp::Gemv as u16,
+            ..Default::default()
+        };
+        // The K3 decode shape: 7168 / 3584 / 7168+gather, sequential gates.
+        let good = vec![
+            xr(7168, 0, 0, 0),
+            other,
+            xr(3584, 1, 0, 0),
+            xr(7168, 2, 896, 7168),
+        ];
+        assert!(check_xr_tagged_insts(0, &good, 7168).is_ok());
+        assert!(
+            check_xr_tagged_insts(0, &[], 7168).is_ok(),
+            "no collectives is fine"
+        );
+        // Same parity twice in a row: the second would overwrite the slot peers still read.
+        let bad = vec![xr(7168, 0, 0, 0), xr(3584, 2, 0, 0)];
+        assert!(check_xr_tagged_insts(0, &bad, 7168).is_err());
+        // Wider than the slot, a prefill-shaped gather, and a tag that does not fit.
+        assert!(check_xr_tagged_insts(0, &[xr(7169, 0, 0, 0)], 7168).is_err());
+        assert!(check_xr_tagged_insts(0, &[xr(7168, 0, 896, 14336)], 7168).is_err());
+        assert!(check_xr_tagged_insts(0, &[xr(7168, 0xffff, 0, 0)], 7168).is_err());
+    }
+
+    #[test]
+    fn prefill_capture_is_exact_one_shot_selection() {
+        assert!(!prefill_capture_due(None, 2, 7));
+        let capture = PrefillCapture {
+            program: 2,
+            segment: 7,
+            targets: vec![("act.pf.q".into(), "/tmp/q.bin".into())],
+        };
+        assert!(prefill_capture_due(Some(&capture), 2, 7));
+        assert!(!prefill_capture_due(Some(&capture), 1, 7));
+        assert!(!prefill_capture_due(Some(&capture), 2, 6));
+    }
+
+    #[test]
+    fn prefill_capture_parser_rejects_ambiguous_targets() {
+        let request =
+            parse_prefill_capture("8192:17:act.pf.q=/tmp/q.bin,act.pf.o=/tmp/o.bin").unwrap();
+        assert_eq!(request.program_t, 8192);
+        assert_eq!(request.segment, 17);
+        assert_eq!(request.targets.len(), 2);
+
+        for spec in [
+            "8192:17:act.pf.q=/tmp/q.bin,act.pf.q=/tmp/q2.bin",
+            "8192:17:act.pf.q=/tmp/x.bin,act.pf.o=/tmp/x.bin",
+            "8192:17:act.pf.q=",
+            "8192:17:",
+            "8192:x:act.pf.q=/tmp/q.bin",
+            "0:17:act.pf.q=/tmp/q.bin",
+        ] {
+            assert!(parse_prefill_capture(spec).is_err(), "accepted {spec:?}");
+        }
+    }
+
+    #[test]
+    fn decode_segments_enqueue_segment_major_across_tp_ranks() {
+        assert_eq!(
+            segment_major_order(3, 4).collect::<Vec<_>>(),
+            [
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (1, 0),
+                (1, 1),
+                (1, 2),
+                (1, 3),
+                (2, 0),
+                (2, 1),
+                (2, 2),
+                (2, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn prefill_segment_major_submits_every_rank_before_the_next_segment() {
+        let order = segment_major_order(4, 3).collect::<Vec<_>>();
+        assert_eq!(order.len(), 12);
+        for (seg, ranks) in order.chunks_exact(3).enumerate() {
+            assert_eq!(ranks, [(seg, 0), (seg, 1), (seg, 2)]);
+        }
+        assert_eq!(order.last(), Some(&(3, 2)));
+    }
+
     #[test]
     fn l2_domains_are_one_tp_launch_not_wave_segments() {
         use crate::exec::amd::ProgramDispatch;
 
-        let placed = ProgramDispatch::classify(8, 8);
+        let placed = ProgramDispatch::classify(8, 8, 8);
         assert_eq!(placed, ProgramDispatch::L2Domains(8));
         assert_eq!(placed.launches(), 1);
+        assert_eq!(
+            segment_major_order(placed.launches(), 8).collect::<Vec<_>>(),
+            (0..8).map(|rank| (0, rank)).collect::<Vec<_>>()
+        );
 
-        let segmented = ProgramDispatch::classify(0, 3);
+        let xcd_segmented = ProgramDispatch::classify(8, 3, 24);
+        assert_eq!(
+            xcd_segmented,
+            ProgramDispatch::L2Segments {
+                domains: 8,
+                segments: 3
+            }
+        );
+        assert_eq!(xcd_segmented.launches(), 3);
+
+        let segmented = ProgramDispatch::classify(0, 3, 3);
         assert_eq!(segmented, ProgramDispatch::WaveSegments(3));
         assert_eq!(segmented.launches(), 3);
 
-        let ordinary = ProgramDispatch::classify(0, 1);
+        let ordinary = ProgramDispatch::classify(0, 1, 1);
         assert_eq!(ordinary, ProgramDispatch::WaveSegments(1));
         assert_eq!(ordinary.launches(), 1);
     }
@@ -1302,6 +2009,8 @@ mod tests {
     #[test]
     fn cross_rank_agreement_is_not_sampled_by_default() {
         assert_eq!(DEFAULT_AGREE_EVERY, 1);
+        assert!(!deferred_capture_saves_readback(DEFAULT_AGREE_EVERY));
+        assert!(deferred_capture_saves_readback(2));
     }
 
     /// The cadence must fire on token ZERO. A rank that bound the wrong shard is
@@ -1313,14 +2022,9 @@ mod tests {
     fn the_cadence_is_armed_on_the_first_token() {
         // The state machine `complete_decode` runs, in isolation: it reads
         // every rank when `tick >= every`, then restarts the count at 1.
-        let step = |tick: &mut u32, every: u32| {
-            let all = *tick >= every;
-            *tick = if all { 1 } else { *tick + 1 };
-            all
-        };
         let every = 4;
         let mut tick = every; // as `load` and `audit_cadence` leave it
-        let fired: Vec<bool> = (0..9).map(|_| step(&mut tick, every)).collect();
+        let fired: Vec<bool> = (0..9).map(|_| agreement_due(&mut tick, every)).collect();
         assert_eq!(
             fired,
             [true, false, false, false, true, false, false, false, true],
@@ -1332,12 +2036,12 @@ mod tests {
         // entire claim is that every rank emitted an identical stream.
         let mut tick = 1u32;
         assert!(
-            (0..8).all(|_| step(&mut tick, 1)),
+            (0..8).all(|_| agreement_due(&mut tick, 1)),
             "every=1 must never skip"
         );
     }
 
-    /// The sharded-lm_head fold owns two or three xctr ids and they are allocated AFTER
+    /// The sharded-lm_head fold owns one gate plus one or more value-line ids, allocated AFTER
     /// every layer collective, so a sizer that only counts reduces under-sizes
     /// the region by exactly the fold — and the fold then signals past the end
     /// of `xctr` with no fault. Measured: on the GLM-5.2 TP4 stacked blob the
@@ -1355,6 +2059,7 @@ mod tests {
         };
         let prog = |insts: Vec<DevInst64>| DevProg {
             t: 1,
+            packed_prefill_only: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),
@@ -1408,5 +2113,11 @@ mod tests {
         assert_eq!(e[0][2], Some(4));
         assert_eq!(e[0][3], None);
         assert_eq!(e[0][4], None);
+
+        blob.progs[0].insts[1].i[1] = 128;
+        assert_eq!(count_xgates(&blob), 11);
+        let e = gate_expectations(&blob, 4, 11);
+        assert_eq!(e[0][2], Some(4));
+        assert!(e[0][3..11].iter().all(Option::is_none));
     }
 }

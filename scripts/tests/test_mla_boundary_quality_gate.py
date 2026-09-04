@@ -1,0 +1,132 @@
+import json
+import struct
+import subprocess
+import sys
+
+
+def manifest(tmp_path, name, inputs, outputs, contract=None):
+    tensors = []
+    for semantic, values in {**inputs, **outputs}.items():
+        path = tmp_path / f"{name}.{semantic}.f32"
+        raw = struct.pack(f"<{len(values)}f", *values)
+        path.write_bytes(raw)
+        import hashlib
+
+        tensors.append(
+            {
+                "semantic": semantic,
+                "layer": 3,
+                "rank": 0,
+                "dtype": "float32",
+                "source_dtype": "bf16",
+                "shape": [len(values)],
+                "file": str(path),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    out = tmp_path / f"{name}.json"
+    out.write_text(
+        json.dumps(
+            {"schema": 1, "prompt_sha256_u32le": "history", "tensors": tensors,
+             **({"contract": contract} if contract is not None else {})}
+        )
+    )
+    return out
+
+
+def run_gate(tmp_path, ref0, ref1, absorbed, materialized):
+    script = __file__.replace("tests/test_mla_boundary_quality_gate.py", "mla_boundary_quality_gate.py")
+    return subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--reference",
+            str(ref0),
+            "--reference",
+            str(ref1),
+            "--absorbed",
+            str(absorbed),
+            "--materialized",
+            str(materialized),
+            "--input-semantic",
+            "q,k,v",
+            "--output-semantic",
+            "attention.output,residual.output",
+            "--output",
+            str(tmp_path / "result.json"),
+        ],
+        capture_output=True,
+    )
+
+
+def test_accepts_materialized_error_within_absorbed_plus_repeat_floor(tmp_path):
+    inputs = {"q": [1.0], "k": [2.0], "v": [3.0]}
+    ref0 = manifest(tmp_path, "r0", inputs, {"attention.output": [10.0], "residual.output": [20.0]})
+    ref1 = manifest(tmp_path, "r1", inputs, {"attention.output": [10.1], "residual.output": [20.1]})
+    absorbed = manifest(tmp_path, "a", inputs, {"attention.output": [10.2], "residual.output": [20.2]})
+    materialized = manifest(tmp_path, "m", inputs, {"attention.output": [10.25], "residual.output": [20.25]})
+    result = run_gate(tmp_path, ref0, ref1, absorbed, materialized)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def test_rejects_upstream_input_mismatch(tmp_path):
+    inputs = {"q": [1.0], "k": [2.0], "v": [3.0]}
+    ref0 = manifest(tmp_path, "r0", inputs, {"attention.output": [10.0], "residual.output": [20.0]})
+    ref1 = manifest(tmp_path, "r1", inputs, {"attention.output": [10.0], "residual.output": [20.0]})
+    absorbed = manifest(tmp_path, "a", inputs, {"attention.output": [10.0], "residual.output": [20.0]})
+    bad = dict(inputs)
+    bad["q"] = [1.5]
+    materialized = manifest(tmp_path, "m", bad, {"attention.output": [10.0], "residual.output": [20.0]})
+    result = run_gate(tmp_path, ref0, ref1, absorbed, materialized)
+    assert result.returncode != 0
+    assert b"upstream input payloads differ" in result.stderr
+
+
+def test_rejects_materialized_error_beyond_control_and_floor(tmp_path):
+    inputs = {"q": [1.0], "k": [2.0], "v": [3.0]}
+    ref0 = manifest(tmp_path, "r0", inputs, {"attention.output": [10.0], "residual.output": [20.0]})
+    ref1 = manifest(tmp_path, "r1", inputs, {"attention.output": [10.01], "residual.output": [20.01]})
+    absorbed = manifest(tmp_path, "a", inputs, {"attention.output": [10.02], "residual.output": [20.02]})
+    materialized = manifest(tmp_path, "m", inputs, {"attention.output": [11.0], "residual.output": [21.0]})
+    result = run_gate(tmp_path, ref0, ref1, absorbed, materialized)
+    assert result.returncode == 2
+
+
+def test_rejects_different_boundary_contract(tmp_path):
+    inputs = {"q": [1.0], "k": [2.0], "v": [3.0]}
+    outputs = {"attention.output": [10.0], "residual.output": [20.0]}
+    contract = {"dimensions": {"tokens": 1}, "softmax_scale": 0.5}
+    ref0 = manifest(tmp_path, "r0", inputs, outputs, contract)
+    ref1 = manifest(tmp_path, "r1", inputs, outputs, contract)
+    absorbed = manifest(tmp_path, "a", inputs, outputs, contract)
+    materialized = manifest(tmp_path, "m", inputs, outputs,
+                            {"dimensions": {"tokens": 1}, "softmax_scale": 1.0})
+    result = run_gate(tmp_path, ref0, ref1, absorbed, materialized)
+    assert result.returncode != 0
+    assert b"boundary contracts differ" in result.stderr
+
+
+def test_rejects_residual_rounding_or_epsilon_mismatch(tmp_path):
+    inputs = {"q": [1.0], "k": [2.0], "v": [3.0]}
+    outputs = {"attention.output": [10.0], "residual.output": [20.0]}
+    common = {
+        "dimensions": {"tokens": 1},
+        "residual_seam": {
+            "score_epsilon": 1e-6,
+            "output_norm_epsilon": 1e-6,
+            "output_norm_input": "mixed-f32",
+        },
+    }
+    for field, value in (
+        ("output_norm_input", "mixed-bf16"),
+        ("output_norm_epsilon", 1e-5),
+    ):
+        candidate = json.loads(json.dumps(common))
+        candidate["residual_seam"][field] = value
+        ref0 = manifest(tmp_path, f"r0-{field}", inputs, outputs, common)
+        ref1 = manifest(tmp_path, f"r1-{field}", inputs, outputs, common)
+        absorbed = manifest(tmp_path, f"a-{field}", inputs, outputs, common)
+        materialized = manifest(tmp_path, f"m-{field}", inputs, outputs, candidate)
+        result = run_gate(tmp_path, ref0, ref1, absorbed, materialized)
+        assert result.returncode != 0
+        assert b"boundary contracts differ" in result.stderr

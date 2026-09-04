@@ -202,10 +202,6 @@ fn term_for(
                 f64lit(*eps)
             )
         }
-        // Group-limited routing selects a DIFFERENT expert set than flat top-k,
-        // and the egglog term carries only `num_experts`/`top_k` — so a grouped
-        // router lowered through it would be indistinguishable from a flat one.
-        // Refused rather than approximated.
         Op::MoeRouter {
             num_experts,
             top_k,
@@ -213,11 +209,19 @@ fn term_for(
         } => {
             format!("(MoeRouter {} {} {} {})", e(0)?, e(1)?, num_experts, top_k)
         }
-        Op::MoeRouter { group: Some(_), .. } => {
-            return Err(LowerError::Unsupported {
-                op: "moe_router (group-limited)",
-            })
-        }
+        Op::MoeRouter {
+            num_experts,
+            top_k,
+            group: Some(group),
+        } => format!(
+            "(MoeRouterGrouped {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            num_experts,
+            top_k,
+            group.n_group,
+            group.topk_group
+        ),
         // --- Kimi-K3 ---
         Op::Conv1dDepthwise { kernel } => {
             format!("(Conv1dDepthwise {} {} {})", e(0)?, e(1)?, kernel)

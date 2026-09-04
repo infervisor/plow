@@ -21,7 +21,7 @@
  *   k_r2       R-split with R=4/UN=3 below nchunk 4 — the variant that LOSES to R=2, kept as the
  *              record of why (ragged tail: half the waves fall into the R=1 path).
  *   k_rA       R=2/UN=7 below nchunk 8 + wide staging. THE SHIPPED COMBINATION.
- *   k_rL       R=4 -> R=2 -> R=1 ladder. Wins at nchunk=2, loses at nchunk=7, net worse than rA.
+ *   k_rL       R=4 -> R=2 -> R=1 ladder. Best arm at the current gfx950 b224/b256 geometry.
  *   k_rF       Current-WG128 fit: R=7 at nchunk=2, the ladder at nchunk=3, R=2 otherwise.
  *   k_noldsx   x from global instead of LDS. A 1.2-1.6x LOSS at every shape including gv_per==1,
  *              which is the measured answer to "the staging cannot be worth it for one column".
@@ -31,14 +31,14 @@
  * candidate ELEMENTWISE against the baseline on device — the R-split only moves which wave takes
  * which column, so anything but bit-identical is a bug.
  *
- * RESULT (per-token totals over the real instance counts, lm_head scaled):
- *     steady 3.61   packet 4.04   wstage 3.82   rA 3.42   rL 3.46   noldsx 5.59 ms
+ * RESULT (per-token totals over the real instance counts):
+ *     current-grid gfx950: packet 3.660   shipped rA 2.998   rL 2.956 ms
  *
  * Build + run (ROCm tooling must be OUTSIDE `nix develop`):
  *   hipcc --offload-arch=gfx950 -O3 -w -std=c++17 --genco \
  *     -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=1 -DPLOW_K3=1 -DGV_UNROLL=14 -DPLOW_FP8_KV=1 \
- *     perf-data/k3_gemvbf16_bench.hip -o /tmp/gvbf.co -Iruntime/amd -Iruntime/common
- *   g++ -O2 -std=c++17 perf-data/k3_gemvbf16_bench.cpp -o /tmp/gvbf \
+ *     runtime/bench/amd/k3_gemvbf16_bench.hip -o /tmp/gvbf.co -Iruntime/amd -Iruntime/common
+ *   g++ -O2 -std=c++17 runtime/bench/amd/k3_gemvbf16_bench.cpp -o /tmp/gvbf \
  *     -I/opt/rocm/include -D__HIP_PLATFORM_AMD__ -L/opt/rocm/lib -lamdhip64
  *   flock /tmp/plow_gpu.lock sg render -c 'unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; \
  *     export ROCR_VISIBLE_DEVICES=6; /tmp/gvbf /tmp/gvbf.co 41'
@@ -211,9 +211,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_packet_aa(bf16* C, 
                                                        LDS);                                       \
     } while (0)
 
-/* LADDER: R=4 groups, then R=2, then R=1 — so a wave whose column count is not a multiple of 4
- * does not dump its whole remainder into the single-column tail (which is what capped the flat
- * R=4 arm at 1.21x on o_proj). Three new bodies instead of two. */
+/* Harness-only short-K ladder. It is not promoted into the production interpreter because the
+ * measured 1.4% body gain would invalidate the tuned kernel profile without closing decode. */
 template <int MM, bool XLDS>
 __device__ __forceinline__ void gemv_rows_lad(bf16* __restrict__ C, const bf16* __restrict__ x,
                                               const bf16* __restrict__ W, unsigned M, unsigned N,
@@ -225,9 +224,9 @@ __device__ __forceinline__ void gemv_rows_lad(bf16* __restrict__ C, const bf16* 
     const unsigned gv_n0 = slice * gv_per;
     const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
     unsigned n = gv_n0 + wave;
-    for (; n + 3u * PLOW_WAVES < gv_n1; n += PLOW_WAVES * 4u)
+    for (; n + 3u * PLOW_WAVES < gv_n1; n += 4u * PLOW_WAVES)
         gemv_rows_r_bench<MM, XLDS, 3, 4>(C, x, W, M, N, K, n, lane, lds);
-    for (; n + PLOW_WAVES < gv_n1; n += PLOW_WAVES * 2u)
+    for (; n + PLOW_WAVES < gv_n1; n += 2u * PLOW_WAVES)
         gemv_rows_r_bench<MM, XLDS, 7, 2>(C, x, W, M, N, K, n, lane, lds);
     for (; n < gv_n1; n += PLOW_WAVES)
         gemv_rows_r_bench<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
@@ -248,7 +247,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_rL(bf16* C, const b
             gemv_rows<PLOW_GEMV_MM, true, false, GV_UNROLL>(C, x, Wp, nullptr, nullptr, 1u, N, K,
                                                             blockIdx.x, gridDim.x, sm.xstage);
         else
-            gemv_rows_lad<PLOW_GEMV_MM, true>(C, x, Wp, 1u, N, K, blockIdx.x, gridDim.x, sm.xstage);
+            gemv_rows_lad<PLOW_GEMV_MM, true>(C, x, Wp, 1u, N, K, blockIdx.x, gridDim.x,
+                                              sm.xstage);
         __syncthreads();
     }
 }

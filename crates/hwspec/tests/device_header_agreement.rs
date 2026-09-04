@@ -205,6 +205,27 @@ fn decode_tile_matches_the_shipped_build_profile() {
     assert_eq!(g4.decode_gemm_tile, g4.gemm_tile);
 }
 
+#[test]
+fn kda_key_factor_specialist_objects_are_opt_in() {
+    let cmake = read("runtime/CMakeLists.txt");
+    assert!(
+        cmake.contains(
+            "option(PLOW_HSACO_KDA_KEY_FACTOR\n       \"Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair\" OFF)"
+        ),
+        "CMake must not build the slower standalone key-factor pair by default"
+    );
+
+    let script = read("scripts/build_gfx950.sh");
+    assert!(
+        script.contains("[ \"${PLOW_KDA_KEY_FACTOR:-0}\" = 1 ]"),
+        "the direct gfx950 build must require an explicit key-factor-object opt-in"
+    );
+    assert!(
+        script.contains("PLOW_KDA_KEY_FACTOR must be 0 or 1"),
+        "the direct gfx950 build must reject ambiguous opt-in values"
+    );
+}
+
 /// The LDS budget, against the DEVICE's own statement of it.
 ///
 /// `amd_arch.h` carries `PLOW_LDS_MAX_BYTES` so the kernels' tile tables can be filtered per

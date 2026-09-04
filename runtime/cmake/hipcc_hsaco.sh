@@ -37,19 +37,20 @@ MINOCC="${7:?min occupancy}"
 shift 7
 
 CO="${OUT%.elf}.co"
+CERT="${OUT}.resources.json"
 READELF="$(dirname "$BUNDLER")/llvm-readelf"
 
 fail() {
     # A build that dies must leave NOTHING behind to run by mistake: a stale
     # artifact that outlives its failed compile is how a test prints CORRECT
     # against a binary that never built.
-    rm -f "$OUT" "$CO"
+    rm -f "$OUT" "$CO" "$CERT" "${CERT}.tmp"
     echo "FATAL: $*" >&2
     exit 1
 }
 
 mkdir -p "$(dirname "$OUT")"
-rm -f "$OUT" "$CO"
+rm -f "$OUT" "$CO" "$CERT" "${CERT}.tmp"
 
 # ONE compile. The resource-usage remarks ride the REAL build, so the numbers
 # gated on below are the numbers of the object that ships — build_gfx950.sh
@@ -88,6 +89,37 @@ fi
 "$BUNDLER" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
     --input="$CO" --output="$OUT" || fail "unbundle failed for $OUT"
 
+# Resource remarks omit final SGPR/private-segment facts. Read the record for
+# the exact shipping entry point, not the first helper kernel in the ELF.
+META="$($READELF -n "$OUT" 2>/dev/null || true)"
+read -r MV MA MSG MSP MP MW MWG MLDS <<<"$(awk -v want="$SYM" '
+    function emit() {
+        if (name == want) {
+            print vgpr+0, agpr+0, sgpr+0, sgspill+0, private+0, wave+0, wg+0, lds+0
+            found = 1
+        }
+    }
+    $1 == "-" && $2 == ".agpr_count:" {
+        if (started) emit()
+        started = 1; name = ""; vgpr = 0; agpr = $3; sgpr = 0; sgspill = 0
+        private = 0; wave = 0; wg = 0; lds = 0
+        next
+    }
+    started && $1 == ".name:"                       { name = $2 }
+    started && $1 == ".vgpr_count:"                 { vgpr = $2 }
+    started && $1 == ".sgpr_count:"                 { sgpr = $2 }
+    started && $1 == ".sgpr_spill_count:"           { sgspill = $2 }
+    started && $1 == ".private_segment_fixed_size:" { private = $2 }
+    started && $1 == ".wavefront_size:"             { wave = $2 }
+    started && $1 == ".max_flat_workgroup_size:"    { wg = $2 }
+    started && $1 == ".group_segment_fixed_size:"   { lds = $2 }
+    END { if (!found) emit() }
+' <<<"$META")"
+[ -n "${MV:-}" ] || fail "$SYM has no AMDGPU metadata record in $OUT"
+[ "$MW" = 64 ] || fail "$SYM advertises wavefront_size=$MW; gfx9xx requires wave64"
+[ "$MWG" -ge 64 ] && [ "$MWG" -le 1024 ] && [ $((MWG % MW)) -eq 0 ] ||
+    fail "$SYM has invalid max workgroup/wave geometry: wg=$MWG wave=$MW"
+
 # Read the symbol table into a variable rather than piping it into `grep -q`:
 # grep exits at the FIRST match, closing the pipe while readelf is still
 # writing; readelf dies of SIGPIPE and `set -o pipefail` promotes that to a
@@ -102,6 +134,111 @@ grep -qE "FUNC .* $SYM\$" <<<"$SYMS" ||
     fail "$SYM not found in $OUT — kernel name/signature changed; update the
        symbol constants in runtime/tests/gemma4_chat.c."
 
+LEAN=0; NOSPILL=0; NOSGPRSPILL=0; REQUIRED_MARKER=""
+for arg in "$@"; do
+    case "$arg" in
+        -DPLOW_LEAN_OBJECT=1) LEAN=1 ;;
+        -DPLOW_NO_SPILL=1) NOSPILL=1 ;;
+        -DPLOW_NO_SGPR_SPILL=1) NOSGPRSPILL=1 ;;
+        -DPLOW_REQUIRED_MARKER=*) REQUIRED_MARKER=${arg#*=} ;;
+    esac
+done
+if [ "$LEAN" != 1 ]; then
+    grep -qE "OBJECT .* plow_packed_prefill_abi_1\$" <<<"$SYMS" ||
+        fail "$OUT does not advertise plow_packed_prefill_abi_1"
+fi
+[ "$NOSPILL" != 1 ] || [ "$S" = 0 ] ||
+    fail "$(basename "$OUT") spills $S VGPRs"
+[ "$NOSPILL" != 1 ] || [ "$MP" = 0 ] ||
+    fail "$(basename "$OUT") has a ${MP}-byte private segment"
+[ "$NOSGPRSPILL" != 1 ] || [ "$MSP" = 0 ] ||
+    fail "$(basename "$OUT") spills $MSP SGPRs"
+if [ -n "$REQUIRED_MARKER" ]; then
+    grep -qE "OBJECT .* ${REQUIRED_MARKER}\$" <<<"$SYMS" ||
+        fail "$OUT does not advertise $REQUIRED_MARKER"
+fi
+PACKED_MLA=0; PACKED_MLA_NORM=0; PACKED_MLA_FLASH=0; PACKED_KDA=0; KDA_CHUNK=0; KDA_QPRE=0
+K3=0; MLA=0; HIER=0; L2=0; GQ=0; DECODE=0
+for arg in "$@"; do
+    case "$arg" in
+        -DPLOW_PACKED_PREFILL_CONSUMERS=1) PACKED_MLA=1; PACKED_KDA=1 ;;
+        -DPLOW_PACKED_PREFILL_MLA_CONSUMERS=1) PACKED_MLA=1 ;;
+        -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1) PACKED_MLA_NORM=1 ;;
+        -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1) PACKED_MLA_FLASH=1 ;;
+        -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1) PACKED_KDA=1 ;;
+        -DPLOW_KDA_CHUNK=1) KDA_CHUNK=1 ;;
+        -DPLOW_KDA_CHUNK_QPRE=1) KDA_QPRE=1 ;;
+        -DPLOW_K3=1) K3=1 ;;
+        -DPLOW_MLA_PREFILL=1|-DPLOW_MLA_PF_V2_ARM=1) MLA=1 ;;
+        -DPLOW_GATE_HIER=1) HIER=1 ;;
+        -DPLOW_L2_PLACE_DISPATCH=1) L2=1 ;;
+        -DPLOW_GLOBAL_QUEUE=1) GQ=1 ;;
+        -DPLOW_BUCKET_DECODE=1) DECODE=1 ;;
+    esac
+done
+if [ "$HIER" = 1 ] && { [ "$L2" != 1 ] || [ "$GQ" != 1 ] || [ "$DECODE" != 1 ]; }; then
+    fail "$OUT enables PLOW_GATE_HIER outside a decode GQ object with L2-domain dispatch"
+fi
+if [ "$HIER" = 1 ]; then
+    grep -qE "OBJECT .* plow_gate_hier_1\$" <<<"$SYMS" ||
+        fail "$OUT enables PLOW_GATE_HIER but is missing plow_gate_hier_1"
+elif grep -qE "OBJECT .* plow_gate_hier_1\$" <<<"$SYMS"; then
+    fail "$OUT unexpectedly advertises plow_gate_hier_1"
+fi
+for cap in mla kda; do
+    marker="plow_packed_prefill_${cap}_consumers_1"
+    required=0
+    [ "$cap" = mla ] && [ "$PACKED_MLA" = 1 ] && required=$MLA
+    [ "$cap" = kda ] && [ "$PACKED_KDA" = 1 ] && required=$K3
+    if [ "$required" = 1 ]; then
+        grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
+    elif grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS"; then
+        fail "default $OUT unexpectedly advertises $marker"
+    fi
+done
+
+for spec in \
+    "PLOW_BUCKET_PACKED_MLA_NORM=plow_packed_prefill_mla_norm_segments_1" \
+    "PLOW_BUCKET_FLASH=plow_packed_prefill_mla_flash_segments_1" \
+    "PLOW_BUCKET_PACKED_KDA=plow_packed_prefill_kda_serial_segments_1" \
+    "PLOW_BUCKET_PACKED_KDA=plow_kda_family_segments_1"; do
+    flag=${spec%%=*}
+    marker=${spec#*=}
+    required=0
+    for arg in "$@"; do
+        case "$arg" in
+            -D${flag}|-D${flag}=1) required=1 ;;
+        esac
+    done
+    # Ordinary flash objects do not consume packed descriptors.
+    if [ "$flag" = PLOW_BUCKET_FLASH ] && [ "$PACKED_MLA_FLASH" != 1 ]; then
+        required=0
+    fi
+    if [ "$required" = 1 ]; then
+        grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
+    fi
+done
+
+if [ "$PACKED_KDA" = 1 ] && [ "$KDA_CHUNK" = 1 ]; then
+    for marker in plow_kda_family_segments_1 plow_packed_prefill_kda_chunk_segments_1 \
+                  plow_kda_chunk_bt64_arm_1; do
+        grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
+    done
+    if [ "$KDA_QPRE" = 1 ]; then
+        grep -qE "OBJECT .* plow_kda_chunk_qpre_arm_1\$" <<<"$SYMS" ||
+            fail "$OUT enables chunk-KDA qpre but is missing plow_kda_chunk_qpre_arm_1"
+    fi
+    [ "$S" = 0 ] || fail "$(basename "$OUT") packed chunk-KDA object spills $S VGPRs"
+elif grep -qE "OBJECT .* plow_packed_prefill_kda_chunk_segments_1\$" <<<"$SYMS"; then
+    fail "default $OUT unexpectedly advertises plow_packed_prefill_kda_chunk_segments_1"
+fi
+
 rm -f "$CO"
-printf "built %s (%s B), %s VGPR=%s AGPR=%s total=%s occ=%s spill=%s\n" \
-    "$OUT" "$(stat -c%s "$OUT")" "$SYM" "$V" "$A" "$((V + A))" "$O" "$S"
+printf '{\n  "schema": 1,\n  "arch": "%s",\n  "kernel": "%s",\n  "object_bytes": %s,\n  "vgpr": %s,\n  "agpr": %s,\n  "total_registers": %s,\n  "sgpr": %s,\n  "occupancy_waves_per_simd": %s,\n  "vgpr_spill": %s,\n  "sgpr_spill": %s,\n  "private_segment_bytes": %s,\n  "group_segment_bytes": %s,\n  "wavefront_size": %s,\n  "max_workgroup_size": %s,\n  "contract": {"max_total_registers": %s, "min_occupancy_waves_per_simd": %s},\n  "accepted": true\n}\n' \
+    "$ARCH" "$SYM" "$(stat -c%s "$OUT")" "$MV" "$MA" "$((MV + MA))" "$MSG" \
+    "$O" "$S" "$MSP" "$MP" "$MLDS" "$MW" "$MWG" "$MAXREG" "$MINOCC" \
+    >"${CERT}.tmp"
+mv "${CERT}.tmp" "$CERT"
+printf "built %s (%s B), %s VGPR=%s AGPR=%s total=%s occ=%s vgpr_spill=%s metadata=[vgpr=%s agpr=%s sgpr=%s sgpr_spill=%s private=%sB lds=%sB wave=%s wgmax=%s waves=%s]\n" \
+    "$OUT" "$(stat -c%s "$OUT")" "$SYM" "$V" "$A" "$((V + A))" "$O" "$S" \
+    "$MV" "$MA" "$MSG" "$MSP" "$MP" "$MLDS" "$MW" "$MWG" "$((MWG / MW))"

@@ -322,6 +322,54 @@ pub fn dense_gemm_inventory(root: &Path, isa: IsaLevel) -> Result<Inventory, Pro
     Ok(Inventory::probed(obj.build().clone(), specs))
 }
 
+/// Build identity for dense-GEMM timing records.
+///
+/// The gfx950 tile sweep launches separate kernels from `test_kernels.hip`, not the
+/// persistent interpreter. Keying those measurements to the entire interpreter
+/// made queue, collective, and attention edits invalidate every GEMM timing,
+/// even though none of the measured code changed. This identity hashes the
+/// preprocessed GEMM family and its in-tree device dependencies instead. Macro
+/// expansion happens before filtering, so relevant values from other headers
+/// still participate. All supported weight encodings are included in one family
+/// identity; changing any one of them conservatively invalidates the family.
+pub fn dense_gemm_tuning_build(root: &Path, isa: IsaLevel) -> Result<crate::BuildId, ProbeError> {
+    let recipe = prefill_recipe(isa).ok_or_else(|| ProbeError::CompilerMissing {
+        program: format!("no interpreter recipe for {}", isa.arch_flag()),
+    })?;
+    let target = recipe.target(root);
+    let toolchain = toolchain_label(&recipe);
+
+    if isa != IsaLevel::Gfx950 {
+        let text = target.preprocess()?;
+        return Ok(target.build_id_from(isa, &toolchain, &text));
+    }
+
+    const FILES: &[&str] = &[
+        "runtime/amd/amd_arch.h",
+        "runtime/amd/amd_common.h",
+        "runtime/amd/op_elementwise.h",
+        "runtime/amd/op_gemm.h",
+    ];
+    let mut family = String::new();
+    for extra in [None, Some("PLOW_FP8=1"), Some("PLOW_MXFP4=1")] {
+        let mut variant = target.clone();
+        if let Some(define) = extra {
+            variant.defines.push(define.to_string());
+        }
+        let text = variant.preprocess()?;
+        family.push_str(extra.unwrap_or("bf16"));
+        family.push(':');
+        family.push_str(&crate::build::preprocessed_digest_for_files(&text, FILES));
+        family.push('\n');
+    }
+    Ok(crate::BuildId::new(
+        isa,
+        target.defines,
+        toolchain,
+        crate::build::digest(family.as_bytes()),
+    ))
+}
+
 fn toolchain_label(recipe: &ObjectRecipe) -> String {
     if let Ok(label) = std::env::var("PLOW_TOOLCHAIN_LABEL") {
         return label;

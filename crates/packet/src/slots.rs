@@ -121,7 +121,7 @@ const DOC: &[S] = &[
     S { op: DevOp::RmsNorm, t: &["out", "x", "gamma?", "xq?", "ascale?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::RowRms, t: &["rms", "x"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },
-    S { op: DevOp::Residual, t: &["out", "a", "b"], i: &["n"], f: &["scale"], j: &[] },
+    S { op: DevOp::Residual, t: &["out", "a", "b", "pre?"], i: &["n"], f: &["scale"], j: &[] },
     S { op: DevOp::Glu, t: &["out", "gate", "up"], i: &["n", "act"], f: &[], j: &[] },
     S { op: DevOp::Embed, t: &["out", "table", "ids"], i: &["ntok", "hidden"], f: &["scale"], j: &[] },
     S { op: DevOp::SoftCap, t: &["out", "x"], i: &["n"], f: &["cap"], j: &[] },
@@ -158,7 +158,9 @@ const DOC: &[S] = &[
     S { op: DevOp::NormResidualNorm, t: &["out", "resid", "a", "b", "gamma_b?", "gamma_n?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::XReduce, t: &["out"], i: &["H", "n_gpu", "slot", "gate", "gslot?", "gcols?", "row_w?"], f: &[], j: &[] },
     S { op: DevOp::XArgmaxFin, t: &["ids", "local_part"], i: &["n_gpu", "", "slot"], f: &[], j: &[] },
-    S { op: DevOp::XReduceTwoShot, t: &["out"], i: &["n", "n_gpu", "slot", "gate_rs", "gate_ag"], f: &[], j: &[] },
+    S { op: DevOp::XReduceTwoShot, t: &["out", "resid?", "attnres_out?", "attnres_ring?", "attnres_score?", "attnres_gamma?", "prefix_out?"], i: &["n", "n_gpu", "slot", "gate_rs", "gate_ag", "e0_or_H", "gslot_or_nb", "gcols_or_nbcap"], f: &["attnres_eps?"], j: &[] },
+    S { op: DevOp::XReduceScatter, t: &["slot_tensor", "band_copy?"], i: &["n", "n_gpu", "slot", "gate_rs", "", "", "gslot?", "gcols?"], f: &[], j: &[] },
+    S { op: DevOp::XAllGather, t: &["dst0?", "dst1?", "dst2?"], i: &["n0?", "n1?", "n2?", "gate", "n_gpu", "src_slot0?", "src_slot1?", "src_slot2?"], f: &[], j: &[] },
     S { op: DevOp::XReduceAddNorm, t: &["out2", "xmid_out", "x", "gamma"], i: &["feat", "n_gpu", "slot", "gate"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRopeFp8, t: &["out", "", "", "", "", "", "scale"], i: &[], f: &[], j: &[] },
     S { op: DevOp::MoeRouter, t: &[], i: &["H", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
@@ -222,10 +224,17 @@ const DOC: &[S] = &[
     // is deliberate — this op cannot silently degrade to the unfused reading of the packet.
     S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode", "parked"], f: &["scale", "lower_bound"], j: &[] },
     S { op: DevOp::KdaConvStateStepG, t: &["o", "q_raw", "k_raw", "v_raw", "g_raw", "beta_raw", "state", "descriptor"], i: &["T", "H", "D", "BV", "flags", "W", "gate_mode"], f: &["scale", "lower_bound"], j: &[] },
+    S { op: DevOp::KdaDecodeFused, t: &["y", "q_raw", "k_raw", "v_raw", "forget_raw", "beta_raw", "state", "descriptor"], i: &["rows", "H", "D", "BV", "W", "flags", "gate_mode", "descriptor_version"], f: &["scale", "lower_bound"], j: &["", "norm_eps_bits"] },
+    S { op: DevOp::MlaMaterializePack, t: &["K", "V", "KV", "K_rope"], i: &["T", "H", "qk_nope", "qk_rope", "v_head"], f: &[], j: &[] },
+    S { op: DevOp::FlashMlaMaterializedPrefill, t: &["O", "Q", "K", "V"], i: &["T", "H", "H_KV", "D_QK", "D_V", "abi"], f: &["scale"], j: &[] },
+    S { op: DevOp::KdaChunkPrepare, t: &["q", "k", "g_prefix", "beta", "g_raw", "beta_raw", "A_log", "dt_bias"], i: &["T", "H", "D", "gate_mode"], f: &["lower_bound"], j: &[] },
+    S { op: DevOp::KdaChunkIntra, t: &["Aqk", "Ainv", "q", "k", "g_prefix", "beta"], i: &["T", "H", "D"], f: &["scale"], j: &[] },
+    S { op: DevOp::KdaChunkWu, t: &["W", "U", "Ainv", "k", "v", "g_prefix", "beta", "q?"], i: &["T", "H", "D", "V", "qpre"], f: &["scale"], j: &[] },
+    S { op: DevOp::KdaChunkCarry, t: &["o", "state", "q", "k", "W", "U", "Aqk", "g_prefix"], i: &["T", "H", "D", "V", "qpre"], f: &["scale"], j: &[] },
     S { op: DevOp::KdaGatedNorm, t: &["y", "o", "norm_w", "g_raw"], i: &["T", "H", "D"], f: &["eps"], j: &[] },
     // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
     // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.
-    S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?"], i: &["T", "H", "nb", "push_row", "nb_cap"], f: &["eps"], j: &[] },
+    S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?", "res_a?", "res_b?"], i: &["T", "H", "nb", "push_row", "nb_cap", "res_pre?"], f: &["eps"], j: &[] },
     S { op: DevOp::SituGlu, t: &["out", "gate", "up"], i: &[], f: &[], j: &[] },
     S { op: DevOp::MlaOutGate, t: &["out", "a", "b"], i: &[], f: &[], j: &[] },
     S { op: DevOp::GemmFp8Blk, t: &["C", "A", "W", "weight_scale_inv"], i: &["M", "N", "K"], f: &[], j: &[] },
@@ -257,7 +266,8 @@ const INHERIT: &[(DevOp, DevOp, S)] = &[
     // Pure tile-size twins: same operands, different MFMA tile.
     (DevOp::GemmSmall,  DevOp::Gemm, NONE),
     (DevOp::GemmMed,    DevOp::Gemm, NONE),
-    (DevOp::GemmWide,   DevOp::Gemm, NONE),
+    (DevOp::GemmWide, DevOp::Gemm,
+     S { op: DevOp::GemmWide, t: &[], i: &["", "", "", "", "", "", "", "tile_variant"], f: &[], j: &[] }),
     (DevOp::GemmC5,     DevOp::Gemm, NONE),
     (DevOp::GemmSmallFp8, DevOp::GemmFp8, NONE),
     (DevOp::GemmMedFp8,   DevOp::GemmFp8, NONE),
@@ -306,8 +316,6 @@ const NONE: S = S {
 /// oversight" rather than "probably fine".
 const RESERVED: &[DevOp] = &[
     DevOp::Nop,
-    DevOp::XReduceScatter,
-    DevOp::XAllGather,
     DevOp::FlashMlaPrefill,
     DevOp::AttnSelect,
     DevOp::FlashGatherPrefill,

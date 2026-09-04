@@ -121,12 +121,14 @@
 //! low-level vehicle earns its keep.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use packet::dev::{DevInst64, DevOp, DevProgram};
-use packet::devbuild::static_seg_ofs;
+use packet::dev::{DevInst64, DevOp, DevProgram, PrefillSpan, PREFILL_SPAN_RESET_STATE, SE_XCTR};
+use packet::devbuild::{lean_attn_res_f32mix_inst64, static_seg_ofs};
+use serde::Serialize;
 
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
@@ -183,31 +185,2427 @@ const WG_THREADS_8: u32 = 8 * 64;
 /// `INVALID_ISA`, not a slowdown.
 const WG_THREADS_4: u32 = 4 * 64;
 
-/// Host dispatch semantics for a program whose stream carries `seg` tags.
-///
-/// L2 placement reuses those tags for domains that drain concurrently inside
-/// one launch. Only ordinary wave-class segments are separate host launches.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AmdOwnedRange {
+    pub name: String,
+    pub address_space: &'static str,
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AmdOverlapRankEvidence {
+    pub rank: usize,
+    pub queue_count: usize,
+    pub prefill_ranges: Vec<AmdOwnedRange>,
+    pub decode_ranges: Vec<AmdOwnedRange>,
+    pub prefill_queue_ids: Vec<u64>,
+    pub decode_queue_ids: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AmdOverlapCapability {
+    pub scratch_isolated: bool,
+    pub queue_isolated: bool,
+    pub overlap_safe: bool,
+    pub queue_scope: &'static str,
+    pub queue_count: usize,
+    pub per_xcd_queues: bool,
+    pub ranks: usize,
+}
+
+fn ranges_overlap(a: &AmdOwnedRange, b: &AmdOwnedRange) -> bool {
+    a.address_space == b.address_space && a.start < b.end && b.start < a.end
+}
+
+pub fn derive_overlap_capability(ranks: &[AmdOverlapRankEvidence]) -> AmdOverlapCapability {
+    let scratch_isolated = !ranks.is_empty()
+        && ranks.iter().all(|rank| {
+            !rank.prefill_ranges.is_empty()
+                && !rank.decode_ranges.is_empty()
+                && !rank
+                    .prefill_ranges
+                    .iter()
+                    .any(|a| rank.decode_ranges.iter().any(|b| ranges_overlap(a, b)))
+        });
+    let queue_isolated = !ranks.is_empty()
+        && ranks.iter().all(|rank| {
+            rank.queue_count >= 2
+                && !rank.prefill_queue_ids.is_empty()
+                && !rank.decode_queue_ids.is_empty()
+                && !rank
+                    .prefill_queue_ids
+                    .iter()
+                    .any(|id| rank.decode_queue_ids.contains(id))
+        });
+    let queue_count = ranks.iter().map(|rank| rank.queue_count).min().unwrap_or(0);
+    AmdOverlapCapability {
+        scratch_isolated,
+        queue_isolated,
+        overlap_safe: scratch_isolated && queue_isolated,
+        queue_scope: "global_per_rank",
+        queue_count,
+        per_xcd_queues: false,
+        ranks: ranks.len(),
+    }
+}
+
+/// Host dispatch semantics for ordered segments and device-side XCD queues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProgramDispatch {
+    /// Legacy placed blob: `seg` was the XCD and there is one host launch.
     L2Domains(u32),
+    /// Current placed blob: every ordered segment owns one queue per XCD.
+    L2Segments {
+        domains: u32,
+        segments: usize,
+    },
     WaveSegments(usize),
 }
 
 impl ProgramDispatch {
-    pub(crate) fn classify(l2_domains: u32, n_segments: usize) -> Self {
-        if l2_domains != 0 {
-            Self::L2Domains(l2_domains)
-        } else {
-            Self::WaveSegments(n_segments)
+    pub(crate) fn classify(l2_domains: u32, n_segments: usize, queue_windows: usize) -> Self {
+        if l2_domains == 0 {
+            return Self::WaveSegments(n_segments);
         }
+        if queue_windows == n_segments.saturating_mul(l2_domains as usize) {
+            return Self::L2Segments {
+                domains: l2_domains,
+                segments: n_segments,
+            };
+        }
+        Self::L2Domains(l2_domains)
     }
 
     pub(crate) fn launches(self) -> usize {
         match self {
             Self::L2Domains(_) => 1,
+            Self::L2Segments { segments, .. } => segments,
             Self::WaveSegments(n) => n,
         }
     }
+}
+
+fn prefill_segment_specialization_allowed(dispatch: ProgramDispatch) -> bool {
+    !matches!(dispatch, ProgramDispatch::L2Domains(_))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeSegmentKind {
+    Interpreter,
+    MlaAttention,
+    KdaDecodeFused(usize),
+    GroupedMoeMxfp4 { glu: usize, down: usize },
+}
+
+fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
+    let n_segments = derive_segments(prog)?.len();
+    let mut kinds = vec![DecodeSegmentKind::Interpreter; n_segments];
+    let mut raw_segment_owner = vec![None; prog.insts.len()];
+    for seg in 0..n_segments {
+        let mut fused_inst = None;
+        let mut mla_flash_inst = None;
+        let mut mla_merge_inst = None;
+        let mut multiple_mla_flash = false;
+        let mut multiple_mla_merge = false;
+        let mut moe_glu_inst = None;
+        let mut moe_down_inst = None;
+        let mut multiple_moe_glu = false;
+        let mut multiple_moe_down = false;
+        let mut has_other = false;
+        for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
+            let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "decode segment {seg} references instruction {} of {}",
+                    e.inst,
+                    prog.insts.len()
+                ))
+            })?;
+            if inst.op == DevOp::FlashMlaDecode as u16 {
+                match mla_flash_inst {
+                    None => mla_flash_inst = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(_) => multiple_mla_flash = true,
+                }
+            } else if inst.op == DevOp::MlaMergeFold as u16 {
+                match mla_merge_inst {
+                    None => mla_merge_inst = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(_) => multiple_mla_merge = true,
+                }
+            } else if inst.op == DevOp::KdaDecodeFused as u16 {
+                match fused_inst {
+                    None => fused_inst = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(i) => {
+                        return Err(RuntimeError::Device(format!(
+                            "decode segment {seg} mixes fused KDA instructions {i} and {}",
+                            e.inst
+                        )))
+                    }
+                }
+                match raw_segment_owner[e.inst as usize] {
+                    Some(owner) if owner != seg => {
+                        return Err(RuntimeError::Device(format!(
+                            "raw instruction {} is referenced by segments {owner} and {seg}; a stateful raw boundary may execute exactly once",
+                            e.inst
+                        )))
+                    }
+                    None => raw_segment_owner[e.inst as usize] = Some(seg),
+                    _ => {}
+                }
+                if e.wait_len != 0 || e.succ_len != 0 || e.flags & SE_XCTR != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "fused KDA instruction {} has counter obligations in segment {seg} (waits={}, succs={}, flags={:#x}); a raw kernel cannot service interpreter counters",
+                        e.inst, e.wait_len, e.succ_len, e.flags
+                    )));
+                }
+            } else if inst.op == DevOp::MoeGroupGluFp8Blk as u16
+                || inst.op == DevOp::MoeGroupDownFp8Blk as u16
+            {
+                let (slot, multiple) = if inst.op == DevOp::MoeGroupGluFp8Blk as u16 {
+                    (&mut moe_glu_inst, &mut multiple_moe_glu)
+                } else {
+                    (&mut moe_down_inst, &mut multiple_moe_down)
+                };
+                match *slot {
+                    None => *slot = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(_) => *multiple = true,
+                }
+            } else {
+                has_other = true;
+            }
+        }
+        if let Some(inst) = fused_inst {
+            if has_other || mla_flash_inst.is_some() || mla_merge_inst.is_some() {
+                return Err(RuntimeError::Device(format!(
+                    "decode segment {seg} mixes KdaDecodeFused with interpreter opcodes; standalone dispatch requires a pure segment"
+                )));
+            }
+            kinds[seg] = DecodeSegmentKind::KdaDecodeFused(inst);
+        } else if !has_other && moe_glu_inst.is_some() && moe_down_inst.is_some() {
+            let (Some(glu), Some(down)) = (moe_glu_inst, moe_down_inst) else {
+                unreachable!()
+            };
+            if multiple_moe_glu || multiple_moe_down || down != glu + 1 {
+                return Err(RuntimeError::Device(format!(
+                    "decode segment {seg} is not a pure adjacent grouped MoE GLU+DOWN pair"
+                )));
+            }
+            for e in prog.stream.iter().filter(|e| {
+                e.seg as usize == seg && matches!(e.inst as usize, i if i == glu || i == down)
+            }) {
+                if e.wait_len != 0 || e.succ_len != 0 || e.flags & SE_XCTR != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "grouped MoE instruction {} has counter obligations in segment {seg}",
+                        e.inst
+                    )));
+                }
+                match raw_segment_owner[e.inst as usize] {
+                    Some(owner) if owner != seg => {
+                        return Err(RuntimeError::Device(format!(
+                            "raw instruction {} is referenced by segments {owner} and {seg}",
+                            e.inst
+                        )))
+                    }
+                    None => raw_segment_owner[e.inst as usize] = Some(seg),
+                    _ => {}
+                }
+            }
+            kinds[seg] = DecodeSegmentKind::GroupedMoeMxfp4 { glu, down };
+        } else if !has_other && (mla_flash_inst.is_some() || mla_merge_inst.is_some()) {
+            let (Some(flash), Some(merge)) = (mla_flash_inst, mla_merge_inst) else {
+                return Err(RuntimeError::Device(format!(
+                    "decode segment {seg} contains only half of the FlashMlaDecode+MlaMergeFold pair"
+                )));
+            };
+            if multiple_mla_flash || multiple_mla_merge || merge != flash + 1 {
+                return Err(RuntimeError::Device(format!(
+                    "decode segment {seg} is not a pure adjacent FlashMlaDecode+MlaMergeFold pair"
+                )));
+            }
+            kinds[seg] = DecodeSegmentKind::MlaAttention;
+        }
+    }
+    for (i, inst) in prog.insts.iter().enumerate() {
+        if inst.op == DevOp::KdaDecodeFused as u16 && raw_segment_owner[i].is_none() {
+            return Err(RuntimeError::Device(format!(
+                "fused KDA instruction {i} is absent from every stream segment"
+            )));
+        }
+    }
+
+    // Ordinary L2 placement also uses `seg`, but does not relaunch the program at those
+    // boundaries. Its interpreter counters may therefore cross domains. Only the standalone
+    // raw-kernel route replaces cross-segment counter ordering with ordered AQL launches.
+    if kinds
+        .iter()
+        .all(|kind| matches!(kind, DecodeSegmentKind::Interpreter))
+    {
+        return Ok(kinds);
+    }
+
+    let mut producer_segments: std::collections::HashMap<u32, Vec<u16>> =
+        std::collections::HashMap::new();
+    for e in &prog.stream {
+        if e.flags & SE_XCTR != 0 {
+            continue;
+        }
+        let end = e.succ_ofs as usize + e.succ_len as usize;
+        let succs = prog.succs.get(e.succ_ofs as usize..end).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "decode stream successor range {}..{end} is out of bounds ({})",
+                e.succ_ofs,
+                prog.succs.len()
+            ))
+        })?;
+        for &counter in succs {
+            producer_segments.entry(counter).or_default().push(e.seg);
+        }
+    }
+    for e in &prog.stream {
+        if e.flags & SE_XCTR != 0 {
+            continue;
+        }
+        let end = e.wait_ofs as usize + e.wait_len as usize;
+        let waits = prog.waits.get(e.wait_ofs as usize..end).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "decode stream wait range {}..{end} is out of bounds ({})",
+                e.wait_ofs,
+                prog.waits.len()
+            ))
+        })?;
+        for wait in waits {
+            if producer_segments
+                .get(&wait.id)
+                .is_some_and(|segs| segs.iter().any(|&s| s != e.seg))
+            {
+                return Err(RuntimeError::Device(format!(
+                    "decode counter {} crosses into segment {}; segmented raw/interpreter dispatch requires cross-segment waits to be removed",
+                    wait.id, e.seg
+                )));
+            }
+        }
+    }
+    Ok(kinds)
+}
+
+fn validate_decode_dispatch(progs: &[DevProg], dec_ix: usize) -> Result<()> {
+    for (rung, prog) in progs[dec_ix..].iter().enumerate() {
+        let kinds = decode_segment_kinds(prog)?;
+        let n_segments = kinds.len();
+        let dispatch = ProgramDispatch::classify(
+            prog.l2_domains,
+            n_segments,
+            prog.gq_seg_ofs.len().saturating_sub(1),
+        );
+        if matches!(dispatch, ProgramDispatch::L2Domains(_))
+            && kinds
+                .iter()
+                .any(|k| !matches!(k, DecodeSegmentKind::Interpreter))
+        {
+            return Err(RuntimeError::Device(format!(
+                "decode program {} (rung {rung}, t={}) mixes raw KDA and interpreter segments                  with L2-domain placement; raw boundaries require ordered wave segments",
+                dec_ix + rung,
+                prog.t,
+            )));
+        }
+        if prog.l2_domains == 0
+            && n_segments > 1
+            && !kinds
+                .iter()
+                .any(|k| !matches!(k, DecodeSegmentKind::Interpreter))
+        {
+            return Err(RuntimeError::Device(format!(
+                "decode program {} (rung {rung}, t={}) has {n_segments} wave segments but no                  standalone KDA boundary; ordinary AMD decode remains single-launch",
+                dec_ix + rung,
+                prog.t
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaDecodeFusedArgs {
+    y: u64,
+    q_raw: u64,
+    k_raw: u64,
+    v_raw: u64,
+    wq: u64,
+    wk: u64,
+    wv: u64,
+    csq: u64,
+    csk: u64,
+    csv: u64,
+    forget_raw: u64,
+    beta_raw: u64,
+    output_gate_raw: u64,
+    a_log: u64,
+    dt_bias: u64,
+    state: u64,
+    norm_w: u64,
+    parked: u64,
+    rows: u32,
+    heads: u32,
+    dim: u32,
+    bv: u32,
+    conv_w: u32,
+    flags: u32,
+    gate_mode: u32,
+    lower_bound: f32,
+    scale: f32,
+    norm_eps: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaDecodeFusedArgs>() == 184);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct GroupedMoeGluArgs {
+    fu: u64,
+    x: u64,
+    table: u64,
+    weights: u64,
+    scales: u64,
+    topk: u32,
+    intermediate: u32,
+    hidden: u32,
+    experts: u32,
+    act: u32,
+    enc: u32,
+    beta: f32,
+    linear_beta: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct GroupedMoeDownArgs {
+    partial: u64,
+    fu: u64,
+    table: u64,
+    weights: u64,
+    scales: u64,
+    topk: u32,
+    hidden: u32,
+    intermediate: u32,
+    experts: u32,
+    enc: u32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GroupedMoeGluArgs>() == 72);
+const _: () = assert!(std::mem::size_of::<GroupedMoeDownArgs>() == 64);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaChunkIntraCachedArgs {
+    aqk: u64,
+    ainv: u64,
+    q: u64,
+    k: u64,
+    g_prefix: u64,
+    beta: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    scale: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkIntraCachedArgs>() == 64);
+
+/// Kernarg ABI of `plow_attn_res_f32mix_gfx950` (runtime/amd/attn_res_f32mix_gfx950.hip).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct AttnResF32MixArgs {
+    out: u64,
+    prefix: u64,
+    ring: u64,
+    score_w: u64,
+    push_src: u64,
+    gamma: u64,
+    res_a: u64,
+    res_b: u64,
+    res_pre: u64,
+    t: u32,
+    hid: u32,
+    nb: u32,
+    push_row: u32,
+    nbcap: u32,
+    eps: f32,
+    out_eps: f32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<AttnResF32MixArgs>() == 104);
+
+/// Persistent workgroups for the f32-mix AttnRes object: three 4-wave tokens per CU on 256 CUs
+/// measured 0.260 ms at T8192 against 0.279 (512) and 0.283 (1024); `PLOW_ATTNRES_F32MIX_GRID`
+/// overrides for a sweep.
+fn attn_res_f32mix_grid(t: u32) -> u32 {
+    let grid = crate::config::RuntimeConfig::get()
+        .amd
+        .attnres_f32mix_grid
+        .filter(|&g| g != 0)
+        .unwrap_or(768);
+    grid.min(t).max(1)
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaChunkKeyFactorWuArgs {
+    w: u64,
+    u: u64,
+    key_hi: u64,
+    key_lo: u64,
+    q: u64,
+    ainv: u64,
+    k: u64,
+    v: u64,
+    g: u64,
+    beta: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    value_dim: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkKeyFactorWuArgs>() == 104);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaChunkKeyFactorCarryArgs {
+    out: u64,
+    state: u64,
+    q: u64,
+    k: u64,
+    key_hi: u64,
+    key_lo: u64,
+    w: u64,
+    u: u64,
+    aqk: u64,
+    g: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    value_dim: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkKeyFactorCarryArgs>() == 104);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaChunkCarryRegstateArgs {
+    out: u64,
+    state: u64,
+    q: u64,
+    k: u64,
+    w: u64,
+    u: u64,
+    aqk: u64,
+    g: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    value_dim: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkCarryRegstateArgs>() == 88);
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct XReduceAttnResArgs {
+    reduced: u64,
+    prefix: u64,
+    out: u64,
+    residual: u64,
+    ring: u64,
+    score: u64,
+    gamma: u64,
+    peer_scratch: u64,
+    xctr: u64,
+    status: u64,
+    n: u32,
+    slot_bytes: u32,
+    gate_rs: u32,
+    gate_ag: u32,
+    rank: u32,
+    nranks: u32,
+    row_w: u32,
+    nb: u32,
+    nbcap: u32,
+    eps: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<XReduceAttnResArgs>() == 120);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeStage2Mxfp4Args {
+    part: u64,
+    activation: u64,
+    weight_table: u64,
+    activation_scale: u64,
+    weight_scale_table: u64,
+    meta: u64,
+    row_partidx: u64,
+    row_gate: u64,
+    model_dim: u32,
+    inter_dim: u32,
+    experts: u32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeStage2Mxfp4Args>() == 80);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeStage1Mxfp4Args {
+    out: u64,
+    activation: u64,
+    weight_table: u64,
+    weight_scale_table: u64,
+    meta: u64,
+    row_token: u64,
+    row_partidx: u64,
+    out_scale: u64,
+    inter_dim: u32,
+    model_dim: u32,
+    experts: u32,
+    act: u32,
+    beta: f32,
+    linear_beta: f32,
+    reserved: u32,
+    reserved2: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeStage1Mxfp4Args>() == 96);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeStage1A4QuantArgs {
+    out: u64,
+    out_scale: u64,
+    activation: u64,
+    row_token: u64,
+    meta: u64,
+    row_capacity: u32,
+    experts: u32,
+    hidden: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeStage1A4QuantArgs>() == 56);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeStage1A4ReuseArgs {
+    out: u64,
+    activation: u64,
+    weight_table: u64,
+    activation_scale: u64,
+    weight_scale_table: u64,
+    meta: u64,
+    row_partidx: u64,
+    out_scale: u64,
+    inter: u32,
+    hidden: u32,
+    experts: u32,
+    act: u32,
+    beta: f32,
+    linear_beta: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeStage1A4ReuseArgs>() == 88);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeCombineArgs {
+    out: u64,
+    residual: u64,
+    shared: u64,
+    part: u64,
+    hidden: u32,
+    topk: u32,
+    tokens: u32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeCombineArgs>() == 48);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeEpAlignArgs {
+    routes: u64,
+    meta: u64,
+    partial: u64,
+    row_token: u64,
+    row_partidx: u64,
+    row_gate: u64,
+    tokens: u32,
+    topk: u32,
+    experts: u32,
+    expert_begin: u32,
+    expert_end: u32,
+    row_capacity: u32,
+    phase: u32,
+    npart: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeEpAlignArgs>() == 80);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeEpCombineArgs {
+    out: u64,
+    part: u64,
+    routes: u64,
+    tokens: u32,
+    hidden: u32,
+    topk: u32,
+    expert_begin: u32,
+    expert_end: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeEpCombineArgs>() == 48);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MlaMaterializePackArgs {
+    k: u64,
+    v: u64,
+    kv: u64,
+    k_rope: u64,
+    t: u32,
+    heads: u32,
+    qk_nope: u32,
+    qk_rope: u32,
+    v_head: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MlaMaterializePackArgs>() == 56);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MlaMaterializedPrefillArgs {
+    q: u64,
+    k: u64,
+    v: u64,
+    o: u64,
+    b: i32,
+    n: i32,
+    n_kv: i32,
+    h: i32,
+    h_kv: i32,
+    d_qk: i32,
+    d_v: i32,
+    stride_q_b: i32,
+    stride_q_n: i32,
+    stride_q_h: i32,
+    stride_o_b: i32,
+    stride_o_n: i32,
+    stride_o_h: i32,
+    stride_k_b: i32,
+    stride_k_n: i32,
+    stride_k_h: i32,
+    stride_v_b: i32,
+    stride_v_n: i32,
+    stride_v_h: i32,
+    softmax_scale: f32,
+    seqstart_q: u64,
+    seqstart_k: u64,
+    seqstart_q_pad: u64,
+    seqstart_k_pad: u64,
+    opt: i32,
+    _pad: u32,
+    lse: u64,
+    stride_lse_b: i32,
+    stride_lse_h: i32,
+}
+
+const _: () = assert!(std::mem::size_of::<MlaMaterializedPrefillArgs>() == 168);
+
+#[derive(Clone, Copy, Debug)]
+struct MoeStage1Mxfp4Route {
+    args: MoeStage1Mxfp4Args,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoeStage1A4ReuseRoute {
+    quant_args: MoeStage1A4QuantArgs,
+    args: MoeStage1A4ReuseArgs,
+    quant_grid: u32,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoeStage2Mxfp4Route {
+    args: MoeStage2Mxfp4Args,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoeCombineRoute {
+    args: MoeCombineArgs,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoeEpAlignRoute {
+    args: MoeEpAlignArgs,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoeEpCombineRoute {
+    args: MoeEpCombineArgs,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PrefillSegmentRoute {
+    Interpreter,
+    XReduceWaveRs,
+    GraphPhaseXReduceWaveRs,
+    XReduceAttnRes {
+        args: XReduceAttnResArgs,
+        device_args: u64,
+        grid: u32,
+    },
+    KdaChunkIntraCached {
+        args: KdaChunkIntraCachedArgs,
+        grid: u32,
+    },
+    KdaChunkIntraWaveItems {
+        args: KdaChunkIntraCachedArgs,
+        grid: u32,
+    },
+    AttnResF32Mix {
+        args: AttnResF32MixArgs,
+        grid: u32,
+    },
+    KdaChunkKeyFactorWu {
+        args: KdaChunkKeyFactorWuArgs,
+        grid: u32,
+    },
+    KdaChunkKeyFactorCarry {
+        args: KdaChunkKeyFactorCarryArgs,
+        grid: u32,
+    },
+    KdaChunkCarryRegstate {
+        args: KdaChunkCarryRegstateArgs,
+        grid: u32,
+        /// Packet tensor ids of the eight operands, in args order, so a launch can rebase the
+        /// KV-slot-strided ones (the recurrent `state`) to the active slot.
+        tens: [u16; 8],
+    },
+    MoeStage1Mxfp4(MoeStage1Mxfp4Route),
+    MoeStage1A4Reuse(MoeStage1A4ReuseRoute),
+    MoeStage2Mxfp4(MoeStage2Mxfp4Route),
+    MoeCombine(MoeCombineRoute),
+    MoeEpAlign(MoeEpAlignRoute),
+    MoeEpStage2(MoeStage2Mxfp4Route),
+    MoeEpCombine(MoeEpCombineRoute),
+    MlaMaterializePack {
+        args: MlaMaterializePackArgs,
+        grid: u32,
+    },
+    MlaMaterializedPrefill {
+        args: MlaMaterializedPrefillArgs,
+        grid: u32,
+    },
+}
+
+const MLA_MATERIALIZED_Q_BLOCK: u32 = 256;
+
+fn mla_materialized_flat_grid(n: u32, heads: u32, batches: u32) -> Result<u32> {
+    if n == 0 || heads == 0 || batches == 0 {
+        return Err(RuntimeError::Device(
+            "materialized MLA grid dimensions must be nonzero".into(),
+        ));
+    }
+    n.div_ceil(MLA_MATERIALIZED_Q_BLOCK)
+        .checked_mul(heads)
+        .and_then(|v| v.checked_mul(batches))
+        .ok_or_else(|| RuntimeError::Device("materialized MLA grid overflows".into()))
+}
+
+fn mla_materialized_routes(
+    prog: &DevProg,
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+) -> Result<()> {
+    let mut members = vec![std::collections::BTreeSet::new(); routes.len()];
+    let mut raw_segment_owner = vec![None; prog.insts.len()];
+    for entry in &prog.stream {
+        let seg = entry.seg as usize;
+        let inst_ix = entry.inst as usize;
+        let inst = prog.insts.get(inst_ix).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "materialized MLA stream references instruction {inst_ix} of {}",
+                prog.insts.len()
+            ))
+        })?;
+        let set = members.get_mut(seg).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "materialized MLA stream references segment {seg} of {}",
+                routes.len()
+            ))
+        })?;
+        set.insert(inst_ix);
+        if matches!(
+            DevOp::from_u16(inst.op),
+            Some(DevOp::MlaMaterializePack | DevOp::FlashMlaMaterializedPrefill)
+        ) {
+            match raw_segment_owner[inst_ix] {
+                Some(owner) if owner != seg => {
+                    return Err(RuntimeError::Device(format!(
+                        "materialized MLA raw instruction {inst_ix} is referenced by segments {owner} and {seg}"
+                    )))
+                }
+                None => raw_segment_owner[inst_ix] = Some(seg),
+                _ => {}
+            }
+            if entry.wait_len != 0 || entry.succ_len != 0 || entry.flags & SE_XCTR != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "materialized MLA raw instruction {inst_ix} has interpreter counter obligations in segment {seg}"
+                )));
+            }
+        }
+    }
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        if h == packet::dev::TENSOR_NONE16 {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA operand `{what}` is absent"
+            )));
+        }
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "materialized MLA operand `{what}` handle {h} is outside {} tensors",
+                devp.len()
+            ))
+        })
+    };
+    for (seg, set) in members.into_iter().enumerate() {
+        let raw = set.iter().any(|&i| {
+            matches!(
+                DevOp::from_u16(prog.insts[i].op),
+                Some(DevOp::MlaMaterializePack | DevOp::FlashMlaMaterializedPrefill)
+            )
+        });
+        if !raw {
+            continue;
+        }
+        if set.len() != 1 {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA segment {seg} mixes a standalone opcode with interpreter work"
+            )));
+        }
+        let d = &prog.insts[*set.first().unwrap()];
+        if d.op == DevOp::MlaMaterializePack as u16 {
+            if d.i[..5] != [prog.t, d.i[1], 128, 64, 128]
+                || d.i[1] == 0
+                || d.blocks == 0
+                || d.i[5..].iter().any(|&v| v != 0)
+                || d.fj.iter().any(|&v| v != 0)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "materialized MLA pack segment {seg} has unsupported geometry"
+                )));
+            }
+            routes[seg] = PrefillSegmentRoute::MlaMaterializePack {
+                args: MlaMaterializePackArgs {
+                    k: addr(d.t[0], "K")?,
+                    v: addr(d.t[1], "V")?,
+                    kv: addr(d.t[2], "KV")?,
+                    k_rope: addr(d.t[3], "K_rope")?,
+                    t: d.i[0],
+                    heads: d.i[1],
+                    qk_nope: d.i[2],
+                    qk_rope: d.i[3],
+                    v_head: d.i[4],
+                },
+                grid: u32::from(d.blocks),
+            };
+        } else if d.op == DevOp::FlashMlaMaterializedPrefill as u16 {
+            let (n, h, h_kv, d_qk, d_v, abi) = (d.i[0], d.i[1], d.i[2], d.i[3], d.i[4], d.i[5]);
+            let scale = f32::from_bits(d.fj[0]);
+            if n != prog.t
+                || h == 0
+                || h_kv != h
+                || d_qk != 192
+                || d_v != 128
+                || abi != 1
+                || d.i[6..].iter().any(|&v| v != 0)
+                || !scale.is_finite()
+                || scale <= 0.0
+            {
+                return Err(RuntimeError::Device(format!(
+                    "materialized MLA prefill segment {seg} has unsupported capability: T={n} H={h} H_KV={h_kv} DQK={d_qk} DV={d_v} abi={abi}"
+                )));
+            }
+            let n = i32::try_from(n).map_err(|_| RuntimeError::Device("T exceeds i32".into()))?;
+            let h = i32::try_from(h).map_err(|_| RuntimeError::Device("H exceeds i32".into()))?;
+            let qn = h
+                .checked_mul(192)
+                .ok_or_else(|| RuntimeError::Device("Q stride overflows".into()))?;
+            let on = h
+                .checked_mul(128)
+                .ok_or_else(|| RuntimeError::Device("O stride overflows".into()))?;
+            let stride_q_b = n
+                .checked_mul(qn)
+                .ok_or_else(|| RuntimeError::Device("Q batch stride overflows".into()))?;
+            let stride_o_b = n
+                .checked_mul(on)
+                .ok_or_else(|| RuntimeError::Device("O batch stride overflows".into()))?;
+            let grid = mla_materialized_flat_grid(n.unsigned_abs(), h.unsigned_abs(), 1)?;
+            routes[seg] = PrefillSegmentRoute::MlaMaterializedPrefill {
+                args: MlaMaterializedPrefillArgs {
+                    q: addr(d.t[1], "Q")?,
+                    k: addr(d.t[2], "K")?,
+                    v: addr(d.t[3], "V")?,
+                    o: addr(d.t[0], "O")?,
+                    b: 1,
+                    n,
+                    n_kv: n,
+                    h,
+                    h_kv: h,
+                    d_qk: 192,
+                    d_v: 128,
+                    stride_q_b,
+                    stride_q_n: qn,
+                    stride_q_h: 192,
+                    stride_o_b,
+                    stride_o_n: on,
+                    stride_o_h: 128,
+                    stride_k_b: stride_q_b,
+                    stride_k_n: qn,
+                    stride_k_h: 192,
+                    stride_v_b: stride_o_b,
+                    stride_v_n: on,
+                    stride_v_h: 128,
+                    softmax_scale: scale,
+                    seqstart_q: 0,
+                    seqstart_k: 0,
+                    seqstart_q_pad: 0,
+                    seqstart_k_pad: 0,
+                    opt: 0,
+                    _pad: 0,
+                    lse: 0,
+                    stride_lse_b: 0,
+                    stride_lse_h: 0,
+                },
+                grid,
+            };
+        }
+    }
+    for (i, inst) in prog.insts.iter().enumerate() {
+        if matches!(
+            DevOp::from_u16(inst.op),
+            Some(DevOp::MlaMaterializePack | DevOp::FlashMlaMaterializedPrefill)
+        ) && raw_segment_owner[i].is_none()
+        {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA raw instruction {i} is absent from every stream segment"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn xreduce_attnres_encoded(d: &DevInst64) -> bool {
+    d.op == DevOp::XReduceTwoShot as u16 && d.t[3] != packet::dev::TENSOR_NONE16
+}
+
+fn xreduce_attnres_inst(d: &DevInst64) -> bool {
+    xreduce_attnres_encoded(d)
+        && d.blocks != 0
+        && d.i[0] != 0
+        && d.i[1] > 1
+        && d.i[5] != 0
+        && d.i[0].is_multiple_of(d.i[5])
+        && (d.i[0] / d.i[5]).is_multiple_of(d.i[1])
+        && d.i[6] <= d.i[7]
+        && d.t[0] != packet::dev::TENSOR_NONE16
+        && d.t[2..=6].iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && d.t[7] == packet::dev::TENSOR_NONE16
+        && f32::from_bits(d.fj[0]).is_finite()
+        && f32::from_bits(d.fj[0]) > 0.0
+        && d.fj[1] == 0
+}
+
+fn moe_stage1_mxfp4_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeGroupGluPf as u16
+        && d.i[0] >= 256
+        && d.i[0].is_multiple_of(32)
+        && d.i[1] != 0
+        && d.i[1].is_multiple_of(128)
+        && d.i[2] != 0
+        && d.i[3] == MOE_ENC_MXFP4
+        && d.i[4] == 0
+        && d.i[5] <= 2
+        && d.i[6] == 0
+        && d.i[7] == 0
+        && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+}
+
+fn moe_stage1_a4_reuse_inst(d: &DevInst64) -> bool {
+    moe_stage1_mxfp4_inst(d) && d.i[0].div_ceil(256) >= 2
+}
+
+fn moe_stage2_mxfp4_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeGroupDownPf as u16
+        && d.i[3] == MOE_ENC_MXFP4
+        && d.i[1] == 384
+        && d.i[0] != 0
+        && d.i[0].is_multiple_of(16)
+        && d.i[2] != 0
+        && d.i[4] == 0
+        && d.i[5] == 0
+        && d.t[5] != packet::dev::TENSOR_NONE16
+        && d.t[6] != packet::dev::TENSOR_NONE16
+        && d.t[7] != packet::dev::TENSOR_NONE16
+}
+
+fn moe_combine_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeCombinePf as u16
+        && d.t[0] != packet::dev::TENSOR_NONE16
+        && d.t[3] != packet::dev::TENSOR_NONE16
+        && d.i[0] != 0
+        && d.i[1] == 16
+        && d.i[2] != 0
+        && d.i[3..].iter().all(|&v| v == 0)
+        && d.fj.iter().all(|&v| v == 0)
+}
+
+fn moe_ep_degree(d: &DevInst64) -> Option<u32> {
+    let degree = match DevOp::from_u16(d.op) {
+        Some(DevOp::MoeAlignPf | DevOp::MoeCombinePf) => d.i[5],
+        Some(DevOp::MoeGroupGluPf | DevOp::MoeGroupDownPf) => d.i[6],
+        _ => 0,
+    };
+    (degree > 1).then_some(degree)
+}
+
+fn moe_ep_stage1_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeGroupGluPf as u16
+        && d.i[0] >= 256
+        && d.i[0].is_multiple_of(128)
+        && d.i[1].is_multiple_of(128)
+        && d.i[2] >= d.i[6]
+        && d.i[3] == MOE_ENC_MXFP4
+        && d.i[4] == 0
+        && d.i[5] <= 2
+        && d.i[6] > 1
+        && d.i[7] == 0
+        && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+}
+
+fn moe_ep_stage2_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeGroupDownPf as u16
+        && d.i[0].is_multiple_of(16)
+        && d.i[1].is_multiple_of(128)
+        && d.i[2] >= d.i[6]
+        && d.i[3] == MOE_ENC_MXFP4
+        && d.i[4] == 0
+        && d.i[5] == 0
+        && d.i[6] > 1
+        && d.i[7] == 0
+        && d.t[5..=7].iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+}
+
+fn moe_ep_combine_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeCombinePf as u16
+        && d.t[0] != packet::dev::TENSOR_NONE16
+        && d.t[3] != packet::dev::TENSOR_NONE16
+        && d.t[4] != packet::dev::TENSOR_NONE16
+        && d.i[0] != 0
+        && d.i[1] == 16
+        && d.i[2] > 1
+        && d.i[3] == 0
+        && d.i[4] == 0
+        && d.i[5] > 1
+        && d.i[6] >= d.i[5]
+        && d.i[7] == 0
+        && d.fj.iter().all(|&v| v == 0)
+}
+
+fn moe_stage2_mxfp4_pair(d: &DevInst64, c: &DevInst64) -> bool {
+    moe_stage2_mxfp4_inst(d)
+        && c.op == DevOp::MoeCombinePf as u16
+        && c.t[1] == packet::dev::TENSOR_NONE16
+        && c.t[2] == packet::dev::TENSOR_NONE16
+        && c.t[3] == d.t[0]
+        && c.i[0] == d.i[0]
+        && c.i[1] != 0
+        && c.i[2] != 0
+        && c.i[3] == 0
+        && c.i[4] == 0
+        && c.i[7] == 0
+}
+
+fn kda_chunk_intra_cached_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::KdaChunkIntra as u16
+        && d.blocks != 0
+        && d.i[0] >= 512
+        && d.i[1] != 0
+        && d.i[2] == 128
+        && d.i[3..].iter().all(|&v| v == 0)
+        && d.t[..6].iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && d.t[6..].iter().all(|&t| t == packet::dev::TENSOR_NONE16)
+        && f32::from_bits(d.fj[0]).is_finite()
+        && f32::from_bits(d.fj[0]) > 0.0
+        && d.fj[1..].iter().all(|&v| v == 0)
+}
+
+fn kda_key_factor_pair(w: &DevInst64, c: &DevInst64) -> bool {
+    w.op == DevOp::KdaChunkWu as u16
+        && c.op == DevOp::KdaChunkCarry as u16
+        && w.blocks != 0
+        && c.blocks != 0
+        && w.i[0] >= 512
+        && w.i[0] == c.i[0]
+        && w.i[1] != 0
+        && w.i[1] == c.i[1]
+        && w.i[2] == 128
+        && w.i[2] == c.i[2]
+        && w.i[3] == 128
+        && w.i[3] == c.i[3]
+        && w.i[4] == 1
+        && c.i[4] == 1
+        && w.i[5..].iter().all(|&v| v == 0)
+        && c.i[5..].iter().all(|&v| v == 0)
+        && w.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && c.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && c.t[2] == w.t[7]
+        && c.t[3] == w.t[3]
+        && c.t[4] == w.t[0]
+        && c.t[5] == w.t[1]
+        && c.t[7] == w.t[5]
+        && w.fj[0] == c.fj[0]
+        && f32::from_bits(w.fj[0]).is_finite()
+        && f32::from_bits(w.fj[0]) > 0.0
+        && w.fj[1..].iter().all(|&v| v == 0)
+        && c.fj[1..].iter().all(|&v| v == 0)
+}
+
+fn kda_key_factor_segment_pairs(prog: &DevProg) -> Vec<(usize, usize, usize, usize)> {
+    let mut members = std::collections::BTreeMap::<u16, std::collections::BTreeSet<usize>>::new();
+    for entry in &prog.stream {
+        members
+            .entry(entry.seg)
+            .or_default()
+            .insert(entry.inst as usize);
+    }
+    let singleton_seg = |inst: usize| {
+        members
+            .iter()
+            .find_map(|(&seg, set)| (set.len() == 1 && set.contains(&inst)).then_some(seg as usize))
+    };
+    prog.insts
+        .windows(2)
+        .enumerate()
+        .filter_map(|(i, pair)| {
+            if !kda_key_factor_pair(&pair[0], &pair[1]) {
+                return None;
+            }
+            let wu_seg = singleton_seg(i)?;
+            let carry_seg = singleton_seg(i + 1)?;
+            (wu_seg != carry_seg).then_some((wu_seg, carry_seg, i, i + 1))
+        })
+        .collect()
+}
+
+fn kda_key_factor_scratch_half_bytes(progs: &[DevProg]) -> Result<u64> {
+    let mut max_half = 0u64;
+    for prog in progs {
+        for (_, _, wu, _) in kda_key_factor_segment_pairs(prog) {
+            let d = &prog.insts[wu];
+            let bytes = u64::from(d.i[0])
+                .checked_mul(u64::from(d.i[1]))
+                .and_then(|v| v.checked_mul(u64::from(d.i[2])))
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| {
+                    RuntimeError::Device("KDA key-factor scratch size overflows".into())
+                })?;
+            max_half = max_half.max(bytes);
+        }
+    }
+    Ok(max_half)
+}
+
+fn add_kda_key_factor_routes(
+    prog: &DevProg,
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+    scratch: Option<(u64, u64)>,
+) -> Result<()> {
+    let Some((key_hi, half_bytes)) = scratch else {
+        return Ok(());
+    };
+    let key_lo = key_hi
+        .checked_add(half_bytes)
+        .ok_or_else(|| RuntimeError::Device("KDA key-factor scratch address overflows".into()))?;
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KDA key-factor operand `{what}` handle {h} is invalid"
+            ))
+        })
+    };
+    for (wu_seg, carry_seg, wi, ci) in kda_key_factor_segment_pairs(prog) {
+        let w = &prog.insts[wi];
+        let c = &prog.insts[ci];
+        let need = u64::from(w.i[0]) * u64::from(w.i[1]) * u64::from(w.i[2]) * 2;
+        if need > half_bytes {
+            return Err(RuntimeError::Device(format!(
+                "KDA key-factor route needs {need} bytes per half, allocation has {half_bytes}"
+            )));
+        }
+        routes[wu_seg] = PrefillSegmentRoute::KdaChunkKeyFactorWu {
+            args: KdaChunkKeyFactorWuArgs {
+                w: addr(w.t[0], "W")?,
+                u: addr(w.t[1], "U")?,
+                key_hi,
+                key_lo,
+                q: addr(w.t[7], "q")?,
+                ainv: addr(w.t[2], "Ainv")?,
+                k: addr(w.t[3], "k")?,
+                v: addr(w.t[4], "v")?,
+                g: addr(w.t[5], "g")?,
+                beta: addr(w.t[6], "beta")?,
+                t: w.i[0],
+                heads: w.i[1],
+                dim: w.i[2],
+                value_dim: w.i[3],
+                scale: f32::from_bits(w.fj[0]),
+                _pad: 0,
+            },
+            grid: u32::from(w.blocks),
+        };
+        routes[carry_seg] = PrefillSegmentRoute::KdaChunkKeyFactorCarry {
+            args: KdaChunkKeyFactorCarryArgs {
+                out: addr(c.t[0], "out")?,
+                state: addr(c.t[1], "state")?,
+                q: addr(c.t[2], "q")?,
+                k: addr(c.t[3], "k")?,
+                key_hi,
+                key_lo,
+                w: addr(c.t[4], "W")?,
+                u: addr(c.t[5], "U")?,
+                aqk: addr(c.t[6], "Aqk")?,
+                g: addr(c.t[7], "g")?,
+                t: c.i[0],
+                heads: c.i[1],
+                dim: c.i[2],
+                value_dim: c.i[3],
+                scale: f32::from_bits(c.fj[0]),
+                _pad: 0,
+            },
+            grid: u32::from(c.blocks),
+        };
+    }
+    Ok(())
+}
+
+fn rebase_kda_key_factor_routes(routes: &mut [PrefillSegmentRoute], t: u32) {
+    for route in routes {
+        match route {
+            PrefillSegmentRoute::KdaChunkKeyFactorWu { args, .. } => args.t = t,
+            PrefillSegmentRoute::KdaChunkKeyFactorCarry { args, .. } => args.t = t,
+            PrefillSegmentRoute::KdaChunkCarryRegstate { args, .. } => args.t = t,
+            _ => {}
+        }
+    }
+}
+
+fn promote_kda_intra_wave_items_routes(
+    prog: &DevProg,
+    classes: &[u8],
+    routes: &mut [PrefillSegmentRoute],
+) -> Result<()> {
+    for (seg, &class) in classes.iter().enumerate() {
+        if class != 20 {
+            continue;
+        }
+        if prog.stream.iter().any(|e| {
+            e.seg as usize == seg
+                && (e.wait_len != 0
+                    || e.succ_len != 0
+                    || e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS == 0)
+        }) {
+            return Err(RuntimeError::Device(format!(
+                "KDA-intra wave-item segment {seg} has counter obligations or an unmarked entry"
+            )));
+        }
+        routes[seg] = match routes[seg] {
+            PrefillSegmentRoute::KdaChunkIntraCached { args, grid } => {
+                PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid }
+            }
+            _ => {
+                return Err(RuntimeError::Device(format!(
+                    "KDA-intra wave-item segment {seg} is not an exact BT64/D128 singleton"
+                )))
+            }
+        };
+    }
+    Ok(())
+}
+
+fn kda_carry_regstate_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::KdaChunkCarry as u16
+        && d.blocks != 0
+        && d.i[0] >= 512
+        && d.i[1] != 0
+        && d.i[2] == 128
+        && d.i[3] == 128
+        && d.i[4] == 1
+        && d.i[5..].iter().all(|&v| v == 0)
+        && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && f32::from_bits(d.fj[0]).is_finite()
+        && f32::from_bits(d.fj[0]) > 0.0
+        && d.fj[1..].iter().all(|&v| v == 0)
+}
+
+/// One workgroup per (head, V16) state tile.
+fn kda_carry_regstate_grid(heads: u32) -> u32 {
+    heads * 8
+}
+
+fn promote_kda_carry_regstate_routes(
+    prog: &DevProg,
+    classes: &[u8],
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+) -> Result<()> {
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KDA carry regstate operand `{what}` handle {h} is invalid"
+            ))
+        })
+    };
+    for (seg, &class) in classes.iter().enumerate() {
+        if class != 23 {
+            continue;
+        }
+        let mut inst = None;
+        for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
+            if e.wait_len != 0
+                || e.succ_len != 0
+                || e.flags & packet::dev::SE_KDA_CARRY_REGSTATE == 0
+                || inst.is_some_and(|i| i != e.inst as usize)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "KDA carry regstate segment {seg} has counter obligations or is not a singleton"
+                )));
+            }
+            inst = Some(e.inst as usize);
+        }
+        let d = inst
+            .and_then(|i| prog.insts.get(i))
+            .filter(|d| kda_carry_regstate_inst(d));
+        let Some(d) = d else {
+            return Err(RuntimeError::Device(format!(
+                "KDA carry regstate segment {seg} is not an exact qpre BT64/D128/V128 carry"
+            )));
+        };
+        routes[seg] = PrefillSegmentRoute::KdaChunkCarryRegstate {
+            args: KdaChunkCarryRegstateArgs {
+                out: addr(d.t[0], "out")?,
+                state: addr(d.t[1], "state")?,
+                q: addr(d.t[2], "q")?,
+                k: addr(d.t[3], "k")?,
+                w: addr(d.t[4], "W")?,
+                u: addr(d.t[5], "U")?,
+                aqk: addr(d.t[6], "Aqk")?,
+                g: addr(d.t[7], "g")?,
+                t: d.i[0],
+                heads: d.i[1],
+                dim: d.i[2],
+                value_dim: d.i[3],
+                scale: f32::from_bits(d.fj[0]),
+                _pad: 0,
+            },
+            grid: kda_carry_regstate_grid(d.i[1]),
+            tens: d.t,
+        };
+    }
+    Ok(())
+}
+
+fn has_moe_stage2_mxfp4_segment(prog: &DevProg) -> bool {
+    let n_seg = prog
+        .stream
+        .iter()
+        .map(|entry| entry.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    let mut members = vec![std::collections::BTreeSet::new(); n_seg];
+    for entry in &prog.stream {
+        members[entry.seg as usize].insert(entry.inst as usize);
+    }
+    members.into_iter().any(|set| {
+        if set.len() != 1 {
+            return false;
+        }
+        moe_stage2_mxfp4_inst(&prog.insts[*set.first().unwrap()])
+    })
+}
+
+fn has_moe_stage1_mxfp4_segment(prog: &DevProg) -> bool {
+    let mut members = std::collections::BTreeMap::<u16, std::collections::BTreeSet<usize>>::new();
+    for entry in &prog.stream {
+        members
+            .entry(entry.seg)
+            .or_default()
+            .insert(entry.inst as usize);
+    }
+    members
+        .values()
+        .any(|set| set.len() == 1 && moe_stage1_mxfp4_inst(&prog.insts[*set.first().unwrap()]))
+}
+
+fn moe_stage1_a4_scratch_bytes(
+    progs: &[DevProg],
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<(u64, u64)> {
+    let mut payload = 0u64;
+    let mut scales = 0u64;
+    for prog in progs {
+        for d in &prog.insts {
+            if !moe_stage1_a4_reuse_inst(d) {
+                continue;
+            }
+            let row_bytes = tensors
+                .get(d.t[5] as usize)
+                .ok_or_else(|| {
+                    RuntimeError::Device("lean MoE stage-1 row-token handle is invalid".into())
+                })?
+                .bytes;
+            if !row_bytes.is_multiple_of(4) {
+                return Err(RuntimeError::Device(
+                    "lean MoE stage-1 row-token bytes are not u32-aligned".into(),
+                ));
+            }
+            let rows = row_bytes / 4;
+            let next_payload = rows.checked_mul(u64::from(d.i[1] / 2)).ok_or_else(|| {
+                RuntimeError::Device("lean MoE stage-1 A4 scratch size overflows".into())
+            })?;
+            let next_scales = rows.checked_mul(u64::from(d.i[1] / 32)).ok_or_else(|| {
+                RuntimeError::Device("lean MoE stage-1 scale scratch size overflows".into())
+            })?;
+            let next_total = next_payload.checked_add(next_scales).ok_or_else(|| {
+                RuntimeError::Device("lean MoE stage-1 total scratch size overflows".into())
+            })?;
+            if next_total > payload + scales {
+                payload = next_payload;
+                scales = next_scales;
+            }
+        }
+    }
+    Ok((payload, scales))
+}
+
+fn has_moe_combine_segment(prog: &DevProg) -> bool {
+    let mut members = std::collections::BTreeMap::<u16, std::collections::BTreeSet<usize>>::new();
+    for entry in &prog.stream {
+        members
+            .entry(entry.seg)
+            .or_default()
+            .insert(entry.inst as usize);
+    }
+    members
+        .values()
+        .any(|set| set.len() == 1 && moe_combine_inst(&prog.insts[*set.first().unwrap()]))
+}
+
+fn has_moe_prefill_ep(prog: &DevProg) -> bool {
+    prog.insts.iter().any(|d| moe_ep_degree(d).is_some())
+}
+
+fn moe_prefill_ep_extra_bytes(
+    progs: &[DevProg],
+    tensors: &[crate::asset::devblob::DevTensor],
+    n_gpu: u32,
+) -> Result<u64> {
+    let mut tables = BTreeSet::new();
+    let mut total = 0u64;
+    for d in progs.iter().flat_map(|p| &p.insts) {
+        if !moe_ep_stage1_inst(d) || !tables.insert(d.t[2]) {
+            continue;
+        }
+        let degree = moe_ep_degree(d).expect("EP stage-1 carries a degree");
+        if degree != n_gpu || d.i[3] != MOE_ENC_MXFP4 || d.i[0] % 32 != 0 {
+            return Err(RuntimeError::Device(
+                "EP memory budget has unsupported geometry".into(),
+            ));
+        }
+        let local_experts = packet::moe_ep::balanced_expert_range(d.i[2], n_gpu, 0).len() as u64;
+        let h = u64::from(d.i[1]);
+        let i = u64::from(d.i[0]);
+        let matrix_payload = h
+            .checked_mul(i)
+            .and_then(|n| n.checked_div(2))
+            .ok_or_else(|| RuntimeError::Device("EP payload budget overflows".into()))?;
+        let matrix_scales = h
+            .checked_mul(i / 32)
+            .ok_or_else(|| RuntimeError::Device("EP scale budget overflows".into()))?;
+        let main = matrix_payload
+            .checked_add(matrix_scales)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or_else(|| RuntimeError::Device("EP primary expert budget overflows".into()))?;
+        let has_moe2 = tensors.get(d.t[2] as usize).is_some_and(|td| {
+            td.name
+                .strip_suffix("expert_weight_table_ep")
+                .is_some_and(|pfx| {
+                    tensors
+                        .iter()
+                        .any(|t| t.name == format!("{pfx}expert_weight_table_moe2_ep"))
+                })
+        });
+        let moe2 = if has_moe2 {
+            let padded_scale = h.div_ceil(256) * 256 * (i.div_ceil(32).div_ceil(8) * 8);
+            matrix_payload
+                .checked_add(padded_scale)
+                .ok_or_else(|| RuntimeError::Device("EP stage-2 budget overflows".into()))?
+        } else {
+            0
+        };
+        total = total
+            .checked_add(
+                local_experts
+                    .checked_mul(main + moe2)
+                    .ok_or_else(|| RuntimeError::Device("EP resident budget overflows".into()))?,
+            )
+            .ok_or_else(|| RuntimeError::Device("EP resident budget overflows".into()))?;
+    }
+    Ok(total)
+}
+
+fn moe_mxfp4_routes_with_scratch(
+    prog: &DevProg,
+    tensors: &[crate::asset::devblob::DevTensor],
+    devp: &[DeviceMem],
+    stage1_a4_scratch: Option<(u64, u64)>,
+    ep_bind: Option<(u32, u32)>,
+) -> Result<Vec<PrefillSegmentRoute>> {
+    let n_seg = prog
+        .stream
+        .iter()
+        .map(|entry| entry.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    let mut members = vec![std::collections::BTreeSet::new(); n_seg];
+    for entry in &prog.stream {
+        if let Some(set) = members.get_mut(entry.seg as usize) {
+            set.insert(entry.inst as usize);
+        }
+    }
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        if h == packet::dev::TENSOR_NONE16 {
+            return Err(RuntimeError::Device(format!(
+                "standalone lean MoE operand `{what}` is absent"
+            )));
+        }
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "standalone lean MoE operand `{what}` handle {h} is outside {} tensors",
+                devp.len()
+            ))
+        })
+    };
+    let companion = |h: u16, from: &str, to: &str| -> Result<Option<u64>> {
+        let td = tensors.get(h as usize).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "lean MoE stage-2 source table handle {h} is outside {} tensors",
+                tensors.len()
+            ))
+        })?;
+        let name = if let Some(pfx) = td.name.strip_suffix(&format!("{from}_ep")) {
+            format!("{pfx}{to}_ep")
+        } else if let Some(pfx) = td.name.strip_suffix(from) {
+            format!("{pfx}{to}")
+        } else {
+            return Ok(None);
+        };
+        let Some(ix) = tensors.iter().position(|t| t.name == name) else {
+            return Ok(None);
+        };
+        devp.get(ix).map(|m| Some(m.base)).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "lean MoE stage-2 companion table `{name}` has no device allocation"
+            ))
+        })
+    };
+    let mut routes = Vec::with_capacity(n_seg);
+    for (seg, set) in members.into_iter().enumerate() {
+        let ep_members: Vec<_> = set
+            .iter()
+            .filter_map(|&i| {
+                prog.insts
+                    .get(i)
+                    .and_then(|d| moe_ep_degree(d).map(|n| (d, n)))
+            })
+            .collect();
+        if !ep_members.is_empty() {
+            let (rank, n_gpu) = ep_bind.ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "program T={} segment {seg} declares expert parallelism without a TP binding",
+                    prog.t
+                ))
+            })?;
+            if rank >= n_gpu
+                || ep_members.len() != set.len()
+                || ep_members.iter().any(|(_, degree)| *degree != n_gpu)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "program T={} segment {seg} has a mixed or topology-mismatched EP boundary",
+                    prog.t
+                )));
+            }
+            if ep_members
+                .iter()
+                .all(|(d, _)| d.op == DevOp::MoeAlignPf as u16)
+            {
+                let first = ep_members[0].0;
+                if first.i[0] != prog.t
+                    || first.i[1] == 0
+                    || first.i[2] != 16
+                    || ep_members.iter().any(|(d, _)| {
+                        d.t[..5] != first.t[..5]
+                            || d.i[0] != first.i[0]
+                            || d.i[1] != first.i[1]
+                            || d.i[2] != first.i[2]
+                    })
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "program T={} segment {seg} has an invalid EP align packet set",
+                        prog.t
+                    )));
+                }
+                let range = packet::moe_ep::balanced_expert_range(first.i[1], n_gpu, rank);
+                let row_bytes = tensors
+                    .get(first.t[2] as usize)
+                    .ok_or_else(|| RuntimeError::Device("EP row-token handle is invalid".into()))?
+                    .bytes;
+                if !row_bytes.is_multiple_of(4) {
+                    return Err(RuntimeError::Device(
+                        "EP row-token tensor is misaligned".into(),
+                    ));
+                }
+                let meta = addr(first.t[0], "meta")?;
+                let meta_words = u64::from(first.i[1])
+                    .checked_mul(67)
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(|| RuntimeError::Device("EP metadata size overflows".into()))?;
+                let meta_bytes = meta_words.checked_mul(4).ok_or_else(|| {
+                    RuntimeError::Device("EP metadata byte size overflows".into())
+                })?;
+                let declared_meta_bytes = tensors
+                    .get(first.t[0] as usize)
+                    .ok_or_else(|| RuntimeError::Device("EP metadata handle is invalid".into()))?
+                    .bytes;
+                if declared_meta_bytes < meta_bytes {
+                    return Err(RuntimeError::Device(format!(
+                        "EP metadata allocation is {declared_meta_bytes} B; {meta_bytes} B required"
+                    )));
+                }
+                let partial = meta
+                    + u64::from(first.i[1])
+                        .checked_mul(3)
+                        .and_then(|n| n.checked_add(1))
+                        .and_then(|n| n.checked_mul(4))
+                        .ok_or_else(|| {
+                            RuntimeError::Device("EP partial-histogram offset overflows".into())
+                        })?;
+                routes.push(PrefillSegmentRoute::MoeEpAlign(MoeEpAlignRoute {
+                    args: MoeEpAlignArgs {
+                        routes: addr(first.t[1], "routes")?,
+                        meta,
+                        partial,
+                        row_token: addr(first.t[2], "row_token")?,
+                        row_partidx: addr(first.t[3], "row_partidx")?,
+                        row_gate: addr(first.t[4], "row_gate")?,
+                        tokens: first.i[0],
+                        topk: first.i[2],
+                        experts: first.i[1],
+                        expert_begin: range.start,
+                        expert_end: range.end,
+                        row_capacity: u32::try_from(row_bytes / 4).map_err(|_| {
+                            RuntimeError::Device("EP row capacity exceeds u32".into())
+                        })?,
+                        phase: 0,
+                        npart: 64,
+                    },
+                }));
+                continue;
+            }
+            if set.len() != 1 {
+                return Err(RuntimeError::Device(format!(
+                    "program T={} segment {seg} mixes multiple EP specialist packets",
+                    prog.t
+                )));
+            }
+        }
+        // An f32-mix AttnRes packet is only ever emitted for the object; a segment that also
+        // holds other work cannot be handed to it and must not fall back to the BF16-seam arm.
+        if set.len() != 1
+            && set
+                .iter()
+                .any(|&i| prog.insts.get(i).is_some_and(lean_attn_res_f32mix_inst64))
+        {
+            return Err(RuntimeError::Device(format!(
+                "program T={} segment {seg} carries an f32-mix AttnRes packet in a mixed segment",
+                prog.t
+            )));
+        }
+        let encoded_xreduce_attnres = set
+            .iter()
+            .find_map(|&i| prog.insts.get(i).filter(|d| xreduce_attnres_encoded(d)));
+        if let Some(d) = encoded_xreduce_attnres {
+            if set.len() == 1 && xreduce_attnres_inst(d) {
+                // Routed below after resolving its tensor addresses.
+            } else {
+                return Err(RuntimeError::Device(format!(
+                    "program T={} segment {seg} carries an invalid or mixed fused \
+                     XReduceTwoShot+AttnRes packet",
+                    prog.t
+                )));
+            }
+        }
+        if set.len() == 1 {
+            let i = *set.first().unwrap();
+            let d = &prog.insts[i];
+            if moe_ep_stage1_inst(d) {
+                let (a4, a4_scale) = stage1_a4_scratch.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "EP stage-1 requires the reusable A4 quantization scratch".into(),
+                    )
+                })?;
+                let row_bytes = tensors
+                    .get(d.t[5] as usize)
+                    .ok_or_else(|| RuntimeError::Device("EP row-token handle is invalid".into()))?
+                    .bytes;
+                let row_capacity = u32::try_from(row_bytes / 4)
+                    .map_err(|_| RuntimeError::Device("EP row capacity exceeds u32".into()))?;
+                let grid = row_capacity
+                    .div_ceil(64)
+                    .checked_mul(d.i[0].div_ceil(128))
+                    .ok_or_else(|| RuntimeError::Device("EP stage-1 grid overflows".into()))?;
+                routes.push(PrefillSegmentRoute::MoeStage1A4Reuse(
+                    MoeStage1A4ReuseRoute {
+                        quant_args: MoeStage1A4QuantArgs {
+                            out: a4,
+                            out_scale: a4_scale,
+                            activation: addr(d.t[1], "activation")?,
+                            row_token: addr(d.t[5], "row_token")?,
+                            meta: addr(d.t[4], "meta")?,
+                            row_capacity,
+                            experts: d.i[2],
+                            hidden: d.i[1],
+                        },
+                        args: MoeStage1A4ReuseArgs {
+                            out: addr(d.t[0], "out")?,
+                            activation: a4,
+                            weight_table: addr(d.t[2], "weight_table")?,
+                            activation_scale: a4_scale,
+                            weight_scale_table: addr(d.t[3], "weight_scale_table")?,
+                            meta: addr(d.t[4], "meta")?,
+                            row_partidx: addr(d.t[6], "row_partidx")?,
+                            out_scale: addr(d.t[7], "out_scale")?,
+                            inter: d.i[0],
+                            hidden: d.i[1],
+                            experts: d.i[2],
+                            act: d.i[5],
+                            beta: f32::from_bits(d.fj[0]),
+                            linear_beta: f32::from_bits(d.fj[1]),
+                        },
+                        quant_grid: 1024,
+                        grid,
+                    },
+                ));
+                continue;
+            }
+            if moe_ep_combine_inst(d) {
+                let (rank, n_gpu) = ep_bind.expect("EP segment binding checked above");
+                let range = packet::moe_ep::balanced_expert_range(d.i[6], n_gpu, rank);
+                let grid = d.i[2]
+                    .checked_mul(d.i[0].div_ceil(256))
+                    .ok_or_else(|| RuntimeError::Device("EP combine grid overflows".into()))?;
+                routes.push(PrefillSegmentRoute::MoeEpCombine(MoeEpCombineRoute {
+                    args: MoeEpCombineArgs {
+                        out: addr(d.t[0], "out")?,
+                        part: addr(d.t[3], "part")?,
+                        routes: addr(d.t[4], "routes")?,
+                        tokens: d.i[2],
+                        hidden: d.i[0],
+                        topk: d.i[1],
+                        expert_begin: range.start,
+                        expert_end: range.end,
+                    },
+                    grid,
+                }));
+                continue;
+            }
+            if moe_ep_stage2_inst(d) {
+                let weight_table =
+                    companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?
+                        .ok_or_else(|| {
+                            RuntimeError::Device(
+                                "EP stage-2 requires its shuffled down-weight companion table"
+                                    .into(),
+                            )
+                        })?;
+                let weight_scale_table =
+                    companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?
+                        .ok_or_else(|| {
+                            RuntimeError::Device(
+                                "EP stage-2 requires its shuffled down-scale companion table"
+                                    .into(),
+                            )
+                        })?;
+                let rows = tensors
+                    .get(d.t[6] as usize)
+                    .ok_or_else(|| RuntimeError::Device("EP row-part handle is invalid".into()))?
+                    .bytes
+                    / 4;
+                let grid = u64::from(d.i[0].div_ceil(256))
+                    .checked_mul(rows.div_ceil(64) * 2)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| RuntimeError::Device("EP stage-2 grid overflows".into()))?;
+                routes.push(PrefillSegmentRoute::MoeEpStage2(MoeStage2Mxfp4Route {
+                    args: MoeStage2Mxfp4Args {
+                        part: addr(d.t[0], "part")?,
+                        activation: addr(d.t[1], "activation")?,
+                        weight_table,
+                        activation_scale: addr(d.t[5], "activation_scale")?,
+                        weight_scale_table,
+                        meta: addr(d.t[4], "meta")?,
+                        row_partidx: addr(d.t[6], "row_partidx")?,
+                        row_gate: addr(d.t[7], "row_gate")?,
+                        model_dim: d.i[0],
+                        inter_dim: d.i[1],
+                        experts: d.i[2],
+                        reserved: 0,
+                    },
+                    grid,
+                }));
+                continue;
+            }
+            if xreduce_attnres_inst(d) {
+                routes.push(PrefillSegmentRoute::XReduceAttnRes {
+                    args: XReduceAttnResArgs {
+                        reduced: addr(d.t[0], "reduced")?,
+                        prefix: addr(d.t[6], "prefix")?,
+                        out: addr(d.t[2], "out")?,
+                        residual: if d.t[1] == packet::dev::TENSOR_NONE16 {
+                            0
+                        } else {
+                            addr(d.t[1], "residual")?
+                        },
+                        ring: addr(d.t[3], "ring")?,
+                        score: addr(d.t[4], "score")?,
+                        gamma: addr(d.t[5], "gamma")?,
+                        n: d.i[0],
+                        slot_bytes: d.i[2],
+                        gate_rs: d.i[3],
+                        gate_ag: d.i[4],
+                        row_w: d.i[5],
+                        nb: d.i[6],
+                        nbcap: d.i[7],
+                        eps: f32::from_bits(d.fj[0]),
+                        status: u64::from(d.fj[2]),
+                        ..Default::default()
+                    },
+                    device_args: 0,
+                    grid: u32::from(d.blocks),
+                });
+                continue;
+            }
+            if lean_attn_res_f32mix_inst64(d) {
+                let opt = |h: u16, what: &str| -> Result<u64> {
+                    if h == packet::dev::TENSOR_NONE16 {
+                        Ok(0)
+                    } else {
+                        addr(h, what)
+                    }
+                };
+                let res_pre = if d.i[5] == packet::dev::TENSOR_NONE_I {
+                    0
+                } else {
+                    u16::try_from(d.i[5])
+                        .ok()
+                        .map(|h| addr(h, "res_pre"))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            RuntimeError::Device(format!(
+                                "f32-mix AttnRes res_pre handle {} is not a tensor handle",
+                                d.i[5]
+                            ))
+                        })?
+                };
+                routes.push(PrefillSegmentRoute::AttnResF32Mix {
+                    args: AttnResF32MixArgs {
+                        out: addr(d.t[0], "out")?,
+                        prefix: addr(d.t[1], "prefix")?,
+                        ring: addr(d.t[2], "ring")?,
+                        score_w: addr(d.t[3], "score_w")?,
+                        push_src: opt(d.t[4], "push_src")?,
+                        gamma: addr(d.t[5], "gamma")?,
+                        res_a: opt(d.t[6], "res_a")?,
+                        res_b: opt(d.t[7], "res_b")?,
+                        res_pre,
+                        t: d.i[0],
+                        hid: d.i[1],
+                        nb: d.i[2],
+                        push_row: d.i[3],
+                        nbcap: d.i[4],
+                        eps: f32::from_bits(d.fj[0]),
+                        out_eps: f32::from_bits(d.fj[1]),
+                        reserved: 0,
+                    },
+                    grid: attn_res_f32mix_grid(d.i[0]),
+                });
+                continue;
+            }
+            if kda_chunk_intra_cached_inst(d) {
+                routes.push(PrefillSegmentRoute::KdaChunkIntraCached {
+                    args: KdaChunkIntraCachedArgs {
+                        aqk: addr(d.t[0], "aqk")?,
+                        ainv: addr(d.t[1], "ainv")?,
+                        q: addr(d.t[2], "q")?,
+                        k: addr(d.t[3], "k")?,
+                        g_prefix: addr(d.t[4], "g_prefix")?,
+                        beta: addr(d.t[5], "beta")?,
+                        t: d.i[0],
+                        heads: d.i[1],
+                        dim: d.i[2],
+                        scale: f32::from_bits(d.fj[0]),
+                    },
+                    grid: u32::from(d.blocks),
+                });
+                continue;
+            }
+            if moe_combine_inst(d) {
+                routes.push(PrefillSegmentRoute::MoeCombine(MoeCombineRoute {
+                    args: MoeCombineArgs {
+                        out: addr(d.t[0], "out")?,
+                        residual: if d.t[1] == packet::dev::TENSOR_NONE16 {
+                            0
+                        } else {
+                            addr(d.t[1], "residual")?
+                        },
+                        shared: if d.t[2] == packet::dev::TENSOR_NONE16 {
+                            0
+                        } else {
+                            addr(d.t[2], "shared")?
+                        },
+                        part: addr(d.t[3], "part")?,
+                        hidden: d.i[0],
+                        topk: d.i[1],
+                        tokens: d.i[2],
+                        reserved: 0,
+                    },
+                    grid: d.i[2].min(512),
+                }));
+                continue;
+            }
+            if !moe_stage1_mxfp4_inst(d) {
+                if moe_stage2_mxfp4_inst(d) {
+                    let Some(c) = prog.insts.get(i + 1) else {
+                        routes.push(PrefillSegmentRoute::Interpreter);
+                        continue;
+                    };
+                    if !moe_stage2_mxfp4_pair(d, c) {
+                        routes.push(PrefillSegmentRoute::Interpreter);
+                        continue;
+                    }
+                    let Some(weight_table) =
+                        companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?
+                    else {
+                        routes.push(PrefillSegmentRoute::Interpreter);
+                        continue;
+                    };
+                    let Some(weight_scale_table) =
+                        companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?
+                    else {
+                        routes.push(PrefillSegmentRoute::Interpreter);
+                        continue;
+                    };
+                    let half_tiles = c.i[2]
+                        .checked_mul(c.i[1])
+                        .and_then(|rows| rows.div_ceil(64).checked_add(d.i[2]))
+                        .and_then(|tiles| tiles.checked_mul(2));
+                    let grid = d.i[0].div_ceil(256).checked_mul(half_tiles.unwrap_or(0));
+                    let Some(grid) = grid.filter(|&grid| grid != 0) else {
+                        return Err(RuntimeError::Device(format!(
+                            "lean MoE stage-2 segment {seg} launch grid overflows"
+                        )));
+                    };
+                    routes.push(PrefillSegmentRoute::MoeStage2Mxfp4(MoeStage2Mxfp4Route {
+                        args: MoeStage2Mxfp4Args {
+                            part: addr(d.t[0], "part")?,
+                            activation: addr(d.t[1], "activation")?,
+                            weight_table,
+                            activation_scale: addr(d.t[5], "activation_scale")?,
+                            weight_scale_table,
+                            meta: addr(d.t[4], "meta")?,
+                            row_partidx: addr(d.t[6], "row_partidx")?,
+                            row_gate: addr(d.t[7], "row_gate")?,
+                            model_dim: d.i[0],
+                            inter_dim: d.i[1],
+                            experts: d.i[2],
+                            reserved: 0,
+                        },
+                        grid,
+                    }));
+                    continue;
+                }
+                routes.push(PrefillSegmentRoute::Interpreter);
+                continue;
+            }
+            let align = prog.insts.iter().find(|a| {
+                a.op == DevOp::MoeAlignPf as u16
+                    && a.t[0] == d.t[4]
+                    && a.i[0] == prog.t
+                    && a.i[1] == d.i[2]
+                    && a.i[2] == 16
+            });
+            if align.is_none() {
+                return Err(RuntimeError::Device(format!(
+                    "segment {seg} isolates a MoE stage-1 packet without its exact T/top-k align producer"
+                )));
+            }
+            if d.blocks == 0 {
+                return Err(RuntimeError::Device(format!(
+                    "segment {seg} has a zero-grid MoE stage-1 packet"
+                )));
+            }
+            if moe_stage1_a4_reuse_inst(d)
+                && crate::config::RuntimeConfig::get().amd.moe_stage1_a4_reuse
+            {
+                if let Some((a4, a4_scale)) = stage1_a4_scratch {
+                    let row_bytes = tensors
+                        .get(d.t[5] as usize)
+                        .ok_or_else(|| {
+                            RuntimeError::Device(
+                                "lean MoE stage-1 row-token handle is invalid".into(),
+                            )
+                        })?
+                        .bytes;
+                    if !row_bytes.is_multiple_of(4) {
+                        return Err(RuntimeError::Device(
+                            "lean MoE stage-1 row-token bytes are not u32-aligned".into(),
+                        ));
+                    }
+                    let row_capacity = u32::try_from(row_bytes / 4).map_err(|_| {
+                        RuntimeError::Device("lean MoE stage-1 row capacity exceeds u32".into())
+                    })?;
+                    let weight_table = addr(d.t[2], "expert_weight_table")?;
+                    let weight_scale_table = addr(d.t[3], "expert_scale_table")?;
+                    let grid = row_capacity
+                        .div_ceil(64)
+                        .checked_mul(d.i[0].div_ceil(128))
+                        .ok_or_else(|| {
+                            RuntimeError::Device("lean MoE stage-1 A4 reuse grid overflows".into())
+                        })?;
+                    routes.push(PrefillSegmentRoute::MoeStage1A4Reuse(
+                        MoeStage1A4ReuseRoute {
+                            quant_args: MoeStage1A4QuantArgs {
+                                out: a4,
+                                out_scale: a4_scale,
+                                activation: addr(d.t[1], "activation")?,
+                                row_token: addr(d.t[5], "row_token")?,
+                                meta: addr(d.t[4], "meta")?,
+                                row_capacity,
+                                experts: d.i[2],
+                                hidden: d.i[1],
+                            },
+                            args: MoeStage1A4ReuseArgs {
+                                out: addr(d.t[0], "out")?,
+                                activation: a4,
+                                weight_table,
+                                activation_scale: a4_scale,
+                                weight_scale_table,
+                                meta: addr(d.t[4], "meta")?,
+                                row_partidx: addr(d.t[6], "row_partidx")?,
+                                out_scale: addr(d.t[7], "out_scale")?,
+                                inter: d.i[0],
+                                hidden: d.i[1],
+                                experts: d.i[2],
+                                act: d.i[5],
+                                beta: f32::from_bits(d.fj[0]),
+                                linear_beta: f32::from_bits(d.fj[1]),
+                            },
+                            quant_grid: 1024,
+                            grid,
+                        },
+                    ));
+                    continue;
+                }
+            }
+            routes.push(PrefillSegmentRoute::MoeStage1Mxfp4(MoeStage1Mxfp4Route {
+                args: MoeStage1Mxfp4Args {
+                    out: addr(d.t[0], "out")?,
+                    activation: addr(d.t[1], "activation")?,
+                    weight_table: addr(d.t[2], "weight_table")?,
+                    weight_scale_table: addr(d.t[3], "weight_scale_table")?,
+                    meta: addr(d.t[4], "meta")?,
+                    row_token: addr(d.t[5], "row_token")?,
+                    row_partidx: addr(d.t[6], "row_partidx")?,
+                    out_scale: addr(d.t[7], "out_scale")?,
+                    inter_dim: d.i[0],
+                    model_dim: d.i[1],
+                    experts: d.i[2],
+                    act: d.i[5],
+                    beta: f32::from_bits(d.fj[0]),
+                    linear_beta: f32::from_bits(d.fj[1]),
+                    reserved: 0,
+                    reserved2: 0,
+                },
+                grid: u32::from(d.blocks),
+            }));
+            continue;
+        }
+        routes.push(PrefillSegmentRoute::Interpreter);
+    }
+    Ok(routes)
+}
+
+#[cfg(test)]
+fn moe_mxfp4_routes(
+    prog: &DevProg,
+    tensors: &[crate::asset::devblob::DevTensor],
+    devp: &[DeviceMem],
+) -> Result<Vec<PrefillSegmentRoute>> {
+    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None, None)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DecodeSegmentRoute {
+    Interpreter,
+    MlaAttention,
+    KdaDecodeFused(KdaDecodeFusedArgs),
+    GroupedMoeMxfp4 {
+        glu: GroupedMoeGluArgs,
+        down: GroupedMoeDownArgs,
+        grid: u32,
+    },
+}
+
+fn requires_segmented_decode(routes: &[DecodeSegmentRoute]) -> bool {
+    routes
+        .iter()
+        .any(|route| !matches!(route, DecodeSegmentRoute::Interpreter))
+}
+
+fn decode_segment_routes(
+    prog: &DevProg,
+    tensors: &[crate::asset::devblob::DevTensor],
+    init: &[u8],
+    devp: &[DeviceMem],
+) -> Result<Vec<DecodeSegmentRoute>> {
+    let kinds = decode_segment_kinds(prog)?;
+    let mut routes = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let inst_ix = match kind {
+            DecodeSegmentKind::Interpreter => {
+                routes.push(DecodeSegmentRoute::Interpreter);
+                continue;
+            }
+            DecodeSegmentKind::MlaAttention => {
+                routes.push(DecodeSegmentRoute::MlaAttention);
+                continue;
+            }
+            DecodeSegmentKind::KdaDecodeFused(inst_ix) => inst_ix,
+            DecodeSegmentKind::GroupedMoeMxfp4 { glu, down } => {
+                let g = &prog.insts[glu];
+                let d = &prog.insts[down];
+                if g.i[0] == 0
+                    || g.i[1] == 0
+                    || g.i[2] == 0
+                    || g.i[3] == 0
+                    || g.i[6] != 2
+                    || d.i[6] != 2
+                    || d.i[0] != g.i[0]
+                    || d.i[1] != g.i[2]
+                    || d.i[2] != g.i[1]
+                    || d.i[3] != g.i[3]
+                    || d.t[1] != g.t[0]
+                    || d.t[2] != g.t[2]
+                    || d.blocks == 0
+                    || g.blocks == 0
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "grouped MoE instructions {glu}/{down} have unsupported or inconsistent MXFP4 geometry"
+                    )));
+                }
+                let addr = |h: u16, what: &str| -> Result<u64> {
+                    devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+                        RuntimeError::Device(format!(
+                            "grouped MoE operand `{what}` handle {h} is outside {} tensors",
+                            devp.len()
+                        ))
+                    })
+                };
+                routes.push(DecodeSegmentRoute::GroupedMoeMxfp4 {
+                    glu: GroupedMoeGluArgs {
+                        fu: addr(g.t[0], "fu")?,
+                        x: addr(g.t[1], "x")?,
+                        table: addr(g.t[2], "table")?,
+                        weights: addr(g.t[3], "weights")?,
+                        scales: addr(g.t[4], "scales")?,
+                        topk: g.i[0],
+                        intermediate: g.i[1],
+                        hidden: g.i[2],
+                        experts: g.i[3],
+                        act: g.i[5],
+                        enc: g.i[6],
+                        beta: f32::from_bits(g.fj[0]),
+                        linear_beta: f32::from_bits(g.fj[1]),
+                    },
+                    down: GroupedMoeDownArgs {
+                        partial: addr(d.t[0], "partial")?,
+                        fu: addr(d.t[1], "fu")?,
+                        table: addr(d.t[2], "table")?,
+                        weights: addr(d.t[3], "weights")?,
+                        scales: addr(d.t[4], "scales")?,
+                        topk: d.i[0],
+                        hidden: d.i[1],
+                        intermediate: d.i[2],
+                        experts: d.i[3],
+                        enc: d.i[6],
+                        reserved: 0,
+                    },
+                    grid: u32::from(g.blocks).saturating_mul(3),
+                });
+                continue;
+            }
+        };
+        let d = &prog.insts[inst_ix];
+        let (rows, heads, dim, bv, conv_w, flags, gate_mode, version) = (
+            d.i[0], d.i[1], d.i[2], d.i[3], d.i[4], d.i[5], d.i[6], d.i[7],
+        );
+        let lower_bound = f32::from_bits(d.fj[1]);
+        let scale = f32::from_bits(d.fj[0]);
+        let norm_eps = f32::from_bits(d.fj[2]);
+        if !matches!(rows, 1 | 8)
+            || heads == 0
+            || dim != 128
+            || bv != 8
+            || conv_w != 4
+            || flags & 1 == 0
+            || flags & !3 != 0
+            || (rows > 1 && flags & 2 == 0)
+            || gate_mode != 1
+            || version != 2
+            || d.blocks as u32 != rows.saturating_mul(heads)
+            || !lower_bound.is_finite()
+            || !scale.is_finite()
+            || scale <= 0.0
+            || !norm_eps.is_finite()
+            || norm_eps <= 0.0
+        {
+            return Err(RuntimeError::Device(format!(
+                "KdaDecodeFused instruction {inst_ix} has unsupported ABI/geometry:                  rows={rows} H={heads} D={dim} BV={bv} W={conv_w} blocks={} flags={flags:#x}                  gate={gate_mode} version={version} lower={lower_bound} scale={scale} eps={norm_eps}",
+                d.blocks
+            )));
+        }
+        let desc_h = d.t[7] as usize;
+        let desc = tensors.get(desc_h).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor handle {desc_h} is outside {} tensors",
+                tensors.len()
+            ))
+        })?;
+        if desc.bytes != 44 {
+            return Err(RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor `{}` is {} bytes, expected 44",
+                desc.name, desc.bytes
+            )));
+        }
+        let range = desc.init.clone().ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor `{}` has no initialized handle table",
+                desc.name
+            ))
+        })?;
+        let bytes = init.get(range).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor `{}` init range is invalid",
+                desc.name
+            ))
+        })?;
+        if bytes.len() != 44 {
+            return Err(RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor `{}` init is {} bytes, expected 44",
+                desc.name,
+                bytes.len()
+            )));
+        }
+        let mut handles = [0u32; 11];
+        for (slot, word) in handles.iter_mut().zip(bytes.chunks_exact(4)) {
+            *slot = u32::from_le_bytes(word.try_into().expect("4"));
+        }
+        let addr = |h: u32, what: &str, optional: bool| -> Result<u64> {
+            if h == packet::dev::TENSOR_NONE_I {
+                return if optional {
+                    Ok(0)
+                } else {
+                    Err(RuntimeError::Device(format!(
+                        "KdaDecodeFused required operand `{what}` is absent"
+                    )))
+                };
+            }
+            devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "KdaDecodeFused operand `{what}` handle {h} is outside {} tensors",
+                    devp.len()
+                ))
+            })
+        };
+        let direct = |slot: usize, what: &str| addr(d.t[slot] as u32, what, false);
+        let a = KdaDecodeFusedArgs {
+            y: direct(0, "y")?,
+            q_raw: direct(1, "q_raw")?,
+            k_raw: direct(2, "k_raw")?,
+            v_raw: direct(3, "v_raw")?,
+            wq: addr(handles[0], "wq", false)?,
+            wk: addr(handles[1], "wk", false)?,
+            wv: addr(handles[2], "wv", false)?,
+            csq: addr(handles[3], "csq", false)?,
+            csk: addr(handles[4], "csk", false)?,
+            csv: addr(handles[5], "csv", false)?,
+            forget_raw: direct(4, "forget_raw")?,
+            beta_raw: direct(5, "beta_raw")?,
+            output_gate_raw: addr(handles[9], "output_gate_raw", false)?,
+            a_log: addr(handles[6], "A_log", false)?,
+            dt_bias: addr(handles[7], "dt_bias", false)?,
+            state: direct(6, "state")?,
+            norm_w: addr(handles[8], "norm_w", false)?,
+            parked: addr(handles[10], "parked", true)?,
+            rows,
+            heads,
+            dim,
+            bv,
+            conv_w,
+            flags,
+            gate_mode,
+            lower_bound,
+            scale,
+            norm_eps,
+        };
+        routes.push(DecodeSegmentRoute::KdaDecodeFused(a));
+    }
+    Ok(routes)
 }
 
 /// Sanity bound on `seg`, so a corrupt stream cannot make the host allocate
@@ -576,6 +2974,12 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // The DETERMINISTIC twin (packet i[5] on op 86, i[4] on op 87). Same silence without it:
     // op 86 would scatter f32 into a [T,H] f64 accumulator and op 87 would read f64 as f32.
     ("PLOW_MOE_PF_DET", &["plow_moe_pf_det_arm"]),
+    ("PLOW_KDA_CHUNK", &["plow_kda_chunk_bt64_arm_1"]),
+    ("PLOW_KDA_CHUNK_QPRE", &["plow_kda_chunk_qpre_arm_1"]),
+    // Sequence-parallel seam arms (ops 25/26), compiled only when the packet's plow_config.h
+    // carries the ops. Without them the dispatch falls through silently: no reduce, no
+    // gather, a prefill of stale slots. Refuse.
+    ("PLOW_SEQ_PAR_SEAMS", &["plow_seq_par_seams_arm_1"]),
     // `#if PLOW_K3` (runtime/amd/interp.hip) gates ops 99-106 in BOTH buckets — the KDA mixer,
     // AttnRes, `situ` and the MLA output gate. It is the one arm flag that is not prefill-only,
     // and the one whose absence is most completely silent: a K3 packet on an object without it
@@ -599,8 +3003,83 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
 /// BLOB-wide: it names arms of both objects, and checking a prefill flag against the decode
 /// object would refuse every GLM asset in the tree. Each check therefore only looks at the flags
 /// ITS table names and leaves the rest to the other phase.
+const COMPILED_OPCODE_MARKERS: &[(DevOp, &str)] = &[
+    (DevOp::KdaConv, "plow_opcode_kda_conv_1"),
+    (DevOp::KdaGate, "plow_opcode_kda_gate_1"),
+    (DevOp::KdaStateStep, "plow_opcode_kda_state_step_1"),
+    (DevOp::KdaGatedNorm, "plow_opcode_kda_gated_norm_1"),
+    (DevOp::AttnRes, "plow_opcode_attn_res_1"),
+    (DevOp::SituGlu, "plow_opcode_situ_glu_1"),
+    (DevOp::MlaOutGate, "plow_opcode_mla_out_gate_1"),
+    (DevOp::KdaConv3, "plow_opcode_kda_conv3_1"),
+    (DevOp::KdaStateStepG, "plow_opcode_kda_state_step_g_1"),
+    (
+        DevOp::KdaConvStateStepG,
+        "plow_opcode_kda_conv_state_step_g_1",
+    ),
+    (DevOp::KdaChunkPrepare, "plow_opcode_kda_chunk_prepare_1"),
+    (DevOp::KdaChunkIntra, "plow_opcode_kda_chunk_intra_1"),
+    (DevOp::KdaChunkWu, "plow_opcode_kda_chunk_wu_1"),
+    (DevOp::KdaChunkCarry, "plow_opcode_kda_chunk_carry_1"),
+];
+
+fn check_compiled_opcode_marker_set(
+    syms: &[&str],
+    path: &Path,
+    required: impl IntoIterator<Item = DevOp>,
+) -> Result<()> {
+    for op in required {
+        let Some((_, marker)) = COMPILED_OPCODE_MARKERS
+            .iter()
+            .find(|(candidate, _)| *candidate == op)
+        else {
+            continue;
+        };
+        if !syms.contains(marker) {
+            return Err(RuntimeError::Device(format!(
+                "packet/object MISMATCH: packet dispatches {op:?}, but {} lacks compiled-opcode marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_compiled_opcode_markers(syms: &[&str], path: &Path, progs: &[DevProg]) -> Result<()> {
+    let required = progs
+        .iter()
+        .flat_map(|prog| &prog.insts)
+        .filter_map(|inst| DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op));
+    check_compiled_opcode_marker_set(syms, path, required)
+}
+
+const MATERIALIZED_RESIDUAL_INPUT_SYM: &str = "plow_materialized_residual_input_1";
+
+fn check_materialized_residual_input(syms: &[&str], path: &Path, progs: &[DevProg]) -> Result<()> {
+    let required = progs.iter().flat_map(|prog| &prog.insts).any(|inst| {
+        inst.op == DevOp::AttnRes as u16
+            && (inst.t[6] != packet::dev::TENSOR_NONE16
+                || inst.t[7] != packet::dev::TENSOR_NONE16
+                || inst.i[5] != packet::dev::TENSOR_NONE_I)
+    });
+    if required && !syms.contains(&MATERIALIZED_RESIDUAL_INPUT_SYM) {
+        return Err(RuntimeError::Device(format!(
+            "packet/object MISMATCH: packet carries a graph-fused materialized residual input, but {} lacks `{MATERIALIZED_RESIDUAL_INPUT_SYM}`",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// `op_collective.h` exports this from a `PLOW_XR_TAGGED=1` decode object: its one-shot
+/// XReduce arm is the tagged form, which needs `PlowProgram::xr_tag_off` and the blob
+/// contract [`super::amd_tp::check_xr_tagged_blob`] enforces.
+const XR_TAGGED_SYM: &str = "plow_xr_tagged_1";
+
 const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
+    ("PLOW_MOE_PF_ATOMIC", &["plow_moe_pf_atomic_arm"]),
+    ("PLOW_MOE_PF_DET", &["plow_moe_pf_det_arm"]),
     // The GLM decode q-rope fold (op 50 t7 = cos, i6 = sin handle, t3 = RAW q_rope). An object
     // built before the arm stages t3 verbatim — an UNROPED query into the flash. Attention still
     // runs, nothing traps, and the model answers fluently and wrongly. This is the same silent
@@ -613,12 +3092,25 @@ const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_GLM_FUSE_QNORM", &["plow_glm_fuse_qnorm_arm"]),
 ];
 
+fn required_moe_pf_accum(progs: &[DevProg], field: usize) -> bool {
+    progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|inst| inst.op == DevOp::MoeGroupDownPf as u16 && inst.i[field] != 0)
+}
+
 /// Refuse a DECODE code object that does not carry the arms the packet needs.
 ///
 /// See [`check_prefill_object`] for the full argument — this is that check, on the other object,
 /// and it ignores any flag [`DECODE_ARM_MARKERS`] does not name (those belong to the prefill
 /// object, which gets its own pass).
-fn check_decode_object(syms: &[&str], path: &Path, requires: &[String]) -> Result<()> {
+fn check_decode_object(
+    syms: &[&str],
+    path: &Path,
+    requires: &[String],
+    need_moe_pf_atomic: bool,
+    need_moe_pf_det: bool,
+) -> Result<()> {
     if syms.is_empty() {
         tracing::warn!(
             object = %path.display(),
@@ -629,6 +3121,13 @@ fn check_decode_object(syms: &[&str], path: &Path, requires: &[String]) -> Resul
     for req in requires {
         let (flag, val) = req.split_once('=').unwrap_or((req.as_str(), "1"));
         if val == "0" {
+            continue;
+        }
+        // `requires` is blob-wide; a B1 decode object must not inherit an arm used only
+        // by grouped prefill programs.
+        if (flag == "PLOW_MOE_PF_ATOMIC" && !need_moe_pf_atomic)
+            || (flag == "PLOW_MOE_PF_DET" && !need_moe_pf_det)
+        {
             continue;
         }
         let Some((_, markers)) = DECODE_ARM_MARKERS.iter().find(|(f, _)| *f == flag) else {
@@ -657,6 +3156,193 @@ fn check_decode_object(syms: &[&str], path: &Path, requires: &[String]) -> Resul
 /// before and stay valid. A manifest that exists and cannot be parsed IS an
 /// error — it is the only statement of what the packet needs, and guessing past
 /// a broken one is how the check would silently stop checking.
+fn manifest_pairing_hash(raw: &[u8], path: &Path) -> Result<u64> {
+    let manifest: serde_json::Value = serde_json::from_slice(raw)
+        .map_err(|e| RuntimeError::Device(format!("{}: not valid JSON: {e}", path.display())))?;
+    manifest
+        .pointer("/pairing/hash")
+        .and_then(|v| v.as_str())
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "specialised AMD object requires {} to contain a valid pairing.hash",
+                path.display()
+            ))
+        })
+}
+
+fn validate_packet_pairing_stamp(
+    lo: Option<u32>,
+    hi: Option<u32>,
+    expected: Option<u64>,
+    object: &Path,
+) -> Result<()> {
+    match (lo, hi) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => Err(RuntimeError::Device(format!(
+            "{} has a partial packet-pairing stamp; refusing an unverifiable specialised object",
+            object.display()
+        ))),
+        (Some(lo), Some(hi)) => {
+            let stamped = ((hi as u64) << 32) | lo as u64;
+            let expected = expected.ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "{} is specialised for packet hash 0x{stamped:016x}, but the asset has no valid build.json pairing hash",
+                    object.display()
+                ))
+            })?;
+            if stamped != expected {
+                return Err(RuntimeError::Device(format!(
+                    "packet/object MISMATCH: specialised AMD object {} stamps 0x{stamped:016x}, asset requires 0x{expected:016x}",
+                    object.display()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn build_pairing_hash(blob_path: &Path) -> Result<Option<u64>> {
+    let path = blob_path.with_file_name("build.json");
+    match std::fs::read(&path) {
+        Ok(raw) => manifest_pairing_hash(&raw, &path).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(RuntimeError::Io { path, source }),
+    }
+}
+
+fn check_packet_pairing_stamp(image: &[u8], blob_path: &Path, object: &Path) -> Result<()> {
+    let lo = elf_symbol_u32(image, "plow_packet_hash_lo");
+    let hi = elf_symbol_u32(image, "plow_packet_hash_hi");
+    let expected = if lo.is_some() || hi.is_some() {
+        build_pairing_hash(blob_path)?
+    } else {
+        None
+    };
+    validate_packet_pairing_stamp(lo, hi, expected, object)
+}
+
+const KDA_INTRA_WAVE_ITEMS_MARKERS: [&str; 6] = [
+    "plow_kda_intra_wave_items_abi_1",
+    "plow_kda_intra_wave_items_bt64_d128_1",
+    "plow_kda_intra_wave_items_wave64_1",
+    "plow_kda_intra_wave_items_no_spill_1",
+    "plow_kda_intra_wave_items_static_lds_131072",
+    "plow_kda_intra_wave_items_vgpr_le_96",
+];
+
+const KDA_CARRY_REGSTATE_MARKERS: [&str; 6] = [
+    "plow_kda_carry_regstate_abi_1",
+    "plow_kda_carry_regstate_bt64_d128_v128_qpre_1",
+    "plow_kda_carry_regstate_wave64_1",
+    "plow_kda_carry_regstate_no_spill_1",
+    "plow_kda_carry_regstate_static_lds_43520",
+    "plow_kda_carry_regstate_vgpr_le_256",
+];
+const KDA_CARRY_REGSTATE_LDS: u32 = 43_520;
+
+fn read_kda_carry_regstate_object(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| {
+        RuntimeError::Device(format!(
+            "marked KDA carry regstate segments require {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn check_kda_carry_regstate_symbols<'a>(syms: &[&'a str], path: &Path) -> Result<()> {
+    for marker in KDA_CARRY_REGSTATE_MARKERS {
+        if !syms.contains(&marker) {
+            return Err(RuntimeError::Device(format!(
+                "KDA carry regstate object {} lacks required ABI/resource marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    if !syms.contains(&"plow_packet_hash_lo") || !syms.contains(&"plow_packet_hash_hi") {
+        return Err(RuntimeError::Device(format!(
+            "KDA carry regstate object {} has no packet-pairing stamp",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_kda_intra_wave_items_object(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| {
+        RuntimeError::Device(format!(
+            "marked KDA-intra wave-item segments require {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn check_kda_intra_wave_items_symbols<'a>(syms: &[&'a str], path: &Path) -> Result<()> {
+    for marker in KDA_INTRA_WAVE_ITEMS_MARKERS {
+        if !syms.contains(&marker) {
+            return Err(RuntimeError::Device(format!(
+                "KDA-intra wave-item object {} lacks required ABI/resource marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    if !syms.contains(&"plow_packet_hash_lo") || !syms.contains(&"plow_packet_hash_hi") {
+        return Err(RuntimeError::Device(format!(
+            "KDA-intra wave-item object {} has no packet-pairing stamp",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+const ATTN_RES_F32MIX_MARKERS: [&str; 6] = [
+    "plow_attn_res_f32mix_abi_1",
+    "plow_attn_res_f32mix_hid7168_1",
+    "plow_attn_res_f32mix_online_softmax_1",
+    "plow_attn_res_f32mix_wave64_1",
+    "plow_attn_res_f32mix_no_spill_1",
+    "plow_attn_res_f32mix_vgpr_le_168",
+];
+
+fn read_attn_res_f32mix_object(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| {
+        RuntimeError::Device(format!(
+            "f32-mix AttnRes packets require {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn check_attn_res_f32mix_symbols(syms: &[&str], path: &Path) -> Result<()> {
+    for marker in ATTN_RES_F32MIX_MARKERS {
+        if !syms.contains(&marker) {
+            return Err(RuntimeError::Device(format!(
+                "f32-mix AttnRes object {} lacks required ABI/resource marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    if !syms.contains(&"plow_packet_hash_lo") || !syms.contains(&"plow_packet_hash_hi") {
+        return Err(RuntimeError::Device(format!(
+            "f32-mix AttnRes object {} has no packet-pairing stamp",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn check_moe_ep_symbols(syms: &[&str], path: &Path, markers: &[&str]) -> Result<()> {
+    for marker in markers {
+        if !syms.contains(marker) {
+            return Err(RuntimeError::Device(format!(
+                "EP object {} lacks required ABI/resource marker {marker}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
     let mpath = blob_path.with_file_name("build.json");
     let Ok(raw) = std::fs::read(&mpath) else {
@@ -680,6 +3366,222 @@ fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect()
         }))
+}
+
+fn graph_phase_xreduce_segments(
+    blob_path: &Path,
+    progs: &[DevProg],
+    dec_ix: usize,
+    enabled: bool,
+) -> Result<Vec<BTreeSet<usize>>> {
+    let selected = vec![BTreeSet::new(); progs.len()];
+    if !enabled {
+        return Ok(selected);
+    }
+    let mpath = blob_path.with_file_name("build.json");
+    let raw = std::fs::read(&mpath).map_err(|source| RuntimeError::Io {
+        path: mpath.clone(),
+        source,
+    })?;
+    let man: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display())))?;
+    graph_phase_xreduce_segments_from_manifest(&man, progs, dec_ix, &mpath)
+}
+
+fn graph_phase_xreduce_segments_from_manifest(
+    man: &serde_json::Value,
+    progs: &[DevProg],
+    dec_ix: usize,
+    mpath: &Path,
+) -> Result<Vec<BTreeSet<usize>>> {
+    let mut selected = vec![BTreeSet::new(); progs.len()];
+    let chains = man
+        .get("dispatch_chains")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "{} has no compiler-derived dispatch_chains; refusing phase-object selection",
+                mpath.display()
+            ))
+        })?;
+    if chains.len() != progs.len() {
+        return Err(RuntimeError::Device(format!(
+            "{} has {} dispatch chains for {} packet programs",
+            mpath.display(),
+            chains.len(),
+            progs.len()
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for chain in chains {
+        let program = chain
+            .get("program")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| RuntimeError::Device("dispatch chain has no program index".into()))?
+            as usize;
+        if program >= progs.len() || !seen.insert(program) {
+            return Err(RuntimeError::Device(format!(
+                "invalid or duplicate dispatch-chain program {program}"
+            )));
+        }
+        let expected_kind = if program < dec_ix {
+            "prefill"
+        } else {
+            "decode"
+        };
+        let expected_topology = if progs[program].packed_prefill_only {
+            "packed"
+        } else {
+            "ordinary"
+        };
+        if chain.get("kind").and_then(|v| v.as_str()) != Some(expected_kind)
+            || chain.get("topology").and_then(|v| v.as_str()) != Some(expected_topology)
+        {
+            return Err(RuntimeError::Device(format!(
+                "dispatch-chain topology mismatch for program {program}"
+            )));
+        }
+        let n_segments = derive_segments(&progs[program])?.len();
+        let segment_rows = chain
+            .get("segments")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| RuntimeError::Device(format!("program {program} has no segments")))?;
+        if segment_rows.len() != n_segments {
+            return Err(RuntimeError::Device(format!(
+                "program {program} manifest has {} segments, packet has {n_segments}",
+                segment_rows.len()
+            )));
+        }
+        for (seg, row) in segment_rows.iter().enumerate() {
+            if row.get("segment").and_then(|v| v.as_u64()) != Some(seg as u64) {
+                return Err(RuntimeError::Device(format!(
+                    "program {program} dispatch segments are not contiguous at {seg}"
+                )));
+            }
+        }
+        if program >= dec_ix || progs[program].packed_prefill_only {
+            continue;
+        }
+        let phases = chain
+            .get("phases")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| RuntimeError::Device(format!("program {program} has no phases")))?;
+        let mut next_phase_segment = 0usize;
+        for phase in phases {
+            let lo = phase
+                .get("first_segment")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX) as usize;
+            let hi = phase
+                .get("last_segment")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX) as usize;
+            let phase_segments = phase
+                .get("segments")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX) as usize;
+            if lo != next_phase_segment
+                || lo > hi
+                || hi >= n_segments
+                || phase_segments != hi - lo + 1
+            {
+                return Err(RuntimeError::Device(format!(
+                    "program {program} phases do not form a contiguous partition at {next_phase_segment}"
+                )));
+            }
+            next_phase_segment = hi + 1;
+            let families = phase.get("families").and_then(|v| v.as_array());
+            let arms = phase.get("arms").and_then(|v| v.as_array());
+            let collective_only = families
+                .is_some_and(|f| f.len() == 1 && f[0].as_str() == Some("collective"))
+                && arms.is_some_and(|a| {
+                    !a.is_empty()
+                        && a.iter().all(|v| {
+                            v.as_str()
+                                .is_some_and(|s| s.split('/').next() == Some("XReduceTwoShot"))
+                        })
+                });
+            if !collective_only {
+                continue;
+            }
+            if phase.get("object_class").and_then(|v| v.as_str()) != Some("ordinary") {
+                return Err(RuntimeError::Device(format!(
+                    "program {program} collective phase is not an ordinary object class"
+                )));
+            }
+            let contract = phase.get("resource_contract").ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "program {program} collective phase has no contract"
+                ))
+            })?;
+            let contract_ok = contract.get("policy").and_then(|v| v.as_str()) == Some("refuse")
+                && contract.get("wavefront_size").and_then(|v| v.as_u64()) == Some(64)
+                && contract
+                    .get("min_occupancy_waves_per_simd")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|v| v >= 2)
+                && contract
+                    .get("max_private_segment_bytes_delta")
+                    .and_then(|v| v.as_u64())
+                    == Some(0)
+                && contract
+                    .get("max_vgpr_spill_delta")
+                    .and_then(|v| v.as_u64())
+                    == Some(0)
+                && contract
+                    .get("max_sgpr_spill_delta")
+                    .and_then(|v| v.as_u64())
+                    == Some(0);
+            if !contract_ok {
+                return Err(RuntimeError::Device(format!(
+                    "program {program} collective phase has an incompatible resource contract"
+                )));
+            }
+            for seg in lo..=hi {
+                let row = &segment_rows[seg];
+                let row_families = row.get("families").and_then(|v| v.as_array());
+                let row_arms = row.get("arms").and_then(|v| v.as_array());
+                if !row_families
+                    .is_some_and(|f| f.len() == 1 && f[0].as_str() == Some("collective"))
+                    || !row_arms.is_some_and(|a| {
+                        !a.is_empty()
+                            && a.iter().all(|v| {
+                                v.as_str()
+                                    .is_some_and(|s| s.split('/').next() == Some("XReduceTwoShot"))
+                            })
+                    })
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "program {program} phase claims collective-only segment {seg}, but its segment inventory differs"
+                    )));
+                }
+                let mut entries = progs[program]
+                    .stream
+                    .iter()
+                    .filter(|e| e.seg as usize == seg)
+                    .peekable();
+                if entries.peek().is_none()
+                    || entries.any(|e| {
+                        progs[program]
+                            .insts
+                            .get(e.inst as usize)
+                            .is_none_or(|inst| inst.op != DevOp::XReduceTwoShot as u16)
+                    })
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "program {program} packet segment {seg} is not XReduceTwoShot-only"
+                    )));
+                }
+            }
+            selected[program].extend(lo..=hi);
+        }
+        if next_phase_segment != n_segments {
+            return Err(RuntimeError::Device(format!(
+                "program {program} phase partition covers {next_phase_segment} of {n_segments} segments"
+            )));
+        }
+    }
+    Ok(selected)
 }
 
 /// Every symbol NAME in an ELF64 object's symbol tables.
@@ -756,6 +3658,86 @@ fn elf_symbol_names(img: &[u8]) -> Vec<&str> {
         }
     }
     out
+}
+
+/// Initial value of a four-byte ELF object symbol.
+///
+/// Pairing stamps are immutable build metadata. Reading them from the file avoids loading a
+/// module and asking SDMA to read a device global merely to compare two constants.
+fn elf_symbol_u32(img: &[u8], wanted: &str) -> Option<u32> {
+    let u16at = |o: usize| -> Option<usize> {
+        img.get(o..o + 2)
+            .and_then(|b| Some(u16::from_le_bytes(b.try_into().ok()?) as usize))
+    };
+    let u32at = |o: usize| -> Option<usize> {
+        img.get(o..o + 4)
+            .and_then(|b| Some(u32::from_le_bytes(b.try_into().ok()?) as usize))
+    };
+    let u64at = |o: usize| -> Option<usize> {
+        img.get(o..o + 8)
+            .and_then(|b| usize::try_from(u64::from_le_bytes(b.try_into().ok()?)).ok())
+    };
+    if img.get(..4) != Some(b"\x7fELF") || img.get(4) != Some(&2) || img.get(5) != Some(&1) {
+        return None;
+    }
+    let (shoff, shent, shnum) = (u64at(0x28)?, u16at(0x3a)?, u16at(0x3c)?);
+    if shent < 64 {
+        return None;
+    }
+    let hdr = |i: usize| -> Option<usize> {
+        (i < shnum)
+            .then(|| i.checked_mul(shent)?.checked_add(shoff))
+            .flatten()
+            .filter(|&off| off.checked_add(64).is_some_and(|end| end <= img.len()))
+    };
+    for i in 0..shnum {
+        let s = hdr(i)?;
+        if !matches!(u32at(s + 4), Some(2) | Some(11)) {
+            continue;
+        }
+        let (off, size, link, entsz) = (
+            u64at(s + 24)?,
+            u64at(s + 32)?,
+            u32at(s + 40)?,
+            u64at(s + 56)?,
+        );
+        if entsz < 24 {
+            continue;
+        }
+        let l = hdr(link)?;
+        let (stroff, strsz) = (u64at(l + 24)?, u64at(l + 32)?);
+        let strtab = img.get(stroff..stroff.checked_add(strsz)?)?;
+        for k in 0..size / entsz {
+            let sym = off.checked_add(k.checked_mul(entsz)?)?;
+            let nm = u32at(sym)?;
+            let tail = strtab.get(nm..)?;
+            let end = tail.iter().position(|&c| c == 0).unwrap_or(tail.len());
+            if tail.get(..end)? != wanted.as_bytes() {
+                continue;
+            }
+            if u64at(sym + 16)? != 4 {
+                return None;
+            }
+            let section = hdr(u16at(sym + 6)?)?;
+            if u32at(section + 4)? != 1 {
+                return None;
+            }
+            let (section_addr, section_off, section_size) = (
+                u64at(section + 16)?,
+                u64at(section + 24)?,
+                u64at(section + 32)?,
+            );
+            let rel = u64at(sym + 8)?.checked_sub(section_addr)?;
+            if rel.checked_add(4)? > section_size {
+                return None;
+            }
+            let value_off = section_off.checked_add(rel)?;
+            return img
+                .get(value_off..value_off.checked_add(4)?)
+                .map(|b| u32::from_le_bytes(b.try_into().expect("four-byte symbol")));
+        }
+    }
+    None
 }
 
 /// Refuse a prefill code object that does not carry the arms the packet's
@@ -843,6 +3825,42 @@ const GEMV_CAP_SYM_PREFIX: &str = "plow_gemv_mm_cap_";
 /// before the walk existed, and every object built with it off, carries no such
 /// symbol and is a hard-capacity object exactly as before.
 const GEMV_WALK_SYM: &str = "plow_gemv_walk_1";
+const XARGMAX_B128_SYM: &str = "plow_xargmax_max_batch_128";
+const PACKED_PREFILL_ABI_SYM: &str = "plow_packed_prefill_abi_1";
+const PACKED_PREFILL_MLA_NORM_SEG_SYM: &str = "plow_packed_prefill_mla_norm_segments_1";
+const PACKED_PREFILL_MLA_FLASH_SEG_SYM: &str = "plow_packed_prefill_mla_flash_segments_1";
+const PACKED_PREFILL_KDA_SEG_SYM: &str = "plow_packed_prefill_kda_serial_segments_1";
+const PACKED_PREFILL_KDA_CHUNK_SEG_SYM: &str = "plow_packed_prefill_kda_chunk_segments_1";
+const KDA_FAMILY_SEG_SYM: &str = "plow_kda_family_segments_1";
+const XR_ATTNRES_SEG_SYM: &str = "plow_xr_attnres_segment_1";
+const XR_ATTNRES_RESOURCE_SYM: &str = "plow_xr_attnres_wave64_nospill_1";
+
+fn check_packed_prefill_abi(prefill: bool, flash_required: bool, flash: bool) -> Result<()> {
+    if !prefill {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill metadata requires a prefill object advertising \
+             `{PACKED_PREFILL_ABI_SYM}`; rebuild the AMD objects before staging it"
+        )));
+    }
+    if flash_required && !flash {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill program routes a segment to a flash object that does not advertise \
+             `{PACKED_PREFILL_ABI_SYM}`; rebuild every routed AMD object before staging it"
+        )));
+    }
+    Ok(())
+}
+
+fn check_packed_family_kv_encoding(has_fp8: bool, want_fp8: bool) -> Result<()> {
+    if has_fp8 == want_fp8 {
+        Ok(())
+    } else {
+        Err(RuntimeError::Device(format!(
+            "packed-prefill family object has fp8-KV capability {has_fp8}, packet requires \
+             {want_fp8}; refusing an encoding mismatch"
+        )))
+    }
+}
 
 /// `PLOW_GEMV_MAXM` from `runtime/amd/op_gemm.h` — the widest bucket the GEMV
 /// path can be instantiated at, and therefore the widest any object can
@@ -945,6 +3963,8 @@ fn is_lm_head_matmul(op: u16) -> bool {
 const K3_ARMS_SYM: &str = "plow_k3_arms_1";
 const MOE_PF_A4W4_SYM: &str = "plow_moe_pf_a4w4_arm";
 const KDA_CONV_STEP_DB_SYM: &str = "plow_kda_conv_step_db_arm";
+const KDA_CHUNK_SYM: &str = "plow_kda_chunk_bt64_arm_1";
+const KDA_CHUNK_QPRE_SYM: &str = "plow_kda_chunk_qpre_arm_1";
 const KDA_CONV_STEP_DB_REPLACED_OPS: &[DevOp] = &[
     DevOp::KdaConv,
     DevOp::KdaGate,
@@ -975,6 +3995,10 @@ const K3_ARM_OPS: &[DevOp] = &[
     DevOp::KdaConv3,
     DevOp::KdaStateStepG,
     DevOp::KdaConvStateStepG,
+    DevOp::KdaChunkPrepare,
+    DevOp::KdaChunkIntra,
+    DevOp::KdaChunkWu,
+    DevOp::KdaChunkCarry,
     DevOp::AttnRes,
     DevOp::SituGlu,
     DevOp::MlaOutGate,
@@ -1007,6 +4031,34 @@ fn required_moe_pf_a4w4(progs: &[DevProg]) -> Option<DevOp> {
 
 fn required_kda_conv_step_db(progs: &[DevProg]) -> Option<DevOp> {
     first_op_in(progs, &[DevOp::KdaConvStateStepG])
+}
+
+fn required_kda_chunk(progs: &[DevProg]) -> Option<DevOp> {
+    first_op_in(
+        progs,
+        &[
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
+        ],
+    )
+}
+
+fn check_kda_chunk(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> {
+    let Some(op) = need else {
+        return Ok(());
+    };
+    if syms.contains(&KDA_CHUNK_SYM) {
+        return Ok(());
+    }
+    Err(RuntimeError::Device(format!(
+        "packet/object chunk-KDA MISMATCH: this packet dispatches {op:?} (op {}), but {} does \
+         not advertise `{KDA_CHUNK_SYM}`. Rebuild the KDA prefill object with \
+         -DPLOW_KDA_CHUNK=1, or emit the serial recurrence.",
+        op as u16,
+        path.display()
+    )))
 }
 
 fn check_kda_conv_step_db(
@@ -1097,11 +4149,26 @@ fn check_k3_arms(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> 
 /// 81/82) are separate build flags: the prefill half is a second full MFMA body and a decode-only
 /// object must not carry it.
 const MOE_GEMMA_SYM: &str = "plow_moe_gemma_arms_1";
-/// Marker for L2-DOMAIN DISPATCH (-DPLOW_L2_PLACE_DISPATCH). A placed blob repurposes the
-/// global-queue `seg` as an L2 domain, so an object without this axis mis-dispatches it SILENTLY.
+/// Marker for L2-DOMAIN DISPATCH (-DPLOW_L2_PLACE_DISPATCH). A placed blob carries per-domain
+/// device queue windows, so an object without this axis mis-dispatches it SILENTLY.
 /// Checked instead of the operator-asserted PLOW_L2_PLACE_DISPATCH env var.
 const L2_DISPATCH_SYM: &str = "plow_l2_place_dispatch_1";
+const GATE_HIER_SYM: &str = "plow_gate_hier_1";
 const MOE_GEMMA_PF_SYM: &str = "plow_moe_gemma_pf_arms_1";
+
+fn check_gate_hier_object(syms: &[&str], path: &Path, phase: Phase, sched: Sched) -> Result<()> {
+    if !syms.contains(&GATE_HIER_SYM) {
+        return Ok(());
+    }
+    if phase != Phase::Decode || sched != Sched::GlobalQueue || !syms.contains(&L2_DISPATCH_SYM) {
+        return Err(RuntimeError::Device(format!(
+            "{} advertises `{GATE_HIER_SYM}`, but hierarchical gates are valid only for a \
+             decode global-queue object carrying `{L2_DISPATCH_SYM}`",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Every opcode behind `#if PLOW_MOE_GEMMA` in `runtime/amd/interp.hip`.
 const MOE_GEMMA_OPS: &[DevOp] = &[
@@ -1371,13 +4438,24 @@ fn check_gemv_capacity(syms: &[&str], path: &Path, need: u32) -> Result<()> {
     }
 }
 
-/// Is the V2 MLA-prefill routing enabled (`PLOW_MLA_PF_V2=1`)?
+fn check_xargmax_capacity(syms: &[&str], path: &Path, need: u32) -> Result<()> {
+    if need <= 32 || syms.contains(&XARGMAX_B128_SYM) {
+        return Ok(());
+    }
+    Err(RuntimeError::Device(format!(
+        "packet/object XArgmax MISMATCH: decode needs {need} rows, but {} does not advertise \
+         `{XARGMAX_B128_SYM}`. A pre-B128 object writes only rows 0..32 and would leave the \
+         remaining sampled ids stale. Rebuild the decode object from the current tree.",
+        path.display()
+    )))
+}
+
+/// Is the V2 MLA-prefill routing enabled (`PLOW_MLA_PF_V2!=0`)?
 ///
-/// Opt-in: it moves `FlashMlaPrefill` segments onto the 4-wave flash object, whose
+/// Enabled by default: it moves `FlashMlaPrefill` segments onto a 4-wave object, whose
 /// full-column-wave kernel (`d_flash_mla_prefill_v2`) needs the 512-register budget the
-/// 8-wave interpreter cannot give. The flash object must advertise
-/// `plow_mla_pf_v2_arm_1` — checked at load, because the dispatch default on a pre-arm
-/// object is a silent skip, not a trap.
+/// 8-wave interpreter cannot give. gfx950 prefers the dedicated scratch-free V2+SV object;
+/// if it is unavailable, the capability-checked general flash object remains the exact fallback.
 pub fn mla_pf_v2_enabled() -> bool {
     crate::config::RuntimeConfig::get().amd.mla_pf_v2
 }
@@ -1385,6 +4463,39 @@ pub fn mla_pf_v2_enabled() -> bool {
 /// The V2 arms' marker symbols (see `interp.hip`).
 const MLA_PF_V2_SYM: &str = "plow_mla_pf_v2_arm_1";
 const MLA_PF_V2_FP8_SYM: &str = "plow_mla_pf_v2_fp8_arm_1";
+const MLA_PF_V2_SV_RAW_SYM: &str = "plow_mla_pf_v2_sv_raw_1";
+
+fn resolve_flash_object_load<T>(load: Result<T>, required: bool) -> Result<Option<T>> {
+    match load {
+        Ok(object) => Ok(Some(object)),
+        Err(error) if required => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+fn check_mla_v2_sv_raw_symbols(syms: &[&str], path: &Path, needs_l2: bool) -> Result<()> {
+    for marker in [MLA_PF_V2_SYM, MLA_PF_V2_SV_RAW_SYM] {
+        if !syms.contains(&marker) {
+            return Err(RuntimeError::Device(format!(
+                "raw MLA V2 object {} lacks required marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    if syms.contains(&MLA_PF_V2_FP8_SYM) || syms.contains(&PACKED_PREFILL_MLA_FLASH_SEG_SYM) {
+        return Err(RuntimeError::Device(format!(
+            "raw MLA V2 object {} carries an fp8 or packed-prefill consumer arm",
+            path.display()
+        )));
+    }
+    if needs_l2 && !syms.contains(&L2_DISPATCH_SYM) {
+        return Err(RuntimeError::Device(format!(
+            "raw MLA V2 object {} lacks `{L2_DISPATCH_SYM}` for an L2-placed packet",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Per-segment wave class, derived from the stream.
 ///
@@ -1424,6 +4535,11 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     let mut mla_pure = vec![v2; n_seg as usize];
     let mut needs_v2: Vec<(usize, u32)> = Vec::new();
     let mut mla_any = vec![false; n_seg as usize];
+    let mut xr_wave_any = vec![false; n_seg as usize];
+    let mut xr_wave_pure = vec![true; n_seg as usize];
+    let mut kda_wave_any = vec![false; n_seg as usize];
+    let mut kda_wave_pure = vec![true; n_seg as usize];
+    let mut kda_carry_pure = vec![true; n_seg as usize];
     for e in &prog.stream {
         let op = prog
             .insts
@@ -1436,6 +4552,14 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
                 ))
             })?
             .op;
+        let seg = e.seg as usize;
+        let xr_marked = e.flags & packet::dev::SE_XR_WAVE_RS != 0;
+        xr_wave_any[seg] |= xr_marked;
+        xr_wave_pure[seg] &= xr_marked && op == DevOp::XReduceTwoShot as u16;
+        let kda_wave_marked = e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0;
+        kda_wave_any[seg] |= kda_wave_marked;
+        kda_wave_pure[seg] &= kda_wave_marked && op == DevOp::KdaChunkIntra as u16;
+        kda_carry_pure[seg] &= kda_wave_marked && op == DevOp::KdaChunkCarry as u16;
         if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
             class[e.seg as usize] = 4;
         } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
@@ -1468,6 +4592,26 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
         if mla_any[s] && mla_pure[s] {
             class[s] = 4;
         }
+        if xr_wave_any[s] {
+            if !xr_wave_pure[s] {
+                return Err(RuntimeError::Device(format!(
+                    "segment {s} carries SE_XR_WAVE_RS but is not pure XReduceTwoShot"
+                )));
+            }
+            class[s] = 19;
+        }
+        if kda_wave_any[s] {
+            if kda_wave_pure[s] {
+                class[s] = 20;
+            } else if kda_carry_pure[s] {
+                class[s] = 23;
+            } else {
+                return Err(RuntimeError::Device(format!(
+                    "segment {s} carries SE_KDA_INTRA_WAVE_ITEMS but is not pure KdaChunkIntra \
+                     (nor SE_KDA_CARRY_REGSTATE on pure KdaChunkCarry)"
+                )));
+            }
+        }
     }
     for &(seg, ns) in &needs_v2 {
         if !(v2 && class[seg] == 4) {
@@ -1487,6 +4631,142 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
         }
     }
     Ok(class)
+}
+
+fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
+    let n_seg = prog
+        .stream
+        .iter()
+        .map(|e| e.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    let mut family = vec![None; n_seg];
+    let mut pure = vec![true; n_seg];
+    for e in &prog.stream {
+        let op = prog
+            .insts
+            .get(e.inst as usize)
+            .ok_or_else(|| {
+                RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
+            })?
+            .op;
+        let next = if op == DevOp::RmsNorm as u16
+            || op == DevOp::HeadNormRope as u16
+            || op == DevOp::HeadNormRopeFp8 as u16
+        {
+            Some(5)
+        } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
+            Some(6)
+        } else if op == DevOp::KdaStateStep as u16
+            || op == DevOp::KdaConv3 as u16
+            || op == DevOp::KdaStateStepG as u16
+            || op == DevOp::KdaChunkPrepare as u16
+            || op == DevOp::KdaChunkIntra as u16
+            || op == DevOp::KdaChunkWu as u16
+            || op == DevOp::KdaChunkCarry as u16
+        {
+            Some(7)
+        } else {
+            None
+        };
+        let s = e.seg as usize;
+        match (family[s], next) {
+            (None, Some(f)) => family[s] = Some(f),
+            (Some(a), Some(b)) if a == b => {}
+            _ => pure[s] = false,
+        }
+    }
+    Ok(family
+        .into_iter()
+        .zip(pure)
+        .map(|(f, p)| if p { f.unwrap_or(0) } else { 0 })
+        .collect())
+}
+
+/// Segments eligible for the dedicated gfx950 MLA V2+SV object.
+///
+/// That object intentionally contains only the dense bf16 opcode. A gathered MLA instruction
+/// uses the same opcode but selects another body through `t7`; routing it here would silently
+/// execute the dense body. This predicate is deliberately independent of model names.
+fn derive_raw_mla_v2_segments(prog: &DevProg) -> Result<Vec<bool>> {
+    let n_seg = prog
+        .stream
+        .iter()
+        .map(|e| e.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    let mut eligible = vec![prog.t >= 2048; n_seg];
+    let mut seen = vec![false; n_seg];
+    for e in &prog.stream {
+        let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
+            RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
+        })?;
+        let dense_bf16 =
+            inst.op == DevOp::FlashMlaPrefill as u16 && inst.t[7] == packet::dev::TENSOR_NONE16;
+        eligible[e.seg as usize] &= dense_bf16;
+        seen[e.seg as usize] |= dense_bf16;
+    }
+    Ok(eligible
+        .into_iter()
+        .zip(seen)
+        .map(|(eligible, seen)| eligible && seen)
+        .collect())
+}
+
+fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) -> bool {
+    let mut seen = false;
+    let covered = prog.stream.iter().all(|e| {
+        let Some(in_) = prog.insts.get(e.inst as usize) else {
+            return false;
+        };
+        let expected = if in_.op == DevOp::RmsNorm as u16
+            || in_.op == DevOp::HeadNormRope as u16
+            || in_.op == DevOp::HeadNormRopeFp8 as u16
+        {
+            5
+        } else if in_.op == DevOp::FlashMlaPrefill as u16
+            || in_.op == DevOp::FlashMlaPrefillFp8 as u16
+        {
+            6
+        } else if in_.op == DevOp::KdaStateStep as u16
+            || in_.op == DevOp::KdaConv3 as u16
+            || in_.op == DevOp::KdaStateStepG as u16
+            || in_.op == DevOp::KdaChunkPrepare as u16
+            || in_.op == DevOp::KdaChunkIntra as u16
+            || in_.op == DevOp::KdaChunkWu as u16
+            || in_.op == DevOp::KdaChunkCarry as u16
+        {
+            7
+        } else {
+            0
+        };
+        if expected != 0 && wanted.contains(&expected) {
+            seen = true;
+            families.get(e.seg as usize).copied() == Some(expected)
+        } else {
+            true
+        }
+    });
+    seen && covered
+}
+
+fn packed_kda_compatible(prog: &DevProg) -> bool {
+    if prog.insts.iter().any(|d| {
+        matches!(
+            DevOp::from_u16(d.op),
+            Some(DevOp::KdaConv | DevOp::KdaConvStateStepG)
+        )
+    }) {
+        return false;
+    }
+    let count = |op| prog.insts.iter().filter(|d| d.op == op as u16).count();
+    let chunks = [
+        count(DevOp::KdaChunkPrepare),
+        count(DevOp::KdaChunkIntra),
+        count(DevOp::KdaChunkWu),
+        count(DevOp::KdaChunkCarry),
+    ];
+    chunks.iter().all(|&n| n == 0) || chunks.iter().all(|&n| n == chunks[0] && n != 0)
 }
 
 /// Rows-equivalent cost charged per launch in the chunk DP. Tuned in the
@@ -1520,9 +4800,19 @@ const LAUNCH_ROWS: u32 = 416;
 /// shrink in [`rebase_chunk_rows`] makes padded rows cost nothing, so the cover
 /// is simply the fewest launches, `ceil(n / max_bucket)`. See the branch below.
 pub fn plan_chunks(buckets: &[u32], n_prompt: u32) -> Result<Vec<u32>> {
+    plan_chunks_capped(buckets, n_prompt, u32::MAX)
+}
+
+/// Plan from compiled prefill rungs no wider than `max_bucket`.
+pub fn plan_chunks_capped(buckets: &[u32], n_prompt: u32, max_bucket: u32) -> Result<Vec<u32>> {
     let cfg = &crate::config::RuntimeConfig::get().amd;
+    let eligible: Vec<u32> = buckets
+        .iter()
+        .copied()
+        .filter(|&b| b > 0 && b <= max_bucket)
+        .collect();
     plan_chunks_cfg(
-        buckets,
+        &eligible,
         n_prompt,
         cfg.launch_rows.unwrap_or(LAUNCH_ROWS),
         cfg.ragged_chunk,
@@ -2152,8 +5442,72 @@ struct GatheredExpert<'a> {
     data: std::borrow::Cow<'a, [u8]>,
     /// (device dst, permuted payload) when the preshuffled pf slab is declared.
     pf: Option<(u64, Vec<u8>)>,
+    /// Lean stage-2 companion payload or scale, already in the object's exact layout.
+    moe2: Option<(u64, Vec<u8>)>,
     gather_ns: u64,
     fault_ns: u64,
+}
+
+fn shuffle_mxfp4_moe2_weight(src: &[u8], rows: usize, kbytes: usize) -> Result<Vec<u8>> {
+    if rows == 0 || !rows.is_multiple_of(16) || kbytes == 0 || !kbytes.is_multiple_of(32) {
+        return Err(RuntimeError::Device(format!(
+            "lean MoE stage-2 weight layout requires rows%16=0 and Kbytes%32=0, got {rows}x{kbytes}"
+        )));
+    }
+    if src.len() != rows.saturating_mul(kbytes) {
+        return Err(RuntimeError::Device(format!(
+            "lean MoE stage-2 weight layout got {} B for {rows}x{kbytes}",
+            src.len()
+        )));
+    }
+    let mut dst = vec![0u8; src.len()];
+    let mut at = 0usize;
+    for nb in 0..rows / 16 {
+        for kb in 0..kbytes / 32 {
+            for kh in 0..2 {
+                for nr in 0..16 {
+                    let s = (nb * 16 + nr) * kbytes + kb * 32 + kh * 16;
+                    dst[at..at + 16].copy_from_slice(&src[s..s + 16]);
+                    at += 16;
+                }
+            }
+        }
+    }
+    Ok(dst)
+}
+
+fn shuffle_mxfp4_moe2_scale(src: &[u8], rows: usize, groups: usize) -> Result<Vec<u8>> {
+    if rows == 0 || groups == 0 || src.len() != rows.saturating_mul(groups) {
+        return Err(RuntimeError::Device(format!(
+            "lean MoE stage-2 scale layout got {} B for {rows}x{groups}",
+            src.len()
+        )));
+    }
+    let padded_rows = rows.div_ceil(256) * 256;
+    let padded_groups = groups.div_ceil(8) * 8;
+    let mut dst = vec![127u8; padded_rows * padded_groups];
+    let mut at = 0usize;
+    for nb in 0..padded_rows / 32 {
+        for gb in 0..padded_groups / 8 {
+            for gi in 0..4 {
+                for nr in 0..16 {
+                    for gh in 0..2 {
+                        for nh in 0..2 {
+                            let row = nb * 32 + nh * 16 + nr;
+                            let group = gb * 8 + gh * 4 + gi;
+                            dst[at] = if row < rows && group < groups {
+                                src[row * groups + group]
+                            } else {
+                                127
+                            };
+                            at += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(dst)
 }
 
 /// Expert-gather workers per rank. Every rank of a TP group loads at once, so
@@ -2170,13 +5524,14 @@ fn expert_gather_threads(n_gpu: u32) -> usize {
 /// worker — and all device interaction stays with the caller.
 fn gather_expert_entry<'a>(
     ckpt: &'a crate::asset::checkpoint::Checkpoint,
-    entry: &(String, u64, u64, bool, u64, u64, u64),
+    entry: &(String, u64, u64, bool, u64, u64, u64, u64, u64, u64, bool),
     shard_rank: u32,
     shard_n: u32,
     populate: bool,
     do_prefault: bool,
 ) -> Result<GatheredExpert<'a>> {
-    let (name, dst, want, scrub, pf_dst, pf_rows, pf_k) = entry;
+    let (name, dst, want, scrub, pf_dst, pf_rows, pf_k, moe2_dst, moe2_rows, moe2_k, moe2_scale) =
+        entry;
     let (src, shape) = ckpt
         .tensor_ex(name)
         .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {name}")))?;
@@ -2223,12 +5578,25 @@ fn gather_expert_entry<'a>(
     } else {
         None
     };
+    let moe2 = if *moe2_dst == 0 {
+        None
+    } else {
+        let t = Instant::now();
+        let shuffled = if *moe2_scale {
+            shuffle_mxfp4_moe2_scale(&data, *moe2_rows as usize, *moe2_k as usize)?
+        } else {
+            shuffle_mxfp4_moe2_weight(&data, *moe2_rows as usize, *moe2_k as usize)?
+        };
+        gather_ns += t.elapsed().as_nanos() as u64;
+        Some((*moe2_dst, shuffled))
+    };
     Ok(GatheredExpert {
         dst: *dst,
         want: *want,
         scrub: *scrub,
         data,
         pf,
+        moe2,
         gather_ns,
         fault_ns,
     })
@@ -2247,14 +5615,18 @@ fn bind_packed_experts(
     do_prefault: bool,
     populate: bool,
 ) -> Result<(Vec<DeviceMem>, u64)> {
-    let layers: Vec<(usize, String)> = blob
+    let layers: Vec<(usize, String, bool)> = blob
         .tensors
         .iter()
         .enumerate()
         .filter_map(|(i, td)| {
-            td.name
-                .strip_suffix("expert_weight_table")
-                .map(|pfx| (i, pfx.to_string()))
+            if let Some(pfx) = td.name.strip_suffix("expert_weight_table_ep") {
+                Some((i, pfx.to_string(), true))
+            } else {
+                td.name
+                    .strip_suffix("expert_weight_table")
+                    .map(|pfx| (i, pfx.to_string(), false))
+            }
         })
         .collect();
     if layers.is_empty() {
@@ -2294,6 +5666,17 @@ fn bind_packed_experts(
     // instruction streams experts through it` on a program that streams them perfectly well.
     let dec = blob.progs.last().expect("checked non-empty");
     let i_moe_of = |i_ewt: usize| -> Option<u64> {
+        let ep_full = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .find(|d| {
+                d.op == DevOp::MoeGroupGluPf as u16 && d.t[2] as usize == i_ewt && d.i[6] == n_gpu
+            })
+            .map(|d| d.i[0] as u64);
+        if ep_full.is_some() {
+            return ep_full;
+        }
         dec.insts.iter().find_map(|d| {
             if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
                 Some(d.i[1] as u64)
@@ -2312,10 +5695,15 @@ fn bind_packed_experts(
     // the resolved answer belongs in the record rather than in a debug session.
     let mut layout = String::from("none");
     let mut wbytes = 0u64;
-    for (i_ewt, pfx) in &layers {
+    for (i_ewt, pfx, ep_table) in &layers {
+        let table_suffix = if *ep_table {
+            "expert_scale_table_ep"
+        } else {
+            "expert_scale_table"
+        };
         let i_est = names
             .iter()
-            .position(|x| *x == format!("{pfx}expert_scale_table"))
+            .position(|x| *x == format!("{pfx}{table_suffix}"))
             .ok_or_else(|| {
                 RuntimeError::Device(format!(
                     "{pfx}expert_weight_table has no matching expert_scale_table"
@@ -2352,14 +5740,10 @@ fn bind_packed_experts(
         let i_moe_full = *shape0.first().unwrap_or(&0) as u64;
         let (owned, whole) = if i_moe == i_moe_full {
             // EP: this rank owns a contiguous block of WHOLE experts.
-            let per = n_exp / n_gpu;
-            if per * n_gpu != n_exp {
-                return Err(RuntimeError::Device(format!(
-                    "expert-parallel packet with {n_exp} experts over {n_gpu} ranks \
-                     does not divide"
-                )));
-            }
-            (rank * per..(rank + 1) * per, true)
+            (
+                packet::moe_ep::balanced_expert_range(n_exp, n_gpu, rank),
+                true,
+            )
         } else if i_moe * n_gpu as u64 == i_moe_full {
             // TP: every rank slices every expert.
             (0..n_exp, false)
@@ -2412,6 +5796,61 @@ fn bind_packed_experts(
         } else {
             (None, None)
         };
+        let moe2_weight_suffix = if *ep_table {
+            "expert_weight_table_moe2_ep"
+        } else {
+            "expert_weight_table_moe2"
+        };
+        let moe2_scale_suffix = if *ep_table {
+            "expert_scale_table_moe2_ep"
+        } else {
+            "expert_scale_table_moe2"
+        };
+        let i_ewt_moe2 = names
+            .iter()
+            .position(|x| *x == format!("{pfx}{moe2_weight_suffix}"));
+        let i_est_moe2 = names
+            .iter()
+            .position(|x| *x == format!("{pfx}{moe2_scale_suffix}"));
+        if i_ewt_moe2.is_some() != i_est_moe2.is_some() {
+            return Err(RuntimeError::Device(format!(
+                "{pfx}: lean MoE stage-2 weight and scale companion tables must be declared together"
+            )));
+        }
+        let (d_w2, d_s2, w2tab, s2tab) = if i_ewt_moe2.is_some() {
+            if !en.microscaled() {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}: lean MoE stage-2 companion requires MXFP4 payloads with E8M0 scales"
+                )));
+            }
+            let kbytes = usize::try_from(i_moe / 2).unwrap_or(0);
+            let groups = usize::try_from(i_moe / 32).unwrap_or(0);
+            if kbytes == 0 || groups == 0 || w_stride as usize % kbytes != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}: lean MoE stage-2 cannot derive down geometry from I={i_moe}, stride={w_stride}"
+                )));
+            }
+            let rows = w_stride as usize / kbytes;
+            if s_stride as usize != rows.saturating_mul(groups) {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}: down scale stride {s_stride} disagrees with {rows}x{groups} E8M0 rows"
+                )));
+            }
+            let scale_stride = rows.div_ceil(256) * 256 * (groups.div_ceil(8) * 8);
+            let t_a = Instant::now();
+            let dw = EngineDevice::alloc(be, (n_local * w_stride).max(1))?;
+            let ds = EngineDevice::alloc(be, (n_local * scale_stride as u64).max(1))?;
+            LoadProf::add(&prof.alloc_ns, t_a);
+            let mut wt = vec![0u64; n_exp as usize * 3];
+            let mut st = vec![0u64; n_exp as usize * 3];
+            for (local, e) in owned.clone().enumerate() {
+                wt[e as usize * 3 + 2] = dw.base + local as u64 * w_stride;
+                st[e as usize * 3 + 2] = ds.base + local as u64 * scale_stride as u64;
+            }
+            (Some(dw), Some(ds), Some(wt), Some(st))
+        } else {
+            (None, None, None, None)
+        };
 
         // The layer's reads, IN ORDER, before any of them happens.
         //
@@ -2429,7 +5868,7 @@ fn bind_packed_experts(
         // preshuffled copy (scale entries, or the pf table not declared). Geometry per
         // projection: gate/up are [I_moe][K] row-major shards, down is [H][I_moe] — in both
         // cases the shard is [rows][kbytes] with rows*kbytes == w_stride.
-        let mut plan: Vec<(String, u64, u64, bool, u64, u64, u64)> =
+        let mut plan: Vec<(String, u64, u64, bool, u64, u64, u64, u64, u64, u64, bool)> =
             Vec::with_capacity(owned.len() * 6);
         for e in owned {
             for j in 0..3 {
@@ -2440,6 +5879,15 @@ fn bind_packed_experts(
                     (w_stride / i_moe, i_moe)
                 };
                 let pf_dst = wptab.as_ref().map_or(0, |t| t[idx]);
+                let w2_dst = w2tab.as_ref().map_or(0, |t| t[idx]);
+                let s2_dst = s2tab.as_ref().map_or(0, |t| t[idx]);
+                let down_kbytes = i_moe / 2;
+                let down_rows = if down_kbytes == 0 {
+                    0
+                } else {
+                    w_stride / down_kbytes
+                };
+                let down_groups = i_moe / 32;
                 plan.push((
                     en.weight_of(e, j),
                     wtab[idx],
@@ -2448,8 +5896,24 @@ fn bind_packed_experts(
                     pf_dst,
                     pf_rows,
                     pf_k,
+                    w2_dst,
+                    down_rows,
+                    down_kbytes,
+                    false,
                 ));
-                plan.push((en.scale_of(e, j), stab[idx], s_stride, false, 0, 0, 0));
+                plan.push((
+                    en.scale_of(e, j),
+                    stab[idx],
+                    s_stride,
+                    false,
+                    0,
+                    0,
+                    0,
+                    s2_dst,
+                    down_rows,
+                    down_groups,
+                    true,
+                ));
             }
         }
         // THE GATHER RUNS ON A WORKER POOL; the ring stays on this thread.
@@ -2506,6 +5970,15 @@ fn bind_packed_experts(
                 }
                 wbytes += g.want;
             }
+            if let Some((dst, shuffled)) = g.moe2 {
+                for (o, chunk) in shuffled.chunks(stage_bytes).enumerate() {
+                    let t = Instant::now();
+                    ring.push(dst + (o * stage_bytes) as u64, chunk)?;
+                    LoadProf::add(&prof.memcpy_ns, t);
+                    prof.chunks.set(prof.chunks.get() + 1);
+                }
+                wbytes += shuffled.len() as u64;
+            }
             Ok(())
         };
         std::thread::scope(|s| -> Result<()> {
@@ -2552,9 +6025,19 @@ fn bind_packed_experts(
         if let (Some(ip), Some(tab)) = (i_ewt_pf, &wptab) {
             EngineDevice::upload(be, &devp[ip], 0, as_bytes(tab))?;
         }
+        if let (Some(iw), Some(is), Some(wt), Some(st)) = (i_ewt_moe2, i_est_moe2, &w2tab, &s2tab) {
+            EngineDevice::upload(be, &devp[iw], 0, as_bytes(wt))?;
+            EngineDevice::upload(be, &devp[is], 0, as_bytes(st))?;
+        }
         bufs.push(d_w);
         bufs.push(d_s);
         if let Some(d) = d_wp {
+            bufs.push(d);
+        }
+        if let Some(d) = d_w2 {
+            bufs.push(d);
+        }
+        if let Some(d) = d_s2 {
             bufs.push(d);
         }
     }
@@ -2861,12 +6344,8 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
 /// never on a precision flag.
 /// Every KDA opcode whose `i[0]` is the token-row count `T`.
 ///
-/// All six, not just the two that carry state. The conv and the recurrence are the
-/// ones a pad row CORRUPTS, but `KdaGate` feeds the recurrence and `KdaGatedNorm`
-/// consumes its output, and leaving those two at the bucket width would have them
-/// read rows the shortened arms never wrote. Uniform `clen` keeps one row count
-/// across the whole mixer, which is also the only version of this that can be
-/// stated in one sentence.
+/// Every mixer stage must see one uniform `clen`: legacy and chunk recurrences
+/// carry state, while their surrounding stages consume the shortened rows.
 const KDA_ROW_COUNT_OPS: &[DevOp] = &[
     DevOp::KdaConv,
     DevOp::KdaConv3,
@@ -2875,6 +6354,10 @@ const KDA_ROW_COUNT_OPS: &[DevOp] = &[
     DevOp::KdaStateStepG,
     DevOp::KdaConvStateStepG,
     DevOp::KdaGatedNorm,
+    DevOp::KdaChunkPrepare,
+    DevOp::KdaChunkIntra,
+    DevOp::KdaChunkWu,
+    DevOp::KdaChunkCarry,
 ];
 
 /// Where a prefill op carries its TOKEN-ROW COUNT, and whether that field is the
@@ -3049,10 +6532,15 @@ fn patch_tp_xaudit(insts: &mut [DevInst64], status_id: u32) {
         if matches!(
             DevOp::from_u16(d.op),
             Some(
-                DevOp::XReduce | DevOp::XReduceTwoShot | DevOp::XReduceAddNorm | DevOp::XArgmaxFin
+                DevOp::XReduce
+                    | DevOp::XReduceTwoShot
+                    | DevOp::XReduceAddNorm
+                    | DevOp::XArgmaxFin
+                    | DevOp::XReduceScatter
+                    | DevOp::XAllGather
             )
         ) {
-            d.i[7] = status_id + 1;
+            d.fj[2] = status_id + 1;
         }
     }
 }
@@ -3105,6 +6593,18 @@ struct XAuditArgs {
     n_gpu: u32,
     status: u64,
 }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TokenCaptureArgs {
+    ids: u64,
+    ring: u64,
+    step: u32,
+    quantum: u32,
+    batch: u32,
+}
+
+pub(crate) const DEFERRED_TOKEN_MAX_STEPS: usize = 4;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -3172,6 +6672,252 @@ pub struct ChunkStep {
     pub clen: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedPrefillBinding {
+    prog: usize,
+    n_spans: u32,
+    n_rows: u32,
+}
+
+fn validate_packed_prefill(
+    prog: usize,
+    rung: u32,
+    batch: usize,
+    spans: &[PrefillSpan],
+    parked: &[u32],
+) -> Result<PackedPrefillBinding> {
+    if spans.is_empty() {
+        return Err(RuntimeError::Device(
+            "packed prefill requires at least one span".into(),
+        ));
+    }
+    let prog_u32 = u32::try_from(prog)
+        .map_err(|_| RuntimeError::Device(format!("prefill program index {prog} exceeds u32")))?;
+    let mut row = 0u32;
+    for (i, span) in spans.iter().enumerate() {
+        if span.row0 != row || span.n_rows == 0 {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} is not dense: row0={} n_rows={} expected row0={row}",
+                span.row0, span.n_rows
+            )));
+        }
+        if span.flags & !PREFILL_SPAN_RESET_STATE != 0 {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} has unknown flags {:#x}",
+                span.flags
+            )));
+        }
+        let reset = span.flags & PREFILL_SPAN_RESET_STATE != 0;
+        if reset != (span.kv_row0 == 0) {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} reset flag disagrees with kv_row0={}",
+                span.kv_row0
+            )));
+        }
+        let kv_end = span.kv_row0.checked_add(span.n_rows).ok_or_else(|| {
+            RuntimeError::Device(format!("packed prefill span {i} KV range overflows u32"))
+        })?;
+        if kv_end != span.kv_len {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} has kv_row0+n_rows={kv_end}, kv_len={}",
+                span.kv_len
+            )));
+        }
+        if span.slot as usize >= batch
+            || span.state_slot as usize >= batch
+            || span.slot != span.state_slot
+        {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} has incompatible KV/state slots {}/{} for batch {batch}",
+                span.slot, span.state_slot
+            )));
+        }
+        if span.program != prog_u32 {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} names program {}, staged for {prog}",
+                span.program
+            )));
+        }
+        if spans[..i].iter().any(|prior| prior.slot == span.slot) {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill slot {} appears in more than one span",
+                span.slot
+            )));
+        }
+        row = row
+            .checked_add(span.n_rows)
+            .ok_or_else(|| RuntimeError::Device("packed prefill row count overflows u32".into()))?;
+    }
+    if row > rung {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill has {row} rows but program {prog} is compiled for {rung}"
+        )));
+    }
+    if parked.len() != rung as usize
+        || parked.iter().any(|&v| v > 1)
+        || parked[..row as usize].iter().any(|&v| v != 0)
+        || parked[row as usize..].iter().any(|&v| v == 0)
+    {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill parked mask must have {rung} binary rows, active [0,{row})=0 and padding [{row},{rung})!=0 (got {})",
+            parked.len()
+        )));
+    }
+    let n_spans = u32::try_from(spans.len())
+        .map_err(|_| RuntimeError::Device("packed prefill span count exceeds u32".into()))?;
+    Ok(PackedPrefillBinding {
+        prog,
+        n_spans,
+        n_rows: rung,
+    })
+}
+
+fn validate_packed_prompt_slices(
+    rung: u32,
+    spans: &[PrefillSpan],
+    prompt_slices: &[&[u32]],
+) -> Result<u32> {
+    if spans.len() != prompt_slices.len() {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill has {} spans but {} prompt slices",
+            spans.len(),
+            prompt_slices.len()
+        )));
+    }
+    let mut rows = 0u32;
+    for (i, (span, prompt)) in spans.iter().zip(prompt_slices).enumerate() {
+        if prompt.len() != span.n_rows as usize {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} has {} rows but its prompt slice has {} tokens",
+                span.n_rows,
+                prompt.len()
+            )));
+        }
+        rows = rows.checked_add(span.n_rows).ok_or_else(|| {
+            RuntimeError::Device("packed prefill prompt row count overflows u32".into())
+        })?;
+    }
+    if rows == 0 || rows > rung {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill prompt slices contribute {rows} rows for rung {rung}"
+        )));
+    }
+    Ok(rows)
+}
+
+fn stage_packed_prompt_rows(
+    stage: &mut [u8],
+    rung: u32,
+    spans: &[PrefillSpan],
+    prompt_slices: &[&[u32]],
+) -> Result<u32> {
+    let rows = validate_packed_prompt_slices(rung, spans, prompt_slices)?;
+    let bytes = rung as usize * 4;
+    if stage.len() < bytes * 2 {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill input staging has {} bytes, needs {}",
+            stage.len(),
+            bytes * 2
+        )));
+    }
+    stage[..bytes * 2].fill(0);
+    for (span, prompt) in spans.iter().zip(prompt_slices) {
+        for (local, &id) in prompt.iter().enumerate() {
+            let row = span.row0 as usize + local;
+            stage[row * 4..row * 4 + 4].copy_from_slice(&id.to_le_bytes());
+            let pos = span.kv_row0 + local as u32;
+            let off = bytes + row * 4;
+            stage[off..off + 4].copy_from_slice(&pos.to_le_bytes());
+        }
+    }
+    Ok(rows)
+}
+
+fn check_packed_prefill_dispatch(binding: Option<PackedPrefillBinding>, prog: usize) -> Result<()> {
+    if let Some(bound) = binding.filter(|b| b.prog != prog) {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill metadata is staged for program {}, refusing to dispatch program {prog}; clear or restage it first",
+            bound.prog
+        )));
+    }
+    Ok(())
+}
+
+fn packed_prefill_kernarg(
+    binding: Option<PackedPrefillBinding>,
+    prog: usize,
+    spans: u64,
+    parked: u64,
+) -> (u64, u64, u32, u32) {
+    match binding.filter(|b| b.prog == prog) {
+        Some(b) => (spans, parked, b.n_spans, b.n_rows),
+        None => (0, 0, 0, 0),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackedSegmentRoute {
+    Primary,
+    MlaNorm,
+    MlaFlash,
+    Kda,
+}
+
+fn packed_segment_route(
+    active: bool,
+    class: u8,
+    mla_norm: bool,
+    mla_flash: bool,
+    kda: bool,
+) -> Result<PackedSegmentRoute> {
+    // The KDA family object is also the spill-isolation object for ordinary prefill.  Its
+    // capability marker proves it supports null packed metadata; older packed-only objects
+    // are never loaded into `kda` and retain the primary fallback here.
+    if class == 7 && kda {
+        return Ok(PackedSegmentRoute::Kda);
+    }
+    if !active {
+        return Ok(PackedSegmentRoute::Primary);
+    }
+    if class == 0 || class == 8 {
+        return Ok(PackedSegmentRoute::Primary);
+    }
+    let (available, route, name) = match class {
+        5 => (mla_norm, PackedSegmentRoute::MlaNorm, "MLA norm/cache"),
+        6 => (mla_flash, PackedSegmentRoute::MlaFlash, "MLA flash"),
+        7 => (kda, PackedSegmentRoute::Kda, "KDA"),
+        _ => {
+            return Err(RuntimeError::Device(format!(
+                "packed-prefill segment has unknown operator-family class {class}"
+            )))
+        }
+    };
+    if !available {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill {name} segment has no exact capability object; refusing to fall \
+             back to the production interpreter"
+        )));
+    }
+    Ok(route)
+}
+
+fn packed_prefill_topology_index(
+    requested: usize,
+    dec_lo: usize,
+    mut role: impl FnMut(usize) -> Option<(u32, bool)>,
+) -> Option<usize> {
+    if requested >= dec_lo {
+        return None;
+    }
+    let (rows, packed_only) = role(requested)?;
+    if packed_only {
+        return Some(requested);
+    }
+    (0..dec_lo)
+        .find(|&candidate| role(candidate) == Some((rows, true)))
+        .or(Some(requested))
+}
+
 /// Per-program local counter-bank state.
 ///
 /// TP keeps `current` on the bank used by the last dispatch so diagnostic
@@ -3233,6 +6979,13 @@ impl CounterBankState {
 /// One program's device-resident tables.
 struct AmdProg {
     t: u32,
+    packed_prefill_only: bool,
+    packed_needs_mla: bool,
+    packed_mla_compatible: bool,
+    packed_mla_segmented: bool,
+    packed_needs_kda: bool,
+    packed_kda_compatible: bool,
+    packed_kda_segmented: bool,
     n_inst: u32,
     trace_records: usize,
     n_counter: u32,
@@ -3251,12 +7004,22 @@ struct AmdProg {
     d_seg_ofs: DeviceMem,
     /// `[n_seg]` wave classes.
     seg_class: Vec<u8>,
+    /// Ordered decode route for each segment. Raw KDA entries carry fully resolved rank-local
+    /// kernargs, so the hot launch path performs no descriptor parsing or allocation.
+    decode_routes: Vec<DecodeSegmentRoute>,
+    /// Optional raw gfx950 route for a pure MXFP4 grouped-MoE Down+Combine segment.
+    prefill_routes: Vec<PrefillSegmentRoute>,
+    /// Immutable device-side typed arguments for raw XR+AttnRes routes. Routes retain only their
+    /// addresses; this owner therefore keeps every pointer valid across queued segment launches.
+    _xreduce_attnres_args: Vec<DeviceMem>,
+    /// `[n_seg]` pure packed-consumer family: 5=MLA norm/cache, 6=MLA flash,
+    /// 7=serial KDA, 0=not safely routable to a family object.
+    packed_seg_family: Vec<u8>,
+    /// Pure dense bf16 MLA segments eligible for the dedicated gfx950 V2+SV object.
+    raw_mla_v2_segment: Vec<bool>,
     /// Global-queue tables; `None` when the blob carries no GQ appendix.
     gq: Option<AmdGq>,
-    /// L2-domain placement (`PLOW_L2_PLACE`): domains `gq_seg_ofs` is windowed by, 0 = not
-    /// placed. When non-zero the `seg` windows are L2 DOMAINS rather than wave classes, so the
-    /// program is dispatched in ONE launch with every domain draining concurrently — see
-    /// [`AmdEngine::run`].
+    /// L2-domain placement (`PLOW_L2_PLACE`): XCD queues per ordered segment, or 0.
     l2_domains: u32,
     /// Base counter id of the two-level maintenance scratch; 0 = off. See `DevProgram::hier_base`.
     hier_base: u32,
@@ -3356,11 +7119,47 @@ pub struct AmdEngine {
 
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
+    /// Packet-paired interpreter containing only FlashMlaDecode+MlaMergeFold.
+    k_decode_mla: Option<HsaKernel>,
+    k_kda_decode_fused: Option<HsaKernel>,
+    k_grouped_moe_glu: Option<HsaKernel>,
+    k_grouped_moe_down: Option<HsaKernel>,
+    k_kda_chunk_intra_cached: Option<HsaKernel>,
+    k_kda_chunk_intra_wave_items: Option<HsaKernel>,
+    k_kda_chunk_carry_regstate: Option<HsaKernel>,
+    k_kda_key_factor_wu: Option<HsaKernel>,
+    k_kda_key_factor_carry: Option<HsaKernel>,
+    /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
+    _kda_key_factor_scratch: Option<DeviceMem>,
+    k_moe_stage1_mxfp4: Option<HsaKernel>,
+    k_moe_stage1_a4_quant: Option<HsaKernel>,
+    k_moe_stage1_a4_reuse: Option<HsaKernel>,
+    _moe_stage1_a4_scratch: Option<DeviceMem>,
+    k_moe_stage2_mxfp4: Option<HsaKernel>,
+    k_moe_combine: Option<HsaKernel>,
+    /// The f32-mix AttnRes object and the workgroup size it advertises.
+    k_attn_res_f32mix: Option<(HsaKernel, u32)>,
+    k_moe_ep_align: Option<HsaKernel>,
+    k_moe_ep_stage2: Option<HsaKernel>,
+    k_moe_ep_combine: Option<HsaKernel>,
+    /// Spill-free interpreter containing only marked XReduceTwoShot segments.
+    k_xreduce_wave_rs: Option<HsaKernel>,
+    k_mla_materialize_pack: Option<HsaKernel>,
+    k_mla_materialized_prefill: Option<HsaKernel>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
+    k_token_capture: Option<HsaKernel>,
+    d_token_ring: Option<DeviceMem>,
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
+    /// Dedicated scratch-free gfx950 V2+SV interpreter for pure bf16 MLA-flash segments.
+    k_mla_v2_sv_raw: Option<HsaKernel>,
+    k_packed_mla_norm: Option<HsaKernel>,
+    k_packed_mla_flash: Option<HsaKernel>,
+    k_packed_kda: Option<HsaKernel>,
+    k_xr_attnres: Option<HsaKernel>,
+    packed_prefill_prefill_abi: bool,
     sched_prefill: Sched,
     sched_decode: Sched,
     _modules: Vec<Module>,
@@ -3376,6 +7175,14 @@ pub struct AmdEngine {
     h_zero: HsaPinned,
     /// Pinned staging for a prefill program's whole instruction array.
     h_pf_inst: HsaPinned,
+    /// Persistent device and pinned-host storage for ragged packed-prefill metadata. Sized once
+    /// for the widest compiled prefill rung; staging performs no allocation.
+    d_prefill_spans: DeviceMem,
+    d_prefill_parked: DeviceMem,
+    h_prefill_meta: HsaPinned,
+    prefill_span_capacity: usize,
+    prefill_row_capacity: usize,
+    packed_prefill: Option<PackedPrefillBinding>,
     d_state_clear: Option<DeviceMem>,
     n_state_clear: u32,
     /// Pristine host copy of each program's instructions. Prefill patching
@@ -3471,6 +7278,51 @@ pub struct AmdEngine {
 }
 
 impl AmdEngine {
+    pub fn overlap_evidence(&self, rank: usize) -> AmdOverlapRankEvidence {
+        let range = |name: String, address_space, start, len: u64| AmdOwnedRange {
+            name,
+            address_space,
+            start,
+            end: start.checked_add(len).unwrap_or(u64::MAX),
+        };
+        let mut ranges = Vec::with_capacity(self.devp.len() + 3);
+        ranges.push(range(
+            "d_tens".into(),
+            "device",
+            self.d_tens.base,
+            self.d_tens.len,
+        ));
+        ranges.extend(
+            self.tensor_names
+                .iter()
+                .zip(&self.devp)
+                .filter(|(name, _)| !packet::names::is_checkpoint_weight(name))
+                .map(|(name, mem)| range(format!("devp:{name}"), "device", mem.base, mem.len)),
+        );
+        ranges.push(range(
+            "h_scalar".into(),
+            "host_pinned",
+            self.h_scalar.as_ptr() as usize as u64,
+            self.h_scalar.len() as u64,
+        ));
+        if let Some(mem) = &self.d_trace {
+            ranges.push(range("d_trace".into(), "device", mem.base, mem.len));
+        }
+        let queue_ids = if self.be.queue_count() == 0 {
+            Vec::new()
+        } else {
+            vec![self.be.queue_identity()]
+        };
+        AmdOverlapRankEvidence {
+            rank,
+            queue_count: self.be.queue_count(),
+            prefill_ranges: ranges.clone(),
+            decode_ranges: ranges,
+            prefill_queue_ids: queue_ids.clone(),
+            decode_queue_ids: queue_ids,
+        }
+    }
+
     /// Bring the engine up from a compiled blob and a directory of gfx950 code
     /// objects.
     ///
@@ -3637,8 +7489,14 @@ impl AmdEngine {
         // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
         let mut blob = DevBlob::parse_l2(&raw, true)?;
-        let tp_audit_compact =
-            tp.is_some() && crate::config::RuntimeConfig::get().amd.tp_audit_compact;
+        let has_fine_xctr = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.stream)
+            .any(|e| e.flags & SE_XCTR != 0);
+        let tp_audit_compact = tp.is_some()
+            && crate::config::RuntimeConfig::get().amd.tp_audit_compact
+            && !has_fine_xctr;
         if tp_audit_compact {
             let status_id = tp.expect("checked").xstatus_id;
             for p in &mut blob.progs {
@@ -3660,6 +7518,8 @@ impl AmdEngine {
             let pt: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
             packet::devbuild::decode_rung_lo(&pt)
         };
+        validate_decode_dispatch(&blob.progs, dec_ix)?;
+        let max_decode_batch = blob.progs[dec_ix..].iter().map(|p| p.t).max().unwrap_or(1);
 
         // THIS USED TO ASK `p.t == 1` / `p.t > 1`, WHICH IS A BUG A BATCHED BLOB ALREADY HAD.
         // A decode program emitted at `PLOW_DECODE_BATCH=16` has `t == 16`, so it counted as a
@@ -3827,7 +7687,60 @@ impl AmdEngine {
         // asked about the phase it actually serves rather than about the blob as a whole.
         let need_k3_decode = required_k3_op(&blob.progs[dec_ix..]);
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
+        let need_kda_chunk_decode = required_kda_chunk(&blob.progs[dec_ix..]);
+        let need_kda_chunk_prefill = required_kda_chunk(&blob.progs[..dec_ix]);
+        let need_kda_decode_fused = first_op_in(&blob.progs[dec_ix..], &[DevOp::KdaDecodeFused]);
+        let need_decode_mla_segments = blob.progs[dec_ix..].iter().try_fold(false, |need, p| {
+            Ok::<_, RuntimeError>(
+                need || decode_segment_kinds(p)?
+                    .iter()
+                    .any(|kind| matches!(kind, DecodeSegmentKind::MlaAttention)),
+            )
+        })?;
+        let need_grouped_moe = blob.progs[dec_ix..].iter().try_fold(false, |need, p| {
+            Ok::<_, RuntimeError>(
+                need || decode_segment_kinds(p)?
+                    .iter()
+                    .any(|kind| matches!(kind, DecodeSegmentKind::GroupedMoeMxfp4 { .. })),
+            )
+        })?;
+        let graph_phase_segments = graph_phase_xreduce_segments(
+            blob_path,
+            &blob.progs,
+            dec_ix,
+            crate::config::RuntimeConfig::get().amd.phase_objects,
+        )?;
+        let need_graph_phase_xreduce = graph_phase_segments.iter().any(|s| !s.is_empty());
+        let need_xreduce_wave_rs = need_graph_phase_xreduce
+            || blob.progs[..dec_ix].iter().any(|p| {
+                p.stream
+                    .iter()
+                    .any(|e| e.flags & packet::dev::SE_XR_WAVE_RS != 0)
+            });
+        let marked_op = |p: &DevProg, op: DevOp| {
+            p.stream.iter().any(|e| {
+                e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0
+                    && p.insts.get(e.inst as usize).map(|d| d.op) == Some(op as u16)
+            })
+        };
+        let need_kda_intra_wave_items = blob.progs[..dec_ix]
+            .iter()
+            .any(|p| marked_op(p, DevOp::KdaChunkIntra));
+        let need_kda_carry_regstate = blob.progs[..dec_ix]
+            .iter()
+            .any(|p| marked_op(p, DevOp::KdaChunkCarry));
+        if let Some(p) = blob.progs[..dec_ix]
+            .iter()
+            .find(|p| p.insts.iter().any(|i| i.op == DevOp::KdaDecodeFused as u16))
+        {
+            return Err(RuntimeError::Device(format!(
+                "KdaDecodeFused is decode-only, but prefill program T={} dispatches it",
+                p.t
+            )));
+        }
         let need_a4w4_decode = required_moe_pf_a4w4(&blob.progs[dec_ix..]);
+        let need_moe_pf_atomic_decode = required_moe_pf_accum(&blob.progs[dec_ix..], 4);
+        let need_moe_pf_det_decode = required_moe_pf_accum(&blob.progs[dec_ix..], 5);
         let need_kda_conv_step_db = required_kda_conv_step_db(&blob.progs[dec_ix..]);
         let legacy_kda_decode = first_op_in(&blob.progs[dec_ix..], KDA_CONV_STEP_DB_REPLACED_OPS);
         if let Some(p) = blob.progs[..dec_ix].iter().find(|p| {
@@ -3879,6 +7792,72 @@ impl AmdEngine {
                         .iter()
                         .any(|i| i.op == DevOp::FlashMlaPrefillFp8 as u16)
             });
+        let need_moe_stage2_lean = blob.progs[..dec_ix]
+            .iter()
+            .any(has_moe_stage2_mxfp4_segment);
+        let need_moe_ep = blob.progs[..dec_ix].iter().any(has_moe_prefill_ep);
+        let need_moe_stage1_lean = need_moe_ep
+            || blob.progs[..dec_ix]
+                .iter()
+                .any(has_moe_stage1_mxfp4_segment);
+        let need_moe_combine_lean = blob.progs[..dec_ix].iter().any(has_moe_combine_segment);
+        let need_attn_res_f32mix = blob.progs[..dec_ix]
+            .iter()
+            .any(|p| p.insts.iter().any(lean_attn_res_f32mix_inst64));
+        if need_moe_ep {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "replicated-input MoE EP requires gfx950 specialist objects, but this device is {arch}"
+                )));
+            }
+            let bind = tp.ok_or_else(|| {
+                RuntimeError::Device(
+                    "replicated-input MoE EP packet requires a tensor-parallel binding".into(),
+                )
+            })?;
+            if blob.progs[..dec_ix]
+                .iter()
+                .flat_map(|p| &p.insts)
+                .filter_map(moe_ep_degree)
+                .any(|degree| degree != bind.n_gpu)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "replicated-input MoE EP packet topology does not match TP{}",
+                    bind.n_gpu
+                )));
+            }
+            let extra =
+                moe_prefill_ep_extra_bytes(&blob.progs[..dec_ix], &blob.tensors, bind.n_gpu)?;
+            let allowed = crate::config::RuntimeConfig::get()
+                .amd
+                .moe_prefill_ep_max_extra_bytes
+                .ok_or_else(|| RuntimeError::Device(format!(
+                    "replicated-input MoE EP requires {extra} additional resident bytes per rank for decode-safe companion weights; set PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES to an audited capacity >= that value"
+                )))?;
+            if extra > allowed {
+                return Err(RuntimeError::Device(format!(
+                    "replicated-input MoE EP requires {extra} additional resident bytes per rank, exceeding the audited {allowed}-byte allowance"
+                )));
+            }
+            tracing::info!(
+                extra_resident_bytes_per_rank = extra,
+                "accepted decode-safe MoE EP companion-weight budget"
+            );
+        }
+        let need_mla_materialized = blob.progs[..dec_ix].iter().any(|p| {
+            p.insts.iter().any(|d| {
+                d.op == DevOp::MlaMaterializePack as u16
+                    || d.op == DevOp::FlashMlaMaterializedPrefill as u16
+            })
+        });
+        if need_mla_materialized && arch != "gfx950" {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA prefill requires gfx950, but this device is {arch}"
+            )));
+        }
+        let need_xr_attnres = blob.progs[..dec_ix]
+            .iter()
+            .any(|p| p.insts.iter().any(xreduce_attnres_inst));
 
         // --- code objects ---------------------------------------------------
         // Resolve the symbol immediately after each load: the HSA backend
@@ -3894,6 +7873,8 @@ impl AmdEngine {
         let mut modules = Vec::new();
         let mut k_xaudit = None;
         let mut k_state_clear = None;
+        let mut k_token_capture = None;
+        let mut prefill_moe_align_bm64 = false;
         let state_clear_device = crate::config::RuntimeConfig::get().amd.state_clear_device;
         // Task-13 per-rung co-load: an optional SECOND decode object for the low
         // rungs (PLOW_HSACO_LOWRUNG=<dir>), so rung 1-2 traffic runs the tight
@@ -3904,150 +7885,198 @@ impl AmdEngine {
             .hsaco_lowrung
             .clone()
             .filter(|d| !d.is_empty());
-        let mut load_one_in =
-            |phase: Phase, sched: Sched, dir: &Path, gemv_need: Option<u32>| -> Result<HsaKernel> {
-                let name = object_name(phase, variant, prefill_arm, sched);
-                let path = dir.join(&name);
-                // WHICH OBJECT, BY NAME, AT INFO — and this line is not cosmetic.
-                //
-                // `variant` and `prefill_arm` are DETECTED from the packet's opcodes
-                // ([`Variant::detect`]), so which object a run opens is a DERIVED fact, not a build
-                // choice, and nothing printed it. `Variant::detect` matches `GemvFp8` and the three
-                // fp8-KV flash ops; it does NOT match the block-scaled `*Fp8Blk` family, so a
-                // GLM-5.2 packet — every one of whose fp8 kernels is block-scaled — detects as
-                // `Bf16` and runs on `interp_decode_gq.elf`. That is correct (the `*Fp8Blk` cases in
-                // interp.hip are outside `#if PLOW_FP8`, deliberately), but it is the opposite of
-                // what the object names suggest, and a whole campaign of decode-kernel arms was
-                // built into `interp_decode_fp8_gq.elf` and measured against a run that never
-                // opened it. Its ablation — delete the kernel entirely — read as "the packet costs
-                // the same", which was taken as evidence for a protocol floor that does not exist.
-                // Rebuilt into the object this line names, the same ablation moves the token by
-                // 11.8% (perf-data/plow-gfx942/glm52-packet-protocol-xcd.md).
-                tracing::info!(object = %name, ?phase, ?variant, ?prefill_arm, ?sched,
+        type LK = (HsaKernel, bool);
+        let mut load_one_in = |phase: Phase,
+                               sched: Sched,
+                               dir: &Path,
+                               gemv_need: Option<u32>|
+         -> Result<LK> {
+            let name = object_name(phase, variant, prefill_arm, sched);
+            let path = dir.join(&name);
+            // WHICH OBJECT, BY NAME, AT INFO — and this line is not cosmetic.
+            //
+            // `variant` and `prefill_arm` are DETECTED from the packet's opcodes
+            // ([`Variant::detect`]), so which object a run opens is a DERIVED fact, not a build
+            // choice, and nothing printed it. `Variant::detect` matches `GemvFp8` and the three
+            // fp8-KV flash ops; it does NOT match the block-scaled `*Fp8Blk` family, so a
+            // GLM-5.2 packet — every one of whose fp8 kernels is block-scaled — detects as
+            // `Bf16` and runs on `interp_decode_gq.elf`. That is correct (the `*Fp8Blk` cases in
+            // interp.hip are outside `#if PLOW_FP8`, deliberately), but it is the opposite of
+            // what the object names suggest, and a whole campaign of decode-kernel arms was
+            // built into `interp_decode_fp8_gq.elf` and measured against a run that never
+            // opened it. Its ablation — delete the kernel entirely — read as "the packet costs
+            // the same", which was taken as evidence for a protocol floor that does not exist.
+            // Rebuilt into the object this line names, the same ablation moves the token by
+            // 11.8% (perf-data/plow-gfx942/glm52-packet-protocol-xcd.md).
+            tracing::info!(object = %name, ?phase, ?variant, ?prefill_arm, ?sched,
                            "code object");
-                let image = std::fs::read(&path).map_err(|e| {
-                    if phase == Phase::Prefill && prefill_arm != PrefillArm::None {
-                        RuntimeError::Device(format!(
-                            "code object {}: {e} — this packet's prefill programs contain {} \
+            let image = std::fs::read(&path).map_err(|e| {
+                if phase == Phase::Prefill && prefill_arm != PrefillArm::None {
+                    RuntimeError::Device(format!(
+                        "code object {}: {e} — this packet's prefill programs contain {} \
                          opcodes, which requires {name} in {}, and it is not there. Build it \
                          (scripts/build_gfx950.sh with {}), or serve a packet that does not \
                          need it; falling back to an object without the arms is the AMD \
                          `default:`-does-not-trap bug this check exists to prevent.",
-                            path.display(),
-                            match prefill_arm {
-                                PrefillArm::MlaMoe => "MLA+MoE prefill",
-                                PrefillArm::Mla => "MLA prefill",
-                                PrefillArm::K3 => "Kimi-K3 block",
-                                PrefillArm::K3Moe => "Kimi-K3 block + grouped MoE prefill",
-                                PrefillArm::K3MoeA4w4 => "Kimi-K3 block + grouped A4W4 MoE prefill",
-                                PrefillArm::None => unreachable!(),
-                            },
-                            hsaco_dir.display(),
-                            match prefill_arm {
-                                PrefillArm::MlaMoe => "PLOW_MOE_PREFILL=1",
-                                PrefillArm::Mla => "PLOW_MLA_PREFILL=1",
-                                PrefillArm::K3 => "PLOW_K3=1 PLOW_MLA_PREFILL=1",
-                                PrefillArm::K3Moe => {
-                                    "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1"
-                                }
-                                PrefillArm::K3MoeA4w4 => {
-                                    "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1 \
+                        path.display(),
+                        match prefill_arm {
+                            PrefillArm::MlaMoe => "MLA+MoE prefill",
+                            PrefillArm::Mla => "MLA prefill",
+                            PrefillArm::K3 => "Kimi-K3 block",
+                            PrefillArm::K3Moe => "Kimi-K3 block + grouped MoE prefill",
+                            PrefillArm::K3MoeA4w4 => "Kimi-K3 block + grouped A4W4 MoE prefill",
+                            PrefillArm::None => unreachable!(),
+                        },
+                        hsaco_dir.display(),
+                        match prefill_arm {
+                            PrefillArm::MlaMoe => "PLOW_MOE_PREFILL=1",
+                            PrefillArm::Mla => "PLOW_MLA_PREFILL=1",
+                            PrefillArm::K3 => "PLOW_K3=1 PLOW_MLA_PREFILL=1",
+                            PrefillArm::K3Moe => {
+                                "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1"
+                            }
+                            PrefillArm::K3MoeA4w4 => {
+                                "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1 \
                                  PLOW_MOE_PF_A4W4=1 PLOW_MXFP4=1"
-                                }
-                                PrefillArm::None => unreachable!(),
-                            },
-                        ))
-                    } else {
-                        RuntimeError::Device(format!("code object {}: {e}", path.display()))
-                    }
+                            }
+                            PrefillArm::None => unreachable!(),
+                        },
+                    ))
+                } else {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                }
+            })?;
+            let syms = elf_symbol_names(&image);
+            if phase == Phase::Prefill {
+                prefill_moe_align_bm64 = syms.contains(&"plow_moe_align_bm64_1");
+            }
+            check_gate_hier_object(&syms, &path, phase, sched)?;
+            let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
+            if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
+                check_prefill_object(&syms, &path, req)?;
+            }
+            if let (Phase::Decode, Some(req)) = (phase, requires.as_ref()) {
+                check_decode_object(
+                    &syms,
+                    &path,
+                    req,
+                    need_moe_pf_atomic_decode,
+                    need_moe_pf_det_decode,
+                )?;
+            }
+            if phase == Phase::Decode && syms.contains(&XR_TAGGED_SYM) && tp.is_some() {
+                // A tagged one-shot object spins on data tags instead of the xctr gate;
+                // it finds its region from the status id every collective carries and
+                // needs a blob whose XReduce packets keep the parity/width contract.
+                // Refuse here rather than trap on the device.
+                super::amd_tp::check_xr_tagged_blob(&blob.progs, blob.tp.map_or(0, |b| b.hidden))
+                    .map_err(|e| {
+                    RuntimeError::Device(format!("{} ({XR_TAGGED_SYM}): {e}", path.display()))
                 })?;
-                let syms = elf_symbol_names(&image);
-                if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
-                    check_prefill_object(&syms, &path, req)?;
-                }
-                if let (Phase::Decode, Some(req)) = (phase, requires.as_ref()) {
-                    check_decode_object(&syms, &path, req)?;
-                }
-                // The W_ofold fusion's arm lives in the FLASH object (the V2 MLA-prefill arm's
-                // ofold epilogue), and it additionally needs the V2 routing itself: without
-                // PLOW_MLA_PF_V2=1 the MLA segments run on the 8-wave prefill kernel, which
-                // ignores packet i[6] and leaves unnormalized f32 partials for the fused GEMM
-                // to read as bf16 — finite, fluent, wrong. Both must hold to serve this blob.
-                if let (Phase::Flash, Some(req)) = (phase, requires.as_ref()) {
-                    if req.iter().any(|r| r == "PLOW_GLM_OFOLD=1") {
-                        if !crate::config::RuntimeConfig::get().amd.mla_pf_v2 {
-                            return Err(RuntimeError::Device(
-                                "this packet fuses MlaMergeFold+o_proj (W_ofold) and REQUIRES the \
+            }
+            // The W_ofold fusion's arm lives in the FLASH object (the V2 MLA-prefill arm's
+            // ofold epilogue), and it additionally needs the V2 routing itself: without
+            // PLOW_MLA_PF_V2=1 the MLA segments run on the 8-wave prefill kernel, which
+            // ignores packet i[6] and leaves unnormalized f32 partials for the fused GEMM
+            // to read as bf16 — finite, fluent, wrong. Both must hold to serve this blob.
+            if let (Phase::Flash, Some(req)) = (phase, requires.as_ref()) {
+                if req.iter().any(|r| r == "PLOW_GLM_OFOLD=1") {
+                    if !crate::config::RuntimeConfig::get().amd.mla_pf_v2 {
+                        return Err(RuntimeError::Device(
+                            "this packet fuses MlaMergeFold+o_proj (W_ofold) and REQUIRES the \
                              V2 MLA-prefill routing: serve with PLOW_MLA_PF_V2=1, or emit \
                              without PLOW_GLM_OFOLD"
-                                    .into(),
-                            ));
-                        }
-                        if !syms.iter().any(|s| s.contains("plow_glm_ofold_arm")) {
-                            return Err(RuntimeError::Device(format!(
-                                "packet/object MISMATCH: this packet requires PLOW_GLM_OFOLD=1 \
+                                .into(),
+                        ));
+                    }
+                    if !syms.iter().any(|s| s.contains("plow_glm_ofold_arm")) {
+                        return Err(RuntimeError::Device(format!(
+                            "packet/object MISMATCH: this packet requires PLOW_GLM_OFOLD=1 \
                              but {} lacks the ofold-aware V2 arm (plow_glm_ofold_arm) — its \
                              flash would write unnormalized f32 partials that the fused \
                              o-GEMM reads as bf16 garbage. Rebuild the flash object from a \
                              tree that carries the arm.",
-                                path.display()
-                            )));
-                        }
+                            path.display()
+                        )));
                     }
                 }
-                // The object's compiled row bucket vs the widest GEMV it will run.
-                // Every phase, not just decode: `case PLOW_DOP_GEMV` is unconditional
-                // in the prefill bucket too.
+            }
+            // The standalone flash object contains only flash-prefill arms. Model and
+            // GEMV capability checks belong to the general prefill/decode objects; applying
+            // them here rejects the intentionally model-neutral flash object.
+            if phase != Phase::Flash {
                 let need = match phase {
                     Phase::Decode => gemv_need.unwrap_or(need_m_decode),
-                    Phase::Prefill | Phase::Flash => need_m_prefill,
+                    Phase::Prefill => need_m_prefill,
+                    Phase::Flash => unreachable!(),
                 };
                 check_gemv_capacity(&syms, &path, need)?;
-                // Whether this object carries the PLOW_K3 arms the packet dispatches. Refused here
-                // rather than tolerated, because AMD's dispatch default is a silent NOP: the run
-                // would otherwise complete on untouched buffers instead of failing.
-                let need_k3 = match phase {
-                    Phase::Decode => need_k3_decode,
-                    Phase::Prefill | Phase::Flash => need_k3_prefill,
+            }
+            if phase == Phase::Decode {
+                check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;
+            }
+            // Whether this object carries the PLOW_K3 arms the packet dispatches. Refused here
+            // rather than tolerated, because AMD's dispatch default is a silent NOP: the run
+            // would otherwise complete on untouched buffers instead of failing.
+            let need_k3 = match phase {
+                Phase::Decode => need_k3_decode,
+                Phase::Prefill => need_k3_prefill,
+                Phase::Flash => None,
+            };
+            check_k3_arms(&syms, &path, need_k3)?;
+            if phase != Phase::Flash {
+                let phase_progs = if phase == Phase::Decode {
+                    &blob.progs[dec_ix..]
+                } else {
+                    &blob.progs[..dec_ix]
                 };
-                check_k3_arms(&syms, &path, need_k3)?;
-                if phase == Phase::Decode {
-                    check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
-                    check_kda_conv_step_db(&syms, &path, need_kda_conv_step_db, legacy_kda_decode)?;
-                }
-                let (need_gm, need_gmpf) = match phase {
-                    Phase::Decode => (need_gm_decode, need_gmpf_decode),
-                    Phase::Prefill | Phase::Flash => (need_gm_prefill, need_gmpf_prefill),
-                };
-                check_moe_gemma_arms(&syms, &path, need_gm, need_gmpf)?;
-                if phase == Phase::Flash && need_mla_v2 && !syms.contains(&MLA_PF_V2_SYM) {
-                    return Err(RuntimeError::Device(format!(
-                        "PLOW_MLA_PF_V2=1 routes FlashMlaPrefill segments to {}, but it was \
+                check_compiled_opcode_markers(&syms, &path, phase_progs)?;
+                check_materialized_residual_input(&syms, &path, phase_progs)?;
+            }
+            let need_chunk = match phase {
+                Phase::Decode => need_kda_chunk_decode,
+                Phase::Prefill => need_kda_chunk_prefill,
+                Phase::Flash => None,
+            };
+            check_kda_chunk(&syms, &path, need_chunk)?;
+            if phase == Phase::Decode {
+                check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
+                check_kda_conv_step_db(&syms, &path, need_kda_conv_step_db, legacy_kda_decode)?;
+            }
+            let (need_gm, need_gmpf) = match phase {
+                Phase::Decode => (need_gm_decode, need_gmpf_decode),
+                Phase::Prefill => (need_gm_prefill, need_gmpf_prefill),
+                Phase::Flash => (None, None),
+            };
+            check_moe_gemma_arms(&syms, &path, need_gm, need_gmpf)?;
+            if phase == Phase::Flash && need_mla_v2 && !syms.contains(&MLA_PF_V2_SYM) {
+                return Err(RuntimeError::Device(format!(
+                    "PLOW_MLA_PF_V2=1 routes FlashMlaPrefill segments to {}, but it was \
                      compiled without the V2 arm (no `{MLA_PF_V2_SYM}`). The dispatch default \
                      writes NOTHING, so those packets would silently skip. Rebuild the flash \
-                     object (scripts/build_gfx942.sh adds -DPLOW_MLA_PF_V2_ARM=1) or unset \
-                     PLOW_MLA_PF_V2.",
-                        path.display()
-                    )));
-                }
-                if phase == Phase::Flash && need_mla_v2_fp8 && !syms.contains(&MLA_PF_V2_FP8_SYM) {
-                    return Err(RuntimeError::Device(format!(
-                        "PLOW_MLA_PF_V2=1 routes FlashMlaPrefillFp8 segments to {}, but it was \
+                     object (`-DPLOW_MLA_PF_V2_ARM=ON` in runtime/CMakeLists.txt; \
+                     scripts/build_gfx942.sh enables it) or unset PLOW_MLA_PF_V2.",
+                    path.display()
+                )));
+            }
+            if phase == Phase::Flash && need_mla_v2_fp8 && !syms.contains(&MLA_PF_V2_FP8_SYM) {
+                return Err(RuntimeError::Device(format!(
+                    "PLOW_MLA_PF_V2=1 routes FlashMlaPrefillFp8 segments to {}, but it was \
                      compiled without the fp8 V2 arm (no `{MLA_PF_V2_FP8_SYM}`). Rebuild the \
                      fp8-KV flash object or unset PLOW_MLA_PF_V2.",
-                        path.display()
-                    )));
-                }
-                // L2-PLACED BLOB vs OBJECT. This is the guard the PLOW_L2_PLACE_DISPATCH env var used
-                // to stand in for, moved to where it can be VERIFIED. A placed program's `seg` is an
-                // L2 domain, not a wave class, so an object built without the axis would run every
-                // packet on the wrong domain -- plausible output, inverted locality, no error.
-                let phase_l2_placed = match phase {
-                    Phase::Decode => decode_l2_placed,
-                    Phase::Prefill | Phase::Flash => prefill_l2_placed,
-                };
-                if phase_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
-                    return Err(RuntimeError::Device(format!(
+                    path.display()
+                )));
+            }
+            // L2-PLACED BLOB vs OBJECT. This is the guard the PLOW_L2_PLACE_DISPATCH env var used
+            // to stand in for, moved to where it can be VERIFIED. A placed program's `seg` is an
+            // L2 domain, not a wave class, so an object built without the axis would run every
+            // packet on the wrong domain -- plausible output, inverted locality, no error.
+            let phase_l2_placed = match phase {
+                Phase::Decode => decode_l2_placed,
+                Phase::Prefill | Phase::Flash => prefill_l2_placed,
+            };
+            if phase_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
+                return Err(RuntimeError::Device(format!(
                     "{}: blob uses L2-domain packet placement (PLOW_L2_PLACE) but this object was \
                      built WITHOUT -DPLOW_L2_PLACE_DISPATCH — its `seg` would be read as a \
                      wave class and every packet would land on the wrong domain. Rebuild the \
@@ -4055,76 +8084,84 @@ impl AmdEngine {
                      model with PLOW_L2_PLACE=0.",
                     path.display()
                 )));
-                }
-                // Whether this object's KV ENCODING matches the packet's. Both directions — the axis
-                // is a swap, so each object is missing an arm the other has.
-                let (need_fp8, need_bf16) = match phase {
-                    Phase::Decode => (need_fp8kv_decode, need_bf16kv_decode),
-                    Phase::Prefill | Phase::Flash => (need_fp8kv_prefill, need_bf16kv_prefill),
-                };
-                check_kv_encoding(&syms, &path, need_fp8, need_bf16)?;
-                let m = EngineDevice::module_load(&*be, &image).map_err(|e| {
-                    RuntimeError::Device(format!(
-                        "{name}: {e} — a BUNDLED object gives exactly this; was it \
+            }
+            // Whether this object's KV ENCODING matches the packet's. Both directions — the axis
+            // is a swap, so each object is missing an arm the other has.
+            let (need_fp8, need_bf16) = match phase {
+                Phase::Decode => (need_fp8kv_decode, need_bf16kv_decode),
+                Phase::Prefill | Phase::Flash => (need_fp8kv_prefill, need_bf16kv_prefill),
+            };
+            check_kv_encoding(&syms, &path, need_fp8, need_bf16)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let m = EngineDevice::module_load(&*be, &image).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "{name}: {e} — a BUNDLED object gives exactly this; was it \
                      run through clang-offload-bundler --unbundle?"
-                    ))
-                })?;
-                let sym = symbol_name(phase, sched, &arch);
-                let k = EngineDevice::get_function(&*be, &m, &sym)
-                    .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {sym}: {e}")))?;
-                if phase == Phase::Decode && tp_audit_compact && k_xaudit.is_none() {
-                    k_xaudit = Some(
-                        EngineDevice::get_function(&*be, &m, "plow_xctr_audit").map_err(|e| {
-                            RuntimeError::Device(format!(
+                ))
+            })?;
+            let sym = symbol_name(phase, sched, &arch);
+            let k = EngineDevice::get_function(&*be, &m, &sym)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {sym}: {e}")))?;
+            if phase == Phase::Decode && tp_audit_compact && k_xaudit.is_none() {
+                k_xaudit = Some(
+                    EngineDevice::get_function(&*be, &m, "plow_xctr_audit").map_err(|e| {
+                        RuntimeError::Device(format!(
                             "{name}: compact TP audit requested but plow_xctr_audit is absent: {e}"
                         ))
-                        })?,
-                    );
-                }
-                if phase == Phase::Decode && state_clear_device && k_state_clear.is_none() {
-                    k_state_clear = Some(
-                        EngineDevice::get_function(&*be, &m, "plow_state_clear").map_err(|e| {
-                            RuntimeError::Device(format!(
-                                "{name}: device recurrent-state clear requested but \
+                    })?,
+                );
+            }
+            if phase == Phase::Decode && state_clear_device && k_state_clear.is_none() {
+                k_state_clear = Some(
+                    EngineDevice::get_function(&*be, &m, "plow_state_clear").map_err(|e| {
+                        RuntimeError::Device(format!(
+                            "{name}: device recurrent-state clear requested but \
                                  plow_state_clear is absent: {e}. Rebuild the decode object"
-                            ))
-                        })?,
-                    );
-                }
-                // STALE-OBJECT REFUSAL. An object's kernarg segment is its explicit
-                // args, 8-aligned, plus the COv5 implicit block — a FIXED 256 B tail
-                // that hipcc emits only when the kernel uses a hidden arg (the flash
-                // object does not, and reports the bare struct size; prefill and
-                // decode do, and report that + 256). Those are the only two legal
-                // values for a kernel whose one argument is `PlowProgram`, and both
-                // are DERIVED from `size_of::<DevProgram>()` below rather than
-                // written as literals — the struct has grown twice already
-                // (128 -> 136 with `seg_ofs`, 136 -> 144 with `l2_domains`), and a
-                // literal here goes stale exactly when it is most needed.
-                //
-                // This matters because the launcher writes that implicit block at
-                // OUR `size_of::<DevProgram>()`. An object built against a different
-                // struct loads and resolves happily, then reads its own fields, or
-                // its block/grid dimensions, from the wrong offsets and faults
-                // somewhere unrelated. Refuse it by name here instead.
-                const IMPLICIT: u32 = 256;
-                let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
-                let got = k.kernarg_size();
-                if got != want && got != want + IMPLICIT {
-                    return Err(RuntimeError::Device(format!(
+                        ))
+                    })?,
+                );
+            }
+            if phase == Phase::Decode
+                && k_token_capture.is_none()
+                && syms.contains(&"plow_token_capture")
+            {
+                k_token_capture = Some(EngineDevice::get_function(&*be, &m, "plow_token_capture")?);
+            }
+            // STALE-OBJECT REFUSAL. An object's kernarg segment is its explicit
+            // args, 8-aligned, plus the COv5 implicit block — a FIXED 256 B tail
+            // that hipcc emits only when the kernel uses a hidden arg (the flash
+            // object does not, and reports the bare struct size; prefill and
+            // decode do, and report that + 256). Those are the only two legal
+            // values for a kernel whose one argument is `PlowProgram`, and both
+            // are DERIVED from `size_of::<DevProgram>()` below rather than
+            // written as literals — the struct has grown twice already
+            // (128 -> 136 with `seg_ofs`, 136 -> 144 with `l2_domains`), and a
+            // literal here goes stale exactly when it is most needed.
+            //
+            // This matters because the launcher writes that implicit block at
+            // OUR `size_of::<DevProgram>()`. An object built against a different
+            // struct loads and resolves happily, then reads its own fields, or
+            // its block/grid dimensions, from the wrong offsets and faults
+            // somewhere unrelated. Refuse it by name here instead.
+            const IMPLICIT: u32 = 256;
+            let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+            let got = k.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
                     "{name}: kernarg segment is {got} B; this build's PlowProgram needs {want} \
                      (or {} with the COv5 implicit block) — the code object is STALE. Rebuild it \
                      with scripts/build_gfx950.sh. A mismatched object does not fail to load; it \
                      faults mid-run.",
                     want + IMPLICIT
                 )));
-                }
-                modules.push(m);
-                Ok(k)
-            };
+            }
+            modules.push(m);
+            Ok((k, packed_prefill_abi))
+        };
 
-        let k_prefill = load_one_in(Phase::Prefill, sched_prefill, hsaco_dir, None)?;
-        let k_decode = load_one_in(Phase::Decode, sched_decode, hsaco_dir, None)?;
+        let (k_prefill, packed_prefill_prefill_abi) =
+            load_one_in(Phase::Prefill, sched_prefill, hsaco_dir, None)?;
+        let (k_decode, _) = load_one_in(Phase::Decode, sched_decode, hsaco_dir, None)?;
         // Task-13: the low-rung decode tier ladder. Each tier's pairing checks
         // run with ITS need (the widest rung it will serve), not the blob-wide
         // max — an MM=4 object legitimately serves rungs 1-2 of a B=32 blob.
@@ -4154,20 +8191,1116 @@ impl AmdEngine {
             }
             tiers.sort_by_key(|&(_, m)| m);
             for (d, max) in tiers {
-                let k = load_one_in(Phase::Decode, sched_decode, Path::new(&d), Some(max))?;
+                let (k, _) = load_one_in(Phase::Decode, sched_decode, Path::new(&d), Some(max))?;
                 decode_tiers.push((max, k));
             }
         }
         // Flash follows the PREFILL scheduler — a flash segment is a prefill
         // segment. Optional: without it every segment runs class 8, which is
         // correct and merely slower.
-        let k_flash = match load_one_in(Phase::Flash, sched_prefill, hsaco_dir, None) {
-            Ok(k) => Some(k),
-            Err(e) => {
-                tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
-                None
+        let flash_load = load_one_in(Phase::Flash, sched_prefill, hsaco_dir, None);
+        let flash_error = flash_load.as_ref().err().map(ToString::to_string);
+        let k_flash =
+            resolve_flash_object_load(flash_load, need_mla_v2 || need_mla_v2_fp8)?.map(|(k, _)| k);
+        if let (None, Some(e)) = (&k_flash, flash_error) {
+            tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
+        }
+        drop(load_one_in);
+
+        let k_decode_mla = if need_decode_mla_segments {
+            const MARKER: &str = "plow_decode_mla_segment_object_1";
+            let name = format!("interp_decode_mla{}.elf", sched_decode.suffix());
+            let path = hsaco_dir.join(&name);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "decode MLA segments require packet-paired object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&MARKER)
+                || !syms.contains(&"plow_packet_hash_lo")
+                || !syms.contains(&"plow_packet_hash_hi")
+            {
+                return Err(RuntimeError::Device(format!(
+                    "{} is not a packet-paired decode MLA segment object",
+                    path.display()
+                )));
             }
+            check_gate_hier_object(&syms, &path, Phase::Decode, sched_decode)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let symbol = format!("plow_interp_decode_mla_{arch}{}", sched_decode.suffix());
+            let kernel = EngineDevice::get_function(&*be, &module, &symbol)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: kernarg segment is {got} B; decode MLA interpreter needs {want} (or {} with implicit args)",
+                    want + IMPLICIT
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
         };
+
+        let k_xreduce_wave_rs = if need_xreduce_wave_rs {
+            const MARKER: &str = "plow_xreduce_wave_rs_segments_1";
+            let name = format!("interp_xreduce{}.elf", sched_prefill.suffix());
+            let path = hsaco_dir.join(&name);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "marked XReduceTwoShot segments require {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&MARKER)
+                || !syms.contains(&"plow_packet_hash_lo")
+                || !syms.contains(&"plow_packet_hash_hi")
+            {
+                return Err(RuntimeError::Device(format!(
+                    "{} is not a packet-paired XReduce wave-RS segment object",
+                    path.display()
+                )));
+            }
+            if need_graph_phase_xreduce {
+                for marker in [
+                    "plow_phase_inventory_xreduce_only_1",
+                    "plow_phase_xreduce_wave64_occ2_nospill_1",
+                ] {
+                    if !syms.contains(&marker) {
+                        return Err(RuntimeError::Device(format!(
+                            "{} lacks graph phase-object marker `{marker}`",
+                            path.display()
+                        )));
+                    }
+                }
+                check_compiled_opcode_marker_set(&syms, &path, [DevOp::XReduceTwoShot])?;
+            }
+            if prefill_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
+                return Err(RuntimeError::Device(format!(
+                    "{} lacks `{L2_DISPATCH_SYM}` for an L2-placed packet",
+                    path.display()
+                )));
+            }
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let symbol = format!("plow_interp_xreduce_{arch}{}", sched_prefill.suffix());
+            let kernel = EngineDevice::get_function(&*be, &module, &symbol)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            const MAX_LDS: u32 = 16 * 1024;
+            let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: kernarg segment is {got} B; XReduce interpreter needs {want} (or {} with implicit args)",
+                    want + IMPLICIT
+                )));
+            }
+            let lds = HsaBackend::kernel_lds_bytes(&kernel);
+            if lds > MAX_LDS || kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: XReduce specialist resource gate failed: lds={lds}, private={} B",
+                    kernel.private_segment_size()
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let k_mla_v2_sv_raw = if arch == "gfx950" && variant != Variant::Fp8Kv && need_mla_v2 {
+            let name = format!("interp_mla_v2_sv{}.elf", sched_prefill.suffix());
+            let path = hsaco_dir.join(&name);
+            if !path.exists() {
+                tracing::info!(object = %path.display(),
+                    "no raw MLA V2+SV object — pure segments use the interpreter fallback");
+                None
+            } else {
+                let load = (|| -> Result<(Module, HsaKernel)> {
+                    let image = std::fs::read(&path).map_err(|e| {
+                        RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                    })?;
+                    let syms = elf_symbol_names(&image);
+                    check_mla_v2_sv_raw_symbols(&syms, &path, prefill_l2_placed)?;
+                    check_packet_pairing_stamp(&image, blob_path, &path)?;
+                    let module = EngineDevice::module_load(&*be, &image)?;
+                    let symbol = symbol_name(Phase::Flash, sched_prefill, &arch);
+                    let kernel =
+                        EngineDevice::get_function(&*be, &module, &symbol).map_err(|e| {
+                            RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}"))
+                        })?;
+                    const IMPLICIT: u32 = 256;
+                    // The GQ twin contributes one 8-byte shared cursor after the 58,368-byte
+                    // flash arena; the static twin contains only the arena.
+                    const MAX_LDS: u32 = 58_376;
+                    let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+                    let got = kernel.kernarg_size();
+                    if got != want && got != want + IMPLICIT {
+                        return Err(RuntimeError::Device(format!(
+                            "{name}: kernarg segment is {got} B; raw MLA ABI needs {want} \
+                             (or {} with COv5 implicit args)",
+                            want + IMPLICIT
+                        )));
+                    }
+                    let lds = HsaBackend::kernel_lds_bytes(&kernel);
+                    if lds > MAX_LDS || kernel.private_segment_size() != 0 {
+                        return Err(RuntimeError::Device(format!(
+                            "{name}: raw MLA resource gate failed: LDS={lds} (max {MAX_LDS}), \
+                             private={} (required 0)",
+                            kernel.private_segment_size()
+                        )));
+                    }
+                    Ok((module, kernel))
+                })();
+                match load {
+                    Ok((module, kernel)) => {
+                        modules.push(module);
+                        Some(kernel)
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e,
+                            "raw MLA V2+SV object rejected — using the interpreter fallback");
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut packed_kda_ops: Vec<DevOp> = blob.progs[..dec_ix]
+            .iter()
+            .flat_map(|prog| &prog.insts)
+            .filter_map(|inst| DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op))
+            .filter(|op| {
+                matches!(
+                    op,
+                    DevOp::KdaStateStep
+                        | DevOp::KdaConv3
+                        | DevOp::KdaStateStepG
+                        | DevOp::KdaChunkPrepare
+                        | DevOp::KdaChunkIntra
+                        | DevOp::KdaChunkWu
+                        | DevOp::KdaChunkCarry
+                )
+            })
+            .collect();
+        packed_kda_ops.sort_unstable_by_key(|op| *op as u16);
+        packed_kda_ops.dedup_by_key(|op| *op as u16);
+        let mut load_packed_family = |stem: &str,
+                                      symbol_base: &str,
+                                      markers: &[&str],
+                                      fp8_kv: Option<bool>,
+                                      required_ops: &[DevOp]|
+         -> Result<Option<HsaKernel>> {
+            let name = format!("{stem}{}.elf", sched_prefill.suffix());
+            let path = hsaco_dir.join(&name);
+            if !path.exists() {
+                return Ok(None);
+            }
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!("code object {}: {e}", path.display()))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&PACKED_PREFILL_ABI_SYM)
+                || markers.iter().any(|marker| !syms.contains(marker))
+            {
+                return Err(RuntimeError::Device(format!(
+                    "packed-prefill family object {} must advertise `{PACKED_PREFILL_ABI_SYM}` \
+                         and markers {:?}; refusing a stale or wrong-family object",
+                    path.display(),
+                    markers
+                )));
+            }
+            check_compiled_opcode_marker_set(&syms, &path, required_ops.iter().copied())?;
+            if let Some(want_fp8) = fp8_kv {
+                let has_fp8 = syms.contains(&FP8_KV_SYM);
+                check_packed_family_kv_encoding(has_fp8, want_fp8)
+                    .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            }
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let symbol = format!("{symbol_base}_{arch}{}", sched_prefill.suffix());
+            let kernel = EngineDevice::get_function(&*be, &module, &symbol)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: kernarg segment is {got} B; packed family ABI needs {want} \
+                         (or {} with implicit args)",
+                    want + IMPLICIT
+                )));
+            }
+            modules.push(module);
+            Ok(Some(kernel))
+        };
+        let packed_kv_infix = if variant == Variant::Fp8Kv {
+            "_fp8kv"
+        } else {
+            ""
+        };
+        let packed_route = crate::config::RuntimeConfig::get().amd.packed_prefill_route;
+        let kda_family_route = crate::config::RuntimeConfig::get().amd.kda_family_route;
+        let k_packed_mla_norm = if packed_route {
+            load_packed_family(
+                &format!("interp_packed_mla_norm{packed_kv_infix}"),
+                "plow_interp_packed_mla_norm",
+                &[PACKED_PREFILL_MLA_NORM_SEG_SYM],
+                Some(variant == Variant::Fp8Kv),
+                &[],
+            )?
+        } else {
+            None
+        };
+        let k_packed_mla_flash = if packed_route {
+            load_packed_family(
+                &format!("interp_packed_mla_flash{packed_kv_infix}"),
+                "plow_interp_packed_mla_flash",
+                &[PACKED_PREFILL_MLA_FLASH_SEG_SYM],
+                Some(variant == Variant::Fp8Kv),
+                &[],
+            )?
+        } else {
+            None
+        };
+        let kda_qpre_required = requires.as_ref().is_some_and(|requires| {
+            requires
+                .iter()
+                .any(|requirement| requirement == "PLOW_KDA_CHUNK_QPRE=1")
+        });
+        let k_packed_kda = if packed_route || kda_family_route {
+            let marker = if need_kda_chunk_prefill.is_some() {
+                PACKED_PREFILL_KDA_CHUNK_SEG_SYM
+            } else {
+                PACKED_PREFILL_KDA_SEG_SYM
+            };
+            let mut markers = vec![KDA_FAMILY_SEG_SYM, marker];
+            if kda_qpre_required {
+                markers.push(KDA_CHUNK_QPRE_SYM);
+            }
+            load_packed_family(
+                "interp_packed_kda",
+                "plow_interp_packed_kda",
+                &markers,
+                None,
+                &packed_kda_ops,
+            )?
+        } else {
+            None
+        };
+        drop(load_packed_family);
+        let k_xr_attnres = if need_xr_attnres {
+            const NAME: &str = "xreduce_attnres_gfx950.elf";
+            const SYMBOL: &str = "plow_xreduce_attnres_gfx950";
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "fused XReduceTwoShot+AttnRes has no qualified object for {arch}"
+                )));
+            }
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                return Err(RuntimeError::Device(format!(
+                    "fused XReduceTwoShot+AttnRes requires {NAME}"
+                )));
+            }
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!("code object {}: {e}", path.display()))
+            })?;
+            let syms = elf_symbol_names(&image);
+            for marker in [XR_ATTNRES_SEG_SYM, XR_ATTNRES_RESOURCE_SYM] {
+                if !syms.contains(&marker) {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME} lacks required ABI/resource marker `{marker}`"
+                    )));
+                }
+            }
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            let got = kernel.kernarg_size();
+            if got != 8 && got != 264 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; raw XR+AttnRes ABI needs 8 (or 264 with implicit args)"
+                )));
+            }
+            if kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: private segment is {} B; raw XR+AttnRes requires zero",
+                    kernel.private_segment_size()
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let k_kda_decode_fused = if need_kda_decode_fused.is_some() {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "KdaDecodeFused opcode 125 requires gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "kda_decode_fused_gfx950.elf";
+            const MARKER: &str = "plow_kda_decode_fused_256x16_2";
+            const SYMBOL: &str = "plow_kda_decode_fused_256x16_v2";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "opcode 125 requires standalone object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "standalone KDA object {} does not advertise required marker `{MARKER}`;                      refusing a missing, wrong, or stale object",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            let want = (std::mem::size_of::<KdaDecodeFusedArgs>() as u32 + 7) & !7;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; fused KDA ABI needs {want}                      (or {} with COv5 implicit args). Rebuild the standalone object.",
+                    want + IMPLICIT
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let (k_grouped_moe_glu, k_grouped_moe_down) = if need_grouped_moe {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "standalone grouped MXFP4 MoE requires gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "moe_decode_grouped_mxfp4_gfx950.elf";
+            const MARKER: &str = "plow_moe_decode_grouped_mxfp4_abi_1";
+            const GLU: &str = "plow_moe_decode_grouped_glu_mxfp4_gfx950";
+            const DOWN: &str = "plow_moe_decode_grouped_down_mxfp4_gfx950";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "grouped MoE segment requires {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "{} lacks required ABI/resource marker `{MARKER}`",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let glu = EngineDevice::get_function(&*be, &module, GLU)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {GLU}: {e}")))?;
+            let down = EngineDevice::get_function(&*be, &module, DOWN)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {DOWN}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            for (kernel, want, role) in [
+                (glu, std::mem::size_of::<GroupedMoeGluArgs>() as u32, "GLU"),
+                (
+                    down,
+                    std::mem::size_of::<GroupedMoeDownArgs>() as u32,
+                    "DOWN",
+                ),
+            ] {
+                let got = kernel.kernarg_size();
+                if got != want && got != want + IMPLICIT {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: {role} kernarg segment is {got} B; expected {want} (or {} with implicit args)",
+                        want + IMPLICIT
+                    )));
+                }
+                if kernel.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: {role} private segment is {} B; zero scratch is required",
+                        kernel.private_segment_size()
+                    )));
+                }
+            }
+            modules.push(module);
+            (Some(glu), Some(down))
+        } else {
+            (None, None)
+        };
+
+        let k_kda_chunk_intra_cached = if arch == "gfx950" {
+            const NAME: &str = "kda_chunk_intra_cached_gfx950.elf";
+            const SYMBOL: &str = "plow_kda_chunk_intra_cached_gfx950";
+            const MARKERS: [&str; 6] = [
+                "plow_kda_intra_cached_abi_1",
+                "plow_kda_intra_cached_bt64_d128_1",
+                "plow_kda_intra_cached_wave64_1",
+                "plow_kda_intra_cached_no_spill_1",
+                "plow_kda_intra_cached_static_lds_114688",
+                "plow_kda_intra_cached_vgpr_le_96",
+            ];
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                None
+            } else {
+                let load = (|| -> Result<(Module, HsaKernel)> {
+                    let image = std::fs::read(&path).map_err(|e| {
+                        RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                    })?;
+                    let syms = elf_symbol_names(&image);
+                    for marker in MARKERS {
+                        if !syms.contains(&marker) {
+                            return Err(RuntimeError::Device(format!(
+                                "cached KDA-intra object {} lacks required ABI/resource marker `{marker}`",
+                                path.display()
+                            )));
+                        }
+                    }
+                    let module = EngineDevice::module_load(&*be, &image)?;
+                    let kernel =
+                        EngineDevice::get_function(&*be, &module, SYMBOL).map_err(|e| {
+                            RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}"))
+                        })?;
+                    let want = std::mem::size_of::<KdaChunkIntraCachedArgs>() as u32;
+                    let got = kernel.kernarg_size();
+                    let lds = HsaBackend::kernel_lds_bytes(&kernel);
+                    let private = kernel.private_segment_size();
+                    if got != want && got != want + 256 {
+                        return Err(RuntimeError::Device(format!(
+                            "{NAME}: kernarg segment is {got} B; cached KDA-intra ABI needs {want} (or {} with COv5 implicit args)",
+                            want + 256
+                        )));
+                    }
+                    if lds != 114_688 || private != 0 {
+                        return Err(RuntimeError::Device(format!(
+                            "{NAME}: resource gate failed: LDS={lds} (required 114688), private={private} (required 0)"
+                        )));
+                    }
+                    Ok((module, kernel))
+                })();
+                match load {
+                    Ok((module, kernel)) => {
+                        tracing::info!(
+                            object = %path.display(),
+                            symbol = SYMBOL,
+                            "cached KDA-intra object accepted"
+                        );
+                        modules.push(module);
+                        Some(kernel)
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "cached KDA-intra object rejected — using interpreter fallback");
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        let k_kda_chunk_intra_wave_items = if need_kda_intra_wave_items {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "marked KDA-intra wave-item segments require gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "kda_chunk_intra_wave_items_gfx950.elf";
+            const SYMBOL: &str = "plow_kda_chunk_intra_wave_items_gfx950";
+            let path = hsaco_dir.join(NAME);
+            let image = read_kda_intra_wave_items_object(&path)?;
+            let syms = elf_symbol_names(&image);
+            check_kda_intra_wave_items_symbols(&syms, &path)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            let want = std::mem::size_of::<KdaChunkIntraCachedArgs>() as u32;
+            let got = kernel.kernarg_size();
+            let lds = HsaBackend::kernel_lds_bytes(&kernel);
+            let private = kernel.private_segment_size();
+            if got != want && got != want + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; wave-item KDA-intra ABI needs {want} (or {} with COv5 implicit args)",
+                    want + 256
+                )));
+            }
+            if lds != 131_072 || private != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: resource gate failed: LDS={lds} (required 131072), private={private} (required 0)"
+                )));
+            }
+            tracing::info!(
+                object = %path.display(),
+                symbol = SYMBOL,
+                "KDA-intra wave-item object accepted"
+            );
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let k_kda_chunk_carry_regstate = if need_kda_carry_regstate {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "marked KDA carry regstate segments require gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "kda_chunk_carry_regstate_gfx950.elf";
+            const SYMBOL: &str = "plow_kda_chunk_carry_regstate_gfx950";
+            let path = hsaco_dir.join(NAME);
+            let image = read_kda_carry_regstate_object(&path)?;
+            let syms = elf_symbol_names(&image);
+            check_kda_carry_regstate_symbols(&syms, &path)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            let want = std::mem::size_of::<KdaChunkCarryRegstateArgs>() as u32;
+            let got = kernel.kernarg_size();
+            let lds = HsaBackend::kernel_lds_bytes(&kernel);
+            let private = kernel.private_segment_size();
+            if got != want && got != want + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; KDA carry regstate ABI needs {want} (or {} with COv5 implicit args)",
+                    want + 256
+                )));
+            }
+            if lds != KDA_CARRY_REGSTATE_LDS || private != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: resource gate failed: LDS={lds} (required {KDA_CARRY_REGSTATE_LDS}), private={private} (required 0)"
+                )));
+            }
+            tracing::info!(
+                object = %path.display(),
+                symbol = SYMBOL,
+                "KDA carry regstate object accepted"
+            );
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
+
+        let need_kda_key_factor = arch == "gfx950"
+            && blob.progs[..dec_ix]
+                .iter()
+                .any(|p| !kda_key_factor_segment_pairs(p).is_empty());
+        let (k_kda_key_factor_wu, k_kda_key_factor_carry) = if need_kda_key_factor {
+            const COMMON: [&str; 7] = [
+                "plow_kda_key_factor_abi_1",
+                "plow_kda_key_factor_pair_1",
+                "plow_kda_key_factor_bt64_d128_v128_1",
+                "plow_kda_key_factor_qpre_1",
+                "plow_kda_key_factor_wave64_1",
+                "plow_kda_key_factor_nospill_1",
+                "plow_kda_key_factor_scratch_pair_bf16_1",
+            ];
+            let specs = [
+                (
+                    "kda_chunk_key_factor_wu_gfx950.elf",
+                    "plow_kda_chunk_key_factor_wu_gfx950",
+                    "plow_kda_key_factor_wu_1",
+                    "plow_kda_key_factor_wu_vgpr_le_160",
+                    std::mem::size_of::<KdaChunkKeyFactorWuArgs>() as u32,
+                    0,
+                ),
+                (
+                    "kda_chunk_key_factor_carry_gfx950.elf",
+                    "plow_kda_chunk_key_factor_carry_gfx950",
+                    "plow_kda_key_factor_carry_1",
+                    "plow_kda_key_factor_carry_vgpr_le_160",
+                    std::mem::size_of::<KdaChunkKeyFactorCarryArgs>() as u32,
+                    14_336,
+                ),
+            ];
+            let paths = specs.map(|spec| hsaco_dir.join(spec.0));
+            match (paths[0].exists(), paths[1].exists()) {
+                (false, false) => {
+                    tracing::warn!(
+                        "KDA key-factor segments have no paired objects — using interpreter fallback"
+                    );
+                    (None, None)
+                }
+                (a, b) if a != b => {
+                    return Err(RuntimeError::Device(format!(
+                        "KDA key-factor object pair is incomplete: {} exists={a}, {} exists={b}",
+                        paths[0].display(),
+                        paths[1].display()
+                    )));
+                }
+                _ => {
+                    let mut kernels = Vec::with_capacity(2);
+                    for (spec, path) in specs.into_iter().zip(paths) {
+                        let image = std::fs::read(&path).map_err(|e| {
+                            RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                        })?;
+                        let syms = elf_symbol_names(&image);
+                        for marker in COMMON.into_iter().chain([spec.2, spec.3]) {
+                            if !syms.contains(&marker) {
+                                return Err(RuntimeError::Device(format!(
+                                    "KDA key-factor object {} lacks required marker `{marker}`",
+                                    path.display()
+                                )));
+                            }
+                        }
+                        check_packet_pairing_stamp(&image, blob_path, &path)?;
+                        let module = EngineDevice::module_load(&*be, &image)?;
+                        let kernel =
+                            EngineDevice::get_function(&*be, &module, spec.1).map_err(|e| {
+                                RuntimeError::Device(format!(
+                                    "{}: no symbol {}: {e}",
+                                    spec.0, spec.1
+                                ))
+                            })?;
+                        let got = kernel.kernarg_size();
+                        if got != spec.4 && got != spec.4 + 256 {
+                            return Err(RuntimeError::Device(format!(
+                                "{}: kernarg segment is {got} B; expected {} (or {} with COv5 implicit args)",
+                                spec.0, spec.4, spec.4 + 256
+                            )));
+                        }
+                        let lds = HsaBackend::kernel_lds_bytes(&kernel);
+                        let private = kernel.private_segment_size();
+                        if lds != spec.5 || private != 0 {
+                            return Err(RuntimeError::Device(format!(
+                                "{}: resource gate failed: LDS={lds} (required {}), private={private} (required 0)",
+                                spec.0, spec.5
+                            )));
+                        }
+                        modules.push(module);
+                        kernels.push(kernel);
+                    }
+                    (Some(kernels[0]), Some(kernels[1]))
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        let (k_moe_stage1_mxfp4, k_moe_stage1_a4_quant, k_moe_stage1_a4_reuse) = if arch == "gfx950"
+            && need_moe_stage1_lean
+        {
+            const NAME: &str = "moe_stage1_mxfp4_gfx950.elf";
+            const SYMBOL: &str = "plow_moe1_mxfp4_bk256_gfx950";
+            const MARKERS: [&str; 6] = [
+                "plow_moe1_mxfp4_stage1_abi_1",
+                "plow_moe1_mxfp4_stage1_bm64_bn256_bk256_1",
+                "plow_moe1_mxfp4_stage1_wave64_1",
+                "plow_moe1_mxfp4_stage1_no_spill_1",
+                "plow_moe1_mxfp4_stage1_dynamic_lds_119808",
+                "plow_moe1_mxfp4_stage1_vgpr_le_192",
+            ];
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                (None, None, None)
+            } else {
+                if !prefill_moe_align_bm64 {
+                    return Err(RuntimeError::Device(format!(
+                        "lean MoE stage-1 object {} requires a producer advertising plow_moe_align_bm64_1",
+                        path.display()
+                    )));
+                }
+                let image = std::fs::read(&path).map_err(|e| {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                })?;
+                let syms = elf_symbol_names(&image);
+                for marker in MARKERS {
+                    if !syms.contains(&marker) {
+                        return Err(RuntimeError::Device(format!(
+                            "lean MoE stage-1 object {} lacks required ABI/resource marker `{marker}`",
+                            path.display()
+                        )));
+                    }
+                }
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, SYMBOL).map_err(|e| {
+                    RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}"))
+                })?;
+                let want = std::mem::size_of::<MoeStage1Mxfp4Args>() as u32;
+                let got = kernel.kernarg_size();
+                if got != want && got != want + 256 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: kernarg segment is {got} B; lean stage-1 ABI needs {want} (or {} with COv5 implicit args)",
+                        want + 256
+                    )));
+                }
+                if kernel.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: private segment is {} B; lean stage-1 requires zero",
+                        kernel.private_segment_size()
+                    )));
+                }
+                EngineDevice::set_max_dynamic_smem(&*be, kernel, 119_808)?;
+                let reuse_markers = [
+                    "plow_moe1_a4_reuse_abi_1",
+                    "plow_moe1_a4_reuse_wave64_1",
+                    "plow_moe1_a4_reuse_four_wave_1",
+                    "plow_moe1_a4_reuse_a_only_lds_8192",
+                    "plow_moe1_a4_reuse_register_b_1",
+                ];
+                let (quant, reuse) = if crate::config::RuntimeConfig::get().amd.moe_stage1_a4_reuse
+                    && reuse_markers.iter().all(|m| syms.contains(m))
+                {
+                    let quant =
+                        EngineDevice::get_function(&*be, &module, "plow_moe1_quant_sort_a4_gfx950")
+                            .map_err(|e| {
+                                RuntimeError::Device(format!(
+                                    "{NAME}: no A4 quant/sort symbol: {e}"
+                                ))
+                            })?;
+                    let reuse = EngineDevice::get_function(
+                        &*be,
+                        &module,
+                        "plow_moe1_a4_reuse_16x16x128_gfx950",
+                    )
+                    .map_err(|e| {
+                        RuntimeError::Device(format!("{NAME}: no A4 reuse symbol: {e}"))
+                    })?;
+                    let qwant = std::mem::size_of::<MoeStage1A4QuantArgs>() as u32;
+                    let rwant = std::mem::size_of::<MoeStage1A4ReuseArgs>() as u32;
+                    if ![qwant, qwant + 256].contains(&quant.kernarg_size())
+                        || ![rwant, rwant + 256].contains(&reuse.kernarg_size())
+                        || quant.private_segment_size() != 0
+                        || reuse.private_segment_size() != 0
+                    {
+                        return Err(RuntimeError::Device(format!(
+                            "{NAME}: A4 reuse resource/ABI gate failed (quant args={}, private={}; reuse args={}, private={})",
+                            quant.kernarg_size(), quant.private_segment_size(),
+                            reuse.kernarg_size(), reuse.private_segment_size()
+                        )));
+                    }
+                    EngineDevice::set_max_dynamic_smem(&*be, reuse, 32_768)?;
+                    (Some(quant), Some(reuse))
+                } else {
+                    (None, None)
+                };
+                modules.push(module);
+                (Some(kernel), quant, reuse)
+            }
+        } else {
+            (None, None, None)
+        };
+
+        let k_moe_stage2_mxfp4 = if arch == "gfx950" && need_moe_stage2_lean {
+            const NAME: &str = "moe_stage2_mxfp4_gfx950.elf";
+            const SYMBOL: &str = "plow_moe2_mxfp4_16x16x128_gfx950";
+            const MARKERS: [&str; 6] = [
+                "plow_moe2_mxfp4_stage2_abi_3",
+                "plow_moe2_mxfp4_stage2_layout_shuffled_1",
+                "plow_moe2_mxfp4_stage2_no_spill_1",
+                "plow_moe2_mxfp4_stage2_f32_scatter_1",
+                "plow_moe2_mxfp4_stage2_dynamic_lds_4352",
+                "plow_moe2_mxfp4_stage2_vgpr_le_100",
+            ];
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                None
+            } else {
+                if !prefill_moe_align_bm64 {
+                    return Err(RuntimeError::Device(format!(
+                        "lean MoE object {} requires a prefill producer advertising plow_moe_align_bm64_1",
+                        path.display()
+                    )));
+                }
+                let image = std::fs::read(&path).map_err(|e| {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                })?;
+                let syms = elf_symbol_names(&image);
+                for marker in MARKERS {
+                    if !syms.contains(&marker) {
+                        return Err(RuntimeError::Device(format!(
+                            "lean MoE object {} lacks required ABI/resource marker `{marker}`",
+                            path.display()
+                        )));
+                    }
+                }
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, SYMBOL).map_err(|e| {
+                    RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}"))
+                })?;
+                let want = std::mem::size_of::<MoeStage2Mxfp4Args>() as u32;
+                let got = kernel.kernarg_size();
+                if got != want && got != want + 256 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: kernarg segment is {got} B; lean MoE ABI needs {want} (or {} with COv5 implicit args)",
+                        want + 256
+                    )));
+                }
+                EngineDevice::set_max_dynamic_smem(&*be, kernel, 4_352)?;
+                modules.push(module);
+                Some(kernel)
+            }
+        } else {
+            None
+        };
+
+        let k_moe_combine = if arch == "gfx950" && need_moe_combine_lean {
+            const NAME: &str = "moe_combine_gfx950.elf";
+            const SYMBOL: &str = "plow_moe_combine_fixed_order_gfx950";
+            const MARKERS: [&str; 5] = [
+                "plow_moe_combine_fixed_order_abi_1",
+                "plow_moe_combine_fixed_order_slots16_1",
+                "plow_moe_combine_materialized_f32_1",
+                "plow_moe_combine_wave64_1",
+                "plow_moe_combine_no_spill_1",
+            ];
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                None
+            } else {
+                let image = std::fs::read(&path).map_err(|e| {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                })?;
+                let syms = elf_symbol_names(&image);
+                for marker in MARKERS {
+                    if !syms.contains(&marker) {
+                        return Err(RuntimeError::Device(format!(
+                            "lean MoE combine object {} lacks required ABI/resource marker `{marker}`",
+                            path.display()
+                        )));
+                    }
+                }
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, SYMBOL).map_err(|e| {
+                    RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}"))
+                })?;
+                let want = std::mem::size_of::<MoeCombineArgs>() as u32;
+                let got = kernel.kernarg_size();
+                if got != want && got != want + 256 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: kernarg segment is {got} B; lean combine ABI needs {want} (or {} with COv5 implicit args)",
+                        want + 256
+                    )));
+                }
+                let lds = HsaBackend::kernel_lds_bytes(&kernel);
+                let private = kernel.private_segment_size();
+                if lds != 0 || private != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: resource gate failed: LDS={lds} (required 0), private={private} (required 0)"
+                    )));
+                }
+                modules.push(module);
+                Some(kernel)
+            }
+        } else {
+            None
+        };
+
+        let k_attn_res_f32mix = if need_attn_res_f32mix {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "f32-mix AttnRes packets require gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "attn_res_f32mix_gfx950.elf";
+            const SYMBOL: &str = "plow_attn_res_f32mix_gfx950";
+            let path = hsaco_dir.join(NAME);
+            let image = read_attn_res_f32mix_object(&path)?;
+            let syms = elf_symbol_names(&image);
+            check_attn_res_f32mix_symbols(&syms, &path)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let threads = elf_symbol_u32(&image, "plow_attn_res_f32mix_threads")
+                .filter(|&n| n != 0 && n % 64 == 0 && n <= 1024)
+                .ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "{NAME}: plow_attn_res_f32mix_threads is missing or not a wave64 workgroup"
+                    ))
+                })?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            let want = std::mem::size_of::<AttnResF32MixArgs>() as u32;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; f32-mix AttnRes ABI needs {want} (or {} with COv5 implicit args)",
+                    want + 256
+                )));
+            }
+            let private = kernel.private_segment_size();
+            if private != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: resource gate failed: private={private} (required 0)"
+                )));
+            }
+            tracing::info!(
+                object = %path.display(),
+                symbol = SYMBOL,
+                threads,
+                "f32-mix AttnRes object accepted"
+            );
+            modules.push(module);
+            Some((kernel, threads))
+        } else {
+            None
+        };
+
+        let (k_moe_ep_align, k_moe_ep_stage2, k_moe_ep_combine) = if need_moe_ep {
+            let mut load_ep = |name: &str,
+                               symbol: &str,
+                               markers: &[&str],
+                               want: u32,
+                               dynamic_lds: u32|
+             -> Result<HsaKernel> {
+                let path = hsaco_dir.join(name);
+                if !path.exists() {
+                    return Err(RuntimeError::Device(format!(
+                        "EP packet requires missing specialist object {}",
+                        path.display()
+                    )));
+                }
+                let image = std::fs::read(&path).map_err(|e| {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                })?;
+                let syms = elf_symbol_names(&image);
+                check_moe_ep_symbols(&syms, &path, markers)?;
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, symbol).map_err(|e| {
+                    RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}"))
+                })?;
+                if ![want, want + 256].contains(&kernel.kernarg_size())
+                    || kernel.private_segment_size() != 0
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "{name}: EP ABI/resource gate failed (args={}, private={})",
+                        kernel.kernarg_size(),
+                        kernel.private_segment_size()
+                    )));
+                }
+                if dynamic_lds != 0 {
+                    EngineDevice::set_max_dynamic_smem(&*be, kernel, dynamic_lds)?;
+                }
+                modules.push(module);
+                Ok(kernel)
+            };
+            let align = load_ep(
+                "moe_ep_align_gfx950.elf",
+                "plow_moe_ep_filter_align_gfx950",
+                &[
+                    "plow_moe_ep_filter_align_abi_1",
+                    "plow_moe_ep_filter_align_wave64_1",
+                    "plow_moe_ep_filter_align_stable_1",
+                    "plow_moe_ep_filter_align_parallel_1",
+                    "plow_moe_ep_filter_align_no_spill_1",
+                ],
+                std::mem::size_of::<MoeEpAlignArgs>() as u32,
+                0,
+            )?;
+            let stage2 = load_ep(
+                "moe_ep_stage2_gfx950.elf",
+                "plow_moe2_ep_full_i_16x16x128_gfx950",
+                &[
+                    "plow_moe2_mxfp4_stage2_abi_3",
+                    "plow_moe2_mxfp4_stage2_no_spill_1",
+                    "plow_moe2_ep_full_i_3072",
+                    "plow_moe2_ep_full_i_vgpr_le_128",
+                ],
+                std::mem::size_of::<MoeStage2Mxfp4Args>() as u32,
+                4_352,
+            )?;
+            let combine = load_ep(
+                "moe_ep_combine_gfx950.elf",
+                "plow_moe_ep_combine_gfx950",
+                &[
+                    "plow_moe_ep_combine_abi_1",
+                    "plow_moe_ep_combine_fixed_slot_1",
+                    "plow_moe_ep_combine_wave64_1",
+                    "plow_moe_ep_combine_no_spill_1",
+                ],
+                std::mem::size_of::<MoeEpCombineArgs>() as u32,
+                0,
+            )?;
+            (Some(align), Some(stage2), Some(combine))
+        } else {
+            (None, None, None)
+        };
+
+        let mut load_mla_raw = |name: &str,
+                                symbol: &str,
+                                markers: &[&str],
+                                kernarg: u32,
+                                lds: u32|
+         -> Result<Option<HsaKernel>> {
+            if !need_mla_materialized {
+                return Ok(None);
+            }
+            let path = hsaco_dir.join(name);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "materialized MLA requires code object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            for marker in markers {
+                if !syms.contains(marker) {
+                    return Err(RuntimeError::Device(format!(
+                        "materialized MLA object {} lacks required marker `{marker}`",
+                        path.display()
+                    )));
+                }
+            }
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, symbol)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}")))?;
+            let got = kernel.kernarg_size();
+            if got != kernarg && got != kernarg + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: kernarg segment is {got} B; expected {kernarg} (or {} with COv5 implicit args)",
+                    kernarg + 256
+                )));
+            }
+            let got_lds = HsaBackend::kernel_lds_bytes(&kernel);
+            if got_lds != lds || kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: resource gate failed: LDS={got_lds} (required {lds}), private={} (required 0)",
+                    kernel.private_segment_size()
+                )));
+            }
+            modules.push(module);
+            Ok(Some(kernel))
+        };
+        let k_mla_materialize_pack = load_mla_raw(
+            "mla_materialize_pack_gfx950.elf",
+            "plow_mla_materialize_pack_gfx950",
+            &[
+                "plow_mla_materialize_pack_abi_1",
+                "plow_mla_materialize_pack_hd192_v128_1",
+                "plow_mla_materialize_pack_nospill_1",
+            ],
+            std::mem::size_of::<MlaMaterializePackArgs>() as u32,
+            0,
+        )?;
+        let k_mla_materialized_prefill = load_mla_raw(
+            "mla_materialized_hd192_v128_gfx950.elf",
+            "plow_mla_materialized_hd192_v128_gfx950",
+            &[
+                "plow_mla_materialized_opus_abi_1",
+                "plow_mla_materialized_hd192_v128_1",
+                "plow_mla_materialized_wave64_nospill_1",
+            ],
+            std::mem::size_of::<MlaMaterializedPrefillArgs>() as u32,
+            149_760,
+        )?;
 
         // --- tensors + weights ------------------------------------------------
         // Staging is one pinned slab, filled and pushed in `STAGE` chunks. The
@@ -4265,9 +9398,18 @@ impl AmdEngine {
         let is_peer_slot = |name: &str| {
             matches!(
                 (tp.is_some(), name),
-                (true, "act.og_tp") | (true, "act.dg_tp") | (true, "act.ug_tp")
+                (true, "act.og_tp")
+                    | (true, "act.dg_tp")
+                    | (true, "act.ug_tp")
+                    | (true, "act.h2_tp")
+                    | (true, "act.xe_tp")
+                    | (true, "act.rt_tp")
             )
         };
+        // Rank-relative BAND VIEWS (`<base>@band<t>`, sequence-parallel seams): rows
+        // `[rank*t/tp, (rank+1)*t/tp)` of an already-bound base, i.e. `base + rank * bytes`.
+        // Storage belongs to the base, so they are views like the peer slots.
+        let is_band_view = |name: &str| tp.is_some() && name.contains("@band");
         let is_vmm = |name: &str| {
             vmm.as_ref()
                 .and_then(|v| {
@@ -4283,7 +9425,7 @@ impl AmdEngine {
         let slab_bytes: u64 = blob
             .tensors
             .iter()
-            .filter(|td| !is_peer_slot(&td.name) && !is_vmm(&td.name))
+            .filter(|td| !is_peer_slot(&td.name) && !is_band_view(&td.name) && !is_vmm(&td.name))
             .map(|td| slab_pad(slab_need(td.bytes)))
             .sum();
         let t_slab = Instant::now();
@@ -4357,6 +9499,12 @@ impl AmdEngine {
                 // Slot 2, the GATHER slot: a column-parallel partial the reduce out of
                 // slot 0 folds in (`PARTIAL_SLOTS`). Only K3's LatentMoE declares it.
                 (Some(t), "act.ug_tp") => Some(t.scratch_base + 2 * t.slot_b),
+                // Slots 3/4/5: the sequence-parallel seams' band results (normed hidden,
+                // latent xe, route table), all-gathered by op 26. K3 declares them only
+                // under `PLOW_SEQ_PAR_SEAMS`; the group sizes the region to six slots then.
+                (Some(t), "act.h2_tp") => Some(t.scratch_base + 3 * t.slot_b),
+                (Some(t), "act.xe_tp") => Some(t.scratch_base + 4 * t.slot_b),
+                (Some(t), "act.rt_tp") => Some(t.scratch_base + 5 * t.slot_b),
                 _ => None,
             };
             if let Some(base) = peer_slot {
@@ -4365,6 +9513,31 @@ impl AmdEngine {
                     "bound into the peer region"
                 );
                 devp.push(DeviceMem::view(base, td.bytes.max(1)));
+                names.push(td.name.clone());
+                n_view += 1;
+                continue;
+            }
+            if is_band_view(&td.name) {
+                let base_name = td.name.split("@band").next().unwrap_or_default();
+                let base_ix = names.iter().position(|n| n == base_name).ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "band view {} names a base that is not bound before it",
+                        td.name
+                    ))
+                })?;
+                let rank = u64::from(tp.map_or(0, |t| t.rank));
+                let base_mem: &DeviceMem = &devp[base_ix];
+                let off = rank * td.bytes;
+                if off + td.bytes > base_mem.len {
+                    return Err(RuntimeError::Device(format!(
+                        "band view {} at rank {rank} ends at {} B past its base {base_name} \
+                         ({} B)",
+                        td.name,
+                        off + td.bytes,
+                        base_mem.len
+                    )));
+                }
+                devp.push(DeviceMem::view(base_mem.base + off, td.bytes.max(1)));
                 names.push(td.name.clone());
                 n_view += 1;
                 continue;
@@ -4660,6 +9833,44 @@ impl AmdEngine {
         let table: Vec<u8> = devp.iter().flat_map(|m| m.base.to_le_bytes()).collect();
         let d_tens = EngineDevice::alloc(&*be, table.len().max(1) as u64)?;
         EngineDevice::upload(&*be, &d_tens, 0, &table)?;
+        let kda_key_factor_half =
+            if k_kda_key_factor_wu.is_some() && k_kda_key_factor_carry.is_some() {
+                kda_key_factor_scratch_half_bytes(&blob.progs[..dec_ix])?
+            } else {
+                0
+            };
+        let d_kda_key_factor_scratch = if kda_key_factor_half != 0 {
+            let bytes = kda_key_factor_half.checked_mul(2).ok_or_else(|| {
+                RuntimeError::Device("KDA key-factor scratch pair size overflows".into())
+            })?;
+            tracing::info!(bytes, "allocating one reusable KDA key-factor scratch pair");
+            Some(EngineDevice::alloc(&*be, bytes)?)
+        } else {
+            None
+        };
+        let kda_key_factor_scratch = d_kda_key_factor_scratch
+            .as_ref()
+            .map(|m| (m.base, kda_key_factor_half));
+        let (stage1_a4_payload, stage1_a4_scales) =
+            if k_moe_stage1_a4_quant.is_some() && k_moe_stage1_a4_reuse.is_some() {
+                moe_stage1_a4_scratch_bytes(&blob.progs[..dec_ix], &blob.tensors)?
+            } else {
+                (0, 0)
+            };
+        let d_moe_stage1_a4_scratch = if stage1_a4_payload != 0 {
+            let bytes = stage1_a4_payload
+                .checked_add(stage1_a4_scales)
+                .ok_or_else(|| {
+                    RuntimeError::Device("lean MoE stage-1 scratch size overflows".into())
+                })?;
+            tracing::info!(bytes, "allocating reusable sorted A4 MoE stage-1 scratch");
+            Some(EngineDevice::alloc(&*be, bytes)?)
+        } else {
+            None
+        };
+        let stage1_a4_scratch = d_moe_stage1_a4_scratch
+            .as_ref()
+            .map(|m| (m.base, m.base + stage1_a4_payload));
 
         // OPTIONAL, because a BLOCK asset is not a model. A block takes
         // `act.x` in and gives `act.x` out — it has no embedding, no lm_head,
@@ -4679,8 +9890,96 @@ impl AmdEngine {
         // --- per-program tables ---------------------------------------------
         let ctr_banks: u64 = if ctr_dbuf() { 2 } else { 1 };
         let mut progs = Vec::with_capacity(blob.progs.len());
-        for p in &blob.progs {
+        for (prog_ix, p) in blob.progs.iter().enumerate() {
             let seg_class = derive_segments(p)?;
+            let decode_routes = if prog_ix >= dec_ix {
+                decode_segment_routes(p, &blob.tensors, &blob.init, &devp)?
+            } else {
+                vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
+            };
+            let mut prefill_routes = if prog_ix < dec_ix {
+                moe_mxfp4_routes_with_scratch(
+                    p,
+                    &blob.tensors,
+                    &devp,
+                    stage1_a4_scratch,
+                    tp.map(|b| (b.rank, b.n_gpu)),
+                )?
+            } else {
+                vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
+            };
+            if prog_ix < dec_ix {
+                add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
+                mla_materialized_routes(p, &devp, &mut prefill_routes)?;
+                promote_kda_intra_wave_items_routes(p, &seg_class, &mut prefill_routes)?;
+                promote_kda_carry_regstate_routes(p, &seg_class, &devp, &mut prefill_routes)?;
+                for (seg, &class) in seg_class.iter().enumerate() {
+                    let graph_phase = graph_phase_segments[prog_ix].contains(&seg);
+                    if class == 19 || graph_phase {
+                        if !matches!(
+                            prefill_routes[seg],
+                            PrefillSegmentRoute::Interpreter
+                                | PrefillSegmentRoute::XReduceAttnRes { .. }
+                        ) {
+                            return Err(RuntimeError::Device(format!(
+                                "XReduce wave-RS segment {seg} overlaps another specialist route"
+                            )));
+                        }
+                        let dispatch = ProgramDispatch::classify(
+                            p.l2_domains,
+                            seg_class.len(),
+                            p.gq_seg_ofs.len().saturating_sub(1),
+                        );
+                        if graph_phase && !prefill_segment_specialization_allowed(dispatch) {
+                            return Err(RuntimeError::Device(format!(
+                                "graph phase segment {seg} in program {prog_ix} has legacy L2-domain topology"
+                            )));
+                        }
+                        prefill_routes[seg] = if graph_phase {
+                            PrefillSegmentRoute::GraphPhaseXReduceWaveRs
+                        } else {
+                            PrefillSegmentRoute::XReduceWaveRs
+                        };
+                    }
+                }
+                let has_materialized = prefill_routes.iter().any(|r| {
+                    matches!(
+                        r,
+                        PrefillSegmentRoute::MlaMaterializePack { .. }
+                            | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
+                    )
+                });
+                let has_ep = prefill_routes.iter().any(|r| {
+                    matches!(
+                        r,
+                        PrefillSegmentRoute::MoeEpAlign(_)
+                            | PrefillSegmentRoute::MoeStage1A4Reuse(_)
+                            | PrefillSegmentRoute::MoeEpStage2(_)
+                            | PrefillSegmentRoute::MoeEpCombine(_)
+                    )
+                }) && has_moe_prefill_ep(p);
+                let dispatch = ProgramDispatch::classify(
+                    p.l2_domains,
+                    seg_class.len(),
+                    p.gq_seg_ofs.len().saturating_sub(1),
+                );
+                if has_materialized && !prefill_segment_specialization_allowed(dispatch) {
+                    return Err(RuntimeError::Device(format!(
+                        "prefill program {prog_ix} (T={}) places materialized MLA raw opcodes in L2-domain windows; standalone objects require ordered wave segments",
+                        p.t
+                    )));
+                }
+                if has_ep && !prefill_segment_specialization_allowed(dispatch) {
+                    return Err(RuntimeError::Device(format!(
+                        "prefill program {prog_ix} (T={}) places expert-parallel raw opcodes in L2-domain windows; standalone objects require ordered wave segments",
+                        p.t
+                    )));
+                }
+            }
+            let packed_seg_family = derive_packed_segment_families(p)?;
+            let raw_mla_v2_segment = derive_raw_mla_v2_segments(p)?;
+            let packed_mla_segmented = packed_family_segments_cover(p, &packed_seg_family, &[5, 6]);
+            let packed_kda_segmented = packed_family_segments_cover(p, &packed_seg_family, &[7]);
             let up = |bytes: &[u8]| -> Result<DeviceMem> {
                 let m = EngineDevice::alloc(&*be, bytes.len().max(1) as u64)?;
                 if !bytes.is_empty() {
@@ -4688,6 +9987,31 @@ impl AmdEngine {
                 }
                 Ok(m)
             };
+            let mut xreduce_attnres_args = Vec::new();
+            for route in &mut prefill_routes {
+                let PrefillSegmentRoute::XReduceAttnRes {
+                    args, device_args, ..
+                } = route
+                else {
+                    continue;
+                };
+                let bind = tp.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "fused XReduceTwoShot+AttnRes requires a tensor-parallel binding".into(),
+                    )
+                })?;
+                let status_id = args.status as u32;
+                args.peer_scratch = bind.peer_table;
+                args.xctr = bind.xctr;
+                args.rank = bind.rank;
+                args.nranks = bind.n_gpu;
+                args.status = status_id.checked_sub(1).map_or(0, |id| {
+                    bind.xctr + u64::from(id) * (CTR_STRIDE_U32 * 4) as u64
+                });
+                let mem = up(as_bytes(std::slice::from_ref(args)))?;
+                *device_args = mem.base;
+                xreduce_attnres_args.push(mem);
+            }
             let d_inst = up(as_bytes(&p.insts))?;
             let d_stream = up(as_bytes(&p.stream))?;
             let d_sofs = up(as_bytes(&p.stream_ofs))?;
@@ -4754,6 +10078,43 @@ impl AmdEngine {
             };
             progs.push(AmdProg {
                 t: p.t,
+                packed_prefill_only: p.packed_prefill_only,
+                packed_needs_mla: p.insts.iter().any(|d| {
+                    d.op == DevOp::RmsNorm as u16
+                        || d.op == DevOp::HeadNormRope as u16
+                        || d.op == DevOp::HeadNormRopeFp8 as u16
+                        || d.op == DevOp::FlashMlaPrefill as u16
+                        || d.op == DevOp::FlashMlaPrefillFp8 as u16
+                }),
+                packed_mla_compatible: !p.insts.iter().any(|d| {
+                    d.op == DevOp::FlashGatherPrefill as u16
+                        || ((d.op == DevOp::FlashMlaPrefill as u16
+                            || d.op == DevOp::FlashMlaPrefillFp8 as u16)
+                            && d.t[7] != packet::dev::TENSOR_NONE as u16
+                            && d.op != DevOp::FlashMlaPrefillFp8 as u16)
+                }),
+                packed_mla_segmented,
+                packed_needs_kda: p.insts.iter().any(|d| {
+                    d.op == DevOp::KdaConv3 as u16
+                        || d.op == DevOp::KdaStateStep as u16
+                        || d.op == DevOp::KdaStateStepG as u16
+                        || matches!(
+                            DevOp::from_u16(d.op),
+                            Some(
+                                DevOp::KdaConv
+                                    | DevOp::KdaChunkPrepare
+                                    | DevOp::KdaChunkIntra
+                                    | DevOp::KdaChunkWu
+                                    | DevOp::KdaChunkCarry
+                                    | DevOp::KdaConvStateStepG
+                            )
+                        )
+                }),
+                packed_kda_compatible: packed_kda_compatible(p),
+                packed_kda_segmented,
+                decode_routes,
+                prefill_routes,
+                _xreduce_attnres_args: xreduce_attnres_args,
                 n_inst: p.insts.len() as u32,
                 trace_records: p.stream.len(),
                 n_counter: p.n_counter,
@@ -4766,6 +10127,8 @@ impl AmdEngine {
                 d_ctr,
                 d_seg_ofs,
                 seg_class,
+                packed_seg_family,
+                raw_mla_v2_segment,
                 gq,
                 l2_domains: p.l2_domains,
                 // DERIVED, not carried in the blob. The emitter appends the two-level
@@ -4849,13 +10212,15 @@ impl AmdEngine {
         // batch above the bucket cap is servable and `check_gemv_capacity` —
         // which sees the actual object — is the gate that refuses a NON-walking
         // object at need > cap, with the correct message. What remains here is
-        // a sanity bound: XArgmaxFin's two-line fold caps sequences at 32
+        // a sanity bound: XArgmaxFin's bounded fold caps sequences at 128
         // (PLOW_XAMAX_MAX_BATCH), and nothing above it has ever been emitted.
-        if batch > 32 {
+        if batch > packet::devbuild::XARGMAX_MAX_BATCH as usize {
             return Err(RuntimeError::Device(format!(
-                "blob is compiled PLOW_DECODE_BATCH={batch}, past the XArgmaxFin two-line \
-                 fold's 32-sequence ceiling (PLOW_XAMAX_MAX_BATCH, runtime/amd/op_collective.h). \
-                 Re-emit at PLOW_DECODE_BATCH <= 32."
+                "blob is compiled PLOW_DECODE_BATCH={batch}, past the XArgmaxFin fold's \
+                 {}-sequence ceiling (PLOW_XAMAX_MAX_BATCH, runtime/amd/op_collective.h). \
+                 Re-emit at PLOW_DECODE_BATCH <= {}.",
+                packet::devbuild::XARGMAX_MAX_BATCH,
+                packet::devbuild::XARGMAX_MAX_BATCH
             )));
         }
 
@@ -5040,6 +10405,18 @@ impl AmdEngine {
             &*be,
             (max_pf_inst * std::mem::size_of::<DevInst64>()).max(64),
         )?;
+        let max_pf_rows = blob.progs[..dec_lo]
+            .iter()
+            .map(|g| g.t as usize)
+            .max()
+            .unwrap_or(0);
+        let prefill_span_capacity = batch.max(1);
+        let prefill_row_capacity = max_pf_rows.max(1);
+        let span_bytes = prefill_span_capacity * std::mem::size_of::<PrefillSpan>();
+        let parked_bytes = prefill_row_capacity * std::mem::size_of::<u32>();
+        let d_prefill_spans = EngineDevice::alloc(&*be, span_bytes as u64)?;
+        let d_prefill_parked = EngineDevice::alloc(&*be, parked_bytes as u64)?;
+        let h_prefill_meta = EngineDevice::host_alloc_pinned(&*be, span_bytes + parked_bytes)?;
         let pf_src: Vec<Vec<DevInst64>> = blob.progs.iter().map(|g| g.insts.clone()).collect();
         let max_ctr = progs
             .iter()
@@ -5056,6 +10433,9 @@ impl AmdEngine {
             );
         let mut h_zero = EngineDevice::host_alloc_pinned(&*be, max_ctr.max(4))?;
         h_zero.as_mut_slice().fill(0);
+        let d_token_ring = k_token_capture
+            .map(|_| EngineDevice::alloc(&*be, (batch * DEFERRED_TOKEN_MAX_STEPS * 4) as u64))
+            .transpose()?;
 
         let (kvrow, kvrow_i2) = if blob.kvrow.is_empty() {
             derive_kvrow(&blob.progs[decode], &names)
@@ -5109,10 +10489,41 @@ impl AmdEngine {
             trace_write_bytes: Cell::new(0),
             k_prefill,
             k_decode,
+            k_decode_mla,
+            k_kda_decode_fused,
+            k_grouped_moe_glu,
+            k_grouped_moe_down,
+            k_kda_chunk_intra_cached,
+            k_kda_chunk_intra_wave_items,
+            k_kda_chunk_carry_regstate,
+            k_kda_key_factor_wu,
+            k_kda_key_factor_carry,
+            _kda_key_factor_scratch: d_kda_key_factor_scratch,
+            k_moe_stage1_mxfp4,
+            k_moe_stage1_a4_quant,
+            k_moe_stage1_a4_reuse,
+            _moe_stage1_a4_scratch: d_moe_stage1_a4_scratch,
+            k_moe_stage2_mxfp4,
+            k_moe_combine,
+            k_attn_res_f32mix,
+            k_moe_ep_align,
+            k_moe_ep_stage2,
+            k_moe_ep_combine,
+            k_xreduce_wave_rs,
+            k_mla_materialize_pack,
+            k_mla_materialized_prefill,
             k_xaudit,
             k_state_clear,
+            k_token_capture,
+            d_token_ring,
             decode_tiers,
             k_flash,
+            k_mla_v2_sv_raw,
+            k_packed_mla_norm,
+            k_packed_mla_flash,
+            k_packed_kda,
+            k_xr_attnres,
+            packed_prefill_prefill_abi,
             sched_prefill,
             sched_decode,
             _modules: modules,
@@ -5120,6 +10531,12 @@ impl AmdEngine {
             h_scalar,
             h_zero,
             h_pf_inst,
+            d_prefill_spans,
+            d_prefill_parked,
+            h_prefill_meta,
+            prefill_span_capacity,
+            prefill_row_capacity,
+            packed_prefill: None,
             d_state_clear,
             n_state_clear,
             pf_src,
@@ -5234,6 +10651,141 @@ impl AmdEngine {
         &self.tensor_names
     }
 
+    fn check_packed_prefill_program(&self, prog: usize) -> Result<u32> {
+        let program = self.progs.get(prog).ok_or_else(|| {
+            RuntimeError::Device(format!("packed-prefill program {prog} is out of range"))
+        })?;
+        if prog >= self.dec_lo {
+            return Err(RuntimeError::Device(format!(
+                "program {prog} is a decode rung, not a packed-prefill program"
+            )));
+        }
+        check_packed_prefill_abi(self.packed_prefill_prefill_abi, false, false)?;
+        if program.prefill_routes.iter().any(|r| {
+            matches!(
+                r,
+                PrefillSegmentRoute::MlaMaterializePack { .. }
+                    | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
+            )
+        }) {
+            return Err(RuntimeError::Device(
+                "materialized MLA prefill currently supports one exact initial sequence, not packed spans"
+                    .into(),
+            ));
+        }
+        if matches!(self.prog_dispatch(prog), ProgramDispatch::L2Domains(_)) {
+            return Err(RuntimeError::Device(
+                "packed-prefill family routing requires independent ordered segments; this legacy \
+                 packet stores L2 domains in the segment field"
+                    .into(),
+            ));
+        }
+        if program.packed_needs_mla {
+            if !program.packed_mla_compatible {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA does not support gathered/per-query selector packets"
+                        .into(),
+                ));
+            }
+            if !program.packed_mla_segmented {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA consumer is in a mixed segment; re-emit with \
+                     PLOW_SEG_PACKED_PREFILL=1"
+                        .into(),
+                ));
+            }
+            if program.packed_seg_family.contains(&5) && self.k_packed_mla_norm.is_none() {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA norm/cache segment requires interp_packed_mla_norm".into(),
+                ));
+            }
+            if program.packed_seg_family.contains(&6) && self.k_packed_mla_flash.is_none() {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA flash segment requires interp_packed_mla_flash".into(),
+                ));
+            }
+        }
+        if program.packed_needs_kda {
+            if !program.packed_kda_compatible {
+                return Err(RuntimeError::Device(
+                    "packed-prefill KDA supports serial Conv3/state or complete BT64/BC16 chunk \
+                     operator groups; gathered or double-buffered layouts remain disabled"
+                        .into(),
+                ));
+            }
+            if !program.packed_kda_segmented || self.k_packed_kda.is_none() {
+                return Err(RuntimeError::Device(
+                    "packed-prefill KDA requires pure family segments and \
+                     interp_packed_kda; re-emit with PLOW_SEG_PACKED_PREFILL=1 and build the \
+                     optional family objects"
+                        .into(),
+                ));
+            }
+        }
+        Ok(program.t)
+    }
+
+    /// Resolve an ordinary prefill rung to its packed-only sibling. Legacy
+    /// single-topology blobs continue to validate the requested program itself.
+    pub fn packed_prefill_prog_for(&self, prog: usize) -> Option<usize> {
+        packed_prefill_topology_index(prog, self.dec_lo, |candidate| {
+            self.progs
+                .get(candidate)
+                .map(|p| (p.t, p.packed_prefill_only))
+        })
+        .filter(|&candidate| self.check_packed_prefill_program(candidate).is_ok())
+    }
+
+    /// Whether this exact prefill program has the packet ABI and every operator-family object
+    /// needed by the packed route.
+    pub fn packed_prefill_prog_capable(&self, prog: usize) -> bool {
+        self.packed_prefill_prog_for(prog).is_some()
+    }
+
+    /// Validate and upload one ragged packed-prefill descriptor. The binding is program-exact:
+    /// every other program continues to receive null metadata in its kernarg.
+    pub fn stage_packed_prefill(
+        &mut self,
+        prog: usize,
+        spans: &[PrefillSpan],
+        parked: &[u32],
+    ) -> Result<()> {
+        self.packed_prefill = None;
+        let rung = self.check_packed_prefill_program(prog)?;
+        let binding = validate_packed_prefill(prog, rung, self.batch, spans, parked)?;
+        if spans.len() > self.prefill_span_capacity || parked.len() > self.prefill_row_capacity {
+            return Err(RuntimeError::Device(format!(
+                "packed-prefill metadata exceeds staging capacity: spans {}/{}, rows {}/{}",
+                spans.len(),
+                self.prefill_span_capacity,
+                parked.len(),
+                self.prefill_row_capacity
+            )));
+        }
+
+        let span_bytes = std::mem::size_of_val(spans);
+        let parked_bytes = std::mem::size_of_val(parked);
+        let parked_off = self.prefill_span_capacity * std::mem::size_of::<PrefillSpan>();
+        self.h_prefill_meta.as_mut_slice()[..span_bytes].copy_from_slice(as_bytes(spans));
+        self.h_prefill_meta.as_mut_slice()[parked_off..parked_off + parked_bytes]
+            .copy_from_slice(as_bytes(parked));
+        self.be.memcpy_htod_pinned(
+            self.d_prefill_spans.base,
+            &self.h_prefill_meta.as_slice()[..span_bytes],
+        )?;
+        self.be.memcpy_htod_pinned(
+            self.d_prefill_parked.base,
+            &self.h_prefill_meta.as_slice()[parked_off..parked_off + parked_bytes],
+        )?;
+        self.packed_prefill = Some(binding);
+        Ok(())
+    }
+
+    /// Remove the current packed-prefill binding. Device buffers remain allocated for reuse.
+    pub fn clear_packed_prefill(&mut self) {
+        self.packed_prefill = None;
+    }
+
     /// Upload bytes into a named tensor (block I/O, and weight loaders).
     pub fn write_tensor(&mut self, name: &str, src: &[u8]) -> Result<()> {
         let i = self
@@ -5293,6 +10845,13 @@ impl AmdEngine {
     /// Build the kernarg block for program `p` at segment `seg`.
     fn kernarg(&self, p: usize, seg: u32) -> DevProgram {
         let g = &self.progs[p];
+        let (prefill_spans, prefill_parked, n_prefill_spans, n_prefill_rows) =
+            packed_prefill_kernarg(
+                self.packed_prefill,
+                p,
+                self.d_prefill_spans.base,
+                self.d_prefill_parked.base,
+            );
         DevProgram {
             insts: g.d_inst.base,
             stream: g.d_stream.base,
@@ -5335,6 +10894,10 @@ impl AmdEngine {
             peer_scratch: self.tp.map_or(0, |t| t.peer_table),
             rank: self.tp.map_or(0, |t| t.rank),
             n_gpu: self.tp.map_or(0, |t| t.n_gpu),
+            prefill_spans,
+            prefill_parked,
+            n_prefill_spans,
+            n_prefill_rows,
         }
     }
 
@@ -5426,21 +10989,504 @@ impl AmdEngine {
         self.progs[p].seg_class[seg]
     }
 
+    /// Diagnostic label for the kernel object that will execute one prefill segment.
+    /// Kept out of the launch path unless segment timing is explicitly enabled.
+    pub(crate) fn prefill_segment_family(&self, p: usize, seg: usize) -> &'static str {
+        let route = self.progs[p]
+            .prefill_routes
+            .get(seg)
+            .copied()
+            .unwrap_or(PrefillSegmentRoute::Interpreter);
+        match route {
+            PrefillSegmentRoute::XReduceAttnRes { .. } => return "xreduce_attnres",
+            PrefillSegmentRoute::XReduceWaveRs => return "xreduce_wave_rs",
+            PrefillSegmentRoute::GraphPhaseXReduceWaveRs => return "graph_phase_xreduce_wave_rs",
+            _ => {}
+        }
+        if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
+            return "interpreter";
+        }
+        let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        if !active {
+            match route {
+                PrefillSegmentRoute::MlaMaterializePack { .. } => return "mla_materialize_pack",
+                PrefillSegmentRoute::MlaMaterializedPrefill { .. } => {
+                    return "mla_materialized_prefill";
+                }
+                PrefillSegmentRoute::KdaChunkIntraCached { .. }
+                    if self.k_kda_chunk_intra_cached.is_some() =>
+                {
+                    return "kda_intra_cached";
+                }
+                PrefillSegmentRoute::KdaChunkIntraWaveItems { .. } => {
+                    return "kda_intra_wave_items";
+                }
+                PrefillSegmentRoute::AttnResF32Mix { .. } => return "attn_res_f32mix",
+                PrefillSegmentRoute::KdaChunkCarryRegstate { .. } => {
+                    return "kda_carry_regstate";
+                }
+                PrefillSegmentRoute::KdaChunkKeyFactorWu { .. }
+                    if self.k_kda_key_factor_wu.is_some() =>
+                {
+                    return "kda_key_factor_wu";
+                }
+                PrefillSegmentRoute::KdaChunkKeyFactorCarry { .. }
+                    if self.k_kda_key_factor_carry.is_some() =>
+                {
+                    return "kda_key_factor_carry";
+                }
+                PrefillSegmentRoute::MoeStage1Mxfp4(_) if self.k_moe_stage1_mxfp4.is_some() => {
+                    return "moe_stage1_mxfp4";
+                }
+                PrefillSegmentRoute::MoeStage1A4Reuse(_)
+                    if self.k_moe_stage1_a4_reuse.is_some() =>
+                {
+                    return "moe_stage1_a4_reuse";
+                }
+                PrefillSegmentRoute::MoeStage2Mxfp4(_) if self.k_moe_stage2_mxfp4.is_some() => {
+                    return "moe_stage2_mxfp4";
+                }
+                PrefillSegmentRoute::MoeCombine(_) if self.k_moe_combine.is_some() => {
+                    return "moe_combine";
+                }
+                PrefillSegmentRoute::MoeEpAlign(_) if self.k_moe_ep_align.is_some() => {
+                    return "moe_ep_align";
+                }
+                PrefillSegmentRoute::MoeEpStage2(_) if self.k_moe_ep_stage2.is_some() => {
+                    return "moe_ep_stage2";
+                }
+                PrefillSegmentRoute::MoeEpCombine(_) if self.k_moe_ep_combine.is_some() => {
+                    return "moe_ep_combine";
+                }
+                _ => {}
+            }
+        }
+        match packed_segment_route(
+            active,
+            self.progs[p].packed_seg_family[seg],
+            self.k_packed_mla_norm.is_some(),
+            self.k_packed_mla_flash.is_some(),
+            self.k_packed_kda.is_some(),
+        ) {
+            Ok(PackedSegmentRoute::MlaNorm) => "packed_mla_norm",
+            Ok(PackedSegmentRoute::MlaFlash) => "packed_mla_flash",
+            Ok(PackedSegmentRoute::Kda) => "kda_family_raw",
+            Ok(PackedSegmentRoute::Primary) | Err(_) => {
+                if self.progs[p].raw_mla_v2_segment[seg] && self.k_mla_v2_sv_raw.is_some() {
+                    "mla_v2_raw"
+                } else if self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4 {
+                    "flash_interpreter"
+                } else {
+                    "interpreter"
+                }
+            }
+        }
+    }
+
     /// Enqueue ONE segment of program `p`. No re-arm, no drain.
     ///
     /// The building block of both the single-GPU segmented run and the TP
     /// per-segment rendezvous. Each launch memcpy's its own kernarg slot, so
     /// mutating `cur_seg` between launches is safe — every packet has already
-    /// captured its own copy. For an L2-placed program the caller invokes this
-    /// exactly once with `seg == 0`; the device ignores `cur_seg` and drains all
-    /// domain windows concurrently.
+    /// captured its own copy. An L2-placed program launches each ordered host
+    /// segment once; all per-XCD queues for that segment drain concurrently.
     pub fn enqueue_segment(&mut self, p: usize, seg: usize) -> Result<()> {
+        check_packed_prefill_dispatch(self.packed_prefill, p)?;
         self.trace_write_bytes
             .set(self.progs[p].trace_records * TRACE_REC_BYTES);
-        let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
-        let (k, threads) = match (use4, self.k_flash) {
-            (true, Some(kf)) => (kf, WG_THREADS_4),
-            _ => (self.k_prefill, WG_THREADS_8),
+        if let Some(PrefillSegmentRoute::XReduceAttnRes {
+            device_args, grid, ..
+        }) = self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.k_xr_attnres.ok_or_else(|| {
+                RuntimeError::Device(
+                    "XReduceTwoShot+AttnRes segment has no exact capability object".into(),
+                )
+            })?;
+            if device_args == 0 {
+                return Err(RuntimeError::Device(
+                    "XReduceTwoShot+AttnRes route has no device argument block".into(),
+                ));
+            }
+            EngineDevice::launch_cooperative(
+                &*self.be,
+                kernel,
+                grid,
+                WG_THREADS_8,
+                0,
+                as_bytes(std::slice::from_ref(&device_args)),
+                None,
+            )?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
+        if matches!(
+            self.progs[p].prefill_routes.get(seg),
+            Some(PrefillSegmentRoute::XReduceWaveRs | PrefillSegmentRoute::GraphPhaseXReduceWaveRs)
+        ) {
+            let kernel = self.k_xreduce_wave_rs.ok_or_else(|| {
+                RuntimeError::Device(
+                    "marked XReduceTwoShot segment has no packet-paired wave-RS object".into(),
+                )
+            })?;
+            let arg = self.kernarg(p, seg as u32);
+            EngineDevice::launch_cooperative(
+                &*self.be,
+                kernel,
+                self.n_cu,
+                WG_THREADS_8,
+                0,
+                kernarg_bytes(&arg),
+                None,
+            )?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
+        if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
+            let arg = self.kernarg(p, seg as u32);
+            EngineDevice::launch_cooperative(
+                &*self.be,
+                self.k_prefill,
+                self.n_cu,
+                WG_THREADS_8,
+                0,
+                kernarg_bytes(&arg),
+                None,
+            )?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
+        let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        if !active {
+            if let Some(PrefillSegmentRoute::MlaMaterializePack { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.k_mla_materialize_pack.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "materialized MLA pack segment has no validated object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::MlaMaterializedPrefill { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.k_mla_materialized_prefill.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "materialized MLA prefill segment has no validated object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    512,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::KdaChunkIntraCached { args, grid })) = (
+                self.k_kda_chunk_intra_cached,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::KdaChunkIntraWaveItems { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.k_kda_chunk_intra_wave_items.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "marked KDA-intra wave-item segment has no validated object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            // The regstate object only covers full BT64 rungs (`t >= 512`, mirrored by the
+            // kernel's early return); a shorter ragged tail chunk stays on the interpreter.
+            if let Some(PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, tens }) = self
+                .progs[p]
+                .prefill_routes
+                .get(seg)
+                .copied()
+                .filter(|r| {
+                    matches!(r, PrefillSegmentRoute::KdaChunkCarryRegstate { args, .. } if args.t >= 512)
+                })
+            {
+                let kernel = self.k_kda_chunk_carry_regstate.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "marked KDA carry regstate segment has no validated object".into(),
+                    )
+                })?;
+                let mut args = args;
+                if self.kv_slot != 0 {
+                    let fields: [&mut u64; 8] = [
+                        &mut args.out,
+                        &mut args.state,
+                        &mut args.q,
+                        &mut args.k,
+                        &mut args.w,
+                        &mut args.u,
+                        &mut args.aqk,
+                        &mut args.g,
+                    ];
+                    for (id, field) in tens.iter().zip(fields) {
+                        if let Some(&(_, stride)) =
+                            self.kv_slot_stride.iter().find(|(i, _)| *i == *id as usize)
+                        {
+                            *field += stride * self.kv_slot as u64;
+                        }
+                    }
+                }
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::KdaChunkKeyFactorWu { args, grid })) = (
+                self.k_kda_key_factor_wu,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (
+                Some(kernel),
+                Some(PrefillSegmentRoute::KdaChunkKeyFactorCarry { args, grid }),
+            ) = (
+                self.k_kda_key_factor_carry,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeStage1Mxfp4(route))) = (
+                self.k_moe_stage1_mxfp4,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    WG_THREADS_8,
+                    119_808,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeEpAlign(route))) = (
+                self.k_moe_ep_align,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                for (phase, grid) in [(1, 64), (2, 1), (3, 64), (4, 64)] {
+                    let mut args = route.args;
+                    args.phase = phase;
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        kernel,
+                        grid,
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&args)),
+                        None,
+                    )?;
+                }
+                self.seg_launches += 4;
+                return Ok(());
+            }
+            if let (Some(quant), Some(kernel), Some(PrefillSegmentRoute::MoeStage1A4Reuse(route))) = (
+                self.k_moe_stage1_a4_quant,
+                self.k_moe_stage1_a4_reuse,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    quant,
+                    route.quant_grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&route.quant_args)),
+                    None,
+                )?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    256,
+                    32_768,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 2;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeStage2Mxfp4(route))) = (
+                self.k_moe_stage2_mxfp4,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    256,
+                    4_352,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeEpStage2(route))) = (
+                self.k_moe_ep_stage2,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    256,
+                    4_352,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeCombine(route))) = (
+                self.k_moe_combine,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::AttnResF32Mix { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let (kernel, threads) = self.k_attn_res_f32mix.ok_or_else(|| {
+                    RuntimeError::Device("f32-mix AttnRes segment has no validated object".into())
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    threads,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeEpCombine(route))) = (
+                self.k_moe_ep_combine,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+        }
+        let family = self.progs[p].packed_seg_family[seg];
+        let route = packed_segment_route(
+            active,
+            family,
+            self.k_packed_mla_norm.is_some(),
+            self.k_packed_mla_flash.is_some(),
+            self.k_packed_kda.is_some(),
+        )?;
+        let (k, threads) = match route {
+            PackedSegmentRoute::MlaNorm => (self.k_packed_mla_norm.unwrap(), WG_THREADS_8),
+            PackedSegmentRoute::MlaFlash => (self.k_packed_mla_flash.unwrap(), WG_THREADS_4),
+            PackedSegmentRoute::Kda => (self.k_packed_kda.unwrap(), WG_THREADS_8),
+            PackedSegmentRoute::Primary => {
+                let raw_mla =
+                    self.progs[p].raw_mla_v2_segment[seg] && self.k_mla_v2_sv_raw.is_some();
+                if let (true, Some(k)) = (raw_mla, self.k_mla_v2_sv_raw) {
+                    (k, WG_THREADS_4)
+                } else {
+                    let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
+                    match (use4, self.k_flash) {
+                        (true, Some(kf)) => (kf, WG_THREADS_4),
+                        _ => (self.k_prefill, WG_THREADS_8),
+                    }
+                }
+            }
         };
         let arg = self.kernarg(p, seg as u32);
         EngineDevice::launch_cooperative(
@@ -5456,6 +11502,153 @@ impl AmdEngine {
         Ok(())
     }
 
+    /// Number of ordered segment steps in a decode program. A grouped-MoE step owns two
+    /// back-to-back raw launches; other raw boundaries and interpreter segments own one.
+    pub(crate) fn decode_launches(&self, p: usize) -> usize {
+        self.prog_dispatch(p).launches()
+    }
+
+    pub(crate) fn graph_phase_replay(&self, p: usize) -> bool {
+        self.progs[p]
+            .prefill_routes
+            .iter()
+            .any(|r| matches!(r, PrefillSegmentRoute::GraphPhaseXReduceWaveRs))
+    }
+
+    pub(crate) fn begin_graph_phase_replay(&self, p: usize) -> Result<()> {
+        if !self.graph_phase_replay(p) {
+            return Err(RuntimeError::Device(format!(
+                "program {p} has no graph-derived phase-object route"
+            )));
+        }
+        let packets = (0..self.prog_dispatch(p).launches())
+            .map(|seg| self.prefill_segment_launches(p, seg))
+            .sum();
+        self.be.begin_dispatch_chain(packets)
+    }
+
+    /// Exact AQL packets `enqueue_segment` emits for one prefill segment. A phase
+    /// chain reserves this many before ringing, so the count must track the
+    /// multi-launch route branches in `enqueue_segment`; the commit check refuses
+    /// a chain whose emission disagrees, so a drift fails closed rather than
+    /// overrunning the queue.
+    fn prefill_segment_launches(&self, p: usize, seg: usize) -> usize {
+        let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        if active || !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
+            return 1;
+        }
+        match self.progs[p].prefill_routes.get(seg) {
+            Some(PrefillSegmentRoute::MoeEpAlign(_)) if self.k_moe_ep_align.is_some() => 4,
+            Some(PrefillSegmentRoute::MoeStage1A4Reuse(_))
+                if self.k_moe_stage1_a4_quant.is_some() && self.k_moe_stage1_a4_reuse.is_some() =>
+            {
+                2
+            }
+            _ => 1,
+        }
+    }
+
+    pub(crate) fn commit_graph_phase_replay(&self) -> Result<()> {
+        self.be.commit_dispatch_chain()
+    }
+
+    /// Enqueue one ordered decode segment without rearming or draining.
+    pub(crate) fn enqueue_decode_segment(
+        &mut self,
+        p: usize,
+        seg: usize,
+        interpreter: HsaKernel,
+    ) -> Result<()> {
+        self.trace_write_bytes
+            .set(self.progs[p].trace_records * TRACE_REC_BYTES);
+        let route = *self.progs[p].decode_routes.get(seg).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "decode segment {seg} is outside {} segments for program {p}",
+                self.progs[p].decode_routes.len()
+            ))
+        })?;
+        match route {
+            DecodeSegmentRoute::Interpreter => {
+                let arg = self.kernarg(p, seg as u32);
+                EngineDevice::launch_cooperative(
+                    &*self.be,
+                    interpreter,
+                    self.n_cu,
+                    WG_THREADS_8,
+                    0,
+                    kernarg_bytes(&arg),
+                    None,
+                )?;
+            }
+            DecodeSegmentRoute::MlaAttention => {
+                let kernel = self.k_decode_mla.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "decode MLA segment has no validated packet-paired object".into(),
+                    )
+                })?;
+                let arg = self.kernarg(p, seg as u32);
+                EngineDevice::launch_cooperative(
+                    &*self.be,
+                    kernel,
+                    self.n_cu,
+                    WG_THREADS_8,
+                    0,
+                    kernarg_bytes(&arg),
+                    None,
+                )?;
+            }
+            DecodeSegmentRoute::KdaDecodeFused(args) => {
+                let kernel = self.k_kda_decode_fused.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "KdaDecodeFused segment has no validated standalone object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    args.rows * args.heads,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+            }
+            DecodeSegmentRoute::GroupedMoeMxfp4 { glu, down, grid } => {
+                let glu_kernel = self.k_grouped_moe_glu.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "grouped MoE segment has no validated standalone GLU object".into(),
+                    )
+                })?;
+                let down_kernel = self.k_grouped_moe_down.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "grouped MoE segment has no validated standalone DOWN object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    glu_kernel,
+                    grid,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&glu)),
+                    None,
+                )?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    down_kernel,
+                    grid,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&down)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+            }
+        }
+        self.seg_launches += 1;
+        Ok(())
+    }
+
     /// Enqueue the single-launch (decode) dispatch of program `p`. No drain.
     ///
     /// Split out of [`AmdEngine::run`] so a TP driver can launch EVERY rank
@@ -5465,6 +11658,7 @@ impl AmdEngine {
     /// been dispatched to produce — reintroducing exactly the launched-collective
     /// latency the inline design exists to avoid.
     pub fn enqueue(&mut self, p: usize, k: HsaKernel) -> Result<()> {
+        check_packed_prefill_dispatch(self.packed_prefill, p)?;
         self.trace_write_bytes
             .set(self.progs[p].trace_records * TRACE_REC_BYTES);
         let arg = self.kernarg(p, 0);
@@ -5478,6 +11672,78 @@ impl AmdEngine {
             None,
         )?;
         self.seg_launches += 1;
+        Ok(())
+    }
+
+    pub(crate) fn deferred_token_capture_available(&self) -> bool {
+        self.k_token_capture.is_some() && self.d_token_ring.is_some()
+    }
+
+    /// Queue a copy of the sampled ids after the current decode dispatch.
+    /// No drain: the caller owns the existing per-token drain/audit boundary.
+    pub(crate) fn enqueue_token_capture(
+        &self,
+        step: usize,
+        quantum: usize,
+        batch: usize,
+    ) -> Result<()> {
+        if step >= quantum || quantum > DEFERRED_TOKEN_MAX_STEPS || batch > self.batch || batch == 0
+        {
+            return Err(RuntimeError::Device(format!(
+                "invalid deferred token capture step={step} quantum={quantum} batch={batch}"
+            )));
+        }
+        let kernel = self.k_token_capture.ok_or_else(|| {
+            RuntimeError::Rejected("decode object has no plow_token_capture helper".into())
+        })?;
+        let ring = self
+            .d_token_ring
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Device("deferred token ring is absent".into()))?;
+        let args = TokenCaptureArgs {
+            ids: self.devp[self.need(self.t_ids, "in.ids")?].base,
+            ring: ring.base,
+            step: step as u32,
+            quantum: quantum as u32,
+            batch: batch as u32,
+        };
+        EngineDevice::launch_kernel(
+            &*self.be,
+            kernel,
+            (batch as u32).div_ceil(256),
+            256,
+            0,
+            as_bytes(std::slice::from_ref(&args)),
+            None,
+        )
+    }
+
+    /// Read one completed row-major `[batch][quantum]` capture into `out`.
+    pub(crate) fn read_token_capture(
+        &mut self,
+        batch: usize,
+        quantum: usize,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        if quantum == 0 || quantum > DEFERRED_TOKEN_MAX_STEPS || batch > self.batch {
+            return Err(RuntimeError::Device(format!(
+                "invalid deferred token read quantum={quantum} batch={batch}"
+            )));
+        }
+        let bytes = batch * quantum * 4;
+        let src = self
+            .d_token_ring
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Device("deferred token ring is absent".into()))?
+            .base;
+        self.be
+            .memcpy_dtoh_pinned(&mut self.h_scalar.as_mut_slice()[..bytes], src)?;
+        out.clear();
+        out.extend(
+            self.h_scalar.as_slice()[..bytes]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().expect("4"))),
+        );
         Ok(())
     }
 
@@ -5537,29 +11803,19 @@ impl AmdEngine {
     /// [`crate::exec::amd_tp::AmdTpGroup::prefill`]. This method stays as it is
     /// because on ONE GPU there is no peer to desync from.
     ///
-    /// # Never valid on an L2-PLACED program
-    ///
-    /// Placement makes `seg` an L2 DOMAIN, so `seg_class` is 8 domains that all read as
-    /// wave-class 8 and this loop would issue 8 launches over windows that are meant to run
-    /// CONCURRENTLY — the opposite of the point. It would still produce correct tokens (the
-    /// first launch drains every domain and the other 7 find their cursors past `hi` and exit),
-    /// which is exactly why it has to be refused rather than left to be noticed: a silent 8x
-    /// launch overhead on a change whose whole purpose is latency. Placed programs go through
-    /// [`AmdEngine::run`], which is already single-launch.
     pub fn run_segmented(&mut self, p: usize) -> Result<()> {
-        if self.progs[p].l2_domains != 0 {
-            return Err(RuntimeError::Device(format!(
-                "program {p} is L2-domain placed ({} domains): its `seg` windows are L2 domains \
-                 meant to drain concurrently in ONE launch, not wave-class segments to relaunch \
-                 over. Use `run` (the single-launch path).",
-                self.progs[p].l2_domains
-            )));
-        }
         self.rearm(p)?;
-        let n_seg = self.progs[p].seg_class.len();
+        let n_seg = self.prog_dispatch(p).launches();
         let t0 = std::time::Instant::now();
+        let replay = self.graph_phase_replay(p);
+        if replay {
+            self.begin_graph_phase_replay(p)?;
+        }
         for seg in 0..n_seg {
             self.enqueue_segment(p, seg)?;
+        }
+        if replay {
+            self.commit_graph_phase_replay()?;
         }
         let t1 = std::time::Instant::now();
         if let Err(e) = self.drain() {
@@ -5600,6 +11856,27 @@ impl AmdEngine {
     /// before dispatch N is even staged.
     pub fn run(&mut self, p: usize, k: HsaKernel) -> Result<()> {
         use crate::obs::dstep;
+        if requires_segmented_decode(&self.progs[p].decode_routes) {
+            if !ctr_dbuf() {
+                dstep::timed(&dstep::REARM, || self.rearm(p))?;
+            }
+            let t0 = std::time::Instant::now();
+            let n = self.decode_launches(p);
+            dstep::timed(&dstep::ENQUEUE, || {
+                for seg in 0..n {
+                    self.enqueue_decode_segment(p, seg, k)?;
+                }
+                Ok(())
+            })?;
+            if ctr_dbuf() {
+                let cur = self.progs[p].bank.current();
+                dstep::timed(&dstep::REARM, || self.rearm_bank(p, 1 - cur))?;
+                self.progs[p].bank.select_rearmed_inactive();
+            }
+            dstep::timed(&dstep::DRAIN, || self.drain())?;
+            self.seg_drain_us += t0.elapsed().as_secs_f64() * 1e6;
+            return Ok(());
+        }
         if !ctr_dbuf() {
             dstep::timed(&dstep::REARM, || self.rearm(p))?;
         }
@@ -5818,7 +12095,13 @@ impl AmdEngine {
     /// * lm_head — the FIRST matmul writing `act.logits` → `i[4] = clen - 1`,
     ///   the chunk's last REAL row, so the sampled logits come from the last
     ///   prompt token and not from a padded one.
-    fn patch_prefill(&mut self, prog: usize, c0: u32, clen: u32) -> Result<()> {
+    fn patch_prefill_rows(
+        &mut self,
+        prog: usize,
+        c0: u32,
+        clen: u32,
+        bucket: Option<u32>,
+    ) -> Result<()> {
         let sz = std::mem::size_of::<DevInst64>();
         let n = self.pf_src[prog].len();
         // Rebuild from the pristine copy every chunk: patches must not
@@ -5838,6 +12121,7 @@ impl AmdEngine {
             self.progs[prog].t,
             self.ragged_bucket(prog),
         );
+        rebase_kda_key_factor_routes(&mut self.progs[prog].prefill_routes, clen);
 
         let mut lm = None;
         for (i, d) in insts.iter().enumerate() {
@@ -5889,6 +12173,10 @@ impl AmdEngine {
         )
     }
 
+    fn patch_prefill(&mut self, prog: usize, c0: u32, clen: u32) -> Result<()> {
+        self.patch_prefill_rows(prog, c0, clen, self.ragged_bucket(prog))
+    }
+
     /// Resolve a chunk plan to the programs and ranges that run it.
     ///
     /// Shared by the single-GPU prefill and the TP one, so both walk the prompt
@@ -5928,6 +12216,19 @@ impl AmdEngine {
             self.kda_conv_alt_stale[self.kv_slot] = true;
         }
         let ch = self.progs[step.prog].t;
+        if self.progs[step.prog].prefill_routes.iter().any(|r| {
+            matches!(
+                r,
+                PrefillSegmentRoute::MlaMaterializePack { .. }
+                    | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
+            )
+        }) && (step.c0 != 0 || step.clen != ch)
+        {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA prefill requires one exact initial bucket (c0=0, clen=T); got c0={}, clen={}, T={ch}",
+                step.c0, step.clen
+            )));
+        }
         // in.kvlen FIRST, so it can borrow the head of the staging slab before
         // ids/pos fill it — the slab is sized for exactly `ids + pos` at the
         // widest bucket and has no spare word past them.
@@ -5994,8 +12295,67 @@ impl AmdEngine {
         self.patch_prefill(step.prog, step.c0, step.clen)
     }
 
+    /// Stage one dense packed-prefill row set. Dispatch remains the TP wrapper's job so no rank
+    /// can launch until every rank has accepted the same descriptor and input rows.
+    pub fn packed_prefill_prepare(
+        &mut self,
+        prog: usize,
+        spans: &[PrefillSpan],
+        prompt_slices: &[&[u32]],
+        parked: &[u32],
+    ) -> Result<()> {
+        if self.kv_slot != 0 {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill requires the shared KV base, currently rebased to slot {}",
+                self.kv_slot
+            )));
+        }
+        let rung = self
+            .prefill_prog_t(prog)
+            .ok_or_else(|| RuntimeError::Device(format!("program {prog} is not a prefill rung")))?;
+        let rows = validate_packed_prompt_slices(rung, spans, prompt_slices)?;
+        self.stage_packed_prefill(prog, spans, parked)?;
+
+        for span in spans {
+            self.vmm_ensure(span.slot as usize, span.kv_len)?;
+            if !self.kda_conv_bank_pairs.is_empty() {
+                self.kda_conv_alt_stale[span.slot as usize] = true;
+            }
+        }
+
+        if let Some(t) = self.t_kvlen {
+            let stage = self.h_scalar.as_mut_slice();
+            for slot in 0..self.batch {
+                stage[slot * 4..slot * 4 + 4].copy_from_slice(&1u32.to_le_bytes());
+            }
+            for span in spans {
+                let slot = span.slot as usize;
+                stage[slot * 4..slot * 4 + 4].copy_from_slice(&span.kv_len.to_le_bytes());
+            }
+            self.be.memcpy_htod_pinned(
+                self.devp[t].base,
+                &self.h_scalar.as_slice()[..self.batch * 4],
+            )?;
+        }
+
+        stage_packed_prompt_rows(self.h_scalar.as_mut_slice(), rung, spans, prompt_slices)?;
+        let bytes = rung as usize * 4;
+        let d_ids = self.devp[self.need(self.t_ids, "in.ids")?].base;
+        let d_pos = self.devp[self.need(self.t_pos, "in.pos")?].base;
+        self.be
+            .memcpy_htod_pinned(d_ids, &self.h_scalar.as_slice()[..bytes])?;
+        self.be
+            .memcpy_htod_pinned(d_pos, &self.h_scalar.as_slice()[bytes..bytes * 2])?;
+        self.patch_prefill_rows(prog, 0, rows, Some(rung))
+    }
+
     /// The chunk plan for a prompt, from the compiled bucket ladder.
     pub fn plan_for(&self, n_prompt: u32) -> Result<Vec<u32>> {
+        self.plan_for_at_most(n_prompt, u32::MAX)
+    }
+
+    /// The chunk plan using only compiled rungs no wider than `max_bucket`.
+    pub fn plan_for_at_most(&self, n_prompt: u32, max_bucket: u32) -> Result<Vec<u32>> {
         // Here rather than at load: it is the ONE call every prefill path goes
         // through (`prefill`, `prefill_span`, `AmdTpGroup::plan_for`), so a
         // banded packet cannot reach the row shrink by some other door.
@@ -6018,11 +12378,12 @@ impl AmdEngine {
                 // The packet's own cap, not a constant: this line is the only
                 // positive signal that a blob's widest rung reached the planner.
                 max_chunk = buckets.iter().copied().max().unwrap_or(0),
+                requested_max_chunk = max_bucket,
                 ?buckets,
                 "prefill chunk policy"
             )
         });
-        plan_chunks(&buckets, n_prompt)
+        plan_chunks_capped(&buckets, n_prompt, max_bucket)
     }
 
     /// Prefill `prompt`, leaving the KV cache populated for `[0, prompt.len())`
@@ -6722,6 +13083,11 @@ impl AmdEngine {
         self.dec_lo > 0
     }
 
+    /// Compiled row count for a prefill program. Decode program indices are rejected.
+    pub fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
+        (prog < self.dec_lo && !self.progs[prog].packed_prefill_only).then(|| self.progs[prog].t)
+    }
+
     /// The decode rung widths, ascending. One entry without a ladder.
     pub fn decode_rungs(&self) -> Vec<u32> {
         (self.dec_lo..=self.decode)
@@ -6776,6 +13142,12 @@ impl AmdEngine {
         slot: usize,
         bytes: usize,
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        if slot >= self.batch {
+            return Err(RuntimeError::Device(format!(
+                "snapshot slot {slot} past engine batch {}",
+                self.batch
+            )));
+        }
         let mut out = Vec::new();
         let picks: Vec<(usize, u64)> = self
             .kv_slot_stride
@@ -6793,8 +13165,8 @@ impl AmdEngine {
         Ok(out)
     }
 
-    /// Full download of a named tensor (small act.* buffers only — caller's
-    /// responsibility). Task-9 round-7 instrument.
+    /// Full download of a named tensor. Production callers validate the
+    /// aggregate selection against a bounded byte budget before dispatch.
     pub fn snapshot_tensor(&mut self, name: &str) -> Result<Vec<u8>> {
         let i = self.need(self.tensor_names.iter().position(|x| x == name), name)?;
         let len = self.devp[i].len as usize;
@@ -6834,11 +13206,14 @@ impl AmdEngine {
         self.progs[p].seg_class.len()
     }
 
-    /// Whether `seg` denotes concurrently-drained L2 domains or sequential
-    /// wave-class launches for program `p`.
+    /// Ordered host launches and their device-side XCD queue layout.
     pub(crate) fn prog_dispatch(&self, p: usize) -> ProgramDispatch {
         let g = &self.progs[p];
-        ProgramDispatch::classify(g.l2_domains, g.seg_class.len())
+        ProgramDispatch::classify(
+            g.l2_domains,
+            g.seg_class.len(),
+            g.gq.as_ref().map_or(0, |q| q.n_seg as usize),
+        )
     }
 
     pub fn schedulers(&self) -> (Sched, Sched) {
@@ -6879,10 +13254,1051 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn materialized_mla_flat_grid_covers_every_qblock_head_and_batch_once() {
+        for &(n, heads, batches) in &[
+            (1u32, 1u32, 1u32),
+            (256, 12, 1),
+            (257, 12, 1),
+            (1025, 12, 1),
+            (8192, 12, 1),
+            (1025, 12, 3),
+        ] {
+            let q_grid = n.div_ceil(MLA_MATERIALIZED_Q_BLOCK);
+            let grid = mla_materialized_flat_grid(n, heads, batches).unwrap();
+            let mut seen = vec![0u8; grid as usize];
+            for flat_id in 0..grid {
+                let q_block = flat_id % q_grid;
+                let rest = flat_id / q_grid;
+                let head = rest % heads;
+                let batch = rest / heads;
+                assert!(q_block < q_grid && head < heads && batch < batches);
+                let logical = ((batch * heads + head) * q_grid + q_block) as usize;
+                seen[logical] += 1;
+            }
+            assert!(seen.into_iter().all(|n| n == 1), "T={n}");
+        }
+    }
+
+    fn materialized_mla_route_probe(t: u32, heads: u32) -> (DevProg, Vec<DeviceMem>) {
+        let pack = DevInst64 {
+            op: DevOp::MlaMaterializePack as u16,
+            blocks: 64,
+            t: [0, 1, 2, 3, 0, 0, 0, 0],
+            i: [t, heads, 128, 64, 128, 0, 0, 0],
+            ..Default::default()
+        };
+        let attention = DevInst64 {
+            op: DevOp::FlashMlaMaterializedPrefill as u16,
+            blocks: 1,
+            t: [0, 1, 2, 3, 0, 0, 0, 0],
+            i: [t, heads, heads, 192, 128, 1, 0, 0],
+            fj: [0.07216878f32.to_bits(), 0, 0],
+            ..Default::default()
+        };
+        let stream = vec![
+            packet::dev::StreamEnt {
+                inst: 0,
+                seg: 0,
+                ..Default::default()
+            },
+            packet::dev::StreamEnt {
+                inst: 1,
+                seg: 1,
+                ..Default::default()
+            },
+        ];
+        let prog = DevProg {
+            t,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts: vec![pack, attention],
+            stream,
+            stream_ofs: vec![0],
+            stream_len: vec![2],
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        let devp = (0..4)
+            .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 0x1000))
+            .collect();
+        (prog, devp)
+    }
+
+    #[test]
+    fn materialized_mla_raw_routes_use_exact_abi_and_flat_grid() {
+        let (prog, devp) = materialized_mla_route_probe(1025, 12);
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        mla_materialized_routes(&prog, &devp, &mut routes).unwrap();
+        assert!(matches!(
+            routes[0],
+            PrefillSegmentRoute::MlaMaterializePack { grid: 64, .. }
+        ));
+        let PrefillSegmentRoute::MlaMaterializedPrefill { args, grid } = routes[1] else {
+            panic!("attention did not take the standalone route")
+        };
+        assert_eq!(grid, 5 * 12);
+        assert_eq!((args.b, args.n, args.h, args.h_kv), (1, 1025, 12, 12));
+        assert_eq!((args.d_qk, args.d_v), (192, 128));
+        assert_eq!((args.stride_q_n, args.stride_k_n), (12 * 192, 12 * 192));
+        assert_eq!((args.stride_o_n, args.stride_v_n), (12 * 128, 12 * 128));
+    }
+
+    #[test]
+    fn materialized_mla_raw_route_rejects_mixed_or_counter_segments() {
+        let (mut prog, devp) = materialized_mla_route_probe(1025, 12);
+        prog.insts.push(DevInst64::default());
+        prog.stream.push(packet::dev::StreamEnt {
+            inst: 2,
+            seg: 0,
+            ..Default::default()
+        });
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        assert!(mla_materialized_routes(&prog, &devp, &mut routes)
+            .unwrap_err()
+            .to_string()
+            .contains("mixes"));
+
+        let (mut prog, devp) = materialized_mla_route_probe(1025, 12);
+        prog.stream[1].wait_len = 1;
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        assert!(mla_materialized_routes(&prog, &devp, &mut routes)
+            .unwrap_err()
+            .to_string()
+            .contains("counter obligations"));
+    }
+
+    #[test]
+    fn grouped_moe_decode_pair_routes_with_exact_mxfp4_abi() {
+        let glu = DevInst64 {
+            op: DevOp::MoeGroupGluFp8Blk as u16,
+            blocks: 256,
+            t: [0, 1, 2, 3, 4, 0, 0, 0],
+            i: [16, 384, 3584, 896, 0, 2, 2, 0],
+            fj: [4.0f32.to_bits(), 25.0f32.to_bits(), 0],
+            ..Default::default()
+        };
+        let down = DevInst64 {
+            op: DevOp::MoeGroupDownFp8Blk as u16,
+            blocks: 256,
+            t: [5, 0, 2, 3, 4, 0, 0, 0],
+            i: [16, 3584, 384, 896, 0, 0, 2, 0],
+            ..Default::default()
+        };
+        let prog = DevProg {
+            t: 1,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts: vec![glu, down],
+            stream: vec![
+                packet::dev::StreamEnt {
+                    inst: 0,
+                    ..Default::default()
+                },
+                packet::dev::StreamEnt {
+                    inst: 1,
+                    ..Default::default()
+                },
+            ],
+            stream_ofs: vec![0],
+            stream_len: vec![2],
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        assert_eq!(
+            decode_segment_kinds(&prog).unwrap(),
+            vec![DecodeSegmentKind::GroupedMoeMxfp4 { glu: 0, down: 1 }]
+        );
+        let devp: Vec<_> = (0..6)
+            .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 0x1000))
+            .collect();
+        let DecodeSegmentRoute::GroupedMoeMxfp4 { glu, down, grid } =
+            decode_segment_routes(&prog, &[], &[], &devp).unwrap()[0]
+        else {
+            panic!("grouped MoE pair did not take standalone route")
+        };
+        assert_eq!(grid, 768);
+        assert_eq!(
+            (glu.topk, glu.intermediate, glu.hidden, glu.enc),
+            (16, 384, 3584, 2)
+        );
+        assert_eq!(
+            (down.topk, down.hidden, down.intermediate, down.enc),
+            (16, 3584, 384, 2)
+        );
+        assert_eq!((glu.beta, glu.linear_beta), (4.0, 25.0));
+    }
+
+    #[test]
+    fn specialised_amd_object_pairing_is_fail_closed() {
+        let object = Path::new("interp_decode.elf");
+        assert!(validate_packet_pairing_stamp(None, None, None, object).is_ok());
+        assert!(validate_packet_pairing_stamp(Some(1), None, Some(1), object).is_err());
+        assert!(validate_packet_pairing_stamp(Some(1), Some(2), None, object).is_err());
+        assert!(validate_packet_pairing_stamp(
+            Some(1),
+            Some(2),
+            Some(0x0000_0002_0000_0001),
+            object
+        )
+        .is_ok());
+        let err =
+            validate_packet_pairing_stamp(Some(1), Some(2), Some(0x0000_0003_0000_0001), object)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("packet/object MISMATCH"));
+    }
+
+    #[test]
+    fn f32mix_attn_res_route_requires_marker_geometry_and_a_pure_segment() {
+        let mut prog = segmented_prog(
+            &[DevOp::RmsNorm, DevOp::AttnRes, DevOp::RmsNorm],
+            &[0, 1, 2],
+        );
+        prog.t = 8192;
+        let d = &mut prog.insts[1];
+        d.blocks = 256;
+        d.t = [0, 1, 2, 3, packet::dev::TENSOR_NONE16, 4, 5, 6];
+        d.i = [8192, 7168, 4, 4, 8, packet::dev::TENSOR_NONE_I, 0, 0];
+        d.fj = [1e-5f32.to_bits(), 1e-5f32.to_bits(), 0];
+        let tensors: Vec<_> = (0..7)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..7)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::AttnResF32Mix { args, grid } = routes[1] else {
+            panic!("a marked, pure f32-mix AttnRes packet must select the object")
+        };
+        assert_eq!(
+            (args.t, args.hid, args.nb, args.nbcap, grid),
+            (8192, 7168, 4, 8, 768)
+        );
+        assert_eq!(
+            (args.out, args.gamma, args.res_a, args.res_b),
+            (0x1000, 0x1400, 0x1500, 0x1600)
+        );
+        assert_eq!((args.push_src, args.res_pre, args.reserved), (0, 0, 0));
+        assert_eq!(args.out_eps, 1e-5);
+
+        // The interpreter's contract (no output-norm epsilon) stays on the interpreter.
+        prog.insts[1].fj[1] = 0;
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
+        prog.insts[1].fj[1] = 1e-5f32.to_bits();
+
+        // Decode width and a foreign hidden size are outside the object's contract.
+        prog.insts[1].i[0] = 1;
+        assert!(matches!(
+            moe_mxfp4_routes(&prog, &tensors, &devp).unwrap()[1],
+            PrefillSegmentRoute::Interpreter
+        ));
+        prog.insts[1].i[0] = 8192;
+        prog.insts[1].i[1] = 4096;
+        assert!(matches!(
+            moe_mxfp4_routes(&prog, &tensors, &devp).unwrap()[1],
+            PrefillSegmentRoute::Interpreter
+        ));
+        prog.insts[1].i[1] = 7168;
+
+        // A marked packet sharing a segment with other work is refused, never silently run.
+        prog.stream[2].seg = 1;
+        let err = moe_mxfp4_routes(&prog, &tensors, &devp)
+            .expect_err("mixed f32-mix segment must fail closed")
+            .to_string();
+        assert!(err.contains("f32-mix AttnRes packet in a mixed segment"));
+    }
+
+    #[test]
+    fn f32mix_attn_res_object_gates_markers_and_pairing() {
+        let path = Path::new("attn_res_f32mix_gfx950.elf");
+        let mut syms = ATTN_RES_F32MIX_MARKERS.to_vec();
+        syms.pop();
+        let err = check_attn_res_f32mix_symbols(&syms, path)
+            .expect_err("a stale resource contract must be rejected")
+            .to_string();
+        assert!(err.contains("lacks required ABI/resource marker"));
+        let err = check_attn_res_f32mix_symbols(&ATTN_RES_F32MIX_MARKERS, path)
+            .expect_err("an unstamped object must be rejected")
+            .to_string();
+        assert!(err.contains("no packet-pairing stamp"));
+        let missing = std::env::temp_dir().join(format!(
+            "plow-attn-res-f32mix-missing-{}.elf",
+            std::process::id()
+        ));
+        let err = read_attn_res_f32mix_object(&missing)
+            .expect_err("a marked packet must not silently use the interpreter")
+            .to_string();
+        assert!(err.contains("f32-mix AttnRes packets require"));
+    }
+
+    #[test]
+    fn marked_kda_wave_items_requires_its_object() {
+        let path = std::env::temp_dir().join(format!(
+            "plow-kda-wave-items-missing-{}-{}.elf",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let err = read_kda_intra_wave_items_object(&path)
+            .expect_err("a marked packet must not silently use the interpreter")
+            .to_string();
+        assert!(err.contains("marked KDA-intra wave-item segments require"));
+    }
+
+    #[test]
+    fn marked_kda_wave_items_rejects_missing_markers_and_pairing() {
+        let path = Path::new("kda_chunk_intra_wave_items_gfx950.elf");
+        let mut syms = KDA_INTRA_WAVE_ITEMS_MARKERS.to_vec();
+        syms.pop();
+        let err = check_kda_intra_wave_items_symbols(&syms, path)
+            .expect_err("a stale resource contract must be rejected")
+            .to_string();
+        assert!(err.contains("lacks required ABI/resource marker"));
+
+        let err = check_kda_intra_wave_items_symbols(&KDA_INTRA_WAVE_ITEMS_MARKERS, path)
+            .expect_err("an unstamped object must be rejected")
+            .to_string();
+        assert!(err.contains("no packet-pairing stamp"));
+    }
+
+    #[test]
+    fn marked_kda_carry_regstate_requires_its_object() {
+        let path = std::env::temp_dir().join(format!(
+            "plow-kda-carry-regstate-missing-{}-{}.elf",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let err = read_kda_carry_regstate_object(&path)
+            .expect_err("a marked packet must not silently use the interpreter")
+            .to_string();
+        assert!(err.contains("marked KDA carry regstate segments require"));
+
+        let path = Path::new("kda_chunk_carry_regstate_gfx950.elf");
+        let mut syms = KDA_CARRY_REGSTATE_MARKERS.to_vec();
+        syms.pop();
+        let err = check_kda_carry_regstate_symbols(&syms, path)
+            .expect_err("a stale resource contract must be rejected")
+            .to_string();
+        assert!(err.contains("lacks required ABI/resource marker"));
+        let err = check_kda_carry_regstate_symbols(&KDA_CARRY_REGSTATE_MARKERS, path)
+            .expect_err("an unstamped object must be rejected")
+            .to_string();
+        assert!(err.contains("no packet-pairing stamp"));
+    }
+
+    #[test]
+    fn expert_parallel_loader_requires_every_abi_and_resource_marker() {
+        let required = [
+            "plow_moe_ep_filter_align_abi_1",
+            "plow_moe_ep_filter_align_wave64_1",
+            "plow_moe_ep_filter_align_stable_1",
+            "plow_moe_ep_filter_align_no_spill_1",
+        ];
+        let path = Path::new("moe_ep_align_gfx950.elf");
+        assert!(check_moe_ep_symbols(&required, path, &required).is_ok());
+        let mut stale = required.to_vec();
+        stale.pop();
+        let err = check_moe_ep_symbols(&stale, path, &required)
+            .expect_err("a stale specialist object must fail closed")
+            .to_string();
+        assert!(err.contains("plow_moe_ep_filter_align_no_spill_1"));
+        assert_eq!(std::mem::size_of::<MoeEpAlignArgs>(), 80);
+        assert_eq!(std::mem::size_of::<MoeEpCombineArgs>(), 48);
+    }
+
+    #[test]
+    fn pairing_stamp_is_read_from_elf_data() {
+        let mut elf = vec![0u8; 0x304];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[0x28..0x30].copy_from_slice(&0x100u64.to_le_bytes());
+        elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+        elf[0x3c..0x3e].copy_from_slice(&4u16.to_le_bytes());
+
+        let symtab = 0x100 + 64;
+        elf[symtab + 4..symtab + 8].copy_from_slice(&2u32.to_le_bytes());
+        elf[symtab + 24..symtab + 32].copy_from_slice(&0x200u64.to_le_bytes());
+        elf[symtab + 32..symtab + 40].copy_from_slice(&48u64.to_le_bytes());
+        elf[symtab + 40..symtab + 44].copy_from_slice(&2u32.to_le_bytes());
+        elf[symtab + 56..symtab + 64].copy_from_slice(&24u64.to_le_bytes());
+
+        let strtab = 0x100 + 128;
+        elf[strtab + 4..strtab + 8].copy_from_slice(&3u32.to_le_bytes());
+        elf[strtab + 24..strtab + 32].copy_from_slice(&0x280u64.to_le_bytes());
+        elf[strtab + 32..strtab + 40].copy_from_slice(&32u64.to_le_bytes());
+
+        let data = 0x100 + 192;
+        elf[data + 4..data + 8].copy_from_slice(&1u32.to_le_bytes());
+        elf[data + 16..data + 24].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[data + 24..data + 32].copy_from_slice(&0x300u64.to_le_bytes());
+        elf[data + 32..data + 40].copy_from_slice(&4u64.to_le_bytes());
+
+        let symbol = 0x200 + 24;
+        elf[symbol..symbol + 4].copy_from_slice(&1u32.to_le_bytes());
+        elf[symbol + 6..symbol + 8].copy_from_slice(&3u16.to_le_bytes());
+        elf[symbol + 8..symbol + 16].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[symbol + 16..symbol + 24].copy_from_slice(&4u64.to_le_bytes());
+        elf[0x281..0x295].copy_from_slice(b"plow_packet_hash_lo\0");
+        elf[0x300..0x304].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+
+        assert_eq!(
+            elf_symbol_u32(&elf, "plow_packet_hash_lo"),
+            Some(0x1234_5678)
+        );
+        assert_eq!(elf_symbol_u32(&elf, "plow_packet_hash_hi"), None);
+    }
+
+    #[test]
+    fn required_compiled_opcode_markers_are_fail_closed() {
+        let path = Path::new("interp_decode_k3.elf");
+        assert!(check_compiled_opcode_marker_set(
+            &["plow_opcode_attn_res_1"],
+            path,
+            [DevOp::AttnRes]
+        )
+        .is_ok());
+        for &(op, marker) in COMPILED_OPCODE_MARKERS {
+            let err = check_compiled_opcode_marker_set(&[], path, [op])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(marker), "{op:?} must require {marker}: {err}");
+            assert!(check_compiled_opcode_marker_set(&[marker], path, [op]).is_ok());
+        }
+    }
+
+    #[test]
+    fn specialised_amd_manifest_hash_must_be_valid() {
+        let path = Path::new("build.json");
+        assert_eq!(
+            manifest_pairing_hash(br#"{"pairing":{"hash":"0x1234"}}"#, path).unwrap(),
+            0x1234
+        );
+        assert!(manifest_pairing_hash(br#"{"pairing":{}}"#, path).is_err());
+    }
+
+    fn segmented_decode_probe() -> DevProg {
+        let insts = vec![
+            DevInst64 {
+                op: DevOp::Nop as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::KdaDecodeFused as u16,
+                blocks: 12,
+                i: [1, 12, 128, 8, 4, 1, 1, 2],
+                fj: [
+                    0.08838835f32.to_bits(),
+                    (-5.0f32).to_bits(),
+                    1.0e-5f32.to_bits(),
+                ],
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::Nop as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+        ];
+        DevProg {
+            t: 1,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts,
+            stream: (0..3)
+                .map(|seg| packet::dev::StreamEnt {
+                    inst: seg,
+                    seg: seg as u16,
+                    ..Default::default()
+                })
+                .collect(),
+            stream_ofs: vec![0],
+            stream_len: vec![3],
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        }
+    }
+
+    #[test]
+    fn fused_decode_segment_is_a_pure_ordered_single_rank_route() {
+        let p = segmented_decode_probe();
+        assert_eq!(
+            decode_segment_kinds(&p).unwrap(),
+            [
+                DecodeSegmentKind::Interpreter,
+                DecodeSegmentKind::KdaDecodeFused(1),
+                DecodeSegmentKind::Interpreter,
+            ]
+        );
+        validate_decode_dispatch(&[p], 0).unwrap();
+    }
+
+    #[test]
+    fn decode_mla_pair_routes_as_one_specialist_segment() {
+        let mut p = segmented_decode_probe();
+        p.insts = vec![
+            DevInst64 {
+                op: DevOp::Nop as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::FlashMlaDecode as u16,
+                blocks: 256,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::MlaMergeFold as u16,
+                blocks: 128,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::Gemv as u16,
+                blocks: 256,
+                ..Default::default()
+            },
+        ];
+        p.stream = [0u32, 1, 2, 3]
+            .into_iter()
+            .zip([0u16, 1, 1, 2])
+            .map(|(inst, seg)| packet::dev::StreamEnt {
+                inst,
+                seg,
+                ..Default::default()
+            })
+            .collect();
+        p.stream_len[0] = 4;
+        assert_eq!(
+            decode_segment_kinds(&p).unwrap(),
+            [
+                DecodeSegmentKind::Interpreter,
+                DecodeSegmentKind::MlaAttention,
+                DecodeSegmentKind::Interpreter,
+            ]
+        );
+        assert!(matches!(
+            decode_segment_routes(&p, &[], &[], &[]).unwrap()[1],
+            DecodeSegmentRoute::MlaAttention
+        ));
+    }
+
+    #[test]
+    fn mixed_decode_mla_ops_remain_on_the_ordinary_interpreter() {
+        let mut p = segmented_decode_probe();
+        p.insts = vec![
+            DevInst64 {
+                op: DevOp::FlashMlaDecode as u16,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::MlaMergeFold as u16,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::Gemv as u16,
+                ..Default::default()
+            },
+        ];
+        p.stream = (0..3)
+            .map(|inst| packet::dev::StreamEnt {
+                inst,
+                seg: 0,
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(
+            decode_segment_kinds(&p).unwrap(),
+            [DecodeSegmentKind::Interpreter]
+        );
+        assert!(!requires_segmented_decode(
+            &decode_segment_routes(&p, &[], &[], &[]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn fused_decode_rejects_one_raw_instruction_in_multiple_segments() {
+        let mut p = segmented_decode_probe();
+        p.stream.push(packet::dev::StreamEnt {
+            inst: 1,
+            seg: 3,
+            ..Default::default()
+        });
+        p.stream_len[0] += 1;
+        let err = decode_segment_kinds(&p)
+            .expect_err("a stateful raw instruction must execute in one segment")
+            .to_string();
+        assert!(err.contains("segments 1 and 3"), "{err}");
+    }
+
+    #[test]
+    fn fused_decode_v1_descriptor_fails_closed() {
+        let mut p = segmented_decode_probe();
+        p.insts[1].i[7] = 1;
+        let err = decode_segment_routes(&p, &[], &[], &[])
+            .expect_err("KDA fused ABI v1 must not route to the v2 object")
+            .to_string();
+        assert!(err.contains("version=1"), "{err}");
+    }
+
+    #[test]
+    fn fused_decode_descriptor_builds_the_exact_raw_kernarg() {
+        let mut p = segmented_decode_probe();
+        p.insts[1].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        let handles = [
+            8u32,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            packet::dev::TENSOR_NONE_I,
+        ];
+        let init: Vec<u8> = handles.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let tensors: Vec<crate::asset::devblob::DevTensor> = (0..18)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: if i == 7 { 44 } else { 1 << 20 },
+                init: (i == 7).then_some(0..44),
+            })
+            .collect();
+        let devp: Vec<DeviceMem> = (0..18)
+            .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 1 << 20))
+            .collect();
+        let routes = decode_segment_routes(&p, &tensors, &init, &devp).unwrap();
+        let DecodeSegmentRoute::KdaDecodeFused(a) = routes[1] else {
+            panic!("segment 1 must route to the raw object")
+        };
+        assert_eq!(
+            (a.y, a.q_raw, a.k_raw, a.v_raw),
+            (0x1000, 0x2000, 0x3000, 0x4000)
+        );
+        assert_eq!((a.wq, a.wk, a.wv), (0x9000, 0xa000, 0xb000));
+        assert_eq!((a.csq, a.csk, a.csv), (0xc000, 0xd000, 0xe000));
+        assert_eq!(
+            (a.forget_raw, a.beta_raw, a.state),
+            (0x5000, 0x6000, 0x7000)
+        );
+        assert_eq!((a.a_log, a.dt_bias, a.norm_w), (0xf000, 0x10000, 0x11000));
+        assert_eq!(a.output_gate_raw, 0x12000);
+        assert_eq!(a.parked, 0);
+        assert_eq!((a.rows, a.heads, a.dim, a.bv, a.conv_w), (1, 12, 128, 8, 4));
+        assert_eq!((a.flags, a.gate_mode), (1, 1));
+        assert_eq!(
+            (a.lower_bound, a.scale, a.norm_eps),
+            (-5.0, 0.08838835, 1.0e-5)
+        );
+        assert_eq!(as_bytes(std::slice::from_ref(&a)).len(), 184);
+    }
+
+    #[test]
+    fn fused_decode_refuses_mixed_countered_and_l2_segments() {
+        let mut mixed = segmented_decode_probe();
+        mixed.stream.push(packet::dev::StreamEnt {
+            inst: 0,
+            seg: 1,
+            ..Default::default()
+        });
+        mixed.stream_len[0] += 1;
+        assert!(decode_segment_kinds(&mixed)
+            .unwrap_err()
+            .to_string()
+            .contains("mixes KdaDecodeFused"));
+
+        let mut countered = segmented_decode_probe();
+        countered.stream[1].succ_len = 1;
+        countered.succs.push(0);
+        assert!(decode_segment_kinds(&countered)
+            .unwrap_err()
+            .to_string()
+            .contains("counter obligations"));
+
+        let mut crossing = segmented_decode_probe();
+        crossing.stream[0].succ_len = 1;
+        crossing.succs.push(7);
+        crossing.stream[2].wait_len = 1;
+        crossing.waits.push(packet::dev::Wait {
+            id: 7,
+            threshold: 1,
+        });
+        assert!(decode_segment_kinds(&crossing)
+            .unwrap_err()
+            .to_string()
+            .contains("crosses into segment"));
+
+        let mut placed = segmented_decode_probe();
+        placed.l2_domains = 8;
+        assert!(validate_decode_dispatch(&[placed], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("L2-domain placement"));
+    }
+
+    #[test]
+    fn ordinary_l2_decode_allows_cross_domain_counters() {
+        let mut placed = segmented_prog(&[DevOp::Gemv, DevOp::RmsNorm], &[0, 1]);
+        placed.l2_domains = 2;
+        placed.stream[0].succ_len = 1;
+        placed.succs.push(7);
+        placed.stream[1].wait_len = 1;
+        placed.waits.push(packet::dev::Wait {
+            id: 7,
+            threshold: 1,
+        });
+
+        assert!(decode_segment_kinds(&placed).is_ok());
+        assert!(validate_decode_dispatch(&[placed], 0).is_ok());
+    }
+
+    #[test]
+    fn legacy_l2_prefill_forces_primary_interpreter() {
+        let legacy = ProgramDispatch::classify(8, 8, 8);
+        assert_eq!(legacy, ProgramDispatch::L2Domains(8));
+        assert!(!prefill_segment_specialization_allowed(legacy));
+
+        let current = ProgramDispatch::classify(8, 3, 24);
+        assert_eq!(
+            current,
+            ProgramDispatch::L2Segments {
+                domains: 8,
+                segments: 3,
+            }
+        );
+        assert!(prefill_segment_specialization_allowed(current));
+        assert!(prefill_segment_specialization_allowed(
+            ProgramDispatch::WaveSegments(3)
+        ));
+    }
+
+    fn overlap_range(name: &str, start: u64, end: u64) -> AmdOwnedRange {
+        AmdOwnedRange {
+            name: name.into(),
+            address_space: "device",
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn overlap_capability_fails_closed_for_shared_or_missing_evidence() {
+        let shared = overlap_range("shared", 0x1000, 0x2000);
+        let evidence = [AmdOverlapRankEvidence {
+            rank: 0,
+            queue_count: 1,
+            prefill_ranges: vec![shared.clone()],
+            decode_ranges: vec![shared],
+            prefill_queue_ids: vec![7],
+            decode_queue_ids: vec![7],
+        }];
+        assert_eq!(
+            derive_overlap_capability(&evidence),
+            AmdOverlapCapability {
+                scratch_isolated: false,
+                queue_isolated: false,
+                overlap_safe: false,
+                queue_scope: "global_per_rank",
+                queue_count: 1,
+                per_xcd_queues: false,
+                ranks: 1,
+            }
+        );
+        let missing = derive_overlap_capability(&[]);
+        assert!(!missing.scratch_isolated);
+        assert!(!missing.queue_isolated);
+        assert!(!missing.overlap_safe);
+        assert_eq!(missing.queue_count, 0);
+    }
+
+    #[test]
+    fn overlap_capability_requires_both_disjoint_intervals_and_queues() {
+        let evidence = [AmdOverlapRankEvidence {
+            rank: 0,
+            queue_count: 2,
+            prefill_ranges: vec![overlap_range("prefill", 0x1000, 0x2000)],
+            decode_ranges: vec![overlap_range("decode", 0x2000, 0x3000)],
+            prefill_queue_ids: vec![7],
+            decode_queue_ids: vec![8],
+        }];
+        let capability = derive_overlap_capability(&evidence);
+        assert!(capability.scratch_isolated);
+        assert!(capability.queue_isolated);
+        assert!(capability.overlap_safe);
+        assert_eq!(capability.queue_count, 2);
+    }
+
+    fn packed_spans() -> [PrefillSpan; 2] {
+        [
+            PrefillSpan {
+                row0: 0,
+                n_rows: 3,
+                slot: 0,
+                flags: PREFILL_SPAN_RESET_STATE,
+                kv_row0: 0,
+                kv_len: 3,
+                state_slot: 0,
+                program: 2,
+            },
+            PrefillSpan {
+                row0: 3,
+                n_rows: 2,
+                slot: 1,
+                flags: 0,
+                kv_row0: 5,
+                kv_len: 7,
+                state_slot: 1,
+                program: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn packed_dispatch_selects_tagged_sibling_without_changing_ordinary_rung() {
+        let roles = [
+            (128, false),
+            (512, false),
+            (128, true),
+            (512, true),
+            (1, false),
+        ];
+        let select =
+            |requested| packed_prefill_topology_index(requested, 4, |i| roles.get(i).copied());
+        assert_eq!(select(0), Some(2));
+        assert_eq!(select(1), Some(3));
+        assert_eq!(select(2), Some(2));
+        assert_eq!(select(4), None);
+
+        let legacy = [(128, false), (1, false)];
+        assert_eq!(
+            packed_prefill_topology_index(0, 1, |i| legacy.get(i).copied()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn packed_prefill_accepts_dense_ragged_rows_and_parked_padding() {
+        let binding =
+            validate_packed_prefill(2, 8, 2, &packed_spans(), &[0, 0, 0, 0, 0, 1, 1, 1]).unwrap();
+        assert_eq!(
+            binding,
+            PackedPrefillBinding {
+                prog: 2,
+                n_spans: 2,
+                n_rows: 8
+            }
+        );
+    }
+
+    #[test]
+    fn packed_prefill_rejects_malformed_spans_and_masks() {
+        let good_mask = [0, 0, 0, 0, 0, 1, 1, 1];
+        let reject = |spans: &[PrefillSpan], mask: &[u32]| {
+            assert!(validate_packed_prefill(2, 8, 2, spans, mask).is_err());
+        };
+
+        let mut spans = packed_spans();
+        spans[1].row0 = 4;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].kv_len = 8;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].flags = PREFILL_SPAN_RESET_STATE;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].slot = 0;
+        spans[1].state_slot = 0;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].state_slot = 0;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].program = 3;
+        reject(&spans, &good_mask);
+        reject(&packed_spans(), &[0, 0, 0, 0, 0]);
+        reject(&packed_spans(), &[0, 1, 0, 0, 0, 1, 1, 1]);
+        reject(&packed_spans(), &[0, 0, 0, 0, 0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn packed_prefill_prompt_slices_must_match_spans_exactly() {
+        let a = [10, 11, 12];
+        let b = [20, 21];
+        assert_eq!(
+            validate_packed_prompt_slices(8, &packed_spans(), &[&a, &b]).unwrap(),
+            5
+        );
+        assert!(validate_packed_prompt_slices(8, &packed_spans(), &[&a]).is_err());
+        assert!(validate_packed_prompt_slices(8, &packed_spans(), &[&a, &[20]]).is_err());
+        assert!(validate_packed_prompt_slices(4, &packed_spans(), &[&a, &b]).is_err());
+    }
+
+    #[test]
+    fn packed_prefill_stages_concatenated_ids_and_absolute_positions() {
+        let a = [10, 11, 12];
+        let b = [20, 21];
+        let mut stage = [0xff; 64];
+        assert_eq!(
+            stage_packed_prompt_rows(&mut stage, 8, &packed_spans(), &[&a, &b]).unwrap(),
+            5
+        );
+        let words = |half: usize| {
+            (0..8)
+                .map(|i| {
+                    let off = half * 32 + i * 4;
+                    u32::from_le_bytes(stage[off..off + 4].try_into().unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(words(0), [10, 11, 12, 20, 21, 0, 0, 0]);
+        assert_eq!(words(1), [0, 1, 2, 5, 6, 0, 0, 0]);
+    }
+
+    #[test]
+    fn packed_prefill_patches_generic_work_to_dense_total_rows() {
+        let mut inst = DevInst64 {
+            op: DevOp::Embed as u16,
+            i: [8, 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        rebase_chunk_rows(std::slice::from_mut(&mut inst), &[], 0, 5, 8, Some(8));
+        assert_eq!(inst.i[0], 5);
+    }
+
+    #[test]
+    fn packed_prefill_kernarg_is_legacy_null_or_exact_program_only() {
+        assert_eq!(
+            packed_prefill_kernarg(None, 2, 0x1000, 0x2000),
+            (0, 0, 0, 0)
+        );
+        let binding = PackedPrefillBinding {
+            prog: 2,
+            n_spans: 2,
+            n_rows: 8,
+        };
+        assert_eq!(
+            packed_prefill_kernarg(Some(binding), 2, 0x1000, 0x2000),
+            (0x1000, 0x2000, 2, 8)
+        );
+        assert_eq!(
+            packed_prefill_kernarg(Some(binding), 1, 0x1000, 0x2000),
+            (0, 0, 0, 0)
+        );
+        assert!(check_packed_prefill_dispatch(Some(binding), 2).is_ok());
+        assert!(check_packed_prefill_dispatch(Some(binding), 1).is_err());
+    }
+
+    #[test]
+    fn packed_prefill_requires_abi_on_every_routed_object() {
+        assert!(check_packed_prefill_abi(true, false, false).is_ok());
+        assert!(check_packed_prefill_abi(true, true, true).is_ok());
+
+        let missing_prefill = check_packed_prefill_abi(false, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_prefill.contains(PACKED_PREFILL_ABI_SYM));
+
+        let missing_flash = check_packed_prefill_abi(true, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_flash.contains("flash object"));
+        assert!(missing_flash.contains(PACKED_PREFILL_ABI_SYM));
+    }
+
+    #[test]
+    fn hierarchical_gate_marker_requires_decode_gq_and_l2_capability() {
+        let object = Path::new("interp_decode_gq.elf");
+        let valid = [GATE_HIER_SYM, L2_DISPATCH_SYM];
+        assert!(check_gate_hier_object(&valid, object, Phase::Decode, Sched::GlobalQueue).is_ok());
+        assert!(
+            check_gate_hier_object(&[L2_DISPATCH_SYM], object, Phase::Prefill, Sched::Static)
+                .is_ok()
+        );
+
+        for (syms, phase, sched) in [
+            (&[GATE_HIER_SYM][..], Phase::Decode, Sched::GlobalQueue),
+            (
+                &[GATE_HIER_SYM, L2_DISPATCH_SYM][..],
+                Phase::Decode,
+                Sched::Static,
+            ),
+            (
+                &[GATE_HIER_SYM, L2_DISPATCH_SYM][..],
+                Phase::Prefill,
+                Sched::GlobalQueue,
+            ),
+        ] {
+            let message = check_gate_hier_object(syms, object, phase, sched)
+                .expect_err("invalid hierarchical-gate object must be refused")
+                .to_string();
+            assert!(message.contains(GATE_HIER_SYM));
+            assert!(message.contains(L2_DISPATCH_SYM));
+        }
+    }
+
+    #[test]
+    fn prefill_only_accumulation_does_not_require_a_decode_arm() {
+        let obj = Path::new("interp_decode_k3.elf");
+        let mut prefill = segmented_prog(&[DevOp::MoeGroupDownPf], &[0]);
+        prefill.insts[0].i[4] = 4;
+        let b1_decode = segmented_prog(&[DevOp::Gemv], &[0]);
+        assert!(required_moe_pf_accum(std::slice::from_ref(&prefill), 4));
+        assert!(!required_moe_pf_accum(std::slice::from_ref(&b1_decode), 4));
+        let requires = vec![
+            "PLOW_MOE_PF_ATOMIC=1".to_owned(),
+            "PLOW_MOE_PF_DET=1".to_owned(),
+        ];
+        assert!(
+            check_decode_object(&["plow_interp_dec_gfx950"], obj, &requires, false, false,).is_ok()
+        );
+    }
+
+    #[test]
+    fn grouped_decode_requires_its_accumulation_arm() {
+        let obj = Path::new("interp_decode_k3.elf");
+        for (flag, marker) in [
+            ("PLOW_MOE_PF_ATOMIC", "plow_moe_pf_atomic_arm"),
+            ("PLOW_MOE_PF_DET", "plow_moe_pf_det_arm"),
+        ] {
+            let requires = vec![format!("{flag}=1")];
+            let mut prog = segmented_prog(&[DevOp::MoeGroupDownPf], &[0]);
+            prog.insts[0].i[if flag == "PLOW_MOE_PF_ATOMIC" { 4 } else { 5 }] = 4;
+            let need_atomic = required_moe_pf_accum(std::slice::from_ref(&prog), 4);
+            let need_det = required_moe_pf_accum(std::slice::from_ref(&prog), 5);
+            assert!(check_decode_object(&[marker], obj, &requires, need_atomic, need_det,).is_ok());
+            let err = check_decode_object(
+                &["plow_interp_dec_gfx950"],
+                obj,
+                &requires,
+                need_atomic,
+                need_det,
+            )
+            .expect_err("a grouped decode object without its accumulation arm must refuse");
+            assert!(err.to_string().contains(flag));
+        }
+    }
+
     fn segmented_prog(ops: &[DevOp], segs: &[u16]) -> DevProg {
         assert_eq!(ops.len(), segs.len());
         DevProg {
             t: 2048,
+            packed_prefill_only: false,
             n_counter: 0,
             insts: ops
                 .iter()
@@ -6910,6 +14326,699 @@ mod tests {
         }
     }
 
+    fn phase_chain_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "dispatch_chains": [{
+                "program": 0,
+                "kind": "prefill",
+                "topology": "ordinary",
+                "segments": [
+                    {"segment": 0, "families": ["elementwise"], "arms": ["Nop"]},
+                    {"segment": 1, "families": ["collective"], "arms": ["XReduceTwoShot"]},
+                    {"segment": 2, "families": ["elementwise"], "arms": ["Nop"]}
+                ],
+                "phases": [
+                    {
+                        "first_segment": 0,
+                        "last_segment": 0,
+                        "segments": 1,
+                        "families": ["elementwise"],
+                        "arms": ["Nop"],
+                        "object_class": "ordinary"
+                    },
+                    {
+                        "first_segment": 1,
+                        "last_segment": 1,
+                        "segments": 1,
+                        "families": ["collective"],
+                        "arms": ["XReduceTwoShot"],
+                        "object_class": "ordinary",
+                        "resource_contract": {
+                            "policy": "refuse",
+                            "wavefront_size": 64,
+                            "min_occupancy_waves_per_simd": 2,
+                            "max_private_segment_bytes_delta": 0,
+                            "max_vgpr_spill_delta": 0,
+                            "max_sgpr_spill_delta": 0
+                        }
+                    },
+                    {
+                        "first_segment": 2,
+                        "last_segment": 2,
+                        "segments": 1,
+                        "families": ["elementwise"],
+                        "arms": ["Nop"],
+                        "object_class": "ordinary"
+                    }
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn graph_phase_selector_requires_matching_contiguous_packet_inventory() {
+        let prog = segmented_prog(&[DevOp::Nop, DevOp::XReduceTwoShot, DevOp::Nop], &[0, 1, 2]);
+        let selected = graph_phase_xreduce_segments_from_manifest(
+            &phase_chain_manifest(),
+            std::slice::from_ref(&prog),
+            1,
+            Path::new("build.json"),
+        )
+        .unwrap();
+        assert_eq!(selected[0], BTreeSet::from([1]));
+
+        let mut bad = phase_chain_manifest();
+        bad["dispatch_chains"][0]["segments"][1]["arms"] = serde_json::json!(["Gemm"]);
+        let err = graph_phase_xreduce_segments_from_manifest(
+            &bad,
+            std::slice::from_ref(&prog),
+            1,
+            Path::new("build.json"),
+        )
+        .expect_err("phase and segment inventories must agree");
+        assert!(err.to_string().contains("segment inventory differs"));
+    }
+
+    #[test]
+    fn graph_phase_selector_rejects_topology_and_resource_drift() {
+        let prog = segmented_prog(&[DevOp::Nop, DevOp::XReduceTwoShot, DevOp::Nop], &[0, 1, 2]);
+        for (pointer, value, needle) in [
+            (
+                "/dispatch_chains/0/topology",
+                serde_json::json!("packed"),
+                "topology mismatch",
+            ),
+            (
+                "/dispatch_chains/0/phases/1/resource_contract/wavefront_size",
+                serde_json::json!(32),
+                "incompatible resource contract",
+            ),
+        ] {
+            let mut bad = phase_chain_manifest();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            let err = graph_phase_xreduce_segments_from_manifest(
+                &bad,
+                std::slice::from_ref(&prog),
+                1,
+                Path::new("build.json"),
+            )
+            .expect_err("manifest drift must fail closed");
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn lean_moe_stage1_route_requires_exact_shape_and_align() {
+        let mut prog = segmented_prog(&[DevOp::MoeAlignPf, DevOp::MoeGroupGluPf], &[0, 1]);
+        prog.t = 8192;
+        prog.insts[0].t[0] = 4;
+        prog.insts[0].i = [8192, 896, 16, 0, 0, 0, 0, 0];
+        prog.insts[1].blocks = 256;
+        prog.insts[1].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        prog.insts[1].i = [384, 3584, 896, MOE_ENC_MXFP4, 0, 2, 0, 0];
+        prog.insts[1].fj = [4.0f32.to_bits(), 25.0f32.to_bits(), 0];
+        let tensors: Vec<_> = (0..8)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..tensors.len())
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::MoeStage1Mxfp4(route) = routes[1] else {
+            panic!("exact stage-1 packet must route to the BK256 object")
+        };
+        assert_eq!(route.grid, 256);
+        assert_eq!((route.args.inter_dim, route.args.model_dim), (384, 3584));
+        assert_eq!((route.args.beta, route.args.linear_beta), (4.0, 25.0));
+
+        prog.insts[1].i[0] = 224;
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn lean_moe_stage1_a4_reuse_is_geometry_gated_and_scratch_bounded() {
+        let mut prog = segmented_prog(&[DevOp::MoeAlignPf, DevOp::MoeGroupGluPf], &[0, 1]);
+        prog.t = 8192;
+        prog.insts[0].t[0] = 4;
+        prog.insts[0].i = [8192, 896, 16, 0, 0, 0, 0, 0];
+        prog.insts[1].blocks = 256;
+        prog.insts[1].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        prog.insts[1].i = [384, 3584, 896, MOE_ENC_MXFP4, 0, 2, 0, 0];
+        prog.insts[1].fj = [4.0f32.to_bits(), 25.0f32.to_bits(), 0];
+        let rows = 151_232u64;
+        let mut tensors: Vec<_> = (0..8)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        tensors[2].name = "moe.x.expert_weight_table".into();
+        tensors[3].name = "moe.x.expert_scale_table".into();
+        tensors[5].bytes = rows * 4;
+        tensors[6].bytes = rows * 4;
+        let devp: Vec<_> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DeviceMem::view(0x1000 + i as u64 * 0x10_0000, t.bytes))
+            .collect();
+        let (payload, scales) =
+            moe_stage1_a4_scratch_bytes(std::slice::from_ref(&prog), &tensors).unwrap();
+        assert_eq!((payload, scales), (rows * 3584 / 2, rows * 3584 / 32));
+        let routes = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            None,
+        )
+        .unwrap();
+        let PrefillSegmentRoute::MoeStage1A4Reuse(route) = routes[1] else {
+            panic!("profitable three-N-tile shape must select A4 reuse")
+        };
+        assert_eq!(route.quant_args.row_capacity, rows as u32);
+        assert_eq!(
+            (route.quant_args.out, route.quant_args.out_scale),
+            (0x8000_0000, 0x9000_0000)
+        );
+        assert_eq!(
+            (route.args.weight_table, route.args.weight_scale_table),
+            (0x201000, 0x301000)
+        );
+        assert_eq!(route.grid, rows.div_ceil(64) as u32 * 3);
+
+        prog.insts[1].i[0] = 256;
+        let fallback = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            fallback[1],
+            PrefillSegmentRoute::MoeStage1Mxfp4(_)
+        ));
+    }
+
+    #[test]
+    fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
+        let mut prog = segmented_prog(
+            &[
+                DevOp::MoeAlignPf,
+                DevOp::MoeGroupGluPf,
+                DevOp::MoeGroupDownPf,
+                DevOp::MoeCombinePf,
+            ],
+            &[0, 1, 2, 3],
+        );
+        prog.t = 8192;
+        prog.insts[0].t = [0, 1, 2, 3, 4, 0, 0, 0];
+        prog.insts[0].i = [8192, 896, 16, 0, 0, 8, 0, 0];
+        prog.insts[1].t = [8, 5, 6, 7, 0, 2, 3, 9];
+        prog.insts[1].i = [3072, 3584, 896, MOE_ENC_MXFP4, 0, 2, 8, 0];
+        prog.insts[1].fj = [4.0f32.to_bits(), 25.0f32.to_bits(), 0];
+        prog.insts[2].t = [10, 8, 6, 7, 0, 9, 3, 4];
+        prog.insts[2].i = [3584, 3072, 896, MOE_ENC_MXFP4, 0, 0, 8, 0];
+        prog.insts[3].t = [11, 0, 0, 10, 1, 0, 0, 0];
+        prog.insts[3].i = [3584, 16, 8192, 0, 0, 8, 896, 0];
+
+        let rows = 8192u64 * 16;
+        let mut tensors: Vec<_> = (0..14)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        tensors[0].bytes = (67 * 896 + 1) * 4;
+        tensors[2].bytes = rows * 4;
+        tensors[3].bytes = rows * 4;
+        tensors[6].name = "m.expert_weight_table_ep".into();
+        tensors[7].name = "m.expert_scale_table_ep".into();
+        tensors[12].name = "m.expert_weight_table_moe2_ep".into();
+        tensors[13].name = "m.expert_scale_table_moe2_ep".into();
+        let devp: Vec<_> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DeviceMem::view(0x1000 + i as u64 * 0x10_0000, t.bytes))
+            .collect();
+
+        let routes = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            Some((3, 8)),
+        )
+        .unwrap();
+        let PrefillSegmentRoute::MoeEpAlign(align) = routes[0] else {
+            panic!("EP align did not take its specialist route")
+        };
+        assert_eq!((align.args.expert_begin, align.args.expert_end), (336, 448));
+        assert_eq!(align.args.experts, 896);
+        assert_eq!(align.args.row_capacity, rows as u32);
+        let PrefillSegmentRoute::MoeStage1A4Reuse(stage1) = routes[1] else {
+            panic!("EP stage-1 did not reuse the qualified A4 object")
+        };
+        assert_eq!((stage1.args.inter, stage1.args.experts), (3072, 896));
+        let PrefillSegmentRoute::MoeEpStage2(stage2) = routes[2] else {
+            panic!("EP stage-2 did not take the full-I object")
+        };
+        assert_eq!((stage2.args.inter_dim, stage2.args.experts), (3072, 896));
+        assert_eq!(stage2.args.weight_table, devp[12].base);
+        let PrefillSegmentRoute::MoeEpCombine(combine) = routes[3] else {
+            panic!("EP combine did not take the fixed-slot object")
+        };
+        assert_eq!(
+            (combine.args.expert_begin, combine.args.expert_end),
+            (336, 448)
+        );
+        let matrix_payload = 3584u64 * 3072 / 2;
+        let matrix_scales = 3584u64 * (3072 / 32);
+        assert_eq!(
+            moe_prefill_ep_extra_bytes(std::slice::from_ref(&prog), &tensors, 8).unwrap(),
+            112 * (3 * (matrix_payload + matrix_scales) + matrix_payload + matrix_scales)
+        );
+
+        let err = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("without a TP binding"));
+        let err = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            Some((0, 4)),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("topology-mismatched"));
+    }
+
+    #[test]
+    fn lean_moe_combine_route_is_generic_and_exact_contract_only() {
+        let mut prog = segmented_prog(&[DevOp::MoeCombinePf], &[0]);
+        let d = &mut prog.insts[0];
+        d.t = [
+            0,
+            packet::dev::TENSOR_NONE16,
+            2,
+            3,
+            packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16,
+        ];
+        d.i = [2816, 16, 1024, 0, 0, 0, 0, 0];
+        let tensors: Vec<_> = (0..4)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..4)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::MoeCombine(route) = routes[0] else {
+            panic!("generic exact combine packet must route to the lean object")
+        };
+        assert_eq!((route.args.hidden, route.args.tokens), (2816, 1024));
+        assert_eq!((route.args.residual, route.args.shared), (0, 0x1200));
+        assert_eq!((route.args.out, route.args.part), (0x1000, 0x1300));
+        assert_eq!(route.grid, 512);
+
+        prog.insts[0].i[2] = 128;
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::MoeCombine(route) = routes[0] else {
+            panic!("short-token exact combine packet must remain eligible")
+        };
+        assert_eq!(route.grid, 128);
+
+        for (integer, value) in [(1, 8), (4, 1), (7, 1)] {
+            prog.insts[0].i = [2816, 16, 1024, 0, 0, 0, 0, 0];
+            prog.insts[0].i[integer] = value;
+            let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+            assert!(matches!(fallback[0], PrefillSegmentRoute::Interpreter));
+        }
+        prog.insts[0].i = [2816, 16, 1024, 0, 0, 0, 0, 0];
+        prog.insts[0].fj[0] = 1;
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(fallback[0], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn lean_moe_combine_route_rejects_mixed_segments() {
+        let mut prog = segmented_prog(&[DevOp::MoeCombinePf, DevOp::RmsNorm], &[0, 0]);
+        prog.insts[0].t[0] = 0;
+        prog.insts[0].t[3] = 1;
+        prog.insts[0].i = [4096, 16, 256, 0, 0, 0, 0, 0];
+        let tensors: Vec<_> = (0..2)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..2)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(routes[0], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn cached_kda_intra_route_requires_a_pure_bt64_d128_segment() {
+        let mut prog = segmented_prog(
+            &[
+                DevOp::KdaChunkPrepare,
+                DevOp::KdaChunkIntra,
+                DevOp::KdaChunkWu,
+            ],
+            &[0, 1, 2],
+        );
+        prog.t = 8192;
+        prog.insts[1].blocks = 256;
+        prog.insts[1].t = [packet::dev::TENSOR_NONE16; 8];
+        prog.insts[1].t[..6].copy_from_slice(&[0, 1, 2, 3, 4, 5]);
+        prog.insts[1].i = [8192, 12, 128, 0, 0, 0, 0, 0];
+        prog.insts[1].fj[0] = (1.0 / 128.0f32.sqrt()).to_bits();
+        let tensors: Vec<_> = (0..6)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..6)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::KdaChunkIntraCached { args, grid } = routes[1] else {
+            panic!("pure BT64/D128 intra packet must select the cached object")
+        };
+        assert_eq!((args.t, args.heads, args.dim, grid), (8192, 12, 128, 256));
+        assert_eq!((args.aqk, args.beta), (0x1000, 0x1500));
+
+        for e in prog.stream.iter_mut().filter(|e| e.seg == 1) {
+            e.flags |= packet::dev::SE_KDA_INTRA_WAVE_ITEMS;
+        }
+        let classes = derive_segments_for(&prog, false).unwrap();
+        let mut routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        promote_kda_intra_wave_items_routes(&prog, &classes, &mut routes).unwrap();
+        assert!(matches!(
+            routes[1],
+            PrefillSegmentRoute::KdaChunkIntraWaveItems { grid: 256, .. }
+        ));
+
+        prog.insts[1].i[2] = 64;
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
+
+        prog.insts[1].i[2] = 128;
+        prog.stream[2].seg = 1;
+        let mixed = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(mixed[1], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn kda_key_factor_pair_routes_share_one_scratch_pair() {
+        let mut prog = segmented_prog(&[DevOp::KdaChunkWu, DevOp::KdaChunkCarry], &[0, 1]);
+        prog.t = 8192;
+        let scale = (1.0 / 128.0f32.sqrt()).to_bits();
+        prog.insts[0].blocks = 256;
+        prog.insts[0].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        prog.insts[0].i = [8192, 12, 128, 128, 1, 0, 0, 0];
+        prog.insts[0].fj[0] = scale;
+        prog.insts[1].blocks = 96;
+        prog.insts[1].t = [8, 9, 7, 3, 0, 1, 10, 5];
+        prog.insts[1].i = [8192, 12, 128, 128, 1, 0, 0, 0];
+        prog.insts[1].fj[0] = scale;
+        let tensors: Vec<_> = (0..11)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..11)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let half = 8192 * 12 * 128 * 2;
+        assert_eq!(
+            kda_key_factor_scratch_half_bytes(std::slice::from_ref(&prog)).unwrap(),
+            half
+        );
+        let mut routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        add_kda_key_factor_routes(&prog, &devp, &mut routes, Some((0x8000_0000, half))).unwrap();
+        let PrefillSegmentRoute::KdaChunkKeyFactorWu {
+            args: wu,
+            grid: 256,
+        } = routes[0]
+        else {
+            panic!("eligible Wu segment did not select key-factor producer")
+        };
+        let PrefillSegmentRoute::KdaChunkKeyFactorCarry {
+            args: carry,
+            grid: 96,
+        } = routes[1]
+        else {
+            panic!("eligible carry segment did not select key-factor consumer")
+        };
+        assert_eq!((wu.key_hi, carry.key_hi), (0x8000_0000, 0x8000_0000));
+        assert_eq!(
+            (wu.key_lo, carry.key_lo),
+            (0x8000_0000 + half, 0x8000_0000 + half)
+        );
+        assert_eq!(
+            (wu.w, carry.w, wu.u, carry.u),
+            (0x1000, 0x1000, 0x1100, 0x1100)
+        );
+
+        rebase_kda_key_factor_routes(&mut routes, 777);
+        let PrefillSegmentRoute::KdaChunkKeyFactorWu { args: wu, .. } = routes[0] else {
+            unreachable!()
+        };
+        let PrefillSegmentRoute::KdaChunkKeyFactorCarry { args: carry, .. } = routes[1] else {
+            unreachable!()
+        };
+        assert_eq!((wu.t, carry.t), (777, 777));
+
+        prog.insts[1].i[4] = 0;
+        assert!(kda_key_factor_segment_pairs(&prog).is_empty());
+        assert_eq!(kda_key_factor_scratch_half_bytes(&[prog]).unwrap(), 0);
+    }
+
+    #[test]
+    fn xreduce_attnres_route_requires_the_exact_row_partition_contract() {
+        let mut prog = segmented_prog(&[DevOp::XReduceTwoShot], &[0]);
+        let d = &mut prog.insts[0];
+        d.blocks = 256;
+        d.t = [
+            0,
+            packet::dev::TENSOR_NONE16,
+            2,
+            3,
+            4,
+            5,
+            6,
+            packet::dev::TENSOR_NONE16,
+        ];
+        d.i = [8192 * 7168, 8, 0, 1, 2, 7168, 4, 8];
+        d.fj[0] = 1e-5f32.to_bits();
+        patch_tp_xaudit(&mut prog.insts, 464);
+        let tensors: Vec<_> = (0..7)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..7)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::XReduceAttnRes {
+            args,
+            device_args,
+            grid,
+        } = routes[0]
+        else {
+            panic!("exact packet must use the raw XR+AttnRes route")
+        };
+        assert_eq!(grid, 256, "raw launch grid comes from packet blocks");
+        assert_eq!((args.n, args.row_w, args.nranks), (8192 * 7168, 7168, 0));
+        assert_eq!(
+            args.status, 465,
+            "route must consume the runtime TP audit id"
+        );
+        assert_eq!(device_args, 0, "load-time upload fills the stable pointer");
+
+        prog.insts[0].i[0] = 8191 * 7168;
+        let err = moe_mxfp4_routes(&prog, &tensors, &devp)
+            .expect_err("an encoded packet with an invalid row contract must fail closed");
+        assert!(err.to_string().contains("invalid or mixed"));
+
+        prog.insts[0].i[0] = 8192 * 7168;
+        prog.insts.push(DevInst64 {
+            op: DevOp::RmsNorm as u16,
+            ..Default::default()
+        });
+        prog.stream.push(packet::dev::StreamEnt {
+            inst: 1,
+            seg: 0,
+            ..Default::default()
+        });
+        let err = moe_mxfp4_routes(&prog, &tensors, &devp)
+            .expect_err("the fused encoding must never fall through to the mega interpreter");
+        assert!(err.to_string().contains("invalid or mixed"));
+    }
+
+    #[test]
+    fn lean_moe_stage2_route_requires_the_exact_pure_down_segment() {
+        let mut prog = segmented_prog(
+            &[DevOp::MoeGroupDownPf, DevOp::MoeCombinePf, DevOp::RmsNorm],
+            &[0, 1, 2],
+        );
+        let (down, rest) = prog.insts.split_at_mut(1);
+        let (d, c) = (&mut down[0], &mut rest[0]);
+        d.t = [0, 1, 2, 3, 4, 5, 6, 7];
+        d.i = [3584, 384, 896, MOE_ENC_MXFP4, 0, 0, 0, 0];
+        c.t[0] = 0;
+        c.t[1] = packet::dev::TENSOR_NONE16;
+        c.t[2] = packet::dev::TENSOR_NONE16;
+        c.t[3] = d.t[0];
+        c.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
+        let tensors: Vec<_> = [
+            "t0",
+            "t1",
+            "moe.mlp.expert_weight_table",
+            "moe.mlp.expert_scale_table",
+            "t4",
+            "t5",
+            "t6",
+            "t7",
+            "moe.mlp.expert_weight_table_moe2",
+            "moe.mlp.expert_scale_table_moe2",
+        ]
+        .into_iter()
+        .map(|name| crate::asset::devblob::DevTensor {
+            name: name.into(),
+            bytes: 0x100,
+            init: None,
+        })
+        .collect();
+        let devp: Vec<_> = (0..tensors.len())
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::MoeStage2Mxfp4(args) = routes[0] else {
+            panic!("pure supported Down must route to the lean object")
+        };
+        assert_eq!((args.args.model_dim, args.args.inter_dim), (3584, 384));
+        assert_eq!(
+            (args.args.weight_table, args.args.weight_scale_table),
+            (0x1800, 0x1900)
+        );
+        assert_eq!(args.grid, 32256);
+        // The pure combine segment takes the exact lean combine object (edffb73).
+        assert!(
+            matches!(routes[1], PrefillSegmentRoute::MoeCombine(_)),
+            "pure combine segment must route to the lean combine object, got {:?}",
+            routes[1]
+        );
+
+        let no_companion = moe_mxfp4_routes(&prog, &tensors[..8], &devp[..8]).unwrap();
+        assert!(matches!(no_companion[0], PrefillSegmentRoute::Interpreter));
+
+        prog.stream[2].seg = 0;
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(fallback[0], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn lean_moe_stage2_companion_layout_matches_the_declared_permutations() {
+        let rows = 32usize;
+        let kbytes = 64usize;
+        let weight: Vec<u8> = (0..rows * kbytes).map(|i| (i % 251) as u8).collect();
+        let shuffled = shuffle_mxfp4_moe2_weight(&weight, rows, kbytes).unwrap();
+        for nb in 0..rows / 16 {
+            for kb in 0..kbytes / 32 {
+                for kh in 0..2 {
+                    for nr in 0..16 {
+                        for b in 0..16 {
+                            let dst = ((((nb * (kbytes / 32) + kb) * 2 + kh) * 16 + nr) * 16) + b;
+                            let src = (nb * 16 + nr) * kbytes + kb * 32 + kh * 16 + b;
+                            assert_eq!(shuffled[dst], weight[src]);
+                        }
+                    }
+                }
+            }
+        }
+
+        let (rows, groups) = (33usize, 12usize);
+        let scales: Vec<u8> = (0..rows * groups).map(|i| (i % 113) as u8).collect();
+        let shuffled = shuffle_mxfp4_moe2_scale(&scales, rows, groups).unwrap();
+        let (padded_rows, padded_groups) = (256usize, 16usize);
+        assert_eq!(shuffled.len(), padded_rows * padded_groups);
+        for nb in 0..padded_rows / 32 {
+            for gb in 0..padded_groups / 8 {
+                for gi in 0..4 {
+                    for nr in 0..16 {
+                        for gh in 0..2 {
+                            for nh in 0..2 {
+                                let dst =
+                                    (((((nb * (padded_groups / 8) + gb) * 4 + gi) * 16 + nr) * 2
+                                        + gh)
+                                        * 2)
+                                        + nh;
+                                let row = nb * 32 + nh * 16 + nr;
+                                let group = gb * 8 + gh * 4 + gi;
+                                let expected = if row < rows && group < groups {
+                                    scales[row * groups + group]
+                                } else {
+                                    127
+                                };
+                                assert_eq!(shuffled[dst], expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_dispatch_rejects_multiple_wave_launches() {
+        let one = segmented_prog(&[DevOp::Gemv], &[0]);
+        assert!(validate_decode_dispatch(std::slice::from_ref(&one), 0).is_ok());
+
+        let split = segmented_prog(&[DevOp::Gemv, DevOp::RmsNorm], &[0, 1]);
+        let err = validate_decode_dispatch(std::slice::from_ref(&split), 0)
+            .expect_err("decode cannot execute multiple host wave launches");
+        assert!(err.to_string().contains("has 2 wave segments"));
+
+        let mut placed = split;
+        placed.l2_domains = 2;
+        assert!(validate_decode_dispatch(std::slice::from_ref(&placed), 0).is_ok());
+    }
+
     #[test]
     fn fp8_mla_v2_routes_only_a_pure_segment_to_four_waves() {
         let pure = segmented_prog(&[DevOp::FlashMlaPrefillFp8], &[0]);
@@ -6918,6 +15027,256 @@ mod tests {
 
         let mixed = segmented_prog(&[DevOp::FlashMlaPrefillFp8, DevOp::Gemv], &[0, 0]);
         assert_eq!(derive_segments_for(&mixed, true).unwrap(), [8]);
+    }
+
+    #[test]
+    fn xreduce_wave_rs_routes_only_a_marked_pure_segment() {
+        let mut pure = segmented_prog(&[DevOp::XReduceTwoShot], &[0]);
+        pure.stream[0].flags |= packet::dev::SE_XR_WAVE_RS;
+        assert_eq!(derive_segments_for(&pure, false).unwrap(), [19]);
+
+        let mut mixed = segmented_prog(&[DevOp::XReduceTwoShot, DevOp::RmsNorm], &[0, 0]);
+        for e in &mut mixed.stream {
+            e.flags |= packet::dev::SE_XR_WAVE_RS;
+        }
+        let err = derive_segments_for(&mixed, false)
+            .expect_err("a marked mixed segment must not reach the specialist object");
+        assert!(err.to_string().contains("not pure XReduceTwoShot"));
+
+        mixed.stream[1].flags &= !packet::dev::SE_XR_WAVE_RS;
+        let err = derive_segments_for(&mixed, false)
+            .expect_err("an incompletely marked segment must not reach the specialist object");
+        assert!(err.to_string().contains("not pure XReduceTwoShot"));
+    }
+
+    #[test]
+    fn kda_wave_items_routes_only_a_marked_pure_segment() {
+        let mut pure = segmented_prog(&[DevOp::KdaChunkIntra], &[0]);
+        pure.stream[0].flags |= packet::dev::SE_KDA_INTRA_WAVE_ITEMS;
+        assert_eq!(derive_segments_for(&pure, false).unwrap(), [20]);
+
+        let mut mixed = segmented_prog(&[DevOp::KdaChunkIntra, DevOp::RmsNorm], &[0, 0]);
+        for e in &mut mixed.stream {
+            e.flags |= packet::dev::SE_KDA_INTRA_WAVE_ITEMS;
+        }
+        let err = derive_segments_for(&mixed, false)
+            .expect_err("a marked mixed segment must not reach the wave-item object");
+        assert!(err.to_string().contains("not pure KdaChunkIntra"));
+
+        mixed.stream[1].flags &= !packet::dev::SE_KDA_INTRA_WAVE_ITEMS;
+        let err = derive_segments_for(&mixed, false)
+            .expect_err("an incompletely marked segment must not reach the wave-item object");
+        assert!(err.to_string().contains("not pure KdaChunkIntra"));
+    }
+
+    #[test]
+    fn kda_carry_regstate_routes_only_a_marked_exact_singleton() {
+        let mut prog = segmented_prog(&[DevOp::KdaChunkWu, DevOp::KdaChunkCarry], &[0, 1]);
+        prog.t = 8192;
+        prog.insts[1].blocks = 256;
+        prog.insts[1].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        prog.insts[1].i = [8192, 12, 128, 128, 1, 0, 0, 0];
+        prog.insts[1].fj[0] = (1.0 / 128.0f32.sqrt()).to_bits();
+        prog.stream[1].flags |= packet::dev::SE_KDA_CARRY_REGSTATE;
+        let devp: Vec<_> = (0..8)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let classes = derive_segments_for(&prog, false).unwrap();
+        assert_eq!(classes, [8, 23]);
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        promote_kda_carry_regstate_routes(&prog, &classes, &devp, &mut routes).unwrap();
+        let PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, .. } = routes[1] else {
+            panic!("a marked exact carry must select the regstate object")
+        };
+        assert_eq!(
+            (args.t, args.heads, args.dim, args.value_dim, grid),
+            (8192, 12, 128, 128, 96)
+        );
+        assert_eq!((args.out, args.g), (0x1000, 0x1700));
+        assert!(matches!(routes[0], PrefillSegmentRoute::Interpreter));
+
+        prog.insts[1].i[4] = 0;
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        let err = promote_kda_carry_regstate_routes(&prog, &classes, &devp, &mut routes)
+            .expect_err("a non-qpre carry must not reach the regstate object");
+        assert!(err.to_string().contains("not an exact qpre"));
+
+        let mut mixed = segmented_prog(&[DevOp::KdaChunkCarry, DevOp::RmsNorm], &[0, 0]);
+        for e in &mut mixed.stream {
+            e.flags |= packet::dev::SE_KDA_CARRY_REGSTATE;
+        }
+        assert!(derive_segments_for(&mixed, false).is_err());
+    }
+
+    #[test]
+    fn raw_mla_v2_object_requires_exact_capabilities() {
+        let object = Path::new("interp_mla_v2_sv_gq.elf");
+        let exact = [MLA_PF_V2_SYM, MLA_PF_V2_SV_RAW_SYM, L2_DISPATCH_SYM];
+        assert!(check_mla_v2_sv_raw_symbols(&exact, object, true).is_ok());
+
+        for bad in [
+            vec![MLA_PF_V2_SYM, L2_DISPATCH_SYM],
+            vec![MLA_PF_V2_SYM, MLA_PF_V2_SV_RAW_SYM],
+            vec![
+                MLA_PF_V2_SYM,
+                MLA_PF_V2_SV_RAW_SYM,
+                L2_DISPATCH_SYM,
+                MLA_PF_V2_FP8_SYM,
+            ],
+            vec![
+                MLA_PF_V2_SYM,
+                MLA_PF_V2_SV_RAW_SYM,
+                L2_DISPATCH_SYM,
+                PACKED_PREFILL_MLA_FLASH_SEG_SYM,
+            ],
+        ] {
+            assert!(check_mla_v2_sv_raw_symbols(&bad, object, true).is_err());
+        }
+    }
+
+    #[test]
+    fn required_flash_object_load_errors_are_not_swallowed() {
+        let required = resolve_flash_object_load::<()>(
+            Err(RuntimeError::Device("missing V2 marker".into())),
+            true,
+        )
+        .expect_err("required V2 flash object must fail closed");
+        assert!(required.to_string().contains("missing V2 marker"));
+
+        let optional = resolve_flash_object_load::<()>(
+            Err(RuntimeError::Device(
+                "optional flash object unavailable".into(),
+            )),
+            false,
+        )
+        .expect("ordinary flash object may fall back");
+        assert!(optional.is_none());
+    }
+
+    #[test]
+    fn raw_mla_v2_route_is_dense_bf16_pure_and_machine_filling() {
+        let mut pure = segmented_prog(&[DevOp::FlashMlaPrefill], &[0]);
+        pure.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        assert_eq!(derive_raw_mla_v2_segments(&pure).unwrap(), [true]);
+
+        let mut gathered = segmented_prog(&[DevOp::FlashMlaPrefill], &[0]);
+        gathered.insts[0].t[7] = 7;
+        assert_eq!(derive_raw_mla_v2_segments(&gathered).unwrap(), [false]);
+
+        let mut fp8 = segmented_prog(&[DevOp::FlashMlaPrefillFp8], &[0]);
+        fp8.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        assert_eq!(derive_raw_mla_v2_segments(&fp8).unwrap(), [false]);
+
+        let mut mixed = segmented_prog(&[DevOp::FlashMlaPrefill, DevOp::Gemv], &[0, 0]);
+        mixed.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        assert_eq!(derive_raw_mla_v2_segments(&mixed).unwrap(), [false]);
+
+        pure.t = 1024;
+        assert_eq!(derive_raw_mla_v2_segments(&pure).unwrap(), [false]);
+    }
+
+    #[test]
+    fn packed_operator_families_require_pure_segments() {
+        let pure = segmented_prog(
+            &[
+                DevOp::RmsNorm,
+                DevOp::HeadNormRope,
+                DevOp::FlashMlaPrefill,
+                DevOp::KdaConv3,
+                DevOp::KdaChunkPrepare,
+                DevOp::KdaChunkIntra,
+                DevOp::KdaChunkWu,
+                DevOp::KdaChunkCarry,
+            ],
+            &[0, 0, 1, 2, 2, 2, 2, 2],
+        );
+        assert_eq!(derive_packed_segment_families(&pure).unwrap(), [5, 6, 7]);
+        let routes: Vec<_> = derive_packed_segment_families(&pure)
+            .unwrap()
+            .into_iter()
+            .map(|family| packed_segment_route(true, family, true, true, true).unwrap())
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                PackedSegmentRoute::MlaNorm,
+                PackedSegmentRoute::MlaFlash,
+                PackedSegmentRoute::Kda,
+            ]
+        );
+        assert!(packed_kda_compatible(&pure));
+        assert_eq!(derive_segments_for(&pure, false).unwrap(), [8, 8, 8]);
+        assert_eq!(derive_segments_for(&pure, true).unwrap(), [8, 4, 8]);
+
+        let mixed = segmented_prog(
+            &[DevOp::RmsNorm, DevOp::Gemv, DevOp::KdaStateStepG],
+            &[0, 0, 1],
+        );
+        assert_eq!(derive_packed_segment_families(&mixed).unwrap(), [0, 7]);
+        assert!(!packed_family_segments_cover(&mixed, &[0, 7], &[5]));
+        assert!(packed_family_segments_cover(&mixed, &[0, 7], &[7]));
+        let none = segmented_prog(&[DevOp::Gemv], &[0]);
+        assert!(!packed_family_segments_cover(&none, &[0], &[5, 6]));
+    }
+
+    #[test]
+    fn packed_chunk_kda_requires_a_complete_operator_group() {
+        let complete = segmented_prog(
+            &[
+                DevOp::KdaChunkPrepare,
+                DevOp::KdaChunkIntra,
+                DevOp::KdaChunkWu,
+                DevOp::KdaChunkCarry,
+            ],
+            &[0, 0, 0, 0],
+        );
+        assert!(packed_kda_compatible(&complete));
+
+        let partial = segmented_prog(&[DevOp::KdaChunkPrepare, DevOp::KdaChunkCarry], &[0, 0]);
+        assert!(!packed_kda_compatible(&partial));
+
+        let serial = segmented_prog(&[DevOp::KdaConv3, DevOp::KdaStateStepG], &[0, 0]);
+        assert!(packed_kda_compatible(&serial));
+        let double_buffered = segmented_prog(&[DevOp::KdaConvStateStepG], &[0]);
+        assert!(!packed_kda_compatible(&double_buffered));
+    }
+
+    #[test]
+    fn packed_family_route_never_falls_back_for_a_consumer_segment() {
+        assert_eq!(
+            packed_segment_route(false, 5, false, false, false).unwrap(),
+            PackedSegmentRoute::Primary
+        );
+        assert_eq!(
+            packed_segment_route(true, 0, false, false, false).unwrap(),
+            PackedSegmentRoute::Primary
+        );
+        assert_eq!(
+            packed_segment_route(true, 5, true, false, false).unwrap(),
+            PackedSegmentRoute::MlaNorm
+        );
+        assert_eq!(
+            packed_segment_route(true, 6, false, true, false).unwrap(),
+            PackedSegmentRoute::MlaFlash
+        );
+        assert_eq!(
+            packed_segment_route(true, 7, false, false, true).unwrap(),
+            PackedSegmentRoute::Kda
+        );
+        assert_eq!(
+            packed_segment_route(false, 7, false, false, true).unwrap(),
+            PackedSegmentRoute::Kda
+        );
+        assert_eq!(
+            packed_segment_route(false, 7, false, false, false).unwrap(),
+            PackedSegmentRoute::Primary
+        );
+        assert!(packed_segment_route(true, 5, false, true, true).is_err());
+        assert!(packed_segment_route(true, 9, true, true, true).is_err());
+        assert!(check_packed_family_kv_encoding(false, false).is_ok());
+        assert!(check_packed_family_kv_encoding(true, true).is_ok());
+        assert!(check_packed_family_kv_encoding(false, true).is_err());
+        assert!(check_packed_family_kv_encoding(true, false).is_err());
     }
 
     #[test]
@@ -7015,6 +15374,16 @@ mod tests {
         let mut insts = [
             DevInst64 {
                 op: DevOp::XReduce as u16,
+                i: [0, 0, 0, 0, 0, 0, 0, 11],
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::XReduceTwoShot as u16,
+                i: [0, 0, 0, 0, 0, 0, 23, 29],
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::XReduceAddNorm as u16,
                 ..Default::default()
             },
             DevInst64 {
@@ -7027,9 +15396,10 @@ mod tests {
             },
         ];
         patch_tp_xaudit(&mut insts, 464);
-        assert_eq!(insts[0].i[7], 465);
-        assert_eq!(insts[1].i[7], 465);
-        assert_eq!(insts[2].i[7], 0);
+        assert!(insts[..4].iter().all(|d| d.fj[2] == 465));
+        assert_eq!(insts[4].fj[2], 0);
+        assert_eq!(insts[0].i[7], 11);
+        assert_eq!(&insts[1].i[6..=7], &[23, 29]);
     }
 
     /// The flash object follows the PREFILL scheduler: a flash segment IS a
@@ -7218,6 +15588,7 @@ mod tests {
                 .collect();
             DevProg {
                 t: 1,
+                packed_prefill_only: false,
                 n_counter: 0,
                 insts,
                 stream: Vec::new(),
@@ -7355,6 +15726,7 @@ mod tests {
             .collect();
         DevProg {
             t: m,
+            packed_prefill_only: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),
@@ -7413,6 +15785,30 @@ mod tests {
         assert_eq!(required_k3_op(&plain), None);
         assert!(check_k3_arms(&bare, obj, required_k3_op(&plain)).is_ok());
         assert!(check_k3_arms(&with_k3, obj, required_k3_op(&plain)).is_ok());
+    }
+
+    #[test]
+    fn chunk_kda_requires_its_exact_object_marker() {
+        let obj = Path::new("interp_prefill_k3.elf");
+        let bare = [K3_ARMS_SYM];
+        let armed = [K3_ARMS_SYM, KDA_CHUNK_SYM];
+        let ops = [
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
+        ];
+        let pkt = vec![prog_gemv(&ops, 512)];
+        assert_eq!(required_kda_chunk(&pkt), Some(DevOp::KdaChunkPrepare));
+        let err = check_kda_chunk(&bare, obj, required_kda_chunk(&pkt)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(KDA_CHUNK_SYM));
+        assert!(msg.contains("PLOW_KDA_CHUNK"));
+        assert!(check_kda_chunk(&armed, obj, required_kda_chunk(&pkt)).is_ok());
+
+        let serial = vec![prog_gemv(&[DevOp::KdaStateStepG], 512)];
+        assert_eq!(required_kda_chunk(&serial), None);
+        assert!(check_kda_chunk(&bare, obj, None).is_ok());
     }
 
     #[test]
@@ -7780,6 +16176,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn b128_argmax_requires_an_object_capacity_marker() {
+        let obj = Path::new("interp_decode_k3.elf");
+        assert!(check_xargmax_capacity(&[], obj, 32).is_ok());
+        assert!(check_xargmax_capacity(&[], obj, 64).is_err());
+        assert!(check_xargmax_capacity(&[XARGMAX_B128_SYM], obj, 128).is_ok());
+    }
+
     /// An object that does not advertise a bucket is refused above M=1 and
     /// accepted at M=1.
     ///
@@ -7995,6 +16399,11 @@ mod tests {
         // why the rung is worth nothing without ragged-M.
         let padded16 = |n| plan_chunks_cfg(B16, n, LAUNCH_ROWS, false).unwrap();
         assert_eq!(padded16(8193), vec![8192, 128]);
+        assert_eq!(
+            plan_chunks_capped(B8, 8192, 4096).unwrap(),
+            vec![4096, 4096]
+        );
+        assert!(plan_chunks_capped(B8, 128, 64).is_err());
     }
 
     /// One contiguous h2d, not `n_kvrow` scattered ones: the sites straddle
@@ -8083,7 +16492,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let mut inst = |op: DevOp, i: [u32; 8]| DevInst64 {
+        let inst = |op: DevOp, i: [u32; 8]| DevInst64 {
             op: op as u16,
             t: [0, 0, 0, 0, 0, 0, 0, 0],
             i,
@@ -8233,47 +16642,41 @@ mod tests {
 
     /// EVERY KDA OP'S ROW COUNT BECOMES `clen`, AND THE BUG IS WHAT THIS ASSERTS.
     ///
-    /// The fixture is the shape that was actually broken: a 1500-token prompt on a
-    /// [1024, 512] ladder, whose last chunk is 476 real rows padded out to 512. The
-    /// pre-fix `rebase_chunk` had no KDA arm at all, so `i[0]` kept the compiler's
-    /// baked 512 and both stateful arms ran 36 pad rows past the prompt — the conv
-    /// rolling zeros through a 4-wide window (evicting every real tap) and the
-    /// recurrence applying 36 extra `exp(a_log)` decays to the state decode then
-    /// starts from.
+    /// This covers both a compiled 512-row rung shortened to 511 and the production
+    /// 8192-row rung shortened to 8191. Before KDA rebasing, every stateful arm ran
+    /// through the padded tail and advanced the carried state past the real final token.
     ///
     /// Asserted as `!= t` rather than only `== clen` so that a future change which
     /// re-bakes `T` somewhere else still fails here: the property is "the KDA row
-    /// count is the REAL row count", not "this field happens to hold 476".
+    /// count is the REAL row count", not one pinned tail size.
     #[test]
     fn rebase_chunk_shortens_every_kda_arm_to_the_real_row_count() {
         let names: Vec<String> = ["kv.0.state", "act.q"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        const T: u32 = 512;
-        const CLEN: u32 = 476;
-        let kda = |op: DevOp| DevInst64 {
-            op: op as u16,
-            i: [T, 96, 128, 0, 0, 0, 0, 0],
-            ..Default::default()
-        };
-        let mut insts: Vec<DevInst64> = KDA_ROW_COUNT_OPS.iter().map(|&o| kda(o)).collect();
-        // A non-KDA neighbour that must NOT be touched by the new arm.
-        insts.push(DevInst64 {
-            op: DevOp::RmsNorm as u16,
-            i: [T, 0, 0, 0, 0, 0, 0, 0],
-            ..Default::default()
-        });
-        rebase_chunk_rows(&mut insts, &names, 1024, CLEN, CLEN, None);
+        for (t, clen) in [(512, 511), (8192, 8191)] {
+            let kda = |op: DevOp| DevInst64 {
+                op: op as u16,
+                i: [t, 96, 128, 0, 0, 0, 0, 0],
+                ..Default::default()
+            };
+            let mut insts: Vec<DevInst64> = KDA_ROW_COUNT_OPS.iter().map(|&o| kda(o)).collect();
+            // A non-KDA neighbour that must NOT be touched by the new arm.
+            insts.push(DevInst64 {
+                op: DevOp::RmsNorm as u16,
+                i: [t, 0, 0, 0, 0, 0, 0, 0],
+                ..Default::default()
+            });
+            rebase_chunk_rows(&mut insts, &names, 1024, clen, t, None);
 
-        for (d, &op) in insts.iter().zip(KDA_ROW_COUNT_OPS) {
-            assert_eq!(d.i[0], CLEN, "{op:?} still runs the padded bucket width");
-            assert_ne!(d.i[0], T, "{op:?} kept the compiler's baked T");
-            // The rest of the immediates are live operands (heads, head_dim) and
-            // patching one of them is the positional bug this module keeps hitting.
-            assert_eq!((d.i[1], d.i[2]), (96, 128), "{op:?}: a live operand moved");
+            for (d, &op) in insts.iter().zip(KDA_ROW_COUNT_OPS) {
+                assert_eq!(d.i[0], clen, "{op:?} still runs the padded bucket width");
+                assert_ne!(d.i[0], t, "{op:?} kept the compiler's baked T");
+                assert_eq!((d.i[1], d.i[2]), (96, 128), "{op:?}: a live operand moved");
+            }
+            assert_eq!(insts.last().unwrap().i[0], t, "a non-KDA op was shortened");
         }
-        assert_eq!(insts.last().unwrap().i[0], T, "a non-KDA op was shortened");
     }
 
     /// GLM-5.3's pooled DSA indexer, non-pool-aligned tail: `DsaPoolCompress` must stop

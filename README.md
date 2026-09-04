@@ -164,6 +164,11 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
     "messages": [{"role":"user","content":"What is the capital of France?"}],
     "max_tokens": 64
   }' | jq .
+
+curl -s http://127.0.0.1:8080/v1/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gemma-4-12b-it","prompt":"The capital of France is","max_tokens":32}' \
+  | jq .
 ```
 
 `plowrt serve` after a successful load — Gemma-4 12B (~22 GiB weights) on an

@@ -1139,6 +1139,9 @@ PLOW_GM_MXFP4_TILE(d_gemm_mxfp4, GM_BM, GM_BN, GM_BK)
 #define GM_C5_BM 192
 #define GM_C5_BN 256
 #define GM_C5_BK 64
+#define GM_C8_BM 128
+#define GM_C8_BN 384
+#define GM_C8_BK 64
 
 __device__ void d_gemm_small(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
                              unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
@@ -1160,6 +1163,16 @@ __device__ void d_gemm_c5(bf16* C, const bf16* A, const bf16* B, unsigned M, uns
     d_gemm_t<GM_C5_BM, GM_C5_BN, GM_C5_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K,
                                                                 slice, nblk, lds);
 }
+#if PLOW_CDNA4
+/* Internal gfx950 specialization of GEMM_WIDE. A 128x384 tile consumes 144 KiB of LDS, so it
+ * cannot exist in the gfx942 object. It has no opcode of its own: the u8 opcode space is full,
+ * and exec_gemm_wide selects it only when this tile maps exactly one workgroup to every CU. */
+__device__ void d_gemm_c8(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
+                          unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
+    d_gemm_t<GM_C8_BM, GM_C8_BN, GM_C8_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K,
+                                                                slice, nblk, lds);
+}
+#endif
 
 /* The mxfp4 (w4a16) twins of the four non-default rungs. Same tiles, same selector; only the
  * B-fetch differs (WFP4). Declared here rather than next to `d_gemm_mxfp4` because the tile
@@ -4394,6 +4407,11 @@ __device__ void d_gemv_glu(bf16* C, const bf16* x, const bf16* Wg, const bf16* W
 #endif
     if (K == 4096)
         gemv_glu_rows<PLOW_GEMV_MM, PLOW_GLU_K4096_UN>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
+    else if (K == 7168)
+        /* 14 chunks: UN=7 is two clean passes where UN=6 runs three with four dead loads, the
+         * same rung d_gemv_qkvg already takes at K=7168. Per-lane accumulation order is
+         * unchanged (chunks still visit k in order), so the output is bit-identical. */
+        gemv_glu_rows<PLOW_GEMV_MM, 7>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
     else
         gemv_glu_rows<PLOW_GEMV_MM>(C_, Wg, Wu, M_, N, K, act, slice, nblk, lds, beta, lbeta);
     /* Re-staging next block into the SAME arena: every wave must be done reading it. */

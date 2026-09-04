@@ -23,7 +23,9 @@
 use core::mem::size_of;
 use std::collections::{BTreeSet, HashSet};
 
-use crate::dev::{DevInst, DevOp, StreamEnt, Wait, SE_FINE, TENSOR_NONE};
+use crate::dev::{
+    DevInst, DevInst64, DevOp, StreamEnt, Wait, SE_FINE, TENSOR_NONE, TENSOR_NONE16, TENSOR_NONE_I,
+};
 use crate::rope::GenTensor;
 
 /// Edges that survive transitive reduction: drop A→C when a path A→…→C of
@@ -222,6 +224,36 @@ struct Op {
     work: Vec<u32>, // per-slice cost, from the cost model. See `select_granularity`.
 }
 
+/// Dependency graph for one complete emitted program. Fusion discovery runs on this graph only
+/// after every model block has been lowered; packet order is retained separately as a scheduling
+/// constraint.
+struct ProgramGraph {
+    predecessors: Vec<Vec<usize>>,
+    successors: Vec<Vec<usize>>,
+}
+
+impl ProgramGraph {
+    fn from_ops(ops: &[Op]) -> Self {
+        let mut predecessors = vec![Vec::new(); ops.len()];
+        let mut successors = vec![Vec::new(); ops.len()];
+        for (consumer, op) in ops.iter().enumerate() {
+            for dep in &op.deps {
+                let producer = dep.producer() as usize;
+                assert!(
+                    producer < consumer,
+                    "program dependency {producer} -> {consumer} is not topological"
+                );
+                predecessors[consumer].push(producer);
+                successors[producer].push(consumer);
+            }
+        }
+        Self {
+            predecessors,
+            successors,
+        }
+    }
+}
+
 /// How the hardware maps a LOGICAL workgroup index to an L2 locality domain.
 ///
 /// This is the single fact the whole placement feature rests on, and the two vendors do not
@@ -279,9 +311,8 @@ pub struct Builder {
     gen: Vec<GenTensor>,
     /// L2-domain-aware placement (`PLOW_L2_PLACE`). `None` ⇒ off; the blob is
     /// byte-identical and `seg` keeps its wave-class meaning. When set,
-    /// [`Builder::finish`] repurposes the `seg` field as a **locality domain**
-    /// `0..P` and groups `gq_stream` by domain, so a physical-SM-aware interp
-    /// (a cluster/XCC_ID cursor per domain) can pull only its domain's packets.
+    /// [`Builder::finish`] carries the locality domain independently in flags
+    /// and groups `gq_stream` into one device queue per ordered segment and domain.
     /// The `cus` sets are NOT touched — placement is dynamic (cursor-claimed) at
     /// runtime, so it cannot regress disjoint `Builder::split` placements.
     /// See the design notes.
@@ -291,6 +322,36 @@ pub struct Builder {
     uniseg_denied: bool,
     /// See [`Builder::force_uniseg`].
     uniseg_forced: bool,
+    /// See [`Builder::set_gq_order_asap`]. Default on; `PLOW_GQ_ORDER=emit` restores emit order.
+    gq_order_asap: bool,
+    /// Split descriptor-consuming prefill families into independent wave classes.
+    /// Callers must enable this only for prefill programs.
+    packed_prefill_segments: bool,
+    /// Isolate structurally compatible MXFP4 grouped-MoE stage-2 boundaries.
+    lean_moe_stage2_segments: bool,
+    /// Isolate structurally compatible MXFP4 grouped-MoE stage-1 packets.
+    lean_moe_stage1_segments: bool,
+    /// Isolate fixed-order f32 grouped-MoE prefill combines.
+    lean_moe_combine_segments: bool,
+    /// Rewrite eligible replicated-input grouped-MoE prefill boundaries to whole-expert/full-I.
+    moe_prefill_ep_degree: Option<u32>,
+    /// Isolate BT64/D128 chunk-KDA intra packets for a standalone gfx950 object.
+    lean_kda_intra_segments: bool,
+    /// Mark isolated BT64/D128 chunk-KDA intra packets for the wave-item object.
+    kda_intra_wave_items_segments: bool,
+    kda_carry_regstate_segments: bool,
+    /// Isolate exact qpre BT64/D128 Wu->carry pairs for standalone gfx950 objects.
+    lean_kda_key_factor_segments: bool,
+    /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
+    decode_mla_segments: bool,
+    /// Isolate adjacent grouped decode GLU+DOWN pairs for ordered raw launches.
+    decode_grouped_moe_segments: bool,
+    /// Isolate XReduceTwoShot packets for the gfx950 wave-RS interpreter object.
+    xreduce_wave_rs_segments: bool,
+    /// Fold an eligible materialized Residual into its AttnRes consumer.
+    fuse_materialized_residual_inputs: bool,
+    /// Isolate f32-mix AttnRes packets (`f[1]` = output-norm epsilon) for the gfx950 object.
+    attn_res_f32mix_segments: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -306,6 +367,184 @@ fn mla_v2_segment(op: u16, n_tok: u32) -> bool {
     n_tok >= 2048 && (op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16)
 }
 
+// Experimental packed-prefill segment classes. These values describe an operator
+// family, not a model. The serving runtime independently re-derives and purity-checks
+// them before it can select a family object.
+fn packed_prefill_segment_class(op: u16) -> Option<u8> {
+    if op == DevOp::RmsNorm as u16
+        || op == DevOp::HeadNormRope as u16
+        || op == DevOp::HeadNormRopeFp8 as u16
+    {
+        Some(5)
+    } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
+        Some(6)
+    } else if op == DevOp::KdaStateStep as u16
+        || op == DevOp::KdaConv3 as u16
+        || op == DevOp::KdaStateStepG as u16
+        || op == DevOp::KdaChunkPrepare as u16
+        || op == DevOp::KdaChunkIntra as u16
+        || op == DevOp::KdaChunkWu as u16
+        || op == DevOp::KdaChunkCarry as u16
+    {
+        Some(7)
+    } else {
+        None
+    }
+}
+
+fn packed_prefill_segmenting_needed(
+    uniseg: bool,
+    enabled: bool,
+    mut ops: impl Iterator<Item = u16>,
+) -> bool {
+    !uniseg && enabled && ops.any(|op| packed_prefill_segment_class(op).is_some())
+}
+
+fn lean_moe_stage2_inst(d: &DevInst) -> bool {
+    d.op == DevOp::MoeGroupDownPf as u16
+        && d.i[3] == 2
+        && d.i[1] == 384
+        && d.i[0] != 0
+        && d.i[0].is_multiple_of(16)
+        && d.i[2] != 0
+        && d.i[4] == 0
+        && d.i[5] == 0
+        && d.t[5] != TENSOR_NONE
+        && d.t[6] != TENSOR_NONE
+        && d.t[7] != TENSOR_NONE
+}
+
+fn lean_moe_stage2_pair(ops: &[Op], i: usize) -> bool {
+    let Some((d, c)) = ops.get(i).zip(ops.get(i + 1)) else {
+        return false;
+    };
+    let (d, c) = (&d.inst, &c.inst);
+    lean_moe_stage2_inst(d)
+        && c.op == DevOp::MoeCombinePf as u16
+        && c.t[1] == TENSOR_NONE
+        && c.t[2] == TENSOR_NONE
+        && c.t[3] == d.t[0]
+        && c.i[0] == d.i[0]
+        && c.i[1] != 0
+        && c.i[2] != 0
+        && c.i[3] == 0
+        && c.i[4] == 0
+        && c.i[7] == 0
+}
+
+fn lean_moe_stage1_inst(inst: &DevInst) -> bool {
+    inst.op == DevOp::MoeGroupGluPf as u16
+        && inst.i[0] == 384
+        && inst.i[1] == 3584
+        && inst.i[2] == 896
+        && inst.i[3] == 2
+        && inst.i[4] == 0
+        && inst.i[5] <= 2
+        && inst.i[6] == 0
+        && inst.i[7] == 0
+        && inst.t[..8].iter().all(|&t| t != TENSOR_NONE)
+}
+
+fn lean_moe_combine_inst(inst: &DevInst) -> bool {
+    inst.op == DevOp::MoeCombinePf as u16
+        && inst.t[0] != TENSOR_NONE
+        && inst.t[3] != TENSOR_NONE
+        && inst.i[0] != 0
+        && inst.i[1] == 16
+        && inst.i[2] != 0
+        && inst.i[3..].iter().all(|&v| v == 0)
+        && inst.f.iter().all(|&v| v.to_bits() == 0)
+        && inst.j.iter().all(|&v| v == 0)
+}
+
+/// An AttnRes packet the f32-mix gfx950 object may own: K3's fused-norm shape (gamma present,
+/// `f[1]` carries the separate output-norm epsilon, which only the f32-mix emitter writes), one
+/// workgroup per token at prefill width, the object's fixed hidden width, and no operands
+/// outside the nine the kernarg ABI carries.
+pub fn lean_attn_res_f32mix_inst(inst: &DevInst) -> bool {
+    inst.op == DevOp::AttnRes as u16
+        && inst.t[0] != TENSOR_NONE
+        && inst.t[1] != TENSOR_NONE
+        && inst.t[2] != TENSOR_NONE
+        && inst.t[3] != TENSOR_NONE
+        && inst.t[5] != TENSOR_NONE
+        && (inst.t[6] == TENSOR_NONE) == (inst.t[7] == TENSOR_NONE)
+        && (inst.i[5] == TENSOR_NONE_I || inst.t[6] != TENSOR_NONE)
+        && inst.i[0] >= 256
+        && inst.i[1] == 7168
+        && inst.i[2] <= 8
+        && inst.i[2] <= inst.i[4]
+        && (inst.t[4] == TENSOR_NONE || inst.i[3] < inst.i[4])
+        && inst.i[6] == 0
+        && inst.i[7] == 0
+        && inst.f[0].is_finite()
+        && inst.f[0] > 0.0
+        && inst.f[1].is_finite()
+        && inst.f[1] > 0.0
+        && inst.j.iter().all(|&v| v == 0)
+}
+
+/// [`lean_attn_res_f32mix_inst`] over the 64-byte wire form (`fj[1]` carries `f[1]`; `fj[2]`
+/// is `j[1]`). The runtime and the manifest select the object through this one.
+pub fn lean_attn_res_f32mix_inst64(d: &DevInst64) -> bool {
+    let f0 = f32::from_bits(d.fj[0]);
+    let f1 = f32::from_bits(d.fj[1]);
+    d.op == DevOp::AttnRes as u16
+        && d.blocks != 0
+        && d.t[..4].iter().all(|&t| t != TENSOR_NONE16)
+        && d.t[5] != TENSOR_NONE16
+        && (d.t[6] == TENSOR_NONE16) == (d.t[7] == TENSOR_NONE16)
+        && (d.i[5] == TENSOR_NONE_I || d.t[6] != TENSOR_NONE16)
+        && d.i[0] >= 256
+        && d.i[1] == 7168
+        && d.i[2] <= 8
+        && d.i[2] <= d.i[4]
+        && (d.t[4] == TENSOR_NONE16 || d.i[3] < d.i[4])
+        && d.i[6] == 0
+        && d.i[7] == 0
+        && f0.is_finite()
+        && f0 > 0.0
+        && f1.is_finite()
+        && f1 > 0.0
+        && d.fj[2] == 0
+}
+
+fn lean_kda_key_factor_pair(ops: &[Op], i: usize) -> bool {
+    let Some((wu, carry)) = ops.get(i).zip(ops.get(i + 1)) else {
+        return false;
+    };
+    let (w, c) = (&wu.inst, &carry.inst);
+    w.op == DevOp::KdaChunkWu as u16
+        && c.op == DevOp::KdaChunkCarry as u16
+        && w.i[0] >= 512
+        && w.i[0] == c.i[0]
+        && w.i[1] != 0
+        && w.i[1] == c.i[1]
+        && w.i[2] == 128
+        && w.i[2] == c.i[2]
+        && w.i[3] == 128
+        && w.i[3] == c.i[3]
+        && w.i[4] == 1
+        && c.i[4] == 1
+        && w.i[5..].iter().all(|&v| v == 0)
+        && c.i[5..].iter().all(|&v| v == 0)
+        && w.t.iter().all(|&t| t != TENSOR_NONE)
+        && c.t.iter().all(|&t| t != TENSOR_NONE)
+        && c.t[2] == w.t[7]
+        && c.t[3] == w.t[3]
+        && c.t[4] == w.t[0]
+        && c.t[5] == w.t[1]
+        && c.t[7] == w.t[5]
+        && w.f[0].to_bits() == c.f[0].to_bits()
+        && w.f[0].is_finite()
+        && w.f[0] > 0.0
+        && w.f[1..].iter().all(|&v| v.to_bits() == 0)
+        && c.f[1..].iter().all(|&v| v.to_bits() == 0)
+        && w.j.iter().all(|&v| v == 0)
+        && c.j.iter().all(|&v| v == 0)
+        && carry.deps.iter().any(|d| d.producer() as usize == i)
+}
+
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
         Self {
@@ -316,6 +555,21 @@ impl Builder {
             place_l2: None,
             uniseg_denied: false,
             uniseg_forced: false,
+            gq_order_asap: std::env::var("PLOW_GQ_ORDER").ok().as_deref() != Some("emit"),
+            packed_prefill_segments: false,
+            lean_moe_stage2_segments: false,
+            lean_moe_stage1_segments: false,
+            lean_moe_combine_segments: false,
+            moe_prefill_ep_degree: None,
+            lean_kda_intra_segments: false,
+            kda_intra_wave_items_segments: false,
+            kda_carry_regstate_segments: false,
+            lean_kda_key_factor_segments: false,
+            decode_mla_segments: false,
+            decode_grouped_moe_segments: false,
+            xreduce_wave_rs_segments: false,
+            fuse_materialized_residual_inputs: true,
+            attn_res_f32mix_segments: false,
             gemv_split: 1,
             tensor_dedup: false,
             tr_dropped: 0,
@@ -326,11 +580,9 @@ impl Builder {
     /// target's workgroup->domain map. `None` (default) leaves the wave-class `seg` and a
     /// byte-identical blob.
     ///
-    /// [`Builder::finish`] may still decline: under [`L2Map::Block`] if `n_cu > domains·sms`
-    /// (occupancy>1 or a grid≠sm_count mismatch, where `cu/sms` would exceed the runtime's
-    /// domain count and orphan packets), and on any program with more than one wave class,
-    /// where `seg` is already carrying information placement would destroy. Both fall back
-    /// byte-identical. See the field docs and the design notes.
+    /// [`Builder::finish`] may still decline under [`L2Map::Block`] if
+    /// `n_cu > domains·sms`, where `cu/sms` would orphan packets. Host segments
+    /// and L2 domains are independent fields, so segmented programs remain placeable.
     pub fn set_l2_placement(&mut self, layout: Option<L2Layout>) {
         self.place_l2 = layout;
     }
@@ -352,12 +604,115 @@ impl Builder {
         self.uniseg_denied = true;
     }
 
+    /// Order each global-queue window by EARLIEST START instead of emit order (default since
+    /// 2026-09-04: -0.21 ms/token, -6 ms TTFT, exact; `PLOW_GQ_ORDER=emit` opts out).
+    ///
+    /// The global queue hands out entries in stream order and a workgroup that claims a gated
+    /// entry SPINS on it. Emit order is topological but not ready-ordered: K3's decode emits the
+    /// shared-expert `GemvGlu -> Gemv` (ready the moment `AttnRes` lands) AFTER the routed chain
+    /// `MoeRouterTopk -> MoeGroupGlu -> MoeGroupDown -> MoeCombine -> XReduce -> Gemv`, so all 256
+    /// workgroups claim the routed slices and spin through the 22 us router while the shared
+    /// expert — which could have run entirely under that spin — waits for them, and the layer's
+    /// closing `XReduce` waits for the shared expert. MEASURED (gfx950 TP8, one-token trace,
+    /// `scripts/k3_trace_wg.py`): 24.2 us/layer x 92 MoE layers = 2.2 ms/token of critical path.
+    ///
+    /// Ranks are a unit-cost list schedule: `start(op) = max over producers (start + cost)`,
+    /// cost 1 per op and 3 for a single-workgroup op (the b=1 router/AttnRes bodies are 2-3
+    /// GEMV bodies long). Every window is STABLE-sorted by rank, so ties keep emit order and a
+    /// consumer's rank is strictly above every producer's: the per-window order stays
+    /// topological, which is what the queue's deadlock-freedom argument (interp.hip, the
+    /// `gq_claim` note) needs. Nothing else moves — static streams, counters, and the segment
+    /// windows are untouched.
+    pub fn set_gq_order_asap(&mut self, on: bool) {
+        self.gq_order_asap = on;
+    }
+
+    fn gq_asap_ranks(&self) -> Vec<u32> {
+        let mut start = vec![0u32; self.ops.len()];
+        for i in 0..self.ops.len() {
+            let mut s = 0u32;
+            for d in &self.ops[i].deps {
+                let p = d.producer() as usize;
+                if p < i {
+                    let cost = if self.ops[p].inst.blocks <= 1 { 3 } else { 1 };
+                    s = s.max(start[p] + cost);
+                }
+            }
+            start[i] = s;
+        }
+        start
+    }
+
     /// T18: force this program to ONE segment regardless of `PLOW_UNISEG`. Set by devgen on
     /// SMALL prefill buckets (`PLOW_UNISEG_MAX_T`): a tail chunk of ~50 tokens pays ~480
     /// segment launches (~40 ms measured) for ~5 ms of work — one launch on the full fat
     /// object wins outright. No-op if `deny_uniseg` was called (the AMD target reads `seg`).
     pub fn force_uniseg(&mut self) {
         self.uniseg_forced = true;
+    }
+
+    pub fn set_packed_prefill_segments(&mut self, enabled: bool) {
+        self.packed_prefill_segments = enabled;
+    }
+
+    pub fn set_lean_moe_stage2_segments(&mut self, enabled: bool) {
+        self.lean_moe_stage2_segments = enabled;
+    }
+
+    pub fn set_lean_moe_stage1_segments(&mut self, enabled: bool) {
+        self.lean_moe_stage1_segments = enabled;
+    }
+
+    pub fn set_lean_moe_combine_segments(&mut self, enabled: bool) {
+        self.lean_moe_combine_segments = enabled;
+    }
+
+    /// Enable the model-independent replicated-input expert-parallel rewrite.
+    ///
+    /// Eligibility is proven from the emitted graph: an MXFP4 align/GLU/down/combine chain
+    /// followed by a TP reduction. The reduction proves that the combine output is a replicated
+    /// tensor boundary. Unsupported graphs fail during `Builder::finish` instead of emitting a
+    /// packet the ordinary interpreter would misread.
+    pub fn set_moe_prefill_ep_degree(&mut self, degree: Option<u32>) {
+        self.moe_prefill_ep_degree = degree.filter(|&n| n > 1);
+    }
+
+    pub fn set_lean_kda_intra_segments(&mut self, enabled: bool) {
+        self.lean_kda_intra_segments = enabled;
+    }
+
+    pub fn set_kda_intra_wave_items_segments(&mut self, enabled: bool) {
+        self.kda_intra_wave_items_segments = enabled;
+    }
+
+    pub fn set_attn_res_f32mix_segments(&mut self, enabled: bool) {
+        self.attn_res_f32mix_segments = enabled;
+    }
+
+    /// Mark exact qpre BT64/D128/V128 `KdaChunkCarry` singleton segments for the
+    /// register-resident gfx950 carry object (isolated like the key-factor pair).
+    pub fn set_kda_carry_regstate_segments(&mut self, enabled: bool) {
+        self.kda_carry_regstate_segments = enabled;
+    }
+
+    pub fn set_lean_kda_key_factor_segments(&mut self, enabled: bool) {
+        self.lean_kda_key_factor_segments = enabled;
+    }
+
+    pub fn set_decode_mla_segments(&mut self, enabled: bool) {
+        self.decode_mla_segments = enabled;
+    }
+
+    pub fn set_decode_grouped_moe_segments(&mut self, enabled: bool) {
+        self.decode_grouped_moe_segments = enabled;
+    }
+
+    pub fn set_xreduce_wave_rs_segments(&mut self, enabled: bool) {
+        self.xreduce_wave_rs_segments = enabled;
+    }
+
+    pub fn set_fuse_materialized_residual_inputs(&mut self, enabled: bool) {
+        self.fuse_materialized_residual_inputs = enabled;
     }
 
     /// Slice the machine-filling `Gemv` / `GemvGlu` / `GemvQkv` packets into `s * n_cu` shares
@@ -414,6 +769,11 @@ impl Builder {
             init: None,
         });
         (self.tensors.len() - 1) as u32
+    }
+
+    /// The declared name of handle `h`.
+    pub fn tensor_name(&self, h: u32) -> &str {
+        &self.tensors[h as usize].name
     }
 
     /// Declare a tensor whose contents the compiler already knows (e.g. RoPE tables).
@@ -866,7 +1226,387 @@ impl Builder {
     /// in-order stream — which is exactly the deadlock that
     /// the design notes document. **Do not reorder streams** without
     /// reading that file.
+    /// Run whole-program fusion after every block has been emitted. Candidate discovery walks the
+    /// complete dependency graph, never a model tag or layer index. The first rule retains packet
+    /// adjacency as a scheduling-safety condition: the packet builder's coarse edges also encode
+    /// ordering for tensor inputs, so moving a consumer across an intervening packet is not legal
+    /// until those tensor edges are explicit. The fused consumer still materializes the residual
+    /// output for every other graph consumer.
+    fn fuse_materialized_residual_inputs(&mut self) -> usize {
+        let graph = ProgramGraph::from_ops(&self.ops);
+        let mut fuse_with = vec![None; self.ops.len()];
+        for consumer_idx in 0..self.ops.len() {
+            let consumer = &self.ops[consumer_idx];
+            let [producer_idx] = graph.predecessors[consumer_idx].as_slice() else {
+                continue;
+            };
+            let producer = &self.ops[*producer_idx];
+            let n = consumer.inst.i[0].checked_mul(consumer.inst.i[1]);
+            let compatible = producer.inst.op == DevOp::Residual as u16
+                && consumer.inst.op == DevOp::AttnRes as u16
+                && consumer_idx == *producer_idx + 1
+                && matches!(consumer.deps.as_slice(), [Dep::Coarse(c)] if *c == *producer_idx as u32)
+                && producer.deps.iter().all(|d| matches!(d, Dep::Coarse(_)))
+                && producer.inst.t[0] == consumer.inst.t[1]
+                && producer.inst.t[1] != TENSOR_NONE
+                && producer.inst.t[2] != TENSOR_NONE
+                && n == Some(producer.inst.i[0])
+                && producer.inst.f[0].to_bits() == 1.0f32.to_bits()
+                && consumer.inst.t[6] == TENSOR_NONE
+                && consumer.inst.t[7] == TENSOR_NONE
+                && consumer.inst.i[5] == TENSOR_NONE_I;
+            if compatible {
+                debug_assert!(graph.successors[*producer_idx].contains(&consumer_idx));
+                fuse_with[*producer_idx] = Some(consumer_idx);
+            }
+        }
+
+        let old = std::mem::take(&mut self.ops);
+        let mut old_to_new = vec![u32::MAX; old.len()];
+        let mut fused = 0usize;
+        let mut next = old.into_iter().enumerate().peekable();
+
+        let remap = |dep: Dep, map: &[u32]| match dep {
+            Dep::Coarse(c) => Dep::Coarse(map[c as usize]),
+            Dep::Fine {
+                producer,
+                map: fine,
+            } => Dep::Fine {
+                producer: map[producer as usize],
+                map: fine,
+            },
+        };
+
+        while let Some((idx, mut op)) = next.next() {
+            let can_fuse = fuse_with[idx].is_some_and(|consumer_idx| {
+                next.peek()
+                    .is_some_and(|(next_idx, _)| *next_idx == consumer_idx)
+            });
+
+            if can_fuse {
+                let (consumer_idx, mut consumer) = next.next().unwrap();
+                let new_idx = self.ops.len() as u32;
+                old_to_new[idx] = new_idx;
+                old_to_new[consumer_idx] = new_idx;
+                consumer.inst.t[6] = op.inst.t[1];
+                consumer.inst.t[7] = op.inst.t[2];
+                consumer.inst.i[5] = if op.inst.t[3] == TENSOR_NONE {
+                    TENSOR_NONE_I
+                } else {
+                    op.inst.t[3]
+                };
+                consumer.deps = op.deps.drain(..).map(|d| remap(d, &old_to_new)).collect();
+                consumer.counter = new_idx;
+                self.ops.push(consumer);
+                fused += 1;
+                continue;
+            }
+
+            let new_idx = self.ops.len() as u32;
+            old_to_new[idx] = new_idx;
+            op.deps = op.deps.drain(..).map(|d| remap(d, &old_to_new)).collect();
+            op.counter = new_idx;
+            self.ops.push(op);
+        }
+        fused
+    }
+
+    /// Fold an eligible two-shot all-reduce into its AttnRes+RMSNorm consumer. The preceding
+    /// residual pass leaves the rounded prefix materialization on `AttnRes`; this pass keeps that
+    /// tensor live while moving the consumer into phase 2 of the collective.
+    fn fuse_xreduce_attnres(&mut self) -> usize {
+        let graph = ProgramGraph::from_ops(&self.ops);
+        let mut fuse_with = vec![None; self.ops.len()];
+        for consumer_idx in 0..self.ops.len() {
+            let consumer = &self.ops[consumer_idx];
+            let [producer_idx] = graph.predecessors[consumer_idx].as_slice() else {
+                continue;
+            };
+            let producer = &self.ops[*producer_idx];
+            let residual = if consumer.inst.t[6] == producer.inst.t[0]
+                && consumer.inst.t[7] != TENSOR_NONE
+            {
+                Some(consumer.inst.t[7])
+            } else if consumer.inst.t[7] == producer.inst.t[0] && consumer.inst.t[6] != TENSOR_NONE
+            {
+                Some(consumer.inst.t[6])
+            } else if consumer.inst.t[6] == TENSOR_NONE
+                && consumer.inst.t[7] == TENSOR_NONE
+                && consumer.inst.t[1] == producer.inst.t[0]
+            {
+                Some(TENSOR_NONE)
+            } else {
+                None
+            };
+            let n = consumer.inst.i[0].checked_mul(consumer.inst.i[1]);
+            let compatible = producer.inst.op == DevOp::XReduceTwoShot as u16
+                && consumer.inst.op == DevOp::AttnRes as u16
+                && consumer_idx == *producer_idx + 1
+                && matches!(consumer.deps.as_slice(), [Dep::Coarse(c)] if *c == *producer_idx as u32)
+                && matches!(graph.successors[*producer_idx].as_slice(), [c] if *c == consumer_idx)
+                && producer.inst.t[1..].iter().all(|&t| t == TENSOR_NONE)
+                && producer.inst.i[5..].iter().all(|&i| i == 0)
+                && producer.inst.i[1] > 1
+                && consumer.inst.i[0] % producer.inst.i[1] == 0
+                && n == Some(producer.inst.i[0])
+                && producer.cus == consumer.cus
+                && consumer.inst.t[1] != TENSOR_NONE
+                && consumer.inst.t[2] != TENSOR_NONE
+                && consumer.inst.t[3] != TENSOR_NONE
+                && consumer.inst.t[4] == TENSOR_NONE
+                && consumer.inst.t[5] != TENSOR_NONE
+                && consumer.inst.i[5] == TENSOR_NONE_I
+                && residual.is_some();
+            if compatible {
+                fuse_with[*producer_idx] = Some((consumer_idx, residual.unwrap()));
+            }
+        }
+
+        let old = std::mem::take(&mut self.ops);
+        let mut old_to_new = vec![u32::MAX; old.len()];
+        let mut fused = 0usize;
+        let mut next = old.into_iter().enumerate().peekable();
+        let remap = |dep: Dep, map: &[u32]| match dep {
+            Dep::Coarse(c) => Dep::Coarse(map[c as usize]),
+            Dep::Fine {
+                producer,
+                map: fine,
+            } => Dep::Fine {
+                producer: map[producer as usize],
+                map: fine,
+            },
+        };
+
+        while let Some((idx, mut op)) = next.next() {
+            let candidate = fuse_with[idx].filter(|(consumer_idx, _)| {
+                next.peek()
+                    .is_some_and(|(next_idx, _)| *next_idx == *consumer_idx)
+            });
+            if let Some((consumer_idx, residual)) = candidate {
+                let (_, consumer) = next.next().unwrap();
+                let new_idx = self.ops.len() as u32;
+                old_to_new[idx] = new_idx;
+                old_to_new[consumer_idx] = new_idx;
+                op.inst.t[1] = residual;
+                op.inst.t[2] = consumer.inst.t[0];
+                op.inst.t[3] = consumer.inst.t[2];
+                op.inst.t[4] = consumer.inst.t[3];
+                op.inst.t[5] = consumer.inst.t[5];
+                op.inst.t[6] = consumer.inst.t[1];
+                op.inst.i[5] = consumer.inst.i[1];
+                op.inst.i[6] = consumer.inst.i[2];
+                op.inst.i[7] = consumer.inst.i[4];
+                op.inst.f[0] = consumer.inst.f[0];
+                op.deps = op.deps.drain(..).map(|d| remap(d, &old_to_new)).collect();
+                op.counter = new_idx;
+                self.ops.push(op);
+                fused += 1;
+                continue;
+            }
+
+            let new_idx = self.ops.len() as u32;
+            old_to_new[idx] = new_idx;
+            op.deps = op.deps.drain(..).map(|d| remap(d, &old_to_new)).collect();
+            op.counter = new_idx;
+            self.ops.push(op);
+        }
+        fused
+    }
+
+    fn ep_companion_tensor(&mut self, handle: u32) -> u32 {
+        let source = self
+            .tensors
+            .get(handle as usize)
+            .expect("EP table handle is invalid")
+            .clone();
+        assert!(source.init.is_none(), "EP tables must be runtime-bound");
+        let ep_name = format!("{}_ep", source.name);
+        if let Some(i) = self.tensors.iter().position(|t| t.name == ep_name) {
+            return i as u32;
+        }
+        let i = self.tensors.len();
+        assert!(
+            i < TENSOR_NONE as usize,
+            "EP companion tensor table overflows u16"
+        );
+        self.tensors.push(TensorDecl {
+            name: ep_name,
+            bytes: source.bytes,
+            init: None,
+        });
+        i as u32
+    }
+
+    fn rewrite_replicated_moe_prefill_ep(&mut self, degree: u32) -> usize {
+        assert!(degree > 1, "EP degree must exceed one");
+        let mut chains = Vec::new();
+        for (glu, op) in self.ops.iter().enumerate() {
+            let g = &op.inst;
+            if g.op != DevOp::MoeGroupGluPf as u16 || g.i[3] != 2 || g.i[6] != 0 {
+                continue;
+            }
+            let Some(down) = self.ops.iter().position(|candidate| {
+                let d = &candidate.inst;
+                d.op == DevOp::MoeGroupDownPf as u16
+                    && d.t[1] == g.t[0]
+                    && d.t[2] == g.t[2]
+                    && d.t[3] == g.t[3]
+                    && d.t[4] == g.t[4]
+                    && d.i[0] == g.i[1]
+                    && d.i[1] == g.i[0]
+                    && d.i[2] == g.i[2]
+                    && d.i[3] == g.i[3]
+                    && d.i[4..].iter().all(|&v| v == 0)
+            }) else {
+                continue;
+            };
+            let d = &self.ops[down].inst;
+            let Some(combine) = self.ops.iter().position(|candidate| {
+                let c = &candidate.inst;
+                c.op == DevOp::MoeCombinePf as u16
+                    && c.t[3] == d.t[0]
+                    && c.i[0] == d.i[0]
+                    && c.i[1] == 16
+                    && c.i[2] != 0
+                    && c.i[3..].iter().all(|&v| v == 0)
+            }) else {
+                continue;
+            };
+            let reduced = self.ops.iter().any(|candidate| {
+                matches!(
+                    DevOp::from_u16(candidate.inst.op),
+                    Some(DevOp::XReduce | DevOp::XReduceTwoShot)
+                ) && candidate
+                    .deps
+                    .iter()
+                    .any(|dep| dep.producer() as usize == combine)
+            });
+            if !reduced {
+                continue;
+            }
+            let align: Vec<usize> = self
+                .ops
+                .iter()
+                .enumerate()
+                .filter_map(|(i, candidate)| {
+                    let a = &candidate.inst;
+                    (a.op == DevOp::MoeAlignPf as u16
+                        && a.t[0] == g.t[4]
+                        && a.i[0] == self.ops[combine].inst.i[2]
+                        && a.i[1] == g.i[2]
+                        && a.i[2] == 16)
+                        .then_some(i)
+                })
+                .collect();
+            assert!(
+                !align.is_empty(),
+                "EP boundary has no align producer for its declared metadata"
+            );
+            let full_i = g.i[0]
+                .checked_mul(degree)
+                .expect("EP full intermediate width overflows u32");
+            assert!(
+                g.i[0] > 0
+                    && full_i.is_multiple_of(128)
+                    && g.i[1].is_multiple_of(128)
+                    && g.i[2] >= degree
+                    && self.ops[combine].inst.i[2] > 1,
+                "EP boundary geometry is unsupported"
+            );
+            chains.push((glu, down, combine, align, full_i));
+        }
+
+        for (glu, down, combine, align, full_i) in &chains {
+            let weight = self.ops[*glu].inst.t[2];
+            let scale = self.ops[*glu].inst.t[3];
+            let ep_weight = self.ep_companion_tensor(weight);
+            let ep_scale = self.ep_companion_tensor(scale);
+            for handle in [weight, scale] {
+                let source_name = self.tensors[handle as usize].name.clone();
+                if let Some(companion) = self
+                    .tensors
+                    .iter()
+                    .position(|t| t.name == format!("{source_name}_moe2"))
+                {
+                    self.ep_companion_tensor(companion as u32);
+                }
+            }
+            self.ops[*glu].inst.t[2] = ep_weight;
+            self.ops[*glu].inst.t[3] = ep_scale;
+            self.ops[*down].inst.t[2] = ep_weight;
+            self.ops[*down].inst.t[3] = ep_scale;
+            let row_token_bytes = self
+                .tensors
+                .get(self.ops[*glu].inst.t[5] as usize)
+                .expect("EP row-token tensor handle is invalid")
+                .bytes;
+            assert!(
+                row_token_bytes.is_multiple_of(4),
+                "EP row-token tensor is misaligned"
+            );
+            let rows = row_token_bytes / 4;
+            let payload_bytes = rows
+                .checked_mul(u64::from(*full_i) / 2)
+                .expect("EP payload tensor size overflows u64");
+            let scale_bytes = rows
+                .checked_mul(u64::from(*full_i) / 32)
+                .expect("EP scale tensor size overflows u64");
+            for (handle, required) in [
+                (self.ops[*glu].inst.t[0], payload_bytes),
+                (self.ops[*glu].inst.t[7], scale_bytes),
+            ] {
+                let tensor = self
+                    .tensors
+                    .get_mut(handle as usize)
+                    .expect("EP boundary tensor handle is invalid");
+                tensor.bytes = tensor.bytes.max(required);
+            }
+            let experts = self.ops[*glu].inst.i[2];
+            let meta = self.ops[align[0]].inst.t[0] as usize;
+            let meta_words = u64::from(experts)
+                .checked_mul(67)
+                .and_then(|n| n.checked_add(1))
+                .expect("EP metadata size overflows u64");
+            let meta_bytes = meta_words * 4;
+            self.tensors
+                .get_mut(meta)
+                .expect("EP align metadata handle is invalid")
+                .bytes = meta_bytes;
+            for &i in align {
+                self.ops[i].inst.i[5] = degree;
+            }
+            self.ops[*glu].inst.i[0] = *full_i;
+            self.ops[*glu].inst.i[6] = degree;
+            self.ops[*down].inst.i[1] = *full_i;
+            self.ops[*down].inst.i[6] = degree;
+            self.ops[*combine].inst.t[4] = self.ops[align[0]].inst.t[1];
+            self.ops[*combine].inst.i[5] = degree;
+            self.ops[*combine].inst.i[6] = experts;
+        }
+        chains.len()
+    }
+
     pub fn finish(mut self) -> Program {
+        if let Some(degree) = self.moe_prefill_ep_degree {
+            let rewritten = self.rewrite_replicated_moe_prefill_ep(degree);
+            assert!(
+                rewritten != 0,
+                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary"
+            );
+            eprintln!("  whole-graph placement: {rewritten} routed-MoE boundaries use EP{degree}");
+        }
+        if self.fuse_materialized_residual_inputs {
+            let fused = self.fuse_materialized_residual_inputs();
+            if fused != 0 {
+                eprintln!("  whole-graph fusion: {fused} materialized residual inputs");
+            }
+        }
+        if std::env::var("PLOW_FUSE_XR_ATTNRES").ok().as_deref() == Some("1") {
+            let fused = self.fuse_xreduce_attnres();
+            if fused != 0 {
+                eprintln!("  whole-graph fusion: {fused} XReduceTwoShot+AttnRes consumers");
+            }
+        }
         let n_cu = self.n_cu as usize;
         let n_ops = self.ops.len();
 
@@ -883,7 +1623,7 @@ impl Builder {
         // probe MEASURED round-robin still holding at occupancy 2 (512 blocks, 100.0%). Applying
         // the block guard there would have silently disabled placement on exactly the occ-2
         // configs it is safe for.
-        let mut l2_place: Option<L2Layout> = self.place_l2.and_then(|l| {
+        let l2_place: Option<L2Layout> = self.place_l2.and_then(|l| {
             if l.sms == 0 || l.domains == 0 {
                 None
             } else if l.map == L2Map::Block && self.n_cu > l.domains * l.sms {
@@ -1116,16 +1856,106 @@ impl Builder {
         // not be given one because a variable said so. See that method for the failure it prevents.
         let uniseg = !self.uniseg_denied
             && (self.uniseg_forced || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
-        // PLOW_MLA_PF_V2=1 splits FlashMlaPrefill (bf16, op 51) and its fp8-KV twin
+        // AMD L2-placed packets split FlashMlaPrefill (bf16, op 51) and its fp8-KV twin
         // (op 110) into their own wave-class-4
         // segments at T>=2048 so the AMD host can route them to the 4-wave flash object's V2
         // kernel (d_flash_mla_prefill_v2). Smaller buckets remain one 8-wave L2-placed launch.
         // Emit-time, because segments only form on wave_class
         // BOUNDARIES: reclassifying host-side would drag whatever ops share the segment onto
-        // an object that silently skips them. Unset = byte-identical blobs. The host applies
+        // an object that silently skips them. PLOW_MLA_PF_V2=0 is the explicit opt-out; non-AMD
+        // packets remain byte-identical. The host applies
         // its own purity + size guards (exec/amd.rs derive_segments), so an env mismatch in
         // either direction degrades to the 8-wave kernel rather than corrupting.
-        let mla_v2 = !uniseg && std::env::var("PLOW_MLA_PF_V2").ok().as_deref() == Some("1");
+        let mla_v2 = !uniseg
+            && match std::env::var("PLOW_MLA_PF_V2").ok().as_deref() {
+                Some("0") => false,
+                Some("1") => true,
+                // A placed packet is an AMD production artifact. Isolating a pure MLA flash
+                // segment is safe even when its optional lean object is absent: the host then
+                // runs that ordered segment on the ordinary 8-wave interpreter.
+                _ => self.place_l2.is_some(),
+            };
+        // Opt-in only: live packed serving remains disabled. Giving descriptor-consuming
+        // families distinct classes lets a future runtime route them to lean objects without
+        // putting their branches in the production megakernel. Unset preserves packet bytes.
+        let packed_prefill_segments = packed_prefill_segmenting_needed(
+            uniseg,
+            self.packed_prefill_segments,
+            self.ops.iter().map(|o| o.inst.op),
+        );
+        let lean_moe_stage2 = !uniseg
+            && self.lean_moe_stage2_segments
+            && (0..self.ops.len()).any(|i| lean_moe_stage2_pair(&self.ops, i));
+        let lean_moe_stage1 = !uniseg
+            && self.lean_moe_stage1_segments
+            && self.ops.iter().any(|op| lean_moe_stage1_inst(&op.inst));
+        let lean_moe_combine = !uniseg
+            && self.lean_moe_combine_segments
+            && self.ops.iter().any(|op| lean_moe_combine_inst(&op.inst));
+        let moe_prefill_ep = self.moe_prefill_ep_degree.is_some();
+        let lean_attn_res_f32mix = !uniseg
+            && self.attn_res_f32mix_segments
+            && self
+                .ops
+                .iter()
+                .any(|op| lean_attn_res_f32mix_inst(&op.inst));
+        let kda_intra_wave_items = !uniseg && self.kda_intra_wave_items_segments;
+        let lean_kda_intra = !uniseg
+            && (self.lean_kda_intra_segments || kda_intra_wave_items)
+            && self.ops.iter().any(|op| {
+                op.inst.op == DevOp::KdaChunkIntra as u16
+                    && op.inst.i[0] >= 512
+                    && op.inst.i[1] != 0
+                    && op.inst.i[2] == 128
+            });
+        let kda_carry_regstate = !uniseg && self.kda_carry_regstate_segments;
+        let lean_kda_key_factor = !uniseg
+            && (self.lean_kda_key_factor_segments || kda_carry_regstate)
+            && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
+        let decode_mla_segments = !uniseg
+            && self.decode_mla_segments
+            && self.ops.windows(2).any(|pair| {
+                pair[0].inst.op == DevOp::FlashMlaDecode as u16
+                    && pair[1].inst.op == DevOp::MlaMergeFold as u16
+            });
+        let decode_grouped_moe = !uniseg
+            && (self.decode_grouped_moe_segments
+                || std::env::var("PLOW_MOE_DECODE_STANDALONE").ok().as_deref() == Some("1"))
+            && self.ops.windows(2).any(|pair| {
+                pair[0].inst.op == DevOp::MoeGroupGluFp8Blk as u16
+                    && pair[1].inst.op == DevOp::MoeGroupDownFp8Blk as u16
+            });
+        let graph_phase_objects = std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1");
+        let xreduce_wave_rs = !uniseg
+            && self.place_l2.is_some()
+            && (self.xreduce_wave_rs_segments
+                || std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1"))
+            && self
+                .ops
+                .iter()
+                .any(|op| op.inst.op == DevOp::XReduceTwoShot as u16);
+        let isolate_xreduce = xreduce_wave_rs
+            || (!uniseg
+                && self.place_l2.is_some()
+                && graph_phase_objects
+                && self
+                    .ops
+                    .iter()
+                    .any(|op| op.inst.op == DevOp::XReduceTwoShot as u16));
+        // This encoding is understood only by its dedicated interpreter object. As with the
+        // raw KDA boundary, keep it isolated even when PLOW_UNISEG was requested; otherwise the
+        // ordinary XReduce arm would silently interpret the fused operand slots as its legacy
+        // residual/gather contract.
+        let xr_attnres = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::XReduceTwoShot as u16 && op.inst.t[3] != TENSOR_NONE);
+        let mla_materialized = self.ops.iter().any(|op| {
+            matches!(
+                DevOp::from_u16(op.inst.op),
+                Some(DevOp::MlaMaterializePack | DevOp::FlashMlaMaterializedPrefill)
+            )
+        });
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -1172,8 +2002,90 @@ impl Builder {
         let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
         let wave_class = |i: usize| -> u8 {
             let op = self.ops[i].inst.op;
-            if uniseg {
+            if op == DevOp::KdaDecodeFused as u16 {
+                // A standalone raw-argument object owns this boundary. Keep its segment pure
+                // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
+                3
+            } else if decode_grouped_moe
+                && ((op == DevOp::MoeGroupGluFp8Blk as u16
+                    && self
+                        .ops
+                        .get(i + 1)
+                        .is_some_and(|next| next.inst.op == DevOp::MoeGroupDownFp8Blk as u16))
+                    || (op == DevOp::MoeGroupDownFp8Blk as u16
+                        && i > 0
+                        && self.ops[i - 1].inst.op == DevOp::MoeGroupGluFp8Blk as u16))
+            {
+                20
+            } else if op == DevOp::MlaMaterializePack as u16 {
+                14
+            } else if op == DevOp::FlashMlaMaterializedPrefill as u16 {
+                15
+            } else if xr_attnres
+                && op == DevOp::XReduceTwoShot as u16
+                && self.ops[i].inst.t[3] != TENSOR_NONE
+            {
+                12
+            } else if lean_kda_intra
+                && op == DevOp::KdaChunkIntra as u16
+                && self.ops[i].inst.i[0] >= 512
+                && self.ops[i].inst.i[1] != 0
+                && self.ops[i].inst.i[2] == 128
+            {
+                11
+            } else if lean_kda_key_factor && lean_kda_key_factor_pair(&self.ops, i) {
+                16
+            } else if lean_kda_key_factor && i > 0 && lean_kda_key_factor_pair(&self.ops, i - 1) {
+                17
+            } else if moe_prefill_ep && op == DevOp::MoeAlignPf as u16 && self.ops[i].inst.i[5] > 1
+            {
+                21
+            } else if moe_prefill_ep
+                && op == DevOp::MoeGroupGluPf as u16
+                && self.ops[i].inst.i[6] > 1
+            {
+                22
+            } else if moe_prefill_ep
+                && op == DevOp::MoeGroupDownPf as u16
+                && self.ops[i].inst.i[6] > 1
+            {
+                23
+            } else if moe_prefill_ep
+                && op == DevOp::MoeCombinePf as u16
+                && self.ops[i].inst.i[5] > 1
+            {
+                24
+            } else if lean_moe_stage2 && lean_moe_stage2_pair(&self.ops, i) {
+                // The standalone gfx950 kernel owns exactly the deterministic Down scatter.
+                // Combine stays in the following interpreter segment and preserves fixed-order
+                // f32 accumulation.
+                9
+            } else if lean_moe_stage1 && lean_moe_stage1_inst(&self.ops[i].inst) {
+                // The BK256 standalone object owns exactly one grouped gate/up packet.
+                10
+            } else if lean_moe_combine && lean_moe_combine_inst(&self.ops[i].inst) {
+                // The standalone object preserves the interpreter's fixed slot order.
+                13
+            } else if lean_attn_res_f32mix && lean_attn_res_f32mix_inst(&self.ops[i].inst) {
+                // The f32-mix AttnRes object owns exactly one packet per segment.
+                25
+            } else if decode_mla_segments
+                && ((op == DevOp::FlashMlaDecode as u16
+                    && self
+                        .ops
+                        .get(i + 1)
+                        .is_some_and(|next| next.inst.op == DevOp::MlaMergeFold as u16))
+                    || (op == DevOp::MlaMergeFold as u16
+                        && i > 0
+                        && self.ops[i - 1].inst.op == DevOp::FlashMlaDecode as u16))
+            {
+                18
+            } else if isolate_xreduce && op == DevOp::XReduceTwoShot as u16 {
+                19
+            } else if uniseg {
                 8
+            } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
+                packed_prefill_segment_class(op).unwrap()
             } else if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
                 // T37: the *_pffa object instantiates hd 256/512 only — other head dims
                 // (Qwen/Llama hd128) stay on the fat object rather than trapping there.
@@ -1251,7 +2163,6 @@ impl Builder {
         // not a design one, and this knob is how it gets answered.
         // Materialized so later passes (SEG_CLASS_SLICE mutates self.ops) can read it.
         let op_class: Vec<u8> = (0..self.ops.len()).map(wave_class).collect();
-        drop(wave_class);
         let wave_class = |i: usize| -> u8 { op_class[i] };
         let seg_per_op = std::env::var("PLOW_SEG_PER_OP").ok().as_deref() == Some("1");
         let mut seg_of = vec![0u16; self.ops.len()];
@@ -1269,6 +2180,45 @@ impl Builder {
                 cur_seg += 1;
             }
             seg_of[i] = cur_seg;
+        }
+        // A standalone raw kernel cannot participate in the interpreter's counter protocol.
+        // The HSA queue barrier between segment launches already orders every earlier segment
+        // before every later one, so cross-segment counter edges are redundant. Keep all
+        // same-segment edges unchanged; this applies only to programs carrying the raw boundary.
+        let raw_segmented = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16)
+            || lean_moe_stage2
+            || lean_moe_stage1
+            || lean_moe_combine
+            || lean_attn_res_f32mix
+            || moe_prefill_ep
+            || lean_kda_intra
+            || lean_kda_key_factor
+            || xr_attnres
+            || mla_materialized
+            || decode_mla_segments
+            || decode_grouped_moe
+            || isolate_xreduce;
+        let same_segment_dep = |consumer: usize, dep: &Dep| {
+            let producer = dep.producer() as usize;
+            let raw_moe_pair_edge =
+                decode_grouped_moe && wave_class(consumer) == 20 && wave_class(producer) == 20;
+            !raw_moe_pair_edge && (!raw_segmented || seg_of[consumer] == seg_of[producer])
+        };
+        let mut same_segment_consumer = vec![false; self.ops.len()];
+        let mut same_segment_fine_consumer = vec![false; self.ops.len()];
+        for (consumer, op) in self.ops.iter().enumerate() {
+            for dep in &op.deps {
+                if same_segment_dep(consumer, dep) {
+                    let producer = dep.producer() as usize;
+                    same_segment_consumer[producer] = true;
+                    if matches!(dep, Dep::Fine { .. }) {
+                        same_segment_fine_consumer[producer] = true;
+                    }
+                }
+            }
         }
 
         // PLOW_SEG_DUMP=1: report the segmentation this program actually got.
@@ -1302,47 +2252,6 @@ impl Builder {
                 summary.join(", ")
             );
         }
-
-        // L2 PLACEMENT vs WAVE-CLASS SEGMENTATION: they want the same 16-bit field, and
-        // segmentation wins exactly when it is carrying something SOMEONE READS.
-        //
-        // Two conditions, and both are needed:
-        //
-        // 1. `cur_seg > 0` — the program actually has more than one wave class. A decode program
-        //    has no `FlashPrefill` op, so every op is class 8, `cur_seg` never increments, and
-        //    `seg` is uniformly 0 with nothing in it to destroy.
-        // 2. `uniseg_denied` — the TARGET reads the class back out of `seg`. That is the same
-        //    fact `deny_uniseg` already records, and it is caller knowledge for the same reason:
-        //    only the caller knows the backend. An AMD host relaunches once per segment and reads
-        //    the class from `seg`; the sm_120 interpreter runs the whole program in ONE
-        //    cooperative launch at a fixed block size and never looks at it, which is why
-        //    segmentation is spurious there and placement over it has always been fine.
-        //
-        // Without (2) this would silently disable a shipped NVIDIA feature: an sm_120 prefill
-        // program is wave-class-segmented too, and it is placed today.
-        // Without (1) AMD decode could never be placed — and that is where the lever is (§7b:
-        // 66% of decode packets and 45.5% of the token run on ≤32 effective workgroups).
-        //
-        // What condition (1)+(2) stops: overwriting the classes collapses every op into segment
-        // 0, the host sees flash packets there, dispatches the ENTIRE program on the 4-wave flash
-        // object — whose body is `if (op == FLASH_PREFILL…)` with no switch — and every GEMM,
-        // norm and the lm_head is silently dropped. Prefill "succeeds" in 8.7 ms instead of 72.1
-        // with all-zero logits. This cost three agents a long time to find, because the packet
-        // loads, runs, and differs from a correct one ONLY in this field.
-        //
-        // SKIPPED, not refused: skipping produces the CORRECT packet, which is what the caller
-        // wants — unlike a wrong-precision flag, where ignoring would produce a wrong one.
-        if l2_place.is_some() && cur_seg > 0 && self.uniseg_denied {
-            eprintln!(
-                "  l2 placement SKIPPED: program has {} wave-class segments on a target that \
-                 relaunches per segment, and `seg` carries the class it relaunches at — \
-                 placement would overwrite it and dispatch every op on the flash object. \
-                 Emitting with wave-class segmentation instead.",
-                cur_seg + 1
-            );
-            l2_place = None;
-        }
-        let l2_place = l2_place;
 
         // Locality census (`PLOW_PLACE_REPORT=1`). Diagnostic only — reads the op DAG, writes
         // nothing. Answers the question a locality-aware placement pass has to answer FIRST:
@@ -1479,6 +2388,9 @@ impl Builder {
             // CU sets: a hand-written threshold is a deadlock.
             inst.wait_ofs = waits.len() as u32;
             for d in &op.deps {
+                if !same_segment_dep(idx, d) {
+                    continue;
+                }
                 let producer = &self.ops[d.producer() as usize];
                 // A Fine dep still needs a coarse fallback entry only if we are NOT emitting
                 // per-slice lists for this op — but we always are (see `fine` below), so a
@@ -1493,11 +2405,19 @@ impl Builder {
             inst.wait_len = (waits.len() as u32 - inst.wait_ofs) as u16;
 
             inst.succ_ofs = succs.len() as u32;
-            succs.push(op.counter);
-            inst.succ_len = 1;
+            if !raw_segmented || same_segment_consumer[idx] {
+                succs.push(op.counter);
+                inst.succ_len = 1;
+            } else {
+                inst.succ_len = 0;
+            }
 
-            let has_fine_dep = op.deps.iter().any(|d| matches!(d, Dep::Fine { .. }));
-            let is_fine_producer = fine_base[idx] != u32::MAX;
+            let has_fine_dep = op
+                .deps
+                .iter()
+                .any(|d| same_segment_dep(idx, d) && matches!(d, Dep::Fine { .. }));
+            let is_fine_producer =
+                fine_base[idx] != u32::MAX && (!raw_segmented || same_segment_fine_consumer[idx]);
             let fine = has_fine_dep || is_fine_producer;
 
             // `slice` is the op-local index of this workgroup, NOT the CU id: the op's
@@ -1508,11 +2428,9 @@ impl Builder {
                     slice: slice as u32,
                     ..Default::default()
                 };
-                // L2-domain placement (PLOW_L2_PLACE): `seg` is a PER-SLICE domain, so a full
-                // op's slices spread across every L2 domain (no skew) and slice `s` sits in the
-                // same domain across ops (consumer reads producer from one L2 slice). A
-                // physical-SM interp pulls its domain's gq window. Off ⇒ `seg` keeps its
-                // wave-class meaning (byte-identical).
+                // Keep the ordered kernel-family segment even under L2 placement. The per-slice domain
+                // is packed into flags below, so a pure family can run on a lean object while
+                // every launch still has one independently drained GQ window per XCD.
                 //
                 // `domain_of` — NOT an inline `cu / sms`. `cu` here is a LOGICAL workgroup index
                 // (`interp`'s `blockIdx.x`), and only NVIDIA fills a GPC with consecutive blocks.
@@ -1521,9 +2439,10 @@ impl Builder {
                 // block formula here would hand every domain-0 packet to workgroups 0..31 that
                 // the hardware has scattered across all eight XCDs — destroying L2 locality
                 // instead of creating it, and emitting perfectly correct tokens while doing it.
-                e.seg = match l2_place {
-                    Some(l) => l.domain_of(cu) as u16,
-                    None => seg_of[idx],
+                e.seg = if l2_place.is_some() && !self.uniseg_denied {
+                    0
+                } else {
+                    seg_of[idx]
                 };
                 if fine {
                     e.flags = SE_FINE;
@@ -1531,6 +2450,9 @@ impl Builder {
                     if has_fine_dep {
                         e.wait_ofs = waits.len() as u32;
                         for d in &op.deps {
+                            if !same_segment_dep(idx, d) {
+                                continue;
+                            }
                             match d {
                                 Dep::Coarse(c) => {
                                     let p = &self.ops[*c as usize];
@@ -1573,6 +2495,32 @@ impl Builder {
                     e.succ_ofs = inst.succ_ofs;
                     e.succ_len = inst.succ_len;
                 }
+                if let Some(l) = l2_place {
+                    assert!(
+                        l.domains <= 8,
+                        "StreamEnt flags hold at most eight L2 domains"
+                    );
+                    let domain = l.domain_of(cu) as u16;
+                    e.flags |= domain << crate::dev::SE_DOMAIN_SHIFT;
+                }
+                if xreduce_wave_rs && inst.op == DevOp::XReduceTwoShot as u16 {
+                    e.flags |= crate::dev::SE_XR_WAVE_RS;
+                }
+                if kda_intra_wave_items
+                    && inst.op == DevOp::KdaChunkIntra as u16
+                    && inst.i[0] >= 512
+                    && inst.i[1] != 0
+                    && inst.i[2] == 128
+                {
+                    e.flags |= crate::dev::SE_KDA_INTRA_WAVE_ITEMS;
+                }
+                if kda_carry_regstate
+                    && inst.op == DevOp::KdaChunkCarry as u16
+                    && idx > 0
+                    && lean_kda_key_factor_pair(&self.ops, idx - 1)
+                {
+                    e.flags |= crate::dev::SE_KDA_CARRY_REGSTATE;
+                }
                 streams[cu as usize].push(e);
                 gq_stream.push(e); // op-major: outer loop is op order, inner is slice order
             }
@@ -1588,13 +2536,23 @@ impl Builder {
             stream.extend_from_slice(s);
         }
 
-        // Under L2 placement, `seg` == domain is not monotonic in op-emit order,
-        // so group gq_stream by domain first. A STABLE sort preserves each
-        // domain's op-major (topological) order; cross-domain deps stay
-        // counter-gated. This yields contiguous per-domain [ofs[d], ofs[d+1))
-        // windows a physical-SM interp pulls with one cursor per domain.
-        if l2_place.is_some() {
-            gq_stream.sort_by_key(|e| e.seg);
+        // Group by ordered kernel-family segment, then L2 domain. A stable sort preserves
+        // op-major order within each window; cross-window deps remain counter-gated.
+        // With `gq_order_asap`, each window is ordered by earliest-start rank instead (see
+        // `set_gq_order_asap`); ties keep op-major order and the order stays topological.
+        let asap = if self.gq_order_asap {
+            Some(self.gq_asap_ranks())
+        } else {
+            None
+        };
+        let rank = |e: &StreamEnt| asap.as_ref().map_or(0, |a| a[e.inst as usize]);
+        if let Some(l) = l2_place {
+            gq_stream.sort_by_key(|e| {
+                let domain = (e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT;
+                (e.seg as u32 * l.domains + domain as u32, rank(e))
+            });
+        } else if asap.is_some() {
+            gq_stream.sort_by_key(|e| (e.seg, rank(e)));
         }
 
         // PER-(PACKET, DOMAIN) SLICE COUNT, for the two-level cache-maintenance rendezvous
@@ -1612,11 +2570,22 @@ impl Builder {
             let mut per: std::collections::HashMap<(u32, u16), u32> =
                 std::collections::HashMap::new();
             for e in &gq_stream {
-                *per.entry((e.inst, e.seg)).or_insert(0) += 1;
+                // Fine slices can carry different wait/successor lists. Sharing one
+                // (instruction, domain) rendezvous would let the elected slice stand in for
+                // dependencies or signals that only a follower carries.
+                if e.flags & SE_FINE != 0 {
+                    continue;
+                }
+                let domain = (e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT;
+                *per.entry((e.inst, domain)).or_insert(0) += 1;
             }
             let mut over = 0usize;
             for e in gq_stream.iter_mut() {
-                let n = *per.get(&(e.inst, e.seg)).unwrap_or(&0);
+                if e.flags & SE_FINE != 0 {
+                    continue;
+                }
+                let domain = (e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT;
+                let n = *per.get(&(e.inst, domain)).unwrap_or(&0);
                 if n > 1 {
                     // 9 bits. A domain cannot hold more than n_cu slices of one packet, and
                     // n_cu > 511 would need a wider field rather than a silent truncation.
@@ -1633,22 +2602,31 @@ impl Builder {
             );
         }
 
-        // Segment window bounds in gq_stream. gq_stream is op-major and seg_of[] is monotonic in
-        // op-emit order, so each segment occupies a contiguous [ofs[s], ofs[s+1]) range — the
-        // interp bounds its cursor to this window under RUNSEG. Under L2 placement `seg` ranges
-        // over the P L2 domains instead of the wave-class count.
-        // Under L2 placement, `seg` ranges over the P L2 domains (fixed by the
-        // hardware partition_count), NOT ceil(n_cu/sms) — so the window count
-        // always matches the runtime's `smid/sms` domain count.
+        // Segment window bounds in gq_stream. With L2 placement every ordered kernel-family
+        // segment has one window per domain, indexed `segment * domains + domain`.
         let n_seg = match l2_place {
-            Some(l) => l.domains as usize,
+            Some(l) => {
+                let ordered_segments = if self.uniseg_denied {
+                    cur_seg as usize + 1
+                } else {
+                    1
+                };
+                ordered_segments * l.domains as usize
+            }
             None => cur_seg as usize + 1,
         };
         let mut gq_seg_ofs = vec![0u32; n_seg + 1];
         {
             let mut s = 0usize;
             for (i, e) in gq_stream.iter().enumerate() {
-                while e.seg as usize > s {
+                let key = if let Some(l) = l2_place {
+                    let domain =
+                        (e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT;
+                    e.seg as usize * l.domains as usize + domain as usize
+                } else {
+                    e.seg as usize
+                };
+                while key > s {
                     s += 1;
                     gq_seg_ofs[s] = i as u32;
                 }
@@ -1662,8 +2640,16 @@ impl Builder {
         // The MAP is printed too, because a placed blob is only as good as that
         // formula matching the hardware, and it is not visible anywhere else.
         if let Some(l) = l2_place {
-            let per: Vec<u32> = (0..n_seg)
-                .map(|d| gq_seg_ofs[d + 1] - gq_seg_ofs[d])
+            let ordered_segments = n_seg / l.domains as usize;
+            let per: Vec<u32> = (0..l.domains as usize)
+                .map(|d| {
+                    (0..ordered_segments)
+                        .map(|s| {
+                            let w = s * l.domains as usize + d;
+                            gq_seg_ofs[w + 1] - gq_seg_ofs[w]
+                        })
+                        .sum()
+                })
                 .collect();
             let (lo, hi) = (
                 per.iter().copied().min().unwrap_or(0),
@@ -1679,8 +2665,10 @@ impl Builder {
                 L2Map::RoundRobin => "round-robin (wg n -> dom n%domains)",
             };
             eprintln!(
-                "  l2 placement: {n_seg} domains × {} SM, map {map}, packets/domain {per:?}, \
+                "  l2 placement: {} domains × {} ordered segments × {} SM, map {map}, packets/domain {per:?}, \
                  skew {skew:.1}% (max {hi} vs min {lo})",
+                l.domains,
+                ordered_segments,
                 l.sms
             );
         }
@@ -1815,13 +2803,13 @@ pub struct Program {
     pub tensors: Vec<TensorDecl>,
     /// Op-major (topological) permutation of `stream` for the global-queue interpreter.
     pub gq_stream: Vec<StreamEnt>,
-    /// `[n_seg+1]` segment window bounds into `gq_stream`.
+    /// Window bounds into `gq_stream`. Under L2 placement the windows are
+    /// `[ordered_segment][domain]`; otherwise there is one per ordered segment.
     pub gq_seg_ofs: Vec<u32>,
     /// L2-domain placement (PLOW_L2_PLACE): SMs per partition, and the number of
-    /// L2 domains `gq_seg_ofs` is windowed by. `0` ⇒ not placed (`seg` is
-    /// wave-class). When non-zero, `gq_stream`'s `seg` is a domain and the blob
-    /// header carries [`PLOW_BLOB_F_L2DOM`]; a runtime without physical-SM
-    /// domain dispatch must refuse it. See the design notes.
+    /// L2 domains per ordered kernel-family segment. `StreamEnt.seg` remains the ordered
+    /// segment and flags carry the domain. The blob header carries
+    /// [`PLOW_BLOB_F_L2DOM`] plus [`PLOW_BLOB_F_L2SEG`].
     pub l2_sms: u32,
     pub l2_domains: u32,
 }
@@ -1840,6 +2828,11 @@ pub const BLOB_MAGIC_V6: &[u8; 8] = b"PLOWDEV\x08";
 /// path, and serve a model with cos=sin=0 — fluent text, wrong text, no error.
 /// Bumping the magic turns that into a load-time rejection.
 pub const BLOB_MAGIC_V7: &[u8; 8] = b"PLOWDEV\x09";
+/// Current L2 placement keeps ordered segments and physical domains independent.
+/// The layout needs a new magic so older runtimes cannot silently read `seg` as a domain.
+pub const BLOB_MAGIC_L2SEG: &[u8; 8] = b"PLOWDEV\x0a";
+/// Generated-tensor v7 plus the independent segment/domain packet layout.
+pub const BLOB_MAGIC_V7_L2SEG: &[u8; 8] = b"PLOWDEV\x0b";
 
 /// Every container version this build can read.
 ///
@@ -1848,7 +2841,13 @@ pub const BLOB_MAGIC_V7: &[u8; 8] = b"PLOWDEV\x09";
 /// `DevBlob::find_in_dir`), and when v7 was added to only one of them a v7 blob
 /// parsed correctly but was never *discovered* — `plowrt serve` just reported no
 /// model. One list, one place.
-pub const BLOB_MAGICS: [&[u8; 8]; 3] = [BLOB_MAGIC, BLOB_MAGIC_V6, BLOB_MAGIC_V7];
+pub const BLOB_MAGICS: [&[u8; 8]; 5] = [
+    BLOB_MAGIC,
+    BLOB_MAGIC_V6,
+    BLOB_MAGIC_V7,
+    BLOB_MAGIC_L2SEG,
+    BLOB_MAGIC_V7_L2SEG,
+];
 
 /// Is `m` a container version this build understands?
 pub fn is_blob_magic(m: &[u8; 8]) -> bool {
@@ -1859,21 +2858,52 @@ pub const INIT_NONE: u64 = u64::MAX;
 
 // --- decode batch ladder -----------------------------------------------------
 
-/// Widest decode rung any emit may declare. Two independent ceilings sit under it:
-/// the MoE decode router's per-CTA `inv[]` scratch (`PLOW_MOE_MAXB`, 32) and the
-/// decode GEMV's compile-time row bucket (`PLOW_GEMV_MAXM`, 16 — enforced against
-/// the code OBJECT by the runtime, not here, because it is an object property).
-pub const DECODE_RUNG_MAX: u32 = 32;
+/// Packed winners carried by one 128-byte XArgmaxFin counter line.
+pub const XARGMAX_BATCH_PER_LINE: u32 = 16;
+/// Widest cross-rank argmax batch supported by the packet/runtime contract.
+pub const XARGMAX_MAX_BATCH: u32 = 128;
+
+/// Number of consecutive peer-visible counter lines needed by XArgmaxFin.
+pub fn xargmax_value_lines(n_batch: u32) -> Option<u32> {
+    let n = n_batch.max(1);
+    (n <= XARGMAX_MAX_BATCH).then(|| n.div_ceil(XARGMAX_BATCH_PER_LINE))
+}
+
+/// Widest decode rung any emit may declare. Individual operator families may impose a
+/// narrower bound (for example Gemma MoE's 32-row per-CTA scratch), while walking AMD GEMV
+/// objects handle widths above their 16-row compile-time bucket.
+pub const DECODE_RUNG_MAX: u32 = 128;
+
+/// [`BlobProgHeader::t`] bit marking a prefill program as a packed-dispatch-only
+/// topology. The low bits remain the compiled row count, preserving the fixed
+/// wire layout while allowing an ordinary and segmented program for one rung.
+pub const PACKED_PREFILL_PROG: u32 = 1 << 31;
+
+pub fn program_rows(t: u32) -> u32 {
+    t & !PACKED_PREFILL_PROG
+}
+
+pub fn is_packed_prefill_program(t: u32) -> bool {
+    t & PACKED_PREFILL_PROG != 0
+}
+
+pub fn packed_prefill_program_t(rows: u32) -> u32 {
+    assert_eq!(
+        rows & PACKED_PREFILL_PROG,
+        0,
+        "program row count exceeds 31 bits"
+    );
+    rows | PACKED_PREFILL_PROG
+}
 
 /// Index of the FIRST decode program in `prog_t`, i.e. the start of the decode
 /// rung ladder. Everything before it is a prefill bucket.
 ///
 /// THE RULE, and why it needs no new blob field. Programs are emitted
 /// prefill-buckets-ascending then decode-rungs-ascending, and the two ranges are
-/// disjoint by construction: a decode rung is at most [`DECODE_RUNG_MAX`] rows and a
-/// prefill bucket is a chunk width (128 and up — `emit_decode_ladder_rungs_are_below_every_prefill_bucket`
-/// asserts the separation at emit, so a blob that would confuse this cannot be written).
-/// So the ladder is the maximal trailing run of programs whose `t` is `<= DECODE_RUNG_MAX`.
+/// ordered by construction: decode is a trailing strictly ascending run at widths no greater
+/// than [`DECODE_RUNG_MAX`]. A width-128 prefill bucket may equal a width-128 decode rung, but
+/// the strict comparison below cannot cross that equal-width boundary.
 ///
 /// A blob with ONE decode program lands on `prog_t.len() - 1`, which is the
 /// `progs.len() - 1` every caller used before the ladder existed.
@@ -1956,13 +2986,15 @@ pub struct BlobHeader {
 /// `gq_stream`/`gq_seg_ofs` appendix), so `PLOW_GLOBAL_QUEUE=1` can run it. Absent ⇒ static-only.
 pub const PLOW_BLOB_F_GQ: u32 = 1;
 
-/// [`BlobHeader::flags`] bit: `gq_stream`'s `seg` is an **L2 domain** (PLOW_L2_PLACE),
-/// and `gq_seg_ofs` windows it by domain, not wave-class. A runtime WITHOUT
-/// physical-SM domain dispatch (`PLOW_L2_PLACE_DISPATCH`) must REFUSE such a blob —
-/// its wave-class segmentation would mis-dispatch `seg`. `reserved[1]` carries SMs
-/// per partition, `reserved[2]` the domain count, so the interp need not be told
-/// via a build define. See the design notes.
+/// [`BlobHeader::flags`] bit: the blob uses L2-domain packet placement. A runtime
+/// without physical-domain dispatch must refuse it. Current blobs also carry
+/// [`PLOW_BLOB_F_L2SEG`]; legacy blobs stored the domain in `StreamEnt.seg`.
 pub const PLOW_BLOB_F_L2DOM: u32 = 2;
+
+/// L2 placement keeps the ordered kernel-family segment in `StreamEnt.seg` and carries
+/// the domain in `flags`. Its GQ appendix is windowed by `(segment, domain)`.
+/// Older `PLOW_BLOB_F_L2DOM` blobs used `seg` itself as the domain.
+pub const PLOW_BLOB_F_L2SEG: u32 = 4;
 
 /// Stable 32-bit fingerprint of a target GPU spec name (e.g. `"H100 SXM5"`), stamped into
 /// [`BlobHeader::target`] so the runtime can warn when a blob is loaded on a GPU it was not
@@ -2151,11 +3183,19 @@ impl Model {
         // L2-domain placement summary across programs (PLOW_L2_PLACE): all placed
         // programs share the target's (sms, domains); mark the header + carry them.
         let (l2_flag, l2_sms, l2_dom) = match self.progs.iter().find(|p| p.l2_domains > 0) {
-            Some(p) => (PLOW_BLOB_F_L2DOM, p.l2_sms, p.l2_domains),
+            Some(p) => (
+                PLOW_BLOB_F_L2DOM | PLOW_BLOB_F_L2SEG,
+                p.l2_sms,
+                p.l2_domains,
+            ),
             None => (0, 0, 0),
         };
         let hdr = BlobHeader {
-            magic: *BLOB_MAGIC,
+            magic: if l2_flag == 0 {
+                *BLOB_MAGIC
+            } else {
+                *BLOB_MAGIC_L2SEG
+            },
             n_cu: self.n_cu,
             n_tensor: self.tensors.len() as u32,
             n_prog: self.progs.len() as u32,
@@ -2284,15 +3324,20 @@ impl Model {
 
         // L2-domain placement summary (PLOW_L2_PLACE) — see to_blob().
         let (l2_flag, l2_sms, l2_dom) = match self.progs.iter().find(|p| p.l2_domains > 0) {
-            Some(p) => (PLOW_BLOB_F_L2DOM, p.l2_sms, p.l2_domains),
+            Some(p) => (
+                PLOW_BLOB_F_L2DOM | PLOW_BLOB_F_L2SEG,
+                p.l2_sms,
+                p.l2_domains,
+            ),
             None => (0, 0, 0),
         };
         // Header placeholder — sect_dir_offset patched after we know the full layout.
         let hdr = BlobHeader {
-            magic: if self.gen.is_empty() {
-                *BLOB_MAGIC_V6
-            } else {
-                *BLOB_MAGIC_V7
+            magic: match (self.gen.is_empty(), l2_flag == 0) {
+                (true, true) => *BLOB_MAGIC_V6,
+                (false, true) => *BLOB_MAGIC_V7,
+                (true, false) => *BLOB_MAGIC_L2SEG,
+                (false, false) => *BLOB_MAGIC_V7_L2SEG,
             },
             n_cu: self.n_cu,
             n_tensor: self.tensors.len() as u32,
@@ -2384,6 +3429,108 @@ impl Builder {
     }
 }
 
+#[cfg(test)]
+mod moe_prefill_ep_tests {
+    use super::*;
+
+    fn graph(with_reduction: bool) -> Builder {
+        let mut b = Builder::new(8);
+        let routes = b.tensor("routes", 8192 * 16 * 4);
+        let meta = b.tensor("meta", (3 * 896 + 1) * 4);
+        let row_token = b.tensor("row_token", 8192 * 16 * 4);
+        let row_partidx = b.tensor("row_partidx", 8192 * 16 * 4);
+        let row_gate = b.tensor("row_gate", 8192 * 16 * 4);
+        let act = b.tensor("act", 8192 * 3584 * 2);
+        let up = b.tensor("up", 8192 * 16 * 384 / 2);
+        let up_scale = b.tensor("up_scale", 8192 * 16 * 384 / 32);
+        let part = b.tensor("part", 8192 * 16 * 3584 * 4);
+        let out = b.tensor("out", 8192 * 3584 * 2);
+        let up_weights = b.tensor("expert_weight_table", 896 * 8);
+        let up_scales = b.tensor("expert_scale_table", 896 * 8);
+        b.tensor("expert_weight_table_moe2", 896 * 8);
+        b.tensor("expert_scale_table_moe2", 896 * 8);
+        let all = b.all();
+        let align = b.emit(DevOp::MoeAlignPf, all.clone(), &[], |d| {
+            d.t[..5].copy_from_slice(&[meta, routes, row_token, row_partidx, row_gate]);
+            d.i[..3].copy_from_slice(&[8192, 896, 16]);
+        });
+        let glu = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[align], |d| {
+            d.t.copy_from_slice(&[
+                up,
+                act,
+                up_weights,
+                up_scales,
+                meta,
+                row_token,
+                row_partidx,
+                up_scale,
+            ]);
+            d.i[..6].copy_from_slice(&[384, 3584, 896, 2, 0, 1]);
+        });
+        let down = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[glu], |d| {
+            d.t.copy_from_slice(&[
+                part,
+                up,
+                up_weights,
+                up_scales,
+                meta,
+                up_scale,
+                row_partidx,
+                row_gate,
+            ]);
+            d.i[..4].copy_from_slice(&[3584, 384, 896, 2]);
+        });
+        let combine = b.emit(DevOp::MoeCombinePf, all.clone(), &[down], |d| {
+            d.t[0] = out;
+            d.t[3] = part;
+            d.i[..3].copy_from_slice(&[3584, 16, 8192]);
+        });
+        if with_reduction {
+            b.emit(DevOp::XReduce, all, &[combine], |d| {
+                d.t[0] = out;
+                d.i[0] = 8192 * 3584;
+                d.i[1] = 8;
+            });
+        }
+        b
+    }
+
+    #[test]
+    fn whole_graph_ep_rewrite_encodes_full_i_and_fixed_slot_ownership() {
+        let mut b = graph(true);
+        assert_eq!(b.rewrite_replicated_moe_prefill_ep(8), 1);
+        let align = &b.ops[0].inst;
+        let glu = &b.ops[1].inst;
+        let down = &b.ops[2].inst;
+        let combine = &b.ops[3].inst;
+        assert_eq!(align.i[5], 8);
+        assert_eq!((glu.i[0], glu.i[6]), (3072, 8));
+        assert_eq!((glu.t[2], glu.t[3]), (14, 15));
+        assert_eq!((down.i[1], down.i[6]), (3072, 8));
+        assert_eq!((down.t[2], down.t[3]), (14, 15));
+        assert_eq!((combine.t[4], combine.i[5], combine.i[6]), (0, 8, 896));
+        assert_eq!(b.tensors[1].bytes, (67 * 896 + 1) * 4);
+        assert_eq!(b.tensors[6].bytes, 8192 * 16 * 3072 / 2);
+        assert_eq!(b.tensors[7].bytes, 8192 * 16 * 3072 / 32);
+        assert_eq!(b.tensors[14].name, "expert_weight_table_ep");
+        assert_eq!(b.tensors[15].name, "expert_scale_table_ep");
+        assert_eq!(b.tensors[16].name, "expert_weight_table_moe2_ep");
+        assert_eq!(b.tensors[17].name, "expert_scale_table_moe2_ep");
+
+        // Shared tensor tables are adopted by every prefill rung. Rewriting an already widened
+        // declaration must be idempotent, not multiply it by the TP degree again.
+        assert_eq!(b.rewrite_replicated_moe_prefill_ep(8), 0);
+        assert_eq!(b.tensors[6].bytes, 8192 * 16 * 3072 / 2);
+    }
+
+    #[test]
+    fn whole_graph_ep_rewrite_requires_a_replicated_reduction_boundary() {
+        let mut b = graph(false);
+        assert_eq!(b.rewrite_replicated_moe_prefill_ep(8), 0);
+        assert!(b.ops.iter().all(|op| op.inst.i[6] == 0));
+    }
+}
+
 /// L2-domain placement: the workgroup->domain formula, and when placement declines.
 ///
 /// The formula is the entire feature. A wrong one still emits correct tokens — it just puts a
@@ -2391,6 +3538,235 @@ impl Builder {
 /// catch it and it has to be pinned here.
 /// Why locality-aware placement has nothing to win on these programs, as a test rather than a
 /// paragraph. See the design notes.
+#[cfg(test)]
+mod whole_graph_fusion_tests {
+    use super::*;
+
+    fn graph(scale: f32, pre: bool) -> Builder {
+        let mut b = Builder::new(4);
+        let out = b.tensor("out", 128);
+        let a = b.tensor("a", 128);
+        let rhs = b.tensor("b", 128);
+        let outer = b.tensor("pre", 128);
+        let ring = b.tensor("ring", 128);
+        let score = b.tensor("score", 256);
+        let seed = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+        let residual = b.emit(DevOp::Residual, vec![0, 1], &[seed], |d| {
+            d.t[0] = out;
+            d.t[1] = a;
+            d.t[2] = rhs;
+            d.t[3] = pre.then_some(outer).unwrap_or(TENSOR_NONE);
+            d.i[0] = 64;
+            d.f[0] = scale;
+        });
+        let consumer = b.emit(DevOp::AttnRes, vec![0], &[residual], |d| {
+            d.t[0] = a;
+            d.t[1] = out;
+            d.t[2] = ring;
+            d.t[3] = score;
+            d.i[0] = 1;
+            d.i[1] = 64;
+            d.i[5] = TENSOR_NONE_I;
+        });
+        b.emit(DevOp::Nop, vec![0], &[consumer], |_| {});
+        b
+    }
+
+    #[test]
+    fn whole_graph_fusion_preserves_materialization_rounding_and_remaps_counters() {
+        for pre in [false, true] {
+            let mut b = graph(1.0, pre);
+            assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+            assert_eq!(b.ops.len(), 3);
+            let fused = &b.ops[1];
+            assert_eq!(fused.inst.op, DevOp::AttnRes as u16);
+            assert_eq!((fused.inst.t[6], fused.inst.t[7]), (1, 2));
+            assert_eq!(fused.inst.i[5], if pre { 3 } else { TENSOR_NONE_I });
+            assert!(matches!(fused.deps.as_slice(), [Dep::Coarse(0)]));
+            assert_eq!(fused.counter, 1);
+            assert!(matches!(b.ops[2].deps.as_slice(), [Dep::Coarse(1)]));
+            assert_eq!(b.ops[2].counter, 2);
+        }
+    }
+
+    #[test]
+    fn materialized_residual_fusion_defaults_on_and_has_a_rollback() {
+        let fused = graph(1.0, false).finish();
+        assert_eq!(
+            fused
+                .insts
+                .iter()
+                .filter(|inst| inst.op == DevOp::Residual as u16)
+                .count(),
+            0
+        );
+
+        let mut rollback = graph(1.0, false);
+        rollback.set_fuse_materialized_residual_inputs(false);
+        assert_eq!(
+            rollback
+                .finish()
+                .insts
+                .iter()
+                .filter(|inst| inst.op == DevOp::Residual as u16)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn whole_graph_fusion_rejects_non_unit_residuals() {
+        let mut b = graph(0.5, false);
+        assert_eq!(b.fuse_materialized_residual_inputs(), 0);
+        assert_eq!(b.ops.len(), 4);
+    }
+
+    #[test]
+    fn whole_graph_fusion_preserves_later_fanout_consumers() {
+        let mut b = graph(1.0, false);
+        b.emit(DevOp::Nop, vec![0], &[1], |_| {});
+        assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+        assert_eq!(b.ops.len(), 4);
+        assert!(matches!(b.ops[3].deps.as_slice(), [Dep::Coarse(1)]));
+    }
+
+    fn xreduce_attnres_graph(extra_xr_consumer: bool) -> Builder {
+        let mut b = Builder::new(8);
+        let partial = b.tensor("partial", 2048);
+        let prefix_in = b.tensor("prefix_in", 2048);
+        let prefix = b.tensor("prefix", 2048);
+        let mixed = b.tensor("mixed", 2048);
+        let ring = b.tensor("ring", 8192);
+        let score = b.tensor("score", 256);
+        let gamma = b.tensor("gamma", 128);
+        let all = b.all();
+        let seed = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let xr = b.emit(DevOp::XReduceTwoShot, all.clone(), &[seed], |d| {
+            d.t[0] = partial;
+            d.i[0] = 16 * 64;
+            d.i[1] = 8;
+            d.i[3] = 4;
+            d.i[4] = 5;
+        });
+        let residual = b.emit(DevOp::Residual, all.clone(), &[xr], |d| {
+            d.t[0] = prefix;
+            d.t[1] = prefix_in;
+            d.t[2] = partial;
+            d.i[0] = 16 * 64;
+            d.f[0] = 1.0;
+        });
+        let consumer = b.emit(DevOp::AttnRes, all.clone(), &[residual], |d| {
+            d.t[0] = mixed;
+            d.t[1] = prefix;
+            d.t[2] = ring;
+            d.t[3] = score;
+            d.t[5] = gamma;
+            d.i[0] = 16;
+            d.i[1] = 64;
+            d.i[2] = 2;
+            d.i[4] = 4;
+            d.i[5] = TENSOR_NONE_I;
+            d.f[0] = 1e-5;
+        });
+        b.emit(DevOp::Nop, all.clone(), &[consumer], |_| {});
+        if extra_xr_consumer {
+            b.emit(DevOp::Nop, all, &[xr], |_| {});
+        }
+        b
+    }
+
+    #[test]
+    fn xreduce_phase2_folds_exact_graph_contract_and_remaps_counters() {
+        let mut b = xreduce_attnres_graph(false);
+        assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+        assert_eq!(b.fuse_xreduce_attnres(), 1);
+        assert_eq!(b.ops.len(), 3);
+        let fused = &b.ops[1];
+        assert_eq!(fused.inst.op, DevOp::XReduceTwoShot as u16);
+        assert_eq!(
+            fused.inst.t[0], 0,
+            "ordinary reduced output remains materialized"
+        );
+        assert_eq!(fused.inst.t[1], 1, "residual addend");
+        assert_eq!(fused.inst.t[2], 3, "AttnRes output");
+        assert_eq!(fused.inst.t[3], 4, "AttnRes ring");
+        assert_eq!(fused.inst.t[4], 5, "AttnRes score");
+        assert_eq!(fused.inst.t[5], 6, "fused post-norm gamma");
+        assert_eq!(fused.inst.t[6], 2, "rounded prefix remains materialized");
+        assert_eq!(&fused.inst.i[5..], &[64, 2, 4]);
+        assert_eq!(fused.inst.f[0].to_bits(), 1e-5f32.to_bits());
+        assert!(matches!(b.ops[2].deps.as_slice(), [Dep::Coarse(1)]));
+    }
+
+    #[test]
+    fn xreduce_phase2_rejects_a_collective_with_another_graph_consumer() {
+        let mut b = xreduce_attnres_graph(true);
+        assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+        assert_eq!(b.fuse_xreduce_attnres(), 0);
+    }
+
+    #[test]
+    fn xreduce_phase2_rejects_flat_slices_that_split_rows() {
+        let mut b = xreduce_attnres_graph(false);
+        assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+        b.ops[1].inst.i[0] = 15 * 64;
+        b.ops[2].inst.i[0] = 15;
+        assert_eq!(b.fuse_xreduce_attnres(), 0);
+    }
+
+    #[test]
+    fn xreduce_phase2_folds_a_direct_prefix_without_inventing_a_residual() {
+        let mut b = Builder::new(8);
+        let prefix = b.tensor("prefix", 2048);
+        let mixed = b.tensor("mixed", 2048);
+        let ring = b.tensor("ring", 8192);
+        let score = b.tensor("score", 256);
+        let gamma = b.tensor("gamma", 128);
+        let all = b.all();
+        let seed = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let xr = b.emit(DevOp::XReduceTwoShot, all.clone(), &[seed], |d| {
+            d.t[0] = prefix;
+            d.i[0] = 16 * 64;
+            d.i[1] = 8;
+        });
+        b.emit(DevOp::AttnRes, all, &[xr], |d| {
+            d.t[0] = mixed;
+            d.t[1] = prefix;
+            d.t[2] = ring;
+            d.t[3] = score;
+            d.t[5] = gamma;
+            d.i[0] = 16;
+            d.i[1] = 64;
+            d.i[2] = 2;
+            d.i[4] = 4;
+            d.i[5] = TENSOR_NONE_I;
+            d.f[0] = 1e-5;
+        });
+        assert_eq!(b.fuse_xreduce_attnres(), 1);
+        assert_eq!(b.ops[1].inst.t[1], TENSOR_NONE);
+        assert_eq!(b.ops[1].inst.t[6], prefix);
+        b.force_uniseg();
+        let p = b.finish();
+        let seg = |inst| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .expect("instruction has a stream entry")
+                .seg
+        };
+        assert_ne!(
+            seg(0),
+            seg(1),
+            "the fused op needs its spill-isolated object even under forced uniseg"
+        );
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.seg == seg(1))
+            .all(|e| e.inst == 1));
+    }
+}
+
 #[cfg(test)]
 mod locality_census_tests {
     use super::*;
@@ -2490,6 +3866,10 @@ mod locality_census_tests {
 mod l2_placement_tests {
     use super::*;
 
+    fn domain(e: &StreamEnt) -> u32 {
+        ((e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT) as u32
+    }
+
     /// One packet per op, each sliced across all `n_cu` workgroups. `reads_class` is the target
     /// fact `deny_uniseg` records: true for a host that relaunches per segment and reads the wave
     /// class out of `seg` (AMD), false for one cooperative launch that never looks (sm_120).
@@ -2525,13 +3905,14 @@ mod l2_placement_tests {
         assert_eq!(p.l2_domains, 8, "placement must be active");
         for e in &p.stream {
             assert_eq!(
-                e.seg as u32,
+                domain(e),
                 e.slice % 8,
                 "slice {} must sit in domain {} (n % 8), got {}",
                 e.slice,
                 e.slice % 8,
-                e.seg
+                domain(e)
             );
+            assert_eq!(e.seg, 0, "the ordered segment must remain independent");
         }
         // Every domain window is equally full — 8 domains × 32 of the 256 slices.
         let per: Vec<u32> = (0..8)
@@ -2542,6 +3923,66 @@ mod l2_placement_tests {
             vec![32; 8],
             "round-robin over 256 slices must not skew"
         );
+    }
+
+    /// K3's MoE layer shape: a b=1 router chain emitted BEFORE an independent shared-expert pair
+    /// that was ready earlier. ASAP ordering must hoist the pair ahead of the gated chain in
+    /// every XCD window, keep every window topological, and leave the static streams alone.
+    #[test]
+    fn gq_asap_order_hoists_ready_packets_ahead_of_gated_ones() {
+        let l = L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::RoundRobin,
+        };
+        let emit = |asap: bool| {
+            let mut b = Builder::new(256);
+            b.set_l2_placement(Some(l));
+            b.deny_uniseg();
+            b.set_gq_order_asap(asap);
+            let all: Vec<u32> = (0..256).collect();
+            let attn = b.emit(DevOp::AttnRes, vec![0], &[], |_| {});
+            let router = b.emit(DevOp::MoeRouterTopk, vec![0], &[attn], |_| {});
+            let glu = b.emit(DevOp::MoeGroupGluFp8Blk, all.clone(), &[router], |_| {});
+            let down = b.emit(DevOp::MoeGroupDownFp8Blk, all.clone(), &[glu], |_| {});
+            let sh_glu = b.emit(DevOp::GemvGlu, all.clone(), &[attn], |_| {});
+            let sh_down = b.emit(DevOp::Gemv, all.clone(), &[sh_glu], |_| {});
+            b.emit(DevOp::XReduce, all, &[down, sh_down], |_| {});
+            (b.finish(), [attn, router, glu, down, sh_glu, sh_down])
+        };
+        let (base, _) = emit(false);
+        let (p, ids) = emit(true);
+        assert_eq!(p.stream, base.stream, "static streams must not move");
+        assert_eq!(p.gq_seg_ofs, base.gq_seg_ofs, "windows must not move");
+        let [_, _, glu, down, sh_glu, sh_down] = ids;
+        for w in 0..p.gq_seg_ofs.len() - 1 {
+            let win = &p.gq_stream[p.gq_seg_ofs[w] as usize..p.gq_seg_ofs[w + 1] as usize];
+            let pos = |inst: u32| win.iter().position(|e| e.inst == inst);
+            if let (Some(a), Some(g)) = (pos(sh_glu), pos(glu)) {
+                assert!(
+                    a < g,
+                    "window {w}: shared GemvGlu must precede the gated MoeGroupGlu"
+                );
+            }
+            if let (Some(a), Some(g)) = (pos(sh_down), pos(glu)) {
+                assert!(
+                    a < g,
+                    "window {w}: shared down Gemv must precede the gated MoeGroupGlu"
+                );
+            }
+            if let (Some(a), Some(g)) = (pos(sh_glu), pos(sh_down)) {
+                assert!(a < g, "window {w}: producer before consumer");
+            }
+            if let (Some(a), Some(g)) = (pos(glu), pos(down)) {
+                assert!(a < g, "window {w}: producer before consumer");
+            }
+        }
+        // Same multiset of entries, just permuted.
+        let mut x: Vec<_> = p.gq_stream.iter().map(|e| (e.inst, e.slice)).collect();
+        let mut y: Vec<_> = base.gq_stream.iter().map(|e| (e.inst, e.slice)).collect();
+        x.sort();
+        y.sort();
+        assert_eq!(x, y);
     }
 
     /// NVIDIA. Consecutive blocks fill a GPC, so the block formula stands — and this test is
@@ -2556,7 +3997,8 @@ mod l2_placement_tests {
         let p = placed(256, &[DevOp::Nop], Some(l));
         assert_eq!(p.l2_domains, 8);
         for e in &p.stream {
-            assert_eq!(e.seg as u32, e.slice / 32, "block map is n / sms");
+            assert_eq!(domain(e), e.slice / 32, "block map is n / sms");
+            assert_eq!(e.seg, 0, "the ordered segment must remain independent");
         }
     }
 
@@ -2614,36 +4056,121 @@ mod l2_placement_tests {
             "round-robin is in range at occupancy 2 — measured"
         );
         for e in &rr.stream {
-            assert_eq!(e.seg as u32, e.slice % 8);
+            assert_eq!(domain(e), e.slice % 8);
+            assert_eq!(e.seg, 0);
         }
     }
 
-    /// THE ZERO-LOGITS GUARD. A program with two wave classes is already using `seg` to tell the
-    /// AMD host which occupancy to relaunch at. Overwriting it collapses prefill into one
-    /// segment, the host dispatches every op on the 4-wave flash object, and every GEMM, norm
-    /// and the lm_head are dropped — 8.7 ms of "prefill" and all-zero logits.
+    /// THE ZERO-LOGITS GUARD. Host family segments and device-side XCD queues must coexist.
+    /// Collapsing either dimension dispatches packets on the wrong object or loses locality.
     #[test]
-    fn a_multi_wave_class_program_is_never_placed() {
+    fn a_multi_wave_class_program_keeps_segments_and_xcd_windows() {
         let l = L2Layout {
             sms: 32,
             domains: 8,
             map: L2Map::RoundRobin,
         };
         let p = placed(256, &[DevOp::Nop, DevOp::FlashPrefill, DevOp::Nop], Some(l));
-        assert_eq!(
-            p.l2_domains, 0,
-            "a segmented program must fall back byte-identical"
-        );
-        // …and the wave classes survive intact: 3 segments, one per class run.
+        assert_eq!(p.l2_domains, 8, "placement must remain active");
+        // Three ordered kernel-family segments, each with eight independently drained XCD windows.
         assert_eq!(
             p.gq_seg_ofs.len() - 1,
-            3,
-            "wave-class segmentation must be preserved"
+            24,
+            "expected [ordered segment][XCD] queue windows"
         );
         assert!(
             p.stream.iter().any(|e| e.seg == 1),
             "the flash run keeps its own segment"
         );
+        assert!(
+            p.stream.iter().any(|e| domain(e) == 7),
+            "packets must be emitted for every XCD"
+        );
+    }
+
+    #[test]
+    fn hierarchy_counts_exclude_fine_entries_with_slice_local_edges() {
+        let mut b = Builder::new(8);
+        b.set_l2_placement(Some(L2Layout {
+            sms: 4,
+            domains: 2,
+            map: L2Map::RoundRobin,
+        }));
+        b.deny_uniseg();
+        let cus: Vec<u32> = (0..8).collect();
+        let producer = b.emit(DevOp::Nop, cus.clone(), &[], |_| {});
+        let map: Vec<Vec<u32>> = (0..8).map(|slice| vec![slice]).collect();
+        b.emit_dep_work(
+            DevOp::Nop,
+            cus,
+            vec![Dep::Fine { producer, map }],
+            (1..=8).collect(),
+            |_| {},
+        );
+        let p = b.finish();
+
+        let fine: Vec<_> = p
+            .gq_stream
+            .iter()
+            .filter(|entry| entry.flags & SE_FINE != 0)
+            .collect();
+        assert!(
+            !fine.is_empty(),
+            "test must retain slice-local dependencies"
+        );
+        assert!(
+            fine.iter()
+                .all(|entry| entry.flags & crate::dev::SE_NPER_MASK == 0),
+            "one fine slice must never rendezvous on behalf of another slice's waits/signals"
+        );
+    }
+
+    #[test]
+    fn raw_boundary_keeps_same_segment_counters_and_removes_cross_segment_edges() {
+        let mut b = Builder::new(4);
+        let cus = vec![0, 1, 2, 3];
+        let coarse = b.emit(DevOp::Nop, cus.clone(), &[], |_| {});
+        let fine_producer = b.emit(DevOp::Nop, cus.clone(), &[coarse], |_| {});
+        let map: Vec<Vec<u32>> = (0..4).map(|slice| vec![slice]).collect();
+        let before_raw = b.emit_dep_work(
+            DevOp::Nop,
+            cus.clone(),
+            vec![Dep::Fine {
+                producer: fine_producer,
+                map: map.clone(),
+            }],
+            vec![1, 40, 3, 9],
+            |_| {},
+        );
+        let raw = b.emit_dep_work(
+            DevOp::KdaDecodeFused,
+            cus.clone(),
+            vec![Dep::Fine {
+                producer: before_raw,
+                map,
+            }],
+            vec![1, 40, 3, 9],
+            |_| {},
+        );
+        b.emit(DevOp::Nop, cus, &[raw], |_| {});
+        let p = b.finish();
+
+        assert_ne!(p.insts[0].succ_len, 0, "same-segment coarse successor lost");
+        assert_ne!(p.insts[1].wait_len, 0, "same-segment coarse wait lost");
+        assert_ne!(p.insts[1].succ_len, 0, "same-segment fine successor lost");
+        assert!(p
+            .stream
+            .iter()
+            .filter(|entry| entry.inst == 2)
+            .any(|entry| entry.flags & SE_FINE != 0 && entry.wait_len != 0));
+
+        assert_eq!((p.insts[3].wait_len, p.insts[3].succ_len), (0, 0));
+        assert_eq!(p.insts[4].wait_len, 0);
+        assert!(p
+            .stream
+            .iter()
+            .filter(|entry| entry.inst == 3)
+            .all(|entry| entry.wait_len == 0 && entry.succ_len == 0 && entry.flags & SE_FINE == 0));
     }
 
     /// The other half: a SINGLE-wave-class program (decode has no `FlashPrefill`) has nothing in
@@ -2687,8 +4214,9 @@ mod l2_placement_tests {
         assert_eq!(
             p.gq_seg_ofs.len() - 1,
             8,
-            "windows are the 8 L2 domains, not wave classes"
+            "a target that ignores ordered segments needs only eight domain queues"
         );
+        assert!(p.stream.iter().all(|e| e.seg == 0));
     }
 
     /// Off ⇒ byte-identical. The whole feature has to be a no-op when unset, or every existing
@@ -2770,6 +4298,61 @@ mod seg_window_tests {
         assert!(mla_v2_segment(DevOp::FlashMlaPrefill as u16, 2048));
         assert!(mla_v2_segment(DevOp::FlashMlaPrefillFp8 as u16, 2048));
         assert!(!mla_v2_segment(DevOp::Gemv as u16, 8192));
+    }
+
+    #[test]
+    fn packed_prefill_classes_are_operator_families() {
+        assert_eq!(packed_prefill_segment_class(DevOp::RmsNorm as u16), Some(5));
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::HeadNormRope as u16),
+            Some(5)
+        );
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::HeadNormRopeFp8 as u16),
+            Some(5)
+        );
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::FlashMlaPrefill as u16),
+            Some(6)
+        );
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::FlashMlaPrefillFp8 as u16),
+            Some(6)
+        );
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::KdaConv3 as u16),
+            Some(7)
+        );
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::KdaChunkIntra as u16),
+            Some(7)
+        );
+        assert_eq!(packed_prefill_segment_class(DevOp::Gemv as u16), None);
+    }
+
+    #[test]
+    fn kda_only_program_can_enable_packed_prefill_segments() {
+        let ops = [DevOp::KdaChunkPrepare as u16, DevOp::Gemv as u16];
+        assert!(packed_prefill_segmenting_needed(
+            false,
+            true,
+            ops.into_iter()
+        ));
+        assert!(!packed_prefill_segmenting_needed(
+            true,
+            true,
+            ops.into_iter()
+        ));
+        assert!(!packed_prefill_segmenting_needed(
+            false,
+            false,
+            ops.into_iter()
+        ));
+        assert!(!packed_prefill_segmenting_needed(
+            false,
+            true,
+            [DevOp::Gemv as u16].into_iter()
+        ));
     }
 
     /// The number of segments a program's stream spans, derived the way every
@@ -2864,18 +4447,10 @@ mod seg_window_tests {
         }
     }
 
-    /// Under L2-domain placement (`PLOW_L2_PLACE`) `seg` is the workgroup's DOMAIN, so one
-    /// CU's stream carries a SINGLE segment and every other window is empty.
-    /// Windowing must stay correct there — it just buys nothing. This is the arm
-    /// that a wave-class-shaped construction would get wrong.
-    ///
-    /// Run over BOTH maps. `L2Map::Block` (`cu / sms`) and `L2Map::RoundRobin` (`cu % domains`)
-    /// give the same one-full-window shape but permute WHICH window is the full one, so a
-    /// windowing bug that assumed the block formula would survive a block-only test. The
-    /// expectation comes from [`L2Layout::domain_of`] rather than a repeated formula, so the
-    /// two cannot drift.
+    /// Static per-CU streams retain ordered kernel-family segments. XCD assignment lives in flags and
+    /// therefore cannot alter the segment windows used by the static fallback.
     #[test]
-    fn l2_placement_gives_one_full_window_and_the_rest_empty() {
+    fn l2_placement_keeps_static_ordered_segment_windows() {
         for map in [L2Map::Block, L2Map::RoundRobin] {
             let l = L2Layout {
                 sms: 2,
@@ -2884,25 +4459,31 @@ mod seg_window_tests {
             };
             let mut b = Builder::new(8);
             b.set_l2_placement(Some(l));
+            b.deny_uniseg();
             let all = b.all();
             let a = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
             b.emit(DevOp::FlashPrefill, all, &[a], |_| {});
             let p = b.finish();
-            let n_seg = l.domains;
+            let n_seg = 2;
             let ofs = static_seg_ofs(&p.stream, &p.stream_ofs, &p.stream_len, n_seg).unwrap();
             let row = n_seg as usize + 1;
             for cu in 0..p.n_cu as usize {
                 let len = p.stream_len[cu] as usize;
                 let r = &ofs[cu * row..(cu + 1) * row];
-                let mine = l.domain_of(cu as u32);
                 for s in 0..n_seg {
                     let (lo, hi) = (r[s as usize], r[s as usize + 1]);
-                    let want = if s == mine { len as u32 } else { 0 };
+                    let want = 1;
                     assert_eq!(
                         hi - lo,
                         want,
                         "{map:?} cu {cu} seg {s}: expected {want} entries"
                     );
+                }
+                let o = p.stream_ofs[cu] as usize;
+                for e in &p.stream[o..o + len] {
+                    let got = ((e.flags & crate::dev::SE_DOMAIN_MASK)
+                        >> crate::dev::SE_DOMAIN_SHIFT) as u32;
+                    assert_eq!(got, l.domain_of(cu as u32));
                 }
             }
         }
@@ -2920,6 +4501,659 @@ mod seg_window_tests {
         let stream = vec![e(0), e(1), e(0)];
         let err = static_seg_ofs(&stream, &[0], &[3], 2).unwrap_err();
         assert!(err.contains("not monotonic"), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod xreduce_wave_rs_segment_tests {
+    use super::*;
+
+    fn program(enabled: bool) -> Program {
+        let mut b = Builder::new(8);
+        b.deny_uniseg();
+        b.set_l2_placement(Some(L2Layout {
+            sms: 1,
+            domains: 8,
+            map: L2Map::RoundRobin,
+        }));
+        b.set_xreduce_wave_rs_segments(enabled);
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let xr = b.emit(DevOp::XReduceTwoShot, all.clone(), &[before], |d| {
+            d.i[0] = 8192 * 7168;
+            d.i[1] = 8;
+        });
+        b.emit(DevOp::Nop, all, &[xr], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn opt_in_marks_one_pure_xreduce_segment() {
+        let p = program(true);
+        let xr_seg = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.seg == xr_seg)
+            .all(|e| e.inst == 1 && e.flags & crate::dev::SE_XR_WAVE_RS != 0));
+        assert_eq!(
+            p.stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+    }
+
+    #[test]
+    fn default_does_not_mark_or_split_xreduce() {
+        let p = program(false);
+        assert!(p
+            .stream
+            .iter()
+            .all(|e| e.flags & crate::dev::SE_XR_WAVE_RS == 0));
+        assert_eq!(
+            p.stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod decode_grouped_moe_segment_tests {
+    use super::*;
+
+    fn program(enabled: bool) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_decode_grouped_moe_segments(enabled);
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let glu = b.emit(DevOp::MoeGroupGluFp8Blk, all.clone(), &[before], |d| {
+            d.i = [16, 384, 3584, 896, 0, 2, 2, 0];
+        });
+        let down = b.emit(DevOp::MoeGroupDownFp8Blk, all.clone(), &[glu], |d| {
+            d.i = [16, 3584, 384, 896, 0, 0, 2, 0];
+        });
+        b.emit(DevOp::Nop, all, &[down], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn raw_pair_strips_internal_and_external_counters_but_keeps_ordered_segment() {
+        let p = program(true);
+        let glu_seg = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+        let down_seg = p.stream.iter().find(|e| e.inst == 2).unwrap().seg;
+        assert_eq!(glu_seg, down_seg);
+        assert!(p.stream.iter().filter(|e| e.seg == glu_seg).all(|e| {
+            matches!(e.inst, 1 | 2)
+                && e.wait_len == 0
+                && e.succ_len == 0
+                && e.flags & crate::dev::SE_XCTR == 0
+        }));
+        assert_eq!(
+            p.stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+    }
+
+    #[test]
+    fn grouped_decode_segmentation_is_default_off() {
+        let p = program(false);
+        assert_eq!(
+            p.stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+        assert_ne!(p.insts[1].succ_len, 0);
+        assert_ne!(p.insts[2].wait_len, 0);
+    }
+}
+
+#[cfg(test)]
+mod lean_moe_stage2_tests {
+    use super::*;
+
+    fn program(enabled: bool, inter_dim: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_moe_stage2_segments(enabled);
+        let tensors: Vec<_> = (0..8).map(|i| b.tensor(&format!("moe{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let down = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [3584, inter_dim, 896, 2, 0, 0, 0, 0];
+        });
+        let combine = b.emit(DevOp::MoeCombinePf, all.clone(), &[down], |d| {
+            d.t[0] = tensors[0];
+            d.t[1] = TENSOR_NONE;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = tensors[0];
+            d.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
+        });
+        b.emit(DevOp::Nop, all, &[combine], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_stage2_down_gets_one_pure_segment() {
+        let p = program(true, 384);
+        let segments_for = |inst: u32| {
+            p.stream
+                .iter()
+                .filter(|e| e.inst == inst)
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_ne!(segments_for(1), segments_for(2));
+        assert_ne!(segments_for(0), segments_for(1));
+        assert_eq!(segments_for(2), segments_for(3));
+        assert_eq!((p.insts[1].wait_len, p.insts[1].succ_len), (0, 0));
+    }
+
+    #[test]
+    fn stage2_route_is_opt_in_and_shape_gated() {
+        let disabled = program(false, 384);
+        assert_eq!(
+            disabled
+                .stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+        let mut unsupported = Builder::new(1);
+        let tensors: Vec<_> = (0..8)
+            .map(|i| unsupported.tensor(&format!("moe{i}"), 4096))
+            .collect();
+        let all = unsupported.all();
+        unsupported.emit(DevOp::MoeGroupDownPf, all.clone(), &[], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [3584, 512, 896, 2, 0, 0, 0, 0];
+        });
+        unsupported.emit(DevOp::MoeCombinePf, all, &[0], |d| {
+            d.t[0] = tensors[0];
+            d.t[1] = TENSOR_NONE;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = tensors[0];
+            d.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
+        });
+        assert!(!lean_moe_stage2_pair(&unsupported.ops, 0));
+    }
+}
+
+#[cfg(test)]
+mod lean_moe_combine_tests {
+    use super::*;
+
+    fn program(enabled: bool, topk: u32, part16: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_moe_combine_segments(enabled);
+        let out = b.tensor("out", 4096);
+        let residual = b.tensor("residual", 4096);
+        let shared = b.tensor("shared", 4096);
+        let part = b.tensor("part", 65536);
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let combine = b.emit(DevOp::MoeCombinePf, all.clone(), &[before], |d| {
+            d.t = [
+                out,
+                residual,
+                shared,
+                part,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+            ];
+            d.i = [2816, topk, 1024, 0, 0, 0, 0, part16];
+        });
+        b.emit(DevOp::Nop, all, &[combine], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_fixed_order_combine_gets_a_pure_segment() {
+        let p = program(true, 16, 0);
+        let segs: Vec<_> = p
+            .stream
+            .iter()
+            .filter(|entry| entry.inst == 1)
+            .map(|entry| entry.seg)
+            .collect();
+        assert!(!segs.is_empty());
+        assert!(p
+            .stream
+            .iter()
+            .filter(|entry| entry.seg == segs[0])
+            .all(|entry| entry.inst == 1));
+        assert_eq!((p.insts[1].wait_len, p.insts[1].succ_len), (0, 0));
+    }
+
+    #[test]
+    fn combine_route_is_opt_in_and_contract_gated() {
+        for p in [
+            program(false, 16, 0),
+            program(true, 8, 0),
+            program(true, 16, 1),
+        ] {
+            assert_eq!(
+                p.stream
+                    .iter()
+                    .map(|entry| entry.seg)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                1
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lean_kda_intra_tests {
+    use super::*;
+
+    fn program(enabled: bool, dim: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_kda_intra_segments(enabled);
+        let tensors: Vec<_> = (0..6).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let intra = b.emit(DevOp::KdaChunkIntra, all.clone(), &[before], |d| {
+            d.t[..6].copy_from_slice(&tensors);
+            d.i = [8192, 12, dim, 0, 0, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[intra], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_intra_gets_one_pure_raw_segment() {
+        let p = program(true, 128);
+        let seg = |inst| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .expect("instruction has a stream entry")
+                .seg
+        };
+        assert_ne!(seg(0), seg(1));
+        assert_ne!(seg(1), seg(2));
+        assert_eq!((p.insts[1].wait_len, p.insts[1].succ_len), (0, 0));
+    }
+
+    #[test]
+    fn intra_segmentation_is_opt_in_and_d128_only() {
+        for p in [program(false, 128), program(true, 64)] {
+            assert_eq!(
+                p.stream
+                    .iter()
+                    .map(|e| e.seg)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn wave_items_marks_only_the_eligible_pure_segment() {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_kda_intra_wave_items_segments(true);
+        let tensors: Vec<_> = (0..6).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let intra = b.emit(DevOp::KdaChunkIntra, all.clone(), &[before], |d| {
+            d.t[..6].copy_from_slice(&tensors);
+            d.i = [8192, 12, 128, 0, 0, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[intra], |_| {});
+        let p = b.finish();
+        let marked: Vec<_> = p
+            .stream
+            .iter()
+            .filter(|e| e.flags & crate::dev::SE_KDA_INTRA_WAVE_ITEMS != 0)
+            .collect();
+        assert!(!marked.is_empty());
+        assert!(marked.iter().all(|e| e.inst == 1));
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.inst != 1)
+            .all(|e| e.flags & crate::dev::SE_KDA_INTRA_WAVE_ITEMS == 0));
+    }
+}
+
+#[cfg(test)]
+mod attn_res_f32mix_segment_tests {
+    use super::*;
+
+    fn attn_res(d: &mut DevInst, t: u32, out_eps: f32) {
+        d.op = DevOp::AttnRes as u16;
+        d.t = [0, 1, 2, 3, TENSOR_NONE, 4, TENSOR_NONE, TENSOR_NONE];
+        d.i = [t, 7168, 4, 4, 8, TENSOR_NONE_I, 0, 0];
+        d.f[0] = 1e-5;
+        d.f[1] = out_eps;
+    }
+
+    fn program(enabled: bool, t: u32, out_eps: f32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_attn_res_f32mix_segments(enabled);
+        for i in 0..5 {
+            b.tensor(&format!("ar{i}"), 8 << 20);
+        }
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let mix = b.emit(DevOp::AttnRes, all.clone(), &[before], |d| {
+            attn_res(d, t, out_eps)
+        });
+        b.emit(DevOp::Nop, all, &[mix], |_| {});
+        b.finish()
+    }
+
+    fn segments(p: &Program) -> usize {
+        p.stream
+            .iter()
+            .map(|e| e.seg)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    #[test]
+    fn f32mix_predicate_requires_the_marker_and_geometry() {
+        let mut d = DevInst::default();
+        attn_res(&mut d, 8192, 1e-5);
+        assert!(lean_attn_res_f32mix_inst(&d));
+        // Materialized residual inputs (t6/t7, optional i5) stay eligible.
+        d.t[6] = 5;
+        d.t[7] = 6;
+        d.i[5] = 7;
+        assert!(lean_attn_res_f32mix_inst(&d));
+        d.t[7] = TENSOR_NONE;
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 8192, 0.0); // no output-norm epsilon: the interpreter's contract
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 1, 1e-5); // decode stays on the interpreter
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 8192, 1e-5);
+        d.t[5] = TENSOR_NONE; // raw mix without the fused norm
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 8192, 1e-5);
+        d.i[1] = 4096;
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 8192, 1e-5);
+        d.i[2] = 9;
+        assert!(!lean_attn_res_f32mix_inst(&d));
+    }
+
+    #[test]
+    fn f32mix_isolates_only_marked_packets_when_enabled() {
+        assert_eq!(segments(&program(true, 8192, 1e-5)), 3);
+        assert_eq!(segments(&program(false, 8192, 1e-5)), 1);
+        assert_eq!(segments(&program(true, 8192, 0.0)), 1);
+        assert_eq!(segments(&program(true, 1, 1e-5)), 1);
+        let p = program(true, 8192, 1e-5);
+        let mix_seg: std::collections::BTreeSet<_> = p
+            .stream
+            .iter()
+            .filter(|e| p.insts[e.inst as usize].op == DevOp::AttnRes as u16)
+            .map(|e| e.seg)
+            .collect();
+        assert_eq!(mix_seg.len(), 1);
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| p.insts[e.inst as usize].op != DevOp::AttnRes as u16)
+            .all(|e| !mix_seg.contains(&e.seg)));
+    }
+}
+
+#[cfg(test)]
+mod kda_carry_regstate_tests {
+    use super::*;
+
+    #[test]
+    fn regstate_marks_only_the_qpre_carry_of_an_exact_pair() {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_kda_carry_regstate_segments(true);
+        let tensors: Vec<_> = (0..8).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let wu = b.emit(DevOp::KdaChunkWu, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        let carry = b.emit(DevOp::KdaChunkCarry, all.clone(), &[wu], |d| {
+            d.t = [
+                tensors[1], tensors[2], tensors[7], tensors[3], tensors[0], tensors[1], tensors[4],
+                tensors[5],
+            ];
+            d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[carry], |_| {});
+        let p = b.finish();
+        let marked: Vec<_> = p
+            .stream
+            .iter()
+            .filter(|e| e.flags & crate::dev::SE_KDA_CARRY_REGSTATE != 0)
+            .collect();
+        assert!(!marked.is_empty());
+        assert!(marked.iter().all(|e| e.inst == 2));
+        let carry_seg = marked[0].seg;
+        assert!(p
+            .stream
+            .iter()
+            .all(|e| (e.seg == carry_seg) == (e.inst == 2)));
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.inst != 2)
+            .all(|e| e.flags & crate::dev::SE_KDA_CARRY_REGSTATE == 0));
+    }
+}
+
+#[cfg(test)]
+mod decode_mla_segment_tests {
+    use super::*;
+
+    fn program(enabled: bool) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_decode_mla_segments(enabled);
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let flash = b.emit(DevOp::FlashMlaDecode, all.clone(), &[before], |_| {});
+        let merge = b.emit(DevOp::MlaMergeFold, all.clone(), &[flash], |_| {});
+        b.emit(DevOp::Gemv, all, &[merge], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn exact_adjacent_pair_forms_one_pure_segment() {
+        let p = program(true);
+        let seg = |inst| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .expect("instruction has a stream entry")
+                .seg
+        };
+        assert_ne!(seg(0), seg(1));
+        assert_eq!(seg(1), seg(2));
+        assert_ne!(seg(2), seg(3));
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.seg == seg(1))
+            .all(|e| e.inst == 1 || e.inst == 2));
+    }
+
+    #[test]
+    fn split_is_disabled_unless_the_target_enables_it() {
+        assert_eq!(
+            program(false)
+                .stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod lean_kda_key_factor_tests {
+    use super::*;
+
+    fn program(enabled: bool, dim: u32, qpre: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_kda_key_factor_segments(enabled);
+        let tensors: Vec<_> = (0..12)
+            .map(|i| b.tensor(&format!("kda{i}"), 4096))
+            .collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let wu = b.emit(DevOp::KdaChunkWu, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors[..8]);
+            d.i = [8192, 12, dim, dim, qpre, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::KdaChunkCarry, all.clone(), &[wu], |d| {
+            d.t = [
+                tensors[8],
+                tensors[9],
+                tensors[7],
+                tensors[3],
+                tensors[0],
+                tensors[1],
+                tensors[10],
+                tensors[5],
+            ];
+            d.i = [8192, 12, dim, dim, qpre, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[2], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_pair_gets_two_pure_ordered_raw_segments() {
+        let p = program(true, 128, 1);
+        let seg = |inst| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .expect("instruction has a stream entry")
+                .seg
+        };
+        assert_ne!(seg(0), seg(1));
+        assert_ne!(seg(1), seg(2));
+        assert_ne!(seg(2), seg(3));
+        assert_eq!((p.insts[1].wait_len, p.insts[1].succ_len), (0, 0));
+        assert_eq!((p.insts[2].wait_len, p.insts[2].succ_len), (0, 0));
+    }
+
+    #[test]
+    fn segmentation_requires_exact_qpre_d128_pair() {
+        for p in [
+            program(false, 128, 1),
+            program(true, 64, 1),
+            program(true, 128, 0),
+        ] {
+            assert_eq!(
+                p.stream
+                    .iter()
+                    .map(|e| e.seg)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                1
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lean_moe_stage1_tests {
+    use super::*;
+
+    fn program(enabled: bool, inter_dim: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_moe_stage1_segments(enabled);
+        let tensors: Vec<_> = (0..8).map(|i| b.tensor(&format!("moe{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        b.emit(DevOp::MoeGroupGluPf, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [inter_dim, 3584, 896, 2, 0, 2, 0, 0];
+        });
+        b.emit(DevOp::Nop, all, &[1], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_stage1_packet_gets_one_pure_segment() {
+        let p = program(true, 384);
+        let segment_for = |inst: u32| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .map(|e| e.seg)
+                .unwrap()
+        };
+        assert_ne!(segment_for(0), segment_for(1));
+        assert_ne!(segment_for(1), segment_for(2));
+    }
+
+    #[test]
+    fn stage1_route_is_opt_in_and_shape_gated() {
+        let disabled = program(false, 384);
+        assert_eq!(
+            disabled
+                .stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+        let unsupported = program(true, 512);
+        assert_eq!(
+            unsupported
+                .stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
     }
 }
 
@@ -3057,6 +5291,15 @@ mod v6_tests {
         // reserved[0] should be 0 in v5
         let r0 = u64::from_le_bytes(v5[40..48].try_into().unwrap());
         assert_eq!(r0, 0);
+    }
+
+    #[test]
+    fn independent_l2_segment_layout_bumps_container_magic() {
+        let mut m = tiny_model();
+        m.progs[0].l2_sms = 1;
+        m.progs[0].l2_domains = 2;
+        assert_eq!(&m.to_blob()[..8], BLOB_MAGIC_L2SEG);
+        assert_eq!(&m.to_blob_v6(&[])[..8], BLOB_MAGIC_L2SEG);
     }
 
     #[test]
@@ -3212,5 +5455,35 @@ mod v6_tests {
         // The widest rung IS the last program: a descending tail is not a ladder, and the
         // scan must not walk into it.
         assert_eq!(decode_rung_lo(&[128, 16, 8]), 2);
+        // Width 128 is legal for decode. The equal-width prefill bucket remains outside the
+        // trailing ladder because the scan is strict.
+        assert_eq!(decode_rung_lo(&[128, 512, 1, 16, 32, 64, 128]), 2);
+        assert_eq!(decode_rung_lo(&[128, 128]), 1);
+        // A packed-only copy of each prefill rung sits between the ordinary
+        // ladder and decode. Its tag cannot be mistaken for a decode width.
+        assert_eq!(
+            decode_rung_lo(&[
+                128,
+                1024,
+                packed_prefill_program_t(128),
+                packed_prefill_program_t(1024),
+                1,
+                4,
+                8,
+            ]),
+            4
+        );
+        assert_eq!(program_rows(packed_prefill_program_t(1024)), 1024);
+        assert!(is_packed_prefill_program(packed_prefill_program_t(1024)));
+    }
+
+    #[test]
+    fn xargmax_line_count_is_bounded_and_rounds_up() {
+        assert_eq!(xargmax_value_lines(0), Some(1));
+        assert_eq!(xargmax_value_lines(1), Some(1));
+        assert_eq!(xargmax_value_lines(16), Some(1));
+        assert_eq!(xargmax_value_lines(17), Some(2));
+        assert_eq!(xargmax_value_lines(128), Some(8));
+        assert_eq!(xargmax_value_lines(129), None);
     }
 }

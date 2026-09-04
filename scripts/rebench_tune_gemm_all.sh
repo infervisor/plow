@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # RE-RUN THE WHOLE gfx950 PREFILL-GEMM TILE CAMPAIGN — bf16 AND mxfp4 — AND PUBLISH IT.
 #
-# This is the answer to "the build digest moved again". Every edit reachable from `interp.hip`
-# (`runtime/amd/op_*.h`, `runtime/common/dev_isa.h`, `interp.hip` itself) changes the PREPROCESSED
-# translation unit that keys the store, and at that moment EVERY record in `tuning/` goes stale at
-# once: `pick_tile` silently reverts to the analytical model and reports tier `portable`, which is
-# what it reports when nothing was ever measured. `cargo test -p devgen --test tuned_tile_selection`
-# is the signal. THIS SCRIPT IS THE FIX, and it is meant to be run without thinking about it:
+# This refreshes the dense-GEMM family key. Relevant GEMM bodies, their expanded macros, and the
+# toolchain participate; unrelated persistent-interpreter arms do not. `cargo test -p devgen
+# --test tuned_tile_selection` is the signal. THIS SCRIPT IS THE FIX:
 #
 #     scripts/rebench_tune_gemm_all.sh                 # rebuild objects, measure both ladders, publish
 #     scripts/rebench_tune_gemm_all.sh --bf16-only     # just the un-staling half (the test gate)
@@ -19,11 +16,11 @@
 # ------------------------------------------------------------------------------------------------
 # THE TWO ENVIRONMENT RULES, AND THEY ARE OPPOSITES. Both are load-bearing.
 #
-#   * `sg render -c` MUST BE OUTSIDE `nix develop`. nix runs in a user namespace where root maps to
-#     `nobody`, so /usr/bin/newgrp's setuid bit is inert inside it and `sg` dies with
-#     `setgroups: Operation not permitted`. Without the render gid `hsa_init` fails 4104 and a
-#     harness can fall back to a CPU backend and print confident garbage. plowc REFUSES rather than
-#     try; that refusal is why this script wraps the way it does.
+#   * Build and measure with the SAME nix ROCm toolchain. The TuneDB key records that toolchain and
+#     the preprocessed dense-GEMM family digest, so building test_kernels.elf with host ROCm and then
+#     publishing through nix labels measurements with the wrong compiler. `sg render -c` still MUST
+#     stay OUTSIDE `nix develop`: nix runs in a user namespace where /usr/bin/newgrp cannot acquire
+#     the render gid. The command under `sg` enters nix for the measurement itself.
 #   * `ROCR_VISIBLE_DEVICES`, NOT `HIP_VISIBLE_DEVICES`. `plowc tune gemm` forwards the former by
 #     name and deliberately drops the latter: they COMPOSE, so setting both makes a correctly
 #     targeted card report "no ROCm-capable device is detected".
@@ -63,6 +60,7 @@ OBJ="${PLOW_TUNE_OBJ:-/tmp/tunecamp-objs}"
 OUT="${PLOW_TUNE_OUT:-/tmp/tunecamp}"
 # rocm-smi device 4 by default; see the numbering note above.
 ROCR="${ROCR_VISIBLE_DEVICES:-5}"
+K3_CONFIG="${PLOW_K3_CONFIG:-/tmp/k3-synth}"
 DO_BF16=1
 DO_K3=1
 case "${1:-}" in
@@ -76,9 +74,9 @@ mkdir -p "$OUT"
 cd "$WT"
 
 echo "=== 1/4  building the interpreter objects and test_kernels.elf into $OBJ"
-# OUTSIDE nix: hipcc is the system ROCm one and nix's CPATH/LIBRARY_PATH shadow the glibc it was
-# built against (knob-contract 0a). The build digest the store keys on comes from THESE sources.
-./scripts/build_gfx950.sh "$OBJ"
+# The object compiler must match `plowc tune`'s toolchain fingerprint. build_gfx950.sh uses
+# PLOW_HOST_CC inside the dev shell, so its host harness and ROCm runtime remain a coherent pair.
+nix develop --command ./scripts/build_gfx950.sh "$OBJ"
 
 echo
 echo "=== 2/4  building plowc"
@@ -86,7 +84,7 @@ nix develop --command cargo build --release -p plowc
 
 echo
 echo "=== 3/4  regenerating the K3 shape list from the config"
-python3 ./scripts/k3_shapes.py > "$WT/scripts/tune_shapes_k3.txt"
+python3 ./scripts/k3_shapes.py "$K3_CONFIG" > "$WT/scripts/tune_shapes_k3.txt"
 wc -l "$WT/scripts/tune_shapes_k3.txt"
 
 echo

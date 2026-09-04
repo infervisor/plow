@@ -49,6 +49,8 @@
 
   ; --- routing (MoE) ---
   (MoeRouter Expr Expr i64 i64)       ; x, weight, num_experts, top_k
+  (MoeRouterGrouped Expr Expr i64 i64 i64 i64)
+      ; x, weight, num_experts, top_k, n_group, topk_group
 
   ; --- Kimi-K3 ---
   ; The hybrid mixer's terms. Every weight leaf is named so the manifest stays
@@ -112,4 +114,12 @@
   ; rules are what lets extraction reach a kernel the runtime can already run.
   (FusedKdaGatedNorm Expr Expr f64 Expr Expr i64 String)
       ; o, o_normw, eps, x, gatew, gate_out, gate-shape
-  (FusedMlaOutGate Expr Expr Expr i64))            ; attn, x, gatew, gate_out
+  (FusedMlaOutGate Expr Expr Expr i64)             ; attn, x, gatew, gate_out
+
+  ; A compatible block-residual consumer may compute its immediately preceding residual
+  ; in-kernel, but must still write that BF16 tensor for its other users. The three-input form is
+  ; distinct so its inner add remains a materialization/rounding point.
+  (FusedMaterializedResidualBlock Expr Expr Expr Expr Expr i64)
+      ; a, b, snapshots, norm_weight, proj_weight, max_snapshots
+  (FusedMaterializedResidual3Block Expr Expr Expr Expr Expr Expr i64))
+      ; pre, a, b, snapshots, norm_weight, proj_weight, max_snapshots

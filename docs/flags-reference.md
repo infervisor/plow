@@ -261,7 +261,7 @@ are not parity-preserving.
 | `PLOW_K3_NS` | measured | pin FlashMLA-decode `nsplit` for K3 MLA layers. |
 | `PLOW_K3_FUSE_NGEMV` | **on** | fold the two B1 `norm→GEMV` sites; `0` restores the unfused control, `lat`/`q` isolate one site. Full TP8 BF16-logit gate is byte-exact. |
 | `PLOW_K3_KDA_CONV_STEP_DB` | off | B1-only experiment: emit `KdaConvStateStepG` and allocate ping-pong KDA convolution-window banks. The selected decode object must also be built with `PLOW_KDA_CONV_STEP_DB=1`; packet/object mismatch is refused. |
-| `PLOW_K3_SHARD_HEAD` | **off** ⚠️ | vocab-column-parallel `lm_head`; unvalidated on real K3. |
+| `PLOW_K3_SHARD_HEAD` | **off** | vocab-column-parallel `lm_head`; measured on real K3 gfx950 TP8 with token-identical output, 33.160 to 32.781 ms/token (-1.14%). |
 | `PLOW_GLM_FUSE_A` / `PLOW_GLM_FUSE_G` | **on** | fuse the GLM A-projection / gate GEMVs (byte-identical); `=0` splits. |
 | `PLOW_GLM_DSA` | **on** (ctx>65536) | arm the DSA sparse-indexer gather above the measured ctx crossover; `=0` forces dense. |
 | `PLOW_GLM_GF` | ctx-adaptive (2/4) | pin the MLA head-fusion factor; `=8` needs a `-DPLOW_GLM_GF8_ARM=1` object. |
@@ -471,12 +471,13 @@ the end, not tabled.
 
 | flag | default | effect |
 |---|---|---|
-| `PLOW_GATE_HIER` | 0 | two-level (LDS→global) counter-gate rendezvous; one representative WG per group hits the global counter, cutting global-atomic traffic on high-fanin gates. |
+| `PLOW_GATE_HIER` | 0 | gfx950 two-level counter-gate rendezvous. The CMake option is default-off and applies only to decode global-queue objects; it requires `PLOW_HSACO_GQ=ON` and `PLOW_L2_PLACE_DISPATCH=ON`. Passing it through global `PLOW_HSACO_EXTRA_DEFINES` is rejected. The gfx942 shell build's existing default is unchanged. |
 | `PLOW_GATE_SC1` | 0 | device-scope (not system-scope) activation stores so the release fence can be elided; the counter-gate carries the ordering. |
 | `PLOW_MLA_FOLD_MAP` / `_UN` / `_VEC` / `_VT` | 0 | fold the MLA up-projection map / output un-projection / V-cache load / V^T transpose into the adjacent kernel to save a launch + round-trip. |
 | `PLOW_MLA_PF_MFMA` | 0 | MLA prefill uses MFMA matrix-core instructions for QK/PV instead of the vector-FMA fallback. |
 | `PLOW_MLA_PF_WPM` | numeric | MLA-prefill waves-per-M-tile, clamped by `min(PLOW_WAVES, PLOW_MLA_PF_WPM)`. |
 | `PLOW_XR_CUS` | 32 | **emit** — cap XReduce participant CUs (clamped 1..n_cu); a TP8 NUMA lever cutting L2 invalidates from idle WGs. |
+| `PLOW_XR2_GATHER` | 1 | **emit** — use the two-shot reduce-scatter/all-gather path for complete folded-gather collectives when `row_w = n_gpu*gcols`; set `0` for the one-shot rollback. |
 | `PLOW_NO_XREDUCE` | unset | **emit** — disable all XReduce all-reduce collectives (diagnostic; numerically wrong). |
 | `PLOW_WG_WAVES` (alias `PLOW_WAVES`) | 8 | waves per AMD workgroup (8×64 = 512 threads); feeds reduction/tiling geometry. |
 | `PLOW_ATTNRES_MAXB` | 16 | compile-time hard cap on K3 attention-residual batch (`nb`); over it traps. |
@@ -616,12 +617,12 @@ values cost.
 
 | var | default | effect |
 |---|---|---|
-| `PLOW_PF_BATCH=1` | off | PX-1 cross-request batched prefill — packs waiting requests' prefill chunks into one launch. +27% saturated multi-user throughput. **Silently inert on fp8-KV packets** (no handle left for the request table; engine logs and serializes). Also ignored under `PLOW_VMM_PREFIX=1`. |
-| `PLOW_PF_INTERLEAVE=N` | 2048 | **Chunked prefill quantum — the default path, not a `PLOW_PF_BATCH` knob.** Once any slot is decoding, a tick admits at most `N` prefill rows, then runs the decode launch. `0` = uncapped. **It can only clamp BELOW the emitted ladder** (fixed at emit by `PLOW_MAX_CHUNK`), so raising above that is a no-op. |
-| `PLOW_PF_CHUNK=C` | 0 (off) | **Experimental** per-request prefill chunk-row cap. Measured ~10% regression at B=8; off = byte-identical. |
+| `PLOW_PF_BATCH=1` | off | Cross-request prefill policy. CUDA packs waiting chunks into one launch (+27% saturated multi-user throughput; inert on fp8-KV and ignored under `PLOW_VMM_PREFIX=1`). AMD TP co-packs compatible, already-initialized non-final chunks only when the packet was emitted with `PLOW_SEG_PACKED_PREFILL=1`, the optional family objects were built, and `PLOW_PACKED_PREFILL_ROUTE=1`; unsupported programs and single-rank engines retain fair isolated scheduling. |
+| `PLOW_PF_INTERLEAVE=N` | 2048 | **CUDA + AMD TP chunked-prefill quantum — the default path, not a `PLOW_PF_BATCH` knob.** Once any slot is decoding, a tick admits at most `N` prefill rows, then runs decode. AMD selects an existing packet rung at or below `N`; compatible pending spans may share that rung when packed prefill is fully enabled. `0` = uncapped. It can only clamp below the emitted ladder. |
+| `PLOW_PF_CHUNK=C` | 0 (off) | **Experimental, CUDA + AMD TP serving** per-request prefill chunk-row cap. AMD selects only compiled packet rungs at or below `C` (for example, K3 8192 with `C=4096` plans 4096+4096); compatible chunks may co-pack when all packed-prefill prerequisites are enabled. The ~10% B=8 regression was measured on CUDA; AMD remains unmeasured. Off preserves the existing plan. |
 | `PLOW_PF_CHUNK_COST=R` | 512 | cost of ONE prefill launch in padded-row equivalents (`rows + R × launches`). A launch re-streams every layer's weights: measured `ttft_ms = 0.112·rows + 60.1·chunks`, i.e. **60 ms ≈ 537 rows**. `0` = pure-minimum-padding. |
 | `PLOW_PF_COVER=1` | off | restore the covering-bucket prefill policy (exact-parity A/B vs the cost-aware default). |
-| `PLOW_PF_DEFER_DECODE=1` | off | **Throughput mode — trades streaming latency for aggregate tok/s.** Runs prefill chains to completion, skips decode, so later decode ticks run at full batch. 8×127k: **+7.1% out tok/s** (PX-17). ⚠️ **No token leaves the server until every prompt is resident** — wrong as an interactive default. |
+| `PLOW_PF_DEFER_DECODE=1` | off | **CUDA + AMD TP throughput mode — trades streaming latency for aggregate tok/s.** While pending prefill remains, skips decode so later decode ticks run at full batch. A completed prefill may emit its first token, but no request advances decode until admitted prefill drains. The 8×127k **+7.1% out tok/s** result was measured on CUDA; AMD is unmeasured. Wrong as an interactive default. |
 | `PLOW_PF_PACKLOG=1` | off | per-launch pack diagnostics. |
 | `PLOW_PF_NO_CHUNK=1` | off | restore whole-prompt-per-tick (disable chunked prefill). |
 | `PLOW_PF_NO_INTERLEAVE=1` | off | restore a prefill-only tick (disable prefill/decode interleave). |
@@ -649,8 +650,17 @@ values cost.
 | `PLOW_TP_AGREE_EVERY=N` | 1 | TP cross-rank agreement interval. `PLOW_TP_NO_AUDIT=1` disables the redundant-rank audit (timing runs); `PLOW_TP_SERIAL_LOAD=1` restores one-at-a-time per-rank load. |
 | `PLOW_LOAD_PROFILE=1` | off | split upload wall time into alloc / stage+DMA profiling. |
 | `PLOW_STEP_TIME=1`, `PLOW_TTFT_LOG=1` | off | per-decode-step host-op timing / TTFT breakdown logging (diagnostics). |
+
+`plowrt bench` always records AMD overlap capability under
+`engine.amd_overlap`. Current HSA engines report shared prefill/decode scratch,
+one global queue per rank, no per-XCD queues, and `overlap_safe=false`; this is
+evidence only and does not enable overlap. With `--engine-diagnostics`, the
+report also includes the per-rank queue identities and raw prefill/decode ranges
+used to derive the fail-closed result.
 | `PLOW_HSACO_LOWRUNG=dir:max[,dir:max…]` | unset | AMD decode-object tiers. The runtime selects the narrowest tier whose `max` covers the occupied decode rung, pairing-checks each tier at that width, and falls back to the primary HSACO inventory above it. A single legacy `dir` uses `PLOW_LOWRUNG_MAX` (default 2). |
 | `PLOW_STATE_CLEAR_DEVICE=1` | off | AMD admission experiment: clear slot-major recurrent state with one device kernel per rank instead of host-staged SDMA fills. Requires rebuilt decode objects carrying `plow_state_clear`. |
+| `PLOW_SEG_PACKED_PREFILL=1` | off | AMD emit-time experiment: split descriptor-consuming MLA norm/cache, MLA flash, and serial-KDA ops into pure topological segments in prefill programs only. Every class transition remains an ordered launch even when `PLOW_PACKED_PREFILL_ROUTE=0`; do not enable this for an ordinary or FP8-KV baseline unless the packed route is being measured. Decode ladder programs remain single-launch; the AMD loader rejects packets that encode decode as multiple wave segments. No model-name predicates. Unset preserves packet bytes. |
+| `PLOW_PACKED_PREFILL_ROUTE=1` | off | Load the optional lean packed-family HSACO objects and permit exact-family routing after metadata is staged. Missing/wrong markers and mixed segments refuse. Live AMD co-packing also requires `PLOW_PF_BATCH=1`, TP, an emitted `PLOW_SEG_PACKED_PREFILL=1` packet, and objects built with `PLOW_HSACO_PACKED_PREFILL_CONSUMERS=ON`; otherwise the mux uses isolated prefill. |
 
 ### Segmented prefill (sm_90a / GH200)
 
@@ -689,7 +699,8 @@ Three things are easily conflated:
    long prompt is admitted a chunk at a time so live decode streams are not
    stalled for a whole prompt.
 2. **Cross-request prefill packing** — `PLOW_PF_BATCH=1`, off by default. Several
-   *waiting requests'* prefill chunks share one launch.
+   *waiting requests'* prefill chunks share one launch. AMD additionally requires TP and the
+   packet/build/runtime family-routing prerequisites above; unsupported programs stay isolated.
 3. **Mixed batching (prefill ⊕ decode in one launch)** — **not implemented**, and
    not hidden behind a flag. A tick that does both runs two launches, each
    re-reading the full weight set (~12 GiB fp8 on the 12B asset, ~9 ms). vLLM's

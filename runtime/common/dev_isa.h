@@ -44,6 +44,8 @@
 #define PLOW_SASSERT(c, m) _Static_assert(c, m)
 #endif
 
+#define PLOW_GEMM_WIDE_C8_TAG ((128u << 16) | 384u)
+
 /* Device opcodes. Deliberately a small closed set — the interpreter's switch is
  * the hot path, so this is an ISA, not an extension point.
  *
@@ -205,8 +207,7 @@ enum {
      * Single weight stream, so the plain GEMV register budget. See op_gemm.h. */
     PLOW_DOP_GEMV_QKV = 22,
 
-    /* ===== CROSS-GPU (tensor-parallel) tile-graph ops. =========================
-     * New opcodes assigned AFTER main's last (23), no collision. Names mirror the
+    /* ===== CROSS-GPU (tensor-parallel) tile-graph ops. ==================     * New opcodes assigned AFTER main's last (23), no collision. Names mirror the
      * generic infervisor RDMA-family variants (p2p/allreduce/allgather/reducescatter)
      * so the two ABIs converge (see the design notes §1b, §8).
      *
@@ -913,7 +914,7 @@ enum {
      * arm traps on either — there is no slot naming a precomputed g, so this op cannot silently
      * degrade to the unfused reading of the packet.
      *
-     * t0=o t1=q t2=k t3=v t4=g_raw t5=beta_raw t6=state t7=A_log ·
+     * t0=o t1=q t2=k t3=v t4=forget_raw t5=beta_raw t6=state t7=A_log ·
      * i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode · f0=scale f1=lower_bound */
     PLOW_DOP_KDA_STATE_STEP_G = 112,
     /* MXFP4 (w4a16) PREFILL fused gate|up GEMM+GLU — the T-row twin of PLOW_DOP_GEMV_GLU_MXFP4 (92)
@@ -1036,6 +1037,22 @@ enum {
      * descriptor: wq,wk,wv, cs0q,cs0k,cs0v, cs1q,cs1k,cs1v, A_log,dt_bias,in.pos,parked. */
     PLOW_DOP_KDA_CONV_STATE_STEP_G = 120,
 
+    /* Opt-in dense single-sequence BT64 chunk-KDA pipeline. The four ordered packets preserve
+     * the serial op-102 fallback and are accepted only by objects advertising the chunk marker. */
+    PLOW_DOP_KDA_CHUNK_PREPARE = 121,
+    PLOW_DOP_KDA_CHUNK_INTRA = 122,
+    PLOW_DOP_KDA_CHUNK_WU = 123,
+    PLOW_DOP_KDA_CHUNK_CARRY = 124,
+
+    /* Standalone fused KDA decode boundary. t7 is a u32 tensor-handle descriptor:
+     * wq,wk,wv,csq,csk,csv,A_log,dt_bias,norm_w,output_gate_raw,parked.
+     * t0=y t1=q_raw t2=k_raw t3=v_raw t4=forget_raw t5=beta_raw t6=state t7=descriptor;
+     * i0=rows i1=H i2=D i3=BV i4=W i5=flags i6=gate_mode i7=descriptor_version;
+     * f0=scale f1=lower_bound j1=norm_eps_bits. */
+    PLOW_DOP_KDA_DECODE_FUSED = 125,
+    PLOW_DOP_MLA_MATERIALIZE_PACK = 126,
+    PLOW_DOP_FLASH_MLA_MATERIALIZED_PREFILL = 127,
+
     /* GLM5-Next hyper-connections (mHC) pre-block. Ported from vLLM's real reference math
      * (mhc_pre_torch), not a guess. The expensive projection (mixes = x @ fn.T, N=n3=24) is an
      * ordinary Gemv/Gemm this op does NOT do; this is the small per-token epilogue after it:
@@ -1050,7 +1067,7 @@ enum {
      *   t2=layer_input(out,bf16[T][hidden],UNNORMED) t3=mixes(in,f32[T][n3])
      *   t4=residual(in,bf16[T][n][hidden]) t5=hc_scale(in,f32[3]) t6=hc_base(in,f32[n3])
      *   i0=T i1=n i2=hidden i3=sinkhorn_repeat; f0=rms_eps f1=hc_eps */
-    PLOW_DOP_HYPER_CONN_PRE = 121,
+    PLOW_DOP_HYPER_CONN_PRE = 128,
 
     /* GLM5-Next hyper-connections (mHC) post-block, paired with PLOW_DOP_HYPER_CONN_PRE.
      * new_residual[j] = sum_i comb_mix[i][j]*residual[i]  +  post_mix[j]*x_out : an nxn (n=4)
@@ -1059,7 +1076,7 @@ enum {
      *   t0=new_residual(out,bf16[T][n][hidden]) t1=x_out(in,bf16[T][hidden])
      *   t2=residual(in,bf16[T][n][hidden]) t3=post_mix(in,f32[T][n]) t4=comb_mix(in,f32[T][n][n])
      *   i0=T i1=n i2=hidden */
-    PLOW_DOP_HYPER_CONN_POST = 122,
+    PLOW_DOP_HYPER_CONN_POST = 129,
 
     /* GLM5-Next DSA indexer key-pooling compress (index_kpool). Ported from vLLM's real
      * reference Triton kernel (kpool_compress.py, AMD variant), verified against a numerical
@@ -1076,7 +1093,7 @@ enum {
      * device-side position t5=pos(in) — boundary = ((pos[0]+1) % pool_size) == 0 — and
      * returns without touching output unless true. t5=PLOW_TENSOR_NONE (prefill) skips
      * the gate: unconditional, byte-identical to the pre-decode-mode behavior. */
-    PLOW_DOP_DSA_POOL_COMPRESS = 123,
+    PLOW_DOP_DSA_POOL_COMPRESS = 130,
 
     /* GLM5-Next DSA indexer pool-select expand + tail-append, fused. Pure index arithmetic,
      * no floats. Expands each selected pool id to pool_size member token ids, then appends
@@ -1089,7 +1106,7 @@ enum {
      *   t0=out(out,i32[rows][topk+pool_size-1], -1 for unused) t1=pool_ids(in,i32[rows]
      *   [n_groups]) t2=kv_len(in,scalar i32, token-granular, chunk-end)
      *   i0=rows i1=n_groups i2=pool_size */
-    PLOW_DOP_DSA_POOL_EXPAND = 124,
+    PLOW_DOP_DSA_POOL_EXPAND = 131,
 
     /* GLM5-Next DSA indexer key-pooling, DECODE side: unconditional per-step ring stash.
      * Decode produces one new (key, score) pair per step, not a whole pool — writes it into
@@ -1100,7 +1117,7 @@ enum {
      *   t0=ring_k(out,bf16[pool_size][head_dim]) t1=ring_score(out,bf16[pool_size][head_dim])
      *   t2=cur_k(in,bf16[head_dim]) t3=cur_score(in,bf16[head_dim]) t4=pos(in)
      *   i0=pool_size i1=head_dim */
-    PLOW_DOP_DSA_POOL_STASH = 125,
+    PLOW_DOP_DSA_POOL_STASH = 132,
 
     /* GLM5-Next DSA indexer QUERY-side fp8 quant (index_kpool's q half). Ported from vLLM's
      * real fwht128_quant_fp8/_fwht_quant_kernel, verified against a numerical oracle
@@ -1113,7 +1130,7 @@ enum {
      *   t0=q_fp8(out,fp8_e4m3[n_rows][head_dim]) t1=q_scale(out,f32[n_rows])
      *   t2=q_raw(in,bf16[n_rows][head_dim])
      *   i0=n_rows i1=head_dim */
-    PLOW_DOP_DSA_Q_QUANT = 126,
+    PLOW_DOP_DSA_Q_QUANT = 133,
 
     /* GLM5-Next DSA indexer score, KPOOL fp8 variant -- the pooled-indexer twin of
      * PLOW_DOP_INDEX_SCORE, consuming fp8 q/k (from PLOW_DOP_DSA_Q_QUANT /
@@ -1142,7 +1159,7 @@ enum {
      *   t4=Kscale(in,f32[n_batch][pool_stride]) t5=W(in,f32[n_batch][index_heads])
      *   t6=kv_len(in,i32[n_batch], TOKEN-granular)
      *   i0=n_batch i1=index_heads i2=pool_stride i3=index_head_dim i4=pool_size; f0=scale */
-    PLOW_DOP_INDEX_SCORE_KPOOL = 127,
+    PLOW_DOP_INDEX_SCORE_KPOOL = 134,
 
     /* fp32-output GEMV. A small, separate op from PLOW_DOP_GEMV -- not a variant, and must
      * never be folded into d_gemv/d_gemv_t's tuned decode hot path (razor-thin register
@@ -1157,7 +1174,7 @@ enum {
      * reference model, not a shortcut to optimize away.
      *   t0=C(out,f32[M][N]) t1=x(in,bf16[M][K]) t2=W(in,f32[N][K])
      *   i0=M i1=N i2=K */
-    PLOW_DOP_GEMV_F32 = 128,
+    PLOW_DOP_GEMV_F32 = 135,
 
     PLOW_DOP__COUNT
 };
@@ -1261,6 +1278,8 @@ typedef struct {
  * the producing GEMV whose successor is a cross-GPU "partial ready" bump. See
  * the design notes §6a. Coarse xctr programs leave this clear and cost nothing. */
 #define PLOW_SE_XCTR 2u /* wait/succ counters are cross-GPU (xctr, system scope)   */
+#define PLOW_SE_XR_WAVE_RS 4u /* pure XREDUCE2 segment may use the wave-RS object */
+#define PLOW_SE_KDA_INTRA_WAVE_ITEMS 8u /* pure KDA intra wave-item object */
 
 /* HOW MANY SLICES OF THIS PACKET LANDED ON THIS ENTRY'S L2 DOMAIN — the count the two-level
  * cache-maintenance rendezvous (PLOW_GATE_HIER, interp.hip) needs, packed into the spare high
@@ -1276,10 +1295,14 @@ typedef struct {
  * zero means "no hierarchy, every workgroup does its own maintenance" — the original behaviour.
  *
  * `flags` is read ONLY through masks (`e.flags & PLOW_SE_XCTR`), never compared whole, so the
- * high bits are free. 9 bits holds the 256-workgroup maximum; bit 15 stays spare. */
+ * high bits are free. 9 bits holds the 256-workgroup maximum; bits 13..15 carry
+ * the L2 domain independently from the ordered kernel-family segment below. */
 #define PLOW_SE_NPER_SHIFT 4u
 #define PLOW_SE_NPER_MASK  0x1FF0u /* bits 4..12 */
 #define PLOW_SE_NPER(f) (((f) & PLOW_SE_NPER_MASK) >> PLOW_SE_NPER_SHIFT)
+#define PLOW_SE_DOMAIN_SHIFT 13u
+#define PLOW_SE_DOMAIN_MASK  0xE000u /* bits 13..15: up to eight XCDs */
+#define PLOW_SE_DOMAIN(f) (((f) & PLOW_SE_DOMAIN_MASK) >> PLOW_SE_DOMAIN_SHIFT)
 
 typedef struct {
     uint32_t inst;
@@ -1289,7 +1312,7 @@ typedef struct {
     uint16_t wait_len;
     uint16_t succ_len;
     uint16_t flags;
-    uint16_t seg; /* wave-class segment id (segmented dispatch); 0 when unsegmented. Was _pad. */
+    uint16_t seg; /* ordered kernel-family segment; L2 domain is independent in flags */
 } PlowStreamEnt;
 
 /* Per-(workgroup, packet) trace record.
@@ -1318,6 +1341,20 @@ typedef struct {
     uint64_t t_end;    /* finished the op body                          */
 } PlowTraceRec;
 
+/* One request span in a ragged prefill pack. This is metadata only until a
+ * PlowProgram points at a span table; old objects therefore retain their ABI. */
+#define PLOW_PREFILL_SPAN_RESET_STATE 1u
+typedef struct {
+    uint32_t row0;       /* first row in packed activation tensors */
+    uint32_t n_rows;     /* real rows in this request span */
+    uint32_t slot;       /* owning decode/KV slot */
+    uint32_t flags;      /* PLOW_PREFILL_SPAN_* */
+    uint32_t kv_row0;    /* request-local absolute KV row */
+    uint32_t kv_len;     /* request-local KV length after this span */
+    uint32_t state_slot; /* carried-state slot */
+    uint32_t program;    /* compiled prefill program/rung */
+} PlowPrefillSpan;
+
 /* Everything the interpreter needs; passed once as the kernel's args. */
 typedef struct {
     const PlowDevInst*   insts;
@@ -1333,17 +1370,16 @@ typedef struct {
      * can relaunch it once per wave-class segment (see the design notes). An
      * unsegmented program has n_seg==1 and every entry seg==0, so cur_seg==0 runs everything. */
     uint32_t             cur_seg;
-    /* L2-DOMAIN PLACEMENT (PLOW_L2_PLACE): number of L2 domains `gq_seg_ofs` is windowed by,
-     * 0 when the program is not placed. Under -DPLOW_L2_PLACE_DISPATCH the interpreter picks its
-     * window from the domain it is PHYSICALLY running on rather than from `cur_seg`, so all
-     * domains drain concurrently in ONE launch instead of one launch per wave-class segment. */
+    /* L2-DOMAIN PLACEMENT (PLOW_L2_PLACE): physical domains per ordered kernel-family segment, or 0.
+     * The interpreter drains window `cur_seg*l2_domains + physical_domain`, so all XCD queues
+     * within one ordered segment run concurrently. */
     uint32_t             l2_domains;
     /* Segments `seg_ofs` is built for; the row stride there is n_seg+1. Only read when
      * `seg_ofs != NULL`. */
     uint32_t             n_seg;
     /* BOTH of the two fields above once shared the single spare `_segpad` u32 — they were added
      * on independent branches and each claimed it. They are genuinely independent: `l2_domains`
-     * windows the GLOBAL QUEUE by physical L2 domain, `n_seg` describes the STATIC per-CU
+     * partitions the dynamic queue by physical L2 domain, `n_seg` describes the STATIC per-CU
      * `seg_ofs` table by wave-class segment. Keeping both costs 8 bytes (4 for the field, 4 for
      * the alignment pad before `gq_stream`) and every gfx950 code object must be rebuilt; the
      * kernarg-size check in AmdEngine::load refuses a stale object by name rather than faulting. */
@@ -1372,7 +1408,7 @@ typedef struct {
     /* Global-queue interpreter (Experiment E1, built only under PLOW_GLOBAL_QUEUE). The static
      * kernel never reads these; the host leaves them NULL unless PLOW_GLOBAL_QUEUE is selected. */
     const PlowStreamEnt* gq_stream;  /* op-major (topological) permutation of `stream`          */
-    const uint32_t*      gq_seg_ofs; /* [n_seg+1] segment window bounds into gq_stream           */
+    const uint32_t*      gq_seg_ofs; /* bounds; placed index = host_seg*l2_domains + domain      */
     uint32_t*            gq_cursor;   /* 1-word shared fetch-add cursor, zeroed per launch        */
     /* ===== CROSS-GPU (tensor-parallel) fields. Single-GPU runs leave these NULL/0 =====
      * Appended AFTER gq_cursor so every existing field (notably `trace`) keeps its offset
@@ -1419,7 +1455,21 @@ typedef struct {
      * sees the size grow, 128 -> 136 -> 144 (the second step is `l2_domains` landing beside
      * `n_seg`). READ THE NOTE ON THAT ASSERT before growing it further. */
     const uint32_t*      seg_ofs;
+    /* Ragged packed-prefill metadata. NULL/0 retains the single-request path. prefill_parked
+     * covers the compiled rung's padded tail and n_prefill_rows is the launched T. */
+    const PlowPrefillSpan* prefill_spans;
+    const uint32_t*        prefill_parked;
+    uint32_t               n_prefill_spans;
+    uint32_t               n_prefill_rows;
 } PlowProgram;
+
+/* Tagged one-shot XReduce region (PLOW_XR_TAGGED decode objects, op_collective.h): four slots
+ * of this many bytes — partial parity 0/1, then gather parity 0/1 — at the same offset in
+ * every rank's peer_scratch, directly after the compact-audit status line. The device finds
+ * it from the packet's status id (fj[2]) and this constant, so PlowProgram is unchanged; the
+ * host lays it out (`PeerLayout`) and refuses a hidden width wider than 3 bf16 per 8-byte
+ * word can hold (3 * 20480 / 8 = 7680). */
+#define PLOW_XR_TAG_SLOT_BYTES 20480u
 
 /* Workgroup geometry of the persistent interpreter. The HOST needs this to size
  * the dispatch, the DEVICE needs it to stride its loops, and Rust needs it to build
@@ -1556,6 +1606,7 @@ PLOW_SASSERT(sizeof(PlowDevInst) == 64, "PlowDevInst size");
  * this only holds if t sits at a 16-byte boundary. */
 PLOW_SASSERT(__builtin_offsetof(PlowDevInst, t) == 16, "PlowDevInst.t must be 16-byte aligned");
 PLOW_SASSERT(sizeof(PlowStreamEnt) == 24, "PlowStreamEnt size");
+PLOW_SASSERT(sizeof(PlowPrefillSpan) == 32, "PlowPrefillSpan size");
 PLOW_SASSERT(sizeof(PlowTraceRec) == 40, "PlowTraceRec size");
 /* GROWING THIS STRUCT: every host must size its kernarg copy with sizeof, never a
  * literal. `plowrt`'s `kernarg_bytes` had `128` baked in; appending `seg_ofs` made
@@ -1564,7 +1615,6 @@ PLOW_SASSERT(sizeof(PlowTraceRec) == 40, "PlowTraceRec size");
  * grid dimension as a device pointer and every static-scheduler prefill died with
  * "Memory access fault ... Reason: Unknown". The C harnesses pass `sizeof(pr)` and
  * were never affected. Bumping this assert is not enough; grep the hosts. */
-PLOW_SASSERT(sizeof(PlowProgram) == 144,
-             "PlowProgram size (9 ptr + cur_seg + l2_domains + n_seg + pad + 3 gq ptr + xctr + peer_scratch + rank + n_gpu + seg_ofs)");
+PLOW_SASSERT(sizeof(PlowProgram) == 168, "PlowProgram packed-prefill ABI size");
 
 #endif /* PLOW_DEV_ISA_H */

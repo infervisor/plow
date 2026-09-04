@@ -195,14 +195,14 @@
  *
  *   Q  [n_q,  n_head,    D]     positions q0 .. q0+n_q
  *   K  [n_kv_head, kv_stride, D]   the cache, HEAD-MAJOR; positions 0 .. n_kv of each head
- *   V  [n_kv_head, kv_stride, D]
- *   O  [n_q,  n_head,    D]
+ *   V  [n_kv_head, kv_stride, DV]
+ *   O  [n_q,  n_head,    DV]
  *
  * `q_pos0` is the absolute position of Q row 0 (so prefill of a continuation
  * chunk masks correctly against cached history).
  * `window == 0` means full causal.
  * ------------------------------------------------------------------------- */
-template <int D, bool FP8KV = false>
+template <int D, bool FP8KV = false, int DV = D>
 __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ mlpart,
                                 bf16* __restrict__ O_final,
                                 const bf16* __restrict__ Q, const bf16* __restrict__ K,
@@ -223,9 +223,11 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
      * the 4-wave flash object), but a model with head_dim < FA_DC (Llama/Qwen: D=128) must not
      * chunk wider than the head — otherwise NCH = D/FA_DC rounds to 0 and the output loop never
      * runs. DCH = min(FA_DC, D) makes NCH >= 1 for any D and is a no-op when D >= FA_DC. */
-    constexpr int DCH = (FA_DC < D) ? FA_DC : D;
+    constexpr int DCH = (FA_DC < DV) ? FA_DC : DV;
     constexpr int NDT = DCH / MFMA_N; /* output d-tiles per chunk           */
-    constexpr int NCH = D / DCH;      /* output chunks: 1 at D<=FA_DC, 2 at D=512 */
+    constexpr int NCH = DV / DCH;     /* output chunks: 1 at DV<=FA_DC, 2 at DV=512 */
+    static_assert(D % MFMA_K == 0 && DV % MFMA_N == 0,
+                  "flash head dimensions must tile");
     constexpr int STRIDE = D + FA_PAD;
     /* V stays [kv][d] in LDS, and the 8 x ds_read_u16 in the PV loop below stays too.
      *
@@ -375,7 +377,8 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
              * The window-skip `continue` is dropped -- my_lo already starts at the window and the
              * per-element softmax mask excludes any out-of-window rows. */
             constexpr int KPT = BKV * D / PLOW_THREADS / 8;
-            constexpr int VPT = BKV * FA_DC / PLOW_THREADS / 8;
+            constexpr int VL = (DV == D) ? FA_DC : DCH;
+            constexpr int VPT = BKV * VL / PLOW_THREADS / 8;
             bf16v8 nk[KPT], nv[VPT];
     /* FP8 KV IN THE PREFETCH PATH. This branch had none, and it is the only path the 4-wave
      * flash object takes (it is the object built -DFA_DBUF=1). `ld_glob8` on a `const bf16*`
@@ -417,12 +420,17 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     }                                                                                            \
     _Pragma("unroll") for (int it = 0; it < VPT; it++) {                                         \
         const unsigned e = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                            \
-        const unsigned kv = (KVB) + e / FA_DC;                                                   \
+        const unsigned kv = (KVB) + e / VL;                                                      \
         if constexpr (FP8KV) {                                                                    \
+            static_assert(DV == D, "rectangular fp8 flash is not implemented");                  \
             if (kv < n_kv) FA_DB_FP8(nv[it], V, v_scale, d_off + e % FA_DC) else nv[it] = bf16v8_zero(); \
         } else {                                                                                  \
-        nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + e % FA_DC) \
-                             : bf16v8_zero();                                                     \
+        if constexpr (DV == D)                                                                    \
+            nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + e % FA_DC) \
+                                 : bf16v8_zero();                                                 \
+        else                                                                                      \
+            nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * DV + d_off + e % DCH) \
+                                 : bf16v8_zero();                                                 \
         }                                                                                         \
     }
             FA_DB_LOAD(my_lo); /* prime */
@@ -474,8 +482,8 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                     const unsigned kv = kv0 + r;
                     bf16 tv[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                     if (kv < n_kv) {
-                        const size_t off =
-                            ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + c;
+                        const size_t row = (size_t)hkv * kv_stride + (kv & kv_mask);
+                        const size_t off = row * (DV == D ? D : DV) + d_off + c;
                         if constexpr (FP8KV) {
                             const bf16v8 dv = fp8v8_to_bf16v8(
                                 ld_glob_fp8v8((const unsigned char*)V + off));
@@ -748,7 +756,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
              * fused write there pushes it 258 > 256 over the cliff for no benefit. */
 #if defined(PLOW_BUCKET_FLASH) || defined(PLOW_FLASH_HD128)
             if (nsplit == 1 && O_final != nullptr) {
-                const unsigned qd = n_head * D; /* row stride of n.at */
+                const unsigned qd = n_head * DV; /* row stride of n.at */
 #pragma unroll
                 for (int i = 0; i < 16; i++) {
                     const unsigned qi = my_q0 + mfma_acc_m(lane, i);
@@ -765,7 +773,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                     /* One base pointer per row (as the partial path does), so the epilogue's
                      * 64-bit address math stays out of the unrolled store loop and does not
                      * blow up register pressure / scratch for the hot KV loop. */
-                    bf16* orow = O_final + ((size_t)qi * qd + h * D + d_off + accn);
+                    bf16* orow = O_final + ((size_t)qi * qd + h * DV + d_off + accn);
 #pragma unroll
                     for (int t = 0; t < NDT; t++) {
                         /* Branchless RNE f32->bf16. A softmax-normalized attention output is
@@ -790,7 +798,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
             for (int i = 0; i < 16; i++) {
                 const unsigned qi = my_q0 + mfma_acc_m(lane, i);
                 if (qi >= n_q) continue;
-                float* op = Opart + ((size_t)(qi * n_head + h) * nsplit + sp) * D;
+                float* op = Opart + ((size_t)(qi * n_head + h) * nsplit + sp) * DV;
 #pragma unroll
                 for (int t = 0; t < NDT; t++)
                     st_act<float>(&op[d_off + t * MFMA_N + accn], oacc[t][i]);
@@ -3192,8 +3200,20 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
 #ifndef PLOW_MLA_PF_SV
 #define PLOW_MLA_PF_SV 0
 #endif
+/* gfx950-only PV transpose loads. The existing scalar path reconstructs one bf16x8
+ * fragment with eight LDS reads and four packs; ds_read_b64_tr_b16 produces four
+ * transposed bf16 values directly, so two instructions form the same fragment. */
+#ifndef PLOW_MLA_PF_TR16
+#define PLOW_MLA_PF_TR16 0
+#endif
+#if PLOW_MLA_PF_TR16 && !defined(__gfx950__)
+#error "PLOW_MLA_PF_TR16 requires gfx950"
+#endif
+#if PLOW_MLA_PF_TR16
+extern "C" __device__ unsigned plow_mla_pf_tr16_arm_1 = 1;
+#endif
 /* Extra halves the kv-block swizzle adds to the slab (blocks 1..3 shifted by 16 each). */
-#if PLOW_MLA_PF_SV
+#if PLOW_MLA_PF_SV && !PLOW_MLA_PF_TR16
 #define FA_MLA_PF2_SWZ 16
 #else
 #define FA_MLA_PF2_SWZ 0
@@ -3205,6 +3225,14 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
     ((FA_MLA_PF2_BKV * ((DK) + (DR) + FA_MLA_PF2_PAD) + 3 * FA_MLA_PF2_SWZ +             \
       4 * 16 * FA_MLA_PF2_BKV) *                                                         \
      2)
+
+#if PLOW_MLA_PF_TR16
+typedef bf16_t mla_pf_bf16x4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ mla_pf_bf16x4 mla_pf_ds_read_tr16(const bf16* p) {
+    auto* lp = (mla_pf_bf16x4 __attribute__((address_space(3)))*)(void*)p;
+    return __builtin_amdgcn_ds_read_tr16_b64_v4bf16(lp);
+}
+#endif
 
 template <int DK, int DR, bool GATHER = false, bool FP8 = false>
 __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restrict__ mlpart,
@@ -3684,7 +3712,24 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
             /* ---- O += P·V, V = the latent columns of the SAME slab ---- */
             bf16x8 pf;
             __builtin_memcpy(&pf, &Pw[fr * BKV + kg * 8], 16);
-#if PLOW_MLA_PF_SV
+#if PLOW_MLA_PF_TR16
+            /* The instruction transposes four adjacent LDS rows into four bf16 values
+             * per lane. Lane decomposition matches the 16x16 MFMA B fragment. */
+#pragma unroll
+            for (int t = 0; t < NT; t++) {
+                const unsigned row = kg * 8 + (fr >> 2);
+                const unsigned col = (unsigned)t * 16 + (fr & 3u) * 4;
+                mla_pf_bf16x4 lo = mla_pf_ds_read_tr16(&Ksm[row * KSTR + col]);
+                mla_pf_bf16x4 hi = mla_pf_ds_read_tr16(&Ksm[(row + 4) * KSTR + col]);
+                bf16x8 vf;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    vf[j] = lo[j];
+                    vf[j + 4] = hi[j];
+                }
+                oacc[t] = plow_mfma_bf16_16x16(pf, vf, oacc[t]);
+            }
+#elif PLOW_MLA_PF_SV
             /* SV(3): the next output tile's 8 transpose reads issue before this tile's
              * MFMAs, so the lgkm pipeline holds 16 outstanding u16 reads instead of 8.
              * Under SV(1) each of those reads is bank-conflict-free. */
@@ -5259,6 +5304,249 @@ __device__ void d_mla_merge_fold(bf16* __restrict__ O_, const float* __restrict_
     }
 }
 
+/* SPLIT-TILE merge+fold for the decode fill problem.  Default on (PLOW_MLA_FOLD_DVT=8);
+ * -DPLOW_MLA_FOLD_DVT=0 restores the VT=32 dispatch for an A/B.
+ *
+ * WHY. `d_mla_merge_fold<512, 32>` gives one workgroup one (row, 32-column V-tile). Kimi-K3 at
+ * TP8 decode has nh_l=12 and V=128, so the packet is 48 work items on the 256 workgroups the
+ * emitter hands it (`mla_fold_cus` cannot narrow it: a 48-wide grid would flip the interpreter's
+ * VT choice). Traced (scripts/k3_trace_wg.py on the gfx950 TP8 trace): 48 workgroups run ~21 us,
+ * 208 exit in ~1.6 us.
+ *
+ * WHAT MOVES. Two things, neither of which touches a floating-point operation's operands or
+ * order:
+ *   1. The V-tile a workgroup owns shrinks to VT (8 or 16) while the FOLD TREE stays the one the
+ *      reference tile VTR=32 defines: the l axis is still cut into LS = PLOW_THREADS/(VTR/VEC) =
+ *      64 contiguous blocks of BL = 8, each block is still one sequential run of `acc += o*w`,
+ *      blocks are still combined by the xor butterfly over groups of GRP = 8 and the 8 group sums
+ *      are still added in increasing order from 0.0f. Only NV = VT/VEC lane-groups per l-slice
+ *      are populated instead of VTR/VEC, so LS*NV threads fold and the rest idle through the
+ *      fold — which is fine, the packet was 81% idle at the WORKGROUP level before.
+ *   2. The merge issues its partial loads MSG splits at a time instead of 8, takes the per-split
+ *      weight from LDS (one v_exp per split per workgroup instead of one per split per THREAD),
+ *      and reads the (m, l) pairs with the loads hoisted ahead of the max/sum loops. The
+ *      accumulation `acc += o[s]*w[s]` runs in the same s order with the same operands, the
+ *      MS=8 block and scalar tail structure of the reference body is preserved for any nsplit
+ *      not a multiple of MSG, and the weight is the same `(m == -inf) ? 0 : exp2(m - gm)`.
+ *
+ * WHAT THE TRACE WAS REALLY SAYING. Measured standalone (runtime/bench/amd/k3_kbench_fold,
+ * nh=12 V=128 ns=64, 256 workgroups, W_uv cold): the reference body is 18.5 us/packet with the
+ * partials L2-hot and 22.8 cold; the split body is 7.9 / 10.5 — and it is 7.9 / 10.5 at VT=32
+ * (the same 48 work items) too. The 21 us body was not the fold's 32 columns, it was the
+ * (m, l) pass: the reference reads 2*nsplit floats one VECTOR load at a time, each behind its
+ * own s_waitcnt, so ns=64 is 128 serial round trips before the first partial is requested. The
+ * finer tile is kept because it costs nothing measurable and it is what the packet's 256
+ * workgroups were dispatched for; DVT=32 is the A/B that isolates the merge rewrite.
+ *
+ * PINNED ARITHMETIC. The reference body leaves contraction to the compiler, and what the
+ * shipped gfx950 decode object actually does (read off its ISA) is: gl by v_fmac, the merge by
+ * v_pk_mul_f32 + v_add_f32 (NOT fused), the fold by v_pk_fma_f32. A copy of the same source with
+ * a different unroll got a different mood from the SLP vectorizer — MSG=64 fused the merge and
+ * missed the oracle by one element — so this body spells each of the three out (__builtin_fmaf,
+ * `fp contract(off)`) instead of trusting the same heuristics twice.
+ *
+ * BIT-IDENTICAL to `d_mla_merge_fold<DK, VTR>` by construction, and gated by the oracle in
+ * runtime/bench/amd/k3_kbench_fold (every element, several nsplit, with dead splits). Any shape
+ * the reference fast map does not take (V % VT, V % VEC) must not be routed here: the body has
+ * no scalar arm, `V % VT == 0` is the caller's precondition. */
+#ifndef PLOW_MLA_FOLD_DVT
+#define PLOW_MLA_FOLD_DVT 8 /* decode V-tile of the split arm; 0 = the VT=32 dispatch (A/B) */
+#endif
+#ifndef PLOW_MLA_FOLD_DEC_MS
+#define PLOW_MLA_FOLD_DEC_MS 32 /* partial loads in flight per thread in the split-tile merge */
+#endif
+/* The pointer is wave-uniform (it is a function of the workgroup's work item) but in the
+ * megakernel it is VGPR-resident by construction (buf_rsrc_u's note); readfirstlane is how the
+ * hoisted (m, l) loads become s_load_dwordx16 into SGPRs instead of 16 VGPRs. The same goes for
+ * every per-row base below (partials, W_uv tile, output row): a uniform SGPR base plus a 32-bit
+ * per-thread offset is what keeps LICM from hoisting eight 64-bit per-thread addresses up into
+ * the interpreter's prologue, where they cost the decode object 45 VGPR spills (VT=8: 6 -> 51,
+ * measured) before this was written the way it is. */
+template <class T>
+__device__ __forceinline__ T* fa_uniform_ptr(T* p) {
+    const unsigned long long u = (unsigned long long)(size_t)p;
+    const unsigned lo = __builtin_amdgcn_readfirstlane((unsigned)u);
+    const unsigned hi = __builtin_amdgcn_readfirstlane((unsigned)(u >> 32));
+    return (T*)(size_t)(((unsigned long long)hi << 32) | lo);
+}
+/* The serial (m, l) reduction of fa_merge_ml with its loads hoisted 8 at a time. Same max
+ * sequence, same `continue`-on-dead-split sum in the same s order — the reduction is the
+ * CDNA4 (FA_MERGE_UNROLL4 == 0) one; where UNROLL4 is on the 4-banked body already has its own
+ * memory-level parallelism and is called as-is so the two arms keep agreeing. */
+__device__ __forceinline__ float fa_merge_ml_hoist(const float* __restrict__ ml, unsigned nsplit,
+                                                   float& gm_out) {
+#if FA_MERGE_UNROLL4
+    return fa_merge_ml(ml, nsplit, gm_out);
+#else
+    constexpr int H = 8;
+    float gm = FA_NEG_INF;
+    unsigned s = 0;
+    for (; s + H <= nsplit; s += H) {
+        float mv[H];
+#pragma unroll
+        for (int u = 0; u < H; u++) mv[u] = ml[(s + (unsigned)u) * 2];
+#pragma unroll
+        for (int u = 0; u < H; u++) gm = fmaxf(gm, mv[u]);
+    }
+    for (; s < nsplit; s++) gm = fmaxf(gm, ml[s * 2]);
+    gm_out = gm;
+    float gl = 0.0f;
+    for (s = 0; s + H <= nsplit; s += H) {
+        float mv[H], lv[H];
+#pragma unroll
+        for (int u = 0; u < H; u++) {
+            mv[u] = ml[(s + (unsigned)u) * 2];
+            lv[u] = ml[(s + (unsigned)u) * 2 + 1];
+        }
+#pragma unroll
+        for (int u = 0; u < H; u++) {
+            if (mv[u] == FA_NEG_INF) continue;
+            gl = __builtin_fmaf(lv[u], FA_EXP(mv[u] - gm), gl);
+        }
+    }
+    for (; s < nsplit; s++) {
+        if (ml[s * 2] == FA_NEG_INF) continue;
+        gl = __builtin_fmaf(ml[s * 2 + 1], FA_EXP(ml[s * 2] - gm), gl);
+    }
+    return gl;
+#endif
+}
+template <int DK, int VT, int VTR, int VEC = PLOW_MLA_FOLD_VEC, int UNW = PLOW_MLA_FOLD_UN,
+          int MSG = PLOW_MLA_FOLD_DEC_MS>
+__device__ void d_mla_merge_fold_split(bf16* __restrict__ O_, const float* __restrict__ Opart_,
+                                       const float* __restrict__ mlpart_,
+                                       const bf16* __restrict__ Wuv_, unsigned n_batch,
+                                       unsigned n_head, unsigned V, unsigned nsplit,
+                                       unsigned slice, unsigned nblk,
+                                       float* olds /* DK + NRED*VT + nsplit floats */) {
+    /* reference fold tree (the VTR map of d_mla_merge_fold) */
+    constexpr int NVR = VTR / VEC;
+    constexpr int LS = PLOW_THREADS / NVR;
+    constexpr int BL = DK / LS;
+    constexpr int UN = (BL >= UNW) ? UNW : BL;
+    constexpr int GRP = PLOW_WAVE / NVR; /* l-slices per butterfly group */
+    constexpr int NRED = LS / GRP;       /* group sums added in LDS */
+    /* this workgroup's tile */
+    constexpr int NV = VT / VEC;
+    constexpr int NACT = LS * NV;
+    static_assert(VTR % VEC == 0 && VT % VEC == 0 && NV >= 1 && NV <= NVR, "tile/vec");
+    static_assert((NV & (NV - 1)) == 0 && (NVR & (NVR - 1)) == 0, "xor lane math");
+    static_assert(PLOW_THREADS % NVR == 0 && DK % LS == 0 && BL % UN == 0, "reference map");
+    static_assert(PLOW_WAVE % NVR == 0 && LS % GRP == 0, "butterfly group");
+    static_assert(NACT % PLOW_WAVE == 0 && NACT <= PLOW_THREADS, "whole waves fold");
+    constexpr int MS = 8; /* the reference merge block */
+    static_assert(MSG % MS == 0 && MSG >= MS, "merge group");
+    typedef typename mla_fold_vec<VEC>::v wvec;
+    const unsigned vtiles = V / VT;
+    const unsigned n_work = n_batch * n_head * vtiles;
+    float* const red = olds + DK;
+    float* const wgt = red + NRED * VT;
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        /* OPAQUE tid. Every lane constant below (cg, rr, the W_uv offset, the red index) is a
+         * one-instruction function of threadIdx.x, and LICM hoists all of them out of this loop
+         * — out of the interpreter's dispatch loop too, into the kernel PROLOGUE, where they sit
+         * in VGPRs for the whole kernel and the decode object pays for them in spills (VT=8:
+         * 6 -> 42, measured; the reloads land in the fold). The empty asm pins the derivation
+         * here, where it costs a v_and each and nothing across the rest of the object. */
+        unsigned tid = threadIdx.x;
+        asm volatile("" : "+v"(tid));
+        const unsigned cg = tid % (unsigned)NV, rr = tid / (unsigned)NV;
+        const unsigned vt = w % vtiles;
+        const unsigned bh = w / vtiles;
+        const unsigned h = bh % n_head, b = bh / n_head;
+        const auto* ml =
+            as_glob(fa_uniform_ptr(mlpart_ + (size_t)(b * n_head + h) * nsplit * 2));
+        float gm;
+        const float gl = fa_merge_ml_hoist(ml, nsplit, gm);
+        const float inv = (gl > 0.0f) ? FA_RECIP(gl) : 0.0f;
+        for (unsigned s = tid; s < nsplit; s += PLOW_THREADS) {
+            const float m = ml[s * 2];
+            wgt[s] = (m == FA_NEG_INF) ? 0.0f : FA_EXP(m - gm);
+        }
+        __syncthreads();
+
+        const auto* opb =
+            as_glob(fa_uniform_ptr(Opart_ + (size_t)(b * n_head + h) * nsplit * DK));
+        for (unsigned d = tid; d < DK; d += PLOW_THREADS) {
+#pragma clang fp contract(off)
+            float acc = 0.0f;
+            unsigned s = 0;
+            for (; s + MSG <= nsplit; s += MSG) {
+                float pv[MSG], wv[MSG];
+#pragma unroll
+                for (int u = 0; u < MSG; u++) pv[u] = opb[(s + (unsigned)u) * (unsigned)DK + d];
+#pragma unroll
+                for (int u = 0; u < MSG; u++) wv[u] = wgt[s + (unsigned)u];
+#pragma unroll
+                for (int u = 0; u < MSG; u++) acc = acc + (pv[u] * wv[u]);
+            }
+            for (; s + MS <= nsplit; s += MS) {
+                float pv[MS], wv[MS];
+#pragma unroll
+                for (int u = 0; u < MS; u++) pv[u] = opb[(s + (unsigned)u) * (unsigned)DK + d];
+#pragma unroll
+                for (int u = 0; u < MS; u++) wv[u] = wgt[s + (unsigned)u];
+#pragma unroll
+                for (int u = 0; u < MS; u++) acc = acc + (pv[u] * wv[u]);
+            }
+            for (; s < nsplit; s++) {
+                const float m = ml[s * 2];
+                acc = acc +
+                      ((m == FA_NEG_INF) ? 0.0f : (opb[s * (unsigned)DK + d] * FA_EXP(m - gm)));
+            }
+            olds[d] = acc * inv;
+        }
+        __syncthreads();
+
+        const unsigned v0 = vt * VT;
+        const auto* const wtile = as_glob(fa_uniform_ptr(Wuv_ + (size_t)h * DK * V + v0));
+        auto* const orow = as_glob(fa_uniform_ptr(O_ + (size_t)(b * n_head + h) * V));
+        if (tid < (unsigned)NACT) {
+            const unsigned woff = cg * (unsigned)VEC + rr * (unsigned)BL * V;
+            float acc[VEC];
+#pragma unroll
+            for (int k = 0; k < VEC; k++) acc[k] = 0.0f;
+            for (unsigned i = 0; i < (unsigned)BL; i += (unsigned)UN) {
+                const unsigned l = rr * (unsigned)BL + i;
+                wvec wq[UN];
+                float sq[UN];
+#pragma unroll
+                for (int u = 0; u < UN; u++)
+                    wq[u] = *(const PLOW_GLOB wvec*)(const PLOW_GLOB void*)(
+                        wtile + (woff + (i + (unsigned)u) * V));
+#pragma unroll
+                for (int u = 0; u < UN; u++) sq[u] = olds[l + (unsigned)u];
+#pragma unroll
+                for (int u = 0; u < UN; u++)
+#pragma unroll
+                    for (int k = 0; k < VEC; k++)
+                        acc[k] = __builtin_fmaf(sq[u], bf2f(wq[u][k]), acc[k]);
+            }
+            /* butterfly over the GRP l-slices of a group: lane offsets NV, 2NV, .. = l-slice
+             * offsets 1, 2, 4, .. — the reference tree's partners, at this tile's lane pitch. */
+#pragma unroll
+            for (int k = 0; k < VEC; k++) {
+#pragma unroll
+                for (int off = NV; off < GRP * NV; off <<= 1)
+                    acc[k] += __shfl_xor(acc[k], off, PLOW_WAVE);
+            }
+            if (rr % (unsigned)GRP == 0u) {
+#pragma unroll
+                for (int k = 0; k < VEC; k++)
+                    red[(rr / (unsigned)GRP) * (unsigned)VT + cg * (unsigned)VEC + k] = acc[k];
+            }
+        }
+        __syncthreads();
+        for (unsigned t = tid; t < (unsigned)VT; t += PLOW_THREADS) {
+            float s = 0.0f;
+#pragma unroll
+            for (int q = 0; q < NRED; q++) s += red[(unsigned)q * (unsigned)VT + t];
+            st_act1(&orow[v0 + t], f2bf(s));
+        }
+        __syncthreads();
+    }
+}
+
 /* TOKEN-BLOCKED merge+fold.  OPT-IN: -DPLOW_MLA_FOLD_TB=<G>, default 1 = this file is inert.
  *
  * WHY. `d_mla_merge_fold` above gives ONE workgroup ONE (row, V-tile), where a prefill "row" is
@@ -5283,13 +5571,16 @@ __device__ void d_mla_merge_fold(bf16* __restrict__ O_, const float* __restrict_
  * the lane->column map (NV), the l-slice split (LS/BL), the unroll (UN) and the two-stage
  * (shfl, LDS) fold are the ones `d_mla_merge_fold` already uses.
  *
- * BIT-IDENTITY. Held, deliberately, and it is the reason the loop nest is written in this order.
+ * BIT-IDENTITY. Intended by the source order, and it is the reason the loop nest is written in
+ * this order.
  * For a fixed token g the sequence of adds into `acc[g][k]` is exactly the sequence the scalar
  * body makes into `acc[k]`: same outer `i` order, same `u` order inside a group, same `l`-block
  * per wave, same shfl tree, same increasing-wave LDS sum. `TB` only interleaves INDEPENDENT
- * accumulator chains; it never reassociates one. The merge half is untouched per token. So this
- * is a pure memory-traffic transform and the output is bit-for-bit the shipped kernel's — which
- * is what makes it gateable against a character-identical control rather than a tolerance.
+ * accumulator chains; it never reassociates one. The merge half is untouched per token. The
+ * V=128 gfx950 oracle nevertheless rejects TB>1: multiple live chains change the compiler's
+ * packed-FMA schedule and 245--1,463 BF16 outputs differ. This arm therefore remains an isolated,
+ * default-off experiment; every new shape needs the character-identical gate rather than a
+ * tolerance.
  *
  * LDS. `olds` grows to TB*DK floats. `red` does NOT grow to TB*PLOW_WAVES*VT (16384 floats at
  * TB=8, VT=256 — 64 KiB, over the arena on top of olds); the cross-wave fold runs in chunks of

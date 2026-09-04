@@ -667,6 +667,10 @@ fn fuse_kimi_k3() {
         fused.contains("FusedMlaOutGate"),
         "MLA output-gate fusion did not fire in K3"
     );
+    assert!(
+        fused.contains("FusedMaterializedResidualBlock"),
+        "cross-block residual materialization fusion did not fire"
+    );
     // The generic fusions must still fire on a hybrid graph.
     assert!(
         fused.contains("FusedNormLinear"),
@@ -688,6 +692,18 @@ fn fuse_kimi_k3() {
         .filter(|w| !w.ends_with(".mlp.gate.weight"))
         .collect();
     assert_eq!(fw, gw, "fusion dropped or duplicated weight leaves in K3");
+}
+
+#[test]
+fn grouped_router_remains_explicit_in_the_complete_rewrite_graph() {
+    let cfg = KIMI_K3.replacen(
+        "\"num_experts\": 8",
+        "\"num_experts\": 8, \"n_group\": 2, \"topk_group\": 1",
+        1,
+    );
+    let g = build_from_config_json(&cfg).expect("build grouped-router graph");
+    let (_, stats) = rewrite::rewrite_graph(&g).expect("rewrite complete grouped-router graph");
+    assert_eq!(stats.ops_before, g.nodes.len());
 }
 
 // --- Qwen3 / Qwen2.5: GQA + SwiGLU (dense) ---

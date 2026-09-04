@@ -710,6 +710,41 @@ GEMV_VARIANT(gemma_gemv_m16, 16)
         }                                                                                    \
     }
 
+#define GEMV_QKVG_WALK_VARIANT(NAME, MM)                                                     \
+    extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(        \
+        bf16* Cq, bf16* Ck, bf16* Cv, bf16* Cg, const bf16* x, const bf16* Wq,              \
+        const bf16* Wk, const bf16* Wv, const bf16* Wg, unsigned M, unsigned Nq,            \
+        unsigned Nk, unsigned Nv, unsigned Ng, unsigned K) {                                \
+        __shared__ bf16 lds[GM_LDS_HALVES];                                                  \
+        for (unsigned m0 = 0; m0 < M; m0 += (MM)) {                                         \
+            const unsigned rem = M - m0, M_ = rem < (MM) ? rem : (MM);                      \
+            const bf16* x_ = x + (size_t)m0 * K;                                            \
+            for (unsigned i = threadIdx.x; i < M_ * K; i += PLOW_THREADS) lds[i] = x_[i];   \
+            __syncthreads();                                                                \
+            if (K == 2560)                                                                  \
+                gemv_qkvg_rows<MM, 5>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,           \
+                                      Cv + (size_t)m0 * Nv, Cg + (size_t)m0 * Ng, Wq, Wk,   \
+                                      Wv, Wg, M_, Nq, Nk, Nv, Ng, K, blockIdx.x, gridDim.x, \
+                                      lds);                                                 \
+            else if (K == 4096)                                                             \
+                gemv_qkvg_rows<MM, 8>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,           \
+                                      Cv + (size_t)m0 * Nv, Cg + (size_t)m0 * Ng, Wq, Wk,   \
+                                      Wv, Wg, M_, Nq, Nk, Nv, Ng, K, blockIdx.x, gridDim.x, \
+                                      lds);                                                 \
+            else if (K == 7168)                                                             \
+                gemv_qkvg_rows<MM, 7>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,           \
+                                      Cv + (size_t)m0 * Nv, Cg + (size_t)m0 * Ng, Wq, Wk,   \
+                                      Wv, Wg, M_, Nq, Nk, Nv, Ng, K, blockIdx.x, gridDim.x, \
+                                      lds);                                                 \
+            else                                                                            \
+                gemv_qkvg_rows<MM, 6>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,           \
+                                      Cv + (size_t)m0 * Nv, Cg + (size_t)m0 * Ng, Wq, Wk,   \
+                                      Wv, Wg, M_, Nq, Nk, Nv, Ng, K, blockIdx.x, gridDim.x, \
+                                      lds);                                                 \
+            __syncthreads();                                                                \
+        }                                                                                   \
+    }
+
 /* The five rungs `PLOW_GEMV_MM` can take (`PLOW_GEMV_MAXM` caps at 16). `tunedb::gemv`'s
  * `gemv_sample_bucket` parses the bucket back out of these names, so the `_m<N>` suffix is
  * load-bearing, not decoration. */
@@ -728,6 +763,11 @@ GEMV_QKV_WALK_VARIANT(gemv_qkv_m2, 2)
 GEMV_QKV_WALK_VARIANT(gemv_qkv_m4, 4)
 GEMV_QKV_WALK_VARIANT(gemv_qkv_m8, 8)
 GEMV_QKV_WALK_VARIANT(gemv_qkv_m16, 16)
+GEMV_QKVG_WALK_VARIANT(gemv_qkvg_m1, 1)
+GEMV_QKVG_WALK_VARIANT(gemv_qkvg_m2, 2)
+GEMV_QKVG_WALK_VARIANT(gemv_qkvg_m4, 4)
+GEMV_QKVG_WALK_VARIANT(gemv_qkvg_m8, 8)
+GEMV_QKVG_WALK_VARIANT(gemv_qkvg_m16, 16)
 
 /* D=128 (Llama/Qwen) prefill. Exercises the BKV=64 two-subtile online-softmax path;
  * O_final=nullptr so the CPU-reference test drives the partial+merge path like the

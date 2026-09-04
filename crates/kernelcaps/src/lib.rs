@@ -51,7 +51,7 @@ pub use spec::{
     ShapeClass, ShapeSignature, TileConfig,
 };
 pub use sweep::{classify as classify_macro, knobs, Knob, Sweepable};
-pub use targets::{dense_gemm_inventory, prefill_recipe, ObjectRecipe};
+pub use targets::{dense_gemm_inventory, dense_gemm_tuning_build, prefill_recipe, ObjectRecipe};
 
 use std::collections::BTreeMap;
 

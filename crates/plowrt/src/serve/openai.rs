@@ -28,6 +28,28 @@ pub struct ChatRequest {
     pub stream_options: Option<StreamOptions>,
 }
 
+/// `POST /v1/completions` request body (supported subset).
+#[derive(Clone, Debug, Deserialize)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub ignore_eos: Option<bool>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    /// Plow parity extension. Available only for non-streaming requests.
+    #[serde(default)]
+    pub return_token_ids: bool,
+}
+
 /// OpenAI `stream_options`: `include_usage` opts the stream into a final
 /// usage-only chunk (empty `choices`) before `[DONE]`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -181,6 +203,32 @@ pub struct Delta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<CompletionTokenIds>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionTokenIds {
+    pub prompt: Vec<u32>,
+    pub completion: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionChoice {
+    pub index: u32,
+    pub text: String,
+    pub logprobs: Option<serde_json::Value>,
+    pub finish_reason: Option<&'static str>,
 }
 
 /// `GET /v1/models` response.

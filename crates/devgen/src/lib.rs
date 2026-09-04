@@ -75,7 +75,7 @@ pub mod tune_demand;
 // | flag | on sm_120 | on gfx950 before the gate | gate |
 // |------|-----------|---------------------------|------|
 // | `PLOW_FP8` (alone) | emits w8a16, which has a cubin | w8a16 into a w8a8-only arm → null `a_scale` fault | REFUSED (`check_fp8_a_scale_bound`) — ignoring would emit a WRONG packet |
-// | `PLOW_L2_PLACE` | L2 domains in `seg` | overwrites the wave-class tag on a MULTI-SEGMENT program → whole prefill on the flash object, zero logits | skipped per PROGRAM by `Builder::finish` when it has >1 wave class; single-class programs (decode) are placed |
+// | `PLOW_L2_PLACE` | per-domain queue windows | formerly overwrote the wave-class tag on a MULTI-SEGMENT program → zero logits | domain now lives independently in flags; ordered kernel-family segments remain intact |
 // | `PLOW_UNISEG` | collapses segments, spurious there | destroyed the wave-class split → zero logits, 8.7 ms "prefill" | ignored + warned (`Builder::deny_uniseg`) |
 // | `PLOW_PF_LADDER=wave` | rungs from the 128x128 sm_120 tile | AMD tiles differently → mis-tuned rungs (degrades, does not corrupt) | ignored quietly |
 //
@@ -384,6 +384,43 @@ fn pick_tile(m: u32, n: u32, k: u32, n_cu: u32, quant: kernelcaps::QuantScheme) 
     pick_tile_tiered(m, n, k, n_cu, quant).0
 }
 
+pub(crate) fn pick_gemm_emit_plan(
+    m: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+) -> (DevOp, u32, u32) {
+    let c8 = tunedb::gemm_rung_emit_plan("128x384x64", quant);
+    let c8 = c8.filter(|plan| {
+        let blocks = plan.blocks(m, n);
+        emit_is_amd()
+            && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+            && quant == kernelcaps::QuantScheme::None
+            && m.is_multiple_of(plan.bm)
+            && n.is_multiple_of(plan.bn)
+            && k.is_multiple_of(plan.bk)
+            && blocks == n_cu
+            && emit_config::active().gemm_wide_c8_for(m, n, k)
+            && gfx950_gemm_measurements().variant_is_winner(
+                m as i64,
+                n as i64,
+                k as i64,
+                quant,
+                plan.measurement_id,
+            )
+    });
+    if let Some(plan) = c8 {
+        // The tagged path queried the same qualified/current shape table as `pick_tile`, but it
+        // bypasses `select_kernel` because the implementation shares an opcode with c2. Preserve
+        // the one-lookup/one-decision accounting contract at this alternate decision boundary.
+        tune_demand::record(m as i64, n as i64, k as i64, quant, true);
+        tune_demand::note_decision(true);
+        return (plan.op, plan.blocks(m, n), plan.packet_tag);
+    }
+    (gfx950_prefill_tile(m, n, k, n_cu, quant), n_cu, 0)
+}
+
 /// [`pick_tile`] plus WHAT DECIDED IT. One implementation, because two copies of this function
 /// is exactly how the pair in `plowc/src/bin/` drifted apart.
 fn pick_tile_tiered(
@@ -492,6 +529,32 @@ fn select_gemm_over(
     n_cu: u32,
     quant: kernelcaps::QuantScheme,
 ) -> (DevOp, kernelcaps::CalibrationTier) {
+    let measured = gfx950_gemm_measurements().for_shape(m as i64, n as i64, k as i64, quant);
+    select_gemm_with(inv, m, n, k, n_cu, quant, measured)
+}
+
+/// The analytical tier alone: the answer with no qualified record for the shape.
+#[cfg(test)]
+fn select_gemm_analytical(
+    inv: &kernelcaps::Inventory,
+    m: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+) -> DevOp {
+    select_gemm_with(inv, m, n, k, n_cu, quant, &ShapeCosts(None)).0
+}
+
+fn select_gemm_with(
+    inv: &kernelcaps::Inventory,
+    m: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+    measured: &dyn kernelcaps::MeasuredCosts,
+) -> (DevOp, kernelcaps::CalibrationTier) {
     let (spec, _isa) = amd_target::active();
     let hw = kernelcaps::HardwareFingerprint::from_spec(spec)
         .unwrap_or_else(|| panic!("no hardware fingerprint for {}", spec.name));
@@ -508,7 +571,7 @@ fn select_gemm_over(
         &op,
         &hw,
         kernelcaps::ProfileId::PrefillDense,
-        gfx950_gemm_measurements().for_shape(m as i64, n as i64, k as i64, quant),
+        measured,
         |kernel| tile_cost(spec, kernel, m as i64, n as i64, k as i64, n_cu),
     )
     .unwrap_or_else(|e| {
@@ -693,6 +756,34 @@ impl GemmMeasurements {
         tune_demand::record(m, n, k, quant, hit.is_some());
         Box::leak(Box::new(ShapeCosts(hit)))
     }
+
+    fn variant_is_winner(
+        &self,
+        m: i64,
+        n: i64,
+        k: i64,
+        quant: kernelcaps::QuantScheme,
+        measurement_id: u16,
+    ) -> bool {
+        let Some(costs) = self.by_case.get(&tunedb::gemm_op_case(m, n, k, quant)) else {
+            return false;
+        };
+        let Some(candidate) = costs.get(&measurement_id) else {
+            return false;
+        };
+        costs.values().all(|cost| candidate <= cost)
+    }
+}
+
+/// Whether the qualified/current c8 measurement wins this exact BF16 shape.
+pub fn gfx950_c8_is_measured_winner(m: i64, n: i64, k: i64) -> bool {
+    gfx950_gemm_measurements().variant_is_winner(
+        m,
+        n,
+        k,
+        kernelcaps::QuantScheme::None,
+        tunedb::GEMM_WIDE_C8_MEASUREMENT_ID,
+    )
 }
 
 /// Qualified, non-stale GEMM measurements for the ACTIVE AMD target.
@@ -728,13 +819,18 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
             Some(s) => s,
         };
         let store = tunedb::TuneStore::new(std::path::PathBuf::from(root));
-        // Digests come from the PROBED build, not from a constant: a tile edit
-        // in op_gemm.h changes the preprocessed digest, which is what makes the
-        // previous campaign's records stale instead of silently authoritative.
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let Ok(build) = kernelcaps::dense_gemm_tuning_build(&source_root, amd_target::active().1)
+        else {
+            return GemmMeasurements { by_case };
+        };
+        // The sweep launches standalone GEMM kernels. Its key covers the
+        // preprocessed dense family across all supported encodings, not
+        // unrelated arms in the persistent interpreter.
         let want = tunedb::Digests {
-            implementation: gfx950_gemm_inventory().build().label(),
-            interpreter: gfx950_gemm_inventory().build().label(),
-            toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
+            implementation: build.label(),
+            interpreter: build.label(),
+            toolchain: build.toolchain.clone(),
             oracle: tunedb::GEMM_ORACLE.to_string(),
         };
         let cell = amd_tuning_cell();
@@ -968,6 +1064,208 @@ fn gfx950_gemm_inventory() -> &'static kernelcaps::Inventory {
 /// never opens.
 fn amd_tuning_cell() -> String {
     tunedb::amd_tuning_cell(amd_target::active().0)
+}
+
+#[derive(Clone, Debug)]
+struct AttentionDecisionReport {
+    hardware: String,
+    n_cu: u32,
+    decode_rung: u32,
+    kv_bucket: &'static str,
+    shape: String,
+    compiled_max_nsplit: u32,
+    compiled_persistent: bool,
+    selected_nsplit: u32,
+    selected_algorithm: &'static str,
+    selected_source: &'static str,
+}
+
+thread_local! {
+    static ATTENTION_DECISIONS: std::cell::RefCell<Vec<AttentionDecisionReport>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+fn clear_attention_decisions() {
+    ATTENTION_DECISIONS.with(|d| d.borrow_mut().clear());
+}
+
+fn attention_decisions() -> Vec<AttentionDecisionReport> {
+    ATTENTION_DECISIONS.with(|d| d.borrow().clone())
+}
+
+/// Exact-cell attention selection. This is compile-time packet policy, not an
+/// online tuner: only qualified records for this arch/CU/rung/KV bucket and
+/// operator geometry can replace the fixed fallback.
+/// Grouped-MoE decode route for one exact geometry, from qualified measurements
+/// of BOTH routes only. The standalone pair is charged the measured segment
+/// handoff; missing or stale evidence keeps the interpreter route.
+pub(crate) fn select_amd_moe_decode_route(
+    n_cu: u32,
+    decode_rung: u32,
+    topk: u32,
+    hidden: u32,
+    inter_local: u32,
+    experts: u32,
+    weight_enc: &str,
+) -> tunedb::MoeDecodeSelection {
+    let hardware = amd_tuning_cell();
+    let records = emit_config::active()
+        .tunedb_root()
+        .and_then(|root| {
+            tunedb::TuneStore::new(std::path::PathBuf::from(root))
+                .load_moe_decode(&hardware)
+                .ok()
+        })
+        .unwrap_or_default();
+    let cell = tunedb::MoeDecodeCell {
+        hardware,
+        n_cu,
+        decode_rung,
+        topk,
+        hidden,
+        inter_local,
+        experts,
+        weight_enc: weight_enc.into(),
+    };
+    #[cfg(test)]
+    let want = tunedb::Digests {
+        implementation: "test-unprobed".into(),
+        interpreter: "test-unprobed".into(),
+        toolchain: "test-unprobed".into(),
+        oracle: tunedb::MOE_DECODE_ORACLE.into(),
+    };
+    #[cfg(not(test))]
+    let want = tunedb::Digests {
+        implementation: gfx950_gemm_inventory().build().label(),
+        interpreter: gfx950_gemm_inventory().build().label(),
+        toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
+        oracle: tunedb::MOE_DECODE_ORACLE.into(),
+    };
+    let selected = tunedb::select_moe_decode_route(
+        &records,
+        &cell,
+        &want,
+        tunedb::GFX950_SEGMENT_HANDOFF_NS,
+        tunedb::MIN_GAIN_FRACTION,
+    );
+    if selected.source == tunedb::MoeDecodeSource::Qualified {
+        eprintln!(
+            "  grouped-MoE decode route: {} -> {:?} (projected {:+.2} us/layer after handoff)",
+            cell.key(),
+            selected.route,
+            selected.projected_gain_ns / 1000.0
+        );
+    } else if !records.is_empty() {
+        // Same shape as the GEMM tuner's STALE report: records exist, none serve this cell.
+        let same_cell = records.iter().filter(|r| r.cell == cell).count();
+        let stale: Vec<String> = records
+            .iter()
+            .filter(|r| r.cell == cell)
+            .map(|r| format!("{:?}:{}", r.route, r.digests.stale_against(&want).join("+")))
+            .collect();
+        eprintln!(
+            "  grouped-MoE decode route: {} record(s), {} for cell {}, none usable (stale fields per route: {:?}; want {}/{}/{}) -- interpreter route kept",
+            records.len(),
+            same_cell,
+            cell.key(),
+            stale,
+            want.implementation,
+            want.toolchain,
+            want.oracle
+        );
+    }
+    selected
+}
+
+fn select_amd_attention(
+    n_cu: u32,
+    decode_rung: u32,
+    kv_len: u32,
+    shape: String,
+    max_nsplit: u32,
+    fallback_nsplit: u32,
+) -> tunedb::AttentionSelection {
+    let fallback = || tunedb::AttentionSelection {
+        algorithm: tunedb::AttentionAlgorithm::SplitReduce,
+        nsplit: fallback_nsplit.clamp(1, max_nsplit.max(1)),
+        source: tunedb::AttentionSource::FixedFallback,
+    };
+    let hardware = amd_tuning_cell();
+    let records = emit_config::active()
+        .tunedb_root()
+        .and_then(|root| {
+            tunedb::TuneStore::new(std::path::PathBuf::from(root))
+                .load_attention(&hardware)
+                .ok()
+        })
+        .unwrap_or_default();
+    #[cfg(test)]
+    let want = tunedb::Digests {
+        implementation: "test-unprobed".into(),
+        interpreter: "test-unprobed".into(),
+        toolchain: "test-unprobed".into(),
+        oracle: tunedb::ATTENTION_ORACLE.into(),
+    };
+    #[cfg(not(test))]
+    let want = tunedb::Digests {
+        implementation: gfx950_gemm_inventory().build().label(),
+        interpreter: gfx950_gemm_inventory().build().label(),
+        toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
+        oracle: tunedb::ATTENTION_ORACLE.into(),
+    };
+    let cell = tunedb::AttentionCell {
+        hardware,
+        n_cu,
+        decode_rung,
+        kv_bucket: tunedb::KvBucket::of(kv_len),
+        shape,
+    };
+    let selected = if records.is_empty() {
+        fallback()
+    } else {
+        tunedb::select_attention(
+            &records,
+            &cell,
+            &want,
+            tunedb::AttentionCapabilities {
+                max_nsplit,
+                // No distinct persistent-attention body is compiled in the AMD
+                // interpreter today. A record requesting one stays ineligible.
+                persistent: false,
+            },
+            fallback_nsplit,
+        )
+    };
+    if selected.source == tunedb::AttentionSource::Qualified {
+        eprintln!(
+            "  attention tuned: {} -> {:?}/ns{}",
+            cell.key(),
+            selected.algorithm,
+            selected.nsplit
+        );
+    }
+    ATTENTION_DECISIONS.with(|d| {
+        d.borrow_mut().push(AttentionDecisionReport {
+            hardware: cell.hardware.clone(),
+            n_cu,
+            decode_rung,
+            kv_bucket: cell.kv_bucket.label(),
+            shape: cell.shape.clone(),
+            compiled_max_nsplit: max_nsplit,
+            compiled_persistent: false,
+            selected_nsplit: selected.nsplit,
+            selected_algorithm: match selected.algorithm {
+                tunedb::AttentionAlgorithm::SplitReduce => "split_reduce",
+                tunedb::AttentionAlgorithm::Persistent => "persistent",
+            },
+            selected_source: match selected.source {
+                tunedb::AttentionSource::FixedFallback => "fixed_fallback",
+                tunedb::AttentionSource::Qualified => "qualified",
+            },
+        });
+    });
+    selected
 }
 
 /// The prefill GEMM inventory for `isa`, probed once per ISA.
@@ -2400,6 +2698,78 @@ fn emit_xreduce_twoshot_band(
     })
 }
 
+/// Reduce-scatter ONLY (sequence-parallel seam, [`DevOp::XReduceScatter`]): rendezvous, then
+/// this rank's owned row band of the `[elems]` partial at byte offset `slot` is reduced in
+/// place into its own peer slot. `slot_tensor` is that slot's handle, so the band consumers
+/// that read it as a rank-relative view depend on this packet. `gather = (gslot, gcols)` folds
+/// the column-parallel partial for the owned rows (rounded-then-added, as the two-shot's AG).
+/// `copy` is a LOCAL band tensor the owned band is also stored to — for a reader that outlives
+/// the slot's next writer (a snapshot layer's restarted prefix). One xctr gate. Bit-identical
+/// to the two-shot's phase 1 (same body).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_xreduce_scatter(
+    b: &mut Builder,
+    xgate: &mut u32,
+    xr_cus: &[u32],
+    deps: &[u32],
+    slot_tensor: u32,
+    elems: u32,
+    tp: u32,
+    slot: u32,
+    gather: Option<(u32, u32)>,
+    copy: Option<u32>,
+) -> u32 {
+    // Phase 1 saturates at `elems / tp / 512` workgroups.
+    let need = ((elems / tp.max(1)).div_ceil(512).max(1) as usize).min(xr_cus.len());
+    let xr_cus = &xr_cus[..need];
+    let gate_rs = *xgate;
+    *xgate += 1;
+    b.emit(DevOp::XReduceScatter, xr_cus.to_vec(), deps, |d| {
+        d.t[0] = slot_tensor;
+        d.t[1] = copy.unwrap_or(packet::dev::TENSOR_NONE);
+        d.i[0] = elems;
+        d.i[1] = tp;
+        d.i[2] = slot;
+        d.i[3] = gate_rs;
+        if let Some((gslot, gcols)) = gather {
+            d.i[6] = gslot;
+            d.i[7] = gcols;
+        }
+    })
+}
+
+/// All-gather ONLY ([`DevOp::XAllGather`]) of up to three row-banded arrays under one
+/// rendezvous: `pairs = (dst full tensor, elems, src slot byte offset)`. Every rank's band of
+/// each array was written into the peer slot by earlier packets (the `deps`); slice `s` of each
+/// is copied from peer `s`. One xctr gate.
+pub(crate) fn emit_xall_gather(
+    b: &mut Builder,
+    xgate: &mut u32,
+    xr_cus: &[u32],
+    deps: &[u32],
+    pairs: &[(u32, u32, u32)],
+    tp: u32,
+) -> u32 {
+    assert!(
+        !pairs.is_empty() && pairs.len() <= 3,
+        "XAllGather carries 1..3 arrays"
+    );
+    let total: u32 = pairs.iter().map(|p| p.1).sum();
+    let need = (total.div_ceil(512).max(1) as usize).min(xr_cus.len());
+    let xr_cus = &xr_cus[..need];
+    let gate = *xgate;
+    *xgate += 1;
+    b.emit(DevOp::XAllGather, xr_cus.to_vec(), deps, |d| {
+        for (k, &(dst, n, src_slot)) in pairs.iter().enumerate() {
+            d.t[k] = dst;
+            d.i[k] = n;
+            d.i[5 + k] = src_slot;
+        }
+        d.i[3] = gate;
+        d.i[4] = tp;
+    })
+}
+
 /// [`emit_xreduce`], plus an ALL-GATHER of a column-parallel partial folded into the same
 /// packet: `out = sum_r reduced_r + concat_r gathered_r`.
 ///
@@ -2408,12 +2778,9 @@ fn emit_xreduce_twoshot_band(
 /// partials are ADDED, so the gather is one extra bf16 load per element on a rendezvous
 /// that already happened, rather than its own packet (~5.3 us) and its own rendezvous.
 ///
-/// ALWAYS THE ONE-SHOT when a gather is present, on both phases. The two-shot's
-/// reduce-scatter owns a 1/N slice of the message and its all-gather phase reassembles it;
-/// there is no place in that decomposition for a SECOND, differently-shaped gather, and
-/// inventing one to save fabric on a prefill chunk is not worth a second reduction body.
-/// The cost is prefill-only and bounded by the one-shot's N× fabric on one collective per
-/// MoE layer.
+/// A large prefill gather may opt into the two-shot path. Its all-gather already visits every
+/// final element, so it can add the owner-derived second partial there without another packet
+/// or rendezvous. The shape gate requires a complete column partition (`row_w = tp*gcols`).
 #[allow(clippy::too_many_arguments)]
 fn emit_xreduce_gather(
     b: &mut Builder,
@@ -2454,7 +2821,10 @@ fn emit_xreduce_gather(
     // reduce-scatter phase saturates even earlier, at `n/nranks`), so this never over-narrows.
     let need = (xr_elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
     let xr_cus = &xr_cus[..need];
-    if decode || gather.is_some() {
+    let xr2_gather = !decode
+        && emit_config::active().xr2_gather
+        && gather.is_some_and(|(_, gcols, row_w)| row_w == tp.saturating_mul(gcols));
+    if decode || (gather.is_some() && !xr2_gather) {
         let gate = *xgate;
         *xgate += 1;
         let (gslot, gcols, row_w) = gather.unwrap_or((0, 0, 0));
@@ -2480,6 +2850,10 @@ fn emit_xreduce_gather(
             d.i[2] = slot; // partial slot byte offset (§7a)
             d.i[3] = gate_rs; // reduce-scatter rendezvous gate id
             d.i[4] = gate_ag; // all-gather rendezvous gate id
+            if let Some((gslot, gcols, _)) = gather {
+                d.i[6] = gslot; // folded all-gather partial slot
+                d.i[7] = gcols; // columns per rank; row width = n_gpu*gcols
+            }
         })
     }
 }
@@ -5018,6 +5392,52 @@ pub struct EmitArgs {
     /// Unified emit-time config. `Some` when driven by the new `plowc` CLI;
     /// `None` from the legacy `gemma4` `from_cli` path (env-var fallback).
     pub emit_cfg: Option<emit_config::EmitConfig>,
+    /// Fusion candidates derived from the complete operator graph. Empty for
+    /// legacy/direct callers; no model name participates in these decisions.
+    pub whole_graph_fusions: WholeGraphFusionDecisions,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WholeGraphFusionDecisions {
+    pub tp: u32,
+    pub parallel_linear2: Vec<ParallelLinear2Decision>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParallelLinear2Decision {
+    pub n0: u32,
+    pub n1: u32,
+    pub k: u32,
+    pub instances: usize,
+    /// Qualification is separate from structural eligibility. The compiler
+    /// carries candidates immediately, but production emission stays unchanged
+    /// until the exact full-token/performance gate promotes the shape.
+    pub qualified: bool,
+}
+
+static WHOLE_GRAPH_FUSIONS: std::sync::atomic::AtomicPtr<WholeGraphFusionDecisions> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn install_whole_graph_fusions(decisions: WholeGraphFusionDecisions) {
+    let ptr = Box::into_raw(Box::new(decisions));
+    WHOLE_GRAPH_FUSIONS.store(ptr, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn whole_graph_parallel_linear2(n0: u32, n1_local: u32, k: u32) -> bool {
+    let ptr = WHOLE_GRAPH_FUSIONS.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: install stores Box::into_raw and deliberately never frees it,
+    // matching emit_config's process-wide per-compile snapshot.
+    let decisions = unsafe { &*ptr };
+    decisions.parallel_linear2.iter().any(|d| {
+        d.qualified
+            && d.n0 == n0
+            && d.n1 == n1_local.saturating_mul(decisions.tp)
+            && d.k == k
+            && d.instances > 0
+    })
 }
 
 /// What the verification gate actually DID, recorded verbatim in `build.json`.
@@ -5164,6 +5584,7 @@ impl EmitArgs {
             gpu: String::new(),
             arch: String::new(),
             emit_cfg: None,
+            whole_graph_fusions: WholeGraphFusionDecisions::default(),
         }
     }
 }
@@ -5427,11 +5848,14 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         gpu,
         arch,
         emit_cfg: _emit_cfg,
+        whole_graph_fusions,
     } = args;
 
     // Resolve the unified emit config: either from the CLI (plowc path) or from env vars (legacy).
     // Installed process-wide so deeply nested emit functions can call emit_config::active().
     emit_config::install(_emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env));
+    install_whole_graph_fusions(whole_graph_fusions);
+    clear_attention_decisions();
 
     // BEFORE any emitter runs: the GEMV census needs the store's answer in hand by the time
     // the first `Builder::emit_dep` fires. Costs one store read on a `PLOW_TUNE_DUMP` run and
@@ -5530,12 +5954,10 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // is loud about this one too even without the claim above. `kimi_k3_emit` never returns: it
     // validates everything the front end can and then reports what is not implemented.
     if model_type == "kimi_k3" {
-        // `K3_FULL=1` selects the real emit (`k3_emit_full`), mirroring GLM's
-        // `GLM_FULL`. The DEFAULT stays the capability report, because the
-        // host-side mxfp4 expert bind and the Mixtral `w1/w2/w3` name template
-        // are still missing — a blob emitted today fails at LOAD with a missing
-        // weight, which is loud and correct but is not what someone who has not
-        // read the report is expecting.
+        // The hybrid emitter is the production default. Keep the old itemised
+        // capability report behind `K3_FULL=0` as a diagnostic; experiments
+        // must otherwise consume the same complete graph/packet path serving
+        // uses, including graph-derived phase and EP rewrites.
         if emit_config::active().k3_full {
             mla::k3_emit_full(
                 &dir,
@@ -5544,6 +5966,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                 n_cu,
                 tp,
                 rope_gen,
+                &arch,
                 verify.as_ref(),
                 l2_layout,
             );
@@ -5872,6 +6295,10 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_KDA_CONV",
     "PLOW_DOP_KDA_CONV3",
     "PLOW_DOP_KDA_CONV_STATE_STEP_G",
+    "PLOW_DOP_KDA_CHUNK_CARRY",
+    "PLOW_DOP_KDA_CHUNK_INTRA",
+    "PLOW_DOP_KDA_CHUNK_PREPARE",
+    "PLOW_DOP_KDA_CHUNK_WU",
     "PLOW_DOP_KDA_GATE",
     "PLOW_DOP_KDA_GATED_NORM",
     "PLOW_DOP_KDA_STATE_STEP",
@@ -5921,10 +6348,12 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ROWRMS",
     "PLOW_DOP_SITU_GLU",
     "PLOW_DOP_SOFTCAP",
+    "PLOW_DOP_XALLGATHER",
     "PLOW_DOP_XARGMAX_FIN",
     "PLOW_DOP_XFLASHMERGE",
     "PLOW_DOP_XREDUCE",
     "PLOW_DOP_XREDUCE2",
+    "PLOW_DOP_XREDUCESCATTER",
     "PLOW_DOP_XREDUCE_ADD_NORM",
 ];
 
@@ -6494,8 +6923,31 @@ fn emit_dense_gqa(
             break;
         } // MoE without prefill: decode-only blob
         let mut b = Builder::new(n_cu);
+        b.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
         b.adopt_tensors(tensors.clone());
         b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
+        b.set_lean_moe_stage2_segments(amd && emit_config::active().moe_stage2_lean);
+        b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
+        b.set_lean_moe_combine_segments(amd && emit_config::active().moe_combine_lean);
+        b.set_moe_prefill_ep_degree((amd && emit_config::active().moe_prefill_ep).then_some(c.tp));
+        b.set_lean_kda_intra_segments(amd && emit_config::active().kda_intra_cached);
+        b.set_kda_intra_wave_items_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().kda_intra_wave_items,
+        );
+        b.set_attn_res_f32mix_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().attnres_f32mix,
+        );
+        b.set_lean_kda_key_factor_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().kda_key_factor,
+        );
+        b.set_kda_carry_regstate_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().kda_chunk_qpre
+                && emit_config::active().kda_carry_regstate,
+        );
         if amd {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }
@@ -6546,6 +6998,7 @@ fn emit_dense_gqa(
     );
     for (ri, &rb) in rungs.iter().enumerate() {
         let mut bd = Builder::new(n_cu);
+        bd.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
         bd.adopt_tensors(tensors.clone());
         bd.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
         if amd {
@@ -6732,6 +7185,10 @@ fn emit_dense_gqa(
     if !arch.is_empty() {
         let man = manifest::build(&m, &arch, &lean);
         let mpath = std::path::Path::new(&out).with_file_name("build.json");
+        let cpath = std::path::Path::new(&out).with_file_name("plow_config.h");
+        manifest::write_config_header(&cpath, &man)
+            .unwrap_or_else(|e| panic!("{}: compile config not written: {e}", cpath.display()));
+        eprintln!("  compile config -> {}", cpath.display());
         match serde_json::to_vec_pretty(&man).map(|b| std::fs::write(&mpath, b)) {
             Ok(Ok(())) => eprintln!("  build manifest -> {}", mpath.display()),
             Ok(Err(e)) => eprintln!("  WARN: build.json not written: {e}"),

@@ -32,6 +32,24 @@ it has the full methodology, commands, and pitfalls; its backbone is
 `docs/arch/12-using-the-tuner.md` (how to measure acceptably). This prompt is
 the executable checklist.
 
+## Promotion order
+
+Performance work proceeds in this order:
+
+1. Derive the exact production shape, dtype, scale layout, strides and output
+   contract from the emitted packet and reference-framework dispatch.
+2. Beat the matching vendor kernel in an isolated same-session A/B using the
+   same inputs and oracle. A nearby shape or an unfused vendor fallback is not
+   a valid comparator.
+3. Beat the exact unfused sequence with the fused semantic kernel.
+4. Beat the reference framework at one isolated semantic block.
+5. Run the full network only as the final correctness and promotion gate.
+
+Do not spend campaign time on whole-model sweeps while a hot individual kernel
+still loses its exact AITER/ROCm or library peer. Keep all harness controls
+operator- and shape-derived; model names belong only in workload manifests and
+result records.
+
 ## Preconditions (from Stages 1–3)
 
 * Stage 3 passed: every compiled bucket verifies, so the schedule you time is
@@ -74,6 +92,15 @@ Record the verdict per family (GEMM / GEMV / attention / MoE / collectives)
 before proceeding: tunable now, blocked-on-oracle, blocked-on-knob, or alias
 no-op.
 
+For `$VENDOR = amd`, inspect the current [AITER](https://github.com/ROCm/aiter) implementation for the same
+model/operator and hipBLASLt for GEMM before proposing a kernel body change.
+Treat them as candidate schedules and measured ceilings, not code to copy or a
+stored baseline. Record the upstream commit, toolchain, architecture, dtype and
+complete live shape; a result from another shape or part is only a hypothesis.
+Trace the reference framework to the kernel it actually dispatches. Record
+padding, quantization, sorting/alignment, reductions and epilogues around that
+call so both sides time the same semantic boundary.
+
 ## Procedure
 
 ### 1. Establish the ceilings
@@ -97,6 +124,12 @@ no-op.
   ```
   Evidence only (no oracle) — use it to classify each kernel compute- vs
   bandwidth-bound and to size the gap.
+* Vendor ceiling (`$VENDOR = amd`): measure each hot live shape against
+  hipBLASLt or the matching AITER operator when one exists. Match ISA,
+  dtype/scale layout, M/N/K, batch/context, head geometry, top-k and expert
+  count. Verify both outputs against the same oracle. Record latency plus VGPR,
+  AGPR, LDS and spills for the plow production object; a standalone wrapper
+  with different occupancy is not evidence that the interpreter improved.
 
 ### 2. Derive the hot shapes from demand — never hand-author
 
@@ -129,8 +162,23 @@ exist on your target.
   Manual alternative: `gemm_tile_sweep <M> <N> <K> [label] [quant]` with
   `PLOW_GEMM_JSONL=<path>`, then `plowc tune ingest --samples <path>`.
 * **Decode GEMV (`$VENDOR = amd`):** `gemv_row_sweep <N> <K>` with
-  `PLOW_GEMV_JSONL` (shape list via `scripts/rebench_tune_gemv.sh` from the
-  census), then `tunedb-gemv ingest --db tuning --gpu "$GPU" --samples <jsonl>`.
+  `scripts/gemv_campaign_lease.sh OBJ JSONL CAMPAIGN -- EMIT_COMMAND...` runs
+  the emitter with `PLOW_TUNE_DUMP=1`, builds the current gfx950 harness outside
+  the lease in the repository's `nix develop`, sweeps the supported census
+  under one lease, then ingests outside it. OBJ must be a fresh path. Set
+  `TUNE_GPU=MI350X` or `MI355X`; the harness separately requires one unique
+  physical MI350X/MI355X name and CU count and records that detected part in the
+  shared `amd/gfx950/mi350x` cell. Every demanded BF16 case requires all five
+  MM=1/2/4/8/16 symbols, including MM>M coverage and walked MM<M cases; MXFP4
+  requires the exact compiled OBJ_MM and M<=OBJ_MM. QKVG sweep support lands
+  with this campaign.
+  Current production demand reaches B=128 while compiled MM remains <=16 and
+  serves wider rows by walking. Unsupported census opcodes, duplicates,
+  unexpected rows, missing rungs, contention, incorrect samples, or
+  interpreter/toolchain/oracle drift prevent ingest. `PLOW_GEMV_BUILD_DIRECT=1`
+  is reserved for the CPU mock selftest. Production captures the exact
+  `PLOW_TOOLCHAIN_LABEL` exported by the repository flake before building and
+  binds that same label through both identity probes and ingest.
   `--gpu` is required — it decides the cell.
 * **Decode knobs (`$VENDOR = nvidia`, object grid):** `scripts/tune_decode_sweep.sh`
   (sweeps `PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, MoE knobs jointly,
@@ -157,6 +205,175 @@ Respect the couplings: `GV_MM_MAX` moves the register ceiling of every arm in
 the object; MoE grouped GEMM shares the dense `PGM_*` tile; `PGM_BM` is
 packet-layout-visible. These cannot be swept independently.
 
+### 3a. Agent iteration loop (AMD)
+
+Use [CUDA-Agent](https://arxiv.org/abs/2602.24286)'s implement → compile → verify → profile loop, with Plow's
+stronger controls:
+
+1. Freeze the oracle, workload generator, lease wrapper and timing parser before
+   the baseline. If one changes, invalidate and re-run the baseline.
+2. Write one hypothesis and expected counter movement before each candidate.
+3. Change one algorithmic lever first; tile/unroll searches come only after the
+   bottleneck is measured. Keep runtime-selectable candidates in one object only
+   when that does not raise production-object registers or instruction footprint.
+4. Compile, run the adversarial oracle grid, audit the production object, then
+   measure repeated same-session A/B samples. Reject correctness failures,
+   spills, route misses, contended samples and wins below `Stats::beats`.
+5. Append every result, including losses, to the campaign record. Promote only
+   the best qualified, current-digest candidate; remove dead candidate code after
+   the record is complete.
+
+A fixed 5% target is not proof of improvement. Precision, scale layout and
+tolerance must be identical across arms. Stop at a decisive measured win or
+exhausted hypotheses, not after a fixed number of agent turns.
+
+### 3b. Prefill fusion promotion ladder (AMD)
+
+Keep this procedure model-agnostic. Derive every operator, shape, dtype,
+consumer count, parallel degree and prompt bucket from the emitted artifact and
+the target workload. Exclude speculative/draft-model work from this campaign.
+A fused kernel is not a candidate for network timing until it decisively beats
+the exact unfused sequence it replaces.
+
+#### Discover candidates; do not encode a model recipe
+
+Audit the production trace for these general seams:
+
+- projection + position transform, or related projections sharing an input;
+- attention input projection + attention, including latent/absorbed forms;
+- gate + up projection + activation;
+- sparse routing/sort/align + grouped expert work, empty-bin skipping, and
+  expert output + deterministic combine;
+- collective + residual + normalization;
+- recurrent/state update + gate/normalization;
+- any producer/consumer pair whose intermediate is written to HBM and has one
+  semantic consumer.
+
+Reject a proposed fusion before coding when it duplicates a reduction across
+consumers, changes a required association/order, extends buffer lifetime,
+crosses workgroups without a valid communication mechanism, or makes the
+production object's register/LDS ceiling worse. A decode-only fused opcode is
+not a prefill implementation; absent dispatch arms must refuse loudly rather
+than silently leave an output unwritten.
+
+#### Fast-path and layout audit
+
+For every live shape, record the selected packet opcode, object, device body and
+fallback reason. Library divisibility/alignment constraints can route a valid
+shape onto a much slower generic path. Test native arbitrary-shape support first;
+padding is a candidate only when `fast_path(padded) + pad/unpad` beats the native
+path despite the extra work. Compare against the current AITER/hipBLASLt route
+for the same shape, but do not import its padding, preshuffle or quant layout
+without an end-to-end conversion-cost measurement.
+
+Treat a lower-bit weight/KV format as a system candidate, not a kernel flag:
+include pack/quant/dequant work, scale traffic, persistent weight layout, KV
+capacity/headroom and any change in the minimum feasible TP degree. Do not
+credit memory saved unless the production allocator or topology consumes it.
+
+#### Gates, in order
+
+1. **Paired kernel gate.** Retain a same-revision switch for the exact unfused
+   decomposition. Time that sequence and the fused candidate in one GPU timing
+   region with identical buffers, inputs, scales, routing tables and warmup. The
+   fusion must beat the sequence *as executed*, including launches and
+   materialized intermediates. Verify every deleted intermediate boundary and
+   final output.
+2. **Shape gate.** Cover every emitted bucket plus ragged boundaries, shortest
+   and longest served contexts, supported precisions, minimum/maximum batch,
+   empty sparse partitions, maximum top-k and adversarial imbalance. Audit ISA,
+   VGPR/AGPR/LDS, spills, achieved occupancy and the live route.
+3. **Operator-chain gate.** Put the winner back beside its real producers,
+   consumers and collectives. Reconcile the observed delta with packet counts,
+   intermediate bytes removed and profiler counters. An unexplained inversion
+   blocks promotion.
+4. **Block gate.** Run a real block of each architecture class present in the
+   artifact. A kernel winner that loses the block is rejected.
+5. **Composition gate.** Enable only individually qualified fusions, first in
+   pairs and then as a set. Re-run correctness and timing after every addition;
+   object-wide register, instruction-cache and scheduling effects can reverse
+   isolated wins.
+6. **Network gate.** Emit the complete checkpoint and run cold/prefix-miss and
+   warm/prefix-hit prefill through `plowrt serve` with the same artifacts and
+   client on both arms. Report TTFT distributions, prefill tok/s, memory use and
+   decode regression checks at workload-derived prompt lengths and concurrency.
+
+At network scope, report collective time separately and evaluate the lowest TP
+degree that fits. A topology change is a separate experimental cell, never
+credited to a kernel fusion. Likewise, profile Plow's existing submission path
+before proposing graph capture; capture is a separate runtime experiment, not
+evidence that a fused body improved.
+
+Record one row per `(candidate, scope, shape, artifact digest)`, with `scope` =
+`kernel`, `operator-chain`, `block`, `composed-block`, or `network`. Adoption
+requires every scope. Never multiply an isolated speedup by layer count to claim
+a network win.
+
+Use [`perf-data/fusion-ladder-row-v1.schema.json`](../../../perf-data/fusion-ladder-row-v1.schema.json)
+for those rows. Keep one JSON object per line and validate before recording a
+decision:
+
+```bash
+python3 perf-data/tools/fusion_ladder_results.py validate results.jsonl
+python3 perf-data/tools/fusion_ladder_results.py aggregate results.jsonl \
+  --output promotion.json
+```
+
+For a production run, provide one `plow.fusion-ladder.run.v1` manifest containing
+exactly one entry for every scope, with explicit baseline/candidate argv and
+artifact paths, then run:
+
+```bash
+python3 perf-data/tools/fusion_ladder_run.py manifest.json --output run-dir
+```
+
+The runner requires at least three alternating paired rounds. Every command's
+final stdout line must be `plow.fusion-ladder.evidence.v1` JSON containing its
+positive latency, correctness result, route/coverage/regression evidence, and
+all scope gates. It hashes argv, artifacts, and canonical configuration,
+snapshots both artifact arms after every command and at the end, preserves
+stdout/stderr per arm and round, and emits
+validated `rows.jsonl` plus `promotion.json`. A missing scope/evidence field,
+failed command/gate, or non-decisive pair fails closed; the runner never fills a
+row from assumptions. Baseline/candidate checksums must match in every round;
+non-exact checks instead require the same explicit tolerance contract on both
+arms in every round, with both commands reporting correctness passed.
+
+The configuration digest is the SHA-256 of compact, key-sorted configuration
+JSON. Every row binds a structured shape; candidate, baseline, and configuration
+digests; checksum method and values; paired raw latency samples; route and
+coverage evidence; and the scope-specific gates. At kernel scope,
+`exact_unfused` explicitly identifies the comparator. Aggregation exits 2 and
+sets `qualified=false` when any scope is missing or any measured shape fails. It
+never fills missing scopes or promotes an unmeasured arm.
+
+### 3c. General AMD candidate families
+
+Derive these from the emitted graph and live trace; never key the harness on a model name.
+
+1. **Long-sequence recurrence:** replace a serial token recurrence with a chunked parallel scan
+   only when the state transition is associative or has an exact chunk composition. Sweep chunk
+   and subchunk sizes. Carry sequence boundaries and reset metadata from the host; never rebuild
+   them with a blocking device-to-host read. Keep the serial body as the oracle and fallback.
+2. **Ownership-preserving recurrent fusion:** test one workgroup owning a complete recurrent head
+   or state shard and fusing its convolution/state update, normalization and output gate. Account
+   for all deleted intermediate traffic and packet edges. A partial fusion that leaves a grid
+   rendezvous is a separate candidate, not evidence for the whole-head form.
+3. **Skinny projection split-K:** sweep split count by exact `(arch, CU, object digest, op, M, N,
+   K, dtype, layout)` and include the reduction kernel in the timed region. Do not copy a vendor
+   table row or use one split for every rung. Missing/stale rows fall back loudly.
+4. **Grouped sparse work:** tune both expert stages by token bucket and observed expert
+   distribution, including persistent vs non-persistent and atomic vs reduction forms. Gate empty,
+   maximally skewed and random expert bins; finite output and deterministic replay are mandatory.
+5. **Attention split/persistence:** select candidates by decode rung and KV-length bucket. Measure
+   split and merge together, including scratch traffic. Prefer deterministic table lookup at
+   runtime; online timing is a separate experiment and must not enter request latency silently.
+
+For every family, distinguish `compiled`, `qualified`, and `selected` in `build.json` or the
+runtime result. A compiled arm or a populated database is not evidence that production selected
+it. Refuse promotion when the artifact has no manifest, Lean was skipped without an accepted
+reason, or any demanded tuned shape resolves to analytical fallback.
+
 ### 4. Interpret
 
 * Compute the roofline % per family against the **binding** side: bytes/time
@@ -170,6 +387,10 @@ packet-layout-visible. These cannot be swept independently.
 * An occupancy delta is only real with a matched-grid control — the measured
   occ-2 "win" on decode flash was wave quantization
   (`perf-data/px16-decode-occupancy.md`).
+* On AMD, collect profiler counters selected by the hypothesis, not every
+  metric. Relate MFMA utilization, memory stalls/TCC traffic, LDS conflicts and
+  achieved occupancy to the change. A resource limiter alone does not establish
+  elapsed-time impact.
 
 ### 5. Register winners and verify consumption
 
@@ -240,6 +461,9 @@ Pass when **all** hold:
    "tuned" was real before trusting block latency.
 6. No command in the campaign contained a literal part name; every `--gpu`,
    `--arch` and `--n-cu` came from the target block.
+7. Every changed AMD object passed the resource/ISA audit: no spill regression,
+   expected VGPR/AGPR/LDS and occupancy, the expected MFMA mnemonic for `$ISA`,
+   and a live marker/routing proof that the measured arm executed.
 
 ## Pitfalls to actively guard against
 

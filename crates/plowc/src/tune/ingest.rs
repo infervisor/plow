@@ -19,13 +19,10 @@
 //!
 //! # Why the digests cannot come from the sweep
 //!
-//! A measurement is only valid for the object it ran inside. `kernelcaps` derives that object's
-//! identity by preprocessing `interp.hip` and hashing the result, so an edit to `op_gemm.h` — a
-//! tile constant, say — changes it and every prior record becomes stale rather than silently
-//! authoritative. The C harness cannot compute that, and should not: it would mean two
-//! implementations of the identity rule. Digest churn is the dominant operational fact here (23
-//! commits touching `runtime/amd/*` in one day produced seven distinct digests), which is why
-//! every subcommand prints the digest it probed.
+//! A measurement is only valid for the dense-GEMM family it ran. `kernelcaps` derives that
+//! identity from the preprocessed GEMM bodies and their expanded dependencies across bf16, fp8,
+//! and mxfp4. Unrelated interpreter arms are excluded because the sweep launches standalone
+//! kernels; changes to any measured GEMM body still stale the whole conservative family key.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -34,8 +31,8 @@ use kernelcaps::QuantScheme;
 use packet::dev::DevOp;
 use tunedb::gemm::parse_quant;
 use tunedb::{
-    gemm_op_case, gemm_rung_opcode, Correctness, Digests, KernelMeasurement, RecordState, Stats,
-    TuneStore, GEMM_ORACLE,
+    gemm_op_case, gemm_rung_emit_plan, gemm_rung_opcode, Correctness, Digests, KernelMeasurement,
+    RecordState, Stats, TuneStore, GEMM_ORACLE,
 };
 
 type Err = Box<dyn std::error::Error>;
@@ -74,10 +71,14 @@ fn probe_inventory(
             "cannot probe the {arch} interpreter ({e}); ingest needs it to key records to a build"
         )
     })?;
+    let build = kernelcaps::dense_gemm_tuning_build(root, isa).map_err(|e| {
+        let arch = isa.arch_flag();
+        format!("cannot fingerprint the {arch} dense-GEMM family ({e})")
+    })?;
     let want = Digests {
-        implementation: inv.build().label(),
-        interpreter: inv.build().label(),
-        toolchain: inv.build().toolchain.clone(),
+        implementation: build.label(),
+        interpreter: build.label(),
+        toolchain: build.toolchain.clone(),
         oracle: GEMM_ORACLE.to_string(),
     };
     Ok((inv, want))
@@ -126,11 +127,9 @@ pub fn ingest(
         }
         let r: Row = serde_json::from_str(line)?;
         let quant = parse_quant(&r.quant).ok_or_else(|| format!("unknown quant {:?}", r.quant))?;
-        // A tile with no dispatch arm is a legitimate measurement of a kernel BODY and not a
-        // selectable fact — the sweep also compiles calibration-only tiles (320x128, 384x128,
-        // 128x384, 192x128). Reported, never stored. The static RUNGS map is kept as a fallback
-        // for a probe that found no tiled specs (it is also what pins the sweep↔dispatch
-        // agreement in `rungs_map_to_distinct_opcodes`).
+        // A tile with no dispatch representation is a legitimate measurement of a kernel BODY
+        // and not a selectable fact. The richer emit-plan map covers tagged bodies that share an
+        // opcode; the static opcode map remains the fallback for ordinary rungs.
         let mut ops: Vec<DevOp> = tile_ops
             .iter()
             .filter(|(t, q, _)| *t == r.tile && *q == quant)
@@ -138,7 +137,8 @@ pub fn ingest(
             .collect();
         ops.sort_unstable_by_key(|op| *op as u16);
         ops.dedup();
-        if ops.is_empty() {
+        let tagged_plan = gemm_rung_emit_plan(&r.tile, quant).filter(|p| p.packet_tag != 0);
+        if ops.is_empty() && tagged_plan.is_none() {
             if let Some(op) = gemm_rung_opcode(&r.tile, quant) {
                 ops.push(op);
             } else {
@@ -156,8 +156,14 @@ pub fn ingest(
                 detail: format!("f64 dot spot-check mismatch on {}", r.sym),
             }
         };
-        for op in ops {
-            let (kernel_id, kernel_name) = (op as u16, op.c_name().to_string());
+        let identities: Vec<(u16, String)> = if let Some(plan) = tagged_plan {
+            vec![(plan.measurement_id, plan.kernel_name())]
+        } else {
+            ops.into_iter()
+                .map(|op| (op as u16, op.c_name().to_string()))
+                .collect()
+        };
+        for (kernel_id, kernel_name) in identities {
             if !r.correct {
                 failed.push(format!("{op_case} {kernel_name}"));
             }

@@ -75,6 +75,8 @@ pub fn is_runtime_tensor(name: &str) -> bool {
 pub fn is_host_filled_table(name: &str) -> bool {
     name.ends_with("mlp.expert_weight_table")
         || name.ends_with("mlp.expert_scale_table")
+        || name.ends_with("mlp.expert_weight_table_moe2")
+        || name.ends_with("mlp.expert_scale_table_moe2")
         || name.ends_with("mlp.dense_weight_table")
         || name.ends_with("mlp.dense_scale_table")
         // The PRESHUFFLED twin of expert_weight_table (PLOW_MOE_PF_SHUF): points into a second
@@ -162,6 +164,8 @@ mod tests {
             for suf in [
                 "mlp.expert_weight_table",
                 "mlp.expert_scale_table",
+                "mlp.expert_weight_table_moe2",
+                "mlp.expert_scale_table_moe2",
                 "mlp.dense_weight_table",
                 "mlp.dense_scale_table",
             ] {

@@ -1,12 +1,10 @@
 //! `plowc` — compile a model or network into runtime packet streams for a GPU.
 //!
-//! **The egglog rewriting stage is analysis, not compilation.** Both of this
-//! binary's paths run it and both throw the result away: the plan path computes
-//! a `FusedGraph` for its statistics and lowers the RAW graph anyway (see the
-//! `plowc` crate docs), and the devblob path calls [`report_devblob_egglog`],
-//! which logs a fusion count and returns `()`. `devgen`, the devblob emitter,
-//! does not depend on `rewrite` at all. **No egglog rewrite has ever reached a
-//! GPU.** Every fusion in a shipped packet is hand-written in `devgen`.
+//! The egglog rewriting stage does not lower packets. On the devblob path its
+//! extracted graph now supplies a fail-closed semantic-coverage gate over the
+//! finished GPU program: only rewrite/opcode mappings proved exact are counted,
+//! and emission is rejected if devgen no longer carries their required ops.
+//! `rewrite_applied` remains zero; existing packet fusions are hand-written.
 //!
 //! This is stated here, at the driver's front door, because the log line alone
 //! ("egglog fusion analysis … fusions_found=662") was read as a compiler pass
@@ -23,6 +21,8 @@ use plowc::{compile, net::NetConfig, Options, Parallel, Report, Source};
 use schedule::Phase;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+mod fusion_coverage;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -270,6 +270,11 @@ struct Cli {
     /// §P Emit a host TOKENIZE packet at the graph head (text/ids → tokens).
     #[arg(long, default_value_t = false)]
     emit_tokenize: bool,
+
+    /// Experiment: fuse structurally matched same-input linear pairs into one
+    /// multi-output GPU packet. Full-graph analysis must establish the match.
+    #[arg(long, default_value_t = false)]
+    experiment_parallel_linear2: bool,
 
     /// Emit a Chrome Trace Event Format JSON per bucket
     /// (`{stem}.trace.json`) showing every scheduled task as a duration
@@ -633,80 +638,40 @@ fn main() -> ExitCode {
     }
 }
 
-/// egglog fusion analysis for the devblob path (`--lean-verify`/`--lean-oracle`).
-///
-/// **ADVISORY ONLY — the result is discarded and NO fusion it finds reaches the
-/// emitted packet.** This is not a caveat about coverage; it is the whole
-/// relationship. `devgen` (the devblob emitter) has no `rewrite`/`egglog`
-/// dependency at all — check `crates/devgen/Cargo.toml` — so there is no path
-/// by which a fused term could be lowered here even in principle. The function
-/// builds a SECOND graph from the same `config.json`, saturates it, counts what
-/// matched, logs the count, and drops it on the floor. Every fusion in a plow
-/// packet (`GemvQkv` op 22, `GemvGlu` op 19, `NormResidualNorm`, …) is
-/// hand-written in `devgen`, chosen by hand, and owes nothing to this pass.
-///
-/// Measured on Gemma-4-31B: `graph_ops=1444, fusions_found=662`
-/// (`FusedNormLinear` 241, `FusedResidualNorm` 120, `FusedNormRope` 120,
-/// `SwiGLU` 60, …). Read that as "the rewrite rules would have found 662
-/// opportunities IF they were wired", not as work the compiler did.
-///
-/// Deliberately not wired up, and the reason is measurement rather than effort:
-/// deleting packets is worth **≤0.064 ms/token**. `PLOW_NO_FUSE_QKV=1` reverts
-/// the shipped fused QKV to three GEMVs — identical binary, identical 79,947
-/// workgroup-packets, +100 gates — and the split version measured *faster*
-/// (17.704 vs 18.070 ms/token, n=8). Replicated on sm_120
-/// (`perf-data/t11-packet-reduce.md`). So the value of routing these 662 through
-/// to emission is bounded near zero, and the honest thing is to say the stage is
-/// advisory rather than to leave a whole-model rewrite pass looking load-bearing.
-///
-/// Failures are warnings — analysis never blocks emission. Same standing as
-/// `plowc`'s plan path, which drops its `FusedGraph` for the same reason; see
-/// the `plowc` crate docs and `perf-data/px18-egglog-wholemodel.md`.
-fn report_devblob_egglog(dir: &std::path::Path) {
-    let json = match std::fs::read_to_string(dir.join("config.json")) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!(error = %e, "egglog analysis skipped: no readable config.json");
-            return;
-        }
-    };
-    let mut g = match nn_graph::models::build_from_config_json_at(
-        &json,
-        &nn_graph::models::ShapeBucket::default(),
-    ) {
-        Ok(g) => g,
-        Err(e) => {
-            warn!(error = %e, "egglog analysis skipped: graph build failed");
-            return;
-        }
-    };
-    g.bind(&nn_graph::Bindings::new().set("B", 1).set("S", 512));
-    // Stats-only exploration (no extraction): the release profile is
-    // `panic = "abort"`, and egglog 2.0.0's extractor has an upstream panic
-    // (extract.rs:471, costless e-class — e.g. Qwen3/Gemma-MoE graphs) that
-    // would kill emission. `explore_stats` saturates and counts fused-op
-    // matches without ever extracting.
-    match rewrite::explore_stats(&g) {
-        Ok((ops, fused)) => {
-            let total: usize = fused.iter().map(|(_, c)| c).sum();
-            // The `applied`/`reaches_gpu` fields are not decoration. Without them
-            // this line reads as a compiler pass reporting its work, and the
-            // number was quoted that way. `devgen` has no `rewrite` dependency:
-            // ALL of these are dropped.
-            info!(
-                graph_ops = ops,
-                fusions_found = total,
-                applied = 0,
-                reaches_gpu = false,
-                by_op = ?fused,
-                "egglog fusion analysis (devblob path): ADVISORY ONLY — all {total} fusions are \
-                 discarded, none reach the emitted packet (devgen has no rewrite dependency). \
-                 devgen's fusions are hand-written; measured value of packet deletion is \
-                 <=0.064 ms/token."
-            );
-        }
-        Err(e) => warn!(error = %e, "egglog analysis failed"),
-    }
+fn fusion_coverage_hook(
+    coverage: fusion_coverage::FusionCoverage,
+    inner: devgen::VerifyHook,
+) -> devgen::VerifyHook {
+    Box::new(move |model| {
+        let report = coverage.validate(model)?;
+        let verified = inner(model)?;
+        info!(
+            graph_ops = coverage.graph_ops,
+            extracted = coverage.extracted,
+            rewrite_applied = 0,
+            gpu_equivalent_covered = report.gpu_equivalent_covered,
+            not_opcode_equivalent = report.not_opcode_equivalent,
+            missing = 0,
+            reaches_gpu_semantics = report.gpu_equivalent_covered > 0,
+            same_input_narrow_pairs_missing_rule = coverage.same_input_narrow_pairs,
+            parallel_linear2 = ?coverage.parallel_linear2(),
+            by_op = ?coverage.by_op,
+            "whole-graph fusion coverage: exact mappings gate the emitted decode program; \
+             rewrite still lowers no packet. Same-input narrow linear pairs need a generic \
+             multi-output rule; GemvQkv with Nv=0 already supplies the GPU opcode."
+        );
+        Ok(verified)
+    })
+}
+
+fn whole_graph_fusion_decisions(
+    coverage: Option<&fusion_coverage::FusionCoverage>,
+    tp: u32,
+    experiment_parallel_linear2: bool,
+) -> devgen::WholeGraphFusionDecisions {
+    coverage
+        .map(|coverage| coverage.decisions(tp, experiment_parallel_linear2))
+        .unwrap_or_default()
 }
 
 /// The devblob Lean gate: certify, per emitted program, that the
@@ -724,7 +689,7 @@ fn report_devblob_egglog(dir: &std::path::Path) {
 ///
 /// Purely an optimisation gate — see the contract on
 /// [`lean_verify::binary_available`]. It exists so a default-on compile skips
-/// `report_devblob_egglog` and the whole `ScheduleRequest` marshal when there is
+/// the whole `ScheduleRequest` marshal when there is
 /// obviously no verifier, NOT so anyone can assume a `None` here means the
 /// verifier will work. The hook below still downgrades a spawn failure.
 fn lean_unavailable_reason() -> Option<&'static str> {
@@ -792,7 +757,8 @@ fn devblob_verify_hook(
                 let (so, sl) = (e.succ_ofs as usize, e.succ_len as usize);
                 succs.push(p.succs[so..so + sl].iter().map(|&c| c as u64).collect());
             }
-            // ONE CURSOR, OR ONE PER DOMAIN — the verifier has to be told which.
+            // ONE CURSOR, OR ONE PER (ORDERED SEGMENT, DOMAIN) — the verifier has to be told
+            // which. These are device-side queues; the host only launches the ordered segment.
             //
             // Unplaced, the GQ is a single global cursor, so entry `i`'s issue predecessor is
             // entry `i-1` and `resource = 0 / stream_idx = i` is exactly right.
@@ -807,19 +773,28 @@ fn devblob_verify_hook(
             // "ordering graph has a cycle (160499 nodes unsorted)", where placement OFF on the
             // identical program certifies clean.)
             //
-            // With `resource = seg` the check gets sharper, not weaker: it now actually proves
-            // the per-window claim §3 only argued informally — each window is internally
-            // op-major, so 8 concurrent cursors cannot deadlock.
+            // With `resource = segment*domains+domain` the check gets sharper, not weaker: each
+            // per-XCD queue is internally op-major, while independent XCDs make progress
+            // concurrently and may have counter edges in either flattened-array direction.
             let placed = p.l2_domains > 0;
             let (resource, stream_idx): (Vec<u64>, Vec<u64>) = if placed {
                 let mut res = Vec::with_capacity(n);
                 let mut idx = Vec::with_capacity(n);
-                let mut next = vec![0u64; p.l2_domains as usize + 1];
+                let windows = p.gq_seg_ofs.len().saturating_sub(1).max(1);
+                let mut next = vec![0u64; windows];
                 for e in &p.gq_stream {
-                    let d = (e.seg as usize).min(p.l2_domains as usize);
-                    res.push(d as u64);
-                    idx.push(next[d]);
-                    next[d] += 1;
+                    let d = ((e.flags & packet::dev::SE_DOMAIN_MASK)
+                        >> packet::dev::SE_DOMAIN_SHIFT) as usize;
+                    let window = e.seg as usize * p.l2_domains as usize + d;
+                    if window >= windows {
+                        return Err(format!(
+                            "program {pi} (T={}): stream entry selects XCD queue {window} of {windows}",
+                            m.prog_t.get(pi).copied().unwrap_or(0)
+                        ));
+                    }
+                    res.push(window as u64);
+                    idx.push(next[window]);
+                    next[window] += 1;
                 }
                 (res, idx)
             } else {
@@ -1124,6 +1099,32 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         .clone()
         .or_else(|| std::env::var("PLOW_BLOCK").ok().filter(|s| !s.is_empty()));
 
+    // Full-model extraction is now a semantic coverage obligation, not a
+    // fusion counter. Partial `--block` emits intentionally contain fewer
+    // instances and remain a debugging path, so only a full model is gated.
+    let fusion_coverage = if block_spec.is_none() {
+        match fusion_coverage::FusionCoverage::analyze(&dir) {
+            fusion_coverage::Analysis::Covered(coverage) => Some(coverage),
+            fusion_coverage::Analysis::Ineligible => None,
+            fusion_coverage::Analysis::AdvisoryFailure(e) => {
+                warn!(error = %e, "whole-graph fusion coverage unavailable; no structurally eligible KDA graph was established");
+                None
+            }
+            fusion_coverage::Analysis::RequiredFailure(e) => {
+                return Err(format!("whole-graph fusion coverage failed closed: {e}").into())
+            }
+        }
+    } else {
+        None
+    };
+    // Candidate eligibility comes only from full-graph analysis. Qualification
+    // remains an explicit experiment until the network gate promotes it.
+    let whole_graph_fusions = whole_graph_fusion_decisions(
+        fusion_coverage.as_ref(),
+        tp,
+        cli.experiment_parallel_linear2,
+    );
+
     // The Lean gates on the devblob path. BOTH ARE ON BY DEFAULT (disable with
     // `--no-lean-verify` / `--no-lean-oracle`, one switch each, no coupling).
     //
@@ -1163,7 +1164,6 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         );
         Some(devgen::skip_hook(why))
     } else {
-        report_devblob_egglog(&dir);
         let spec = hwspec::registry::lookup(&cli.gpu)
             .ok_or_else(|| format!("unknown GPU {:?}", cli.gpu))?;
         // MEASURED bandwidth, not the datasheet peak — `bandwidth_for_bound()`, not
@@ -1183,6 +1183,11 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             spec.clock_boost.0,
         )?)
     };
+    let verify = match (fusion_coverage, verify) {
+        (Some(coverage), Some(inner)) => Some(fusion_coverage_hook(coverage, inner)),
+        (None, hook) => hook,
+        (Some(_), None) => unreachable!("devblob emission always constructs a verification hook"),
+    };
     // `PLOW_L2_PLACE=1`: L2-domain-aware placement. The whole layout — SMs per L2 partition and
     // the partition count — is resolved from `hwspec` (XCD on MI300/MI350, GPC on H100/B200),
     // not from an env-supplied constant; the flag only says whether to use it. `None` (flag
@@ -1196,19 +1201,15 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // live so in-flight scripts and recipes do not break.
     let l2_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
     let l2_off = |k: &str| std::env::var(k).ok().as_deref() == Some("0");
-    // DEFAULT ON FOR gfx942. Per-XCD queues are the shipped MI300X decode path, not a tuning
+    // DEFAULT ON FOR gfx942/gfx950. Per-XCD queues are the shipped CDNA decode/prefill path,
     // knob: windowing the global queue by L2 domain drains EIGHT queues concurrently instead of
     // one, and it is what makes the two-level gate (PLOW_GATE_HIER) expressible. MEASURED on
     // MI300X, Gemma-4-12B fp8 decode: placement -1.5%, hierarchy -16.0% on top -- the largest
     // win on that arch by a wide margin. Opt out with PLOW_L2_PLACE=0.
     //
-    // SCOPED TO gfx942 DELIBERATELY. A placed blob REQUIRES objects built with
-    // -DPLOW_L2_PLACE_DISPATCH (plowrt refuses the mismatch rather than mis-dispatching), and
-    // scripts/build_gfx942.sh now passes that by default while build_gfx950.sh does NOT. Turning
-    // this on for all AMD would therefore break every gfx950 asset pipeline until its objects
-    // were rebuilt -- and the gfx950 numbers have not been measured here. gfx950 keeps the
-    // explicit opt-in it has always had.
-    let l2_default = cli.arch == "gfx942" && !l2_off("PLOW_L2_PLACE");
+    // Both shipping AMD object recipes carry the checked dispatch marker. Other architectures
+    // remain explicit opt-in until their physical-domain mapping is measured.
+    let l2_default = matches!(cli.arch.as_str(), "gfx942" | "gfx950") && !l2_off("PLOW_L2_PLACE");
     let l2_layout = if l2_default || l2_on("PLOW_L2_PLACE") || l2_on("PLOW_NV_PLACE") {
         hwspec::registry::lookup(&cli.gpu)
             .and_then(|s| s.l2_partitioning.as_ref())
@@ -1271,6 +1272,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
                 }
                 cfg
             }),
+            whole_graph_fusions,
         },
         verify,
     );
@@ -2116,6 +2118,20 @@ mod cli_tests {
         // The opt-in still works and is still independent per subsystem.
         assert!(parse(&["--lean-verify"]).lean_verify);
         assert!(parse(&["--lean-oracle"]).lean_oracle);
+    }
+
+    #[test]
+    fn parallel_linear2_experiment_defaults_off_and_is_explicit() {
+        assert!(!parse(&[]).experiment_parallel_linear2);
+        assert!(parse(&["--experiment-parallel-linear2"]).experiment_parallel_linear2);
+    }
+
+    #[test]
+    fn parallel_linear2_experiment_without_full_graph_candidate_is_inert() {
+        assert_eq!(
+            whole_graph_fusion_decisions(None, 8, true),
+            devgen::WholeGraphFusionDecisions::default()
+        );
     }
 
     /// CORRECTION 1, HALF TWO — THE TRAP THIS PINS SHUT.

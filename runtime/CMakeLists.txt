@@ -682,6 +682,33 @@ option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
 # (+14.9% on decode) and is exactly why these stay SEPARATE OBJECTS rather than becoming defines
 # on the rows above. Cost of the default: ~31 s of build, doubled by the `_gq` twins, and ~3 MB.
 option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON)
+option(PLOW_HSACO_PACKED_PREFILL_CONSUMERS
+       "Emit separate default-off operator-family objects that consume packed prefill metadata" OFF)
+option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF)
+option(PLOW_HSACO_KDA_INTRA_CACHED
+       "Build the standalone cached BT64/D128 KDA-intra segment" OFF)
+option(PLOW_HSACO_KDA_INTRA_WAVE_ITEMS
+       "Also build the packet-paired wave-item BT64/D128 KDA-intra segment" OFF)
+option(PLOW_HSACO_ATTN_RES_F32MIX
+       "Also build the packet-paired f32-mix AttnRes prefill object (PLOW_ATTNRES_F32MIX=1 packets)" OFF)
+option(PLOW_HSACO_KDA_KEY_FACTOR
+       "Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair" OFF)
+option(PLOW_HSACO_KDA_CARRY_REGSTATE
+       "Also build the packet-paired register-resident BT64/D128 KDA carry segment" OFF)
+option(PLOW_HSACO_XR_ATTNRES
+       "Build the standalone two-shot XReduce+AttnRes segment object" OFF)
+option(PLOW_HSACO_MOE_STAGE2_LEAN
+       "Emit the standalone gfx950 MXFP4 grouped-MoE stage-2 object" ON)
+option(PLOW_HSACO_MOE_STAGE1_LEAN
+       "Emit the standalone gfx950 MXFP4 grouped-MoE stage-1 BK256 object" ON)
+option(PLOW_HSACO_MOE_COMBINE_LEAN
+       "Emit the standalone gfx950 fixed-order f32-part MoE combine object" ON)
+option(PLOW_HSACO_MOE_PREFILL_EP
+       "Emit the default-off gfx950 replicated-input expert-parallel boundary objects" OFF)
+option(PLOW_HSACO_MOE_DECODE_GROUPED
+       "Emit the default-off gfx950 grouped MXFP4 decode GLU+DOWN object" OFF)
+option(PLOW_HSACO_MLA_MATERIALIZED_OPUS
+       "Emit the standalone gfx950 bf16 MLA materialized hd192/v128 object" ON)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
 option(PLOW_K3_DECODE_GROUPED
@@ -690,6 +717,13 @@ option(PLOW_MXFP4_DECODE_NT
        "Use non-temporal loads for one-use decode MXFP4 projection weights" ON)
 option(PLOW_MOE_PF_A4W4_WEIGHT_NT
        "Use non-temporal loads for grouped A4W4 expert weights" OFF)
+option(PLOW_MOE_PF_ATOMIC
+       "Fuse grouped-MoE prefill down/combine through an f32 atomic accumulator" OFF)
+option(PLOW_MOE_PF_DET
+       "Fuse grouped-MoE prefill down/combine through a deterministic f64 accumulator" OFF)
+if(PLOW_MOE_PF_ATOMIC AND PLOW_MOE_PF_DET)
+    message(FATAL_ERROR "PLOW_MOE_PF_ATOMIC and PLOW_MOE_PF_DET are mutually exclusive")
+endif()
 option(PLOW_K3_DECODE_TILE_BINSEARCH
        "Use binary expert-tile lookup in batched K3 decode" ON)
 option(PLOW_K3_DECODE_ALIGN_PAR_PREFIX
@@ -700,14 +734,36 @@ option(PLOW_K3_DECODE_XR_AGG
        "Aggregate batched K3 decode two-shot all-gather signals per rank" ON)
 option(PLOW_XR_AGG
        "Aggregate prefill two-shot all-gather signals per rank" ON)
+option(PLOW_XR_WAVE_RS
+       "Use experimental TP8 wave-per-peer prefill reduce-scatter on gfx950" OFF)
+option(PLOW_XR_TRACE_PHASES
+       "Record diagnostic XReduceTwoShot internal phases in packet traces" OFF)
+option(PLOW_XR_TAGGED
+       "Decode one-shot XReduce spins on tagged data words instead of the xctr gate (TP8 gate 2026-09-04: -2.12 ms/token, exact)" ON)
 option(PLOW_KDA_PF_STATE_RESIDENT
        "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
 option(PLOW_K3_KDA_CONV_STEP_DB
        "Fuse K3 B1 Conv3 into StateStepG with ping-pong convolution windows" OFF)
 option(PLOW_MLA_PF_SV
        "Use the V2 MLA-prefill LDS swizzle and fragment staging" ON)
-
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
+set(_PLOW_MLA_PF_TR16_DEFAULT OFF)
+if(PLOW_HSACO_ARCH STREQUAL "gfx950")
+    set(_PLOW_MLA_PF_TR16_DEFAULT ON)
+endif()
+option(PLOW_MLA_PF_TR16
+       "Use gfx950 transpose LDS reads in the V2 MLA-prefill PV stage"
+       ${_PLOW_MLA_PF_TR16_DEFAULT})
+set(_PLOW_XR_RS_U_DEFAULT "1")
+if(PLOW_HSACO_ARCH STREQUAL "gfx950")
+    set(_PLOW_XR_RS_U_DEFAULT "2")
+endif()
+set(PLOW_XR_RS_U "${_PLOW_XR_RS_U_DEFAULT}" CACHE STRING
+    "Independent-element unroll for strict-order prefill reduce-scatter (1 or 2)")
+if(NOT PLOW_XR_RS_U MATCHES "^(1|2)$")
+    message(FATAL_ERROR "PLOW_XR_RS_U must be 1 or 2")
+endif()
+
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
 # Discovered from the INSTALLED ROCm rather than pinned: this path was pinned to
 # 7.0.2 once and the build died on the first box that had 7.2.4.
@@ -722,24 +778,147 @@ set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
 # op_gemm.h's PLOW_GEMV_MM default of 1 and wrote row 0 only, so every sequence but the
 # first sampled token 0 off an all-zero logits row -- with a correct B-wide program around
 # it. See scripts/build_gfx950.sh for the full note.
-set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket (-> PLOW_GEMV_MM)")
+set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket")
+set(PLOW_GEMV_MM "" CACHE STRING "decode GEMV rows per walk pass (empty = derived)")
 option(PLOW_GEMV_WALK "Walk a <=16-row GEMV object across wider decode batches" OFF)
+set(_plow_l2_default OFF)
+set(_plow_gate_hier_default OFF)
+if(PLOW_HSACO_ARCH STREQUAL "gfx942" OR PLOW_HSACO_ARCH STREQUAL "gfx950")
+    set(_plow_l2_default ON)
+endif()
+if(PLOW_HSACO_ARCH STREQUAL "gfx950")
+    set(_plow_gate_hier_default ON)
+endif()
+option(PLOW_GATE_HIER
+       "Use hierarchical cache-maintenance gates in gfx950 decode GQ objects"
+       ${_plow_gate_hier_default})
+option(PLOW_L2_PLACE_DISPATCH "Compile support for L2-domain placed packets"
+       ${_plow_l2_default})
+option(PLOW_MLA_PF_V2_ARM "Compile the four-wave MLA prefill V2 arm" OFF)
 set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
+set(PLOW_HSACO_CONFIG "" CACHE FILEPATH
+    "manifest-derived plow_config.h used to specialise ordinary interpreter objects")
+set(_plow_decode_inventory_prune_default OFF)
+if(PLOW_HSACO_CONFIG)
+    set(_plow_decode_inventory_prune_default ON)
+endif()
+option(PLOW_HSACO_DECODE_INVENTORY_PRUNE
+       "Prune ordinary interpreter arms to the generated packet inventory"
+       ${_plow_decode_inventory_prune_default})
+option(PLOW_HSACO_DECODE_MLA_SEGMENTS
+       "Emit the paired FlashMlaDecode+MlaMergeFold decode segment object" OFF)
 
 if(PLOW_GFX950_HSACO)
-    if(NOT PLOW_DECODE_BATCH MATCHES "^[0-9]+$")
-        message(FATAL_ERROR "PLOW_DECODE_BATCH must be an integer in 1..32")
+    if(PLOW_HSACO_EXTRA_DEFINES MATCHES "(^|[ \t;])-DPLOW_GATE_HIER(=|[ \t;]|$)")
+        message(FATAL_ERROR
+            "PLOW_GATE_HIER must use -DPLOW_GATE_HIER=ON; it cannot be a global PLOW_HSACO_EXTRA_DEFINES flag")
     endif()
-    if(PLOW_DECODE_BATCH LESS 1 OR PLOW_DECODE_BATCH GREATER 32)
-        message(FATAL_ERROR "PLOW_DECODE_BATCH must be in 1..32")
+    if(PLOW_GATE_HIER AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR "PLOW_GATE_HIER is supported only for gfx950 code objects")
+    endif()
+    if(PLOW_GATE_HIER AND NOT PLOW_L2_PLACE_DISPATCH)
+        message(FATAL_ERROR "PLOW_GATE_HIER requires PLOW_L2_PLACE_DISPATCH=ON")
+    endif()
+    if(PLOW_GATE_HIER AND NOT PLOW_HSACO_GQ)
+        message(FATAL_ERROR "PLOW_GATE_HIER requires PLOW_HSACO_GQ=ON")
+    endif()
+    if(NOT PLOW_DECODE_BATCH MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "PLOW_DECODE_BATCH must be an integer in 1..128")
+    endif()
+    if(PLOW_DECODE_BATCH LESS 1 OR PLOW_DECODE_BATCH GREATER 128)
+        message(FATAL_ERROR "PLOW_DECODE_BATCH must be in 1..128")
     endif()
     if(PLOW_DECODE_BATCH GREATER 16 AND NOT PLOW_GEMV_WALK)
         message(FATAL_ERROR "PLOW_DECODE_BATCH above 16 requires PLOW_GEMV_WALK=ON")
     endif()
     string(REPLACE " " ";" _hs_extra "${PLOW_HSACO_EXTRA_DEFINES}")
+    if(PLOW_L2_PLACE_DISPATCH)
+        list(APPEND _hs_extra -DPLOW_L2_PLACE_DISPATCH=1)
+    endif()
     set(_hs_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/interp.hip")
     set(_hs_tk_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/test_kernels.hip")
     set(_hs_inc -I "${CMAKE_CURRENT_SOURCE_DIR}/amd" -I "${CMAKE_CURRENT_SOURCE_DIR}/common")
+    set(_hs_config_dep "")
+    set(_hs_need_kda_fused ON)
+    set(_hs_need_kda_intra_wave_items OFF)
+    set(_hs_need_attn_res_f32mix OFF)
+    set(_hs_need_kda_carry_regstate OFF)
+    set(_hs_need_decode_mla ${PLOW_HSACO_DECODE_MLA_SEGMENTS})
+    if(PLOW_HSACO_CONFIG)
+        get_filename_component(_hs_cfg_dir "${PLOW_HSACO_CONFIG}" DIRECTORY)
+        get_filename_component(_hs_cfg_name "${PLOW_HSACO_CONFIG}" NAME)
+        list(APPEND _hs_inc -I "${_hs_cfg_dir}")
+        list(APPEND _hs_extra "-DPLOW_CONFIG=\"${_hs_cfg_name}\"")
+        set(_hs_config_dep "${PLOW_HSACO_CONFIG}")
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_fused_presence
+             REGEX "^#define PLOW_PACKET_HAS_KDA_DECODE_FUSED 1$")
+        if(NOT _hs_kda_fused_presence)
+            set(_hs_need_kda_fused OFF)
+        endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_qpre_presence
+             REGEX "^#define PLOW_KDA_CHUNK_QPRE 1$")
+        if(_hs_kda_qpre_presence)
+            list(APPEND _hs_extra -DPLOW_KDA_CHUNK_QPRE=1)
+        endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_decode_mla_presence
+             REGEX "^#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS 1$")
+        if(_hs_decode_mla_presence)
+            set(_hs_need_decode_mla ON)
+        endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_intra_wave_items_presence
+             REGEX "^#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS 1$")
+        if(_hs_kda_intra_wave_items_presence)
+            set(_hs_need_kda_intra_wave_items ON)
+        endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_attn_res_f32mix_presence
+             REGEX "^#define PLOW_PACKET_REQUIRES_ATTN_RES_F32MIX 1$")
+        if(_hs_attn_res_f32mix_presence)
+            set(_hs_need_attn_res_f32mix ON)
+        endif()
+    endif()
+    if(PLOW_HSACO_ATTN_RES_F32MIX AND NOT PLOW_HSACO_CONFIG)
+        message(FATAL_ERROR
+            "PLOW_HSACO_ATTN_RES_F32MIX requires PLOW_HSACO_CONFIG for packet pairing")
+    endif()
+    if(_hs_need_attn_res_f32mix AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR
+            "manifest-required f32-mix AttnRes object is supported only on gfx950")
+    endif()
+    if(PLOW_HSACO_CONFIG)
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_carry_regstate_presence
+             REGEX "^#define PLOW_PACKET_REQUIRES_KDA_CARRY_REGSTATE 1$")
+        if(_hs_kda_carry_regstate_presence)
+            set(_hs_need_kda_carry_regstate ON)
+        endif()
+    endif()
+    if(PLOW_HSACO_DECODE_INVENTORY_PRUNE AND NOT PLOW_HSACO_CONFIG)
+        message(FATAL_ERROR
+            "PLOW_HSACO_DECODE_INVENTORY_PRUNE requires PLOW_HSACO_CONFIG")
+    endif()
+    if(PLOW_HSACO_KDA_INTRA_WAVE_ITEMS AND NOT PLOW_HSACO_CONFIG)
+        message(FATAL_ERROR
+            "PLOW_HSACO_KDA_INTRA_WAVE_ITEMS requires PLOW_HSACO_CONFIG for packet pairing")
+    endif()
+    if(_hs_need_kda_intra_wave_items AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR
+            "manifest-required KDA intra wave-item object is supported only on gfx950")
+    endif()
+    if(PLOW_HSACO_KDA_CARRY_REGSTATE AND NOT PLOW_HSACO_CONFIG)
+        message(FATAL_ERROR
+            "PLOW_HSACO_KDA_CARRY_REGSTATE requires PLOW_HSACO_CONFIG for packet pairing")
+    endif()
+    if(_hs_need_kda_carry_regstate AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR
+            "manifest-required KDA carry regstate object is supported only on gfx950")
+    endif()
+    if(_hs_need_decode_mla AND
+       (NOT PLOW_HSACO_DECODE_INVENTORY_PRUNE OR NOT PLOW_HSACO_CONFIG))
+        message(FATAL_ERROR
+            "manifest-required decode MLA segments need packet-paired inventory pruning")
+    endif()
+    if(_hs_need_decode_mla AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR "decode MLA segment objects are supported only on gfx950")
+    endif()
     set(_hs_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hipcc_hsaco.sh")
     # The op bodies live entirely in headers, so without these a kernel edit
     # leaves every .elf stale — the exact failure every guard in
@@ -750,10 +929,25 @@ if(PLOW_GFX950_HSACO)
     # THE AXES. No row below spells out a define set; every row is axes only.
     set(_hs_ax_none "")
     set(_hs_ax_prefill -DPLOW_BUCKET_DECODE=0)
-    if(PLOW_XR_AGG AND PLOW_HSACO_ARCH STREQUAL "gfx942")
+    if(PLOW_HSACO_DECODE_INVENTORY_PRUNE)
+        list(APPEND _hs_ax_prefill -DPLOW_DECODE_INVENTORY_PRUNE=1)
+    endif()
+    # The same bit-exact aggregation is profitable on both CDNA3 and CDNA4. Exact K3
+    # TP8 gfx950 shapes: 15.107 -> 9.032 us (T512), 19.007 -> 12.931 us (T1024).
+    if(PLOW_XR_AGG AND (PLOW_HSACO_ARCH STREQUAL "gfx942" OR
+                        PLOW_HSACO_ARCH STREQUAL "gfx950"))
         list(APPEND _hs_ax_prefill -DPLOW_XR_AGG=1)
     endif()
-    # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). One instantiation with a
+    if(PLOW_XR_TRACE_PHASES)
+        list(APPEND _hs_ax_prefill -DPLOW_XR_TRACE_PHASES=1)
+    endif()
+    if(PLOW_XR_RS_U STREQUAL "2")
+        list(APPEND _hs_ax_prefill -DPLOW_XR_RS_U=2)
+    endif()
+    # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). Wide gfx950 objects use
+    # MM=8 with the walk: the B128 production A/B retained occupancy 2 and improved output
+    # throughput 10.0% over MM=16. B1..B32 retain their existing derived width.
+    # One instantiation with a
     # runtime M and an `m < M` predicate serves every M <= MM, so the bucket is a ceiling, not
     # an exact width. Do NOT make this a runtime ladder -- that was built, measured at 276
     # registers, and removed (op_gemm.h:2163). Measured cost, ROCm 7.2.4/gfx950 decode object:
@@ -762,7 +956,32 @@ if(PLOW_GFX950_HSACO)
     while(_hs_gvmm LESS PLOW_DECODE_BATCH AND _hs_gvmm LESS 16)
         math(EXPR _hs_gvmm "${_hs_gvmm} * 2")
     endwhile()
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_DECODE_BATCH GREATER 32 AND _hs_gvmm GREATER 8)
+        set(_hs_gvmm 8)
+    endif()
+    if(NOT PLOW_GEMV_MM STREQUAL "")
+        if(NOT PLOW_GEMV_MM MATCHES "^[0-9]+$")
+            message(FATAL_ERROR "PLOW_GEMV_MM must be an integer in 1..16")
+        endif()
+        if(PLOW_GEMV_MM LESS 1 OR PLOW_GEMV_MM GREATER 16)
+            message(FATAL_ERROR "PLOW_GEMV_MM must be in 1..16")
+        endif()
+        if(PLOW_GEMV_MM LESS _hs_gvmm AND NOT PLOW_GEMV_WALK)
+            message(FATAL_ERROR "PLOW_GEMV_MM below the derived decode width requires PLOW_GEMV_WALK=ON")
+        endif()
+        set(_hs_gvmm ${PLOW_GEMV_MM})
+    endif()
     set(_hs_ax_decode -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=${_hs_gvmm})
+    if(PLOW_HSACO_DECODE_INVENTORY_PRUNE)
+        list(APPEND _hs_ax_decode -DPLOW_DECODE_INVENTORY_PRUNE=1)
+    endif()
+    if(PLOW_XR_TRACE_PHASES)
+        list(APPEND _hs_ax_decode -DPLOW_XR_TRACE_PHASES=1)
+    endif()
+    if(PLOW_XR_TAGGED)
+        list(APPEND _hs_ax_decode -DPLOW_XR_TAGGED=1)
+    endif()
+    set(_hs_ax_decode_mla ${_hs_ax_decode} -DPLOW_BUCKET_DECODE_MLA=1)
     if(PLOW_GEMV_WALK)
         list(APPEND _hs_ax_decode -DPLOW_GEMV_WALK=1)
     endif()
@@ -770,13 +989,18 @@ if(PLOW_GFX950_HSACO)
     # (the Q-hoist spills Q to scratch, cheaper than the L2 re-read it replaces).
     set(_hs_ax_flash -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
                      -DFA_DC=256 -DFA_DBUF=1)
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942" OR PLOW_HSACO_ARCH STREQUAL "gfx950"
+       OR PLOW_MLA_PF_V2_ARM)
+        list(APPEND _hs_ax_flash -DPLOW_MLA_PF_V2_ARM=1)
+    endif()
     if(PLOW_HSACO_ARCH STREQUAL "gfx942")
-        list(APPEND _hs_ax_flash -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_L2_PLACE_DISPATCH=1)
+        list(APPEND _hs_ax_flash -DPLOW_L2_PLACE_DISPATCH=1)
         if(PLOW_MLA_PF_SV)
             list(APPEND _hs_ax_flash -DPLOW_MLA_PF_SV=1)
         endif()
     endif()
     set(_hs_ax_gq -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH})
+    set(_hs_ax_gate_hier -DPLOW_GATE_HIER=1)
     # PRECISION AXES, ONE PER INDEPENDENT CHOICE. They were not independent: _hs_ax_fp8kv used
     # to expand to `-DPLOW_FP8=1 -DPLOW_FP8_KV=1`, so the KV-encoding axis silently dragged the
     # WEIGHT-encoding axis with it and a bf16-weight/fp8-KV packet — a combination the NVIDIA
@@ -796,6 +1020,12 @@ if(PLOW_GFX950_HSACO)
         list(APPEND _hs_ax_mxfp4 -DPLOW_MXFP4_DEC_NT=0)
     endif()
     set(_hs_ax_mla -DPLOW_MLA_PREFILL=1)
+    set(_hs_ax_moe_pf_accum "")
+    if(PLOW_MOE_PF_ATOMIC)
+        set(_hs_ax_moe_pf_accum -DPLOW_MOE_PF_ATOMIC=1)
+    elseif(PLOW_MOE_PF_DET)
+        set(_hs_ax_moe_pf_accum -DPLOW_MOE_PF_DET=1)
+    endif()
     # Composed, not spelled out: an all-fp8 Kimi K2.7 / GLM-5.2 / DeepSeek prefill
     # needs the MLA attention arms AND the w8a8 GEMM arms in the same object, and a
     # showcase run must be all-fp8 or all-bf16 — never one bucket of each.
@@ -804,8 +1034,10 @@ if(PLOW_GFX950_HSACO)
     # attention-complete and FFN-incomplete — the expert packets fall through to `default:`
     # and write nothing — so these are the rows that actually make a Kimi/GLM/DeepSeek
     # prompt runnable. Measured: the grouped-expert GEMM costs occ NOTHING (see the rows).
-    set(_hs_ax_mla_moe ${_hs_ax_mla} -DPLOW_MOE_PREFILL=1)
-    set(_hs_ax_mla_moe_fp8 ${_hs_ax_mla_fp8} -DPLOW_MOE_PREFILL=1)
+    set(_hs_ax_mla_moe
+        ${_hs_ax_mla} -DPLOW_MOE_PREFILL=1 ${_hs_ax_moe_pf_accum})
+    set(_hs_ax_mla_moe_fp8
+        ${_hs_ax_mla_fp8} -DPLOW_MOE_PREFILL=1 ${_hs_ax_moe_pf_accum})
     # A4W4: MXFP4 on BOTH operands through the matrix core, the encoding ATOM runs. Compile-time
     # like every other precision axis -- a runtime encoding switch would make the register
     # allocator budget for the worst body and then every body spills (interp.hip states the trap).
@@ -836,6 +1068,9 @@ if(PLOW_GFX950_HSACO)
     # REPLACING the unroll does not grow the register union the way adding a second arm does.
     set(_hs_ax_k3 -DPLOW_K3=1 -DGV_UNROLL=14)
     set(_hs_ax_mla_k3 ${_hs_ax_mla} -DPLOW_K3=1)
+    if(PLOW_HSACO_KDA_CHUNK)
+        list(APPEND _hs_ax_mla_k3 -DPLOW_KDA_CHUNK=1)
+    endif()
     # K3's optional compressed-latent KV uses the same model arms with the fp8-KV swap. These are
     # separate objects: PLOW_FP8_KV removes the bf16 FlashMLA arm, so composing it into the plain
     # K3 row would make bf16 packets silently miss their dispatch case.
@@ -883,11 +1118,13 @@ if(PLOW_GFX950_HSACO)
             set(_hs_ax_k3_dec_mxfp4 ${_hs_ax_mxfp4})
         endif()
         set(_hs_ax_k3_dec ${_hs_ax_k3_dec} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
-            ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search} ${_hs_ax_k3_align_prefix}
+            ${_hs_ax_moe_pf_accum} ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search}
+            ${_hs_ax_k3_align_prefix}
             ${_hs_ax_k3_router_local} ${_hs_ax_k3_decode_xr_agg} ${_hs_ax_k3_dec_mxfp4})
         set(_hs_ax_k3_dec_fp8kv
             ${_hs_ax_k3_dec_fp8kv} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
-            ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search} ${_hs_ax_k3_align_prefix}
+            ${_hs_ax_moe_pf_accum} ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search}
+            ${_hs_ax_k3_align_prefix}
             ${_hs_ax_k3_router_local} ${_hs_ax_k3_decode_xr_agg} ${_hs_ax_k3_dec_mxfp4})
     endif()
     # ...and the FFN half. A K3 prefill bucket runs the GROUPED expert chain (ops 83-87), not the
@@ -895,8 +1132,10 @@ if(PLOW_GFX950_HSACO)
     # it. Without PLOW_MOE_PREFILL those five packets fall through the dispatch `default:` and
     # write NOTHING, which on this interpreter is silent. So `interp_prefill_k3` above is an
     # ATTENTION-ONLY object and a whole-layer K3 prompt needs one of these two.
-    set(_hs_ax_k3_moe ${_hs_ax_mla_k3} -DPLOW_MOE_PREFILL=1)
-    set(_hs_ax_k3_moe_fp8kv ${_hs_ax_mla_k3_fp8kv} -DPLOW_MOE_PREFILL=1)
+    set(_hs_ax_k3_moe
+        ${_hs_ax_mla_k3} -DPLOW_MOE_PREFILL=1 ${_hs_ax_moe_pf_accum})
+    set(_hs_ax_k3_moe_fp8kv
+        ${_hs_ax_mla_k3_fp8kv} -DPLOW_MOE_PREFILL=1 ${_hs_ax_moe_pf_accum})
     set(_hs_ax_k3_pf_state "")
     if(PLOW_KDA_PF_STATE_RESIDENT)
         set(_hs_ax_k3_pf_state -DPLOW_KDA_PF_STATE_RESIDENT=1)
@@ -909,6 +1148,30 @@ if(PLOW_GFX950_HSACO)
     set(_hs_ax_k3_moe_a4w4
         ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
         ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
+    set(_hs_ax_packed_mla_norm
+        ${_hs_ax_prefill} ${_hs_ax_mla} -DPLOW_BUCKET_PACKED_MLA_NORM=1
+        -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1)
+    set(_hs_ax_packed_mla_flash
+        ${_hs_ax_flash} -DPLOW_MLA_PF_V2_ARM=1
+        -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1)
+    # Raw single-request MLA-V2 route. Separate from the packed-prefill family object:
+    # no descriptor loop, no model arms, and only the bf16 FlashMlaPrefill dispatch case.
+    set(_hs_ax_mla_v2_sv_raw
+        ${_hs_ax_flash} -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_MLA_PF_SV=1
+        -DPLOW_BUCKET_MLA_V2_RAW=1 -DPLOW_NO_SPILL=1
+        -DPLOW_REQUIRED_MARKER=plow_mla_pf_v2_sv_raw_1)
+    if(PLOW_MLA_PF_TR16)
+        if(NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+            message(FATAL_ERROR "PLOW_MLA_PF_TR16 requires gfx950")
+        endif()
+        list(APPEND _hs_ax_mla_v2_sv_raw -DPLOW_MLA_PF_TR16=1)
+    endif()
+    set(_hs_ax_packed_kda
+        ${_hs_ax_prefill} -DPLOW_K3=1 -DPLOW_BUCKET_PACKED_KDA=1
+        -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1)
+    if(PLOW_HSACO_KDA_CHUNK)
+        list(APPEND _hs_ax_packed_kda -DPLOW_KDA_CHUNK=1)
+    endif()
     set(_hs_ax_k3_moe_a4w4_fp8kv
         ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
         ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
@@ -925,6 +1188,9 @@ if(PLOW_GFX950_HSACO)
     set(_hs_kpf "plow_interp_${PLOW_HSACO_ARCH}")
     set(_hs_kdec "plow_interp_dec_${PLOW_HSACO_ARCH}")
     set(_hs_kfl "plow_interp_flash_${PLOW_HSACO_ARCH}")
+    set(_hs_kpn "plow_interp_packed_mla_norm_${PLOW_HSACO_ARCH}")
+    set(_hs_kpfm "plow_interp_packed_mla_flash_${PLOW_HSACO_ARCH}")
+    set(_hs_kpk "plow_interp_packed_kda_${PLOW_HSACO_ARCH}")
 
     # THE TABLE: <stem> <kernel symbol> <axis-1> <axis-2> <max total regs> <min occ>.
     # The 8-wave interpreters must stay <= 256 total (2 waves/SIMD); the 4-wave
@@ -984,6 +1250,12 @@ if(PLOW_GFX950_HSACO)
     if(PLOW_HSACO_MLA)
         list(APPEND _hs_rows
             "interp_prefill_mla|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla|256|2")
+        if(PLOW_HSACO_ARCH STREQUAL "gfx950")
+            # Build-time gate: V2+SV is 348 architectural registers, occupancy 1,
+            # scratch-free in the exact T8192 kernel probe.
+            list(APPEND _hs_rows
+                "interp_mla_v2_sv|${_hs_kfl}|_hs_ax_none|_hs_ax_mla_v2_sv_raw|384|1")
+        endif()
         if(PLOW_HSACO_FP8)
             # Kimi K2.7 / GLM-5.2 / DeepSeek ship fp8, so the bf16-GEMM MLA prefill
             # object above cannot serve them without mixing dtypes across buckets.
@@ -1023,6 +1295,10 @@ if(PLOW_GFX950_HSACO)
     # IDENTICAL to the object without them. The gate stays because a gate that only fires on
     # regression is doing its job — it turns HSA_STATUS_ERROR_INVALID_ISA at launch into a build
     # error — and because op_attention.h:1282 is why "it fits" was never the whole question.
+    if(_hs_need_decode_mla)
+        list(APPEND _hs_rows
+            "interp_decode_mla|plow_interp_decode_mla_${PLOW_HSACO_ARCH}|_hs_ax_decode_mla|_hs_ax_none|256|2")
+    endif()
     if(PLOW_HSACO_K3)
         list(APPEND _hs_rows
             "interp_decode_k3|${_hs_kdec}|_hs_ax_decode|_hs_ax_k3_dec|256|2"
@@ -1036,6 +1312,26 @@ if(PLOW_GFX950_HSACO)
                 "interp_prefill_fp8kv_k3|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_k3_fp8kv|256|2"
                 "interp_prefill_fp8kv_k3_moe|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_fp8kv|256|2"
                 "interp_prefill_fp8kv_k3_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4_fp8kv|256|2")
+        endif()
+        if(PLOW_HSACO_PACKED_PREFILL_CONSUMERS OR PLOW_HSACO_KDA_CHUNK)
+            # Family objects are deliberately lean: compiling any packed call arm into the full
+            # K3 interpreter raises its VGPR spill count to 116 even when metadata is null.
+            # A model requiring chunk KDA packages the exact family object even without live
+            # mux; runtime use for ordinary segments remains behind PLOW_KDA_FAMILY_ROUTE.
+            list(APPEND _hs_rows
+                "interp_packed_kda|${_hs_kpk}|_hs_ax_prefill|_hs_ax_packed_kda|256|2")
+            if(PLOW_HSACO_PACKED_PREFILL_CONSUMERS)
+                list(APPEND _hs_rows
+                    "interp_packed_mla_norm|${_hs_kpn}|_hs_ax_prefill|_hs_ax_packed_mla_norm|256|2"
+                    "interp_packed_mla_flash|${_hs_kpfm}|_hs_ax_prefill|_hs_ax_packed_mla_flash|512|1")
+            endif()
+            if(PLOW_HSACO_PACKED_PREFILL_CONSUMERS AND PLOW_HSACO_FP8KV)
+                set(_hs_ax_packed_mla_norm_fp8kv ${_hs_ax_packed_mla_norm} ${_hs_ax_fp8kv})
+                set(_hs_ax_packed_mla_flash_fp8kv ${_hs_ax_packed_mla_flash} ${_hs_ax_fp8kv})
+                list(APPEND _hs_rows
+                    "interp_packed_mla_norm_fp8kv|${_hs_kpn}|_hs_ax_prefill|_hs_ax_packed_mla_norm_fp8kv|256|2"
+                    "interp_packed_mla_flash_fp8kv|${_hs_kpfm}|_hs_ax_prefill|_hs_ax_packed_mla_flash_fp8kv|512|1")
+            endif()
         endif()
     endif()
 
@@ -1056,23 +1352,357 @@ if(PLOW_GFX950_HSACO)
         foreach(_kind ${_hs_kinds})
             set(_sfx "")
             set(_gq "")
+            set(_row_kind_extra "")
             if(_kind STREQUAL "gq")
                 # Both the filename and the kernel symbol take the suffix, and
                 # gemma4_chat.c resolves both by name.
                 set(_sfx "_gq")
                 set(_gq ${_hs_ax_gq})
+                if(PLOW_GATE_HIER AND
+                   (_a1 STREQUAL "_hs_ax_decode" OR _a1 STREQUAL "_hs_ax_decode_mla"))
+                    set(_row_kind_extra ${_hs_ax_gate_hier})
+                endif()
             endif()
             set(_out "${PLOW_HSACO_DIR}/${_stem}${_sfx}.elf")
             add_custom_command(OUTPUT "${_out}"
                 COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
                         "${PLOW_HSACO_ARCH}" "${_out}" "${_sym}${_sfx}" ${_maxreg} ${_minocc}
-                        ${_hs_inc} ${_hs_arch_def} ${${_a1}} ${${_a2}} ${_gq} ${_hs_extra} "${_hs_src}"
-                DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs}
+                        ${_hs_inc} ${_hs_arch_def} ${${_a1}} ${${_a2}} ${_gq}
+                        ${_row_kind_extra} ${_hs_extra} "${_hs_src}"
+                DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
                 COMMENT "hipcc ${_stem}${_sfx}.elf"
                 VERBATIM)
             list(APPEND _hs_outs "${_out}")
         endforeach()
     endforeach()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_XR_WAVE_RS)
+        foreach(_kind static gq)
+            set(_sfx "")
+            set(_gq "")
+            if(_kind STREQUAL "gq")
+                set(_sfx "_gq")
+                set(_gq ${_hs_ax_gq})
+            endif()
+            set(_out "${PLOW_HSACO_DIR}/interp_xreduce${_sfx}.elf")
+            add_custom_command(OUTPUT "${_out}"
+                COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                        "${PLOW_HSACO_ARCH}" "${_out}"
+                        "plow_interp_xreduce_${PLOW_HSACO_ARCH}${_sfx}" 256 2
+                        ${_hs_inc} ${_hs_arch_def} -DPLOW_BUCKET_XREDUCE=1
+                        -DPLOW_XR_AGG=1 -DPLOW_XR_WAVE_RS=1 ${_gq} ${_hs_extra}
+                        -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                        -DPLOW_REQUIRED_MARKER=plow_xreduce_wave_rs_segments_1 "${_hs_src}"
+                DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+                COMMENT "hipcc interp_xreduce${_sfx}.elf"
+                VERBATIM)
+            list(APPEND _hs_outs "${_out}")
+        endforeach()
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND _hs_need_kda_fused)
+        set(_hs_kda_fused_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_decode_fused.hip")
+        set(_hs_kda_fused_out "${PLOW_HSACO_DIR}/kda_decode_fused_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_fused_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_fused_out}"
+                    plow_kda_decode_fused_256x16_v2 128 4
+                    ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_decode_fused_256x16_2
+                    "${_hs_kda_fused_src}"
+            DEPENDS "${_hs_kda_fused_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc kda_decode_fused_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_decode_fused_gfx950 DEPENDS "${_hs_kda_fused_out}")
+        list(APPEND _hs_outs "${_hs_kda_fused_out}")
+
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_INTRA_CACHED)
+        set(_hs_kda_intra_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_intra_cached.hip")
+        set(_hs_kda_intra_out "${PLOW_HSACO_DIR}/kda_chunk_intra_cached_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_intra_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_intra_out}"
+                    plow_kda_chunk_intra_cached_gfx950 96 1
+                    ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_intra_cached_abi_1
+                    "${_hs_kda_intra_src}"
+            DEPENDS "${_hs_kda_intra_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc kda_chunk_intra_cached_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_intra_cached_gfx950 DEPENDS "${_hs_kda_intra_out}")
+        list(APPEND _hs_outs "${_hs_kda_intra_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND
+       (PLOW_HSACO_KDA_INTRA_WAVE_ITEMS OR _hs_need_kda_intra_wave_items))
+        set(_hs_kda_intra_wave_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_intra_wave_items.hip")
+        set(_hs_kda_intra_wave_out "${PLOW_HSACO_DIR}/kda_chunk_intra_wave_items_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_intra_wave_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_intra_wave_out}"
+                    plow_kda_chunk_intra_wave_items_gfx950 96 2
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_intra_wave_items_abi_1
+                    "${_hs_kda_intra_wave_src}"
+            DEPENDS "${_hs_kda_intra_wave_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_intra_wave_items_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_intra_wave_items_gfx950 DEPENDS "${_hs_kda_intra_wave_out}")
+        list(APPEND _hs_outs "${_hs_kda_intra_wave_out}")
+    endif()
+
+    # -fno-slp-vectorize: packed-f32 FMA formation costs this object ~30 VGPRs of operand
+    # shuffling and pushes it over the register cliff; see the source header.
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND
+       (PLOW_HSACO_ATTN_RES_F32MIX OR _hs_need_attn_res_f32mix))
+        set(_hs_attn_res_f32mix_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/attn_res_f32mix_gfx950.hip")
+        set(_hs_attn_res_f32mix_out "${PLOW_HSACO_DIR}/attn_res_f32mix_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_attn_res_f32mix_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_attn_res_f32mix_out}"
+                    plow_attn_res_f32mix_gfx950 168 3
+                    ${_hs_inc} ${_hs_extra} -fno-slp-vectorize
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_attn_res_f32mix_abi_1
+                    "${_hs_attn_res_f32mix_src}"
+            DEPENDS "${_hs_attn_res_f32mix_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc attn_res_f32mix_gfx950.elf"
+            VERBATIM)
+        add_custom_target(attn_res_f32mix_gfx950 DEPENDS "${_hs_attn_res_f32mix_out}")
+        list(APPEND _hs_outs "${_hs_attn_res_f32mix_out}")
+    endif()
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND
+       (PLOW_HSACO_KDA_CARRY_REGSTATE OR _hs_need_kda_carry_regstate))
+        set(_hs_kda_carry_reg_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_carry_regstate.hip")
+        set(_hs_kda_carry_reg_out "${PLOW_HSACO_DIR}/kda_chunk_carry_regstate_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_carry_reg_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_carry_reg_out}"
+                    plow_kda_chunk_carry_regstate_gfx950 256 1
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1
+                    "${_hs_kda_carry_reg_src}"
+            DEPENDS "${_hs_kda_carry_reg_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_carry_regstate_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_carry_regstate_gfx950 DEPENDS "${_hs_kda_carry_reg_out}")
+        list(APPEND _hs_outs "${_hs_kda_carry_reg_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_KEY_FACTOR)
+        set(_hs_kda_key_wu_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_key_factor_wu.hip")
+        set(_hs_kda_key_carry_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_key_factor_carry.hip")
+        set(_hs_kda_key_wu_out "${PLOW_HSACO_DIR}/kda_chunk_key_factor_wu_gfx950.elf")
+        set(_hs_kda_key_carry_out "${PLOW_HSACO_DIR}/kda_chunk_key_factor_carry_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_key_wu_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_key_wu_out}"
+                    plow_kda_chunk_key_factor_wu_gfx950 160 3
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_key_factor_wu_1
+                    "${_hs_kda_key_wu_src}"
+            DEPENDS "${_hs_kda_key_wu_src}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_key_factor_common.h"
+                    "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_key_factor_wu_gfx950.elf"
+            VERBATIM)
+        add_custom_command(OUTPUT "${_hs_kda_key_carry_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_key_carry_out}"
+                    plow_kda_chunk_key_factor_carry_gfx950 160 3
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_key_factor_carry_1
+                    "${_hs_kda_key_carry_src}"
+            DEPENDS "${_hs_kda_key_carry_src}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_key_factor_common.h"
+                    "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_key_factor_carry_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_key_factor_gfx950
+            DEPENDS "${_hs_kda_key_wu_out}" "${_hs_kda_key_carry_out}")
+        list(APPEND _hs_outs "${_hs_kda_key_wu_out}" "${_hs_kda_key_carry_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_XR_ATTNRES)
+        set(_hs_xr_attnres_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/xreduce_attnres_fused.hip")
+        set(_hs_xr_attnres_out "${PLOW_HSACO_DIR}/xreduce_attnres_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_xr_attnres_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_xr_attnres_out}"
+                    plow_xreduce_attnres_gfx950 256 2
+                    ${_hs_inc} ${_hs_arch_def} ${_hs_extra}
+                    -DPLOW_K3=1 -DPLOW_XR_ATTNRES=1
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_xr_attnres_wave64_nospill_1
+                    "${_hs_xr_attnres_src}"
+            DEPENDS "${_hs_xr_attnres_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc xreduce_attnres_gfx950.elf"
+            VERBATIM)
+        add_custom_target(xreduce_attnres_gfx950 DEPENDS "${_hs_xr_attnres_out}")
+        list(APPEND _hs_outs "${_hs_xr_attnres_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_STAGE2_LEAN)
+        set(_hs_moe2_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/lean_moe_stage2_ref/native_kernel.hip")
+        set(_hs_moe2_out "${PLOW_HSACO_DIR}/moe_stage2_mxfp4_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe2_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe2_out}"
+                    plow_moe2_mxfp4_16x16x128_gfx950 100 2
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_3
+                    "${_hs_moe2_src}"
+            DEPENDS "${_hs_moe2_src}" "${_hs_run}"
+            COMMENT "hipcc moe_stage2_mxfp4_gfx950.elf"
+            VERBATIM)
+        list(APPEND _hs_outs "${_hs_moe2_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_STAGE1_LEAN)
+        set(_hs_moe1_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/lean_moe_stage1_ref/reuse_kernel.hip")
+        set(_hs_moe1_out "${PLOW_HSACO_DIR}/moe_stage1_mxfp4_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe1_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe1_out}"
+                    plow_moe1_a4_reuse_16x16x128_gfx950 192 2
+                    ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe1_a4_reuse_abi_1
+                    "${_hs_moe1_src}"
+            DEPENDS "${_hs_moe1_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc moe_stage1_mxfp4_gfx950.elf"
+            VERBATIM)
+        list(APPEND _hs_outs "${_hs_moe1_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_COMBINE_LEAN)
+        set(_hs_moe_combine_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/lean_moe_combine_ref/kernel.hip")
+        set(_hs_moe_combine_out "${PLOW_HSACO_DIR}/moe_combine_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe_combine_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe_combine_out}"
+                    plow_moe_combine_fixed_order_gfx950 64 4
+                    ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe_combine_fixed_order_abi_1
+                    "${_hs_moe_combine_src}"
+            DEPENDS "${_hs_moe_combine_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc moe_combine_gfx950.elf"
+            VERBATIM)
+        add_custom_target(moe_combine_gfx950 DEPENDS "${_hs_moe_combine_out}")
+        list(APPEND _hs_outs "${_hs_moe_combine_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_PREFILL_EP)
+        set(_hs_moe_ep_dir "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/moe_ep_boundary")
+        set(_hs_moe_ep_align_out "${PLOW_HSACO_DIR}/moe_ep_align_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe_ep_align_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe_ep_align_out}"
+                    plow_moe_ep_filter_align_gfx950 64 2
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe_ep_filter_align_no_spill_1
+                    "${_hs_moe_ep_dir}/filter_align.hip"
+            DEPENDS "${_hs_moe_ep_dir}/filter_align.hip" "${_hs_run}"
+            COMMENT "hipcc moe_ep_align_gfx950.elf"
+            VERBATIM)
+        set(_hs_moe_ep_stage2_out "${PLOW_HSACO_DIR}/moe_ep_stage2_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe_ep_stage2_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe_ep_stage2_out}"
+                    plow_moe2_ep_full_i_16x16x128_gfx950 128 2
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe2_ep_full_i_vgpr_le_128
+                    "${_hs_moe_ep_dir}/stage2_full_i.hip"
+            DEPENDS "${_hs_moe_ep_dir}/stage2_full_i.hip" "${_hs_run}"
+            COMMENT "hipcc moe_ep_stage2_gfx950.elf"
+            VERBATIM)
+        set(_hs_moe_ep_combine_out "${PLOW_HSACO_DIR}/moe_ep_combine_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe_ep_combine_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe_ep_combine_out}"
+                    plow_moe_ep_combine_gfx950 64 2
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe_ep_combine_no_spill_1
+                    "${_hs_moe_ep_dir}/combine.hip"
+            DEPENDS "${_hs_moe_ep_dir}/combine.hip" "${_hs_run}"
+            COMMENT "hipcc moe_ep_combine_gfx950.elf"
+            VERBATIM)
+        list(APPEND _hs_outs
+             "${_hs_moe_ep_align_out}" "${_hs_moe_ep_stage2_out}" "${_hs_moe_ep_combine_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_DECODE_GROUPED)
+        set(_hs_moe_decode_grouped_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/amd/moe_decode_grouped_mxfp4.hip")
+        set(_hs_moe_decode_grouped_out
+            "${PLOW_HSACO_DIR}/moe_decode_grouped_mxfp4_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe_decode_grouped_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe_decode_grouped_out}"
+                    plow_moe_decode_grouped_glu_mxfp4_gfx950 96 5
+                    ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe_decode_grouped_mxfp4_abi_1
+                    "${_hs_moe_decode_grouped_src}"
+            DEPENDS "${_hs_moe_decode_grouped_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc moe_decode_grouped_mxfp4_gfx950.elf"
+            VERBATIM)
+        add_custom_target(moe_decode_grouped_mxfp4_gfx950
+                          DEPENDS "${_hs_moe_decode_grouped_out}")
+        list(APPEND _hs_outs "${_hs_moe_decode_grouped_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MLA_MATERIALIZED_OPUS)
+        set(_hs_mla_materialized_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/amd/mla_materialized_opus.hip")
+        set(_hs_mla_materialized_inc
+            "${CMAKE_CURRENT_SOURCE_DIR}/amd/third_party/aiter_opus")
+        set(_hs_mla_materialized_out
+            "${PLOW_HSACO_DIR}/mla_materialized_hd192_v128_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_mla_materialized_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_mla_materialized_out}"
+                    plow_mla_materialized_hd192_v128_gfx950 256 2
+                    -std=c++20 -I${_hs_mla_materialized_inc}
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_mla_materialized_opus_abi_1
+                    "${_hs_mla_materialized_src}"
+            DEPENDS "${_hs_mla_materialized_src}" "${_hs_run}"
+                    "${_hs_mla_materialized_inc}/fmha_fwd_hd192_v128_bf16_opus_defs.h"
+                    "${_hs_mla_materialized_inc}/fmha_fwd_hd192_v128_bf16_opus_kernel.hpp"
+                    "${_hs_mla_materialized_inc}/opus/opus.hpp"
+                    "${_hs_mla_materialized_inc}/LICENSE"
+            COMMENT "hipcc mla_materialized_hd192_v128_gfx950.elf"
+            VERBATIM)
+        add_custom_target(mla_materialized_hd192_v128_gfx950
+                          DEPENDS "${_hs_mla_materialized_out}")
+        list(APPEND _hs_outs "${_hs_mla_materialized_out}")
+
+        set(_hs_mla_pack_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/mla_materialize_pack.hip")
+        set(_hs_mla_pack_out "${PLOW_HSACO_DIR}/mla_materialize_pack_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_mla_pack_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_mla_pack_out}"
+                    plow_mla_materialize_pack_gfx950 64 4
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_mla_materialize_pack_abi_1
+                    "${_hs_mla_pack_src}"
+            DEPENDS "${_hs_mla_pack_src}" "${_hs_run}"
+            COMMENT "hipcc mla_materialize_pack_gfx950.elf"
+            VERBATIM)
+        add_custom_target(mla_materialize_pack_gfx950 DEPENDS "${_hs_mla_pack_out}")
+        add_dependencies(mla_materialized_hd192_v128_gfx950 mla_materialize_pack_gfx950)
+        list(APPEND _hs_outs "${_hs_mla_pack_out}")
+    endif()
 
     # Golden __device__ wrappers. They call the SAME op_*.h bodies the
     # interpreter runs, so they are rebuilt WITH it — building the interpreter

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # `vllm bench serve` against a plowrt OpenAI endpoint (§0-BENCH: same client
-# binary, same metric definitions, different base-url).
+# binary, same metric definitions, different base-url). Set BENCH_BACKEND=openai
+# for raw `/v1/completions`; the default remains `openai-chat`.
 #
 # Runs the server and the client inside ONE leased command, so the server can
 # never outlive the lease. The server is `setsid`'d and torn down by PROCESS
@@ -14,16 +15,18 @@
 # mounting the snapshot alone gives the client a directory of dangling links and
 # it dies in `convert_slow_tokenizer`.
 #   IN_LENS  space-separated input lengths (default 1024)
-#   CONCS    space-separated concurrencies (default 1) — AMD serve is batch=1,
-#            so anything above 1 measures QUEUEING, not batching.
+#   CONCS    space-separated concurrencies (default 1). The packet's compiled
+#            ladder determines whether wider points batch or queue.
 #   NPROMPT  prompts per point (default 8)
 #   OUTLEN   output tokens per request (default 128)
-set -u
+set -euo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="${1:?assets}"; PORT="${2:?port}"; MODEL="${3:?model}"; TOKZ="${4:?tokenizer}"
 READY="${5:-1200}"
 IN_LENS="${IN_LENS:-1024}"; CONCS="${CONCS:-1}"; NPROMPT="${NPROMPT:-8}"
 OUTLEN="${OUTLEN:-128}"
+BENCH_BACKEND="${BENCH_BACKEND:-openai-chat}"
+BENCH_TRUST_REMOTE_CODE="${BENCH_TRUST_REMOTE_CODE:-0}"
 # PLOWRT_BIN exists because `target/release/plowrt` is SHARED. A concurrent agent
 # running `cargo build -p plowrt` (no features) replaces the binary mid-benchmark
 # with one built without `hsa`, and that build does not fail — it serves from the
@@ -41,9 +44,20 @@ PLOWRT_BIN="${PLOWRT_BIN:-./target/release/plowrt}"
 # The tokenizer MUST still be the one the server uses: input-len control and
 # every token count in the report are computed with it.
 TOKZ_MOUNT="${TOKZ_MOUNT:-}"
-IMAGE=rocm/vllm:rocm7.14.0_cdna_ubuntu24.04_py3.14_pytorch_2.11.0_vllm_0.23.0
+IMAGE="${IMAGE:-rocm/vllm:rocm7.14.0_cdna_ubuntu24.04_py3.14_pytorch_2.11.0_vllm_0.23.0}"
 LOG="${LOG:-/tmp/plowrt_bench_$PORT.log}"
-DOCKER="sudo -n docker"
+DOCKER="${DOCKER:-docker}"
+
+case "$BENCH_BACKEND" in
+  openai-chat) ENDPOINT=/v1/chat/completions ;;
+  openai) ENDPOINT=/v1/completions ;;
+  *) echo "FAIL: BENCH_BACKEND must be openai-chat or openai" >&2; exit 2 ;;
+esac
+case "$BENCH_TRUST_REMOTE_CODE" in
+  0) TRUST_ARGS="" ;;
+  1) TRUST_ARGS="--trust-remote-code" ;;
+  *) echo "FAIL: BENCH_TRUST_REMOTE_CODE must be 0 or 1" >&2; exit 2 ;;
+esac
 
 echo "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-<unset>}"
 cd "$WT" || exit 1
@@ -53,10 +67,10 @@ setsid nix develop -c "$PLOWRT_BIN" serve --assets "$ASSETS" --port "$PORT" \
 SRV=$!
 cleanup() {
   # Whole process group — see the header.
-  kill -TERM -"$SRV" 2>/dev/null || kill -TERM "$SRV" 2>/dev/null
+  kill -TERM -"$SRV" 2>/dev/null || kill -TERM "$SRV" 2>/dev/null || true
   sleep 2
-  kill -KILL -"$SRV" 2>/dev/null
-  pkill -f "plowrt serve --assets $ASSETS" 2>/dev/null
+  kill -KILL -"$SRV" 2>/dev/null || true
+  pkill -f "plowrt serve --assets $ASSETS" 2>/dev/null || true
   sleep 2
 }
 trap cleanup EXIT
@@ -75,17 +89,22 @@ echo
 
 # Coherence gate BEFORE any timing — a fast wrong server is not a result.
 echo "== coherence gate =="
-GATE=$(curl -s --max-time 300 "http://127.0.0.1:$PORT/v1/chat/completions" \
-  -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France? Answer in one short sentence.\"}],\"max_tokens\":32,\"temperature\":0}")
+if [ "$BENCH_BACKEND" = openai ]; then
+  GATE=$(curl -s --max-time 300 "http://127.0.0.1:$PORT$ENDPOINT" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL\",\"prompt\":\"The capital of France is\",\"max_tokens\":32,\"temperature\":0}")
+else
+  GATE=$(curl -s --max-time 300 "http://127.0.0.1:$PORT$ENDPOINT" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France? Answer in one short sentence.\"}],\"max_tokens\":32,\"temperature\":0}")
+fi
 echo "$GATE"
 echo "$GATE" | grep -qi paris && echo ">>> coherence gate: PASS" || {
   echo ">>> coherence gate: FAIL — numbers below would be meaningless"; exit 1; }
 echo
 
-# plowrt implements /v1/chat/completions only, so the client runs vLLM's
-# `openai-chat` backend. Same binary, same TTFT/TPOT/ITL definitions; the vLLM
-# side must be re-measured with THIS backend before the two are tabled together.
+# The two endpoint modes let the client contract match the comparison server:
+# never table an `openai-chat` result against an `openai` result.
 # MEDIANS ARE REPORTED BESIDE THE MEANS, and `BENCH_EXTRA_ARGS` exists so both
 # sides can be given the SAME client flags (`--num-warmups` above all).
 #
@@ -118,21 +137,33 @@ for L in $IN_LENS; do
     WARM="${BENCH_EXTRA_ARGS:-}"; [ -n "$NW" ] && WARM="--num-warmups $NW"
     blog="/tmp/vllmbench_${MODEL}_in${L}_c${C}.log"
     $DOCKER run --rm --network host \
-      -e HF_HUB_OFFLINE=1 -e HF_HOME=/hf \
+      -e HF_HUB_OFFLINE=1 -e HF_HOME=/hf -e HF_MODULES_CACHE=/tmp/hf_modules \
       -v "$HOME/.cache/huggingface":/hf:ro $TOKZ_MOUNT \
       --entrypoint vllm "$IMAGE" \
-      bench serve --backend openai-chat \
-      --base-url "http://127.0.0.1:$PORT" --endpoint /v1/chat/completions \
-      --model "$MODEL" --tokenizer "$TOKZ" \
+      bench serve --backend "$BENCH_BACKEND" \
+      --base-url "http://127.0.0.1:$PORT" --endpoint "$ENDPOINT" \
+      --model "$MODEL" --tokenizer "$TOKZ" $TRUST_ARGS \
       --dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" \
+      --random-range-ratio 0 --request-rate inf --ignore-eos --temperature 0 \
       --max-concurrency "$C" --num-prompts "$NP" $WARM \
       > "$blog" 2>&1
-    python3 - "$L" "$C" "$blog" <<'PY'
-import re,sys
-L,C,p=int(sys.argv[1]),int(sys.argv[2]),sys.argv[3]
+    python3 - "$L" "$C" "$blog" "$NP" "$OUTLEN" <<'PY'
+import math,re,sys
+L,C,p,expected,outlen=int(sys.argv[1]),int(sys.argv[2]),sys.argv[3],int(sys.argv[4]),int(sys.argv[5])
 t=open(p).read()
 def g(pat):
     m=re.search(pat+r"\D*([\d.]+)",t); return float(m.group(1)) if m else float('nan')
+ok=g(r'Successful requests:')
+failed=g(r'Failed requests:')
+gen=g(r'Total generated tokens:')
+required=[g(r'Mean TTFT .ms.:'),g(r'Median TTFT .ms.:'),g(r'Mean TPOT .ms.:'),
+          g(r'Median TPOT .ms.:'),g(r'Mean ITL .ms.:'),g(r'Median ITL .ms.:'),
+          g(r'P99 ITL .ms.:'),g(r'Output token throughput .tok/s.:'),
+          g(r'Request throughput .req/s.:'),ok,failed,gen]
+if not all(math.isfinite(v) for v in required):
+    raise SystemExit(f"FAIL: incomplete vllm bench output in {p}")
+if int(ok) != expected or int(failed) != 0 or int(gen) != expected*outlen:
+    raise SystemExit(f"FAIL: incomplete cell: ok={ok:g}/{expected} failed={failed:g} generated={gen:g}/{expected*outlen}")
 # P99 ITL beside mean/median: the tail is what a stream is judged on, and it is
 # the metric the two engines are tabled against.
 print(f"{L},{C},{g(r'Mean TTFT .ms.:'):.2f},{g(r'Median TTFT .ms.:'):.2f},"
@@ -147,8 +178,8 @@ print(f"{L},{C},{g(r'Mean TTFT .ms.:'):.2f},{g(r'Median TTFT .ms.:'):.2f},"
       # 131085 tokens" — the chat template adds ~13) and still reported
       # 4 successful requests, 99.1 tok/s and 3.42 req/s with ITL 0.00.
       # `gen_toks` is the honest check: it must equal num_prompts x OUTLEN.
-      f"{g(r'Successful requests:'):.0f},"
-      f"{g(r'Total generated tokens:'):.0f}")
+      f"{ok:.0f},"
+      f"{gen:.0f}")
 PY
     tail -3 "$blog" | sed 's/^/    | /'
   done

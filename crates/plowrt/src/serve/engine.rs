@@ -16,6 +16,11 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "hsa")]
+use std::path::Path;
+
+use super::bench::{DecodeSelection, EngineDiagnostics, PrefillSelection, RankAgreement};
+
 /// The device engine serving one slug.
 pub enum ServeEngine {
     /// The sm_120 persistent-interpreter engine (slotted, continuous batching).
@@ -27,6 +32,42 @@ pub enum ServeEngine {
 }
 
 impl ServeEngine {
+    #[cfg(feature = "hsa")]
+    pub fn amd_overlap_capability(&self) -> Option<crate::exec::amd::AmdOverlapCapability> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => None,
+            ServeEngine::Amd(e) => Some(e.overlap_capability()),
+        }
+    }
+
+    #[cfg(feature = "hsa")]
+    pub fn amd_overlap_evidence(&self) -> Option<Vec<crate::exec::amd::AmdOverlapRankEvidence>> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => None,
+            ServeEngine::Amd(e) => Some(e.overlap_evidence()),
+        }
+    }
+
+    pub fn begin_diagnostics(&mut self) {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => {}
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.begin_diagnostics(),
+        }
+    }
+
+    pub fn finish_diagnostics(&mut self) -> EngineDiagnostics {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => EngineDiagnostics::unsupported(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.finish_diagnostics(),
+        }
+    }
+
     /// Sequences one decode launch advances — the mux sizes its slot table to
     /// this, so mux slot `i` IS engine slot `i`.
     pub fn batch(&self) -> usize {
@@ -58,6 +99,23 @@ impl ServeEngine {
         }
     }
 
+    /// Write the last completed raw AMD packet trace.
+    ///
+    /// The trace buffer is allocated only when `--trace-raw` / `PLOW_TRACE_RAW`
+    /// is set before engine load. `PLOW_TRACE_ALLRANKS=1` writes TP ranks as
+    /// `path.rkN`; otherwise only rank 0 is written. Callers must quiesce the
+    /// model mux first.
+    #[cfg(feature = "hsa")]
+    pub fn write_amd_packet_trace(&self, path: &Path) -> crate::Result<()> {
+        match self {
+            ServeEngine::Amd(e) => e.write_packet_trace(path),
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => Err(crate::RuntimeError::Device(
+                "raw AMD packet traces require an AMD serving engine".into(),
+            )),
+        }
+    }
+
     /// The VMM prefix-cache stats reader, when this engine has one. Only the
     /// CUDA engine does.
     #[cfg(feature = "cuda")]
@@ -79,12 +137,18 @@ pub use amd_serve::AmdServe;
 
 #[cfg(feature = "hsa")]
 mod amd_serve {
-    use std::path::Path;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use crate::exec::amd::AmdEngine;
+    use crate::exec::amd::{
+        derive_overlap_capability, AmdEngine, AmdOverlapCapability, AmdOverlapRankEvidence,
+    };
     use crate::exec::amd_tp::AmdTpGroup;
     use crate::{Result, RuntimeError};
+    use packet::dev::PrefillSpan;
+
+    use super::{DecodeSelection, EngineDiagnostics, PrefillSelection, RankAgreement};
 
     /// One or N ranks of a gfx950 model, driven as ONE sequence.
     ///
@@ -94,6 +158,158 @@ mod amd_serve {
     enum Ranks {
         One(AmdEngine),
         Tp(AmdTpGroup),
+    }
+
+    const DEFAULT_SNAPSHOT_TENSORS: &str = "act.qa,act.oat,act.attn,act.xn";
+    const MAX_SNAPSHOT_TENSORS: usize = 16;
+    const MAX_SNAPSHOT_TENSOR_NAME: usize = 128;
+    const MAX_SNAPSHOT_TENSOR_BYTES: u64 = 64 << 20;
+    const SNAPSHOT_KV_BYTES: usize = 65_536;
+
+    struct TensorSnapshotConfig {
+        dir: PathBuf,
+        slot: usize,
+        tensors: Vec<String>,
+    }
+
+    impl Ranks {
+        fn overlap_evidence(&self) -> Vec<AmdOverlapRankEvidence> {
+            match self {
+                Ranks::One(e) => vec![e.overlap_evidence(0)],
+                Ranks::Tp(g) => (0..g.n_gpu())
+                    .map(|rank| g.rank(rank).overlap_evidence(rank))
+                    .collect(),
+            }
+        }
+
+        fn rank0(&self) -> &AmdEngine {
+            match self {
+                Ranks::One(e) => e,
+                Ranks::Tp(g) => g.rank(0),
+            }
+        }
+
+        fn ctr_snapshot(&mut self, program: usize) -> Result<Vec<u32>> {
+            match self {
+                Ranks::One(e) => e.ctr_word0_snapshot(program),
+                Ranks::Tp(g) => g.ctr_snapshot(program),
+            }
+        }
+
+        fn data_snapshot(
+            &mut self,
+            slot: usize,
+            tensors: &[String],
+        ) -> Result<Vec<(String, Vec<u8>)>> {
+            match self {
+                Ranks::One(e) => {
+                    let mut out = e.snapshot_kv_slot(slot, SNAPSHOT_KV_BYTES)?;
+                    for name in tensors {
+                        out.push((name.clone(), e.snapshot_tensor(name)?));
+                    }
+                    Ok(out)
+                }
+                Ranks::Tp(g) => g.data_snapshot(slot, SNAPSHOT_KV_BYTES, tensors),
+            }
+        }
+    }
+
+    fn parse_snapshot_tensors(spec: Option<&str>) -> Result<Vec<String>> {
+        let spec = spec.unwrap_or(DEFAULT_SNAPSHOT_TENSORS);
+        let tensors = spec
+            .split(',')
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if tensors.is_empty() || tensors.iter().any(String::is_empty) {
+            return Err(RuntimeError::Device(
+                "AMD snapshot tensor list contains an empty name".into(),
+            ));
+        }
+        if tensors.len() > MAX_SNAPSHOT_TENSORS {
+            return Err(RuntimeError::Device(format!(
+                "AMD snapshot tensor list has {} entries; maximum is {MAX_SNAPSHOT_TENSORS}",
+                tensors.len()
+            )));
+        }
+        for (i, name) in tensors.iter().enumerate() {
+            if name.len() > MAX_SNAPSHOT_TENSOR_NAME {
+                return Err(RuntimeError::Device(format!(
+                    "AMD snapshot tensor name {name:?} is longer than {MAX_SNAPSHOT_TENSOR_NAME} bytes"
+                )));
+            }
+            if tensors[..i].contains(name) {
+                return Err(RuntimeError::Device(format!(
+                    "duplicate AMD snapshot tensor {name:?}"
+                )));
+            }
+            let component = snapshot_file_component(name);
+            if tensors[..i]
+                .iter()
+                .any(|prior| snapshot_file_component(prior) == component)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "AMD snapshot tensor {name:?} aliases another output filename"
+                )));
+            }
+        }
+        Ok(tensors)
+    }
+
+    fn validate_tensor_snapshot(engine: &AmdEngine, slot: usize, tensors: &[String]) -> Result<()> {
+        if slot >= engine.batch() {
+            return Err(RuntimeError::Device(format!(
+                "AMD snapshot slot {slot} past engine batch {}",
+                engine.batch()
+            )));
+        }
+        let mut total = 0u64;
+        for name in tensors {
+            let bytes = engine.tensor_bytes(name).ok_or_else(|| {
+                RuntimeError::Device(format!("AMD snapshot tensor {name:?} is not declared"))
+            })?;
+            total = total.checked_add(bytes).ok_or_else(|| {
+                RuntimeError::Device("AMD snapshot tensor byte count overflow".into())
+            })?;
+        }
+        if total > MAX_SNAPSHOT_TENSOR_BYTES {
+            return Err(RuntimeError::Device(format!(
+                "AMD snapshot tensors total {total} bytes; maximum is {MAX_SNAPSHOT_TENSOR_BYTES}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn prepare_snapshot_dir(path: &Path) -> Result<()> {
+        std::fs::create_dir_all(path).map_err(|source| RuntimeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn write_snapshot(path: PathBuf, bytes: &[u8]) -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|source| RuntimeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.write_all(bytes)
+            .map_err(|source| RuntimeError::Io { path, source })
+    }
+
+    fn snapshot_file_component(name: &str) -> String {
+        name.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
     }
 
     /// The gfx950 serving engine: `B` independent sequence slots sharing one
@@ -136,6 +352,7 @@ mod amd_serve {
         pos_stage: Vec<u32>,
         kvlen_stage: Vec<u32>,
         parked_stage: Vec<u32>,
+        advance_stage: Vec<usize>,
         /// The packet declares exactly one program, so there is no prefill
         /// bucket ladder to chunk a prompt over and the prompt is walked
         /// through the decode program one token at a time. GLM-5.2 is this
@@ -155,15 +372,23 @@ mod amd_serve {
         /// in between. `PLOW_PF_NO_CHUNK=1` restores whole-prompt-per-tick.
         pf: Vec<Option<PfCursor>>,
         chunk_prefill: bool,
+        /// Maximum compiled prefill rung selected per tick. `u32::MAX` = packet ladder cap.
+        prefill_chunk_rows: u32,
+        /// Next slot considered first by opt-in cross-request prefill fairness.
+        prefill_turn: usize,
         /// Width of the decode rung the last dispatch ran, so a rung CHANGE can be logged
         /// once instead of every step. It is the only externally visible evidence that the
         /// ladder is engaging, and a measurement that cannot show that is not a measurement.
         last_rung: u32,
+        diagnostics: Option<EngineDiagnostics>,
+        counter_snapshot_dir: Option<PathBuf>,
+        tensor_snapshot: Option<TensorSnapshotConfig>,
+        counter_snapshot_tick: u64,
+        tensor_snapshot_tick: u64,
     }
 
     /// A prompt part-way through its prefill.
     struct PfCursor {
-        prompt: Vec<u32>,
         steps: Vec<crate::exec::amd::ChunkStep>,
         next: usize,
         /// Rows already written. A parked row still takes a decode dispatch's KV write, so it is
@@ -175,6 +400,42 @@ mod amd_serve {
         /// Where the prefix cache resumed from, for the bookkeeping after the last chunk.
         resume: u32,
         arm: u32,
+    }
+
+    fn split_pending_prefill(cur: &mut PfCursor, steps: Vec<crate::exec::amd::ChunkStep>) {
+        let added = steps.len().saturating_sub(1);
+        cur.steps.splice(cur.next..=cur.next, steps);
+        if let Some(snap) = cur.snap_after.as_mut() {
+            if *snap >= cur.next {
+                *snap += added;
+            }
+        }
+    }
+
+    fn commit_packed_prefill(
+        cursors: &mut [Option<PfCursor>],
+        completed: &[(usize, crate::exec::amd::ChunkStep)],
+    ) {
+        for &(slot, step) in completed {
+            let cur = cursors[slot]
+                .as_mut()
+                .expect("packed cursor was validated before dispatch");
+            debug_assert_eq!(cur.steps.get(cur.next), Some(&step));
+            cur.next += 1;
+            cur.frontier = step.c0 + step.clen;
+        }
+    }
+
+    fn packable_prefill_step(cur: &PfCursor, max_rows: u32) -> Option<crate::exec::amd::ChunkStep> {
+        let step = *cur.steps.get(cur.next)?;
+        (cur.next + 1 < cur.steps.len()
+            && cur.snap_after != Some(cur.next)
+            && step.clen <= max_rows)
+            .then_some(step)
+    }
+
+    fn packed_prefill_dispatch_supported(is_tp: bool, program_capable: bool) -> bool {
+        is_tp && program_capable
     }
 
     /// Shortest prefix worth caching. Below this the snapshot/restore pair costs more than the
@@ -202,6 +463,13 @@ mod amd_serve {
 
     fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
         a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
+
+    fn bounded_deferred_quantum(requested: usize, context_room: usize) -> Option<usize> {
+        let quantum = requested
+            .min(crate::exec::amd::DEFERRED_TOKEN_MAX_STEPS)
+            .min(context_room);
+        (quantum >= 2).then_some(quantum)
     }
 
     impl AmdServe {
@@ -288,12 +556,37 @@ mod amd_serve {
                 Ranks::Tp(g) => g.rank(0).decode_rungs(),
             }
             .into_boxed_slice();
+            let snapshot_cfg = &crate::config::RuntimeConfig::get().amd;
+            let counter_snapshot_dir = snapshot_cfg.ctr_snap.as_deref().map(PathBuf::from);
+            let tensor_snapshot = snapshot_cfg
+                .tens_snap
+                .as_deref()
+                .map(|dir| {
+                    let tensors = parse_snapshot_tensors(snapshot_cfg.snap_tensors.as_deref())?;
+                    validate_tensor_snapshot(ranks.rank0(), snapshot_cfg.snap_slot, &tensors)?;
+                    Ok(TensorSnapshotConfig {
+                        dir: PathBuf::from(dir),
+                        slot: snapshot_cfg.snap_slot,
+                        tensors,
+                    })
+                })
+                .transpose()?;
+            if let Some(dir) = counter_snapshot_dir.as_deref() {
+                prepare_snapshot_dir(dir)?;
+            }
+            if let Some(snapshot) = tensor_snapshot.as_ref() {
+                prepare_snapshot_dir(&snapshot.dir)?;
+            }
             tracing::info!(
                 n_gpu,
                 max_ctx,
                 batch,
                 decode_rungs = ?decode_rungs,
                 decode_only = !has_prefill,
+                pf_batch = crate::config::RuntimeConfig::get().nv.pf_batch,
+                pf_chunk = crate::config::RuntimeConfig::get().nv.pf_chunk,
+                pf_interleave = crate::config::RuntimeConfig::get().nv.pf_interleave,
+                pf_defer_decode = crate::config::RuntimeConfig::get().nv.pf_defer_decode,
                 stop_ids = ?stop_ids,
                 "AMD serve engine ready"
             );
@@ -308,6 +601,7 @@ mod amd_serve {
                 pos_stage: vec![0; batch],
                 kvlen_stage: vec![1; batch],
                 parked_stage: vec![1; batch],
+                advance_stage: Vec::with_capacity(batch),
                 decode_only: !has_prefill,
                 max_ctx,
                 prefix_cache: crate::config::RuntimeConfig::get().nv.prefix_cache,
@@ -315,12 +609,59 @@ mod amd_serve {
                 snap_at: vec![0; batch],
                 pf: (0..batch).map(|_| None).collect(),
                 chunk_prefill: !crate::config::RuntimeConfig::get().nv.pf_no_chunk,
+                prefill_chunk_rows: match crate::config::RuntimeConfig::get().nv.pf_chunk {
+                    0 => u32::MAX,
+                    rows => rows,
+                },
+                prefill_turn: 0,
                 last_rung: 0,
+                diagnostics: None,
+                counter_snapshot_dir,
+                tensor_snapshot,
+                counter_snapshot_tick: 0,
+                tensor_snapshot_tick: 0,
             })
+        }
+
+        pub fn begin_diagnostics(&mut self) {
+            let overlap_ranges = Some(self.overlap_evidence());
+            let rank_agreement = match &self.ranks {
+                Ranks::One(_) => None,
+                Ranks::Tp(g) => Some(RankAgreement {
+                    ranks: g.n_gpu(),
+                    sampled_token_every: g.agreement_cadence(),
+                    counter_audit_every_dispatch: g.counter_audit_enabled(),
+                    prefill_completion_all_ranks: true,
+                }),
+            };
+            self.diagnostics = Some(EngineDiagnostics {
+                supported: true,
+                complete: true,
+                overflowed: false,
+                scope: "warmup_and_measured",
+                prefill_selections: Vec::new(),
+                decode_selections: Vec::new(),
+                rank_agreement,
+                amd_overlap_ranges: overlap_ranges,
+            });
+        }
+
+        pub fn finish_diagnostics(&mut self) -> EngineDiagnostics {
+            self.diagnostics
+                .take()
+                .unwrap_or_else(EngineDiagnostics::unsupported)
         }
 
         pub fn decode_rungs(&self) -> &[u32] {
             &self.decode_rungs
+        }
+
+        pub fn overlap_evidence(&self) -> Vec<AmdOverlapRankEvidence> {
+            self.ranks.overlap_evidence()
+        }
+
+        pub fn overlap_capability(&self) -> AmdOverlapCapability {
+            derive_overlap_capability(&self.overlap_evidence())
         }
 
         /// Sequence slots one decode dispatch advances. The mux sizes its slot
@@ -337,6 +678,42 @@ mod amd_serve {
             self.max_ctx
         }
 
+        /// Stage a mux-formed packed-prefill descriptor without dispatching it. Every span must
+        /// name the same compiled program; the rank wrappers perform the full structural checks.
+        pub fn stage_packed_prefill(
+            &mut self,
+            spans: &[PrefillSpan],
+            parked: &[u32],
+        ) -> Result<()> {
+            let first = spans.first().ok_or_else(|| {
+                RuntimeError::Device("packed prefill requires at least one span".into())
+            })?;
+            if spans.iter().any(|s| s.program != first.program) {
+                return Err(RuntimeError::Device(
+                    "packed prefill spans do not share one compiled program".into(),
+                ));
+            }
+            let prog = first.program as usize;
+            match &mut self.ranks {
+                Ranks::One(e) => e.stage_packed_prefill(prog, spans, parked),
+                Ranks::Tp(g) => g.stage_packed_prefill(prog, spans, parked),
+            }
+        }
+
+        pub fn clear_packed_prefill(&mut self) {
+            match &mut self.ranks {
+                Ranks::One(e) => e.clear_packed_prefill(),
+                Ranks::Tp(g) => g.clear_packed_prefill(),
+            }
+        }
+
+        pub fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
+            match &self.ranks {
+                Ranks::One(e) => e.prefill_prog_t(prog),
+                Ranks::Tp(g) => g.prefill_prog_t(prog),
+            }
+        }
+
         /// Admit `prompt` into sequence slot `slot` and return its first
         /// generated token. Leaves `pos[slot]` at `prompt.len()`.
         ///
@@ -347,6 +724,9 @@ mod amd_serve {
         /// one tick, and it is why TTFT under load is bounded by the longest
         /// prompt in the batch rather than by a chunk.
         pub fn prefill(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                diagnostics.complete = false;
+            }
             if prompt.is_empty() {
                 return Err(RuntimeError::Rejected("empty prompt".into()));
             }
@@ -450,6 +830,11 @@ mod amd_serve {
                 self.pos[slot] = prompt.len() as u32;
                 t
             };
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                if !diagnostics.overflowed {
+                    diagnostics.complete = true;
+                }
+            }
             Ok(tok)
         }
 
@@ -512,6 +897,16 @@ mod amd_serve {
         /// single-GPU, `decode_only`, a 1-token prompt, or the prefix cache (whose split points
         /// are its own and are not the bucket plan).
         pub fn prefill_chunked(&mut self, slot: usize, prompt: &[u32]) -> Result<Option<u32>> {
+            self.prefill_chunked_at_most(slot, prompt, u32::MAX)
+        }
+
+        /// Advance one chunk, selecting only compiled packet rungs within this tick's budget.
+        pub fn prefill_chunked_at_most(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            tick_max_bucket: u32,
+        ) -> Result<Option<u32>> {
             let plain_tp = matches!(self.ranks, Ranks::Tp(_))
                 && self.chunk_prefill
                 && !self.decode_only
@@ -546,20 +941,21 @@ mod amd_serve {
                 if resume == 0 {
                     self.invalidate_prefix(slot);
                 }
+                let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
                 let (steps, snap_after) = match &mut self.ranks {
                     Ranks::Tp(g) => {
                         if resume > 0 {
                             g.restore_carried(slot)?;
-                            (g.plan_span(resume, n)?, None)
+                            (g.plan_span_at_most(resume, n, max_bucket)?, None)
                         } else if arm > 0 {
-                            let head = g.plan_span(0, arm)?;
-                            let tail = g.plan_span(arm, n)?;
+                            let head = g.plan_span_at_most(0, arm, max_bucket)?;
+                            let tail = g.plan_span_at_most(arm, n, max_bucket)?;
                             let cut = head.len();
                             let mut all = head;
                             all.extend(tail);
                             (all, cut.checked_sub(1))
                         } else {
-                            (g.plan_span(0, n)?, None)
+                            (g.plan_span_at_most(0, n, max_bucket)?, None)
                         }
                     }
                     Ranks::One(_) => unreachable!("gated on Tp above"),
@@ -569,7 +965,6 @@ mod amd_serve {
                 // half-prefilled slot must stay parked.
                 self.live[slot] = false;
                 self.pf[slot] = Some(PfCursor {
-                    prompt: prompt.to_vec(),
                     steps,
                     next: 0,
                     frontier: resume,
@@ -581,8 +976,27 @@ mod amd_serve {
             let Ranks::Tp(g) = &mut self.ranks else {
                 unreachable!("gated on Tp above")
             };
+            let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
+            let pending = {
+                let cur = self.pf[slot].as_ref().expect("just built");
+                cur.steps[cur.next]
+            };
+            if pending.clen > max_bucket {
+                let split =
+                    g.plan_span_at_most(pending.c0, pending.c0 + pending.clen, max_bucket)?;
+                let cur = self.pf[slot].as_mut().expect("just built");
+                split_pending_prefill(cur, split);
+            }
             let cur = self.pf[slot].as_mut().expect("just built");
             let step = cur.steps[cur.next];
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                diagnostics.push_prefill(PrefillSelection {
+                    slot,
+                    row_start: step.c0,
+                    rows: step.clen,
+                    bucket: g.rank(0).prog_t(step.prog),
+                });
+            }
             tracing::debug!(
                 slot,
                 c0 = step.c0,
@@ -594,7 +1008,7 @@ mod amd_serve {
             // Rebase for this chunk and hand the base back before returning: the decode that runs
             // later in this same tick refuses a non-zero base.
             g.kv_rebase_all(slot)?;
-            let r = g.prefill_chunk(&cur.prompt, step);
+            let r = g.prefill_chunk(prompt, step);
             let restore = g.kv_rebase_all(0);
             r?;
             restore?;
@@ -610,10 +1024,9 @@ mod amd_serve {
             }
             let ids = g.read_sampled_all()?;
             let tok = AmdTpGroup::agree(&ids)?;
-            tracing::debug!(slot, tok, n = cur.prompt.len(), "pf complete");
-            let n = cur.prompt.len() as u32;
+            tracing::debug!(slot, tok, n = prompt.len(), "pf complete");
+            let n = prompt.len() as u32;
             let (resume, arm) = (cur.resume, cur.arm);
-            let prompt_owned = std::mem::take(&mut cur.prompt);
             self.pf[slot] = None;
             self.pos[slot] = n;
             self.live[slot] = true;
@@ -621,7 +1034,8 @@ mod amd_serve {
                 // Same invariant as the whole-prompt path: the snapshot describes
                 // `cached_prompt[..snap_at]`, so a hit keeps it, an arm replaces it, and anything
                 // else makes it stale.
-                self.cached_prompt[slot] = prompt_owned;
+                self.cached_prompt[slot].clear();
+                self.cached_prompt[slot].extend_from_slice(prompt);
                 if arm > 0 {
                     self.snap_at[slot] = arm;
                 } else if resume == 0 {
@@ -629,6 +1043,218 @@ mod amd_serve {
                 }
             }
             Ok(Some(tok))
+        }
+
+        /// Rows completed by a request whose chunked prefill is still active.
+        pub fn prefill_frontier(&self, slot: usize) -> Option<usize> {
+            self.pf
+                .get(slot)
+                .and_then(Option::as_ref)
+                .map(|cursor| cursor.frontier as usize)
+        }
+
+        /// Device-independent metadata for the next already-planned chunk.
+        ///
+        /// A fresh request has no cursor yet and returns `None`; the caller must
+        /// take the isolated path once to perform admission-time state clear and
+        /// prefix-cache planning. Subsequent chunks can participate in compatible-
+        /// rung pack formation without duplicating either side effect.
+        pub fn prefill_span(&self, slot: usize, max_rows: u32) -> Option<packet::dev::PrefillSpan> {
+            let cur = self.pf.get(slot)?.as_ref()?;
+            let step = *cur.steps.get(cur.next)?;
+            if step.clen > max_rows {
+                return None;
+            }
+            Some(packet::dev::PrefillSpan {
+                row0: 0,
+                n_rows: step.clen,
+                slot: u32::try_from(slot).ok()?,
+                flags: if step.c0 == 0 {
+                    packet::dev::PREFILL_SPAN_RESET_STATE
+                } else {
+                    0
+                },
+                kv_row0: step.c0,
+                kv_len: step.c0.checked_add(step.clen)?,
+                state_slot: u32::try_from(slot).ok()?,
+                program: u32::try_from(step.prog).ok()?,
+            })
+        }
+
+        /// The next span iff it can complete without producing a token or crossing a prefix-cache
+        /// snapshot boundary. Fresh cursors remain ineligible until isolated admission initializes
+        /// their state and prefix plan.
+        pub fn packable_prefill_span(
+            &self,
+            slot: usize,
+            max_rows: u32,
+        ) -> Option<packet::dev::PrefillSpan> {
+            let cur = self.pf.get(slot)?.as_ref()?;
+            let step = packable_prefill_step(cur, max_rows)?;
+            let supported = match &self.ranks {
+                Ranks::One(_) => packed_prefill_dispatch_supported(false, false),
+                Ranks::Tp(group) => packed_prefill_dispatch_supported(
+                    true,
+                    group.packed_prefill_prog_capable(step.prog),
+                ),
+            };
+            supported.then_some(())?;
+            self.prefill_span(slot, max_rows)
+        }
+
+        /// Advance compatible, already-initialized TP prefill cursors in one packed dispatch.
+        /// Final chunks remain isolated because the current model prefill head exposes one
+        /// sampled token, not one result per span. Snapshot boundaries remain isolated too.
+        pub fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> Result<()> {
+            if members.len() < 2 {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill requires at least two cursors".into(),
+                ));
+            }
+            if !matches!(self.ranks, Ranks::Tp(_)) {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill requires an AMD TP engine".into(),
+                ));
+            }
+
+            let mut spans = Vec::with_capacity(members.len());
+            let mut slices = Vec::with_capacity(members.len());
+            let mut completed = Vec::with_capacity(members.len());
+            let mut row0 = 0u32;
+            let mut program = None;
+            for &(slot, prompt) in members {
+                if spans
+                    .iter()
+                    .any(|span: &PrefillSpan| span.slot as usize == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "packed prefill slot {slot} appears more than once"
+                    )));
+                }
+                let cur = self.pf.get(slot).and_then(Option::as_ref).ok_or_else(|| {
+                    RuntimeError::Rejected(format!(
+                        "packed prefill slot {slot} has no initialized cursor"
+                    ))
+                })?;
+                if self.live.get(slot).copied() != Some(false) {
+                    return Err(RuntimeError::Device(format!(
+                        "packed prefill slot {slot} has both a live decode row and a prefill cursor"
+                    )));
+                }
+                let step = *cur.steps.get(cur.next).ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "packed prefill slot {slot} cursor is past its plan"
+                    ))
+                })?;
+                if cur.next + 1 == cur.steps.len() {
+                    return Err(RuntimeError::Rejected(format!(
+                        "packed prefill slot {slot} is on its final chunk; use isolated prefill to collect its sampled token"
+                    )));
+                }
+                if cur.snap_after == Some(cur.next) {
+                    return Err(RuntimeError::Rejected(format!(
+                        "packed prefill slot {slot} is on a prefix snapshot boundary; use isolated prefill"
+                    )));
+                }
+                if program.is_some_and(|p| p != step.prog) {
+                    return Err(RuntimeError::Rejected(
+                        "packed prefill cursors do not share one compiled program".into(),
+                    ));
+                }
+                program = Some(step.prog);
+                let end = (step.c0 as usize)
+                    .checked_add(step.clen as usize)
+                    .filter(|&end| end <= prompt.len())
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected(format!(
+                            "packed prefill slot {slot} prompt does not cover [{}, {})",
+                            step.c0,
+                            step.c0.saturating_add(step.clen)
+                        ))
+                    })?;
+                let mut span = self.prefill_span(slot, u32::MAX).ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "packed prefill slot {slot} lost its planned span"
+                    ))
+                })?;
+                span.row0 = row0;
+                row0 = row0.checked_add(span.n_rows).ok_or_else(|| {
+                    RuntimeError::Rejected("packed prefill row count overflows u32".into())
+                })?;
+                spans.push(span);
+                slices.push(&prompt[step.c0 as usize..end]);
+                completed.push((slot, step));
+            }
+
+            let prog = program.expect("non-empty members set a program");
+            let rung = self.prefill_prog_t(prog).ok_or_else(|| {
+                RuntimeError::Rejected(format!(
+                    "packed prefill program {prog} is not a common prefill rung"
+                ))
+            })?;
+            if row0 > rung {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed prefill has {row0} dense rows but program {prog} is compiled for {rung}"
+                )));
+            }
+            let mut parked = vec![1; rung as usize];
+            parked[..row0 as usize].fill(0);
+            let Ranks::Tp(group) = &mut self.ranks else {
+                unreachable!("TP checked above")
+            };
+            group.prefill_packed_chunk(&spans, &slices, &parked)?;
+            commit_packed_prefill(&mut self.pf, &completed);
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                for &(slot, step) in &completed {
+                    diagnostics.push_prefill(PrefillSelection {
+                        slot,
+                        row_start: step.c0,
+                        rows: step.clen,
+                        bucket: rung,
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        pub fn prefill_turn(&self) -> usize {
+            self.prefill_turn
+        }
+
+        pub fn advance_prefill_turn(&mut self, slot: usize) {
+            self.prefill_turn = (slot + 1) % self.batch.max(1);
+        }
+
+        fn packet_trace_paths(path: &Path, n_gpu: usize, all: bool) -> Vec<std::path::PathBuf> {
+            (0..if all { n_gpu } else { 1 })
+                .map(|rank| {
+                    if all {
+                        let mut out = path.as_os_str().to_owned();
+                        out.push(format!(".rk{rank}"));
+                        std::path::PathBuf::from(out)
+                    } else {
+                        path.to_owned()
+                    }
+                })
+                .collect()
+        }
+
+        /// Write the last completed program trace. `PLOW_TRACE_ALLRANKS=1` is a
+        /// diagnostic-only TP mode that appends `.rkN` to `path`.
+        pub fn write_packet_trace(&self, path: &Path) -> Result<()> {
+            match &self.ranks {
+                Ranks::One(e) => e.trace_write(path),
+                Ranks::Tp(g) => {
+                    let all = crate::config::RuntimeConfig::get().amd.trace_allranks;
+                    for (rank, out) in Self::packet_trace_paths(path, g.n_gpu(), all)
+                        .iter()
+                        .enumerate()
+                    {
+                        g.rank(rank).trace_write(&out)?;
+                    }
+                    Ok(())
+                }
+            }
         }
 
         /// Feed `id` into slot `slot` and produce its next token.
@@ -654,6 +1280,110 @@ mod amd_serve {
             self.dispatch(slot)
         }
 
+        /// Largest safe deferred-read quantum for this feed set.
+        pub fn multistep_quantum(&self, feeds: &[(usize, u32)], requested: usize) -> Option<usize> {
+            let Ranks::Tp(g) = &self.ranks else {
+                return None;
+            };
+            if !g.deferred_token_capture_available()
+                || crate::config::RuntimeConfig::get().amd.ctr_snap.is_some()
+                || crate::config::RuntimeConfig::get().amd.tens_snap.is_some()
+            {
+                return None;
+            }
+            let room = feeds
+                .iter()
+                .filter_map(|&(slot, _)| self.pos.get(slot))
+                .map(|&pos| self.max_ctx.saturating_sub(pos as usize))
+                .min()?;
+            bounded_deferred_quantum(requested, room)
+        }
+
+        /// Run several greedy TP decode tokens while retaining every per-token
+        /// drain/counter audit. Tokens are captured device-side and read once.
+        pub fn multi_step(
+            &mut self,
+            feeds: &[(usize, u32)],
+            quantum: usize,
+            out: &mut Vec<u32>,
+        ) -> Result<usize> {
+            if self.multistep_quantum(feeds, quantum) != Some(quantum) {
+                return Err(RuntimeError::Rejected(
+                    "AMD deferred-read multi-step is unavailable for this quantum".into(),
+                ));
+            }
+            for &(slot, id) in feeds {
+                self.check_slot(slot)?;
+                self.next_id[slot] = id;
+            }
+            let mut advance = std::mem::take(&mut self.advance_stage);
+            advance.clear();
+            advance.extend(feeds.iter().map(|&(slot, _)| slot));
+            let rows = (0..self.batch)
+                .filter(|&slot| self.live[slot] || self.pf[slot].is_some())
+                .map(|slot| slot + 1)
+                .max()
+                .unwrap_or(1);
+            if let Some(&slot) = advance.iter().find(|&&slot| slot >= rows) {
+                self.advance_stage = advance;
+                return Err(RuntimeError::Device(format!(
+                    "decode ladder: slot {slot} is being advanced but the rung covers only {rows} rows"
+                )));
+            }
+
+            let result = (|| -> Result<()> {
+                let Ranks::Tp(g) = &mut self.ranks else {
+                    unreachable!("multistep_quantum accepted only TP")
+                };
+                let dp = g.rank(0).decode_prog_for(rows);
+                let width = g.rank(0).prog_t(dp);
+                if width != self.last_rung {
+                    tracing::info!(rung = width, occupied = rows, "decode ladder rung");
+                    self.last_rung = width;
+                }
+                stage_parked(&mut self.parked_stage, &advance);
+                g.upload_parked(&self.parked_stage)?;
+                g.seed_ids(&self.next_id)?;
+
+                let started = self.diagnostics.is_some().then(std::time::Instant::now);
+                let dispatch = (|| {
+                    for step in 0..quantum {
+                        for slot in 0..self.batch {
+                            let (pos, kvlen) = match (&self.pf[slot], self.live[slot]) {
+                                (Some(cursor), _) => (cursor.frontier, cursor.frontier + 1),
+                                (None, true) => (self.pos[slot], self.pos[slot] + 1),
+                                (None, false) => (0, 1),
+                            };
+                            self.pos_stage[slot] = pos;
+                            self.kvlen_stage[slot] = kvlen;
+                        }
+                        g.submit_decode_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
+                        g.complete_decode_batched_deferred(self.batch, step, quantum)?;
+                        for &slot in &advance {
+                            self.pos[slot] += 1;
+                        }
+                    }
+                    g.read_deferred_tokens(width as usize, quantum, out)
+                })();
+                if let Some(started) = started {
+                    self.diagnostics
+                        .as_mut()
+                        .expect("diagnostic timer requires diagnostics")
+                        .push_decode(DecodeSelection {
+                            occupied_rows: rows,
+                            bucket: width,
+                            elapsed_ns: u64::try_from(started.elapsed().as_nanos())
+                                .unwrap_or(u64::MAX),
+                            steps: quantum,
+                        });
+                }
+                dispatch
+            })();
+            self.advance_stage = advance;
+            result?;
+            Ok(quantum)
+        }
+
         /// Advance EVERY live slot by one token in ONE dispatch.
         ///
         /// `feeds` is `(slot, id)` for each slot that has a token to consume.
@@ -670,8 +1400,12 @@ mod amd_serve {
                 }
                 self.next_id[s] = id;
             }
-            let advance: Vec<usize> = feeds.iter().map(|&(s, _)| s).collect();
-            let out = self.dispatch_all(&advance)?;
+            let mut advance = std::mem::take(&mut self.advance_stage);
+            advance.clear();
+            advance.extend(feeds.iter().map(|&(s, _)| s));
+            let result = self.dispatch_all(&advance);
+            self.advance_stage = advance;
+            let out = result?;
             Ok(feeds.iter().map(|&(s, _)| (s, out[s])).collect())
         }
 
@@ -695,6 +1429,35 @@ mod amd_serve {
                     "slot {slot} past engine batch {}",
                     self.batch
                 )));
+            }
+            Ok(())
+        }
+
+        fn capture_decode_snapshots(&mut self, program: usize, rung: u32) -> Result<()> {
+            if let Some(dir) = self.counter_snapshot_dir.as_ref() {
+                let snapshot = self.ranks.ctr_snapshot(program)?;
+                let bytes = snapshot
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>();
+                let path = dir.join(format!(
+                    "tick_{:05}_r{rung}.bin",
+                    self.counter_snapshot_tick
+                ));
+                write_snapshot(path, &bytes)?;
+                self.counter_snapshot_tick += 1;
+            }
+            if let Some(snapshot) = self.tensor_snapshot.as_ref() {
+                let tensors = self.ranks.data_snapshot(snapshot.slot, &snapshot.tensors)?;
+                for (name, bytes) in tensors {
+                    let path = snapshot.dir.join(format!(
+                        "t{:05}_r{rung}_{}.bin",
+                        self.tensor_snapshot_tick,
+                        snapshot_file_component(&name)
+                    ));
+                    write_snapshot(path, &bytes)?;
+                }
+                self.tensor_snapshot_tick += 1;
             }
             Ok(())
         }
@@ -724,11 +1487,23 @@ mod amd_serve {
         fn dispatch_all(&mut self, advance: &[usize]) -> Result<Vec<u32>> {
             if self.batch == 1 {
                 let pos = self.pos[0];
+                let measure_dispatch = self.diagnostics.is_some();
                 use crate::obs::dstep;
-                let t = match &mut self.ranks {
+                let (token, program, rung, elapsed_ns) = match &mut self.ranks {
                     Ranks::One(e) => {
+                        let program = e.decode_prog();
+                        let rung = e.prog_t(program);
                         dstep::timed(&dstep::SEED, || e.seed_ids(&self.next_id))?;
-                        e.decode_step(pos, pos + 1)?
+                        let started = measure_dispatch.then(std::time::Instant::now);
+                        let token = e.decode_step(pos, pos + 1)?;
+                        (
+                            token,
+                            program,
+                            rung,
+                            started.map(|started| {
+                                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            }),
+                        )
                     }
                     // The split pair, not `decode_step`, because this is the
                     // server and the split exists for it. NOTHING sits between
@@ -738,16 +1513,38 @@ mod amd_serve {
                     // The argument, with the numbers, is in `exec::amd_tp`'s
                     // module doc — read it before putting work here.
                     Ranks::Tp(g) => {
+                        let program = g.rank(0).decode_prog();
+                        let rung = g.rank(0).prog_t(program);
                         dstep::timed(&dstep::SEED, || g.seed_ids(&self.next_id))?;
+                        let started = measure_dispatch.then(std::time::Instant::now);
                         g.submit_decode(pos, pos + 1)?;
                         let ids = g.complete_decode()?;
-                        dstep::timed(&dstep::AGREE, || AmdTpGroup::agree(&ids))?
+                        (
+                            dstep::timed(&dstep::AGREE, || AmdTpGroup::agree(&ids))?,
+                            program,
+                            rung,
+                            started.map(|started| {
+                                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            }),
+                        )
                     }
                 };
+                if let Some(elapsed_ns) = elapsed_ns {
+                    self.diagnostics
+                        .as_mut()
+                        .expect("diagnostic timer requires diagnostics")
+                        .push_decode(DecodeSelection {
+                            occupied_rows: 1,
+                            bucket: rung,
+                            elapsed_ns,
+                            steps: 1,
+                        });
+                }
+                self.capture_decode_snapshots(program, rung)?;
                 for &s in advance {
                     self.pos[s] += 1;
                 }
-                return Ok(vec![t]);
+                return Ok(vec![token]);
             }
             for s in 0..self.batch {
                 // A slot MID-CHUNKED-PREFILL is not live, but it must not be fed row 0 either:
@@ -806,7 +1603,8 @@ mod amd_serve {
                      {rows} rows — the slot table and the live set disagree"
                 )));
             }
-            let out = match &mut self.ranks {
+            let measure_dispatch = self.diagnostics.is_some();
+            let (out, program, rung, elapsed_ns) = match &mut self.ranks {
                 Ranks::One(e) => {
                     let dp = e.decode_prog_for(rows);
                     let w = e.prog_t(dp);
@@ -816,7 +1614,16 @@ mod amd_serve {
                     }
                     e.upload_parked(&self.parked_stage)?;
                     e.seed_ids(&self.next_id)?;
-                    e.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?
+                    let started = measure_dispatch.then(std::time::Instant::now);
+                    let out = e.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
+                    (
+                        out,
+                        dp,
+                        w,
+                        started.map(|started| {
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                        }),
+                    )
                 }
                 Ranks::Tp(g) => {
                     let dp = g.rank(0).decode_prog_for(rows);
@@ -835,43 +1642,30 @@ mod amd_serve {
                     );
                     g.upload_parked(&self.parked_stage)?;
                     g.seed_ids(&self.next_id)?;
+                    let started = measure_dispatch.then(std::time::Instant::now);
                     let out = g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
-                    // Task-9 differential counter audit: dump rank-0 end-state
-                    // counters per tick for offline diff (same rung ⇒ must be
-                    // byte-identical every tick).
-                    if let Some(dir) = crate::config::RuntimeConfig::get().amd.ctr_snap.as_deref() {
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static TICK: AtomicU64 = AtomicU64::new(0);
-                        let t = TICK.fetch_add(1, Ordering::Relaxed);
-                        if let Ok(snap) = g.ctr_snapshot(dp) {
-                            let bytes: Vec<u8> =
-                                snap.iter().flat_map(|v| v.to_le_bytes()).collect();
-                            let _ = std::fs::write(format!("{dir}/tick_{t:05}_r{w}.bin"), bytes);
-                        }
-                    }
-                    // Round-7 data audit: layer-0 KV slot head + act tensors of
-                    // PLOW_SNAP_SLOT after each tick.
-                    if let Some(dir) = crate::config::RuntimeConfig::get().amd.tens_snap.as_deref()
-                    {
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static DTICK: AtomicU64 = AtomicU64::new(0);
-                        let t = DTICK.fetch_add(1, Ordering::Relaxed);
-                        let slot = crate::config::RuntimeConfig::get().amd.snap_slot;
-                        if let Ok(snaps) = g.data_snapshot(
-                            slot,
-                            65536,
-                            &["act.qa", "act.oat", "act.attn", "act.xn"],
-                        ) {
-                            for (name, bytes) in snaps {
-                                let f = name.replace('/', "_");
-                                let _ =
-                                    std::fs::write(format!("{dir}/t{t:05}_r{w}_{f}.bin"), bytes);
-                            }
-                        }
-                    }
-                    out
+                    (
+                        out,
+                        dp,
+                        w,
+                        started.map(|started| {
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                        }),
+                    )
                 }
             };
+            if let Some(elapsed_ns) = elapsed_ns {
+                self.diagnostics
+                    .as_mut()
+                    .expect("diagnostic timer requires diagnostics")
+                    .push_decode(DecodeSelection {
+                        occupied_rows: rows,
+                        bucket: rung,
+                        elapsed_ns,
+                        steps: 1,
+                    });
+            }
+            self.capture_decode_snapshots(program, rung)?;
             for &s in advance {
                 self.pos[s] += 1;
             }
@@ -881,7 +1675,181 @@ mod amd_serve {
 
     #[cfg(test)]
     mod tests {
-        use super::{invalidate_prefix_metadata, stage_parked};
+        use super::{
+            bounded_deferred_quantum, commit_packed_prefill, invalidate_prefix_metadata,
+            packable_prefill_step, packed_prefill_dispatch_supported, parse_snapshot_tensors,
+            snapshot_file_component, split_pending_prefill, stage_parked, AmdServe, PfCursor,
+            DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
+        };
+        use crate::exec::amd::ChunkStep;
+
+        #[test]
+        fn packet_trace_paths_cover_single_and_all_tp_ranks() {
+            assert_eq!(
+                AmdServe::packet_trace_paths(std::path::Path::new("trace"), 8, false),
+                [std::path::PathBuf::from("trace")]
+            );
+            assert_eq!(
+                AmdServe::packet_trace_paths(std::path::Path::new("trace"), 3, true),
+                [
+                    std::path::PathBuf::from("trace.rk0"),
+                    std::path::PathBuf::from("trace.rk1"),
+                    std::path::PathBuf::from("trace.rk2"),
+                ]
+            );
+        }
+
+        #[test]
+        fn deferred_quantum_is_bounded_by_scheduler_capture_and_context() {
+            assert_eq!(bounded_deferred_quantum(4, 100), Some(4));
+            assert_eq!(bounded_deferred_quantum(9, 100), Some(4));
+            assert_eq!(bounded_deferred_quantum(4, 3), Some(3));
+            assert_eq!(bounded_deferred_quantum(4, 1), None);
+        }
+
+        #[test]
+        fn snapshot_tensor_list_is_bounded_and_uses_compatibility_default() {
+            assert_eq!(
+                parse_snapshot_tensors(None).unwrap().join(","),
+                DEFAULT_SNAPSHOT_TENSORS
+            );
+            assert_eq!(
+                parse_snapshot_tensors(Some(" act.logits, act.x ")).unwrap(),
+                ["act.logits", "act.x"]
+            );
+            assert!(parse_snapshot_tensors(Some("act.x,,act.logits")).is_err());
+            assert!(parse_snapshot_tensors(Some("act.x,act.x")).is_err());
+            assert!(parse_snapshot_tensors(Some("act/a,act:a")).is_err());
+            let too_many = (0..=MAX_SNAPSHOT_TENSORS)
+                .map(|i| format!("act.{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            assert!(parse_snapshot_tensors(Some(&too_many)).is_err());
+        }
+
+        #[test]
+        fn snapshot_tensor_names_cannot_create_subdirectories() {
+            assert_eq!(snapshot_file_component("act/a:b"), "act_a_b");
+        }
+
+        #[test]
+        fn snapshot_write_errors_are_not_swallowed() {
+            let dir = std::env::temp_dir()
+                .join(format!("plow-snapshot-write-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(super::write_snapshot(dir.clone(), b"snapshot").is_err());
+            std::fs::remove_dir(dir).unwrap();
+        }
+
+        #[test]
+        fn snapshot_writes_never_overwrite_an_existing_tick() {
+            let path = std::env::temp_dir().join(format!(
+                "plow-snapshot-create-new-test-{}",
+                std::process::id()
+            ));
+            super::write_snapshot(path.clone(), b"first").unwrap();
+            let err = super::write_snapshot(path.clone(), b"second").unwrap_err();
+            match err {
+                crate::RuntimeError::Io { source, .. } => {
+                    assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists)
+                }
+                other => panic!("unexpected snapshot error: {other}"),
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), b"first");
+            std::fs::remove_file(path).unwrap();
+        }
+
+        #[test]
+        fn shrinking_a_pending_prefill_step_preserves_the_snapshot_boundary() {
+            let mut cur = PfCursor {
+                steps: vec![ChunkStep {
+                    prog: 3,
+                    c0: 0,
+                    clen: 8,
+                }],
+                next: 0,
+                frontier: 0,
+                snap_after: Some(0),
+                resume: 0,
+                arm: 8,
+            };
+            split_pending_prefill(
+                &mut cur,
+                vec![
+                    ChunkStep {
+                        prog: 1,
+                        c0: 0,
+                        clen: 4,
+                    },
+                    ChunkStep {
+                        prog: 1,
+                        c0: 4,
+                        clen: 4,
+                    },
+                ],
+            );
+            assert_eq!(cur.steps.len(), 2);
+            assert_eq!(cur.snap_after, Some(1));
+        }
+
+        #[test]
+        fn packed_cursor_commit_advances_all_selected_rows_together() {
+            let step0 = ChunkStep {
+                prog: 2,
+                c0: 0,
+                clen: 3,
+            };
+            let step1 = ChunkStep {
+                prog: 2,
+                c0: 4,
+                clen: 2,
+            };
+            let cursor = |step| {
+                Some(PfCursor {
+                    steps: vec![step, ChunkStep { c0: 8, ..step }],
+                    next: 0,
+                    frontier: step.c0,
+                    snap_after: None,
+                    resume: 0,
+                    arm: 0,
+                })
+            };
+            let mut cursors = vec![cursor(step0), None, cursor(step1)];
+            commit_packed_prefill(&mut cursors, &[(0, step0), (2, step1)]);
+            assert_eq!(cursors[0].as_ref().unwrap().next, 1);
+            assert_eq!(cursors[0].as_ref().unwrap().frontier, 3);
+            assert_eq!(cursors[2].as_ref().unwrap().next, 1);
+            assert_eq!(cursors[2].as_ref().unwrap().frontier, 6);
+            assert!(cursors[1].is_none());
+        }
+
+        #[test]
+        fn packed_prefill_eligibility_excludes_final_snapshot_and_oversized_steps() {
+            let step = ChunkStep {
+                prog: 2,
+                c0: 4,
+                clen: 3,
+            };
+            let cursor = |next, snap_after| PfCursor {
+                steps: vec![step, ChunkStep { c0: 7, ..step }],
+                next,
+                frontier: 4,
+                snap_after,
+                resume: 0,
+                arm: 0,
+            };
+            assert_eq!(packable_prefill_step(&cursor(0, None), 3), Some(step));
+            assert_eq!(packable_prefill_step(&cursor(0, None), 2), None);
+            assert_eq!(packable_prefill_step(&cursor(0, Some(0)), 3), None);
+            assert_eq!(packable_prefill_step(&cursor(1, None), 3), None);
+        }
+
+        #[test]
+        fn packed_prefill_dispatch_requires_tp_and_program_capability() {
+            assert!(packed_prefill_dispatch_supported(true, true));
+            assert!(!packed_prefill_dispatch_supported(false, true));
+            assert!(!packed_prefill_dispatch_supported(true, false));
+        }
 
         #[test]
         fn parked_rows_follow_the_advance_set_not_liveness() {

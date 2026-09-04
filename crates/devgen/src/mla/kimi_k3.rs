@@ -785,46 +785,24 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
         });
     }
     g.push(K3Gap {
-        what: "full-model emit for a hybrid MLA arch — THE ONE REMAINING BLOCKER",
+        what: "full-model emit for a hybrid MLA/KDA architecture",
         scope: "the whole blob".into(),
-        why:
-            "EVERY OP K3 NEEDS NOW EXISTS AND PASSES A REAL-WEIGHT GATE (see CLOSED, above). What \
-              does not exist is anything that CALLS them together. Concretely, and this is the \
-              honest state of the tree rather than a plan:\n\
-              * `crates/devgen/src/k3.rs` and `crates/devgen/src/kda.rs` are reached by NOTHING \
-                outside their own `#[cfg(test)]` modules. `emit_kda_layer` emits a whole KDA \
-                mixer; `emit_attn_res`/`emit_situ_glu`/`emit_mla_out_gate`/`emit_k3_block_out` \
-                emit one packet each. No function composes them into even ONE complete layer, and \
-                there is no loop over layers anywhere.\n\
-              * the three rung gates build their instruction streams BY HAND IN C \
-                (`runtime/tests/k3_{block,moe_block,mla_block}_gfx950_test.c`, a private \
-                `emitop()` each), against fixtures pinned to a single `K3_LAYER`. So the C \
-                harnesses and the devgen modules are two independent transcriptions of the same \
-                graph with nothing tying them together — a drift hazard that only a shared emit \
-                closes.\n\
-              * `glm_emit_full` cannot be reused as-is: it assumes a UNIFORM MLA layer and a PLAIN \
-                RESIDUAL ADD, and K3 breaks both. It needs the per-layer attention map to select \
-                layer L's ops AND its carried state (a KDA recurrent state + 3 conv states on 69 \
-                layers, a ckv/krot KV ring on 24), plus the `block_residual` snapshot ring.\n\
-              * there is no embed / final-norm / lm_head / argmax tail for K3 in ANY form: all \
-                three C gates are block-only, `act.x` in and a residual out.\n\
-              * and there is a SECOND, independent refusal outside devgen: \
-                `crates/plowc/src/hf_config.rs` `build_full_model_plan` asserts \
-                `arch != HfArch::KimiK3`, locked by `test_kimi_k3_has_no_full_model_plan`. Both \
-                have to open.\n\
-              THERE IS ALSO NO TRUNCATION KNOB. GLM's `GLM_NLAYERS` (mla.rs, `glm_emit_full`) is \
-              what makes a cheap iteration loop possible — a truncated model loads in seconds \
-              instead of the 4-minute 183 GiB/rank full load. K3 has no equivalent and cannot \
-              have one until there is a loop to truncate. When it is written: layers 0..3 is the \
-              minimum honest span, because 0/1/2 are KDA and 3 is the first MLA, so anything \
-              shorter is not testing the hybrid at all."
-                .into(),
-        fix: "crates/devgen/src/lib.rs (dispatch: stop routing kimi_k3 unconditionally into \
-              `kimi_k3_emit`), crates/plowc/src/hf_config.rs (the second refusal), and a new \
-              `k3_main`/`k3_emit_full` in crates/devgen/src/mla.rs or a k3 module: a declare keyed \
-              on the per-layer attention map, the layer loop composing kda.rs + k3.rs + the MLA \
-              emit, a K3_NLAYERS truncation knob, and the embed/tail.",
-        done: None,
+        why: "CLOSED. The production devblob emitter follows the config-provided per-layer \
+              attention map, carries KDA state and MLA KV independently, composes both AttnRes \
+              seams and the latent routed-MoE tail, and emits embed through argmax. The normal \
+              scheduled-packet HF planner remains a different CPU/simulator artifact path and \
+              deliberately refuses operators its bridge cannot execute; phase-object experiments \
+              consume this production devblob graph instead of duplicating hybrid lowering."
+            .into(),
+        fix: "Use `crates/devgen/src/mla/kimi_k3.rs::k3_emit_full`. `PLOW_K3_LAYERS=N` \
+              provides a cheap hybrid prefix; graph-derived phase/EP transforms are packet \
+              rewrites and contain no model-name predicate.",
+        done: Some(
+            "`k3_emit_full` declares and emits the complete hybrid model, checkpoint coverage is \
+             fatal, and build.json records each program's exact arms and graph-derived dispatch \
+             chains. The TP8 gate emitted 93/93 layers (0e+0 missing). The real emitter is now \
+             default; `K3_FULL=0` explicitly requests this historical report.",
+        ),
     });
     g.push(K3Gap {
         what: "MoE sub-namespace + expert-name template",
@@ -875,9 +853,8 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
 /// specific, accurate statement of what is not implemented rather than an `Option::unwrap` panic
 /// three crates deep (which is what `kimi_k3` produced before: `crates/devgen/src/config.rs:93`,
 /// because the `text_config` probe routed it into the Gemma-4 parser).
-/// Emit the full K3 decode blob. `K3_FULL=1` selects this; the default stays
-/// the capability report in [`kimi_k3_emit`], which is still the honest answer
-/// for anyone who has not read what is missing.
+/// Emit the full K3 blob. This is the default production path; `K3_FULL=0`
+/// retains the legacy capability report as an explicit diagnostic.
 ///
 /// `K3_NLAYERS` truncates, and it is what makes iteration affordable — the same
 /// role `GLM_NLAYERS` plays. **0..3 is the minimum honest span**: 0/1/2 are KDA
@@ -885,12 +862,9 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
 /// all. Truncation shrinks the tensor table, so a short model loads in seconds
 /// instead of paying the full-checkpoint load.
 ///
-/// What this does NOT yet do, and what will therefore fail at LOAD rather than
-/// here: the host-side mxfp4 expert bind (`bind_packed_experts` knows
-/// `.weight` + `.weight_scale_inv`, K3 ships `weight_packed` + `weight_scale`)
-/// and the Mixtral `w1/w2/w3` expert-name template. Both fail loudly with a
-/// missing weight, which is the right failure — but they are why this is gated
-/// rather than default.
+/// The production loader consumes the packet-declared expert tables and the
+/// Mixtral `w1`/`w2`/`w3` checkpoint names; neither is inferred from a model
+/// name at load time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn k3_emit_full(
     dir: &Path,
@@ -899,6 +873,7 @@ pub(crate) fn k3_emit_full(
     n_cu: u32,
     tp: u32,
     rope_gen: bool,
+    target: &str,
     verify: Option<&crate::VerifyHook>,
     l2_layout: Option<packet::devbuild::L2Layout>,
 ) {
@@ -947,12 +922,20 @@ pub(crate) fn k3_emit_full(
         );
         first..end
     });
+    let indirect: Vec<&str> = K3_INDIRECT
+        .iter()
+        .copied()
+        .filter(|name| {
+            !emit_config::active().mla_materialized_prefill
+                || !matches!(*name, "q_b_proj.weight" | "kv_b_proj.weight")
+        })
+        .collect();
     match crate::checkpoint::validate_coverage(
         dir,
         K3_PREFIX,
         &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
         covered_layers,
-        K3_INDIRECT,
+        &indirect,
         K3_PAIRED,
         K3_SYNTHESIZED,
     ) {
@@ -966,7 +949,7 @@ pub(crate) fn k3_emit_full(
         }
     }
     // Gate BEFORE the bytes land: a rejected program must never exist on disk.
-    crate::apply_verify_gate(&m, verify);
+    let lean = crate::apply_verify_gate(&m, verify);
     std::fs::write(out, m.to_blob()).expect("write k3 devblob");
     eprintln!(
         "kimi_k3: emitted {} layers ({} KDA, {} MLA), tp={tp}, {} tensors, {} decode \
@@ -984,6 +967,7 @@ pub(crate) fn k3_emit_full(
         m.progs.last().map(|p| p.insts.len()).unwrap_or(0),
         m.progs.len(),
     );
+    write_mla_manifest(&m, out, target, MoeEnc::Mxfp4, &lean);
 }
 
 /// The 0-based layer span a K3 emit covers. `K3_NLAYERS` truncates it, and BOTH program kinds are
@@ -1103,7 +1087,7 @@ fn k3_ablate_bodies(m: &mut Model) {
 /// as the flash shrinks and the net is a U-shape whose minimum `mla.rs`'s own `NS_CEIL_MEASURED`
 /// note records as UNSWEPT at TP8. `PLOW_K3_NS` is therefore the sweep handle and the default is
 /// the measured winner; do not change the default without re-running the sweep.
-fn k3_nsplit(ctx: u32) -> u32 {
+fn k3_nsplit_fallback(ctx: u32) -> u32 {
     if let Some(v) = emit_config::active().k3_ns {
         return v.max(1);
     }
@@ -1127,7 +1111,7 @@ fn k3_build_model(
     let c = cfg_kimi_k3(dir);
     let layers = k3_emit_layers(&c);
 
-    let mcfg = K3ModelCfg {
+    let mut mcfg = K3ModelCfg {
         block: crate::k3::K3BlockCfg {
             hidden: c.hidden,
             eps: c.eps,
@@ -1152,11 +1136,12 @@ fn k3_build_model(
             heads: c.heads,
             q_lora: c.q_lora,
             kv_lora: c.kv_lora,
+            qk_nope: c.qk_nope,
             qk_rope: c.qk_rope,
             v_head: c.v_head,
             eps: c.eps,
             scale: 1.0 / ((c.qk_nope + c.qk_rope) as f32).sqrt(),
-            n_split: k3_nsplit(ctx),
+            n_split: k3_nsplit_fallback(ctx),
             gf: 4,
             fp8_kv: emit_config::active().fp8_kv,
         },
@@ -1209,10 +1194,10 @@ fn k3_build_model(
     //
     // Above 16 rows the gfx942 GEMV object must carry PLOW_GEMV_WALK: its largest compiled row
     // bucket is 16, and the walk is what covers the remaining rows instead of leaving stale
-    // logits. XArgmaxFin's two peer-data lines are the hard 32-row ceiling.
+    // logits. XArgmaxFin carries up to 128 rows across eight peer-data lines.
     // A ladder carries one independent-sequence decode program per rung, including B1. Build the
-    // widest first: it declares the authoritative slot-major state/cache extents and preserves
-    // the old single-rung tensor handles byte for byte. Narrower programs adopt that table.
+    // widest first to preserve the old single-rung tensor handles byte for byte. Extents no longer
+    // rely on that ordering: scratch rows and independently carried sequence slots are explicit.
     let ladder_on = emit_config::active().decode_ladder.is_some();
     let rungs: Vec<u32> = emit_config::active()
         .decode_rungs()
@@ -1220,16 +1205,61 @@ fn k3_build_model(
         .map(|r| checked_k3_decode_batch(r, emit_config::active().gemv_walk))
         .collect();
     let dbatch = *rungs.last().expect("decode_rungs is non-empty");
-    let slot_rows = pf.iter().copied().max().unwrap_or(1).max(dbatch);
+    // Prefill contributes transient rows, never sequence slots. The widest decode rung owns the
+    // persistent KDA state, MLA caches, kvlen entries, and sampled-output rows.
+    let scratch_rows = pf.iter().copied().max().unwrap_or(1).max(dbatch);
+    let sequence_slots = dbatch;
     let mut decode_build_order = Vec::with_capacity(rungs.len());
     decode_build_order.push(dbatch);
     decode_build_order.extend_from_slice(&rungs[..rungs.len() - 1]);
 
     let mut decode = Vec::with_capacity(rungs.len());
-    let mut prefill = Vec::with_capacity(pf.len());
+    let packed_prefill_topology = crate::emit_is_amd()
+        && std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1");
+    let mut prefill = Vec::with_capacity(pf.len() * (1 + usize::from(packed_prefill_topology)));
     for (i, &t) in decode_build_order.iter().enumerate() {
+        let fallback_ns = k3_nsplit_fallback(ctx);
+        let local_heads = c.heads / tp.max(1);
+        let shape = format!("mla/dk{}/dr{}/h{}/gf4", c.kv_lora, c.qk_rope, local_heads);
+        mcfg.mla.gf = 4;
+        mcfg.mla.n_split = if emit_config::active().k3_ns.is_some() {
+            fallback_ns
+        } else {
+            crate::select_amd_attention(n_cu, t, ctx, shape, fallback_ns, fallback_ns).nsplit
+        };
         let mut b = Builder::new(n_cu);
+        b.set_fuse_materialized_residual_inputs(emit_config::active().fuse_residual_input);
         b.set_tensor_dedup(true);
+        b.set_decode_mla_segments(
+            crate::emit_is_amd()
+                && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().decode_mla_segments,
+        );
+        // Grouped GLU+DOWN decode pairs: explicit flag wins; otherwise only a qualified,
+        // current measurement of BOTH routes for this exact geometry may reroute it.
+        let grouped_moe_segments = match emit_config::active().decode_grouped_moe_segments {
+            Some(explicit) => explicit,
+            None => {
+                crate::emit_is_amd()
+                    && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                    && crate::select_amd_moe_decode_route(
+                        n_cu,
+                        t,
+                        c.top_k,
+                        c.moe_latent,
+                        c.moe_inter / tp.max(1),
+                        c.n_exp,
+                        match mcfg.moe.enc {
+                            e if e == MoeEnc::Mxfp4 as u32 => "mxfp4",
+                            e if e == MoeEnc::Fp8Blk as u32 => "fp8blk",
+                            _ => "bf16",
+                        },
+                    )
+                    .route
+                        == tunedb::MoeDecodeRoute::Standalone
+            }
+        };
+        b.set_decode_grouped_moe_segments(grouped_moe_segments);
         // PLOW_L2_PLACE: `None` => byte-identical. Until this line the flag reached the dense-GQA
         // builders only, and `kimi_k3` is absent from the arch list that warns about being
         // ignored (`lib.rs:4327`), so setting it on K3 was a silent no-op.
@@ -1245,7 +1275,8 @@ fn k3_build_model(
             &layers,
             ctx,
             t,
-            slot_rows,
+            scratch_rows,
+            sequence_slots,
             n_cu,
             // Every rung of a ladder carries independent sequences, including B1. Without a
             // ladder, B1 remains byte-identical unless PLOW_K3_SEQ_ROWS forces the carrier.
@@ -1272,35 +1303,95 @@ fn k3_build_model(
         tensors = prog.tensors.clone();
         decode.push((t, prog));
     }
+    let build_prefill =
+        |t: u32, packed_segments: bool, tensors: Vec<packet::devbuild::TensorDecl>| {
+            let mut b = Builder::new(n_cu);
+            b.set_fuse_materialized_residual_inputs(emit_config::active().fuse_residual_input);
+            b.set_tensor_dedup(true);
+            b.set_l2_placement(l2_layout);
+            b.set_lean_moe_stage2_segments(
+                crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
+            );
+            b.set_lean_moe_stage1_segments(
+                crate::emit_is_amd() && emit_config::active().moe_stage1_lean,
+            );
+            b.set_lean_moe_combine_segments(
+                crate::emit_is_amd() && emit_config::active().moe_combine_lean,
+            );
+            b.set_moe_prefill_ep_degree(
+                (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(tp),
+            );
+            b.set_lean_kda_intra_segments(
+                crate::emit_is_amd() && emit_config::active().kda_intra_cached,
+            );
+            b.set_kda_intra_wave_items_segments(
+                crate::emit_is_amd()
+                    && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                    && emit_config::active().kda_intra_wave_items,
+            );
+            b.set_attn_res_f32mix_segments(
+                crate::emit_is_amd()
+                    && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                    && emit_config::active().attnres_f32mix,
+            );
+            b.set_lean_kda_key_factor_segments(
+                crate::emit_is_amd()
+                    && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                    && emit_config::active().kda_key_factor,
+            );
+            b.set_kda_carry_regstate_segments(
+                crate::emit_is_amd()
+                    && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                    && emit_config::active().kda_chunk_qpre
+                    && emit_config::active().kda_carry_regstate,
+            );
+            b.set_packed_prefill_segments(packed_segments);
+            if crate::emit_is_amd() {
+                b.deny_uniseg();
+            }
+            b.adopt_tensors(tensors);
+            crate::k3::emit_k3_model(
+                &mut b,
+                &mcfg,
+                &|l| matches!(c.attn[l as usize], K3Attn::Kda),
+                &layers,
+                ctx,
+                t,
+                scratch_rows,
+                sequence_slots,
+                n_cu,
+                crate::k3::RowKind::Tokens,
+            );
+            b.finish()
+        };
     for &t in pf {
-        let mut b = Builder::new(n_cu);
-        b.set_tensor_dedup(true);
-        b.set_l2_placement(l2_layout);
-        if crate::emit_is_amd() {
-            b.deny_uniseg();
-        }
-        b.adopt_tensors(tensors.clone());
-        crate::k3::emit_k3_model(
-            &mut b,
-            &mcfg,
-            &|l| matches!(c.attn[l as usize], K3Attn::Kda),
-            &layers,
-            ctx,
-            t,
-            slot_rows,
-            n_cu,
-            crate::k3::RowKind::Tokens,
-        );
-        let prog = b.finish();
+        let prog = build_prefill(t, false, tensors.clone());
         tensors = prog.tensors.clone();
         prefill.push(prog);
+    }
+    if packed_prefill_topology {
+        for &t in pf {
+            prefill.push(build_prefill(t, true, tensors.clone()));
+        }
     }
     decode.sort_unstable_by_key(|(t, _)| *t);
     built.extend(prefill);
     built.extend(decode.into_iter().map(|(_, p)| p));
     // Prefill buckets first, then trailing ascending decode rungs. `decode_rung_lo` and the
     // runtime both derive the split from this ordering.
-    let prog_t: Vec<u32> = pf.iter().copied().chain(rungs.iter().copied()).collect();
+    let prog_t: Vec<u32> = pf
+        .iter()
+        .copied()
+        .chain(
+            packed_prefill_topology
+                .then_some(pf)
+                .into_iter()
+                .flatten()
+                .copied()
+                .map(packet::devbuild::packed_prefill_program_t),
+        )
+        .chain(rungs.iter().copied())
+        .collect();
 
     Model {
         n_cu,
@@ -1316,8 +1407,9 @@ fn k3_build_model(
 fn checked_k3_decode_batch(decode_batch: u32, gemv_walk: bool) -> u32 {
     let dbatch = decode_batch.max(1);
     assert!(
-        dbatch <= 32,
-        "K3 PLOW_DECODE_BATCH={dbatch} exceeds the 32-sequence XArgmaxFin ceiling"
+        dbatch <= packet::devbuild::XARGMAX_MAX_BATCH,
+        "K3 PLOW_DECODE_BATCH={dbatch} exceeds the {}-sequence XArgmaxFin ceiling",
+        packet::devbuild::XARGMAX_MAX_BATCH
     );
     assert!(
         dbatch <= 16 || gemv_walk,
@@ -1584,12 +1676,13 @@ mod kimi_k3_tests {
     use super::*;
 
     #[test]
-    fn decode_batch_above_sixteen_requires_walk_and_caps_at_thirty_two() {
+    fn decode_batch_above_sixteen_requires_walk_and_caps_at_xargmax_limit() {
         assert_eq!(checked_k3_decode_batch(0, false), 1);
         assert_eq!(checked_k3_decode_batch(16, false), 16);
         assert_eq!(checked_k3_decode_batch(32, true), 32);
+        assert_eq!(checked_k3_decode_batch(128, true), 128);
         assert!(std::panic::catch_unwind(|| checked_k3_decode_batch(17, false)).is_err());
-        assert!(std::panic::catch_unwind(|| checked_k3_decode_batch(33, true)).is_err());
+        assert!(std::panic::catch_unwind(|| checked_k3_decode_batch(129, true)).is_err());
     }
 
     /// A faithful miniature of the real `config.json`: same key spellings, same nesting, same
@@ -1674,7 +1767,11 @@ mod kimi_k3_tests {
         std::fs::create_dir_all(&d).unwrap();
         // head_dim 64, not the fixture's 32: `emit_kda_mixer` refuses a head_dim that is not a
         // multiple of the 64-lane wave, and these two tests are the only ones here that EMIT.
-        let cfg = k3_json(&[("text_config/linear_attn_config/head_dim", "64")]);
+        let mut patch = vec![("text_config/linear_attn_config/head_dim", "64")];
+        if name == "attention_profiles" {
+            patch.push(("text_config/num_attention_heads", "24"));
+        }
+        let cfg = k3_json(&patch);
         std::fs::write(d.join("config.json"), cfg.to_string()).unwrap();
         d
     }
@@ -1757,16 +1854,82 @@ mod kimi_k3_tests {
     }
 
     #[test]
+    fn prefill_rows_do_not_expand_sequence_state() {
+        let _guard = crate::test_env::env_guard();
+        let d = k3_dir("row_extents");
+        let base = k3_build_model(&d, 8192, 256, 2, &[], None);
+        let bytes = |m: &Model, name: &str| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("missing tensor {name}"))
+                .bytes
+        };
+
+        let wide = {
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_DECODE_BATCH_LADDER", "1,128"),
+                ("PLOW_GEMV_WALK", "1"),
+            ]);
+            k3_build_model(&d, 8192, 256, 2, &[8192], None)
+        };
+        let c = cfg_kimi_k3(&d);
+
+        assert_eq!(bytes(&wide, "in.kvlen"), 128 * 4);
+        assert_eq!(bytes(&wide, "act.x"), 8192 * c.hidden as u64 * 2);
+        assert_eq!(
+            bytes(&wide, "act.og_tp"),
+            8192 * c.hidden as u64 * 2,
+            "peer scratch follows the largest row program"
+        );
+        assert_eq!(
+            bytes(&wide, "kv.0.state"),
+            128 * bytes(&base, "kv.0.state"),
+            "KDA state follows decode sequence slots, not prefill rows"
+        );
+        assert_eq!(
+            bytes(&wide, "kv.2.ckv"),
+            128 * bytes(&base, "kv.2.ckv"),
+            "MLA cache follows decode sequence slots, not prefill rows"
+        );
+    }
+
+    #[test]
+    fn decode_only_b1_keeps_single_row_and_slot_extents() {
+        let _guard = crate::test_env::env_guard();
+        let d = k3_dir("decode_only_extents");
+        let m = k3_build_model(&d, 8192, 256, 2, &[], None);
+        let c = cfg_kimi_k3(&d);
+        let bytes = |name: &str| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("missing tensor {name}"))
+                .bytes
+        };
+
+        assert_eq!(m.prog_t, [1]);
+        assert_eq!(bytes("in.kvlen"), 4);
+        assert_eq!(bytes("act.x"), c.hidden as u64 * 2);
+        assert_eq!(bytes("act.og_tp"), c.hidden as u64 * 2);
+        assert_eq!(
+            bytes("kv.2.ckv"),
+            8192 * c.kv_lora as u64 * 2,
+            "one sequence owns one context-length MLA cache"
+        );
+    }
+
+    #[test]
     fn k3_decode_ladder_is_trailing_ascending_and_every_rung_is_sequence_state() {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[
-            ("PLOW_DECODE_BATCH_LADDER", "1,3,7,16,32"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,3,7,16,32,64,128"),
             ("PLOW_GEMV_WALK", "1"),
         ]);
         let d = k3_dir("decode_ladder");
         let m = k3_build_model(&d, 4096, 256, 1, &[128], None);
 
-        assert_eq!(m.prog_t, [128, 1, 3, 7, 16, 32]);
+        assert_eq!(m.prog_t, [128, 1, 3, 7, 16, 32, 64, 128]);
         for (&t, p) in m.prog_t[1..].iter().zip(&m.progs[1..]) {
             let state_steps: Vec<_> = p
                 .insts
@@ -1789,7 +1952,206 @@ mod kimi_k3_tests {
             .iter()
             .find(|t| t.name == "in.parked")
             .expect("ladder must declare the parked mask");
-        assert_eq!(parked.bytes, 32 * 4);
+        assert_eq!(parked.bytes, 128 * 4);
+    }
+
+    fn publish_attention_test_record(root: &std::path::Path, rung: u32, nsplit: u32, shape: &str) {
+        let record = tunedb::AttentionMeasurement {
+            cell: tunedb::AttentionCell {
+                hardware: "amd/gfx950/mi350x".into(),
+                n_cu: 256,
+                decode_rung: rung,
+                kv_bucket: tunedb::KvBucket::K8,
+                shape: shape.into(),
+            },
+            algorithm: tunedb::AttentionAlgorithm::SplitReduce,
+            nsplit,
+            digests: tunedb::Digests {
+                implementation: "test-unprobed".into(),
+                interpreter: "test-unprobed".into(),
+                toolchain: "test-unprobed".into(),
+                oracle: tunedb::ATTENTION_ORACLE.into(),
+            },
+            stats: tunedb::Stats::from_samples(vec![10_000.0; 5]).unwrap(),
+            correctness: tunedb::Correctness::Pass,
+            state: tunedb::RecordState::Provisional,
+            campaign: "attention-rung-test".into(),
+        };
+        tunedb::TuneStore::new(root)
+            .publish_attention("amd/gfx950/mi350x", vec![record])
+            .unwrap();
+    }
+
+    fn assert_decode_mla_policy(model: &Model, rungs: &[(u32, u32)]) {
+        assert_eq!(model.prog_t, rungs.iter().map(|x| x.0).collect::<Vec<_>>());
+        for (program, &(batch, nsplit)) in model.progs.iter().zip(rungs) {
+            let flashes: Vec<_> = program
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::FlashMlaDecode as u16)
+                .collect();
+            let merges: Vec<_> = program
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::MlaMergeFold as u16)
+                .collect();
+            assert!(!flashes.is_empty());
+            assert_eq!(flashes.len(), merges.len());
+            for (flash, merge) in flashes.into_iter().zip(merges) {
+                assert_eq!(flash.i[4], nsplit, "B{batch} flash nsplit");
+                assert_eq!(flash.i[7], 4, "B{batch} flash group factor");
+                assert_eq!(merge.i[4], nsplit, "B{batch} merge nsplit");
+                let groups = (flash.i[1] / flash.i[7].max(1)).max(1);
+                let want_blocks = (batch * groups * nsplit).min(256) as u16;
+                assert_eq!(flash.blocks, want_blocks, "B{batch} flash blocks");
+            }
+        }
+    }
+
+    #[test]
+    fn k3_attention_profiles_select_each_rung_and_size_scratch() {
+        let _guard = crate::test_env::env_guard();
+        let d = k3_dir("attention_profiles");
+        let db = d.join("tuning");
+        let shape = "mla/dk32/dr8/h12/gf4";
+        publish_attention_test_record(&db, 1, 32, shape);
+        publish_attention_test_record(&db, 8, 32, shape);
+        let dbs = db.to_string_lossy().into_owned();
+
+        let tuned = {
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_DECODE_BATCH_LADDER", "1,8"),
+                ("PLOW_TUNEDB", &dbs),
+            ]);
+            k3_build_model(&d, 8192, 256, 2, &[], None)
+        };
+        assert_decode_mla_policy(&tuned, &[(1, 32), (8, 32)]);
+        let scratch_bytes = |name: &str| {
+            tuned
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("missing MLA partial scratch {name}"))
+                .bytes
+        };
+        assert_eq!(scratch_bytes("act.l2.o_part"), 12 * 32 * 32 * 4);
+        assert_eq!(
+            scratch_bytes("act.pf.o_part"),
+            8 * 12 * 32 * 32 * 4,
+            "widest selected decode scratch extent is retained"
+        );
+
+        let fallback = {
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_DECODE_BATCH_LADDER", "1,8"),
+                ("PLOW_TUNEDB", ""),
+            ]);
+            k3_build_model(&d, 8192, 256, 2, &[], None)
+        };
+        assert_decode_mla_policy(&fallback, &[(1, 64), (8, 64)]);
+
+        let pinned = {
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_DECODE_BATCH_LADDER", "1,8"),
+                ("PLOW_TUNEDB", &dbs),
+                ("PLOW_K3_NS", "7"),
+            ]);
+            k3_build_model(&d, 8192, 256, 2, &[], None)
+        };
+        assert_decode_mla_policy(&pinned, &[(1, 7), (8, 7)]);
+    }
+
+    #[test]
+    fn packed_prefill_segmentation_does_not_split_decode_rungs() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_SEG_PACKED_PREFILL", "1"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,4,8"),
+            ("PLOW_GEMV_WALK", "1"),
+        ]);
+        let d = k3_dir("packed_prefill_segments");
+        let l2 = packet::devbuild::L2Layout {
+            sms: 32,
+            domains: 8,
+            map: packet::devbuild::L2Map::RoundRobin,
+        };
+        let m = k3_build_model(&d, 4096, 256, 2, &[128], Some(l2));
+
+        assert_eq!(
+            m.prog_t,
+            [
+                128,
+                packet::devbuild::packed_prefill_program_t(128),
+                1,
+                4,
+                8
+            ]
+        );
+        assert_eq!(m.progs[0].l2_domains, 8);
+        assert_eq!(m.progs[1].l2_domains, 8);
+        assert!(m.progs[1].gq_seg_ofs.len() > m.progs[0].gq_seg_ofs.len());
+        for p in &m.progs[2..] {
+            assert_eq!(p.l2_domains, 8);
+            assert_eq!(p.gq_seg_ofs.len(), 9);
+        }
+    }
+
+    #[test]
+    fn k3_lean_moe_defaults_are_applied_to_prefill_builders() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_K3_LAYERS", "2")]);
+        let d = k3_dir("stage1_lean");
+        let cfg = k3_json(&[
+            ("text_config/hidden_size", "7168"),
+            ("text_config/num_attention_heads", "96"),
+            ("text_config/intermediate_size", "33792"),
+            ("text_config/q_lora_rank", "1536"),
+            ("text_config/kv_lora_rank", "512"),
+            ("text_config/qk_nope_head_dim", "128"),
+            ("text_config/qk_rope_head_dim", "64"),
+            ("text_config/v_head_dim", "128"),
+            ("text_config/num_experts", "896"),
+            ("text_config/num_experts_per_token", "16"),
+            ("text_config/moe_intermediate_size", "3072"),
+            ("text_config/routed_expert_hidden_size", "3584"),
+            ("text_config/linear_attn_config/num_heads", "96"),
+            ("text_config/linear_attn_config/head_dim", "128"),
+        ]);
+        std::fs::write(d.join("config.json"), cfg.to_string()).unwrap();
+
+        let m = k3_build_model(&d, 8192, 256, 8, &[128], None);
+        let p = &m.progs[0];
+        for op in [
+            DevOp::MoeGroupGluPf,
+            DevOp::MoeGroupDownPf,
+            DevOp::MoeCombinePf,
+        ] {
+            let matches: Vec<_> = p
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, inst)| inst.op == op as u16)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "two-layer fixture has one routed-MoE block"
+            );
+            let inst_ix = matches[0].0 as u32;
+            let seg = p
+                .stream
+                .iter()
+                .find(|entry| entry.inst == inst_ix)
+                .expect("lean MoE packet must be scheduled")
+                .seg;
+            let members: std::collections::BTreeSet<_> = p
+                .stream
+                .iter()
+                .filter(|entry| entry.seg == seg)
+                .map(|entry| entry.inst)
+                .collect();
+            assert_eq!(members, [inst_ix].into_iter().collect());
+        }
     }
 
     /// Every program must address the same peer slot B. The host has one peer layout for the
@@ -1797,6 +2159,9 @@ mod kimi_k3_tests {
     /// immediate makes decode reduce unrelated memory whenever a prefill ladder is present.
     #[test]
     fn k3_tp_peer_slot_is_program_invariant() {
+        // The TP8 collective set depends on `PLOW_SEQ_PAR_SEAMS`; pin the replicated-row set.
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_SEQ_PAR_SEAMS", "0")]);
         let d = k3_dir("tp_slot");
         let m = k3_build_model(&d, 4096, 256, 2, &[128, 512], None);
         let hidden = cfg_kimi_k3(&d).hidden;
@@ -1996,7 +2361,7 @@ mod kimi_k3_tests {
     ///
     /// This is the assertion that keeps the report honest in both directions. Printing a landed
     /// capability as an unimplemented blocker sends the next agent to rebuild four opcodes that
-    /// already dispatch (it did); marking one closed without the measured residual next to it
+    /// already dispatch (it did); marking one closed without quantitative evidence next to it
     /// makes the claim unfalsifiable.
     #[test]
     fn closed_gaps_carry_evidence_and_open_gaps_do_not_claim_any() {
@@ -2017,12 +2382,16 @@ mod kimi_k3_tests {
                 g.what
             );
         }
-        assert!(!open.is_empty(), "the full-model emit is still open");
         assert!(
-            open[0].what.contains("full-model emit"),
-            "the model-level assembly is THE remaining blocker and must rank first among the \
-             open items; got {:?}",
-            open[0].what
+            !open.is_empty(),
+            "the report should retain unresolved capabilities"
+        );
+        assert!(
+            gaps.iter()
+                .find(|g| g.what.contains("full-model emit"))
+                .and_then(|g| g.done)
+                .is_some(),
+            "the production full-model emitter must not regress to an open capability"
         );
     }
 

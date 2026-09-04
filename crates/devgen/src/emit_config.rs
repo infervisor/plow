@@ -46,6 +46,9 @@ use clap::Args;
 /// Constructed by `plowc` via `#[command(flatten)]` and threaded through the emit
 /// pipeline as `&EmitConfig`. The struct is the single source of truth for every
 /// compile-time knob; `std::env::var` calls in `devgen` are being migrated here.
+/// K3 TP8 q-projection `8192x1536x7168`; the only shape with a measured c8 win.
+pub const GEMM_WIDE_C8_DEFAULT_SHAPE: &str = "8192x1536x7168";
+
 #[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Emit knobs")]
 pub struct EmitConfig {
@@ -94,6 +97,17 @@ pub struct EmitConfig {
     /// WARNING: do NOT set on gfx950 — silently breaks AMD assets.
     #[arg(long, env = "PLOW_UNISEG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub uniseg: bool,
+
+    /// Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs on gfx950.
+    #[arg(long = "emit-decode-mla-segments", env = "PLOW_SEG_DECODE_MLA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_mla_segments: bool,
+
+    /// Isolate adjacent grouped MXFP4 GLU+DOWN decode pairs into ordered raw launches.
+    /// Unset = decide from qualified per-geometry route measurements
+    /// (`moe_decode_measurement.jsonl`, both routes, current digests); missing evidence keeps
+    /// the interpreter route. `PLOW_MOE_DECODE_STANDALONE=1` remains the packet-level override.
+    #[arg(long = "emit-decode-grouped-moe-segments", env = "PLOW_SEG_DECODE_GROUPED_MOE", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_grouped_moe_segments: Option<bool>,
 
     /// Batched decode dispatch width (sequences per launch).
     #[arg(
@@ -205,6 +219,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_XR_CUS")]
     pub xr_cus: Option<u32>,
 
+    /// Use reduce-scatter/all-gather for complete folded-gather collectives. The second
+    /// partial is added while the reduced slices are gathered. Set false for rollback.
+    #[arg(long, env = "PLOW_XR2_GATHER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub xr2_gather: bool,
+
     /// Disable all XReduce collectives (diagnostic — numerically wrong).
     #[arg(long, env = "PLOW_NO_XREDUCE", default_value_t = false, hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub no_xreduce: bool,
@@ -235,8 +254,8 @@ pub struct EmitConfig {
     // ──────────────────────────────────────────────────────────────────────────
     // K3 model family
     // ──────────────────────────────────────────────────────────────────────────
-    /// Emit the full K3 model (all layers). Default is capability-report only.
-    #[arg(long, env = "K3_FULL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Emit the full K3 model. Set false only to print the legacy capability report.
+    #[arg(long, env = "K3_FULL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_full: bool,
 
     /// Fuse MLA q/kv/k_rope/gate A-projection into one GemvQkvg (decode-only).
@@ -351,6 +370,45 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_K3_KDA_CONV_STEP_DB", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_kda_conv_step_db: bool,
 
+    /// Emit the standalone fused KDA decode boundary when its geometry is supported.
+    /// Default off; unsupported shapes retain the legacy Conv3 -> StateStepG -> GatedNorm chain.
+    #[arg(long = "emit-kda-decode-fused", env = "PLOW_KDA_DECODE_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_decode_fused: bool,
+
+    /// Materialize MLA Q/K/V and emit the standalone asymmetric gfx950 prefill boundary.
+    /// Default off until the full-network cost gate clears.
+    #[arg(long, env = "PLOW_MLA_MATERIALIZED_PREFILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub mla_materialized_prefill: bool,
+
+    /// Emit the model-independent BT64 chunk-KDA prefill pipeline. Defaults on for gfx950;
+    /// unsupported shapes retain the serial recurrence. Set false to force the serial oracle.
+    #[arg(long, env = "PLOW_KDA_CHUNK", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_chunk: Option<bool>,
+
+    /// Precompute the V-independent scaled/gated query in chunk W/U. Set false to disable.
+    #[arg(long, env = "PLOW_KDA_CHUNK_QPRE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_chunk_qpre: bool,
+
+    /// Isolate BT64/D128 chunk-KDA intra packets for the cached gfx950 object.
+    #[arg(long, env = "PLOW_KDA_INTRA_CACHED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_intra_cached: bool,
+
+    /// Route exact BT64/D128 chunk-KDA intra work through the wave-item gfx950 object.
+    /// Defaults on; set `PLOW_KDA_INTRA_WAVE_ITEMS=0` to retain the interpreter path.
+    #[arg(long, env = "PLOW_KDA_INTRA_WAVE_ITEMS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_intra_wave_items: bool,
+
+    /// Mark exact qpre BT64/D128 carry segments for the register-resident gfx950 carry object.
+    /// Defaults on (TP8 gate 2026-09-04: -112 ms TTFT, bit-exact); the marked packet then
+    /// requires its packet-paired object at load. Set false to retain the interpreter carry.
+    #[arg(long, env = "PLOW_KDA_CARRY_REGSTATE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_carry_regstate: bool,
+
+    /// Route exact qpre BT64/D128 Wu->carry pairs through spill-free gfx950 objects.
+    /// Defaults on; set false to retain the interpreter path.
+    #[arg(long, env = "PLOW_KDA_KEY_FACTOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_key_factor: bool,
+
     /// K3 up-projection no-gather mode (diagnostic).
     #[arg(long, env = "PLOW_K3_UP_NOGATHER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_up_nogather: bool,
@@ -377,6 +435,16 @@ pub struct EmitConfig {
     /// Wide-arm walk loop for AMD GEMV.
     #[arg(long, env = "PLOW_GEMV_WALK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemv_walk: bool,
+
+    /// Fold graph-adjacent materialized Residual inputs into AttnRes. Bit-identical and
+    /// model-independent. DEFAULT ON; set `PLOW_FUSE_RESIDUAL_INPUT=0` to roll back.
+    #[arg(long, env = "PLOW_FUSE_RESIDUAL_INPUT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fuse_residual_input: bool,
+
+    /// Fuse AttnRes with its sole following RMSNorm. Disable only to materialize the raw
+    /// residual seam for a boundary capture; the production default remains fused.
+    #[arg(long, env = "PLOW_K3_FUSE_ARNORM", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub k3_fuse_arnorm: bool,
 
     // ──────────────────────────────────────────────────────────────────────────
     // GLM-5.2 / gfx942 campaign knobs
@@ -458,6 +526,43 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_PF_A8", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_a8: bool,
 
+    /// Isolate compatible MXFP4 grouped-MoE Down+Combine boundaries for a standalone object.
+    #[arg(long, env = "PLOW_MOE_STAGE2_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_stage2_lean: bool,
+
+    /// Isolate compatible MXFP4 grouped-MoE gate/up packets for a standalone object.
+    #[arg(long, env = "PLOW_MOE_STAGE1_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_stage1_lean: bool,
+
+    /// Isolate compatible fixed-order grouped-MoE prefill combines. Default on;
+    /// `PLOW_MOE_COMBINE_LEAN=0` restores the interpreter route.
+    #[arg(long, env = "PLOW_MOE_COMBINE_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_combine_lean: bool,
+
+    /// Emit prefill AttnRes packets with vLLM's f32-mix contract (separate output-norm
+    /// epsilon in `f[1]`) and isolate them for the gfx950 `attn_res_f32mix` object. Default
+    /// on (C3 contract; TP8 gate 2026-09-04: -48 ms TTFT, GSM8K 122 vs 124/200). Set false
+    /// for the BF16-seam interpreter contract (packet byte-identical to the pre-C3 default).
+    #[arg(long, env = "PLOW_ATTNRES_F32MIX", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub attnres_f32mix: bool,
+
+    /// Split grouped-MoE align into expert-parallel count/prefix/scatter packets.
+    /// Default on (TP8 gate 2026-09-04 with the c8 tile: -22.9 ms TTFT, exact).
+    #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_align_par: bool,
+
+    /// Sequence-parallel TP seams (K3 prefill): run AttnRes / router / latent xe / top-k on the
+    /// reduce-scatter-owned `t/tp` row band and all-gather the results (`XReduceScatter` +
+    /// `XAllGather`) instead of all-gathering the raw attention output and replicating the row
+    /// work on every rank. Default on (TP8 gate 2026-09-04: -110 ms TTFT, bit-exact); the
+    /// manifest requires the paired seams arm. Set false for the replicated-row packet.
+    #[arg(long, env = "PLOW_SEQ_PAR_SEAMS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub seq_par_seams: bool,
+
+    /// Whole-expert/full-I prefill route for graph-proven replicated MoE boundaries.
+    #[arg(long, env = "PLOW_MOE_PREFILL_EP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_prefill_ep: bool,
+
     /// Atomic combine for the grouped MoE prefill scatter.
     #[arg(long, env = "PLOW_MOE_PF_ATOMIC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_atomic: bool,
@@ -535,6 +640,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_TUNE_DUMP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub tune_dump: bool,
 
+    /// Exact MxNxK shape allowed to use the gfx950 128x384x64 GemmWide body. Defaults to the
+    /// K3 TP8 q-projection shape (TP8 gate 2026-09-04: -11 ms TTFT, exact); `none` keeps
+    /// packet bytes and the 128x256x64 body unchanged everywhere.
+    #[arg(long = "emit-gemm-wide-c8-shape", env = "PLOW_GEMM_WIDE_C8_SHAPE", default_value = GEMM_WIDE_C8_DEFAULT_SHAPE)]
+    pub gemm_wide_c8_shape: Option<String>,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / never-ship (hidden from --help)
     // ──────────────────────────────────────────────────────────────────────────
@@ -548,6 +659,26 @@ pub struct EmitConfig {
 }
 
 impl EmitConfig {
+    pub fn gemm_wide_c8_for(&self, m: u32, n: u32, k: u32) -> bool {
+        let Some(shape) = self
+            .gemm_wide_c8_shape
+            .as_deref()
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+        else {
+            return false;
+        };
+        let dims: Vec<_> = shape.split(['x', 'X']).collect();
+        assert!(
+            dims.len() == 3,
+            "PLOW_GEMM_WIDE_C8_SHAPE must be MxNxK, got {shape:?}"
+        );
+        let parse = |v: &str| {
+            v.parse::<u32>()
+                .unwrap_or_else(|_| panic!("PLOW_GEMM_WIDE_C8_SHAPE must be MxNxK, got {shape:?}"))
+        };
+        (parse(dims[0]), parse(dims[1]), parse(dims[2])) == (m, n, k)
+    }
+
     /// Return the first valid shape-keyed workgroup cap for `(N,K)`.
     pub fn gemv_wg_for(&self, n: u32, k: u32) -> Option<u32> {
         self.gemv_wg_tuning
@@ -567,11 +698,18 @@ impl EmitConfig {
     /// Mirrors what clap's `env` attribute does: each field reads its `PLOW_*` var.
     pub fn from_env() -> EmitConfig {
         let env_bool = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
+        let env_bool_opt = |k: &str| std::env::var(k).ok().map(|v| v == "1");
         let env_u32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u32>().ok());
         let env_str = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
         // DEFAULT-ON knobs: the call sites these replaced tested `!= Some("0")`, which is
         // not the negation of `env_bool` — unset enables, and so does any value but "0".
         let env_opt_out = |k: &str| std::env::var(k).ok().as_deref() != Some("0");
+        let env_bool_default_true = |k: &str| {
+            !matches!(
+                std::env::var(k).ok().as_deref(),
+                Some("0") | Some("false") | Some("False") | Some("FALSE")
+            )
+        };
         EmitConfig {
             fp8: env_bool("PLOW_FP8"),
             w8a8: env_bool("PLOW_W8A8"),
@@ -581,6 +719,10 @@ impl EmitConfig {
             fp8_kv_full: env_bool("PLOW_FP8_KV_FULL"),
             fp8_head: env_bool("PLOW_FP8_HEAD"),
             uniseg: env_bool("PLOW_UNISEG"),
+            // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
+            // value; direct legacy callers must name the feature explicitly.
+            decode_mla_segments: env_bool("PLOW_SEG_DECODE_MLA"),
+            decode_grouped_moe_segments: env_bool_opt("PLOW_SEG_DECODE_GROUPED_MOE"),
             decode_batch: env_u32("PLOW_DECODE_BATCH").unwrap_or(1),
             decode_ladder: env_str("PLOW_DECODE_BATCH_LADDER"),
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
@@ -602,13 +744,14 @@ impl EmitConfig {
             pf_ladder_append: env_str("PLOW_PF_LADDER_APPEND"),
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
             xr_cus: env_u32("PLOW_XR_CUS"),
+            xr2_gather: env_opt_out("PLOW_XR2_GATHER"),
             no_xreduce: env_bool("PLOW_NO_XREDUCE"),
             moe_prefill: env_str("PLOW_MOE_PREFILL"),
             gemma_moe_router_fused: env_bool("PLOW_GEMMA_MOE_ROUTER_FUSED"),
             gemma_moe_router_blocks: env_u32("PLOW_GEMMA_MOE_ROUTER_BLOCKS"),
             gemma_moe_router_exact: env_bool("PLOW_GEMMA_MOE_ROUTER_EXACT"),
             gemma_moe_tail_fuse: env_bool("PLOW_GEMMA_MOE_TAIL_FUSE"),
-            k3_full: env_bool("K3_FULL"),
+            k3_full: env_bool_default_true("K3_FULL"),
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             k3_ns: env_u32("PLOW_K3_NS"),
             k3_layers: env_str("PLOW_K3_LAYERS").unwrap_or_else(|| "all".into()),
@@ -653,12 +796,22 @@ impl EmitConfig {
             glm_router_old: env_bool("GLM_ROUTER_OLD"),
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
             k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
+            kda_decode_fused: env_bool("PLOW_KDA_DECODE_FUSED"),
+            mla_materialized_prefill: env_bool("PLOW_MLA_MATERIALIZED_PREFILL"),
+            kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
+            kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
+            kda_intra_cached: env_bool("PLOW_KDA_INTRA_CACHED"),
+            kda_intra_wave_items: env_opt_out("PLOW_KDA_INTRA_WAVE_ITEMS"),
+            kda_carry_regstate: env_opt_out("PLOW_KDA_CARRY_REGSTATE"),
+            kda_key_factor: env_opt_out("PLOW_KDA_KEY_FACTOR"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),
             k3_seq_rows: std::env::var_os("PLOW_K3_SEQ_ROWS").is_some(),
             gemv_mm: env_u32("PLOW_GEMV_MM"),
             gemv_walk: env_bool("PLOW_GEMV_WALK"),
+            fuse_residual_input: env_opt_out("PLOW_FUSE_RESIDUAL_INPUT"),
+            k3_fuse_arnorm: env_opt_out("PLOW_K3_FUSE_ARNORM"),
             // GLM-5.2 / gfx942 campaign knobs. `env_opt_out` is NOT `!env_bool`: the
             // original call sites tested `!= Some("0")`, so any value other than "0"
             // (including an empty string) enables. Preserved verbatim.
@@ -679,6 +832,13 @@ impl EmitConfig {
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             moe_pf_a8: env_bool("PLOW_MOE_PF_A8"),
+            moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
+            moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
+            seq_par_seams: env_opt_out("PLOW_SEQ_PAR_SEAMS"),
+            moe_prefill_ep: env_bool("PLOW_MOE_PREFILL_EP"),
+            moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
+            moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
+            attnres_f32mix: env_opt_out("PLOW_ATTNRES_F32MIX"),
             moe_pf_atomic: env_bool("PLOW_MOE_PF_ATOMIC"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_part16: env_bool("PLOW_MOE_PF_PART16"),
@@ -690,6 +850,8 @@ impl EmitConfig {
             glm_wgfit: env_opt_out("PLOW_GLM_WGFIT"),
             tunedb: std::env::var("PLOW_TUNEDB").ok(), // preserves "" for "disable tuning"
             tune_dump: env_bool("PLOW_TUNE_DUMP"),
+            gemm_wide_c8_shape: env_str("PLOW_GEMM_WIDE_C8_SHAPE")
+                .or_else(|| Some(GEMM_WIDE_C8_DEFAULT_SHAPE.into())),
             skip_coverage: env_bool("PLOW_SKIP_COVERAGE"),
             k3_ablate: env_str("PLOW_K3_ABLATE"),
         }
@@ -705,6 +867,10 @@ impl EmitConfig {
         assert!(
             !(self.mxfp4 && (self.w8a8 || self.w8a16)),
             "PLOW_MXFP4=1 is A4W4; it is incompatible with PLOW_W8A8/PLOW_W8A16"
+        );
+        assert!(
+            !(self.moe_pf_atomic && self.moe_pf_det),
+            "PLOW_MOE_PF_ATOMIC=1 and PLOW_MOE_PF_DET=1 are mutually exclusive"
         );
         if self.fp8_kv_full && !self.fp8_kv {
             tracing::warn!("--fp8-kv-full has no effect without --fp8-kv");
@@ -861,6 +1027,250 @@ pub fn active() -> &'static EmitConfig {
 #[cfg(test)]
 mod tests {
     use super::EmitConfig;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestArgs {
+        #[command(flatten)]
+        emit: EmitConfig,
+    }
+
+    #[test]
+    fn k3_hybrid_emit_defaults_on_and_keeps_explicit_report_mode() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("K3_FULL", "1")]);
+        std::env::remove_var("K3_FULL");
+        assert!(EmitConfig::from_env().k3_full);
+        assert!(TestArgs::try_parse_from(["test"]).unwrap().emit.k3_full);
+
+        std::env::set_var("K3_FULL", "0");
+        assert!(!EmitConfig::from_env().k3_full);
+        assert!(
+            !TestArgs::try_parse_from(["test", "--k3-full=false"])
+                .unwrap()
+                .emit
+                .k3_full
+        );
+    }
+
+    #[test]
+    fn lean_moe_stage1_default_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_STAGE1_LEAN", "0")]);
+        assert!(!super::active().moe_stage1_lean);
+    }
+
+    #[test]
+    fn lean_moe_stage2_default_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_STAGE2_LEAN", "0")]);
+        assert!(!super::active().moe_stage2_lean);
+    }
+
+    #[test]
+    fn lean_moe_combine_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_COMBINE_LEAN", "1")]);
+        std::env::remove_var("PLOW_MOE_COMBINE_LEAN");
+        assert!(EmitConfig::from_env().moe_combine_lean);
+
+        std::env::set_var("PLOW_MOE_COMBINE_LEAN", "0");
+        assert!(!EmitConfig::from_env().moe_combine_lean);
+
+        std::env::set_var("PLOW_MOE_COMBINE_LEAN", "false");
+        assert!(!EmitConfig::from_env().moe_combine_lean);
+    }
+
+    #[test]
+    fn kda_chunk_qpre_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_CHUNK_QPRE", "1")]);
+        std::env::remove_var("PLOW_KDA_CHUNK_QPRE");
+        assert!(EmitConfig::from_env().kda_chunk_qpre);
+
+        std::env::set_var("PLOW_KDA_CHUNK_QPRE", "0");
+        assert!(!EmitConfig::from_env().kda_chunk_qpre);
+    }
+
+    #[test]
+    fn kda_key_factor_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_KEY_FACTOR", "1")]);
+        std::env::remove_var("PLOW_KDA_KEY_FACTOR");
+        assert!(EmitConfig::from_env().kda_key_factor);
+
+        std::env::set_var("PLOW_KDA_KEY_FACTOR", "0");
+        assert!(!EmitConfig::from_env().kda_key_factor);
+
+        std::env::remove_var("PLOW_KDA_KEY_FACTOR");
+        assert!(
+            TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .kda_key_factor
+        );
+        assert!(
+            !TestArgs::try_parse_from(["test", "--kda-key-factor=0"])
+                .unwrap()
+                .emit
+                .kda_key_factor
+        );
+    }
+
+    #[test]
+    fn attnres_f32mix_defaults_on_and_env_opts_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_ATTNRES_F32MIX", "0")]);
+        std::env::remove_var("PLOW_ATTNRES_F32MIX");
+        assert!(EmitConfig::from_env().attnres_f32mix);
+        assert!(
+            TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .attnres_f32mix
+        );
+        std::env::set_var("PLOW_ATTNRES_F32MIX", "0");
+        assert!(!EmitConfig::from_env().attnres_f32mix);
+        assert!(
+            !TestArgs::try_parse_from(["test", "--attnres-f32mix=false"])
+                .unwrap()
+                .emit
+                .attnres_f32mix
+        );
+    }
+
+    #[test]
+    fn kda_carry_regstate_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_CARRY_REGSTATE", "1")]);
+        std::env::remove_var("PLOW_KDA_CARRY_REGSTATE");
+        assert!(EmitConfig::from_env().kda_carry_regstate);
+        std::env::set_var("PLOW_KDA_CARRY_REGSTATE", "0");
+        assert!(!EmitConfig::from_env().kda_carry_regstate);
+    }
+
+    #[test]
+    fn kda_intra_wave_items_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_INTRA_WAVE_ITEMS", "1")]);
+        std::env::remove_var("PLOW_KDA_INTRA_WAVE_ITEMS");
+        assert!(EmitConfig::from_env().kda_intra_wave_items);
+        assert!(
+            TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .kda_intra_wave_items
+        );
+
+        std::env::set_var("PLOW_KDA_INTRA_WAVE_ITEMS", "0");
+        assert!(!EmitConfig::from_env().kda_intra_wave_items);
+        assert!(
+            !TestArgs::try_parse_from(["test", "--kda-intra-wave-items=0"])
+                .unwrap()
+                .emit
+                .kda_intra_wave_items
+        );
+    }
+
+    #[test]
+    fn decode_grouped_moe_segments_is_unset_by_default_and_explicit_when_given() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_SEG_DECODE_GROUPED_MOE", "0")]);
+        std::env::remove_var("PLOW_SEG_DECODE_GROUPED_MOE");
+        assert_eq!(EmitConfig::from_env().decode_grouped_moe_segments, None);
+        std::env::set_var("PLOW_SEG_DECODE_GROUPED_MOE", "1");
+        assert_eq!(
+            EmitConfig::from_env().decode_grouped_moe_segments,
+            Some(true)
+        );
+        std::env::remove_var("PLOW_SEG_DECODE_GROUPED_MOE");
+
+        assert_eq!(
+            TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .decode_grouped_moe_segments,
+            None
+        );
+        assert_eq!(
+            TestArgs::try_parse_from(["test", "--emit-decode-grouped-moe-segments=false"])
+                .unwrap()
+                .emit
+                .decode_grouped_moe_segments,
+            Some(false)
+        );
+        assert_eq!(
+            TestArgs::try_parse_from(["test", "--emit-decode-grouped-moe-segments"])
+                .unwrap()
+                .emit
+                .decode_grouped_moe_segments,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn decode_mla_segments_default_on_for_plowc_but_legacy_is_opt_in() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_SEG_DECODE_MLA", "0")]);
+        std::env::remove_var("PLOW_SEG_DECODE_MLA");
+        assert!(!EmitConfig::from_env().decode_mla_segments);
+
+        std::env::set_var("PLOW_SEG_DECODE_MLA", "1");
+        assert!(EmitConfig::from_env().decode_mla_segments);
+        std::env::remove_var("PLOW_SEG_DECODE_MLA");
+
+        assert!(
+            TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .decode_mla_segments
+        );
+        assert!(
+            !TestArgs::try_parse_from(["test", "--emit-decode-mla-segments=false"])
+                .unwrap()
+                .emit
+                .decode_mla_segments
+        );
+    }
+
+    #[test]
+    fn materialized_residual_fusion_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_FUSE_RESIDUAL_INPUT", "1")]);
+        std::env::remove_var("PLOW_FUSE_RESIDUAL_INPUT");
+        assert!(EmitConfig::from_env().fuse_residual_input);
+
+        std::env::set_var("PLOW_FUSE_RESIDUAL_INPUT", "0");
+        assert!(!EmitConfig::from_env().fuse_residual_input);
+    }
+
+    #[test]
+    fn attnres_norm_fusion_defaults_on_and_allows_capture_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_K3_FUSE_ARNORM", "1")]);
+        std::env::remove_var("PLOW_K3_FUSE_ARNORM");
+        assert!(EmitConfig::from_env().k3_fuse_arnorm);
+        std::env::set_var("PLOW_K3_FUSE_ARNORM", "0");
+        assert!(!EmitConfig::from_env().k3_fuse_arnorm);
+    }
+
+    #[test]
+    fn grouped_prefill_accumulator_arms_are_mutually_exclusive() {
+        let mut cfg = EmitConfig::from_env();
+        cfg.w8a8 = false;
+        cfg.w8a16 = false;
+        cfg.mxfp4 = false;
+        cfg.moe_pf_atomic = true;
+        cfg.moe_pf_det = true;
+        let err = std::panic::catch_unwind(|| cfg.validate())
+            .expect_err("atomic and deterministic accumulation cannot share one packet");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+    }
 
     #[test]
     fn shape_keyed_gemv_cap_parses_exact_shapes() {
@@ -954,6 +1364,7 @@ mod tests {
             ("w8a8", "any_fp8_weights()"),
             ("w8a16", "any_fp8_weights()"),
             ("gemv_wg_tuning", "gemv_wg_for("),
+            ("gemm_wide_c8_shape", "gemm_wide_c8_for("),
         ];
 
         let dead: Vec<&str> = fields
@@ -1044,5 +1455,21 @@ mod tests {
              `emit_config::active()`. If it genuinely belongs to another crate, add it to \
              ALLOWED with the reason — but prefer migrating."
         );
+    }
+
+    #[test]
+    fn gemm_wide_c8_selector_matches_one_exact_shape() {
+        let mut cfg = EmitConfig::from_env();
+        cfg.gemm_wide_c8_shape = Some("8192x1536x7168".into());
+        assert!(cfg.gemm_wide_c8_for(8192, 1536, 7168));
+        assert!(!cfg.gemm_wide_c8_for(4096, 1536, 7168));
+    }
+
+    #[test]
+    #[should_panic(expected = "PLOW_GEMM_WIDE_C8_SHAPE must be MxNxK")]
+    fn gemm_wide_c8_selector_rejects_an_invalid_shape() {
+        let mut cfg = EmitConfig::from_env();
+        cfg.gemm_wide_c8_shape = Some("8192x1536".into());
+        cfg.gemm_wide_c8_for(8192, 1536, 7168);
     }
 }

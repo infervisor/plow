@@ -49,7 +49,7 @@ use tunedb::gemm::parse_quant;
 use tunedb::gemv::gemv_sample_family;
 use tunedb::{
     gemv_op_case, gemv_sample_bucket, gemv_sample_opcode, Correctness, Digests, KernelMeasurement,
-    RecordState, Stats, TuneStore, GEMV_ORACLE, GFX950_CELL,
+    RecordState, Stats, TuneStore, GEMV_ORACLE,
 };
 
 /// The part this invocation's records belong to: cell, probed ISA, and the SKU label.
@@ -72,14 +72,7 @@ impl Target {
             .ok_or_else(|| format!("{} has no ISA level mapping", spec.name))?;
         let cell = tunedb::amd_tuning_cell(spec);
         Ok(Target {
-            // The gfx950 cell keeps its recorded label (MI355X silicon measured into the mi350x
-            // cell) rather than silently relabelling old provenance — the same rule
-            // `plowc tune ingest` applies. Every other cell takes its SKU from the fingerprint.
-            sku: if cell == GFX950_CELL {
-                "MI355X".into()
-            } else {
-                hw.sku.clone()
-            },
+            sku: spec.name.into(),
             isa: hw.isa,
             cell,
         })
@@ -130,12 +123,30 @@ fn run() -> Result<(), Err> {
         "ingest" => {
             let samples = opt("--samples").ok_or("ingest needs --samples <sweep.jsonl>")?;
             let target = Target::resolve(&opt("--gpu").ok_or("ingest needs --gpu <name>")?)?;
+            let expected = match (
+                opt("--expect-cell"),
+                opt("--expect-build"),
+                opt("--expect-toolchain"),
+                opt("--expect-oracle"),
+            ) {
+                (None, None, None, None) => None,
+                (Some(cell), Some(build), Some(toolchain), Some(oracle)) => {
+                    Some(ExpectedIdentity {
+                        cell,
+                        build,
+                        toolchain,
+                        oracle,
+                    })
+                }
+                _ => return Err("ingest identity expectations must be supplied together".into()),
+            };
             ingest(
                 &db,
                 &target,
                 &PathBuf::from(samples),
                 &opt("--campaign").unwrap_or_else(|| "gemv-row-inventory".into()),
                 flag("--provisional"),
+                expected.as_ref(),
             )
         }
         "best" => best(
@@ -147,6 +158,28 @@ fn run() -> Result<(), Err> {
             eprintln!("       tunedb-gemv best   --db <dir> --gpu <name>");
             Err("no command".into())
         }
+    }
+}
+
+struct ExpectedIdentity {
+    cell: String,
+    build: String,
+    toolchain: String,
+    oracle: String,
+}
+
+impl ExpectedIdentity {
+    fn verify(&self, cell: &str, actual: &Digests) -> Result<(), Err> {
+        if self.cell != cell
+            || self.build != actual.interpreter
+            || self.toolchain != actual.toolchain
+            || self.oracle != actual.oracle
+        {
+            return Err(
+                "publication-time cell/interpreter/toolchain/oracle identity changed".into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -185,13 +218,18 @@ fn ingest(
     samples: &PathBuf,
     campaign: &str,
     provisional: bool,
+    expected: Option<&ExpectedIdentity>,
 ) -> Result<(), Err> {
     let cell = target.cell.as_str();
     let text = std::fs::read_to_string(samples)?;
     let want = digests(&repo_root(), target.isa)?;
+    if let Some(expected) = expected {
+        expected.verify(cell, &want)?;
+    }
     println!("cell        : {cell}");
     println!("build       : {}", want.interpreter);
     println!("toolchain   : {}", want.toolchain);
+    println!("oracle      : {}", want.oracle);
 
     let mut records = Vec::new();
     let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
@@ -287,6 +325,45 @@ fn ingest(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digests() -> Digests {
+        Digests {
+            implementation: "build-a".into(),
+            interpreter: "build-a".into(),
+            toolchain: "rocm-a".into(),
+            oracle: "oracle-a".into(),
+        }
+    }
+
+    #[test]
+    fn target_preserves_physical_sku_inside_the_shared_gfx950_cell() {
+        let mi350 = Target::resolve("MI350X").unwrap();
+        let mi355 = Target::resolve("MI355X").unwrap();
+        assert_eq!(mi350.cell, "amd/gfx950/mi350x");
+        assert_eq!(mi355.cell, "amd/gfx950/mi350x");
+        assert_eq!(mi350.sku, "MI350X");
+        assert_eq!(mi355.sku, "MI355X");
+    }
+
+    #[test]
+    fn publication_identity_is_exact() {
+        let expected = ExpectedIdentity {
+            cell: "amd/gfx950/mi350x".into(),
+            build: "build-a".into(),
+            toolchain: "rocm-a".into(),
+            oracle: "oracle-a".into(),
+        };
+        assert!(expected.verify("amd/gfx950/mi350x", &digests()).is_ok());
+        let mut changed = digests();
+        changed.toolchain = "rocm-b".into();
+        assert!(expected.verify("amd/gfx950/mi350x", &changed).is_err());
+        assert!(expected.verify("amd/gfx942/mi300x", &digests()).is_err());
+    }
+}
+
 /// Print the M curve, which is the shape of this cell's only real answer.
 ///
 /// Grouped by `(N, K)` and laid out across M, because "the per-token cost of a decode GEMV as
@@ -300,6 +377,8 @@ fn best(db: &PathBuf, target: &Target) -> Result<(), Err> {
     let (best, stale) = store.best_for(cell, &want)?;
     println!("cell        : {cell}");
     println!("build       : {}", want.interpreter);
+    println!("toolchain   : {}", want.toolchain);
+    println!("oracle      : {}", want.oracle);
     let mut rows: BTreeMap<(u32, u32, String), BTreeMap<u32, f64>> = BTreeMap::new();
     for (case, rec) in &best {
         if rec.profile != "decode_gemv" {

@@ -42,6 +42,7 @@
 #define PLOW_OP_KDA_H
 
 #include "amd_common.h"
+#include "packed_prefill.h"
 
 #ifndef PLOW_KDA_PF_STATE_RESIDENT
 #define PLOW_KDA_PF_STATE_RESIDENT 0
@@ -69,6 +70,11 @@ enum {
     PLOW_KDA_F_SEQ_ROWS = 2u,
 };
 
+__device__ __forceinline__ uint2 kda_chunk_desc(const uint2* chunks, unsigned chunk, unsigned T) {
+    const unsigned row0 = chunk * 64u;
+    return chunks ? chunks[chunk] : make_uint2(row0, min(64u, T - row0));
+}
+
 __device__ __forceinline__ float kda_sigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
 /* softplus(x) = log1p(exp(x)), evaluated in the numerically safe branch. [fla] uses
@@ -77,6 +83,845 @@ __device__ __forceinline__ float kda_sigmoid(float x) { return 1.0f / (1.0f + __
 __device__ __forceinline__ float kda_softplus(float x) {
     return x > 20.0f ? x : __logf(1.0f + __expf(x));
 }
+
+/* BT64 chunk-local gate prefix. `chunks[c] = {row0, n_rows}` and n_rows is in [1, 64].
+ * One wave owns one (chunk, head, dimension): its lanes are the token axis, so the ordered
+ * dependency is a wave shuffle scan rather than a cross-workgroup handoff. The result is stored
+ * in log2 units for direct exp2 use by a chunk recurrence. Each chunk deliberately starts from
+ * zero; inter-chunk carry is a separate stage. */
+__device__ void d_kda_chunk_gate_prefix_bt64(
+    float* __restrict__ g_cumsum_log2, float* __restrict__ beta,
+    const bf16* __restrict__ g_raw, const bf16* __restrict__ beta_raw,
+    const float* __restrict__ A_log, const float* __restrict__ dt_bias,
+    const uint2* __restrict__ chunks, unsigned n_chunks, unsigned T, unsigned H, unsigned D,
+    unsigned mode, float lb, unsigned slice, unsigned nblk) {
+    constexpr float RCP_LN2 = 1.4426950408889634f;
+    const unsigned lane = threadIdx.x & (PLOW_WAVE - 1u);
+    const unsigned wave = threadIdx.x >> 6;
+    const size_t hd_count = (size_t)H * D;
+    const size_t n_items = (size_t)n_chunks * hd_count;
+
+    for (size_t item = (size_t)slice * PLOW_WAVES + wave; item < n_items;
+         item += (size_t)nblk * PLOW_WAVES) {
+        const unsigned chunk = (unsigned)(item / hd_count);
+        const unsigned hd = (unsigned)(item - (size_t)chunk * hd_count);
+        const unsigned h = hd / D;
+        const uint2 desc = kda_chunk_desc(chunks, chunk, T);
+        const bool valid = lane < desc.y;
+        const size_t row = (size_t)desc.x + lane;
+
+        float gate = 0.0f;
+        if (valid) {
+            const size_t i = row * hd_count + hd;
+            const float a = __expf(A_log[h]);
+            const float s = bf2f(g_raw[i]) + dt_bias[hd];
+            gate = (mode == PLOW_KDA_GATE_LOWER_BOUND) ? lb * kda_sigmoid(a * s)
+                                                       : -a * kda_softplus(s);
+        }
+        gate *= RCP_LN2;
+#pragma unroll
+        for (unsigned delta = 1; delta < PLOW_WAVE; delta <<= 1) {
+            const float prior = __shfl_up(gate, delta, PLOW_WAVE);
+            if (lane >= delta) gate += prior;
+        }
+        if (valid) {
+            g_cumsum_log2[row * hd_count + hd] = gate;
+            if (hd % D == 0)
+                beta[row * H + h] = kda_sigmoid(bf2f(beta_raw[row * H + h]));
+        }
+    }
+}
+
+/* Dense production preparation: chunk-local gate prefix plus in-place q/k L2 normalization.
+ * Null chunk descriptors derive contiguous BT64 chunks and a final tail bounded by T. */
+__device__ void d_kda_chunk_prepare_bt64(
+    bf16* __restrict__ q, bf16* __restrict__ k, float* __restrict__ g_cumsum_log2,
+    float* __restrict__ beta, const bf16* __restrict__ g_raw,
+    const bf16* __restrict__ beta_raw, const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias, const uint2* __restrict__ chunks, unsigned n_chunks,
+    unsigned T, unsigned H, unsigned D, unsigned mode, float lb, unsigned slice, unsigned nblk) {
+    d_kda_chunk_gate_prefix_bt64(g_cumsum_log2, beta, g_raw, beta_raw, A_log, dt_bias, chunks,
+                                 n_chunks, T, H, D, mode, lb, slice, nblk);
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const size_t n_rows = (size_t)T * H;
+    for (size_t rowh = (size_t)slice * PLOW_WAVES + wave; rowh < n_rows;
+         rowh += (size_t)nblk * PLOW_WAVES) {
+        const size_t base = rowh * D;
+        float qss = 0.0f, kss = 0.0f;
+        for (unsigned d = lane; d < D; d += 64u) {
+            const float qv = bf2f(q[base + d]), kv = bf2f(k[base + d]);
+            qss += qv * qv;
+            kss += kv * kv;
+        }
+        const float qinv = rsqrtf(wave_sum(qss) + 1.0e-6f);
+        const float kinv = rsqrtf(wave_sum(kss) + 1.0e-6f);
+        for (unsigned d = lane; d < D; d += 64u) {
+            q[base + d] = f2bf(bf2f(q[base + d]) * qinv);
+            k[base + d] = f2bf(bf2f(k[base + d]) * kinv);
+        }
+    }
+}
+
+/* BC16 diagonal intra-chunk products and solve. One wave owns one
+ * (BT64 chunk, 16-token subchunk, head). `g_cumsum_log2` is the chunk-local result above.
+ * Products use the native 16x16 bf16 MFMA and accumulate in f32. The strict-lower KK product is
+ * multiplied by beta on its row, then solved as (I + L)^-1 in f32. Outputs are [row,H,16], with
+ * the local subchunk column in the final dimension. q/k are already normalized and D is a
+ * multiple of the MFMA K=32. Inter-subchunk products are deliberately not computed here. */
+__device__ void d_kda_chunk_intra_bc16(
+    float* __restrict__ Aqk, float* __restrict__ Ainv, const bf16* __restrict__ q,
+    const bf16* __restrict__ k, const float* __restrict__ g_cumsum_log2,
+    const float* __restrict__ beta, const uint2* __restrict__ chunks, unsigned n_chunks,
+    unsigned T, unsigned H, unsigned D, float scale, unsigned slice, unsigned nblk,
+    float* __restrict__ lds) {
+    const unsigned lane = threadIdx.x & (PLOW_WAVE - 1u);
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned token = lane & 15u;
+    const unsigned kgroup = lane >> 4;
+    const size_t n_items = (size_t)n_chunks * H * 4u;
+    float* const mat = lds + (size_t)wave * 16u * 16u;
+
+    for (size_t item = (size_t)slice * PLOW_WAVES + wave; item < n_items;
+         item += (size_t)nblk * PLOW_WAVES) {
+        const unsigned chunk = (unsigned)(item / ((size_t)H * 4u));
+        const unsigned rem = (unsigned)(item - (size_t)chunk * H * 4u);
+        const unsigned h = rem >> 2;
+        const unsigned sub = rem & 3u;
+        const uint2 desc = kda_chunk_desc(chunks, chunk, T);
+        const unsigned sub0 = sub * 16u;
+        if (sub0 >= desc.y) continue;
+        const unsigned valid = min(16u, desc.y - sub0);
+        const size_t row0 = (size_t)desc.x + sub0;
+        const size_t hd_count = (size_t)H * D;
+        const size_t anchor_row = row0 + min(8u, valid - 1u);
+
+        f32x4 qk_acc = (f32x4)(0.0f);
+        f32x4 kk_acc = (f32x4)(0.0f);
+        for (unsigned d0 = 0; d0 < D; d0 += 32u) {
+            bf16x8 qf = (bf16x8)((bf16_t)0);
+            bf16x8 kf = (bf16x8)((bf16_t)0);
+            bf16x8 kt = (bf16x8)((bf16_t)0);
+            const unsigned d = d0 + 8u * kgroup;
+            if (token < valid) {
+                const size_t row = row0 + token;
+#pragma unroll
+                for (unsigned j = 0; j < 8; j++) {
+                    const size_t i = row * hd_count + (size_t)h * D + d + j;
+                    const size_t ia = anchor_row * hd_count + (size_t)h * D + d + j;
+                    const float dg = g_cumsum_log2[i] - g_cumsum_log2[ia];
+                    qf[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(q[i]) * exp2f(dg)));
+                    kf[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(k[i]) * exp2f(dg)));
+                    kt[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(k[i]) * exp2f(-dg)));
+                }
+            }
+            qk_acc = plow_mfma_bf16_16x16(qf, kt, qk_acc);
+            kk_acc = plow_mfma_bf16_16x16(kf, kt, kk_acc);
+        }
+
+#pragma unroll
+        for (unsigned e = 0; e < 4; e++) {
+            const unsigned m = 4u * kgroup + e;
+            const unsigned n = token;
+            if (m < valid) {
+                const size_t out = ((row0 + m) * H + h) * 16u + n;
+                Aqk[out] = n < valid && n <= m ? qk_acc[e] * scale : 0.0f;
+            }
+            mat[m * 16u + n] = m < valid && n < m ? kk_acc[e] * beta[(row0 + m) * H + h]
+                                                   : 0.0f;
+        }
+        __builtin_amdgcn_wave_barrier();
+
+        for (unsigned i = 0; i < valid; i++) {
+            const float row_value = token < valid ? mat[i * 16u + token] : 0.0f;
+            float value = token < i ? -row_value : (token == i ? 1.0f : 0.0f);
+#pragma unroll
+            for (unsigned j = 1; j < 16; j++) {
+                const float lij = __shfl(row_value, j, PLOW_WAVE);
+                if (j < i && token < j) value -= lij * mat[j * 16u + token];
+            }
+            __builtin_amdgcn_wave_barrier();
+            if (token <= i && lane < 16u) mat[i * 16u + token] = value;
+            __builtin_amdgcn_wave_barrier();
+        }
+        for (unsigned x = lane; x < 16u * 16u; x += PLOW_WAVE) {
+            const unsigned m = x >> 4, n = x & 15u;
+            if (m < valid)
+                Ainv[((row0 + m) * H + h) * 16u + n] = n <= m ? mat[x] : 0.0f;
+        }
+    }
+}
+
+/* Full BT64 intra-chunk matrix. One workgroup owns one (chunk, head); its waves cover the ten
+ * lower-triangular BC16 block pairs. All QK/KK products use 16x16 bf16 MFMA with f32
+ * accumulation. The complete strict-lower L is then solved in workgroup-local memory, so no
+ * inter-workgroup ordering or handoff exists. Outputs are [row,H,64]. Chunk lengths are in
+ * [1,64], q/k are already normalized, and D is a multiple of the MFMA K=32. */
+__device__ void d_kda_chunk_intra_bt64(
+    float* __restrict__ Aqk, float* __restrict__ Ainv, const bf16* __restrict__ q,
+    const bf16* __restrict__ k, const float* __restrict__ g_cumsum_log2,
+    const float* __restrict__ beta, const uint2* __restrict__ chunks, unsigned n_chunks,
+    unsigned T, unsigned H, unsigned D, float scale, unsigned slice, unsigned nblk,
+    float* __restrict__ mat) {
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & (PLOW_WAVE - 1u);
+    const unsigned wave = tid >> 6;
+    const unsigned token = lane & 15u;
+    const unsigned kgroup = lane >> 4;
+    const size_t n_items = (size_t)n_chunks * H;
+
+    for (size_t item = slice; item < n_items; item += nblk) {
+        const unsigned chunk = (unsigned)(item / H);
+        const unsigned h = (unsigned)(item - (size_t)chunk * H);
+        const uint2 desc = kda_chunk_desc(chunks, chunk, T);
+        const unsigned valid = desc.y;
+        const size_t row0 = desc.x;
+        const size_t hd_count = (size_t)H * D;
+
+        for (unsigned x = tid; x < 64u * 64u; x += PLOW_THREADS) mat[x] = 0.0f;
+        for (unsigned x = tid; x < valid * 64u; x += PLOW_THREADS)
+            Aqk[((row0 + x / 64u) * H + h) * 64u + x % 64u] = 0.0f;
+        __syncthreads();
+
+        for (unsigned pair = wave; pair < 10u; pair += PLOW_WAVES) {
+            const unsigned bm = pair >= 6u ? 3u : (pair >= 3u ? 2u : (pair >= 1u ? 1u : 0u));
+            const unsigned bn = pair - bm * (bm + 1u) / 2u;
+            const unsigned m0 = bm * 16u, n0 = bn * 16u;
+            const unsigned mv = valid > m0 ? min(16u, valid - m0) : 0u;
+            const unsigned nv = valid > n0 ? min(16u, valid - n0) : 0u;
+            if (mv != 0 && nv != 0) {
+                const unsigned anchor_local = bm == bn ? m0 + min(8u, mv - 1u) : m0;
+                const size_t anchor_row = row0 + anchor_local;
+                f32x4 qk_acc = (f32x4)(0.0f);
+                f32x4 kk_acc = (f32x4)(0.0f);
+                for (unsigned d0 = 0; d0 < D; d0 += 32u) {
+                    bf16x8 qf = (bf16x8)((bf16_t)0);
+                    bf16x8 kf = (bf16x8)((bf16_t)0);
+                    bf16x8 kt = (bf16x8)((bf16_t)0);
+                    const unsigned d = d0 + 8u * kgroup;
+                    if (token < mv) {
+                        const size_t row = row0 + m0 + token;
+#pragma unroll
+                        for (unsigned j = 0; j < 8; j++) {
+                            const size_t i = row * hd_count + (size_t)h * D + d + j;
+                            const size_t ia = anchor_row * hd_count + (size_t)h * D + d + j;
+                            const float dg = g_cumsum_log2[i] - g_cumsum_log2[ia];
+                            qf[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(q[i]) * exp2f(dg)));
+                            kf[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(k[i]) * exp2f(dg)));
+                        }
+                    }
+                    if (token < nv) {
+                        const size_t row = row0 + n0 + token;
+#pragma unroll
+                        for (unsigned j = 0; j < 8; j++) {
+                            const size_t i = row * hd_count + (size_t)h * D + d + j;
+                            const size_t ia = anchor_row * hd_count + (size_t)h * D + d + j;
+                            const float dg = g_cumsum_log2[i] - g_cumsum_log2[ia];
+                            kt[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(k[i]) * exp2f(-dg)));
+                        }
+                    }
+                    qk_acc = plow_mfma_bf16_16x16(qf, kt, qk_acc);
+                    kk_acc = plow_mfma_bf16_16x16(kf, kt, kk_acc);
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 4; e++) {
+                    const unsigned ml = 4u * kgroup + e;
+                    const unsigned nl = token;
+                    if (ml < mv && nl < nv && (bm != bn || nl <= ml)) {
+                        const unsigned m = m0 + ml, n = n0 + nl;
+                        Aqk[((row0 + m) * H + h) * 64u + n] = qk_acc[e] * scale;
+                        if (n < m)
+                            mat[m * 64u + n] =
+                                kk_acc[e] * beta[(row0 + m) * H + h];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        if (wave == 0) {
+            for (unsigned i = 0; i < valid; i++) {
+                const float row_value = mat[i * 64u + lane];
+                float value = lane < i ? -row_value : (lane == i ? 1.0f : 0.0f);
+#pragma unroll 1
+                for (unsigned j = 1; j < 64u; j++) {
+                    const float lij = __shfl(row_value, j, PLOW_WAVE);
+                    if (j < i && lane < j) value -= lij * mat[j * 64u + lane];
+                }
+                __builtin_amdgcn_wave_barrier();
+                if (lane <= i) mat[i * 64u + lane] = value;
+                __builtin_amdgcn_wave_barrier();
+            }
+        }
+        __syncthreads();
+        for (unsigned x = tid; x < valid * 64u; x += PLOW_THREADS) {
+            const unsigned m = x / 64u, n = x % 64u;
+            Ainv[((row0 + m) * H + h) * 64u + n] = n <= m ? mat[m * 64u + n] : 0.0f;
+        }
+        __syncthreads();
+    }
+}
+
+/* Keep the strict per-item arithmetic order while using otherwise-idle waves for independent
+ * (chunk, head) items.  Each wave owns a disjoint 64x64 matrix in LDS; no workgroup barrier is
+ * legal inside the item loop because some waves can exhaust their item stream earlier. */
+__device__ void d_kda_chunk_intra_bt64_wave_items(
+    float* __restrict__ Aqk, float* __restrict__ Ainv, const bf16* __restrict__ q,
+    const bf16* __restrict__ k, const float* __restrict__ g_cumsum_log2,
+    const float* __restrict__ beta, const uint2* __restrict__ chunks, unsigned n_chunks,
+    unsigned T, unsigned H, unsigned D, float scale, unsigned slice, unsigned nblk,
+    float* __restrict__ matrices) {
+    const unsigned lane = threadIdx.x & (PLOW_WAVE - 1u);
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned token = lane & 15u;
+    const unsigned kgroup = lane >> 4;
+    const size_t n_items = (size_t)n_chunks * H;
+    float* const mat = matrices + (size_t)wave * 64u * 64u;
+
+    for (size_t item = (size_t)slice + (size_t)wave * nblk; item < n_items;
+         item += (size_t)nblk * PLOW_WAVES) {
+        const unsigned chunk = (unsigned)(item / H);
+        const unsigned h = (unsigned)(item - (size_t)chunk * H);
+        const uint2 desc = kda_chunk_desc(chunks, chunk, T);
+        const unsigned valid = desc.y;
+        const size_t row0 = desc.x;
+        const size_t hd_count = (size_t)H * D;
+
+        for (unsigned x = lane; x < 64u * 64u; x += PLOW_WAVE) mat[x] = 0.0f;
+        for (unsigned x = lane; x < valid * 64u; x += PLOW_WAVE)
+            Aqk[((row0 + x / 64u) * H + h) * 64u + x % 64u] = 0.0f;
+        __builtin_amdgcn_wave_barrier();
+
+        for (unsigned pair = 0; pair < 10u; ++pair) {
+            const unsigned bm = pair >= 6u ? 3u : (pair >= 3u ? 2u : (pair >= 1u ? 1u : 0u));
+            const unsigned bn = pair - bm * (bm + 1u) / 2u;
+            const unsigned m0 = bm * 16u, n0 = bn * 16u;
+            const unsigned mv = valid > m0 ? min(16u, valid - m0) : 0u;
+            const unsigned nv = valid > n0 ? min(16u, valid - n0) : 0u;
+            if (mv != 0 && nv != 0) {
+                const unsigned anchor_local = bm == bn ? m0 + min(8u, mv - 1u) : m0;
+                const size_t anchor_row = row0 + anchor_local;
+                f32x4 qk_acc = (f32x4)(0.0f);
+                f32x4 kk_acc = (f32x4)(0.0f);
+                for (unsigned d0 = 0; d0 < D; d0 += 32u) {
+                    bf16x8 qf = (bf16x8)((bf16_t)0);
+                    bf16x8 kf = (bf16x8)((bf16_t)0);
+                    bf16x8 kt = (bf16x8)((bf16_t)0);
+                    const unsigned d = d0 + 8u * kgroup;
+                    if (token < mv) {
+                        const size_t row = row0 + m0 + token;
+#pragma unroll
+                        for (unsigned j = 0; j < 8; ++j) {
+                            const size_t i = row * hd_count + (size_t)h * D + d + j;
+                            const size_t ia = anchor_row * hd_count + (size_t)h * D + d + j;
+                            const float dg = g_cumsum_log2[i] - g_cumsum_log2[ia];
+                            qf[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(q[i]) * exp2f(dg)));
+                            kf[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(k[i]) * exp2f(dg)));
+                        }
+                    }
+                    if (token < nv) {
+                        const size_t row = row0 + n0 + token;
+#pragma unroll
+                        for (unsigned j = 0; j < 8; ++j) {
+                            const size_t i = row * hd_count + (size_t)h * D + d + j;
+                            const size_t ia = anchor_row * hd_count + (size_t)h * D + d + j;
+                            const float dg = g_cumsum_log2[i] - g_cumsum_log2[ia];
+                            kt[j] = __builtin_bit_cast(bf16_t, f2bf(bf2f(k[i]) * exp2f(-dg)));
+                        }
+                    }
+                    qk_acc = plow_mfma_bf16_16x16(qf, kt, qk_acc);
+                    kk_acc = plow_mfma_bf16_16x16(kf, kt, kk_acc);
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 4; ++e) {
+                    const unsigned ml = 4u * kgroup + e;
+                    const unsigned nl = token;
+                    if (ml < mv && nl < nv && (bm != bn || nl <= ml)) {
+                        const unsigned m = m0 + ml, n = n0 + nl;
+                        Aqk[((row0 + m) * H + h) * 64u + n] = qk_acc[e] * scale;
+                        if (n < m)
+                            mat[m * 64u + n] =
+                                kk_acc[e] * beta[(row0 + m) * H + h];
+                    }
+                }
+            }
+        }
+        __builtin_amdgcn_wave_barrier();
+
+        for (unsigned i = 0; i < valid; ++i) {
+            const float row_value = mat[i * 64u + lane];
+            float value = lane < i ? -row_value : (lane == i ? 1.0f : 0.0f);
+#pragma unroll 1
+            for (unsigned j = 1; j < 64u; ++j) {
+                const float lij = __shfl(row_value, j, PLOW_WAVE);
+                if (j < i && lane < j) value -= lij * mat[j * 64u + lane];
+            }
+            __builtin_amdgcn_wave_barrier();
+            if (lane <= i) mat[i * 64u + lane] = value;
+            __builtin_amdgcn_wave_barrier();
+        }
+        for (unsigned x = lane; x < valid * 64u; x += PLOW_WAVE) {
+            const unsigned m = x / 64u, n = x % 64u;
+            Ainv[((row0 + m) * H + h) * 64u + n] = n <= m ? mat[m * 64u + n] : 0.0f;
+        }
+        __builtin_amdgcn_wave_barrier();
+    }
+}
+
+/* Standalone gfx950 candidate for the full BT64 intra solve.  The production body above
+ * regenerates the gated bf16 operands in every one of the ten lower-triangular block products.
+ * This variant materializes those operands once in LDS, preserves the MFMA order, and distributes
+ * the f32 substitution in the production wave/order.  `scratch` needs 57,344 bf16 values at
+ * D=128 (114,688 bytes). */
+__device__ void d_kda_chunk_intra_bt64_cached(
+    float* __restrict__ Aqk, float* __restrict__ Ainv, const bf16* __restrict__ q,
+    const bf16* __restrict__ k, const float* __restrict__ g_cumsum_log2,
+    const float* __restrict__ beta, const uint2* __restrict__ chunks, unsigned n_chunks,
+    unsigned T, unsigned H, unsigned D, float scale, unsigned slice, unsigned nblk,
+    bf16* __restrict__ scratch) {
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & (PLOW_WAVE - 1u);
+    const unsigned wave = tid >> 6;
+    const unsigned token = lane & 15u;
+    const unsigned kgroup = lane >> 4;
+    const size_t n_items = (size_t)n_chunks * H;
+    float* const mat = reinterpret_cast<float*>(scratch);
+    bf16* const pos_diag = scratch + 64u * 64u * 2u;
+    bf16* const pos_off = pos_diag + 4u * 2u * 16u * D;
+    bf16* const neg = pos_off + 3u * 2u * 16u * D;
+
+    for (size_t item = slice; item < n_items; item += nblk) {
+        const unsigned chunk = (unsigned)(item / H);
+        const unsigned h = (unsigned)(item - (size_t)chunk * H);
+        const uint2 desc = kda_chunk_desc(chunks, chunk, T);
+        const unsigned valid = desc.y;
+        const size_t row0 = desc.x;
+        const size_t hd_count = (size_t)H * D;
+
+        for (unsigned x = tid; x < 64u * 64u; x += PLOW_THREADS) mat[x] = 0.0f;
+        for (unsigned x = tid; x < valid * 64u; x += PLOW_THREADS)
+            Aqk[((row0 + x / 64u) * H + h) * 64u + x % 64u] = 0.0f;
+
+        for (unsigned bm = 0; bm < 4u; ++bm) {
+            const unsigned m0 = bm * 16u;
+            const unsigned mv = valid > m0 ? min(16u, valid - m0) : 0u;
+            if (mv == 0) continue;
+            const size_t anchor_row = row0 + m0 + min(8u, mv - 1u);
+            bf16* const qp = pos_diag + (size_t)(2u * bm) * 16u * D;
+            bf16* const kp = qp + 16u * D;
+            for (unsigned x = tid; x < mv * D; x += PLOW_THREADS) {
+                const unsigned ml = x / D, d = x % D;
+                const size_t i = ((row0 + m0 + ml) * H + h) * D + d;
+                const size_t ia = (anchor_row * H + h) * D + d;
+                const float e = exp2f(g_cumsum_log2[i] - g_cumsum_log2[ia]);
+                qp[x] = f2bf(bf2f(q[i]) * e);
+                kp[x] = f2bf(bf2f(k[i]) * e);
+            }
+            if (bm != 0u) {
+                bf16* const qpo = pos_off + (size_t)(2u * (bm - 1u)) * 16u * D;
+                bf16* const kpo = qpo + 16u * D;
+                const size_t off_anchor = row0 + m0;
+                for (unsigned x = tid; x < mv * D; x += PLOW_THREADS) {
+                    const unsigned ml = x / D, d = x % D;
+                    const size_t i = ((row0 + m0 + ml) * H + h) * D + d;
+                    const size_t ia = (off_anchor * H + h) * D + d;
+                    const float e = exp2f(g_cumsum_log2[i] - g_cumsum_log2[ia]);
+                    qpo[x] = f2bf(bf2f(q[i]) * e);
+                    kpo[x] = f2bf(bf2f(k[i]) * e);
+                }
+            }
+            const size_t tri = (size_t)bm * (bm + 1u) / 2u;
+            for (unsigned bn = 0; bn <= bm; ++bn) {
+                const unsigned n0 = bn * 16u;
+                const unsigned nv = min(16u, valid - n0);
+                const size_t neg_anchor = bn == bm ? anchor_row : row0 + m0;
+                bf16* const kn = neg + (tri + bn) * 16u * D;
+                for (unsigned x = tid; x < nv * D; x += PLOW_THREADS) {
+                    const unsigned nl = x / D, d = x % D;
+                    const size_t i = ((row0 + n0 + nl) * H + h) * D + d;
+                    const size_t ia = (neg_anchor * H + h) * D + d;
+                    kn[x] = f2bf(bf2f(k[i]) *
+                                 exp2f(g_cumsum_log2[ia] - g_cumsum_log2[i]));
+                }
+            }
+        }
+        __syncthreads();
+
+        for (unsigned pair = wave; pair < 10u; pair += PLOW_WAVES) {
+            const unsigned bm = pair >= 6u ? 3u : (pair >= 3u ? 2u : (pair >= 1u ? 1u : 0u));
+            const unsigned bn = pair - bm * (bm + 1u) / 2u;
+            const unsigned m0 = bm * 16u, n0 = bn * 16u;
+            const unsigned mv = valid > m0 ? min(16u, valid - m0) : 0u;
+            const unsigned nv = valid > n0 ? min(16u, valid - n0) : 0u;
+            if (mv != 0 && nv != 0) {
+                const bf16* const qp = bm == bn
+                    ? pos_diag + (size_t)(2u * bm) * 16u * D
+                    : pos_off + (size_t)(2u * (bm - 1u)) * 16u * D;
+                const bf16* const kp = qp + 16u * D;
+                const bf16* const kn =
+                    neg + ((size_t)bm * (bm + 1u) / 2u + bn) * 16u * D;
+                f32x4 qk_acc = (f32x4)(0.0f);
+                f32x4 kk_acc = (f32x4)(0.0f);
+                for (unsigned d0 = 0; d0 < D; d0 += 32u) {
+                    bf16x8 qf = (bf16x8)((bf16_t)0);
+                    bf16x8 kf = (bf16x8)((bf16_t)0);
+                    bf16x8 kt = (bf16x8)((bf16_t)0);
+                    const unsigned d = d0 + 8u * kgroup;
+                    if (token < mv) {
+#pragma unroll
+                        for (unsigned j = 0; j < 8; ++j) {
+                            qf[j] = __builtin_bit_cast(bf16_t, qp[token * D + d + j]);
+                            kf[j] = __builtin_bit_cast(bf16_t, kp[token * D + d + j]);
+                        }
+                    }
+                    if (token < nv) {
+#pragma unroll
+                        for (unsigned j = 0; j < 8; ++j)
+                            kt[j] = __builtin_bit_cast(bf16_t, kn[token * D + d + j]);
+                    }
+                    qk_acc = plow_mfma_bf16_16x16(qf, kt, qk_acc);
+                    kk_acc = plow_mfma_bf16_16x16(kf, kt, kk_acc);
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 4; ++e) {
+                    const unsigned ml = 4u * kgroup + e, nl = token;
+                    if (ml < mv && nl < nv && (bm != bn || nl <= ml)) {
+                        const unsigned m = m0 + ml, n = n0 + nl;
+                        Aqk[((row0 + m) * H + h) * 64u + n] = qk_acc[e] * scale;
+                        if (n < m)
+                            mat[m * 64u + n] = kk_acc[e] * beta[(row0 + m) * H + h];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        if (wave == 0) {
+            for (unsigned i = 0; i < valid; ++i) {
+                const float row_value = mat[i * 64u + lane];
+                float value = lane < i ? -row_value : (lane == i ? 1.0f : 0.0f);
+#pragma unroll 1
+                for (unsigned j = 1u; j < 64u; ++j) {
+                    const float lij = __shfl(row_value, j, PLOW_WAVE);
+                    if (j < i && lane < j) value -= lij * mat[j * 64u + lane];
+                }
+                __builtin_amdgcn_wave_barrier();
+                if (lane <= i) mat[i * 64u + lane] = value;
+                __builtin_amdgcn_wave_barrier();
+            }
+        }
+        __syncthreads();
+        for (unsigned x = tid; x < valid * 64u; x += PLOW_THREADS) {
+            const unsigned m = x / 64u, n = x % 64u;
+            Ainv[((row0 + m) * H + h) * 64u + n] = n <= m ? mat[m * 64u + n] : 0.0f;
+        }
+        __syncthreads();
+    }
+}
+
+/* Transform a full BT64 inverse into the write/value factors used by the chunk carry:
+ *   W = Ainv @ (beta * K * exp2(g)), U = Ainv @ (beta * V).
+ * One wave owns one (chunk, head, 16 token rows, 16 output channels) tile. */
+__device__ void d_kda_chunk_wu_bt64(
+    bf16* __restrict__ W, bf16* __restrict__ U, bf16* __restrict__ q,
+    const float* __restrict__ Ainv, const bf16* __restrict__ k, const bf16* __restrict__ v,
+    const float* __restrict__ g_cumsum_log2, const float* __restrict__ beta,
+    const uint2* __restrict__ chunks, unsigned n_chunks, unsigned T, unsigned H, unsigned D,
+    unsigned V, float scale, bool q_precompute, unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned col = lane & 15u, kgroup = lane >> 4;
+    const unsigned dtiles = (D + 15u) / 16u, vtiles = (V + 15u) / 16u;
+    const unsigned otiles = dtiles + vtiles;
+    if (q_precompute) {
+        const size_t q_items = (size_t)T * H * D;
+        for (size_t qi = (size_t)slice * PLOW_THREADS + threadIdx.x; qi < q_items;
+             qi += (size_t)nblk * PLOW_THREADS) {
+            const bf16 qs = f2bf(bf2f(q[qi]) * scale);
+            q[qi] = f2bf(bf2f(qs) * exp2f(g_cumsum_log2[qi]));
+        }
+    }
+    const size_t n_items = (size_t)n_chunks * H * 4u * otiles;
+    for (size_t item = (size_t)slice * PLOW_WAVES + wave; item < n_items;
+         item += (size_t)nblk * PLOW_WAVES) {
+        size_t z = item;
+        const unsigned ot = z % otiles; z /= otiles;
+        const unsigned mb = z & 3u; z >>= 2;
+        const unsigned h = z % H, chunk = z / H;
+        const uint2 desc = kda_chunk_desc(chunks, chunk, T);
+        const unsigned m0 = mb * 16u;
+        const unsigned mv = desc.y > m0 ? min(16u, desc.y - m0) : 0u;
+        if (mv == 0) continue;
+        const bool make_w = ot < dtiles;
+        const unsigned out0 = (make_w ? ot : ot - dtiles) * 16u;
+        const unsigned width = make_w ? D : V;
+        const size_t row0 = desc.x;
+        f32x4 acc = (f32x4)(0.0f);
+        for (unsigned s0 = 0; s0 < 64u; s0 += 32u) {
+            bf16x8 af = (bf16x8)((bf16_t)0), bf = (bf16x8)((bf16_t)0);
+            const unsigned s = s0 + 8u * kgroup;
+#pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                const unsigned sl = s + j;
+                if (col < mv && sl < desc.y) {
+                    const size_t ai = ((row0 + m0 + col) * H + h) * 64u + sl;
+                    af[j] = __builtin_bit_cast(bf16_t, f2bf(Ainv[ai]));
+                }
+                if (out0 + col < width && sl < desc.y) {
+                    const size_t row = row0 + sl;
+                    const float b = beta[row * H + h];
+                    float x;
+                    if (make_w) {
+                        const size_t i = (row * H + h) * D + out0 + col;
+                        x = bf2f(k[i]) * b * exp2f(g_cumsum_log2[i]);
+                    } else {
+                        const size_t i = (row * H + h) * V + out0 + col;
+                        x = bf2f(v[i]) * b;
+                    }
+                    bf[j] = __builtin_bit_cast(bf16_t, f2bf(x));
+                }
+            }
+            acc = plow_mfma_bf16_16x16(af, bf, acc);
+        }
+#pragma unroll
+        for (unsigned e = 0; e < 4; e++) {
+            const unsigned ml = 4u * kgroup + e;
+            if (ml < mv && out0 + col < width) {
+                const size_t row = row0 + m0 + ml;
+                const size_t oi = make_w ? (row * H + h) * D + out0 + col
+                                         : (row * H + h) * V + out0 + col;
+                (make_w ? W : U)[oi] = f2bf(acc[e]);
+            }
+        }
+    }
+}
+
+/* Ordered multi-chunk carry for one sequence (chunk lengths [1,64], D <= 128 and divisible by
+ * 32). One workgroup owns a (head, V16) state tile and
+ * walks `chunks` in order; distinct workgroups own disjoint V rows, so no cross-workgroup handoff
+ * is required. The decomposition matches FLA: V' = U-WH, O = Q exp(g) H + Aqk V', then
+ * H = H exp(g_last) + V'^T (K exp(g_last-g)). State is V-first f32. */
+template <bool Q_PRECOMPUTED = false, bool KEY_PRECOMPUTED = false>
+__device__ void d_kda_chunk_carry_bt64(
+    bf16* __restrict__ out, float* __restrict__ state, const bf16* __restrict__ q,
+    const bf16* __restrict__ k, const bf16* __restrict__ W, const bf16* __restrict__ U,
+    const float* __restrict__ Aqk, const float* __restrict__ g_cumsum_log2,
+    const uint2* __restrict__ chunks, unsigned n_chunks, unsigned T, unsigned H, unsigned D,
+    unsigned V, float scale, unsigned slice, unsigned nblk, float* __restrict__ st,
+    bf16* __restrict__ vsm, float* __restrict__ osm,
+    const bf16* __restrict__ key_hi = nullptr,
+    const bf16* __restrict__ key_lo = nullptr) {
+    const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
+    const unsigned token = lane & 15u, kgroup = lane >> 4;
+    const unsigned vtiles = (V + 15u) / 16u;
+    const size_t n_items = (size_t)H * vtiles;
+    for (size_t item = slice; item < n_items; item += nblk) {
+        const unsigned h = (unsigned)(item / vtiles), vt = (unsigned)(item % vtiles);
+        const unsigned v0 = vt * 16u, vv = min(16u, V - v0);
+        for (unsigned x = tid; x < vv * D; x += PLOW_THREADS)
+            st[x] = state[((size_t)h * V + v0 + x / D) * D + x % D];
+        __syncthreads();
+        for (unsigned c = 0; c < n_chunks; c++) {
+            const uint2 desc = kda_chunk_desc(chunks, c, T);
+            const size_t row0 = desc.x;
+            for (unsigned mb = wave; mb < 4u; mb += PLOW_WAVES) {
+                const unsigned m0 = mb * 16u;
+                const unsigned mv = desc.y > m0 ? min(16u, desc.y - m0) : 0u;
+                if (mv == 0) continue;
+                f32x4 pred = (f32x4)(0.0f), from_state = (f32x4)(0.0f);
+                for (unsigned d0 = 0; d0 < D; d0 += 32u) {
+                    bf16x8 wf = (bf16x8)((bf16_t)0), qf = (bf16x8)((bf16_t)0);
+                    bf16x8 sf = (bf16x8)((bf16_t)0);
+                    const unsigned d = d0 + 8u * kgroup;
+                    if (token < mv) {
+                        const size_t row = row0 + m0 + token;
+#pragma unroll
+                        for (unsigned j = 0; j < 8; j++) {
+                            const size_t i = (row * H + h) * D + d + j;
+                            wf[j] = __builtin_bit_cast(bf16_t, W[i]);
+                            if constexpr (Q_PRECOMPUTED) {
+                                qf[j] = __builtin_bit_cast(bf16_t, q[i]);
+                            } else {
+                                const float qs = bf2f(f2bf(bf2f(q[i]) * scale));
+                                qf[j] = __builtin_bit_cast(
+                                    bf16_t, f2bf(qs * exp2f(g_cumsum_log2[i])));
+                            }
+                        }
+                    }
+                    if (token < vv) {
+#pragma unroll
+                        for (unsigned j = 0; j < 8; j++)
+                            sf[j] = __builtin_bit_cast(bf16_t, f2bf(st[token * D + d + j]));
+                    }
+                    pred = plow_mfma_bf16_16x16(wf, sf, pred);
+                    from_state = plow_mfma_bf16_16x16(qf, sf, from_state);
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 4; e++) {
+                    const unsigned ml = 4u * kgroup + e;
+                    if (ml < mv && token < vv) {
+                        const size_t row = row0 + m0 + ml;
+                        vsm[(m0 + ml) * 16u + token] =
+                            f2bf(bf2f(U[(row * H + h) * V + v0 + token]) - pred[e]);
+                        osm[(m0 + ml) * 16u + token] = from_state[e];
+                    }
+                }
+            }
+            __syncthreads();
+            for (unsigned mb = wave; mb < 4u; mb += PLOW_WAVES) {
+                const unsigned m0 = mb * 16u;
+                const unsigned mv = desc.y > m0 ? min(16u, desc.y - m0) : 0u;
+                if (mv == 0) continue;
+                f32x4 local = (f32x4)(0.0f);
+                for (unsigned s0 = 0; s0 < 64u; s0 += 32u) {
+                    bf16x8 af = (bf16x8)((bf16_t)0), vf = (bf16x8)((bf16_t)0);
+                    const unsigned s = s0 + 8u * kgroup;
+#pragma unroll
+                    for (unsigned j = 0; j < 8; j++) {
+                        if (token < mv && s + j < desc.y) {
+                            const size_t ai = ((row0 + m0 + token) * H + h) * 64u + s + j;
+                            af[j] = __builtin_bit_cast(bf16_t, f2bf(Aqk[ai]));
+                        }
+                        if (token < vv && s + j < desc.y)
+                            vf[j] = __builtin_bit_cast(bf16_t, vsm[(s + j) * 16u + token]);
+                    }
+                    local = plow_mfma_bf16_16x16(af, vf, local);
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 4; e++) {
+                    const unsigned ml = 4u * kgroup + e;
+                    if (ml < mv && token < vv) {
+                        const size_t row = row0 + m0 + ml;
+                        out[(row * H + h) * V + v0 + token] =
+                            f2bf(osm[(m0 + ml) * 16u + token] + local[e]);
+                    }
+                }
+            }
+            __syncthreads();
+
+            const size_t last = row0 + desc.y - 1u;
+            for (unsigned d0 = wave * 16u; d0 < D; d0 += PLOW_WAVES * 16u) {
+                f32x4 upd = (f32x4)(0.0f);
+                for (unsigned s0 = 0; s0 < 64u; s0 += 32u) {
+                    bf16x8 vf = (bf16x8)((bf16_t)0), kf = (bf16x8)((bf16_t)0);
+                    bf16x8 kr = (bf16x8)((bf16_t)0);
+                    const unsigned s = s0 + 8u * kgroup;
+#pragma unroll
+                    for (unsigned j = 0; j < 8; j++) {
+                        if (token < vv && s + j < desc.y)
+                            vf[j] = __builtin_bit_cast(bf16_t, vsm[(s + j) * 16u + token]);
+                        if (d0 + token < D && s + j < desc.y) {
+                            const size_t row = row0 + s + j;
+                            const size_t i = (row * H + h) * D + d0 + token;
+                            if constexpr (KEY_PRECOMPUTED) {
+                                kf[j] = __builtin_bit_cast(bf16_t, key_hi[i]);
+                                kr[j] = __builtin_bit_cast(bf16_t, key_lo[i]);
+                            } else {
+                                const size_t il = (last * H + h) * D + d0 + token;
+                                const float scaled =
+                                    bf2f(k[i]) * exp2f(g_cumsum_log2[il] - g_cumsum_log2[i]);
+                                const bf16 high = f2bf(scaled);
+                                kf[j] = __builtin_bit_cast(bf16_t, high);
+                                kr[j] = __builtin_bit_cast(bf16_t, f2bf(scaled - bf2f(high)));
+                            }
+                        }
+                    }
+                    upd = plow_mfma_bf16_16x16(vf, kf, upd);
+                    upd = plow_mfma_bf16_16x16(vf, kr, upd);
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 4; e++) {
+                    const unsigned vl = 4u * kgroup + e;
+                    if (vl < vv && d0 + token < D) {
+                        const size_t il = (last * H + h) * D + d0 + token;
+                        st[vl * D + d0 + token] =
+                            st[vl * D + d0 + token] * exp2f(g_cumsum_log2[il]) + upd[e];
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        for (unsigned x = tid; x < vv * D; x += PLOW_THREADS)
+            state[((size_t)h * V + v0 + x / D) * D + x % D] = st[x];
+        __syncthreads();
+    }
+}
+
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS
+__device__ void d_kda_chunk_prepare_packed_bt64(
+    bf16* q, bf16* k, float* g_prefix, float* beta, const bf16* g_raw,
+    const bf16* beta_raw, const float* A_log, const float* dt_bias, unsigned H, unsigned D,
+    unsigned mode, float lb, unsigned slice, unsigned nblk, const PlowProgram* prog) {
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        const size_t rd = (size_t)span->row0 * H * D;
+        const size_t rh = (size_t)span->row0 * H;
+        d_kda_chunk_prepare_bt64(q + rd, k + rd, g_prefix + rd, beta + rh, g_raw + rd,
+                                 beta_raw + rh, A_log, dt_bias, nullptr,
+                                 (span->n_rows + 63u) / 64u, span->n_rows, H, D, mode, lb,
+                                 slice, nblk);
+    }
+}
+
+__device__ void d_kda_chunk_intra_packed_bt64(
+    float* Aqk, float* Ainv, const bf16* q, const bf16* k, const float* g_prefix,
+    const float* beta, unsigned H, unsigned D, float scale, unsigned slice, unsigned nblk,
+    float* mat, const PlowProgram* prog) {
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        const size_t rd = (size_t)span->row0 * H * D;
+        const size_t rh = (size_t)span->row0 * H;
+        const size_t ra = (size_t)span->row0 * H * 64u;
+        d_kda_chunk_intra_bt64(Aqk + ra, Ainv + ra, q + rd, k + rd, g_prefix + rd,
+                               beta + rh, nullptr, (span->n_rows + 63u) / 64u,
+                               span->n_rows, H, D, scale, slice, nblk, mat);
+    }
+}
+
+__device__ void d_kda_chunk_wu_packed_bt64(
+    bf16* W, bf16* U, bf16* q, const float* Ainv, const bf16* k, const bf16* v,
+    const float* g_prefix, const float* beta, unsigned H, unsigned D, unsigned V,
+    float scale, bool q_precompute, unsigned slice, unsigned nblk, const PlowProgram* prog) {
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        const size_t rd = (size_t)span->row0 * H * D;
+        const size_t rv = (size_t)span->row0 * H * V;
+        const size_t rh = (size_t)span->row0 * H;
+        const size_t ra = (size_t)span->row0 * H * 64u;
+        d_kda_chunk_wu_bt64(W + rd, U + rv, q ? q + rd : nullptr, Ainv + ra, k + rd,
+                            v + rv, g_prefix + rd, beta + rh, nullptr,
+                            (span->n_rows + 63u) / 64u, span->n_rows, H, D, V, scale,
+                            q_precompute, slice, nblk);
+    }
+}
+
+template <bool Q_PRECOMPUTED = false>
+__device__ void d_kda_chunk_carry_packed_bt64(
+    bf16* out, float* state, const bf16* q, const bf16* k, const bf16* W,
+    const bf16* U, const float* Aqk, const float* g_prefix, unsigned H, unsigned D,
+    unsigned V, float scale, unsigned slice, unsigned nblk, float* st, bf16* vsm,
+    float* osm, const PlowProgram* prog) {
+    const unsigned vtiles = (V + 15u) / 16u;
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        float* ss = state + (size_t)span->state_slot * H * V * D;
+        if (span->flags & PLOW_PREFILL_SPAN_RESET_STATE) {
+            for (size_t item = slice; item < (size_t)H * vtiles; item += nblk) {
+                const unsigned vt = (unsigned)(item % vtiles);
+                const unsigned vv = min(16u, V - vt * 16u);
+                const size_t base = ((item / vtiles) * V + vt * 16u) * D;
+                for (unsigned x = threadIdx.x; x < vv * D; x += PLOW_THREADS) ss[base + x] = 0.0f;
+                __syncthreads();
+            }
+        }
+        const size_t rd = (size_t)span->row0 * H * D;
+        const size_t rv = (size_t)span->row0 * H * V;
+        const size_t ra = (size_t)span->row0 * H * 64u;
+        d_kda_chunk_carry_bt64<Q_PRECOMPUTED>(
+            out + rv, ss, q + rd, k + rd, W + rd, U + rv, Aqk + ra, g_prefix + rd,
+            nullptr, (span->n_rows + 63u) / 64u, span->n_rows, H, D, V, scale, slice,
+            nblk, st, vsm, osm);
+    }
+}
+#endif
 
 /* -------------------------------------------------------------------------------------------
  * op 88 — KDA short conv.
@@ -96,10 +941,10 @@ __device__ __forceinline__ float kda_softplus(float x) {
  * because the reference the numeric gate runs against is [fla].
  *
  * SLICE MAP: the conv is a W-tap STENCIL, not a scan — y_t depends on x_{t-W+1..t}, never on
- * y_{t-1} — so it is fully parallel over (t, channel). Only the window carry is sequential, and
- * that is per channel and lives in 4 registers. Channels are therefore the parallel axis and each
- * thread walks all T tokens of its own channel, which also produces the final `state` for free
- * with no second pass.
+ * y_{t-1} — so prefill is parallel over (t, channel). Only its first W-1 rows read the incoming
+ * window; one designated worker per channel computes those rows and publishes the final window,
+ * while the remaining rows are spread across every worker in the channel's packet slice. Decode
+ * and independent-sequence rows retain the serial per-channel path below.
  *
  * Each block takes a CONTIGUOUS chunk of channels rather than a strided one: a channel's window is
  * 4 contiguous f32 = one global_load_dwordx4, and contiguous chunks keep the 512-byte-per-16-lane
@@ -232,6 +1077,93 @@ __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* 
     unsigned g1 = g0 + chunk;
     if (g1 > total) g1 = total;
     if (g0 >= g1) return;
+    if (T > 1u && bstride == 0) {
+        enum { PLOW_KDA_WMAX = 8 };
+        const unsigned Wc = W < PLOW_KDA_WMAX ? W : PLOW_KDA_WMAX;
+        if (Wc == 0) __builtin_trap();
+
+        /* Rows [0,W-1) still read the incoming convolution window. Give all of them, and the
+         * final-window store, to one worker per (stream,channel): no other worker reads `state`, so
+         * publishing the new window needs no grid-wide barrier. */
+        const unsigned prefix = T < Wc - 1u ? T : Wc - 1u;
+        for (unsigned g = g0 + threadIdx.x; g < g1; g += PLOW_THREADS) {
+            const unsigned s = g / C;
+            const unsigned c = g - s * C;
+            bf16* out = s == 0 ? oq : (s == 1 ? ok : ov);
+            const bf16* x = s == 0 ? xq : (s == 1 ? xk : xv);
+            const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
+            float* state = s == 0 ? sq : (s == 1 ? sk : sv);
+            float win[PLOW_KDA_WMAX], tap[PLOW_KDA_WMAX];
+#pragma unroll
+            for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) {
+                win[j] = j < Wc ? state[(size_t)c * W + j] : 0.0f;
+                tap[j] = j < Wc ? w[(size_t)c * W + j] : 0.0f;
+            }
+            for (unsigned t = 0; t < prefix; ++t) {
+#pragma unroll
+                for (unsigned j = 0; j + 1 < PLOW_KDA_WMAX; ++j) win[j] = win[j + 1];
+                win[Wc - 1u] = bf2f(x[(size_t)t * C + c]);
+                float y = 0.0f;
+#pragma unroll
+                for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) y += win[j] * tap[j];
+                st_act1(&out[(size_t)t * C + c], f2bf(act == 1u ? act_silu(y) : y));
+            }
+#pragma unroll
+            for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) {
+                if (j >= Wc) continue;
+                const float v = j + T < Wc
+                                    ? win[j]
+                                    : bf2f(x[((size_t)T - Wc + j) * C + c]);
+                state[(size_t)c * W + j] = v;
+            }
+        }
+
+        /* From row W-1 onward every tap comes from this chunk's input. Split that row range into
+         * contiguous spans per channel, so all workers participate while each reuses one tap vector
+         * and rolls one local input window. */
+        const unsigned row0 = Wc - 1u;
+        if (row0 >= T) return;
+        const unsigned rows = T - row0;
+        const unsigned nch = g1 - g0;
+        const unsigned ncpar = nch < PLOW_THREADS ? nch : PLOW_THREADS;
+        const unsigned cworker = threadIdx.x % ncpar;
+        const unsigned lane = threadIdx.x / ncpar;
+        const unsigned lanes = (PLOW_THREADS + ncpar - 1u - cworker) / ncpar;
+        const unsigned rchunk = (rows + lanes - 1u) / lanes;
+        const unsigned t0 = row0 + lane * rchunk;
+        unsigned t1 = t0 + rchunk;
+        if (t1 > T) t1 = T;
+        for (unsigned g = g0 + cworker; g < g1; g += ncpar) {
+            if (t0 >= t1) continue;
+            const unsigned s = g / C;
+            const unsigned c = g - s * C;
+            bf16* out = s == 0 ? oq : (s == 1 ? ok : ov);
+            const bf16* x = s == 0 ? xq : (s == 1 ? xk : xv);
+            const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
+            float win[PLOW_KDA_WMAX], tap[PLOW_KDA_WMAX];
+#pragma unroll
+            for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) {
+                win[j] = j < Wc
+                             ? bf2f(x[((size_t)t0 - (Wc - 1u - j)) * C + c])
+                             : 0.0f;
+                tap[j] = j < Wc ? w[(size_t)c * W + j] : 0.0f;
+            }
+            for (unsigned t = t0; t < t1; ++t) {
+                float y = 0.0f;
+#pragma unroll
+                for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) y += win[j] * tap[j];
+                st_act1(&out[(size_t)t * C + c], f2bf(act == 1u ? act_silu(y) : y));
+                if (t + 1u < t1) {
+#pragma unroll
+                    for (unsigned j = 0; j + 1u < PLOW_KDA_WMAX; ++j) {
+                        win[j] = win[j + 1u];
+                    }
+                    win[Wc - 1u] = bf2f(x[((size_t)t + 1u) * C + c]);
+                }
+            }
+        }
+        return;
+    }
     /* ROLLED, not unrolled. `kda_conv_range` is force-inlined and holds 2*PLOW_KDA_WMAX floats of
      * window and taps, so unrolling puts three copies of that in the function; rolled there is ONE
      * inline site and the pointer triples become selects. Measured on the K3 decode object it
@@ -251,6 +1183,36 @@ __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* 
         const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
         float* st = s == 0 ? sq : (s == 1 ? sk : sv);
         kda_conv_range(o, x, w, st, T, C, W, act, a, b, bstride, parked);
+    }
+}
+
+__device__ void d_kda_conv3_packed(
+    bf16* oq, bf16* ok, bf16* ov, const bf16* xq, const bf16* xk, const bf16* xv,
+    const float* wq, const float* wk, const float* wv, float* sq, float* sk, float* sv,
+    unsigned C, unsigned W, unsigned act, unsigned slice, unsigned nblk,
+    const PlowProgram* prog) {
+    const unsigned total = 3u * C;
+    const unsigned chunk = (total + nblk - 1u) / nblk;
+    const unsigned g0 = slice * chunk;
+    const unsigned g1 = g0 + chunk < total ? g0 + chunk : total;
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        float* states[3] = {sq + (size_t)span->state_slot * C * W,
+                            sk + (size_t)span->state_slot * C * W,
+                            sv + (size_t)span->state_slot * C * W};
+        if (span->flags & PLOW_PREFILL_SPAN_RESET_STATE) {
+            for (unsigned g = g0 + threadIdx.x; g < g1; g += PLOW_THREADS) {
+                const unsigned stream = g / C, channel = g % C;
+                for (unsigned j = 0; j < W; ++j)
+                    states[stream][(size_t)channel * W + j] = 0.0f;
+            }
+            __syncthreads();
+        }
+        d_kda_conv3(oq + (size_t)span->row0 * C, ok + (size_t)span->row0 * C,
+                    ov + (size_t)span->row0 * C, xq + (size_t)span->row0 * C,
+                    xk + (size_t)span->row0 * C, xv + (size_t)span->row0 * C,
+                    wq, wk, wv, states[0], states[1], states[2], span->n_rows, C, W, act,
+                    slice, nblk, 0u, nullptr);
     }
 }
 
@@ -463,7 +1425,7 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                  * over whatever the loop above accumulated. eps INSIDE the sqrt. */
                 qs = block_sum(qs, lds + 3 * D);
                 ks = block_sum(ks, lds + 3 * D + PLOW_WAVES);
-                const float rq = scale / sqrtf(qs + 1e-6f), rk = 1.0f / sqrtf(ks + 1e-6f);
+                const float rq = scale * rsqrtf(qs + 1e-6f), rk = rsqrtf(ks + 1e-6f);
                 for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS) {
                     l_q[d] *= rq;
                     l_k[d] *= rk;
@@ -583,6 +1545,41 @@ __device__ void d_kda_state_step_g(bf16* __restrict__ o, const bf16* __restrict_
     const float *g = nullptr, *beta = nullptr;
     PLOW_KDA_STEP_RUNGS(true)
 }
+
+template <bool GATED>
+__device__ void d_kda_state_step_packed(
+    bf16* o, const bf16* q, const bf16* k, const bf16* v, const float* g,
+    const float* beta, const bf16* g_raw, const bf16* beta_raw, const float* a_log,
+    const float* dt_bias, unsigned gate_mode, float lb, float* state, unsigned H, unsigned D,
+    unsigned BV, unsigned flags, float scale, unsigned slice, unsigned nblk, float* lds,
+    const PlowProgram* prog) {
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        float* ss = state + (size_t)span->state_slot * H * D * D;
+        if (span->flags & PLOW_PREFILL_SPAN_RESET_STATE) {
+            const unsigned vb = D / BV;
+            for (unsigned it = slice; it < H * vb; it += nblk) {
+                const unsigned h = it / vb, v0 = (it % vb) * BV;
+                for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS)
+                    for (unsigned j = 0; j < BV; ++j)
+                        ss[((size_t)h * D + v0 + j) * D + d] = 0.0f;
+            }
+            __syncthreads();
+        }
+        const size_t rd = (size_t)span->row0 * H * D;
+        const size_t rh = (size_t)span->row0 * H;
+        if constexpr (GATED)
+            d_kda_state_step_g(o + rd, q + rd, k + rd, v + rd, g_raw + rd,
+                               beta_raw + rh, a_log, dt_bias, gate_mode, lb, ss, span->n_rows,
+                               H, D, BV, flags & ~PLOW_KDA_F_SEQ_ROWS, scale, slice, nblk, lds,
+                               0u, nullptr);
+        else
+            d_kda_state_step(o + rd, q + rd, k + rd, v + rd,
+                             g ? g + rd : nullptr, beta ? beta + rh : nullptr, ss,
+                             span->n_rows, H, D, BV, flags & ~PLOW_KDA_F_SEQ_ROWS, scale,
+                             slice, nblk, lds, 0u, nullptr);
+    }
+}
 #undef PLOW_KDA_STEP_RUNGS
 
 #if PLOW_KDA_CONV_STEP_DB
@@ -610,9 +1607,97 @@ __device__ __forceinline__ bf16 kda_conv_db_one(
     return f2bf(act_silu(value));
 }
 
-/* B1-only Conv3 + StateStepG candidate. The old and new conv-window banks are distinct for the
+/* Single-row Conv3 + StateStepG candidate. The old and new conv-window banks are distinct for the
  * whole packet, so every value tile can read the old q/k window before tile 0 publishes the next
- * one. This is the cross-workgroup race an in-place fusion cannot avoid. */
+ * one. This is the cross-workgroup race an in-place fusion cannot avoid.
+ *
+ * BV must equal the number of waves: every wave owns one value column. D is selected into a
+ * compile-time lane depth below, just like d_kda_state_step_t. Heads and the CU count are runtime
+ * dimensions; when H*D/BV exceeds nblk a workgroup walks multiple independent value tiles. */
+template <int PL>
+__device__ __forceinline__ void d_kda_conv_state_step_g_t(
+    bf16* output, const bf16* q_raw, const bf16* k_raw, const bf16* v_raw,
+    const bf16* gate_raw, const bf16* beta_raw, float* state, const float* wq, const float* wk,
+    const float* wv, const float* csq_source, const float* csk_source,
+    const float* csv_source, float* csq_target, float* csk_target, float* csv_target,
+    const float* a_log, const float* dt_bias, unsigned H, unsigned D, unsigned BV, unsigned W,
+    unsigned flags, unsigned gate_mode, float scale, float lb, unsigned slice, unsigned nblk,
+    float* lds) {
+    if (H == 0 || D != PL * PLOW_WAVE || BV != PLOW_WAVES || W == 0 || W > 8 ||
+        !(flags & PLOW_KDA_F_QK_L2NORM))
+        __builtin_trap();
+    const unsigned items = H * D / BV;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63u;
+    const unsigned wave = tid >> 6;
+    float* l_q = lds;
+    float* l_k = lds + D;
+    float* l_g = lds + 2u * D;
+    float* l_v = lds + 3u * D + 2u * PLOW_WAVES;
+    for (unsigned item = slice; item < items; item += nblk) {
+        const unsigned h = item / (D / BV);
+        const unsigned tile = item % (D / BV);
+        const unsigned hd0 = h * D;
+        float qsum = 0.0f, ksum = 0.0f;
+        if (tid < D) {
+            const unsigned channel = hd0 + tid;
+            const bf16 q =
+                kda_conv_db_one(q_raw, wq, csq_source, csq_target, channel, W, tile == 0);
+            const bf16 k =
+                kda_conv_db_one(k_raw, wk, csk_source, csk_target, channel, W, tile == 0);
+            l_q[tid] = bf2f(q);
+            l_k[tid] = bf2f(k);
+            float gate;
+            const float gate_input = bf2f(gate_raw[channel]) + dt_bias[channel];
+            if (gate_mode == PLOW_KDA_GATE_LOWER_BOUND)
+                gate = lb * kda_sigmoid(__expf(a_log[h]) * gate_input);
+            else
+                gate = -__expf(a_log[h]) * kda_softplus(gate_input);
+            l_g[tid] = __expf(gate);
+            qsum = l_q[tid] * l_q[tid];
+            ksum = l_k[tid] * l_k[tid];
+        }
+        if (tid < BV) {
+            const unsigned channel = hd0 + tile * BV + tid;
+            const bf16 v = kda_conv_db_one(v_raw, wv, csv_source, csv_target, channel, W, true);
+            l_v[tid] = bf2f(v);
+        }
+        qsum = block_sum(qsum, lds + 3u * D);
+        ksum = block_sum(ksum, lds + 3u * D + PLOW_WAVES);
+        const float rq = scale / sqrtf(qsum + 1e-6f);
+        const float rk = 1.0f / sqrtf(ksum + 1e-6f);
+        if (tid < D) {
+            l_q[tid] *= rq;
+            l_k[tid] *= rk;
+        }
+        __syncthreads();
+
+        const unsigned j = tile * BV + wave;
+        float* column = state + (size_t)h * D * D + (size_t)j * D;
+        float sc[PL];
+        float pk = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < PL; ++r) {
+            const unsigned d = r * PLOW_WAVE + lane;
+            sc[r] = column[d] * l_g[d];
+            pk += sc[r] * l_k[d];
+        }
+        pk = wave_sum(pk);
+        const float update = kda_sigmoid(bf2f(beta_raw[h])) * (l_v[wave] - pk);
+        float pq = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < PL; ++r) {
+            const unsigned d = r * PLOW_WAVE + lane;
+            sc[r] += update * l_k[d];
+            column[d] = sc[r];
+            pq += sc[r] * l_q[d];
+        }
+        pq = wave_sum(pq);
+        if (lane == 0) output[hd0 + j] = f2bf(pq);
+        __syncthreads();
+    }
+}
+
 __device__ void d_kda_conv_state_step_g(
     bf16* output, const bf16* q_raw, const bf16* k_raw, const bf16* v_raw,
     const bf16* gate_raw, const bf16* beta_raw, float* state, const float* wq, const float* wk,
@@ -621,75 +1706,23 @@ __device__ void d_kda_conv_state_step_g(
     const float* a_log, const float* dt_bias, unsigned H, unsigned D, unsigned BV, unsigned W,
     unsigned flags, unsigned gate_mode, float scale, float lb, unsigned slice, unsigned nblk,
     float* lds) {
-    if (H != 12 || D != 128 || BV != 8 || W != 4 || !(flags & PLOW_KDA_F_QK_L2NORM))
+    if (D == 64)
+        d_kda_conv_state_step_g_t<1>(
+            output, q_raw, k_raw, v_raw, gate_raw, beta_raw, state, wq, wk, wv, csq_source,
+            csk_source, csv_source, csq_target, csk_target, csv_target, a_log, dt_bias, H, D, BV,
+            W, flags, gate_mode, scale, lb, slice, nblk, lds);
+    else if (D == 128)
+        d_kda_conv_state_step_g_t<2>(
+            output, q_raw, k_raw, v_raw, gate_raw, beta_raw, state, wq, wk, wv, csq_source,
+            csk_source, csv_source, csq_target, csk_target, csv_target, a_log, dt_bias, H, D, BV,
+            W, flags, gate_mode, scale, lb, slice, nblk, lds);
+    else if (D == 256)
+        d_kda_conv_state_step_g_t<4>(
+            output, q_raw, k_raw, v_raw, gate_raw, beta_raw, state, wq, wk, wv, csq_source,
+            csk_source, csv_source, csq_target, csk_target, csv_target, a_log, dt_bias, H, D, BV,
+            W, flags, gate_mode, scale, lb, slice, nblk, lds);
+    else
         __builtin_trap();
-    const unsigned items = H * D / BV;
-    if (slice >= items) return;
-    const unsigned tid = threadIdx.x;
-    const unsigned lane = tid & 63u;
-    const unsigned wave = tid >> 6;
-    const unsigned h = slice / (D / BV);
-    const unsigned tile = slice % (D / BV);
-    float* l_q = lds;
-    float* l_k = lds + D;
-    float* l_g = lds + 2u * D;
-    float* l_v = lds + 3u * D + 2u * PLOW_WAVES;
-    const unsigned hd0 = h * D;
-    float qsum = 0.0f, ksum = 0.0f;
-    if (tid < D) {
-        const unsigned channel = hd0 + tid;
-        const bf16 q = kda_conv_db_one(q_raw, wq, csq_source, csq_target, channel, W, tile == 0);
-        const bf16 k = kda_conv_db_one(k_raw, wk, csk_source, csk_target, channel, W, tile == 0);
-        l_q[tid] = bf2f(q);
-        l_k[tid] = bf2f(k);
-        float gate;
-        const float gate_input = bf2f(gate_raw[channel]) + dt_bias[channel];
-        if (gate_mode == PLOW_KDA_GATE_LOWER_BOUND)
-            gate = lb * kda_sigmoid(__expf(a_log[h]) * gate_input);
-        else
-            gate = -__expf(a_log[h]) * kda_softplus(gate_input);
-        l_g[tid] = __expf(gate);
-        qsum = l_q[tid] * l_q[tid];
-        ksum = l_k[tid] * l_k[tid];
-    }
-    if (tid < BV) {
-        const unsigned channel = hd0 + tile * BV + tid;
-        const bf16 v = kda_conv_db_one(v_raw, wv, csv_source, csv_target, channel, W, true);
-        l_v[tid] = bf2f(v);
-    }
-    qsum = block_sum(qsum, lds + 3u * D);
-    ksum = block_sum(ksum, lds + 3u * D + PLOW_WAVES);
-    const float rq = scale / sqrtf(qsum + 1e-6f);
-    const float rk = 1.0f / sqrtf(ksum + 1e-6f);
-    if (tid < D) {
-        l_q[tid] *= rq;
-        l_k[tid] *= rk;
-    }
-    __syncthreads();
-
-    const unsigned j = tile * BV + wave;
-    float* column = state + (size_t)h * D * D + (size_t)j * D;
-    float sc[2];
-    float pk = 0.0f;
-#pragma unroll
-    for (unsigned r = 0; r < 2; ++r) {
-        const unsigned d = r * PLOW_WAVE + lane;
-        sc[r] = column[d] * l_g[d];
-        pk += sc[r] * l_k[d];
-    }
-    pk = wave_sum(pk);
-    const float update = kda_sigmoid(bf2f(beta_raw[h])) * (l_v[wave] - pk);
-    float pq = 0.0f;
-#pragma unroll
-    for (unsigned r = 0; r < 2; ++r) {
-        const unsigned d = r * PLOW_WAVE + lane;
-        sc[r] += update * l_k[d];
-        column[d] = sc[r];
-        pq += sc[r] * l_q[d];
-    }
-    pq = wave_sum(pq);
-    if (lane == 0) output[hd0 + j] = f2bf(pq);
-    (void)nblk;
 }
 #endif
 

@@ -1360,6 +1360,11 @@ struct GlmLW {
     // per-k-tile B stream is one contiguous 16 KiB block instead of 64 B row-slices at K-stride.
     // Prefill-only — the decode expert GEMVs keep streaming whole rows from `ewt`'s slab.
     ewt_pf: u32,
+    // Optional gfx950 lean stage-2 companion tables. The loader fills only slot 2 (down) with
+    // pointers to the validated shuffled MXFP4 payload/E8M0 layouts. Ordinary row-major tables
+    // remain intact for decode and the interpreter fallback.
+    _ewt_moe2: u32,
+    _est_moe2: u32,
     // Dense FFN (layers < first_k_dense): block-fp8 gate/up/down + their weight_scale_inv grids.
     // TENSOR_NONE on MoE layers.
     dgate: u32,
@@ -1751,8 +1756,14 @@ pub(crate) fn declare_glm_rows_batched(
             MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
             _ => pad_rows * imoe_e as u64 * BF16,
         };
+        const ALIGN_BLOCKS: u64 = 64;
+        let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
+            ALIGN_BLOCKS * e as u64
+        } else {
+            0
+        };
         (
-            ac(b, "moe_meta", (3 * e + 1) as u64 * I32),
+            ac(b, "moe_meta", ((3 * e + 1) as u64 + align_extra) * I32),
             ac(b, "moe_rowtok", pad_rows * I32),
             ac(b, "moe_rowpart", pad_rows * I32),
             ac(b, "moe_rowgate", pad_rows * F32),
@@ -2261,6 +2272,26 @@ pub(crate) fn declare_glm_rows_batched(
                 TENSOR_NONE
             } else {
                 t(b, "mlp.expert_weight_table_pf", (e * 3) as u64 * 8)
+            },
+            _ewt_moe2: if dense
+                || enc != MoeEnc::Mxfp4
+                || imoe_e != 384
+                || h % 16 != 0
+                || !emit_config::active().moe_stage2_lean
+            {
+                TENSOR_NONE
+            } else {
+                t(b, "mlp.expert_weight_table_moe2", (e * 3) as u64 * 8)
+            },
+            _est_moe2: if dense
+                || enc != MoeEnc::Mxfp4
+                || imoe_e != 384
+                || h % 16 != 0
+                || !emit_config::active().moe_stage2_lean
+            {
+                TENSOR_NONE
+            } else {
+                t(b, "mlp.expert_scale_table_moe2", (e * 3) as u64 * 8)
             },
             // Dense-FFN weights. Block-fp8 keeps the checkpoint's own byte layout and its
             // [N/128][K/128] f32 `weight_scale_inv` grid; MXFP4 halves the weight and swaps the
@@ -4013,7 +4044,7 @@ pub(crate) enum MoePfFuse {
     Atomic,
     Det,
 }
-fn moe_pf_fuse(tk: u32) -> MoePfFuse {
+pub(crate) fn moe_pf_fuse(tk: u32) -> MoePfFuse {
     if moe_pf_part16() || tk == 0 || !tk.is_power_of_two() {
         return MoePfFuse::None;
     }
@@ -4533,6 +4564,7 @@ pub(crate) fn emit_glm_mla_prefill(
                 d.i[2] = dk;
                 d.i[3] = 0; // chunk base, patched per chunk
                 d.i[4] = 0; // apply RMSNorm before quantizing
+                d.i[7] = ctx; // packed-prefill per-slot cache row stride
                 d.f[0] = eps;
                 d.j[1] = KV_MASK_NONE;
             },
@@ -4544,6 +4576,7 @@ pub(crate) fn emit_glm_mla_prefill(
             d.t[2] = w.gkva;
             d.i[0] = t;
             d.i[1] = dk;
+            d.i[7] = ctx; // packed-prefill per-slot cache row stride
             d.f[0] = eps;
         })
     };
@@ -4560,6 +4593,7 @@ pub(crate) fn emit_glm_mla_prefill(
         d.i[2] = dr;
         d.i[3] = 0;
         d.i[4] = 1;
+        d.i[7] = ctx; // packed-prefill per-slot cache row stride
         d.f[0] = eps;
         d.j[0] = 0;
         d.j[1] = KV_MASK_NONE;
@@ -5000,7 +5034,9 @@ fn emit_glm_moe_ffn_prefill(
     let atom = fuse == MoePfFuse::Atomic;
     // PLOW_MOE_PF_DET: same decomposition, f64 fixed-point accumulator, order-independent sum.
     let det = fuse == MoePfFuse::Det;
-    let c_router = b.emit(DevOp::MoeRouterTopkPf, all.clone(), &[c_score], |d| {
+    let align_par = emit_config::active().moe_align_par && t >= 1024;
+    let router_blocks: Vec<_> = (0..t.min(n_cu)).collect();
+    let c_router = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;
         d.t[3] = w.bias;
@@ -5019,19 +5055,29 @@ fn emit_glm_moe_ffn_prefill(
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
     });
-    // 15c ALIGN/SORT — ONE workgroup, and it must be: the MPF_BM-padded row prefix is a global scan.
-    //     The other 255 CUs are gated behind it by the counter DAG exactly as they are behind the
-    //     decode router, so this is the same shape of serialization the decode path already pays.
-    let c_align = b.emit(DevOp::MoeAlignPf, one.clone(), &[c_router], |d| {
-        d.t[0] = n.meta;
-        d.t[1] = n.tab;
-        d.t[2] = n.row_token;
-        d.t[3] = n.row_partidx;
-        d.t[4] = n.row_gate;
-        d.i[0] = t;
-        d.i[1] = e;
-        d.i[2] = tk;
-    });
+    let align = |b: &mut Builder, blocks: Vec<u32>, deps: &[u32], phase: u32| {
+        b.emit(DevOp::MoeAlignPf, blocks, deps, |d| {
+            d.t[0] = n.meta;
+            d.t[1] = n.tab;
+            d.t[2] = n.row_token;
+            d.t[3] = n.row_partidx;
+            d.t[4] = n.row_gate;
+            d.i[0] = t;
+            d.i[1] = e;
+            d.i[2] = tk;
+            d.i[3] = phase;
+            d.i[4] = u32::from(phase != 0) * 64;
+        })
+    };
+    let c_align = if align_par {
+        let par_blocks: Vec<u32> = all.iter().copied().take(64).collect();
+        let c_count = align(b, par_blocks.clone(), &[c_router], 1);
+        let c_prefix = align(b, one.clone(), &[c_count], 2);
+        let c_init = align(b, par_blocks.clone(), &[c_prefix], 3);
+        align(b, par_blocks, &[c_init], 4)
+    } else {
+        align(b, one.clone(), &[c_router], 0)
+    };
     // 16 shared expert gate|up — GemmGlu, the T-row twin of decode's GemvGlu (same operand slots,
     //    M in i[0]). Column-parallel: this rank's imoe_l lanes. Routing-independent, so it gates
     //    only on the post-attn norm and overlaps the whole router/align/expert chain.
@@ -6877,6 +6923,15 @@ fn glm_emit_full(
     let mut prog_t = Vec::new();
     for &t in &pf {
         let mut pb = Builder::new(n_cu);
+        pb.set_lean_moe_stage2_segments(
+            crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
+        );
+        pb.set_lean_moe_combine_segments(
+            crate::emit_is_amd() && emit_config::active().moe_combine_lean,
+        );
+        pb.set_moe_prefill_ep_degree(
+            (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
+        );
         // PLOW_L2_PLACE reaches the DECODE builder unconditionally (below). GLM's prefill
         // program is uni-segment, so `Builder::finish` WOULD place it too — but the
         // shipped prefill objects are built without -DPLOW_L2_PLACE_DISPATCH
@@ -7165,23 +7220,23 @@ fn emit_glm_tail(
     if glm_shard_head(c) {
         // XARGMAX_FIN SUBSUMES ArgmaxFin: it folds the AMAX_BLOCKS partials itself, rebases the
         // winning index by rank*vocab_l and takes the cross-rank max, so emitting both would fold
-        // twice and write the LOCAL winner's id first. Two xctr ids from this program's allocator:
-        // the arrival gate and the peer-visible 8-byte value slot — distinct, because the gate is
-        // an atomic counter and the slot is data.
-        // The fold publishes one u64 per sequence, 16 keys per 128-byte xctr counter line;
-        // above 16 the value slot spans TWO consecutive ids (kernel: PLOW_XAMAX_LINE), so
-        // the ceiling is 32. The extra id is allocated only when the rung needs it — a
-        // narrow blob's id map is unchanged. Assert rather than leave ids[32..] holding the
-        // previous step's token.
-        const XAMAX_MAX_BATCH: u32 = 32;
+        // twice and write the LOCAL winner's id first. The program allocator reserves one arrival
+        // gate plus the peer-visible value lines; the gate is an atomic counter and the lines are
+        // data.
+        // The fold publishes one u64 per sequence, 16 keys per 128-byte xctr counter line.
+        // Additional consecutive ids are allocated only when the rung needs them, so a narrow
+        // blob's id map is unchanged.
         let n_batch = nb.max(1);
-        assert!(
-            n_batch <= XAMAX_MAX_BATCH,
-            "XARGMAX_FIN carries at most {XAMAX_MAX_BATCH} sequences across two xctr counter \
-             lines (asked for {n_batch}); cap the decode ladder at 32 under GLM_SHARD_HEAD"
-        );
+        let value_lines = packet::devbuild::xargmax_value_lines(n_batch).unwrap_or_else(|| {
+            panic!(
+                "XARGMAX_FIN carries at most {} sequences (asked for {n_batch})",
+                packet::devbuild::XARGMAX_MAX_BATCH
+            )
+        });
         let gate = *xgate;
-        *xgate += if n_batch > 16 { 3 } else { 2 };
+        *xgate = xgate
+            .checked_add(1 + value_lines)
+            .expect("XArgmaxFin counter id overflow");
         b.emit(DevOp::XArgmaxFin, vec![0u32], &[c_am], |d| {
             d.t[0] = n.ids;
             d.t[1] = n.amax;
@@ -7450,6 +7505,15 @@ pub(crate) fn glm_build_block_pf(
     let mut prog_t = Vec::new();
     for &t in pf {
         let mut pb = Builder::new(n_cu);
+        pb.set_lean_moe_stage2_segments(
+            crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
+        );
+        pb.set_lean_moe_combine_segments(
+            crate::emit_is_amd() && emit_config::active().moe_combine_lean,
+        );
+        pb.set_moe_prefill_ep_degree(
+            (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(c.tp),
+        );
         pb.adopt_tensors(tensors.clone());
         let pall = pb.all();
         let mut pxgate = 0u32;
@@ -7755,6 +7819,10 @@ fn write_mla_manifest(m: &Model, out: &str, target: &str, enc: MoeEnc, lean: &cr
         });
     }
     let mpath = std::path::Path::new(out).with_file_name("build.json");
+    let cpath = std::path::Path::new(out).with_file_name("plow_config.h");
+    crate::manifest::write_config_header(&cpath, &man)
+        .unwrap_or_else(|e| panic!("{}: compile config not written: {e}", cpath.display()));
+    eprintln!("  compile config -> {}", cpath.display());
     match serde_json::to_vec_pretty(&man).map(|b| std::fs::write(&mpath, b)) {
         Ok(Ok(())) => eprintln!("  build manifest -> {}", mpath.display()),
         Ok(Err(e)) => eprintln!("  WARN: build.json not written: {e}"),

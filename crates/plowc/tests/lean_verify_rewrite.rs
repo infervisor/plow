@@ -17,6 +17,8 @@ fn accepts_known_sound_rules() {
             "linear-act-fuse".into(),
             "gated-mlp-fuse".into(),
             "residual-rmsnorm-fuse".into(),
+            "materialized-residual-block-fuse".into(),
+            "materialized-residual3-block-fuse".into(),
         ],
     };
     let cert = check_rewrite_rules(&req).expect("verifier call");

@@ -18,6 +18,7 @@ toolchain.
 tuning/<vendor>/<isa>/<sku>/kernel_measurement.jsonl
 tuning/<vendor>/<isa>/<sku>/decode_measurement.jsonl
 tuning/<vendor>/<isa>/<sku>/object_measurement.jsonl
+tuning/<vendor>/<isa>/<sku>/attention_measurement.jsonl
 ```
 
 The path comes from `HardwareFingerprint::tuning_path()`, so two GPUs cannot
@@ -28,8 +29,10 @@ separate cells, and so are `sm_100a` and `sm_120a` despite both being
 
 ## Schema
 
-One JSON object per line, appended, never rewritten. Fields are
-`tunedb::KernelMeasurement`. The rules the store enforces:
+One JSON object per line, appended, never rewritten. Fields are `tunedb::KernelMeasurement` or `tunedb::AttentionMeasurement`.
+Raw attention timing rows are published with `tunedb-attention publish`, which
+constructs `Stats` and passes the typed records through `TuneStore`'s gates.
+The rules the store enforces:
 
 - **No single-sample records.** A statistic without dispersion cannot
   distinguish a win from noise, so `Stats` requires a minimum sample count and
@@ -59,8 +62,23 @@ which is the whole argument for the check.
 
 | cell | what is calibrated | status |
 |---|---|---|
+| `amd/gfx950/mi350x` | dense BF16/MXFP4 GEMM tiles plus exact-cell decode MLA split count | 242 GEMM cells and B1/B8 8K attention qualified |
 | `nvidia/sm_90a/h100-nvl` | interpreter dispatch floor | measured, see below |
 | `nvidia/sm_120a/rtx-5090` | prefill GEMM tile (`prefill_tile_measurement.jsonl`) | measured, see below |
+
+### `amd/gfx950/mi350x`
+
+The 2026-09-03 refresh used one uncontended gfx950 lease and ROCm 7.14 for both
+object compilation and TuneDB publication. The BF16 inventory produced 500 raw
+rows (50 cells x 10 candidates); the K3-derived ladder produced 1,440 raw rows
+(96 BF16 cells x 10 candidates plus 96 MXFP4 cells x 5 candidates). Ingestion
+deduplicated overlapping cells into 1,210 qualified records: five production
+rungs for each of 242 selectable operator cells. The current build key is
+`gfx950-8d25b6a4d36627e9` with toolchain `rocm-7.14.0-nix`.
+
+`cargo test -p devgen --test tuned_tile_selection` passes all four gfx950/store
+assertions. Its two gfx942 assertions remain intentionally failing because the
+gfx942 records are stale; this gfx950 campaign does not re-key or weaken them.
 
 ### `nvidia/sm_120a/rtx-5090`
 

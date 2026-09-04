@@ -16,11 +16,25 @@
 //! asserting the analytical answer on a machine that cannot probe would pin the fallback as if
 //! it were the contract.
 
-use devgen::{gfx950_measured_rungs, gfx950_prefill_tile};
+use devgen::{gfx950_c8_is_measured_winner, gfx950_measured_rungs, gfx950_prefill_tile};
 use kernelcaps::QuantScheme::None as Bf16;
 use packet::dev::DevOp;
 
 const N_CU: u32 = 256;
+
+#[test]
+fn tagged_c8_is_a_qualified_current_winner_for_its_measured_shape() {
+    if !probe_available() {
+        eprintln!("SKIP: cannot probe the gfx950 interpreter (no hipcc)");
+        return;
+    }
+    assert!(
+        gfx950_c8_is_measured_winner(8192, 1536, 7168),
+        "c8 must be ingested under its tagged measurement identity and beat every qualified \
+         current candidate for the exact measured shape"
+    );
+    assert!(!gfx950_c8_is_measured_winner(4096, 1536, 7168));
+}
 
 fn probe_available() -> bool {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

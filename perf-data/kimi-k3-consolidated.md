@@ -5,14 +5,31 @@ remain as dated evidence links; this file owns the current baseline, decisions, 
 
 ## Scope and measurement contract
 
-- Target: B1, TP8, 8×MI325X/gfx942, native MXFP4 weights, FP8 KV, `plowrt serve`.
-- Client: Nix-pinned vLLM 0.27.0 `vllm bench serve`, one warmup unless a report says otherwise.
+- Current target: TP8, 8×MI355X/gfx950, native MXFP4 weights, BF16 KV.
+- Current performance authority: `plowrt bench` for Plow and vLLM 0.28
+  `bench serve` for the reference server.
 - A valid result requires completed requests, exact output length, empty errors, all-rank token/counter
   agreement, and uncontended `gpulease`. Standalone kernels are screening evidence, not throughput.
-- The official vLLM K3 image is validated for gfx950; its MI325X/RCCL eager attempt failed before
-  model load, so it is not an apples-to-apples MI325X comparator.
+- Current records: `kimi-k3-vllm-mi355x-baseline.md` and
+  `kimi-k3-plowrt-mi355x-baseline.md`. The production Plow C1 record uses the
+  same vLLM 0.28 client, raw-completions endpoint, tokenizer, 8192→1024 shape,
+  and request contract. Every 2026-09-02 → 09-04 experiment, its verdict, and its
+  switch is in `kimi-k3-mi355x-campaign-summary-20260904.md`.
 
-## Current B1 baseline
+## Current MI355X C1 baseline
+
+| Engine | TTFT p50 | TPOT p50 | ITL p99 | Output throughput |
+|---|---:|---:|---:|---:|
+| Plow | 1271.86 ms | 28.53 ms | 28.60 ms | 33.63 tok/s |
+| vLLM 0.28 | 567.74 ms | 20.81 ms | 20.97 ms | 46.86 tok/s |
+
+Plow is 2.24× slower at median TTFT and 1.37× slower at median TPOT. Its
+output throughput is 28.2% lower. These are fresh three-fold, order-alternated
+served deficits on the same vLLM 0.28 client and BF16-KV contract. The active
+priorities remain prefill KDA/MoE/MLA architecture and decode GEMV, MoE, and
+boundary amortization; endpoint or benchmark-driver changes cannot close them.
+
+## Historical MI325X B1 baseline
 
 | Effective context | TPOT | Decode tok/s |
 |---:|---:|---:|
@@ -29,6 +46,8 @@ trace is dominated by ordinary BF16 GEMV (~22 ms), while the long-context slope 
 
 ## Adopted production changes
 
+- KDA Conv3 suffix-row parallelization: 14.2% lower 8192-token TTFT with an
+  exact full-model output checksum; decode and strided-row paths are unchanged.
 - Narrow KDA norm-to-GEMV fusion: ~1.3–1.45 ms/token saved, full-logit exact.
 - KDA gated-norm workgroup fit: served B1 48.232 ms/token in the strongest exact gate.
 - KDA Conv/state double-bank arm: explicit opt-in; 50.140 ms/token, GSM8K 196/200, not default.
@@ -63,6 +82,7 @@ new implementation hypothesis.
 ### Reproducibility, architecture, and runtime
 
 - [`kimi-k3-README.md`](kimi-k3-README.md) — build, flags, serving, measurement rules.
+- [`kimi-k3-mi355x-campaign-summary-20260904.md`](kimi-k3-mi355x-campaign-summary-20260904.md) — MI355X campaign: one row per experiment, closed mechanisms, collective-bench erratum.
 - [`archive/k3/k3-batched-decode-design.md`](archive/k3/k3-batched-decode-design.md) — batch/state contract.
 - [`archive/k3/k3-decode-counter-graph.md`](archive/k3/k3-decode-counter-graph.md) — packet/counter graph.
 - [`archive/k3/k3-prefix-cache-design.md`](archive/k3/k3-prefix-cache-design.md) — recurrent-state prefix cache.
@@ -108,7 +128,7 @@ These are explicitly experimental and excluded from the production merge.
 `archive/k3/k3-gsm8k.md`, `archive/k3/k3-hier2-ceiling.md`, `archive/k3/k3-serving-speed.md`, `archive/k3/k3-75tps-program.md`,
 `archive/k3/kimi-k3-kernel-gap.md`, `archive/k3/kimi-k3-atom-reference.md`, and `archive/k3/coldstart-amd-k3-tp8.md` are retained
 only when their historical context is needed; their numbers must not be compared with the current
-MI325X B1 baseline.
+MI355X campaign.
 
 ## Merge policy
 

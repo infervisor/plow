@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# L1 A/B: flash_merge 32 -> 256 workgroups, interleaved.
+# L1 synthetic A/B: flash_merge 32 -> 256 workgroups, interleaved.
 #
 # The two arms differ ONLY in the BLOB (dsplit=1 vs dsplit=8); both load the SAME
 # code objects, because `d_flash_merge` derives its D-split from the workgroup count
@@ -7,12 +7,13 @@
 #
 # Interleaved A,B,A,B,... so a drift in clocks or a neighbour's load hits both arms.
 # rc=76 from gpulease is contention -> the caller must re-run, never report it.
+# This is an unbound packet/kernel probe at an artificial context. Its timings
+# are valid only for the internal A/B and are not served-model performance.
 #
 #   l1_ab.sh <reps> [ctx] [steps]
 set -euo pipefail
 W="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPS="${1:-6}"; CTX="${2:-1024}"; STEPS="${3:-64}"
-CK=/home/lava/.cache/huggingface/hub/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475
 HSACO=/home/lava/plow/build-amd/l1-gfx950
 OUT="${OUT:-/tmp/l1-ab.txt}"
 : > "$OUT"
@@ -30,8 +31,8 @@ run() { # <arm>
   log=$(mktemp)
   set +e
   "$W/perf-data/tools/gpulease" -n 1 "l1-$arm" \
-      "$W/target/release/plowrt" amd-bench \
-      --blob "$dir/model.pkt" --hsaco "$hs" --checkpoint "$CK" \
+      "$W/target/release/plowrt" amd-probe \
+      --blob "$dir/model.pkt" --hsaco "$hs" \
       --ctx "$CTX" --steps "$STEPS" >"$log" 2>&1
   rc=$?
   set -e

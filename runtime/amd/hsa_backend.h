@@ -67,6 +67,19 @@ void* plow_hsa_alloc_peer(plow_hsa* h, int owner_dev, size_t bytes);
 int   plow_hsa_copy_p2p(plow_hsa* h, int dst_dev, void* dst,
                         int src_dev, const void* src, size_t bytes);
 
+typedef struct {
+    int dst_dev;
+    void* dst;
+    int src_dev;
+    const void* src;
+    size_t bytes;
+} plow_hsa_p2p_copy;
+
+/* Submit independent SDMA peer copies before waiting for any of them.  This is
+ * the bulk all-to-all primitive; calling copy_p2p in a loop serialises ranks. */
+int plow_hsa_copy_p2p_batch(plow_hsa* h, const plow_hsa_p2p_copy* copies,
+                            size_t count);
+
 /* Blocking H2D / D2H over the SDMA engines.
  *
  * CONTRACT: the host side MUST be memory from `plow_hsa_alloc_host`. The SDMA

@@ -17,7 +17,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use crate::attention::AttentionMeasurement;
 use crate::decode::{rank_by_cell, CellRanking, DecodeMeasurement};
+use crate::moe_decode::MoeDecodeMeasurement;
 use crate::object::{rank_by_cell as rank_objects_by_cell, ObjectMeasurement, ObjectRanking};
 use crate::record::{Correctness, Digests, KernelMeasurement, RecordState};
 
@@ -76,6 +78,10 @@ impl TuneStore {
         self.root.join(hardware).join("kernel_measurement.jsonl")
     }
 
+    fn attention_path(&self, hardware: &str) -> PathBuf {
+        self.root.join(hardware).join("attention_measurement.jsonl")
+    }
+
     /// Every hardware cell that has a `kernel_measurement.jsonl`, as `vendor/isa/sku`.
     ///
     /// Exists so an empty cell can be reported as a MISMATCH rather than a cold start: the cell is
@@ -130,6 +136,46 @@ impl TuneStore {
         Ok(out)
     }
 
+    /// Attention policy records are separate from kernel measurements because
+    /// their value changes packet scratch/merge operands rather than an opcode.
+    pub fn load_attention(&self, hardware: &str) -> Result<Vec<AttentionMeasurement>, StoreError> {
+        let path = self.attention_path(hardware);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for line in BufReader::new(File::open(&path)?).lines() {
+            let line = line?;
+            if !line.trim().is_empty() {
+                out.push(serde_json::from_str(&line)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Publish attention choices only after the same correctness/sample gates
+    /// as every other selectable tuning record.
+    pub fn publish_attention(
+        &self,
+        hardware: &str,
+        mut records: Vec<AttentionMeasurement>,
+    ) -> Result<usize, StoreError> {
+        for r in &records {
+            let blockers = r.qualification_blockers();
+            if !blockers.is_empty() {
+                return Err(StoreError::NotQualifiable {
+                    kernel: format!("{}:{:?}:ns{}", r.cell.key(), r.algorithm, r.nsplit),
+                    blockers,
+                });
+            }
+        }
+        for r in &mut records {
+            r.state = RecordState::Qualified;
+        }
+        self.append_jsonl(&self.attention_path(hardware), &records)?;
+        Ok(records.len())
+    }
+
     /// Publish a campaign as one unit.
     ///
     /// Every record is checked before anything is written; if any cannot be
@@ -171,6 +217,53 @@ impl TuneStore {
             };
         }
         self.append_atomic(hardware, &records)?;
+        Ok(records.len())
+    }
+
+    fn moe_decode_path(&self, hardware: &str) -> PathBuf {
+        self.root
+            .join(hardware)
+            .join("moe_decode_measurement.jsonl")
+    }
+
+    /// Grouped-MoE decode route records for one hardware key; empty when the
+    /// campaign has never run here.
+    pub fn load_moe_decode(&self, hardware: &str) -> Result<Vec<MoeDecodeMeasurement>, StoreError> {
+        let path = self.moe_decode_path(hardware);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for line in BufReader::new(File::open(&path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            out.push(serde_json::from_str(&line)?);
+        }
+        Ok(out)
+    }
+
+    /// Publish grouped-MoE decode route records under the shared gates: an
+    /// unchecked or under-sampled route aborts the whole publication.
+    pub fn publish_moe_decode(
+        &self,
+        hardware: &str,
+        mut records: Vec<MoeDecodeMeasurement>,
+    ) -> Result<usize, StoreError> {
+        for r in &records {
+            let blockers = r.qualification_blockers();
+            if !blockers.is_empty() {
+                return Err(StoreError::NotQualifiable {
+                    kernel: format!("{}/{:?}", r.cell.key(), r.route),
+                    blockers,
+                });
+            }
+        }
+        for r in &mut records {
+            r.state = RecordState::Qualified;
+        }
+        self.append_jsonl(&self.moe_decode_path(hardware), &records)?;
         Ok(records.len())
     }
 
@@ -497,6 +590,35 @@ mod tests {
         let all = s.load_kernels(HW).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].state, RecordState::Qualified, "publish qualifies");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attention_publish_qualifies_and_uses_a_separate_store() {
+        let dir = tmpdir("attention_publish");
+        let s = TuneStore::new(&dir);
+        let record = crate::attention::AttentionMeasurement {
+            cell: crate::attention::AttentionCell {
+                hardware: HW.into(),
+                n_cu: 256,
+                decode_rung: 8,
+                kv_bucket: crate::attention::KvBucket::K8,
+                shape: "mla/dk512/dr64/h12/gf4".into(),
+            },
+            algorithm: crate::attention::AttentionAlgorithm::SplitReduce,
+            nsplit: 32,
+            digests: digests(),
+            stats: Stats::from_samples(vec![100.0; 5]).unwrap(),
+            correctness: Correctness::Pass,
+            state: RecordState::Provisional,
+            campaign: "attention-c1".into(),
+        };
+
+        assert_eq!(s.publish_attention(HW, vec![record]).unwrap(), 1);
+        let all = s.load_attention(HW).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].state, RecordState::Qualified);
+        assert!(s.load_kernels(HW).unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

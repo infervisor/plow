@@ -1,6 +1,8 @@
 //! §G OpenAI-compatible API server.
 
+pub mod bench;
 pub mod chat;
+pub mod completion;
 /// The loaded device engine behind a slug, as one type over both backends —
 /// the seam that lets `serve` stop being CUDA-only.
 #[cfg(any(feature = "cuda", feature = "hsa"))]
@@ -11,6 +13,7 @@ pub mod models;
 pub mod mux;
 pub mod openai;
 pub mod stream;
+pub mod tokenize;
 
 use std::sync::Arc;
 
@@ -572,6 +575,9 @@ impl AppState {
 pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/completions", post(completion::completions))
+        .route("/tokenize", post(tokenize::tokenize))
+        .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))

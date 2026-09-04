@@ -5,11 +5,9 @@
 //!
 //! Coverage gaps are cheap and visible: a missing shape is one shape selecting from the analytical
 //! model, and a census prints it. **Total silent staleness is neither cheap nor visible.** The
-//! tunedb key is the PREPROCESSED `interp.hip` build digest, so *any* edit to `runtime/amd/*.hip|h`
-//! or `runtime/common/dev_isa.h` re-stales **every record at once** — 23 such commits and seven
-//! distinct digests landed in a single day, and this tree read `0 HIT / 2472 MISS` against a
-//! campaign that had been ingested hours earlier. Nothing failed. Every gate stayed green. The
-//! compiler silently reverted to tier `portable` across the board.
+//! tunedb key is the preprocessed dense-GEMM-family digest. Relevant body, expanded macro, or
+//! toolchain changes stale the records; unrelated interpreter arms do not. Total staleness still
+//! silently reverts the compiler to tier `portable`, so it remains the first check here.
 //!
 //! So this command does three things, in this order:
 //!
@@ -140,8 +138,8 @@ pub fn status(
         println!("falls back to the analytical model for every shape and reports tier `portable`,");
         println!("while `tuned_tile_selection` keeps passing on whatever other cell has data.");
         println!();
-        println!("The key is the PREPROCESSED interp build digest, so one edit under runtime/amd/");
-        println!("re-stales the whole store at once. Re-run the campaign against this object:");
+        println!("The key is the preprocessed dense-GEMM family digest. Re-run the campaign");
+        println!("against the current family when its implementation or toolchain changes:");
         println!("  plowc --hf-dir <ckpt> --max-ctx <c> --n-cu <n> --num-gpus <g> \\");
         println!("        tune gemm --obj <objdir> --samples <out.jsonl>");
         return Err("every record in this cell is stale; the compiler has no measurements".into());

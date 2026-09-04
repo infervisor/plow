@@ -152,3 +152,16 @@
 ; rule: mla-out-gate-fuse
 (rewrite (Ew "mul" ?attn (Act "sigmoid" (Linear ?x ?gw ?gout)))
          (FusedMlaOutGate ?attn ?x ?gw ?gout))
+
+; === Cross-block residual materialization ===
+;
+; The fused consumer still writes the residual result, so graph fan-out remains valid. Keep the
+; nested form distinct: two Ew nodes mean two BF16 materializations, not an associative add.
+
+; rule: materialized-residual-block-fuse
+(rewrite (BlockResidual (Ew "add" ?a ?b) ?snaps ?nw ?pw ?max)
+         (FusedMaterializedResidualBlock ?a ?b ?snaps ?nw ?pw ?max))
+
+; rule: materialized-residual3-block-fuse
+(rewrite (BlockResidual (Ew "add" ?pre (Ew "add" ?a ?b)) ?snaps ?nw ?pw ?max)
+         (FusedMaterializedResidual3Block ?pre ?a ?b ?snaps ?nw ?pw ?max))

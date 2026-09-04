@@ -62,14 +62,15 @@ Three properties separate a campaign number from a benchmark you can't trust:
 
 ## The harness
 
-Two client families, both driving the running `plowrt serve` over its OpenAI
-route (`/v1/chat/completions` — the only route plowrt implements). Pick per what
-you are measuring; **use the same client for every arm of one campaign.**
+Two client families drive the running `plowrt serve` over its OpenAI routes.
+Use `/v1/completions` with `--backend openai` for a raw-prompt baseline, or
+`/v1/chat/completions` with `--backend openai-chat` when chat templating is part
+of the contract. **Use the same endpoint and client for every arm.**
 
 | harness | what it drives | where |
 |---|---|---|
 | `huggingface/inference-benchmarker` (pinned rev) | multi-user **capacity** sweeps: fixed virtual users (ConstantVUs), warm+measure windows, aggregate tok/s + TTFT/ITL percentiles | invoked via `perf-data/bench_ib.sh` / `bench_b2_ib.sh` (parameterized: `CAMPAIGN`, `PROMPT_TOKS`, `VUS`, `MODEL_NAME`, `TOKENIZER`, `ASSETS`) |
-| `vllm bench serve` (`--backend openai-chat`) | single-stream + low-concurrency latency, and the like-for-like comparator (same client both engines) | `perf-data/tools/bringup_bench.sh`, orchestrated by `bringup_showdown.sh` |
+| `vllm bench serve` (`--backend openai` or `openai-chat`) | single-stream + low-concurrency latency, and the like-for-like comparator (same endpoint/client both engines) | `perf-data/tools/bringup_bench.sh`, orchestrated by `bringup_showdown.sh` |
 
 Supporting scripts in `perf-data/tools/`:
 
@@ -77,14 +78,21 @@ Supporting scripts in `perf-data/tools/`:
 |---|---|
 | `gpulease <label> <cmd>` | advisory GPU lease + contention audit. Wraps the **run**, not the build. Exits **76** if the GPU was contended — that run's timings are void. See the contention pitfall below. |
 | `bringup_gate.sh <assets> <tag> <port>` | token-identity correctness gate: serves the bundle, runs 4 fixed greedy prompts (temp 0, 32 tok), dumps to `$BRINGUP_OUT/gate-out/<tag>.txt` for `diff` against the reference arm |
-| `bringup_bench.sh <tag> <url> <model> <tokenizer> [round]` | one client pass over one endpoint; env `IN_LENS`/`NPROMPT`/`OUTLEN`; appends one row per input length to `cells.tsv` |
-| `bringup_showdown.sh` | sequential-**exclusive** multi-arm template — one server at a time, kill+drain between arms, medians over ≥5 rounds |
+| `bringup_bench.sh <tag> <url> <model> <tokenizer> [round]` | raw `/v1/completions` client pass; keyed `INPUT_MAP`, `CONCURRENCY_MAP`, `PROMPT_MAP`, `WARMUP_MAP`, `OUTLEN_MAP`; rejects partial request/token counts and appends structured rows to `cells.tsv` |
+| `bringup_showdown.sh` | sequential-exclusive two-arm harness — alternates whole Plow/vLLM server lifetimes over ≥3 rounds, freezes arm identities, and preserves every client/server log |
 | `bringup_ceiling.py` | vendor-BLAS/torch fp8+bf16 GEMM ceiling at your model's exact prefill shapes — the roofline reference (edit `SHAPES`); written against cuBLASLt, so on `$VENDOR = amd` it needs the hipBLASLt equivalent or Stage 4's `$COMPUTE_CEIL` instead |
 | `consolidate_b2_ib.py`, `b2-ib/{slo_capacity,summarize}.py` | ingest the tool's raw report JSON into `b2-concurrency-*.json`; derive max-users-under-SLO. Scratch reducers — the markdown table is typed by hand from their output |
 
 Accuracy battery: `scripts/bench_gsm8k.sh` (GSM8K 8-shot greedy) is the
 whole-stack accuracy gate — it exercises chat template, channel stop, tokenizer,
 prefill, on-device sampling and SSE in a way `amd-bench` cannot.
+
+Promotion runs must set `PLOW_REQUIRE_TUNED=1` for both `bringup_gate.sh` and
+`bringup_showdown.sh`. The scripts then require `build.json` to report
+`tuning.tile_measured > 0` and a nonempty, non-analytical `tuning.tile_source`.
+The default remains `0` so analytical baselines can run, but they print a
+`baseline evidence only` warning and record `tuning_profile=analytical-fallback`
+plus the manifest values in the gate/showdown config evidence.
 
 > **`bench_ib.sh` may not be in the tree.** The `inference-benchmarker` driver is
 > referenced by the historical campaigns (`b2-concurrency-family.md`,

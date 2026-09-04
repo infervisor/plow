@@ -13,6 +13,8 @@ use std::sync::Arc;
 pub trait Tokenize: Send + Sync {
     fn encode(&self, text: &str) -> Vec<u32>;
     fn decode(&self, ids: &[u32]) -> String;
+    /// Number of token ids accepted by the model embedding table.
+    fn vocab_size(&self) -> usize;
     /// True for the byte-fallback tokenizer. A real model served through the
     /// byte fallback produces silent garbage (the ids bear no relation to the
     /// checkpoint's vocab), so the GPU-engine install path refuses it loudly.
@@ -33,6 +35,10 @@ impl Tokenize for ByteTokenizer {
     fn decode(&self, ids: &[u32]) -> String {
         let bytes: Vec<u8> = ids.iter().map(|&id| id as u8).collect();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn vocab_size(&self) -> usize {
+        256
     }
 
     fn is_byte_fallback(&self) -> bool {
@@ -91,5 +97,9 @@ impl Tokenize for HfTokenizer {
 
     fn decode(&self, ids: &[u32]) -> String {
         self.inner.decode(ids, true).unwrap_or_default()
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
     }
 }

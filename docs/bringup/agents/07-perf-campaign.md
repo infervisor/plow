@@ -96,6 +96,11 @@ perf-data/tools/gpulease gate perf-data/tools/bringup_gate.sh $ASSETS <tag> 8080
 diff $BRINGUP_OUT/gate-out/<reference>.txt $BRINGUP_OUT/gate-out/<tag>.txt
 ```
 
+Set `PLOW_REQUIRE_TUNED=1` for promotion evidence. It makes both the fixed-prompt
+gate and the alternating showdown reject a missing/analytical tile profile;
+baseline runs retain the default `0`, report the analytical fallback loudly,
+and stamp it into their config evidence.
+
 Token-identical (required for refactors/staging/reordering), coherent-but-shifted
 (only for a *documented* numerics change, called out), or garbage / truncation /
 wrong first token (**reject**). On TP, every rank must emit the identical stream.
@@ -105,7 +110,7 @@ with a real prompt.
 **Accuracy number**, at least one:
 
 ```bash
-perf-data/tools/gpulease gsm8k scripts/bench_gsm8k.sh   # 8-shot greedy, n=200
+perf-data/tools/gpulease gsm8k scripts/bench_gsm8k.sh "$ASSETS" 8080 auto  # 8-shot greedy, n=200
 ```
 
 A throughput number without an accuracy number is not publishable — token
@@ -126,13 +131,17 @@ whether `$BW_BOUND` is measured on `$GPU` or the datasheet peak
 
 ### 3. Same-session baseline (both engines, interleaved)
 
-One server at a time, same box, same client, medians over ≥5 rounds (9 for a
-headline). `bringup_showdown.sh` is the template — edit the arm list:
+One server at a time, same box, the same raw-completions client, alternating
+whole-server rounds (minimum 3; use 5 or 9 for a headline).
+`bringup_showdown.sh` requires explicit frozen artifact identities:
 
 ```bash
-SNAP=$HF_SNAPSHOT MODEL_ID=$SERVED_ID BUNDLES=$BUNDLE_DIR CUBINS=$CUBIN_DIR \
-IN_LENS="1024 4096" NPROMPT=9 \
-  perf-data/tools/gpulease showdown perf-data/tools/bringup_showdown.sh
+PLOWRT=$PRIVATE_PLOWRT PLOW_ASSETS=$BUNDLE_DIR \
+PLOW_ARTIFACTS="$PRIVATE_PLOWRT $BUNDLE_DIR" \
+VLLM_MODEL=$MODEL_DIR VLLM_ARTIFACTS="$MODEL_DIR" \
+SNAP=$HF_SNAPSHOT MODEL_ID=$SERVED_ID INPUT_MAP="1024 4096" \
+PROMPT_MAP=default=9 \
+  perf-data/tools/gpulease -n "$TP" showdown perf-data/tools/bringup_showdown.sh
 ```
 
 Cross-engine checks, mandatory: identical `Total input tokens`; identical `Total
@@ -175,7 +184,7 @@ recompile, do not re-run.
 
 Transcribe every number verbatim from the tool's report JSON. Consolidators build
 the `*.json`; **you write the markdown by hand** from those JSONs with the prose
-and caveats. Commit under `$RESULTS` (per-ISA home `perf-data/plow-<isa>/` —
+and caveats. Write under `$RESULTS`; do not commit unless explicitly requested (per-ISA home `perf-data/plow-<isa>/` —
 `perf-data/plow-gfx942/` is the only one in the tree today; cross-arch capacity
 reports at the `perf-data/` root). If `$ISA` has no home yet, create one on the
 same pattern rather than filing under another ISA's directory. Match the

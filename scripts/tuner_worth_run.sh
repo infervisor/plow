@@ -17,9 +17,9 @@
 # INTERLEAVED, NOT SEQUENTIAL. `A B A B`, four separate weight loads. A one-shot `A then B`
 # cannot separate the arm from drift, and every cell here costs a 167 s TP4 load anyway.
 #
-# BEFORE RUNNING: the store must not be stale against THIS tree. `tuning/` records are keyed
-# by the PREPROCESSED interp digest, so any `interp.hip`/`op_gemm.h`/`op_moe.h` edit stales
-# the whole campaign and the "tuned" arm silently becomes the "notuned" arm — the A/B then
+# BEFORE RUNNING: the store must not be stale against THIS tree. GEMM records are keyed by the
+# preprocessed dense-family digest, so a relevant `op_gemm.h` or toolchain edit stales the
+# campaign and the "tuned" arm silently becomes the "notuned" arm — the A/B then
 # measures nothing and reports a confident zero. Verify with `PLOW_TUNE_DUMP=1` on the emit:
 # it must read HIT, not MISS. (Measured 2026-07-29 on this tree BEFORE re-running the
 # campaign: 0 HIT / 2472 MISS.)

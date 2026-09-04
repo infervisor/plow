@@ -50,7 +50,6 @@ export PLOW_K3_PLOWRT="$ROOT/target/release/plowrt"
 export PLOW_K3_BLOB="$OUT/model.pkt"
 export PLOW_K3_HSACO_DIR="$HS"
 export PLOW_K3_CHECKPOINT="$CK"
-export PLOW_K3_PROMPT_IDS="${PLOW_K3_PROMPT:-1008,10484,318,15383,387}"
 export PLOW_K3_STEP_COUNT="$STEPS"
 "$ROOT/perf-data/tools/gpulease" -n 8 k3-mi325x-block-sweep \
   bash -c 'set -euo pipefail
@@ -60,7 +59,7 @@ export PLOW_K3_STEP_COUNT="$STEPS"
       log="/tmp/k3-mi325x-block-${ctx}.log"
       if ! PLOW_TP_NO_AUDIT=1 "$PLOW_K3_PLOWRT" amd-bench \
         --blob "$PLOW_K3_BLOB" --hsaco "$PLOW_K3_HSACO_DIR" \
-        --checkpoint "$PLOW_K3_CHECKPOINT" --prompt "$PLOW_K3_PROMPT_IDS" \
+        --checkpoint "$PLOW_K3_CHECKPOINT" \
         --steps "$PLOW_K3_STEP_COUNT" --ctx "$ctx" --tp 8 >"$log" 2>&1; then
         echo FAILED
         tail -40 "$log"

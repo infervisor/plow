@@ -373,8 +373,8 @@ if(PLOW_ROCM)
     target_link_libraries(k3_moe_grid_sweep PRIVATE ${PLOW_AMDHIP64} m)
     add_dependencies(k3_moe_grid_sweep k3_moe_grid_sweep_gfx942_object)
 
-    # Exact one-workgroup K3 B1 router tail. Two objects differ only in whether
-    # each lane caches its packed expert keys across the 16 block reductions.
+    # Exact one-workgroup K3 B1 router tail: the k block-max rounds (control) against
+    # the per-wave rank + merge select (local). Same winners, order and gates.
     set(K3_ROUTER_TOPK_SRC ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_router_topk_sweep.hip)
     set(K3_ROUTER_TOPK_CTL ${CMAKE_CURRENT_BINARY_DIR}/k3_router_topk_control_gfx942.elf)
     set(K3_ROUTER_TOPK_LOCAL ${CMAKE_CURRENT_BINARY_DIR}/k3_router_topk_local_gfx942.elf)
@@ -383,8 +383,8 @@ if(PLOW_ROCM)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
                 "$ENV{PLOW_HIPCC}" "$ENV{PLOW_BUNDLER}" gfx942
                 ${K3_ROUTER_TOPK_CTL} k3_router_topk 256 2
-                -std=c++17 -DPLOW_BUCKET_DECODE=1 -DPLOW_K3=1
-                -DPLOW_MOE_ROUTER_SELECT=1 -DPLOW_MOE_ROUTER_SELECT_LOCAL=0
+                -std=c++17 -DPLOW_LEAN_OBJECT=1 -DPLOW_BUCKET_DECODE=1 -DPLOW_K3=1
+                -DPLOW_MOE_ROUTER_SELECT=2 -DPLOW_MOE_ROUTER_SELECT_LOCAL=0
                 -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
                 -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
                 ${K3_ROUTER_TOPK_SRC}
@@ -397,8 +397,8 @@ if(PLOW_ROCM)
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
                 "$ENV{PLOW_HIPCC}" "$ENV{PLOW_BUNDLER}" gfx942
                 ${K3_ROUTER_TOPK_LOCAL} k3_router_topk 256 2
-                -std=c++17 -DPLOW_BUCKET_DECODE=1 -DPLOW_K3=1
-                -DPLOW_MOE_ROUTER_SELECT=1 -DPLOW_MOE_ROUTER_SELECT_LOCAL=1
+                -std=c++17 -DPLOW_LEAN_OBJECT=1 -DPLOW_BUCKET_DECODE=1 -DPLOW_K3=1
+                -DPLOW_MOE_ROUTER_SELECT=1 -DPLOW_MOE_ROUTER_SELECT_LOCAL=0
                 -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
                 -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
                 ${K3_ROUTER_TOPK_SRC}

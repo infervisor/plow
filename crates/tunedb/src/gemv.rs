@@ -262,6 +262,7 @@ mod tests {
         assert_eq!(gemv_sample_opcode("gemv_m8"), Some(DevOp::Gemv));
         assert_eq!(gemv_sample_opcode("gemv_glu_m16"), Some(DevOp::GemvGlu));
         assert_eq!(gemv_sample_opcode("gemv_qkv_m1"), Some(DevOp::GemvQkv));
+        assert_eq!(gemv_sample_opcode("gemv_qkvg_m16"), Some(DevOp::GemvQkvg));
         assert_eq!(gemv_sample_opcode("gemm_c0"), None);
         assert_eq!(gemv_sample_bucket("gemv_m8"), Some(8));
         assert_eq!(gemv_sample_bucket("gemv_glu_m16"), Some(16));
@@ -270,6 +271,7 @@ mod tests {
         assert_eq!(gemv_sample_family("gemv_m8"), Some("gemv"));
         assert_eq!(gemv_sample_family("gemv_glu_m8"), Some("gemvglu"));
         assert_eq!(gemv_sample_family("gemv_qkv_m8"), Some("gemvqkv"));
+        assert_eq!(gemv_sample_family("gemv_qkvg_m8"), Some("gemvqkvg"));
     }
 
     /// The quantized symbols resolve to the QUANTIZED opcodes, and the bf16 stem does not
@@ -372,6 +374,7 @@ mod tests {
             "gemv",
             "gemv_glu",
             "gemv_qkv",
+            "gemv_qkvg",
             "gemv_mxfp4",
             "gemv_glu_mxfp4",
         ] {
@@ -383,11 +386,9 @@ mod tests {
         // Named residuals: the schema knows these, the harness has no arm for them.
         //
         // `gemv_fp8` / `gemv_blk` need a per-channel and a `[N/128][K/128]` f32 scale grid
-        // respectively — a different ORACLE, not a different shape. `gemv_qkvg` needs a
-        // `GEMV_QKVG_WALK_VARIANT` golden that `test_kernels.hip` does not yet declare; the op
-        // itself is covered on hardware by `runtime/tests/gemv_qkvg_gfx950_test.hip`, which is
-        // a correctness golden and not a shape sweep. Each reads MISS in the census, which is
-        // the correct reading, and is why this asserts their absence rather than omitting them.
+        // respectively — a different ORACLE, not a different shape. Each reads MISS in the
+        // census, which is the correct reading, and is why this asserts their absence rather
+        // than omitting them.
         assert!(
             !src.contains("\"gemv_fp8_m\""),
             "gemv_fp8 gained an arm — assert it above"
@@ -395,10 +396,6 @@ mod tests {
         assert!(
             !src.contains("\"gemv_blk_m\""),
             "gemv_blk gained an arm — assert it above"
-        );
-        assert!(
-            !src.contains("\"gemv_qkvg_m\""),
-            "gemv_qkvg gained an arm — assert it above"
         );
     }
 }

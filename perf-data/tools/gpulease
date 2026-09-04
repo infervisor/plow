@@ -27,11 +27,17 @@ if [ -n "$GPU_LEASE_DIR" ]; then
 elif mkdir -p /workspace/gpu 2>/dev/null; then
   LEASE_DIR=/workspace/gpu
 else
-  LEASE_DIR="${TMPDIR:-/tmp}/gpulease"
+  # TMPDIR is deliberately not used here. `nix develop` assigns a fresh
+  # /tmp/nix-shell.* directory to each invocation; deriving locks from it lets
+  # concurrent shells acquire disjoint leases for the same physical GPUs.
+  LEASE_DIR=/tmp/gpulease
 fi
 mkdir -p "$LEASE_DIR" 2>/dev/null || { echo "gpulease: cannot create $LEASE_DIR" >&2; exit 1; }
 chmod 1777 "$LEASE_DIR" 2>/dev/null || true
 LOG="$LEASE_DIR/lease.log"
+if [ -e "$LOG" ] && [ ! -w "$LOG" ]; then
+  LOG="$LEASE_DIR/lease.$(id -u).log"
+fi
 
 # ---- vendor detect
 if command -v nvidia-smi >/dev/null 2>&1; then VENDOR=nvidia
@@ -175,7 +181,7 @@ fi
 if [ "$1" = "--status" ]; then
   echo "vendor=$VENDOR gpus=$NGPU lease-dir=$LEASE_DIR"
   for ((i = 0; i < NGPU; i++)); do
-    f="$LEASE_DIR/gpu.$i.lease"; touch "$f" 2>/dev/null
+    f="$LEASE_DIR/gpu.$i.lease"; [ -e "$f" ] || : >"$f" 2>/dev/null
     if flock -n "$f" true 2>/dev/null; then echo "  gpu$i: free"; else echo "  gpu$i: HELD"; fi
   done
   echo "--- recent ---"; tail -20 "$LOG" 2>/dev/null
@@ -210,8 +216,11 @@ try_acquire() {
   local i f
   for ((i = 0; i < NGPU; i++)); do
     [ "$NGOT" -ge "$WANT" ] && break
-    f="$LEASE_DIR/gpu.$i.lease"; touch "$f" 2>/dev/null || continue
-    eval "exec $FD>\"$f\"" 2>/dev/null || continue
+    f="$LEASE_DIR/gpu.$i.lease"
+    [ -e "$f" ] || : >"$f" 2>/dev/null || continue
+    # The lease directory is shared across users. Existing lock files may be readable but
+    # not writable by this user; flock only needs an open descriptor, so open read-only.
+    eval "exec $FD<\"$f\"" 2>/dev/null || continue
     if flock -n "$FD" 2>/dev/null; then
       GOT="${GOT:+$GOT }$i"; NGOT=$((NGOT + 1)); FD=$((FD + 1))
     else
@@ -236,11 +245,21 @@ W=$(( $(date +%s) - S ))
 # every device would make the lease meaningless.
 if [ "$NGOT" -lt "$NGPU" ]; then
   VIS=$(echo "$GOT" | tr ' ' ',')
-  export CUDA_VISIBLE_DEVICES="$VIS" HIP_VISIBLE_DEVICES="$VIS" ROCR_VISIBLE_DEVICES="$VIS"
+  if [ "$VENDOR" = amd ]; then
+    # ROCr renumbers its filtered agents. Applying the original physical ids a
+    # second time through HIP/CUDA_VISIBLE_DEVICES can therefore hide every
+    # device when a partial lease starts above gpu0.
+    export ROCR_VISIBLE_DEVICES="$VIS"
+    unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+  else
+    export CUDA_VISIBLE_DEVICES="$VIS"
+  fi
 fi
 
 PRE=$(foreign "$GOT")
+CONTENDED=0
 if [ -n "$PRE" ]; then
+  CONTENDED=1
   echo "[$(date -Is)] $LABEL WARN foreign-before: $(echo $PRE|tr '\n' ' ')" | tee -a "$LOG" >&2
   echo "*** GPU CONTENDED AT START — TIMINGS FROM THIS RUN ARE NOT TRUSTWORTHY ***" >&2
 fi
@@ -250,9 +269,10 @@ echo "[$(date -Is)] $LABEL ACQUIRED gpus=[$GOT] (waited ${W}s) pid=$$" >> "$LOG"
 
 POST=$(foreign "$GOT")
 if [ -n "$POST" ]; then
+  CONTENDED=1
   echo "[$(date -Is)] $LABEL WARN foreign-during: $(echo $POST|tr '\n' ' ')" | tee -a "$LOG" >&2
   echo "*** GPU WAS CONTENDED — RE-RUN THIS MEASUREMENT ***" >&2
-  RC=$([ $RC -eq 0 ] && echo 76 || echo $RC)   # 76 = completed but contended
 fi
+[ "$CONTENDED" -eq 0 ] || RC=$([ $RC -eq 0 ] && echo 76 || echo $RC)
 echo "[$(date -Is)] $LABEL RELEASED gpus=[$GOT] rc=$RC held=$(( $(date +%s) - S - W ))s" >> "$LOG"
 exit $RC

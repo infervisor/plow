@@ -12,6 +12,42 @@
 use kernelcaps::QuantScheme;
 use packet::dev::DevOp;
 
+/// Stable measurement id for the tagged `GemmWide` 128x384x64 body.
+///
+/// Variant bodies share a device opcode, so their TuneDB identities must not. The high bit keeps
+/// this outside the live device ABI while still fitting `KernelMeasurement::kernel_id`.
+pub const GEMM_WIDE_C8_MEASUREMENT_ID: u16 = 0x8000 | DevOp::GemmWide as u16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmEmitPlan {
+    pub op: DevOp,
+    pub measurement_id: u16,
+    pub packet_tag: u32,
+    pub bm: u32,
+    pub bn: u32,
+    pub bk: u32,
+}
+
+impl GemmEmitPlan {
+    pub fn blocks(self, m: u32, n: u32) -> u32 {
+        m.div_ceil(self.bm).saturating_mul(n.div_ceil(self.bn))
+    }
+
+    pub fn kernel_name(self) -> String {
+        if self.packet_tag == 0 {
+            self.op.c_name().to_string()
+        } else {
+            format!(
+                "{}/tile{}x{}x{}",
+                self.op.c_name(),
+                self.bm,
+                self.bn,
+                self.bk
+            )
+        }
+    }
+}
+
 /// `HardwareFingerprint::tuning_path()` for the MI350X/MI355X cell.
 pub const GFX950_CELL: &str = "amd/gfx950/mi350x";
 
@@ -90,18 +126,40 @@ const RUNGS: [(&str, DevOp, DevOp, DevOp); 5] = [
 
 /// The opcode that carries `tile` under `quant`, or `None` when no dispatch arm does.
 ///
-/// `None` is the right answer for the calibration-only tiles the sweep also compiles
-/// (320x128, 384x128, 128x384, 192x128 — `runtime/amd/test_kernels.hip`). They are legitimate
-/// measurements of a kernel body and NOT selectable facts, because the interpreter has no arm
-/// for them; storing them as if they were is how a plan comes to name a kernel that does not
-/// exist.
+/// `None` is the right answer for calibration-only tiles and for tagged bodies that cannot be
+/// represented by an opcode alone. Call [`gemm_rung_emit_plan`] when packet tags are supported.
 pub fn gemm_rung_opcode(tile: &str, quant: QuantScheme) -> Option<DevOp> {
+    let plan = gemm_rung_emit_plan(tile, quant)?;
+    (plan.packet_tag == 0).then_some(plan.op)
+}
+
+/// Dispatch representation for a measured tile, including tagged bodies sharing an opcode.
+pub fn gemm_rung_emit_plan(tile: &str, quant: QuantScheme) -> Option<GemmEmitPlan> {
+    if tile == "128x384x64" && quant == QuantScheme::None {
+        return Some(GemmEmitPlan {
+            op: DevOp::GemmWide,
+            measurement_id: GEMM_WIDE_C8_MEASUREMENT_ID,
+            packet_tag: packet::dev::GEMM_WIDE_C8_TAG,
+            bm: 128,
+            bn: 384,
+            bk: 64,
+        });
+    }
     let (_, bf16, fp8, mx) = RUNGS.iter().find(|r| r.0 == tile)?;
-    Some(match quant {
+    let op = match quant {
         QuantScheme::None => *bf16,
         QuantScheme::W8A8 => *fp8,
         QuantScheme::Mxfp4 => *mx,
         _ => return None,
+    };
+    let mut dims = tile.split('x').map(|v| v.parse::<u32>().ok());
+    Some(GemmEmitPlan {
+        op,
+        measurement_id: op as u16,
+        packet_tag: 0,
+        bm: dims.next()??,
+        bn: dims.next()??,
+        bk: dims.next()??,
     })
 }
 
@@ -159,8 +217,8 @@ mod tests {
         assert_eq!(a, "gemm/128x576x6144/None");
     }
 
-    /// Every rung resolves to a distinct opcode in every encoding, and a calibration-only tile
-    /// resolves to none.
+    /// Every ordinary rung resolves to a distinct opcode in every encoding. Tagged c8 resolves
+    /// only through the richer emit-plan mapping.
     #[test]
     fn rungs_map_to_distinct_opcodes() {
         let mut seen = std::collections::BTreeSet::new();
@@ -173,6 +231,12 @@ mod tests {
         assert_eq!(seen.len(), RUNGS.len() * 3);
         assert_eq!(gemm_rung_opcode("320x128x64", QuantScheme::None), None);
         assert_eq!(gemm_rung_opcode("128x384x64", QuantScheme::None), None);
+        let c8 = gemm_rung_emit_plan("128x384x64", QuantScheme::None).unwrap();
+        assert_eq!(c8.op, DevOp::GemmWide);
+        assert_eq!(c8.measurement_id, GEMM_WIDE_C8_MEASUREMENT_ID);
+        assert_eq!(c8.packet_tag, packet::dev::GEMM_WIDE_C8_TAG);
+        assert_eq!(c8.blocks(8192, 1536), 256);
+        assert_eq!(c8.kernel_name(), "PLOW_DOP_GEMM_WIDE/tile128x384x64");
         // An encoding with no prefill GEMM family at all must not silently borrow another's.
         assert_eq!(gemm_rung_opcode("256x256x64", QuantScheme::BlockFp8), None);
     }

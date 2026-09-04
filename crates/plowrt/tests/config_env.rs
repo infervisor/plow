@@ -18,6 +18,11 @@ fn env_zero_and_one_mean_false_and_true() {
     // Value knobs ride along.
     std::env::set_var("PLOW_KV_POOL_MIB", "256");
     std::env::set_var("PLOW_PF_SEG_PURE", "fp8");
+    std::env::set_var("PLOW_PF_CHUNK", "4096");
+    std::env::set_var("PLOW_PF_INTERLEAVE", "1024");
+    std::env::set_var("PLOW_PF_DEFER_DECODE", "1");
+    std::env::set_var("PLOW_PF_BATCH", "1");
+    std::env::set_var("PLOW_TP_PREFILL_SEGMENT_MAJOR", "0");
 
     let c = RuntimeConfig::get();
     assert!(!c.preload, "PLOW_PRELOAD=0 must disable preload");
@@ -27,4 +32,10 @@ fn env_zero_and_one_mean_false_and_true() {
     );
     assert_eq!(c.kv_pool_mib, 256);
     assert_eq!(c.nv.pf_seg_pure.as_deref(), Some("fp8"));
+    assert_eq!(c.nv.pf_chunk, 4096);
+    assert_eq!(c.nv.pf_chunk_rows(), 4096);
+    assert_eq!(c.nv.pf_interleave, 1024);
+    assert!(c.nv.pf_defer_decode);
+    assert!(c.nv.pf_batch);
+    assert!(!c.amd.tp_prefill_segment_major);
 }
