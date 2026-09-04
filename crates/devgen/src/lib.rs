@@ -411,6 +411,11 @@ pub(crate) fn pick_gemm_emit_plan(
             )
     });
     if let Some(plan) = c8 {
+        // The tagged path queried the same qualified/current shape table as `pick_tile`, but it
+        // bypasses `select_kernel` because the implementation shares an opcode with c2. Preserve
+        // the one-lookup/one-decision accounting contract at this alternate decision boundary.
+        tune_demand::record(m as i64, n as i64, k as i64, quant, true);
+        tune_demand::note_decision(true);
         return (plan.op, plan.blocks(m, n), plan.packet_tag);
     }
     (gfx950_prefill_tile(m, n, k, n_cu, quant), n_cu, 0)

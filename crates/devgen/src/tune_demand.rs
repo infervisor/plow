@@ -49,6 +49,7 @@
 //! coupling and the rule that follows from it — change the ladder, re-derive the shapes. With
 //! `--shapes auto` the rule enforces itself, because the ladder is read off the same emit.
 
+#[cfg(not(test))]
 use std::sync::Mutex;
 
 use kernelcaps::QuantScheme;
@@ -80,7 +81,14 @@ impl Demand {
 
 /// `None` = not recording. Recording is opt-in so a normal compile pays nothing but the lock-free
 /// `is_none` check, and so a long-running emit cannot accumulate an unbounded log nobody reads.
+#[cfg(not(test))]
 static SINK: Mutex<Option<Vec<Demand>>> = Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    static TEST_SINK: std::cell::RefCell<Option<Vec<Demand>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
 
 /// Begin recording, discarding anything already collected.
 ///
@@ -88,16 +96,25 @@ static SINK: Mutex<Option<Vec<Demand>>> = Mutex::new(None);
 /// the honest shape here: there is exactly one compile per process, and `pick_tile` is reached
 /// from too many call sites to thread a context through without touching every emitter.
 pub fn start_recording() {
-    *SINK.lock().expect("tune-demand sink") = Some(Vec::new());
+    #[cfg(not(test))]
+    {
+        *SINK.lock().expect("tune-demand sink") = Some(Vec::new());
+    }
+    #[cfg(test)]
+    TEST_SINK.with_borrow_mut(|sink| *sink = Some(Vec::new()));
 }
 
 /// Stop recording and return what was collected, in lookup order (duplicates included — the
 /// caller decides whether repetition is signal).
 pub fn take() -> Vec<Demand> {
-    SINK.lock()
+    #[cfg(not(test))]
+    return SINK
+        .lock()
         .expect("tune-demand sink")
         .take()
-        .unwrap_or_default()
+        .unwrap_or_default();
+    #[cfg(test)]
+    return TEST_SINK.with_borrow_mut(|sink| sink.take().unwrap_or_default());
 }
 
 /// Record one lookup. Called from `GemmMeasurements::for_shape`, the single place the compiler
@@ -115,19 +132,36 @@ pub(crate) fn record(m: i64, n: i64, k: i64, quant: QuantScheme, hit: bool) {
             if hit { "HIT" } else { "MISS" }
         );
     }
-    if let Some(v) = SINK.lock().expect("tune-demand sink").as_mut() {
-        v.push(Demand {
-            m,
-            n,
-            k,
-            quant,
-            hit,
-        });
+    let demand = Demand {
+        m,
+        n,
+        k,
+        quant,
+        hit,
+    };
+    #[cfg(not(test))]
+    {
+        if let Some(v) = SINK.lock().expect("tune-demand sink").as_mut() {
+            v.push(demand);
+        }
     }
+    #[cfg(test)]
+    TEST_SINK.with_borrow_mut(|sink| {
+        if let Some(v) = sink.as_mut() {
+            v.push(demand);
+        }
+    });
 }
 
+#[cfg(not(test))]
 static DECIDED_MEASURED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(not(test))]
 static DECISIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+thread_local! {
+    static TEST_DECIDED_MEASURED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Record what actually DECIDED one tile: the selector's calibration tier.
 ///
@@ -145,18 +179,37 @@ static DECISIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// which read the `hit` tally -- while the emitted packet was byte-identical to a `--no-tuning`
 /// build. Provenance has to come from the DECISION, not from the lookup.
 pub fn note_decision(measured: bool) {
-    DECISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if measured {
-        DECIDED_MEASURED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    {
+        DECISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if measured {
+            DECIDED_MEASURED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    #[cfg(test)]
+    {
+        TEST_DECISIONS.set(TEST_DECISIONS.get() + 1);
+        if measured {
+            TEST_DECIDED_MEASURED.set(TEST_DECIDED_MEASURED.get() + 1);
+        }
     }
 }
 
 /// `(decided_by_measurement, decisions)` over every dense-GEMM tile this process selected.
 pub fn tally() -> (usize, usize) {
-    (
+    #[cfg(not(test))]
+    return (
         DECIDED_MEASURED.load(std::sync::atomic::Ordering::Relaxed),
         DECISIONS.load(std::sync::atomic::Ordering::Relaxed),
-    )
+    );
+    #[cfg(test)]
+    return (TEST_DECIDED_MEASURED.get(), TEST_DECISIONS.get());
+}
+
+#[cfg(test)]
+pub(crate) fn reset_tally() {
+    TEST_DECIDED_MEASURED.set(0);
+    TEST_DECISIONS.set(0);
 }
 
 /// Collapse a lookup log into the distinct shapes a campaign must cover.

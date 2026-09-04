@@ -3323,7 +3323,7 @@ mod tests {
             hidden: 7168,
             latent: 3584,
             moe_inter: 3072,
-            shared_inter: 2048,
+            shared_inter: 6144,
             n_exp: 896,
             top_k: 16,
             route_flags: 3,
@@ -3611,7 +3611,7 @@ mod tests {
             moe: k3_moe(),
             vocab: 163840,
             first_k_dense: 1,
-            dense_inter: 18432,
+            dense_inter: 33792,
             prefix: "language_model.model.".into(),
             tp: 1,
         }
@@ -4769,6 +4769,65 @@ mod tests {
                 "a 128-tile grid must not claim the 256-CU c8 arm"
             );
         }
+    }
+
+    #[test]
+    fn c8_full_graph_preserves_the_measured_tune_census() {
+        let _guard = crate::test_env::env_guard();
+        crate::set_amd_target("MI350X");
+        let buckets = [128, 512, 1024, 2048, 4096, 8192];
+        let emit = |shape: &str| {
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", shape)]);
+            crate::tune_demand::reset_tally();
+            crate::tune_demand::start_recording();
+            let programs: Vec<_> = buckets.iter().map(|&t| build_full_t(8, t)).collect();
+            let model = packet::devbuild::Model {
+                n_cu: 256,
+                target: 0,
+                tensors: programs.last().unwrap().tensors.clone(),
+                progs: programs,
+                kv_row_insts: Vec::new(),
+                prog_t: buckets.to_vec(),
+                gen: Vec::new(),
+            };
+            let manifest = crate::manifest::build(&model, "gfx950", &crate::LeanReport::default());
+            (
+                model.progs,
+                crate::tune_demand::tally(),
+                crate::tune_demand::take(),
+                manifest,
+            )
+        };
+
+        let (control, control_census, control_lookups, control_manifest) = emit("");
+        let (candidate, candidate_census, candidate_lookups, candidate_manifest) =
+            emit("8192x1536x7168");
+        assert_eq!(control_census, (7650, 7650));
+        assert_eq!(candidate_census, control_census);
+        for manifest in [&control_manifest, &candidate_manifest] {
+            assert_eq!(manifest["tuning"]["tile_measured"], 7650);
+            assert_eq!(manifest["tuning"]["tile_lookups"], 7650);
+            assert_eq!(manifest["tuning"]["tile_source"], "measured");
+        }
+        assert_eq!(control_lookups.len(), 7650);
+        assert_eq!(candidate_lookups.len(), control_lookups.len());
+        assert!(control_lookups.iter().all(|d| d.hit));
+        assert!(candidate_lookups.iter().all(|d| d.hit));
+
+        let mut tagged = 0usize;
+        for (t, (a, b)) in buckets.iter().zip(control.iter().zip(&candidate)) {
+            assert_eq!(a.insts.len(), b.insts.len(), "M={t}: packet count moved");
+            for (before, after) in a.insts.iter().zip(&b.insts) {
+                if before != after {
+                    assert_eq!(*t, 8192, "C8 changed a non-qualified bucket");
+                    let mut expected = *before;
+                    expected.i[7] = packet::dev::GEMM_WIDE_C8_TAG;
+                    assert_eq!(*after, expected, "C8 may change only the explicit tile tag");
+                    tagged += 1;
+                }
+            }
+        }
+        assert_eq!(tagged, 324, "the qualified full-graph shape census moved");
     }
 
     /// **BLOCKER 1.** The ring strides by its CAPACITY, and the capacity reaches the packet.
