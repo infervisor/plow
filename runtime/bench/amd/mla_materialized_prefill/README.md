@@ -150,3 +150,32 @@ nix develop -c python3 scripts/openai_correctness_gate.py compare \
 The comparator requires exact cold-run determinism within each arm, then exact
 prompt and output token parity between arms. It reports the first prompt token
 or generated-token divergence.
+
+### Same-input boundary gate
+
+Whole-model logits do not isolate MLA when an earlier layer already differs.
+For promotion, capture the first target attention boundary as generic semantic
+tensors. Every reference repeat and both Plow arms must contain byte-identical
+`q`, `k`, and `v` payloads (or equivalently named projected inputs), plus the
+BF16 attention output and the first downstream residual output. Manifests also
+carry the SHA256 of the complete token history and every tensor payload.
+
+Run the local decision gate with adjacent pinned-runtime repeats:
+
+```sh
+nix develop -c python3 scripts/mla_boundary_quality_gate.py \
+  --reference /tmp/mla/vllm-0.json \
+  --reference /tmp/mla/vllm-1.json \
+  --reference /tmp/mla/vllm-2.json \
+  --absorbed /tmp/mla/plow-absorbed.json \
+  --materialized /tmp/mla/plow-materialized.json \
+  --input-semantic q,k,v \
+  --output-semantic attention.output,residual.output \
+  --output /tmp/mla/quality-gate.json
+```
+
+The gate rejects a history mismatch, a stale/corrupt payload hash, or any input
+payload mismatch before comparing outputs. For rel-L2, max-absolute error, and
+cosine loss, materialized Plow must be no worse than absorbed Plow plus the
+largest adjacent vLLM repeat floor. This boundary gate is required before the
+existing long-continuation and TP8 timing gates; it does not replace them.
