@@ -1607,15 +1607,24 @@ impl Builder {
                 pair[0].inst.op == DevOp::MoeGroupGluFp8Blk as u16
                     && pair[1].inst.op == DevOp::MoeGroupDownFp8Blk as u16
             });
+        let graph_phase_objects =
+            std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1");
         let xreduce_wave_rs = !uniseg
             && self.place_l2.is_some()
             && (self.xreduce_wave_rs_segments
-                || std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1")
-                || std::env::var("PLOW_PHASE_OBJECTS").ok().as_deref() == Some("1"))
+                || std::env::var("PLOW_XR_WAVE_RS").ok().as_deref() == Some("1"))
             && self
                 .ops
                 .iter()
                 .any(|op| op.inst.op == DevOp::XReduceTwoShot as u16);
+        let isolate_xreduce = xreduce_wave_rs
+            || (!uniseg
+                && self.place_l2.is_some()
+                && graph_phase_objects
+                && self
+                    .ops
+                    .iter()
+                    .any(|op| op.inst.op == DevOp::XReduceTwoShot as u16));
         // This encoding is understood only by its dedicated interpreter object. As with the
         // raw KDA boundary, keep it isolated even when PLOW_UNISEG was requested; otherwise the
         // ordinary XReduce arm would silently interpret the fused operand slots as its legacy
@@ -1733,7 +1742,7 @@ impl Builder {
                         && self.ops[i - 1].inst.op == DevOp::FlashMlaDecode as u16))
             {
                 18
-            } else if xreduce_wave_rs && op == DevOp::XReduceTwoShot as u16 {
+            } else if isolate_xreduce && op == DevOp::XReduceTwoShot as u16 {
                 19
             } else if uniseg {
                 8
@@ -1851,7 +1860,7 @@ impl Builder {
             || mla_materialized
             || decode_mla_segments
             || decode_grouped_moe
-            || xreduce_wave_rs;
+            || isolate_xreduce;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             let producer = dep.producer() as usize;
             let raw_moe_pair_edge =
