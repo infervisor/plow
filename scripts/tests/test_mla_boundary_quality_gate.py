@@ -104,3 +104,29 @@ def test_rejects_different_boundary_contract(tmp_path):
     result = run_gate(tmp_path, ref0, ref1, absorbed, materialized)
     assert result.returncode != 0
     assert b"boundary contracts differ" in result.stderr
+
+
+def test_rejects_residual_rounding_or_epsilon_mismatch(tmp_path):
+    inputs = {"q": [1.0], "k": [2.0], "v": [3.0]}
+    outputs = {"attention.output": [10.0], "residual.output": [20.0]}
+    common = {
+        "dimensions": {"tokens": 1},
+        "residual_seam": {
+            "score_epsilon": 1e-6,
+            "output_norm_epsilon": 1e-6,
+            "output_norm_input": "mixed-f32",
+        },
+    }
+    for field, value in (
+        ("output_norm_input", "mixed-bf16"),
+        ("output_norm_epsilon", 1e-5),
+    ):
+        candidate = json.loads(json.dumps(common))
+        candidate["residual_seam"][field] = value
+        ref0 = manifest(tmp_path, f"r0-{field}", inputs, outputs, common)
+        ref1 = manifest(tmp_path, f"r1-{field}", inputs, outputs, common)
+        absorbed = manifest(tmp_path, f"a-{field}", inputs, outputs, common)
+        materialized = manifest(tmp_path, f"m-{field}", inputs, outputs, candidate)
+        result = run_gate(tmp_path, ref0, ref1, absorbed, materialized)
+        assert result.returncode != 0
+        assert b"boundary contracts differ" in result.stderr

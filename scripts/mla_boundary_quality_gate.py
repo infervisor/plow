@@ -25,9 +25,11 @@ ABI_SOURCE_SEMANTICS = {
     "weight.output_projection",
 }
 ABI_OPTIONAL_SEAM_INPUTS = {
-    "residual.input",
+    "residual.prefix",
+    "residual.delta",
     "residual.ring",
-    "weight.residual_score",
+    "weight.residual_norm",
+    "weight.residual_projection",
     "weight.post_attention_norm",
 }
 

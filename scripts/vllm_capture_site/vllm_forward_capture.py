@@ -47,6 +47,8 @@ def _descend(value, path):
 def _extract(spec, module, args, kwargs, output):
     import torch
 
+    if "literal" in spec:
+        return spec["literal"]
     if "first_tensor" in spec:
         for candidate in spec["first_tensor"]:
             try:
@@ -78,6 +80,18 @@ def _extract(spec, module, args, kwargs, output):
     return _descend(value, spec.get("path", []))
 
 
+def _capture_context(specs, source_object, args, kwargs, output):
+    context = {}
+    for name, spec in specs.items():
+        value = _extract(spec, source_object, args, kwargs, output)
+        if value is None or isinstance(value, (bool, int, float, str)):
+            context[name] = value
+        else:
+            raise TypeError(f"capture context {name!r} is not a JSON scalar")
+    encoded = json.dumps(context, sort_keys=True, separators=(",", ":")).encode()
+    return context, hashlib.sha256(encoded).hexdigest()
+
+
 def install(config):
     global _installed
     if _installed:
@@ -96,6 +110,10 @@ def install(config):
     for raw in config.get("method_selectors", []):
         item = dict(raw)
         method_selectors.setdefault(item.pop("target"), []).append(item)
+    callable_selectors = {}
+    for raw in config.get("callable_selectors", []):
+        item = dict(raw)
+        callable_selectors.setdefault(item.pop("target"), []).append(item)
     prompt_hash = config["prompt_sha256_u32le"]
     history_id = config.get("history_id", prompt_hash[:16])
     wanted_rank = config.get("rank", 0)
@@ -181,6 +199,12 @@ def install(config):
             "file": data_path.name,
             "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
         }
+        if item.get("context"):
+            context, context_hash = _capture_context(
+                item["context"], source_object, args, kwargs, output
+            )
+            meta["context"] = context
+            meta["context_sha256"] = context_hash
         meta_tmp = output_dir / f".{stem}.{os.getpid()}.json.tmp"
         meta_tmp.write_text(json.dumps(meta, indent=2) + "\n")
         os.replace(meta_tmp, output_dir / f"{stem}.json")
@@ -223,6 +247,30 @@ def install(config):
             return result
 
         setattr(owner, method_name, method_wrapper)
+    for target, items in callable_selectors.items():
+        module_name, function_name = target.rsplit(".", 1)
+        owner = importlib.import_module(module_name)
+        original_function = getattr(owner, function_name)
+
+        def callable_wrapper(*args, __items=items, __target=target, __owner=owner,
+                             __original=original_function, __calls=[0], **kwargs):
+            call_index = __calls[0]
+            __calls[0] += 1
+            match = re.fullmatch("", "")
+            for item in __items:
+                if item.get("phase", "before") == "before" and item.get(
+                    "call_index", call_index
+                ) == call_index:
+                    capture(__owner, __target, item, match, args, kwargs, None)
+            result = __original(*args, **kwargs)
+            for item in __items:
+                if item.get("phase", "before") == "after" and item.get(
+                    "call_index", call_index
+                ) == call_index:
+                    capture(__owner, __target, item, match, args, kwargs, result)
+            return result
+
+        setattr(owner, function_name, callable_wrapper)
     _installed = True
 
 

@@ -22,6 +22,14 @@ REQUIRED_SOURCE = {
     "weight.kv_projection",
     "weight.output_projection",
 }
+RESIDUAL_SEAM_INPUTS = {
+    "residual.prefix",
+    "residual.delta",
+    "residual.ring",
+    "weight.residual_norm",
+    "weight.residual_projection",
+    "weight.post_attention_norm",
+}
 
 
 def product(xs):
@@ -33,6 +41,11 @@ def product(xs):
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def canonical_hash(value):
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def resolved(base, value):
@@ -104,6 +117,48 @@ def validate(data, manifest_path, require_source=False, require_qkv=False):
         for semantic, shape in expected.items():
             if by_semantic[semantic]["dtype"] != "bf16" or by_semantic[semantic]["shape"] != shape:
                 raise ValueError(f"{semantic} must be bf16 with shape {shape}")
+    seam_present = RESIDUAL_SEAM_INPUTS & semantics
+    if seam_present:
+        missing = RESIDUAL_SEAM_INPUTS - semantics
+        if missing:
+            raise ValueError(f"incomplete residual seam, missing {sorted(missing)}")
+        seam = contract.get("residual_seam")
+        if not isinstance(seam, dict):
+            raise ValueError("residual seam tensors require contract.residual_seam")
+        required_state = {
+            "operation", "prefix_delta_rounding", "ring_layout", "num_blocks",
+            "block_capacity", "block_write_idx", "score_epsilon",
+            "output_norm_epsilon", "output_norm_input",
+        }
+        if missing_state := required_state - set(seam):
+            raise ValueError(f"residual seam state missing {sorted(missing_state)}")
+        state = {k: v for k, v in seam.items() if k != "state_sha256"}
+        if seam.get("state_sha256") != canonical_hash(state):
+            raise ValueError("residual seam state hash is missing or stale")
+        if seam["operation"] != "softmax-rms-residual-mix":
+            raise ValueError("unsupported residual seam operation")
+        if seam["prefix_delta_rounding"] != "add-f32-round-bf16":
+            raise ValueError("unsupported prefix/delta rounding")
+        if seam["ring_layout"] != "token-block-hidden":
+            raise ValueError("unsupported residual ring layout")
+        if seam["output_norm_input"] not in {"mixed-f32", "mixed-bf16"}:
+            raise ValueError("unsupported residual output norm input")
+        num_blocks, capacity = int(seam["num_blocks"]), int(seam["block_capacity"])
+        if num_blocks < 0 or capacity < num_blocks:
+            raise ValueError("invalid residual block count/capacity")
+        hidden = by_semantic["weight.output_projection"]["shape"][0]
+        expected_seam = {
+            "residual.prefix": [t, hidden],
+            "residual.delta": [t, hidden],
+            "residual.ring": [t, capacity, hidden],
+            "weight.residual_norm": [hidden],
+            "weight.residual_projection": [hidden],
+            "weight.post_attention_norm": [hidden],
+        }
+        for semantic, shape in expected_seam.items():
+            item = by_semantic[semantic]
+            if item["dtype"] != "bf16" or item["shape"] != shape:
+                raise ValueError(f"{semantic} must be bf16 with shape {shape}")
     history = data["prompt"]
     token_path = resolved(manifest_path.parent, history["u32le_file"])
     if token_path.stat().st_size % 4:
@@ -125,6 +180,10 @@ def write_manifest(spec_path, output, require_source=False):
         "tokens": token_path.stat().st_size // 4,
     }
     data["prompt_sha256_u32le"] = data["prompt"]["sha256"]
+    seam = data.get("contract", {}).get("residual_seam")
+    if seam is not None:
+        state = {k: v for k, v in seam.items() if k != "state_sha256"}
+        seam["state_sha256"] = canonical_hash(state)
     data["tensors"] = tensors
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(data, indent=2) + "\n")

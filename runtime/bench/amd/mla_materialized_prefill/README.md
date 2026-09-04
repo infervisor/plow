@@ -220,10 +220,13 @@ from the same sealed factor weights and latent tensors, also outside timing.
 The materialized replay records the object hash and median kernel time. Input capture, hashing,
 packing, uploads, and downloads are outside the event interval. It deliberately
 does not synthesize `residual.output`: that tensor must come from each runtime's
-real output projection/residual seam. The vLLM capture template reads the second
-output of `post_attention_layernorm`, which is the BF16 residual produced after
-the attention projection. Plow normally fuses the corresponding AttnRes and
-following RMSNorm in place, so a capture asset must be emitted with
+real output projection/residual seam. The vLLM template wraps the configured
+fused residual callable and captures its prefix, projected attention delta,
+residual ring, both score factors, output norm gain, scalar state, and returned
+BF16 output. `call_index` is a graph-boundary ordinal and must select the same
+boundary as the MLA capture. The hook remains model-generic; only the benchmark
+configuration names the callable. Plow normally fuses the corresponding
+AttnRes and following RMSNorm in place, so a capture asset must be emitted with
 `PLOW_K3_FUSE_ARNORM=0 PLOW_SEG_PER_OP=1`; this materializes
 `act.l<layer>.h2` and gives it its own segment. Capture that segment with
 `PLOW_PF_CAPTURE=T:SEG:act.l<layer>.h2=/tmp/mla/residual.output.bf16`.
@@ -248,3 +251,15 @@ and learned score weights. Those inputs must either hash identically in the
 manifest or be injected from the same capture. Comparing residuals from two
 ordinary whole-model runs does not meet this gate when an earlier layer already
 differs.
+
+The residual contract also records arithmetic order. Pinned vLLM 0.28 adds
+prefix and delta in f32, rounds that sum to BF16, scores the BF16 sources, mixes
+in f32, and applies output RMSNorm to the unrounded f32 mix
+(`output_norm_input=mixed-f32`). Production `d_attn_res` matches the prefix
+round and score equation, but rounds the mix to BF16 before its fused RMSNorm
+(`output_norm_input=mixed-bf16`). It also has one epsilon operand while vLLM
+accepts separate score and output-norm epsilons. Both epsilons and the norm input
+are in the hashed state, so the same-contract gate rejects this mismatch. An
+exact full-seam gate needs either a Plow arm that normalizes the f32 accumulator
+or a vLLM capture of the raw BF16 mix; the fused vLLM callable exposes only its
+normalized return.

@@ -44,6 +44,89 @@
       "phase": "after"
     }
   ],
+  "callable_selectors": [
+    {
+      "target": "vllm.models.kimi_k3.amd.linear.attn_res",
+      "semantic": "residual.prefix",
+      "extract": {"source": "args", "path": [0]},
+      "context": {
+        "operation": {"literal": "softmax-rms-residual-mix"},
+        "prefix_delta_rounding": {"literal": "add-f32-round-bf16"},
+        "ring_layout": {"literal": "token-block-hidden"},
+        "num_blocks": {"source": "args", "path": [6]},
+        "block_capacity": {"source": "args", "path": [2, "shape", 1]},
+        "block_write_idx": {"source": "args", "path": [7]},
+        "score_epsilon": {"source": "args", "path": [8]},
+        "output_norm_epsilon": {"source": "args", "path": [9]},
+        "output_norm_input": {"literal": "mixed-f32"}
+      },
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 1,
+      "phase": "before"
+    },
+    {
+      "target": "vllm.models.kimi_k3.amd.linear.attn_res",
+      "semantic": "residual.delta",
+      "extract": {"source": "args", "path": [1]},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 1,
+      "phase": "before"
+    },
+    {
+      "target": "vllm.models.kimi_k3.amd.linear.attn_res",
+      "semantic": "residual.ring",
+      "extract": {"source": "args", "path": [2]},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 1,
+      "phase": "before"
+    },
+    {
+      "target": "vllm.models.kimi_k3.amd.linear.attn_res",
+      "semantic": "weight.residual_norm",
+      "extract": {"source": "args", "path": [3]},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 1,
+      "phase": "before"
+    },
+    {
+      "target": "vllm.models.kimi_k3.amd.linear.attn_res",
+      "semantic": "weight.residual_projection",
+      "extract": {"source": "args", "path": [4]},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 1,
+      "phase": "before"
+    },
+    {
+      "target": "vllm.models.kimi_k3.amd.linear.attn_res",
+      "semantic": "weight.post_attention_norm",
+      "extract": {"source": "args", "path": [5]},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 1,
+      "phase": "before"
+    },
+    {
+      "target": "vllm.models.kimi_k3.amd.linear.attn_res",
+      "semantic": "residual.output",
+      "extract": {"source": "output"},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 1,
+      "phase": "after"
+    }
+  ],
   "selectors": [
     {
       "module_regex": ".*layers\\.(?P<layer>[0-9]+)\\.self_attn\\.q_a_layernorm$",
@@ -77,13 +160,6 @@
       "module_regex": ".*layers\\.(?P<layer>[0-9]+)\\.self_attn\\.o_proj$",
       "semantic": "weight.output_projection",
       "extract": {"source": "module", "path": ["weight"]},
-      "storage_dtype": "bf16",
-      "row": "all"
-    },
-    {
-      "module_regex": ".*layers\\.(?P<layer>[0-9]+)\\.post_attention_layernorm$",
-      "semantic": "residual.output",
-      "extract": {"source": "output", "path": [1]},
       "storage_dtype": "bf16",
       "row": "all"
     }

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import struct
 import subprocess
 import sys
@@ -104,3 +105,66 @@ def test_attach_tensor_preserves_history_and_seals_payload(tmp_path):
     assert result["prompt_sha256_u32le"] == hashlib.sha256(tokens.read_bytes()).hexdigest()
     item = next(x for x in result["tensors"] if x["semantic"] == "residual.output")
     assert item["sha256"] == hashlib.sha256(residual.read_bytes()).hexdigest()
+
+
+def test_seal_requires_complete_hashed_residual_seam(tmp_path):
+    tokens = tmp_path / "tokens.u32le"
+    tokens.write_bytes(struct.pack("<I", 3))
+    shapes = {
+        "latent.q": [1, 1],
+        "latent.kv": [1, 1],
+        "rope.k": [1, 1],
+        "weight.q_projection": [1, 2, 1],
+        "weight.kv_projection": [1, 2, 1],
+        "weight.output_projection": [2, 1],
+        "residual.prefix": [1, 2],
+        "residual.delta": [1, 2],
+        "residual.ring": [1, 1, 2],
+        "weight.residual_norm": [2],
+        "weight.residual_projection": [2],
+        "weight.post_attention_norm": [2],
+    }
+    rows = []
+    for i, (semantic, shape) in enumerate(shapes.items()):
+        words = [i + 1] * math.prod(shape)
+        rows.append({"semantic": semantic, "dtype": "bf16", "shape": shape,
+                     "file": payload(tmp_path, semantic, words)})
+    state = {
+        "operation": "softmax-rms-residual-mix",
+        "prefix_delta_rounding": "add-f32-round-bf16",
+        "ring_layout": "token-block-hidden",
+        "num_blocks": 1,
+        "block_capacity": 1,
+        "block_write_idx": -1,
+        "score_epsilon": 1e-6,
+        "output_norm_epsilon": 1e-6,
+        "output_norm_input": "mixed-f32",
+    }
+    spec = tmp_path / "seam-spec.json"
+    spec.write_text(json.dumps({
+        "contract": {
+            "dimensions": {"tokens": 1, "heads": 1, "qk_nope": 1,
+                           "qk_rope": 1, "v_head": 1},
+            "layout": "token-head-dense", "causal": True,
+            "softmax_scale": 1.0, "residual_seam": state,
+        },
+        "prompt": {"u32le_file": str(tokens)}, "tensors": rows,
+    }))
+    sealed = tmp_path / "seam.json"
+    subprocess.run([sys.executable, SCRIPT, "seal", "--spec", str(spec),
+                    "--output", str(sealed), "--require-source"], check=True)
+    result = json.loads(sealed.read_text())
+    seam = result["contract"]["residual_seam"]
+    expected = hashlib.sha256(json.dumps(
+        state, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    assert seam["state_sha256"] == expected
+
+    result["tensors"] = [x for x in result["tensors"]
+                         if x["semantic"] != "residual.delta"]
+    broken = tmp_path / "broken.json"
+    broken.write_text(json.dumps(result))
+    check = subprocess.run([sys.executable, SCRIPT, "validate", "--manifest", str(broken)],
+                           text=True, capture_output=True)
+    assert check.returncode != 0
+    assert "incomplete residual seam" in check.stderr
