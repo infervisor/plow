@@ -104,7 +104,7 @@ pub mod tune_demand;
 //   `PLOW_FP8_KV`, `PLOW_FP8_KV_FULL`, `PLOW_MXFP4`, `PLOW_MLA_PREFILL`, `PLOW_MOE_PREFILL`,
 //   `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_ROUTER_OLD` (GLM arm), `GLM_GROUP`;
 // * tuning constants carried in an existing instruction field, read identically by both
-//   interpreters: `PLOW_NS_MUL`, `PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_GLM_GF`, `PLOW_GLM_NS`,
+//   interpreters: `PLOW_NS_MUL`, `PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_GLM_GF`, `PLOW_MLA_NS`,
 //   `PLOW_MAX_CHUNK`, `PLOW_DECODE_BATCH`. (`PLOW_NS_FULL_ABS`'s comment cites an sm_120 part —
 //   that records where it was MEASURED, not a target dependence.)
 // * structure, but geometry-driven rather than ISA-driven: `GLM_EP`, `GLM_MOE_CORESIDENT`,
@@ -392,16 +392,23 @@ pub(crate) fn pick_gemm_emit_plan(
     quant: kernelcaps::QuantScheme,
 ) -> (DevOp, u32, u32) {
     let c8 = tunedb::gemm_rung_emit_plan("128x384x64", quant);
+    // The tagged tile is DERIVED, not configured: an exact BF16 shape takes it when its qualified
+    // TuneDB measurement names c8 the winner AND its grid fills every CU AND it is the ladder-cap
+    // chunk (`MAX_CHUNK_MAX` rows). The row restriction is the network-gate boundary — the c8
+    // promotion (TP8 2026-09-04, exact) served the widest chunk; interior buckets such as
+    // `2048x6144x1536` also win in isolation but were never gated in the network, and an
+    // isolated win is not a promotion.
     let c8 = c8.filter(|plan| {
         let blocks = plan.blocks(m, n);
         emit_is_amd()
             && amd_target::active().1 == hwspec::IsaLevel::Gfx950
             && quant == kernelcaps::QuantScheme::None
+            && m == MAX_CHUNK_MAX
             && m.is_multiple_of(plan.bm)
             && n.is_multiple_of(plan.bn)
             && k.is_multiple_of(plan.bk)
             && blocks == n_cu
-            && emit_config::active().gemm_wide_c8_for(m, n, k)
+            && emit_config::active().gemm_wide_c8
             && gfx950_gemm_measurements().variant_is_winner(
                 m as i64,
                 n as i64,
@@ -6942,7 +6949,6 @@ fn emit_dense_gqa(
         b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
         b.set_lean_moe_combine_segments(amd && emit_config::active().moe_combine_lean);
         b.set_moe_prefill_ep_degree((amd && emit_config::active().moe_prefill_ep).then_some(c.tp));
-        b.set_lean_kda_intra_segments(amd && emit_config::active().kda_intra_cached);
         b.set_kda_intra_wave_items_segments(
             amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
                 && emit_config::active().kda_intra_wave_items,

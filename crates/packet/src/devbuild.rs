@@ -338,9 +338,7 @@ pub struct Builder {
     lean_moe_combine_segments: bool,
     /// Rewrite eligible replicated-input grouped-MoE prefill boundaries to whole-expert/full-I.
     moe_prefill_ep_degree: Option<u32>,
-    /// Isolate BT64/D128 chunk-KDA intra packets for a standalone gfx950 object.
-    lean_kda_intra_segments: bool,
-    /// Mark isolated BT64/D128 chunk-KDA intra packets for the wave-item object.
+    /// Isolate BT64/D128 chunk-KDA intra packets and mark them for the wave-item object.
     kda_intra_wave_items_segments: bool,
     kda_carry_regstate_segments: bool,
     /// Mark the Wu of an exact qpre pair for the lean four-wave gfx950 Wu object.
@@ -572,7 +570,6 @@ impl Builder {
             lean_moe_stage1_segments: false,
             lean_moe_combine_segments: false,
             moe_prefill_ep_degree: None,
-            lean_kda_intra_segments: false,
             kda_intra_wave_items_segments: false,
             kda_carry_regstate_segments: false,
             kda_wu_lean_segments: false,
@@ -706,10 +703,6 @@ impl Builder {
     /// packet the ordinary interpreter would misread.
     pub fn set_moe_prefill_ep_degree(&mut self, degree: Option<u32>) {
         self.moe_prefill_ep_degree = degree.filter(|&n| n > 1);
-    }
-
-    pub fn set_lean_kda_intra_segments(&mut self, enabled: bool) {
-        self.lean_kda_intra_segments = enabled;
     }
 
     pub fn set_kda_intra_wave_items_segments(&mut self, enabled: bool) {
@@ -1943,8 +1936,7 @@ impl Builder {
                 .iter()
                 .any(|op| lean_attn_res_f32mix_inst(&op.inst));
         let kda_intra_wave_items = !uniseg && self.kda_intra_wave_items_segments;
-        let lean_kda_intra = !uniseg
-            && (self.lean_kda_intra_segments || kda_intra_wave_items)
+        let lean_kda_intra = kda_intra_wave_items
             && self.ops.iter().any(|op| {
                 op.inst.op == DevOp::KdaChunkIntra as u16
                     && op.inst.i[0] >= 512
@@ -4889,7 +4881,7 @@ mod lean_kda_intra_tests {
     fn program(enabled: bool, dim: u32) -> Program {
         let mut b = Builder::new(4);
         b.deny_uniseg();
-        b.set_lean_kda_intra_segments(enabled);
+        b.set_kda_intra_wave_items_segments(enabled);
         let tensors: Vec<_> = (0..6).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
         let all = b.all();
         let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});

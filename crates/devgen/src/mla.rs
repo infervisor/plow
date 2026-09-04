@@ -467,7 +467,7 @@ fn require_gf_divides(gf: u32, nh_l: u32, phase: &str) {
 /// MLA flash-decode KV-split count, CTX-ADAPTIVE (mirrors Gemma's PLOW_NS_MUL/ABS). The flash
 /// splits its work into `n_grp*nsplit = (heads/GF)*nsplit` items over 256 CUs; nsplit must fill
 /// the machine (n_grp*nsplit >= n_cu) without over-splitting short contexts (FlashMerge crit-path
-/// busy scales with nsplit). fill_base = ceil(n_cu/n_grp); halve it below 2k ctx. Env PLOW_GLM_NS
+/// busy scales with nsplit). fill_base = ceil(n_cu/n_grp); halve it below 2k ctx. Env PLOW_MLA_NS
 /// pins nsplit directly (occupancy sweeps).
 ///
 /// `heads` MUST be the PER-RANK head count (nh_l = n_head/tp), NOT the global n_head. The kernel
@@ -564,7 +564,7 @@ pub(crate) fn glm_nsplit(ctx: u32, heads: u32) -> u32 {
         .min(kv_tiles)
         .max(1);
     emit_config::active()
-        .glm_ns
+        .mla_ns
         .filter(|&v| v >= 1)
         .unwrap_or(ns)
 }
@@ -979,11 +979,6 @@ struct GlmLW {
     shd: u32,  // shared_experts.down_proj
     ewt: u32,  // expert_weight_table [E*3] u64 device ptrs (loader-filled from bound experts)
     est: u32,  // expert_scale_table  [E*3] u64 device ptrs (block-fp8 scale grids)
-    // PRESHUFFLED twin of `ewt` (PLOW_MOE_PF_SHUF=1, else TENSOR_NONE): pointers into a SECOND
-    // packed slab whose per-projection layout is B'[K/64][R][64], so the grouped prefill GEMM's
-    // per-k-tile B stream is one contiguous 16 KiB block instead of 64 B row-slices at K-stride.
-    // Prefill-only — the decode expert GEMVs keep streaming whole rows from `ewt`'s slab.
-    ewt_pf: u32,
     // Optional gfx950 lean stage-2 companion tables. The loader fills only slot 2 (down) with
     // pointers to the validated shuffled MXFP4 payload/E8M0 layouts. Ordinary row-major tables
     // remain intact for decode and the interpreter fallback.
@@ -1046,9 +1041,6 @@ pub(crate) struct GlmTn {
     attn: u32,
     xmid: u32,
     xn2: u32,
-    /// fp8 twin of xn2 + its per-token f32 scales (PLOW_MOE_PF_A8); TENSOR_NONE otherwise.
-    xn2q: u32,
-    xn2s: u32,
     // MoE activations
     tab: u32,
     rlogit: u32, // router score-GEMV output [n_exp] bf16 (feeds MoeRouterTopk)
@@ -1270,11 +1262,6 @@ pub(crate) fn declare_glm_rows_batched(
     let attn = ac(b, "attn", rows * h as u64 * BF16);
     let xmid = ac(b, "xmid", rows * h as u64 * BF16);
     let xn2 = ac(b, "xn2", rows * h as u64 * BF16);
-    let (xn2q, xn2s) = if rows > 1 && moe_pf_a8() {
-        (ac(b, "xn2q", rows * h as u64), ac(b, "xn2s", rows * F32))
-    } else {
-        (TENSOR_NONE, TENSOR_NONE)
-    };
     // MoE activations. Row-dimensioned ones widen for the prefill FFN (the grouped path is
     // token-sorted, so the routing table, the [T,n_exp] logits, the shared-expert lanes and the
     // per-slot partials all carry T tokens); `fu`/`dfu` are the DECODE per-slot buffers and stay
@@ -1304,20 +1291,15 @@ pub(crate) fn declare_glm_rows_batched(
     // Routed-expert gate/up buffer: full moe_inter width per slot under EP (whole experts), else TP shard.
     let fu = ac(b, "fu", (tk * imoe_e) as u64 * BF16);
     let dfu = ac(b, "dfu", di_l as u64 * BF16);
-    // part16: bf16 at prefill. The DECODE expert ops still write f32 `part` for their single
-    // token — tk*h*F32 bytes, under the prefill bf16 size for every real bucket (rows >= 128) —
-    // so one buffer serves both widths with no cross-program flow through it.
-    let part_w = if moe_pf_part16() { BF16 } else { F32 };
-    // A FUSED 86 -> 87 arm collapses the k per-slot rows into ONE accumulator row per token, so
-    // the prefill side of this allocation drops by k (atomic, f32) or k/2 (det, f64) — 1.611 GB
-    // -> 0.201 / 0.403 GB per rank at T=8192, H=6144, k=8. The size comes from `moe_pf_fuse`,
-    // the SAME function the packet fields come from, because a size that disagreed with the
-    // kernel arm is a silent k-fold heap overrun rather than a fault. The `.max()` term is the
-    // DECODE expert ops, which still write f32 `part` for their single token out of this buffer.
+    // The FUSED 86 -> 87 arm collapses the k per-slot rows into ONE f64 accumulator row per
+    // token, so the prefill side of this allocation drops by k/2 — 1.611 GB -> 0.403 GB per rank
+    // at T=8192, H=6144, k=8. The size comes from `moe_pf_fuse`, the SAME function the packet
+    // fields come from, because a size that disagreed with the kernel arm is a silent k-fold
+    // heap overrun rather than a fault. The `.max()` term is the DECODE expert ops, which still
+    // write f32 `part` for their single token out of this buffer.
     let part_pf = match moe_pf_fuse(tk) {
         MoePfFuse::Det => rows * h as u64 * 8,
-        MoePfFuse::Atomic => rows * h as u64 * F32,
-        MoePfFuse::None => rows * (tk * h) as u64 * part_w,
+        MoePfFuse::None => rows * (tk * h) as u64 * F32,
     };
     let part = ac(b, "part", part_pf.max((tk * h) as u64 * F32));
     // Grouped MoE prefill scratch. `MPF_MAX_ROWS(T,k,n_exp) = T*k + n_exp*(MPF_BM-1)` is the padded
@@ -1732,11 +1714,6 @@ pub(crate) fn declare_glm_rows_batched(
             } else {
                 t(b, "mlp.expert_scale_table", (e * 3) as u64 * 8)
             },
-            ewt_pf: if dense || !emit_config::active().moe_pf_shuf {
-                TENSOR_NONE
-            } else {
-                t(b, "mlp.expert_weight_table_pf", (e * 3) as u64 * 8)
-            },
             _ewt_moe2: if dense
                 || enc != MoeEnc::Mxfp4
                 || imoe_e != 384
@@ -1907,8 +1884,6 @@ pub(crate) fn declare_glm_rows_batched(
         attn,
         xmid,
         xn2,
-        xn2q,
-        xn2s,
         tab,
         rlogit,
         shfu,
@@ -2215,7 +2190,7 @@ fn mla_fold_cus(cus: &[u32], bh: u32, v: u32) -> Vec<u32> {
 ///   work items where GF=4 had 256. Narrowing to 128 stops launching 128 workgroups that grid-
 ///   stride straight past `n_work` and exit — the §6c/L6 shape, pure narrowing, bit-identical —
 ///   but it does NOT recover the parallelism: at GF=8 half the chip has no flash work to do
-///   unless `PLOW_GLM_NS` doubles nsplit. That is the whole GF=8 trade and it is why the arm has
+///   unless `PLOW_MLA_NS` doubles nsplit. That is the whole GF=8 trade and it is why the arm has
 ///   to be measured end-to-end rather than argued from latent bytes.
 fn flash_mla_cus(
     cus: &[u32],
@@ -3250,72 +3225,35 @@ fn xr_band_k(t: u32, seam: &str) -> u32 {
     }
 }
 
-/// `PLOW_MOE_PF_PART16=1`: the grouped MoE prefill's `part` scatter is bf16 instead of f32 —
-/// halves the pair's LARGEST stream (the DOWN scatter + the combine readback; the preshuffle
-/// record's corrected traffic model). Numerics-changing (each expert output rounds to bf16
-/// before the k-way f32 slot sum); the packet carries it in i[7] on ops 86/87 and the loader
-/// refuses objects without the `plow_moe_pf_part16_arm` marker. Decode is untouched — its
-/// expert ops keep writing f32 into the same (larger) buffer.
-fn moe_pf_part16() -> bool {
-    emit_config::active().moe_pf_part16
-}
-
-/// `PLOW_MOE_PF_ATOMIC=1`: FUSE the grouped MoE prefill's ops 86 -> 87. Op 86 stops scattering
-/// `part[T*k, H]` and instead ATOMICALLY ADDS into a `[T, H]` f32 accumulator (the head of the
-/// same `act.part` allocation), op 83 zeroes that accumulator as a prologue, and op 87 runs
-/// UNCHANGED with `k = 1`. Removes `T*k*H*4` written by 86 and the same read by 87 — 1.611 GB
-/// each way per layer per rank at T=8192 — and turns 87's k strided streams into one contiguous
-/// one. Requires a power-of-two top-k (`tok = pidx >> log2(k)`) and an object built with
-/// `-DPLOW_MOE_PF_ATOMIC=1`; the `plow_moe_pf_atomic_arm` marker is what refuses the mismatch.
-/// NUMERICS-CHANGING: the k-way f32 sum happens in atomic-arrival order instead of fixed slot
-/// order, so it is not bit-identical and not run-to-run deterministic. See op_moe.h's header.
-fn moe_pf_atomic() -> bool {
-    emit_config::active().moe_pf_atomic
-}
-
-/// `PLOW_MOE_PF_DET=1`: the DETERMINISTIC form of the same 86 -> 87 fusion. Op 86 accumulates
-/// `rint(gate * value * 2^32)` into a `[T, H]` **f64** accumulator with a device-scope f64
+/// `PLOW_MOE_PF_DET=1`: FUSE the grouped MoE prefill's ops 86 -> 87 deterministically. Op 86
+/// stops scattering `part[T*k, H]` and accumulates `rint(gate * value * 2^32)` into a `[T, H]`
+/// **f64** accumulator (the head of the same `act.part` allocation) with a device-scope f64
 /// atomic; every partial sum is an integer below 2^53, hence exact, hence INDEPENDENT of the
-/// order the k workgroups arrive in. Op 87 reads one contiguous stream and scales by 2^-32.
-/// Costs twice the accumulator bytes of `PLOW_MOE_PF_ATOMIC` and buys run-to-run
-/// bit-reproducibility, which that arm does not have. Requires an object built with
-/// `-DPLOW_MOE_PF_DET=1` (`plow_moe_pf_det_arm`). See op_moe.h's header and
+/// order the k workgroups arrive in. Op 83 zeroes the accumulator as a prologue and op 87 reads
+/// one contiguous stream with `k = 1` and scales by 2^-32. Requires a power-of-two top-k
+/// (`tok = pidx >> log2(k)`) and an object built with `-DPLOW_MOE_PF_DET=1`
+/// (`plow_moe_pf_det_arm`). See op_moe.h's header and
 /// perf-data/plow-gfx942/glm52-moe-deterministic-writer.md.
 fn moe_pf_det() -> bool {
     emit_config::active().moe_pf_det
 }
 
-/// Which fused 86 -> 87 decomposition is in force. ONE function because the `act.part` SIZE and
-/// the packet FIELDS are two halves of the same decision: a sizing that disagreed with the
-/// kernel arm is a silent k-fold heap overrun, which is exactly why the atomic branch left the
-/// allocation alone. `k` must be a power of two (`tok = pidx >> log2(k)`) and, for DET, at most
-/// 16 (the f64 exact-integer bound, op_moe.h MPF_DET_SCALE). part16 excludes both: the
-/// accumulator is f32/f64 by construction, so a bf16 combine would misread it.
+/// Whether the fused 86 -> 87 decomposition is in force. ONE function because the `act.part`
+/// SIZE and the packet FIELDS are two halves of the same decision: a sizing that disagreed with
+/// the kernel arm is a silent k-fold heap overrun. `k` must be a power of two
+/// (`tok = pidx >> log2(k)`) and at most 16 (the f64 exact-integer bound, op_moe.h
+/// MPF_DET_SCALE).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoePfFuse {
     None,
-    Atomic,
     Det,
 }
 pub(crate) fn moe_pf_fuse(tk: u32) -> MoePfFuse {
-    if moe_pf_part16() || tk == 0 || !tk.is_power_of_two() {
-        return MoePfFuse::None;
-    }
-    if moe_pf_det() && tk <= 16 {
+    if moe_pf_det() && tk != 0 && tk.is_power_of_two() && tk <= 16 {
         MoePfFuse::Det
-    } else if moe_pf_atomic() {
-        MoePfFuse::Atomic
     } else {
         MoePfFuse::None
     }
-}
-
-/// `PLOW_MOE_PF_A8=1`: the grouped GLU's gathered activations are fp8 — the post-attention
-/// norm's fused quant (d_rmsnorm t3/t4) writes xn2q + per-token scales, and op 85 reads them
-/// (t6/t7, i[7]=1), halving the gathered-A stream. Numerics-changing; marker-gated like
-/// part16. Block-fp8 experts only (A4W4 owns those operand slots).
-fn moe_pf_a8() -> bool {
-    emit_config::active().moe_pf_a8
 }
 
 fn glm_gf_prefill(ctx: u32, nh_l: u32) -> u32 {
@@ -3969,12 +3907,6 @@ fn emit_glm_mla_prefill(
         d.t[0] = n.xn2;
         d.t[1] = n.xmid;
         d.t[2] = w.gpost;
-        // PLOW_MOE_PF_A8: the fused w8a8 quant epilogue also writes xn2q + per-token scales
-        // for the grouped GLU's fp8 gathered-A arm (bit-identical xn2 either way).
-        if n.xn2q != TENSOR_NONE {
-            d.t[3] = n.xn2q;
-            d.t[4] = n.xn2s;
-        }
         d.i[0] = t;
         d.i[1] = h;
         d.f[0] = eps;
@@ -4067,24 +3999,18 @@ fn emit_glm_block_prefill(
     // 15b router TOP-K tail, block-per-token. Bit-identical PER TOKEN to the decode tail (the kernel
     //     is literally that kernel under a token loop), so the 8-of-384 selection a prefill chunk
     //     makes is the selection decode would have made for the same row.
-    // PLOW_MOE_PF_ATOMIC: this packet also zeroes the [T, H] f32 accumulator op 86 will
-    // atomically add into. It is the earliest packet of the MoE chain (router -> align -> GLU ->
-    // DOWN), so the existing edges already order the zero before every writer — no new packet,
-    // no new gate, and the zero (201 MB at T=8192) rides a packet that is 1.8% of the layer.
-    // `!moe_pf_part16()` is a real exclusion, not tidiness: the accumulator is f32 by
-    // construction (the atomic is an f32 add), so a part16 blob would have op 87 read it as bf16.
+    // PLOW_MOE_PF_DET: this packet also zeroes the [T, H] f64 accumulator op 86 will add into.
+    // It is the earliest packet of the MoE chain (router -> align -> GLU -> DOWN), so the
+    // existing edges already order the zero before every writer — no new packet, no new gate.
     // `tk.is_power_of_two()` is what makes `tok = pidx >> log2(k)` exact.
-    let fuse = moe_pf_fuse(tk);
-    let atom = fuse == MoePfFuse::Atomic;
-    // PLOW_MOE_PF_DET: same decomposition, f64 fixed-point accumulator, order-independent sum.
-    let det = fuse == MoePfFuse::Det;
+    let det = moe_pf_fuse(tk) == MoePfFuse::Det;
     let align_par = emit_config::active().moe_align_par && t >= 1024;
     let router_blocks: Vec<_> = (0..t.min(n_cu)).collect();
     let c_router = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;
         d.t[3] = w.bias;
-        if atom || det {
+        if det {
             d.t[2] = n.part;
             d.i[0] = h;
         }
@@ -4227,17 +4153,13 @@ fn emit_glm_block_prefill(
     // 18 grouped gate/up + GLU over the sorted rows. A is gathered from xn2 by row_token, so an
     //    expert's gate|up crosses HBM ONCE for every token that chose it — the reuse decode cannot
     //    have. i[3] picks the block-fp8 or bf16 weight arm from the same tables decode uses.
-    // PLOW_MOE_PF_SHUF: read the routed weights from the PRESHUFFLED prefill slab (i6=1 tells
-    // the kernel the B'[K/64][R][64] layout). Scales and every other operand are unchanged.
-    let shuf = w.ewt_pf != TENSOR_NONE;
     let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
         d.t[0] = n.fu_g;
         d.t[1] = n.xn2;
-        d.t[2] = if shuf { w.ewt_pf } else { w.ewt };
+        d.t[2] = w.ewt;
         d.t[3] = w.est;
         d.t[4] = n.meta;
         d.t[5] = n.row_token;
-        d.i[6] = u32::from(shuf);
         // A4W4 binds two more: t6 = row_partidx, so the fused bridge can tell a PAD row from a live
         // one and skip it (the bf16/fp8 arms let pad rows fall out in DOWN's scatter instead, but a
         // bridge that quantized them would write E8M0 bytes for rows nothing reads); t7 = the E8M0
@@ -4245,12 +4167,6 @@ fn emit_glm_block_prefill(
         if enc == MoeEnc::Mxfp4 {
             d.t[6] = n.row_partidx;
             d.t[7] = n.fu_scale;
-        }
-        // PLOW_MOE_PF_A8 (block-fp8 experts only — A4W4 owns t6/t7): fp8 gathered A.
-        if enc == MoeEnc::Fp8Blk && n.xn2q != TENSOR_NONE {
-            d.t[6] = n.xn2q;
-            d.t[7] = n.xn2s;
-            d.i[7] = 1;
         }
         d.i[0] = imoe_e;
         d.i[1] = h;
@@ -4264,10 +4180,9 @@ fn emit_glm_block_prefill(
     let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
         d.t[0] = n.part;
         d.t[1] = n.fu_g;
-        d.t[2] = if shuf { w.ewt_pf } else { w.ewt };
+        d.t[2] = w.ewt;
         d.t[3] = w.est;
         d.t[4] = n.meta;
-        d.i[6] = u32::from(shuf);
         // t5 = the E8M0 rows the bridge wrote — DOWN's A operand is fp4 + these, so under A4W4 the
         // activation never returns to bf16 between the two GEMMs.
         if enc == MoeEnc::Mxfp4 {
@@ -4279,14 +4194,10 @@ fn emit_glm_block_prefill(
         d.i[1] = imoe_e;
         d.i[2] = e;
         d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[7] = u32::from(moe_pf_part16()); // bf16 part scatter
-                                             // PLOW_MOE_PF_ATOMIC: log2(k)+1. `row_partidx[row] == token*k + slot` (d_moe_align_pf),
-                                             // so the epilogue recovers the token with one shift and adds into acc[token][H].
-        if atom {
-            d.i[4] = tk.trailing_zeros() + 1;
-        }
-        // PLOW_MOE_PF_DET: the SAME log2(k)+1, in a DIFFERENT field, so an object carrying one
-        // arm can never read a blob emitted for the other as its own.
+        // PLOW_MOE_PF_DET: log2(k)+1 in i[5]. `row_partidx[row] == token*k + slot`
+        // (d_moe_align_pf), so the epilogue recovers the token with one shift and adds into
+        // acc[token][H]. i[4] was the retired atomic arm's field; an object carrying one arm can
+        // never read a blob emitted for the other as its own.
         if det {
             d.i[5] = tk.trailing_zeros() + 1;
         }
@@ -4326,13 +4237,12 @@ fn emit_glm_block_prefill(
                     d.t[2] = n.shared;
                     d.t[3] = n.part;
                     d.i[0] = h;
-                    // PLOW_MOE_PF_ATOMIC: op 86 already summed the k slots in place, so this
-                    // reads ONE contiguous f32 stream. Same kernel, same expression, k = 1.
-                    d.i[1] = if atom || det { 1 } else { tk };
+                    // PLOW_MOE_PF_DET: op 86 already summed the k slots in place, so this
+                    // reads ONE contiguous stream. Same kernel, same expression, k = 1.
+                    d.i[1] = if det { 1 } else { tk };
                     d.i[2] = rows;
                     d.i[3] = i * rows; // t_row0
                     d.i[4] = u32::from(det); // f64 fixed-point accumulator (PLOW_MOE_PF_DET)
-                    d.i[7] = u32::from(moe_pf_part16());
                 });
                 // `n.slot_b`, NOT `t * h * 2`: the offset is a property of the BLOB (where
                 // the host binds `act.dg_tp`), not of this bucket. See GlmTn.
@@ -4369,10 +4279,9 @@ fn emit_glm_block_prefill(
             d.t[2] = n.shared;
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if atom || det { 1 } else { tk }; // see the banded twin
+            d.i[1] = if det { 1 } else { tk }; // see the banded twin
             d.i[2] = t;
             d.i[4] = u32::from(det); // see the banded twin
-            d.i[7] = u32::from(moe_pf_part16());
         })
     }
 }
@@ -4498,12 +4407,6 @@ fn emit_glm_dense_block_prefill(
         d.t[3] = w.dst;
         d.t[4] = n.meta;
         d.t[5] = n.row_token;
-        // PLOW_MOE_PF_A8: same fp8 gathered-A arm as the routed GLU (dense = 1-expert routing).
-        if enc == MoeEnc::Fp8Blk && n.xn2q != TENSOR_NONE {
-            d.t[6] = n.xn2q;
-            d.t[7] = n.xn2s;
-            d.i[7] = 1;
-        }
         d.i[0] = di_l;
         d.i[1] = h;
         d.i[2] = DENSE_N_EXP;
@@ -4524,7 +4427,6 @@ fn emit_glm_dense_block_prefill(
         d.i[1] = di_l;
         d.i[2] = DENSE_N_EXP;
         d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[7] = u32::from(moe_pf_part16()); // bf16 part scatter
     });
     // Combine. Identical TP structure to the MoE prefill block: under TP the partial is combined
     // with a ZERO residual, two-shot all-reduced, and the real residual added after — folding xmid
@@ -4539,7 +4441,6 @@ fn emit_glm_dense_block_prefill(
             d.i[0] = h;
             d.i[1] = DENSE_TOP_K;
             d.i[2] = t;
-            d.i[7] = u32::from(moe_pf_part16());
         });
         // `n.slot_b`, NOT `t * h * 2`: the offset is a property of the BLOB (where the host binds
         // `act.dg_tp`), not of this bucket. See the field's header on GlmTn.
@@ -4576,7 +4477,6 @@ fn emit_glm_dense_block_prefill(
             d.i[0] = h;
             d.i[1] = DENSE_TOP_K;
             d.i[2] = t;
-            d.i[7] = u32::from(moe_pf_part16());
         })
     }
 }
@@ -4879,14 +4779,12 @@ fn emit_glm_moe_ffn_rows(
         d.i[2] = h;
         d.f[0] = 1.0;
     });
-    let fuse = moe_pf_fuse(tk);
-    let atom = fuse == MoePfFuse::Atomic;
-    let det = fuse == MoePfFuse::Det;
+    let det = moe_pf_fuse(tk) == MoePfFuse::Det;
     let c_router = b.emit(DevOp::MoeRouterTopkPf, all.clone(), &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;
         d.t[3] = w.bias;
-        if atom || det {
+        if det {
             d.t[2] = n.part;
             d.i[0] = h;
         }
@@ -5017,16 +4915,14 @@ fn emit_glm_moe_ffn_rows(
     };
 
     // Grouped gate/up + down over the sorted (row, expert) slots — the prefill pair verbatim
-    // at T = rows, minus the A8 arm (see the header).
-    let shuf = w.ewt_pf != TENSOR_NONE;
+    // at T = rows.
     let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_rn2], |d| {
         d.t[0] = n.fu_g;
         d.t[1] = n.xn2;
-        d.t[2] = if shuf { w.ewt_pf } else { w.ewt };
+        d.t[2] = w.ewt;
         d.t[3] = w.est;
         d.t[4] = n.meta;
         d.t[5] = n.row_token;
-        d.i[6] = u32::from(shuf);
         if enc == MoeEnc::Mxfp4 {
             d.t[6] = n.row_partidx;
             d.t[7] = n.fu_scale;
@@ -5040,7 +4936,7 @@ fn emit_glm_moe_ffn_rows(
     let c_d = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[c_g], |d| {
         d.t[0] = n.part;
         d.t[1] = n.fu_g;
-        d.t[2] = if shuf { w.ewt_pf } else { w.ewt };
+        d.t[2] = w.ewt;
         d.t[3] = w.est;
         d.t[4] = n.meta;
         if enc == MoeEnc::Mxfp4 {
@@ -5052,10 +4948,6 @@ fn emit_glm_moe_ffn_rows(
         d.i[1] = imoe_e;
         d.i[2] = e;
         d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[7] = u32::from(moe_pf_part16());
-        if atom {
-            d.i[4] = tk.trailing_zeros() + 1;
-        }
         if det {
             d.i[5] = tk.trailing_zeros() + 1;
         }
@@ -5071,11 +4963,10 @@ fn emit_glm_moe_ffn_rows(
             d.t[2] = n.shared;
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if atom || det { 1 } else { tk };
+            d.i[1] = if det { 1 } else { tk };
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
-            d.i[7] = u32::from(moe_pf_part16());
         });
         let c_xr = emit_xreduce(
             b,
@@ -5115,11 +5006,10 @@ fn emit_glm_moe_ffn_rows(
             d.t[2] = n.shared;
             d.t[3] = n.part;
             d.i[0] = h;
-            d.i[1] = if atom || det { 1 } else { tk };
+            d.i[1] = if det { 1 } else { tk };
             d.i[2] = rows;
             d.i[3] = 0;
             d.i[4] = u32::from(det);
-            d.i[7] = u32::from(moe_pf_part16());
         })
     }
 }
@@ -5767,7 +5657,6 @@ fn emit_glm_dense_ffn_rows(
         d.i[1] = di_l;
         d.i[2] = DENSE_N_EXP;
         d.i[MoeEnc::PREFILL_SLOT] = enc.code();
-        d.i[7] = u32::from(moe_pf_part16());
     });
     let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
@@ -5779,7 +5668,6 @@ fn emit_glm_dense_ffn_rows(
             d.i[0] = h;
             d.i[1] = DENSE_TOP_K;
             d.i[2] = rows;
-            d.i[7] = u32::from(moe_pf_part16());
         });
         let c_xr = emit_xreduce(
             b,
@@ -5821,7 +5709,6 @@ fn emit_glm_dense_ffn_rows(
             d.i[0] = h;
             d.i[1] = DENSE_TOP_K;
             d.i[2] = rows;
-            d.i[7] = u32::from(moe_pf_part16());
         })
     }
 }
@@ -5859,7 +5746,7 @@ fn glm_emit_full(
     // --glm-layers cap truncates the model to the first N layers — a single-GPU smoke test of the
     // decode LOOP mechanics (embed/chain/KV-row patch/argmax/multi-step) that fits without TP or
     // all 78 layers' weights. Default = full 0..77 (layer 78 = MTP, skipped).
-    let (_full, cap, _single) = emit_config::active().glm_layer_cfg();
+    let (_full, cap, _single) = emit_config::active().layer_cfg();
     let nl = cap.unwrap_or(c.layers).min(c.layers);
     let layers: Vec<u32> = (0..nl).collect();
     let enc = MoeEnc::from_flags(use_fp8, false);
@@ -6245,7 +6132,7 @@ pub(crate) fn glm_main(
     let enc = mla_moe_enc_env(dir);
     let use_fp8 = enc == MoeEnc::Fp8Blk;
     // Full 78-layer serving decode program (GLM_FULL=1) vs the single-layer validation gate (default).
-    let (glm_full, _glm_cap, glm_single) = emit_config::active().glm_layer_cfg();
+    let (glm_full, _glm_cap, glm_single) = emit_config::active().layer_cfg();
     if glm_full {
         glm_emit_full(
             dir, ctx, out, n_cu, tp, use_fp8, rope_gen, target, l2_layout, verify,

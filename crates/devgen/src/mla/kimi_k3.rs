@@ -794,7 +794,7 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
               deliberately refuses operators its bridge cannot execute; phase-object experiments \
               consume this production devblob graph instead of duplicating hybrid lowering."
             .into(),
-        fix: "Use `crates/devgen/src/mla/kimi_k3.rs::k3_emit_full`. `PLOW_K3_LAYERS=N` \
+        fix: "Use `crates/devgen/src/mla/kimi_k3.rs::k3_emit_full`. `PLOW_LAYERS=N` \
               provides a cheap hybrid prefix; graph-derived phase/EP transforms are packet \
               rewrites and contain no model-name predicate.",
         done: Some(
@@ -1021,7 +1021,7 @@ const K3_INDIRECT: &[&str] = &[
 ];
 
 fn k3_emit_layers(c: &K3Cfg) -> Vec<u32> {
-    let (_full, cap, single) = emit_config::active().k3_layer_cfg();
+    let (_full, cap, single) = emit_config::active().layer_cfg();
     if let Some(layer) = single {
         assert!(
             layer < c.layers,
@@ -1085,10 +1085,10 @@ fn k3_ablate_bodies(m: &mut Model) {
 ///
 /// It is NOT a free widening: `MlaMergeFold` reduces over the `nsplit` partials, so the merge grows
 /// as the flash shrinks and the net is a U-shape whose minimum `mla.rs`'s own `NS_CEIL_MEASURED`
-/// note records as UNSWEPT at TP8. `PLOW_K3_NS` is therefore the sweep handle and the default is
+/// note records as UNSWEPT at TP8. `PLOW_MLA_NS` is therefore the sweep handle and the default is
 /// the measured winner; do not change the default without re-running the sweep.
 fn k3_nsplit_fallback(ctx: u32) -> u32 {
-    if let Some(v) = emit_config::active().k3_ns {
+    if let Some(v) = emit_config::active().mla_ns {
         return v.max(1);
     }
     let _ = ctx;
@@ -1221,7 +1221,7 @@ fn k3_build_model(
         let local_heads = c.heads / tp.max(1);
         let shape = format!("mla/dk{}/dr{}/h{}/gf4", c.kv_lora, c.qk_rope, local_heads);
         mcfg.mla.gf = 4;
-        mcfg.mla.n_split = if emit_config::active().k3_ns.is_some() {
+        mcfg.mla.n_split = if emit_config::active().mla_ns.is_some() {
             fallback_ns
         } else {
             crate::select_amd_attention(n_cu, t, ctx, shape, fallback_ns, fallback_ns).nsplit
@@ -1320,9 +1320,6 @@ fn k3_build_model(
         );
         b.set_moe_prefill_ep_degree(
             (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(tp),
-        );
-        b.set_lean_kda_intra_segments(
-            crate::emit_is_amd() && emit_config::active().kda_intra_cached,
         );
         b.set_kda_intra_wave_items_segments(
             crate::emit_is_amd()
@@ -2061,7 +2058,7 @@ mod kimi_k3_tests {
             let _scope = crate::test_env::EnvScope::set(&[
                 ("PLOW_DECODE_BATCH_LADDER", "1,8"),
                 ("PLOW_TUNEDB", &dbs),
-                ("PLOW_K3_NS", "7"),
+                ("PLOW_MLA_NS", "7"),
             ]);
             k3_build_model(&d, 8192, 256, 2, &[], None)
         };
@@ -2106,7 +2103,7 @@ mod kimi_k3_tests {
     #[test]
     fn k3_lean_moe_defaults_are_applied_to_prefill_builders() {
         let _guard = crate::test_env::env_guard();
-        let _scope = crate::test_env::EnvScope::set(&[("PLOW_K3_LAYERS", "2")]);
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_LAYERS", "2")]);
         let d = k3_dir("stage1_lean");
         let cfg = k3_json(&[
             ("text_config/hidden_size", "7168"),

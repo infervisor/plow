@@ -498,37 +498,6 @@ pub(crate) fn shard_up_proj(tp: u32) -> bool {
     tp > 1
 }
 
-/// BISECTION INSTRUMENTS for the column-parallel up projection. Neither is a serving mode.
-///
-/// The shard has two independent halves — a SLICED WEIGHT and a GATHERED partial — and when
-/// the output is wrong, "which half" is the only question worth asking. Each knob keeps one
-/// half and removes the other, so the answer is one run each:
-///
-/// * `PLOW_K3_UP_NOGATHER=1` — slice the weight, write the peer slot, and DO NOT gather.
-///   `ffn` then loses the routed-expert path entirely. If the output equals the sharded
-///   one, the gather is contributing nothing at runtime.
-/// * `PLOW_K3_UP_GATHER_ONLY=1` — keep the weight REPLICATED (so every rank computes the
-///   WHOLE `yh`) but still route it through the peer slot and the gather. The gather indexes
-///   each owner's slot COMPACTLY, so what it assembles is `yh[e % gcols]` tiled — wrong by
-///   construction, and that is the point: it is nonzero and structurally unrelated to the
-///   sharded answer, so it separates "the gather never ran" from "the gather ran".
-///
-/// HOW THE TWO READ, and this is the reason to write them down rather than re-derive them:
-/// on the real checkpoint (24 steps, `1008,10484,318,15383,387`) the replicated emit answers
-/// ". The population is approximately 67 million people. …", `nogather` answers
-/// "6. 2. 2. 2. …" and `gather_only` answers "\n The \n The …" — both controls collapse
-/// completely, while the SHARDED emit stayed grammatical. That gap is what said the peer
-/// path was intact and the error was arithmetic, which is how the missing bf16 round in
-/// `d_xreduce`'s gather arm was found.
-///
-/// Neither knob is a serving mode. They exist because the alternative was guessing.
-fn up_nogather() -> bool {
-    crate::emit_config::active().k3_up_nogather
-}
-fn up_gather_only() -> bool {
-    crate::emit_config::active().k3_up_gather_only
-}
-
 /// `PLOW_K3_SHARD_HEAD=1` — vocab-column-parallel `lm_head`, and this rank's slice of the vocab.
 ///
 /// The replicated default streams the FULL `vocab * hidden` bf16 table on EVERY rank EVERY step:
@@ -1107,7 +1076,6 @@ pub fn emit_k3_latent_moe(
         crate::mla::MoePfFuse::None
     };
     let part_pf = match pf_fuse {
-        crate::mla::MoePfFuse::Atomic => tt * lat as u64 * 4,
         crate::mla::MoePfFuse::Det => tt * lat as u64 * 8,
         crate::mla::MoePfFuse::None => tt * c.top_k as u64 * lat as u64 * 4,
     };
@@ -1324,7 +1292,6 @@ pub fn emit_k3_latent_moe(
             }
         }
     } else {
-        let atom = pf_fuse == crate::mla::MoePfFuse::Atomic;
         let det = pf_fuse == crate::mla::MoePfFuse::Det;
         // The grouped arrays are sized on the MPF_BM-PADDED row bound: the align op rounds each
         // expert's row range up to a whole tile, so every expert can waste up to MPF_BM-1 rows.
@@ -1368,7 +1335,7 @@ pub fn emit_k3_latent_moe(
             d.t[0] = tab_wr;
             d.t[1] = logit_rd;
             d.t[3] = w.router_bias;
-            if atom || det {
+            if det {
                 d.t[2] = part;
                 d.i[0] = lat;
             }
@@ -1471,9 +1438,6 @@ pub fn emit_k3_latent_moe(
             d.i[1] = imoe;
             d.i[2] = c.n_exp;
             d.i[crate::mla::MoeEnc::PREFILL_SLOT] = c.enc;
-            if atom {
-                d.i[4] = c.top_k.trailing_zeros() + 1;
-            }
             if det {
                 d.i[5] = c.top_k.trailing_zeros() + 1;
             }
@@ -1484,7 +1448,7 @@ pub fn emit_k3_latent_moe(
             d.t[0] = cmb_dst;
             d.t[3] = part;
             d.i[0] = lat;
-            d.i[1] = if atom || det { 1 } else { c.top_k };
+            d.i[1] = if det { 1 } else { c.top_k };
             d.i[2] = t;
             d.i[4] = u32::from(det);
         })
@@ -1562,14 +1526,9 @@ pub fn emit_k3_latent_moe(
     // an all-gather. That gather is folded into the shared expert's existing all-reduce
     // below — one packet, one rendezvous, for both — because the two results are ADDED.
     let shard_up = shard_up_proj(tp.tp);
-    // `hid_l` is the GATHER's per-rank column count; `up_n` is what the GEMV computes. They
-    // differ only under `PLOW_K3_UP_GATHER_ONLY`, which keeps the weight whole on purpose.
+    // `hid_l` is both the GATHER's per-rank column count and what the GEMV computes.
     let hid_l = if shard_up { tp.local(hid) } else { hid };
-    let up_n = if shard_up && !up_gather_only() {
-        hid_l
-    } else {
-        hid
-    };
+    let up_n = hid_l;
     let up_dst = if shard_up { tp.ug } else { yh };
     let c_up = emit_k3_linear_norm(
         b,
@@ -1723,7 +1682,7 @@ pub fn emit_k3_latent_moe(
         // The next layer's pre-attention AttnRes reads `out` as a band and publishes `h_a`.
         if sp_x.is_some() {
             let p = resid_in.expect("sequence-parallel seams need the folded block residual");
-            let gather = (!up_nogather()).then_some((tp.slot_c(), hid_l));
+            let gather = Some((tp.slot_c(), hid_l));
             let c_rs = crate::emit_xreduce_scatter(
                 b,
                 &mut tp.xgate,
@@ -1750,11 +1709,7 @@ pub fn emit_k3_latent_moe(
         // the collective lands in `shd`. Without it, the collective already IS the answer and
         // writes `out` directly — one packet fewer than the replicated emit, not one more.
         let ffn = if resid_in.is_some() { shd } else { out };
-        let gather = if up_nogather() {
-            None
-        } else {
-            Some((tp.slot_c(), hid_l, hid))
-        };
+        let gather = Some((tp.slot_c(), hid_l, hid));
         c_sd = crate::emit_xreduce_gather(
             b,
             &mut tp.xgate,
@@ -3700,7 +3655,7 @@ pub fn declare_k3_moe_weights(b: &mut Builder, c: &K3MoeCfg, lp: &str, tp: u32) 
         // for why COLUMN is the only axis available and why the gather is free.
         up_latent: b.tensor(
             &n("routed_expert_up_proj.weight"),
-            if shard_up_proj(tp) && !up_gather_only() {
+            if shard_up_proj(tp) {
                 tp_local(c.hidden)
             } else {
                 c.hidden as u64
@@ -5411,7 +5366,7 @@ mod tests {
     }
 
     #[test]
-    fn c8_exact_shape_is_explicit_and_opts_out_in_the_packet() {
+    fn c8_is_measurement_derived_and_opts_out_in_the_packet() {
         let _guard = crate::test_env::env_guard();
         crate::set_amd_target("MI350X");
         let emit = |m: u32, n: u32, k: u32| {
@@ -5424,7 +5379,7 @@ mod tests {
         };
 
         {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "none")]);
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", "0")]);
             let inst = emit(8192, 1536, 7168);
             assert_eq!(
                 inst.pack(),
@@ -5447,23 +5402,16 @@ mod tests {
             assert_eq!(inst.blocks, 256);
         }
         {
-            let _scope =
-                crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "8192x1536x7168")]);
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", "1")]);
             let inst = emit(8192, 1536, 7168);
             assert_eq!(inst.op, DevOp::GemmWide as u16);
             assert_eq!(inst.i[7], packet::dev::GEMM_WIDE_C8_TAG);
             assert_eq!(inst.blocks, 256, "64x4 c8 tiles must emit the exact grid");
 
             let other = emit(4096, 1536, 7168);
-            assert_eq!(other.i[7], 0, "the opt-in is exact-shape, not model-wide");
-        }
-        {
-            let _scope =
-                crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "4096x1536x7168")]);
-            let inst = emit(4096, 1536, 7168);
             assert_eq!(
-                inst.i[7], 0,
-                "a 128-tile grid must not claim the 256-CU c8 arm"
+                other.i[7], 0,
+                "a 128-tile grid has no qualified winner and must not claim the 256-CU c8 arm"
             );
         }
     }
@@ -5473,8 +5421,8 @@ mod tests {
         let _guard = crate::test_env::env_guard();
         crate::set_amd_target("MI350X");
         let buckets = [128, 512, 1024, 2048, 4096, 8192];
-        let emit = |shape: &str| {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", shape)]);
+        let emit = |c8: &str| {
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", c8)]);
             crate::tune_demand::reset_tally();
             crate::tune_demand::start_recording();
             let programs: Vec<_> = buckets.iter().map(|&t| build_full_t(8, t)).collect();
@@ -5496,9 +5444,8 @@ mod tests {
             )
         };
 
-        let (control, control_census, control_lookups, control_manifest) = emit("none");
-        let (candidate, candidate_census, candidate_lookups, candidate_manifest) =
-            emit("8192x1536x7168");
+        let (control, control_census, control_lookups, control_manifest) = emit("0");
+        let (candidate, candidate_census, candidate_lookups, candidate_manifest) = emit("1");
         assert_eq!(control_census, (7650, 7650));
         assert_eq!(candidate_census, control_census);
         for manifest in [&control_manifest, &candidate_manifest] {
@@ -5742,69 +5689,9 @@ mod tests {
     }
 
     #[test]
-    fn atomic_k3_grouped_prefill_sets_packets_and_manifest_requirement() {
-        let _guard = crate::test_env::env_guard();
-        let _scope = crate::test_env::EnvScope::set(&[
-            ("PLOW_MOE_PF_ATOMIC", "1"),
-            ("PLOW_MOE_PF_DET", "0"),
-        ]);
-        let p = build_full_t(1, 512);
-        let router = p
-            .insts
-            .iter()
-            .find(|i| i.op == DevOp::MoeRouterTopkPf as u16)
-            .unwrap();
-        let down = p
-            .insts
-            .iter()
-            .find(|i| i.op == DevOp::MoeGroupDownPf as u16)
-            .unwrap();
-        let combine = p
-            .insts
-            .iter()
-            .find(|i| i.op == DevOp::MoeCombinePf as u16)
-            .unwrap();
-        assert_eq!(router.t[2], down.t[0], "router zeros DOWN's accumulator");
-        assert_eq!(router.i[0], 3584, "the accumulator is at latent width");
-        assert_eq!(
-            down.i[4],
-            model_cfg().moe.top_k.trailing_zeros() + 1,
-            "log2(top_k) + 1 arms atomic scatter"
-        );
-        assert_eq!(down.i[5], 0, "the deterministic arm stays disjoint");
-        assert_eq!(combine.i[1], 1, "combine reads one accumulated row");
-        assert_eq!(combine.i[4], 0, "the accumulator contains f32");
-
-        let m = packet::devbuild::Model {
-            n_cu: 256,
-            target: 0,
-            tensors: p.tensors.clone(),
-            progs: vec![p],
-            kv_row_insts: Vec::new(),
-            prog_t: vec![512],
-            gen: Vec::new(),
-        };
-        let manifest = crate::manifest::build(&m, "gfx950", &crate::LeanReport::default());
-        assert_eq!(
-            manifest.pointer("/features/moe_pf_atomic"),
-            Some(&serde_json::Value::Bool(true))
-        );
-        let requires = manifest
-            .pointer("/backends/gfx950/requires")
-            .and_then(serde_json::Value::as_array)
-            .unwrap();
-        assert!(requires
-            .iter()
-            .any(|v| v.as_str() == Some("PLOW_MOE_PF_ATOMIC=1")));
-    }
-
-    #[test]
     fn deterministic_k3_grouped_prefill_sets_f64_packets_and_manifest_requirement() {
         let _guard = crate::test_env::env_guard();
-        let _scope = crate::test_env::EnvScope::set(&[
-            ("PLOW_MOE_PF_ATOMIC", "0"),
-            ("PLOW_MOE_PF_DET", "1"),
-        ]);
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_PF_DET", "1")]);
         let t = 512u32;
         let p = build_full_t(1, t);
         let router = p
