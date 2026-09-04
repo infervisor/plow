@@ -320,6 +320,8 @@ pub struct Builder {
     uniseg_denied: bool,
     /// See [`Builder::force_uniseg`].
     uniseg_forced: bool,
+    /// See [`Builder::set_gq_order_asap`]. Default from `PLOW_GQ_ORDER=asap`.
+    gq_order_asap: bool,
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
     packed_prefill_segments: bool,
@@ -496,6 +498,7 @@ impl Builder {
             place_l2: None,
             uniseg_denied: false,
             uniseg_forced: false,
+            gq_order_asap: std::env::var("PLOW_GQ_ORDER").ok().as_deref() == Some("asap"),
             packed_prefill_segments: false,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
@@ -540,6 +543,44 @@ impl Builder {
     /// whose meaning depends on the backend cannot be resolved in a backend-agnostic builder.
     pub fn deny_uniseg(&mut self) {
         self.uniseg_denied = true;
+    }
+
+    /// Order each global-queue window by EARLIEST START instead of emit order (`PLOW_GQ_ORDER=asap`).
+    ///
+    /// The global queue hands out entries in stream order and a workgroup that claims a gated
+    /// entry SPINS on it. Emit order is topological but not ready-ordered: K3's decode emits the
+    /// shared-expert `GemvGlu -> Gemv` (ready the moment `AttnRes` lands) AFTER the routed chain
+    /// `MoeRouterTopk -> MoeGroupGlu -> MoeGroupDown -> MoeCombine -> XReduce -> Gemv`, so all 256
+    /// workgroups claim the routed slices and spin through the 22 us router while the shared
+    /// expert — which could have run entirely under that spin — waits for them, and the layer's
+    /// closing `XReduce` waits for the shared expert. MEASURED (gfx950 TP8, one-token trace,
+    /// `scripts/k3_trace_wg.py`): 24.2 us/layer x 92 MoE layers = 2.2 ms/token of critical path.
+    ///
+    /// Ranks are a unit-cost list schedule: `start(op) = max over producers (start + cost)`,
+    /// cost 1 per op and 3 for a single-workgroup op (the b=1 router/AttnRes bodies are 2-3
+    /// GEMV bodies long). Every window is STABLE-sorted by rank, so ties keep emit order and a
+    /// consumer's rank is strictly above every producer's: the per-window order stays
+    /// topological, which is what the queue's deadlock-freedom argument (interp.hip, the
+    /// `gq_claim` note) needs. Nothing else moves — static streams, counters, and the segment
+    /// windows are untouched.
+    pub fn set_gq_order_asap(&mut self, on: bool) {
+        self.gq_order_asap = on;
+    }
+
+    fn gq_asap_ranks(&self) -> Vec<u32> {
+        let mut start = vec![0u32; self.ops.len()];
+        for i in 0..self.ops.len() {
+            let mut s = 0u32;
+            for d in &self.ops[i].deps {
+                let p = d.producer() as usize;
+                if p < i {
+                    let cost = if self.ops[p].inst.blocks <= 1 { 3 } else { 1 };
+                    s = s.max(start[p] + cost);
+                }
+            }
+            start[i] = s;
+        }
+        start
     }
 
     /// T18: force this program to ONE segment regardless of `PLOW_UNISEG`. Set by devgen on
@@ -2405,11 +2446,21 @@ impl Builder {
 
         // Group by ordered kernel-family segment, then L2 domain. A stable sort preserves
         // op-major order within each window; cross-window deps remain counter-gated.
+        // With `gq_order_asap`, each window is ordered by earliest-start rank instead (see
+        // `set_gq_order_asap`); ties keep op-major order and the order stays topological.
+        let asap = if self.gq_order_asap {
+            Some(self.gq_asap_ranks())
+        } else {
+            None
+        };
+        let rank = |e: &StreamEnt| asap.as_ref().map_or(0, |a| a[e.inst as usize]);
         if let Some(l) = l2_place {
             gq_stream.sort_by_key(|e| {
                 let domain = (e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT;
-                e.seg as u32 * l.domains + domain as u32
+                (e.seg as u32 * l.domains + domain as u32, rank(e))
             });
+        } else if asap.is_some() {
+            gq_stream.sort_by_key(|e| (e.seg, rank(e)));
         }
 
         // PER-(PACKET, DOMAIN) SLICE COUNT, for the two-level cache-maintenance rendezvous
@@ -3780,6 +3831,60 @@ mod l2_placement_tests {
             vec![32; 8],
             "round-robin over 256 slices must not skew"
         );
+    }
+
+    /// K3's MoE layer shape: a b=1 router chain emitted BEFORE an independent shared-expert pair
+    /// that was ready earlier. ASAP ordering must hoist the pair ahead of the gated chain in
+    /// every XCD window, keep every window topological, and leave the static streams alone.
+    #[test]
+    fn gq_asap_order_hoists_ready_packets_ahead_of_gated_ones() {
+        let l = L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::RoundRobin,
+        };
+        let emit = |asap: bool| {
+            let mut b = Builder::new(256);
+            b.set_l2_placement(Some(l));
+            b.deny_uniseg();
+            b.set_gq_order_asap(asap);
+            let all: Vec<u32> = (0..256).collect();
+            let attn = b.emit(DevOp::AttnRes, vec![0], &[], |_| {});
+            let router = b.emit(DevOp::MoeRouterTopk, vec![0], &[attn], |_| {});
+            let glu = b.emit(DevOp::MoeGroupGluFp8Blk, all.clone(), &[router], |_| {});
+            let down = b.emit(DevOp::MoeGroupDownFp8Blk, all.clone(), &[glu], |_| {});
+            let sh_glu = b.emit(DevOp::GemvGlu, all.clone(), &[attn], |_| {});
+            let sh_down = b.emit(DevOp::Gemv, all.clone(), &[sh_glu], |_| {});
+            b.emit(DevOp::XReduce, all, &[down, sh_down], |_| {});
+            (b.finish(), [attn, router, glu, down, sh_glu, sh_down])
+        };
+        let (base, _) = emit(false);
+        let (p, ids) = emit(true);
+        assert_eq!(p.stream, base.stream, "static streams must not move");
+        assert_eq!(p.gq_seg_ofs, base.gq_seg_ofs, "windows must not move");
+        let [_, _, glu, down, sh_glu, sh_down] = ids;
+        for w in 0..p.gq_seg_ofs.len() - 1 {
+            let win = &p.gq_stream[p.gq_seg_ofs[w] as usize..p.gq_seg_ofs[w + 1] as usize];
+            let pos = |inst: u32| win.iter().position(|e| e.inst == inst);
+            if let (Some(a), Some(g)) = (pos(sh_glu), pos(glu)) {
+                assert!(a < g, "window {w}: shared GemvGlu must precede the gated MoeGroupGlu");
+            }
+            if let (Some(a), Some(g)) = (pos(sh_down), pos(glu)) {
+                assert!(a < g, "window {w}: shared down Gemv must precede the gated MoeGroupGlu");
+            }
+            if let (Some(a), Some(g)) = (pos(sh_glu), pos(sh_down)) {
+                assert!(a < g, "window {w}: producer before consumer");
+            }
+            if let (Some(a), Some(g)) = (pos(glu), pos(down)) {
+                assert!(a < g, "window {w}: producer before consumer");
+            }
+        }
+        // Same multiset of entries, just permuted.
+        let mut x: Vec<_> = p.gq_stream.iter().map(|e| (e.inst, e.slice)).collect();
+        let mut y: Vec<_> = base.gq_stream.iter().map(|e| (e.inst, e.slice)).collect();
+        x.sort();
+        y.sort();
+        assert_eq!(x, y);
     }
 
     /// NVIDIA. Consecutive blocks fill a GPC, so the block formula stands — and this test is
