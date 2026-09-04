@@ -1365,12 +1365,22 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
     let mut objects = object_inventory(&progs, arch);
     let kda_intra_wave_items_required = m.progs.iter().any(|p| {
-        p.stream
-            .iter()
-            .any(|e| e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0)
+        p.stream.iter().any(|e| {
+            e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0
+                && p.insts.get(e.inst as usize).map(|d| d.op) == Some(DevOp::KdaChunkIntra as u16)
+        })
     });
     objects["lean"]["kda_intra_wave_items"] = json!({
         "required": kda_intra_wave_items_required,
+    });
+    let kda_carry_regstate_required = m.progs.iter().any(|p| {
+        p.stream.iter().any(|e| {
+            e.flags & packet::dev::SE_KDA_CARRY_REGSTATE != 0
+                && p.insts.get(e.inst as usize).map(|d| d.op) == Some(DevOp::KdaChunkCarry as u16)
+        })
+    });
+    objects["lean"]["kda_carry_regstate"] = json!({
+        "required": kda_carry_regstate_required,
     });
     let s = shapes(m);
     let mut ep_tables = BTreeSet::new();
@@ -1662,6 +1672,10 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/lean/kda_intra_wave_items/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let kda_carry_regstate_required = manifest
+        .pointer("/objects/lean/kda_carry_regstate/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let moe_prefill_ep_required = manifest
         .pointer("/objects/lean/moe_prefill_ep/required")
         .and_then(Value::as_bool)
@@ -1677,6 +1691,10 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS {}\n",
         if kda_intra_wave_items_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_CARRY_REGSTATE {}\n",
+        if kda_carry_regstate_required { 1 } else { 0 }
     ));
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",

@@ -335,6 +335,7 @@ pub struct Builder {
     lean_kda_intra_segments: bool,
     /// Mark isolated BT64/D128 chunk-KDA intra packets for the wave-item object.
     kda_intra_wave_items_segments: bool,
+    kda_carry_regstate_segments: bool,
     /// Isolate exact qpre BT64/D128 Wu->carry pairs for standalone gfx950 objects.
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
@@ -503,6 +504,7 @@ impl Builder {
             moe_prefill_ep_degree: None,
             lean_kda_intra_segments: false,
             kda_intra_wave_items_segments: false,
+            kda_carry_regstate_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
             decode_grouped_moe_segments: false,
@@ -582,6 +584,12 @@ impl Builder {
 
     pub fn set_kda_intra_wave_items_segments(&mut self, enabled: bool) {
         self.kda_intra_wave_items_segments = enabled;
+    }
+
+    /// Mark exact qpre BT64/D128/V128 `KdaChunkCarry` singleton segments for the
+    /// register-resident gfx950 carry object (isolated like the key-factor pair).
+    pub fn set_kda_carry_regstate_segments(&mut self, enabled: bool) {
+        self.kda_carry_regstate_segments = enabled;
     }
 
     pub fn set_lean_kda_key_factor_segments(&mut self, enabled: bool) {
@@ -1786,8 +1794,9 @@ impl Builder {
                     && op.inst.i[1] != 0
                     && op.inst.i[2] == 128
             });
+        let kda_carry_regstate = !uniseg && self.kda_carry_regstate_segments;
         let lean_kda_key_factor = !uniseg
-            && self.lean_kda_key_factor_segments
+            && (self.lean_kda_key_factor_segments || kda_carry_regstate)
             && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
         let decode_mla_segments = !uniseg
             && self.decode_mla_segments
@@ -2387,6 +2396,13 @@ impl Builder {
                     && inst.i[2] == 128
                 {
                     e.flags |= crate::dev::SE_KDA_INTRA_WAVE_ITEMS;
+                }
+                if kda_carry_regstate
+                    && inst.op == DevOp::KdaChunkCarry as u16
+                    && idx > 0
+                    && lean_kda_key_factor_pair(&self.ops, idx - 1)
+                {
+                    e.flags |= crate::dev::SE_KDA_CARRY_REGSTATE;
                 }
                 streams[cu as usize].push(e);
                 gq_stream.push(e); // op-major: outer loop is op order, inner is slice order
@@ -4639,6 +4655,53 @@ mod lean_kda_intra_tests {
             .iter()
             .filter(|e| e.inst != 1)
             .all(|e| e.flags & crate::dev::SE_KDA_INTRA_WAVE_ITEMS == 0));
+    }
+}
+
+#[cfg(test)]
+mod kda_carry_regstate_tests {
+    use super::*;
+
+    #[test]
+    fn regstate_marks_only_the_qpre_carry_of_an_exact_pair() {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_kda_carry_regstate_segments(true);
+        let tensors: Vec<_> = (0..8).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let wu = b.emit(DevOp::KdaChunkWu, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        let carry = b.emit(DevOp::KdaChunkCarry, all.clone(), &[wu], |d| {
+            d.t = [
+                tensors[1], tensors[2], tensors[7], tensors[3], tensors[0], tensors[1],
+                tensors[4], tensors[5],
+            ];
+            d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[carry], |_| {});
+        let p = b.finish();
+        let marked: Vec<_> = p
+            .stream
+            .iter()
+            .filter(|e| e.flags & crate::dev::SE_KDA_CARRY_REGSTATE != 0)
+            .collect();
+        assert!(!marked.is_empty());
+        assert!(marked.iter().all(|e| e.inst == 2));
+        let carry_seg = marked[0].seg;
+        assert!(p
+            .stream
+            .iter()
+            .all(|e| (e.seg == carry_seg) == (e.inst == 2)));
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.inst != 2)
+            .all(|e| e.flags & crate::dev::SE_KDA_CARRY_REGSTATE == 0));
     }
 }
 

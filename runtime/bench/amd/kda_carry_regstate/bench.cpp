@@ -15,6 +15,8 @@
 extern "C" void k_carry_control();
 extern "C" void k_carry_control_timed();
 extern "C" void k_carry_regstate();
+extern "C" void k_carry_regstate_timed();
+extern "C" void k_carry_regstate_hwcvt();
 
 static uint16_t bf16(float x) {
     uint32_t u;
@@ -108,6 +110,8 @@ int main(int argc, char** argv) {
          control_lds, allocate<uint16_t>(vn), upload(state0), {}},
         {"regstate_v16_wg256", (const void*)k_carry_regstate, dim3(H * 8u), dim3(256),
          0, allocate<uint16_t>(vn), upload(state0), {}},
+        {"regstate_hwcvt_v16_wg256", (const void*)k_carry_regstate_hwcvt, dim3(H * 8u),
+         dim3(256), 0, allocate<uint16_t>(vn), upload(state0), {}},
     };
     constexpr unsigned narms = sizeof(arms) / sizeof(arms[0]);
 
@@ -124,6 +128,19 @@ int main(int argc, char** argv) {
         const size_t sb = mismatches(arms[0].state, arms[i].state, sn);
         std::printf("oracle arm=%s output_mismatch=%zu/%zu state_mismatch=%zu/%zu\n",
                     arms[i].name, ob, vn, sb, sn);
+        if (sb && std::getenv("KDA_DEBUG")) {
+            std::vector<float> a(sn), b(sn);
+            CHECK(hipMemcpy(a.data(), arms[0].state, sn * 4, hipMemcpyDeviceToHost));
+            CHECK(hipMemcpy(b.data(), arms[i].state, sn * 4, hipMemcpyDeviceToHost));
+            unsigned byd[128] = {0}, byv[128] = {0};
+            for (size_t j = 0; j < sn; ++j)
+                if (std::memcmp(&a[j], &b[j], 4)) { byd[j % 128]++; byv[(j / 128) % 128]++; }
+            std::printf("bad_by_d:"); for (unsigned d = 0; d < 128; ++d) std::printf(" %u", byd[d]);
+            std::printf("\nbad_by_v:"); for (unsigned v = 0; v < 128; ++v) std::printf(" %u", byv[v]);
+            std::printf("\n");
+            for (size_t j = 0, n = 0; j < sn && n < 6; ++j)
+                if (std::memcmp(&a[j], &b[j], 4)) { std::printf("  [%zu] h=%zu v=%zu d=%zu ctl=%.8g cand=%.8g\n", j, j / 16384, (j / 128) % 128, j % 128, a[j], b[j]); ++n; }
+        }
         if (ob || sb) return 3;
     }
     const size_t ab = mismatches(da, da_ref, an);
@@ -132,28 +149,37 @@ int main(int argc, char** argv) {
 
     if (timers_on) {
         const unsigned nblk = H * 8u;
-        unsigned long long* dt = allocate<unsigned long long>((size_t)nblk * 8u);
-        uint16_t* tout = allocate<uint16_t>(vn);
-        float* tstate = upload(state0);
-        void* args[] = {&tout, &tstate, &dq, &dk, &dw, &du, &da, &dg,
-                        (void*)&T, (void*)&H, &dt};
-        for (unsigned rep = 0; rep < 3u; ++rep)
-            CHECK(hipLaunchKernel((const void*)k_carry_control_timed, dim3(nblk), dim3(512),
-                                  args, control_lds, nullptr));
-        CHECK(hipDeviceSynchronize());
-        std::vector<unsigned long long> ht((size_t)nblk * 8u);
-        CHECK(hipMemcpy(ht.data(), dt, ht.size() * sizeof(ht[0]), hipMemcpyDeviceToHost));
-        const char* names[7] = {"p1_pred_vsm", "bar1", "p2_out", "bar2", "p3_keys_state",
-                                "bar3", "total"};
         const unsigned n_chunks = (T + 63u) / 64u;
-        double sum[7] = {0, 0, 0, 0, 0, 0, 0};
-        for (unsigned b = 0; b < nblk; ++b)
-            for (unsigned i = 0; i < 7u; ++i) sum[i] += double(ht[(size_t)b * 8u + i]);
-        std::printf("timers wave0 s_memtime cycles per chunk, mean over %u workgroups, %u chunks\n",
-                    nblk, n_chunks);
-        for (unsigned i = 0; i < 7u; ++i)
-            std::printf("timer %-14s cycles_per_chunk=%.0f share=%.3f\n", names[i],
-                        sum[i] / nblk / n_chunks, sum[i] / sum[6]);
+        struct Timed { const char* name; const void* kernel; unsigned block; size_t lds;
+                       const char* phases[7]; };
+        const Timed timed[] = {
+            {"control", (const void*)k_carry_control_timed, 512, control_lds,
+             {"p1_pred_vsm", "bar1", "p2_out", "bar2", "p3_keys_state", "bar3", "total"}},
+            {"regstate", (const void*)k_carry_regstate_timed, 256, 0,
+             {"p1_pred_vsm", "loads+bar1", "p2_out", "p3_upd_state", "keys+loads", "bar2",
+              "total"}},
+        };
+        for (const Timed& tk : timed) {
+            unsigned long long* dt = allocate<unsigned long long>((size_t)nblk * 8u);
+            uint16_t* tout = allocate<uint16_t>(vn);
+            float* tstate = upload(state0);
+            void* args[] = {&tout, &tstate, &dq, &dk, &dw, &du, &da, &dg,
+                            (void*)&T, (void*)&H, &dt};
+            for (unsigned rep = 0; rep < 3u; ++rep)
+                CHECK(hipLaunchKernel(tk.kernel, dim3(nblk), dim3(tk.block), args, tk.lds,
+                                      nullptr));
+            CHECK(hipDeviceSynchronize());
+            std::vector<unsigned long long> ht((size_t)nblk * 8u);
+            CHECK(hipMemcpy(ht.data(), dt, ht.size() * sizeof(ht[0]), hipMemcpyDeviceToHost));
+            double sum[7] = {0, 0, 0, 0, 0, 0, 0};
+            for (unsigned b = 0; b < nblk; ++b)
+                for (unsigned i = 0; i < 7u; ++i) sum[i] += double(ht[(size_t)b * 8u + i]);
+            std::printf("timers %s wave0 s_memtime cycles per chunk, mean over %u workgroups, "
+                        "%u chunks\n", tk.name, nblk, n_chunks);
+            for (unsigned i = 0; i < 7u; ++i)
+                std::printf("timer %s %-14s cycles_per_chunk=%.0f share=%.3f\n", tk.name,
+                            tk.phases[i], sum[i] / nblk / n_chunks, sum[i] / sum[6]);
+        }
     }
 
     hipEvent_t begin, end;

@@ -17,7 +17,7 @@ resource() {
         grep -F "$2:" | head -1 | sed 's/^.*: *//; s/ .*$//'
 }
 
-for name in k_carry_control k_carry_regstate; do
+for name in k_carry_control k_carry_regstate k_carry_regstate_hwcvt; do
     vgpr=$(resource "$name" VGPRs); agpr=$(resource "$name" AGPRs)
     sgpr=$(resource "$name" TotalSGPRs)
     scratch=$(resource "$name" 'ScratchSize [bytes/lane]')

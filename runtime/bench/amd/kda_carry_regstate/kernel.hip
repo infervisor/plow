@@ -187,8 +187,28 @@ __attribute__((amdgpu_waves_per_eu(1, 1)))
 void k_carry_regstate(bf16* out, float* state, const bf16* q, const bf16* k,
                       const bf16* W, const bf16* U, const float* Aqk, const float* g,
                       unsigned T, unsigned H) {
-    __shared__ __align__(16) bf16 ssm[16u * plow_kda_regstate::SST];
-    __shared__ __align__(16) bf16 vsm[16u * plow_kda_regstate::VST];
+    __shared__ __align__(16) bf16 lds[plow_kda_regstate::LDS_BYTES / 2u];
     d_kda_chunk_carry_bt64_regstate(out, state, q, k, W, U, Aqk, g, (T + BT - 1u) / BT,
-                                    T, H, blockIdx.x, gridDim.x, ssm, vsm);
+                                    T, H, blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(256, 1)
+__attribute__((amdgpu_waves_per_eu(1, 1)))
+void k_carry_regstate_hwcvt(bf16* out, float* state, const bf16* q, const bf16* k,
+                            const bf16* W, const bf16* U, const float* Aqk, const float* g,
+                            unsigned T, unsigned H) {
+    __shared__ __align__(16) bf16 lds[plow_kda_regstate::LDS_BYTES / 2u];
+    d_kda_chunk_carry_bt64_regstate<false, true>(out, state, q, k, W, U, Aqk, g,
+                                                 (T + BT - 1u) / BT, T, H, blockIdx.x,
+                                                 gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(256, 1)
+__attribute__((amdgpu_waves_per_eu(1, 1)))
+void k_carry_regstate_timed(bf16* out, float* state, const bf16* q, const bf16* k,
+                            const bf16* W, const bf16* U, const float* Aqk, const float* g,
+                            unsigned T, unsigned H, unsigned long long* timers) {
+    __shared__ __align__(16) bf16 lds[plow_kda_regstate::LDS_BYTES / 2u];
+    d_kda_chunk_carry_bt64_regstate<true>(out, state, q, k, W, U, Aqk, g, (T + BT - 1u) / BT,
+                                          T, H, blockIdx.x, gridDim.x, lds, timers);
 }

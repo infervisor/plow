@@ -1308,6 +1308,12 @@ fn k3_build_model(
                     && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
                     && emit_config::active().kda_key_factor,
             );
+            b.set_kda_carry_regstate_segments(
+                crate::emit_is_amd()
+                    && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                    && emit_config::active().kda_chunk_qpre
+                    && emit_config::active().kda_carry_regstate,
+            );
             b.set_packed_prefill_segments(packed_segments);
             if crate::emit_is_amd() {
                 b.deny_uniseg();

@@ -1921,6 +1921,12 @@ pub const SE_XR_WAVE_RS: u16 = 4;
 /// Older runtimes ignore the bit and execute the unchanged instruction normally.
 pub const SE_KDA_INTRA_WAVE_ITEMS: u16 = 8;
 
+/// The same bit on a pure `KdaChunkCarry` segment selects the register-resident gfx950 carry
+/// object. `flags` has no free bit left (4..12 hold [`SE_NPER_MASK`], 13..15 the domain), so
+/// the opcode of the entry disambiguates; a runtime that predates this route refuses such a
+/// packet as an impure wave-item segment rather than running it.
+pub const SE_KDA_CARRY_REGSTATE: u16 = SE_KDA_INTRA_WAVE_ITEMS;
+
 /// Shift of the per-(packet, L2 domain) slice count packed into [`StreamEnt::flags`].
 ///
 /// Mirrors `PLOW_SE_NPER_SHIFT` in `runtime/common/dev_isa.h`; read the note there for why the
