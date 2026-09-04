@@ -1177,6 +1177,10 @@ pub fn emit_k3_latent_moe(
     // norm: `routed_expert_norm` is nonlinear, so normalising a partial sum
     // would be finite, plausible and wrong.
     let cmb_dst = if tp.on() { tp.dg } else { ylat };
+    // L4: under TP at T=1 the tagged publish computes the combine itself (`part`, `top_k` ride
+    // the XReduce packet) and the MoeCombine packet is not emitted.
+    let fold_combine = t == 1 && tp.on() && crate::emit_config::active().xr_combine_fold;
+    let mut fold_deps: Vec<u32> = Vec::new();
 
     // THE EXPERT CHAIN, AND IT IS TWO CHAINS. Decode's grouped ops loop the `top_k` routing-table
     // slots inside ONE gate/up packet and ONE down packet. They do not reuse weights across
@@ -1224,12 +1228,17 @@ pub fn emit_k3_latent_moe(
                 d.i[3] = c.n_exp;
                 d.i[6] = c.enc;
             });
-            b.emit(DevOp::MoeCombine, combine_cus(&all, t * lat), &[c_d], |d| {
-                d.t[0] = cmb_dst;
-                d.t[3] = part;
-                d.i[0] = lat;
-                d.i[1] = c.top_k;
-            })
+            if fold_combine {
+                fold_deps.push(c_d);
+                c_d
+            } else {
+                b.emit(DevOp::MoeCombine, combine_cus(&all, t * lat), &[c_d], |d| {
+                    d.t[0] = cmb_dst;
+                    d.t[3] = part;
+                    d.i[0] = lat;
+                    d.i[1] = c.top_k;
+                })
+            }
         } else {
             // Baseline: one gate/up + down pair per selected slot.
             let mut c_down = Vec::with_capacity(c.top_k as usize);
@@ -1266,17 +1275,22 @@ pub fn emit_k3_latent_moe(
             }
             // Combine at LATENT width. `t[1]` (residual) and `t[2]` (shared) stay
             // TENSOR_NONE — see the doc comment.
-            b.emit(
-                DevOp::MoeCombine,
-                combine_cus(&all, t * lat),
-                &c_down,
-                |d| {
-                    d.t[0] = cmb_dst;
-                    d.t[3] = part;
-                    d.i[0] = lat;
-                    d.i[1] = c.top_k;
-                },
-            )
+            if fold_combine {
+                fold_deps.extend_from_slice(&c_down);
+                c_down[c_down.len() - 1]
+            } else {
+                b.emit(
+                    DevOp::MoeCombine,
+                    combine_cus(&all, t * lat),
+                    &c_down,
+                    |d| {
+                        d.t[0] = cmb_dst;
+                        d.t[3] = part;
+                        d.i[0] = lat;
+                        d.i[1] = c.top_k;
+                    },
+                )
+            }
         }
     } else {
         let atom = pf_fuse == crate::mla::MoePfFuse::Atomic;
@@ -1444,7 +1458,20 @@ pub fn emit_k3_latent_moe(
             d.i[4] = u32::from(det);
         })
     };
-    if tp.on() {
+    if fold_combine {
+        c_cmb = crate::emit_xreduce_combine_fold(
+            b,
+            &mut tp.xgate,
+            &tp.xr_cus,
+            &fold_deps,
+            ylat,
+            lat,
+            tp.tp,
+            tp.slot_b,
+            part,
+            c.top_k,
+        );
+    } else if tp.on() {
         c_cmb = crate::emit_xreduce(
             b,
             &mut tp.xgate,
@@ -4472,6 +4499,63 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    /// L4 (`PLOW_XR_COMBINE_FOLD`): the latent `MoeCombine` folds into the tagged one-shot
+    /// publish. Off by default — and the default packet carries no fold field at all, so a
+    /// pre-L4 object reads it exactly as before. On, every MoE layer loses its combine packet,
+    /// the latent XReduce carries `t1 = part`, `i7 = top_k`, and no other packet changes.
+    #[test]
+    fn xr_combine_fold_is_off_by_default_and_folds_the_latent_combine() {
+        let _guard = crate::test_env::env_guard();
+        let base = build_full(8);
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        assert_eq!(n(&base, DevOp::MoeCombine), 92);
+        let lat = base
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeCombine as u16)
+            .map(|i| i.i[0])
+            .expect("a latent combine");
+        for i in base.insts.iter().filter(|i| i.op == DevOp::XReduce as u16) {
+            assert_eq!(i.i[7], 0, "default XReduce carries no fold");
+            assert_eq!(i.t[1], packet::dev::TENSOR_NONE);
+        }
+        let n_xr = n(&base, DevOp::XReduce);
+        let n_all = base.insts.len();
+
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_XR_COMBINE_FOLD", "1")]);
+        let p = build_full(8);
+        assert_eq!(n(&p, DevOp::MoeCombine), 0, "the combine packet is gone");
+        assert_eq!(n(&p, DevOp::XReduce), n_xr, "no collective added");
+        assert_eq!(
+            p.insts.len(),
+            n_all - 92,
+            "exactly one packet per MoE layer removed"
+        );
+        let folded: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::XReduce as u16 && i.i[7] != 0)
+            .collect();
+        assert_eq!(folded.len(), 92, "one folded publish per MoE layer");
+        for f in &folded {
+            assert_eq!(f.i[0], lat, "the folded reduce is the latent one");
+            assert_eq!(f.i[7], 16, "top_k slots summed in fixed order");
+            assert_ne!(f.t[1], packet::dev::TENSOR_NONE, "part rides t1");
+            assert_eq!(f.i[5], 0, "no gather on the latent seam");
+        }
+        // Every non-latent collective is byte-identical to the default emit.
+        let other = |p: &packet::devbuild::Program| -> Vec<(u32, u32, u32)> {
+            p.insts
+                .iter()
+                .filter(|i| i.op == DevOp::XReduce as u16 && i.i[0] != lat)
+                .map(|i| (i.i[0], i.i[2], i.i[5]))
+                .collect()
+        };
+        assert_eq!(other(&base), other(&p));
     }
 
     /// TP shards the HEAD axis and the expert INTERMEDIATE, and leaves the

@@ -4560,6 +4560,13 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                   PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
                                   in->i[4], in->i[5], in->i[6], xr_tag_off,
                                   PLOW_XR_TAG_SLOT_BYTES
+#if PLOW_XR_COMBINE_FOLD
+                                  /* L4 fold: t1 = [k, n] f32 slot partials, i7 = k. */
+                                  , in->t[1] == PLOW_TENSOR_NONE
+                                        ? nullptr
+                                        : (const float*)tens[in->t[1]],
+                                  in->i[7]
+#endif
 #if PLOW_XR_TRACE_PHASES
                                   , prog.trace ? &prog.trace[base + ix] : nullptr
 #endif
