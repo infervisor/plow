@@ -1271,7 +1271,7 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
     for program in progs.iter().map(|p| p.program).collect::<BTreeSet<_>>() {
         let rows: Vec<&ProgramArms> = progs.iter().filter(|p| p.program == program).collect();
         let Some(first) = rows.first() else { continue };
-        let segments: Vec<Value> = rows
+        let segment_values: Vec<Value> = rows
             .iter()
             .map(|p| {
                 let families: BTreeSet<_> = p.arms.iter().map(|a| opcode_family(&a.op)).collect();
@@ -1289,12 +1289,50 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
                 })
             })
             .collect();
+        let mut phases = Vec::new();
+        let mut lo = 0usize;
+        while lo < rows.len() {
+            let families: BTreeSet<_> =
+                rows[lo].arms.iter().map(|a| opcode_family(&a.op)).collect();
+            let flash = rows[lo]
+                .arms
+                .iter()
+                .any(|a| a.op.starts_with("Flash") || a.op == "MlaMergeFold");
+            let mut hi = lo + 1;
+            while hi < rows.len() {
+                let next_families: BTreeSet<_> =
+                    rows[hi].arms.iter().map(|a| opcode_family(&a.op)).collect();
+                let next_flash = rows[hi]
+                    .arms
+                    .iter()
+                    .any(|a| a.op.starts_with("Flash") || a.op == "MlaMergeFold");
+                if next_families != families || next_flash != flash {
+                    break;
+                }
+                hi += 1;
+            }
+            let arms: BTreeSet<_> = rows[lo..hi]
+                .iter()
+                .flat_map(|p| p.arms.iter().map(Arm::key))
+                .collect();
+            phases.push(json!({
+                "first_segment": rows[lo].seg.unwrap_or(0),
+                "last_segment": rows[hi - 1].seg.unwrap_or(0),
+                "segments": hi - lo,
+                "arms": arms,
+                "families": families,
+                "object_class": if flash { "flash" } else { "ordinary" },
+                "resource_contract": resource_contract(flash),
+            }));
+            lo = hi;
+        }
         out.push(json!({
             "program": program,
             "kind": first.kind,
             "topology": if first.packed_prefill_only { "packed" } else { "ordinary" },
             if first.kind == "prefill" { "bucket" } else { "batch" }: first.t,
-            "segments": segments,
+            "segments": segment_values,
+            "phases": phases,
             "aql_replay": {
                 "packets": rows.len(),
                 "ordering": "barrier_agent_scope",
@@ -2265,6 +2303,8 @@ mod tests {
         assert_eq!(chains[0]["kind"], "prefill");
         assert_eq!(chains[0]["bucket"], 128);
         assert_eq!(chains[0]["aql_replay"]["packets"], 1);
+        assert_eq!(chains[0]["phases"][0]["first_segment"], 0);
+        assert_eq!(chains[0]["phases"][0]["last_segment"], 0);
         assert_eq!(
             chains[0]["aql_replay"]["rank_commit"],
             "prepare_all_ranks_then_ring_all"
