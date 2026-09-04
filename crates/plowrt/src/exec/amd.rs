@@ -121,6 +121,7 @@
 //! low-level vehicle earns its keep.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -867,6 +868,7 @@ struct MoeCombineRoute {
 enum PrefillSegmentRoute {
     Interpreter,
     XReduceWaveRs,
+    GraphPhaseXReduceWaveRs,
     XReduceAttnRes {
         args: XReduceAttnResArgs,
         device_args: u64,
@@ -2667,6 +2669,222 @@ fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect()
         }))
+}
+
+fn graph_phase_xreduce_segments(
+    blob_path: &Path,
+    progs: &[DevProg],
+    dec_ix: usize,
+    enabled: bool,
+) -> Result<Vec<BTreeSet<usize>>> {
+    let selected = vec![BTreeSet::new(); progs.len()];
+    if !enabled {
+        return Ok(selected);
+    }
+    let mpath = blob_path.with_file_name("build.json");
+    let raw = std::fs::read(&mpath).map_err(|source| RuntimeError::Io {
+        path: mpath.clone(),
+        source,
+    })?;
+    let man: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display())))?;
+    graph_phase_xreduce_segments_from_manifest(&man, progs, dec_ix, &mpath)
+}
+
+fn graph_phase_xreduce_segments_from_manifest(
+    man: &serde_json::Value,
+    progs: &[DevProg],
+    dec_ix: usize,
+    mpath: &Path,
+) -> Result<Vec<BTreeSet<usize>>> {
+    let mut selected = vec![BTreeSet::new(); progs.len()];
+    let chains = man
+        .get("dispatch_chains")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "{} has no compiler-derived dispatch_chains; refusing phase-object selection",
+                mpath.display()
+            ))
+        })?;
+    if chains.len() != progs.len() {
+        return Err(RuntimeError::Device(format!(
+            "{} has {} dispatch chains for {} packet programs",
+            mpath.display(),
+            chains.len(),
+            progs.len()
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for chain in chains {
+        let program = chain
+            .get("program")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| RuntimeError::Device("dispatch chain has no program index".into()))?
+            as usize;
+        if program >= progs.len() || !seen.insert(program) {
+            return Err(RuntimeError::Device(format!(
+                "invalid or duplicate dispatch-chain program {program}"
+            )));
+        }
+        let expected_kind = if program < dec_ix {
+            "prefill"
+        } else {
+            "decode"
+        };
+        let expected_topology = if progs[program].packed_prefill_only {
+            "packed"
+        } else {
+            "ordinary"
+        };
+        if chain.get("kind").and_then(|v| v.as_str()) != Some(expected_kind)
+            || chain.get("topology").and_then(|v| v.as_str()) != Some(expected_topology)
+        {
+            return Err(RuntimeError::Device(format!(
+                "dispatch-chain topology mismatch for program {program}"
+            )));
+        }
+        let n_segments = derive_segments(&progs[program])?.len();
+        let segment_rows = chain
+            .get("segments")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| RuntimeError::Device(format!("program {program} has no segments")))?;
+        if segment_rows.len() != n_segments {
+            return Err(RuntimeError::Device(format!(
+                "program {program} manifest has {} segments, packet has {n_segments}",
+                segment_rows.len()
+            )));
+        }
+        for (seg, row) in segment_rows.iter().enumerate() {
+            if row.get("segment").and_then(|v| v.as_u64()) != Some(seg as u64) {
+                return Err(RuntimeError::Device(format!(
+                    "program {program} dispatch segments are not contiguous at {seg}"
+                )));
+            }
+        }
+        if program >= dec_ix || progs[program].packed_prefill_only {
+            continue;
+        }
+        let phases = chain
+            .get("phases")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| RuntimeError::Device(format!("program {program} has no phases")))?;
+        let mut next_phase_segment = 0usize;
+        for phase in phases {
+            let lo = phase
+                .get("first_segment")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX) as usize;
+            let hi = phase
+                .get("last_segment")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX) as usize;
+            let phase_segments = phase
+                .get("segments")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX) as usize;
+            if lo != next_phase_segment
+                || lo > hi
+                || hi >= n_segments
+                || phase_segments != hi - lo + 1
+            {
+                return Err(RuntimeError::Device(format!(
+                    "program {program} phases do not form a contiguous partition at {next_phase_segment}"
+                )));
+            }
+            next_phase_segment = hi + 1;
+            let families = phase.get("families").and_then(|v| v.as_array());
+            let arms = phase.get("arms").and_then(|v| v.as_array());
+            let collective_only = families
+                .is_some_and(|f| f.len() == 1 && f[0].as_str() == Some("collective"))
+                && arms.is_some_and(|a| {
+                    !a.is_empty()
+                        && a.iter().all(|v| {
+                            v.as_str()
+                                .is_some_and(|s| s.split('/').next() == Some("XReduceTwoShot"))
+                        })
+                });
+            if !collective_only {
+                continue;
+            }
+            if phase.get("object_class").and_then(|v| v.as_str()) != Some("ordinary") {
+                return Err(RuntimeError::Device(format!(
+                    "program {program} collective phase is not an ordinary object class"
+                )));
+            }
+            let contract = phase.get("resource_contract").ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "program {program} collective phase has no contract"
+                ))
+            })?;
+            let contract_ok = contract.get("policy").and_then(|v| v.as_str()) == Some("refuse")
+                && contract.get("wavefront_size").and_then(|v| v.as_u64()) == Some(64)
+                && contract
+                    .get("min_occupancy_waves_per_simd")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|v| v >= 2)
+                && contract
+                    .get("max_private_segment_bytes_delta")
+                    .and_then(|v| v.as_u64())
+                    == Some(0)
+                && contract
+                    .get("max_vgpr_spill_delta")
+                    .and_then(|v| v.as_u64())
+                    == Some(0)
+                && contract
+                    .get("max_sgpr_spill_delta")
+                    .and_then(|v| v.as_u64())
+                    == Some(0);
+            if !contract_ok {
+                return Err(RuntimeError::Device(format!(
+                    "program {program} collective phase has an incompatible resource contract"
+                )));
+            }
+            for seg in lo..=hi {
+                let row = &segment_rows[seg];
+                let row_families = row.get("families").and_then(|v| v.as_array());
+                let row_arms = row.get("arms").and_then(|v| v.as_array());
+                if !row_families
+                    .is_some_and(|f| f.len() == 1 && f[0].as_str() == Some("collective"))
+                    || !row_arms.is_some_and(|a| {
+                        !a.is_empty()
+                            && a.iter().all(|v| {
+                                v.as_str()
+                                    .is_some_and(|s| s.split('/').next() == Some("XReduceTwoShot"))
+                            })
+                    })
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "program {program} phase claims collective-only segment {seg}, but its segment inventory differs"
+                    )));
+                }
+                let mut entries = progs[program]
+                    .stream
+                    .iter()
+                    .filter(|e| e.seg as usize == seg)
+                    .peekable();
+                if entries.peek().is_none()
+                    || entries.any(|e| {
+                        progs[program]
+                            .insts
+                            .get(e.inst as usize)
+                            .is_none_or(|inst| inst.op != DevOp::XReduceTwoShot as u16)
+                    })
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "program {program} packet segment {seg} is not XReduceTwoShot-only"
+                    )));
+                }
+            }
+            selected[program].extend(lo..=hi);
+        }
+        if next_phase_segment != n_segments {
+            return Err(RuntimeError::Device(format!(
+                "program {program} phase partition covers {next_phase_segment} of {n_segments} segments"
+            )));
+        }
+    }
+    Ok(selected)
 }
 
 /// Every symbol NAME in an ELF64 object's symbol tables.
@@ -6690,11 +6908,19 @@ impl AmdEngine {
                     .any(|kind| matches!(kind, DecodeSegmentKind::GroupedMoeMxfp4 { .. })),
             )
         })?;
-        let need_xreduce_wave_rs = blob.progs[..dec_ix].iter().any(|p| {
-            p.stream
-                .iter()
-                .any(|e| e.flags & packet::dev::SE_XR_WAVE_RS != 0)
-        });
+        let graph_phase_segments = graph_phase_xreduce_segments(
+            blob_path,
+            &blob.progs,
+            dec_ix,
+            crate::config::RuntimeConfig::get().amd.phase_objects,
+        )?;
+        let need_graph_phase_xreduce = graph_phase_segments.iter().any(|s| !s.is_empty());
+        let need_xreduce_wave_rs = need_graph_phase_xreduce
+            || blob.progs[..dec_ix].iter().any(|p| {
+                p.stream
+                    .iter()
+                    .any(|e| e.flags & packet::dev::SE_XR_WAVE_RS != 0)
+            });
         let need_kda_intra_wave_items = blob.progs[..dec_ix].iter().any(|p| {
             p.stream
                 .iter()
@@ -7181,6 +7407,20 @@ impl AmdEngine {
                     "{} is not a packet-paired XReduce wave-RS segment object",
                     path.display()
                 )));
+            }
+            if need_graph_phase_xreduce {
+                for marker in [
+                    "plow_phase_inventory_xreduce_only_1",
+                    "plow_phase_xreduce_wave64_occ2_nospill_1",
+                ] {
+                    if !syms.contains(&marker) {
+                        return Err(RuntimeError::Device(format!(
+                            "{} lacks graph phase-object marker `{marker}`",
+                            path.display()
+                        )));
+                    }
+                }
+                check_compiled_opcode_marker_set(&syms, &path, [DevOp::XReduceTwoShot])?;
             }
             if prefill_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
                 return Err(RuntimeError::Device(format!(
@@ -8596,7 +8836,8 @@ impl AmdEngine {
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
                 promote_kda_intra_wave_items_routes(p, &seg_class, &mut prefill_routes)?;
                 for (seg, &class) in seg_class.iter().enumerate() {
-                    if class == 19 {
+                    let graph_phase = graph_phase_segments[prog_ix].contains(&seg);
+                    if class == 19 || graph_phase {
                         if !matches!(
                             prefill_routes[seg],
                             PrefillSegmentRoute::Interpreter
@@ -8606,7 +8847,21 @@ impl AmdEngine {
                                 "XReduce wave-RS segment {seg} overlaps another specialist route"
                             )));
                         }
-                        prefill_routes[seg] = PrefillSegmentRoute::XReduceWaveRs;
+                        let dispatch = ProgramDispatch::classify(
+                            p.l2_domains,
+                            seg_class.len(),
+                            p.gq_seg_ofs.len().saturating_sub(1),
+                        );
+                        if graph_phase && !prefill_segment_specialization_allowed(dispatch) {
+                            return Err(RuntimeError::Device(format!(
+                                "graph phase segment {seg} in program {prog_ix} has legacy L2-domain topology"
+                            )));
+                        }
+                        prefill_routes[seg] = if graph_phase {
+                            PrefillSegmentRoute::GraphPhaseXReduceWaveRs
+                        } else {
+                            PrefillSegmentRoute::XReduceWaveRs
+                        };
                     }
                 }
                 let has_materialized = prefill_routes.iter().any(|r| {
@@ -9647,6 +9902,7 @@ impl AmdEngine {
         match route {
             PrefillSegmentRoute::XReduceAttnRes { .. } => return "xreduce_attnres",
             PrefillSegmentRoute::XReduceWaveRs => return "xreduce_wave_rs",
+            PrefillSegmentRoute::GraphPhaseXReduceWaveRs => return "graph_phase_xreduce_wave_rs",
             _ => {}
         }
         if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
@@ -9755,7 +10011,7 @@ impl AmdEngine {
         }
         if matches!(
             self.progs[p].prefill_routes.get(seg),
-            Some(PrefillSegmentRoute::XReduceWaveRs)
+            Some(PrefillSegmentRoute::XReduceWaveRs | PrefillSegmentRoute::GraphPhaseXReduceWaveRs)
         ) {
             let kernel = self.k_xreduce_wave_rs.ok_or_else(|| {
                 RuntimeError::Device(
@@ -10023,6 +10279,27 @@ impl AmdEngine {
         self.prog_dispatch(p).launches()
     }
 
+    pub(crate) fn graph_phase_replay(&self, p: usize) -> bool {
+        self.progs[p]
+            .prefill_routes
+            .iter()
+            .any(|r| matches!(r, PrefillSegmentRoute::GraphPhaseXReduceWaveRs))
+    }
+
+    pub(crate) fn begin_graph_phase_replay(&self, p: usize) -> Result<()> {
+        if !self.graph_phase_replay(p) {
+            return Err(RuntimeError::Device(format!(
+                "program {p} has no graph-derived phase-object route"
+            )));
+        }
+        self.be
+            .begin_dispatch_chain(self.prog_dispatch(p).launches())
+    }
+
+    pub(crate) fn commit_graph_phase_replay(&self) -> Result<()> {
+        self.be.commit_dispatch_chain()
+    }
+
     /// Enqueue one ordered decode segment without rearming or draining.
     pub(crate) fn enqueue_decode_segment(
         &mut self,
@@ -10278,8 +10555,15 @@ impl AmdEngine {
         self.rearm(p)?;
         let n_seg = self.prog_dispatch(p).launches();
         let t0 = std::time::Instant::now();
+        let replay = self.graph_phase_replay(p);
+        if replay {
+            self.begin_graph_phase_replay(p)?;
+        }
         for seg in 0..n_seg {
             self.enqueue_segment(p, seg)?;
+        }
+        if replay {
+            self.commit_graph_phase_replay()?;
         }
         let t1 = std::time::Instant::now();
         if let Err(e) = self.drain() {
@@ -12646,6 +12930,107 @@ mod tests {
             gq_stream: Vec::new(),
             gq_seg_ofs: Vec::new(),
             l2_domains: 0,
+        }
+    }
+
+    fn phase_chain_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "dispatch_chains": [{
+                "program": 0,
+                "kind": "prefill",
+                "topology": "ordinary",
+                "segments": [
+                    {"segment": 0, "families": ["elementwise"], "arms": ["Nop"]},
+                    {"segment": 1, "families": ["collective"], "arms": ["XReduceTwoShot"]},
+                    {"segment": 2, "families": ["elementwise"], "arms": ["Nop"]}
+                ],
+                "phases": [
+                    {
+                        "first_segment": 0,
+                        "last_segment": 0,
+                        "segments": 1,
+                        "families": ["elementwise"],
+                        "arms": ["Nop"],
+                        "object_class": "ordinary"
+                    },
+                    {
+                        "first_segment": 1,
+                        "last_segment": 1,
+                        "segments": 1,
+                        "families": ["collective"],
+                        "arms": ["XReduceTwoShot"],
+                        "object_class": "ordinary",
+                        "resource_contract": {
+                            "policy": "refuse",
+                            "wavefront_size": 64,
+                            "min_occupancy_waves_per_simd": 2,
+                            "max_private_segment_bytes_delta": 0,
+                            "max_vgpr_spill_delta": 0,
+                            "max_sgpr_spill_delta": 0
+                        }
+                    },
+                    {
+                        "first_segment": 2,
+                        "last_segment": 2,
+                        "segments": 1,
+                        "families": ["elementwise"],
+                        "arms": ["Nop"],
+                        "object_class": "ordinary"
+                    }
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn graph_phase_selector_requires_matching_contiguous_packet_inventory() {
+        let prog = segmented_prog(&[DevOp::Nop, DevOp::XReduceTwoShot, DevOp::Nop], &[0, 1, 2]);
+        let selected = graph_phase_xreduce_segments_from_manifest(
+            &phase_chain_manifest(),
+            std::slice::from_ref(&prog),
+            1,
+            Path::new("build.json"),
+        )
+        .unwrap();
+        assert_eq!(selected[0], BTreeSet::from([1]));
+
+        let mut bad = phase_chain_manifest();
+        bad["dispatch_chains"][0]["segments"][1]["arms"] = serde_json::json!(["Gemm"]);
+        let err = graph_phase_xreduce_segments_from_manifest(
+            &bad,
+            std::slice::from_ref(&prog),
+            1,
+            Path::new("build.json"),
+        )
+        .expect_err("phase and segment inventories must agree");
+        assert!(err.to_string().contains("segment inventory differs"));
+    }
+
+    #[test]
+    fn graph_phase_selector_rejects_topology_and_resource_drift() {
+        let prog = segmented_prog(&[DevOp::Nop, DevOp::XReduceTwoShot, DevOp::Nop], &[0, 1, 2]);
+        for (pointer, value, needle) in [
+            (
+                "/dispatch_chains/0/topology",
+                serde_json::json!("packed"),
+                "topology mismatch",
+            ),
+            (
+                "/dispatch_chains/0/phases/1/resource_contract/wavefront_size",
+                serde_json::json!(32),
+                "incompatible resource contract",
+            ),
+        ] {
+            let mut bad = phase_chain_manifest();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            let err = graph_phase_xreduce_segments_from_manifest(
+                &bad,
+                std::slice::from_ref(&prog),
+                1,
+                Path::new("build.json"),
+            )
+            .expect_err("manifest drift must fail closed");
+            assert!(err.to_string().contains(needle), "{err}");
         }
     }
 
