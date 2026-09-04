@@ -2071,7 +2071,19 @@ __device__ __forceinline__ void stage_x_lds(bf16* __restrict__ lds, const bf16* 
  *
  * BIT-EXACT: a row's chunk order, lane->k map, accumulation and wave_sum never depend on which
  * workgroup or wave runs it; only the row->workgroup map moves. `PLOW_FINE`'s gemv->headnorm
- * column map is the one consumer of that map, hence the SE_FINE refusal above. */
+ * column map is the one consumer of that map, hence the SE_FINE refusal above.
+ *
+ * MEASURED IN ISOLATION AND NOT PROFITABLE AS BUILT (gfx950, runtime/bench/amd/k3_gemvbf16_bench
+ * k_dyn vs k_dyn0, grid 256, bit-exact on every shape): o_proj 5.16 -> 6.05 us, shared_down
+ * 4.73 -> 5.68, moe_down_latent 7.19 -> 8.12, q_absorb 5.09 -> 5.92, and the 2-4-row-per-slice
+ * shapes double (routed_up 2.25 -> 4.73). Two costs: vmcnt is IN-ORDER, so the claiming wave's
+ * first weight loads of every range wait for the returning atomic (~1 us more than an HBM load),
+ * and each pool range costs two workgroup barriers that drain every wave's pipeline. Against
+ * that, the true-critical-path analysis (scripts/k3_trace_critpath.py) puts the balanced-claim
+ * ceiling on the b=256 GEMVs at ~1.5 us/packet (the tail there is random per-packet body
+ * variance, (max-median)/median p50 0.29, not slice- or CU-bound), i.e. about what the
+ * mechanism costs. Kept as a knob for a cheaper claim (a wave with no weight stream, or a
+ * per-wave claim without barriers); do not ship this form. */
 #ifndef PLOW_GV_DYNCLAIM
 #define PLOW_GV_DYNCLAIM 0
 #endif
