@@ -763,7 +763,7 @@ if(PLOW_HSACO_CONFIG)
     set(_plow_decode_inventory_prune_default ON)
 endif()
 option(PLOW_HSACO_DECODE_INVENTORY_PRUNE
-       "Prune decode interpreter arms to the generated packet inventory"
+       "Prune ordinary interpreter arms to the generated packet inventory"
        ${_plow_decode_inventory_prune_default})
 option(PLOW_HSACO_DECODE_MLA_SEGMENTS
        "Emit the paired FlashMlaDecode+MlaMergeFold decode segment object" OFF)
@@ -859,6 +859,9 @@ if(PLOW_GFX950_HSACO)
     # THE AXES. No row below spells out a define set; every row is axes only.
     set(_hs_ax_none "")
     set(_hs_ax_prefill -DPLOW_BUCKET_DECODE=0)
+    if(PLOW_HSACO_DECODE_INVENTORY_PRUNE)
+        list(APPEND _hs_ax_prefill -DPLOW_DECODE_INVENTORY_PRUNE=1)
+    endif()
     # The same bit-exact aggregation is profitable on both CDNA3 and CDNA4. Exact K3
     # TP8 gfx950 shapes: 15.107 -> 9.032 us (T512), 19.007 -> 12.931 us (T1024).
     if(PLOW_XR_AGG AND (PLOW_HSACO_ARCH STREQUAL "gfx942" OR

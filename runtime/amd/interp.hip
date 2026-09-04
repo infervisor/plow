@@ -436,6 +436,18 @@ extern "C" __device__ unsigned plow_moe_gemma_arms_1 = 1;
 #if PLOW_MOE_GEMMA_PF
 extern "C" __device__ unsigned plow_moe_gemma_pf_arms_1 = 1;
 #endif
+/* Stable capability evidence for the host's legacy substring audit. Reachability pruning can
+ * inline or delete the helper functions that audit originally observed, even when their dispatch
+ * arms survive. Keep the evidence tied to compile axes rather than optimizer accidents. */
+#if PLOW_MLA_PREFILL
+extern "C" __device__ unsigned plow_cap_d_flash_mla_1 = 1;
+#endif
+#if PLOW_MOE_PREFILL
+extern "C" __device__ unsigned plow_cap_d_moe_router_topk_pf_1 = 1;
+#endif
+#if PLOW_K3
+extern "C" __device__ unsigned plow_cap_d_attn_res_1 = 1;
+#endif
 /* Same contract, for the V2 MLA-prefill arm in the FLASH object (d_flash_mla_prefill_v2).
  * The host routes FlashMlaPrefill segments to the flash object only when PLOW_MLA_PF_V2=1;
  * if the loaded flash object predates this arm, the dispatch below would skip those packets
