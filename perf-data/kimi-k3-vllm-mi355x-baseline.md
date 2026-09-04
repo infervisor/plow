@@ -1,9 +1,9 @@
 # Kimi-K3 vLLM baseline on MI355X
 
-The current C1 baseline was measured 2026-09-03 on one node with 8×AMD
-Instinct MI355X. It is the predeclared median-of-folds reading from three exact cells in
-campaign `k3-showdown-c1-7a54489-retry2`. The 2026-09-02 single-run C1
-values are superseded. The older C128 cell is unchanged and was not rerun.
+The current C1 baseline was measured 2026-09-04 on one node with 8×AMD
+Instinct MI355X. It is the predeclared median-of-folds reading from three fresh,
+alternating cells in campaign `k3-showdown-c1-fe871e6-final`. Older C1 rows
+are superseded. The older C128 cell is unchanged and was not rerun.
 
 ## Stack and server
 
@@ -28,25 +28,25 @@ completed. The older C128 cell used 1280 measured requests.
 | metric | C1, 3-fold mean | C128, N=1280 (unchanged) |
 |---|---:|---:|
 | successful / failed | 10 / 0 per fold | 1280 / 0 |
-| duration | 219.12 s | 1155.90 s |
-| output throughput | 46.73 tok/s | 1133.93 tok/s |
-| total token throughput | 420.60 tok/s | 10205.41 tok/s |
-| mean / median TTFT | 567.86 / 568.35 ms | 5441.21 / 1436.79 ms |
-| P90 / P99 TTFT | 570.28 / 572.01 ms | 2594.22 / 70942.77 ms |
-| mean / median TPOT | 20.86 / 20.86 ms | 107.232 / 109.630 ms |
-| median / P90 / P99 ITL | 20.86 / 20.96 / 21.06 ms | 49.633 / 287.441 / 290.985 ms |
-| mean / median E2E | 21.911 / 21.910 s | 115.139 / 113.738 s |
+| duration | 218.53 s | 1155.90 s |
+| output throughput | 46.86 tok/s | 1133.93 tok/s |
+| total token throughput | 421.72 tok/s | 10205.41 tok/s |
+| mean / median TTFT | 567.87 / 567.74 ms | 5441.21 / 1436.79 ms |
+| P90 / P99 TTFT | 570.08 / 570.58 ms | 2594.22 / 70942.77 ms |
+| mean / median TPOT | 20.81 / 20.81 ms | 107.232 / 109.630 ms |
+| median / P90 / P99 ITL | 20.81 / 20.88 / 20.97 ms | 49.633 / 287.441 / 290.985 ms |
+| mean / median E2E | 21.853 / 21.852 s | 115.139 / 113.738 s |
 
-C1 implies a 14,414.8 input-token/s TTFT proxy and 47.94 decode tok/s from
+C1 implies a 14,429.1 input-token/s TTFT proxy and 48.05 decode tok/s from
 median TPOT. These are served-workload ratios, not isolated-kernel measurements.
 
 ## Exact C1 fold provenance
 
 | fold | mean / median / P99 TTFT (ms) | mean / median / P99 TPOT (ms) | output tok/s | mean / median / P99 E2E (ms) |
 |---|---:|---:|---:|---:|
-| showdown-1 | 568.60 / 568.77 / 573.42 | 20.86 / 20.86 / 20.87 | 46.73 | 21911.41 / 21910.17 / 21921.70 |
-| showdown-2 | 567.86 / 568.35 / 572.01 | 20.78 / 20.78 / 20.79 | 46.91 | 21829.56 / 21830.47 / 21841.47 |
-| showdown-3 | 567.06 / 567.31 / 570.38 | 20.93 / 20.93 / 20.95 | 46.59 | 21979.50 / 21979.00 / 21991.35 |
+| showdown-1 | 568.31 / 568.20 / 570.58 | 20.70 / 20.70 / 20.71 | 47.09 | 21745.91 / 21746.12 / 21752.54 |
+| showdown-2 | 567.87 / 567.74 / 570.27 | 20.81 / 20.81 / 20.81 | 46.86 | 21852.87 / 21852.24 / 21859.58 |
+| showdown-3 | 566.74 / 566.43 / 570.78 | 20.81 / 20.81 / 20.82 | 46.85 | 21855.13 / 21854.52 / 21867.26 |
 
 Artifact-set digest:
 `f76f9e25be770d36f397f446f285b14061dca8a8f918012d977e8ff5bf18a2b6`.
@@ -57,9 +57,9 @@ three raw client logs.
 
 ## Superseded result
 
-The 2026-09-02 C1 single run (218.13 s, 46.94 output tok/s, 567.52 ms mean
-TTFT, 20.768 ms mean TPOT) remains in the JSON `supersedes` record but is
-not the current C1 baseline.
+The 2026-09-03 three-fold row (568.35 ms median TTFT, 20.86 ms median TPOT,
+46.73 output tok/s) is replaced by this fresh same-client campaign and remains
+only in the JSON `supersedes` summary.
 
 Raw C1 data: `perf-data/kimi-k3-vllm-mi355x-c1.json`.
 Unchanged C128 data: `perf-data/kimi-k3-vllm-mi355x-c128.json`.

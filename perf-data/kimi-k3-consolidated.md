@@ -20,12 +20,14 @@ remain as dated evidence links; this file owns the current baseline, decisions, 
 
 | Engine | TTFT p50 | TPOT p50 | ITL p99 | Output throughput |
 |---|---:|---:|---:|---:|
-| Plow | 3645.01 ms | 55.15 ms | 55.59 ms | 17.05 tok/s |
-| vLLM 0.28 | 567.03 ms | 20.768 ms | 21.008 ms | 46.94 tok/s |
+| Plow | 1271.86 ms | 28.53 ms | 28.60 ms | 33.63 tok/s |
+| vLLM 0.28 | 567.74 ms | 20.81 ms | 20.97 ms | 46.86 tok/s |
 
-Plow is 6.43× slower at median TTFT and 2.66× slower at median TPOT. These
-are measured deficits, so the active priorities are prefill KDA/MoE work and
-decode GEMV/body work; endpoint or benchmark-driver changes cannot close them.
+Plow is 2.24× slower at median TTFT and 1.37× slower at median TPOT. Its
+output throughput is 28.2% lower. These are fresh three-fold, order-alternated
+served deficits on the same vLLM 0.28 client and BF16-KV contract. The active
+priorities remain prefill KDA/MoE/MLA architecture and decode GEMV, MoE, and
+boundary amortization; endpoint or benchmark-driver changes cannot close them.
 
 ## Historical MI325X B1 baseline
 
