@@ -27,7 +27,10 @@ if [ -n "$GPU_LEASE_DIR" ]; then
 elif mkdir -p /workspace/gpu 2>/dev/null; then
   LEASE_DIR=/workspace/gpu
 else
-  LEASE_DIR="${TMPDIR:-/tmp}/gpulease"
+  # TMPDIR is deliberately not used here. `nix develop` assigns a fresh
+  # /tmp/nix-shell.* directory to each invocation; deriving locks from it lets
+  # concurrent shells acquire disjoint leases for the same physical GPUs.
+  LEASE_DIR=/tmp/gpulease
 fi
 mkdir -p "$LEASE_DIR" 2>/dev/null || { echo "gpulease: cannot create $LEASE_DIR" >&2; exit 1; }
 chmod 1777 "$LEASE_DIR" 2>/dev/null || true
