@@ -707,7 +707,7 @@ option(PLOW_XR_WAVE_RS
 option(PLOW_XR_TRACE_PHASES
        "Record diagnostic XReduceTwoShot internal phases in packet traces" OFF)
 option(PLOW_XR_TAGGED
-       "Decode one-shot XReduce spins on tagged data words instead of the xctr gate" OFF)
+       "Decode one-shot XReduce spins on tagged data words instead of the xctr gate (TP8 gate 2026-09-04: -2.12 ms/token, exact)" ON)
 option(PLOW_KDA_PF_STATE_RESIDENT
        "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
 option(PLOW_K3_KDA_CONV_STEP_DB

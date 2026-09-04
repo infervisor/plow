@@ -524,7 +524,7 @@ __device__ __forceinline__ void d_xreduce_mega(
 #endif
 }
 
-/* ---- TAGGED ONE-SHOT (-DPLOW_XR_TAGGED=1, decode objects; default OFF) ------------------
+/* ---- TAGGED ONE-SHOT (-DPLOW_XR_TAGGED=1, decode objects; default ON since 2026-09-04) ----
  *
  * The shipped one-shot pays, per collective, on the last-arriving rank: `nranks` serialised
  * system-scope release RMWs (each a buffer_wbl2 + a remote atomic whose completion the next

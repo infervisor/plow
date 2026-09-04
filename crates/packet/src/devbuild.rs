@@ -322,7 +322,7 @@ pub struct Builder {
     uniseg_denied: bool,
     /// See [`Builder::force_uniseg`].
     uniseg_forced: bool,
-    /// See [`Builder::set_gq_order_asap`]. Default from `PLOW_GQ_ORDER=asap`.
+    /// See [`Builder::set_gq_order_asap`]. Default on; `PLOW_GQ_ORDER=emit` restores emit order.
     gq_order_asap: bool,
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
@@ -555,7 +555,7 @@ impl Builder {
             place_l2: None,
             uniseg_denied: false,
             uniseg_forced: false,
-            gq_order_asap: std::env::var("PLOW_GQ_ORDER").ok().as_deref() == Some("asap"),
+            gq_order_asap: std::env::var("PLOW_GQ_ORDER").ok().as_deref() != Some("emit"),
             packed_prefill_segments: false,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
@@ -604,7 +604,8 @@ impl Builder {
         self.uniseg_denied = true;
     }
 
-    /// Order each global-queue window by EARLIEST START instead of emit order (`PLOW_GQ_ORDER=asap`).
+    /// Order each global-queue window by EARLIEST START instead of emit order (default since
+    /// 2026-09-04: -0.21 ms/token, -6 ms TTFT, exact; `PLOW_GQ_ORDER=emit` opts out).
     ///
     /// The global queue hands out entries in stream order and a workgroup that claims a gated
     /// entry SPINS on it. Emit order is topological but not ready-ordered: K3's decode emits the
