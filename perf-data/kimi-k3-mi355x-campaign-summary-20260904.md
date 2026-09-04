@@ -70,7 +70,7 @@ tok/s total, TTFT 382,965 ms, TPOT 1,482.9 ms).
 | Deterministic DOWN→COMBINE tree | Balanced reduction tree, 2 slots/leaf, WG512 | 9.290 vs 14.148 µs → 0.445 ms/token vs 0.5 ms gate; 1 f32 ULP, BF16 exact | rejected | `runtime/bench/amd/k3_moe_grid_sweep.{hip,cpp}` |
 | DOWN→COMBINE phase objects | XCD-local rendezvous instead of a packet boundary (3 prototypes) | +49.5% / +229.0% / +312.4% vs control | rejected | `k3_moe_down_combine_xcd` |
 | KDA decode fused 256×16 (09-02) | Fused KDA decode block | 6.902 / 7.347 µs B1/B8 vs vLLM 8.40 / 9.24; fused-block gate 14.099 vs 14.030 ms/token (+0.49%) | benchmark only | `plow_kda_decode_fused_256x16_2` |
-| MLA GF4 ns32 (09-02) | Decode MLA split rung | B1 38.532 µs (−17.3%, beats AITER 43.232); B8 85.913 µs (~2× AITER) | promoted rung; GF6 rejected (4 spills, +31%) | `PLOW_K3_NS` |
+| MLA GF4 ns32 (09-02) | Decode MLA split rung | B1 38.532 µs (−17.3%, beats AITER 43.232); B8 85.913 µs (~2× AITER) | measured rung; GF6 rejected (4 spills, +31%) | `PLOW_K3_NS` |
 
 ### Prefill — MoE
 
