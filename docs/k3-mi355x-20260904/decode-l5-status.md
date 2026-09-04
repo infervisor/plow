@@ -19,7 +19,7 @@ same packet.
 - `runtime/amd/interp.hip`: `PLOW_DOP_ATTN_RES` takes the banded arm when `i6 != 0` (the scratch
   handle), else the existing single-workgroup arm, byte for byte.
 - Emit knob `PLOW_ATTNRES_DECODE_MWG=<n>` (`emit_config.attnres_decode_mwg`, 2..=16): `emit_attn_res`
-  at `t == 1` with a fused norm emits `blocks = 0..n`, allocates `attnres.mwg.<id>` (2568 B) per
+  at `t == 1` with a fused norm emits `blocks = 0..n`, allocates `act.attnres.mwg.<id>` (2568 B, compiler-owned, loader-zeroed) per
   site, sets `i6` = scratch and `f1` = output-norm eps. Manifest feature `attnres_decode_mwg` ->
   `#define PLOW_ATTNRES_DECODE_MWG 1` in `plow_config.h` and `PLOW_ATTNRES_DECODE_MWG=1` in the
   object requirements. Slot table/doc: `i6=mwg_scratch`. Default off: packets byte-identical.
