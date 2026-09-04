@@ -50,6 +50,19 @@ The 256 MiB cache buffer is read and rewritten by a compute kernel ordered immed
 timed event; no SDMA memset is accepted as a cache flush. Expect roughly 3 GiB of transient GPU
 allocation.
 
+For schedule exploration, `schedule_kernel.hip` exposes tile, workgroup, minimum-occupancy,
+WGM/XCD, cache-hint, priority, and epilogue compile defines without instantiating unrelated
+grouped-MoE entry points. The comparator's extended form accepts the candidate launch contract
+and independent grids:
+
+```sh
+compare SHIPPING.elf CANDIDATE.elf --run CANDIDATE_SYMBOL THREADS LDS \
+  SHIPPING_GRID CANDIDATE_GRID
+```
+
+It reports the arithmetic mean, median, minimum, and maximum of the 31 samples. See
+`perf-data/gfx950-moe-stage1-schedule-screen-20260904.md` for the closed T8192 schedule matrix.
+
 ## Result: rejected
 
 Measured on one leased MI355X GPU with the command above (`moe1-xcd8-wgm4-byte31-c2ed0c5`,

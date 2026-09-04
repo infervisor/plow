@@ -3341,6 +3341,9 @@ typedef unsigned mpf4_b16 __attribute__((ext_vector_type(4), aligned(4)));
 #ifndef PLOW_MOE_PF_A4W4_BRIDGE_ALIAS
 #define PLOW_MOE_PF_A4W4_BRIDGE_ALIAS 0
 #endif
+#ifndef PLOW_MOE_PF_A4W4_PRIO
+#define PLOW_MOE_PF_A4W4_PRIO 1
+#endif
 
 __device__ __forceinline__ float mpf4_glu(float g, float u, unsigned act, float beta,
                                           float lbeta) {
@@ -3726,11 +3729,11 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                                 MPF4_XORSWZ(br_, boff_));                                      \
             sb_[j_] = (int)Bsc[(buf)*MPF4_BN * MPF4_SPR + br_ * MPF4_SPR + sblk_];             \
         }                                                                                      \
-        __builtin_amdgcn_s_setprio(1);                                                         \
+        if constexpr (PLOW_MOE_PF_A4W4_PRIO) __builtin_amdgcn_s_setprio(1);                   \
         _Pragma("unroll") for (int i_ = 0; i_ < SMa; i_++)                                     \
             _Pragma("unroll") for (int j_ = 0; j_ < SNa; j_++)                                 \
                 acc[i_][j_] = mfma_a4w4(af_[i_], bfr_[j_], acc[i_][j_], sa_[i_], sb_[j_]);     \
-        __builtin_amdgcn_s_setprio(0);                                                         \
+        if constexpr (PLOW_MOE_PF_A4W4_PRIO) __builtin_amdgcn_s_setprio(0);                   \
     }                                                                                          \
     /* PIN THE MATRIX BLOCK HERE. `acc` is a loop-carried PHI whose only use is in the latch, so \
      * LLVM sinks every MFMA past the staging code below and out of its own `s_setprio` window — \
@@ -4033,9 +4036,6 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 #endif
 #if PLOW_MOE_PF_A4W4_C3_BK != 32u && PLOW_MOE_PF_A4W4_C3_BK != 64u
 #error "PLOW_MOE_PF_A4W4_C3_BK must be 32 or 64"
-#endif
-#ifndef PLOW_MOE_PF_A4W4_PRIO
-#define PLOW_MOE_PF_A4W4_PRIO 1
 #endif
 #define MPF4_C3_BK PLOW_MOE_PF_A4W4_C3_BK  /* K per staged tile */
 #define MPF4_C3_RB (MPF4_C3_BK * 2u)        /* bf16 LDS row stride */
@@ -4481,6 +4481,7 @@ __device__ __forceinline__ void moe_pf_refuse(void* Cout, const int* meta,
  * epilogues below call `moe_glu` (the pair form), never `moe_act` — situ transforms the UP
  * branch too, so a gate-only call would leave `up` un-clipped. For every other activation
  * `moe_glu` is byte-identical to the `moe_act(g, act) * u` it replaces. */
+#ifndef PLOW_MOE_PF_A4W4_DIRECT_ONLY
 __device__ void d_moe_group_glu_pf(bf16* fu, const bf16* xn2, const unsigned long long* wtab,
                                    const unsigned long long* stab, const int* meta,
                                    const unsigned* row_token, unsigned I_moe, unsigned H,
@@ -4567,6 +4568,7 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
                                        H, I_moe, n_exp, 0, slice, nblk, 0.0f, 0.0f, 0u, lds,
                                        nullptr, nullptr, 0u, part16 MPF_ATOM_ARG MPF_DET_ARG);
 }
+#endif
 
 /* ARM MARKERS for the activation-side flags (packet fields i[7] on ops 85/86/87). The loader's
  * `check_prefill_object` refuses a blob that requires an arm the object's symbol table cannot

@@ -60,9 +60,10 @@ uint32_t xorshift(uint32_t x) {
 struct Module {
     hipModule_t module{};
     hipFunction_t function{};
-    uint32_t threads, lds;
-    Module(const char* path, const char* symbol, uint32_t threads_, uint32_t lds_)
-        : threads(threads_), lds(lds_) {
+    uint32_t threads, lds, grid;
+    Module(const char* path, const char* symbol, uint32_t threads_, uint32_t lds_,
+           uint32_t grid_ = GRID)
+        : threads(threads_), lds(lds_), grid(grid_) {
         CK(hipModuleLoad(&module, path));
         CK(hipModuleGetFunction(&function, module, symbol));
         CK(hipFuncSetAttribute(function, hipFuncAttributeMaxDynamicSharedMemorySize, lds));
@@ -74,7 +75,7 @@ struct Module {
         void* args[] = {&out, &activation, &wtab, &stab, &meta, &row_token, &row_partidx,
                         &out_scale, &inter, &hidden, &experts, &act, &beta, &linear_beta,
                         &zero, &zero};
-        CK(hipModuleLaunchKernel(function, GRID, 1, 1, threads, 1, 1, lds, nullptr, args, nullptr));
+        CK(hipModuleLaunchKernel(function, grid, 1, 1, threads, 1, 1, lds, nullptr, args, nullptr));
     }
 };
 
@@ -90,12 +91,24 @@ double median(std::vector<float> values) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4 || std::string(argv[3]) != "--run") {
-        std::fprintf(stderr, "dry by default; usage: compare SHIPPING.elf CANDIDATE.elf --run\n");
+    if ((argc != 4 && argc != 7 && argc != 9) || std::string(argv[3]) != "--run") {
+        std::fprintf(stderr,
+                     "dry by default; usage: compare SHIPPING.elf CANDIDATE.elf --run "
+                     "[CANDIDATE_SYMBOL THREADS LDS [SHIPPING_GRID CANDIDATE_GRID]]\n");
         return 2;
     }
-    Module shipping(argv[1], "plow_moe1_mxfp4_bk256_gfx950", 512, 119808);
-    Module candidate(argv[2], "plow_moe1_mxfp4_bm64_bn128_bk256_xcd8_wgm4_gfx950", 256, 52224);
+    const uint32_t shipping_grid = argc == 9
+        ? static_cast<uint32_t>(std::strtoul(argv[7], nullptr, 10)) : GRID;
+    const uint32_t candidate_grid = argc == 9
+        ? static_cast<uint32_t>(std::strtoul(argv[8], nullptr, 10)) : GRID;
+    Module shipping(argv[1], "plow_moe1_mxfp4_bk256_gfx950", 512, 119808, shipping_grid);
+    const char* candidate_symbol = argc >= 7
+        ? argv[4] : "plow_moe1_mxfp4_bm64_bn128_bk256_xcd8_wgm4_gfx950";
+    const uint32_t candidate_threads = argc >= 7
+        ? static_cast<uint32_t>(std::strtoul(argv[5], nullptr, 10)) : 256;
+    const uint32_t candidate_lds = argc >= 7
+        ? static_cast<uint32_t>(std::strtoul(argv[6], nullptr, 10)) : 52224;
+    Module candidate(argv[2], candidate_symbol, candidate_threads, candidate_lds, candidate_grid);
 
     std::vector<std::vector<uint32_t>> buckets(E);
     uint32_t state = 930100;
@@ -196,8 +209,10 @@ int main(int argc, char** argv) {
         }
     }
     auto report = [](const char* name, const std::vector<float>& v) {
-        std::printf("%s n=31 median_ms=%.6f min_ms=%.6f max_ms=%.6f\n", name, median(v),
-                    *std::min_element(v.begin(), v.end()), *std::max_element(v.begin(), v.end()));
+        const double mean = std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+        std::printf("%s n=31 mean_ms=%.6f median_ms=%.6f min_ms=%.6f max_ms=%.6f\n",
+                    name, mean, median(v), *std::min_element(v.begin(), v.end()),
+                    *std::max_element(v.begin(), v.end()));
     };
     report("shipping", ship_samples); report("candidate", cand_samples);
     return 0;
