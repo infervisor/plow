@@ -1914,12 +1914,16 @@ pub fn emit_k3_mla_mixer(
     let qr = bft(b, format!("{a}q_rope"), tt * nh as u64 * dr as u64);
     let ckvraw = bft(b, format!("{a}ckv_raw"), tt * dk as u64);
     let krr = bft(b, format!("{a}krot_raw"), tt * dr as u64);
+    // Sized at the CACHE capacity, not the bucket: a continuation chunk re-materializes K/V for
+    // every cached row `[0, c0 + T)` from `kv.*.ckv`/`kv.*.krot`, so the runtime patches the
+    // projection's `M`, the pack's `T` and the attention's `N_KV` to `kv_len` per chunk.
+    let kv_rows = ctx as u64;
     let kvmat = materialized
         .then(|| {
             bft(
                 b,
                 format!("{a}kv_materialized"),
-                tt * nh as u64 * (dn + vd) as u64,
+                kv_rows * nh as u64 * (dn + vd) as u64,
             )
         })
         .unwrap_or(TENSOR_NONE);
@@ -1928,12 +1932,18 @@ pub fn emit_k3_mla_mixer(
             bft(
                 b,
                 format!("{a}k_materialized"),
-                tt * nh as u64 * (dn + dr) as u64,
+                kv_rows * nh as u64 * (dn + dr) as u64,
             )
         })
         .unwrap_or(TENSOR_NONE);
     let vmat = materialized
-        .then(|| bft(b, format!("{a}v_materialized"), tt * nh as u64 * vd as u64))
+        .then(|| {
+            bft(
+                b,
+                format!("{a}v_materialized"),
+                kv_rows * nh as u64 * vd as u64,
+            )
+        })
         .unwrap_or(TENSOR_NONE);
     // NSPLIT IS 1 ON THE PREFILL ARM, and it is forced rather than chosen: under a per-token
     // causal bound an early token's later splits cover nothing, and an empty split emits `l = 0`
@@ -2198,15 +2208,18 @@ pub fn emit_k3_mla_mixer(
             false,
             &[c_rnkv],
         );
+        // The rope half comes from the CACHE row, not the chunk's raw `krr`: rows `[0, c0)` of a
+        // continuation chunk exist only there. K3's MLA is NoPE (identity table), so for the
+        // chunk's own rows `krot` is a bit-exact copy of `krr` and the initial chunk is unchanged.
         let c_pack = b.emit(
             DevOp::MlaMaterializePack,
             all.clone(),
-            &[c_kvmat, c_krr],
+            &[c_kvmat, c_krd],
             |d| {
                 d.t[0] = kmat;
                 d.t[1] = vmat;
                 d.t[2] = kvmat;
-                d.t[3] = krr;
+                d.t[3] = w.krot;
                 d.i[0] = t;
                 d.i[1] = nh;
                 d.i[2] = dn;
@@ -5077,10 +5090,24 @@ mod tests {
                 .all(|e| e.inst as usize == ix));
             if inst.op == DevOp::MlaMaterializePack as u16 {
                 assert_eq!(inst.i[..5], [512, 96, 128, 64, 128]);
+                // The rope half comes from the cache row, so continuation chunks can pack
+                // `[0, c0)`; the runtime patches `i[0]` to `kv_len` per chunk.
+                assert!(p.tensors[inst.t[3] as usize].name.ends_with(".krot"));
             } else {
                 assert_eq!(inst.i[..6], [512, 96, 96, 192, 128, 1]);
             }
         }
+        // K/V transients hold the cache capacity (ctx 4096), not the 512-row bucket.
+        let bytes = |suffix: &str| {
+            p.tensors
+                .iter()
+                .find(|t| t.name.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing {suffix}"))
+                .bytes
+        };
+        assert_eq!(bytes(".kv_materialized"), 4096 * 96 * 256 * 2);
+        assert_eq!(bytes(".k_materialized"), 4096 * 96 * 192 * 2);
+        assert_eq!(bytes(".v_materialized"), 4096 * 96 * 128 * 2);
     }
 
     #[test]
