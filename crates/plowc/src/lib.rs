@@ -965,11 +965,35 @@ fn ensure_model_packet_path_supported(
     metadata: &nn_graph::hub::ModelMetadata,
 ) -> Result<(), PlowcError> {
     let config: serde_json::Value = serde_json::from_str(metadata.config_json())?;
-    match config.get("model_type").and_then(serde_json::Value::as_str) {
+    let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
+    let routed_experts = config
+        .get("n_routed_experts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    match model_type {
         Some("kimi_k3" | "kimi_linear") => Err(PlowcError::InvalidDim(
             "Kimi-K3 is supported by the dedicated MI355X devblob emitter, but the \
              metadata-only `--model` scheduled-packet path does not yet lower its AttnRes \
              block-residual state; use the existing Kimi HF-directory/devblob path"
+                .into(),
+        )),
+        Some("deepseek" | "deepseek_v2" | "deepseek_v3") if routed_experts > 1 => {
+            Err(PlowcError::InvalidDim(
+                "DeepSeek MoE scheduled packets currently model only one representative routed \
+                 expert and do not bind the complete expert/FP8-scale manifest; refusing an \
+                 incomplete packet"
+                    .into(),
+            ))
+        }
+        Some("kimi" | "kimi_k2" | "moonshot") if routed_experts > 1 => Err(PlowcError::InvalidDim(
+            "Kimi-K2 MoE scheduled packets currently model only one representative routed \
+                 expert and do not bind the complete expert/FP8-scale manifest; refusing an \
+                 incomplete packet"
+                .into(),
+        )),
+        Some("glm_moe_dsa") if routed_experts > 1 => Err(PlowcError::InvalidDim(
+            "GLM-5.3 scheduled packets do not yet bind the official DSA indexer, every routed \
+             expert, FP8 scales, and next-token layer; refusing an incomplete packet"
                 .into(),
         )),
         _ => Ok(()),
@@ -1050,10 +1074,19 @@ fn build_assets(
     let footprint_csv = file_size("footprint.csv");
     let static_tensors_bin = file_size("static_tensors.bin");
     let fp8_weights_json = file_size("fp8_weights.json");
+    let chat_templates_total = std::fs::read_dir(opts.out.join("chat_templates"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum::<u64>();
     let hf_metadata_total = nn_graph::hub::METADATA_FILES
         .iter()
         .map(|name| file_size(name))
         .sum::<u64>()
+        .saturating_add(chat_templates_total)
         .saturating_add(file_size("hf_metadata.json"));
     // Excludes assets.json itself: this total is serialized into that file,
     // so its own size isn't known yet.

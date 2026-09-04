@@ -258,6 +258,24 @@ const DEEPSEEK_V4_FLASH_0731: &str = r#"{
   "dspark_block_size":5, "dspark_target_layer_ids":[40,41,42]
 }"#;
 
+// Scaled meta-models/Muse-Glimmer-30B wrapper. The text and vision networks
+// both require dedicated semantics; neither may fall through to a generic graph.
+const MUSE_GLIMMER: &str = r#"{
+  "architectures":["MuseGlimmerForConditionalGeneration"],
+  "model_type":"muse_glimmer", "dtype":"bfloat16",
+  "text_config": {
+    "model_type":"muse_glimmer_text", "vocab_size":64, "hidden_size":32,
+    "intermediate_size":64, "num_hidden_layers":4,
+    "num_attention_heads":4, "num_key_value_heads":1, "head_dim":8,
+    "layer_types":["sliding_attention","sliding_attention","sliding_attention","full_attention"],
+    "sliding_window":16, "final_logit_softcapping":20.0,
+    "qk_scale_factor":3.87, "output_multiplier":0.196116,
+    "rope_parameters":{"sliding_attention":{"rope_theta":500000.0},"full_attention":{"rope_theta":0.0}}
+  },
+  "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":16,"patch_size":14},
+  "multimodal_projector_config":{"hidden_size":16,"out_hidden_size":32}
+}"#;
+
 #[test]
 fn representative_hf_models_compile_from_metadata_only_for_selected_gpu() {
     for (family, config, gpu, hbm_capacity) in [
@@ -265,9 +283,6 @@ fn representative_hf_models_compile_from_metadata_only_for_selected_gpu() {
         ("qwen3", QWEN3, "rtx6000", 96_u64 << 30),
         ("gemma3", GEMMA3, "h100", 80_u64 << 30),
         ("qwen35", QWEN35, "rtx6000", 96_u64 << 30),
-        ("deepseek-v3", DEEPSEEK_V3, "h100", 80_u64 << 30),
-        ("kimi-k2", KIMI_K2, "rtx6000", 96_u64 << 30),
-        ("glm53", GLM53, "h100", 80_u64 << 30),
         ("gemma4", GEMMA4, "rtx6000", 96_u64 << 30),
     ] {
         let metadata = tempdir(&format!("{family}-source"));
@@ -442,6 +457,21 @@ fn packet_routes_missing_from_model_source_fail_closed_instead_of_generic_loweri
             "Kimi-K3 is supported by the dedicated MI355X devblob emitter",
         ),
         (
+            "moonshotai/Kimi-K2-Instruct",
+            KIMI_K2,
+            "Kimi-K2 MoE scheduled packets currently model only one representative routed expert",
+        ),
+        (
+            "deepseek-ai/DeepSeek-V3",
+            DEEPSEEK_V3,
+            "DeepSeek MoE scheduled packets currently model only one representative routed expert",
+        ),
+        (
+            "zai-org/GLM-5.3",
+            GLM53,
+            "GLM-5.3 scheduled packets do not yet bind the official DSA indexer",
+        ),
+        (
             "MiniMaxAI/MiniMax-M2",
             MINIMAX_M2,
             "MiniMax-M2 hybrid linear-attention MoE is not implemented",
@@ -455,6 +485,11 @@ fn packet_routes_missing_from_model_source_fail_closed_instead_of_generic_loweri
             "deepseek-ai/DeepSeek-V4-Flash-0731",
             DEEPSEEK_V4_FLASH_0731,
             "deepseek_v4 (CSA/HCA hybrid attention, mHC residuals",
+        ),
+        (
+            "meta-models/Muse-Glimmer-30B",
+            MUSE_GLIMMER,
+            "muse_glimmer (Muse Glimmer text uses alternating sliding/NoPE attention",
         ),
     ] {
         let metadata = tempdir(&model_id.replace('/', "-"));

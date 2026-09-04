@@ -878,6 +878,10 @@ pub(crate) fn k3_emit_full(
     l2_layout: Option<packet::devbuild::L2Layout>,
 ) {
     let c = cfg_kimi_k3(dir);
+    if let Err(error) = ensure_k3_text_only(&c) {
+        eprintln!("kimi_k3: {error}");
+        std::process::exit(1);
+    }
     let pf = k3_prefill_buckets(ctx);
     let mut m = k3_build_model(dir, ctx, n_cu, tp, &pf, l2_layout);
     k3_ablate_bodies(&mut m);
@@ -968,6 +972,18 @@ pub(crate) fn k3_emit_full(
         m.progs.len(),
     );
     write_mla_manifest(&m, out, target, MoeEnc::Mxfp4, &lean);
+}
+
+fn ensure_k3_text_only(c: &K3Cfg) -> Result<(), String> {
+    let Some(vision) = &c.vision else {
+        return Ok(());
+    };
+    Err(format!(
+        "refusing multimodal checkpoint: the Kimi-K3 devblob implements only the text tower, \
+         not MoonViT ({} layers, hidden {}) or projector {:?}; strip vision_config from a \
+         text-only checkpoint export before compiling",
+        vision.layers, vision.hidden, vision.projector
+    ))
 }
 
 /// The 0-based layer span a K3 emit covers. `K3_NLAYERS` truncates it, and BOTH program kinds are
@@ -2329,11 +2345,16 @@ mod kimi_k3_tests {
         let c = k3_cfg_from(&k3_json(&[]));
         let v = c
             .vision
+            .as_ref()
             .expect("vision_config must be recorded, not ignored");
         assert_eq!((v.layers, v.hidden), (27, 1024));
         // A text-only re-export has none and must not be flagged.
         let text_only = k3_cfg_from(&k3_json(&[("vision_config", "<remove>")]));
         assert!(text_only.vision.is_none());
+        assert!(ensure_k3_text_only(&c)
+            .unwrap_err()
+            .contains("refusing multimodal checkpoint"));
+        assert!(ensure_k3_text_only(&text_only).is_ok());
     }
 
     /// Every gap must name a concrete fix site; a report that says "not supported" and stops is

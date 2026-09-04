@@ -157,6 +157,14 @@ impl ModelConfig {
                  refusing DeepSeek-V3 MLA fallback)"
                     .to_string(),
             )),
+            "muse_glimmer" | "muse_glimmer_text" | "muse_glimmer_vision" => {
+                Err(ConfigError::Unsupported(
+                    "muse_glimmer (Muse Glimmer text uses alternating sliding/NoPE attention, \
+                     qk/output scaling, and post-norms; its ViT-G/14 vision tower and projector \
+                     are also not implemented; refusing a generic decoder fallback)"
+                        .to_string(),
+                ))
+            }
             "glm_moe_dsa" | "glm" | "glm4" => Ok(ModelConfig::Glm(serde_json::from_value(v)?)),
             "minimax_m2" => Err(ConfigError::Unsupported(
                 "minimax_m2 (MiniMax-M2 hybrid linear-attention MoE is not implemented; \

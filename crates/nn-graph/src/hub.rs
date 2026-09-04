@@ -30,6 +30,10 @@ pub const METADATA_FILES: &[&str] = &[
     "merges.txt",
     "processor_config.json",
     "preprocessor_config.json",
+    "video_preprocessor_config.json",
+    "sentencepiece.bpe.model",
+    "tekken.json",
+    "vocab.txt",
 ];
 
 #[derive(thiserror::Error, Debug)]
@@ -44,7 +48,9 @@ pub enum HubError {
 #[derive(Clone, Debug)]
 pub struct ModelMetadata {
     model_id: String,
+    revision: Option<String>,
     config_json: String,
+    has_vision_config: bool,
     files: Vec<(String, PathBuf)>,
 }
 
@@ -52,6 +58,16 @@ impl ModelMetadata {
     /// Model id supplied by the caller, or the local directory path.
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// Immutable Hub commit used for this snapshot, when resolved from HF.
+    pub fn revision(&self) -> Option<&str> {
+        self.revision.as_deref()
+    }
+
+    /// Whether the source checkpoint declares a vision tower.
+    pub fn has_vision_config(&self) -> bool {
+        self.has_vision_config
     }
 
     /// Resolved path for one allowlisted artifact.
@@ -151,14 +167,21 @@ impl ModelMetadata {
             .map_err(|e| HubError::Hub(format!("cannot create {}: {e}", out.display())))?;
         for &name in METADATA_FILES {
             let target = out.join(name);
-            let Some(source) = self.path(name) else {
+            if self.path(name).is_none() {
                 if target.is_file() {
                     std::fs::remove_file(&target).map_err(|e| {
                         HubError::Hub(format!("cannot remove stale {}: {e}", target.display()))
                     })?;
                 }
-                continue;
-            };
+            }
+        }
+        for (name, source) in &self.files {
+            let target = out.join(name);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    HubError::Hub(format!("cannot create {}: {e}", parent.display()))
+                })?;
+            }
             std::fs::copy(source, &target).map_err(|e| {
                 HubError::Hub(format!(
                     "cannot copy {} to {}: {e}",
@@ -170,7 +193,15 @@ impl ModelMetadata {
         let (index_tensors, index_shards) = self.index_counts()?;
         let manifest = serde_json::json!({
             "source": self.model_id(),
+            "revision": self.revision(),
             "files": self.filenames().collect::<Vec<_>>(),
+            "compile_scope": "text_generation",
+            "source_modalities": if self.has_vision_config() {
+                vec!["text", "vision"]
+            } else {
+                vec!["text"]
+            },
+            "compiled_modalities": ["text"],
             "safetensors_index": {
                 "tensors": index_tensors,
                 "shards": index_shards,
@@ -279,65 +310,112 @@ pub fn resolve_model_metadata(model_id: &str) -> Result<ModelMetadata, HubError>
         return metadata_from_dir(model_id, local);
     }
 
-    use hf_hub::{api::sync::ApiBuilder, Cache};
+    use hf_hub::{api::sync::ApiBuilder, Cache, Repo, RepoType};
 
-    let cache = Cache::from_env().model(model_id.to_string());
-    let offline = std::env::var("HF_HUB_OFFLINE").is_ok_and(|value| {
-        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
-    });
+    let cache = Cache::from_env();
+    let cached_main = cache.model(model_id.to_string());
+    let offline = offline_enabled();
     if offline {
-        return metadata_from_getter(model_id, |name| cache.get(name));
+        return metadata_from_cached_main(model_id, &cached_main);
     }
 
     let api = ApiBuilder::from_env()
         .with_progress(false)
         .build()
         .map_err(|e| HubError::Hub(e.to_string()))?;
-    let repo = api.model(model_id.to_string());
-    let info = match repo.info() {
+    let main_repo = api.model(model_id.to_string());
+    let info = match main_repo.info() {
         Ok(info) => info,
-        Err(_error) if cache.get("config.json").is_some() => {
-            return metadata_from_getter(model_id, |name| cache.get(name));
+        Err(_error) if cached_main.get("config.json").is_some() => {
+            return metadata_from_cached_main(model_id, &cached_main);
         }
         Err(error) => return Err(HubError::Hub(error.to_string())),
     };
+    let revision = info.sha;
     let available = info
         .siblings
         .into_iter()
         .map(|file| file.rfilename)
         .collect::<std::collections::HashSet<_>>();
+    let repo = api.repo(Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        revision.clone(),
+    ));
     let mut files = Vec::new();
-    for &name in METADATA_FILES {
-        if available.contains(name) {
+    let mut names = available
+        .iter()
+        .filter(|name| is_metadata_filename(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        if available.contains(&name) {
             let path = repo
-                .get(name)
+                .get(&name)
                 .map_err(|e| HubError::Hub(format!("cannot resolve {model_id}/{name}: {e}")))?;
-            files.push((name.to_string(), path));
+            files.push((name, path));
         }
     }
-    metadata_from_files(model_id, files)
+    metadata_from_files(model_id, Some(revision), files)
 }
 
 fn metadata_from_dir(model_id: &str, dir: &Path) -> Result<ModelMetadata, HubError> {
-    metadata_from_getter(model_id, |name| {
-        let path = dir.join(name);
-        path.is_file().then_some(path)
-    })
+    metadata_from_dir_at_revision(model_id, dir, None)
 }
 
-fn metadata_from_getter(
+fn metadata_from_dir_at_revision(
     model_id: &str,
-    mut get: impl FnMut(&str) -> Option<PathBuf>,
+    dir: &Path,
+    revision: Option<String>,
 ) -> Result<ModelMetadata, HubError> {
-    let files = METADATA_FILES
+    let mut files = METADATA_FILES
         .iter()
-        .filter_map(|name| get(name).map(|path| ((*name).to_string(), path)))
+        .filter_map(|name| {
+            let path = dir.join(name);
+            path.is_file().then(|| ((*name).to_string(), path))
+        })
         .collect::<Vec<_>>();
-    metadata_from_files(model_id, files)
+    let templates = dir.join("chat_templates");
+    if let Ok(entries) = std::fs::read_dir(templates) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let name = format!("chat_templates/{filename}");
+            if path.is_file() && is_metadata_filename(&name) {
+                files.push((name, path));
+            }
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    metadata_from_files(model_id, revision, files)
+}
+
+fn metadata_from_cached_main(
+    model_id: &str,
+    cache: &hf_hub::CacheRepo,
+) -> Result<ModelMetadata, HubError> {
+    let config = cache.get("config.json").ok_or_else(|| {
+        HubError::Hub(format!(
+            "{model_id}: config.json is not available in the Hugging Face cache \
+             (HF_HUB_OFFLINE is set)"
+        ))
+    })?;
+    let snapshot = config
+        .parent()
+        .ok_or_else(|| HubError::Hub(format!("cannot determine cached snapshot for {model_id}")))?;
+    let revision = snapshot
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    metadata_from_dir_at_revision(model_id, snapshot, revision)
 }
 
 fn metadata_from_files(
     model_id: &str,
+    revision: Option<String>,
     files: Vec<(String, PathBuf)>,
 ) -> Result<ModelMetadata, HubError> {
     let Some(config_path) = files
@@ -347,7 +425,7 @@ fn metadata_from_files(
     else {
         return Err(HubError::Hub(format!(
             "{model_id}: config.json is not available{}",
-            if std::env::var_os("HF_HUB_OFFLINE").is_some() {
+            if offline_enabled() {
                 " in the Hugging Face cache (HF_HUB_OFFLINE is set)"
             } else {
                 ""
@@ -356,6 +434,10 @@ fn metadata_from_files(
     };
     let config_json = std::fs::read_to_string(config_path)
         .map_err(|e| HubError::Hub(format!("cannot read {}: {e}", config_path.display())))?;
+    let has_vision_config = serde_json::from_str::<serde_json::Value>(&config_json)
+        .ok()
+        .and_then(|config| config.get("vision_config").cloned())
+        .is_some_and(|vision| !vision.is_null());
     if !files
         .iter()
         .any(|(name, _)| name == "model.safetensors.index.json")
@@ -367,8 +449,23 @@ fn metadata_from_files(
     }
     Ok(ModelMetadata {
         model_id: model_id.to_string(),
+        revision,
         config_json,
+        has_vision_config,
         files,
+    })
+}
+
+fn is_metadata_filename(name: &str) -> bool {
+    METADATA_FILES.contains(&name)
+        || name
+            .strip_prefix("chat_templates/")
+            .is_some_and(|filename| !filename.contains('/') && filename.ends_with(".jinja"))
+}
+
+fn offline_enabled() -> bool {
+    std::env::var("HF_HUB_OFFLINE").is_ok_and(|value| {
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
     })
 }
 
@@ -469,6 +566,9 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(dir.join("chat_template.jinja"), "{{ messages }}").unwrap();
+        std::fs::write(dir.join("video_preprocessor_config.json"), "{}").unwrap();
+        std::fs::create_dir(dir.join("chat_templates")).unwrap();
+        std::fs::write(dir.join("chat_templates/tool_use.jinja"), "{{ tools }}").unwrap();
         std::fs::write(dir.join("model-00001-of-00001.safetensors"), "weight bytes").unwrap();
         std::fs::write(dir.join("modeling_test.py"), "remote code").unwrap();
 
@@ -477,10 +577,12 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "chat_template.jinja",
+                "chat_templates/tool_use.jinja",
                 "config.json",
                 "model.safetensors.index.json",
                 "tokenizer.json",
-                "chat_template.jinja"
+                "video_preprocessor_config.json",
             ]
         );
 
@@ -490,12 +592,75 @@ mod tests {
         assert!(out.join("model.safetensors.index.json").is_file());
         assert!(out.join("tokenizer.json").is_file());
         assert!(out.join("chat_template.jinja").is_file());
+        assert!(out.join("video_preprocessor_config.json").is_file());
+        assert!(out.join("chat_templates/tool_use.jinja").is_file());
         assert!(out.join("hf_metadata.json").is_file());
         assert!(!out.join("model-00001-of-00001.safetensors").exists());
         assert!(!out.join("modeling_test.py").exists());
 
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(out).ok();
+    }
+
+    #[test]
+    fn manifest_marks_multimodal_checkpoints_as_text_only_compilation() {
+        let dir = tempdir("vision-scope");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"fixture","text_config":{},"vision_config":{"hidden_size":16}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"x":"model-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let metadata = resolve_model_metadata(dir.to_str().unwrap()).unwrap();
+        assert!(metadata.has_vision_config());
+        assert_eq!(metadata.revision(), None);
+        let out = tempdir("vision-scope-out");
+        metadata.copy_to(&out).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("hf_metadata.json")).unwrap()).unwrap();
+        assert_eq!(manifest["compile_scope"], "text_generation");
+        assert_eq!(
+            manifest["source_modalities"],
+            serde_json::json!(["text", "vision"])
+        );
+        assert_eq!(manifest["compiled_modalities"], serde_json::json!(["text"]));
+
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(out).ok();
+    }
+
+    #[test]
+    fn cached_resolution_pins_one_snapshot() {
+        use hf_hub::{Cache, Repo, RepoType};
+
+        let root = tempdir("cache-root");
+        let repo = Repo::with_revision("org/model".into(), RepoType::Model, "main".into());
+        let snapshot = root
+            .join(repo.folder_name())
+            .join("snapshots")
+            .join("abc123");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        std::fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"x":"model.safetensors"}}"#,
+        )
+        .unwrap();
+        let cache = Cache::new(root.clone()).repo(repo);
+        cache.create_ref("abc123").unwrap();
+
+        let metadata = metadata_from_cached_main("org/model", &cache).unwrap();
+        assert_eq!(metadata.revision(), Some("abc123"));
+        assert!(metadata
+            .path("model.safetensors.index.json")
+            .is_some_and(|path| path.starts_with(&snapshot)));
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
