@@ -87,10 +87,12 @@ Every measured request enabled per-dispatch TP audit and reported completion on 
 eight ranks.
 
 The complete object directories contain 37 objects each. Only
-`interp_mla_v2_sv{,_gq}.elf` differ. Static-object SHA256:
+`interp_mla_v2_sv{,_gq}.elf` differ. Object SHA256:
 
-- current: `040a9f2a52d821445dee20a7d9a05265d998fe2eacd0ba2e4894c5b6b85a65bb`
-- TR16: `ce1fc55bdfbb4e6cf0d0ce5343e9d97a150e099c7f2b64e042e5782a41bd53f6`
+- current static: `040a9f2a52d821445dee20a7d9a05265d998fe2eacd0ba2e4894c5b6b85a65bb`
+- current GQ: `c21c0572a56abf73355a1c1ce3221685a43917f617e6de685c5f03e33ebf4b2e`
+- TR16 static: `ce1fc55bdfbb4e6cf0d0ce5343e9d97a150e099c7f2b64e042e5782a41bd53f6`
+- TR16 GQ: `6ff9e108fc5db33ad4fb7e355052b2fc0d20512fcdd2de44a16d35c45a145b5c`
 
 The current object has 256 `ds_read_u16`, 128 `v_perm_b32`, and no transpose
 reads. The candidate has 64 `ds_read_b64_tr_b16`, no old reads/packs, and alone
