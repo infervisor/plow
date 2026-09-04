@@ -3209,6 +3209,9 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
 #if PLOW_MLA_PF_TR16 && !defined(__gfx950__)
 #error "PLOW_MLA_PF_TR16 requires gfx950"
 #endif
+#if PLOW_MLA_PF_TR16
+extern "C" __device__ unsigned plow_mla_pf_tr16_arm_1 = 1;
+#endif
 /* Extra halves the kv-block swizzle adds to the slab (blocks 1..3 shifted by 16 each). */
 #if PLOW_MLA_PF_SV && !PLOW_MLA_PF_TR16
 #define FA_MLA_PF2_SWZ 16

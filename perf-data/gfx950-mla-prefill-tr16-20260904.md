@@ -7,7 +7,8 @@ geometry it is bit-exact to the current V2 body and reduces the isolated body by
 16.62% without changing occupancy or introducing scratch/spills.
 
 The change is model-independent. It is selected by gfx950 capability and the generic
-`DK`/`DR` V2 template, not by a model name.
+`DK`/`DR` V2 template, not by a model name. Candidate objects export
+`plow_mla_pf_tr16_arm_1`; controls do not.
 
 ## Why this schedule
 
