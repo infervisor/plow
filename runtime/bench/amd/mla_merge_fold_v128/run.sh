@@ -16,7 +16,9 @@ resource() {
     sed -n "/Function Name: $1/,/Function Name:/p" "$OUT/resources" |
         grep -F "$2:" | head -1 | sed 's/^.*: *//; s/ .*$//'
 }
-for name in k_fold_v128_tb1 k_fold_v128_tb2 k_fold_v128_tb4 k_fold_v128_tb8; do
+for name in k_fold_v128_tb1 k_fold_v128_tb2 k_fold_v128_tb4 k_fold_v128_tb8 \
+    k_fold_v128_tb2_serial_merge k_fold_v128_tb4_serial_merge \
+    k_fold_v128_tb8_serial_merge; do
     vgpr=$(resource "$name" VGPRs); sgpr=$(resource "$name" TotalSGPRs)
     scratch=$(resource "$name" 'ScratchSize [bytes/lane]')
     vspill=$(resource "$name" 'VGPRs Spill'); sspill=$(resource "$name" 'SGPRs Spill')

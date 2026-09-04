@@ -27,10 +27,20 @@ typedef union __align__(16) {
                                           blockIdx.x, gridDim.x, sm.f);                           \
     }
 
+#define FOLD_TB_SERIAL_MERGE(NAME, TB)                                                            \
+    extern "C" __global__ __launch_bounds__(PLOW_THREADS) void NAME(FOLD_ARGS) {                 \
+        __shared__ FoldSmem sm;                                                                   \
+        d_mla_merge_fold_tb<512, 128, TB, PLOW_MLA_FOLD_VEC, PLOW_MLA_FOLD_UN, false>(           \
+            out, opart, mlpart, wuv, n_batch, n_head, v, nsplit, blockIdx.x, gridDim.x, sm.f);    \
+    }
+
 FOLD_BASE(k_fold_v128_tb1)
 FOLD_TB(k_fold_v128_tb2, 2)
 FOLD_TB(k_fold_v128_tb4, 4)
 FOLD_TB(k_fold_v128_tb8, 8)
+FOLD_TB_SERIAL_MERGE(k_fold_v128_tb2_serial_merge, 2)
+FOLD_TB_SERIAL_MERGE(k_fold_v128_tb4_serial_merge, 4)
+FOLD_TB_SERIAL_MERGE(k_fold_v128_tb8_serial_merge, 8)
 
 extern "C" __global__ void k_cache_flush(const unsigned* in, unsigned* out, size_t n) {
     unsigned v = 0;

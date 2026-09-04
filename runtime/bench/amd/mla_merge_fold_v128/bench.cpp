@@ -77,9 +77,10 @@ int main(int argc, char** argv) {
     hipModule_t module;
     CK(hipModuleLoad(&module, argv[1]));
     const char* names[] = {"k_fold_v128_tb1", "k_fold_v128_tb2", "k_fold_v128_tb4",
-                           "k_fold_v128_tb8"};
-    hipFunction_t kernels[4], flush;
-    for (unsigned i = 0; i < 4; ++i) CK(hipModuleGetFunction(&kernels[i], module, names[i]));
+                           "k_fold_v128_tb8", "k_fold_v128_tb2_serial_merge",
+                           "k_fold_v128_tb4_serial_merge", "k_fold_v128_tb8_serial_merge"};
+    hipFunction_t kernels[7], flush;
+    for (unsigned i = 0; i < 7; ++i) CK(hipModuleGetFunction(&kernels[i], module, names[i]));
     CK(hipModuleGetFunction(&flush, module, "k_cache_flush"));
 
     const size_t rows = (size_t)TOKENS * HEADS;
@@ -123,7 +124,7 @@ int main(int argc, char** argv) {
     std::printf("%-20s %12s %12s %12s %18s\n", "variant", "median_us", "vs_tb1", "bitcmp",
                 "fnv1a64");
     double control_us = 0.0;
-    for (unsigned kernel = 0; kernel < 4; ++kernel) {
+    for (unsigned kernel = 0; kernel < 7; ++kernel) {
         CK(hipMemset(out, 0, out_count * sizeof(*out)));
         launch(kernels[kernel], args);
         CK(hipDeviceSynchronize());
