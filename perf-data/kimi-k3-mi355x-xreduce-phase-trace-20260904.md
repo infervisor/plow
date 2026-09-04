@@ -172,6 +172,30 @@ not an independently removable 39.4 ms: most of that interval co-varies with ong
 and other workgroups. The next isolated experiments target strict-order reduce-scatter and
 folded-gather data motion directly.
 
+### Isolated data-motion screen
+
+Three alternating exact TP8 screens retained both rendezvous, all signals, strict global
+rank-0-through-rank-7 accumulation, and exact output:
+
+| schedule | half | full | folded gather | weighted 92/94/92 | decision |
+|---|---:|---:|---:|---:|---|
+| scalar control | 38.606 us | 72.993 us | 96.990 us | 19.336 ms | control |
+| rank-load MLP | 41.111 us | 76.482 us | 99.944 us | 20.166 ms | reject (+4.29%) |
+| RS independent-element U2 | 34.708 us | 63.398 us | 86.439 us | 17.105 ms | keep (-11.54%) |
+| RS independent-element U4 | 40.469 us | 71.204 us | 94.582 us | 19.118 ms | reject (-1.13%) |
+| folded-gather U4 | unchanged | unchanged | 93.956 us | 19.057 ms | reject: only -0.279 ms |
+| folded-gather U8 | unchanged | unchanged | 107.622 us | 20.314 ms | reject (+5.06%) |
+
+RS-U2 interleaves two independent elements' peer loads while accumulating each element in the
+same rank order. It is generic in message dimensions and has no packet/runtime/model check. The
+focused object is wave64, 28 VGPR / 74 SGPR, 4 B LDS, zero private/spills. More importantly, the
+full prefill GQ object is resource-identical to control: 256 VGPR / 108 SGPR, occupancy 2,
+1348 B private, 147504 B LDS, eight VGPR spills and 74 SGPR spills. It therefore remains an
+inline, default-off candidate with no segment launch cost. The flag-off full-object `.text` hash
+is `790122b960030c28e49cf4dbcc11cef03609c168d22d45d44a5f67db31c8111c`, identical to the
+pre-axis production control. All other screened data axes were removed from the production
+header.
+
 ## Pinned vLLM/AITER comparison
 
 vLLM 0.28 pins AITER 0.1.19. Its default custom-all-reduce cutoff is 64 MiB even though the

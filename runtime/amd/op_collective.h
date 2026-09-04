@@ -145,6 +145,17 @@ extern "C" __device__ unsigned plow_xr_trace_phases_v2 = 1;
  * body's instruction mix while rotating the read index, so it must not also change the mix. */
 #define PLOW_XR_MLP_ON (PLOW_XR_MLP && !PLOW_XR_SHUFFLE)
 
+/* Strict rank-order reduce-scatter with independent elements in flight. Default one keeps
+ * the shipping loop byte-identical; isolated specialist objects screen wider schedules. */
+#ifndef PLOW_XR_RS_U
+#define PLOW_XR_RS_U 1
+#endif
+#if PLOW_XR_RS_U == 2
+extern "C" __device__ unsigned plow_xr_rs_u2 = 1;
+#elif PLOW_XR_RS_U != 1
+#error "PLOW_XR_RS_U must be 1 or 2"
+#endif
+
 /* Experimental TP8 reduce-scatter schedule. Eight waves load one 16-byte pack per
  * lane from distinct peers into LDS; wave 0 then accumulates logical ranks 0..7 in
  * the shipping order. Gates and all-gather are unchanged. Misaligned or partial
@@ -737,6 +748,34 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         }
     } else
 #endif
+#if PLOW_XR_RS_U > 1
+    {
+        constexpr uint32_t U = PLOW_XR_RS_U;
+        uint32_t e = my_lo + tid;
+        for (; e + (U - 1) * stride < my_hi; e += U * stride) {
+            float acc[U] = {};
+            for (uint32_t r = 0; r < nranks; r++) {
+                const bf16* part = (const bf16*)((const char*)peer_scratch[r] + slot_bytes);
+                bf16 v[U];
+#pragma unroll
+                for (uint32_t u = 0; u < U; u++) v[u] = as_glob(part)[e + u * stride];
+#pragma unroll
+                for (uint32_t u = 0; u < U; u++) acc[u] += bf2f(v[u]);
+            }
+#pragma unroll
+            for (uint32_t u = 0; u < U; u++)
+                st_act1(&as_glob(my_part)[e + u * stride], f2bf(acc[u]));
+        }
+        for (; e < my_hi; e += stride) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < nranks; r++) {
+                const bf16* part = (const bf16*)((const char*)peer_scratch[r] + slot_bytes);
+                acc += bf2f(as_glob(part)[e]);
+            }
+            st_act1(&as_glob(my_part)[e], f2bf(acc));
+        }
+    }
+#else
     for (uint32_t e = my_lo + tid; e < my_hi; e += stride) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < nranks; r++) {
@@ -749,6 +788,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         }
         st_act1(&as_glob(my_part)[e], f2bf(acc));
     }
+#endif
     __syncthreads();
 #if PLOW_XR_TRACE_PHASES
     if (threadIdx.x == 0 && xr_trace) {
