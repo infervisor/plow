@@ -1674,6 +1674,10 @@ pub fn check_xr_tagged_blob(progs: &[crate::asset::devblob::DevProg], hidden: u3
     Ok(())
 }
 
+/// `PLOW_XRT_FOLD_MAXK` in `op_collective.h`: the folded combine (XReduce `i7 = k`, `t1 = part`)
+/// stages every slot load in registers, so `k` is bounded at build time.
+const XR_FOLD_MAX_K: u32 = 16;
+
 fn check_xr_tagged_insts(pi: usize, insts: &[packet::dev::DevInst64], hidden: u32) -> Result<()> {
     use packet::dev::DevOp;
     {
@@ -1688,6 +1692,8 @@ fn check_xr_tagged_insts(pi: usize, insts: &[packet::dev::DevInst64], hidden: u3
                 || hidden > PeerLayout::XR_TAG_MAX_WIDTH
                 || gcols > hidden
                 || (gcols != 0 && row_w != n)
+                || (d.i[7] != 0 && d.t[1] == packet::dev::TENSOR_NONE16)
+                || d.i[7] > XR_FOLD_MAX_K
                 || gate >= 0xffff;
             if bad {
                 return Err(RuntimeError::Device(format!(

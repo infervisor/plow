@@ -234,7 +234,7 @@ measurement, never a result with a caveat. Wrap the run, not the build.
 |---|---|---|---|
 | prefill GEMM tiles | amd | `plowc … tune gemm` (measure + ingest + verify, one command) or `gemm_tile_sweep <M> <N> <K> [label] [quant]` with `PLOW_GEMM_JSONL=<path>` | `plowc tune ingest --samples <jsonl>`; read back by `devgen::pick_tile` |
 | decode GEMV rungs | amd | `gemv_campaign_lease.sh OBJ JSONL CAMPAIGN -- EMIT_COMMAND...`; requires a fresh OBJ, builds all harness components in `nix develop` outside one leased sweep, then derives/filter-checks the live `TUNEDUMP_GEMV` census | Ingests only passing uncontended samples after physical MI350X/MI355X detection and exact cell/interpreter/toolchain/oracle checks |
-| decode attention split count | both | emit matched packet arms with the model's `nsplit` knob (K3: `PLOW_K3_NS`) and score with `plowrt serve` + `vllm bench serve`; keep weights and interpreter object fixed | packet/program selection, not the kernel tune store |
+| decode attention split count | both | emit matched packet arms with the model's `nsplit` knob (K3: `PLOW_MLA_NS`) and score with `plowrt serve` + `vllm bench serve`; keep weights and interpreter object fixed | packet/program selection, not the kernel tune store |
 | decode knob grid | nvidia | `scripts/tune_decode_sweep.sh` — joint OBJECT knobs (`PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, `PLOW_MOE_DOWN_SG`) scored by end-to-end step TPOT | `tunedb-decode ingest --db tuning --results <jsonl>` |
 | single-CU roofline (evidence only) | amd | `run_ubench_cu.sh` | none — no oracle, never selectable |
 | dispatch floor (evidence only) | both | `runtime/bench/dispatch/interp_dispatch_floor_nv.cu` / `.hip` | stored `provisional` with `reason_not_qualified` |
@@ -275,7 +275,7 @@ For every arm, re-emit only the packet, reuse the exact weights and interpreter
 object, and prove by disassembly that only the attention and merge packets plus
 their scratch extents changed. Sweep at the shortest and longest served context,
 then add crossover points before choosing thresholds. K3 TP8 uses
-`workgroups = (local_heads / head_group) * PLOW_K3_NS`; its measured 128K sweep
+`workgroups = (local_heads / head_group) * PLOW_MLA_NS`; its measured 128K sweep
 was ns16/ns32/ns64/ns128 = 81.400/67.417/60.569/60.683 ms TPOT, so ns64 won and
 ns128 bracketed the merge-cost reversal.
 
@@ -292,7 +292,7 @@ packet and object settings, changing only the layer set and split count:
 ```bash
 for ns in 16 32 64 128; do
   nix develop --command env \
-    K3_FULL=1 PLOW_K3_LAYERS=single:3 PLOW_K3_NS="$ns" \
+    K3_FULL=1 PLOW_LAYERS=single:3 PLOW_MLA_NS="$ns" \
     PLOW_FP8_KV=1 PLOW_MXFP4=1 PLOW_MLA_PF_V2=1 \
     PLOW_L2_PLACE=1 PLOW_DECODE_BATCH=1 PLOW_GEMV_MM=1 \
     ./target/release/plowc --hf-dir /home/lava/models/k3_farm \

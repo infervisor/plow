@@ -129,18 +129,18 @@ bundle () { echo "$OUT/${VARIANT}tp$1"; }
 emit_one () { # <tp>   ; DSA_ENV = "0" forces dense, "" arms the gate
   local tp="$1" b; b="$(bundle "$tp")"; mkdir -p "$b"
   echo "== emit TP$tp  max-ctx=$MAXCTX  ladder=$LADDER  PLOW_GLM_DSA=${DSA_ENV-0}" \
-       "PLOW_GLM_GF=${GF_ENV:-<auto>} PLOW_GLM_NS=${NS_ENV:-<auto>}" \
+       "PLOW_GLM_GF=${GF_ENV:-<auto>} PLOW_MLA_NS=${NS_ENV:-<auto>}" \
        "GLM_NLAYERS=${NLAYERS:-<all 78>} objs=$OBJ"
   # NLAYERS truncates the emit to the first N layers (`glm_emit_full`, mla.rs) while keeping the
   # FULL serving structure and the TP sharding — it is a SEARCH vehicle, not a shipping blob.
   # The 4-minute 183 GiB/rank weight load is the entire cost of an arm (glm52_decode.c:224), and
-  # an emit-time knob like PLOW_GLM_NS pays it once per arm; N=8 (3 dense + 5 MoE, since
+  # an emit-time knob like PLOW_MLA_NS pays it once per arm; N=8 (3 dense + 5 MoE, since
   # `first_k_dense_replace=3`) cuts it ~10x and still exercises both layer kinds. Do NOT confuse
   # it with the single-layer bring-up path (GLM_FULL unset), which asserts tp == 1.
   env GLM_FULL=1 PLOW_FP8=1 GLM_SHARD_HEAD=1 GLM_MOE_CORESIDENT=2 GLM_SHARED_CUS=48 \
       PLOW_MLA_PREFILL="$LADDER" PLOW_GLM_DSA="${DSA_ENV-0}" \
       ${NLAYERS:+GLM_NLAYERS="$NLAYERS"} \
-      ${GF_ENV:+PLOW_GLM_GF="$GF_ENV"} ${NS_ENV:+PLOW_GLM_NS="$NS_ENV"} \
+      ${GF_ENV:+PLOW_GLM_GF="$GF_ENV"} ${NS_ENV:+PLOW_MLA_NS="$NS_ENV"} \
     nix develop --command "$WT/target/release/plowc" --hf-dir "$CKPT" --emit devblob \
       ${NOROPEGEN:+--no-rope-gen} \
       --max-ctx "$MAXCTX" --n-cu 256 --num-gpus "$tp" --out "$b/model.pkt"
@@ -255,7 +255,7 @@ emitgf)
 # GATED OFF for GLM — it needs `kvh_slide != kvh_full` and GLM has no sliding-window layers).
 # UNDER-FILL at short/mid ctx is the lever, not alignment.
 #
-# ONE BLOB PER (GF, ns) SERVES BOTH CTX POINTS. `PLOW_GLM_NS` REPLACES ns outright
+# ONE BLOB PER (GF, ns) SERVES BOTH CTX POINTS. `PLOW_MLA_NS` REPLACES ns outright
 # (`unwrap_or(ns)`), bypassing the `fill` and `kv_tiles` caps, so >64 is reachable — and the
 # kernel splits over the LIVE `kv_len` (`d_flash_mla_decode`: `span = cend - first`, `cend` from
 # the `kv_len` operand), NOT over the emit-time max ctx. So an 8192-position decode on a
@@ -267,7 +267,7 @@ emitgf)
 # `(nh_l/GF)*ns` HALVES. GF=8 therefore needs DOUBLE the ns for the same chip fill:
 #   GF=4 ns {16,32,64,128} and GF=8 ns {32,64,128,256}  both give items {64,128,256,512}.
 # The §6g-GF8 open question ("GF=8 halves latent traffic AND halves the work items, to first
-# order these cancel unless PLOW_GLM_NS doubles") is answered by GF=8@ns128 vs GF=4@ns64.
+# order these cancel unless PLOW_MLA_NS doubles") is answered by GF=8@ns128 vs GF=4@ns64.
 #
 # THE TOP RUNG IS OVER-SUBSCRIPTION, NOT WIDTH. `flash_mla_cus` hands back `min(n_work, n_cu)`
 # workgroups and `d_flash_mla_decode` grid-strides `for (w=slice; w<n_work; w+=nblk)`, so the
@@ -286,7 +286,7 @@ emitgf)
 # LABEL THE DIRECTORIES. `build.json` records neither GF nor nsplit, so a gf4ns64 and a gf8ns128
 # bundle are indistinguishable on disk — the same trap §6g-GF8 names for GF alone.
 #
-# SEARCH TRUNCATED, PRICE FULL. `PLOW_GLM_NS` is an EMIT-time knob, so every arm is a fresh blob
+# SEARCH TRUNCATED, PRICE FULL. `PLOW_MLA_NS` is an EMIT-time knob, so every arm is a fresh blob
 # AND a fresh weight load — and the load, not the measurement, is what a lease actually buys
 # (glm52_decode.c:224). So the 8-arm grid is emitted with `NLAYERS=8` (3 dense + 5 MoE) and the
 # WINNER plus its control are then re-emitted at all 78 layers and priced end-to-end through

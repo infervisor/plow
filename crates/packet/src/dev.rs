@@ -1007,7 +1007,7 @@ pub enum DevOp {
     ///
     /// `t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb_cap,H] bf16)
     /// t3=score_w([H] f32) t4=push_src? t5=gamma? t6=res_a? t7=res_b?` ·
-    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre?` · `f0=eps`.
+    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre? i6=mwg_scratch` · `f0=eps`.
     ///
     /// `gamma` is the FUSED POST-NORM, `[H] bf16`, and it is what makes the slice map above
     /// affordable. Every AttnRes in a K3 program is read by exactly one consumer and that consumer
@@ -1035,6 +1035,10 @@ pub enum DevOp {
     /// `res_a`/`res_b` optionally materialize `prefix_sum = bf16(res_a + res_b)` inside this
     /// packet. `res_pre` selects `prefix_sum = bf16(res_pre + bf16(res_a + res_b))`, retaining
     /// the intermediate BF16 rounding and the materialized tensor for all other consumers.
+    ///
+    /// `mwg_scratch` (non-zero only on a decode packet emitted with `PLOW_ATTNRES_DECODE_MWG=n`)
+    /// is the tagged-word rendezvous scratch of the banded multi-workgroup arm; `blocks = n`
+    /// column bands then share one packet. `f1` carries the output-norm epsilon (f32-mix).
     AttnRes = 104,
     /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
     /// experts, routed experts).
@@ -1236,8 +1240,13 @@ pub enum DevOp {
     /// gate operands this op cannot fall back to reading a precomputed `g`, because it has no
     /// slot naming one.
     ///
+    /// `flags` bit 2 (`PLOW_KDA_F_FB_FOLD`, decode objects built with `PLOW_KDA_FB_FOLD=1`):
+    /// `t4` is `f_a` (`[T, D]`) and `j1` the `f_b_proj` weight (`[H*D, D]`); the step computes
+    /// its head's `D` gate logits in its prologue with the GEMV's own column routine, and the
+    /// standalone `f_b` GEMV is not emitted.
+    ///
     /// `t0=o t1=q t2=k t3=v t4=g_raw t5=beta_raw t6=state t7=A_log` ·
-    /// `i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode i7=parked` · `f0=scale f1=lower_bound`.
+    /// `i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode i7=parked` · `f0=scale f1=lower_bound j1=w_fb`.
     KdaStateStepG = 112,
     /// `t0=fu t1=A t2=Wg(fp4) t5=Wu(fp4) t3=Sg(e8m0) t4=Su(e8m0)` · `i0=M i1=N i2=K i5=act`,
     /// computing `fu = act(Wg @ A) * (Wu @ A)` — the MXFP4 twin of [`DevOp::GemmGlu`] and the T-row
@@ -1937,6 +1946,12 @@ pub const SE_KDA_INTRA_WAVE_ITEMS: u16 = 8;
 /// the opcode of the entry disambiguates; a runtime that predates this route refuses such a
 /// packet as an impure wave-item segment rather than running it.
 pub const SE_KDA_CARRY_REGSTATE: u16 = SE_KDA_INTRA_WAVE_ITEMS;
+
+/// The same bit on a pure `KdaChunkWu` segment selects the lean four-wave gfx950 Wu object
+/// (opcode-disambiguated like [`SE_KDA_CARRY_REGSTATE`]). A marked Wu whose `i[5]` is 1 also
+/// emits the scaled-key hi/lo pair that the following register-state carry consumes (keyfeed);
+/// the interpreter ignores `i[5]`, so the fallback stays exact.
+pub const SE_KDA_WU_LEAN: u16 = SE_KDA_INTRA_WAVE_ITEMS;
 
 /// Shift of the per-(packet, L2 domain) slice count packed into [`StreamEnt::flags`].
 ///

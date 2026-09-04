@@ -634,6 +634,22 @@ fn emit_kda_mixer_ex(
     let (hi, p, hd, nh) = (c.hidden, c.proj(), c.head_dim, c.heads);
     let (tt, pu, hiu) = (t as u64, p as u64, hi as u64);
     let a = act_prefix;
+    let chunk = chunk_enable && t >= 512 && !seq_rows && matches!(hd, 64 | 128);
+    let decode_fused = fused_decode_enable
+        && fuse
+        && !chunk
+        && st.conv_state_alt.is_none()
+        && c.supports_decode_fused(t, n_cu, seq_rows);
+    // L3 (`PLOW_KDA_FB_FOLD`): at decode the f_b GEMV folds into `KdaStateStepG`'s prologue.
+    // Only the plain Conv3 -> StepG chain carries the arm; f_a's row rides the step's `t4`, the
+    // weight its `j1`, and `f_raw` is never declared.
+    let fb_fold = t == 1
+        && !seq_rows
+        && fuse
+        && !chunk
+        && !decode_fused
+        && st.conv_state_alt.is_none()
+        && crate::emit_config::active().kda_fb_fold;
 
     // Activations. q, k and v stay three separate [T, H*D] buffers all the way through: the three
     // projections are independent packets, the three convs are independent packets, and the state
@@ -660,12 +676,15 @@ fn emit_kda_mixer_ex(
     ];
     let g_raw = bft(b, format!("{a}g_raw"), tt * pu);
     let fa = bft(b, format!("{a}f_a"), tt * hd as u64);
-    let f_raw = bft(b, format!("{a}f_raw"), tt * pu);
+    let f_raw = if fb_fold {
+        fa
+    } else {
+        bft(b, format!("{a}f_raw"), tt * pu)
+    };
     let b_raw = bft(b, format!("{a}b_raw"), tt * nh as u64);
     // `gate`/`beta` exist ONLY on the unfused path. A declared handle nothing writes is the
     // `Mamba2Scan` smell — 69 layers x 49 KiB of arena that no op touches — and an emitter that
     // allocates it anyway is one refactor away from an op reading it.
-    let chunk = chunk_enable && t >= 512 && !seq_rows && matches!(hd, 64 | 128);
     let (gate, beta) = if fuse && !chunk {
         (u32::MAX, u32::MAX)
     } else {
@@ -768,7 +787,11 @@ fn emit_kda_mixer_ex(
     );
     // P7 — forget-gate up-projection. The forget gate stays LOW RANK 128 even though the output
     // gate is full rank; that asymmetry is `use_full_rank_gate`'s and it is easy to get backwards.
-    let c_fb = gemv(b, f_raw, fa, w.f_b_proj, p, hd, c_fa);
+    let c_fb = if fb_fold {
+        c_fa
+    } else {
+        gemv(b, f_raw, fa, w.f_b_proj, p, hd, c_fa)
+    };
 
     // P8/P9/P10 — the K3-specific chain, SIX packets decomposed and THREE fused. `fuse_kda`
     // argues the direction; both spellings of the graph are emitted from here so the fusion stays
@@ -783,12 +806,7 @@ fn emit_kda_mixer_ex(
     // scale = D^-0.5, applied to q AFTER the L2 norm; k is NOT scaled.
     let scale = (c.head_dim as f32).powf(-0.5);
 
-    if fused_decode_enable
-        && fuse
-        && chunk_tmp.is_none()
-        && st.conv_state_alt.is_none()
-        && c.supports_decode_fused(t, n_cu, seq_rows)
-    {
+    if decode_fused {
         let handles = [
             w.conv_w[0],
             w.conv_w[1],
@@ -1036,7 +1054,8 @@ fn emit_kda_mixer_ex(
             // bit0: L2-normalize q and k in kernel, eps INSIDE the sqrt.
             // bit1 (PLOW_KDA_F_SEQ_ROWS): the rows are INDEPENDENT SEQUENCES, so the recurrence
             // strides its carried state per row instead of threading them all through one.
-            d.i[4] = 1 | if seq_rows { 2 } else { 0 };
+            // bit2 (PLOW_KDA_F_FB_FOLD): t4 is f_a and j1 the f_b weight; the step projects.
+            d.i[4] = 1 | if seq_rows { 2 } else { 0 } | if fb_fold { 4 } else { 0 };
             d.i[5] = w.dt_bias;
             d.i[6] = gate_mode;
             // `i[7]`, the one free integer slot. Read only when the flags word carries
@@ -1045,6 +1064,10 @@ fn emit_kda_mixer_ex(
             d.i[7] = parked;
             d.f[0] = scale;
             d.f[1] = lower_bound;
+            // `j[1]` (= `fj[2]`), read only under bit2 for the same reason as `i[7]`.
+            if fb_fold {
+                d.j[1] = w.f_b_proj;
+            }
         })
     } else {
         // P8a-c — the three short convs, one per stream, each over H*D = 12288 channels and each
@@ -1496,6 +1519,104 @@ mod tests {
                 assert_eq!(n(DevOp::KdaChunkPrepare), 0);
             }
         }
+    }
+
+    /// L3 (`PLOW_KDA_FB_FOLD`): the decode f_b GEMV folds into `KdaStateStepG`. Unset and "0"
+    /// emit the same bytes; on, the layer loses exactly the f_b packet and the step carries
+    /// `t4 = f_a`, `j1 = W_fb`, flags bit 2. Prefill rows are untouched either way.
+    #[test]
+    fn fb_fold_removes_the_f_b_gemv_and_leaves_the_default_packet_byte_identical() {
+        let _guard = crate::test_env::env_guard();
+        let build = |t: u32| {
+            let c = KdaCfg {
+                heads: 12,
+                bv: 8,
+                ..k3()
+            };
+            let mut b = Builder::new(256);
+            let hidden = b.tensor("in.hidden", t as u64 * c.hidden as u64 * 2);
+            let w = declare_kda_weights(&mut b, &c, "p.", "l.");
+            let st = declare_kda_state(&mut b, &c, "kv.0.", 1);
+            let seed = b.emit(DevOp::Nop, (0..256).collect(), &[], |_| {});
+            emit_kda_mixer_ex(
+                &mut b,
+                &c,
+                &w,
+                &st,
+                "act.",
+                t,
+                hidden,
+                None,
+                256,
+                false,
+                &[seed],
+                true,
+                false,
+                false,
+                false,
+            );
+            (b.finish(), w)
+        };
+        let packed = |p: &packet::devbuild::Program| -> Vec<packet::dev::DevInst64> {
+            p.insts.iter().map(|i| i.pack()).collect()
+        };
+        let (unset, _) = build(1);
+        let (off, w_off) = {
+            let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "0")]);
+            build(1)
+        };
+        assert_eq!(packed(&unset), packed(&off), "unset == off, byte for byte");
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        let step_off = off
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step_off.i[4] & 4, 0);
+        assert_eq!(step_off.j[1], 0);
+        assert!(off
+            .insts
+            .iter()
+            .any(|i| i.op == DevOp::Gemv as u16 && i.t[2] == w_off.f_b_proj));
+
+        let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "1")]);
+        let (on, w_on) = build(1);
+        assert_eq!(
+            on.insts.len(),
+            off.insts.len() - 1,
+            "exactly the f_b packet"
+        );
+        assert_eq!(n(&on, DevOp::Gemv), n(&off, DevOp::Gemv) - 1);
+        assert!(!on
+            .insts
+            .iter()
+            .any(|i| i.op == DevOp::Gemv as u16 && i.t[2] == w_on.f_b_proj));
+        assert_eq!(n(&on, DevOp::KdaStateStepG), 1);
+        let step = on
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step.i[4], 1 | 4, "l2norm + fold");
+        assert_eq!(on.tensors[step.t[4] as usize].name, "act.f_a");
+        assert_eq!(step.j[1], w_on.f_b_proj);
+        assert_eq!(
+            step.blocks, step_off.blocks,
+            "the fold never narrows the step"
+        );
+        assert!(
+            !on.tensors.iter().any(|t| t.name == "act.f_raw"),
+            "no unwritten f_raw"
+        );
+        // Prefill rows keep the GEMM chain untouched.
+        let (pf, _) = build(128);
+        let (pf_off, _) = {
+            let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "0")]);
+            build(128)
+        };
+        assert_eq!(packed(&pf), packed(&pf_off));
     }
 
     #[test]

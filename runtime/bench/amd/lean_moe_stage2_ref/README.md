@@ -59,3 +59,22 @@ overlaps the next A load through a two-slot LDS ping-pong. The row-major tables
 remain available to decode and the interpreter fallback. The pinned exact AITER
 configuration sets `use_async_copy=False`; therefore the native gate does not
 claim a three-slot asynchronous-copy path.
+
+## 64x128 body (`PLOW_MOE2_BODY=1`)
+
+`native_kernel.hip` carries an opt-in 64x128-tile body, selected at emit with
+`PLOW_MOE_STAGE2_BODY=1` (manifest → `plow_config.h` → `-DPLOW_MOE2_BODY=1`). It reads the
+runtime's unchanged grid as `n_tiles(128) * tiles64`, streams each expert's down rows once per
+64 sorted rows instead of twice, keeps the same three K-ordered MFMAs and `acc * gate` store per
+element (bit-identical `part`), the same symbol/ABI/markers and the 4,352 B LDS contract.
+`build_compare.sh` builds shipping + candidate and the `stage2_compare` byte oracle/timer:
+
+```sh
+nix develop -c runtime/bench/amd/lean_moe_stage2_ref/build_compare.sh /tmp/plow-moe2-body -DPLOW_MOE2_BODY=1
+GPU_LEASE_TIMEOUT=14400 perf-data/tools/gpulease -n 1 moe2-body \
+  /tmp/plow-moe2-body/stage2_compare /tmp/plow-moe2-body/shipping.elf /tmp/plow-moe2-body/candidate.elf --run
+```
+
+Measured 2026-09-04 at T8192: shipping 0.783 ms, 64x128 body 0.728 ms (−7.0%), 0 / 469,762,048
+differing `part` words; 90 VGPR, occupancy 5, no spills. The `native_manifest.py` text digest
+gate applies to the default (flag-off) object only.

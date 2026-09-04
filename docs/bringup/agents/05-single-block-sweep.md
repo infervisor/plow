@@ -56,7 +56,7 @@ Two block shapes exist, and they use different runners:
   only `act.x`-in / `act.x`-out (no embed, no lm_head, no `act.logits`). It is
   driven by `plowrt amd-block` (A/B) or a **C oracle harness** in
   `runtime/tests/`. `amd-bench` cannot drive it; for latency use a
-  truncated-model sweep (`PLOW_GLM_LAYERS=N` / `K3_NLAYERS=N`).
+  truncated-model sweep (`PLOW_LAYERS=N`).
 
 Confirm which you have with `plowrt amd-block --list-tensors` or
 `plowrt disasm <model.pkt>` before proceeding.

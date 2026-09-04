@@ -2769,7 +2769,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                 * leaves i[7] at 0 there. */
                                (in->i[4] & PLOW_KDA_F_SEQ_ROWS)
                                    ? (const unsigned*)T[in->i[7]]
-                                   : nullptr);
+                                   : nullptr
+#if PLOW_KDA_FB_FOLD
+                               /* L3 fold: t4 = f_a, j1 = W_fb; read only under the flag bit,
+                                * so a non-folded packet's zero j1 is never dereferenced. */
+                               , (in->i[4] & PLOW_KDA_F_FB_FOLD)
+                                   ? (const bf16*)T[in->fj[2].u]
+                                   : nullptr
+#endif
+                               );
             break;
         }
 #endif /* PLOW_HAS_KDA_STATE_STEP_G */
@@ -2817,6 +2825,19 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * is read by exactly one RMSNORM over its own output, so the two narrow packets collapse. */
 #if PLOW_HAS_ATTN_RES
         case PLOW_DOP_ATTN_RES:
+#if PLOW_ATTNRES_DECODE_MWG
+            /* i6 = the banded decode arm's rendezvous scratch (0 = single-workgroup arm). The
+             * residual seam is materialized per band inside the arm. */
+            if (in->i[6] != 0u) {
+                d_attn_res_mwg((bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const float*)TEN(3),
+                               in->i[1], in->i[2], in->i[4], in->fj[0].f, in->fj[1].f, slice,
+                               nblk, (float*)sm->raw, (const bf16*)TEN(4), in->i[3],
+                               (const bf16*)TEN(5), (const bf16*)TEN(6), (const bf16*)TEN(7),
+                               in->i[5] == PLOW_TENSOR_NONE ? nullptr : (const bf16*)T[in->i[5]],
+                               (uint64_t*)T[in->i[6]]);
+                break;
+            }
+#endif
 #if PLOW_MATERIALIZED_RESIDUAL_INPUT
             if (in->t[6] != PLOW_TENSOR_NONE) {
                 if (in->t[7] == PLOW_TENSOR_NONE) __builtin_trap();
@@ -4560,6 +4581,13 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                   PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
                                   in->i[4], in->i[5], in->i[6], xr_tag_off,
                                   PLOW_XR_TAG_SLOT_BYTES
+#if PLOW_XR_COMBINE_FOLD
+                                  /* L4 fold: t1 = [k, n] f32 slot partials, i7 = k. */
+                                  , in->t[1] == PLOW_TENSOR_NONE
+                                        ? nullptr
+                                        : (const float*)tens[in->t[1]],
+                                  in->i[7]
+#endif
 #if PLOW_XR_TRACE_PHASES
                                   , prog.trace ? &prog.trace[base + ix] : nullptr
 #endif

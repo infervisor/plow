@@ -98,6 +98,11 @@ pub struct K3BlockCfg {
 /// the end of its LDS carve, so the emitter has to refuse first — a silent no-write is the failure
 /// this tree keeps finding.
 pub const K3_ATTNRES_MAXB: u32 = 16;
+/// Bands of `d_attn_res_mwg` (`PLOW_ATTNRES_MWG_MAXBLK`).
+pub const K3_ATTNRES_MWG_MAXBLK: u32 = 16;
+/// `PLOW_ATTNRES_MWG_WORDS` (1 + 16 bands * 2 * 9 rows + 2 parities * 16 = 321) tagged 8-byte
+/// words per site.
+pub const K3_ATTNRES_MWG_SCRATCH_BYTES: u64 = 321 * 8;
 
 /// `PLOW_MOE_ACT_SITU` (`runtime/amd/op_moe.h`) — the act code every K3 expert GLU carries.
 ///
@@ -493,37 +498,6 @@ pub(crate) fn shard_up_proj(tp: u32) -> bool {
     tp > 1
 }
 
-/// BISECTION INSTRUMENTS for the column-parallel up projection. Neither is a serving mode.
-///
-/// The shard has two independent halves — a SLICED WEIGHT and a GATHERED partial — and when
-/// the output is wrong, "which half" is the only question worth asking. Each knob keeps one
-/// half and removes the other, so the answer is one run each:
-///
-/// * `PLOW_K3_UP_NOGATHER=1` — slice the weight, write the peer slot, and DO NOT gather.
-///   `ffn` then loses the routed-expert path entirely. If the output equals the sharded
-///   one, the gather is contributing nothing at runtime.
-/// * `PLOW_K3_UP_GATHER_ONLY=1` — keep the weight REPLICATED (so every rank computes the
-///   WHOLE `yh`) but still route it through the peer slot and the gather. The gather indexes
-///   each owner's slot COMPACTLY, so what it assembles is `yh[e % gcols]` tiled — wrong by
-///   construction, and that is the point: it is nonzero and structurally unrelated to the
-///   sharded answer, so it separates "the gather never ran" from "the gather ran".
-///
-/// HOW THE TWO READ, and this is the reason to write them down rather than re-derive them:
-/// on the real checkpoint (24 steps, `1008,10484,318,15383,387`) the replicated emit answers
-/// ". The population is approximately 67 million people. …", `nogather` answers
-/// "6. 2. 2. 2. …" and `gather_only` answers "\n The \n The …" — both controls collapse
-/// completely, while the SHARDED emit stayed grammatical. That gap is what said the peer
-/// path was intact and the error was arithmetic, which is how the missing bf16 round in
-/// `d_xreduce`'s gather arm was found.
-///
-/// Neither knob is a serving mode. They exist because the alternative was guessing.
-fn up_nogather() -> bool {
-    crate::emit_config::active().k3_up_nogather
-}
-fn up_gather_only() -> bool {
-    crate::emit_config::active().k3_up_gather_only
-}
-
 /// `PLOW_K3_SHARD_HEAD=1` — vocab-column-parallel `lm_head`, and this rank's slice of the vocab.
 ///
 /// The replicated default streams the FULL `vocab * hidden` bf16 table on EVERY rank EVERY step:
@@ -674,7 +648,30 @@ pub fn emit_attn_res(
             ""
         }
     );
-    let blocks: Vec<u32> = (0..t.min(n_cu).max(1)).collect();
+    // The banded decode arm (`d_attn_res_mwg`): `n` column-band workgroups on CUs 0..n, one
+    // rendezvous scratch per site. Only the fused-norm decode shape; prefill keeps its object.
+    let mwg = match crate::emit_config::active().attnres_decode_mwg {
+        Some(n) if n > 0 && t == 1 && post_norm.is_some() => {
+            assert!(
+                (2..=K3_ATTNRES_MWG_MAXBLK).contains(&n) && n <= n_cu,
+                "PLOW_ATTNRES_DECODE_MWG={n}: the arm takes 2..={K3_ATTNRES_MWG_MAXBLK} bands \
+                 on distinct CUs"
+            );
+            n
+        }
+        _ => 0,
+    };
+    let scratch = (mwg > 0).then(|| {
+        let name = format!("act.attnres.mwg.{}", b.n_tensors());
+        let h = b.tensor(&name, K3_ATTNRES_MWG_SCRATCH_BYTES);
+        assert!(h != 0, "handle 0 is the arm's off sentinel");
+        h
+    });
+    let blocks: Vec<u32> = if mwg > 0 {
+        (0..mwg).collect()
+    } else {
+        (0..t.min(n_cu).max(1)).collect()
+    };
     b.emit(DevOp::AttnRes, blocks, deps, |d| {
         d.t[0] = out;
         d.t[1] = prefix;
@@ -694,8 +691,11 @@ pub fn emit_attn_res(
         // which the fusion asserts (`mixer_eps == cb.eps`), so the operand is the same value
         // today; it is still a distinct slot because the object reads it as one. The
         // interpreter ignores `f[1]`, so without the object the packet runs its BF16-seam arm.
-        if post_norm.is_some() && crate::emit_config::active().attnres_f32mix {
+        if post_norm.is_some() && (crate::emit_config::active().attnres_f32mix || mwg > 0) {
             d.f[1] = c.eps;
+        }
+        if let Some(h) = scratch {
+            d.i[6] = h;
         }
     })
 }
@@ -1076,7 +1076,6 @@ pub fn emit_k3_latent_moe(
         crate::mla::MoePfFuse::None
     };
     let part_pf = match pf_fuse {
-        crate::mla::MoePfFuse::Atomic => tt * lat as u64 * 4,
         crate::mla::MoePfFuse::Det => tt * lat as u64 * 8,
         crate::mla::MoePfFuse::None => tt * c.top_k as u64 * lat as u64 * 4,
     };
@@ -1177,6 +1176,10 @@ pub fn emit_k3_latent_moe(
     // norm: `routed_expert_norm` is nonlinear, so normalising a partial sum
     // would be finite, plausible and wrong.
     let cmb_dst = if tp.on() { tp.dg } else { ylat };
+    // L4: under TP at T=1 the tagged publish computes the combine itself (`part`, `top_k` ride
+    // the XReduce packet) and the MoeCombine packet is not emitted.
+    let fold_combine = t == 1 && tp.on() && crate::emit_config::active().xr_combine_fold;
+    let mut fold_deps: Vec<u32> = Vec::new();
 
     // THE EXPERT CHAIN, AND IT IS TWO CHAINS. Decode's grouped ops loop the `top_k` routing-table
     // slots inside ONE gate/up packet and ONE down packet. They do not reuse weights across
@@ -1224,12 +1227,17 @@ pub fn emit_k3_latent_moe(
                 d.i[3] = c.n_exp;
                 d.i[6] = c.enc;
             });
-            b.emit(DevOp::MoeCombine, combine_cus(&all, t * lat), &[c_d], |d| {
-                d.t[0] = cmb_dst;
-                d.t[3] = part;
-                d.i[0] = lat;
-                d.i[1] = c.top_k;
-            })
+            if fold_combine {
+                fold_deps.push(c_d);
+                c_d
+            } else {
+                b.emit(DevOp::MoeCombine, combine_cus(&all, t * lat), &[c_d], |d| {
+                    d.t[0] = cmb_dst;
+                    d.t[3] = part;
+                    d.i[0] = lat;
+                    d.i[1] = c.top_k;
+                })
+            }
         } else {
             // Baseline: one gate/up + down pair per selected slot.
             let mut c_down = Vec::with_capacity(c.top_k as usize);
@@ -1266,20 +1274,24 @@ pub fn emit_k3_latent_moe(
             }
             // Combine at LATENT width. `t[1]` (residual) and `t[2]` (shared) stay
             // TENSOR_NONE — see the doc comment.
-            b.emit(
-                DevOp::MoeCombine,
-                combine_cus(&all, t * lat),
-                &c_down,
-                |d| {
-                    d.t[0] = cmb_dst;
-                    d.t[3] = part;
-                    d.i[0] = lat;
-                    d.i[1] = c.top_k;
-                },
-            )
+            if fold_combine {
+                fold_deps.extend_from_slice(&c_down);
+                c_down[c_down.len() - 1]
+            } else {
+                b.emit(
+                    DevOp::MoeCombine,
+                    combine_cus(&all, t * lat),
+                    &c_down,
+                    |d| {
+                        d.t[0] = cmb_dst;
+                        d.t[3] = part;
+                        d.i[0] = lat;
+                        d.i[1] = c.top_k;
+                    },
+                )
+            }
         }
     } else {
-        let atom = pf_fuse == crate::mla::MoePfFuse::Atomic;
         let det = pf_fuse == crate::mla::MoePfFuse::Det;
         // The grouped arrays are sized on the MPF_BM-PADDED row bound: the align op rounds each
         // expert's row range up to a whole tile, so every expert can waste up to MPF_BM-1 rows.
@@ -1323,7 +1335,7 @@ pub fn emit_k3_latent_moe(
             d.t[0] = tab_wr;
             d.t[1] = logit_rd;
             d.t[3] = w.router_bias;
-            if atom || det {
+            if det {
                 d.t[2] = part;
                 d.i[0] = lat;
             }
@@ -1426,9 +1438,6 @@ pub fn emit_k3_latent_moe(
             d.i[1] = imoe;
             d.i[2] = c.n_exp;
             d.i[crate::mla::MoeEnc::PREFILL_SLOT] = c.enc;
-            if atom {
-                d.i[4] = c.top_k.trailing_zeros() + 1;
-            }
             if det {
                 d.i[5] = c.top_k.trailing_zeros() + 1;
             }
@@ -1439,12 +1448,25 @@ pub fn emit_k3_latent_moe(
             d.t[0] = cmb_dst;
             d.t[3] = part;
             d.i[0] = lat;
-            d.i[1] = if atom || det { 1 } else { c.top_k };
+            d.i[1] = if det { 1 } else { c.top_k };
             d.i[2] = t;
             d.i[4] = u32::from(det);
         })
     };
-    if tp.on() {
+    if fold_combine {
+        c_cmb = crate::emit_xreduce_combine_fold(
+            b,
+            &mut tp.xgate,
+            &tp.xr_cus,
+            &fold_deps,
+            ylat,
+            lat,
+            tp.tp,
+            tp.slot_b,
+            part,
+            c.top_k,
+        );
+    } else if tp.on() {
         c_cmb = crate::emit_xreduce(
             b,
             &mut tp.xgate,
@@ -1504,14 +1526,9 @@ pub fn emit_k3_latent_moe(
     // an all-gather. That gather is folded into the shared expert's existing all-reduce
     // below — one packet, one rendezvous, for both — because the two results are ADDED.
     let shard_up = shard_up_proj(tp.tp);
-    // `hid_l` is the GATHER's per-rank column count; `up_n` is what the GEMV computes. They
-    // differ only under `PLOW_K3_UP_GATHER_ONLY`, which keeps the weight whole on purpose.
+    // `hid_l` is both the GATHER's per-rank column count and what the GEMV computes.
     let hid_l = if shard_up { tp.local(hid) } else { hid };
-    let up_n = if shard_up && !up_gather_only() {
-        hid_l
-    } else {
-        hid
-    };
+    let up_n = hid_l;
     let up_dst = if shard_up { tp.ug } else { yh };
     let c_up = emit_k3_linear_norm(
         b,
@@ -1665,7 +1682,7 @@ pub fn emit_k3_latent_moe(
         // The next layer's pre-attention AttnRes reads `out` as a band and publishes `h_a`.
         if sp_x.is_some() {
             let p = resid_in.expect("sequence-parallel seams need the folded block residual");
-            let gather = (!up_nogather()).then_some((tp.slot_c(), hid_l));
+            let gather = Some((tp.slot_c(), hid_l));
             let c_rs = crate::emit_xreduce_scatter(
                 b,
                 &mut tp.xgate,
@@ -1692,11 +1709,7 @@ pub fn emit_k3_latent_moe(
         // the collective lands in `shd`. Without it, the collective already IS the answer and
         // writes `out` directly — one packet fewer than the replicated emit, not one more.
         let ffn = if resid_in.is_some() { shd } else { out };
-        let gather = if up_nogather() {
-            None
-        } else {
-            Some((tp.slot_c(), hid_l, hid))
-        };
+        let gather = Some((tp.slot_c(), hid_l, hid));
         c_sd = crate::emit_xreduce_gather(
             b,
             &mut tp.xgate,
@@ -1914,12 +1927,16 @@ pub fn emit_k3_mla_mixer(
     let qr = bft(b, format!("{a}q_rope"), tt * nh as u64 * dr as u64);
     let ckvraw = bft(b, format!("{a}ckv_raw"), tt * dk as u64);
     let krr = bft(b, format!("{a}krot_raw"), tt * dr as u64);
+    // Sized at the CACHE capacity, not the bucket: a continuation chunk re-materializes K/V for
+    // every cached row `[0, c0 + T)` from `kv.*.ckv`/`kv.*.krot`, so the runtime patches the
+    // projection's `M`, the pack's `T` and the attention's `N_KV` to `kv_len` per chunk.
+    let kv_rows = ctx as u64;
     let kvmat = materialized
         .then(|| {
             bft(
                 b,
                 format!("{a}kv_materialized"),
-                tt * nh as u64 * (dn + vd) as u64,
+                kv_rows * nh as u64 * (dn + vd) as u64,
             )
         })
         .unwrap_or(TENSOR_NONE);
@@ -1928,12 +1945,18 @@ pub fn emit_k3_mla_mixer(
             bft(
                 b,
                 format!("{a}k_materialized"),
-                tt * nh as u64 * (dn + dr) as u64,
+                kv_rows * nh as u64 * (dn + dr) as u64,
             )
         })
         .unwrap_or(TENSOR_NONE);
     let vmat = materialized
-        .then(|| bft(b, format!("{a}v_materialized"), tt * nh as u64 * vd as u64))
+        .then(|| {
+            bft(
+                b,
+                format!("{a}v_materialized"),
+                kv_rows * nh as u64 * vd as u64,
+            )
+        })
         .unwrap_or(TENSOR_NONE);
     // NSPLIT IS 1 ON THE PREFILL ARM, and it is forced rather than chosen: under a per-token
     // causal bound an early token's later splits cover nothing, and an empty split emits `l = 0`
@@ -2198,15 +2221,18 @@ pub fn emit_k3_mla_mixer(
             false,
             &[c_rnkv],
         );
+        // The rope half comes from the CACHE row, not the chunk's raw `krr`: rows `[0, c0)` of a
+        // continuation chunk exist only there. K3's MLA is NoPE (identity table), so for the
+        // chunk's own rows `krot` is a bit-exact copy of `krr` and the initial chunk is unchanged.
         let c_pack = b.emit(
             DevOp::MlaMaterializePack,
             all.clone(),
-            &[c_kvmat, c_krr],
+            &[c_kvmat, c_krd],
             |d| {
                 d.t[0] = kmat;
                 d.t[1] = vmat;
                 d.t[2] = kvmat;
-                d.t[3] = krr;
+                d.t[3] = w.krot;
                 d.i[0] = t;
                 d.i[1] = nh;
                 d.i[2] = dn;
@@ -3629,7 +3655,7 @@ pub fn declare_k3_moe_weights(b: &mut Builder, c: &K3MoeCfg, lp: &str, tp: u32) 
         // for why COLUMN is the only axis available and why the gather is free.
         up_latent: b.tensor(
             &n("routed_expert_up_proj.weight"),
-            if shard_up_proj(tp) && !up_gather_only() {
+            if shard_up_proj(tp) {
                 tp_local(c.hidden)
             } else {
                 c.hidden as u64
@@ -4474,6 +4500,122 @@ mod tests {
         );
     }
 
+    /// L3 (`PLOW_KDA_FB_FOLD`): every KDA decode layer loses its `f_b` GEMV (N=1536, K=128 at
+    /// TP8) and its `KdaStateStepG` carries flags bit 2, `t4 = f_a`, `j1 = W_fb`. Off, no step
+    /// carries the bit and every layer has the GEMV.
+    #[test]
+    fn kda_fb_fold_removes_one_gemv_per_kda_layer() {
+        let _guard = crate::test_env::env_guard();
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        let f_b = |p: &packet::devbuild::Program| {
+            p.insts
+                .iter()
+                .filter(|i| i.op == DevOp::Gemv as u16 && i.i[1] == 1536 && i.i[2] == 128)
+                .count()
+        };
+        let base = {
+            let _off = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "0")]);
+            build_full(8)
+        };
+        assert_eq!(n(&base, DevOp::KdaStateStepG), 69);
+        assert_eq!(f_b(&base), 69, "one f_b GEMV per KDA layer");
+        assert!(base
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::KdaStateStepG as u16)
+            .all(|i| i.i[4] & 4 == 0 && i.j[1] == 0));
+
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "1")]);
+        let p = build_full(8);
+        assert_eq!(
+            p.insts.len(),
+            base.insts.len() - 69,
+            "exactly one packet per KDA layer"
+        );
+        assert_eq!(n(&p, DevOp::Gemv), n(&base, DevOp::Gemv) - 69);
+        assert_eq!(f_b(&p), 0, "no f_b GEMV survives");
+        let steps: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::KdaStateStepG as u16)
+            .collect();
+        assert_eq!(steps.len(), 69);
+        for s in &steps {
+            assert_eq!(s.i[4], 1 | 4, "l2norm + fold");
+            assert!(
+                p.tensors[s.t[4] as usize].name.ends_with("f_a"),
+                "t4 is f_a"
+            );
+            assert!(
+                p.tensors[s.j[1] as usize].name.ends_with("f_b_proj.weight"),
+                "j1 is W_fb: {}",
+                p.tensors[s.j[1] as usize].name
+            );
+        }
+    }
+
+    /// L4 (`PLOW_XR_COMBINE_FOLD`): the latent `MoeCombine` folds into the tagged one-shot
+    /// publish. Opted out, the packet carries no fold field at all, so a pre-L4 object
+    /// reads it exactly as before. On, every MoE layer loses its combine packet,
+    /// the latent XReduce carries `t1 = part`, `i7 = top_k`, and no other packet changes.
+    #[test]
+    fn xr_combine_fold_opts_out_to_the_pre_l4_packet_and_folds_the_latent_combine() {
+        let _guard = crate::test_env::env_guard();
+        let base = {
+            let _off = crate::test_env::EnvScope::set(&[("PLOW_XR_COMBINE_FOLD", "0")]);
+            build_full(8)
+        };
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        assert_eq!(n(&base, DevOp::MoeCombine), 92);
+        let lat = base
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeCombine as u16)
+            .map(|i| i.i[0])
+            .expect("a latent combine");
+        for i in base.insts.iter().filter(|i| i.op == DevOp::XReduce as u16) {
+            assert_eq!(i.i[7], 0, "default XReduce carries no fold");
+            assert_eq!(i.t[1], packet::dev::TENSOR_NONE);
+        }
+        let n_xr = n(&base, DevOp::XReduce);
+        let n_all = base.insts.len();
+
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_XR_COMBINE_FOLD", "1")]);
+        let p = build_full(8);
+        assert_eq!(n(&p, DevOp::MoeCombine), 0, "the combine packet is gone");
+        assert_eq!(n(&p, DevOp::XReduce), n_xr, "no collective added");
+        assert_eq!(
+            p.insts.len(),
+            n_all - 92,
+            "exactly one packet per MoE layer removed"
+        );
+        let folded: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::XReduce as u16 && i.i[7] != 0)
+            .collect();
+        assert_eq!(folded.len(), 92, "one folded publish per MoE layer");
+        for f in &folded {
+            assert_eq!(f.i[0], lat, "the folded reduce is the latent one");
+            assert_eq!(f.i[7], 16, "top_k slots summed in fixed order");
+            assert_ne!(f.t[1], packet::dev::TENSOR_NONE, "part rides t1");
+            assert_eq!(f.i[5], 0, "no gather on the latent seam");
+        }
+        // Every non-latent collective is byte-identical to the default emit.
+        let other = |p: &packet::devbuild::Program| -> Vec<(u32, u32, u32)> {
+            p.insts
+                .iter()
+                .filter(|i| i.op == DevOp::XReduce as u16 && i.i[0] != lat)
+                .map(|i| (i.i[0], i.i[2], i.i[5]))
+                .collect()
+        };
+        assert_eq!(other(&base), other(&p));
+    }
+
     /// TP shards the HEAD axis and the expert INTERMEDIATE, and leaves the
     /// latent projections whole. At tp8 K3's 96 KDA heads become 12 and its 96
     /// MLA heads become 12 — which is why the group factor is 4 and not 8.
@@ -5077,10 +5219,24 @@ mod tests {
                 .all(|e| e.inst as usize == ix));
             if inst.op == DevOp::MlaMaterializePack as u16 {
                 assert_eq!(inst.i[..5], [512, 96, 128, 64, 128]);
+                // The rope half comes from the cache row, so continuation chunks can pack
+                // `[0, c0)`; the runtime patches `i[0]` to `kv_len` per chunk.
+                assert!(p.tensors[inst.t[3] as usize].name.ends_with(".krot"));
             } else {
                 assert_eq!(inst.i[..6], [512, 96, 96, 192, 128, 1]);
             }
         }
+        // K/V transients hold the cache capacity (ctx 4096), not the 512-row bucket.
+        let bytes = |suffix: &str| {
+            p.tensors
+                .iter()
+                .find(|t| t.name.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing {suffix}"))
+                .bytes
+        };
+        assert_eq!(bytes(".kv_materialized"), 4096 * 96 * 256 * 2);
+        assert_eq!(bytes(".k_materialized"), 4096 * 96 * 192 * 2);
+        assert_eq!(bytes(".v_materialized"), 4096 * 96 * 128 * 2);
     }
 
     #[test]
@@ -5210,7 +5366,7 @@ mod tests {
     }
 
     #[test]
-    fn c8_exact_shape_is_explicit_and_opts_out_in_the_packet() {
+    fn c8_is_measurement_derived_and_opts_out_in_the_packet() {
         let _guard = crate::test_env::env_guard();
         crate::set_amd_target("MI350X");
         let emit = |m: u32, n: u32, k: u32| {
@@ -5223,7 +5379,7 @@ mod tests {
         };
 
         {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "none")]);
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", "0")]);
             let inst = emit(8192, 1536, 7168);
             assert_eq!(
                 inst.pack(),
@@ -5246,23 +5402,16 @@ mod tests {
             assert_eq!(inst.blocks, 256);
         }
         {
-            let _scope =
-                crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "8192x1536x7168")]);
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", "1")]);
             let inst = emit(8192, 1536, 7168);
             assert_eq!(inst.op, DevOp::GemmWide as u16);
             assert_eq!(inst.i[7], packet::dev::GEMM_WIDE_C8_TAG);
             assert_eq!(inst.blocks, 256, "64x4 c8 tiles must emit the exact grid");
 
             let other = emit(4096, 1536, 7168);
-            assert_eq!(other.i[7], 0, "the opt-in is exact-shape, not model-wide");
-        }
-        {
-            let _scope =
-                crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "4096x1536x7168")]);
-            let inst = emit(4096, 1536, 7168);
             assert_eq!(
-                inst.i[7], 0,
-                "a 128-tile grid must not claim the 256-CU c8 arm"
+                other.i[7], 0,
+                "a 128-tile grid has no qualified winner and must not claim the 256-CU c8 arm"
             );
         }
     }
@@ -5272,8 +5421,8 @@ mod tests {
         let _guard = crate::test_env::env_guard();
         crate::set_amd_target("MI350X");
         let buckets = [128, 512, 1024, 2048, 4096, 8192];
-        let emit = |shape: &str| {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", shape)]);
+        let emit = |c8: &str| {
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", c8)]);
             crate::tune_demand::reset_tally();
             crate::tune_demand::start_recording();
             let programs: Vec<_> = buckets.iter().map(|&t| build_full_t(8, t)).collect();
@@ -5295,9 +5444,8 @@ mod tests {
             )
         };
 
-        let (control, control_census, control_lookups, control_manifest) = emit("none");
-        let (candidate, candidate_census, candidate_lookups, candidate_manifest) =
-            emit("8192x1536x7168");
+        let (control, control_census, control_lookups, control_manifest) = emit("0");
+        let (candidate, candidate_census, candidate_lookups, candidate_manifest) = emit("1");
         assert_eq!(control_census, (7650, 7650));
         assert_eq!(candidate_census, control_census);
         for manifest in [&control_manifest, &candidate_manifest] {
@@ -5541,69 +5689,9 @@ mod tests {
     }
 
     #[test]
-    fn atomic_k3_grouped_prefill_sets_packets_and_manifest_requirement() {
-        let _guard = crate::test_env::env_guard();
-        let _scope = crate::test_env::EnvScope::set(&[
-            ("PLOW_MOE_PF_ATOMIC", "1"),
-            ("PLOW_MOE_PF_DET", "0"),
-        ]);
-        let p = build_full_t(1, 512);
-        let router = p
-            .insts
-            .iter()
-            .find(|i| i.op == DevOp::MoeRouterTopkPf as u16)
-            .unwrap();
-        let down = p
-            .insts
-            .iter()
-            .find(|i| i.op == DevOp::MoeGroupDownPf as u16)
-            .unwrap();
-        let combine = p
-            .insts
-            .iter()
-            .find(|i| i.op == DevOp::MoeCombinePf as u16)
-            .unwrap();
-        assert_eq!(router.t[2], down.t[0], "router zeros DOWN's accumulator");
-        assert_eq!(router.i[0], 3584, "the accumulator is at latent width");
-        assert_eq!(
-            down.i[4],
-            model_cfg().moe.top_k.trailing_zeros() + 1,
-            "log2(top_k) + 1 arms atomic scatter"
-        );
-        assert_eq!(down.i[5], 0, "the deterministic arm stays disjoint");
-        assert_eq!(combine.i[1], 1, "combine reads one accumulated row");
-        assert_eq!(combine.i[4], 0, "the accumulator contains f32");
-
-        let m = packet::devbuild::Model {
-            n_cu: 256,
-            target: 0,
-            tensors: p.tensors.clone(),
-            progs: vec![p],
-            kv_row_insts: Vec::new(),
-            prog_t: vec![512],
-            gen: Vec::new(),
-        };
-        let manifest = crate::manifest::build(&m, "gfx950", &crate::LeanReport::default());
-        assert_eq!(
-            manifest.pointer("/features/moe_pf_atomic"),
-            Some(&serde_json::Value::Bool(true))
-        );
-        let requires = manifest
-            .pointer("/backends/gfx950/requires")
-            .and_then(serde_json::Value::as_array)
-            .unwrap();
-        assert!(requires
-            .iter()
-            .any(|v| v.as_str() == Some("PLOW_MOE_PF_ATOMIC=1")));
-    }
-
-    #[test]
     fn deterministic_k3_grouped_prefill_sets_f64_packets_and_manifest_requirement() {
         let _guard = crate::test_env::env_guard();
-        let _scope = crate::test_env::EnvScope::set(&[
-            ("PLOW_MOE_PF_ATOMIC", "0"),
-            ("PLOW_MOE_PF_DET", "1"),
-        ]);
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_PF_DET", "1")]);
         let t = 512u32;
         let p = build_full_t(1, t);
         let router = p

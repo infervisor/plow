@@ -324,6 +324,9 @@ pub struct Builder {
     uniseg_forced: bool,
     /// See [`Builder::set_gq_order_asap`]. Default on; `PLOW_GQ_ORDER=emit` restores emit order.
     gq_order_asap: bool,
+    /// See [`Builder::set_gq_order_seg`]. Default on; `PLOW_GQ_ORDER=asap` keeps program-wide
+    /// ranks and `=emit` keeps emit order.
+    gq_order_seg: bool,
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
     packed_prefill_segments: bool,
@@ -335,11 +338,13 @@ pub struct Builder {
     lean_moe_combine_segments: bool,
     /// Rewrite eligible replicated-input grouped-MoE prefill boundaries to whole-expert/full-I.
     moe_prefill_ep_degree: Option<u32>,
-    /// Isolate BT64/D128 chunk-KDA intra packets for a standalone gfx950 object.
-    lean_kda_intra_segments: bool,
-    /// Mark isolated BT64/D128 chunk-KDA intra packets for the wave-item object.
+    /// Isolate BT64/D128 chunk-KDA intra packets and mark them for the wave-item object.
     kda_intra_wave_items_segments: bool,
     kda_carry_regstate_segments: bool,
+    /// Mark the Wu of an exact qpre pair for the lean four-wave gfx950 Wu object.
+    kda_wu_lean_segments: bool,
+    /// Also have that Wu emit the scaled-key pair the register-state carry consumes.
+    kda_carry_keyfeed_segments: bool,
     /// Isolate exact qpre BT64/D128 Wu->carry pairs for standalone gfx950 objects.
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
@@ -556,14 +561,19 @@ impl Builder {
             uniseg_denied: false,
             uniseg_forced: false,
             gq_order_asap: std::env::var("PLOW_GQ_ORDER").ok().as_deref() != Some("emit"),
+            gq_order_seg: !matches!(
+                std::env::var("PLOW_GQ_ORDER").ok().as_deref(),
+                Some("emit") | Some("asap")
+            ),
             packed_prefill_segments: false,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
             lean_moe_combine_segments: false,
             moe_prefill_ep_degree: None,
-            lean_kda_intra_segments: false,
             kda_intra_wave_items_segments: false,
             kda_carry_regstate_segments: false,
+            kda_wu_lean_segments: false,
+            kda_carry_keyfeed_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
             decode_grouped_moe_segments: false,
@@ -627,13 +637,31 @@ impl Builder {
         self.gq_order_asap = on;
     }
 
-    fn gq_asap_ranks(&self) -> Vec<u32> {
+    /// SEGMENT-RELATIVE ASAP ranks (`PLOW_GQ_ORDER=asap-seg`; requires `set_gq_order_asap`).
+    ///
+    /// Whole-program ranks carry a producer's start across a segment boundary, but a segment
+    /// launch only begins once every earlier segment has drained, so inside the segment that
+    /// history is already paid for. K3's decode makes this concrete: `MoeGroupDown` is a raw
+    /// launch boundary, and in the segment after it `GemvGlu` (program rank 3, ready since
+    /// `AttnRes`) sorts ahead of `MoeCombine` (rank 9) although both are ready at the launch.
+    /// The 256 `GemvGlu` workgroups then delay the combine chain, which is the layer's critical
+    /// path. With each segment's launch as time zero the window becomes
+    /// `[Combine, GemvGlu, XReduce, up_proj, sh_down, XReduce]`, modelled -15 us/MoE layer.
+    /// Order-only: ranks stay topological within a window (a same-segment consumer is still
+    /// strictly above its producers), so counters and windows are untouched.
+    pub fn set_gq_order_seg(&mut self, on: bool) {
+        self.gq_order_seg = on;
+    }
+
+    /// Earliest-start rank per op. With `seg_of`, a producer in an earlier segment contributes
+    /// start 0 (see [`Builder::set_gq_order_seg`]).
+    fn gq_asap_ranks(&self, seg_of: Option<&[u16]>) -> Vec<u32> {
         let mut start = vec![0u32; self.ops.len()];
         for i in 0..self.ops.len() {
             let mut s = 0u32;
             for d in &self.ops[i].deps {
                 let p = d.producer() as usize;
-                if p < i {
+                if p < i && seg_of.is_none_or(|seg| seg[p] == seg[i]) {
                     let cost = if self.ops[p].inst.blocks <= 1 { 3 } else { 1 };
                     s = s.max(start[p] + cost);
                 }
@@ -677,10 +705,6 @@ impl Builder {
         self.moe_prefill_ep_degree = degree.filter(|&n| n > 1);
     }
 
-    pub fn set_lean_kda_intra_segments(&mut self, enabled: bool) {
-        self.lean_kda_intra_segments = enabled;
-    }
-
     pub fn set_kda_intra_wave_items_segments(&mut self, enabled: bool) {
         self.kda_intra_wave_items_segments = enabled;
     }
@@ -693,6 +717,14 @@ impl Builder {
     /// register-resident gfx950 carry object (isolated like the key-factor pair).
     pub fn set_kda_carry_regstate_segments(&mut self, enabled: bool) {
         self.kda_carry_regstate_segments = enabled;
+    }
+
+    pub fn set_kda_wu_lean_segments(&mut self, enabled: bool) {
+        self.kda_wu_lean_segments = enabled;
+    }
+
+    pub fn set_kda_carry_keyfeed_segments(&mut self, enabled: bool) {
+        self.kda_carry_keyfeed_segments = enabled;
     }
 
     pub fn set_lean_kda_key_factor_segments(&mut self, enabled: bool) {
@@ -769,6 +801,10 @@ impl Builder {
             init: None,
         });
         (self.tensors.len() - 1) as u32
+    }
+
+    pub fn n_tensors(&self) -> usize {
+        self.tensors.len()
     }
 
     /// The declared name of handle `h`.
@@ -1900,8 +1936,7 @@ impl Builder {
                 .iter()
                 .any(|op| lean_attn_res_f32mix_inst(&op.inst));
         let kda_intra_wave_items = !uniseg && self.kda_intra_wave_items_segments;
-        let lean_kda_intra = !uniseg
-            && (self.lean_kda_intra_segments || kda_intra_wave_items)
+        let lean_kda_intra = kda_intra_wave_items
             && self.ops.iter().any(|op| {
                 op.inst.op == DevOp::KdaChunkIntra as u16
                     && op.inst.i[0] >= 512
@@ -1909,8 +1944,11 @@ impl Builder {
                     && op.inst.i[2] == 128
             });
         let kda_carry_regstate = !uniseg && self.kda_carry_regstate_segments;
+        let kda_wu_lean = !uniseg && self.kda_wu_lean_segments;
+        let kda_carry_keyfeed =
+            kda_wu_lean && kda_carry_regstate && self.kda_carry_keyfeed_segments;
         let lean_kda_key_factor = !uniseg
-            && (self.lean_kda_key_factor_segments || kda_carry_regstate)
+            && (self.lean_kda_key_factor_segments || kda_carry_regstate || kda_wu_lean)
             && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
         let decode_mla_segments = !uniseg
             && self.decode_mla_segments
@@ -2382,6 +2420,12 @@ impl Builder {
 
         for (idx, op) in self.ops.iter().enumerate() {
             let mut inst = op.inst;
+            if kda_carry_keyfeed
+                && inst.op == DevOp::KdaChunkWu as u16
+                && lean_kda_key_factor_pair(&self.ops, idx)
+            {
+                inst.i[5] = 1;
+            }
 
             // The op's COARSE lists, on the instruction. A dep's threshold is how the
             // PRODUCER was sliced — deriving it here is the whole reason the builder owns the
@@ -2521,6 +2565,12 @@ impl Builder {
                 {
                     e.flags |= crate::dev::SE_KDA_CARRY_REGSTATE;
                 }
+                if kda_wu_lean
+                    && inst.op == DevOp::KdaChunkWu as u16
+                    && lean_kda_key_factor_pair(&self.ops, idx)
+                {
+                    e.flags |= crate::dev::SE_KDA_WU_LEAN;
+                }
                 streams[cu as usize].push(e);
                 gq_stream.push(e); // op-major: outer loop is op order, inner is slice order
             }
@@ -2541,7 +2591,7 @@ impl Builder {
         // With `gq_order_asap`, each window is ordered by earliest-start rank instead (see
         // `set_gq_order_asap`); ties keep op-major order and the order stays topological.
         let asap = if self.gq_order_asap {
-            Some(self.gq_asap_ranks())
+            Some(self.gq_asap_ranks(self.gq_order_seg.then_some(&seg_of[..])))
         } else {
             None
         };
@@ -3985,6 +4035,64 @@ mod l2_placement_tests {
         assert_eq!(x, y);
     }
 
+    /// K3's post-DOWN decode segment: the raw `MoeGroupGlu -> MoeGroupDown` pair is a launch
+    /// boundary, so `MoeCombine` and the shared-expert `GemvGlu` are BOTH ready when the next
+    /// segment starts. Whole-program ranks still put `GemvGlu` (rank 3) ahead of `MoeCombine`
+    /// (rank 8); segment-relative ranks tie them and emit order (combine first) wins, while the
+    /// window stays topological and nothing else moves.
+    #[test]
+    fn gq_asap_seg_order_ranks_relative_to_the_segment_launch() {
+        let emit = |seg: bool| {
+            let mut b = Builder::new(256);
+            b.deny_uniseg();
+            b.set_decode_grouped_moe_segments(true);
+            b.set_gq_order_asap(true);
+            b.set_gq_order_seg(seg);
+            let all: Vec<u32> = (0..256).collect();
+            let attn = b.emit(DevOp::AttnRes, vec![0], &[], |_| {});
+            let router = b.emit(DevOp::MoeRouterTopk, vec![0], &[attn], |_| {});
+            let glu = b.emit(DevOp::MoeGroupGluFp8Blk, all.clone(), &[router], |d| {
+                d.i = [16, 384, 3584, 896, 0, 2, 2, 0];
+            });
+            let down = b.emit(DevOp::MoeGroupDownFp8Blk, all.clone(), &[glu], |d| {
+                d.i = [16, 3584, 384, 896, 0, 0, 2, 0];
+            });
+            let combine = b.emit(DevOp::MoeCombine, all.clone(), &[down], |_| {});
+            let sh_glu = b.emit(DevOp::GemvGlu, all.clone(), &[attn], |_| {});
+            let xr1 = b.emit(DevOp::XReduce, all.clone(), &[combine], |_| {});
+            let sh_down = b.emit(DevOp::Gemv, all.clone(), &[sh_glu], |_| {});
+            let xr2 = b.emit(DevOp::XReduce, all, &[xr1, sh_down], |_| {});
+            (b.finish(), [down, combine, sh_glu, xr1, sh_down, xr2])
+        };
+        let (base, _) = emit(false);
+        let (p, [down, combine, sh_glu, xr1, sh_down, xr2]) = emit(true);
+        assert_eq!(p.stream, base.stream, "static streams must not move");
+        assert_eq!(p.gq_seg_ofs, base.gq_seg_ofs, "windows must not move");
+        assert_eq!(p.insts, base.insts, "counter edges must not move");
+        let order = |q: &Program, w: usize| -> Vec<u32> {
+            let win = &q.gq_stream[q.gq_seg_ofs[w] as usize..q.gq_seg_ofs[w + 1] as usize];
+            let mut v: Vec<u32> = win.iter().map(|e| e.inst).collect();
+            v.dedup();
+            v
+        };
+        let n_win = p.gq_seg_ofs.len() - 1;
+        let last = n_win - 1;
+        assert_eq!(order(&p, last)[0], combine);
+        assert_eq!(order(&base, last)[0], sh_glu);
+        assert_eq!(order(&p, last), vec![combine, sh_glu, xr1, sh_down, xr2]);
+        assert_eq!(order(&base, last), vec![sh_glu, sh_down, combine, xr1, xr2]);
+        for w in 0..last {
+            assert_eq!(order(&p, w), order(&base, w));
+            assert!(!order(&p, w).contains(&combine));
+        }
+        assert!(order(&p, last - 1).contains(&down));
+        let mut x: Vec<_> = p.gq_stream.iter().map(|e| (e.inst, e.slice)).collect();
+        let mut y: Vec<_> = base.gq_stream.iter().map(|e| (e.inst, e.slice)).collect();
+        x.sort();
+        y.sort();
+        assert_eq!(x, y);
+    }
+
     /// NVIDIA. Consecutive blocks fill a GPC, so the block formula stands — and this test is
     /// what stops the AMD fix from becoming a blanket rewrite of a shipped NVIDIA path.
     #[test]
@@ -4773,7 +4881,7 @@ mod lean_kda_intra_tests {
     fn program(enabled: bool, dim: u32) -> Program {
         let mut b = Builder::new(4);
         b.deny_uniseg();
-        b.set_lean_kda_intra_segments(enabled);
+        b.set_kda_intra_wave_items_segments(enabled);
         let tensors: Vec<_> = (0..6).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
         let all = b.all();
         let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
@@ -4974,6 +5082,64 @@ mod kda_carry_regstate_tests {
             .iter()
             .filter(|e| e.inst != 2)
             .all(|e| e.flags & crate::dev::SE_KDA_CARRY_REGSTATE == 0));
+    }
+}
+
+#[cfg(test)]
+mod kda_wu_lean_tests {
+    use super::*;
+
+    fn program(lean: bool, keyfeed: bool, regstate: bool) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_kda_carry_regstate_segments(regstate);
+        b.set_kda_wu_lean_segments(lean);
+        b.set_kda_carry_keyfeed_segments(keyfeed);
+        let tensors: Vec<_> = (0..8).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let wu = b.emit(DevOp::KdaChunkWu, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        let carry = b.emit(DevOp::KdaChunkCarry, all.clone(), &[wu], |d| {
+            d.t = [
+                tensors[1], tensors[2], tensors[7], tensors[3], tensors[0], tensors[1], tensors[4],
+                tensors[5],
+            ];
+            d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[carry], |_| {});
+        b.finish()
+    }
+
+    fn marked(p: &Program, inst: u32) -> bool {
+        let entries: Vec<_> = p.stream.iter().filter(|e| e.inst == inst).collect();
+        assert!(!entries.is_empty());
+        entries
+            .iter()
+            .all(|e| e.flags & crate::dev::SE_KDA_WU_LEAN != 0)
+    }
+
+    #[test]
+    fn lean_marks_the_wu_of_an_exact_pair_in_its_own_segment() {
+        let p = program(true, false, true);
+        assert!(marked(&p, 1));
+        assert!(!marked(&p, 0) && !marked(&p, 3));
+        let wu_seg = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+        assert!(p.stream.iter().all(|e| (e.seg == wu_seg) == (e.inst == 1)));
+        assert_eq!(p.insts[1].i[5], 0);
+        assert!(marked(&p, 2), "the carry keeps its regstate mark");
+    }
+
+    #[test]
+    fn keyfeed_tags_the_wu_only_under_lean_and_regstate() {
+        assert_eq!(program(true, true, true).insts[1].i[5], 1);
+        assert_eq!(program(true, true, false).insts[1].i[5], 0);
+        assert_eq!(program(false, true, true).insts[1].i[5], 0);
+        assert!(!marked(&program(false, false, true), 1));
     }
 }
 

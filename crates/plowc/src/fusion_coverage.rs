@@ -97,7 +97,7 @@ impl FusionCoverage {
             .last()
             .ok_or_else(|| "emitted model has no decode program".to_string())?;
         // The egg graph is built from the full checkpoint config, while an
-        // intentional PLOW_K3_LAYERS truncation emits only a prefix.  Count the
+        // intentional PLOW_LAYERS truncation emits only a prefix.  Count the
         // emitted KDA layers from their unique checkpoint tensor instead of
         // imposing the full graph's obligation on a diagnostic artifact.
         let emitted_kda = model

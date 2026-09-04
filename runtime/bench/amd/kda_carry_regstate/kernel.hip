@@ -203,6 +203,47 @@ void k_carry_regstate_hwcvt(bf16* out, float* state, const bf16* q, const bf16* 
                                                  gridDim.x, lds);
 }
 
+/* The kda_chunk_key_factor pair: k exp2(g_last - g) split into bf16 hi/lo, [T][H][D]. */
+extern "C" __global__ __launch_bounds__(256)
+void k_key_precompute(bf16* key_hi, bf16* key_lo, const bf16* k, const float* g,
+                      unsigned T, unsigned H) {
+    const size_t count = (size_t)T * H * D;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += (size_t)gridDim.x * blockDim.x) {
+        const unsigned row = (unsigned)(i / ((size_t)H * D));
+        const unsigned last = min((row | 63u), T - 1u);
+        const size_t il = (size_t)last * H * D + i % ((size_t)H * D);
+        const float scaled = bf2f(k[i]) * exp2f(g[il] - g[i]);
+        const bf16 high = f2bf(scaled);
+        key_hi[i] = high;
+        key_lo[i] = f2bf(scaled - bf2f(high));
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 1)
+__attribute__((amdgpu_waves_per_eu(1, 1)))
+void k_carry_regstate_keyfeed(bf16* out, float* state, const bf16* q, const bf16* k,
+                              const bf16* W, const bf16* U, const float* Aqk, const float* g,
+                              unsigned T, unsigned H, const bf16* key_hi, const bf16* key_lo) {
+    __shared__ __align__(16) bf16 lds[plow_kda_regstate::LDS_BYTES / 2u];
+    d_kda_chunk_carry_bt64_regstate<false, false, true>(
+        out, state, q, k, W, U, Aqk, g, (T + BT - 1u) / BT, T, H, blockIdx.x, gridDim.x, lds,
+        nullptr, key_hi, key_lo);
+}
+
+extern "C" __global__ __launch_bounds__(256, 1)
+__attribute__((amdgpu_waves_per_eu(1, 1)))
+void k_carry_regstate_keyfeed_timed(bf16* out, float* state, const bf16* q, const bf16* k,
+                                    const bf16* W, const bf16* U, const float* Aqk,
+                                    const float* g, unsigned T, unsigned H,
+                                    unsigned long long* timers, const bf16* key_hi,
+                                    const bf16* key_lo) {
+    __shared__ __align__(16) bf16 lds[plow_kda_regstate::LDS_BYTES / 2u];
+    d_kda_chunk_carry_bt64_regstate<true, false, true>(
+        out, state, q, k, W, U, Aqk, g, (T + BT - 1u) / BT, T, H, blockIdx.x, gridDim.x, lds,
+        timers, key_hi, key_lo);
+}
+
 extern "C" __global__ __launch_bounds__(256, 1)
 __attribute__((amdgpu_waves_per_eu(1, 1)))
 void k_carry_regstate_timed(bf16* out, float* state, const bf16* q, const bf16* k,
