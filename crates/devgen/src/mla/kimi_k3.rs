@@ -785,46 +785,24 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
         });
     }
     g.push(K3Gap {
-        what: "full-model emit for a hybrid MLA arch — THE ONE REMAINING BLOCKER",
+        what: "full-model emit for a hybrid MLA/KDA architecture",
         scope: "the whole blob".into(),
-        why:
-            "EVERY OP K3 NEEDS NOW EXISTS AND PASSES A REAL-WEIGHT GATE (see CLOSED, above). What \
-              does not exist is anything that CALLS them together. Concretely, and this is the \
-              honest state of the tree rather than a plan:\n\
-              * `crates/devgen/src/k3.rs` and `crates/devgen/src/kda.rs` are reached by NOTHING \
-                outside their own `#[cfg(test)]` modules. `emit_kda_layer` emits a whole KDA \
-                mixer; `emit_attn_res`/`emit_situ_glu`/`emit_mla_out_gate`/`emit_k3_block_out` \
-                emit one packet each. No function composes them into even ONE complete layer, and \
-                there is no loop over layers anywhere.\n\
-              * the three rung gates build their instruction streams BY HAND IN C \
-                (`runtime/tests/k3_{block,moe_block,mla_block}_gfx950_test.c`, a private \
-                `emitop()` each), against fixtures pinned to a single `K3_LAYER`. So the C \
-                harnesses and the devgen modules are two independent transcriptions of the same \
-                graph with nothing tying them together — a drift hazard that only a shared emit \
-                closes.\n\
-              * `glm_emit_full` cannot be reused as-is: it assumes a UNIFORM MLA layer and a PLAIN \
-                RESIDUAL ADD, and K3 breaks both. It needs the per-layer attention map to select \
-                layer L's ops AND its carried state (a KDA recurrent state + 3 conv states on 69 \
-                layers, a ckv/krot KV ring on 24), plus the `block_residual` snapshot ring.\n\
-              * there is no embed / final-norm / lm_head / argmax tail for K3 in ANY form: all \
-                three C gates are block-only, `act.x` in and a residual out.\n\
-              * and there is a SECOND, independent refusal outside devgen: \
-                `crates/plowc/src/hf_config.rs` `build_full_model_plan` asserts \
-                `arch != HfArch::KimiK3`, locked by `test_kimi_k3_has_no_full_model_plan`. Both \
-                have to open.\n\
-              THERE IS ALSO NO TRUNCATION KNOB. GLM's `GLM_NLAYERS` (mla.rs, `glm_emit_full`) is \
-              what makes a cheap iteration loop possible — a truncated model loads in seconds \
-              instead of the 4-minute 183 GiB/rank full load. K3 has no equivalent and cannot \
-              have one until there is a loop to truncate. When it is written: layers 0..3 is the \
-              minimum honest span, because 0/1/2 are KDA and 3 is the first MLA, so anything \
-              shorter is not testing the hybrid at all."
-                .into(),
-        fix: "crates/devgen/src/lib.rs (dispatch: stop routing kimi_k3 unconditionally into \
-              `kimi_k3_emit`), crates/plowc/src/hf_config.rs (the second refusal), and a new \
-              `k3_main`/`k3_emit_full` in crates/devgen/src/mla.rs or a k3 module: a declare keyed \
-              on the per-layer attention map, the layer loop composing kda.rs + k3.rs + the MLA \
-              emit, a K3_NLAYERS truncation knob, and the embed/tail.",
-        done: None,
+        why: "CLOSED. The production devblob emitter follows the config-provided per-layer \
+              attention map, carries KDA state and MLA KV independently, composes both AttnRes \
+              seams and the latent routed-MoE tail, and emits embed through argmax. The normal \
+              scheduled-packet HF planner remains a different CPU/simulator artifact path and \
+              deliberately refuses operators its bridge cannot execute; phase-object experiments \
+              consume this production devblob graph instead of duplicating hybrid lowering."
+            .into(),
+        fix: "Use `crates/devgen/src/mla/kimi_k3.rs::k3_emit_full`. `PLOW_K3_LAYERS=N` \
+              provides a cheap hybrid prefix; graph-derived phase/EP transforms are packet \
+              rewrites and contain no model-name predicate.",
+        done: Some(
+            "`k3_emit_full` declares and emits the complete hybrid model, checkpoint coverage is \
+             fatal, and build.json records each program's exact arms and graph-derived dispatch \
+             chains. The TP8 gate emitted 93/93 layers (0e+0 missing). The real emitter is now \
+             default; `K3_FULL=0` explicitly requests this historical report.",
+        ),
     });
     g.push(K3Gap {
         what: "MoE sub-namespace + expert-name template",
@@ -875,9 +853,8 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
 /// specific, accurate statement of what is not implemented rather than an `Option::unwrap` panic
 /// three crates deep (which is what `kimi_k3` produced before: `crates/devgen/src/config.rs:93`,
 /// because the `text_config` probe routed it into the Gemma-4 parser).
-/// Emit the full K3 decode blob. `K3_FULL=1` selects this; the default stays
-/// the capability report in [`kimi_k3_emit`], which is still the honest answer
-/// for anyone who has not read what is missing.
+/// Emit the full K3 blob. This is the default production path; `K3_FULL=0`
+/// retains the legacy capability report as an explicit diagnostic.
 ///
 /// `K3_NLAYERS` truncates, and it is what makes iteration affordable — the same
 /// role `GLM_NLAYERS` plays. **0..3 is the minimum honest span**: 0/1/2 are KDA
@@ -885,12 +862,9 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
 /// all. Truncation shrinks the tensor table, so a short model loads in seconds
 /// instead of paying the full-checkpoint load.
 ///
-/// What this does NOT yet do, and what will therefore fail at LOAD rather than
-/// here: the host-side mxfp4 expert bind (`bind_packed_experts` knows
-/// `.weight` + `.weight_scale_inv`, K3 ships `weight_packed` + `weight_scale`)
-/// and the Mixtral `w1/w2/w3` expert-name template. Both fail loudly with a
-/// missing weight, which is the right failure — but they are why this is gated
-/// rather than default.
+/// The production loader consumes the packet-declared expert tables and the
+/// Mixtral `w1`/`w2`/`w3` checkpoint names; neither is inferred from a model
+/// name at load time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn k3_emit_full(
     dir: &Path,
@@ -2347,7 +2321,7 @@ mod kimi_k3_tests {
     ///
     /// This is the assertion that keeps the report honest in both directions. Printing a landed
     /// capability as an unimplemented blocker sends the next agent to rebuild four opcodes that
-    /// already dispatch (it did); marking one closed without the measured residual next to it
+    /// already dispatch (it did); marking one closed without quantitative evidence next to it
     /// makes the claim unfalsifiable.
     #[test]
     fn closed_gaps_carry_evidence_and_open_gaps_do_not_claim_any() {
@@ -2368,12 +2342,13 @@ mod kimi_k3_tests {
                 g.what
             );
         }
-        assert!(!open.is_empty(), "the full-model emit is still open");
+        assert!(!open.is_empty(), "the report should retain unresolved capabilities");
         assert!(
-            open[0].what.contains("full-model emit"),
-            "the model-level assembly is THE remaining blocker and must rank first among the \
-             open items; got {:?}",
-            open[0].what
+            gaps.iter()
+                .find(|g| g.what.contains("full-model emit"))
+                .and_then(|g| g.done)
+                .is_some(),
+            "the production full-model emitter must not regress to an open capability"
         );
     }
 

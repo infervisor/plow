@@ -244,8 +244,8 @@ pub struct EmitConfig {
     // ──────────────────────────────────────────────────────────────────────────
     // K3 model family
     // ──────────────────────────────────────────────────────────────────────────
-    /// Emit the full K3 model (all layers). Default is capability-report only.
-    #[arg(long, env = "K3_FULL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Emit the full K3 model. Set false only to print the legacy capability report.
+    #[arg(long, env = "K3_FULL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_full: bool,
 
     /// Fuse MLA q/kv/k_rope/gate A-projection into one GemvQkvg (decode-only).
@@ -713,7 +713,7 @@ impl EmitConfig {
             gemma_moe_router_blocks: env_u32("PLOW_GEMMA_MOE_ROUTER_BLOCKS"),
             gemma_moe_router_exact: env_bool("PLOW_GEMMA_MOE_ROUTER_EXACT"),
             gemma_moe_tail_fuse: env_bool("PLOW_GEMMA_MOE_TAIL_FUSE"),
-            k3_full: env_bool("K3_FULL"),
+            k3_full: env_bool_default_true("K3_FULL"),
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             k3_ns: env_u32("PLOW_K3_NS"),
             k3_layers: env_str("PLOW_K3_LAYERS").unwrap_or_else(|| "all".into()),
@@ -991,6 +991,24 @@ mod tests {
     struct TestArgs {
         #[command(flatten)]
         emit: EmitConfig,
+    }
+
+    #[test]
+    fn k3_hybrid_emit_defaults_on_and_keeps_explicit_report_mode() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("K3_FULL", "1")]);
+        std::env::remove_var("K3_FULL");
+        assert!(EmitConfig::from_env().k3_full);
+        assert!(TestArgs::try_parse_from(["test"]).unwrap().emit.k3_full);
+
+        std::env::set_var("K3_FULL", "0");
+        assert!(!EmitConfig::from_env().k3_full);
+        assert!(
+            !TestArgs::try_parse_from(["test", "--k3-full=false"])
+                .unwrap()
+                .emit
+                .k3_full
+        );
     }
 
     #[test]

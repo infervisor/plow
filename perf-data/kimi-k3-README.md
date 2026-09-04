@@ -143,8 +143,8 @@ Warmup: arms emitted with different `--n-cu` were observed to sample warmup toke
 
 | knob | default | effect |
 |---|---|---|
-| `K3_FULL=1` | off | REQUIRED for the real 93-layer emit; otherwise an analysis-and-refusal path |
-| `K3_NLAYERS=n` | all | truncate. NOTE: a truncated K3 is not a language model — degenerate output at small n carries NO signal |
+| `K3_FULL=0` | off | Explicit legacy analysis-and-refusal report. The real hybrid emit is the default. |
+| `PLOW_K3_LAYERS=N` | `all` | Emit the first N layers (`single:L` emits one diagnostic layer). A truncated K3 is not a language model; use at least N=4 to cover both KDA and MLA. |
 | `PLOW_FP8_KV=1` | off | fp8 KV cache. Selects `FlashMlaDecodeFp8`/`HeadNormRopeFp8` |
 | `PLOW_MXFP4=1` | off | mxfp4 routed experts |
 | `K3_MOE_GROUP` | **on** (`!= "0"`) | grouped MoE path |

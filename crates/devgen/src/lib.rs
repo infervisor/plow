@@ -5775,12 +5775,10 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // is loud about this one too even without the claim above. `kimi_k3_emit` never returns: it
     // validates everything the front end can and then reports what is not implemented.
     if model_type == "kimi_k3" {
-        // `K3_FULL=1` selects the real emit (`k3_emit_full`), mirroring GLM's
-        // `GLM_FULL`. The DEFAULT stays the capability report, because the
-        // host-side mxfp4 expert bind and the Mixtral `w1/w2/w3` name template
-        // are still missing — a blob emitted today fails at LOAD with a missing
-        // weight, which is loud and correct but is not what someone who has not
-        // read the report is expecting.
+        // The hybrid emitter is the production default. Keep the old itemised
+        // capability report behind `K3_FULL=0` as a diagnostic; experiments
+        // must otherwise consume the same complete graph/packet path serving
+        // uses, including graph-derived phase and EP rewrites.
         if emit_config::active().k3_full {
             mla::k3_emit_full(
                 &dir,

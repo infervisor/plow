@@ -1503,6 +1503,11 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         "schema": 1,
         "arch": arch,
         "n_cu": m.n_cu,
+        "input_contract": {
+            "kind": "token_ids",
+            "modalities": ["text"],
+            "vision": false,
+        },
         "opcodes": opcodes,
         "shapes": {
             "hd": s.hd,
@@ -1839,6 +1844,14 @@ mod tests {
         assert!(ops.contains(&"FlashDecodeFp8"));
         assert!(ops.contains(&"Gemv"));
         assert!(!ops.contains(&"FlashMlaDecode"));
+    }
+
+    #[test]
+    fn devblob_input_scope_is_explicitly_text_only() {
+        let man = build(&model(), "gfx950");
+        assert_eq!(man["input_contract"]["kind"], "token_ids");
+        assert_eq!(man["input_contract"]["modalities"], json!(["text"]));
+        assert_eq!(man["input_contract"]["vision"], false);
     }
 
     #[test]
