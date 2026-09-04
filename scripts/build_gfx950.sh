@@ -78,6 +78,7 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
       kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
       kda_chunk_intra_wave_items_gfx950.co kda_chunk_intra_wave_items_gfx950.elf \
+      attn_res_f32mix_gfx950.co attn_res_f32mix_gfx950.elf \
       kda_chunk_key_factor_wu_gfx950.co kda_chunk_key_factor_wu_gfx950.elf \
       kda_chunk_key_factor_carry_gfx950.co kda_chunk_key_factor_carry_gfx950.elf \
       xreduce_attnres_gfx950.co xreduce_attnres_gfx950.elf \
@@ -141,6 +142,31 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_intra_wave_items" = 1 ]; then
     -DPLOW_REQUIRED_MARKER=plow_kda_intra_wave_items_abi_1 \
     "$R/amd/kda_chunk_intra_wave_items.hip"
   KDA_INTRA_WAVE_ITEMS_ELFS="kda_chunk_intra_wave_items_gfx950.elf"
+fi
+
+ATTN_RES_F32MIX_ELFS=""
+need_attn_res_f32mix=${PLOW_ATTNRES_F32MIX:-0}
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_ATTN_RES_F32MIX 1' "$PLOW_HSACO_CONFIG"; then
+  need_attn_res_f32mix=1
+fi
+if [ "$need_attn_res_f32mix" = 1 ] && [ "$ARCH" != gfx950 ]; then
+  echo "manifest-required f32-mix AttnRes object is supported only on gfx950" >&2
+  exit 2
+fi
+if [ "$ARCH" = gfx950 ] && [ "$need_attn_res_f32mix" = 1 ]; then
+  [ -n "${PLOW_HSACO_CONFIG:-}" ] || {
+    echo "PLOW_ATTNRES_F32MIX=1 requires PLOW_HSACO_CONFIG for packet pairing" >&2
+    exit 2
+  }
+  # -fno-slp-vectorize: packed-f32 FMA formation costs ~30 VGPRs here (see the source header).
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/attn_res_f32mix_gfx950.elf" \
+    plow_attn_res_f32mix_gfx950 168 3 \
+    $INC -fno-slp-vectorize -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_attn_res_f32mix_abi_1 \
+    "$R/amd/attn_res_f32mix_gfx950.hip"
+  ATTN_RES_F32MIX_ELFS="attn_res_f32mix_gfx950.elf"
 fi
 
 KDA_KEY_FACTOR_ELFS=""
@@ -725,7 +751,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

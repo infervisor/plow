@@ -1303,6 +1303,11 @@ fn k3_build_model(
                     && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
                     && emit_config::active().kda_intra_wave_items,
             );
+            b.set_attn_res_f32mix_segments(
+                crate::emit_is_amd()
+                    && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                    && emit_config::active().attnres_f32mix,
+            );
             b.set_lean_kda_key_factor_segments(
                 crate::emit_is_amd()
                     && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950

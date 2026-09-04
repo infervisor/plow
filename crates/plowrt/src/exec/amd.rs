@@ -127,7 +127,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use packet::dev::{DevInst64, DevOp, DevProgram, PrefillSpan, PREFILL_SPAN_RESET_STATE, SE_XCTR};
-use packet::devbuild::static_seg_ofs;
+use packet::devbuild::{lean_attn_res_f32mix_inst64, static_seg_ofs};
 use serde::Serialize;
 
 use crate::asset::devblob::{DevBlob, DevProg};
@@ -616,6 +616,43 @@ struct KdaChunkIntraCachedArgs {
 
 const _: () = assert!(std::mem::size_of::<KdaChunkIntraCachedArgs>() == 64);
 
+/// Kernarg ABI of `plow_attn_res_f32mix_gfx950` (runtime/amd/attn_res_f32mix_gfx950.hip).
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct AttnResF32MixArgs {
+    out: u64,
+    prefix: u64,
+    ring: u64,
+    score_w: u64,
+    push_src: u64,
+    gamma: u64,
+    res_a: u64,
+    res_b: u64,
+    res_pre: u64,
+    t: u32,
+    hid: u32,
+    nb: u32,
+    push_row: u32,
+    nbcap: u32,
+    eps: f32,
+    out_eps: f32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<AttnResF32MixArgs>() == 104);
+
+/// Persistent workgroups for the f32-mix AttnRes object: three 4-wave tokens per CU on 256 CUs
+/// measured 0.260 ms at T8192 against 0.279 (512) and 0.283 (1024); `PLOW_ATTNRES_F32MIX_GRID`
+/// overrides for a sweep.
+fn attn_res_f32mix_grid(t: u32) -> u32 {
+    let grid = std::env::var("PLOW_ATTNRES_F32MIX_GRID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&g| g != 0)
+        .unwrap_or(768);
+    grid.min(t).max(1)
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct KdaChunkKeyFactorWuArgs {
@@ -927,6 +964,10 @@ enum PrefillSegmentRoute {
     },
     KdaChunkIntraWaveItems {
         args: KdaChunkIntraCachedArgs,
+        grid: u32,
+    },
+    AttnResF32Mix {
+        args: AttnResF32MixArgs,
         grid: u32,
     },
     KdaChunkKeyFactorWu {
@@ -1803,6 +1844,18 @@ fn moe_mxfp4_routes_with_scratch(
                 )));
             }
         }
+        // An f32-mix AttnRes packet is only ever emitted for the object; a segment that also
+        // holds other work cannot be handed to it and must not fall back to the BF16-seam arm.
+        if set.len() != 1
+            && set
+                .iter()
+                .any(|&i| prog.insts.get(i).is_some_and(lean_attn_res_f32mix_inst64))
+        {
+            return Err(RuntimeError::Device(format!(
+                "program T={} segment {seg} carries an f32-mix AttnRes packet in a mixed segment",
+                prog.t
+            )));
+        }
         let encoded_xreduce_attnres = set
             .iter()
             .find_map(|&i| prog.insts.get(i).filter(|d| xreduce_attnres_encoded(d)));
@@ -1963,6 +2016,52 @@ fn moe_mxfp4_routes_with_scratch(
                     },
                     device_args: 0,
                     grid: u32::from(d.blocks),
+                });
+                continue;
+            }
+            if lean_attn_res_f32mix_inst64(d) {
+                let opt = |h: u16, what: &str| -> Result<u64> {
+                    if h == packet::dev::TENSOR_NONE16 {
+                        Ok(0)
+                    } else {
+                        addr(h, what)
+                    }
+                };
+                let res_pre = if d.i[5] == packet::dev::TENSOR_NONE_I {
+                    0
+                } else {
+                    u16::try_from(d.i[5])
+                        .ok()
+                        .map(|h| addr(h, "res_pre"))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            RuntimeError::Device(format!(
+                                "f32-mix AttnRes res_pre handle {} is not a tensor handle",
+                                d.i[5]
+                            ))
+                        })?
+                };
+                routes.push(PrefillSegmentRoute::AttnResF32Mix {
+                    args: AttnResF32MixArgs {
+                        out: addr(d.t[0], "out")?,
+                        prefix: addr(d.t[1], "prefix")?,
+                        ring: addr(d.t[2], "ring")?,
+                        score_w: addr(d.t[3], "score_w")?,
+                        push_src: opt(d.t[4], "push_src")?,
+                        gamma: addr(d.t[5], "gamma")?,
+                        res_a: opt(d.t[6], "res_a")?,
+                        res_b: opt(d.t[7], "res_b")?,
+                        res_pre,
+                        t: d.i[0],
+                        hid: d.i[1],
+                        nb: d.i[2],
+                        push_row: d.i[3],
+                        nbcap: d.i[4],
+                        eps: f32::from_bits(d.fj[0]),
+                        out_eps: f32::from_bits(d.fj[1]),
+                        reserved: 0,
+                    },
+                    grid: attn_res_f32mix_grid(d.i[0]),
                 });
                 continue;
             }
@@ -3033,6 +3132,42 @@ fn check_kda_intra_wave_items_symbols<'a>(syms: &[&'a str], path: &Path) -> Resu
     if !syms.contains(&"plow_packet_hash_lo") || !syms.contains(&"plow_packet_hash_hi") {
         return Err(RuntimeError::Device(format!(
             "KDA-intra wave-item object {} has no packet-pairing stamp",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+const ATTN_RES_F32MIX_MARKERS: [&str; 6] = [
+    "plow_attn_res_f32mix_abi_1",
+    "plow_attn_res_f32mix_hid7168_1",
+    "plow_attn_res_f32mix_online_softmax_1",
+    "plow_attn_res_f32mix_wave64_1",
+    "plow_attn_res_f32mix_no_spill_1",
+    "plow_attn_res_f32mix_vgpr_le_168",
+];
+
+fn read_attn_res_f32mix_object(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| {
+        RuntimeError::Device(format!(
+            "f32-mix AttnRes packets require {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn check_attn_res_f32mix_symbols(syms: &[&str], path: &Path) -> Result<()> {
+    for marker in ATTN_RES_F32MIX_MARKERS {
+        if !syms.contains(&marker) {
+            return Err(RuntimeError::Device(format!(
+                "f32-mix AttnRes object {} lacks required ABI/resource marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    if !syms.contains(&"plow_packet_hash_lo") || !syms.contains(&"plow_packet_hash_hi") {
+        return Err(RuntimeError::Device(format!(
+            "f32-mix AttnRes object {} has no packet-pairing stamp",
             path.display()
         )));
     }
@@ -6781,6 +6916,8 @@ pub struct AmdEngine {
     _moe_stage1_a4_scratch: Option<DeviceMem>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
+    /// The f32-mix AttnRes object and the workgroup size it advertises.
+    k_attn_res_f32mix: Option<(HsaKernel, u32)>,
     k_moe_ep_align: Option<HsaKernel>,
     k_moe_ep_stage2: Option<HsaKernel>,
     k_moe_ep_combine: Option<HsaKernel>,
@@ -7436,6 +7573,9 @@ impl AmdEngine {
                 .iter()
                 .any(has_moe_stage1_mxfp4_segment);
         let need_moe_combine_lean = blob.progs[..dec_ix].iter().any(has_moe_combine_segment);
+        let need_attn_res_f32mix = blob.progs[..dec_ix]
+            .iter()
+            .any(|p| p.insts.iter().any(lean_attn_res_f32mix_inst64));
         if need_moe_ep {
             if arch != "gfx950" {
                 return Err(RuntimeError::Device(format!(
@@ -8679,6 +8819,55 @@ impl AmdEngine {
                 modules.push(module);
                 Some(kernel)
             }
+        } else {
+            None
+        };
+
+        let k_attn_res_f32mix = if need_attn_res_f32mix {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "f32-mix AttnRes packets require gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "attn_res_f32mix_gfx950.elf";
+            const SYMBOL: &str = "plow_attn_res_f32mix_gfx950";
+            let path = hsaco_dir.join(NAME);
+            let image = read_attn_res_f32mix_object(&path)?;
+            let syms = elf_symbol_names(&image);
+            check_attn_res_f32mix_symbols(&syms, &path)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let threads = elf_symbol_u32(&image, "plow_attn_res_f32mix_threads")
+                .filter(|&n| n != 0 && n % 64 == 0 && n <= 1024)
+                .ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "{NAME}: plow_attn_res_f32mix_threads is missing or not a wave64 workgroup"
+                    ))
+                })?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            let want = std::mem::size_of::<AttnResF32MixArgs>() as u32;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; f32-mix AttnRes ABI needs {want} (or {} with COv5 implicit args)",
+                    want + 256
+                )));
+            }
+            let private = kernel.private_segment_size();
+            if private != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: resource gate failed: private={private} (required 0)"
+                )));
+            }
+            tracing::info!(
+                object = %path.display(),
+                symbol = SYMBOL,
+                threads,
+                "f32-mix AttnRes object accepted"
+            );
+            modules.push(module);
+            Some((kernel, threads))
         } else {
             None
         };
@@ -9992,6 +10181,7 @@ impl AmdEngine {
             _moe_stage1_a4_scratch: d_moe_stage1_a4_scratch,
             k_moe_stage2_mxfp4,
             k_moe_combine,
+            k_attn_res_f32mix,
             k_moe_ep_align,
             k_moe_ep_stage2,
             k_moe_ep_combine,
@@ -10507,6 +10697,7 @@ impl AmdEngine {
                 PrefillSegmentRoute::KdaChunkIntraWaveItems { .. } => {
                     return "kda_intra_wave_items";
                 }
+                PrefillSegmentRoute::AttnResF32Mix { .. } => return "attn_res_f32mix",
                 PrefillSegmentRoute::KdaChunkKeyFactorWu { .. }
                     if self.k_kda_key_factor_wu.is_some() =>
                 {
@@ -10856,6 +11047,24 @@ impl AmdEngine {
                     256,
                     0,
                     as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::AttnResF32Mix { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let (kernel, threads) = self.k_attn_res_f32mix.ok_or_else(|| {
+                    RuntimeError::Device("f32-mix AttnRes segment has no validated object".into())
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    threads,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
                     None,
                 )?;
                 self.seg_launches += 1;
@@ -12839,6 +13048,95 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("packet/object MISMATCH"));
+    }
+
+    #[test]
+    fn f32mix_attn_res_route_requires_marker_geometry_and_a_pure_segment() {
+        let mut prog = segmented_prog(
+            &[DevOp::RmsNorm, DevOp::AttnRes, DevOp::RmsNorm],
+            &[0, 1, 2],
+        );
+        prog.t = 8192;
+        let d = &mut prog.insts[1];
+        d.blocks = 256;
+        d.t = [0, 1, 2, 3, packet::dev::TENSOR_NONE16, 4, 5, 6];
+        d.i = [8192, 7168, 4, 4, 8, packet::dev::TENSOR_NONE_I, 0, 0];
+        d.fj = [1e-5f32.to_bits(), 1e-5f32.to_bits(), 0];
+        let tensors: Vec<_> = (0..7)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..7)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::AttnResF32Mix { args, grid } = routes[1] else {
+            panic!("a marked, pure f32-mix AttnRes packet must select the object")
+        };
+        assert_eq!(
+            (args.t, args.hid, args.nb, args.nbcap, grid),
+            (8192, 7168, 4, 8, 768)
+        );
+        assert_eq!(
+            (args.out, args.gamma, args.res_a, args.res_b),
+            (0x1000, 0x1400, 0x1500, 0x1600)
+        );
+        assert_eq!((args.push_src, args.res_pre, args.reserved), (0, 0, 0));
+        assert_eq!(args.out_eps, 1e-5);
+
+        // The interpreter's contract (no output-norm epsilon) stays on the interpreter.
+        prog.insts[1].fj[1] = 0;
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
+        prog.insts[1].fj[1] = 1e-5f32.to_bits();
+
+        // Decode width and a foreign hidden size are outside the object's contract.
+        prog.insts[1].i[0] = 1;
+        assert!(matches!(
+            moe_mxfp4_routes(&prog, &tensors, &devp).unwrap()[1],
+            PrefillSegmentRoute::Interpreter
+        ));
+        prog.insts[1].i[0] = 8192;
+        prog.insts[1].i[1] = 4096;
+        assert!(matches!(
+            moe_mxfp4_routes(&prog, &tensors, &devp).unwrap()[1],
+            PrefillSegmentRoute::Interpreter
+        ));
+        prog.insts[1].i[1] = 7168;
+
+        // A marked packet sharing a segment with other work is refused, never silently run.
+        prog.stream[2].seg = 1;
+        let err = moe_mxfp4_routes(&prog, &tensors, &devp)
+            .expect_err("mixed f32-mix segment must fail closed")
+            .to_string();
+        assert!(err.contains("f32-mix AttnRes packet in a mixed segment"));
+    }
+
+    #[test]
+    fn f32mix_attn_res_object_gates_markers_and_pairing() {
+        let path = Path::new("attn_res_f32mix_gfx950.elf");
+        let mut syms = ATTN_RES_F32MIX_MARKERS.to_vec();
+        syms.pop();
+        let err = check_attn_res_f32mix_symbols(&syms, path)
+            .expect_err("a stale resource contract must be rejected")
+            .to_string();
+        assert!(err.contains("lacks required ABI/resource marker"));
+        let err = check_attn_res_f32mix_symbols(&ATTN_RES_F32MIX_MARKERS, path)
+            .expect_err("an unstamped object must be rejected")
+            .to_string();
+        assert!(err.contains("no packet-pairing stamp"));
+        let missing = std::env::temp_dir().join(format!(
+            "plow-attn-res-f32mix-missing-{}.elf",
+            std::process::id()
+        ));
+        let err = read_attn_res_f32mix_object(&missing)
+            .expect_err("a marked packet must not silently use the interpreter")
+            .to_string();
+        assert!(err.contains("f32-mix AttnRes packets require"));
     }
 
     #[test]

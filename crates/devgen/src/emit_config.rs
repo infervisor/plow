@@ -523,6 +523,12 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_COMBINE_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_combine_lean: bool,
 
+    /// Emit prefill AttnRes packets with vLLM's f32-mix contract (separate output-norm
+    /// epsilon in `f[1]`) and isolate them for the gfx950 `attn_res_f32mix` object. Default
+    /// off: the packet is then byte-identical to the BF16-seam interpreter contract.
+    #[arg(long, env = "PLOW_ATTNRES_F32MIX", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub attnres_f32mix: bool,
+
     /// Split grouped-MoE align into expert-parallel count/prefix/scatter packets.
     #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_align_par: bool,
@@ -798,6 +804,7 @@ impl EmitConfig {
             moe_prefill_ep: env_bool("PLOW_MOE_PREFILL_EP"),
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
+            attnres_f32mix: env_bool("PLOW_ATTNRES_F32MIX"),
             moe_pf_atomic: env_bool("PLOW_MOE_PF_ATOMIC"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_part16: env_bool("PLOW_MOE_PF_PART16"),
@@ -1072,6 +1079,28 @@ mod tests {
                 .unwrap()
                 .emit
                 .kda_key_factor
+        );
+    }
+
+    #[test]
+    fn attnres_f32mix_defaults_off_and_env_opts_in() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_ATTNRES_F32MIX", "1")]);
+        std::env::remove_var("PLOW_ATTNRES_F32MIX");
+        assert!(!EmitConfig::from_env().attnres_f32mix);
+        assert!(
+            !TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .attnres_f32mix
+        );
+        std::env::set_var("PLOW_ATTNRES_F32MIX", "1");
+        assert!(EmitConfig::from_env().attnres_f32mix);
+        assert!(
+            TestArgs::try_parse_from(["test", "--attnres-f32mix"])
+                .unwrap()
+                .emit
+                .attnres_f32mix
         );
     }
 
