@@ -57,6 +57,11 @@ def add_layer(idx, w, layer):
         add_bf16(w, a + "o_proj.weight", matrix(idx, a + "o_proj.weight"))
         wp = a + "indexer.weights_proj.weight"
         add_f32(w, wp, P.load_tensor(idx, wp))
+        # The reference constructs this as an F32 nn.Parameter (accuracy: it feeds the same
+        # pooled-indexer scoring path weights_proj's own F32 upcast exists for), but the
+        # checkpoint stores it BF16 like everything else -- upcast it here too, same pattern.
+        ape = a + "indexer.index_kpool_compress_ape"
+        add_f32(w, ape, P.load_tensor(idx, ape))
 
     else:
         # KDA layer. devgen's declare_kda_weights (kda.rs) declares q/k/v_conv1d.weight and
