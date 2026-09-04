@@ -589,7 +589,10 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         // An indexed local directory contains the same compiler metadata as a
         // Hub snapshot. Lower it through the same frontend so source access
         // (`--model` vs `--hf-dir`) cannot change the emitted program.
-        Source::HfDir(dir) if dir.join("model.safetensors.index.json").is_file() => {
+        Source::HfDir(dir)
+            if dir.join("model.safetensors.index.json").is_file()
+                || dir.join("model.safetensors").is_file() =>
+        {
             info!(
                 stage = "model-resolution", path = %dir.display(),
                 "resolving indexed Hugging Face compiler metadata"

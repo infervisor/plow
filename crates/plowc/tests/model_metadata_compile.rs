@@ -81,6 +81,32 @@ fn write_metadata(dir: &Path, config: &str) {
     .unwrap();
 }
 
+fn replace_index_with_monolithic_safetensors(dir: &Path) {
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("model.safetensors.index.json")).unwrap(),
+    )
+    .unwrap();
+    let mut header = serde_json::Map::new();
+    for name in index["weight_map"].as_object().unwrap().keys() {
+        header.insert(
+            name.clone(),
+            serde_json::json!({
+                "dtype": "F32",
+                "shape": [0],
+                "data_offsets": [0, 0],
+            }),
+        );
+    }
+    let mut header = serde_json::to_vec(&header).unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut file = (header.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(&header);
+    std::fs::write(dir.join("model.safetensors"), file).unwrap();
+    std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
+}
+
 fn options(out: PathBuf, gpu: &str) -> Options {
     Options {
         no_tuning: true,
@@ -504,6 +530,40 @@ fn model_and_indexed_hf_dir_emit_identical_packets_and_maps() {
         std::fs::remove_dir_all(model_out).ok();
         std::fs::remove_dir_all(hf_dir_out).ok();
     }
+}
+
+#[test]
+fn model_and_monolithic_hf_dir_emit_identical_packets_and_maps() {
+    let metadata = tempdir("source-parity-monolithic");
+    let model_out = tempdir("source-parity-monolithic-model-out");
+    let hf_dir_out = tempdir("source-parity-monolithic-hf-dir-out");
+    write_metadata(&metadata, LLAMA);
+    replace_index_with_monolithic_safetensors(&metadata);
+
+    let mut model_opts = options(model_out.clone(), "h100");
+    model_opts.emit_sample = true;
+    let mut hf_dir_opts = options(hf_dir_out.clone(), "h100");
+    hf_dir_opts.emit_sample = true;
+
+    compile(
+        &Source::Model(metadata.to_string_lossy().into_owned()),
+        &model_opts,
+    )
+    .expect("monolithic metadata model compile");
+    compile(&Source::HfDir(metadata.clone()), &hf_dir_opts)
+        .expect("monolithic hf-dir compile");
+
+    for file in ["decode_b1_s1.pkt", "decode_b1_s1.map.json"] {
+        assert_eq!(
+            std::fs::read(model_out.join(file)).unwrap(),
+            std::fs::read(hf_dir_out.join(file)).unwrap(),
+            "monolithic source access changed {file}"
+        );
+    }
+
+    std::fs::remove_dir_all(metadata).ok();
+    std::fs::remove_dir_all(model_out).ok();
+    std::fs::remove_dir_all(hf_dir_out).ok();
 }
 
 #[test]
