@@ -33,13 +33,14 @@
 //! A class-8 segment holds both of a layer's all-reduces. The inline gate
 //! rendezvouses in ~0.3 µs only if every rank is inside that segment at the same
 //! time; if one rank is three segments behind, its peers spin to the
-//! `PLOW_XCTR_DEADLINE_TICKS` deadline (1 s) and give up. So prefill goes
-//! **per-segment, all-ranks, with a host barrier between segments** — see
-//! [`AmdTpGroup::prefill`]. The barrier costs one drain per segment and buys the
-//! rendezvous; it is not a conservatism that could be relaxed. L2-domain
-//! placement is not wave-class segmentation: every domain drains concurrently
-//! inside one launch, so a placed prefill program uses launch-all/drain-all
-//! exactly once.
+//! `PLOW_XCTR_DEADLINE_TICKS` deadline (1 s) and give up. Production therefore
+//! runs per-segment, all-ranks, with a host barrier between segments. The
+//! default-off segment-major experiment instead submits each segment to all
+//! ranks before the next segment, relies on every rank's AQL barrier packets to
+//! preserve local order, and drains once. The exact counter audit remains
+//! mandatory. L2-domain placement is not wave-class segmentation: every domain
+//! drains concurrently inside one launch, so a placed prefill program uses
+//! launch-all/drain-all exactly once.
 //!
 //! # Status, measured on this node (Gemma-4 31B bf16, gfx950 x8, 2026-07-27)
 //!
@@ -1371,6 +1372,47 @@ impl AmdTpGroup {
         let dispatch = self.ranks[0].prog_dispatch(step.prog);
         let launches = dispatch.launches();
         ttft::PF_SEGMENTS.tally(launches as u64);
+        let segment_major = crate::config::RuntimeConfig::get()
+            .amd
+            .tp_prefill_segment_major
+            && self.prefill_capture.is_none();
+        if segment_major {
+            let t = std::time::Instant::now();
+            let n_ranks = self.ranks.len();
+            for (seg, rank) in segment_major_order(launches, n_ranks) {
+                self.ranks[rank].enqueue_segment(step.prog, seg)?;
+            }
+            ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+
+            let t = std::time::Instant::now();
+            for e in &self.ranks {
+                e.drain()?;
+            }
+            let ns = t.elapsed().as_nanos() as u64;
+            ttft::PF_DRAIN.add(ns);
+            if ttft::on() {
+                let bucket = self.ranks[0].prog_t(step.prog);
+                let timing = if self.weights_bound() {
+                    ""
+                } else {
+                    "SYNTHETIC DIAGNOSTIC: "
+                };
+                eprintln!(
+                    "{timing}PF CHUNK T={bucket} c0={} clen={} segment-major launches={} \
+                     drain={:.3} ms ({:.0} tok/s over the bucket, {:.0} over the real rows)",
+                    step.c0,
+                    step.clen,
+                    launches,
+                    ns as f64 / 1e6,
+                    bucket as f64 / (ns as f64 / 1e9),
+                    step.clen as f64 / (ns as f64 / 1e9),
+                );
+            }
+            if self.audit {
+                self.group.audit_xctr(&self.gate_expect[step.prog])?;
+            }
+            return Ok(());
+        }
         for seg in 0..launches {
             let t = std::time::Instant::now();
             for e in &mut self.ranks {
@@ -1718,6 +1760,16 @@ mod tests {
                 (2, 3),
             ]
         );
+    }
+
+    #[test]
+    fn prefill_segment_major_submits_every_rank_before_the_next_segment() {
+        let order = segment_major_order(4, 3).collect::<Vec<_>>();
+        assert_eq!(order.len(), 12);
+        for (seg, ranks) in order.chunks_exact(3).enumerate() {
+            assert_eq!(ranks, [(seg, 0), (seg, 1), (seg, 2)]);
+        }
+        assert_eq!(order.last(), Some(&(3, 2)));
     }
 
     #[test]

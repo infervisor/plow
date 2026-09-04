@@ -402,6 +402,10 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-seg-window", env = "PLOW_SEG_WINDOW", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub seg_window: bool,
 
+    /// Enqueue prefill segments in segment-major rank order and drain once per chunk.
+    #[arg(long = "amd-tp-prefill-segment-major", env = "PLOW_TP_PREFILL_SEGMENT_MAJOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_prefill_segment_major: bool,
+
     /// VMM-backed KV on ROCr (opt-in, requires hsa_amd_vmem_*).
     #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_kv: bool,
