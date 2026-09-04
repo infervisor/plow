@@ -148,6 +148,29 @@ probe passed 9000 through `plowrt bench` before the seams merged at 8b2555d). GP
 the lease owner, control bundle only: `amd-bench --prompt <9000 ids>` on an emit with
 `PLOW_SEQ_PAR_SEAMS=0`, then `PLOW_KDA_CARRY_REGSTATE=0`, then `PLOW_RAGGED_CHUNK=0` at runtime.
 
+## 5c. Q0 oracle (vLLM 0.28 TP8, 109 repeat pairs) — parity, but neither arm passes
+
+vLLM repeat floor (conservative max over 109 pairs): full-row relL2 0.2551 (median 0.0455, p90
+0.094), head64 0.0573, min top-64 overlap 0.844, argmax flips 2/109. All 17 "severe" flips per arm
+were the gsm9000 NaN rows (§5b); excluding them:
+
+| arm | rows | top-1 | within 2× floor (full) | worst | head64 within 2× | top-64 overlap med/min |
+|---|---:|---:|---:|---:|---:|---|
+| materialized | 68 | 72.1% | 38.2% | 4.46× | 23.5% | 0.61 / 0.30 |
+| absorbed | 68 | 73.5% | 25.0% | 4.52× | 17.6% | 0.63 / 0.30 |
+
+Per prompt (top-1 mat/abs): 300 → 100/100%, 1024 → 88/94%, 8192 → 53/53% (identical flip pattern
+in both arms), 8400 → 47/47%. Every disagreement is a near-tie by the compare tool's rule; min gap
+median 0.5 logits. Prefill rows agree 4/4 on both arms; the loss is on decode steps after long
+(≥ 8192) prompts, scattered, not drifting. On the 44 histories shared by both arms: full relL2
+median 0.549 vs 0.563, head64 0.148 vs 0.146, top-64 0.609 vs 0.633, top-1 32 vs 33, same
+verdict on 43/44, arm-vs-arm argmax 42/44. Alignment checks: dumped-row argmax == the token Plow
+sampled on 68/68 rows per arm (full-vocab row, right index); vLLM argmax == its sampled token
+67/68; bf16 dump quantisation (0.125 at |logit| 16–32) explains ≤ 7/19 of the flips, none of the
+relL2. Verdict: the materialized arm is at parity with the absorbed arm on this oracle; the
+~50% decode top-1 on 8192+ prompts is the pre-existing whole-model Plow-vs-vLLM long-context
+divergence (both arms, the served packet included) and is not attributable to MLA formulation.
+
 ## 6. Follow-ups / risks
 
 - tunedb: re-qualify the 12 materialized projection shapes (`{128..8192}×2304×1536`,
