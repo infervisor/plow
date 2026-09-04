@@ -1016,6 +1016,11 @@ enum PrefillSegmentRoute {
     MlaMaterializePack {
         args: MlaMaterializePackArgs,
         grid: u32,
+        /// Packet tensor id of `K_rope` (the `kv.*.krot` cache), so a launch can rebase it to
+        /// the active KV slot; the other three operands are transients.
+        k_rope_ten: u16,
+        /// Rows the K/V transients can hold — the bound on the per-chunk `kv_len` patch.
+        kv_rows_cap: u32,
     },
     MlaMaterializedPrefill {
         args: MlaMaterializedPrefillArgs,
@@ -1120,6 +1125,19 @@ fn mla_materialized_routes(
                     "materialized MLA pack segment {seg} has unsupported geometry"
                 )));
             }
+            let rows_of = |h: u16, width: u64| -> u32 {
+                let bytes = devp.get(h as usize).map_or(0, |m| m.len);
+                u32::try_from(bytes / (u64::from(d.i[1]) * width * 2)).unwrap_or(u32::MAX)
+            };
+            let kv_rows_cap = rows_of(d.t[0], 192)
+                .min(rows_of(d.t[1], 128))
+                .min(rows_of(d.t[2], 256));
+            if kv_rows_cap < prog.t {
+                return Err(RuntimeError::Device(format!(
+                    "materialized MLA pack segment {seg}: K/V transients hold {kv_rows_cap} rows, fewer than the bucket's {}",
+                    prog.t
+                )));
+            }
             routes[seg] = PrefillSegmentRoute::MlaMaterializePack {
                 args: MlaMaterializePackArgs {
                     k: addr(d.t[0], "K")?,
@@ -1133,6 +1151,8 @@ fn mla_materialized_routes(
                     v_head: d.i[4],
                 },
                 grid: u32::from(d.blocks),
+                k_rope_ten: d.t[3],
+                kv_rows_cap,
             };
         } else if d.op == DevOp::FlashMlaMaterializedPrefill as u16 {
             let (n, h, h_kv, d_qk, d_v, abi) = (d.i[0], d.i[1], d.i[2], d.i[3], d.i[4], d.i[5]);
@@ -1524,6 +1544,73 @@ fn rebase_kda_key_factor_routes(routes: &mut [PrefillSegmentRoute], t: u32) {
             _ => {}
         }
     }
+}
+
+/// Per-chunk operands of the materialized MLA route.
+///
+/// `rows` is the chunk's query count (the bucket width, or `clen` under RAGGED-M) and
+/// `n_kv = c0 + rows` the cached rows its keys span — the same pair `in.kvlen` carries for the
+/// absorbed flash. A continuation chunk has no K/V for `[0, c0)` anywhere but the latent cache,
+/// so its projection (`kv.*.ckv[0, n_kv) · kv_b`, the GEMM writing `kv_materialized`), the pack
+/// (rope half from `kv.*.krot`) and the attention's `N_KV` all address `[0, n_kv)`. The
+/// standalone object aligns its causal mask bottom-right (`causal_offset = N_KV - N`), which puts
+/// query `i` at absolute position `c0 + i` — exactly `qpos = kv_len - n_tok + t` in
+/// `d_flash_mla_prefill`. Runs after [`rebase_chunk_rows`], whose RAGGED-M shrink would otherwise
+/// leave the projection at `clen` rows.
+fn rebase_mla_materialized_routes(
+    insts: &mut [DevInst64],
+    names: &[String],
+    routes: &mut [PrefillSegmentRoute],
+    rows: u32,
+    n_kv: u32,
+) -> Result<()> {
+    if !routes.iter().any(|r| {
+        matches!(
+            r,
+            PrefillSegmentRoute::MlaMaterializePack { .. }
+                | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
+        )
+    }) {
+        return Ok(());
+    }
+    for d in insts.iter_mut() {
+        if matches!(prefill_row_field(d.op), Some(RowField::Rows(0)))
+            && names
+                .get(d.t[0] as usize)
+                .is_some_and(|n| n.ends_with(".kv_materialized"))
+        {
+            d.i[0] = n_kv;
+        }
+    }
+    for route in routes {
+        match route {
+            PrefillSegmentRoute::MlaMaterializePack {
+                args, kv_rows_cap, ..
+            } => {
+                if n_kv > *kv_rows_cap {
+                    return Err(RuntimeError::Device(format!(
+                        "materialized MLA chunk spans {n_kv} cached rows, but the K/V transients hold {kv_rows_cap}"
+                    )));
+                }
+                args.t = n_kv;
+            }
+            PrefillSegmentRoute::MlaMaterializedPrefill { args, grid } => {
+                let n = i32::try_from(rows)
+                    .map_err(|_| RuntimeError::Device("chunk rows exceed i32".into()))?;
+                let nk = i32::try_from(n_kv)
+                    .map_err(|_| RuntimeError::Device("kv_len exceeds i32".into()))?;
+                args.n = n;
+                args.n_kv = nk;
+                args.stride_q_b = n * args.stride_q_n;
+                args.stride_o_b = n * args.stride_o_n;
+                args.stride_k_b = nk * args.stride_k_n;
+                args.stride_v_b = nk * args.stride_v_n;
+                *grid = mla_materialized_flat_grid(rows, args.h.unsigned_abs(), 1)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn promote_kda_intra_wave_items_routes(
@@ -11127,14 +11214,28 @@ impl AmdEngine {
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
-            if let Some(PrefillSegmentRoute::MlaMaterializePack { args, grid }) =
-                self.progs[p].prefill_routes.get(seg).copied()
+            if let Some(PrefillSegmentRoute::MlaMaterializePack {
+                args,
+                grid,
+                k_rope_ten,
+                ..
+            }) = self.progs[p].prefill_routes.get(seg).copied()
             {
                 let kernel = self.k_mla_materialize_pack.ok_or_else(|| {
                     RuntimeError::Device(
                         "materialized MLA pack segment has no validated object".into(),
                     )
                 })?;
+                let mut args = args;
+                if self.kv_slot != 0 {
+                    if let Some(&(_, stride)) = self
+                        .kv_slot_stride
+                        .iter()
+                        .find(|(i, _)| *i == k_rope_ten as usize)
+                    {
+                        args.k_rope += stride * self.kv_slot as u64;
+                    }
+                }
                 EngineDevice::launch_kernel(
                     &*self.be,
                     kernel,
@@ -12084,6 +12185,19 @@ impl AmdEngine {
 
         rebase_chunk_rows(insts, &self.tensor_names, c0, clen, bucket);
         rebase_kda_key_factor_routes(&mut self.progs[prog].prefill_routes, clen);
+        // The same `rows`/`kv_len` pair [`AmdEngine::prefill_prepare`] uploads to `in.kvlen`.
+        let rows = if bucket.is_some_and(|t| clen < t) {
+            clen
+        } else {
+            self.progs[prog].t
+        };
+        rebase_mla_materialized_routes(
+            insts,
+            &self.tensor_names,
+            &mut self.progs[prog].prefill_routes,
+            rows,
+            c0 + rows,
+        )?;
 
         let mut lm = None;
         for (i, d) in insts.iter().enumerate() {
@@ -12178,19 +12292,6 @@ impl AmdEngine {
             self.kda_conv_alt_stale[self.kv_slot] = true;
         }
         let ch = self.progs[step.prog].t;
-        if self.progs[step.prog].prefill_routes.iter().any(|r| {
-            matches!(
-                r,
-                PrefillSegmentRoute::MlaMaterializePack { .. }
-                    | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
-            )
-        }) && (step.c0 != 0 || step.clen != ch)
-        {
-            return Err(RuntimeError::Device(format!(
-                "materialized MLA prefill requires one exact initial bucket (c0=0, clen=T); got c0={}, clen={}, T={ch}",
-                step.c0, step.clen
-            )));
-        }
         // in.kvlen FIRST, so it can borrow the head of the staging slab before
         // ids/pos fill it — the slab is sized for exactly `ids + pos` at the
         // widest bucket and has no spare word past them.
@@ -13284,10 +13385,84 @@ mod tests {
             gq_seg_ofs: Vec::new(),
             l2_domains: 0,
         };
-        let devp = (0..4)
-            .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 0x1000))
+        // K/V transients sized at a 16384-row cache capacity; `K_rope` is the krot cache.
+        let rows = 16384 * u64::from(heads) * 2;
+        let devp = [rows * 192, rows * 128, rows * 256, 16384 * 64 * 2]
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| DeviceMem::view(0x1000 + (i as u64) * 0x1000_0000, len))
             .collect();
         (prog, devp)
+    }
+
+    #[test]
+    fn materialized_mla_routes_follow_the_chunk() {
+        let (mut prog, devp) = materialized_mla_route_probe(256, 12);
+        // The kv_b projection over the latent cache, `M = T` at emit.
+        prog.insts.push(DevInst64 {
+            op: DevOp::Gemm as u16,
+            blocks: 256,
+            t: [4, 5, 6, 0, 0, 0, 0, 0],
+            i: [256, 12 * 256, 512, 0, 0, 0, 0, 0],
+            ..Default::default()
+        });
+        let names: Vec<String> = [
+            "act.pf.k_materialized",
+            "act.pf.v_materialized",
+            "act.pf.kv_materialized",
+            "kv.l3.krot",
+            "act.pf.kv_materialized",
+            "kv.l3.ckv",
+            "l3.kv_b",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        mla_materialized_routes(&prog, &devp, &mut routes).unwrap();
+        assert!(matches!(
+            routes[0],
+            PrefillSegmentRoute::MlaMaterializePack {
+                k_rope_ten: 3,
+                kv_rows_cap: 16384,
+                ..
+            }
+        ));
+
+        // Continuation chunk: 8192 cached rows, 208 real of a 256 bucket under RAGGED-M.
+        let mut insts = prog.insts.clone();
+        rebase_mla_materialized_routes(&mut insts, &names, &mut routes, 208, 8400).unwrap();
+        assert_eq!(insts[2].i[0], 8400, "projection spans every cached row");
+        assert_eq!(
+            insts[0].i[0], 256,
+            "raw instruction words are the route's, not patched"
+        );
+        let PrefillSegmentRoute::MlaMaterializePack { args, .. } = routes[0] else {
+            panic!()
+        };
+        assert_eq!(args.t, 8400);
+        let PrefillSegmentRoute::MlaMaterializedPrefill { args, grid } = routes[1] else {
+            panic!()
+        };
+        assert_eq!((args.n, args.n_kv), (208, 8400));
+        assert_eq!(grid, 12);
+        assert_eq!(args.stride_k_b, 8400 * 12 * 192);
+        assert_eq!(args.stride_q_b, 208 * 12 * 192);
+
+        // Back to an exact initial chunk: every patch is re-derived, none accumulates.
+        rebase_mla_materialized_routes(&mut insts, &names, &mut routes, 256, 256).unwrap();
+        let PrefillSegmentRoute::MlaMaterializedPrefill { args, grid } = routes[1] else {
+            panic!()
+        };
+        assert_eq!((args.n, args.n_kv, grid), (256, 256, 12));
+
+        // Past the transient capacity: refuse rather than overrun.
+        assert!(
+            rebase_mla_materialized_routes(&mut insts, &names, &mut routes, 256, 16385)
+                .unwrap_err()
+                .to_string()
+                .contains("hold 16384")
+        );
     }
 
     #[test]
