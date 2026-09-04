@@ -41,7 +41,7 @@ PLOW_PF_INTERLEAVE=2048 plowrt serve --pf-interleave 4096 …   # uses 4096
 
 | binary | struct | file | scope |
 |--------|--------|------|-------|
-| `plowc` | `EmitConfig` | `crates/devgen/src/emit_config.rs` | Emit-time knobs (60+ fields) |
+| `plowc` | `EmitConfig` | `crates/devgen/src/emit_config.rs` | Emit-time knobs (114 fields, 9 hidden diagnostics) |
 | `plowrt` | `RuntimeConfig` | `crates/plowrt/src/config.rs` | Shared runtime knobs |
 | `plowrt` | `NvidiaRuntimeConfig` | (nested in RuntimeConfig) | NVIDIA/sm_120 serving |
 | `plowrt` | `AmdRuntimeConfig` | (nested in RuntimeConfig) | AMD/gfx950 serving |
@@ -210,72 +210,211 @@ shipped one.
   token-identical); the *lever* is not on this workload. See the plan for where it
   is.
 
-More emit knobs (all **byte-identical when unset** unless noted):
+### Every `EmitConfig` knob (`plowc --help`, `crates/devgen/src/emit_config.rs`)
 
-- `PLOW_GEMV_SPLIT=S` — emit `S·n_cu` decode slices for Gemv/GemvGlu/GemvQkv
-  packets (finer CU work-stealing). Ships at `1`; `S>1` measured a loss,
-  bit-identical.
-- `PLOW_GEMV_MM=M` / `PLOW_GEMV_WALK=1` — **AMD** compile-time decode row-batch
-  bucket and its wide-arm walk loop. `PLOW_GEMV_MM` is derived from
-  `next_pow2(PLOW_DECODE_BATCH)` clamped to 16 and baked into the ELF symbol
-  `plow_gemv_mm_cap_<MM>` (the plowrt loader validates it). `PLOW_GEMV_WALK`
-  toggles the outer `ceil(M/MM)` loop so one MM object serves any M; **serving
-  batch > MM without WALK is refused.** Kimi-K3 requires WALK for decode batches
-  17..32 because the largest compiled AMD bucket is 16. NVIDIA analogue is the
-  build-time `GV_MM_MAX`.
-- `PLOW_PF_GEMV_HEAD` — force prefill `lm_head` onto the M=1 GEMV arm vs a tiled
-  BM=128 tile (on by default for AMD; `=1`/`=0` to force). Traps on M≠1.
-- `PLOW_NO_FUSE_QKV=1` — revert the fused QKV projection to the historical
-  split-3 path (packet-reduction A/B).
-- `PLOW_DECODE_TILED=1` — **AMD only**; emit prefill (tiled) opcodes into the
-  decode bucket.
-- `PLOW_SEG_PER_OP=1` — one SEGMENT per op (host-side AQL chaining instead of
-  batched). `PLOW_SEG_CLASS_SLICE=1` re-slices GEMM segments so both occ-2
-  blocks/SM get work.
-- `PLOW_TUNEDB=<dir>` — tune-DB root the compiler resolves shapes against
-  (default `tuning/`). `PLOW_TUNE_DUMP=1` prints a `TUNEDUMP…` census line per
-  resolved GEMV shape; `PLOW_GEMM_JSONL=<path>` appends raw per-tile GEMM
-  samples (tuning-harness diagnostics).
-- **Known-wrong escape hatches** (produce garbage tokens by design — never
-  serve): `PLOW_CHAIN_BYPASS=<op[,op…]>` splices opcodes out of the chain,
-  `PLOW_SKIP_COVERAGE=1` emits a model that fails coverage checks,
-  `PLOW_K3_ABLATE=<op…>` / `PLOW_K3_UP_NOGATHER` / `PLOW_K3_UP_GATHER_ONLY` /
-  `PLOW_K3_SEQ_ROWS` are K3 bisection instruments.
+One row per field, grouped by what it controls. Every row is a `--flag` with an env
+fallback (CLI wins). **Unset = the shipped default**; a `true` default with "`=0` is the
+rollback" is a promoted MI355X campaign result and the `=0` arm is the pre-promotion
+packet. Per-knob provenance (promoted / rollback / opt-in / rejected / diagnostic) and
+the 2026-09-04 audit that removed the rejected experiment knobs are in
+`docs/k3-mi355x-20260904/emit-knob-audit.md`.
 
-### Model-family emit arms (K3 / GLM / Gemma-MoE / KDA)
+#### Precision
 
-Advanced per-model fusion/sharding knobs, read by `plowc`/`devgen` at emit
-(they change the emitted packet). Most default **on** and their `=0` restores an
-un-fused, byte-identical control; the experimental ones are **off** because they
-are not parity-preserving.
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_FP8` | `--fp8` | false | Enable fp8 weight encoding. On dense families this is w8a16 (sm_120) or triggers a refusal pointing at --w8a8 (gfx950). On MLA+MoE families it enables block-fp8 expert arms. |
+| `PLOW_W8A8` | `--w8a8` | false | fp8 weights + fp8 activations (the w8a8 profile). Mutually exclusive with --w8a16. |
+| `PLOW_W8A16` | `--w8a16` | false | fp8 weights, bf16 activations (w8a16 profile). Mutually exclusive with --w8a8. |
+| `PLOW_MXFP4` | `--mxfp4` | false | MXFP4 (A4W4) encoding — both operands are 4-bit with E8M0 microscales. |
+| `PLOW_FP8_KV` | `--fp8-kv` | false | e4m3 KV cache (halves KV bytes). Lossy — greedy diverges after ~21 tokens. |
+| `PLOW_FP8_KV_FULL` | `--fp8-kv-full` | false | Mixed fp8 KV: restrict e4m3 cache to full-attention (hd512) layers only. Requires --fp8-kv. |
+| `PLOW_FP8_HEAD` | `--fp8-head` | false | Emit an e4m3 tied embed/lm_head (rtx-19). Requires the fp8 twin to include the embed/lm_head tensor. |
 
-| flag | default | effect |
-|---|---|---|
-| `PLOW_K3` | off | **BUILD `-D`** + emit gate: compiles the seven Kimi-K3/KDA interpreter arms (ops 99–106) and marks a K3 blob's `req`, so a K3 packet is refused against an object built without it. |
-| `PLOW_K3_FUSE_ARNORM` | **on** | fuse each `AttnRes` mix with the following RMSNorm (bit-exact, 186 sites). |
-| `PLOW_K3_FUSE_BRESID` | **on** | fold the LatentMoE-tail residual into the block-output residual (bit-exact). |
-| `PLOW_K3_FUSE_SHGLU` | **on** | collapse shared-expert `gate/up/SituGlu` into one `GemvGlu` (decode-only, LDS-bounded). |
-| `PLOW_K3_FUSE_A` | off | fuse the MLA `q/kv/k_rope/gate` A-projection into one `GemvQkvg` (decode-only). |
-| `PLOW_K3_SHARD_UP` | **on** (tp>1) | column-parallel `routed_expert_up_proj`; `=0` = replicated A/B. |
-| `PLOW_K3_WGFIT` | **on** | narrow workgroup/CU counts to what a packet uses (bit-identical). |
-| `PLOW_K3_NS` | measured | pin FlashMLA-decode `nsplit` for K3 MLA layers. |
-| `PLOW_K3_FUSE_NGEMV` | **on** | fold the two B1 `norm→GEMV` sites; `0` restores the unfused control, `lat`/`q` isolate one site. Full TP8 BF16-logit gate is byte-exact. |
-| `PLOW_K3_KDA_CONV_STEP_DB` | off | B1-only experiment: emit `KdaConvStateStepG` and allocate ping-pong KDA convolution-window banks. The selected decode object must also be built with `PLOW_KDA_CONV_STEP_DB=1`; packet/object mismatch is refused. |
-| `PLOW_K3_SHARD_HEAD` | **off** | vocab-column-parallel `lm_head`; measured on real K3 gfx950 TP8 with token-identical output, 33.160 to 32.781 ms/token (-1.14%). |
-| `PLOW_GLM_FUSE_A` / `PLOW_GLM_FUSE_G` | **on** | fuse the GLM A-projection / gate GEMVs (byte-identical); `=0` splits. |
-| `PLOW_GLM_DSA` | **on** (ctx>65536) | arm the DSA sparse-indexer gather above the measured ctx crossover; `=0` forces dense. |
-| `PLOW_GLM_GF` | ctx-adaptive (2/4) | pin the MLA head-fusion factor; `=8` needs a `-DPLOW_GLM_GF8_ARM=1` object. |
-| `PLOW_GLM_NS` / `PLOW_GLM_WGFIT` | computed / **on** | pin MLA flash-decode `nsplit` / narrow sizing rules (bit-identical). |
-| `PLOW_GLM_FUSE_B1` | **off** ⚠️ | fuse `Residual+RmsNorm` into `AddNorm`; fp reorder can flip an early argmax — ship only behind an HF-coherence gate. |
-| `PLOW_GLM_GF8_ARM` | **0** (BUILD `-D`) | compile the GF=8 flash-decode arm; merely compiling it in is a measured **+32% decode regression**. |
-| `PLOW_GEMMA_MOE_ROUTER_FUSED=1` | off | disable the split router, serializing the score GEMV on one CTA (escape hatch). |
-| `PLOW_GEMMA_MOE_ROUTER_BLOCKS=N` | max useful | CTA count for the split router score GEMV. |
-| `PLOW_GEMMA_MOE_ROUTER_EXACT=1` | off | exact `MoeRouterGemmaScore` op instead of the default `…ScoreFast`. |
-| `PLOW_GEMMA_MOE_TAIL_FUSE=1` | **off** ⚠️ | fuse the MoE-combine residual/norm tail (op72); **B=1 only, reorders summation** (not byte-identical). |
-| `PLOW_KDA_FUSE` | **on** | collapse the KDA mixer chain 6→3 packets; `=0` emits the six-packet control. |
-| `PLOW_KDA_FUSE_QKVG` | **on** | fuse KDA `q/k/v/g` projections into one 4-stream `GemvQkvg` (decode-only). |
-| `PLOW_NS_MUL` | 1 / 2 (ctx>8k) | scale the CU-fill target for the flash-decode `nsplit` calc. |
-| `PLOW_NS_ABS` / `PLOW_NS_FULL_ABS` | unset | pin `nsplit` absolutely / for full-attention layers only; both baked into the tuned-decode packet record (`tunedb`). |
+#### Scheduling / segmentation
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_UNISEG` | `--uniseg` | false | Single-segment programs. Required for sm_120 prefill interpreter. WARNING: do NOT set on gfx950 — silently breaks AMD assets. |
+| `PLOW_SEG_DECODE_MLA` | `--emit-decode-mla-segments` | true | Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs in their own gfx950 segment. Default on; `=0` is the rollback to the interpreter-resident pair. |
+| `PLOW_SEG_DECODE_GROUPED_MOE` | `--emit-decode-grouped-moe-segments` | unset | Isolate adjacent grouped MXFP4 GLU+DOWN decode pairs into ordered raw launches. Unset = decide from qualified per-geometry route measurements (`moe_decode_measurement.jsonl`, both routes, current digests); missing evidence keeps the interpreter route. `PLOW_MOE_DECODE_STANDALONE=1` remains the packet-level override. |
+| `PLOW_DECODE_BATCH` | `--emit-decode-batch` | 1 | Batched decode dispatch width (sequences per launch). |
+| `PLOW_DECODE_BATCH_LADDER` | `--emit-decode-batch-ladder` | unset | DECODE BATCH LADDER: a comma list of decode widths emitted as SEPARATE programs in ONE blob (e.g. `1,2,4,8,16`), so the runtime picks the smallest rung that covers the live sequences instead of being committed to one `PLOW_DECODE_BATCH` at emit.  Unset (the default) is BYTE-IDENTICAL to today's blob: [`EmitConfig::decode_rungs`] then returns the single `decode_batch` rung and the emitter takes the exact code path it always took. Set, the WIDEST rung sizes every per-slot tensor (the KV cache above all), because a sequence keeps its slot across a rung change and the per-slot stride must not move with `B`. |
+| `PLOW_MAX_CHUNK` | `--emit-max-chunk` | unset | Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket ladder and the runtime PLOW_PF_INTERLEAVE ceiling. |
+| `PLOW_GEMV_SPLIT` | `--gemv-split` | 1 | Emit S·n_cu decode slices for Gemv packets (finer work-stealing). |
+| `PLOW_DECODE_TILED` | `--decode-tiled` | false | AMD: emit prefill (tiled) opcodes into the decode bucket. |
+| `PLOW_UNISEG_MAX_T` | `--uniseg-max-t` | unset | Force single-segment emit for buckets at or below this T. |
+
+#### Fusion (cross-model)
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_FUSE_ARGMAX` | `--fuse-argmax` | false | Fold greedy argmax into the lm_head GEMV epilogue. |
+| `PLOW_NO_FUSE_QKV` | `--no-fuse-qkv` | false | Revert fused QKV to split-3 path (A/B control). |
+| `PLOW_FUSE_QKV_FP8` | `--fuse-qkv-fp8` | false | Fused Q\|K\|V, per-channel fp8. |
+| `PLOW_NO_FUSE_NRN` | `--no-fuse-nrn` | false | Disable norm+residual+norm fusion. |
+| `PLOW_FUSE_HNR` | `--fuse-hnr` | false | Fuse head-norm + reduce. |
+| `PLOW_FUSE_MERGE` | `--fuse-merge` | false | Fuse merge fold. |
+| `PLOW_HN_SPLIT` | `--hn-split` | false | Head-number split (3*nhn <= n_cu). |
+| `PLOW_QNORM_FUSE` | `--qnorm-fuse` | false | Fuse the q/k RMSNorm into the QKV GEMV epilogue. |
+| `PLOW_FUSE_QUANT` | `--fuse-quant` | true | Fuse activation quantisation into the producing epilogue. DEFAULT ON for AMD (opt out with `=0`); the `amd &&` guard stays at the call site. |
+| `PLOW_FUSE_RESIDUAL_INPUT` | `--fuse-residual-input` | true | Fold graph-adjacent materialized Residual inputs into AttnRes. Bit-identical and model-independent. DEFAULT ON; set `PLOW_FUSE_RESIDUAL_INPUT=0` to roll back. |
+| `PLOW_NO_GLU_FUSE` | `--no-glu-fuse` | false | Opt OUT of the fused GLU GEMM on non-AMD backends. DEFAULT ON (`=1` disables). |
+| `PLOW_TMA_GEMM` | `--tma-gemm` | false | Emit TMA descriptors for GEMM operands (sm_90a+). |
+| `PLOW_PF_GFUSE` | `--pf-gfuse` | false | Fuse the prefill norm pair on Gemma-4 even off the gemv family. |
+
+#### Attention / prefill ladder geometry
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_FA_GF_FULL` | `--fa-gf-full` | unset | AMD flash-decode GQA fusion factor on full-attention layers. |
+| `PLOW_NS_MUL` | `--ns-mul` | unset | Scale the CU-fill target for flash-decode nsplit. |
+| `PLOW_NS_ABS` | `--ns-abs` | unset | Pin nsplit absolutely. |
+| `PLOW_NS_FULL_ABS` | `--ns-full-abs` | unset | Pin nsplit for full-attention layers only. |
+| `PLOW_MLA_NS` | `--mla-ns` | unset | Pin the MLA flash-decode `nsplit` (K3 and GLM). Unset = the measured/ctx-adaptive default; this is the sweep handle for a re-measurement. |
+| `PLOW_PF_LADDER` | `--pf-ladder` | unset | Prefill bucket ladder derivation: "wave" for SM-count-derived rungs. NVIDIA-only. |
+| `PLOW_PF_LADDER_APPEND` | `--pf-ladder-append` | unset | Extra prefill ladder rungs, comma-separated (T32: e.g. "640,1152,2176,4224" swallows the chat template's +14-row overhang in one chunk instead of a second full-model pass). Rungs above the chunk cap are filtered. |
+| `PLOW_PF_GEMV_HEAD` | `--pf-gemv-head` | unset | Force prefill lm_head onto M=1 GEMV arm vs tiled. "1"/"0" to force. |
+
+#### GEMM / GEMV geometry
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_GEMV_MM` | `--gemv-mm` | unset | AMD compile-time decode row-batch bucket. |
+| `PLOW_GEMV_WALK` | `--gemv-walk` | false | Wide-arm walk loop for AMD GEMV. |
+| `PLOW_GEMV_WG` | `--gemv-wg` | unset | Cap the dispatch width of the fused prefill GEMV. |
+| `PLOW_GEMV_WG_TUNING` | `--gemv-wg-tuning` | unset | Shape-keyed workgroup caps for blocked decode GEMVs, `NxK=cap[,NxK=cap...]` (for example `896x7168=224,1536x7168=152`). An A/B override: there is no TuneDB record for GEMV width, so unset keeps the normal workgroup selection. |
+| `PLOW_GEMM_WIDE_C8` | `--gemm-wide-c8` | true | Allow the gfx950 128x384x64 `GemmWide` body on a dense BF16 GEMM. The shape is derived, not configured: the tile is taken only at the ladder-cap chunk where the exact MxNxK has a qualified TuneDB measurement naming it the winner and its grid fills every CU. Default on; `=0` is the rollback to the 128x256x64 body everywhere. |
+
+#### Collectives / TP seams
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_XR_CUS` | `--xr-cus` | unset | Cap XReduce participant CUs. |
+| `PLOW_XR2_GATHER` | `--xr2-gather` | true | Use reduce-scatter/all-gather for complete folded-gather collectives. The second partial is added while the reduced slices are gathered. Default on; `=0` is the rollback to the one-shot collective. |
+| `PLOW_SEQ_PAR_SEAMS` | `--seq-par-seams` | true | Sequence-parallel TP seams for prefill: run AttnRes / router / latent xe / top-k on the reduce-scatter-owned `t/tp` row band and all-gather the results (`XReduceScatter` + `XAllGather`) instead of replicating the row work on every rank. Default on; the manifest requires the paired seams arm. `=0` is the rollback to the replicated-row packet. |
+| `PLOW_XR_COMBINE_FOLD` | `--xr-combine-fold` | true | Fold the decode latent `MoeCombine` into the tagged one-shot `XReduce` publish: the XReduce packet carries `t1 = part`, `i7 = top_k` and no combine packet is emitted. Needs a `PLOW_XR_COMBINE_FOLD=1` decode object. Default on; `=0` is the rollback. |
+| `PLOW_ATTNRES_F32MIX` | `--attnres-f32mix` | true | Emit prefill AttnRes packets with the f32-mix contract (separate output-norm epsilon in `f[1]`) and isolate them for the gfx950 `attn_res_f32mix` object. Default on; tokens differ from the BF16-seam contract by design. `=0` is the rollback to the interpreter BF16-seam packet. |
+| `PLOW_ATTNRES_DECODE_MWG` | `--attnres-decode-mwg` | unset | Decode AttnRes on N column-band workgroups with an in-packet tagged rendezvous (`d_attn_res_mwg`, C3 f32-mix contract). 0/unset = the single-workgroup arm. |
+
+#### Grouped MoE prefill / decode
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_MOE_STAGE1_LEAN` | `--moe-stage1-lean` | true | Isolate compatible MXFP4 grouped-MoE gate/up prefill packets for the standalone stage-1 object. Default on; `=0` is the rollback to the interpreter route. |
+| `PLOW_MOE_STAGE2_LEAN` | `--moe-stage2-lean` | true | Isolate compatible MXFP4 grouped-MoE Down+Combine prefill boundaries for the standalone deterministic stage-2 object. Default on; `=0` is the rollback to the interpreter route. |
+| `PLOW_MOE_COMBINE_LEAN` | `--moe-combine-lean` | true | Isolate compatible fixed-order grouped-MoE prefill combines for the standalone combine object. Default on; `=0` is the rollback to the interpreter route. |
+| `PLOW_MOE_ALIGN_PAR` | `--moe-align-par` | true | Split the grouped-MoE prefill align into expert-parallel count/prefix/scatter packets (T >= 1024). Default on; `=0` is the rollback to the single align packet. |
+| `PLOW_MOE_PREFILL_EP` | `--moe-prefill-ep` | false | Whole-expert (expert-parallel) prefill route for graph-proven replicated MoE boundaries. Opt-in; the emitted EP asset is experiment input for `runtime/bench/amd/moe_ep_boundary`. |
+| `PLOW_MOE_PF_DET` | `--moe-pf-det` | false | Deterministic fused DOWN->combine for the grouped MoE prefill: op 86 accumulates an integer-valued f64 per token so the k-way sum is exact and order-independent, op 87 reads one contiguous stream. Requires an object built `-DPLOW_MOE_PF_DET=1` (`plow_moe_pf_det_arm`). Opt-in: gate-passed on GLM-5.2/gfx942 (paired GSM8K 0.9613 vs 0.9613, TTFT -1.7..-2.9%) and the gfx942 recipe sets it at emit, but `moe_pf_fuse` serves every MLA+MoE model and a default-on would make Kimi/DeepSeek blobs require the arm on evidence measured only on GLM. Flip only alongside a Kimi/DeepSeek accuracy run. |
+
+#### KDA / MLA chain
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_KDA_FB_FOLD` | `--kda-fb-fold` | false | Fold the K3 decode `f_b` forget-gate GEMV into `KdaStateStepG`'s prologue (L3): the step packet carries `t4 = f_a`, `j1 = W_fb`, flags bit 2, and the GEMV packet is not emitted. Needs a `PLOW_KDA_FB_FOLD=1` decode object. Opt-in candidate (default off). |
+| `PLOW_KDA_CHUNK` | `--kda-chunk` | unset | Emit the BT64 chunk-KDA prefill pipeline. Default on for gfx950; unsupported shapes keep the serial recurrence. `=0` forces the serial oracle (rollback). |
+| `PLOW_KDA_CHUNK_QPRE` | `--kda-chunk-qpre` | true | Precompute the V-independent scaled/gated query in chunk W/U. Default on; `=0` rollback. |
+| `PLOW_KDA_INTRA_WAVE_ITEMS` | `--kda-intra-wave-items` | true | Isolate exact BT64/D128 chunk-KDA intra packets for the wave-item gfx950 object. Default on; `=0` is the rollback to the interpreter path. |
+| `PLOW_KDA_CARRY_REGSTATE` | `--kda-carry-regstate` | true | Mark exact qpre BT64/D128 carry segments for the register-resident gfx950 carry object. Default on; the marked packet requires its paired object at load. `=0` is the rollback to the interpreter carry. |
+| `PLOW_KDA_KEY_FACTOR` | `--kda-key-factor` | true | Mark exact qpre BT64/D128 Wu->carry pairs for the spill-free key-factor gfx950 objects. Default on at emit; the runtime only takes the route when those objects are built (`PLOW_HSACO_KDA_KEY_FACTOR`, default OFF: the pair displaces the faster regstate carry). |
+| `PLOW_KDA_WU_LEAN` | `--kda-wu-lean` | false | Mark exact qpre BT64/D128 chunk-KDA Wu segments for the lean four-wave gfx950 Wu object. Opt-in candidate (TP8 gate pending); the marked packet requires its paired object. |
+| `PLOW_KDA_CARRY_KEYFEED` | `--kda-carry-keyfeed` | false | Feed the lean Wu's scaled-key hi/lo pair into the register-state carry (implies the lean Wu; needs `PLOW_KDA_CARRY_REGSTATE`). Opt-in candidate (TP8 gate pending). |
+| `PLOW_KDA_DECODE_FUSED` | `--emit-kda-decode-fused` | false | Emit the standalone fused KDA decode boundary when its geometry is supported. Opt-in (benchmark-only so far); unsupported shapes keep the Conv3 -> StateStepG -> GatedNorm chain. |
+| `PLOW_MLA_MATERIALIZED_PREFILL` | `--mla-materialized-prefill` | false | Materialize MLA Q/K/V and emit the standalone asymmetric gfx950 prefill boundary. Opt-in candidate: exact for the first chunk, continuation chunks still diverge. |
+| `PLOW_K3_KDA_CONV_STEP_DB` | `--k3-kda-conv-step-db` | false | Emit `KdaConvStateStepG` (Conv3 + StateStepG with ping-pong convolution windows) for B1 decode. Opt-in; the decode object must be built `PLOW_K3_KDA_CONV_STEP_DB=1`. |
+
+#### K3 family
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_K3_FUSE_A` | `--k3-fuse-a` | false | Fuse the MLA q/kv/k_rope/gate A-projection GEMVs into one `GemvQkvg` (decode only, LDS-bounded). Opt-in; not network-gated. |
+| `PLOW_K3_FUSE_NGEMV` | `--k3-fuse-ngemv` | unset | Fold the decode B1 `RmsNorm -> GEMV` pairs into the GEMV's LDS staging. Default on (bit-exact); `0` is the unfused rollback, `lat`/`q` keep one site for bisection. |
+| `PLOW_K3_FUSE_ARNORM` | `--k3-fuse-arnorm` | true | Fuse each AttnRes with its sole following RMSNorm (bit-exact). Default on; `=0` is the rollback, used to materialize the raw residual seam for a boundary capture. |
+| `PLOW_K3_SHARD_HEAD` | `--k3-shard-head` | false | Vocab-column-parallel K3 `lm_head` with an `XArgmaxFin` handoff. Rejected for serving (TTFT +8 ms for TPOT -0.09 ms); kept for `scripts/k3_tp_equivalence.sh`. |
+| `K3_PREFILL` | `--k3-prefill` | unset | K3 prefill bucket control: unset/`full` = the whole ladder, `0` = decode only, `512,1024` = those rungs. |
+
+#### Gemma-MoE family
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_MOE_PREFILL` | `--moe-prefill` | unset | MoE prefill control. "0" to disable, unset = auto (on for MoE bf16). |
+| `PLOW_GEMMA_MOE_ROUTER_FUSED` | `--gemma-moe-router-fused` | false | Disable split router, serialize score GEMV on one CTA. |
+| `PLOW_GEMMA_MOE_ROUTER_BLOCKS` | `--gemma-moe-router-blocks` | unset | CTA count for the split router score GEMV. |
+| `PLOW_GEMMA_MOE_ROUTER_EXACT` | `--gemma-moe-router-exact` | false | Exact MoeRouterGemmaScore op instead of ScoreFast. |
+| `PLOW_GEMMA_MOE_TAIL_FUSE` | `--gemma-moe-tail-fuse` | false | Fuse MoE-combine residual/norm tail (B=1 only, reorders summation). |
+
+#### GLM family
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_GLM_DSA` | `--glm-dsa` | unset | GLM sparse-attention arm control. "0" forces dense, unset = auto (on above ctx crossover). |
+| `PLOW_GLM_GF` | `--glm-gf` | unset | Pin the MLA head-fusion factor. |
+| `GLM_SHARD_HEAD` | `--glm-shard-head` | false | Vocab-column-parallel lm_head. |
+| `GLM_MOE_CORESIDENT` | `--glm-moe-coresident` | unset | Co-resident shared expert mode (0/1/2). |
+| `GLM_SHARED_CUS` | `--glm-shared-cus` | unset | CUs for shared expert. |
+| `GLM_SPINE_CUS` | `--glm-spine-cus` | unset | Spine CU allocation (comma-separated or expression). |
+| `GLM_LINEAR_FP8` | `--glm-linear-fp8` | false | fp8 shared-expert linear projections. |
+| `GLM_SHARED_GLU_SPLIT` | `--glm-shared-glu-split` | false | Split GLU path for fp8 linear. |
+| `PLOW_MLA_PREFILL` | `--mla-prefill` | unset | MLA prefill ladder (e.g. "full:512,2048,4096,8192"). |
+| `GLM_EP` | `--glm-ep` | false | GLM expert-parallel mode. |
+| `GLM_GROUP` | `--glm-group` | false | GLM grouped MoE dispatch. |
+| `PLOW_GLM_FUSE_B1` | `--glm-fuse-b1` | false | GLM fuse block-1 residual+norm (opt-in, off by default). |
+| `PLOW_GLM_FUSE_SEAM` | `--glm-fuse-seam` | false | GLM layer-seam fold: the FFN tail's residual and the next layer's input_layernorm as one AddNorm packet (opt-in, off by default; TP only). |
+| `PLOW_GLM_FUSE_ROPE` | `--glm-fuse-rope` | false | GLM decode q-rope fold: apply the interleaved q RoPE inside the MLA flash decode's query staging and drop the `HeadNormRope` packet (opt-in, off by default). |
+| `PLOW_GLM_FUSE_QNORM` | `--glm-fuse-qnorm` | false | GLM decode q-norm fold: compute `q_a_layernorm` inside fusion G's `GemvQkv` LDS staging and drop the one-workgroup `RmsNorm` packet (opt-in, off by default). |
+| `GLM_ROUTER_OFF_SHARED` | `--glm-router-off-shared` | false | GLM router off-shared dispatch (co-resident mode 2 only). |
+| `GLM_ROUTER_OLD` | `--glm-router-old` | false | GLM use legacy (unfused) single-CU router. |
+| `PLOW_GLM_DSA_PF` | `--glm-dsa-pf` | false | Route GLM's DSA indexer through the prefill chain (requires `has_dsa`). |
+| `PLOW_GLM_FP8_KV` | `--glm-fp8-kv` | false | Store the MLA latent cache as e4m3 + per-row f32 scale. NOT bit-identical. |
+| `PLOW_GLM_GEMV_WG` | `--glm-gemv-wg` | unset | Cap the dispatch width of every blocked GEMV. Unset ⇒ byte-identical. |
+| `PLOW_GLM_OFOLD` | `--glm-ofold` | false | Fold W_o into the MLA prefill flash epilogue. Reassociated, logit-gate class. |
+| `PLOW_GLM_PF_NS` | `--glm-pf-ns` | unset | Causal KV-split factor for the V2 MLA prefill flash (2..=8; unset/1 = unsplit). |
+| `PLOW_GLM_PF_WIDE` | `--glm-pf-wide` | true | Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the single-workgroup emit for A/B). Bit-identical either way. |
+| `PLOW_GLM_PLACE_PF` | `--glm-place-pf` | false | Per-XCD CU placement for the GLM prefill chain. |
+| `PLOW_GLM_XR_BAND` | `--glm-xr-band` | unset | Band count for a prefill TP seam (2..=8; unset/1 = the unbanded emit). |
+| `PLOW_GLM_XR_BAND_CUS` | `--glm-xr-band-cus` | unset | Restrict the banded seam to the first N of the seam's CU list. |
+| `PLOW_GLM_XR_RES` | `--glm-xr-res` | false | Fold the post-collective Residual into the two-shot all-gather. Bit-identical. |
+| `GLM_FUSE_XRN` | `--glm-fuse-xrn` | false | Fuse the seam Residual+Norm into XReduceAddNorm (requires fuse_b1, tp>1). |
+| `PLOW_GLM_WGFIT` | `--glm-wgfit` | true | Narrow GLM dispatch to the workgroups that own work. DEFAULT ON (`=0` for the A/B control arm); the emitted arithmetic is unchanged either way. |
+
+#### Tuning
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `PLOW_TUNEDB` | `--tunedb` | unset | Tuning database root directory. |
+
+#### Diagnostics (hidden from `--help`; never serve)
+
+| env | flag | default | effect |
+|---|---|---|---|
+| `K3_FULL` | `--k3-full` | true | Diagnostic: `K3_FULL=0` prints the legacy K3 capability report instead of emitting. |
+| `PLOW_LAYERS` | `--layers` | all | Layers to emit (K3 and GLM): "all", a number N (first N layers), or "single:L". A truncation instrument for block sweeps and TP-equivalence checks; never a served packet. |
+| `PLOW_K3_SEQ_ROWS` | `--k3-seq-rows` | false | Diagnostic: force the per-sequence GEMV row carrier at B=1 (bisects the batched-decode addressing against the known-good B=1 stream). |
+| `PLOW_GLM_XR_BAND_SEAM` | `--glm-xr-band-seam` | unset | Diagnostic: restrict banding to one seam (`attn` \| `moe`) to bisect a divergence. |
+| `PLOW_FLASH_MERGE_DSPLIT` | `--flash-merge-dsplit` | unset | Widen the flash-merge dispatch by this factor (diagnostic; measured no effect). |
+| `PLOW_NO_XREDUCE` | `--no-xreduce` | false | Disable all XReduce collectives (diagnostic — numerically wrong). |
+| `PLOW_TUNE_DUMP` | `--tune-dump` | false | Print a TUNEDUMP census line per resolved GEMV shape (tuning-harness diagnostic). |
+| `PLOW_SKIP_COVERAGE` | `--skip-coverage` | false | Emit a model known to fail coverage checks (diagnostic only). |
+| `PLOW_K3_ABLATE` | `--k3-ablate` | unset | K3 bisection instrument (diagnostic only). |
+
+#### Emit-side knobs that are NOT `EmitConfig` fields
+
+Raw `std::env::var` reads owned by `packet::devbuild` / `plowc` (see the module header of
+`emit_config.rs` for why they stay raw):
+
+- `PLOW_SEG_PER_OP=1` — one SEGMENT per op (host-side AQL chaining instead of batched);
+  `PLOW_SEG_CLASS_SLICE=1` re-slices GEMM segments so both occ-2 blocks/SM get work.
+- `PLOW_MOE_DECODE_STANDALONE=1` — packet-level override that forces the grouped-MoE
+  standalone decode route regardless of the TuneDB rule.
+- `PLOW_FUSE_XR_ATTNRES=1` / `PLOW_XR_WAVE_RS=1` / `PLOW_PHASE_OBJECTS=1` — rejected
+  (+91.7 ms / +3.6 ms / +22.6 ms TTFT) segmentation experiments kept for their builder tests
+  and the pending AQL-replay design; never set them for a served packet.
+- `PLOW_GEMM_JSONL=<path>` — appends raw per-tile GEMM samples (tuning-harness diagnostic).
+- **Known-wrong escape hatches** (garbage tokens by design — never serve):
+  `PLOW_CHAIN_BYPASS=<op[,op…]>` splices opcodes out of the chain; the hidden `EmitConfig`
+  diagnostics above (`PLOW_SKIP_COVERAGE`, `PLOW_K3_ABLATE`, `PLOW_K3_SEQ_ROWS`,
+  `PLOW_NO_XREDUCE`) are the same class.
 
 ---
 
