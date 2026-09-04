@@ -698,11 +698,6 @@ option(PLOW_XR_WAVE_RS
        "Use experimental TP8 wave-per-peer prefill reduce-scatter on gfx950" OFF)
 option(PLOW_XR_TRACE_PHASES
        "Record diagnostic XReduceTwoShot internal phases in packet traces" OFF)
-set(PLOW_XR_RS_U "1" CACHE STRING
-    "Independent-element unroll for strict-order prefill reduce-scatter (1 or 2)")
-if(NOT PLOW_XR_RS_U MATCHES "^(1|2)$")
-    message(FATAL_ERROR "PLOW_XR_RS_U must be 1 or 2")
-endif()
 option(PLOW_KDA_PF_STATE_RESIDENT
        "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
 option(PLOW_K3_KDA_CONV_STEP_DB
@@ -717,6 +712,15 @@ endif()
 option(PLOW_MLA_PF_TR16
        "Use gfx950 transpose LDS reads in the V2 MLA-prefill PV stage"
        ${_PLOW_MLA_PF_TR16_DEFAULT})
+set(_PLOW_XR_RS_U_DEFAULT "1")
+if(PLOW_HSACO_ARCH STREQUAL "gfx950")
+    set(_PLOW_XR_RS_U_DEFAULT "2")
+endif()
+set(PLOW_XR_RS_U "${_PLOW_XR_RS_U_DEFAULT}" CACHE STRING
+    "Independent-element unroll for strict-order prefill reduce-scatter (1 or 2)")
+if(NOT PLOW_XR_RS_U MATCHES "^(1|2)$")
+    message(FATAL_ERROR "PLOW_XR_RS_U must be 1 or 2")
+endif()
 
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
 # Discovered from the INSTALLED ROCm rather than pinned: this path was pinned to

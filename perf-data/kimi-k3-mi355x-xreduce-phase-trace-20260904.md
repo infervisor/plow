@@ -209,15 +209,34 @@ Median saving is 35.130 ms. Every pair used the same prompt checksum
 `a65599fc8a00c9146bd0c6fbed7ab8ce12dbd20911011cb6589e356457bfcdd4` and exact output token
 `6896`, with counter audit and all-rank completion. Both 37-object directories were byte-identical
 except the active prefill GQ object; runtime, packet, config/TuneDB, checkpoint, BF16 variant/KV
-mode, and segment-major dispatch were held fixed. Promotion still requires an exact 256-token
-continuation with neutral TPOT and a matched raw trace showing the reduce-scatter reduction.
+mode, and segment-major dispatch were held fixed. At this point promotion still required an exact
+256-token continuation with neutral TPOT and a matched raw trace showing the reduce-scatter
+reduction.
 
 The paired 8192→256 continuation gate passed with all 256 output IDs exact
 (`sha256=ae45c1ca8beb25651b4cc103900d7c3001d015530fff1b5241b0c04882f7a4b0`), every-dispatch
 counter audit, and all-rank completion. Control/U2 TTFT was 1405.525/1371.488 ms, a 34.036 ms
 saving. TPOT was 29.937729/29.921618 ms, so U2 was neutral at −0.016111 ms. The same BF16,
-segment-major, 37-object pairing and rollback contract were used. A matched phase trace remains
-the final attribution gate before promotion.
+segment-major, 37-object pairing and rollback contract were used. The matched phase trace below
+was the final attribution gate before promotion.
+
+The matched all-rank phase-v2 trace passed exactness and attributes the improvement to the intended
+strict-order reduce-scatter loop. Endpoint TTFT was 1403.091/1368.036 ms (−35.055 ms). The
+92/94/92 gather/full/half critical sums changed as follows:
+
+| phase | control | RS-U2 | delta |
+|---|---:|---:|---:|
+| gate 1 | 19.555 ms | 19.473 ms | −0.082 ms |
+| reduce-scatter | 104.313 ms | 70.708 ms | −33.605 ms |
+| gate 2 | 40.755 ms | 20.936 ms | −19.819 ms |
+| all-gather | 106.781 ms | 106.892 ms | +0.111 ms |
+| collective envelope | 229.130 ms | 195.638 ms | −33.493 ms |
+
+Gate-2 maxima overlap the shortened reduce-scatter envelope and are not additive to its saving.
+Both objects remain wave64 with the same 256 VGPR, 108 SGPR, occupancy 2, 1348-byte private
+segment and existing mega-interpreter spill envelope. The gfx950 build default is therefore U2;
+`PLOW_XR_RS_U=1` is the explicit bit-exact rollback. Other AMD architectures retain U1 until
+separately measured.
 
 ## Pinned vLLM/AITER comparison
 

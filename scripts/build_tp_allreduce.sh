@@ -27,7 +27,13 @@ XR_DEF=()
 [ "${PLOW_XR_NOWAIT:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_NOWAIT=1")
 [ "${PLOW_XR_NOSIG:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_NOSIG=1")
 [ "${PLOW_XR_MLP:-0}" = 1 ] && XR_DEF+=("-DPLOW_XR_MLP=1")
-XR_DEF+=("-DPLOW_XR_RS_U=${PLOW_XR_RS_U:-1}")
+XR_RS_U=${PLOW_XR_RS_U:-}
+if [ -z "$XR_RS_U" ]; then
+  XR_RS_U=1
+  [ "$ARCH" = gfx950 ] && XR_RS_U=2
+fi
+case "$XR_RS_U" in 1|2) ;; *) echo "PLOW_XR_RS_U must be 1 or 2" >&2; exit 2;; esac
+XR_DEF+=("-DPLOW_XR_RS_U=$XR_RS_U")
 hipcc --offload-arch="$ARCH" -O3 -w "${XR_DEF[@]}" --genco \
     "$R/tests/tp_allreduce_kernels.hip" -o tp_allreduce.co
 "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
@@ -51,6 +57,7 @@ echo "run:  (cd $OUT && /usr/bin/env -i PATH=/usr/bin:/bin HOME=\$HOME LD_LIBRAR
 echo "      rank count = number of device ids; env TP_HIDDEN (default 7168) TP_ITERS TP_ELF"
 echo "prefill: (cd $OUT && ./tp_allreduce_prefill_bench 0 1 2 3 4 5 6 7)  PLOW_XR_AGG=${PLOW_XR_AGG:-0}"
 echo "         PLOW_XR_WAVE_RS=${PLOW_XR_WAVE_RS:-0}"
+echo "         PLOW_XR_RS_U=$XR_RS_U"
 echo "         env TP_ROWS TP_HIDDEN TP_NWG (default 256) TP_GATHER TP_ONESHOT"
 echo "config:  (cd $OUT && TP_ROWS=8192 TP_HIDDEN=7168 TP_NWG=80 ./tp_allreduce_prefill_bench --check-config)"
 echo "sweep:   scripts/run_tp_allreduce_prefill_sweep.sh $OUT gpu0 gpu1 gpu2 gpu3 gpu4 gpu5 gpu6 gpu7"
