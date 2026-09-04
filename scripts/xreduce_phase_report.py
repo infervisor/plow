@@ -31,6 +31,13 @@ def median(values):
     return statistics.median(values) if values else 0.0
 
 
+def percentile(values, q):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[round(q * (len(ordered) - 1))]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("disasm", help="pure JSON from `plowrt disasm ... --format json`")
@@ -68,6 +75,9 @@ def main():
         family = producer.get("op_name", "START")
         producer_dims = "x".join(str(v) for v in producer.get("raw", {}).get("i", [])[:3])
         rank_phase = []
+        ready_spreads = []
+        wg_durations = []
+        envelopes = []
         for rank, records in enumerate(ranks):
             slice0 = [r for r in records[inst] if r[1] == 0]
             if len(slice0) != 1:
@@ -78,6 +88,11 @@ def main():
                 ((publish - entry) / TPUS, (ready - publish) / TPUS,
                  (done - ready) / TPUS)
             )
+            readies = [r[4] for r in records[inst]]
+            dones = [r[5] for r in records[inst]]
+            ready_spreads.append((max(readies) - min(readies)) / TPUS)
+            wg_durations.extend((r[5] - r[4]) / TPUS for r in records[inst])
+            envelopes.append((max(dones) - min(readies)) / TPUS)
         waits = [p[1] for p in rank_phase]
         latest = min(range(len(waits)), key=waits.__getitem__)
         skew = max(waits) - min(waits)
@@ -92,6 +107,9 @@ def main():
             "latest": latest,
             "publish": median([p[0] for p in rank_phase]),
             "rest": max(p[2] for p in rank_phase),
+            "ready_spread": max(ready_spreads),
+            "wg_durations": wg_durations,
+            "envelope": max(envelopes),
         }
         rows.append(row)
         families[(family, shape)].append(row)
@@ -99,21 +117,25 @@ def main():
     print(f"ranks={len(ranks)} collectives={len(rows)} tick/us={TPUS:g}")
     print("skew=max(publish->ready)-min(publish->ready); latest=min wait (same-rank deltas only)")
     print(f"{'inst':>5} {'producer':<20} {'producer i0:i2':<22} {'shape':<7} {'MiB':>7} {'r0wait':>9} "
-          f"{'skew':>9} {'latest':>7} {'publish':>9} {'rest':>9}")
+          f"{'skew':>9} {'latest':>7} {'publish':>9} {'ready-spr':>9} {'wg-p90':>9} {'wg-max':>9} {'envelope':>9}")
     for r in sorted(rows, key=lambda x: -x["skew"])[: args.top]:
         print(f"{r['inst']:5d} {r['family']:<20.20} {r['producer_dims']:<22.22} "
               f"{r['shape']:<7} {r['mib']:7.1f} "
               f"{r['rank0_wait']:9.2f} {r['skew']:9.2f} {r['latest']:7d} "
-              f"{r['publish']:9.2f} {r['rest']:9.2f}")
+              f"{r['publish']:9.2f} {r['ready_spread']:9.2f} "
+              f"{percentile(r['wg_durations'], 0.90):9.2f} {max(r['wg_durations']):9.2f} "
+              f"{r['envelope']:9.2f}")
 
     print("\nproducer-family summary")
     print(f"{'producer':<20} {'shape':<7} {'n':>4} {'skew-sum':>10} {'skew-med':>10} "
-          f"{'r0wait-sum':>11} {'rest-sum':>10}")
+          f"{'ready-sum':>10} {'wg-p50':>9} {'wg-p90':>9} {'wg-max':>9} {'env-sum':>10}")
     for (family, shape), rs in sorted(families.items(), key=lambda x: -sum(r["skew"] for r in x[1])):
         skews = [r["skew"] for r in rs]
+        durations = [d for r in rs for d in r["wg_durations"]]
         print(f"{family:<20.20} {shape:<7} {len(rs):4d} {sum(skews):10.2f} "
-              f"{median(skews):10.2f} {sum(r['rank0_wait'] for r in rs):11.2f} "
-              f"{sum(r['rest'] for r in rs):10.2f}")
+              f"{median(skews):10.2f} {sum(r['ready_spread'] for r in rs):10.2f} "
+              f"{median(durations):9.2f} {percentile(durations, 0.90):9.2f} "
+              f"{max(durations):9.2f} {sum(r['envelope'] for r in rs):10.2f}")
 
 
 if __name__ == "__main__":
