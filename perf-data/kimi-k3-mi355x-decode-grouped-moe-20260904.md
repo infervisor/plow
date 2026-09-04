@@ -85,9 +85,13 @@ per-op table is not interpretable, while its whole-chain timestamps and engine d
 valid and agree within 24 us.
 
 **Decision:** qualify and retain the generic route as default-off. It clears exactness and produces
-a stable 0.66-0.76 ms TPOT gain, but the requirement for an explicit opt-in remains. A next variant
-should amortize the measured handoff cost by grouping multiple layers or adding a device-side
-GLU-to-DOWN handoff; it must keep combine/router/collective order unchanged.
+a stable 0.66-0.76 ms TPOT gain. Default-on is blocked by generic performance coverage: eligibility
+accepts every adjacent MXFP4 grouped GLU+DOWN geometry on gfx950, while only k16/H3584/I384/E896
+has resource, latency, and network qualification. A model/shape predicate is intentionally not an
+option, so unmeasured shapes must not be rerouted by default. A representative cross-shape sweep or
+generic runtime profitability rule can clear that gate. Separately, a next variant should amortize
+the measured handoff cost by grouping multiple layers or adding a device-side GLU-to-DOWN handoff;
+it must keep combine/router/collective order unchanged.
 
 Network evidence is under `/tmp/k3-moe-decode-network`. Packet SHA256 is `f1bf783d...` control and
 `a1f7f6f7...` candidate; runtime SHA256 is `b1c4feb4...`; standalone object SHA256 is
