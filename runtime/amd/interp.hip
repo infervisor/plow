@@ -790,6 +790,13 @@ typedef union __align__(16) {
     bf16  raw[PLOW_SMEM_HALVES];
 } plow_smem;
 
+#if PLOW_GV_DYNCLAIM
+/* The GEMV row-claim broadcast word sits at the top of the GEMV arena, below the norm scratch.
+ * PLOW_GM_ARENA == 1 is an object with no GEMM/GEMV arm at all (the arena is a placeholder). */
+static_assert(PLOW_GM_ARENA == 1 || GV_DYN_SLOT_OFS + GV_DYN_SLOT_HALVES <= PLOW_GM_ARENA,
+              "PLOW_GV_DYNCLAIM: the claim slot falls outside the GEMV LDS arena");
+#endif
+
 #if PLOW_MLA_PREFILL
 /* `raw` is what the launcher sizes the dynamic arena from, so a member that outgrows it
  * would read past the allocation rather than fail to compile. It fits today (128,512 B
@@ -1618,14 +1625,15 @@ __device__ __forceinline__ void exec_gemm_norm(CInst in, CTens T,
 #undef TEN
 }
 __device__ __forceinline__ void exec_gemv(CInst in, CTens T,
-                                                    unsigned slice, unsigned nblk, bf16* lds) {
+                                                    unsigned slice, unsigned nblk,
+                                                    bf16* lds GV_DYN_PARAM_DEF) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     /* No `part` here on purpose: `plow_smem` is a UNION, so `sm->part` and `sm->gm` are one
      * buffer. The fused-norm arm (norm == 2) takes its reduction scratch from the TOP of the
      * arena itself — handing it `sm->part` would write through the row it is reducing. */
     d_gemv((bf16*)TEN(0), (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2], (const bf16*)TEN(2),
            (const float*)TEN(3), (const bf16*)TEN(4), in->i[0], in->i[1], in->i[2],
-           (int)in->i[3], in->fj[0].f, slice, nblk, lds);
+           (int)in->i[3], in->fj[0].f, slice, nblk, lds GV_DYN_ARG);
 #undef TEN
 }
 #if PLOW_FP8
@@ -1968,7 +1976,7 @@ __device__ __forceinline__ void exec_flash_mla_prefill_v2_packed(
 #endif
 
 __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_smem* sm,
-                                 const PlowProgram* prog_meta) {
+                                 const PlowProgram* prog_meta GV_DYN_PARAM_DEF) {
     CInst in = plow_scalar_ptr(in_v);
     CTens T = plow_scalar_ptr(T_v);
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
@@ -2908,7 +2916,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * scalar code; it adds no accumulator tile to the worst case the GEMM already sets. */
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV
         case PLOW_DOP_GEMV:
-            exec_gemv(in, T, slice, nblk, sm->gm);
+            exec_gemv(in, T, slice, nblk, sm->gm GV_DYN_ARG);
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM
@@ -3145,7 +3153,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #else
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV
         case PLOW_DOP_GEMV:
-            exec_gemv(in, T, slice, nblk, sm->gm);
+            exec_gemv(in, T, slice, nblk, sm->gm GV_DYN_ARG);
             break;
 #endif
 #if PLOW_FP8
@@ -4588,7 +4596,20 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
          * experiment available. */
         __asm__ __volatile__("s_icache_inv" ::: "memory");
 #endif
+#if PLOW_GV_DYNCLAIM
+        {
+            /* Row-claim cursor for the GEMV family (op_gemm.h, PLOW_GV_DYNCLAIM): a spare word
+             * of this packet's OWN counter line — succs[succ_ofs] is `op.counter` (devbuild.rs).
+             * NULL where the line is not this packet's alone or not local: no successor in this
+             * segment, a per-slice (SE_FINE) producer, or a cross-GPU entry. */
+            uint32_t* const gv_cur = (succ_len != 0u && !xctr && !(e.flags & PLOW_SE_FINE))
+                ? PLOW_CTR(prog.counters, prog.succs[succ_ofs]) + GV_DYN_CTR_WORD
+                : nullptr;
+            plow_exec(in, e.slice, tens, &sm, &prog, gv_cur);
+        }
+#else
         plow_exec(in, e.slice, tens, &sm, &prog);
+#endif
 #endif
 
         __syncthreads();
