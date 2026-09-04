@@ -88,7 +88,11 @@ and the GemmWide c8 tile at `8192x1536x7168` on this packet measured 8192→1 TT
 1072.3 / 1072.0 / 1072.0 ms vs 1095.1 / 1095.0 / 1094.7 ms (−22.9 ms, three
 alternating folds), TPOT 25.28 vs 25.30 ms, with identical 1- and 256-token
 output checksums; both are default-on from commit "amd: promote align-parallel
-MoE and the c8 tile shape". The next served cell should read ~1090 ms TTFT.
+MoE and the c8 tile shape". The sequence-parallel TP seams (default on, commit
+"amd: sequence-parallel TP seams default on for K3 prefill") and the wave-parallel
+router select then measured 961.5 / 963.1 ms TTFT and 25.08 / 25.10 ms TPOT on the
+same 8192→256 gate against 1072.6 / 1071.7 and 25.28 / 25.24, exact. The next
+served cell should read ~980 ms TTFT and ~25.1 ms TPOT.
 
 Raw data: `perf-data/kimi-k3-plowrt-mi355x-c1.json`.
 Comparator: `perf-data/kimi-k3-vllm-mi355x-c1.json`.
