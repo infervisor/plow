@@ -61,7 +61,7 @@ compare SHIPPING.elf CANDIDATE.elf --run CANDIDATE_SYMBOL THREADS LDS \
 ```
 
 It reports the arithmetic mean, median, minimum, and maximum of the 31 samples. See
-`perf-data/gfx950-moe-stage1-schedule-screen-20260904.md` for the closed T8192 schedule matrix.
+`perf-data/kimi-k3-mi355x-campaign-summary-20260904.md` (stage-1 schedule screen) for the closed T8192 schedule result.
 
 ## Result: rejected
 

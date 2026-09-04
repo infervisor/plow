@@ -2222,6 +2222,7 @@ fn run_one_tick(
     (slots, bufs, obs, tokens_this_tick, false, tick_fault)
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 fn deferred_token(tokens: &[u32], slot: usize, step: usize, quantum: usize) -> Result<u32> {
     tokens
         .get(slot.saturating_mul(quantum).saturating_add(step))

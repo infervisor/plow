@@ -4,22 +4,24 @@
 //! fills the CUs on the underutilized shapes AND does not regress the ones that already
 //! saturate. `n_cu = 256` (MI350X).
 use super::{
-    amd_target, amd_tuning_cell, gemm_lds_bytes, gemm_lds_bytes_buffered, glu_era_inventory,
-    hwspec, pick_tile, select_gemm_over, set_amd_target, stage_buffers, DevOp, GFX950_RUNGS,
-    GFX950_TILES,
+    amd_target, amd_tuning_cell, gemm_lds_bytes, gemm_lds_bytes_buffered, gfx950_gemm_inventory,
+    glu_era_inventory, hwspec, pick_tile, select_gemm_analytical, set_amd_target, stage_buffers,
+    DevOp, GFX950_RUNGS, GFX950_TILES,
 };
 use costmodel::cost::{dma_cycles, macs_cycles};
 use costmodel::MmaDtype;
 use kernelcaps::QuantScheme;
 
 const N_CU: u32 = 256;
+/// The analytical picker. Since 83120a7 the tuning digest is derived from the source tree, so
+/// the qualified `tuning/` records (fa6cd6b) would otherwise decide the shapes pinned here.
 fn pt(m: u32, n: u32, k: u32) -> DevOp {
-    pick_tile(m, n, k, N_CU, QuantScheme::None)
+    select_gemm_analytical(gfx950_gemm_inventory(), m, n, k, N_CU, QuantScheme::None)
 }
 /// The picker restricted to the three rungs that existed before the tile-inventory
 /// campaign — the set the legacy reference below ranks over.
 fn pt_legacy_rungs(m: u32, n: u32, k: u32, n_cu: u32) -> DevOp {
-    select_gemm_over(glu_era_inventory(), m, n, k, n_cu, QuantScheme::None).0
+    select_gemm_analytical(glu_era_inventory(), m, n, k, n_cu, QuantScheme::None)
 }
 
 /// The picker exactly as it was before selection moved behind the capability
@@ -101,13 +103,20 @@ fn the_original_rungs_still_rank_exactly_as_the_legacy_picker_did() {
 /// won silently and the campaign would have measured nothing.
 #[test]
 fn every_shape_resolves_on_cost_rather_than_opcode_number() {
-    use super::{gfx950_gemm_inventory, tile_cost};
+    use super::tile_cost;
     let spec = hwspec::registry::lookup("MI350X").unwrap();
     for &m in &MS {
         for &n in &NS {
             for &k in &KS {
                 for &n_cu in &CUS {
-                    let chosen = pick_tile(m, n, k, n_cu, QuantScheme::None);
+                    let chosen = select_gemm_analytical(
+                        gfx950_gemm_inventory(),
+                        m,
+                        n,
+                        k,
+                        n_cu,
+                        QuantScheme::None,
+                    );
                     let costs: Vec<(DevOp, u64)> = gfx950_gemm_inventory()
                         .iter()
                         .filter(|s| s.quant == QuantScheme::None)

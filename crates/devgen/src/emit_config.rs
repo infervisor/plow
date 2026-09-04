@@ -1159,7 +1159,10 @@ mod tests {
         std::env::remove_var("PLOW_SEG_DECODE_GROUPED_MOE");
         assert_eq!(EmitConfig::from_env().decode_grouped_moe_segments, None);
         std::env::set_var("PLOW_SEG_DECODE_GROUPED_MOE", "1");
-        assert_eq!(EmitConfig::from_env().decode_grouped_moe_segments, Some(true));
+        assert_eq!(
+            EmitConfig::from_env().decode_grouped_moe_segments,
+            Some(true)
+        );
         std::env::remove_var("PLOW_SEG_DECODE_GROUPED_MOE");
 
         assert_eq!(

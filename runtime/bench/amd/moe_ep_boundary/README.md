@@ -54,4 +54,4 @@ every `EP * TPexpert = world` factorization. The decode body probe accepts
 
 The stage-2 experiment accepts compile-time `PLOW_MOE2_EP_INTER_DIM` and manifest-time
 `PLOW_MOE2_EP_{INTER_DIM,EXPERTS,TOPK}`. Only I in `{768,1536,3072}` has an audited spill/resource
-contract. See `perf-data/gfx950-moe-2d-layout-20260904.md`.
+contract. See `perf-data/kimi-k3-mi355x-campaign-summary-20260904.md` (2D EP×TP expert layout).

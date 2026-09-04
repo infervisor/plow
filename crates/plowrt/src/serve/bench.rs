@@ -44,6 +44,7 @@ pub struct PrefillSweepConfig {
     pub runtime: serde_json::Value,
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 const MAX_DIAGNOSTIC_SELECTIONS: usize = 16 * 1024;
 
 pub fn read_prompt_rows(path: &Path) -> Result<Vec<Vec<u32>>> {
@@ -155,6 +156,7 @@ pub struct RankAgreement {
     pub prefill_completion_all_ranks: bool,
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 impl EngineDiagnostics {
     pub(crate) fn unsupported() -> Self {
         Self {
@@ -386,6 +388,7 @@ pub fn finish_engine_diagnostics(state: &AppState, model: &str) -> Result<Engine
     validate_engine_diagnostics(diagnostics)
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 fn validate_engine_diagnostics(diagnostics: EngineDiagnostics) -> Result<EngineDiagnostics> {
     if !diagnostics.supported {
         return Err(RuntimeError::Msg(

@@ -18,7 +18,7 @@ pub const MOE_DECODE_ORACLE: &str = "moe-decode-pair-bitexact-v1";
 /// all-workgroup convergence), gfx950, nanoseconds. From the exact TP8 network
 /// gate: control charges 3.216 ms/token to 92 grouped pairs against the
 /// isolated 1.543 ms chain, leaving 0.940-0.964 ms/token of handoff
-/// (`perf-data/kimi-k3-mi355x-decode-grouped-moe-20260904.md`).
+/// (`perf-data/kimi-k3-mi355x-campaign-summary-20260904.md`, grouped-MoE standalone route).
 pub const GFX950_SEGMENT_HANDOFF_NS: f64 = 10_300.0;
 
 /// Do not reroute for less than this fraction of the interpreter pair body.
@@ -267,6 +267,9 @@ mod tests {
 
     #[test]
     fn cell_key_is_geometry_only() {
-        assert_eq!(cell().key(), "amd/gfx950/mi350x|ncu256|b1|k16/h3584/i384/e896/mxfp4");
+        assert_eq!(
+            cell().key(),
+            "amd/gfx950/mi350x|ncu256|b1|k16/h3584/i384/e896/mxfp4"
+        );
     }
 }

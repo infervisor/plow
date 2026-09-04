@@ -2378,7 +2378,10 @@ mod kimi_k3_tests {
                 g.what
             );
         }
-        assert!(!open.is_empty(), "the report should retain unresolved capabilities");
+        assert!(
+            !open.is_empty(),
+            "the report should retain unresolved capabilities"
+        );
         assert!(
             gaps.iter()
                 .find(|g| g.what.contains("full-model emit"))

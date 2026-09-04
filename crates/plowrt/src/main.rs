@@ -659,6 +659,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 fn require_synthetic_probe(
     has_checkpoint: bool,
     synthetic_probe: bool,
@@ -676,6 +677,7 @@ fn require_synthetic_probe(
     Ok(false)
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 fn validate_amd_probe_steps(
     steps: u32,
     has_prefill_sweep: bool,
@@ -686,6 +688,7 @@ fn validate_amd_probe_steps(
     Ok(())
 }
 
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 fn synthetic_timing_prefix(synthetic_probe: bool) -> &'static str {
     if synthetic_probe {
         "SYNTHETIC DIAGNOSTIC: "
@@ -1424,7 +1427,7 @@ fn trace_dump_1(
 #[cfg(feature = "hsa")]
 fn trace_dump(g: &plowrt::exec::amd_tp::AmdTpGroup) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(p) = plowrt::config::RuntimeConfig::get().amd.trace_raw.as_ref() {
-        let all = std::env::var_os("PLOW_TRACE_ALLRANKS").is_some_and(|v| v != "0");
+        let all = plowrt::config::RuntimeConfig::get().amd.trace_allranks;
         for rank in 0..if all { g.n_gpu() } else { 1 } {
             let mut out = PathBuf::from(p).into_os_string();
             if all {
@@ -1711,7 +1714,7 @@ fn amd_bench_tp(
             //
             // Written to `<PLOW_TRACE_RAW>.prefill` so both survive one run.
             if let Some(t) = plowrt::config::RuntimeConfig::get().amd.trace_raw.as_ref() {
-                let all = std::env::var_os("PLOW_TRACE_ALLRANKS").is_some_and(|v| v != "0");
+                let all = plowrt::config::RuntimeConfig::get().amd.trace_allranks;
                 for rank in 0..if all { g.n_gpu() } else { 1 } {
                     let mut pf = PathBuf::from(t).into_os_string();
                     if all {

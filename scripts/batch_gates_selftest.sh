@@ -97,8 +97,8 @@ run_k3() {
     "$TMP/checkpoint" 4 "$TMP/k3-b8" "$TMP/k3-b8-hsaco"
 }
 
-run_gemma valid | rg -q '^PASS:'
-run_k3 valid | rg -q '^BATCH GATE: PASS'
+run_gemma valid | grep -q '^PASS:'
+run_k3 valid | grep -q '^BATCH GATE: PASS'
 if run_gemma incomplete >/dev/null 2>&1; then echo "incomplete report passed" >&2; exit 1; fi
 if run_gemma misordered >/dev/null 2>&1; then echo "misordered report passed" >&2; exit 1; fi
 if run_k3 ragged-mismatch >/dev/null 2>&1; then echo "ragged cross-width mismatch passed" >&2; exit 1; fi

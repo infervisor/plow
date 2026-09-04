@@ -11,7 +11,7 @@ prefill concurrency (`256` workgroups, 32 token rows per workgroup).
 
 The 2026-09-04 MI355X gate rejected the arm: T8192/nb8 improved only 7.25% and T1/nb8
 only 8.15%, below the 10% requirement; the candidate also retained SGPR spills. See
-`perf-data/mi355x-attnres-f32-mix-norm-20260904.md`. It is intentionally not wired into dispatch.
+`perf-data/kimi-k3-mi355x-campaign-summary-20260904.md` (AttnRes f32-mix, interpreter arm). It is intentionally not wired into dispatch.
 
 Run under the shared GPU lease:
 
