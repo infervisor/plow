@@ -84,3 +84,16 @@ re-reads a 117 MB working set that fits the 256 MB Infinity Cache. Consequences 
 - Boundary cost at ~80 µs/segment with segment-major dispatch means phase objects are cheap to
   add where a body win exists (dense GEMM, AttnRes), and expensive only when they add
   convergence-heavy seams.
+
+## Erratum (2026-09-04, later the same day)
+
+The "focused object 17.1 ms / 10.9x" comparison this gate set out to explain was a units bug in
+the isolated harnesses (`tp_allreduce_bench.c`, `tp_allreduce_prefill_bench.c` scaled
+`s_memrealtime` by the 1 GHz `HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY`; the counter is the 100 MHz
+REFCLK, as the trace calibration already used). Corrected isolated figures: 14 KiB one-shot
+9.81 µs (not 0.98), 112 MiB two-shot 634.5 µs (not 63), i.e. the in-network 0.73 ms per full
+collective was never 10x off its isolated cost. The verdict above stands on its own evidence
+(the phase object ran the collective at the same in-network cost); the fabric-floor reading is
+strengthened. The AITER parity report's 7-21x also needs the same correction: AITER is 1.5-2.1x
+slower at decode sizes and 0.79-0.86x (faster) at 28-112 MiB. Fix and details:
+`perf-data/kimi-k3-mi355x-xr-decode-tagged-20260904.md` (branch `worktree-agent-a3db1e5a3e4fae120`).
