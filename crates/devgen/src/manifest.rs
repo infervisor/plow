@@ -895,6 +895,9 @@ fn backend_amd(
     if on("materialized_residual_input") {
         req.push("PLOW_MATERIALIZED_RESIDUAL_INPUT=1".into());
     }
+    if on("attnres_decode_mwg") {
+        req.push("PLOW_ATTNRES_DECODE_MWG=1".into());
+    }
     if has("KdaChunkPrepare") || has("KdaChunkIntra") || has("KdaChunkWu") || has("KdaChunkCarry") {
         req.push("PLOW_KDA_CHUNK=1".into());
     }
@@ -1457,6 +1460,12 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         "materialized_residual_input".into(),
         json!(materialized_residual_input),
     );
+    let attnres_decode_mwg = m
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|inst| inst.op == DevOp::AttnRes as u16 && inst.i[6] != 0);
+    f.insert("attnres_decode_mwg".into(), json!(attnres_decode_mwg));
     encoding_features(&mut f, &s);
     let axes = precision_axes(&mut f, &s, &union);
     let t = tuning(&s);
@@ -1765,6 +1774,14 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str(&format!(
         "#ifndef PLOW_MATERIALIZED_RESIDUAL_INPUT\n#define PLOW_MATERIALIZED_RESIDUAL_INPUT {}\n#endif\n",
         if materialized_residual_input { 1 } else { 0 }
+    ));
+    let attnres_decode_mwg = manifest
+        .pointer("/features/attnres_decode_mwg")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#ifndef PLOW_ATTNRES_DECODE_MWG\n#define PLOW_ATTNRES_DECODE_MWG {}\n#endif\n",
+        if attnres_decode_mwg { 1 } else { 0 }
     ));
 
     // Head dims the flash family is instantiated at.

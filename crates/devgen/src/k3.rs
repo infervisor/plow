@@ -98,6 +98,11 @@ pub struct K3BlockCfg {
 /// the end of its LDS carve, so the emitter has to refuse first — a silent no-write is the failure
 /// this tree keeps finding.
 pub const K3_ATTNRES_MAXB: u32 = 16;
+/// Bands of `d_attn_res_mwg` (`PLOW_ATTNRES_MWG_MAXBLK`).
+pub const K3_ATTNRES_MWG_MAXBLK: u32 = 16;
+/// `PLOW_ATTNRES_MWG_WORDS` (1 + 16 bands * 2 * 9 rows + 2 parities * 16 = 321) tagged 8-byte
+/// words per site.
+pub const K3_ATTNRES_MWG_SCRATCH_BYTES: u64 = 321 * 8;
 
 /// `PLOW_MOE_ACT_SITU` (`runtime/amd/op_moe.h`) — the act code every K3 expert GLU carries.
 ///
@@ -674,7 +679,30 @@ pub fn emit_attn_res(
             ""
         }
     );
-    let blocks: Vec<u32> = (0..t.min(n_cu).max(1)).collect();
+    // The banded decode arm (`d_attn_res_mwg`): `n` column-band workgroups on CUs 0..n, one
+    // rendezvous scratch per site. Only the fused-norm decode shape; prefill keeps its object.
+    let mwg = match crate::emit_config::active().attnres_decode_mwg {
+        Some(n) if n > 0 && t == 1 && post_norm.is_some() => {
+            assert!(
+                (2..=K3_ATTNRES_MWG_MAXBLK).contains(&n) && n <= n_cu,
+                "PLOW_ATTNRES_DECODE_MWG={n}: the arm takes 2..={K3_ATTNRES_MWG_MAXBLK} bands \
+                 on distinct CUs"
+            );
+            n
+        }
+        _ => 0,
+    };
+    let scratch = (mwg > 0).then(|| {
+        let name = format!("attnres.mwg.{}", b.n_tensors());
+        let h = b.tensor(&name, K3_ATTNRES_MWG_SCRATCH_BYTES);
+        assert!(h != 0, "handle 0 is the arm's off sentinel");
+        h
+    });
+    let blocks: Vec<u32> = if mwg > 0 {
+        (0..mwg).collect()
+    } else {
+        (0..t.min(n_cu).max(1)).collect()
+    };
     b.emit(DevOp::AttnRes, blocks, deps, |d| {
         d.t[0] = out;
         d.t[1] = prefix;
@@ -694,8 +722,11 @@ pub fn emit_attn_res(
         // which the fusion asserts (`mixer_eps == cb.eps`), so the operand is the same value
         // today; it is still a distinct slot because the object reads it as one. The
         // interpreter ignores `f[1]`, so without the object the packet runs its BF16-seam arm.
-        if post_norm.is_some() && crate::emit_config::active().attnres_f32mix {
+        if post_norm.is_some() && (crate::emit_config::active().attnres_f32mix || mwg > 0) {
             d.f[1] = c.eps;
+        }
+        if let Some(h) = scratch {
+            d.i[6] = h;
         }
     })
 }
