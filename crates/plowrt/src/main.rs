@@ -1424,9 +1424,16 @@ fn trace_dump_1(
 #[cfg(feature = "hsa")]
 fn trace_dump(g: &plowrt::exec::amd_tp::AmdTpGroup) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(p) = plowrt::config::RuntimeConfig::get().amd.trace_raw.as_ref() {
-        let p = PathBuf::from(p);
-        g.rank(0).trace_write(&p)?;
-        println!("packet trace -> {}", p.display());
+        let all = std::env::var_os("PLOW_TRACE_ALLRANKS").is_some_and(|v| v != "0");
+        for rank in 0..if all { g.n_gpu() } else { 1 } {
+            let mut out = PathBuf::from(p).into_os_string();
+            if all {
+                out.push(format!(".rk{rank}"));
+            }
+            let out = PathBuf::from(out);
+            g.rank(rank).trace_write(&out)?;
+            println!("packet trace -> {}", out.display());
+        }
     }
     Ok(())
 }
@@ -1704,11 +1711,17 @@ fn amd_bench_tp(
             //
             // Written to `<PLOW_TRACE_RAW>.prefill` so both survive one run.
             if let Some(t) = plowrt::config::RuntimeConfig::get().amd.trace_raw.as_ref() {
-                let mut pf = PathBuf::from(t).into_os_string();
-                pf.push(".prefill");
-                let pf = PathBuf::from(pf);
-                g.rank(0).trace_write(&pf)?;
-                println!("prefill packet trace -> {}", pf.display());
+                let all = std::env::var_os("PLOW_TRACE_ALLRANKS").is_some_and(|v| v != "0");
+                for rank in 0..if all { g.n_gpu() } else { 1 } {
+                    let mut pf = PathBuf::from(t).into_os_string();
+                    if all {
+                        pf.push(format!(".rk{rank}"));
+                    }
+                    pf.push(".prefill");
+                    let pf = PathBuf::from(pf);
+                    g.rank(rank).trace_write(&pf)?;
+                    println!("prefill packet trace -> {}", pf.display());
+                }
             }
         } else {
             g.seed_ids(&ids)?;

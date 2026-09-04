@@ -425,6 +425,11 @@ if [ "${PLOW_XR_NOWAIT:-0}" = 1 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_XR_NOWAIT=1"
 fi
 
+# Diagnostic-only XREDUCE2 phase timeline in PlowTraceRec. Never a serve asset.
+if [ "${PLOW_XR_TRACE_PHASES:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_XR_TRACE_PHASES=1"
+fi
+
 # OPT-IN (PLOW_XR_MLP=1): PEER-BATCHED REDUCE in the cross-GPU collectives (op_collective.h).
 # The reduce bodies walked the N peers one serialised round trip at a time (ISA: a pointer
 # re-load + s_waitcnt vmcnt(0), then the remote load + another vmcnt(0), PER PEER PER ELEMENT);

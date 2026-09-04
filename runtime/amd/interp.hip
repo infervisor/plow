@@ -4394,7 +4394,11 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                    prog.n_gpu, prog.rank, in->i[0],
                                    in->i[2] + in->i[5] * 2u, xoff, in->i[3], in->i[4],
                                    PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
-                                   xr_res, xr_o2, in->i[6], in->i[7]);
+                                   xr_res, xr_o2, in->i[6], in->i[7]
+#if PLOW_XR_TRACE_PHASES
+                                   , prog.trace ? &prog.trace[base + ix] : nullptr
+#endif
+                                   );
         }
 #else
 #if !defined(PLOW_BUCKET_FLASH)  /* collectives in the DECODE and 8-wave PREFILL interpreters —
@@ -4459,7 +4463,11 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                    prog.n_gpu, prog.rank,
                                    in->i[0], in->i[2] + in->i[5] * 2u, xoff, in->i[3], in->i[4],
                                    PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
-                                   xr_res, xr_o2, in->i[6], in->i[7]);
+                                   xr_res, xr_o2, in->i[6], in->i[7]
+#if PLOW_XR_TRACE_PHASES
+                                   , prog.trace ? &prog.trace[base + ix] : nullptr
+#endif
+                                   );
         } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
             /* Cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head.
              * Subsumes ARGMAX_FIN: it does the local nparts fold too, then rebases the index
@@ -4578,6 +4586,16 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                  * no atomic and no ring -- the trace cannot drop or reorder records. */
                 PlowTraceRec r;
                 r.cu = cu;
+#if PLOW_XR_TRACE_PHASES
+                if (in->op == PLOW_DOP_XREDUCE2) {
+                    PlowTraceRec* xr = &prog.trace[base + ix];
+                    xr->cu = cu;
+                    xr->inst = e.inst;
+                    xr->op = in->op;
+                    xr->slice = (uint16_t)e.slice | 0x8000u;
+                    continue;
+                }
+#endif
 #if PLOW_TRACE_PHASE
                 {
                     const uint64_t a = t_p1 - t_p0, b = t_p3 - t_ready;

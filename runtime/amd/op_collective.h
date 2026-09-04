@@ -67,6 +67,11 @@
 #define PLOW_XR_SHUFFLE 0
 #endif
 
+/* Diagnostic-only reinterpretation of XREDUCE2 PlowTraceRec timestamps. */
+#ifndef PLOW_XR_TRACE_PHASES
+#define PLOW_XR_TRACE_PHASES 0
+#endif
+
 /* PLOW_XR_MLP=1: PEER-BATCHED REDUCE. Opt-in build axis, BIT-IDENTICAL, default OFF.
  *
  * The REDUCE bodies (d_xreduce, and the two-shot's PHASE 1) walk the N peers with a runtime
@@ -611,8 +616,18 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
 #if PLOW_XR_ATTNRES
     , bf16* __restrict__ row_prefix = nullptr, uint32_t row_w = 0
 #endif
+#if PLOW_XR_TRACE_PHASES
+    , PlowTraceRec* xr_trace = nullptr
+#endif
     ) {
     __shared__ int bailed;
+#if PLOW_XR_TRACE_PHASES
+    __shared__ uint64_t xr_entry;
+    if (threadIdx.x == 0) {
+        xr_entry = __builtin_amdgcn_s_memrealtime();
+        if (xr_trace) xr_trace->t_arrive = xr_entry;
+    }
+#endif
 #if PLOW_XR_WAVE_RS_ON
     __shared__ __align__(16) bf16 xr_peer_tile[8u * PLOW_THREADS];
 #endif
@@ -628,6 +643,12 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     if (slice == 0 && threadIdx.x == 0)
         for (uint32_t r = 0; r < nranks; r++)
             xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_rs));
+#endif
+#if PLOW_XR_TRACE_PHASES
+    if (threadIdx.x == 0 && xr_trace) {
+        const uint64_t d = __builtin_amdgcn_s_memrealtime() - xr_entry;
+        xr_trace->pc = (uint32_t)(d > 0xffffffffull ? 0xffffffffull : d);
+    }
 #endif
     if (threadIdx.x == 0) {
 #if !PLOW_XR2_SKIP_RS
@@ -650,6 +671,10 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     }
     __syncthreads();
     if (bailed) return;
+#if PLOW_XR_TRACE_PHASES
+    if (threadIdx.x == 0 && xr_trace)
+        xr_trace->t_ready = __builtin_amdgcn_s_memrealtime();
+#endif
 
     /* ---- PHASE 1 reduce-scatter: reduce this rank's OWNED slice, write it in-place into
      * this rank's own (peer-visible) partial slot. All nblk workgroups collaborate on the
@@ -824,6 +849,10 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
             }
         }
         __syncthreads();
+#if PLOW_XR_TRACE_PHASES
+        if (threadIdx.x == 0 && xr_trace)
+            xr_trace->t_end = __builtin_amdgcn_s_memrealtime();
+#endif
         return;
     }
 #endif
@@ -901,6 +930,11 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         for (uint32_t e = lo + tid; e < hi; e += stride) st_act1(&as_glob(out)[e], as_glob(src)[e]);
 #endif
     }
+#if PLOW_XR_TRACE_PHASES
+    __syncthreads();
+    if (threadIdx.x == 0 && xr_trace)
+        xr_trace->t_end = __builtin_amdgcn_s_memrealtime();
+#endif
 }
 
 #endif /* PLOW_OP_COLLECTIVE_H */

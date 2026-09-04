@@ -696,6 +696,8 @@ option(PLOW_XR_AGG
        "Aggregate prefill two-shot all-gather signals per rank" ON)
 option(PLOW_XR_WAVE_RS
        "Use experimental TP8 wave-per-peer prefill reduce-scatter on gfx950" OFF)
+option(PLOW_XR_TRACE_PHASES
+       "Record diagnostic XReduceTwoShot internal phases in packet traces" OFF)
 option(PLOW_KDA_PF_STATE_RESIDENT
        "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
 option(PLOW_K3_KDA_CONV_STEP_DB
@@ -844,6 +846,9 @@ if(PLOW_GFX950_HSACO)
     if(PLOW_XR_AGG AND (PLOW_HSACO_ARCH STREQUAL "gfx942" OR
                         PLOW_HSACO_ARCH STREQUAL "gfx950"))
         list(APPEND _hs_ax_prefill -DPLOW_XR_AGG=1)
+    endif()
+    if(PLOW_XR_TRACE_PHASES)
+        list(APPEND _hs_ax_prefill -DPLOW_XR_TRACE_PHASES=1)
     endif()
     # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). Wide gfx950 objects use
     # MM=8 with the walk: the B128 production A/B retained occupancy 2 and improved output
