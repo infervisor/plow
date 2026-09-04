@@ -1572,6 +1572,9 @@ int main() {
 
     printf("\n== flash prefill mma.sync QK^T (fused ns=1) ==\n");
     /* args: nh, nkv, seq_q, seq_kv, q_pos0, window, nsplit */
+    /* Qwen hd128 production tile, including the BKV64 two-cols-per-lane softmax path. */
+    test_flash_prefill<128,64,64>("flash_pre hd128 h4 kv2 len128 causal fused (BKV64)", 4, 2, 128, 128, 0, 0, 1);
+    test_flash_prefill<128,64,64>("flash_pre hd128 h4 kv2 chunk sq100 skv612 qp0=512", 4, 2, 100, 612, 512, 0, 1);
     test_flash_prefill<256,64,32>("flash_pre hd256 h4 kv2 len128 causal fused (tile-exact)", 4, 2, 128, 128, 0, 0, 1);
     test_flash_prefill<256,64,32>("flash_pre hd256 h4 kv2 len200 causal fused (ragged q+kv)", 4, 2, 200, 200, 0, 0, 1);
     test_flash_prefill<512,32,16>("flash_pre hd512 h4 kv1 len200 causal fused", 4, 1, 200, 200, 0, 0, 1);
@@ -1585,6 +1588,7 @@ int main() {
     /* Soft, spread-out softmax so P is a genuine distribution (NOT one-hot): this is the case that
      * charges the tensor-core P.V's bf16 P-operand rounding against the f32 CPU ref. Multi-KV-tile
      * (len>>BKV) so the online rescale + corr path is stressed across many tiles. */
+    test_flash_prefill<128,64,64>("flash_pre hd128 soft len512 causal BKV64", 4, 2, 512, 512, 0, 0, 1, 0.0884f);
     test_flash_prefill<256,64,32>("flash_pre hd256 soft len512 causal",      4, 2, 512,  512,  0, 0,   1, 0.0625f);
     test_flash_prefill<256,64,32>("flash_pre hd256 soft len512 window128",   4, 2, 512,  512,  0, 128, 1, 0.0625f);
     test_flash_prefill<512,32,16>("flash_pre hd512 soft len512 causal",      4, 1, 512,  512,  0, 0,   1, 0.0442f);
@@ -1638,6 +1642,7 @@ int main() {
         {32,90,15,64}, {32,90,15,64}, {3,1,0,2}, 0, 0.0442f);
 
     printf("\n== flash prefill mma.sync QK^T (split ns>1 + merge) ==\n");
+    test_flash_prefill<128,64,64>("flash_pre hd128 h4 kv2 len200 causal ns3 BKV64", 4, 2, 200, 200, 0, 0, 3);
     test_flash_prefill<256,64,32>("flash_pre hd256 h4 kv2 len200 causal ns3", 4, 2, 200, 200, 0, 0, 3);
     test_flash_prefill<512,32,16>("flash_pre hd512 h4 kv1 len300 causal ns4", 4, 1, 300, 300, 0, 0, 4);
     test_flash_prefill<256,64,32>("flash_pre hd256 h4 kv2 chunk sq128 skv2048 qp0=1920 causal ns4", 4, 2, 128, 2048, 1920, 0, 4);

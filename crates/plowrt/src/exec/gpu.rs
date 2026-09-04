@@ -427,7 +427,7 @@ struct SegPf {
     grid_gemm: u32,
     /// T31: the GEMM object's launch block size (`plow_block_pfgemm` global; 256 = legacy).
     block_gemm: u32,
-    /// T12: dedicated hd512 flash object (`interp_sm90a_pffa.cubin` in the pair dir,
+    /// T12: dedicated hd512 flash object (`interp_<tag>_pffa.cubin` in the pair dir,
     /// optional). Class-2 segments (PLOW_PF_SEG_FA512) launch here.
     fa512: Option<(KernelFn, u32, u32)>,
     _m_flash: Module,
@@ -2387,7 +2387,7 @@ impl GpuEngine {
         let pf = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
         let (f_pf, smem_pf, module_pf, prefill, seg_pf) = if let Some(pf) = pf {
             let pf_src = pf.source.clone();
-            match Self::load_prefill(&be, pf, &blob, d_tens.base, grid) {
+            match Self::load_prefill(&be, pf, &blob, d_tens.base, grid, profile.tag) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf)) => {
                     tracing::info!(
                         pf_cubin = %pf_src,
@@ -3837,6 +3837,7 @@ impl GpuEngine {
         blob: &DevBlob,
         d_tens: u64,
         grid: u32,
+        interp_tag: &str,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
         let module = be.module_load(&pf.image)?;
         let kname = std::env::var(env_kernel_var(Role::Prefill))
@@ -3856,11 +3857,24 @@ impl GpuEngine {
         be.set_max_dynamic_smem(f_pf, smem_pf)?;
 
         // Segmented-prefill pair (T9c). `--pf-seg-dir` / PLOW_PF_SEG_DIR names a directory
-        // holding interp_sm90a_pfseg.cubin + interp_sm90a_pfgemm.cubin
-        // (scripts/build_sm90a_cubin.sh PLOW_BUILD_SEG=1); packets must be emitted WITHOUT
+        // holding interp_<tag>_pfseg.cubin + interp_<tag>_pfgemm.cubin;
+        // packets must be emitted WITHOUT
         // PLOW_UNISEG. Next step: promote to the asset manifest once the A/B settles.
         let seg_pf = match crate::config::RuntimeConfig::get().nv.pf_seg_dir.clone() {
             Some(dir) if !dir.is_empty() => {
+                // Segmented objects currently have only bf16-KV variants. Loading one for an
+                // fp8-KV packet would resolve valid symbols and then reinterpret the cache with
+                // the wrong element width, so reject the requested pairing before loading it.
+                if blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
+                    inst.op == DevOp::HeadNormRopeFp8 as u16
+                        || inst.op == DevOp::FlashPrefillFp8 as u16
+                }) {
+                    return Err(RuntimeError::Device(
+                        "PLOW_PF_SEG_DIR cannot be used with fp8-KV packets: segmented NVIDIA \
+                         prefill objects currently have no fp8-KV variants"
+                            .into(),
+                    ));
+                }
                 let load =
                     |file: &str, sym: &str, arena: &str| -> Result<(Module, KernelFn, u32, u32)> {
                         let img =
@@ -3874,16 +3888,15 @@ impl GpuEngine {
                         let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
                         Ok((m, f, sm, occ * be.sm_count()))
                     };
-                let (m1, f1, s1, g1) = load(
-                    "interp_sm90a_pfseg.cubin",
-                    "_Z18interp_sm90a_pfseg11PlowProgram",
-                    "plow_arena_bytes_pfseg",
-                )?;
-                let (m2, f2, s2, _g2unused) = load(
-                    "interp_sm90a_pfgemm.cubin",
-                    "_Z19interp_sm90a_pfgemm11PlowProgram",
-                    "plow_arena_bytes_pfgemm",
-                )?;
+                let seg_file = format!("interp_{interp_tag}_pfseg.cubin");
+                let gemm_file = format!("interp_{interp_tag}_pfgemm.cubin");
+                let seg_sym_name = format!("interp_{interp_tag}_pfseg");
+                let gemm_sym_name = format!("interp_{interp_tag}_pfgemm");
+                let seg_sym = format!("_Z{}{}11PlowProgram", seg_sym_name.len(), seg_sym_name);
+                let gemm_sym = format!("_Z{}{}11PlowProgram", gemm_sym_name.len(), gemm_sym_name);
+                let (m1, f1, s1, g1) = load(&seg_file, &seg_sym, "plow_arena_bytes_pfseg")?;
+                let (m2, f2, s2, _g2unused) =
+                    load(&gemm_file, &gemm_sym, "plow_arena_bytes_pfgemm")?;
                 // T31: the GEMM object may declare its own launch block size (384-thread ws).
                 let blk2 = be
                     .module_global_u32(&m2, "plow_block_pfgemm")?
@@ -3892,15 +3905,11 @@ impl GpuEngine {
                 // Optional third object (T12): dedicated hd512 flash. Only loaded when the
                 // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
                 // segments are emitted at all.
-                let fa = if std::path::Path::new(&dir)
-                    .join("interp_sm90a_pffa.cubin")
-                    .exists()
-                {
-                    let (m3, f3, s3, g3) = load(
-                        "interp_sm90a_pffa.cubin",
-                        "_Z17interp_sm90a_pffa11PlowProgram",
-                        "plow_arena_bytes_pffa",
-                    )?;
+                let fa_file = format!("interp_{interp_tag}_pffa.cubin");
+                let fa = if std::path::Path::new(&dir).join(&fa_file).exists() {
+                    let fa_sym_name = format!("interp_{interp_tag}_pffa");
+                    let fa_sym = format!("_Z{}{}11PlowProgram", fa_sym_name.len(), fa_sym_name);
+                    let (m3, f3, s3, g3) = load(&fa_file, &fa_sym, "plow_arena_bytes_pffa")?;
                     // PLOW_PF_SEG_FA512=all classes hd256 FlashPrefill onto this object too,
                     // but its hd256 arm exists only when built PLOW_BUILD_FA_HD256=1 —
                     // without it the dispatch hits a bare __trap(): LAUNCH_FAILED, poisoned
@@ -3914,13 +3923,12 @@ impl GpuEngine {
                         == Some("all")
                         && be.module_global_u32(&m3, "plow_fa_hd256_pffa")? == Some(0)
                     {
-                        return Err(RuntimeError::Device(
-                            "PLOW_PF_SEG_FA512=all classes hd256 flash onto \
-                             interp_sm90a_pffa.cubin, but that object was built without its \
-                             hd256 arm (PLOW_BUILD_FA_HD256=1) — it would trap on the first \
-                             hd256 segment. Rebuild the object or set PLOW_PF_SEG_FA512=1."
-                                .into(),
-                        ));
+                        return Err(RuntimeError::Device(format!(
+                            "PLOW_PF_SEG_FA512=all classes hd256 flash onto {fa_file}, but that \
+                             object was built without its hd256 arm (PLOW_BUILD_FA_HD256=1) — \
+                             it would trap on the first hd256 segment. Rebuild the object or set \
+                             PLOW_PF_SEG_FA512=1."
+                        )));
                     }
                     Some((m3, f3, s3, g3))
                 } else {

@@ -1166,9 +1166,12 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     constexpr int KSTEPS_PV = BKV / 16;                /* k16 contraction over kv */
     static_assert(WPV_M * WPV_N == (int)PLOW_NV_WARPS, "P.V grid must use all warps");
     static_assert(HD % WPV_N == 0 && HDW % 8 == 0, "hd slice must be a multiple of 8");
-    /* Softmax phase: each warp owns RPW_S query rows; one lane per kv column (needs BKV <= warp). */
+    /* Softmax phase: each warp owns RPW_S query rows. BKV <= 32: one lane per kv column.
+     * BKV > 32: each lane owns BKV/32 columns and reduces those locally first. */
     constexpr int RPW_S = BQ / (int)PLOW_NV_WARPS;
-    static_assert(BKV <= 32, "softmax lane-per-kv reduction needs BKV <= 32");
+    constexpr int SOFT_COLS = BKV > 32 ? BKV / 32 : 1;
+    static_assert(BKV <= 64, "softmax reduction supports at most 2 kv cols per lane");
+    static_assert(BKV <= 32 || BKV % 32 == 0, "BKV > 32 must be a multiple of 32");
 
     float* Ss = lds;                                       /* [BQ][BKV] scaled scores */
     float* m_arr = Ss + BQ * BKV;                          /* [BQ] running max (log2 domain) */
@@ -1315,28 +1318,44 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 
             const unsigned rmax = (hi - kv0 < (unsigned)BKV) ? (hi - kv0) : (unsigned)BKV;
 
-            /* SOFTMAX phase: each warp owns RPW_S query rows; lane == kv column. Compute the row max
-             * over the (masked) tile, update the running (m,l), and emit P = exp(S - m_new) as bf16
-             * into Ps for the P.V mma. corr = exp(m_old - m_new) rescales O in the P.V phase below. */
+            /* SOFTMAX phase: each warp owns RPW_S query rows. At BKV=64 each lane owns two
+             * columns (lane and lane+32), reduced locally before the warp max/sum. */
 #pragma unroll
             for (int rr = 0; rr < RPW_S; rr++) {
                 const int row = warp * RPW_S + rr;
                 const int qabs = (int)(q_pos0 + q0 + row);
-                float sv = FA_NEG_INF;
-                bool active = false;
-                if ((unsigned)lane < rmax) {
-                    const int kv = (int)kv0 + lane;
-                    bool masked = (kv > qabs);
-                    if (window) masked |= ((unsigned)(qabs - kv) >= window);
-                    if (!masked) { sv = Ss[row * BKV + lane]; active = true; }
+                float sv[SOFT_COLS];
+                bool active[SOFT_COLS];
+#pragma unroll
+                for (int sc = 0; sc < SOFT_COLS; sc++) {
+                    sv[sc] = FA_NEG_INF;
+                    active[sc] = false;
+                    const unsigned col = lane + sc * 32;
+                    if (col < rmax) {
+                        const int kv = (int)kv0 + col;
+                        bool masked = (kv > qabs);
+                        if (window) masked |= ((unsigned)(qabs - kv) >= window);
+                        if (!masked) { sv[sc] = Ss[row * BKV + col]; active[sc] = true; }
+                    }
                 }
-                const float rowmax = warp_max32(sv);
+                float local_max = sv[0];
+#pragma unroll
+                for (int sc = 1; sc < SOFT_COLS; sc++) local_max = fmaxf(local_max, sv[sc]);
+                const float rowmax = warp_max32(local_max);
                 const float m_old = m_arr[row];
                 const float m_new = fmaxf(m_old, rowmax);
                 const float corr = (m_old == FA_NEG_INF) ? 0.0f : FA_EXP(m_old - m_new);
-                const float p = (active && m_new != FA_NEG_INF) ? FA_EXP(sv - m_new) : 0.0f;
-                if (lane < BKV) Ps[row * (BKV + PAD) + lane] = __float2bfloat16(p);
-                const float rowsum = warp_sum32(p);
+                float psum = 0.0f;
+#pragma unroll
+                for (int sc = 0; sc < SOFT_COLS; sc++) {
+                    const unsigned col = lane + sc * 32;
+                    const float p = (active[sc] && m_new != FA_NEG_INF)
+                                      ? FA_EXP(sv[sc] - m_new) : 0.0f;
+                    if (col < (unsigned)BKV)
+                        Ps[row * (BKV + PAD) + col] = __float2bfloat16(p);
+                    psum += p;
+                }
+                const float rowsum = warp_sum32(psum);
                 if (lane == 0) {
                     l_arr[row] = l_arr[row] * corr + rowsum;
                     m_arr[row] = m_new;
@@ -2940,7 +2959,9 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     static_assert(WPV_M * WPV_N == (int)PLOW_NV_WARPS, "P.V grid must use all warps");
     static_assert(HD % WPV_N == 0 && HDW % 8 == 0, "hd slice must be a multiple of 8");
     constexpr int RPW_S = BQ / (int)PLOW_NV_WARPS;
-    static_assert(BKV <= 32, "softmax lane-per-kv reduction needs BKV <= 32");
+    constexpr int SOFT_COLS = BKV > 32 ? BKV / 32 : 1;
+    static_assert(BKV <= 64, "softmax reduction supports at most 2 kv cols per lane");
+    static_assert(BKV <= 32 || BKV % 32 == 0, "BKV > 32 must be a multiple of 32");
     constexpr int HCH = HD / 8; /* 16B cp.async lines per K/V row */
     constexpr int VBUF = FA_PRE_VBUF(HD); /* T7 L1: 2 on hd512 (V double-buffer), 1 on hd256 */
     constexpr int VBSZ = BKV * (HD + PAD); /* one V buffer's bf16 count */
@@ -3144,21 +3165,38 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
             for (int rr = 0; rr < RPW_S; rr++) {
                 const int row = warp * RPW_S + rr;
                 const int qabs = (int)(qp0 + q0 + row);
-                float sv = FA_NEG_INF;
-                bool active = false;
-                if ((unsigned)lane < rmax) {
-                    const int kv = (int)kv0 + lane;
-                    bool masked = (kv > qabs);
-                    if (window) masked |= ((unsigned)(qabs - kv) >= window);
-                    if (!masked) { sv = Ss[row * BKV + lane]; active = true; }
+                float sv[SOFT_COLS];
+                bool active[SOFT_COLS];
+#pragma unroll
+                for (int sc = 0; sc < SOFT_COLS; sc++) {
+                    sv[sc] = FA_NEG_INF;
+                    active[sc] = false;
+                    const unsigned col = lane + sc * 32;
+                    if (col < rmax) {
+                        const int kv = (int)kv0 + col;
+                        bool masked = (kv > qabs);
+                        if (window) masked |= ((unsigned)(qabs - kv) >= window);
+                        if (!masked) { sv[sc] = Ss[row * BKV + col]; active[sc] = true; }
+                    }
                 }
-                const float rowmax = warp_max32(sv);
+                float local_max = sv[0];
+#pragma unroll
+                for (int sc = 1; sc < SOFT_COLS; sc++) local_max = fmaxf(local_max, sv[sc]);
+                const float rowmax = warp_max32(local_max);
                 const float m_old = m_arr[row];
                 const float m_new = fmaxf(m_old, rowmax);
                 const float corr = (m_old == FA_NEG_INF) ? 0.0f : FA_EXP(m_old - m_new);
-                const float p = (active && m_new != FA_NEG_INF) ? FA_EXP(sv - m_new) : 0.0f;
-                if (lane < BKV) Ps[row * (BKV + PAD) + lane] = __float2bfloat16(p);
-                const float rowsum = warp_sum32(p);
+                float psum = 0.0f;
+#pragma unroll
+                for (int sc = 0; sc < SOFT_COLS; sc++) {
+                    const unsigned col = lane + sc * 32;
+                    const float p = (active[sc] && m_new != FA_NEG_INF)
+                                      ? FA_EXP(sv[sc] - m_new) : 0.0f;
+                    if (col < (unsigned)BKV)
+                        Ps[row * (BKV + PAD) + col] = __float2bfloat16(p);
+                    psum += p;
+                }
+                const float rowsum = warp_sum32(psum);
                 if (lane == 0) {
                     l_arr[row] = l_arr[row] * corr + rowsum;
                     m_arr[row] = m_new;

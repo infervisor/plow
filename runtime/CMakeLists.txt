@@ -426,6 +426,8 @@ option(PLOW_SM120_CUBIN "Emit the sm_120a .cubin artifacts `plowrt serve` loads"
 # (PLOW_BUILD_SEG etc.); the two DEFAULT served objects come from here.
 option(PLOW_SM90A_CUBIN "Emit the sm_90a .cubin artifacts `plowrt serve` loads" OFF)
 option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants (all enabled arches)" OFF)
+option(PLOW_SM120_CUBIN_SEG
+       "Also emit the bf16-KV _pfseg (fat) and _pfgemm (lean) segmented prefill cubins" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -483,6 +485,9 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # prefill carries the tiled-GEMM + FLASH_PREFILL arms.
     set(_ax_decode -DPLOW_NV_FA_GF_FULL=${PLOW_NV_FA_GF_FULL})
     set(_ax_prefill -DPLOW_NV_PREFILL=1)
+    set(_ax_seg_fat -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1)
+    set(_ax_seg_gemm
+        -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1)
     # AXIS 2 — bf16 KV vs fp8 (e4m3) KV. On the PREFILL side fp8-KV also fixes the
     # staging arm, and it comes from the OPTION, never a literal: FLASH_PREFILL_FP8
     # dequants at the smem stage (cp.async cannot convert fp8 inline), so PIPE=0 is
@@ -539,6 +544,15 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(APPEND _cubin_rows
                 "${_vstem}_fp8kv|${_ksym_dec}|_ax_decode|_ax_fp8kv"
                 "${_vstem}_pf_fp8kv|${_ksym_pf}|_ax_prefill|_ax_fp8kv_pf")
+        endif()
+        if(PLOW_SM120_CUBIN_SEG)
+            string(LENGTH "${_vstem}_pfseg" _len_pfseg)
+            string(LENGTH "${_vstem}_pfgemm" _len_pfgemm)
+            set(_ksym_pfseg "_Z${_len_pfseg}${_vstem}_pfseg11PlowProgram")
+            set(_ksym_pfgemm "_Z${_len_pfgemm}${_vstem}_pfgemm11PlowProgram")
+            list(APPEND _cubin_rows
+                "${_vstem}_pfseg|${_ksym_pfseg}|_ax_seg_fat|"
+                "${_vstem}_pfgemm|${_ksym_pfgemm}|_ax_seg_gemm|")
         endif()
 
         foreach(_row ${_cubin_rows})
