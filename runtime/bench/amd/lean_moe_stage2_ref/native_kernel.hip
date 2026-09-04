@@ -70,9 +70,17 @@ extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_no_spill_1 = 1;
 extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_f32_scatter_1 = 1;
 extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_dynamic_lds_4352 = 1;
 extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_vgpr_le_100 = 1;
+#ifdef PLOW_MOE2_EP_FULL_I
+extern "C" __device__ unsigned plow_moe2_ep_full_i_3072 = 1;
+extern "C" __device__ unsigned plow_moe2_ep_full_i_vgpr_le_128 = 1;
+#endif
 
 extern "C" __global__ __launch_bounds__(256, 2)
+#ifdef PLOW_MOE2_EP_FULL_I
+void plow_moe2_ep_full_i_16x16x128_gfx950(
+#else
 void plow_moe2_mxfp4_16x16x128_gfx950(
+#endif
     float* __restrict__ part,
     const unsigned char* __restrict__ activation,
     const unsigned long long* __restrict__ weight_table,
@@ -105,7 +113,13 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
     const unsigned n0 = n_tile * TN;
     const unsigned kbytes = static_cast<unsigned>(inter_dim) / 2;
     const unsigned scale_stride = static_cast<unsigned>(inter_dim) / 32u;
+#ifdef PLOW_MOE2_EP_FULL_I
+    constexpr unsigned NTK = 24;
+    if (inter_dim != 3072 || experts <= 0)
+#else
+    constexpr unsigned NTK = 3;
     if (inter_dim != 384 || experts <= 0)
+#endif
         return;
     const int* tile_prefix = meta + 2 * experts;
     const unsigned total_half_tiles = static_cast<unsigned>(tile_prefix[experts]) * 2u;
@@ -165,7 +179,7 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
     __syncthreads();
 
 #pragma unroll
-    for (unsigned kt = 0; kt < 3; ++kt) {
+    for (unsigned kt = 0; kt < NTK; ++kt) {
         i32x8 a_frag[2];
         const unsigned scale_row = block_m * TM + lane_n;
         const unsigned sa_lo = activation_scale[
@@ -183,7 +197,7 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
 
         BStage b_next;
         u32x4 a_next{0, 0, 0, 0};
-        if (kt < 2) {
+        if (kt + 1u < NTK) {
             b_next = load_b_stage(
                 weight, weight_scale, kt + 1, n0, wave, lane_k, lane_n, model_dim, inter_dim);
             a_next = load_a_stage(kt + 1);
@@ -198,7 +212,7 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
         acc[1][2] = mfma_fp4<1, 0>(a_frag[1], b_cur.frag[2], acc[1][2], a_scale_pair, b_cur.scale[1]);
         acc[1][3] = mfma_fp4<1, 1>(a_frag[1], b_cur.frag[3], acc[1][3], a_scale_pair, b_cur.scale[1]);
         __builtin_amdgcn_s_setprio(0);
-        if (kt < 2) {
+        if (kt + 1u < NTK) {
             store_a_stage(a_next, (kt + 1) & 1u);
             b_cur = b_next;
         }

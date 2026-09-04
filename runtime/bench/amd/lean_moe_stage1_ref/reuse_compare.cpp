@@ -12,7 +12,23 @@
     std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(e_)); \
     std::exit(1); } } while (0)
 
-constexpr uint32_t T = 8192, H = 3584, I = 384, E = 896, TOPK = 16, BM = 64;
+#ifndef MOE1_T
+#define MOE1_T 8192
+#endif
+#ifndef MOE1_H
+#define MOE1_H 3584
+#endif
+#ifndef MOE1_I
+#define MOE1_I 384
+#endif
+#ifndef MOE1_E
+#define MOE1_E 896
+#endif
+#ifndef MOE1_TOPK
+#define MOE1_TOPK 16
+#endif
+constexpr uint32_t T = MOE1_T, H = MOE1_H, I = MOE1_I, E = MOE1_E,
+                   TOPK = MOE1_TOPK, BM = 64;
 constexpr uint32_t UNUSED = ~0u;
 
 __device__ __forceinline__ uint32_t mix32(uint32_t x) {

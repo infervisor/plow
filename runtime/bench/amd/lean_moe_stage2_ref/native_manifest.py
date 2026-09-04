@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -40,24 +41,27 @@ def main():
     if len(sys.argv) != 5:
         raise SystemExit("usage: native_manifest.py OBJECT MANIFEST LLVM_READELF LLVM_OBJCOPY")
     obj, output, readelf, objcopy = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+    ep_full_i = os.environ.get("PLOW_MOE2_EP_FULL_I") == "1"
+    symbol = "plow_moe2_ep_full_i_16x16x128_gfx950" if ep_full_i else SYMBOL
     digest = hashlib.sha256(obj.read_bytes()).hexdigest()
     with tempfile.NamedTemporaryFile() as text, tempfile.NamedTemporaryFile() as copied:
         subprocess.check_call([
             objcopy, f"--dump-section=.text={text.name}", str(obj), copied.name,
         ])
         text_digest = hashlib.sha256(Path(text.name).read_bytes()).hexdigest()
-    if text_digest != EXPECTED_TEXT_SHA256:
+    if not ep_full_i and text_digest != EXPECTED_TEXT_SHA256:
         raise SystemExit(
             f"native executable reproducibility failure: {text_digest} != {EXPECTED_TEXT_SHA256}"
         )
     notes = subprocess.check_output([readelf, "-n", str(obj)], text=True)
-    if f".name:           {SYMBOL}" not in notes or "amdgcn-amd-amdhsa--gfx950" not in notes:
+    if f".name:           {symbol}" not in notes or "amdgcn-amd-amdhsa--gfx950" not in notes:
         raise SystemExit("native object symbol/target gate failed")
     symbols = subprocess.check_output([readelf, "-sW", str(obj)], text=True)
-    for marker in MARKERS:
+    markers = (MARKERS[:-1] + ("plow_moe2_ep_full_i_3072", "plow_moe2_ep_full_i_vgpr_le_128")) if ep_full_i else MARKERS
+    for marker in markers:
         if not re.search(rf"OBJECT .* {re.escape(marker)}$", symbols, re.MULTILINE):
             raise SystemExit(f"native object lacks required marker {marker}")
-    knotes = kernel_notes(notes, SYMBOL)
+    knotes = kernel_notes(notes, symbol)
     resources = {
         "vgpr": field(knotes, "vgpr_count"),
         "sgpr": field(knotes, "sgpr_count"),
@@ -69,7 +73,7 @@ def main():
         "sgpr_spills": field(knotes, "sgpr_spill_count"),
     }
     expected = {
-        "vgpr": 98, "sgpr": 40, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 4352,
+        "vgpr": 120 if ep_full_i else 98, "sgpr": 40, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 4352,
         "lds_bytes": 4352, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0,
     }
     if resources != expected:
@@ -83,12 +87,13 @@ def main():
             "toolchain": "nix ROCm 7.14",
         },
         "object": {
-            "file": "kernel.co", "sha256": digest, "text_sha256": text_digest, "symbol": SYMBOL,
+            "file": "kernel.co", "sha256": digest, "text_sha256": text_digest, "symbol": symbol,
         },
         "capability": {"arch": "gfx950", "wavefront": 64, "workgroup": 256},
         "geometry": {
-            "tokens": 1024, "topk": 16, "model_dim": 3584, "inter_dim": 384,
-            "experts": 896, "tile_m": 32, "tile_n": 256, "tile_k": 128,
+            "tokens": 1024, "topk": 2 if ep_full_i else 16, "model_dim": 3584,
+            "inter_dim": 3072 if ep_full_i else 384,
+            "experts": 112 if ep_full_i else 896, "tile_m": 32, "tile_n": 256, "tile_k": 128,
             "sort_block_m": 64,
         },
         "encoding": {

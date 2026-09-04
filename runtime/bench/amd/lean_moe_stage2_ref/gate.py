@@ -43,7 +43,7 @@ def unpack_fp4(src):
     return lut[indices.long()]
 
 
-def check_manifest(obj, manifest):
+def check_manifest(obj, manifest, ep_full_i=False):
     required = {
         "status": "production-capability-routed",
         "capability.arch": "gfx950",
@@ -54,10 +54,10 @@ def check_manifest(obj, manifest):
         "geometry.tile_k": 128,
         "geometry.sort_block_m": 64,
         "geometry.tokens": 1024,
-        "geometry.topk": 16,
+        "geometry.topk": 2 if ep_full_i else 16,
         "geometry.model_dim": 3584,
-        "geometry.inter_dim": 384,
-        "geometry.experts": 896,
+        "geometry.inter_dim": 3072 if ep_full_i else 384,
+        "geometry.experts": 112 if ep_full_i else 896,
         "abi.kernarg_bytes": 80,
         "encoding.activation": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
         "encoding.weight": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
@@ -102,14 +102,18 @@ def check_manifest(obj, manifest):
     if not any(f".kernarg_segment_size: {n}" in notes for n in (80, 336)):
         raise SystemExit("ELF metadata gate failed: lean stage-2 kernarg is neither 80 nor 336 B")
     symbols = subprocess.check_output([readelf, "-sW", str(obj)], text=True)
-    for marker in (
+    markers = [
         "plow_moe2_mxfp4_stage2_abi_3",
         "plow_moe2_mxfp4_stage2_layout_shuffled_1",
         "plow_moe2_mxfp4_stage2_no_spill_1",
         "plow_moe2_mxfp4_stage2_f32_scatter_1",
         "plow_moe2_mxfp4_stage2_dynamic_lds_4352",
-        "plow_moe2_mxfp4_stage2_vgpr_le_100",
-    ):
+    ]
+    if ep_full_i:
+        markers.extend(("plow_moe2_ep_full_i_3072", "plow_moe2_ep_full_i_vgpr_le_128"))
+    else:
+        markers.append("plow_moe2_mxfp4_stage2_vgpr_le_100")
+    for marker in markers:
         if marker not in symbols:
             raise SystemExit(f"ELF marker gate failed: missing {marker!r}")
 
@@ -292,9 +296,10 @@ def main():
     p.add_argument("object", type=Path)
     p.add_argument("manifest", type=Path)
     p.add_argument("--timing-tokens", type=int)
+    p.add_argument("--ep-full-i", action="store_true")
     args = p.parse_args()
     manifest = json.loads(args.manifest.read_text())
-    check_manifest(args.object, manifest)
+    check_manifest(args.object, manifest, args.ep_full_i)
     module = HipModule(args.object, manifest["object"]["symbol"])
     oracle(module, manifest)
     if args.timing_tokens is not None and args.timing_tokens <= 0:

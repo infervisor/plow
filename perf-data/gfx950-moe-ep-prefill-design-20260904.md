@@ -30,6 +30,11 @@ The exact all-rank segment diagnostic at `T=8192`, top-k 16, `E=896`, `H=3584`, 
 | fixed-slot combine | 39.038 ms | 0.424 ms |
 | **boundary** | **323.499 ms** | **3.516 ms** |
 
+That attribution predates the subsequently promoted reusable-A4 stage-1 object. Its exact
+current-stack endpoint gate saved 88.006 ms, so the post-promotion boundary estimate is
+235.493 ms (`125.537 + 70.918 + 39.038`). This subtraction must be replaced by a matched segment
+trace before publication, but it is the relevant go/no-go denominator for the full-I experiment.
+
 One logical layer has 131,072 routed rows. Its minimum per-rank traffic is:
 
 | item | TP8 bytes/rank/layer | EP8 bytes/rank/layer |
@@ -63,11 +68,12 @@ uniform independent top-k, the expected number of remote destination ranks per t
 `7*(1-(7/8)^16)=6.1735`. Dispatch + return + 16-byte `(token,slot,expert,gate)` metadata is
 90.86 MB/rank/layer, or 0.2950 ms at the measured rate and 27.14 ms over 92 layers.
 
-The acceptance target is `max(15%,35 ms)`: 323.499 ms must fall to at most 288.499 ms. A
-token-sharded implementation therefore has 261.36 ms left for route/sort + both expert stages +
-combine after transport, requiring at least 23.10 ms (8.12%) off the current 284.461 ms expert
-bodies.
-bodies. The replicated-input path pays no new fabric charge; reducing f32 route-partial traffic
+Against the post-reuse estimate, the acceptance target is 200.493 ms (the 35 ms arm is slightly
+looser than 15%). A token-sharded implementation has 173.356 ms left for route/sort + expert
+bodies after transport, requiring at least 23.10 ms off the current 196.455 ms stage-1+stage-2
+bodies. The required incremental body saving is unchanged because reusable A4 improved both the
+control denominator and the EP stage-1 starting point before this comparison.
+The replicated-input path pays no new fabric charge; reducing f32 route-partial traffic
 alone has a 34.16 ms proportional ceiling, just short of the gate without a measured GEMM gain.
 
 ## Implemented ABI and remaining integration
@@ -94,7 +100,47 @@ The smallest production integration is:
    error `<=6.25e-2`, then run the existing teacher-forced/logit and long-generation gates. Do not
    label reassociated output bit-exact.
 
-No graph integration is promoted yet: the transport primitive passes, but a full-I wave64,
-zero-spill specialist has not been built and the required whole-boundary gain has not been
-measured. The next experiment is an isolated owned-112-expert full-I pair using the existing packed
-loader, compared against eight TP partials with identical route tables and cache flushing.
+No graph integration is promoted by this experiment. The isolated full-I boundary clears the
+projection gate below; graph lowering still needs a matched eight-rank compound/tolerance gate.
+
+## Full-I experiment build
+
+The follow-on isolated objects build reproducibly and pass their component gate.
+
+| object | geometry | VGPR | SGPR | private/spills | wave |
+|---|---|---:|---:|---:|---:|
+| stable owner filter/align | runtime E/range/top-k | 40 | 52 | 0/0 | 64 |
+| reusable-A4 stage 1 | owned E=112, N=3072 | 182 | 44 | 0/0 | 64 |
+| full-I stage 2 | owned E=112, K=3072 | 120 | 40 | 0/0 | 64 |
+| fixed-slot local combine | runtime E/range/top-k | 8 | 30 | 0/0 | 64 |
+
+The normal K=384 stage-2 object retains its exact `.text` digest and 98-VGPR resource contract;
+the full-I compile arm does not perturb the shipping object.
+
+## Full-I boundary result
+
+Each component ran under an uncontended one-GPU `/tmp/gpulease` lease at the exact
+`T=8192,H=3584,E=896,top-k=16` logical geometry. The EP objects own the balanced range
+`[0,112)`; their two GEMMs use `E_local=112,I=3072`. The control stage-1 result is the
+post-promotion reusable-A4 object, not the older shipping kernel.
+
+| included phase | current TP8 ms/layer | isolated EP8 ms/layer |
+|---|---:|---:|
+| stable route align/filter | 0.211121 | 0.085081 |
+| reusable-A4 stage 1 | 1.728292 | 1.056448 |
+| MXFP4 stage 2 | 0.846248 | 0.479004 |
+| deterministic fixed-slot combine | 0.424331 | 0.154281 |
+| **isolated boundary projection** | **3.209992** | **1.774814** |
+
+The replicated-placement projection saves 1.435178 ms/layer, or **132.036 ms over 92 layers
+(44.7%)**. Token-sharded placement adds the separately measured 27.14 ms round-trip transport,
+leaving **104.90 ms projected net improvement (35.5%)**. Both clear the required 35 ms and 15%
+arms. The unchanged BF16 reduction is included symbolically in both totals: 58.72 MB message and
+102.76 MB two-shot fabric traffic per rank per layer. Its time cancels exactly; the available
+278-collective trace does not isolate this reduction, so no reduction saving is claimed.
+
+Stage 1 matched every one of 29,196,288 MXFP4 payload bytes and 1,824,768 E8M0 scale bytes.
+Filter ordering and fixed-slot BF16 combine were exact. Both stage-2 geometry oracles reported
+zero error on 114,688 values. This is an isolated projection, not a whole-graph numerical proof:
+promotion still requires a compound TP8 run with the existing finite, relative-RMS, and
+max-absolute-error gates after the rank reduction.

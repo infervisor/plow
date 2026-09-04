@@ -245,7 +245,15 @@ W=$(( $(date +%s) - S ))
 # every device would make the lease meaningless.
 if [ "$NGOT" -lt "$NGPU" ]; then
   VIS=$(echo "$GOT" | tr ' ' ',')
-  export CUDA_VISIBLE_DEVICES="$VIS" HIP_VISIBLE_DEVICES="$VIS" ROCR_VISIBLE_DEVICES="$VIS"
+  if [ "$VENDOR" = amd ]; then
+    # ROCr renumbers its filtered agents. Applying the original physical ids a
+    # second time through HIP/CUDA_VISIBLE_DEVICES can therefore hide every
+    # device when a partial lease starts above gpu0.
+    export ROCR_VISIBLE_DEVICES="$VIS"
+    unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+  else
+    export CUDA_VISIBLE_DEVICES="$VIS"
+  fi
 fi
 
 PRE=$(foreign "$GOT")
