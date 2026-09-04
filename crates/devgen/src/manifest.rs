@@ -269,6 +269,10 @@ struct Shapes {
     moe_pf_part16: bool,
     /// Any prefill GLU with `i[7]=1` — fp8 gathered activations (PLOW_MOE_PF_A8).
     moe_pf_a8: bool,
+    /// Any decode one-shot XReduce with `i[7]!=0` — the K3 latent MoeCombine folded into the
+    /// tagged publish (PLOW_XR_COMBINE_FOLD). An object without the arm publishes the unwritten
+    /// plain slot: finite, stale, wrong.
+    xr_combine_fold: bool,
     /// Any prefill DOWN with `i[4]!=0` — the fused 86->87 decomposition (PLOW_MOE_PF_ATOMIC):
     /// t[0] is a [T,H] f32 accumulator the DOWN epilogue atomically adds into, NOT the
     /// [T*k,H] `part` scatter. An object without the arm would overrun it k-fold.
@@ -333,6 +337,7 @@ fn shapes(m: &Model) -> Shapes {
             let Some(op) = op_of(inst.op) else { continue };
             s.ops_present.insert(op_name(op));
             match op {
+                DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
                 // `i0=n_batch i1=n_head i2=n_kv_head … i6=hd`
                 DevOp::FlashDecode | DevOp::FlashDecodeFp8 => {
                     let (hd, nh, kvh, nb) = (inst.i[6], inst.i[1], inst.i[2], inst.i[0]);
@@ -686,6 +691,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_pf_atomic".into(), json!(s.moe_pf_atomic));
     f.insert("moe_pf_det".into(), json!(s.moe_pf_det));
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
+    f.insert("xr_combine_fold".into(), json!(s.xr_combine_fold));
     f.insert("moe_prefill_ep".into(), json!(!s.moe_prefill_ep.is_empty()));
     f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
@@ -917,6 +923,10 @@ fn backend_amd(
     }
     if on("moe_pf_a8") {
         req.push("PLOW_MOE_PF_A8=1".into());
+    }
+    // L4 combine fold: a BUILD axis of the tagged decode object (`#if PLOW_XR_COMBINE_FOLD`).
+    if on("xr_combine_fold") {
+        req.push("PLOW_XR_COMBINE_FOLD=1".into());
     }
     // The fused 86->87 decomposition. Unlike the two above this is a BUILD axis (the atomic
     // branch is `#if PLOW_MOE_PF_ATOMIC`), so an object may genuinely not have it.
@@ -1766,6 +1776,14 @@ pub fn config_header(manifest: &Value) -> String {
         "#ifndef PLOW_MATERIALIZED_RESIDUAL_INPUT\n#define PLOW_MATERIALIZED_RESIDUAL_INPUT {}\n#endif\n",
         if materialized_residual_input { 1 } else { 0 }
     ));
+    let xr_combine_fold = manifest
+        .pointer("/features/xr_combine_fold")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD {0}\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD {0}\n#endif\n",
+        if xr_combine_fold { 1 } else { 0 }
+    ));
 
     // Head dims the flash family is instantiated at.
     out.push_str("\n/* --- flash head dims present --- */\n");
@@ -1927,6 +1945,38 @@ mod tests {
             false
         );
         assert!(config_header(&ordinary).contains("#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP 0"));
+    }
+
+    /// L4: a decode XReduce with `i7 != 0` (the folded latent combine) is a build axis of the
+    /// tagged decode object; the ordinary model must not carry it.
+    #[test]
+    fn xr_combine_fold_is_a_decode_object_requirement() {
+        let mut m = model();
+        m.progs[1]
+            .insts
+            .push(inst(DevOp::XReduce, [3584, 8, 0, 5, 0, 0, 0, 16]));
+        let man = build(&m, "gfx950");
+        assert_eq!(man["features"]["xr_combine_fold"], true);
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(req.contains(&"PLOW_XR_COMBINE_FOLD=1"), "{req:?}");
+        let hdr = config_header(&man);
+        assert!(hdr.contains("#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD 1\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD 1\n#endif\n"));
+
+        let ordinary = build(&model(), "gfx950");
+        assert_eq!(ordinary["features"]["xr_combine_fold"], false);
+        let req: Vec<&str> = ordinary["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!req.contains(&"PLOW_XR_COMBINE_FOLD=1"));
+        assert!(config_header(&ordinary).contains("#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD 0\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD 0\n#endif\n"));
     }
 
     /// One opcode, two bodies: hd is an instruction field, so hd256 and hd512

@@ -601,6 +601,61 @@ __device__ __forceinline__ void d_xreduce_tag_publish(const bf16* part, void* ts
         __hip_atomic_store(as_glob(dst) + w, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
+/* ---- COMBINE FOLD (-DPLOW_XR_COMBINE_FOLD=1, tagged decode objects; default OFF) ----
+ *
+ * Lever L4 (docs/k3-mi355x-20260904/decode-gap-plan-20260904.md): K3's latent MoeCombine has
+ * no residual and no shared operand — out[h] = bf16(sum_{j<k} part[j*n + h]), f32 accumulate
+ * in FIXED slot order — and its only reader is the one-shot publish above, which copies the
+ * bf16 row into the tagged words. Here the publishing workgroups run that same loop (same
+ * start value, same order, same rounding, no reassociation) and write the tagged words
+ * directly, so the combine packet and its gate are not emitted at all. Bit-exact against
+ * d_moe_combine -> d_xreduce_tag_publish by construction; the plain partial slot is not
+ * written. Carried on the XReduce packet as `t1 = part ([k, n] f32)`, `i7 = k` (0 = off);
+ * the loader refuses a folded packet on an object without `plow_xr_combine_fold_1`. */
+#ifndef PLOW_XR_COMBINE_FOLD
+#define PLOW_XR_COMBINE_FOLD 0
+#endif
+#if PLOW_XR_COMBINE_FOLD
+#if !PLOW_XR_TAGGED
+#error "PLOW_XR_COMBINE_FOLD needs the tagged one-shot (PLOW_XR_TAGGED=1)"
+#endif
+extern "C" __device__ unsigned plow_xr_combine_fold_1 = 1;
+/* `k` is bounded so every slot load of a word is issued before the first add: a runtime-k
+ * loop serialises k DRAM latencies per element (measured 2x the publish). The loader
+ * refuses `i7 > PLOW_XRT_FOLD_MAXK`. Loads past `k` are predicated off, and so are their
+ * adds (adding +0.0f would turn a -0.0f sum into +0.0f). */
+#define PLOW_XRT_FOLD_MAXK 16u
+__device__ __forceinline__ void d_xreduce_tag_publish_combine(const float* part, uint32_t k,
+                                                              void* tslot, uint32_t n,
+                                                              uint32_t tag, unsigned slice,
+                                                              unsigned nblk) {
+    const uint32_t nw = xrt_words(n);
+    uint64_t* dst = (uint64_t*)tslot;
+    const PLOW_GLOB float* gp = as_glob(part);
+    for (uint32_t w = slice * PLOW_THREADS + threadIdx.x; w < nw; w += nblk * PLOW_THREADS) {
+        const uint32_t e = w * PLOW_XRT_PER_WORD;
+        float v[PLOW_XRT_PER_WORD][PLOW_XRT_FOLD_MAXK];
+#pragma unroll
+        for (uint32_t j = 0; j < PLOW_XRT_PER_WORD; j++) {
+            /* Elements past `n` alias element e so the loads stay unconditional. */
+            const uint32_t c = (e + j < n) ? e + j : e;
+#pragma unroll
+            for (uint32_t s = 0; s < PLOW_XRT_FOLD_MAXK; s++)
+                v[j][s] = (s < k) ? gp[(size_t)s * n + c] : 0.0f;
+        }
+        uint64_t word = (uint64_t)(tag & 0xffffu) << 48;
+#pragma unroll
+        for (uint32_t j = 0; j < PLOW_XRT_PER_WORD; j++) {
+            float acc = 0.0f;
+#pragma unroll
+            for (uint32_t s = 0; s < PLOW_XRT_FOLD_MAXK; s++)
+                if (s < k) acc += v[j][s];
+            if (e + j < n) word |= (uint64_t)f2bf(acc) << (16u * j);
+        }
+        __hip_atomic_store(as_glob(dst) + w, word, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+#endif
 /* Same operands as d_xreduce_mega plus the tagged region. `tag_off == 0` is refused by the
  * loader; `gcols` with `row_w != n` bails with status 0xBAD0.... */
 __device__ __forceinline__ void d_xreduce_tagged_mega(
@@ -608,6 +663,9 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
     uint32_t slot_bytes, size_t xctr_byte_off, uint32_t gate_id, uint64_t deadline_ticks,
     uint32_t* status, unsigned slice, unsigned nblk, uint32_t gslot_bytes, uint32_t gcols,
     uint32_t row_w, uint32_t tag_off, uint32_t tag_slot
+#if PLOW_XR_COMBINE_FOLD
+    , const float* cpart, uint32_t ck
+#endif
 #if PLOW_XR_TRACE_PHASES
     , PlowTraceRec* xr_trace = nullptr
 #endif
@@ -630,6 +688,12 @@ __device__ __forceinline__ void d_xreduce_tagged_mega(
     const uint32_t want = (gate_id + 1u) & 0xffffu;
     const uint32_t tp_off = tag_off + parity * tag_slot;
     const uint32_t tg_off = tag_off + (2u + parity) * tag_slot;
+#if PLOW_XR_COMBINE_FOLD
+    if (ck)
+        d_xreduce_tag_publish_combine(cpart, ck, (char*)peer_scratch[rank] + tp_off, n, want,
+                                      slice, nblk);
+    else
+#endif
     d_xreduce_tag_publish((const bf16*)((const char*)peer_scratch[rank] + slot_bytes),
                           (char*)peer_scratch[rank] + tp_off, n, want, slice, nblk);
     if (gcols)

@@ -2642,6 +2642,40 @@ fn emit_xreduce(
     )
 }
 
+/// [`emit_xreduce`] for the decode one-shot with the K3 latent `MoeCombine` folded into the
+/// publish (lever L4, `PLOW_XR_COMBINE_FOLD`): the packet depends on the DOWN producers directly,
+/// carries the `[k, elems]` f32 slot partials in `t1` and `k` in `i7`, and the tagged publish
+/// sums them in the combine's fixed slot order before writing the words. Same gate and sizing
+/// rules as the plain one-shot; `d_xreduce_tag_publish_combine` in `op_collective.h`.
+#[allow(clippy::too_many_arguments)]
+fn emit_xreduce_combine_fold(
+    b: &mut Builder,
+    xgate: &mut u32,
+    xr_cus: &[u32],
+    deps: &[u32],
+    out: u32,
+    xr_elems: u32,
+    tp: u32,
+    slot: u32,
+    part: u32,
+    k: u32,
+) -> u32 {
+    assert!(k > 0, "combine fold needs at least one routed slot");
+    let need = (xr_elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
+    let xr_cus = &xr_cus[..need];
+    let gate = *xgate;
+    *xgate += 1;
+    b.emit(DevOp::XReduce, xr_cus.to_vec(), deps, |d| {
+        d.t[0] = out;
+        d.t[1] = part;
+        d.i[0] = xr_elems;
+        d.i[1] = tp;
+        d.i[2] = slot;
+        d.i[3] = gate;
+        d.i[7] = k;
+    })
+}
+
 /// ONE BAND of a row-banded prefill TP seam: a two-shot all-reduce over `elems` elements of
 /// the partial, at byte offset `slot` in the peer window and element offset `e0` into `out`.
 ///

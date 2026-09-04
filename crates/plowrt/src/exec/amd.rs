@@ -3090,6 +3090,10 @@ const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     // class, same treatment — and here the marker is genuinely load-bearing rather than a
     // vintage stamp, because the fold is a BUILD AXIS: an unarmed object has no fold body.
     ("PLOW_GLM_FUSE_QNORM", &["plow_glm_fuse_qnorm_arm"]),
+    // The K3 latent MoeCombine folded into the tagged one-shot publish (XReduce t1 = part,
+    // i7 = k). An object without the arm publishes the plain partial slot, which no packet
+    // wrote — stale data, no trap. A BUILD axis (`#if PLOW_XR_COMBINE_FOLD`).
+    ("PLOW_XR_COMBINE_FOLD", &["plow_xr_combine_fold_1"]),
 ];
 
 fn required_moe_pf_accum(progs: &[DevProg], field: usize) -> bool {
