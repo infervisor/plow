@@ -17,6 +17,9 @@ extern "C" void k_carry_v8_wg256();
 extern "C" void k_carry_v16_wg256();
 extern "C" void k_carry_v32_wg512();
 extern "C" void k_carry_v32_staged();
+extern "C" void k_carry_tail_overlap();
+extern "C" void k_carry_key_stage();
+extern "C" void k_carry_key_stage_tail_overlap();
 
 static uint16_t bf16(float x) {
     uint32_t u;
@@ -78,6 +81,8 @@ int main(int argc, char** argv) {
     constexpr size_t v16_lds = 14336u;
     constexpr size_t v32_lds = 28672u;
     constexpr size_t staged_lds = 120320u;
+    constexpr size_t key_stage_lds = control_lds + 2u * 64u * D * sizeof(uint16_t) +
+                                     D * sizeof(float);
     const size_t qn = (size_t)T * H * D;
     const size_t vn = (size_t)T * H * V;
     const size_t an = (size_t)T * H * 64u;
@@ -118,6 +123,13 @@ int main(int argc, char** argv) {
          v32_lds, allocate<uint16_t>(vn), upload(state0), {}, true},
         {"v32_staged_wg512", (const void*)k_carry_v32_staged, dim3(H * 4u), dim3(512),
          staged_lds, allocate<uint16_t>(vn), upload(state0), {}, true},
+        {"tail_overlap_wg512", (const void*)k_carry_tail_overlap, dim3(H * 8u), dim3(512),
+         control_lds, allocate<uint16_t>(vn), upload(state0), {}, true},
+        {"key_stage_wg512", (const void*)k_carry_key_stage, dim3(H * 8u), dim3(512),
+         key_stage_lds, allocate<uint16_t>(vn), upload(state0), {}, true},
+        {"key_stage_tail_overlap_wg512", (const void*)k_carry_key_stage_tail_overlap,
+         dim3(H * 8u), dim3(512), key_stage_lds, allocate<uint16_t>(vn),
+         upload(state0), {}, true},
     };
 
     auto launch = [&](Arm& arm) {

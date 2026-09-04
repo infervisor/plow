@@ -8,7 +8,60 @@ constexpr unsigned BT = 64u;
 constexpr unsigned D = 128u;
 constexpr unsigned V = 128u;
 
-template <unsigned BV, unsigned WAVES, bool STAGED>
+template <unsigned BV, bool KEY_FACTORS, bool CACHED_DECAY>
+__device__ __forceinline__ void carry_update_d16(
+    float* __restrict__ st, const bf16* __restrict__ k,
+    const bf16* __restrict__ vsm, const float* __restrict__ g,
+    const bf16* __restrict__ kh, const bf16* __restrict__ kr,
+    const float* __restrict__ decay,
+    unsigned T, unsigned H, unsigned h, unsigned row0, unsigned valid,
+    unsigned last, unsigned vv, unsigned v_stride, unsigned st_stride,
+    unsigned d0, unsigned token, unsigned kgroup) {
+    f32x4 upd = (f32x4)(0.0f);
+    for (unsigned s0 = 0; s0 < BT; s0 += 32u) {
+        bf16x8 vf = (bf16x8)((bf16_t)0), kf = (bf16x8)((bf16_t)0);
+        bf16x8 kres = (bf16x8)((bf16_t)0);
+        const unsigned s = s0 + 8u * kgroup;
+#pragma unroll
+        for (unsigned j = 0; j < 8u; ++j) {
+            if (token < vv && s + j < valid)
+                vf[j] = __builtin_bit_cast(
+                    bf16_t, vsm[(s + j) * v_stride + token]);
+            if (s + j < valid) {
+                if constexpr (KEY_FACTORS) {
+                    kf[j] = __builtin_bit_cast(
+                        bf16_t, kh[(s + j) * st_stride + d0 + token]);
+                    kres[j] = __builtin_bit_cast(
+                        bf16_t, kr[(s + j) * st_stride + d0 + token]);
+                } else {
+                    const size_t i = ((size_t)(row0 + s + j) * H + h) * D +
+                                     d0 + token;
+                    const size_t il = (last * H + h) * D + d0 + token;
+                    const float scaled = bf2f(k[i]) * exp2f(g[il] - g[i]);
+                    const bf16 high = f2bf(scaled);
+                    kf[j] = __builtin_bit_cast(bf16_t, high);
+                    kres[j] = __builtin_bit_cast(
+                        bf16_t, f2bf(scaled - bf2f(high)));
+                }
+            }
+        }
+        upd = plow_mfma_bf16_16x16(vf, kf, upd);
+        upd = plow_mfma_bf16_16x16(vf, kres, upd);
+    }
+#pragma unroll
+    for (unsigned e = 0; e < 4u; ++e) {
+        const unsigned vl = 4u * kgroup + e;
+        if (vl < vv) {
+            const size_t il = (last * H + h) * D + d0 + token;
+            const float factor = CACHED_DECAY ? decay[d0 + token] : exp2f(g[il]);
+            st[vl * st_stride + d0 + token] =
+                st[vl * st_stride + d0 + token] * factor + upd[e];
+        }
+    }
+}
+
+template <unsigned BV, unsigned WAVES, bool STAGED, bool OVERLAP_TAIL = false,
+          bool STAGE_KEYS = false>
 __device__ void carry_vtile(
     bf16* __restrict__ out, float* __restrict__ state,
     const bf16* __restrict__ q, const bf16* __restrict__ k,
@@ -29,6 +82,7 @@ __device__ void carry_vtile(
     float* ap = nullptr;
     bf16* kh = nullptr;
     bf16* kr = nullptr;
+    float* decay = nullptr;
     if constexpr (STAGED) {
         wp = reinterpret_cast<bf16*>(osm + BT * V_STRIDE);
         qp = wp + BT * ST_STRIDE;
@@ -36,6 +90,10 @@ __device__ void carry_vtile(
         ap = reinterpret_cast<float*>(up + BT * V_STRIDE);
         kh = reinterpret_cast<bf16*>(ap + BT * A_STRIDE);
         kr = kh + BT * ST_STRIDE;
+    } else if constexpr (STAGE_KEYS) {
+        kh = reinterpret_cast<bf16*>(osm + BT * V_STRIDE);
+        kr = kh + BT * D;
+        decay = reinterpret_cast<float*>(kr + BT * D);
     }
 
     const unsigned tid = threadIdx.x;
@@ -60,6 +118,20 @@ __device__ void carry_vtile(
             const unsigned row0 = c * BT;
             const unsigned valid = min(BT, T - row0);
             const size_t last = row0 + valid - 1u;
+
+            if constexpr (STAGE_KEYS) {
+                for (unsigned x = tid; x < valid * D; x += WAVES * 64u) {
+                    const unsigned m = x / D, d = x % D;
+                    const size_t i = ((size_t)(row0 + m) * H + h) * D + d;
+                    const size_t il = (last * H + h) * D + d;
+                    const float scaled = bf2f(k[i]) * exp2f(g[il] - g[i]);
+                    const bf16 high = f2bf(scaled);
+                    kh[m * D + d] = high;
+                    kr[m * D + d] = f2bf(scaled - bf2f(high));
+                }
+                if (tid < D) decay[tid] = exp2f(g[(last * H + h) * D + tid]);
+                __syncthreads();
+            }
 
             if constexpr (STAGED) {
                 for (unsigned x = tid; x < BT * D; x += WAVES * 64u) {
@@ -176,51 +248,20 @@ __device__ void carry_vtile(
                     }
                 }
             }
-            __syncthreads();
-
-            for (unsigned task = wave; task < 8u * V_MFMA; task += WAVES) {
-                const unsigned vh = task >> 3;
-                const unsigned d0 = (task & 7u) * 16u;
-                f32x4 upd = (f32x4)(0.0f);
-                for (unsigned s0 = 0; s0 < BT; s0 += 32u) {
-                    bf16x8 vf = (bf16x8)((bf16_t)0), kf = (bf16x8)((bf16_t)0);
-                    bf16x8 kres = (bf16x8)((bf16_t)0);
-                    const unsigned s = s0 + 8u * kgroup;
-#pragma unroll
-                    for (unsigned j = 0; j < 8u; ++j) {
-                        const unsigned vl = vh * 16u + token;
-                        if (vl < vv && s + j < valid)
-                            vf[j] = __builtin_bit_cast(
-                                bf16_t, vsm[(s + j) * V_STRIDE + vl]);
-                        if (s + j < valid) {
-                            if constexpr (STAGED) {
-                                kf[j] = __builtin_bit_cast(
-                                    bf16_t, kh[(s + j) * ST_STRIDE + d0 + token]);
-                                kres[j] = __builtin_bit_cast(
-                                    bf16_t, kr[(s + j) * ST_STRIDE + d0 + token]);
-                            } else {
-                                const size_t i = ((size_t)(row0 + s + j) * H + h) * D +
-                                                 d0 + token;
-                                const size_t il = (last * H + h) * D + d0 + token;
-                                const float scaled = bf2f(k[i]) * exp2f(g[il] - g[i]);
-                                const bf16 high = f2bf(scaled);
-                                kf[j] = __builtin_bit_cast(bf16_t, high);
-                                kres[j] = __builtin_bit_cast(
-                                    bf16_t, f2bf(scaled - bf2f(high)));
-                            }
-                        }
-                    }
-                    upd = plow_mfma_bf16_16x16(vf, kf, upd);
-                    upd = plow_mfma_bf16_16x16(vf, kres, upd);
-                }
-#pragma unroll
-                for (unsigned e = 0; e < 4u; ++e) {
-                    const unsigned vl = vh * 16u + 4u * kgroup + e;
-                    if (vl < vv) {
-                        const size_t il = (last * H + h) * D + d0 + token;
-                        st[vl * ST_STRIDE + d0 + token] =
-                            st[vl * ST_STRIDE + d0 + token] * exp2f(g[il]) + upd[e];
-                    }
+            if constexpr (OVERLAP_TAIL) {
+                const unsigned d0 = ((wave + 4u) & 7u) * 16u;
+                carry_update_d16<BV, STAGED || STAGE_KEYS, STAGE_KEYS>(
+                    st, k, vsm, g, kh, kr, decay, T, H, h, row0, valid, (unsigned)last,
+                    vv, V_STRIDE, ST_STRIDE, d0, token, kgroup);
+            } else {
+                __syncthreads();
+                for (unsigned task = wave; task < 8u * V_MFMA; task += WAVES) {
+                    const unsigned vh = task >> 3;
+                    const unsigned d0 = (task & 7u) * 16u;
+                    carry_update_d16<BV, STAGED || STAGE_KEYS, STAGE_KEYS>(
+                        st + vh * 16u * ST_STRIDE, k, vsm + vh * 16u, g, kh, kr, decay,
+                        T, H, h, row0, valid, (unsigned)last, min(16u, vv - vh * 16u),
+                        V_STRIDE, ST_STRIDE, d0, token, kgroup);
                 }
             }
             __syncthreads();
@@ -290,4 +331,32 @@ void k_carry_v32_staged(bf16* out, float* state, const bf16* q, const bf16* k,
     extern __shared__ __align__(16) unsigned char shared[];
     carry_vtile<32, 8, true>(out, state, q, k, W, U, Aqk, g, T, H,
                        blockIdx.x, gridDim.x, shared);
+}
+
+extern "C" __global__ __launch_bounds__(512, 1)
+void k_carry_tail_overlap(bf16* out, float* state, const bf16* q, const bf16* k,
+                          const bf16* W, const bf16* U, const float* Aqk,
+                          const float* g, unsigned T, unsigned H) {
+    extern __shared__ __align__(16) unsigned char shared[];
+    carry_vtile<16, 8, false, true>(out, state, q, k, W, U, Aqk, g, T, H,
+                                   blockIdx.x, gridDim.x, shared);
+}
+
+extern "C" __global__ __launch_bounds__(512, 1)
+void k_carry_key_stage(bf16* out, float* state, const bf16* q, const bf16* k,
+                         const bf16* W, const bf16* U, const float* Aqk,
+                         const float* g, unsigned T, unsigned H) {
+    extern __shared__ __align__(16) unsigned char shared[];
+    carry_vtile<16, 8, false, false, true>(out, state, q, k, W, U, Aqk, g, T, H,
+                                          blockIdx.x, gridDim.x, shared);
+}
+
+extern "C" __global__ __launch_bounds__(512, 1)
+void k_carry_key_stage_tail_overlap(bf16* out, float* state, const bf16* q,
+                              const bf16* k, const bf16* W, const bf16* U,
+                              const float* Aqk, const float* g, unsigned T,
+                              unsigned H) {
+    extern __shared__ __align__(16) unsigned char shared[];
+    carry_vtile<16, 8, false, true, true>(out, state, q, k, W, U, Aqk, g, T, H,
+                                         blockIdx.x, gridDim.x, shared);
 }

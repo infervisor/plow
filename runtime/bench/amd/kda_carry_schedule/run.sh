@@ -18,7 +18,8 @@ resource() {
 }
 
 for name in k_carry_control k_carry_v16_wg256 \
-            k_carry_v32_wg512 k_carry_v32_staged; do
+            k_carry_v32_wg512 k_carry_v32_staged k_carry_tail_overlap \
+            k_carry_key_stage k_carry_key_stage_tail_overlap; do
     vgpr=$(resource "$name" VGPRs); sgpr=$(resource "$name" TotalSGPRs)
     scratch=$(resource "$name" 'ScratchSize [bytes/lane]')
     vspill=$(resource "$name" 'VGPRs Spill'); sspill=$(resource "$name" 'SGPRs Spill')
