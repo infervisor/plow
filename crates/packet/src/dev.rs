@@ -1007,7 +1007,7 @@ pub enum DevOp {
     ///
     /// `t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb_cap,H] bf16)
     /// t3=score_w([H] f32) t4=push_src? t5=gamma? t6=res_a? t7=res_b?` ·
-    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre?` · `f0=eps`.
+    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre? i6=mwg_scratch` · `f0=eps`.
     ///
     /// `gamma` is the FUSED POST-NORM, `[H] bf16`, and it is what makes the slice map above
     /// affordable. Every AttnRes in a K3 program is read by exactly one consumer and that consumer
@@ -1035,6 +1035,10 @@ pub enum DevOp {
     /// `res_a`/`res_b` optionally materialize `prefix_sum = bf16(res_a + res_b)` inside this
     /// packet. `res_pre` selects `prefix_sum = bf16(res_pre + bf16(res_a + res_b))`, retaining
     /// the intermediate BF16 rounding and the materialized tensor for all other consumers.
+    ///
+    /// `mwg_scratch` (non-zero only on a decode packet emitted with `PLOW_ATTNRES_DECODE_MWG=n`)
+    /// is the tagged-word rendezvous scratch of the banded multi-workgroup arm; `blocks = n`
+    /// column bands then share one packet. `f1` carries the output-norm epsilon (f32-mix).
     AttnRes = 104,
     /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
     /// experts, routed experts).

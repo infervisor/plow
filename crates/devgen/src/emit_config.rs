@@ -510,6 +510,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_XR_BAND_CUS")]
     pub glm_xr_band_cus: Option<u32>,
 
+    /// Decode AttnRes on N column-band workgroups with an in-packet tagged rendezvous
+    /// (`d_attn_res_mwg`, C3 f32-mix contract). 0/unset = the single-workgroup arm.
+    #[arg(long, env = "PLOW_ATTNRES_DECODE_MWG")]
+    pub attnres_decode_mwg: Option<u32>,
+
     /// Restrict banding to one seam (`attn` | `moe`) — a divergence-bisect instrument.
     #[arg(long, env = "PLOW_GLM_XR_BAND_SEAM")]
     pub glm_xr_band_seam: Option<String>,
@@ -835,6 +840,7 @@ impl EmitConfig {
             glm_place_pf: env_bool("PLOW_GLM_PLACE_PF"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),
             glm_xr_band_cus: env_u32("PLOW_GLM_XR_BAND_CUS"),
+            attnres_decode_mwg: env_u32("PLOW_ATTNRES_DECODE_MWG"),
             glm_xr_band_seam: env_str("PLOW_GLM_XR_BAND_SEAM"),
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),

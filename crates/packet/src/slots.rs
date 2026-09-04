@@ -234,7 +234,7 @@ const DOC: &[S] = &[
     S { op: DevOp::KdaGatedNorm, t: &["y", "o", "norm_w", "g_raw"], i: &["T", "H", "D"], f: &["eps"], j: &[] },
     // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
     // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.
-    S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?", "res_a?", "res_b?"], i: &["T", "H", "nb", "push_row", "nb_cap", "res_pre?"], f: &["eps"], j: &[] },
+    S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?", "res_a?", "res_b?"], i: &["T", "H", "nb", "push_row", "nb_cap", "res_pre?", "mwg_scratch"], f: &["eps"], j: &[] },
     S { op: DevOp::SituGlu, t: &["out", "gate", "up"], i: &[], f: &[], j: &[] },
     S { op: DevOp::MlaOutGate, t: &["out", "a", "b"], i: &[], f: &[], j: &[] },
     S { op: DevOp::GemmFp8Blk, t: &["C", "A", "W", "weight_scale_inv"], i: &["M", "N", "K"], f: &[], j: &[] },

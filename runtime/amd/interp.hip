@@ -2817,6 +2817,19 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * is read by exactly one RMSNORM over its own output, so the two narrow packets collapse. */
 #if PLOW_HAS_ATTN_RES
         case PLOW_DOP_ATTN_RES:
+#if PLOW_ATTNRES_DECODE_MWG
+            /* i6 = the banded decode arm's rendezvous scratch (0 = single-workgroup arm). The
+             * residual seam is materialized per band inside the arm. */
+            if (in->i[6] != 0u) {
+                d_attn_res_mwg((bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const float*)TEN(3),
+                               in->i[1], in->i[2], in->i[4], in->fj[0].f, in->fj[1].f, slice,
+                               nblk, (float*)sm->raw, (const bf16*)TEN(4), in->i[3],
+                               (const bf16*)TEN(5), (const bf16*)TEN(6), (const bf16*)TEN(7),
+                               in->i[5] == PLOW_TENSOR_NONE ? nullptr : (const bf16*)T[in->i[5]],
+                               (uint64_t*)T[in->i[6]]);
+                break;
+            }
+#endif
 #if PLOW_MATERIALIZED_RESIDUAL_INPUT
             if (in->t[6] != PLOW_TENSOR_NONE) {
                 if (in->t[7] == PLOW_TENSOR_NONE) __builtin_trap();
