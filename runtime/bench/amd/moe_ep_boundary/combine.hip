@@ -9,6 +9,7 @@ struct RouteEntry {
 extern "C" __device__ unsigned plow_moe_ep_combine_abi_1 = 1;
 extern "C" __device__ unsigned plow_moe_ep_combine_fixed_slot_1 = 1;
 extern "C" __device__ unsigned plow_moe_ep_combine_wave64_1 = 1;
+extern "C" __device__ unsigned plow_moe_ep_combine_no_spill_1 = 1;
 
 extern "C" __global__ __launch_bounds__(256, 2)
 void plow_moe_ep_combine_gfx950(
@@ -20,8 +21,9 @@ void plow_moe_ep_combine_gfx950(
     unsigned topk,
     unsigned expert_begin,
     unsigned expert_end) {
-    const unsigned token = blockIdx.y;
-    const unsigned col = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned col_tiles = (hidden + blockDim.x - 1u) / blockDim.x;
+    const unsigned token = blockIdx.x / col_tiles;
+    const unsigned col = (blockIdx.x - token * col_tiles) * blockDim.x + threadIdx.x;
     if (token < tokens && col < hidden) {
         float acc = 0.0f;
 #pragma unroll 16

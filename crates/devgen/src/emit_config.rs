@@ -527,6 +527,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_align_par: bool,
 
+    /// Whole-expert/full-I prefill route for graph-proven replicated MoE boundaries.
+    #[arg(long, env = "PLOW_MOE_PREFILL_EP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_prefill_ep: bool,
+
     /// Atomic combine for the grouped MoE prefill scatter.
     #[arg(long, env = "PLOW_MOE_PF_ATOMIC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_atomic: bool,
@@ -791,6 +795,7 @@ impl EmitConfig {
             moe_pf_a8: env_bool("PLOW_MOE_PF_A8"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_bool("PLOW_MOE_ALIGN_PAR"),
+            moe_prefill_ep: env_bool("PLOW_MOE_PREFILL_EP"),
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
             moe_pf_atomic: env_bool("PLOW_MOE_PF_ATOMIC"),

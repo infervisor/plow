@@ -48,7 +48,7 @@ def main():
 
     def launch():
         call(lib, "hipModuleLaunchKernel", function,
-             ctypes.c_uint((H + 255) // 256), ctypes.c_uint(T), ctypes.c_uint(1),
+             ctypes.c_uint(T * ((H + 255) // 256)), ctypes.c_uint(1), ctypes.c_uint(1),
              ctypes.c_uint(256), ctypes.c_uint(1), ctypes.c_uint(1),
              ctypes.c_uint(0), ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
              params, ctypes.c_void_p())

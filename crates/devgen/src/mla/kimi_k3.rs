@@ -1318,6 +1318,9 @@ fn k3_build_model(
             b.set_lean_moe_combine_segments(
                 crate::emit_is_amd() && emit_config::active().moe_combine_lean,
             );
+            b.set_moe_prefill_ep_degree(
+                (crate::emit_is_amd() && emit_config::active().moe_prefill_ep).then_some(tp),
+            );
             b.set_lean_kda_intra_segments(
                 crate::emit_is_amd() && emit_config::active().kda_intra_cached,
             );

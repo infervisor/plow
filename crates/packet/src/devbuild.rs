@@ -329,6 +329,8 @@ pub struct Builder {
     lean_moe_stage1_segments: bool,
     /// Isolate fixed-order f32 grouped-MoE prefill combines.
     lean_moe_combine_segments: bool,
+    /// Rewrite eligible replicated-input grouped-MoE prefill boundaries to whole-expert/full-I.
+    moe_prefill_ep_degree: Option<u32>,
     /// Isolate BT64/D128 chunk-KDA intra packets for a standalone gfx950 object.
     lean_kda_intra_segments: bool,
     /// Mark isolated BT64/D128 chunk-KDA intra packets for the wave-item object.
@@ -498,6 +500,7 @@ impl Builder {
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
             lean_moe_combine_segments: false,
+            moe_prefill_ep_degree: None,
             lean_kda_intra_segments: false,
             kda_intra_wave_items_segments: false,
             lean_kda_key_factor_segments: false,
@@ -561,6 +564,16 @@ impl Builder {
 
     pub fn set_lean_moe_combine_segments(&mut self, enabled: bool) {
         self.lean_moe_combine_segments = enabled;
+    }
+
+    /// Enable the model-independent replicated-input expert-parallel rewrite.
+    ///
+    /// Eligibility is proven from the emitted graph: an MXFP4 align/GLU/down/combine chain
+    /// followed by a TP reduction. The reduction proves that the combine output is a replicated
+    /// tensor boundary. Unsupported graphs fail during `Builder::finish` instead of emitting a
+    /// packet the ordinary interpreter would misread.
+    pub fn set_moe_prefill_ep_degree(&mut self, degree: Option<u32>) {
+        self.moe_prefill_ep_degree = degree.filter(|&n| n > 1);
     }
 
     pub fn set_lean_kda_intra_segments(&mut self, enabled: bool) {
@@ -1284,7 +1297,188 @@ impl Builder {
         fused
     }
 
+    fn ep_companion_tensor(&mut self, handle: u32) -> u32 {
+        let source = self
+            .tensors
+            .get(handle as usize)
+            .expect("EP table handle is invalid")
+            .clone();
+        assert!(source.init.is_none(), "EP tables must be runtime-bound");
+        let ep_name = format!("{}_ep", source.name);
+        if let Some(i) = self.tensors.iter().position(|t| t.name == ep_name) {
+            return i as u32;
+        }
+        let i = self.tensors.len();
+        assert!(
+            i < TENSOR_NONE as usize,
+            "EP companion tensor table overflows u16"
+        );
+        self.tensors.push(TensorDecl {
+            name: ep_name,
+            bytes: source.bytes,
+            init: None,
+        });
+        i as u32
+    }
+
+    fn rewrite_replicated_moe_prefill_ep(&mut self, degree: u32) -> usize {
+        assert!(degree > 1, "EP degree must exceed one");
+        let mut chains = Vec::new();
+        for (glu, op) in self.ops.iter().enumerate() {
+            let g = &op.inst;
+            if g.op != DevOp::MoeGroupGluPf as u16 || g.i[3] != 2 || g.i[6] != 0 {
+                continue;
+            }
+            let Some(down) = self.ops.iter().position(|candidate| {
+                let d = &candidate.inst;
+                d.op == DevOp::MoeGroupDownPf as u16
+                    && d.t[1] == g.t[0]
+                    && d.t[2] == g.t[2]
+                    && d.t[3] == g.t[3]
+                    && d.t[4] == g.t[4]
+                    && d.i[0] == g.i[1]
+                    && d.i[1] == g.i[0]
+                    && d.i[2] == g.i[2]
+                    && d.i[3] == g.i[3]
+                    && d.i[4..].iter().all(|&v| v == 0)
+            }) else {
+                continue;
+            };
+            let d = &self.ops[down].inst;
+            let Some(combine) = self.ops.iter().position(|candidate| {
+                let c = &candidate.inst;
+                c.op == DevOp::MoeCombinePf as u16
+                    && c.t[3] == d.t[0]
+                    && c.i[0] == d.i[0]
+                    && c.i[1] == 16
+                    && c.i[2] != 0
+                    && c.i[3..].iter().all(|&v| v == 0)
+            }) else {
+                continue;
+            };
+            let reduced = self.ops.iter().any(|candidate| {
+                matches!(
+                    DevOp::from_u16(candidate.inst.op),
+                    Some(DevOp::XReduce | DevOp::XReduceTwoShot)
+                ) && candidate
+                    .deps
+                    .iter()
+                    .any(|dep| dep.producer() as usize == combine)
+            });
+            if !reduced {
+                continue;
+            }
+            let align: Vec<usize> = self
+                .ops
+                .iter()
+                .enumerate()
+                .filter_map(|(i, candidate)| {
+                    let a = &candidate.inst;
+                    (a.op == DevOp::MoeAlignPf as u16
+                        && a.t[0] == g.t[4]
+                        && a.i[0] == self.ops[combine].inst.i[2]
+                        && a.i[1] == g.i[2]
+                        && a.i[2] == 16)
+                        .then_some(i)
+                })
+                .collect();
+            assert!(
+                !align.is_empty(),
+                "EP boundary has no align producer for its declared metadata"
+            );
+            let full_i = g.i[0]
+                .checked_mul(degree)
+                .expect("EP full intermediate width overflows u32");
+            assert!(
+                g.i[0] > 0
+                    && full_i.is_multiple_of(128)
+                    && g.i[1].is_multiple_of(128)
+                    && g.i[2] >= degree
+                    && self.ops[combine].inst.i[2] > 1,
+                "EP boundary geometry is unsupported"
+            );
+            chains.push((glu, down, combine, align, full_i));
+        }
+
+        for (glu, down, combine, align, full_i) in &chains {
+            let weight = self.ops[*glu].inst.t[2];
+            let scale = self.ops[*glu].inst.t[3];
+            let ep_weight = self.ep_companion_tensor(weight);
+            let ep_scale = self.ep_companion_tensor(scale);
+            for handle in [weight, scale] {
+                let source_name = self.tensors[handle as usize].name.clone();
+                if let Some(companion) = self
+                    .tensors
+                    .iter()
+                    .position(|t| t.name == format!("{source_name}_moe2"))
+                {
+                    self.ep_companion_tensor(companion as u32);
+                }
+            }
+            self.ops[*glu].inst.t[2] = ep_weight;
+            self.ops[*glu].inst.t[3] = ep_scale;
+            self.ops[*down].inst.t[2] = ep_weight;
+            self.ops[*down].inst.t[3] = ep_scale;
+            let row_token_bytes = self
+                .tensors
+                .get(self.ops[*glu].inst.t[5] as usize)
+                .expect("EP row-token tensor handle is invalid")
+                .bytes;
+            assert!(
+                row_token_bytes.is_multiple_of(4),
+                "EP row-token tensor is misaligned"
+            );
+            let rows = row_token_bytes / 4;
+            let payload_bytes = rows
+                .checked_mul(u64::from(*full_i) / 2)
+                .expect("EP payload tensor size overflows u64");
+            let scale_bytes = rows
+                .checked_mul(u64::from(*full_i) / 32)
+                .expect("EP scale tensor size overflows u64");
+            for (handle, required) in [
+                (self.ops[*glu].inst.t[0], payload_bytes),
+                (self.ops[*glu].inst.t[7], scale_bytes),
+            ] {
+                let tensor = self
+                    .tensors
+                    .get_mut(handle as usize)
+                    .expect("EP boundary tensor handle is invalid");
+                tensor.bytes = tensor.bytes.max(required);
+            }
+            let experts = self.ops[*glu].inst.i[2];
+            let meta = self.ops[align[0]].inst.t[0] as usize;
+            let meta_words = u64::from(experts)
+                .checked_mul(67)
+                .and_then(|n| n.checked_add(1))
+                .expect("EP metadata size overflows u64");
+            let meta_bytes = meta_words * 4;
+            self.tensors
+                .get_mut(meta)
+                .expect("EP align metadata handle is invalid")
+                .bytes = meta_bytes;
+            for &i in align {
+                self.ops[i].inst.i[5] = degree;
+            }
+            self.ops[*glu].inst.i[0] = *full_i;
+            self.ops[*glu].inst.i[6] = degree;
+            self.ops[*down].inst.i[1] = *full_i;
+            self.ops[*down].inst.i[6] = degree;
+            self.ops[*combine].inst.t[4] = self.ops[align[0]].inst.t[1];
+            self.ops[*combine].inst.i[5] = degree;
+            self.ops[*combine].inst.i[6] = experts;
+        }
+        chains.len()
+    }
+
     pub fn finish(mut self) -> Program {
+        if let Some(degree) = self.moe_prefill_ep_degree {
+            let rewritten = self.rewrite_replicated_moe_prefill_ep(degree);
+            assert!(
+                rewritten != 0,
+                "replicated MoE EP requested at degree {degree}, but the complete graph has no eligible MXFP4 align/GLU/down/combine -> TP-reduction boundary"
+            );
+            eprintln!("  whole-graph placement: {rewritten} routed-MoE boundaries use EP{degree}");
+        }
         if self.fuse_materialized_residual_inputs {
             let fused = self.fuse_materialized_residual_inputs();
             if fused != 0 {
@@ -1582,6 +1776,7 @@ impl Builder {
         let lean_moe_combine = !uniseg
             && self.lean_moe_combine_segments
             && self.ops.iter().any(|op| lean_moe_combine_inst(&op.inst));
+        let moe_prefill_ep = self.moe_prefill_ep_degree.is_some();
         let kda_intra_wave_items = !uniseg && self.kda_intra_wave_items_segments;
         let lean_kda_intra = !uniseg
             && (self.lean_kda_intra_segments || kda_intra_wave_items)
@@ -1720,6 +1915,24 @@ impl Builder {
                 16
             } else if lean_kda_key_factor && i > 0 && lean_kda_key_factor_pair(&self.ops, i - 1) {
                 17
+            } else if moe_prefill_ep && op == DevOp::MoeAlignPf as u16 && self.ops[i].inst.i[5] > 1
+            {
+                21
+            } else if moe_prefill_ep
+                && op == DevOp::MoeGroupGluPf as u16
+                && self.ops[i].inst.i[6] > 1
+            {
+                22
+            } else if moe_prefill_ep
+                && op == DevOp::MoeGroupDownPf as u16
+                && self.ops[i].inst.i[6] > 1
+            {
+                23
+            } else if moe_prefill_ep
+                && op == DevOp::MoeCombinePf as u16
+                && self.ops[i].inst.i[5] > 1
+            {
+                24
             } else if lean_moe_stage2 && lean_moe_stage2_pair(&self.ops, i) {
                 // The standalone gfx950 kernel owns exactly the deterministic Down scatter.
                 // Combine stays in the following interpreter segment and preserves fixed-order
@@ -1854,6 +2067,7 @@ impl Builder {
             || lean_moe_stage2
             || lean_moe_stage1
             || lean_moe_combine
+            || moe_prefill_ep
             || lean_kda_intra
             || lean_kda_key_factor
             || xr_attnres
@@ -3069,6 +3283,108 @@ impl Builder {
     }
     pub fn tensors(&self) -> Vec<TensorDecl> {
         self.tensors.clone()
+    }
+}
+
+#[cfg(test)]
+mod moe_prefill_ep_tests {
+    use super::*;
+
+    fn graph(with_reduction: bool) -> Builder {
+        let mut b = Builder::new(8);
+        let routes = b.tensor("routes", 8192 * 16 * 4);
+        let meta = b.tensor("meta", (3 * 896 + 1) * 4);
+        let row_token = b.tensor("row_token", 8192 * 16 * 4);
+        let row_partidx = b.tensor("row_partidx", 8192 * 16 * 4);
+        let row_gate = b.tensor("row_gate", 8192 * 16 * 4);
+        let act = b.tensor("act", 8192 * 3584 * 2);
+        let up = b.tensor("up", 8192 * 16 * 384 / 2);
+        let up_scale = b.tensor("up_scale", 8192 * 16 * 384 / 32);
+        let part = b.tensor("part", 8192 * 16 * 3584 * 4);
+        let out = b.tensor("out", 8192 * 3584 * 2);
+        let up_weights = b.tensor("expert_weight_table", 896 * 8);
+        let up_scales = b.tensor("expert_scale_table", 896 * 8);
+        b.tensor("expert_weight_table_moe2", 896 * 8);
+        b.tensor("expert_scale_table_moe2", 896 * 8);
+        let all = b.all();
+        let align = b.emit(DevOp::MoeAlignPf, all.clone(), &[], |d| {
+            d.t[..5].copy_from_slice(&[meta, routes, row_token, row_partidx, row_gate]);
+            d.i[..3].copy_from_slice(&[8192, 896, 16]);
+        });
+        let glu = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[align], |d| {
+            d.t.copy_from_slice(&[
+                up,
+                act,
+                up_weights,
+                up_scales,
+                meta,
+                row_token,
+                row_partidx,
+                up_scale,
+            ]);
+            d.i[..6].copy_from_slice(&[384, 3584, 896, 2, 0, 1]);
+        });
+        let down = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[glu], |d| {
+            d.t.copy_from_slice(&[
+                part,
+                up,
+                up_weights,
+                up_scales,
+                meta,
+                up_scale,
+                row_partidx,
+                row_gate,
+            ]);
+            d.i[..4].copy_from_slice(&[3584, 384, 896, 2]);
+        });
+        let combine = b.emit(DevOp::MoeCombinePf, all.clone(), &[down], |d| {
+            d.t[0] = out;
+            d.t[3] = part;
+            d.i[..3].copy_from_slice(&[3584, 16, 8192]);
+        });
+        if with_reduction {
+            b.emit(DevOp::XReduce, all, &[combine], |d| {
+                d.t[0] = out;
+                d.i[0] = 8192 * 3584;
+                d.i[1] = 8;
+            });
+        }
+        b
+    }
+
+    #[test]
+    fn whole_graph_ep_rewrite_encodes_full_i_and_fixed_slot_ownership() {
+        let mut b = graph(true);
+        assert_eq!(b.rewrite_replicated_moe_prefill_ep(8), 1);
+        let align = &b.ops[0].inst;
+        let glu = &b.ops[1].inst;
+        let down = &b.ops[2].inst;
+        let combine = &b.ops[3].inst;
+        assert_eq!(align.i[5], 8);
+        assert_eq!((glu.i[0], glu.i[6]), (3072, 8));
+        assert_eq!((glu.t[2], glu.t[3]), (14, 15));
+        assert_eq!((down.i[1], down.i[6]), (3072, 8));
+        assert_eq!((down.t[2], down.t[3]), (14, 15));
+        assert_eq!((combine.t[4], combine.i[5], combine.i[6]), (0, 8, 896));
+        assert_eq!(b.tensors[1].bytes, (67 * 896 + 1) * 4);
+        assert_eq!(b.tensors[6].bytes, 8192 * 16 * 3072 / 2);
+        assert_eq!(b.tensors[7].bytes, 8192 * 16 * 3072 / 32);
+        assert_eq!(b.tensors[14].name, "expert_weight_table_ep");
+        assert_eq!(b.tensors[15].name, "expert_scale_table_ep");
+        assert_eq!(b.tensors[16].name, "expert_weight_table_moe2_ep");
+        assert_eq!(b.tensors[17].name, "expert_scale_table_moe2_ep");
+
+        // Shared tensor tables are adopted by every prefill rung. Rewriting an already widened
+        // declaration must be idempotent, not multiply it by the TP degree again.
+        assert_eq!(b.rewrite_replicated_moe_prefill_ep(8), 0);
+        assert_eq!(b.tensors[6].bytes, 8192 * 16 * 3072 / 2);
+    }
+
+    #[test]
+    fn whole_graph_ep_rewrite_requires_a_replicated_reduction_boundary() {
+        let mut b = graph(false);
+        assert_eq!(b.rewrite_replicated_moe_prefill_ep(8), 0);
+        assert!(b.ops.iter().all(|op| op.inst.i[6] == 0));
     }
 }
 

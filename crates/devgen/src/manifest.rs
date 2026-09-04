@@ -277,6 +277,9 @@ struct Shapes {
     /// t[0] is a [T,H] **f64** fixed-point accumulator. Same overrun class as `moe_pf_atomic`,
     /// and additionally op 87 would read f64 bytes as f32 without the arm.
     moe_pf_det: bool,
+    /// Compiler-declared replicated-input expert-parallel boundaries as
+    /// `(degree, experts, full_intermediate_width)` tuples.
+    moe_prefill_ep: BTreeSet<(u32, u32, u32)>,
     /// Any DENSE FlashMlaPrefill with `(i[6] & 0xff) > 1` — the causal KV-split partial
     /// layout (PLOW_MLA_PF_NS). The sparse GATHER arm reuses `i[6]` whole as `cap`,
     /// disambiguated by the union table in `t[7]`.
@@ -371,6 +374,17 @@ fn shapes(m: &Model) -> Shapes {
                 // expert COUNT as an encoding.
                 DevOp::MoeGroupGluPf | DevOp::MoeGroupDownPf => {
                     s.moe_enc.insert(inst.i[3]);
+                    if inst.i[6] > 1 {
+                        s.moe_prefill_ep.insert((
+                            inst.i[6],
+                            inst.i[2],
+                            if op == DevOp::MoeGroupGluPf {
+                                inst.i[0]
+                            } else {
+                                inst.i[1]
+                            },
+                        ));
+                    }
                     // i[7] carries the activation-side arms: a8 on GLU, part16 on DOWN.
                     if inst.i[7] != 0 {
                         if op == DevOp::MoeGroupGluPf {
@@ -672,6 +686,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_pf_atomic".into(), json!(s.moe_pf_atomic));
     f.insert("moe_pf_det".into(), json!(s.moe_pf_det));
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
+    f.insert("moe_prefill_ep".into(), json!(!s.moe_prefill_ep.is_empty()));
     f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
@@ -1358,6 +1373,53 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         "required": kda_intra_wave_items_required,
     });
     let s = shapes(m);
+    let mut ep_tables = BTreeSet::new();
+    let ep_extra_resident_bytes_per_rank = m
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|d| d.op == DevOp::MoeGroupGluPf as u16 && d.i[6] > 1 && ep_tables.insert(d.t[2]))
+        .map(|d| {
+            let degree = u64::from(d.i[6]);
+            let local_experts = u64::from(d.i[2]).div_ceil(degree);
+            let h = u64::from(d.i[1]);
+            let i = u64::from(d.i[0]);
+            let matrix_payload = h * i / 2;
+            let matrix_scales = h * (i / 32);
+            let has_moe2 = m
+                .tensors
+                .get(d.t[2] as usize)
+                .and_then(|t| t.name.strip_suffix("expert_weight_table_ep"))
+                .is_some_and(|pfx| {
+                    m.tensors
+                        .iter()
+                        .any(|t| t.name == format!("{pfx}expert_weight_table_moe2_ep"))
+                });
+            let moe2 = if has_moe2 {
+                matrix_payload + h.div_ceil(256) * 256 * ((i / 32).div_ceil(8) * 8)
+            } else {
+                0
+            };
+            local_experts * (3 * (matrix_payload + matrix_scales) + moe2)
+        })
+        .sum::<u64>();
+    objects["lean"]["moe_prefill_ep"] = json!({
+        "required": !s.moe_prefill_ep.is_empty(),
+        "boundaries": s.moe_prefill_ep.iter().map(|(degree, experts, full_i)| json!({
+            "degree": degree,
+            "experts": experts,
+            "full_intermediate_width": full_i,
+            "ownership": "balanced_contiguous_whole_experts",
+        })).collect::<Vec<_>>(),
+        "objects": ["moe_ep_align", "moe_stage1_mxfp4", "moe_ep_stage2", "moe_ep_combine"],
+        "additional_resident_bytes_per_rank": ep_extra_resident_bytes_per_rank,
+        "capacity_ack_env": "PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES",
+        "resource_contract": {
+            "wavefront_size": 64,
+            "private_segment_bytes": 0,
+            "policy": "refuse",
+        },
+    });
     let mut f = features(&union);
     let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
         inst.op == DevOp::AttnRes as u16
@@ -1451,6 +1513,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
             "max_chunk": s.max_chunk,
             "prefill_buckets": s.prefill_buckets,
             "moe_enc": s.moe_enc,
+            "moe_prefill_ep": s.moe_prefill_ep,
         },
         "features": f,
         // The four precision axes, so "what precision is this packet?" is a lookup rather than a
@@ -1594,6 +1657,10 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/lean/kda_intra_wave_items/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let moe_prefill_ep_required = manifest
+        .pointer("/objects/lean/moe_prefill_ep/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let kda_chunk_qpre = union
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
@@ -1605,6 +1672,10 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS {}\n",
         if kda_intra_wave_items_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",
+        if moe_prefill_ep_required { 1 } else { 0 }
     ));
     for o in DevOp::ALL {
         let name = op_name(*o);
@@ -1768,6 +1839,39 @@ mod tests {
         assert!(ops.contains(&"FlashDecodeFp8"));
         assert!(ops.contains(&"Gemv"));
         assert!(!ops.contains(&"FlashMlaDecode"));
+    }
+
+    #[test]
+    fn expert_parallel_objects_and_geometry_come_from_packet_immediates() {
+        let mut m = model();
+        m.progs[0].insts.extend([
+            inst(DevOp::MoeGroupGluPf, [3072, 3584, 896, 2, 0, 1, 8, 0]),
+            inst(DevOp::MoeGroupDownPf, [3584, 3072, 896, 2, 0, 0, 8, 0]),
+        ]);
+        let man = build(&m, "gfx950");
+        let ep = &man["objects"]["lean"]["moe_prefill_ep"];
+        assert_eq!(ep["required"], true);
+        assert_eq!(ep["boundaries"][0]["degree"], 8);
+        assert_eq!(ep["boundaries"][0]["experts"], 896);
+        assert_eq!(ep["boundaries"][0]["full_intermediate_width"], 3072);
+        assert_eq!(ep["resource_contract"]["wavefront_size"], 64);
+        assert_eq!(ep["resource_contract"]["private_segment_bytes"], 0);
+        assert_eq!(
+            ep["additional_resident_bytes_per_rank"],
+            112u64 * 3 * (3584u64 * 3072 / 2 + 3584u64 * (3072 / 32))
+        );
+        assert_eq!(
+            ep["capacity_ack_env"],
+            "PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES"
+        );
+        assert!(config_header(&man).contains("#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP 1"));
+
+        let ordinary = build(&model(), "gfx950");
+        assert_eq!(
+            ordinary["objects"]["lean"]["moe_prefill_ep"]["required"],
+            false
+        );
+        assert!(config_header(&ordinary).contains("#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP 0"));
     }
 
     /// One opcode, two bodies: hd is an instruction field, so hd256 and hd512

@@ -55,6 +55,13 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
     echo "decode MLA segment objects require packet-paired inventory pruning" >&2; exit 2; }
   need_decode_mla=1
 fi
+need_moe_prefill_ep=0
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP 1' "$PLOW_HSACO_CONFIG"; then
+  [ "$ARCH" = gfx950 ] || {
+    echo "prefill expert-parallel objects are supported only on gfx950" >&2; exit 2; }
+  need_moe_prefill_ep=1
+fi
 mkdir -p "$OUT"; cd "$OUT"
 
 # Delete FIRST. A build that fails must leave nothing behind to run.
@@ -77,6 +84,9 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
       moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf \
       moe_combine_gfx950.co moe_combine_gfx950.elf \
+      moe_ep_align_gfx950.co moe_ep_align_gfx950.elf \
+      moe_ep_stage2_gfx950.co moe_ep_stage2_gfx950.elf \
+      moe_ep_combine_gfx950.co moe_ep_combine_gfx950.elf \
       moe_decode_grouped_mxfp4_gfx950.co moe_decode_grouped_mxfp4_gfx950.elf \
       mla_materialized_hd192_v128_gfx950.co mla_materialized_hd192_v128_gfx950.elf \
       mla_materialize_pack_gfx950.co mla_materialize_pack_gfx950.elf
@@ -198,6 +208,26 @@ if [ "$ARCH" = gfx950 ]; then
     -DPLOW_REQUIRED_MARKER=plow_moe_combine_fixed_order_abi_1 \
     "$R/bench/amd/lean_moe_combine_ref/kernel.hip"
   MOE_COMBINE_ELFS="moe_combine_gfx950.elf"
+fi
+
+MOE_EP_ELFS=""
+if [ "$need_moe_prefill_ep" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_ep_align_gfx950.elf" plow_moe_ep_filter_align_gfx950 64 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_ep_filter_align_no_spill_1 \
+    "$R/bench/amd/moe_ep_boundary/filter_align.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_ep_stage2_gfx950.elf" plow_moe2_ep_full_i_16x16x128_gfx950 128 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe2_ep_full_i_vgpr_le_128 \
+    "$R/bench/amd/moe_ep_boundary/stage2_full_i.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_ep_combine_gfx950.elf" plow_moe_ep_combine_gfx950 64 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_ep_combine_no_spill_1 \
+    "$R/bench/amd/moe_ep_boundary/combine.hip"
+  MOE_EP_ELFS="moe_ep_align_gfx950.elf moe_ep_stage2_gfx950.elf moe_ep_combine_gfx950.elf"
 fi
 
 MOE_DECODE_GROUPED_ELFS=""
@@ -695,7 +725,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

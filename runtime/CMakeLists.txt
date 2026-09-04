@@ -667,6 +667,8 @@ option(PLOW_HSACO_MOE_STAGE1_LEAN
        "Emit the standalone gfx950 MXFP4 grouped-MoE stage-1 BK256 object" ON)
 option(PLOW_HSACO_MOE_COMBINE_LEAN
        "Emit the standalone gfx950 fixed-order f32-part MoE combine object" ON)
+option(PLOW_HSACO_MOE_PREFILL_EP
+       "Emit the default-off gfx950 replicated-input expert-parallel boundary objects" OFF)
 option(PLOW_HSACO_MOE_DECODE_GROUPED
        "Emit the default-off gfx950 grouped MXFP4 decode GLU+DOWN object" OFF)
 option(PLOW_HSACO_MLA_MATERIALIZED_OPUS
@@ -1484,6 +1486,45 @@ if(PLOW_GFX950_HSACO)
             VERBATIM)
         add_custom_target(moe_combine_gfx950 DEPENDS "${_hs_moe_combine_out}")
         list(APPEND _hs_outs "${_hs_moe_combine_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_PREFILL_EP)
+        set(_hs_moe_ep_dir "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/moe_ep_boundary")
+        set(_hs_moe_ep_align_out "${PLOW_HSACO_DIR}/moe_ep_align_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe_ep_align_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe_ep_align_out}"
+                    plow_moe_ep_filter_align_gfx950 64 2
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe_ep_filter_align_no_spill_1
+                    "${_hs_moe_ep_dir}/filter_align.hip"
+            DEPENDS "${_hs_moe_ep_dir}/filter_align.hip" "${_hs_run}"
+            COMMENT "hipcc moe_ep_align_gfx950.elf"
+            VERBATIM)
+        set(_hs_moe_ep_stage2_out "${PLOW_HSACO_DIR}/moe_ep_stage2_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe_ep_stage2_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe_ep_stage2_out}"
+                    plow_moe2_ep_full_i_16x16x128_gfx950 128 2
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe2_ep_full_i_vgpr_le_128
+                    "${_hs_moe_ep_dir}/stage2_full_i.hip"
+            DEPENDS "${_hs_moe_ep_dir}/stage2_full_i.hip" "${_hs_run}"
+            COMMENT "hipcc moe_ep_stage2_gfx950.elf"
+            VERBATIM)
+        set(_hs_moe_ep_combine_out "${PLOW_HSACO_DIR}/moe_ep_combine_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe_ep_combine_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe_ep_combine_out}"
+                    plow_moe_ep_combine_gfx950 64 2
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe_ep_combine_no_spill_1
+                    "${_hs_moe_ep_dir}/combine.hip"
+            DEPENDS "${_hs_moe_ep_dir}/combine.hip" "${_hs_run}"
+            COMMENT "hipcc moe_ep_combine_gfx950.elf"
+            VERBATIM)
+        list(APPEND _hs_outs
+             "${_hs_moe_ep_align_out}" "${_hs_moe_ep_stage2_out}" "${_hs_moe_ep_combine_out}")
     endif()
 
     if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_DECODE_GROUPED)

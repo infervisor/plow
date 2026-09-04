@@ -2,11 +2,13 @@
 
 ## Decision
 
-The checkpoint/runtime memory layout does **not** block expert parallelism. The packed-expert
-loader already switches from TP to EP when a graph packet declares the checkpoint's full expert
-intermediate width: it packs a contiguous balanced expert range and leaves remote entries null.
-The shared ownership helper now covers non-divisible expert counts as well as the 896/8 case.
-The missing work is graph lowering and full-width specialist kernels.
+The checkpoint bytes support whole-expert ownership, but the current shared prefill/decode device
+table **does block production promotion**. Prefill EP needs one rank to own full-width weights for
+a subset of experts; unchanged decode needs every rank to own an intermediate-width slice of every
+expert. Those sets cannot be address views of one allocation: gate/up TP shards select rows of
+every expert, while EP selects every row of a subset. The default-off graph route therefore emits
+separate `_ep` table declarations and the loader keeps the original TP tables for decode. It also
+refuses the duplicate allocation unless the operator supplies an audited byte allowance.
 
 Transport must follow graph tensor placement:
 
@@ -102,6 +104,24 @@ The smallest production integration is:
 
 No graph integration is promoted by this experiment. The isolated full-I boundary clears the
 projection gate below; graph lowering still needs a matched eight-rank compound/tolerance gate.
+
+## Decode-safe resident-memory gate
+
+The local checkpoint was audited directly from all 96 safetensor headers. Its 92 routed layers
+contain 1,446,456,066,048 expert payload+scale bytes (1,347.117 GiB), exactly
+15,722,348,544 bytes/layer. A TP8 rank currently owns 168.390 GiB of primary expert data. The
+stage-2 shuffled down copy adds 56.130 GiB/rank. Keeping decode TP unchanged while adding EP
+therefore needs another **224.520 GiB/rank** (primary gate/up/down plus shuffled down), before
+activation tensors and non-expert weights. MI355X exposes 288 GiB/rank, so the dual layout cannot
+fit this production serve.
+
+The manifest records the exact graph-derived `additional_resident_bytes_per_rank` and names
+`PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES` as the required capacity acknowledgement. The runtime
+recomputes the amount from packet geometry and refuses a missing or smaller allowance before
+loading companion weights. This keeps the generic route usable for smaller routed-MoE graphs but
+blocks K3 promotion. Closing the architecture gap requires changing decode to whole-expert
+ownership (EP decode plus a collective) or paging/repacking expert layouts between phases; neither
+is an address-view change and both are outside this isolated prefill experiment.
 
 ## Full-I experiment build
 

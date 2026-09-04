@@ -8,7 +8,7 @@ import torch
 T, TOPK, E, RANKS, BM = 8192, 16, 896, 8, 64
 BEGIN, END = 0, E // RANKS
 NPART = 64
-CAPACITY = T * TOPK + (END - BEGIN) * (BM - 1)
+CAPACITY = T * TOPK + E * (BM - 1)
 
 
 def call(lib, name, *args):
@@ -37,8 +37,8 @@ def main():
     gate_bits = struct.unpack("I", struct.pack("f", 0.25))[0]
     packed = torch.tensor([e | (gate_bits << 32) for e in experts],
                           dtype=torch.int64, device="cuda")
-    meta = torch.empty(3 * (END - BEGIN) + 1, dtype=torch.int32, device="cuda")
-    partial = torch.empty(NPART * (END - BEGIN), dtype=torch.int32, device="cuda")
+    meta = torch.empty(3 * E + 1, dtype=torch.int32, device="cuda")
+    partial = torch.empty(NPART * E, dtype=torch.int32, device="cuda")
     row_token = torch.empty(CAPACITY, dtype=torch.int32, device="cuda")
     row_partidx = torch.empty(CAPACITY, dtype=torch.int32, device="cuda")
     row_gate = torch.empty(CAPACITY, dtype=torch.float32, device="cuda")
@@ -46,7 +46,7 @@ def main():
     holders = [ctypes.c_void_p(x.data_ptr()) for x in
                (packed, meta, partial, row_token, row_partidx, row_gate)]
     holders += [ctypes.c_uint32(x) for x in
-                (T, TOPK, BEGIN, END, CAPACITY)]
+                (T, TOPK, E, BEGIN, END, CAPACITY)]
 
     def launch():
         for phase, blocks in ((1, NPART), (2, 1), (3, NPART), (4, NPART)):
@@ -62,18 +62,18 @@ def main():
 
     launch(); torch.cuda.synchronize()
     mh = meta.cpu()
-    rows = int(mh[2 * (END - BEGIN) + END - BEGIN]) * BM
-    expected = [[] for _ in range(END - BEGIN)]
+    rows = int(mh[3 * E]) * BM
+    expected = [[] for _ in range(E)]
     for p, e in enumerate(experts):
         if BEGIN <= e < END:
-            expected[e - BEGIN].append(p)
+            expected[e].append(p)
     expected_idx = []
     for bucket in expected:
         expected_idx.extend(bucket + [-1] * ((-len(bucket)) % BM))
     got = row_partidx[:rows].cpu().tolist()
     if got != expected_idx:
         raise SystemExit("stable filter/sort oracle mismatch")
-    if any(int(mh[END - BEGIN + e]) != len(bucket)
+    if any(int(mh[E + e]) != len(bucket)
            for e, bucket in enumerate(expected)):
         raise SystemExit("count oracle mismatch")
 
