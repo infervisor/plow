@@ -99,10 +99,12 @@ impl ServeEngine {
         }
     }
 
-    /// Write rank 0's last completed raw AMD packet trace.
+    /// Write the last completed raw AMD packet trace.
     ///
     /// The trace buffer is allocated only when `--trace-raw` / `PLOW_TRACE_RAW`
-    /// is set before engine load. Callers must quiesce the model mux first.
+    /// is set before engine load. `PLOW_TRACE_ALLRANKS=1` writes TP ranks as
+    /// `path.rkN`; otherwise only rank 0 is written. Callers must quiesce the
+    /// model mux first.
     #[cfg(feature = "hsa")]
     pub fn write_amd_packet_trace(&self, path: &Path) -> crate::Result<()> {
         match self {
@@ -1223,11 +1225,35 @@ mod amd_serve {
             self.prefill_turn = (slot + 1) % self.batch.max(1);
         }
 
-        /// Write rank 0's last completed program trace.
+        fn packet_trace_paths(path: &Path, n_gpu: usize, all: bool) -> Vec<std::path::PathBuf> {
+            (0..if all { n_gpu } else { 1 })
+                .map(|rank| {
+                    if all {
+                        let mut out = path.as_os_str().to_owned();
+                        out.push(format!(".rk{rank}"));
+                        std::path::PathBuf::from(out)
+                    } else {
+                        path.to_owned()
+                    }
+                })
+                .collect()
+        }
+
+        /// Write the last completed program trace. `PLOW_TRACE_ALLRANKS=1` is a
+        /// diagnostic-only TP mode that appends `.rkN` to `path`.
         pub fn write_packet_trace(&self, path: &Path) -> Result<()> {
             match &self.ranks {
                 Ranks::One(e) => e.trace_write(path),
-                Ranks::Tp(g) => g.rank(0).trace_write(path),
+                Ranks::Tp(g) => {
+                    let all = std::env::var_os("PLOW_TRACE_ALLRANKS").is_some_and(|v| v != "0");
+                    for (rank, out) in Self::packet_trace_paths(path, g.n_gpu(), all)
+                        .iter()
+                        .enumerate()
+                    {
+                        g.rank(rank).trace_write(&out)?;
+                    }
+                    Ok(())
+                }
             }
         }
 
@@ -1652,10 +1678,26 @@ mod amd_serve {
         use super::{
             bounded_deferred_quantum, commit_packed_prefill, invalidate_prefix_metadata,
             packable_prefill_step, packed_prefill_dispatch_supported, parse_snapshot_tensors,
-            snapshot_file_component, split_pending_prefill, stage_parked, PfCursor,
+            snapshot_file_component, split_pending_prefill, stage_parked, AmdServe, PfCursor,
             DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
+
+        #[test]
+        fn packet_trace_paths_cover_single_and_all_tp_ranks() {
+            assert_eq!(
+                AmdServe::packet_trace_paths(std::path::Path::new("trace"), 8, false),
+                [std::path::PathBuf::from("trace")]
+            );
+            assert_eq!(
+                AmdServe::packet_trace_paths(std::path::Path::new("trace"), 3, true),
+                [
+                    std::path::PathBuf::from("trace.rk0"),
+                    std::path::PathBuf::from("trace.rk1"),
+                    std::path::PathBuf::from("trace.rk2"),
+                ]
+            );
+        }
 
         #[test]
         fn deferred_quantum_is_bounded_by_scheduler_capture_and_context() {
