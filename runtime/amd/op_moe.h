@@ -42,9 +42,9 @@
 #ifndef PLOW_MOE_MFMA
 #define PLOW_MOE_MFMA 0
 #endif
-/* Router selection: 0 = one all-pairs rank pass; 1 = k parallel block-max passes.
- * K3's 896 experts/top-16 benefit from changing O(E²/threads) comparisons into
- * O(k*E/threads) plus 3*k barriers. Preserve the established path for other models. */
+/* Router selection: 0 = one all-pairs rank pass; 1 = per-wave rank + one merge (3 barriers);
+ * 2 = k block-max rounds (3*k barriers; the previous K3 arm, kept as the bench control).
+ * All three pick the same keys in the same order. Preserve the rank pass for other models. */
 #ifndef PLOW_MOE_ROUTER_SELECT
 #define PLOW_MOE_ROUTER_SELECT PLOW_K3
 #endif
@@ -439,7 +439,49 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
                    (unsigned char*)((unsigned long long*)(wl + PLOW_MOE_MAX_TOPK) +
                                     PLOW_MOE_MAX_GROUPS));
 
-#if PLOW_MOE_ROUTER_SELECT
+#if PLOW_MOE_ROUTER_SELECT == 1
+    {
+    /* WAVE-PARALLEL EXACT SELECT (3 barriers, was 3*k). Keys are unique and nonzero for every
+     * live expert, so top-k = the k lowest ranks. Each wave ranks only the keys it holds
+     * (uniform-address LDS reads broadcast) and publishes its own top-k; the global top-k is a
+     * subset of that union, so wave 0 ranks the PLOW_WAVES*k candidates once more. wl[rank] in
+     * descending-key order is exactly what the serial block_max rounds produced; a zero key
+     * (only a masked expert n_exp-1) never ranks, and the n_exp-1 pre-fill is the rounds' pick
+     * once nothing nonzero is left. */
+    unsigned long long* cand =
+        (unsigned long long*)((unsigned char*)(wl + PLOW_MOE_MAX_TOPK) +
+                              PLOW_MOE_MAX_GROUPS * 8u + PLOW_MOE_MAX_GROUPS);
+    const unsigned lane = tid & (PLOW_WAVE - 1u), wave = tid / PLOW_WAVE;
+    const unsigned per = (n_exp + PLOW_THREADS - 1u) / PLOW_THREADS;
+    if (tid < PLOW_WAVES * PLOW_MOE_MAX_TOPK) cand[tid] = 0ull;
+    if (tid < k) wl[tid] = n_exp - 1u;
+    __syncthreads();
+    for (unsigned c = 0; c < per; c++) {
+        const unsigned e = tid + c * PLOW_THREADS;
+        const unsigned long long my = e < n_exp ? keys[e] : 0ull;
+        unsigned rank = 0;
+        for (unsigned c2 = 0; c2 < per; c2++) {
+            const unsigned base = wave * PLOW_WAVE + c2 * PLOW_THREADS;
+            const unsigned lim = base + PLOW_WAVE < n_exp ? base + PLOW_WAVE : n_exp;
+#pragma unroll 16
+            for (unsigned f = base; f < lim; f++) rank += (keys[f] > my);
+        }
+        if (my != 0ull && rank < k) cand[wave * PLOW_MOE_MAX_TOPK + rank] = my;
+    }
+    __syncthreads();
+    if (wave == 0) {
+        const unsigned nc = PLOW_WAVES * PLOW_MOE_MAX_TOPK;
+        for (unsigned i = lane; i < nc; i += PLOW_WAVE) {
+            const unsigned long long my = cand[i];
+            unsigned rank = 0;
+#pragma unroll 16
+            for (unsigned f = 0; f < nc; f++) rank += (cand[f] > my);
+            if (my != 0ull && rank < k) wl[rank] = n_exp - 1u - (unsigned)(my & 0xFFFFFu);
+        }
+    }
+    __syncthreads();
+    }
+#elif PLOW_MOE_ROUTER_SELECT
 #if PLOW_MOE_ROUTER_SELECT_LOCAL
     if (n_exp <= 4u * PLOW_THREADS) {
         unsigned long long local[4] = {0ull, 0ull, 0ull, 0ull};
