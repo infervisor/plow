@@ -45,7 +45,7 @@ TTFT was 1262.4-1262.9 ms on every fold (prefill unaffected). E2E 8192→256 8,5
   consistent with the network to within 0.3 µs/layer.
 - Selection: gain = 34.70 − (17.09 + 10.3) = 7.3 µs/layer = 21% of the interpreter body ≥ the
   10% floor → `Standalone`. Published under campaign `k3-moe-decode-network-derived-20260904`,
-  digests `gfx950-870078e93f2c92f0` / `rocm-7.14.0-nix`.
+  digests `gfx950-e95f0a91a5a3c577` (emitter build label) / `rocm-7.14.0-nix`.
 
 ## Verification that the rule reproduces the measured packet
 
