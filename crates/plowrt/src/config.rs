@@ -155,6 +155,10 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "vmm-live", env = "PLOW_VMM_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_live: bool,
 
+    /// Retain whole sliding-ring slots on first use; requires live KV without prefix reuse.
+    #[arg(long = "vmm-live-rings", env = "PLOW_VMM_LIVE_RINGS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_live_rings: bool,
+
     /// VMM sharing block size (MiB). 2 MiB ≈ 4096 tokens at hd256 bf16.
     #[arg(
         long = "vmm-block-mib",
@@ -776,6 +780,21 @@ mod tests {
         let config = super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(config.vmm_live);
         assert!(!config.vmm_prefix && !config.prefix_cache);
+        assert!(!config.vmm_live_rings);
+        let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "vmm_live_rings")
+            .unwrap();
+        assert_eq!(arg.get_default_values(), ["false"]);
+        let matches = command
+            .try_get_matches_from(["test", "--vmm-live=true", "--vmm-live-rings=true"])
+            .unwrap();
+        assert!(
+            super::NvidiaRuntimeConfig::from_arg_matches(&matches)
+                .unwrap()
+                .vmm_live_rings
+        );
     }
 
     #[test]

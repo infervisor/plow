@@ -11,6 +11,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use plowrt::device::cuda::CudaBackend;
 use plowrt::exec::gpu::GpuEngine;
@@ -103,22 +104,29 @@ fn compare_snapshot(actual: LogitSnapshot, expected: &LogitSnapshot, case: &str)
 
 #[test]
 fn serialized_tma_slots_match_isolated_full_logits() {
-    serialized_tma_slot_parity(false);
+    serialized_tma_slot_parity(false, false);
 }
 
 #[test]
 fn live_tma_all_slots_match_flat_full_logits() {
-    serialized_tma_slot_parity(true);
+    serialized_tma_slot_parity(true, false);
 }
 
-fn serialized_tma_slot_parity(all_slots_live: bool) {
+#[test]
+fn live_ring_prefix_all_slots_match_live_full_logits() {
+    serialized_tma_slot_parity(true, true);
+}
+
+fn serialized_tma_slot_parity(all_slots_live: bool, lazy_rings: bool) {
     let _env = common::env_guard();
     if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
         eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + B>=2 TMA assets)");
         return;
     }
     let _config = common::EnvScope::set(&[
-        ("PLOW_VMM_LIVE", "0"),
+        ("PLOW_VMM_LIVE", if lazy_rings { "1" } else { "0" }),
+        ("PLOW_VMM_LIVE_RINGS", "0"),
+        ("PLOW_MULTISTEP", "0"),
         ("PLOW_VMM_PREFIX", "0"),
         ("PLOW_PREFIX_CACHE", "0"),
         ("PLOW_PF_BATCH", "0"),
@@ -164,7 +172,14 @@ fn serialized_tma_slot_parity(all_slots_live: bool) {
     let mut e =
         GpuEngine::load(Arc::clone(&be), &assets, &assets.join("checkpoint")).expect("engine load");
     assert!(e.batch() >= 2 && e.has_prefill() && e.max_ctx() >= 16400);
-    assert!(e.vmm_stats().is_none(), "gate requires flat KV allocation");
+    assert_eq!(e.vmm_stats().is_some(), lazy_rings);
+    assert!(
+        e.live_ring_stats().is_none(),
+        "baseline rings must stay flat"
+    );
+    if lazy_rings {
+        assert_eq!(e.batch(), 16, "cold-prefix gate requires B16 ladder");
+    }
     let slots = if all_slots_live { e.batch() } else { 2 };
     let prompts: Vec<Vec<u32>> = [8192, 16384, 8193, 16385]
         .into_iter()
@@ -204,13 +219,66 @@ fn serialized_tma_slot_parity(all_slots_live: bool) {
         if live {
             drop(e);
             std::env::set_var("PLOW_VMM_LIVE", "1");
+            std::env::set_var("PLOW_VMM_LIVE_RINGS", if lazy_rings { "1" } else { "0" });
             e = GpuEngine::load(Arc::clone(&be), &assets, &assets.join("checkpoint"))
                 .expect("live engine load");
             assert_eq!(e.batch(), slots);
         }
+        if live && lazy_rings {
+            assert_eq!(e.live_ring_stats().unwrap().mapped_slots, 0);
+            for (case, slot, prefill_slots, prefix) in [(0, 0, 1, 1), (1, 3, 2, 4), (2, 15, 5, 16)]
+            {
+                let prompt = &prompts[case];
+                let start = Instant::now();
+                e.begin_slot(slot, prompt.len() + 13)
+                    .expect("cold slot map");
+                eprintln!(
+                    "cold slot={slot} begin_ms={} rings={:?}",
+                    start.elapsed().as_secs_f64() * 1e3,
+                    e.live_ring_stats()
+                );
+                let mut token = e.prefill_slot(slot, prompt).expect("cold slot prefill");
+                compare_snapshot(
+                    snapshot(&mut e, 0, token),
+                    &reference[case][0],
+                    &format!("cold slot={slot} prefill"),
+                );
+                assert_eq!(e.live_ring_stats().unwrap().mapped_slots, prefill_slots);
+                e.step_slots(&[(slot, token)], &mut decoded)
+                    .expect("cold rung decode");
+                token = decoded[0];
+                compare_snapshot(
+                    snapshot(&mut e, slot, token),
+                    &reference[case][1],
+                    &format!("cold slot={slot} decode"),
+                );
+                let stats = e.live_ring_stats().unwrap();
+                assert_eq!((stats.mapped_slots, stats.mapped_prefix), (prefix, prefix));
+                token = e
+                    .consume_prompt(slot, &[token], &mut decoded)
+                    .expect("ring prompt continuation");
+                compare_snapshot(
+                    snapshot(&mut e, slot, token),
+                    &reference[case][2],
+                    &format!("cold slot={slot} continuation"),
+                );
+                assert_eq!(e.live_ring_stats(), Some(stats));
+                let (free, total) = be.mem_info().unwrap();
+                eprintln!(
+                    "cold slot={slot} prefix={prefix} rings={stats:?} used_bytes={}",
+                    total - free
+                );
+            }
+        }
+        let retained = e.live_ring_stats();
         for slot in 0..e.batch() {
             e.begin_slot(slot, 1).expect("clear baseline positions");
         }
+        assert_eq!(
+            e.live_ring_stats(),
+            retained,
+            "slot reset must retain ring backing"
+        );
 
         let mut active: Vec<usize> = (0..slots)
             .map(|slot| if slot < 2 { slot } else { slot + 2 })
@@ -264,7 +332,7 @@ fn serialized_tma_slot_parity(all_slots_live: bool) {
             for slot in 0..e.batch() {
                 assert_eq!(e.attached_rows(slot), 0);
             }
-            if live {
+            if live || lazy_rings {
                 let stats = e.vmm_stats().expect("live allocator enabled");
                 assert_eq!(stats.attach_hits + stats.attach_misses, 0);
                 assert_eq!(stats.tokens_attached + stats.blocks_shared_mapped, 0);
@@ -281,6 +349,9 @@ fn serialized_tma_slot_parity(all_slots_live: bool) {
         }
         for slot in 0..e.batch() {
             e.begin_slot(slot, 1).expect("release active slots");
+        }
+        if lazy_rings && live {
+            assert_eq!(e.live_ring_stats(), retained);
         }
     }
 }

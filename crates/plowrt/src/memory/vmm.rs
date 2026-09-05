@@ -208,10 +208,183 @@ impl VmmGeometry {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveRingTensor {
+    pub tensor: usize,
+    pub slot_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveRingStats {
+    pub reserved_bytes: u64,
+    pub resident_bytes: u64,
+    pub mapped_slots: usize,
+    pub mapped_prefix: usize,
+}
+
+struct RingWindow {
+    tensor: usize,
+    va: u64,
+    bytes: u64,
+    slot_bytes: u64,
+    handles: Vec<Option<u64>>,
+}
+
+/// Whole-slot ring backing is retained until teardown; absolute token frontiers do not apply.
+pub struct VmmRings {
+    ops: Arc<dyn VmmOps>,
+    windows: Vec<RingWindow>,
+    mapped: Vec<bool>,
+    prefix: usize,
+    slot_bytes: u64,
+    stats: LiveRingStats,
+}
+
+impl VmmRings {
+    pub fn new(ops: Arc<dyn VmmOps>, tensors: &[LiveRingTensor], batch: usize) -> Result<Self> {
+        let reject = || RuntimeError::Rejected("invalid live ring allocation geometry".into());
+        if batch == 0 {
+            return Err(reject());
+        }
+        let granularity = ops.granularity()?;
+        if granularity == 0 {
+            return Err(reject());
+        }
+        let mut slot_bytes = 0u64;
+        for (i, t) in tensors.iter().enumerate() {
+            if t.slot_bytes == 0
+                || t.slot_bytes % granularity != 0
+                || tensors[..i].iter().any(|p| p.tensor == t.tensor)
+            {
+                return Err(reject());
+            }
+            slot_bytes = slot_bytes.checked_add(t.slot_bytes).ok_or_else(reject)?;
+        }
+        let reserved_bytes = slot_bytes.checked_mul(batch as u64).ok_or_else(reject)?;
+        let mut rings = Self {
+            ops,
+            windows: Vec::with_capacity(tensors.len()),
+            mapped: vec![false; batch],
+            prefix: 0,
+            slot_bytes,
+            stats: LiveRingStats {
+                reserved_bytes,
+                resident_bytes: 0,
+                mapped_slots: 0,
+                mapped_prefix: 0,
+            },
+        };
+        for t in tensors {
+            let bytes = t.slot_bytes * batch as u64;
+            let va = rings.ops.reserve(bytes)?;
+            if va == 0 || va % granularity != 0 || va.checked_add(bytes).is_none() {
+                rings.ops.address_free(va, bytes);
+                return Err(reject());
+            }
+            rings.windows.push(RingWindow {
+                tensor: t.tensor,
+                va,
+                bytes,
+                slot_bytes: t.slot_bytes,
+                handles: vec![None; batch],
+            });
+        }
+        Ok(rings)
+    }
+
+    pub fn tensor_va(&self, tensor: usize) -> Option<u64> {
+        self.windows
+            .iter()
+            .find(|w| w.tensor == tensor)
+            .map(|w| w.va)
+    }
+
+    pub fn stats(&self) -> LiveRingStats {
+        self.stats
+    }
+
+    pub fn ensure_slot(&mut self, slot: usize) -> Result<()> {
+        if slot >= self.mapped.len() {
+            return Err(RuntimeError::Rejected(
+                "live ring slot out of bounds".into(),
+            ));
+        }
+        if self.mapped[slot] {
+            return Ok(());
+        }
+        for i in 0..self.windows.len() {
+            let w = &self.windows[i];
+            let va = w.va + slot as u64 * w.slot_bytes;
+            let result = (|| {
+                let handle = self.ops.create(w.slot_bytes)?;
+                if let Err(e) = self.ops.map(va, w.slot_bytes, handle) {
+                    self.ops.release(handle);
+                    return Err(e);
+                }
+                if let Err(e) = self.ops.set_access(va, w.slot_bytes) {
+                    self.ops.unmap(va, w.slot_bytes);
+                    self.ops.release(handle);
+                    return Err(e);
+                }
+                Ok(handle)
+            })();
+            match result {
+                Ok(handle) => self.windows[i].handles[slot] = Some(handle),
+                Err(e) => {
+                    for w in &mut self.windows[..i] {
+                        if let Some(handle) = w.handles[slot].take() {
+                            self.ops
+                                .unmap(w.va + slot as u64 * w.slot_bytes, w.slot_bytes);
+                            self.ops.release(handle);
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        self.mapped[slot] = true;
+        while self.prefix < self.mapped.len() && self.mapped[self.prefix] {
+            self.prefix += 1;
+        }
+        self.stats.mapped_slots += 1;
+        self.stats.mapped_prefix = self.prefix;
+        self.stats.resident_bytes += self.slot_bytes;
+        Ok(())
+    }
+
+    pub fn ensure_prefix(&mut self, rows: usize) -> Result<()> {
+        if rows > self.mapped.len() {
+            return Err(RuntimeError::Rejected(
+                "live ring prefix out of bounds".into(),
+            ));
+        }
+        while self.prefix < rows {
+            self.ensure_slot(self.prefix)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VmmRings {
+    fn drop(&mut self) {
+        for w in &mut self.windows {
+            for (slot, handle) in w.handles.iter_mut().enumerate() {
+                if let Some(handle) = handle.take() {
+                    self.ops
+                        .unmap(w.va + slot as u64 * w.slot_bytes, w.slot_bytes);
+                    self.ops.release(handle);
+                }
+            }
+            self.ops.address_free(w.va, w.bytes);
+        }
+    }
+}
+
 pub struct LiveKvLayout {
     pub geometry: VmmGeometry,
     /// Synthetic allocator track index → actual packet K/V handles.
     pub full_tensors: Vec<[usize; 2]>,
+    pub ring_tensors: Vec<LiveRingTensor>,
     pub cache_tensors: Vec<usize>,
 }
 
@@ -281,6 +454,7 @@ impl LiveKvLayout {
             }
         }
         let mut full_tensors = Vec::new();
+        let mut ring_tensors = Vec::new();
         let mut full_shape = None;
         let mut cache_tensors = Vec::new();
         for (&pair, &(heads, hd, _, window, _)) in &caches {
@@ -296,6 +470,13 @@ impl LiveKvLayout {
                 }
                 full_shape = Some((heads, hd));
                 full_tensors.push(pair);
+            } else {
+                for tensor in pair {
+                    ring_tensors.push(LiveRingTensor {
+                        tensor,
+                        slot_bytes: blob.tensors[tensor].bytes / u64::from(batch),
+                    });
+                }
             }
         }
         let (kvh_full, hd_full) = full_shape.ok_or_else(|| reject("no supported full KV cache"))?;
@@ -461,6 +642,7 @@ impl LiveKvLayout {
                 batch,
             },
             full_tensors,
+            ring_tensors,
             cache_tensors,
         })
     }
@@ -2477,3 +2659,7 @@ mod tests {
         assert_ne!(b[1], a[1]);
     }
 }
+
+#[cfg(test)]
+#[path = "vmm_ring_tests.rs"]
+mod ring_tests;

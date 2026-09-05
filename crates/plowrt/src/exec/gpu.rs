@@ -367,11 +367,11 @@ const SMEM_PF: u32 = 21312 * 4;
 
 /// VMM live allocation or prefix-sharing state: the pool
 /// backing every FULL layer's `kv.{l}.k/v` tensor with per-sequence VA
-/// windows, plus the sliding-ring metadata the boundary snapshots need
-/// (sliding layers stay on cudaMalloc; their last `window` rows are
-/// D2D-copied to/from a snapshot buffer at publish/attach — plan §8).
+/// windows. Live mode can retain demand-mapped whole-slot rings; prefix
+/// mode keeps rings flat and snapshots their last `window` rows.
 struct VmmServe {
     kv: crate::memory::vmm::VmmKv,
+    rings: Option<crate::memory::vmm::VmmRings>,
     tensor_tracks: Vec<(usize, u32, u32)>,
     cache_tensors: Vec<usize>,
     /// Per sliding layer: (devp index of `kv.{l}.k`, of `kv.{l}.v`,
@@ -2965,7 +2965,15 @@ impl GpuEngine {
         let vmm = {
             let run = || {
                 let config = RuntimeConfig::get();
-                if RuntimeConfig::env_bool_or("PLOW_VMM_LIVE", config.nv.vmm_live) {
+                let live = RuntimeConfig::env_bool_or("PLOW_VMM_LIVE", config.nv.vmm_live);
+                let rings =
+                    RuntimeConfig::env_bool_or("PLOW_VMM_LIVE_RINGS", config.nv.vmm_live_rings);
+                if rings && !live {
+                    return Err(RuntimeError::Rejected(
+                        "live rings require PLOW_VMM_LIVE=1".into(),
+                    ));
+                }
+                if live {
                     if RuntimeConfig::env_bool_or("PLOW_VMM_PREFIX", config.nv.vmm_prefix)
                         || RuntimeConfig::env_bool_or("PLOW_PREFIX_CACHE", config.nv.prefix_cache)
                     {
@@ -2973,7 +2981,7 @@ impl GpuEngine {
                             "live KV allocation requires prefix caching off".into(),
                         ));
                     }
-                    Self::vmm_live_bringup(&be, &blob).map(Some)
+                    Self::vmm_live_bringup(&be, &blob, rings).map(Some)
                 } else {
                     Ok(Self::vmm_bringup(&be, &blob, checkpoint_dir))
                 }
@@ -2992,8 +3000,11 @@ impl GpuEngine {
         // and the upload loop cannot disagree about it.
         let vmm_va_of = |id: usize| -> Option<u64> {
             let v = vmm.as_ref()?;
-            let &(_, layer, tensor) = v.tensor_tracks.iter().find(|&&(i, _, _)| i == id)?;
-            v.kv.tensor_va(layer, tensor)
+            if let Some(&(_, layer, tensor)) = v.tensor_tracks.iter().find(|&&(i, _, _)| i == id) {
+                v.kv.tensor_va(layer, tensor)
+            } else {
+                v.rings.as_ref().and_then(|rings| rings.tensor_va(id))
+            }
         };
         let slab_bytes: u64 = blob
             .tensors
@@ -4135,7 +4146,10 @@ impl GpuEngine {
         // dynamic-kvrow arm fired (the local `kvrow` was cleared above). A B==1
         // legacy cubin still host-patches i[3] each step, so multi-step is off.
         let dyn_kvrow = batch > 1 || kvrow.is_empty();
-        let multistep = if recurrent.is_some() || !decode_packet_roles.is_empty() {
+        let multistep = if recurrent.is_some()
+            || !decode_packet_roles.is_empty()
+            || vmm.as_ref().is_some_and(|v| v.rings.is_some())
+        {
             None
         } else {
             Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow).unwrap_or_else(|e| {
@@ -4318,11 +4332,24 @@ impl GpuEngine {
         Ok(())
     }
 
-    fn vmm_live_bringup(be: &Arc<CudaBackend>, blob: &DevBlob) -> Result<VmmServe> {
+    fn vmm_live_bringup(
+        be: &Arc<CudaBackend>,
+        blob: &DevBlob,
+        live_rings: bool,
+    ) -> Result<VmmServe> {
         let layout = crate::memory::vmm::LiveKvLayout::from_blob(blob)?;
         let config = RuntimeConfig::get();
         let block_hint =
             RuntimeConfig::env_parse_or("PLOW_VMM_BLOCK_MIB", config.nv.vmm_block_mib as u64) << 20;
+        let rings = if live_rings && !layout.ring_tensors.is_empty() {
+            Some(crate::memory::vmm::VmmRings::new(
+                Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
+                &layout.ring_tensors,
+                layout.geometry.batch as usize,
+            )?)
+        } else {
+            None
+        };
         let kv = crate::memory::vmm::VmmKv::new_live(
             Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
             layout.geometry,
@@ -4340,6 +4367,7 @@ impl GpuEngine {
             .collect();
         Ok(VmmServe {
             kv,
+            rings,
             tensor_tracks,
             cache_tensors: layout.cache_tensors,
             slide: Vec::new(),
@@ -4519,6 +4547,7 @@ impl GpuEngine {
             cache_cap,
         ) {
             Ok(mut kv) => Some(VmmServe {
+                rings: None,
                 tensor_tracks: blob
                     .tensors
                     .iter()
@@ -4863,6 +4892,13 @@ impl GpuEngine {
         self.vmm.as_ref().map(|v| v.kv.stats())
     }
 
+    pub fn live_ring_stats(&self) -> Option<crate::memory::vmm::LiveRingStats> {
+        self.vmm
+            .as_ref()
+            .and_then(|v| v.rings.as_ref())
+            .map(|r| r.stats())
+    }
+
     /// Engine-lock-free stats reader for `/metrics`; `None` when
     /// `PLOW_VMM_PREFIX` is off.
     pub fn vmm_stats_handle(&self) -> Option<crate::memory::vmm::VmmStatsHandle> {
@@ -4929,6 +4965,9 @@ impl GpuEngine {
                     &self.stream,
                 )?;
             }
+        }
+        if let Some(rings) = self.vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+            rings.ensure_slot(b)?;
         }
         // VMM: publish the finished sequence's generated whole blocks first —
         // a follow-up turn embedding this turn's output then attaches instead
@@ -5054,7 +5093,10 @@ impl GpuEngine {
         // VMM backstop: every row this launch writes (fed rows at pos, idle
         // rows' garbage write at their own pos) must be mapped. The
         // pre-mapper keeps this a lock-free frontier check in steady state.
-        if let Some(v) = &self.vmm {
+        if let Some(v) = &mut self.vmm {
+            if let Some(rings) = &mut v.rings {
+                rings.ensure_prefix(launch_rows)?;
+            }
             for b in 0..launch_rows {
                 let need = self.pos[b] + 1;
                 if v.kv.mapped_rows(b) < need {
@@ -5299,14 +5341,18 @@ impl GpuEngine {
         }
         // Map the whole prompt span once. Per-token `step_slots` only needs
         // `pos+1`; a cold walk of L tokens would otherwise ensure L times.
-        if let Some(v) = &self.vmm {
+        if self.vmm.is_some() {
+            let launch_rows = self
+                .decode_rung(slot)
+                .map_or(bsz, |ix| self.decode_rungs[ix].rows);
+            let v = self.vmm.as_mut().expect("checked");
+            if let Some(rings) = &mut v.rings {
+                rings.ensure_prefix(launch_rows)?;
+            }
             let need = self.pos[slot] + tokens.len() as u32;
             if v.kv.mapped_rows(slot) < need {
                 v.kv.ensure_rows(slot, need)?;
             }
-            let launch_rows = self
-                .decode_rung(slot)
-                .map_or(bsz, |ix| self.decode_rungs[ix].rows);
             for b in 0..launch_rows {
                 if b == slot {
                     continue;
@@ -6520,11 +6566,14 @@ impl GpuEngine {
 
         // VMM: the bucket writes all tc rows (pad rows write garbage past
         // `real`) — map the chunk's full row span before launching.
-        if let Some(v) = &self.vmm {
+        if let Some(v) = &mut self.vmm {
             if !v.kv.prefix_reuse() && c0 + tc > self.max_ctx {
                 return Err(RuntimeError::Rejected(
                     "live KV prefill padding exceeds the reserved context".into(),
                 ));
+            }
+            if let Some(rings) = &mut v.rings {
+                rings.ensure_slot(b)?;
             }
             v.kv.ensure_rows(b, ((c0 + tc) as u32).min(self.max_ctx as u32))?;
         }
