@@ -44,7 +44,23 @@ def prompt_digest(ids):
     return hashlib.sha256(a.tobytes()).hexdigest()
 
 
-def dense_scores(position, vocab_size, diagnostic_prefix=None):
+def suppression_metadata(model_config, vocab_size):
+    config = model_config.try_get_generation_config() or {}
+    ids = config.get("suppress_tokens") or []
+    if not isinstance(ids, list) or any(
+        type(token) is not int or not 0 <= token < vocab_size for token in ids
+    ):
+        raise ValueError("generation_config.suppress_tokens must contain valid vocabulary IDs")
+    return {
+        "source": "vllm.model_config.try_get_generation_config().suppress_tokens",
+        "token_ids": sorted(set(ids)),
+        "allowed_nonfinite": "negative_infinity_only_at_declared_ids",
+        "raw_layout": "full_vocabulary_in_original_token_id_order",
+        "repeat_metrics_exclude_token_ids": sorted(set(ids)),
+    }
+
+
+def dense_scores(position, vocab_size, diagnostic_prefix=None, suppressed_ids=()):
     # Offline outputs use either the compatibility dict or FlatLogprobs.  Both
     # expose token IDs, unlike the OpenAI JSON surface where decoded-token keys
     # can collide.
@@ -60,7 +76,10 @@ def dense_scores(position, vocab_size, diagnostic_prefix=None):
             out[token_id] = float(score)
             seen[token_id] = True
     missing = int((~seen).sum())
-    if missing or not np.isfinite(out).all():
+    allowed = np.zeros(vocab_size, dtype=bool)
+    allowed[list(suppressed_ids)] = True
+    invalid = ~np.isfinite(out) & ~(allowed & np.isneginf(out))
+    if missing or invalid.any():
         diagnostic = {
             "vocab_size": vocab_size,
             "missing_indices": np.flatnonzero(~seen).tolist(),
@@ -77,9 +96,13 @@ def dense_scores(position, vocab_size, diagnostic_prefix=None):
     return out
 
 
-def repeat_metrics(current, prior):
-    a = current.astype(np.float64)
-    b = prior.astype(np.float64)
+def repeat_metrics(current, prior, suppressed_ids=()):
+    keep = np.ones(len(current), dtype=bool)
+    keep[list(suppressed_ids)] = False
+    a = current[keep].astype(np.float64)
+    b = prior[keep].astype(np.float64)
+    if not len(a) or not np.isfinite(a).all() or not np.isfinite(b).all():
+        raise ValueError("repeat metrics require finite unsuppressed logits")
     a -= a.mean()
     b -= b.mean()
     delta = a - b
@@ -125,6 +148,8 @@ def main():
         quantization=args.quantization,
     )
     vocab_size = int(llm.model_config.get_vocab_size())
+    suppression = suppression_metadata(llm.model_config, vocab_size)
+    suppressed_ids = suppression["token_ids"]
     sampling = SamplingParams(
         temperature=0.0,
         max_tokens=1,
@@ -150,6 +175,7 @@ def main():
         "quantization": args.quantization,
         "hf_vocab_size": llm.model_config.hf_text_config.vocab_size,
         "final_logit_softcapping": getattr(llm.model_config.hf_text_config, "final_logit_softcapping", None),
+        "suppression": suppression,
         "cases": [],
         "repeat_checks": [],
         "invalid_cases": [],
@@ -168,7 +194,7 @@ def main():
         if not completion.logprobs or len(completion.logprobs) != 1:
             raise RuntimeError(f"case {cid}: missing one-step logprobs")
         try:
-            scores = dense_scores(completion.logprobs[0], vocab_size, args.output / cid)
+            scores = dense_scores(completion.logprobs[0], vocab_size, args.output / cid, suppressed_ids)
         except RuntimeError as error:
             manifest["invalid_cases"].append({"id": cid, "error": str(error)})
             continue
@@ -182,7 +208,7 @@ def main():
                     "first_case": prior_id,
                     "repeat_case": cid,
                     "prompt_sha256_u32le": sha,
-                    **repeat_metrics(scores, prior_scores),
+                    **repeat_metrics(scores, prior_scores, suppressed_ids),
                 }
             )
         else:
@@ -194,6 +220,7 @@ def main():
                 "prompt_len": len(ids),
                 "prompt_sha256_u32le": sha,
                 "sampled_token_id": int(completion.token_ids[0]),
+                "negative_inf_token_ids": np.flatnonzero(np.isneginf(scores)).tolist(),
             }
         )
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

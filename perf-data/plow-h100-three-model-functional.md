@@ -94,3 +94,20 @@ Native batch-16 tensor-core GEMV variants retain packet slice ownership and the 
 | lm_head | 4905.9 | 2253.8 | 3092.7 |
 
 The warp-pipeline revision regresses every routed shape against v1 and remains disabled. No tensor-core variant is promoted for serving; full-model qualification and shape-specific selection remain necessary. Raw logs: `gemv-m16-mma/result1.log` and `gemv-m16-mma-pipeline/result{,-mm16-control}.log` under `/tmp/plow-model-support-checks`.
+
+The v1 interpreter was rebuilt from its frozen source with `GV_MM_MAX=16`, removing the earlier MM8 fallback confound. Three-prefix full-model checks match the SIMD control's leading tokens, with centered full-row differences 0.52%, 1.04%, 2.71% and reference-head64 differences 0.27%, 0.29%, 0.62%. Two slot0 resets and a slot15 replay reproduce the candidate's own logits exactly. This does not establish general numerical equivalence.
+
+A fresh serving pair uses the same frozen `plowrt-qwen-w8a8-candidate1` runtime, Gemma12 B16 asset, segmented prefill, input/output128, C16, 32 measured requests, 16 warmups and seed42; only the decoder cubin changes. Both complete32/32 with zero failures:
+
+| Decoder | TTFT ms | TPOT ms | p99 ITL ms | Mean E2E ms | Output tok/s |
+|---|---:|---:|---:|---:|---:|
+| SIMD MM16 control | 321.72 | 48.15 | 74.48 | 6436.49 | 309.96 |
+| Tensor-core v1, MM16 fallback | 300.44 | 42.12 | 68.47 | 5650.08 | 353.26 |
+
+The measured TPOT reduction is12.51% and throughput increase13.97%. This single pair supports further correctness work and repetition, not promotion; vLLM remains about11ms TPOT at this cell. Raw serving files: `gemma12b-m16-mma{,-control}-128-c16-r1/in128_c16.json` under the campaign directory. Build and quality artifacts: `/tmp/plow-model-support-checks/gemv-m16-mma-mm16fallback/`.
+
+## First 8192-token correctness cell
+
+Gemma12 BF16 was compiled for context16384, batch1, with the existing WS384 segmented prefill. Native prefill of8192 tokens plus two teacher-forced continuations completed with finite logits. The matching vLLM0.28 oracle uses identical token IDs/context, BF16, eager execution, max-num-batched-tokens8192 and prefix caching off; all three prefix repeats are bit-exact. The oracle now records effective checkpoint suppression IDs258882/258883 and accepts negative infinity only at those declared IDs, preserving full raw vectors. Three CPU tests cover suppression and rejection behavior.
+
+Both native stock and the decoder-only HNR+NRN+GLU variant match vLLM's leading token and top5 set at all three prefixes. Numerical qualification remains open: stock centered full-row errors are8.46%,6.93%,7.88%; decoder candidate errors are8.46%,7.34%,7.24%. Reference-head64 errors are2.40–4.41%. The first prefill row is bit-exact between native variants because their prefill objects are unchanged. These results require checking a matching prefill rounding build; they do not establish long-context parity. Evidence: `/tmp/plow-gemma-long-context/vllm-comparison.json`, native manifests and `vllm-bf16/manifest.json` in the same directory.
