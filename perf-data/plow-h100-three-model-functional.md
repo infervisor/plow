@@ -49,3 +49,16 @@ TMA repeat (same seed 42/settings) completed 32/32: TTFT 87.28 ms, TPOT 35.36 ms
 - Gemma B16 MM8/MM16 decoder variants produced identical logits on the checked three-token history; comparative serving timing is pending. The opt-in `PLOW_NV_GEMMA_HNR_BF16=1` norm/RoPE rounding change improves the checked Gemma12B prefix-6 relative logit error from 18.89% to 13.59%, but the leading token still differs from vLLM. It is not a complete quality fix, and segmented prefill needs a matching build before whole-serving evaluation.
 
 These switches remain opt-in. Long-context Qwen and Gemma numerical qualification remains open. The existing baseline matrix does not cover all supported contexts or end-to-end latency percentiles.
+
+The optimization direction is now restricted to kernels executed within Plow's packet interpreter. External cuBLASLt dispatch is parked as a comparison experiment; its isolated kernel measurements can guide native kernel work. The non-graph counter-preseed diagnostic subsequently matched all five previous Lt logit rows bit-for-bit and passed two request resets, but graph qualification and serving timing were not pursued after this decision. The external GDN prefill implementation also remains a reference for an interpreter implementation.
+
+## Native Gemma12B batch-16 weight reuse experiment
+
+Both variants execute inside the Plow interpreter and share the same segmented prefill objects. BF16, context 8192, input/output 128, concurrency 16, 32 measured requests, 16 warmups, seed 42. Three-token full-logit and request-reset diagnostics matched exactly between variants before timing.
+
+| Decode weight reuse | Successful requests | TTFT ms | TPOT ms | p99 ITL ms | Mean E2E ms | p99 E2E ms | Output tok/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| MM8 | 32 | 342.87 | 54.54 | 81.93 | 7269.72 | 7999.25 | 274.28 |
+| MM16 | 32 | 321.41 | 48.22 | 74.47 | 6445.56 | 7200.21 | 309.51 |
+
+MM16 reduces TPOT by 11.6% in this single comparison, but still trails the corresponding vLLM baseline (about 11.00 ms TPOT and 1364–1367 output tok/s). This supports investigating a small-batch tensor-core implementation; it does not qualify a default change or resolve Gemma numerical differences. Each process built 16 prefill graphs, one per slot. Raw results: `gemma12b-mm{8,16}-128-c16-r1/in128_c16.json` under the campaign directory, including end-to-end percentiles and detailed request data.
