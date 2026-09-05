@@ -50,5 +50,7 @@
     "/tmp/plow-model-support-checks/e1-pv-ns-window-20260905/clocks-power.log": "67058df33dbb733496c1e28eaca2a94e5179b9b316365cf28744d348428c81be",
     "/tmp/plow-model-support-checks/gemma12-realworld-lazy2048-20260905/queue.json": "c740b849ace4591935d2802f60ecb3887eb41c0b3416569d02f8947fa698a40d",
     "/tmp/plow-model-support-checks/quality-realworld-first-window-20260905/queue.json": "a17bac5996da71eafefb858a4a17426fa84a9f3822dc68cfa40dc0e6b083f995"
-  }
+  },
+  "first_serving_attempt": "All three stopped at coherence gate before timing: new recipe omitted required <bos> present in original qualified gate. Fresh unchanged-gate-format retries being prepared; no serving numbers accepted.",
+  "qwen_capture": "Postload hooks installed, compilation failed missing ninja in sudo PATH; explicit build-tool path retry active. Full-reference invariance remains required."
 }

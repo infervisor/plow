@@ -1,0 +1,334 @@
+{
+  "note": "Posthoc operator choices using mean2orders, not compiler/runtime policy or independent finalgate",
+  "rows": [
+    {
+      "model": "gemma12",
+      "batch": 1,
+      "context": 1024,
+      "ns": 33,
+      "native_us": 23.535999469459057,
+      "fa_us": 15.899999998509884,
+      "ratio": 1.4802515390984152
+    },
+    {
+      "model": "gemma12",
+      "batch": 1,
+      "context": 4096,
+      "ns": 33,
+      "native_us": 30.775999650359154,
+      "fa_us": 21.875999867916107,
+      "ratio": 1.4068385370351009
+    },
+    {
+      "model": "gemma12",
+      "batch": 1,
+      "context": 8192,
+      "ns": 66,
+      "native_us": 40.01599922776222,
+      "fa_us": 29.696000274270773,
+      "ratio": 1.3475215132737222
+    },
+    {
+      "model": "gemma12",
+      "batch": 1,
+      "context": 32768,
+      "ns": 132,
+      "native_us": 69.77600045502186,
+      "fa_us": 53.700000047683716,
+      "ratio": 1.2993668602060189
+    },
+    {
+      "model": "gemma12",
+      "batch": 4,
+      "context": 1024,
+      "ns": 16,
+      "native_us": 23.768000304698944,
+      "fa_us": 18.360000103712082,
+      "ratio": 1.29455338618944
+    },
+    {
+      "model": "gemma12",
+      "batch": 4,
+      "context": 4096,
+      "ns": 33,
+      "native_us": 41.240000165998936,
+      "fa_us": 31.903999857604504,
+      "ratio": 1.292627894623349
+    },
+    {
+      "model": "gemma12",
+      "batch": 4,
+      "context": 8192,
+      "ns": 33,
+      "native_us": 54.24799956381321,
+      "fa_us": 46.632000245153904,
+      "ratio": 1.1633213089427956
+    },
+    {
+      "model": "gemma12",
+      "batch": 4,
+      "context": 32768,
+      "ns": 33,
+      "native_us": 124.18399937450886,
+      "fa_us": 113.5840006172657,
+      "ratio": 1.0933229917914324
+    },
+    {
+      "model": "gemma12",
+      "batch": 16,
+      "context": 1024,
+      "ns": 8,
+      "native_us": 39.46399874985218,
+      "fa_us": 31.272000167518854,
+      "ratio": 1.2619595337186673
+    },
+    {
+      "model": "gemma12",
+      "batch": 16,
+      "context": 4096,
+      "ns": 8,
+      "native_us": 75.07999800145626,
+      "fa_us": 68.44799965620041,
+      "ratio": 1.0968910469051973
+    },
+    {
+      "model": "gemma12",
+      "batch": 16,
+      "context": 8192,
+      "ns": 8,
+      "native_us": 121.59999832510948,
+      "fa_us": 111.85599863529205,
+      "ratio": 1.0871119994340925
+    },
+    {
+      "model": "gemma12",
+      "batch": 16,
+      "context": 32768,
+      "ns": 8,
+      "native_us": 402.3759961128235,
+      "fa_us": 362.65599727630615,
+      "ratio": 1.1095252777696514
+    },
+    {
+      "model": "gemma31",
+      "batch": 1,
+      "context": 1024,
+      "ns": 16,
+      "native_us": 20.655999891459942,
+      "fa_us": 17.816000152379274,
+      "ratio": 1.159407258351499
+    },
+    {
+      "model": "gemma31",
+      "batch": 1,
+      "context": 4096,
+      "ns": 33,
+      "native_us": 37.167999893426895,
+      "fa_us": 31.095999758690596,
+      "ratio": 1.1952662780375576
+    },
+    {
+      "model": "gemma31",
+      "batch": 1,
+      "context": 8192,
+      "ns": 33,
+      "native_us": 50.663999281823635,
+      "fa_us": 46.896000392735004,
+      "ratio": 1.080347979732454
+    },
+    {
+      "model": "gemma31",
+      "batch": 1,
+      "context": 32768,
+      "ns": 33,
+      "native_us": 118.58400143682957,
+      "fa_us": 111.70400120317936,
+      "ratio": 1.0615913499923437
+    },
+    {
+      "model": "gemma31",
+      "batch": 4,
+      "context": 1024,
+      "ns": 8,
+      "native_us": 33.215999603271484,
+      "fa_us": 30.167999677360058,
+      "ratio": 1.1010342070574481
+    },
+    {
+      "model": "gemma31",
+      "batch": 4,
+      "context": 4096,
+      "ns": 8,
+      "native_us": 68.56000050902367,
+      "fa_us": 67.30399839580059,
+      "ratio": 1.0186616269933444
+    },
+    {
+      "model": "gemma31",
+      "batch": 4,
+      "context": 8192,
+      "ns": 8,
+      "native_us": 113.68800140917301,
+      "fa_us": 110.44799908995628,
+      "ratio": 1.0293350929479297
+    },
+    {
+      "model": "gemma31",
+      "batch": 4,
+      "context": 32768,
+      "ns": 8,
+      "native_us": 378.83200496435165,
+      "fa_us": 363.95999789237976,
+      "ratio": 1.0408616528137509
+    },
+    {
+      "model": "gemma31",
+      "batch": 16,
+      "context": 1024,
+      "ns": 2,
+      "native_us": 72.52800092101097,
+      "fa_us": 69.68799978494644,
+      "ratio": 1.0407530872579014
+    },
+    {
+      "model": "gemma31",
+      "batch": 16,
+      "context": 4096,
+      "ns": 2,
+      "native_us": 206.70399814844131,
+      "fa_us": 197.1600018441677,
+      "ratio": 1.04840736566749
+    },
+    {
+      "model": "gemma31",
+      "batch": 16,
+      "context": 8192,
+      "ns": 2,
+      "native_us": 383.4559917449951,
+      "fa_us": 364.55999314785004,
+      "ratio": 1.0518323429677092
+    },
+    {
+      "model": "gemma31",
+      "batch": 16,
+      "context": 32768,
+      "ns": 2,
+      "native_us": 1428.4240007400513,
+      "fa_us": 1369.2960143089294,
+      "ratio": 1.0431813032487085
+    },
+    {
+      "model": "qwen27",
+      "batch": 1,
+      "context": 1024,
+      "ns": 16,
+      "native_us": 15.368000138550997,
+      "fa_us": 15.74400020763278,
+      "ratio": 0.976117882106004
+    },
+    {
+      "model": "qwen27",
+      "batch": 1,
+      "context": 4096,
+      "ns": 33,
+      "native_us": 24.263999424874783,
+      "fa_us": 21.880000364035368,
+      "ratio": 1.1089579077319416
+    },
+    {
+      "model": "qwen27",
+      "batch": 1,
+      "context": 8192,
+      "ns": 33,
+      "native_us": 34.81600061058998,
+      "fa_us": 29.64000031352043,
+      "ratio": 1.1746288880674705
+    },
+    {
+      "model": "qwen27",
+      "batch": 1,
+      "context": 32768,
+      "ns": 33,
+      "native_us": 79.40800115466118,
+      "fa_us": 68.0880006402731,
+      "ratio": 1.1662554401354013
+    },
+    {
+      "model": "qwen27",
+      "batch": 4,
+      "context": 1024,
+      "ns": 8,
+      "native_us": 21.25599980354309,
+      "fa_us": 20.440000109374523,
+      "ratio": 1.0399217069374829
+    },
+    {
+      "model": "qwen27",
+      "batch": 4,
+      "context": 4096,
+      "ns": 8,
+      "native_us": 47.86400031298399,
+      "fa_us": 42.09599923342466,
+      "ratio": 1.1370201725721116
+    },
+    {
+      "model": "qwen27",
+      "batch": 4,
+      "context": 8192,
+      "ns": 8,
+      "native_us": 76.13599859178066,
+      "fa_us": 65.06400182843208,
+      "ratio": 1.1701708541159894
+    },
+    {
+      "model": "qwen27",
+      "batch": 4,
+      "context": 32768,
+      "ns": 8,
+      "native_us": 244.03999745845795,
+      "fa_us": 192.9199993610382,
+      "ratio": 1.2649802937317647
+    },
+    {
+      "model": "qwen27",
+      "batch": 16,
+      "context": 1024,
+      "ns": 2,
+      "native_us": 48.808000050485134,
+      "fa_us": 42.57600009441376,
+      "ratio": 1.1463735424241757
+    },
+    {
+      "model": "qwen27",
+      "batch": 16,
+      "context": 4096,
+      "ns": 2,
+      "native_us": 134.20000299811363,
+      "fa_us": 107.41599835455418,
+      "ratio": 1.2493483750451395
+    },
+    {
+      "model": "qwen27",
+      "batch": 16,
+      "context": 8192,
+      "ns": 2,
+      "native_us": 245.9920011460781,
+      "fa_us": 192.71999970078468,
+      "ratio": 1.2764217596928344
+    },
+    {
+      "model": "qwen27",
+      "batch": 16,
+      "context": 32768,
+      "ns": 2,
+      "native_us": 902.4399966001511,
+      "fa_us": 698.5439956188202,
+      "ratio": 1.291887128455961
+    }
+  ],
+  "raw_source": {
+    "path": "/tmp/plow-model-support-checks/attention-e1-pv-ns-20260905/analysis/best-observed.json",
+    "sha256": "94600b38d3196d83895a9a75e08550bc90161e5fca770268df5de80ea1a290ca"
+  },
+  "promotion": "No production or serving promotion. Choosing best observed split counts is posthoc; it requires an independent policy validation and full-model gates."
+}
