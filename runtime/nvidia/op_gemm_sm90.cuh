@@ -2298,6 +2298,18 @@ __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
 #ifndef PLOW_NV_GEMV_M16_PIPE
 #define PLOW_NV_GEMV_M16_PIPE 0
 #endif
+#ifndef PLOW_NV_GEMV_M16_BK128
+#define PLOW_NV_GEMV_M16_BK128 0
+#endif
+#if PLOW_NV_GEMV_M16_BK128 && PLOW_NV_GEMV_M16_PIPE
+#error "M16 BK128 and warp-local PIPE are separate experiments"
+#endif
+#ifndef PLOW_NV_GEMV_M16_ARENA_BYTES
+#define PLOW_NV_GEMV_M16_ARENA_BYTES \
+    (PLOW_NV_GEMV_M16_BK128 ? 21776u : (PLOW_NV_GEMV_M16_PIPE ? 12304u : 11536u))
+#endif
+static_assert(PLOW_NV_GEMV_M16_ARENA_BYTES >=
+    (PLOW_NV_GEMV_M16_BK128 ? 21776u : (PLOW_NV_GEMV_M16_PIPE ? 12304u : 11536u)));
 #if PLOW_NV_GEMV_M16_PIPE
 static __device__ void d_gemv_sm90_m16_pipeline(__nv_bfloat16* C, const __nv_bfloat16* x,
     const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
@@ -2359,13 +2371,22 @@ static __device__ void d_gemv_sm90_m16_pipeline(__nv_bfloat16* C, const __nv_bfl
 }
 #endif
 
-static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
+#if PLOW_NV_GEMV_M16_BK128
+template <unsigned BK>
+static __device__ void d_gemv_sm90_m16_stage(__nv_bfloat16* C,
+#else
+static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C,
+#endif
+    const __nv_bfloat16* x,
     const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
     unsigned nblk, __nv_bfloat16* arena) {
 #if PLOW_NV_GEMV_M16_PIPE
     d_gemv_sm90_m16_pipeline(C, x, W, N, K, slice, nblk, arena);
 #else
-    constexpr unsigned stride = 72;
+#if !PLOW_NV_GEMV_M16_BK128
+    constexpr unsigned BK = 64;
+#endif
+    constexpr unsigned stride = BK + 8;
     auto* a = (__nv_bfloat16*)(((uintptr_t)arena + 15u) & ~(uintptr_t)15u);
     auto* b = a + 16 * stride;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
@@ -2373,13 +2394,13 @@ static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
     const unsigned first = slice * per, end = min(first + per, N);
     for (unsigned col = first; col < end; col += 64) {
         float acc[4] = {};
-        for (unsigned kb = 0; kb < K; kb += 64) {
-            for (unsigned v = tid; v < 16 * 8; v += 256) {
-                const unsigned row = v / 8, k = v % 8 * 8;
+        for (unsigned kb = 0; kb < K; kb += BK) {
+            for (unsigned v = tid; v < 16 * (BK / 8); v += 256) {
+                const unsigned row = v / (BK / 8), k = v % (BK / 8) * 8;
                 sm90_cp16(a + row * stride + k, x + (size_t)row * K + kb + k, 16);
             }
-            for (unsigned v = tid; v < 64 * 8; v += 256) {
-                const unsigned row = v / 8, k = v % 8 * 8;
+            for (unsigned v = tid; v < 64 * (BK / 8); v += 256) {
+                const unsigned row = v / (BK / 8), k = v % (BK / 8) * 8;
                 const bool valid = col + row < end;
                 const auto* source = valid ? W + (size_t)(col + row) * K + kb + k : W;
                 sm90_cp16(b + row * stride + k, source, valid ? 16 : 0);
@@ -2388,7 +2409,7 @@ static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
             sm90_cp_wait<0>();
             __syncthreads();
 #pragma unroll
-            for (unsigned kk = 0; kk < 64; kk += 16) {
+            for (unsigned kk = 0; kk < BK; kk += 16) {
                 unsigned af[4], bf[2];
                 const unsigned ap = (unsigned)__cvta_generic_to_shared(
                     a + (lane % 16) * stride + kk + (lane / 16) * 8);
@@ -2417,6 +2438,17 @@ static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
     }
 #endif
 }
+#if PLOW_NV_GEMV_M16_BK128
+static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
+    const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
+    unsigned nblk, __nv_bfloat16* arena) {
+    if (!(K % 128u))
+        d_gemv_sm90_m16_stage<128>(C, x, W, N, K, slice, nblk, arena);
+    else
+        d_gemv_sm90_m16_stage<64>(C, x, W, N, K, slice, nblk, arena);
+}
+#endif
+
 #endif
 
 #endif /* PLOW_OP_GEMM_SM90_CUH */

@@ -80,6 +80,10 @@ static const Shape SHAPES[] = {
 #ifdef PLOW_BENCH_GEMV_M16
     {"gemma_down",3840,15360,0}, {"gemma_q",8192,3840,0}, {"gemma_o",3840,8192,0},
 #endif
+#ifdef PLOW_BENCH_GEMV_M16_BK128
+    {"g31_down",5376,21504,0}, {"g31_q",16384,5376,0}, {"g31_o",5376,16384,0},
+    {"m16_k64",1030,64,0}, {"m16_k192",1030,192,0}, {"m16_k128",1030,128,0},
+#endif
     {"a_or_b", 48, 5120, 0}, {"qkv", 10240, 5120, 0},
     {"z", 6144, 5120, 0}, {"gdn_out", 5120, 6144, 0},
     {"q_full", 12288, 5120, 0}, {"k_or_v", 1024, 5120, 0},
@@ -148,6 +152,12 @@ static CUtensorMap bf16_map(void* base, unsigned rows, unsigned k) {
 #endif
 
 #ifdef PLOW_BENCH_QWEN_GEMV
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA
+static constexpr unsigned decode_arena_bytes =
+    PLOW_NV_GEMV_M16_ARENA_BYTES > 12352u ? PLOW_NV_GEMV_M16_ARENA_BYTES : 12352u;
+#else
+static constexpr unsigned decode_arena_bytes = 12352u;
+#endif
 __global__ void k_decode_gemv(bf16* c, const bf16* a, const bf16* w, unsigned m, unsigned n, unsigned k) {
     extern __shared__ bf16 arena[];
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA
@@ -174,6 +184,13 @@ __global__ void k_decode_gemv(bf16* c, const bf16* a, const bf16* w, unsigned m,
         d_gemv(c, a, w, m, n, k, blockIdx.x, gridDim.x, arena);
     else d_gemv(c, a, w, m, n, k, blockIdx.x, gridDim.x);
 }
+#if defined(PLOW_BENCH_GEMV_M16_BK128) && PLOW_NV_GEMV_M16_BK128
+__global__ void k_m16_bk64_reference(bf16* c, const bf16* a, const bf16* w,
+                                    unsigned n, unsigned k) {
+    extern __shared__ bf16 arena[];
+    d_gemv_sm90_m16_stage<64>(c, a, w, n, k, blockIdx.x, gridDim.x, arena);
+}
+#endif
 #endif
 
 #if defined(PLOW_BENCH_QWEN_GEMV) || defined(PLOW_BENCH_GEMM_ODOWN)
@@ -340,9 +357,16 @@ static void bench_cublas(unsigned M) {
         int dev; CK(cudaGetDevice(&dev));
         cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, dev));
 #ifdef PLOW_BENCH_QWEN_GEMV
+#ifdef PLOW_BENCH_GEMV_M16_BK128
+        bf16* cp_alloc;
+        CK(cudaMalloc(&cp_alloc, ((size_t)M * s.N + 16) * sizeof(bf16)));
+        CK(cudaMemset(cp_alloc, 0xa5, ((size_t)M * s.N + 16) * sizeof(bf16)));
+        bf16* cp = cp_alloc + 8;
+#else
         bf16* cp; CK(cudaMalloc(&cp, (size_t)M*s.N*sizeof(bf16)));
+#endif
         auto run_plow = [&](int it) {
-            k_decode_gemv<<<prop.multiProcessorCount,256,12352>>>(cp,A,Bv[it%nrep],M,s.N,s.K);
+            k_decode_gemv<<<prop.multiProcessorCount,256,decode_arena_bytes>>>(cp,A,Bv[it%nrep],M,s.N,s.K);
         };
 #else
 #if defined(PLOW_BENCH_M64N64) || defined(PLOW_BENCH_M64N128)
@@ -373,7 +397,7 @@ static void bench_cublas(unsigned M) {
         std::vector<bf16> ref((size_t)M * s.N), got(ref.size());
         CK(cudaMemcpy(ref.data(), C, ref.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(got.data(), cp, got.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
-#ifdef PLOW_BENCH_WS384
+#if defined(PLOW_BENCH_WS384) || defined(PLOW_BENCH_GEMV_M16_BK128)
         uint16_t guards[16];
         CK(cudaMemcpy(guards, cp_alloc, 8 * sizeof(bf16), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(guards + 8, cp + (size_t)M * s.N, 8 * sizeof(bf16), cudaMemcpyDeviceToHost));
@@ -390,6 +414,22 @@ static void bench_cublas(unsigned M) {
         double rel = std::sqrt(err2 / std::max(ref2, 1e-30));
         printf("correctness %s M=%u relL2=%.6g max_abs=%.6g max_ref=%.6g\n", s.name, M, rel, maxerr, maxref);
         if (rel > 0.006 || maxerr > 0.05 + 0.02 * maxref) exit(3);
+#if defined(PLOW_BENCH_GEMV_M16_BK128) && PLOW_NV_GEMV_M16_BK128
+        if (M == 16 && s.N >= 1024 && s.K && !(s.K % 64)) {
+            bf16* cr; CK(cudaMalloc(&cr, got.size() * sizeof(bf16)));
+            k_m16_bk64_reference<<<prop.multiProcessorCount,256,decode_arena_bytes>>>(cr,A,Bv[0],s.N,s.K);
+            CK(cudaGetLastError());
+            std::vector<bf16> base(got.size());
+            CK(cudaMemcpy(base.data(),cr,base.size()*sizeof(bf16),cudaMemcpyDeviceToHost));
+            size_t mismatches = 0;
+            for (size_t i = 0; i < base.size(); i++)
+                mismatches += reinterpret_cast<const uint16_t*>(base.data())[i] !=
+                              reinterpret_cast<const uint16_t*>(got.data())[i];
+            CK(cudaFree(cr));
+            printf("BK64 exact %s M=%u mismatches=%zu\n",s.name,M,mismatches);
+            if (mismatches) exit(3);
+        }
+#endif
         for (int i = 0; i < WARM; i++) run_plow(i);
         CK(cudaDeviceSynchronize()); cold_flush(); CK(cudaEventRecord(e0));
         for (int i = 0; i < ITERS; i++) run_plow(i);
@@ -398,12 +438,12 @@ static void bench_cublas(unsigned M) {
         printf("%-9s %6u %8.4f %9.1f Plow speedup=%.4f cold_MiB=%.1f\n", s.name, M, pms,
                fl / (pms * 1e-3) / 1e12, ms / pms, (double)nrep * wn * sizeof(bf16) / (1024 * 1024));
 #ifdef PLOW_BENCH_QWEN_GEMV
-        printf("bandwidth %s Lt_GBs=%.1f Plow_GBs=%.1f arena=12352 M=%u\n",
-            s.name, 2.0*wn/(ms*1e6), 2.0*wn/(pms*1e6), M);
+        printf("bandwidth %s Lt_GBs=%.1f Plow_GBs=%.1f arena=%u M=%u\n",
+            s.name, 2.0*wn/(ms*1e6), 2.0*wn/(pms*1e6), decode_arena_bytes, M);
 #else
         CK(cudaFree(dm));
 #endif
-#ifdef PLOW_BENCH_WS384
+#if defined(PLOW_BENCH_WS384) || defined(PLOW_BENCH_GEMV_M16_BK128)
         CK(cudaFree(cp_alloc));
 #else
         CK(cudaFree(cp));
@@ -458,12 +498,17 @@ int main(int argc, char** argv) {
     int P = prop.multiProcessorCount;
     unsigned M = argc > 1 ? (unsigned)atoi(argv[1]) : 8192;
 #ifdef PLOW_BENCH_QWEN_GEMV
+#ifdef PLOW_BENCH_GEMV_M16_BK128
+    const unsigned rows = argc > 1 ? M : 16u;
+    if (rows != 1 && rows != 4 && rows != 16) { printf("M16 BK128 probe requires M=1/4/16\n"); return 2; }
+#else
 #ifdef PLOW_BENCH_GEMV_M16
     const unsigned rows = 16;
 #else
     const unsigned rows = 1;
 #endif
     if (argc > 1 && M != rows) { printf("GEMV mode requires M=%u\n", rows); return 2; }
+#endif
     if (prop.major != 9) { printf("GEMV comparison requires Hopper\n"); return 2; }
     printf("BF16 GEMV vs cuBLASLt M=%u SMs=%d GV_UNROLL=%d\n", rows, P, GV_UNROLL);
     bench_cublas(rows);

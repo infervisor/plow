@@ -716,8 +716,15 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_NV_FP8_M1_ARENA 0
 #endif
 #define PLOW_NV_OP_ARENA (PLOW_NV_FA_ARENA > PLOW_NV_FP8_M1_ARENA ? PLOW_NV_FA_ARENA : PLOW_NV_FP8_M1_ARENA)
-#define PLOW_NV_ARENA_FLOATS                                                                   \
+#define PLOW_NV_BASE_ARENA_FLOATS                                                              \
     (PLOW_NV_OP_ARENA > 2 * (int)PLOW_NV_WARPS ? PLOW_NV_OP_ARENA : 2 * (int)PLOW_NV_WARPS)
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA && !PLOW_NV_PREFILL
+#define PLOW_NV_M16_ARENA_FLOATS ((PLOW_NV_GEMV_M16_ARENA_BYTES + 3u) / 4u)
+#else
+#define PLOW_NV_M16_ARENA_FLOATS 0u
+#endif
+#define PLOW_NV_ARENA_FLOATS                                                                  \
+    (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
 /* block_max_u64 needs PLOW_NV_WARPS u64 = 2*WARPS floats; block_sum needs WARPS floats. Both
  * fit inside the flash claim at any supported head dim, but the max above keeps that true if
  * flash is ever compiled out. */
@@ -1457,8 +1464,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_GEMV:
         if (in->i[3] != 0) { __trap(); break; }
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA
-        static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >=
-            (PLOW_NV_GEMV_M16_PIPE ? 12304 : 11536));
+        static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_GEMV_M16_ARENA_BYTES);
         if (in->i[0] == 16 && in->i[1] >= 1024 && in->i[2] && !(in->i[2] % 64)) {
             d_gemv_sm90_m16((__nv_bfloat16*)TEN(0),
                 (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
@@ -1489,7 +1495,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
-        if (in->i[2] <= PLOW_NV_ARENA_FLOATS * 2u)
+        if (in->i[2] <= PLOW_NV_BASE_ARENA_FLOATS * 2u)
             d_gemv((__nv_bfloat16*)TEN(0),
                    (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                    (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk,
@@ -1546,7 +1552,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * GEMV_GLU_FP8 t0=fu t1=x t2=Wg(fp8) t5=Wu(fp8) t3=g_scale t4=u_scale  i0=M i1=N i2=K i5=act. */
 #if PLOW_HAS_GEMV_FP8
     case PLOW_DOP_GEMV_FP8:
-        if (in->i[2] <= PLOW_NV_ARENA_FLOATS * 2u)
+        if (in->i[2] <= PLOW_NV_BASE_ARENA_FLOATS * 2u)
             d_gemv_fp8((__nv_bfloat16*)TEN(0),
                        (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                        (const uint8_t*)TEN(2), (const float*)TEN(5), in->i[0], in->i[1], in->i[2],
