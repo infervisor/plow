@@ -31,6 +31,64 @@ use parking_lot::Mutex;
 use crate::exec::counters::CounterPool;
 use crate::exec::cpu::control::Feedback;
 
+/// Opt-in per-packet trace (profiling). Off: one relaxed load per packet. On: each
+/// worker records `(inst, slice, worker, t0, t1)` into a thread-local buffer and
+/// flushes it into [`trace_take`]'s sink when its run drains — no lock on the hot path.
+pub static TRACE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug)]
+pub struct TraceEv {
+    pub inst: u32,
+    pub slice: u32,
+    pub worker: u16,
+    /// Nanoseconds since [`trace_begin`].
+    pub t0_ns: u64,
+    pub t1_ns: u64,
+}
+
+static TRACE_EPOCH: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static TRACE_SINK: Mutex<Vec<TraceEv>> = Mutex::new(Vec::new());
+thread_local! {
+    static TRACE_BUF: std::cell::RefCell<Vec<TraceEv>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TRACE_T0: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Start recording; clears any previous trace.
+pub fn trace_begin() {
+    *TRACE_EPOCH.lock() = Some(std::time::Instant::now());
+    TRACE_SINK.lock().clear();
+    TRACE_ON.store(true, Ordering::SeqCst);
+}
+
+/// Stop recording and take everything the workers flushed (call after `wait_done`).
+pub fn trace_take() -> Vec<TraceEv> {
+    TRACE_ON.store(false, Ordering::SeqCst);
+    std::mem::take(&mut *TRACE_SINK.lock())
+}
+
+#[inline]
+fn trace_now_ns() -> u64 {
+    let epoch = TRACE_T0.with(|c| {
+        if let Some(t) = c.get() {
+            t
+        } else {
+            let t = TRACE_EPOCH.lock().unwrap_or_else(std::time::Instant::now);
+            c.set(Some(t));
+            t
+        }
+    });
+    epoch.elapsed().as_nanos() as u64
+}
+
+/// Worker: hand this thread's events to the sink (end of a traced run).
+pub fn trace_flush() {
+    TRACE_T0.with(|c| c.set(None));
+    let evs: Vec<TraceEv> = TRACE_BUF.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    if !evs.is_empty() {
+        TRACE_SINK.lock().extend(evs);
+    }
+}
+
 /// Per-window cursors of the global queue. `[n_seg * domains]`.
 #[derive(Clone)]
 pub struct GlobalQueue {
@@ -248,7 +306,19 @@ impl<'a> RunShared<'a> {
     #[inline]
     fn fire(&self, e: &StreamEnt, exec: &dyn Exec, me: &WorkerCtx) {
         let inst = &self.prog.insts[e.inst as usize];
+        let tracing = TRACE_ON.load(Ordering::Relaxed);
+        let t0 = if tracing { trace_now_ns() } else { 0 };
         exec.exec(inst, e.slice, inst.blocks as u32, me);
+        if tracing {
+            let ev = TraceEv {
+                inst: e.inst,
+                slice: e.slice,
+                worker: me.worker as u16,
+                t0_ns: t0,
+                t1_ns: trace_now_ns(),
+            };
+            TRACE_BUF.with(|b| b.borrow_mut().push(ev));
+        }
         let succs = self.prog.succs_of(e);
         for &c in succs {
             self.pool.add(c, 1);

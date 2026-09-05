@@ -402,6 +402,9 @@ fn worker_main(init: WorkerInit, sh: Arc<Shared>, exec: Arc<dyn Exec>) {
                 if r.is_err() {
                     sh.fb.fault(u16::MAX, u32::MAX, init.idx as u16);
                 }
+                if crate::exec::cpu::interp::TRACE_ON.load(Ordering::Relaxed) {
+                    crate::exec::cpu::interp::trace_flush();
+                }
                 sh.fb.done.fetch_add(1, Ordering::AcqRel);
             }
             // The store on `cancel_gen` did the work; the record only wakes parked workers.
