@@ -2,6 +2,41 @@
 
 These experiments preserve native packet execution and are disabled by default. They do not establish an all-model/all-context win over vLLM. GPU runs are serialized. Kernel microbenchmarks, direct decode diagnostics, and serving results are separate gates.
 
+## Latest measurement priority and completed gates
+
+The serving screen now targets1K–32K inputs and512 outputs atC1/4/16, then64K,
+131K and near262K contexts. Both endpoints use `vllm bench serve`;128-token cases
+remain correctness checks. See [the workload contract](h100-realworld-serving-sweep.md).
+
+The matched native FP8 TMA serving pair has completed. Both arms used the same
+frozen host and mapped shared-quantization asset, input/output128, C1,32 measured
+requests and16 warmups; all32 requests completed with4096 input/output tokens and
+zero failures. Prompt processing used serial decode, so this is not native-prefill
+qualification:
+
+| Arm | TTFT ms | TPOT ms | p99 ITL ms | E2E ms | Output tok/s |
+|---|---:|---:|---:|---:|---:|
+| Matched control |4675.381|36.632220|36.740700|9327.673|13.722249|
+| Native FP8 TMA |3825.754|29.999522|30.108897|7635.693|16.762814|
+
+Raw JSON: campaign `qwen-fp8-tma-{control,final}-128-c1-r1/in128_c1.json`.
+The gain is against the native control; it does not establish a vLLM win.
+
+Corrected M64 primitives containing the async-proxy initialization fence have now
+run on the GPU: control, M64N64 and M64N128 each matched cuBLASLt exactly on all nine
+M128 cases. The M64N128 M65 tail run passed its comparator; Gemma31 down had relative
+L2=0.000177496 and max absolute error0.25, while the other eight cases were exact.
+Logs are in `gemma-prefill-m64n128-fence/{control,candidate,m64n64_preserved}-m128.log`
+and `candidate-m65.log` under the checks directory. Final fenced full-model/serving
+qualification remains pending; historical pre-fence serving results below remain
+distinct.
+
+Qwen single-layer block emission and default-off W8A8 prefill buckets128/1024/4096/8192
+are implemented, with distinct activation tensor maps per bucket and a B1 guard.
+Single-block timing remains a ranking tool, not a full-model prediction. The new
+M1024 FP8 primitive passes ten exact CUTLASS comparisons but QKV is2.64× slower;
+larger-shape performance and full-model numeric gates remain open.
+
 ## Compiler candidates
 
 | Experiment | Compile control | Implemented change | Current evidence |
