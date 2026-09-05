@@ -29,6 +29,8 @@ def parse_args():
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--enforce-eager", action="store_true")
     p.add_argument("--disable-cuda-graphs", action="store_true")
+    p.add_argument("--rms-norm-provider", choices=["native", "vllm_c"],
+                   help="override only the RMSNorm IR provider; keep compilation defaults")
     p.add_argument("--language-model-only", action="store_true")
     p.add_argument("--quantization", choices=["fp8"])
     return p.parse_args()
@@ -39,6 +41,19 @@ def case_id(value):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
         raise ValueError(f"unsafe case id: {value!r}")
     return value
+
+
+def engine_overrides(disable_cuda_graphs=False, rms_norm_provider=None):
+    overrides = {}
+    if disable_cuda_graphs:
+        overrides["compilation_config"] = {"cudagraph_mode": "NONE"}
+    if rms_norm_provider is not None:
+        if rms_norm_provider not in {"native", "vllm_c"}:
+            raise ValueError("unsupported RMSNorm provider")
+        overrides["kernel_config"] = {
+            "ir_op_priority": {"rms_norm": [rms_norm_provider]},
+        }
+    return overrides
 
 
 def prompt_digest(ids):
@@ -179,10 +194,10 @@ def main():
         logprobs_mode="raw_logits",
         language_model_only=args.language_model_only,
         quantization=args.quantization,
-        **({"compilation_config": {"cudagraph_mode": "NONE"}}
-           if args.disable_cuda_graphs else {}),
+        **engine_overrides(args.disable_cuda_graphs, args.rms_norm_provider),
     )
     effective_compile = llm.llm_engine.vllm_config.compilation_config
+    effective_ir = llm.llm_engine.vllm_config.kernel_config.ir_op_priority
     vocab_size = int(llm.model_config.get_vocab_size())
     suppression = suppression_metadata(llm.model_config, vocab_size)
     suppressed_ids = suppression["token_ids"]
@@ -211,6 +226,11 @@ def main():
         "max_output_tokens": args.max_output_tokens,
         "enforce_eager": args.enforce_eager,
         "disable_cuda_graphs": args.disable_cuda_graphs,
+        "rms_norm_provider": args.rms_norm_provider,
+        "effective_ir_op_priority": {
+            "rms_norm": list(effective_ir.rms_norm),
+            "fused_add_rms_norm": list(effective_ir.fused_add_rms_norm),
+        },
         "effective_compilation_config": {
             "mode": getattr(effective_compile.mode, "name", str(effective_compile.mode)),
             "cudagraph_mode": getattr(effective_compile.cudagraph_mode, "name", str(effective_compile.cudagraph_mode)),

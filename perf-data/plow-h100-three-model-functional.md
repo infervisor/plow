@@ -134,6 +134,16 @@ At this8192-token history, eager vLLM prefill plus two decode steps generates `[
 
 The subsequent compile-on/graphs-off control completed successfully with effective mode `VLLM_COMPILE`, Inductor backend, custom ops `none`, and graph mode `NONE`. Both requests still generate `[4284,9885,9885]`; all six raw rows are byte-identical to the default-graph run. CUDA graph replay therefore does not explain this observed discrepancy. The remaining investigation concerns compiled execution and its selected operators/fusions; no vLLM bug is established. Evidence: `/tmp/plow-gemma-long-context/vllm-bf16-compiled-nographs-decode/manifest.json` and `/tmp/plow-model-support-checks/gemma-compiled-graph-control.json`.
 
+Changing only the RMSNorm IR provider preference to `vllm_c` removes the third-token greedy divergence on this history: both requests generate `[4284,9885,13512]`, matching eager vLLM and native Plow. Effective execution remains `VLLM_COMPILE`/Inductor, `FULL_AND_PIECEWISE` graphs and custom ops `none`; RMSNorm priority becomes `[vllm_c,native]`, with other providers unchanged. All three repeated rows are byte-identical and all prefix hashes match the original comparison. The default compiled third row differs from eager by65.89% centered full-logit relative L2; this diagnostic control reduces that difference to7.91%.
+
+| Prefix length | RMSNorm control vs eager, centered full relative L2 | RMSNorm control vs native, centered full relative L2 |
+|---|---:|---:|
+|8192|9.09%|8.73%|
+|8193|9.18%|8.45%|
+|8194|7.91%|8.43%|
+
+This implicates the normalization implementation or its surrounding compiler fusion boundaries, without establishing a specific vLLM bug. Remaining logit differences leave numerical qualification open. The benchmark reference remains default compiled vLLM; this provider override is diagnostic. Exact file hashes, token margins, prefix checks and all pairwise metrics: `/tmp/plow-model-support-checks/gemma-compiled-rms-provider-result.json`; raw rows: `/tmp/plow-gemma-long-context/vllm-bf16-compiled-vllmc-norm-decode/`.
+
 An isolated installed-forward probe also confirms a narrower distinction: eager execution rounds the residual sum to BF16 before applying the layer scalar, whereas default Inductor fusion matches Plow's FP32 sum followed by scaling. All six captured rows agree with those respective forms. No scalar-rounding production change was made. Evidence: `/tmp/plow-model-support-checks/vllm-gemma-layer-scalar-boundary.json`.
 
 The standalone prefill GELU activation rounding was added under the same opt-in Gemma flag and tested with a fresh PFseg control/candidate pair, retaining identical GEMM, attention and decode objects. Its effect is mixed: against eager recomputed prefixes, centered errors change8.46/7.34/7.24%→10.72/7.92/6.92%, with all three leading tokens unchanged. It remains disabled by default and is not promoted. The fresh PFseg control reproduces the prior control logits; both builds retain the original255-register/1672-byte-stack resource profile. Evidence: `/tmp/plow-model-support-checks/gemma-pf-rounding/quality-eager.json`.

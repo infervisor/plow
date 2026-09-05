@@ -6,7 +6,26 @@ from types import SimpleNamespace
 import numpy as np
 
 from vllm_logit_oracle import (dense_scores, repeat_metrics, suppression_metadata,
-                               generation_rows, required_model_length, prompt_digest)
+                               generation_rows, required_model_length, prompt_digest,
+                               engine_overrides)
+
+
+class EngineOverridesTests(unittest.TestCase):
+    def test_defaults_do_not_override_engine_policy(self):
+        self.assertEqual(engine_overrides(), {})
+
+    def test_provider_control_preserves_compile_and_other_providers(self):
+        overrides = engine_overrides(rms_norm_provider="vllm_c")
+        self.assertNotIn("compilation_config", overrides)
+        self.assertEqual(overrides["kernel_config"]["ir_op_priority"],
+                         {"rms_norm": ["vllm_c"]})
+        combined = engine_overrides(True, "vllm_c")
+        self.assertEqual(combined["kernel_config"], overrides["kernel_config"])
+        self.assertEqual(combined["compilation_config"], {"cudagraph_mode": "NONE"})
+
+    def test_unknown_provider_is_rejected(self):
+        with self.assertRaises(ValueError):
+            engine_overrides(rms_norm_provider="all")
 
 
 class SuppressionTests(unittest.TestCase):
