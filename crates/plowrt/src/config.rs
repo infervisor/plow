@@ -151,6 +151,10 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_prefix: bool,
 
+    /// Grow packet-described full KV backing with the live frontier, without prefix reuse.
+    #[arg(long = "vmm-live", env = "PLOW_VMM_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_live: bool,
+
     /// VMM sharing block size (MiB). 2 MiB ≈ 4096 tokens at hd256 bf16.
     #[arg(
         long = "vmm-block-mib",
@@ -752,6 +756,28 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_kv_defaults_off_and_can_be_enabled_without_prefix_reuse() {
+        use clap::{Args, FromArgMatches};
+        let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "vmm_live")
+            .unwrap();
+        assert_eq!(arg.get_default_values(), ["false"]);
+        let matches = command
+            .try_get_matches_from([
+                "test",
+                "--vmm-live=true",
+                "--vmm-prefix=false",
+                "--prefix-cache=false",
+            ])
+            .unwrap();
+        let config = super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap();
+        assert!(config.vmm_live);
+        assert!(!config.vmm_prefix && !config.prefix_cache);
+    }
+
     #[test]
     fn device_state_clear_defaults_on_and_has_a_false_rollback() {
         use clap::{Args, FromArgMatches};

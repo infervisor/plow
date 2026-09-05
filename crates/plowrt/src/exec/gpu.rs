@@ -365,13 +365,15 @@ const STAGE: usize = 64 << 20;
 /// the launch loudly (never silent), so a stale value here cannot corrupt.
 const SMEM_PF: u32 = 21312 * 4;
 
-/// VMM prefix-sharing state (`PLOW_VMM_PREFIX=1`): the pool
+/// VMM live allocation or prefix-sharing state: the pool
 /// backing every FULL layer's `kv.{l}.k/v` tensor with per-sequence VA
 /// windows, plus the sliding-ring metadata the boundary snapshots need
 /// (sliding layers stay on cudaMalloc; their last `window` rows are
 /// D2D-copied to/from a snapshot buffer at publish/attach — plan §8).
 struct VmmServe {
     kv: crate::memory::vmm::VmmKv,
+    tensor_tracks: Vec<(usize, u32, u32)>,
+    cache_tensors: Vec<usize>,
     /// Per sliding layer: (devp index of `kv.{l}.k`, of `kv.{l}.v`,
     /// per-slot byte stride). K and V share one stride.
     slide: Vec<(usize, usize, u64)>,
@@ -2297,7 +2299,21 @@ impl GpuEngine {
 
         // ---- VMM prefix sharing (PLOW_VMM_PREFIX=1; default off) ----
         let vmm = {
-            let run = || Self::vmm_bringup(&be, &blob, checkpoint_dir);
+            let run = || {
+                let config = RuntimeConfig::get();
+                if RuntimeConfig::env_bool_or("PLOW_VMM_LIVE", config.nv.vmm_live) {
+                    if RuntimeConfig::env_bool_or("PLOW_VMM_PREFIX", config.nv.vmm_prefix)
+                        || RuntimeConfig::env_bool_or("PLOW_PREFIX_CACHE", config.nv.prefix_cache)
+                    {
+                        return Err(RuntimeError::Rejected(
+                            "live KV allocation requires prefix caching off".into(),
+                        ));
+                    }
+                    Self::vmm_live_bringup(&be, &blob).map(Some)
+                } else {
+                    Ok(Self::vmm_bringup(&be, &blob, checkpoint_dir))
+                }
+            };
             if let Some(tm) = load_tim.as_mut() {
                 let (v, ms) = tm.phase("vmm_bringup", run);
                 tm.vmm_ms = ms;
@@ -2305,21 +2321,22 @@ impl GpuEngine {
             } else {
                 run()
             }
-        };
+        }?;
 
         // ---- weight slab ----
         // Where a tensor's storage comes from, decided once so the sizing pass
         // and the upload loop cannot disagree about it.
-        let vmm_va_of = |name: &str| -> Option<u64> {
+        let vmm_va_of = |id: usize| -> Option<u64> {
             let v = vmm.as_ref()?;
-            let (l, t) = kv_tensor_name(name)?;
-            v.kv.tensor_va(l, t)
+            let &(_, layer, tensor) = v.tensor_tracks.iter().find(|&&(i, _, _)| i == id)?;
+            v.kv.tensor_va(layer, tensor)
         };
         let slab_bytes: u64 = blob
             .tensors
             .iter()
-            .filter(|td| vmm_va_of(&td.name).is_none())
-            .map(|td| slab_pad(td.bytes))
+            .enumerate()
+            .filter(|(id, _)| vmm_va_of(*id).is_none())
+            .map(|(_, td)| slab_pad(td.bytes))
             .sum();
         // Brought up BEFORE the checkpoint opens: the VMM reserve returns in
         // µs and its mapper then commits pages concurrently with the open,
@@ -2474,7 +2491,8 @@ impl GpuEngine {
         let (mut wb, mut kvb, mut nw) = (0u64, 0u64, 0usize);
         let mut upload_all = || -> Result<()> {
             for (i, td) in blob.tensors.iter().enumerate() {
-                let vmm_va = vmm_va_of(&td.name);
+                let vmm_va = vmm_va_of(i);
+                let packet_cache = vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(&i));
                 let t_alloc =
                     (load_prof && vmm_va.is_none() && matches!(weight_slab, WeightSlab::PerTensor))
                         .then(std::time::Instant::now);
@@ -2502,7 +2520,7 @@ impl GpuEngine {
                     "act.logits" => t_logits = Some(i),
                     _ => {}
                 }
-                if td.name.starts_with("kv.") {
+                if td.name.starts_with("kv.") || packet_cache {
                     kvb += td.bytes;
                 }
                 if packet::names::is_host_filled_table(&td.name) {
@@ -2514,7 +2532,7 @@ impl GpuEngine {
                         td.name
                     )));
                 }
-                if packet::names::is_checkpoint_weight(&td.name) {
+                if !packet_cache && packet::names::is_checkpoint_weight(&td.name) {
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {
                         RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name))
                     })?;
@@ -2594,7 +2612,7 @@ impl GpuEngine {
                         tensor = %td.name, bytes = td.bytes, kind = g.kind,
                         "materialised generated tensor"
                     );
-                } else if vmm_va.is_none() && !td.name.starts_with("kv.") {
+                } else if vmm_va.is_none() && !packet_cache && !td.name.starts_with("kv.") {
                     slab_commit_wait(&weight_slab, mem.base + td.bytes, &mut slab_wait_ms)?;
                     let t_ms = load_prof.then(std::time::Instant::now);
                     be.memset_d8(mem.base, 0, td.bytes as usize)?;
@@ -3104,7 +3122,11 @@ impl GpuEngine {
             .tensors
             .iter()
             .enumerate()
-            .filter(|(_, td)| td.name.starts_with("kv.") || td.name.starts_with("state.qwen."))
+            .filter(|(id, td)| {
+                td.name.starts_with("kv.")
+                    || td.name.starts_with("state.qwen.")
+                    || vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(id))
+            })
             .map(|(i, td)| (i, td.bytes / batch as u64))
             .collect();
 
@@ -3280,7 +3302,7 @@ impl GpuEngine {
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
                 if vmm.is_some() {
-                    tracing::warn!("PLOW_PF_BATCH=1 ignored: incompatible with PLOW_VMM_PREFIX=1");
+                    tracing::warn!("PLOW_PF_BATCH=1 ignored: incompatible with VMM KV allocation");
                     None
                 } else {
                     let fused = prefill.iter().find(|b| {
@@ -3354,7 +3376,8 @@ impl GpuEngine {
             batch,
             prefill_buckets = prefill.len(),
             stop_ids = ?stop_ids,
-            vmm_prefix = vmm.is_some(),
+            vmm_prefix = vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse()),
+            vmm_live = vmm.as_ref().is_some_and(|v| !v.kv.prefix_reuse()),
             elapsed_s = t0.elapsed().as_secs_f32(),
             // Was a hardcoded "sm_120" from the sm120-only era. On a Hopper card it
             // printed sm_120 while running the sm90a object, which reads as a
@@ -3569,6 +3592,42 @@ impl GpuEngine {
         Ok(())
     }
 
+    fn vmm_live_bringup(be: &Arc<CudaBackend>, blob: &DevBlob) -> Result<VmmServe> {
+        let layout = crate::memory::vmm::LiveKvLayout::from_blob(blob)?;
+        let config = RuntimeConfig::get();
+        let block_hint =
+            RuntimeConfig::env_parse_or("PLOW_VMM_BLOCK_MIB", config.nv.vmm_block_mib as u64) << 20;
+        let kv = crate::memory::vmm::VmmKv::new_live(
+            Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
+            layout.geometry,
+            block_hint,
+        )?;
+        let tensor_tracks = layout
+            .full_tensors
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, pair)| {
+                pair.iter()
+                    .enumerate()
+                    .map(move |(which, &id)| (id, layer as u32, which as u32))
+            })
+            .collect();
+        Ok(VmmServe {
+            kv,
+            tensor_tracks,
+            cache_tensors: layout.cache_tensors,
+            slide: Vec::new(),
+            slide_scale: Vec::new(),
+            full_scale: Vec::new(),
+            ring: 0,
+            snap_bytes: 0,
+        })
+    }
+
+    fn vmm_prefix_enabled(&self) -> bool {
+        self.vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
+    }
+
     /// Bring up VMM prefix sharing when `--vmm-prefix` / `PLOW_VMM_PREFIX=1`
     /// and the model's KV geometry (from the checkpoint's `config.json`)
     /// validates against the blob's declared tensor sizes. Any mismatch logs
@@ -3734,6 +3793,16 @@ impl GpuEngine {
             cache_cap,
         ) {
             Ok(mut kv) => Some(VmmServe {
+                tensor_tracks: blob
+                    .tensors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, tensor)| {
+                        let (layer, which) = kv_tensor_name(&tensor.name)?;
+                        kv.tensor_va(layer, which).map(|_| (id, layer, which))
+                    })
+                    .collect(),
+                cache_tensors: Vec::new(),
                 kv: {
                     kv.enable_block_pool(crate::memory::vmm::kv_pool_cap_from_env());
                     kv
@@ -4022,7 +4091,9 @@ impl GpuEngine {
     /// windows from the boundary snapshot, and advance the prefill frontier
     /// so the tail (< one sharing block) is recomputed by normal prefill.
     fn vmm_attach(&mut self, b: usize, prompt: &[u32]) -> Result<()> {
-        let Some(v) = &self.vmm else { return Ok(()) };
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+            return Ok(());
+        };
         let Some(a) = v.kv.try_attach(b, prompt)? else {
             return Ok(());
         };
@@ -4084,7 +4155,7 @@ impl GpuEngine {
     /// already mapped, so only the tail goes through per-token decode steps.
     /// A no-op (returns 0) with VMM off or on a warm slot.
     pub fn attach_prompt(&mut self, b: usize, prompt: &[u32]) -> Result<usize> {
-        if self.pos[b] == 0 && self.vmm.is_some() {
+        if self.pos[b] == 0 && self.vmm_prefix_enabled() {
             self.vmm_attach(b, prompt)?;
         }
         Ok(self.pos[b] as usize)
@@ -4156,7 +4227,9 @@ impl GpuEngine {
     /// hold the boundary's window rows (`rows - p_a > ring - window`:
     /// wrapped past, unrecoverable).
     fn vmm_tail_publish(&self, b: usize) {
-        let Some(v) = &self.vmm else { return };
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+            return;
+        };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         if rows == 0 || toks.len() != rows as usize {
@@ -4434,7 +4507,9 @@ impl GpuEngine {
         for &(b, tok) in feeds {
             toks.push(self.stage.token(b));
             self.pos[b] += 1;
-            self.seq_tokens[b].push(tok);
+            if self.vmm_prefix_enabled() {
+                self.seq_tokens[b].push(tok);
+            }
         }
         // VMM: hint the pre-mapper so the next block is mapped before the
         // frontier reaches it (map-during-decode is safe — probe [5]).
@@ -4520,7 +4595,9 @@ impl GpuEngine {
                 self.retire_prompt_token(slot, token, toks)?;
             } else {
                 self.pos[slot] += 1;
-                self.seq_tokens[slot].push(token);
+                if self.vmm_prefix_enabled() {
+                    self.seq_tokens[slot].push(token);
+                }
                 if let Some(v) = &self.vmm {
                     v.kv.advise(slot, self.pos[slot]);
                 }
@@ -4672,7 +4749,9 @@ impl GpuEngine {
         toks.clear();
         toks.push(self.stage.token(slot));
         self.pos[slot] += 1;
-        self.seq_tokens[slot].push(token);
+        if self.vmm_prefix_enabled() {
+            self.seq_tokens[slot].push(token);
+        }
         if let Some(v) = &self.vmm {
             v.kv.advise(slot, self.pos[slot]);
         }
@@ -4846,8 +4925,10 @@ impl GpuEngine {
             self.pos[b] += k as u32;
             // Rows written this quantum: the fed token, then the device's own
             // feed chain (the first k-1 produced tokens).
-            self.seq_tokens[b].push(tok);
-            self.seq_tokens[b].extend_from_slice(&out[ri * k..ri * k + (k - 1)]);
+            if self.vmm_prefix_enabled() {
+                self.seq_tokens[b].push(tok);
+                self.seq_tokens[b].extend_from_slice(&out[ri * k..ri * k + (k - 1)]);
+            }
             if let Some(v) = &self.vmm {
                 v.kv.advise(b, self.pos[b]);
             }
@@ -5474,7 +5555,7 @@ impl GpuEngine {
         }
         // VMM: first chunk of a fresh sequence consults the prefix cache —
         // a hit shares the whole-block prefix and moves the frontier there.
-        if self.pos[b] == 0 && self.vmm.is_some() {
+        if self.pos[b] == 0 && self.vmm_prefix_enabled() {
             self.vmm_attach(b, prompt)?;
         }
         let c0 = self.pos[b] as usize;
@@ -5509,11 +5590,11 @@ impl GpuEngine {
         // and the boundary's sliding-window snapshot into the prefix cache.
         // The consumed prompt also seeds the slot's row-token record so the
         // sequence's GENERATED blocks can publish at the next begin_slot.
-        if self.vmm.is_some() {
+        if self.vmm_prefix_enabled() {
             self.seq_tokens[b].clear();
             self.seq_tokens[b].extend_from_slice(prompt);
         }
-        if let Some(v) = &self.vmm {
+        if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
             let bt = v.kv.block_rows();
             let p_a = (n as u32 / bt) * bt;
             if p_a >= v.kv.geometry().window.max(bt) {
@@ -5660,6 +5741,11 @@ impl GpuEngine {
         // VMM: the bucket writes all tc rows (pad rows write garbage past
         // `real`) — map the chunk's full row span before launching.
         if let Some(v) = &self.vmm {
+            if !v.kv.prefix_reuse() && c0 + tc > self.max_ctx {
+                return Err(RuntimeError::Rejected(
+                    "live KV prefill padding exceeds the reserved context".into(),
+                ));
+            }
             v.kv.ensure_rows(b, ((c0 + tc) as u32).min(self.max_ctx as u32))?;
         }
 
