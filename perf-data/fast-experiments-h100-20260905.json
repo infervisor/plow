@@ -1,0 +1,300 @@
+{
+  "recorded_utc": "2026-09-05T19:14:31.817288+00:00",
+  "io_commit": "8e856a4",
+  "screening_only": true,
+  "queue": "/tmp/plow-model-support-checks/fast-experiment-window-20260905/queue.json",
+  "serving_retry_queue": "/tmp/plow-model-support-checks/fast-serving-retry-20260905/queue.json",
+  "serving_retry_session": 65633,
+  "completed_job_wall_times": {
+    "ws384-m1024-control": {
+      "seconds": 3.0,
+      "passed": true
+    },
+    "ws384-m1024-cursor": {
+      "seconds": 3.0,
+      "passed": true
+    },
+    "ws384-m4096-control": {
+      "seconds": 7.0,
+      "passed": true
+    },
+    "ws384-m4096-cursor": {
+      "seconds": 8.0,
+      "passed": true
+    },
+    "ws384-m8192-control": {
+      "seconds": 14.0,
+      "passed": true
+    },
+    "ws384-m8192-cursor": {
+      "seconds": 13.0,
+      "passed": true
+    },
+    "ws384-m65-control": {
+      "seconds": 2.0,
+      "passed": true
+    },
+    "ws384-m65-cursor": {
+      "seconds": 2.0,
+      "passed": true
+    },
+    "split-m1024": {
+      "seconds": 1.0,
+      "passed": true
+    },
+    "split-m4096": {
+      "seconds": 1.0,
+      "passed": true
+    },
+    "split-m8192": {
+      "seconds": 2.0,
+      "passed": true
+    },
+    "split-bench-r1-control": {
+      "seconds": 11.0,
+      "passed": true
+    },
+    "split-bench-r1-candidate": {
+      "seconds": 11.0,
+      "passed": true
+    },
+    "split-bench-r2-candidate": {
+      "seconds": 11.0,
+      "passed": true
+    },
+    "split-bench-r2-control": {
+      "seconds": 12.0,
+      "passed": true
+    },
+    "full-control-m1024": {
+      "seconds": 7.0,
+      "passed": true
+    },
+    "full-attention-m1024": {
+      "seconds": 8.0,
+      "passed": true
+    },
+    "full-control-m8192": {
+      "seconds": 10.0,
+      "passed": true
+    },
+    "full-attention-m8192": {
+      "seconds": 9.0,
+      "passed": true
+    },
+    "full-control-m32768": {
+      "seconds": 33.0,
+      "passed": true
+    },
+    "full-attention-m32768": {
+      "seconds": 15.0,
+      "passed": true
+    },
+    "live_tma_all_slots_match_flat_full_logits": {
+      "seconds": 72.0,
+      "passed": true
+    },
+    "gemma12-bf16-screen-c1": {
+      "seconds": 13.0,
+      "passed": false
+    },
+    "gemma12-bf16-screen-c4": {
+      "seconds": 14.0,
+      "passed": false
+    },
+    "gemma12-bf16-screen-c16": {
+      "seconds": 13.0,
+      "passed": false
+    },
+    "serve-control": {
+      "seconds": 13.0,
+      "passed": false
+    }
+  },
+  "results": {
+    "ws384-m1024-control": {
+      "passed": true,
+      "returncode": 0,
+      "finite_correctness_cases": 15
+    },
+    "ws384-m1024-cursor": {
+      "passed": true,
+      "returncode": 0,
+      "finite_correctness_cases": 15
+    },
+    "ws384-m4096-control": {
+      "passed": true,
+      "returncode": 0,
+      "finite_correctness_cases": 15
+    },
+    "ws384-m4096-cursor": {
+      "passed": true,
+      "returncode": 0,
+      "finite_correctness_cases": 15
+    },
+    "ws384-m8192-control": {
+      "passed": true,
+      "returncode": 0,
+      "finite_correctness_cases": 15
+    },
+    "ws384-m8192-cursor": {
+      "passed": true,
+      "returncode": 0,
+      "finite_correctness_cases": 15
+    },
+    "ws384-m65-control": {
+      "passed": true,
+      "returncode": 0,
+      "finite_correctness_cases": 15
+    },
+    "ws384-m65-cursor": {
+      "passed": true,
+      "returncode": 0,
+      "finite_correctness_cases": 15
+    },
+    "split-m1024": {
+      "passed": true,
+      "returncode": 0,
+      "bit_exact": true
+    },
+    "split-m4096": {
+      "passed": true,
+      "returncode": 0,
+      "bit_exact": true
+    },
+    "split-m8192": {
+      "passed": true,
+      "returncode": 0,
+      "bit_exact": true
+    },
+    "split-bench-r1-control": {
+      "passed": true,
+      "returncode": 0
+    },
+    "split-bench-r1-candidate": {
+      "passed": true,
+      "returncode": 0
+    },
+    "split-bench-r2-candidate": {
+      "passed": true,
+      "returncode": 0
+    },
+    "split-bench-r2-control": {
+      "passed": true,
+      "returncode": 0
+    },
+    "full-control-m1024": {
+      "passed": true,
+      "returncode": 0,
+      "bit_exact_full_logits": true
+    },
+    "full-attention-m1024": {
+      "passed": true,
+      "returncode": 0,
+      "bit_exact_full_logits": true
+    },
+    "full-control-m8192": {
+      "passed": true,
+      "returncode": 0,
+      "bit_exact_full_logits": true
+    },
+    "full-attention-m8192": {
+      "passed": true,
+      "returncode": 0,
+      "bit_exact_full_logits": true
+    },
+    "full-control-m32768": {
+      "passed": true,
+      "returncode": 0,
+      "bit_exact_full_logits": true
+    },
+    "full-attention-m32768": {
+      "passed": true,
+      "returncode": 0,
+      "bit_exact_full_logits": true
+    },
+    "live_tma_all_slots_match_flat_full_logits": {
+      "passed": true,
+      "returncode": 0
+    },
+    "gemma12-bf16-screen-c1": {
+      "passed": false,
+      "returncode": 1
+    },
+    "gemma12-bf16-screen-c4": {
+      "passed": false,
+      "returncode": 1
+    },
+    "gemma12-bf16-screen-c16": {
+      "passed": false,
+      "returncode": 1
+    },
+    "serve-control": {
+      "passed": false,
+      "returncode": 1
+    }
+  },
+  "block_output_microbenchmark": {
+    "float_count": 1048576,
+    "old_seconds": 1.080591,
+    "buffered_seconds": 0.002475,
+    "byte_exact": true,
+    "scope": "CPU output writer only; not GPU kernel speedup"
+  },
+  "screening_contract": {
+    "contexts": [
+      1024,
+      4096,
+      8192,
+      32768
+    ],
+    "output_tokens": 512,
+    "requests_by_concurrency": {
+      "1": 4,
+      "4": 4,
+      "16": 16
+    },
+    "warmups_by_concurrency": {
+      "1": 1,
+      "4": 4,
+      "16": 16
+    },
+    "finalists": {
+      "requests": 32,
+      "warmups": 16
+    }
+  },
+  "reference_boundary": {
+    "status": "reference_cell_finished_cleanup_requested",
+    "harness_pid": 826212,
+    "client_pid": 844623,
+    "result": "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r2/in32768_c1.json",
+    "utc": "2026-09-05T19:07:20Z",
+    "completed": 32,
+    "failed": 0,
+    "valid_result": true
+  },
+  "deferred_reference_cells": {
+    "group": "qwen27b-1k-32k-r2",
+    "cells": [
+      [
+        32768,
+        4
+      ],
+      [
+        32768,
+        16
+      ]
+    ]
+  },
+  "limits": [
+    "Reduced-sample screens do not establish p99 or final throughput wins.",
+    "Qwen native FP8 serving is not precision matched to existing BF16 vLLM references.",
+    "Full-model synthetic parity does not replace serving coherence and quality gates."
+  ],
+  "serving_correction": "Prior five serving attempts used an unregistered model slug and failed before inference; retry uses advertised checkpoint slug.",
+  "serving_retry_observed": {
+    "gemma12": "Correct slug resolves routing; all three concurrency screens fail coherence with repetitive numeric output before timing. CPU-only serving-path investigation assigned to gdn_prefill_debug.",
+    "qwen_control": "Coherence PASS (Paris); vllm bench serve screening running."
+  }
+}

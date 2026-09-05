@@ -1,7 +1,7 @@
 {
   "source_commit": "bd6e1008abe4a1366d05a66edefc533140227249",
   "session_id": 44041,
-  "status": "waiting_for_uninterrupted_qwen_reference_group",
+  "status": "superseded_before_execution",
   "reference_driver_pid": 622803,
   "reference_child_pid": 826212,
   "reference_driver_paused": true,
@@ -140,5 +140,7 @@
     "cpu_validated_role_segments": 128,
     "gpu_qualified": false,
     "artifact_dir": "/tmp/plow-model-support-checks/qwen-attention-full-20260905"
-  }
+  },
+  "replacement_report": "fast-experiments-h100-20260905.json",
+  "reason": "Prioritize kernel/block experiments and reduced-sample serving screens after completed reference cell; retain original full-sample configuration for finalists."
 }
