@@ -981,7 +981,7 @@ pub(super) fn run(
                 }
             })
             .collect::<Vec<_>>(),
-        None,
+        c.block.map(|layer| layer..layer + 1),
         &[],
         &[],
         &[],
@@ -1087,6 +1087,66 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn block_emission_checks_only_selected_checkpoint_layers() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_QWEN_PREFILL", "128"),
+            ("PLOW_DECODE_BATCH", "1"),
+        ]);
+        let c = Config::parse(&fixture());
+        let m = model(&c, 128, 132, 0, false, 1);
+        let mut header = serde_json::Map::new();
+        for t in &m.tensors {
+            if t.name.starts_with(&c.prefix) {
+                header.insert(
+                    t.name.clone(),
+                    serde_json::json!({"dtype":"BF16","shape":[1],"data_offsets":[0,2]}),
+                );
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("qwen-block-coverage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), fixture().to_string()).unwrap();
+        let write_checkpoint = |header: &serde_json::Map<String, Value>| {
+            let json = serde_json::to_vec(header).unwrap();
+            let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(json);
+            bytes.extend([0, 0]);
+            std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+        };
+        let emit = |layer: &str| {
+            run(
+                &dir,
+                128,
+                dir.join("model.pkt").to_str().unwrap(),
+                132,
+                1,
+                Some(layer),
+                true,
+                "sm_90a",
+                "H100 NVL",
+                None,
+            )
+        };
+        write_checkpoint(&header);
+        emit("0");
+        emit("3");
+        let required = format!("{}layers.0.input_layernorm.weight", c.prefix);
+        let weight = header.remove(&required).unwrap();
+        write_checkpoint(&header);
+        assert!(std::panic::catch_unwind(|| emit("0")).is_err());
+        header.insert(required, weight);
+        header.insert(
+            format!("{}layers.0.unimplemented.weight", c.prefix),
+            serde_json::json!({"dtype":"BF16","shape":[1],"data_offsets":[0,2]}),
+        );
+        write_checkpoint(&header);
+        assert!(std::panic::catch_unwind(|| emit("0")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn fused_mlp_keeps_bf16_gate_up_and_separate_silu() {
         let _env = crate::test_env::env_guard();
