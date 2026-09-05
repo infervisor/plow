@@ -601,7 +601,7 @@ impl Default for CpuEngineOpts {
             threads: 0,
             numa: NumaMode::Auto,
             isa: Isa::Amx,
-            spin_us: 50,
+            spin_us: 2000,
         }
     }
 }

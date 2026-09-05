@@ -153,14 +153,17 @@ G_K(g_flash_decode) {
     }
 }
 
-/* t0=O t1=Opart t2=mlpart  i0=n_batch i1=n_head i2=nsplit i3=hd
+/* t0=O t1=Opart t2=mlpart t3=sinks?(PLOW_SINK_T[n_head])  i0=n_batch i1=n_head i2=nsplit i3=hd
  * Work is (row, head, d-chunk) with dsplit = ceil(nblk / (n_batch*n_head)) — must match
- * flash_merge_map() in crates/devgen/src/lib.rs. */
+ * flash_merge_map() in crates/devgen/src/lib.rs.
+ * Sinks (GPT-OSS): one extra UNSCALED logit per head that has no value row. It enters the
+ * softmax denominator exactly once, here: gm' = max(gm, sink_h), gl' = gl*e^(gm-gm') + e^(sink_h-gm'). */
 G_K(g_flash_merge) {
     (void)ctx;
     plow_bf16* O = PLOW_CPU_TEN(in, T, 0);
     const float* Opart = PLOW_CPU_TEN(in, T, 1);
     const float* mlpart = PLOW_CPU_TEN(in, T, 2);
+    const PLOW_SINK_T* sinks = PLOW_CPU_TEN(in, T, 3);
     const uint32_t n_batch = in->i[0], n_head = in->i[1], nsplit = in->i[2], D = in->i[3];
     const uint32_t n_bh = n_batch * n_head;
     if (n_bh == 0u) return;
@@ -173,7 +176,9 @@ G_K(g_flash_merge) {
         const float* ml = mlpart + (size_t)hb * nsplit * 2;
         float gm = G_NEG_INF;
         for (uint32_t s = 0; s < nsplit; s++) gm = gm > ml[s * 2] ? gm : ml[s * 2];
-        float gl = 0.0f;
+        const float sink = sinks ? PLOW_SINK_LOAD(sinks[hb % n_head]) : G_NEG_INF;
+        if (sink > gm) gm = sink;
+        float gl = sinks ? expf(sink - gm) : 0.0f;
         for (uint32_t s = 0; s < nsplit; s++)
             if (ml[s * 2] != G_NEG_INF) gl += ml[s * 2 + 1] * expf(ml[s * 2] - gm);
         const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;

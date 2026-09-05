@@ -14,7 +14,9 @@ V_K(v_headnorm_rope) {
     const uint32_t skip_norm = in->i[4], n_batch_kv = in->i[6];
     const uint32_t out_stride = in->fj[1].u, kv_mask = in->fj[2].u;
     const float eps = in->fj[0].f;
-    const int interleave = (hd == 64u) || (hd == 128u && in->i[5] == 1u);
+    /* i5: 0 = the legacy rule (hd 64 interleaved, hd 128 half-split), 1 = force interleaved at
+     * hd 128, 2 = force half-split (GPT-OSS NeoX at hd 64). */
+    const int interleave = in->i[5] == 2u ? 0 : (hd == 64u) || (hd == 128u && in->i[5] == 1u);
     const uint32_t H2 = hd >> 1, total = ntok * nhead;
     /* H2 must be a whole 16-lane chunk; the interleaved form needs 16-lane pair groups. */
     if (hd > 512u || (hd & 31u)) {

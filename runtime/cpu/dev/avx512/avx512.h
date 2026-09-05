@@ -35,6 +35,13 @@ V_K(v_flash_prefill);
 V_K(v_flash_decode);
 V_K(v_flash_merge);
 void v_register_attention(plow_cpu_kernel_fn* tab);
+/* gptoss.c / moe.c */
+V_K(v_gemv_mxfp4);
+V_K(v_moe_glu_mx);
+V_K(v_moe_down_mx);
+V_K(v_moe_glu_mx_pf);
+V_K(v_moe_down_mx_pf);
+void v_register_gptoss(plow_cpu_kernel_fn* tab);
 
 /* --- bf16 <-> f32 (spec §5: explicit widen, cvtneps_pbh on store) ------------------- */
 
@@ -104,6 +111,29 @@ static inline __m512 v_act_gate(__m512 g, uint32_t act) {
     if (act == 1u) return v_silu(g);
     if (act == 0u) return v_gelu_tanh(g);
     return _mm512_set1_ps(NAN);
+}
+/* act 3 = swiglu_oai pair form (golden g_swiglu_oai). */
+static inline __m512 v_swiglu_oai(__m512 g, __m512 u, float alpha, float limit) {
+    const __m512 vl = _mm512_set1_ps(limit);
+    g = _mm512_min_ps(g, vl);
+    u = _mm512_max_ps(_mm512_min_ps(u, vl), _mm512_sub_ps(_mm512_setzero_ps(), vl));
+    const __m512 glu = _mm512_mul_ps(g, v_sigmoid(_mm512_mul_ps(g, _mm512_set1_ps(alpha))));
+    return _mm512_mul_ps(glu, _mm512_add_ps(u, _mm512_set1_ps(1.0f)));
+}
+/* golden g_glu_pair, 16 lanes. */
+static inline __m512 v_glu_pair(__m512 g, __m512 u, uint32_t act, float f0, float f1) {
+    if (act == 2u) {
+        const __m512 vb = _mm512_set1_ps(f0);
+        const __m512 gate = _mm512_mul_ps(_mm512_mul_ps(vb, v_tanh(_mm512_div_ps(g, vb))), v_sigmoid(g));
+        __m512 up = u;
+        if (f1 > 0.0f) {
+            const __m512 vl = _mm512_set1_ps(f1);
+            up = _mm512_mul_ps(vl, v_tanh(_mm512_div_ps(u, vl)));
+        }
+        return _mm512_mul_ps(gate, up);
+    }
+    if (act == 3u) return f1 > 0.0f ? v_swiglu_oai(g, u, f0, f1) : _mm512_set1_ps(NAN);
+    return _mm512_mul_ps(v_act_gate(g, act), u);
 }
 
 /* --- row helpers shared by norm.c and the gemv norm folds --------------------------------- */

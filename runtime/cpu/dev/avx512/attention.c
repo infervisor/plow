@@ -266,13 +266,15 @@ V_K(v_flash_decode) {
     }
 }
 
-/* t0=O t1=Opart t2=mlpart  i0=n_batch i1=n_head i2=nsplit i3=hd. Work = (row, head, d-chunk),
- * dsplit = ceil(nblk / (n_batch*n_head)) exactly as golden / devgen flash_merge_map. */
+/* t0=O t1=Opart t2=mlpart t3=sinks?  i0=n_batch i1=n_head i2=nsplit i3=hd. Work = (row, head,
+ * d-chunk), dsplit = ceil(nblk / (n_batch*n_head)) exactly as golden / devgen flash_merge_map.
+ * The sink (golden g_flash_merge) is folded into (gm, gl) once per (row, head). */
 V_K(v_flash_merge) {
     (void)ctx;
     plow_bf16* O = PLOW_CPU_TEN(in, T, 0);
     const float* Opart = PLOW_CPU_TEN(in, T, 1);
     const float* mlpart = PLOW_CPU_TEN(in, T, 2);
+    const PLOW_SINK_T* sinks = PLOW_CPU_TEN(in, T, 3);
     const uint32_t n_batch = in->i[0], n_head = in->i[1], nsplit = in->i[2], D = in->i[3];
     const uint32_t n_bh = n_batch * n_head;
     if (n_bh == 0u || nsplit == 0u) return;
@@ -290,7 +292,9 @@ V_K(v_flash_merge) {
         const float* ml = mlpart + (size_t)hb * nsplit * 2;
         float gm = G_NEG_INF;
         for (uint32_t s = 0; s < nsplit; s++) gm = gm > ml[s * 2] ? gm : ml[s * 2];
-        float gl = 0.0f;
+        const float sink = sinks ? PLOW_SINK_LOAD(sinks[hb % n_head]) : G_NEG_INF;
+        if (sink > gm) gm = sink;
+        float gl = sinks ? expf(sink - gm) : 0.0f;
         for (uint32_t s = 0; s < nsplit; s++) {
             wgt[s] = ml[s * 2] != G_NEG_INF ? expf(ml[s * 2] - gm) : 0.0f;
             gl += ml[s * 2 + 1] * wgt[s];

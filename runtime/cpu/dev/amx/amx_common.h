@@ -15,7 +15,11 @@ typedef struct {
     const float* us;     /* fp8 GLU up scale [N] */
     const float* rms;    /* GEMM_NORM */
     const plow_bf16* gamma;
+    const plow_bf16* bias; /* t7: bf16[N], added in f32 before the bf16 store (GEMM / GEMM_NORM);
+                              GLU: t6 = gate bias */
+    const plow_bf16* bias_up; /* GLU t7: up bias */
     uint32_t M, N, K, BM, BN, act;
+    float f0, f1;           /* GLU act immediates */
 } gemm_args;
 
 /* Scratch large enough and K a multiple of 32 (else the caller falls back to golden). */

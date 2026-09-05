@@ -19,19 +19,20 @@ V_K(v_residual) {
     }
 }
 
-/* out = act(gate) * up */
+/* out = pair(gate, up): act(gate) * up, or the act-3 swiglu_oai pair form (f0 alpha, f1 limit). */
 V_K(v_glu) {
     (void)ctx;
     plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
     const plow_bf16* gate = PLOW_CPU_TEN(in, T, 1);
     const plow_bf16* up = PLOW_CPU_TEN(in, T, 2);
     const uint32_t act = in->i[1];
+    const float f0 = in->fj[0].f, f1 = in->fj[1].f;
     uint32_t lo, hi;
     g_range(in->i[0], slice, nblk, &lo, &hi);
     for (uint32_t i = lo; i < hi; i += 16) {
         const __mmask16 m = i + 16 <= hi ? 0xFFFF : v_tail16(hi - i);
-        const __m512 g = v_act_gate(v_load_bf16_mask(gate + i, m), act);
-        v_store_bf16_mask(out + i, m, _mm512_mul_ps(g, v_load_bf16_mask(up + i, m)));
+        const __m512 o = v_glu_pair(v_load_bf16_mask(gate + i, m), v_load_bf16_mask(up + i, m), act, f0, f1);
+        v_store_bf16_mask(out + i, m, o);
     }
 }
 

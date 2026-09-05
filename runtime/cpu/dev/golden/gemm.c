@@ -12,10 +12,11 @@ static float dot_bf16(const plow_bf16* a, const plow_bf16* b, uint32_t k) {
     return acc;
 }
 
-/* C[M,N] = A[M,K] . B[N,K]^T over this slice's tiles. NORM: a' = bf16(a * rms[m] * gamma[k]). */
+/* C[M,N] = A[M,K] . B[N,K]^T over this slice's tiles. NORM: a' = bf16(a * rms[m] * gamma[k]).
+ * bias (bf16[N]) is added to the f32 accumulator before the bf16 round. */
 static void gemm_tiles(plow_bf16* C, const plow_bf16* A, const plow_bf16* B, const float* rms,
-                       const plow_bf16* gamma, uint32_t M, uint32_t N, uint32_t K, uint32_t BM,
-                       uint32_t BN, uint32_t slice, uint32_t nblk) {
+                       const plow_bf16* gamma, const plow_bf16* bias, uint32_t M, uint32_t N,
+                       uint32_t K, uint32_t BM, uint32_t BN, uint32_t slice, uint32_t nblk) {
     const uint32_t tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN;
     for (uint32_t lin = slice; lin < tm * tn; lin += nblk) {
         const uint32_t m0 = (lin / tn) * BM, n0 = (lin % tn) * BN;
@@ -34,20 +35,21 @@ static void gemm_tiles(plow_bf16* C, const plow_bf16* A, const plow_bf16* B, con
                 } else {
                     acc = dot_bf16(a, b, K);
                 }
+                if (bias) acc += plow_bf2f(bias[n]);
                 C[(size_t)m * N + n] = plow_f2bf(acc);
             }
         }
     }
 }
 
-/* t0=C t1=A t2=B  i0=M i1=N i2=K i4=a_row0 i5=c_row0 */
+/* t0=C t1=A t2=B t7=bias?  i0=M i1=N i2=K i4=a_row0 i5=c_row0 */
 static void gemm_op(const PlowDevInst* in, void* const* T, uint32_t BM, uint32_t BN,
                     uint32_t slice, uint32_t nblk) {
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2];
     plow_bf16* C = (plow_bf16*)PLOW_CPU_TEN(in, T, 0) + (size_t)in->i[5] * N;
     const plow_bf16* A = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K;
     const plow_bf16* B = PLOW_CPU_TEN(in, T, 2);
-    gemm_tiles(C, A, B, NULL, NULL, M, N, K, BM, BN, slice, nblk);
+    gemm_tiles(C, A, B, NULL, NULL, PLOW_CPU_TEN(in, T, 7), M, N, K, BM, BN, slice, nblk);
 }
 
 G_K(g_gemm)       { (void)ctx; gemm_op(in, T, 256, 256, slice, nblk); }
@@ -56,23 +58,27 @@ G_K(g_gemm_med)   { (void)ctx; gemm_op(in, T, 128, 128, slice, nblk); }
 G_K(g_gemm_wide)  { (void)ctx; gemm_op(in, T, 128, 256, slice, nblk); }
 G_K(g_gemm_c5)    { (void)ctx; gemm_op(in, T, 192, 256, slice, nblk); }
 
-/* t0=C t1=A t2=B t3=rms(f32) t4=gamma  i0=M i1=N i2=K */
+/* t0=C t1=A t2=B t3=rms(f32) t4=gamma t7=bias?  i0=M i1=N i2=K */
 G_K(g_gemm_norm) {
     (void)ctx;
     gemm_tiles(PLOW_CPU_TEN(in, T, 0), PLOW_CPU_TEN(in, T, 1), PLOW_CPU_TEN(in, T, 2),
-               PLOW_CPU_TEN(in, T, 3), PLOW_CPU_TEN(in, T, 4), in->i[0], in->i[1], in->i[2], 256,
-               256, slice, nblk);
+               PLOW_CPU_TEN(in, T, 3), PLOW_CPU_TEN(in, T, 4), PLOW_CPU_TEN(in, T, 7), in->i[0],
+               in->i[1], in->i[2], 256, 256, slice, nblk);
 }
 
-/* t0=fu t1=x t2=W_gate t5=W_up  i0=M i1=N i2=K i5=act.  fu = act(x.Wg^T) * (x.Wu^T).
- * The fused 256x256 tile emits BN/2 = 128 output columns. */
+/* t0=fu t1=x t2=W_gate t5=W_up t6=bias_gate? t7=bias_up?  i0=M i1=N i2=K i5=act  f0/f1 = act
+ * immediates.  fu = pair(x.Wg^T + bg, x.Wu^T + bu).  The fused 256x256 tile emits BN/2 = 128
+ * output columns. */
 G_K(g_gemm_glu) {
     (void)ctx;
     plow_bf16* C = PLOW_CPU_TEN(in, T, 0);
     const plow_bf16* A = PLOW_CPU_TEN(in, T, 1);
     const plow_bf16* Wg = PLOW_CPU_TEN(in, T, 2);
     const plow_bf16* Wu = PLOW_CPU_TEN(in, T, 5);
+    const plow_bf16* bg = PLOW_CPU_TEN(in, T, 6);
+    const plow_bf16* bu = PLOW_CPU_TEN(in, T, 7);
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2], act = in->i[5];
+    const float f0 = in->fj[0].f, f1 = in->fj[1].f;
     const uint32_t BM = 256, BN = 128;
     const uint32_t tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN;
     for (uint32_t lin = slice; lin < tm * tn; lin += nblk) {
@@ -80,9 +86,11 @@ G_K(g_gemm_glu) {
         const uint32_t m1 = m0 + BM < M ? m0 + BM : M, n1 = n0 + BN < N ? n0 + BN : N;
         for (uint32_t m = m0; m < m1; m++)
             for (uint32_t n = n0; n < n1; n++) {
-                const float g = dot_bf16(A + (size_t)m * K, Wg + (size_t)n * K, K);
-                const float u = dot_bf16(A + (size_t)m * K, Wu + (size_t)n * K, K);
-                C[(size_t)m * N + n] = plow_f2bf(g_act_gate_only(g, act) * u);
+                float g = dot_bf16(A + (size_t)m * K, Wg + (size_t)n * K, K);
+                float u = dot_bf16(A + (size_t)m * K, Wu + (size_t)n * K, K);
+                if (bg) g += plow_bf2f(bg[n]);
+                if (bu) u += plow_bf2f(bu[n]);
+                C[(size_t)m * N + n] = plow_f2bf(g_glu_pair(g, u, act, f0, f1));
             }
     }
 }
@@ -108,8 +116,9 @@ static float dot_normed(const plow_bf16* w, const plow_bf16* x, const plow_bf16*
     return acc;
 }
 
-/* t0=C t1=x t2=W t3=rms? t4=gamma?  i0=M i1=N i2=K i3=norm i4=a_row0  f0=eps
- * norm 0: plain; 1: acc = (sum w*x*gamma) * rms[m]; 2: row RMS computed here, applied to x. */
+/* t0=C t1=x t2=W t3=rms? t4=gamma? t7=bias?(bf16[N])  i0=M i1=N i2=K i3=norm i4=a_row0  f0=eps
+ * norm 0: plain; 1: acc = (sum w*x*gamma) * rms[m]; 2: row RMS computed here, applied to x.
+ * bias is added to the f32 accumulator before the bf16 round. */
 G_K(g_gemv) {
     (void)ctx;
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2], norm = in->i[3];
@@ -118,6 +127,7 @@ G_K(g_gemv) {
     const plow_bf16* W = PLOW_CPU_TEN(in, T, 2);
     const float* rms = PLOW_CPU_TEN(in, T, 3);
     const plow_bf16* gamma = PLOW_CPU_TEN(in, T, 4);
+    const plow_bf16* bias = PLOW_CPU_TEN(in, T, 7);
     const float eps = in->fj[0].f;
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
@@ -139,12 +149,15 @@ G_K(g_gemv) {
             } else {
                 acc = dot_bf16(w, xm, K);
             }
+            if (bias) acc += plow_bf2f(bias[n]);
             C[(size_t)m * N + n] = plow_f2bf(acc);
         }
     }
 }
 
-/* t0=fu t1=x t2=W_gate t5=W_up  i0=M i1=N i2=K i5=act  f0=beta f1=lbeta (situ, act==2) */
+/* t0=fu t1=x t2=W_gate t5=W_up t6=bias_gate? t7=bias_up?  i0=M i1=N i2=K i5=act
+ * f0/f1 = act immediates (situ: beta, lbeta; swiglu_oai: alpha, limit). Biases join g / u in f32
+ * before the pair activation. */
 G_K(g_gemv_glu) {
     (void)ctx;
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2], act = in->i[5];
@@ -152,21 +165,25 @@ G_K(g_gemv_glu) {
     const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
     const plow_bf16* Wg = PLOW_CPU_TEN(in, T, 2);
     const plow_bf16* Wu = PLOW_CPU_TEN(in, T, 5);
-    const float beta = in->fj[0].f, lbeta = in->fj[1].f;
+    const plow_bf16* bg = PLOW_CPU_TEN(in, T, 6);
+    const plow_bf16* bu = PLOW_CPU_TEN(in, T, 7);
+    const float f0 = in->fj[0].f, f1 = in->fj[1].f;
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
     for (uint32_t n = n0; n < n1; n++)
         for (uint32_t m = 0; m < M; m++) {
-            const float g = dot_bf16(Wg + (size_t)n * K, x + (size_t)m * K, K);
-            const float u = dot_bf16(Wu + (size_t)n * K, x + (size_t)m * K, K);
-            const float o = act == 2u ? g_situ_gate(g, beta) * g_situ_up(u, lbeta)
-                                      : g_act_gate_only(g, act) * u;
-            C[(size_t)m * N + n] = plow_f2bf(o);
+            float g = dot_bf16(Wg + (size_t)n * K, x + (size_t)m * K, K);
+            float u = dot_bf16(Wu + (size_t)n * K, x + (size_t)m * K, K);
+            if (bg) g += plow_bf2f(bg[n]);
+            if (bu) u += plow_bf2f(bu[n]);
+            C[(size_t)m * N + n] = plow_f2bf(g_glu_pair(g, u, act, f0, f1));
         }
 }
 
-/* t0=q t1=x t2=W_q t3=k t4=W_k t5=v t6=W_v t7=q-norm gamma?  i0=M i1=Nq i2=K i3=Nk i4=Nv  f0=eps
- * Blocked ownership over the concatenated q|k|v span. t7 present = the q_a_layernorm fold. */
+/* t0=q t1=x t2=W_q t3=k t4=W_k t5=v t6=W_v t7=q-norm gamma?
+ * i0=M i1=Nq i2=K i3=Nk i4=Nv i5/i6/i7=bias_q/k/v tensor HANDLES (0 = absent; bf16 [Nq]/[Nk]/[Nv])
+ * f0=eps.  Blocked ownership over the concatenated q|k|v span. t7 present = the q_a_layernorm
+ * fold. Biases are added to the f32 dot before the bf16 store (dev_isa.h op 22). */
 G_K(g_gemv_qkv) {
     (void)ctx;
     const uint32_t M = in->i[0], Nq = in->i[1], K = in->i[2], Nk = in->i[3], Nv = in->i[4];
@@ -176,6 +193,7 @@ G_K(g_gemv_qkv) {
     plow_bf16* Cs[3] = {PLOW_CPU_TEN(in, T, 0), PLOW_CPU_TEN(in, T, 3), PLOW_CPU_TEN(in, T, 5)};
     const plow_bf16* Ws[3] = {PLOW_CPU_TEN(in, T, 2), PLOW_CPU_TEN(in, T, 4),
                               PLOW_CPU_TEN(in, T, 6)};
+    const plow_bf16* Bs[3] = {G_QKV_BIAS(in, T, 5), G_QKV_BIAS(in, T, 6), G_QKV_BIAS(in, T, 7)};
     const uint32_t Ns[3] = {Nq, Nk, Nv};
     uint32_t n0, n1;
     g_range(Nq + Nk + Nv, slice, nblk, &n0, &n1);
@@ -186,7 +204,8 @@ G_K(g_gemv_qkv) {
             uint32_t s = 0, col = n;
             while (col >= Ns[s]) { col -= Ns[s]; s++; }
             const plow_bf16* w = Ws[s] + (size_t)col * K;
-            const float acc = gnorm ? dot_normed(w, xm, gnorm, inv, K) : dot_bf16(w, xm, K);
+            float acc = gnorm ? dot_normed(w, xm, gnorm, inv, K) : dot_bf16(w, xm, K);
+            if (Bs[s]) acc += plow_bf2f(Bs[s][col]);
             Cs[s][(size_t)m * Ns[s] + col] = plow_f2bf(acc);
         }
     }

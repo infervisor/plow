@@ -176,7 +176,10 @@ typedef struct {
     plow_bf16* dst;     /* C + m*N + n */
     const float* sc;    /* fp8: per-column w_scale for these 32 columns, else NULL */
     const float* sc_up; /* fp8 GLU: up scale */
+    const plow_bf16* bias; /* per-column bias for these 32 columns, else NULL (GLU: gate bias) */
+    const plow_bf16* bias_up;
     uint32_t ldc, rows, cols, done, act;
+    float f0, f1;
 } ils_t;
 
 static inline void ils_row(const ils_t* e, uint32_t r) {
@@ -184,12 +187,20 @@ static inline void ils_row(const ils_t* e, uint32_t r) {
     plow_bf16* d = e->dst + (size_t)r * e->ldc;
     if (!e->cb_up) {
         __m512 lo = _mm512_loadu_ps(c), hi = _mm512_loadu_ps(c + 16);
-        if (e->sc) {
+        if (e->sc || e->bias) {
             const __mmask16 mlo = e->cols >= 16u ? 0xFFFF : (__mmask16)((1u << e->cols) - 1u);
             const __mmask16 mhi = e->cols >= 32u ? 0xFFFF
                                   : e->cols > 16u ? (__mmask16)((1u << (e->cols - 16u)) - 1u) : 0;
-            lo = _mm512_mul_ps(lo, _mm512_maskz_loadu_ps(mlo, e->sc));
-            hi = _mm512_mul_ps(hi, _mm512_maskz_loadu_ps(mhi, e->sc + 16));
+            if (e->sc) {
+                lo = _mm512_mul_ps(lo, _mm512_maskz_loadu_ps(mlo, e->sc));
+                hi = _mm512_mul_ps(hi, _mm512_maskz_loadu_ps(mhi, e->sc + 16));
+            }
+            if (e->bias) {
+                lo = _mm512_add_ps(lo, _mm512_castsi512_ps(_mm512_slli_epi32(
+                                           _mm512_cvtepu16_epi32(_mm256_maskz_loadu_epi16(mlo, e->bias)), 16)));
+                hi = _mm512_add_ps(hi, _mm512_castsi512_ps(_mm512_slli_epi32(
+                                           _mm512_cvtepu16_epi32(_mm256_maskz_loadu_epi16(mhi, e->bias + 16)), 16)));
+            }
         }
         const __m512i v = (__m512i)_mm512_cvtne2ps_pbh(hi, lo);
         if (e->cols == 32u) _mm512_storeu_si512((void*)d, v);
@@ -197,9 +208,11 @@ static inline void ils_row(const ils_t* e, uint32_t r) {
     } else {
         const float* u = e->cb_up + (size_t)r * 32u;
         for (uint32_t j = 0; j < e->cols; j++) {
-            const float g = e->sc ? c[j] * e->sc[j] : c[j];
-            const float uu = e->sc_up ? u[j] * e->sc_up[j] : u[j];
-            d[j] = plow_f2bf(g_act_gate_only(g, e->act) * uu);
+            float g = e->sc ? c[j] * e->sc[j] : c[j];
+            float uu = e->sc_up ? u[j] * e->sc_up[j] : u[j];
+            if (e->bias) g += plow_bf2f(e->bias[j]);
+            if (e->bias_up) uu += plow_bf2f(e->bias_up[j]);
+            d[j] = plow_f2bf(g_glu_pair(g, uu, e->act, e->f0, e->f1));
         }
     }
 }
@@ -322,6 +335,10 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
                                    .dst = g->C + (size_t)m * g->N + n,
                                    .sc = g->ws ? g->ws + n : NULL,
                                    .sc_up = g->us ? g->us + n : NULL,
+                                   .bias = g->bias ? g->bias + n : NULL,
+                                   .bias_up = g->bias_up ? g->bias_up + n : NULL,
+                                   .f0 = g->f0,
+                                   .f1 = g->f1,
                                    .ldc = g->N,
                                    .rows = rows,
                                    .cols = cols,
@@ -349,7 +366,7 @@ void plow_amx_run_tiles(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowC
     }
 }
 
-/* t0=C t1=A t2=B  i0=M i1=N i2=K i4=a_row0 i5=c_row0 (golden gemm_op) */
+/* t0=C t1=A t2=B t7=bias?  i0=M i1=N i2=K i4=a_row0 i5=c_row0 (golden gemm_op) */
 static void gemm_op(const PlowDevInst* in, void* const* T, PlowCpuCtx* ctx, uint32_t BM,
                     uint32_t BN, uint32_t slice, uint32_t nblk, void (*fallback)(const PlowDevInst*, uint32_t, uint32_t, void* const*, PlowCpuCtx*)) {
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2];
@@ -359,7 +376,7 @@ static void gemm_op(const PlowDevInst* in, void* const* T, PlowCpuCtx* ctx, uint
     }
     gemm_args g = {.C = (plow_bf16*)PLOW_CPU_TEN(in, T, 0) + (size_t)in->i[5] * N,
                    .A = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K,
-                   .W = PLOW_CPU_TEN(in, T, 2),
+                   .W = PLOW_CPU_TEN(in, T, 2), .bias = PLOW_CPU_TEN(in, T, 7),
                    .M = M, .N = N, .K = K, .BM = BM, .BN = BN};
     plow_amx_run_tiles(&g, slice, nblk, ctx);
 }
@@ -373,7 +390,7 @@ X_K(x_gemm_med)   { gemm_op(in, T, ctx, 128, 128, slice, nblk, g_gemm_med); }
 X_K(x_gemm_wide)  { gemm_op(in, T, ctx, 128, 256, slice, nblk, g_gemm_wide); }
 X_K(x_gemm_c5)    { gemm_op(in, T, ctx, 192, 256, slice, nblk, g_gemm_c5); }
 
-/* t0=C t1=A t2=B t3=rms(f32) t4=gamma  i0=M i1=N i2=K */
+/* t0=C t1=A t2=B t3=rms(f32) t4=gamma t7=bias?  i0=M i1=N i2=K */
 X_K(x_gemm_norm) {
     const uint32_t K = in->i[2];
     if (!plow_amx_usable(ctx, K) || !PLOW_CPU_TEN(in, T, 3) || !PLOW_CPU_TEN(in, T, 4)) {
@@ -382,20 +399,23 @@ X_K(x_gemm_norm) {
     }
     gemm_args g = {.C = PLOW_CPU_TEN(in, T, 0), .A = PLOW_CPU_TEN(in, T, 1), .W = PLOW_CPU_TEN(in, T, 2),
                    .rms = PLOW_CPU_TEN(in, T, 3), .gamma = PLOW_CPU_TEN(in, T, 4),
+                   .bias = PLOW_CPU_TEN(in, T, 7),
                    .M = in->i[0], .N = in->i[1], .K = K, .BM = 256, .BN = 256};
     plow_amx_run_tiles(&g, slice, nblk, ctx);
 }
 
-/* t0=fu t1=x t2=W_gate t5=W_up  i0=M i1=N i2=K i5=act; nominal 256x128 output tile. */
+/* t0=fu t1=x t2=W_gate t5=W_up t6=bias_gate? t7=bias_up?  i0=M i1=N i2=K i5=act f0/f1; nominal
+ * 256x128 output tile. */
 X_K(x_gemm_glu) {
     const uint32_t K = in->i[2];
-    if (!plow_amx_usable(ctx, K) || in->i[5] == 2u) { /* situ pairs poison in golden too */
+    if (!plow_amx_usable(ctx, K)) {
         g_gemm_glu(in, slice, nblk, T, ctx);
         return;
     }
     gemm_args g = {.C = PLOW_CPU_TEN(in, T, 0), .A = PLOW_CPU_TEN(in, T, 1), .W = PLOW_CPU_TEN(in, T, 2),
-                   .Wu = PLOW_CPU_TEN(in, T, 5), .M = in->i[0], .N = in->i[1], .K = K, .BM = 256,
-                   .BN = 128, .act = in->i[5]};
+                   .Wu = PLOW_CPU_TEN(in, T, 5), .bias = PLOW_CPU_TEN(in, T, 6),
+                   .bias_up = PLOW_CPU_TEN(in, T, 7), .M = in->i[0], .N = in->i[1], .K = K, .BM = 256,
+                   .BN = 128, .act = in->i[5], .f0 = in->fj[0].f, .f1 = in->fj[1].f};
     plow_amx_run_tiles(&g, slice, nblk, ctx);
 }
 

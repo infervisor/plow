@@ -19,17 +19,18 @@ G_K(g_residual) {
     }
 }
 
-/* t0=out t1=gate t2=up  i0=n i1=act */
+/* t0=out t1=gate t2=up  i0=n i1=act  f0/f1 = the act's immediates (act 3 swiglu_oai: alpha, limit) */
 G_K(g_glu) {
     (void)ctx;
     plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
     const plow_bf16* gate = PLOW_CPU_TEN(in, T, 1);
     const plow_bf16* up = PLOW_CPU_TEN(in, T, 2);
     const uint32_t act = in->i[1];
+    const float f0 = in->fj[0].f, f1 = in->fj[1].f;
     uint32_t lo, hi;
     g_range(in->i[0], slice, nblk, &lo, &hi);
     for (uint32_t i = lo; i < hi; i++)
-        out[i] = plow_f2bf(g_act_gate_only(plow_bf2f(gate[i]), act) * plow_bf2f(up[i]));
+        out[i] = plow_f2bf(g_glu_pair(plow_bf2f(gate[i]), plow_bf2f(up[i]), act, f0, f1));
 }
 
 /* t0=out t1=x  i0=n  f0=cap.  out = cap * tanh(x / cap). */

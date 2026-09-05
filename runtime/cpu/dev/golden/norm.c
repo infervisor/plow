@@ -74,7 +74,7 @@ G_K(g_layernorm) {
 }
 
 /* t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos(i32)?
- * i0=ntok i1=nhead i2=hd i3=out_row0 i4=skip_norm i5=interleave(hd==128) i6=n_batch_kv
+ * i0=ntok i1=nhead i2=hd i3=out_row0 i4=skip_norm i5=rope_form(0 auto,1 interleaved,2 half-split) i6=n_batch_kv
  * f0=eps  fj1.u=out_stride (0 = plain [ntok][nhead][hd])  fj2.u=kv_mask (sliding ring).
  * Half-split RoPE (i, i+hd/2); interleaved GPT-J pairs when hd==64 or (hd==128 && i5==1). */
 G_K(g_headnorm_rope) {
@@ -89,7 +89,9 @@ G_K(g_headnorm_rope) {
     const uint32_t skip_norm = in->i[4], n_batch_kv = in->i[6];
     const uint32_t out_stride = in->fj[1].u, kv_mask = in->fj[2].u;
     const float eps = in->fj[0].f;
-    const int interleave = (hd == 64u) || (hd == 128u && in->i[5] == 1u);
+    /* i5: 0 = the legacy rule (hd 64 interleaved, hd 128 half-split), 1 = force interleaved at
+     * hd 128, 2 = force half-split (GPT-OSS NeoX at hd 64). */
+    const int interleave = in->i[5] == 2u ? 0 : (hd == 64u) || (hd == 128u && in->i[5] == 1u);
     const uint32_t H2 = hd >> 1, total = ntok * nhead;
     if (hd > 512u) return;
     float v[512], r[512];

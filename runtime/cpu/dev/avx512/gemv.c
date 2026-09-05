@@ -147,24 +147,28 @@ static void prenorm_rows(plow_bf16* xn, const plow_bf16* x, const plow_bf16* gam
     }
 }
 
-/* C[m][n0..n1) = X[m] . W[n]^T, plain bf16 store. */
+/* C[m][n0..n1) = X[m] . W[n]^T (+ bias[n]), plain bf16 store. */
 static void gemv_span(plow_bf16* C, size_t ldc, const plow_bf16* W, const plow_bf16* X,
-                      size_t ldx, uint32_t M, uint32_t K, uint32_t n0, uint32_t n1) {
+                      size_t ldx, uint32_t M, uint32_t K, uint32_t n0, uint32_t n1,
+                      const plow_bf16* bias) {
     float out[32];
     const uint32_t RB = rb_for(M);
     uint32_t n = n0;
     for (; n + RB <= n1; n += RB) {
         gemv_rows(W + (size_t)n * K, K, X, ldx, K, RB, M, out);
-        for (uint32_t r = 0; r < RB; r++)
-            for (uint32_t m = 0; m < M; m++) C[m * ldc + n + r] = plow_f2bf(out[r * M + m]);
+        for (uint32_t r = 0; r < RB; r++) {
+            const float b = bias ? plow_bf2f(bias[n + r]) : 0.0f;
+            for (uint32_t m = 0; m < M; m++) C[m * ldc + n + r] = plow_f2bf(out[r * M + m] + b);
+        }
     }
     for (; n < n1; n++) {
         gemv_rows(W + (size_t)n * K, K, X, ldx, K, 1, M, out);
-        for (uint32_t m = 0; m < M; m++) C[m * ldc + n] = plow_f2bf(out[m]);
+        const float b = bias ? plow_bf2f(bias[n]) : 0.0f;
+        for (uint32_t m = 0; m < M; m++) C[m * ldc + n] = plow_f2bf(out[m] + b);
     }
 }
 
-/* t0=C t1=x t2=W t3=rms? t4=gamma?  i0=M i1=N i2=K i3=norm i4=a_row0  f0=eps */
+/* t0=C t1=x t2=W t3=rms? t4=gamma? t7=bias?  i0=M i1=N i2=K i3=norm i4=a_row0  f0=eps */
 V_K(v_gemv) {
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2], norm = in->i[3];
     plow_bf16* C = PLOW_CPU_TEN(in, T, 0);
@@ -172,6 +176,7 @@ V_K(v_gemv) {
     const plow_bf16* W = PLOW_CPU_TEN(in, T, 2);
     const float* rms = PLOW_CPU_TEN(in, T, 3);
     const plow_bf16* gamma = PLOW_CPU_TEN(in, T, 4);
+    const plow_bf16* bias = PLOW_CPU_TEN(in, T, 7);
     const float eps = in->fj[0].f;
     if (M == 0u || M > 8u) { g_gemv(in, slice, nblk, T, ctx); return; }
     uint32_t n0, n1;
@@ -191,12 +196,15 @@ V_K(v_gemv) {
         uint32_t n = n0;
         for (; n + 2 <= n1; n += 2) {
             gemvf_rows(W + (size_t)n * K, K, XG, K, K, 2, M, out);
-            for (uint32_t r = 0; r < 2; r++)
-                for (uint32_t m = 0; m < M; m++) C[m * N + n + r] = plow_f2bf(out[r * M + m] * rms[m]);
+            for (uint32_t r = 0; r < 2; r++) {
+                const float b = bias ? plow_bf2f(bias[n + r]) : 0.0f;
+                for (uint32_t m = 0; m < M; m++) C[m * N + n + r] = plow_f2bf(out[r * M + m] * rms[m] + b);
+            }
         }
         for (; n < n1; n++) {
             gemvf_rows(W + (size_t)n * K, K, XG, K, K, 1, M, out);
-            for (uint32_t m = 0; m < M; m++) C[m * N + n] = plow_f2bf(out[m] * rms[m]);
+            const float b = bias ? plow_bf2f(bias[n]) : 0.0f;
+            for (uint32_t m = 0; m < M; m++) C[m * N + n] = plow_f2bf(out[m] * rms[m] + b);
         }
         return;
     }
@@ -207,10 +215,11 @@ V_K(v_gemv) {
         prenorm_rows(ctx->scratch, x, gamma, M, K, eps);
         X = ctx->scratch;
     }
-    gemv_span(C, N, W, X, K, M, K, n0, n1);
+    gemv_span(C, N, W, X, K, M, K, n0, n1, bias);
 }
 
-/* t0=fu t1=x t2=W_gate t5=W_up  i0=M i1=N i2=K i5=act  f0=beta f1=lbeta (situ, act==2) */
+/* t0=fu t1=x t2=W_gate t5=W_up t6=bias_gate? t7=bias_up?  i0=M i1=N i2=K i5=act  f0/f1 = act
+ * immediates (situ beta/lbeta, swiglu_oai alpha/limit). */
 V_K(v_gemv_glu) {
     (void)ctx;
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2], act = in->i[5];
@@ -218,7 +227,9 @@ V_K(v_gemv_glu) {
     const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
     const plow_bf16* Wg = PLOW_CPU_TEN(in, T, 2);
     const plow_bf16* Wu = PLOW_CPU_TEN(in, T, 5);
-    const float beta = in->fj[0].f, lbeta = in->fj[1].f;
+    const plow_bf16* bg = PLOW_CPU_TEN(in, T, 6);
+    const plow_bf16* bu = PLOW_CPU_TEN(in, T, 7);
+    const float f0 = in->fj[0].f, f1 = in->fj[1].f;
     if (M == 0u || M > 8u) { g_gemv_glu(in, slice, nblk, T, ctx); return; }
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
@@ -228,22 +239,16 @@ V_K(v_gemv_glu) {
         const uint32_t rb = n + RB <= n1 ? RB : 1u;
         gemv_rows(Wg + (size_t)n * K, K, x, K, K, rb, M, g);
         gemv_rows(Wu + (size_t)n * K, K, x, K, K, rb, M, u);
+        if (bg || bu)
+            for (uint32_t r = 0; r < rb; r++)
+                for (uint32_t m = 0; m < M; m++) {
+                    if (bg) g[r * M + m] += plow_bf2f(bg[n + r]);
+                    if (bu) u[r * M + m] += plow_bf2f(bu[n + r]);
+                }
         const uint32_t cnt = rb * M; /* <= 16 */
         const __mmask16 mk = v_tail16(cnt);
         const __m512 gv = _mm512_maskz_loadu_ps(mk, g), uv = _mm512_maskz_loadu_ps(mk, u);
-        __m512 o;
-        if (act == 2u) {
-            const __m512 vb = _mm512_set1_ps(beta);
-            const __m512 gate = _mm512_mul_ps(_mm512_mul_ps(vb, v_tanh(_mm512_div_ps(gv, vb))), v_sigmoid(gv));
-            __m512 up = uv;
-            if (lbeta > 0.0f) {
-                const __m512 vl = _mm512_set1_ps(lbeta);
-                up = _mm512_mul_ps(vl, v_tanh(_mm512_div_ps(uv, vl)));
-            }
-            o = _mm512_mul_ps(gate, up);
-        } else {
-            o = _mm512_mul_ps(v_act_gate(gv, act), uv);
-        }
+        const __m512 o = v_glu_pair(gv, uv, act, f0, f1);
         float of[16];
         _mm512_mask_storeu_ps(of, mk, o);
         for (uint32_t r = 0; r < rb; r++)
@@ -252,7 +257,8 @@ V_K(v_gemv_glu) {
     }
 }
 
-/* t0=q t1=x t2=W_q t3=k t4=W_k t5=v t6=W_v t7=q-norm gamma?  i0=M i1=Nq i2=K i3=Nk i4=Nv  f0=eps
+/* t0=q t1=x t2=W_q t3=k t4=W_k t5=v t6=W_v t7=q-norm gamma?  i0=M i1=Nq i2=K i3=Nk i4=Nv
+ * i5/i6/i7 = bias_q/k/v tensor handles (0 = absent)  f0=eps
  * Blocked ownership over the concatenated q|k|v span; t7 = the q_a_layernorm fold. */
 V_K(v_gemv_qkv) {
     const uint32_t M = in->i[0], Nq = in->i[1], K = in->i[2], Nk = in->i[3], Nv = in->i[4];
@@ -261,6 +267,7 @@ V_K(v_gemv_qkv) {
     const float eps = in->fj[0].f;
     plow_bf16* Cs[3] = {PLOW_CPU_TEN(in, T, 0), PLOW_CPU_TEN(in, T, 3), PLOW_CPU_TEN(in, T, 5)};
     const plow_bf16* Ws[3] = {PLOW_CPU_TEN(in, T, 2), PLOW_CPU_TEN(in, T, 4), PLOW_CPU_TEN(in, T, 6)};
+    const plow_bf16* Bs[3] = {G_QKV_BIAS(in, T, 5), G_QKV_BIAS(in, T, 6), G_QKV_BIAS(in, T, 7)};
     const uint32_t Ns[3] = {Nq, Nk, Nv};
     if (M == 0u || M > 8u) { g_gemv_qkv(in, slice, nblk, T, ctx); return; }
     const plow_bf16* X = x;
@@ -276,7 +283,7 @@ V_K(v_gemv_qkv) {
     for (uint32_t s = 0; s < 3; s++) {
         const uint32_t S1 = S0 + Ns[s];
         const uint32_t a = n0 > S0 ? n0 : S0, b = n1 < S1 ? n1 : S1;
-        if (a < b) gemv_span(Cs[s], Ns[s], Ws[s], X, K, M, K, a - S0, b - S0);
+        if (a < b) gemv_span(Cs[s], Ns[s], Ws[s], X, K, M, K, a - S0, b - S0, Bs[s]);
         S0 = S1;
     }
 }
@@ -345,4 +352,5 @@ void plow_cpu_register_avx512(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_GEMV_QKV] = v_gemv_qkv;
     tab[PLOW_DOP_GEMV_ARGMAX] = v_gemv_argmax;
     v_register_attention(tab);
+    v_register_gptoss(tab);
 }
