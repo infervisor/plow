@@ -4148,7 +4148,8 @@ impl GpuEngine {
         let dyn_kvrow = batch > 1 || kvrow.is_empty();
         let multistep = if recurrent.is_some()
             || !decode_packet_roles.is_empty()
-            || vmm.as_ref().is_some_and(|v| v.rings.is_some())
+            // Multi-step maps fed rows, but its widest launch also writes idle rows.
+            || vmm.as_ref().is_some_and(|v| !v.kv.prefix_reuse())
         {
             None
         } else {
