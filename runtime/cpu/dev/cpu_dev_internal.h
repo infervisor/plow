@@ -22,5 +22,6 @@ int plow_cpu_thread_init_amx(PlowCpuCtx* ctx);
 
 /* dispatch.c: attribute changed table entries to `tier` (see plow_cpu_tier_of). */
 void plow_cpu_table_mark(const plow_cpu_kernel_fn* before, int tier);
+void plow_cpu_table_mark_one(uint16_t op, int tier);
 
 #endif /* PLOW_CPU_DEV_INTERNAL_H */

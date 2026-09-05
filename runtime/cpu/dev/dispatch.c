@@ -18,6 +18,10 @@ void plow_cpu_table_mark(const plow_cpu_kernel_fn* before, int tier) {
         if (g_tab[op] != before[op]) g_tier[op] = (int8_t)tier;
 }
 
+void plow_cpu_table_mark_one(uint16_t op, int tier) {
+    if (op < PLOW_CPU_DOP_TABLE) g_tier[op] = (int8_t)tier;
+}
+
 int plow_cpu_tier_of(uint16_t op) {
     return (op < PLOW_CPU_DOP_TABLE && g_tab[op]) ? g_tier[op] : -1;
 }

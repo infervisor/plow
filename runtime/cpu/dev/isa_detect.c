@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include "cpu_dev_internal.h"
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -80,6 +81,25 @@ int plow_cpu_init(int isa_cap) {
         memcpy(before, tab, sizeof(before));
         plow_cpu_register_amx(tab);
         plow_cpu_table_mark(before, PLOW_CPU_ISA_AMX);
+    }
+    /* Debug bisection: PLOW_CPU_GOLDEN_OPS="1,16,20" pins the listed ops back to their
+     * golden kernels while every other op keeps its fast tier — localizes a tier bug
+     * inside a real model run without rebuilding. */
+    const char* pin = getenv("PLOW_CPU_GOLDEN_OPS");
+    if (pin && *pin) {
+        plow_cpu_kernel_fn golden[PLOW_CPU_DOP_TABLE];
+        memset(golden, 0, sizeof(golden));
+        plow_cpu_register_golden(golden);
+        for (const char* p = pin; *p;) {
+            char* end;
+            long op = strtol(p, &end, 10);
+            if (end == p) break;
+            if (op >= 0 && op < PLOW_CPU_DOP_TABLE && golden[op]) {
+                tab[op] = golden[op];
+                plow_cpu_table_mark_one((uint16_t)op, PLOW_CPU_ISA_SCALAR);
+            }
+            p = (*end == ',') ? end + 1 : end;
+        }
     }
     g_isa = isa;
     return g_isa;

@@ -34,6 +34,18 @@ fn main() {
         for (op, (n, slices)) in &hist {
             println!("  {:>4} {:<32} insts={:<5} slices={}", op, name(*op), n, slices);
         }
+        if std::env::args().any(|a| a == "--fields") {
+            // First instance of every op: the operand contract as emitted for this model.
+            let mut seen = std::collections::BTreeSet::new();
+            for d in &p.insts {
+                if seen.insert(d.op) {
+                    println!(
+                        "    {:<28} blocks={:<4} t={:?} i={:?} fj={:#x?}",
+                        name(d.op), d.blocks, d.t, d.i, d.fj
+                    );
+                }
+            }
+        }
     }
     println!("union: {} distinct ops", union.len());
     for op in union.keys() {

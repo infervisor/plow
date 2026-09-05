@@ -344,4 +344,5 @@ void plow_cpu_register_avx512(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_GEMV_GLU] = v_gemv_glu;
     tab[PLOW_DOP_GEMV_QKV] = v_gemv_qkv;
     tab[PLOW_DOP_GEMV_ARGMAX] = v_gemv_argmax;
+    v_register_attention(tab);
 }

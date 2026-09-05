@@ -22,20 +22,55 @@ fn main() {
     let mut prompt = String::from("The capital of France is");
     let mut filter = String::from("act.");
     let mut decode_steps = 0usize;
+    let mut prompt_tokens = 0usize;
+    let mut dump_logits: Option<PathBuf> = None;
+    let mut opts = CpuEngineOpts::default();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--prompt" => prompt = args.next().unwrap(),
             "--filter" => filter = args.next().unwrap(),
             "--decode" => decode_steps = args.next().unwrap().parse().unwrap(),
+            // Same synthetic prompt as cpu_bench (<bos> + repeated sentence), for tier A/B.
+            "--prompt-tokens" => prompt_tokens = args.next().unwrap().parse().unwrap(),
+            "--dump-logits" => dump_logits = Some(args.next().unwrap().into()),
+            "--threads" => opts.threads = args.next().unwrap().parse().unwrap(),
+            "--isa" => {
+                opts.isa = match args.next().unwrap().as_str() {
+                    "scalar" => plowrt::exec::cpu::ffi::Isa::Scalar,
+                    "avx512" => plowrt::exec::cpu::ffi::Isa::Avx512,
+                    _ => plowrt::exec::cpu::ffi::Isa::Amx,
+                }
+            }
             other => panic!("unknown arg {other}"),
         }
     }
     let tok = load_tokenizer(&ckpt);
-    let ids = tok.encode_with_special_tokens(&prompt, true);
-    println!("prompt ids: {ids:?}");
-    let mut eng = CpuEngine::load(&blob, &ckpt, &CpuEngineOpts::default()).expect("load");
+    let ids = if prompt_tokens > 0 {
+        let base = tok.encode_with_special_tokens(
+            "The quick brown fox jumps over the lazy dog while the river flows quietly past the old mill. ",
+            false,
+        );
+        let mut ids = vec![2u32];
+        while ids.len() < prompt_tokens {
+            ids.extend_from_slice(&base);
+        }
+        ids.truncate(prompt_tokens);
+        ids
+    } else {
+        tok.encode_with_special_tokens(&prompt, true)
+    };
+    println!("prompt ids ({}): {:?}", ids.len(), &ids[..ids.len().min(16)]);
+    let mut eng = CpuEngine::load(&blob, &ckpt, &opts).expect("load");
+    println!("isa={:?} threads={}", eng.isa, eng.threads);
     let first = eng.prefill(&ids).expect("prefill");
     println!("prefill -> token {first} {:?}", tok.decode(&[first]));
+    if let Some(p) = &dump_logits {
+        let h = eng.model().wk.logits.expect("act.logits");
+        // SAFETY: quiescent.
+        let bytes = unsafe { eng.model().tensor(h).as_slice() };
+        std::fs::write(p, bytes).expect("write logits");
+        println!("dumped {} bytes of act.logits to {}", bytes.len(), p.display());
+    }
     dump(eng.model(), &filter);
     let mut pos = ids.len() as u32;
     for s in 0..decode_steps {

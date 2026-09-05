@@ -28,6 +28,13 @@ V_K(v_layernorm);
 V_K(v_norm_residual);
 V_K(v_add_norm);
 V_K(v_norm_residual_norm);
+/* rope.c */
+V_K(v_headnorm_rope);
+/* attention.c */
+V_K(v_flash_prefill);
+V_K(v_flash_decode);
+V_K(v_flash_merge);
+void v_register_attention(plow_cpu_kernel_fn* tab);
 
 /* --- bf16 <-> f32 (spec §5: explicit widen, cvtneps_pbh on store) ------------------- */
 
