@@ -135,19 +135,29 @@ ratio = second/first), a paired-request sanity line (prompt mismatches, identica
 80-char output prefixes — greedy decoding on identical weights should agree often),
 and optional sample outputs side by side.
 
-## API notes (observed)
+## API notes
+
+plowrt behaviour below is from `crates/plowrt/src/serve/{chat,openai}.rs`; vLLM
+behaviour is its documented OpenAI-compatible stream shape. The harness was validated
+against a local mock emitting the vLLM shape (role frame, per-token chunks, finish
+chunk, usage-only chunk, `[DONE]`, chunked transfer encoding); a live run against
+both servers is still to be done as part of the head-to-head.
 
 - Both servers honour `stream_options.include_usage`: a final chunk with empty `choices`
-  and a `usage` object precedes `data: [DONE]`. vLLM additionally repeats
-  `usage: null` on every chunk; plowrt omits the key until the usage chunk.
+  and a `usage` object precedes `data: [DONE]`. vLLM sends `usage: null` on ordinary
+  chunks; plowrt omits the key. The parser accepts both.
 - vLLM's first SSE frame is a role-only delta (`{"role":"assistant","content":""}`)
   sent before prefill finishes; it is NOT counted as a token or as TTFT. plowrt sends
-  no role frame; its `role` rides the first real token chunk.
+  no role frame; its `role` rides the first real token chunk (deliberately, so TTFT
+  is comparable under one client).
 - plowrt may emit empty-`content` chunks for partial-UTF-8 tokens (no `role` key);
   those count as tokens for TPOT but not for TTFT.
 - `output_tokens` prefers `usage.completion_tokens`; the chunk count is kept as
-  `content_chunks` for cross-checking.
+  `content_chunks` for cross-checking (vLLM may merge tokens into one chunk when
+  detokenization lags, so chunk count can be lower than completion_tokens).
 - plowrt accepts `max_completion_tokens` as an alias for `max_tokens`, and `ignore_eos`.
-- The vLLM `usage` also carries `prompt_tokens_details` and (for non-streaming)
-  `prompt_logprobs`; plowrt's `usage.prompt_tokens_details.cached_tokens` reports
-  prefix-cache hits.
+- plowrt's `usage.prompt_tokens_details.cached_tokens` reports prefix-cache hits;
+  check it on `rag_4k` to confirm the shuffled passages defeat the cache.
+- Both servers close the connection after `[DONE]`; the client sends `Connection: close`
+  and opens one TCP connection per request (no keep-alive), so TTFT includes one
+  connect round trip on both sides equally.
