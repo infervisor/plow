@@ -705,6 +705,124 @@ impl SegPf {
 mod seg_gemm;
 use seg_gemm::small_gemm_segments;
 
+struct KvTensorMap {
+    tensor: usize,
+    pair: [usize; 2],
+    rows: u32,
+    hd: u32,
+    heads: u32,
+    stride: u64,
+    batch: usize,
+}
+
+fn kv_tensor_maps(
+    tensors: &[crate::asset::devblob::DevTensor],
+    recipes: &[packet::rope::GenTensor],
+    batch: usize,
+) -> Result<Vec<KvTensorMap>> {
+    let mut maps: Vec<KvTensorMap> = Vec::new();
+    for g in recipes
+        .iter()
+        .filter(|g| g.kind == packet::rope::GEN_TMAP_KV_PAIR)
+    {
+        let reject = || {
+            RuntimeError::Rejected(format!(
+                "GEN_TMAP_KV_PAIR tensor {} has invalid targets, extent or geometry",
+                g.tensor
+            ))
+        };
+        let tensor = g.tensor as usize;
+        let pair = [g.aux as usize, g.scale as usize];
+        if batch == 0
+            || g.ctx == 0
+            || g.hd == 0
+            || g.hd % 64 != 0
+            || !g.frac.is_finite()
+            || g.frac < 1.0
+            || g.frac > u32::MAX as f64
+            || g.frac.fract() != 0.0
+            || pair[0] == pair[1]
+            || pair.contains(&tensor)
+            || tensors.get(tensor).is_none_or(|t| t.bytes != 256)
+            || recipes.iter().filter(|r| r.tensor == g.tensor).count() != 1
+            || recipes.iter().any(|r| pair.contains(&(r.tensor as usize)))
+        {
+            return Err(reject());
+        }
+        let heads = g.frac as u32;
+        let stride = u64::from(g.ctx)
+            .checked_mul(u64::from(g.hd))
+            .and_then(|bytes| bytes.checked_mul(u64::from(heads)))
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(reject)?;
+        let bytes = stride.checked_mul(batch as u64).ok_or_else(reject)?;
+        if pair.iter().any(|&id| {
+            tensors
+                .get(id)
+                .is_none_or(|t| t.bytes % batch as u64 != 0 || t.bytes != bytes)
+        }) || maps.iter().any(|map| {
+            map.pair.iter().any(|id| pair.contains(id))
+                && (map.pair != pair || map.rows != g.ctx || map.hd != g.hd || map.heads != heads)
+        }) {
+            return Err(reject());
+        }
+        maps.push(KvTensorMap {
+            tensor,
+            pair,
+            rows: g.ctx,
+            hd: g.hd,
+            heads,
+            stride,
+            batch,
+        });
+    }
+    Ok(maps)
+}
+
+impl KvTensorMap {
+    fn slot_bindings(
+        &self,
+        ptrs: &[u64],
+        slot: usize,
+        descriptor: u64,
+    ) -> Result<[(usize, u64); 3]> {
+        let reject = || RuntimeError::Rejected("invalid per-slot KV tensormap address".into());
+        if slot >= self.batch || descriptor == 0 || descriptor % 128 != 0 {
+            return Err(reject());
+        }
+        let offset = self.stride.checked_mul(slot as u64).ok_or_else(reject)?;
+        let mut bindings = [
+            (self.tensor, descriptor),
+            (self.pair[0], 0),
+            (self.pair[1], 0),
+        ];
+        for (id, address) in &mut bindings[1..] {
+            let base = *ptrs.get(*id).ok_or_else(reject)?;
+            if base == 0 || base % 16 != 0 {
+                return Err(reject());
+            }
+            *address = base.checked_add(offset).ok_or_else(reject)?;
+            address.checked_add(self.stride).ok_or_else(reject)?;
+        }
+        Ok(bindings)
+    }
+
+    fn encode_slot(
+        &self,
+        be: &CudaBackend,
+        ptrs: &[u64],
+        slot: usize,
+        descriptor: &DeviceMem,
+    ) -> Result<[(usize, u64); 3]> {
+        let bindings = self.slot_bindings(ptrs, slot, descriptor.base)?;
+        for (i, &(_, base)) in bindings[1..].iter().enumerate() {
+            let bytes = be.encode_tmap_kv3(base, self.rows, self.hd, self.heads, 32)?;
+            be.upload(descriptor, (i * 128) as u64, &bytes)?;
+        }
+        Ok(bindings)
+    }
+}
+
 struct PrefillBucket {
     /// Chunk size this bucket was compiled for.
     t: u32,
@@ -1200,11 +1318,13 @@ pub struct GpuEngine {
     /// bases decode expects. Immutable after load.
     d_tens: DeviceMem,
     /// Per-slot prefill tables (index b-1 = slot b; slot 0 is `d_tens`): the
-    /// same table with every `kv.*` base shifted to that slot's ring, since
-    /// the prefill programs address the cache slot-relative. A per-slot
+    /// same table with KV bases and rank-3 descriptors bound to that slot,
+    /// since the prefill programs address the cache slot-relative. A per-slot
     /// launch selects its table through the kernarg (`tens_slot_base`) —
     /// nothing is rewritten or restored. Empty at B == 1.
     d_tens_slots: Vec<DeviceMem>,
+    /// Rank-3 KV descriptors bind slot-specific addresses and outlive every slot table use.
+    _kv_tmap_slots: Vec<DeviceMem>,
     /// The other decode tables live for the engine's lifetime and are never
     /// re-uploaded; their device pointers are baked into `kernarg`.
     _tables: Vec<DeviceMem>,
@@ -2122,6 +2242,7 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
+        let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let qwen_block = blob
             .section_data_named(&raw, packet::devbuild::SECT_METADATA, "block.json")
             .map(|bytes| serde_json::from_slice::<plow_asset::BlockDescriptor>(bytes))
@@ -2846,9 +2967,7 @@ impl GpuEngine {
         // the packet carries in i[6]/i[7] resolves to finished bytes. A TMA-bearing
         // packet on a driver that cannot encode fails HERE, loudly, not on first prefill.
         for g in blob.gen.iter().filter(|g| {
-            g.kind == packet::rope::GEN_TMAP_BF16
-                || g.kind == packet::rope::GEN_TMAP_E4M3
-                || g.kind == packet::rope::GEN_TMAP_KV_PAIR
+            g.kind == packet::rope::GEN_TMAP_BF16 || g.kind == packet::rope::GEN_TMAP_E4M3
         }) {
             let (map, tgt) = (g.tensor as usize, g.aux as usize);
             if tgt >= devp.len() || map >= devp.len() {
@@ -2863,23 +2982,6 @@ impl GpuEngine {
                 devp[map].base % 128 == 0,
                 "tensormap tensor not 128 B aligned"
             );
-            if g.kind == packet::rope::GEN_TMAP_KV_PAIR {
-                // K's rank-3 map at +0, V's at +128; V handle rides in `scale`, kv heads in
-                // `frac` (see GEN_TMAP_KV_PAIR). Box rows = the wgmma arm's BKV = 32.
-                let vtgt = g.scale as usize;
-                if vtgt >= devp.len() {
-                    return Err(RuntimeError::Device(format!(
-                        "GEN_TMAP_KV_PAIR tensor {} V-handle {} out of range",
-                        g.tensor, g.scale
-                    )));
-                }
-                let nkv = g.frac as u32;
-                let kb = be.encode_tmap_kv3(devp[tgt].base, g.ctx, g.hd, nkv, 32)?;
-                let vb = be.encode_tmap_kv3(devp[vtgt].base, g.ctx, g.hd, nkv, 32)?;
-                be.upload(&devp[map], 0, &kb)?;
-                be.upload(&devp[map], 128, &vb)?;
-                continue;
-            }
             let bytes = if g.kind == packet::rope::GEN_TMAP_E4M3 {
                 be.encode_tmap_e4m3(devp[tgt].base, g.ctx, g.hd, g.scale)?
             } else {
@@ -2893,6 +2995,9 @@ impl GpuEngine {
         }
 
         let mut ptrs: Vec<u64> = devp.iter().map(|m| m.base).collect();
+        for map in &kv_maps {
+            map.encode_slot(&be, &ptrs, 0, &devp[map.tensor])?;
+        }
         let pf_handles = pf_bufs.as_ref().map(|(s, r)| {
             let h_slot = ptrs.len() as u32;
             // These runtime-appended handles are patched into u16 wire slots
@@ -3137,11 +3242,19 @@ impl GpuEngine {
         // tables never change after this point, and decode can never observe
         // a shifted table. A few KiB per slot.
         let mut d_tens_slots: Vec<DeviceMem> = Vec::new();
-        if batch > 1 && !kv_slots.is_empty() {
+        let mut kv_tmap_slots: Vec<DeviceMem> = Vec::new();
+        if batch > 1 && (!kv_slots.is_empty() || !kv_maps.is_empty()) {
             let mut shifted = ptrs.clone();
             for b in 1..batch {
                 for &(i, stride) in &kv_slots {
                     shifted[i] = ptrs[i] + b as u64 * stride;
+                }
+                for map in &kv_maps {
+                    let descriptor = be.alloc(0, 256)?;
+                    for (id, base) in map.encode_slot(&be, &ptrs, b, &descriptor)? {
+                        shifted[id] = base;
+                    }
+                    kv_tmap_slots.push(descriptor);
                 }
                 let mem = be.alloc(0, (shifted.len() * 8) as u64)?;
                 be.upload(&mem, 0, bytemuck::cast_slice(&shifted))?;
@@ -3474,6 +3587,7 @@ impl GpuEngine {
             _d_gq_cursor: d_gq_cursor,
             d_tens,
             d_tens_slots,
+            _kv_tmap_slots: kv_tmap_slots,
             _tables: vec![
                 d_stream,
                 d_sofs,
@@ -6706,6 +6820,10 @@ impl Drop for GpuEngine {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gpu_kv_tmap_tests.rs"]
+mod kv_tmap_tests;
 
 #[cfg(test)]
 mod prefill_patch_tests {
