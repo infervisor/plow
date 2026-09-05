@@ -15,6 +15,9 @@ pub mod amd;
 #[cfg(feature = "hsa")]
 pub mod amd_tp;
 pub mod counters;
+/// CPU engine: device-ISA interpreter on persistent pinned worker threads,
+/// C kernels via `cpu::ffi`. See `plans/cpu-backend.md`.
+pub mod cpu;
 /// The device surface the interpreter engine drives, as a trait — the step
 /// that lets `gpu` stop being CUDA-only. Not gated on a vendor feature: it is
 /// the definition both backends implement.

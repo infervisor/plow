@@ -56,9 +56,23 @@ hf-hub = { workspace = true, optional = true }
 # static binary carries no link-time GPU dependency, and NVIDIA + AMD libs can be
 # loaded side-by-side in one process (distinct `cu*` / `hsa_*` symbol namespaces).
 libloading = { version = "0.8", optional = true }
+# CPU engine: thread affinity / mbind for the persistent worker pool
+# (`exec::cpu`). Optional because only the `cpu` feature links the kernel lib.
+libc = { version = "0.2", optional = true }
+
+[build-dependencies]
+# Compiles the CPU kernel library `runtime/cpu/dev/` into the binary (see
+# build.rs). The GPU backends dlopen their drivers instead, so this is the only
+# link-time native code plowrt carries, and only under `cpu`.
+cc = { version = "1", optional = true }
 
 [features]
 default = []
+# CPU device-ISA engine: persistent pinned worker threads in Rust, kernels in C
+# (`runtime/cpu/dev/`, golden / AVX-512 / AMX tiers) built by build.rs and
+# reached through `exec::cpu::ffi`. Real-weight loading (safetensors, tokenizer)
+# joins this feature in P2 — see `plans/cpu-backend.md`.
+cpu = ["dep:cc", "dep:libc"]
 # Real Hugging Face tokenizer (loads a model's `tokenizer.json`). Enable this
 # alone for tokenization without pulling the checkpoint/download deps.
 hf-tokenizer = ["dep:tokenizers"]
