@@ -196,11 +196,38 @@ fn gpu_chat_prompt(bundle: Option<&crate::asset::ModelBundle>, messages: &[Messa
     // the least ambiguous thing in the vocab to key on.
     if one("<|end_of_msg|>") {
         k3_chat_prompt(messages)
+    } else if one("<|start|>") && one("<|channel|>") {
+        harmony_chat_prompt(messages)
     } else if one("<|assistant|>") {
         glm_chat_prompt(messages)
     } else {
         gemma_chat_prompt(messages)
     }
+}
+
+/// OpenAI harmony format (gpt-oss), text-only, no tools, reasoning DISABLED: one
+/// `<|start|>{role}<|message|>{text}<|end|>` block per message, then the generation prompt
+/// `<|start|>assistant<|channel|>final<|message|>` — opening the FINAL channel directly, so
+/// the served tokens are the answer and not an analysis trace (the same choice the K3/GLM
+/// arms make). `<|start|>` 200006, `<|message|>` 200008, `<|end|>` 200007, `<|channel|>`
+/// 200005 are single ids via `added_tokens`; the stop set (`<|return|>` 200002, `<|call|>`
+/// 200012) comes from `generation_config.json` through `read_eos_ids`.
+fn harmony_chat_prompt(messages: &[Message]) -> String {
+    let mut p = String::new();
+    for m in messages {
+        let role = match m.role.as_str() {
+            "assistant" => "assistant",
+            "system" | "developer" => "developer",
+            _ => "user",
+        };
+        p.push_str("<|start|>");
+        p.push_str(role);
+        p.push_str("<|message|>");
+        p.push_str(m.content.as_text().trim());
+        p.push_str("<|end|>");
+    }
+    p.push_str("<|start|>assistant<|channel|>final<|message|>");
+    p
 }
 
 /// Kimi-K3's chat format — text-only, no tools, thinking DISABLED.

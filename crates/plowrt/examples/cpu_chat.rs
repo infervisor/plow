@@ -44,6 +44,13 @@ fn main() {
                     "<bos><start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n"
                 );
             }
+            // OpenAI harmony format (gpt-oss): force the final channel so the answer comes first.
+            "--harmony" => {
+                let q = args.next().unwrap();
+                prompt = format!(
+                    "<|start|>user<|message|>{q}<|end|><|start|>assistant<|channel|>final<|message|>"
+                );
+            }
             "--chat" => {
                 let q = args.next().unwrap();
                 prompt = format!(
