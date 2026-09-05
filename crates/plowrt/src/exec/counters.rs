@@ -94,6 +94,24 @@ impl CounterPool {
         }
     }
 
+    /// A host-backed pool of `n` zeroed cells with no thresholds (all 0). For
+    /// programs whose gates carry their own thresholds (the device ISA's
+    /// `StreamEnt` waits), the pool is storage only.
+    pub fn with_len(n: usize) -> Self {
+        let mut cells: Vec<CachePadded<AtomicU64>> = Vec::with_capacity(n);
+        cells.resize_with(n, || CachePadded::new(AtomicU64::new(0)));
+        let boxed = cells.into_boxed_slice();
+        let base = boxed.as_ptr() as *const AtomicU64;
+        CounterPool {
+            base,
+            stride: std::mem::size_of::<CachePadded<AtomicU64>>(),
+            len: n,
+            thresholds: vec![0u64; n].into_boxed_slice(),
+            scopes: vec![Scope::CrossUnit; n].into_boxed_slice(),
+            _backing: Backing::Host(boxed),
+        }
+    }
+
     /// Build a pool over a backend-allocated device-mapped region. `dev.base`
     /// must be a host-usable pointer into pinned+device-mapped memory of at
     /// least `n * CELL_STRIDE` bytes; the same region's device pointer is handed

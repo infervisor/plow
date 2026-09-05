@@ -327,3 +327,365 @@ impl CpuModel {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Step driver
+// ---------------------------------------------------------------------------
+
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use packet::dev::DevOp;
+
+use crate::exec::counters::CounterPool;
+use crate::exec::cpu::control::unpack_fault;
+use crate::exec::cpu::ffi::{Isa, KernelFn, PlowCpuCtx};
+use crate::exec::cpu::interp::{Exec, LoadedProgram, WorkerCtx};
+use crate::exec::cpu::topology::{NumaMode, Topology};
+use crate::exec::cpu::workers::WorkerPool;
+use crate::exec::kvrow::rebase_chunk_rows;
+
+/// One worker's kernel context: the C `PlowCpuCtx` plus its scratch arena.
+/// `thread_init` (AMX tile config) must run ON the worker thread, so it is done
+/// lazily at the worker's first packet.
+struct WorkerSlot {
+    ctx: UnsafeCell<PlowCpuCtx>,
+    _scratch: HostTensor,
+    inited: AtomicBool,
+}
+
+// SAFETY: each slot is touched only by its own worker thread.
+unsafe impl Send for WorkerSlot {}
+unsafe impl Sync for WorkerSlot {}
+
+/// [`Exec`] over the C kernel library: resolves `inst.op` in a flat table and
+/// calls it with the model's host pointer table.
+pub struct KernelExec {
+    table: Vec<Option<KernelFn>>,
+    tensors: Vec<*mut c_void>,
+    slots: Vec<WorkerSlot>,
+}
+
+// SAFETY: `tensors` are pointers into the model's allocations, which outlive
+// the pool (the engine drops the pool first).
+unsafe impl Send for KernelExec {}
+unsafe impl Sync for KernelExec {}
+
+impl KernelExec {
+    fn new(model: &CpuModel, workers: usize, worker_node: impl Fn(usize) -> u32) -> Result<Self> {
+        let mut table: Vec<Option<KernelFn>> = vec![None; ffi::DOP_TABLE];
+        for p in &model.blob.progs {
+            for d in &p.insts {
+                let op = d.op as usize;
+                if table[op].is_none() {
+                    table[op] = ffi::kernel(d.op);
+                }
+            }
+        }
+        let scratch_bytes = ffi::scratch_bytes().max(64) as usize;
+        let mut slots = Vec::with_capacity(workers);
+        for w in 0..workers {
+            let scratch = HostTensor::alloc(scratch_bytes, true)?;
+            let mut ctx = PlowCpuCtx::new(w as u32, worker_node(w));
+            ctx.scratch = scratch.as_ptr() as *mut c_void;
+            ctx.scratch_bytes = scratch_bytes as u32;
+            slots.push(WorkerSlot {
+                ctx: UnsafeCell::new(ctx),
+                _scratch: scratch,
+                inited: AtomicBool::new(false),
+            });
+        }
+        Ok(KernelExec {
+            table,
+            tensors: model.ptrs.clone(),
+            slots,
+        })
+    }
+}
+
+impl Exec for KernelExec {
+    #[inline]
+    fn exec(&self, inst: &DevInst64, slice: u32, nblk: u32, w: &WorkerCtx) {
+        let slot = &self.slots[w.worker as usize];
+        // SAFETY: only this worker thread touches its slot.
+        let ctx = unsafe { &mut *slot.ctx.get() };
+        if !slot.inited.load(Ordering::Relaxed) {
+            ffi::thread_init(ctx).expect("cpu kernel thread init");
+            slot.inited.store(true, Ordering::Relaxed);
+        }
+        let f = self.table[inst.op as usize].unwrap_or_else(|| {
+            panic!(
+                "no CPU kernel for {} (op {})",
+                DevOp::from_u16(inst.op).map(|o| o.c_name()).unwrap_or("?"),
+                inst.op
+            )
+        });
+        // SAFETY: handles were validated at load (< n_tensors or NONE); the
+        // kernel contract is the interpreter's (slice of nblk, disjoint work).
+        unsafe { f(inst, slice, nblk, self.tensors.as_ptr(), ctx) };
+    }
+}
+
+/// Copy a blob program into the interpreter's form. Static per-cu streams; the
+/// global-queue windows are wired in P6.
+fn loaded(p: &DevProg, n_cu: u32) -> LoadedProgram {
+    let n_seg = p.stream.iter().map(|e| e.seg as u32).max().map_or(1, |m| m + 1);
+    let seg_ofs = if n_seg > 1 {
+        packet::devbuild::static_seg_ofs(&p.stream, &p.stream_ofs, &p.stream_len, n_seg).ok()
+    } else {
+        None
+    };
+    LoadedProgram {
+        insts: p.insts.clone(),
+        stream: p.stream.clone(),
+        stream_ofs: p.stream_ofs.clone(),
+        stream_len: p.stream_len.clone(),
+        waits: p.waits.clone(),
+        succs: p.succs.clone(),
+        n_cu,
+        n_seg,
+        seg_ofs,
+        gq: None,
+    }
+}
+
+/// Worker-pool knobs (`CpuRuntimeConfig` resolved).
+#[derive(Clone, Debug)]
+pub struct CpuEngineOpts {
+    /// 0 = one per physical core.
+    pub threads: usize,
+    pub numa: NumaMode,
+    pub isa: Isa,
+    pub spin_us: u32,
+}
+
+impl Default for CpuEngineOpts {
+    fn default() -> Self {
+        CpuEngineOpts {
+            threads: 0,
+            numa: NumaMode::Auto,
+            isa: Isa::Amx,
+            spin_us: 50,
+        }
+    }
+}
+
+/// One chunk of a prefill: program index, first absolute row, real rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunk {
+    pub prog: usize,
+    pub c0: u32,
+    pub clen: u32,
+}
+
+/// Greedy chunk plan over the compiled prefill buckets: the smallest bucket
+/// that holds the remainder, else the largest, repeated.
+pub fn plan_chunks(buckets: &[(usize, u32)], n_prompt: u32) -> Vec<Chunk> {
+    let mut out = Vec::new();
+    let mut c0 = 0u32;
+    while c0 < n_prompt {
+        let rem = n_prompt - c0;
+        let &(prog, t) = buckets
+            .iter()
+            .filter(|(_, t)| *t >= rem)
+            .min_by_key(|(_, t)| *t)
+            .or_else(|| buckets.iter().max_by_key(|(_, t)| *t))
+            .expect("at least one prefill bucket");
+        let clen = rem.min(t);
+        out.push(Chunk { prog, c0, clen });
+        c0 += clen;
+    }
+    out
+}
+
+/// A loaded model + its persistent worker pool: single sequence, greedy
+/// on-device sampling, the `exec::amd` step protocol on host memory.
+pub struct CpuEngine {
+    model: CpuModel,
+    pool: WorkerPool,
+    progs: Vec<Arc<LoadedProgram>>,
+    counters: Vec<Arc<CounterPool>>,
+    max_ctx: usize,
+    pub isa: Isa,
+    pub threads: usize,
+    /// Wall time of the last `run_prog`, for step telemetry.
+    pub last_run_us: f64,
+}
+
+impl CpuEngine {
+    pub fn load(blob: &Path, checkpoint: &Path, opts: &CpuEngineOpts) -> Result<CpuEngine> {
+        let isa = ffi::init(opts.isa)?;
+        let model = CpuModel::load(blob, checkpoint)?;
+        let n_cu = model.blob.n_cu;
+        let topo = Topology::detect();
+        // The pool needs the Exec before it exists; build the exec against the
+        // node placement the pool will use (same rule: round-robin over nodes).
+        let nodes = topo.select_nodes(&opts.numa);
+        let threads = if opts.threads == 0 {
+            nodes
+                .iter()
+                .map(|&n| topo.cores_on_node(n).count())
+                .sum::<usize>()
+                .max(1)
+        } else {
+            opts.threads
+        };
+        let exec = Arc::new(KernelExec::new(&model, threads, |w| {
+            // Mirrors WorkerPool::spawn's placement; only informational for kernels.
+            nodes[w % nodes.len()]
+        })?);
+        let pool = WorkerPool::spawn(&topo, threads, &opts.numa, opts.spin_us, n_cu, exec);
+        let progs: Vec<Arc<LoadedProgram>> =
+            model.blob.progs.iter().map(|p| Arc::new(loaded(p, n_cu))).collect();
+        let counters = model
+            .blob
+            .progs
+            .iter()
+            .map(|p| Arc::new(CounterPool::with_len(p.n_counter as usize)))
+            .collect();
+        let max_ctx = model
+            .wk
+            .pos
+            .map(|h| model.tensor(h).bytes / 4)
+            .unwrap_or(0);
+        tracing::info!(
+            threads = pool.threads(),
+            n_cu,
+            ?isa,
+            max_ctx,
+            "CPU engine ready"
+        );
+        Ok(CpuEngine {
+            model,
+            pool,
+            progs,
+            counters,
+            max_ctx,
+            isa,
+            threads,
+            last_run_us: 0.0,
+        })
+    }
+
+    pub fn model(&self) -> &CpuModel {
+        &self.model
+    }
+
+    pub fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
+    fn need(&self, h: Option<usize>, what: &str) -> Result<usize> {
+        h.ok_or_else(|| RuntimeError::Device(format!("blob declares no `{what}` tensor")))
+    }
+
+    /// Zero the program's counters and run every segment to completion.
+    fn run_prog(&mut self, p: usize) -> Result<()> {
+        let t0 = Instant::now();
+        let ctr = &self.counters[p];
+        ctr.reset_all();
+        let prog = &self.progs[p];
+        for seg in 0..prog.n_seg() {
+            let gen = self.pool.run(prog, seg, ctr);
+            if let Some(f) = self.pool.wait_done(gen) {
+                let (op, inst, worker) = unpack_fault(f).unwrap_or((0, 0, 0));
+                return Err(RuntimeError::Device(format!(
+                    "CPU worker {worker} faulted in program {p} seg {seg}: op {op} ({}) inst {inst}",
+                    DevOp::from_u16(op).map(|o| o.c_name()).unwrap_or("?")
+                )));
+            }
+        }
+        self.last_run_us = t0.elapsed().as_secs_f64() * 1e6;
+        Ok(())
+    }
+
+    /// Prefill `prompt` into KV rows `[0, len)`; returns the greedy next token
+    /// (which the device also leaves in `in.ids[0]` for the first decode step).
+    pub fn prefill(&mut self, prompt: &[u32]) -> Result<u32> {
+        if prompt.is_empty() {
+            return Err(RuntimeError::Device("prefill of an empty prompt".into()));
+        }
+        if prompt.len() > self.max_ctx {
+            return Err(RuntimeError::Device(format!(
+                "prompt of {} tokens exceeds max_ctx {}",
+                prompt.len(),
+                self.max_ctx
+            )));
+        }
+        let buckets: Vec<(usize, u32)> = (0..self.model.dec_ix)
+            .map(|i| (i, self.model.blob.progs[i].t))
+            .collect();
+        if buckets.is_empty() {
+            return Err(RuntimeError::Device("blob has no prefill program".into()));
+        }
+        let (t_ids, t_pos, t_kvlen) = (
+            self.need(self.model.wk.ids, "in.ids")?,
+            self.need(self.model.wk.pos, "in.pos")?,
+            self.need(self.model.wk.kvlen, "in.kvlen")?,
+        );
+        let plan = plan_chunks(&buckets, prompt.len() as u32);
+        tracing::info!(tokens = prompt.len(), chunks = ?plan, "prefill plan");
+        for ch in plan {
+            let t = self.model.blob.progs[ch.prog].t;
+            // Inputs: ids (padded), positions, kv length after this chunk.
+            {
+                // SAFETY: no run in flight.
+                let ids = unsafe { self.model.tensor(t_ids).as_mut_slice() };
+                let pos = unsafe { self.model.tensor(t_pos).as_mut_slice() };
+                for i in 0..t as usize {
+                    let id = if (i as u32) < ch.clen {
+                        prompt[(ch.c0 + i as u32) as usize]
+                    } else {
+                        0
+                    };
+                    ids[i * 4..i * 4 + 4].copy_from_slice(&id.to_le_bytes());
+                    pos[i * 4..i * 4 + 4].copy_from_slice(&(ch.c0 + i as u32).to_le_bytes());
+                }
+            }
+            self.model.write_u32(t_kvlen, ch.c0 + ch.clen);
+            // Rebase the program from its pristine copy: KV write rows at c0,
+            // flash window [c0, c0+clen), row counts for a partial chunk.
+            let lp = Arc::make_mut(&mut self.progs[ch.prog]);
+            lp.insts.copy_from_slice(&self.model.blob.progs[ch.prog].insts);
+            rebase_chunk_rows(&mut lp.insts, &self.model.names, ch.c0, ch.clen, t, Some(t));
+            self.run_prog(ch.prog)?;
+        }
+        Ok(self.model.read_u32(t_ids))
+    }
+
+    /// One decode step: the token in `in.ids[0]` (the previous sample) is
+    /// embedded at `pos`, attends over `kvlen` rows, and the greedy next token
+    /// is written back to `in.ids[0]` and returned.
+    pub fn decode_step(&mut self, pos: u32, kvlen: u32) -> Result<u32> {
+        if pos as usize >= self.max_ctx {
+            return Err(RuntimeError::Device(format!(
+                "position {pos} past max_ctx {}",
+                self.max_ctx
+            )));
+        }
+        let dp = self.model.dec_ix;
+        let (t_ids, t_pos, t_kvlen) = (
+            self.need(self.model.wk.ids, "in.ids")?,
+            self.need(self.model.wk.pos, "in.pos")?,
+            self.need(self.model.wk.kvlen, "in.kvlen")?,
+        );
+        {
+            let lp = Arc::make_mut(&mut self.progs[dp]);
+            for &i in &self.model.kvrow {
+                lp.insts[i as usize].i[3] = pos;
+            }
+        }
+        self.model.write_u32(t_pos, pos);
+        self.model.write_u32(t_kvlen, kvlen);
+        self.run_prog(dp)?;
+        Ok(self.model.read_u32(t_ids))
+    }
+
+    /// Seed `in.ids[0]` (e.g. to decode from a given token without a prefill).
+    pub fn set_token(&self, id: u32) -> Result<()> {
+        let t_ids = self.need(self.model.wk.ids, "in.ids")?;
+        self.model.write_u32(t_ids, id);
+        Ok(())
+    }
+}

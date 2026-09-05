@@ -28,6 +28,10 @@ pub mod gpu;
 pub mod health;
 pub mod host;
 pub mod indirection;
+/// KV write-row sites + prefill-chunk rebasing, shared by the AMD and CPU engines.
+// Prefill-chunk helpers are only exercised by an engine with a prefill path (AMD today).
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
+pub mod kvrow;
 pub mod oob;
 pub mod queue;
 /// Multi-GPU (tensor-parallel) device group: peer buffers, cross-GPU counters,

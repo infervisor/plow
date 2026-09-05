@@ -32,6 +32,7 @@ use crate::exec::counters::CounterPool;
 use crate::exec::cpu::control::Feedback;
 
 /// Per-window cursors of the global queue. `[n_seg * domains]`.
+#[derive(Clone)]
 pub struct GlobalQueue {
     /// Op-major (topological) permutation of the stream entries.
     pub stream: Vec<StreamEnt>,
@@ -43,6 +44,7 @@ pub struct GlobalQueue {
 
 /// A program as the interpreter sees it: the blob's tables copied into host
 /// memory once at load. Pointer-free, so it is `Send + Sync` for free.
+#[derive(Clone)]
 pub struct LoadedProgram {
     pub insts: Vec<DevInst64>,
     /// Flattened per-cu streams, `stream[stream_ofs[cu] .. +stream_len[cu]]`.
