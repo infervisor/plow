@@ -118,6 +118,17 @@ fn slot(raw: &'static str) -> Option<Slot> {
 /// comments and checked against them by `table_matches_doc_comments`.
 #[rustfmt::skip]
 const DOC: &[S] = &[
+    S { op: DevOp::QwenGdnConv, t: &["out", "x", "weight", "history", "active?"], i: &["C", "W", "B"], f: &[], j: &[] },
+    S { op: DevOp::QwenGdnStep, t: &["out", "qkv", "a", "b", "A_log", "dt_bias", "state", "active?"], i: &["HK", "HV", "K", "V", "B", "alog_f32"], f: &["q_scale", "l2_eps"], j: &[] },
+    S { op: DevOp::QwenGatedNorm, t: &["out", "core", "z", "gamma", "active?"], i: &["HV", "V", "B"], f: &["eps"], j: &[] },
+    S { op: DevOp::QwenQGateSplit, t: &["Q", "gate", "packed", "active?"], i: &["H", "D", "B"], f: &[], j: &[] },
+    S { op: DevOp::QwenSigmoidGate, t: &["out", "x", "gate", "active?"], i: &["width", "B"], f: &[], j: &[] },
+    S { op: DevOp::QwenRmsNorm, t: &["out", "x", "gamma", "active?"], i: &["width", "B"], f: &["eps", "gamma_offset"], j: &[] },
+    S { op: DevOp::QwenHeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos?", "active?"], i: &["H", "D", "rotary", "rows", "ctx", "normalize", "prefill"], f: &["eps", "gamma_offset"], j: &[] },
+    S { op: DevOp::QwenGdnConvPrefill, t: &["out", "x", "weight", "history"], i: &["C", "W", "T"], f: &[], j: &[] },
+    S { op: DevOp::QwenGdnQkvPrep, t: &["Q", "K", "V", "packed"], i: &["HK", "HV", "K", "V", "T"], f: &["l2_eps"], j: &[] },
+    S { op: DevOp::QwenGdnGatePrep, t: &["alpha", "beta", "a", "b", "A_log", "dt_bias"], i: &["HV", "T"], f: &[], j: &[] },
+    S { op: DevOp::QwenGdnPrefill, t: &["core", "Q", "K", "V", "alpha", "beta", "state", "outstate"], i: &["T", "HK", "HV", "K", "V"], f: &["q_scale"], j: &[] },
     S { op: DevOp::RmsNorm, t: &["out", "x", "gamma?", "xq?", "ascale?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::RowRms, t: &["rms", "x"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },
@@ -179,9 +190,9 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeRouterTopk, t: &["table", "logit", "", "bias"], i: &["", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MlaMergeFold, t: &["O", "Opart", "mlpart", "Wuv"], i: &["n_batch", "n_head", "V", "", "nsplit"], f: &[], j: &[] },
     S { op: DevOp::IndexScore, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_batch", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
-    S { op: DevOp::IndexSelect, t: &["idx", "Score", "gHist", "gCtl"], i: &["len", "top_k"], f: &[], j: &[] },
+    S { op: DevOp::IndexSelect, t: &["idx", "Score", "gHist", "gCtl", "kv_len"], i: &["len_max", "top_k", "pool_size"], f: &[], j: &[] },
     S { op: DevOp::IndexScorePf, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_tok", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
-    S { op: DevOp::IndexSelectPf, t: &["idx", "Score", "kv_len"], i: &["n_tok", "top_k", "kv_stride"], f: &[], j: &[] },
+    S { op: DevOp::IndexSelectPf, t: &["idx", "Score", "kv_len"], i: &["n_tok", "top_k", "kv_stride", "pool_size"], f: &[], j: &[] },
     S { op: DevOp::IndexUnionPf, t: &["union", "umask", "idx", "kv_len"], i: &["n_tok", "top_k", "kv_stride", "cap"], f: &[], j: &[] },
     S { op: DevOp::LayerNorm, t: &["out", "x", "gamma", "beta"], i: &["rows", "feat", "", "out_row0"], f: &["eps"], j: &[] },
     S { op: DevOp::MoeRouterGemma, t: &["table", "resid", "proj", "scale", "per_expert_scale"], i: &["H", "n_exp", "k"], f: &["root", "eps"], j: &[] },
@@ -222,7 +233,7 @@ const DOC: &[S] = &[
     // `KdaStateStep` with `KdaGate` inlined: `t4`/`t5` are the RAW projections, not the gate's
     // f32 output, and `i5` is the `dt_bias` handle. There is no slot for a precomputed `g`, which
     // is deliberate — this op cannot silently degrade to the unfused reading of the packet.
-    S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode", "parked"], f: &["scale", "lower_bound"], j: &[] },
+    S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode", "parked"], f: &["scale", "lower_bound"], j: &["", "w_fb"] },
     S { op: DevOp::KdaConvStateStepG, t: &["o", "q_raw", "k_raw", "v_raw", "g_raw", "beta_raw", "state", "descriptor"], i: &["T", "H", "D", "BV", "flags", "W", "gate_mode"], f: &["scale", "lower_bound"], j: &[] },
     S { op: DevOp::KdaDecodeFused, t: &["y", "q_raw", "k_raw", "v_raw", "forget_raw", "beta_raw", "state", "descriptor"], i: &["rows", "H", "D", "BV", "W", "flags", "gate_mode", "descriptor_version"], f: &["scale", "lower_bound"], j: &["", "norm_eps_bits"] },
     S { op: DevOp::MlaMaterializePack, t: &["K", "V", "KV", "K_rope"], i: &["T", "H", "qk_nope", "qk_rope", "v_head"], f: &[], j: &[] },
@@ -234,7 +245,7 @@ const DOC: &[S] = &[
     S { op: DevOp::KdaGatedNorm, t: &["y", "o", "norm_w", "g_raw"], i: &["T", "H", "D"], f: &["eps"], j: &[] },
     // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
     // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.
-    S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?", "res_a?", "res_b?"], i: &["T", "H", "nb", "push_row", "nb_cap", "res_pre?"], f: &["eps"], j: &[] },
+    S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?", "res_a?", "res_b?"], i: &["T", "H", "nb", "push_row", "nb_cap", "res_pre?", "mwg_scratch"], f: &["eps"], j: &[] },
     S { op: DevOp::SituGlu, t: &["out", "gate", "up"], i: &[], f: &[], j: &[] },
     S { op: DevOp::MlaOutGate, t: &["out", "a", "b"], i: &[], f: &[], j: &[] },
     S { op: DevOp::GemmFp8Blk, t: &["C", "A", "W", "weight_scale_inv"], i: &["M", "N", "K"], f: &[], j: &[] },
@@ -244,6 +255,14 @@ const DOC: &[S] = &[
     S { op: DevOp::GemvQkvMxfp4, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv", "S_q", "S_k", "S_v"], f: &[], j: &[] },
     // Same demotion: i5/i6/i7 are the three f32[N] dequant-scale TENSOR HANDLES.
     S { op: DevOp::GemvQkvFp8, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv", "S_q", "S_k", "S_v"], f: &[], j: &[] },
+    S { op: DevOp::HyperConnPre, t: &["post_mix", "comb_mix", "layer_input", "mixes", "residual", "hc_scale", "hc_base"], i: &["T", "n", "hidden", "sinkhorn_repeat"], f: &["rms_eps", "hc_eps"], j: &[] },
+    S { op: DevOp::HyperConnPost, t: &["new_residual", "x_out", "residual", "post_mix", "comb_mix"], i: &["T", "n", "hidden", "mode"], f: &[], j: &[] },
+    S { op: DevOp::DsaPoolCompress, t: &["compressed_k", "compressed_scale", "slot_k", "slot_score", "ape", "pos"], i: &["n_pools", "pool_size", "head_dim", "chunk_base"], f: &[], j: &[] },
+    S { op: DevOp::DsaPoolExpand, t: &["out", "pool_ids", "kv_len"], i: &["rows", "n_groups", "pool_size"], f: &[], j: &[] },
+    S { op: DevOp::DsaPoolStash, t: &["ring_k", "ring_score", "cur_k", "cur_score", "pos"], i: &["pool_size", "head_dim", "row"], f: &[], j: &[] },
+    S { op: DevOp::DsaQQuant, t: &["q_fp8", "q_scale", "q_raw"], i: &["n_rows", "head_dim"], f: &[], j: &[] },
+    S { op: DevOp::IndexScoreKpool, t: &["Score", "Qfp8", "Qscale", "Kfp8", "Kscale", "W", "kv_len"], i: &["n_batch", "index_heads", "pool_stride", "index_head_dim", "pool_size", "prefill"], f: &["scale"], j: &[] },
+    S { op: DevOp::GemvF32, t: &["C", "x", "W"], i: &["M", "N", "K"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

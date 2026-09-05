@@ -14,8 +14,25 @@
  * the template below for why the layout used here is correct at 128/256/512 alike.
  */
 #pragma once
+#ifndef PLOW_NV_GEMMA_HNR_BF16
+#define PLOW_NV_GEMMA_HNR_BF16 0
+#endif
+#ifndef PLOW_NV_GEMMA_NRN_BF16
+#define PLOW_NV_GEMMA_NRN_BF16 0
+#endif
+#ifndef PLOW_NV_NRN_WPR
+#define PLOW_NV_NRN_WPR 0
+#endif
 #include "sm120_common.cuh"
 #include <cuda_fp8.h> /* __nv_fp8_e4m3 — the T11 fused activation quant */
+
+static __device__ __forceinline__ float gemma_postnorm_round(float x) {
+#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && PLOW_NV_GEMMA_NRN_BF16
+    return __bfloat162float(__float2bfloat16(x));
+#else
+    return x;
+#endif
+}
 
 /* Elements one thread holds when the row fits in registers, as 16-byte vector loads.
  * RN_REG * 256 threads = 6144 covers every decode hidden the family uses: Qwen3 2560,
@@ -361,7 +378,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
                 for (int j = 0; j < 8; j++) {
                     const float g = gamma ? __bfloat162float(w.x[j]) : 1.0f;
                     o.x[j] = __float2bfloat16(
-                        (__bfloat162float(av.x[j]) + __bfloat162float(v.x[j]) * inv * g) * scale);
+                        (__bfloat162float(av.x[j]) + gemma_postnorm_round(__bfloat162float(v.x[j]) * inv * g)) * scale);
                 }
                 st_glob8(out + base + i, o);
             }
@@ -403,7 +420,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
                     for (int j = 0; j < 8; j++) {
                         const float g = gamma ? __bfloat162float(w[c].x[j]) : 1.0f;
                         o.x[j] = __float2bfloat16(
-                            (__bfloat162float(av[c].x[j]) + __bfloat162float(v[c].x[j]) * inv * g) *
+                            (__bfloat162float(av[c].x[j]) + gemma_postnorm_round(__bfloat162float(v[c].x[j]) * inv * g)) *
                             scale);
                     }
                     st_glob8(out + base + i, o);
@@ -419,7 +436,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
                 const float g = gamma ? __bfloat162float(gamma[i]) : 1.0f;
                 out[base + i] = __float2bfloat16(
-                    (__bfloat162float(a[base + i]) + __bfloat162float(b[base + i]) * inv * g) *
+                    (__bfloat162float(a[base + i]) + gemma_postnorm_round(__bfloat162float(b[base + i]) * inv * g)) *
                     scale);
             }
         }
@@ -430,9 +447,9 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
  *     resid = (a + RMSNorm(b, gb)) * scale     (the running residual stream)
  *     out   = RMSNorm(resid, gn)               (the normed activation the next sublayer reads)
  *
- * Warp32 port of runtime/amd/op_norm.h d_norm_residual_norm. BIT-EXACT to the NORM_RESIDUAL +
- * RMSNORM pair: `resid` is ROUNDED to bf16 (the value the first op would have stored) before the
- * SECOND reduction runs over it, reproducing the HBM round trip without the traffic. `resid`
+ * Warp32 port of runtime/amd/op_norm.h d_norm_residual_norm. `resid` is rounded to bf16 before
+ * the second reduction. PLOW_NV_NRN_WPR matches the prefill pair's warp reduction order;
+ * the legacy block reduction can round differently from the prefill pair. `resid`
  * aliases `a` in the caller; `b`/`out` are distinct. gb/gn == nullptr are the weightless variants. */
 static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16* resid,
                                      const __nv_bfloat16* a, const __nv_bfloat16* __restrict__ b,
@@ -440,6 +457,56 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                                      const __nv_bfloat16* __restrict__ gn, unsigned rows,
                                      unsigned feat, float eps, float scale, unsigned slice,
                                      unsigned nblk, float* part) {
+#if PLOW_NV_NRN_WPR
+    if (rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+        const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+        const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+        for (unsigned k = warp;; k += PLOW_NV_WARPS) {
+            const unsigned row = slice + k * nblk;
+            if (row >= rows) break;
+            const size_t base = (size_t)row * feat;
+            float ssb = 0.0f;
+            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+                const bf16v8 v = ld_glob8(b + base + i);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float f = __bfloat162float(v.x[j]);
+                    ssb += f * f;
+                }
+            }
+            const float invb = rsqrtf(warp_sum32(ssb) * __fdividef(1.0f, (float)feat) + eps);
+            float ssr = 0.0f;
+            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+                const bf16v8 v = ld_glob8(b + base + i);
+                const bf16v8 av = ld_glob8(a + base + i);
+                const bf16v8 w = gb ? ld_glob8(gb + i) : bf16v8_zero();
+                bf16v8 r;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float g = gb ? __bfloat162float(w.x[j]) : 1.0f;
+                    r.x[j] = __float2bfloat16(
+                        (__bfloat162float(av.x[j]) + gemma_postnorm_round(__bfloat162float(v.x[j]) * invb * g)) * scale);
+                    const float f = __bfloat162float(r.x[j]);
+                    ssr += f * f;
+                }
+                st_glob8(resid + base + i, r);
+            }
+            const float invr = rsqrtf(warp_sum32(ssr) * __fdividef(1.0f, (float)feat) + eps);
+            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+                const bf16v8 r = ld_glob8(resid + base + i);
+                const bf16v8 w = gn ? ld_glob8(gn + i) : bf16v8_zero();
+                bf16v8 o;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float g = gn ? __bfloat162float(w.x[j]) : 1.0f;
+                    o.x[j] = __float2bfloat16(__bfloat162float(r.x[j]) * invr * g);
+                }
+                st_glob8(out + base + i, o);
+            }
+        }
+        return;
+    }
+#endif
     const bool fits = (feat <= RN_REG * PLOW_NV_THREADS) && ((feat & 7u) == 0);
     for (unsigned row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;
@@ -480,7 +547,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                 for (int j = 0; j < 8; j++) {
                     const float g = gb ? __bfloat162float(wb[c].x[j]) : 1.0f;
                     const float f =
-                        (__bfloat162float(av[c].x[j]) + __bfloat162float(bv[c].x[j]) * invb * g) *
+                        (__bfloat162float(av[c].x[j]) + gemma_postnorm_round(__bfloat162float(bv[c].x[j]) * invb * g)) *
                         scale;
                     r.x[j] = __float2bfloat16(f);
                     const float rf = __bfloat162float(r.x[j]);
@@ -514,7 +581,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
                 const float g = gb ? __bfloat162float(gb[i]) : 1.0f;
                 const __nv_bfloat16 rb = __float2bfloat16(
-                    (__bfloat162float(a[base + i]) + __bfloat162float(b[base + i]) * invb * g) *
+                    (__bfloat162float(a[base + i]) + gemma_postnorm_round(__bfloat162float(b[base + i]) * invb * g)) *
                     scale);
                 resid[base + i] = rb;
                 const float rf = __bfloat162float(rb);
@@ -649,6 +716,12 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
 #pragma unroll
             for (unsigned e = 0; e < 4 * C; e++) v[e] = v[e] * inv * g[e];
             if (cosb) {
+#if PLOW_NV_GEMMA && PLOW_NV_GEMMA_HNR_BF16
+                // Match separate BF16 Q/K normalization before the rotary kernel.
+#pragma unroll
+                for (unsigned e = 0; e < 4 * C; e++)
+                    v[e] = __bfloat162float(__float2bfloat16(v[e]));
+#endif
                 const size_t p = (size_t)pos[t] * (HD / 2);
                 float r[4 * C];
 #pragma unroll
@@ -661,8 +734,15 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
 #pragma unroll
                     for (int k = 0; k < 4; k++) {
                         const unsigned lo = 4 * c + k, hi = 4 * (c + CH) + k;
+#if PLOW_NV_GEMMA && PLOW_NV_GEMMA_HNR_BF16
+                        const float cr = __bfloat162float(__float2bfloat16(cp[k]));
+                        const float sr = __bfloat162float(__float2bfloat16(sp[k]));
+                        r[lo] = v[lo] * cr - v[hi] * sr;
+                        r[hi] = v[hi] * cr + v[lo] * sr;
+#else
                         r[lo] = v[lo] * cp[k] - v[hi] * sp[k];
                         r[hi] = v[hi] * cp[k] + v[lo] * sp[k];
+#endif
                     }
                 }
 #pragma unroll

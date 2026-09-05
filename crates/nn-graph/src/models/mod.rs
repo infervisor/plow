@@ -17,6 +17,7 @@ mod kimi;
 mod kimi_k3;
 mod llama;
 mod qwen3;
+mod qwen3_5;
 mod qwen_image_dit;
 mod qwen_image_vae;
 mod qwen_vl;
@@ -72,6 +73,7 @@ pub fn build_graph(cfg: &ModelConfig, bucket: &ShapeBucket) -> Result<Graph, Bui
         ModelConfig::KimiK3(c) => kimi_k3::build(c)?,
         ModelConfig::Llama(c) => llama::build(c),
         ModelConfig::Qwen3(c) => qwen3::build(c),
+        ModelConfig::Qwen35(c) => qwen3_5::build(c),
         ModelConfig::DeepSeek(c) => deepseek::build(c),
         ModelConfig::Siglip(c) => siglip::build(c),
         ModelConfig::QwenVl(c) => qwen_vl::build(c),
@@ -102,6 +104,7 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
                 ModelConfig::QwenVl(_) => "qwen_vl",
                 ModelConfig::QwenImageDit(_) => "qwen_image_dit",
                 ModelConfig::QwenImageVae(_) => "qwen_image_vae",
+                ModelConfig::Qwen35(_) => "qwen3_5",
                 ModelConfig::Llama(_) | ModelConfig::Qwen3(_) => unreachable!(),
             }))
         }
@@ -130,14 +133,57 @@ pub fn build_text_generation_from_config_json_at(
     bucket: &ShapeBucket,
 ) -> Result<Graph, BuildError> {
     let mut outer: serde_json::Value = serde_json::from_str(json).map_err(ConfigError::from)?;
+    let wrapper_type = outer
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let language_model_wrapper = matches!(
+        wrapper_type.as_str(),
+        "qwen3_5" | "gemma4" | "gemma4_unified" | "kimi_k3"
+    );
     if let Some(mut text) = outer.get_mut("text_config").map(serde_json::Value::take) {
         if let serde_json::Value::Object(fields) = &mut text {
+            if !fields.contains_key("model_type") && !fields.contains_key("architectures") {
+                let text_type = match wrapper_type.as_str() {
+                    "gemma3" => Some("gemma3_text"),
+                    "gemma4" | "gemma4_unified" => Some("gemma4_text"),
+                    "qwen3_5" => Some("qwen3_5_text"),
+                    "kimi_k3" => Some("kimi_linear"),
+                    _ => None,
+                };
+                if let Some(text_type) = text_type {
+                    fields.insert("model_type".into(), text_type.into());
+                }
+            }
             if !fields.contains_key("dtype") && !fields.contains_key("torch_dtype") {
                 for key in ["dtype", "torch_dtype"] {
                     if let Some(dtype) = outer.get(key) {
                         fields.insert(key.into(), dtype.clone());
                         break;
                     }
+                }
+            }
+            if !fields.contains_key("quantization_config") {
+                if let Some(quant) = outer.get("quantization_config") {
+                    fields.insert("quantization_config".into(), quant.clone());
+                }
+            }
+            if language_model_wrapper {
+                let weight_prefix = if wrapper_type == "kimi_k3" {
+                    "language_model.model"
+                } else {
+                    "model.language_model"
+                };
+                fields.insert(
+                    "_plow_weight_prefix".to_string(),
+                    serde_json::Value::String(weight_prefix.to_string()),
+                );
+                if wrapper_type == "kimi_k3" {
+                    fields.insert(
+                        "_plow_head_prefix".to_string(),
+                        serde_json::Value::String("language_model".to_string()),
+                    );
                 }
             }
         }

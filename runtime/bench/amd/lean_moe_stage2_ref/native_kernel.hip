@@ -81,6 +81,197 @@ extern "C" __device__ unsigned plow_moe2_ep_full_i_3072 = 1;
 #endif
 #endif
 
+#ifndef PLOW_MOE2_BODY
+#define PLOW_MOE2_BODY 0
+#endif
+#if PLOW_MOE2_BODY && !defined(PLOW_MOE2_EP_FULL_I)
+extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_body_tm64_1 = 1;
+
+/* 64x128 tile body on the same launch grid: the runtime's `n_tiles(256) * 2 * tiles64`
+ * workgroups are read as `n_tiles(128) * tiles64`, so every 64-row sorted tile streams its
+ * expert's weight columns once instead of twice. Each output element sees the same three
+ * K-ordered 16x16x128 MFMAs with the same operands and scales as the 32x256 body, then the
+ * same `acc * gate` store, so the part tensor is bit-identical. A stays in one 4 KiB LDS slot
+ * (the 4,352 B contract); the row ids/gates alias it after the mainloop. */
+extern "C" __global__ __launch_bounds__(256, 2)
+void plow_moe2_mxfp4_16x16x128_gfx950(
+    float* __restrict__ part,
+    const unsigned char* __restrict__ activation,
+    const unsigned long long* __restrict__ weight_table,
+    const unsigned char* __restrict__ activation_scale,
+    const unsigned long long* __restrict__ weight_scale_table,
+    const int* __restrict__ meta,
+    const unsigned* __restrict__ row_partidx,
+    const float* __restrict__ row_gate,
+    int model_dim, int inter_dim, int experts, int reserved) {
+    (void)reserved;
+    constexpr unsigned TM = 64;
+    constexpr unsigned TN = 128;
+    constexpr unsigned TK = 128;
+    constexpr unsigned WAVE = 64;
+    constexpr unsigned KBYTES = TK / 2;
+    constexpr unsigned NTK = 3;
+
+    extern __shared__ __align__(16) unsigned char shared[];
+    unsigned char* a_lds = shared;
+    int* row_ids_lds = reinterpret_cast<int*>(shared);
+    float* row_gates_lds = reinterpret_cast<float*>(shared + TM * sizeof(int));
+
+    const unsigned tid = threadIdx.x;
+    const unsigned wave = tid / WAVE;
+    const unsigned lane = tid % WAVE;
+    const unsigned lane_k = lane / 16;
+    const unsigned lane_n = lane % 16;
+    const unsigned n_tiles = (static_cast<unsigned>(model_dim) + TN - 1u) / TN;
+    unsigned bid = blockIdx.x;
+#if PLOW_MOE2_XCD
+    /* Fold the grid so consecutive tiles (same expert, shared B) share one XCD's L2. */
+    {
+        const unsigned per = gridDim.x / 8u;
+        if (bid < per * 8u) bid = (bid % 8u) * per + bid / 8u;
+    }
+#endif
+    const unsigned n_tile = bid % n_tiles;
+    const unsigned block_m = bid / n_tiles;
+    const unsigned n0 = n_tile * TN;
+    const unsigned kbytes = static_cast<unsigned>(inter_dim) / 2;
+    const unsigned scale_stride = static_cast<unsigned>(inter_dim) / 32u;
+    if (inter_dim != 384 || experts <= 0)
+        return;
+    const int* tile_prefix = meta + 2 * experts;
+    const unsigned total_tiles = static_cast<unsigned>(tile_prefix[experts]);
+    if (block_m >= total_tiles)
+        return;
+    const unsigned expert = expert_for_tile(tile_prefix, block_m, static_cast<unsigned>(experts));
+    const unsigned char* weight = reinterpret_cast<const unsigned char*>(
+        static_cast<size_t>(weight_table[static_cast<size_t>(expert) * 3u + 2u]));
+    const unsigned* weight_scale = reinterpret_cast<const unsigned*>(
+        static_cast<size_t>(weight_scale_table[static_cast<size_t>(expert) * 3u + 2u]));
+    if (weight == nullptr || weight_scale == nullptr)
+        return;
+    const unsigned row0 = block_m * TM;
+
+    /* B: wave covers 32 columns (2 ni); the shuffled layout keeps 16-column blocks. */
+    auto load_b = [&](unsigned kt, i32x8* frag, int* scale) {
+        const unsigned weight_stride_n0 = (kbytes / 64u) * 1024u;
+        const unsigned scale_k_padded = (static_cast<unsigned>(inter_dim) + 255u) & ~255u;
+        const unsigned scale_stride_n0 = (scale_k_padded / 256u) * 64u;
+#pragma unroll
+        for (unsigned ni = 0; ni < 2; ++ni) {
+            const unsigned global_n = n0 + wave * 32u + ni * 16u + lane_n;
+            const unsigned n_block = global_n / 16u;
+            const size_t offset = static_cast<size_t>(n_block) * weight_stride_n0
+                + static_cast<size_t>(kt) * 1024u + lane_k * 256u + lane_n * 16u;
+            frag[ni] = global_n < static_cast<unsigned>(model_dim)
+                ? fp4_operand(weight + offset) : i32x8{0, 0, 0, 0, 0, 0, 0, 0};
+        }
+        const unsigned n_pair = n0 + wave * 32u;
+        const unsigned index = (n_pair / 32u) * scale_stride_n0 + (kt / 2u) * 64u
+            + lane_k * 16u + lane_n;
+        *scale = static_cast<int>(weight_scale[index] >> ((kt & 1u) * 16u));
+    };
+    /* A: 64 rows x 64 B per k-step, thread -> row tid/4, chunk tid%4; pad rows load zeros. */
+    const unsigned a_row = tid / 4u;
+    const unsigned a_chunk = tid % 4u;
+    const unsigned a_partidx = row_partidx[row0 + a_row];
+    auto load_a = [&](unsigned kt) {
+        u32x4 value{0, 0, 0, 0};
+        if (a_partidx != ~0u)
+            value = *reinterpret_cast<const u32x4*>(
+                activation + static_cast<size_t>(row0 + a_row) * kbytes + kt * KBYTES
+                + a_chunk * 16u);
+        return value;
+    };
+    auto store_a = [&](u32x4 value) {
+        *reinterpret_cast<u32x4*>(
+            a_lds + a_row * KBYTES + ((a_chunk ^ (a_row & 3u)) * 16u)) = value;
+    };
+
+    f32x4 acc[4][2];
+#pragma unroll
+    for (unsigned mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (unsigned ni = 0; ni < 2; ++ni)
+            acc[mi][ni] = f32x4{0.0f, 0.0f, 0.0f, 0.0f};
+
+    i32x8 b_cur[2];
+    int bs_cur;
+    load_b(0, b_cur, &bs_cur);
+    store_a(load_a(0));
+    __syncthreads();
+#pragma unroll
+    for (unsigned kt = 0; kt < NTK; ++kt) {
+        i32x8 b_next[2];
+        int bs_next = 0;
+        u32x4 a_next{0, 0, 0, 0};
+        if (kt + 1u < NTK) {
+            load_b(kt + 1u, b_next, &bs_next);
+            a_next = load_a(kt + 1u);
+        }
+        i32x8 a_frag[4];
+        int a_scale_words[2];
+#pragma unroll
+        for (unsigned mi = 0; mi < 4; ++mi) {
+            const unsigned row = lane_n + mi * 16u;
+            a_frag[mi] = fp4_operand(a_lds + row * KBYTES + ((lane_k ^ (row & 3u)) * 16u));
+        }
+#pragma unroll
+        for (unsigned mp = 0; mp < 2; ++mp) {
+            const unsigned scale_row = row0 + mp * 32u + lane_n;
+            const unsigned sa_lo = activation_scale[
+                static_cast<size_t>(scale_row) * scale_stride + kt * 4u + lane_k];
+            const unsigned sa_hi = activation_scale[
+                static_cast<size_t>(scale_row + 16u) * scale_stride + kt * 4u + lane_k];
+            a_scale_words[mp] = static_cast<int>(sa_lo | (sa_hi << 8u));
+        }
+        __builtin_amdgcn_s_setprio(1);
+        acc[0][0] = mfma_fp4<0, 0>(a_frag[0], b_cur[0], acc[0][0], a_scale_words[0], bs_cur);
+        acc[0][1] = mfma_fp4<0, 1>(a_frag[0], b_cur[1], acc[0][1], a_scale_words[0], bs_cur);
+        acc[1][0] = mfma_fp4<1, 0>(a_frag[1], b_cur[0], acc[1][0], a_scale_words[0], bs_cur);
+        acc[1][1] = mfma_fp4<1, 1>(a_frag[1], b_cur[1], acc[1][1], a_scale_words[0], bs_cur);
+        acc[2][0] = mfma_fp4<0, 0>(a_frag[2], b_cur[0], acc[2][0], a_scale_words[1], bs_cur);
+        acc[2][1] = mfma_fp4<0, 1>(a_frag[2], b_cur[1], acc[2][1], a_scale_words[1], bs_cur);
+        acc[3][0] = mfma_fp4<1, 0>(a_frag[3], b_cur[0], acc[3][0], a_scale_words[1], bs_cur);
+        acc[3][1] = mfma_fp4<1, 1>(a_frag[3], b_cur[1], acc[3][1], a_scale_words[1], bs_cur);
+        __builtin_amdgcn_s_setprio(0);
+        __syncthreads();
+        if (kt + 1u < NTK) {
+            store_a(a_next);
+            b_cur[0] = b_next[0];
+            b_cur[1] = b_next[1];
+            bs_cur = bs_next;
+            __syncthreads();
+        }
+    }
+
+    if (tid < TM) {
+        const unsigned partidx = row_partidx[row0 + tid];
+        row_ids_lds[tid] = partidx == ~0u ? -1 : static_cast<int>(partidx);
+        row_gates_lds[tid] = partidx == ~0u ? 0.0f : row_gate[row0 + tid];
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (unsigned ni = 0; ni < 2; ++ni)
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                const unsigned row = mi * 16u + lane_k * 4u + i;
+                const unsigned col = wave * 32u + ni * 16u + lane_n;
+                const int partidx = row_ids_lds[row];
+                if (partidx >= 0 && n0 + col < static_cast<unsigned>(model_dim)) {
+#if PLOW_MOE2_NT_STORE
+                    __builtin_nontemporal_store(
+                        acc[mi][ni][i] * row_gates_lds[row],
+                        part + static_cast<size_t>(partidx) * model_dim + n0 + col);
+#else
+                    part[static_cast<size_t>(partidx) * model_dim + n0 + col] =
+                        acc[mi][ni][i] * row_gates_lds[row];
+#endif
+                }
+            }
+}
+#else
 extern "C" __global__ __launch_bounds__(256, 2)
 #ifdef PLOW_MOE2_EP_FULL_I
 void plow_moe2_ep_full_i_16x16x128_gfx950(
@@ -240,3 +431,4 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
                         acc[mi][ni][i] * row_gates_lds[row];
             }
 }
+#endif

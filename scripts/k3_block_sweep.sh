@@ -2,7 +2,7 @@
 # k3_block_sweep.sh — the FAST K3 decode iteration loop: a 5-layer TP8 asset swept over ctx.
 #
 # WHY A BLOCK AND NOT THE MODEL. A full 93-layer emit + load + 32 steps is ~5 minutes a point,
-# almost all of it weight-table allocation and bind. `PLOW_K3_LAYERS=5` is the smallest span that
+# almost all of it weight-table allocation and bind. `PLOW_LAYERS=5` is the smallest span that
 # contains BOTH mixers (4 KDA + 1 MLA, because layer 3 is the first MLA layer), so it exercises the
 # ctx-invariant half of a layer AND the ctx-scaling half. It loads in ~1 s and sweeps three context
 # points in under two minutes.
@@ -38,8 +38,8 @@ IFS=, read -ra CTXS <<< "${PLOW_K3_CTX:-8000,16000,32000}"
 [ -x ./target/release/plowc ] || { echo "FAIL: build plowc in nix develop" >&2; exit 2; }
 [ -x ./target/release/plowrt ] || { echo "FAIL: build plowrt with HSA in nix develop" >&2; exit 2; }
 
-echo "=== emit (PLOW_K3_LAYERS=5, K3_PREFILL=0, TP8, fp8 KV) ${*:-no extra knobs}"
-env K3_FULL=1 PLOW_K3_LAYERS=5 K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 "$@" \
+echo "=== emit (PLOW_LAYERS=5, K3_PREFILL=0, TP8, fp8 KV) ${*:-no extra knobs}"
+env K3_FULL=1 PLOW_LAYERS=5 K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 "$@" \
   ./target/release/plowc --hf-dir "$CK" --emit devblob --arch gfx942 --gpu MI325X \
   --num-gpus 8 --parallel tp --max-ctx 32768 --n-cu 304 --out "$OUT" 2>&1 \
   | grep -aE "emitted 5 layers|decode instructions|ABLATE"

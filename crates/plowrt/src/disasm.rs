@@ -730,6 +730,8 @@ pub mod sched {
                 bq,
                 bkv,
                 heads,
+                kv_heads,
+                window,
                 out,
                 tmem,
                 variant,
@@ -737,6 +739,7 @@ pub mod sched {
                 json!({
                     "coord": coord, "seq_q": seq_q, "seq_kv": seq_kv, "head_dim": head_dim,
                     "tile": { "bq": bq, "bkv": bkv }, "heads": heads,
+                    "kv_heads": kv_heads, "window": window,
                     "out": out, "tmem": tmem, "variant": variant
                 })
             }
@@ -749,9 +752,11 @@ pub mod sched {
                 br,
                 out,
                 variant,
+                args,
             } => json!({
                 "reduce": reduce, "coord": coord, "rows": rows, "feat": feat,
-                "operands": operands, "br": br, "out": out, "variant": variant
+                "operands": operands, "br": br, "out": out, "variant": variant,
+                "args": args
             }),
             Body::Layout {
                 kind,

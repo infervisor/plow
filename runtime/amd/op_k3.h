@@ -473,6 +473,284 @@ __device__ void d_attn_res(bf16* __restrict__ out, const bf16* __restrict__ pref
 }
 
 /* -------------------------------------------------------------------------------------------
+ * op 104, DECODE MULTI-WORKGROUP arm (`-DPLOW_ATTNRES_DECODE_MWG=1`, default off; the packet
+ * selects it per instruction through `i6` = rendezvous scratch, so a flag-on object still runs
+ * the single-workgroup arm on a flag-off packet).
+ *
+ * The 7168-wide row is split into `nblk` column bands of `ceil(HID/8/nblk)` 8-wide vectors, one
+ * vector per thread. Each workgroup loads its band of every source row ONCE into registers (nb+1
+ * <= 9 rows, 36 VGPRs), reduces the band's (sum x^2, sum x*w) per row, and exchanges the partials
+ * through `scratch` as TAGGED 8-byte words (32-bit tag | f32), the tagged-XReduce scheme of
+ * op_collective.h: one relaxed agent-scope store per word, and a reader that sees the tag sees
+ * the value, so no fence sits between the bands. All words of all bands are polled at once, one
+ * per thread, so the latencies overlap. A second, one-word exchange folds the output norm's
+ * `sum mixed^2` the same way. (Folding the norm into the first exchange through the rows' Gram
+ * matrix — `sum mixed^2 = p^T G p` — was measured: it saves the second round trip but its 45
+ * wave reductions per band cost more VALU than the round trip saves from nb >= 3, and K3's
+ * schedule averages nb = 4.1; 6.08 vs 5.43 us weighted mean at 4 bands.)
+ *
+ * The tag is a per-site round number taken from an agent-scope counter at word 0
+ * (`old / nblk + 1`): decode tokens are strictly serial, so the `nblk` arrivals of one token are
+ * one round, and a word left by the previous token can never match. The scratch is
+ * loader-zeroed, and tag 0 is never issued. The norm words are parity double-buffered by round:
+ * a band that has read every peer's norm word may start the next round while a peer is still
+ * reading THIS band's norm word (the stat words cannot race — the next round's stats are
+ * published only after every peer's norm word of this round landed, i.e. after every peer
+ * finished its stat reads).
+ *
+ * NUMERICS: the C3 f32-mix contract of the promoted prefill object (attn_res_f32mix_gfx950.hip)
+ * — the mix stays f32 through the output RMSNorm, no bf16 seam — because a banded split cannot
+ * reproduce the single-workgroup arm's reduction order anyway, and decode then computes the
+ * same contract prefill already does. Within that contract the order is FIXED: per-lane
+ * sequential FMAs, a DPP wave tree, waves 0..7, bands 0..nblk-1, and the probs-then-sum mix in
+ * row order (ring rows, prefix last), so a run is deterministic for a given `nblk`.
+ * runtime/bench/amd/attnres_decode_mwg checks every output element within 1 bf16 ulp of a
+ * double-precision port of the contract and byte-stable repeats.
+ *
+ * DEADLOCK: the spin waits only on the other bands of the SAME packet. Every per-CU stream is a
+ * subsequence of one op-major topological order (devbuild), so everything ahead of this packet
+ * on a peer's stream precedes it globally and cannot depend on it; by induction on that order
+ * every band reaches the packet. Two slices of one packet on one CU are refused by the emitter.
+ *
+ * Geometry outside the contract (nblk in [2, 16], HID % 8 == 0, band <= PLOW_THREADS vectors,
+ * gamma present) poisons the band with qNaN rather than NOP. A rendezvous that never completes
+ * (2^20 polls, ~1 s) poisons the same way. */
+#ifndef PLOW_ATTNRES_DECODE_MWG
+#define PLOW_ATTNRES_DECODE_MWG 0
+#endif
+#if PLOW_ATTNRES_DECODE_MWG
+extern "C" __device__ unsigned plow_attnres_decode_mwg_1 = 1;
+enum { PLOW_ATTNRES_MWG_MAXBLK = 16, PLOW_ATTNRES_MWG_MAXB = 8 };
+/* Scratch words: [0] round counter; [1 + (s*(MAXB+1) + r)*2 + k] stat k of row r from band s;
+ * [1 + STAT + (round & 1)*MAXBLK + s] the band's output-norm sum of squares. 321 words =
+ * 2568 B per site; devgen `K3_ATTNRES_MWG_SCRATCH_BYTES` must match. */
+enum {
+    PLOW_ATTNRES_MWG_STAT_WORDS = PLOW_ATTNRES_MWG_MAXBLK * 2 * (PLOW_ATTNRES_MWG_MAXB + 1),
+    PLOW_ATTNRES_MWG_WORDS = 1 + PLOW_ATTNRES_MWG_STAT_WORDS + 2 * PLOW_ATTNRES_MWG_MAXBLK,
+};
+
+__device__ __forceinline__ void armwg_put(uint64_t* w, unsigned tag, float v) {
+    __hip_atomic_store(as_glob(w), ((uint64_t)tag << 32) | (uint64_t)__float_as_uint(v),
+                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+__device__ __forceinline__ float armwg_get(const uint64_t* w, unsigned tag) {
+    for (unsigned n = 0; n < (1u << 20); ++n) {
+        const uint64_t v =
+            __hip_atomic_load(as_glob(w), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        if ((unsigned)(v >> 32) == tag) return __uint_as_float((unsigned)v);
+    }
+    return __uint_as_float(0x7fc00000u);
+}
+/* Wave64 sum on DPP row shifts + row broadcasts (the attn_res_f32mix object's tree), read back
+ * from lane 63 as a wave-uniform value. Fixed order; no LDS round trips, unlike `__shfl_xor`. */
+template <int CTRL, int ROW_MASK>
+__device__ __forceinline__ float armwg_dpp_add(float v) {
+    const int x = __builtin_bit_cast(int, v);
+    const int y = __builtin_amdgcn_update_dpp(0, x, CTRL, ROW_MASK, 0xf, true);
+    return v + __builtin_bit_cast(float, y);
+}
+__device__ __forceinline__ float armwg_wave_sum(float v) {
+    v = armwg_dpp_add<0x111, 0xf>(v); /* row_shr:1 */
+    v = armwg_dpp_add<0x112, 0xf>(v); /* row_shr:2 */
+    v = armwg_dpp_add<0x114, 0xf>(v); /* row_shr:4 */
+    v = armwg_dpp_add<0x118, 0xf>(v); /* row_shr:8 */
+    v = armwg_dpp_add<0x142, 0xa>(v); /* row_bcast:15 */
+    v = armwg_dpp_add<0x143, 0xc>(v); /* row_bcast:31 */
+    return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), 63));
+}
+
+__device__ void d_attn_res_mwg(bf16* __restrict__ out, bf16* __restrict__ prefix,
+                               bf16* __restrict__ ring, const float* __restrict__ score_w,
+                               unsigned HID, unsigned NB, unsigned NBCAP, float eps, float out_eps,
+                               unsigned slice, unsigned nblk, float* __restrict__ lds,
+                               const bf16* __restrict__ push_src, unsigned push_row,
+                               const bf16* __restrict__ gamma, const bf16* __restrict__ res_a,
+                               const bf16* __restrict__ res_b, const bf16* __restrict__ res_pre,
+                               uint64_t* __restrict__ scratch) {
+    const unsigned NV = HID >> 3;
+    const unsigned per = (NV + nblk - 1u) / nblk;
+    const unsigned v0 = slice * per, v1 = (v0 + per < NV) ? v0 + per : NV;
+    if ((HID & 7u) || NB > PLOW_ATTNRES_MWG_MAXB || NBCAP < NB ||
+        (push_src != nullptr && push_row >= NBCAP) || gamma == nullptr || nblk < 2u ||
+        nblk > PLOW_ATTNRES_MWG_MAXBLK || per > PLOW_THREADS ||
+        (res_a != nullptr) != (res_b != nullptr) || (res_pre != nullptr && res_a == nullptr) ||
+        scratch == nullptr) {
+        for (unsigned d = v0 * 8u + threadIdx.x; d < v1 * 8u; d += PLOW_THREADS)
+            st_act1(&out[d], (bf16)0x7fc1u);
+        return;
+    }
+
+    constexpr unsigned MAXR = PLOW_ATTNRES_MWG_MAXB + 1;
+    float* part = lds;                       /* [PLOW_WAVES][2 * MAXR] */
+    float* sco = part + PLOW_WAVES * 2 * MAXR; /* [NB+1] probs */
+    unsigned* ltag = (unsigned*)(sco + MAXR + 1);
+    float* xw = sco + MAXR + 3; /* [nblk][2 * MAXR], every band's words, one poll per thread */
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add((unsigned*)scratch, 1u, __ATOMIC_RELAXED,
+                                                    __HIP_MEMORY_SCOPE_AGENT);
+        *ltag = old / nblk + 1u;
+    }
+
+    const unsigned i = v0 + threadIdx.x;
+    const bool act = i < v1;
+    const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
+    const bool wave_act = (wave << 6) < v1 - v0; /* a wave with no active lane skips the VALU */
+    const unsigned pstr = 2u * MAXR;
+    auto* pg = as_glob(prefix);
+    auto* rg = as_glob(ring);
+
+    /* Band of every source row, loaded once: ring rows [0, NB) in `v`, the prefix in `pv`
+     * (materialized here when the residual seam is folded into this packet; the pushed row is
+     * one past NB). `v` is only ever indexed by unrolled constants — a runtime index would put
+     * the rows in scratch memory. `gamma` is issued now so its cold miss hides under the rest. */
+    bf16v8 v[PLOW_ATTNRES_MWG_MAXB];
+    bf16v8 pv = bf16v8_zero(), g = bf16v8_zero();
+#pragma unroll
+    for (unsigned r = 0; r < PLOW_ATTNRES_MWG_MAXB; ++r) v[r] = bf16v8_zero();
+    float w[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) w[j] = 0.0f;
+    if (act) {
+        if (res_a != nullptr) {
+            const bf16v8 va = ld_glob8(as_glob(res_a) + i * 8u);
+            const bf16v8 vb = ld_glob8(as_glob(res_b) + i * 8u);
+            const bf16v8 vp = res_pre ? ld_glob8(as_glob(res_pre) + i * 8u) : bf16v8_zero();
+            bf16v8 p;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const bf16 inner = f2bf(bf2f(va[j]) + bf2f(vb[j]));
+                p[j] = res_pre ? f2bf(bf2f(vp[j]) + bf2f(inner)) : inner;
+            }
+            st_glob8(pg + i * 8u, p);
+            pv = p;
+        } else {
+            pv = ld_glob8(pg + i * 8u);
+        }
+        if (push_src != nullptr)
+            st_glob8(rg + (size_t)push_row * HID + i * 8u, ld_glob8(as_glob(push_src) + i * 8u));
+#pragma unroll
+        for (unsigned r = 0; r < PLOW_ATTNRES_MWG_MAXB; ++r)
+            if (r < NB) v[r] = ld_glob8(rg + (size_t)r * HID + i * 8u);
+        const f32x4 w0 = *(const PLOW_GLOB f32x4*)(score_w + i * 8u);
+        const f32x4 w1 = *(const PLOW_GLOB f32x4*)(score_w + i * 8u + 4u);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            w[j] = w0[j];
+            w[4 + j] = w1[j];
+        }
+        g = ld_glob8(as_glob(gamma) + i * 8u);
+    }
+    /* Row r < NB is a ring row, row NB the prefix: a uniform select on unrolled constants. */
+    auto xr = [&](unsigned r, int j) -> float {
+        return (r < NB) ? bf2f(v[r < PLOW_ATTNRES_MWG_MAXB ? r : 0][j]) : bf2f(pv[j]);
+    };
+
+    /* Band statistics per row, wave-summed into LDS; one cross-wave fold, one row per lane. */
+    if (wave_act) {
+#pragma unroll
+        for (unsigned r = 0; r < MAXR; ++r) {
+            if (r <= NB) {
+                float ss = 0.0f, sw = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float x = xr(r, j);
+                    ss = fmaf(x, x, ss);
+                    sw = fmaf(x, w[j], sw);
+                }
+                ss = armwg_wave_sum(ss);
+                sw = armwg_wave_sum(sw);
+                if (lane == 0) {
+                    part[wave * pstr + 2 * r] = ss;
+                    part[wave * pstr + 2 * r + 1] = sw;
+                }
+            }
+        }
+    } else if (lane < 2 * MAXR) {
+        part[wave * pstr + lane] = 0.0f;
+    }
+    __syncthreads();
+    const unsigned tag = *ltag;
+    uint64_t* stat = scratch + 1u;
+    if (wave == 0 && lane <= NB) {
+        float ss = 0.0f, sw = 0.0f;
+#pragma unroll
+        for (int q = 0; q < PLOW_WAVES; ++q) {
+            ss += part[q * pstr + 2 * lane];
+            sw += part[q * pstr + 2 * lane + 1];
+        }
+        armwg_put(stat + (slice * MAXR + lane) * 2u, tag, ss);
+        armwg_put(stat + (slice * MAXR + lane) * 2u + 1u, tag, sw);
+    }
+    {
+        const unsigned rows = 2u * (NB + 1u);
+        for (unsigned t = threadIdx.x; t < nblk * rows; t += PLOW_THREADS) {
+            const unsigned b = t / rows, rem = t - b * rows;
+            xw[b * pstr + rem] = armwg_get(stat + (b * MAXR + (rem >> 1)) * 2u + (rem & 1u), tag);
+        }
+    }
+    __syncthreads();
+    if (wave == 0) {
+        float s = -INFINITY;
+        if (lane <= NB) {
+            float tss = 0.0f, tsw = 0.0f;
+            for (unsigned b = 0; b < nblk; ++b) {
+                tss += xw[b * pstr + 2 * lane];
+                tsw += xw[b * pstr + 2 * lane + 1];
+            }
+            s = tsw * rsqrtf(tss / (float)HID + eps);
+        }
+        const float m = half_wave_max(s);
+        const float e = (lane <= NB) ? __expf(s - m) : 0.0f;
+        const float z = half_wave_sum(e);
+        if (lane <= NB) sco[lane] = e / z;
+    }
+    __syncthreads();
+
+    /* The mix, f32 and never rounded; its sum of squares folded the same way for the norm. */
+    float mixed[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) mixed[j] = 0.0f;
+    float ss = 0.0f;
+    if (wave_act) {
+#pragma unroll
+        for (unsigned r = 0; r < MAXR; ++r) {
+            if (r <= NB) {
+                const float p = sco[r];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) mixed[j] = fmaf(p, xr(r, j), mixed[j]);
+            }
+        }
+        if (act)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) ss = fmaf(mixed[j], mixed[j], ss);
+        ss = armwg_wave_sum(ss);
+    }
+    if (lane == 0) part[wave] = ss;
+    __syncthreads();
+    uint64_t* nw =
+        scratch + 1u + PLOW_ATTNRES_MWG_STAT_WORDS + (tag & 1u) * PLOW_ATTNRES_MWG_MAXBLK;
+    if (threadIdx.x == 0) {
+        float bs = 0.0f;
+#pragma unroll
+        for (int q = 0; q < PLOW_WAVES; ++q) bs += part[q];
+        armwg_put(nw + slice, tag, bs);
+    }
+    if (threadIdx.x < nblk) xw[threadIdx.x] = armwg_get(nw + threadIdx.x, tag);
+    __syncthreads();
+    if (act) {
+        float tot = 0.0f;
+        for (unsigned b = 0; b < nblk; ++b) tot += xw[b];
+        const float inv = rsqrtf(tot / (float)HID + out_eps);
+        bf16v8 o;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o[j] = f2bf(mixed[j] * inv * bf2f(g[j]));
+        st_glob8(as_glob(out) + i * 8u, o);
+    }
+    __syncthreads(); /* `sco`/`part`/`xw` are rewritten by the next op */
+}
+#endif /* PLOW_ATTNRES_DECODE_MWG */
+
+/* -------------------------------------------------------------------------------------------
  * op 105 — `situ` GLU. K3's activation, on EVERY GLU in the model.
  *
  * Reference, verbatim (modeling_kimi_linear.py:64-85, registered as ACT2FN["situ"]):

@@ -115,13 +115,16 @@ fn op_detail(op: &Op) -> serde_json::Value {
         }),
         Op::MatMul => json!({}),
         Op::RmsNorm { eps } => json!({ "eps": eps }),
+        Op::RmsNormZeroCentered { eps } => json!({ "eps": eps }),
         Op::LayerNorm { eps } => json!({ "eps": eps }),
         Op::Rope {
             dim,
             theta,
             interleave,
+            frequency_dim,
         } => json!({
             "dim": dim, "theta": theta, "interleave": interleave,
+            "frequency_dim": frequency_dim,
         }),
         Op::Act(kind) => json!({ "activation": format!("{kind:?}") }),
         Op::Elementwise(kind) => json!({ "kind": format!("{kind:?}") }),
@@ -170,13 +173,51 @@ fn op_detail(op: &Op) -> serde_json::Value {
             num_experts,
             top_k,
             group,
+            scoring,
+            norm_topk,
+            route_scale,
+            correction_bias,
         } => json!({
             "num_experts": num_experts,
             "top_k": top_k,
+            "scoring": format!("{scoring:?}"),
+            "norm_topk": norm_topk,
+            "route_scale": route_scale,
+            "correction_bias": correction_bias,
             "group": group.map(|g| serde_json::json!({
                 "n_group": g.n_group,
                 "topk_group": g.topk_group,
             })),
+        }),
+        Op::MoeExperts {
+            num_experts,
+            top_k,
+            intermediate_size,
+            block_fp8,
+        } => json!({
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "intermediate_size": intermediate_size,
+            "block_fp8": block_fp8,
+        }),
+        Op::DsaIndexer {
+            num_heads,
+            head_dim,
+            rope_dim,
+            top_k,
+            theta,
+        } => json!({
+            "num_heads": num_heads, "head_dim": head_dim, "rope_dim": rope_dim,
+            "top_k": top_k, "theta": theta,
+        }),
+        Op::DsaAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            top_k,
+        } => json!({
+            "num_heads": num_heads, "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim, "top_k": top_k,
         }),
         Op::Conv1dDepthwise { kernel } => json!({ "kernel": kernel }),
         Op::LinearAttention {
@@ -305,7 +346,9 @@ const OP_COLORS = {{
   'rmsnorm': ['#14171c','#8b929c'], 'layernorm': ['#14171c','#8b929c'], 'groupnorm': ['#14171c','#8b929c'],
   'act': ['#0f1d17','#6cc0a0'], 'situ_glu': ['#0f1d17','#6cc0a0'],
   'conv1d_depthwise': ['#10233a','#5a9fd4'], 'conv2d': ['#10233a','#5a9fd4'], 'conv3d': ['#10233a','#5a9fd4'],
-  'moe_router': ['#231708','#b8813a'], 'block_residual': ['#211018','#b07a9a'],
+  'moe_router': ['#231708','#b8813a'], 'moe_experts': ['#231708','#b8813a'],
+  'dsa_indexer': ['#231708','#b8813a'], 'dsa_attention': ['#132c47','#8fcaf4'],
+  'block_residual': ['#211018','#b07a9a'],
   'softmax': ['#14171c','#565d67'], 'rope': ['#0e1820','#3d6e9c'],
 }};
 const DEFAULT_COLOR = ['#101318','#3a424c'];

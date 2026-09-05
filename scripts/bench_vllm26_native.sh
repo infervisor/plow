@@ -20,6 +20,8 @@
 #   PORT      default 8477
 #   CONCS NPROMPT OUTLEN IN_LENS REPS   as sweep_client.py
 #   CALIB     1 to also run `vllm bench serve` at the same points (default 1)
+#   CALIB_ONLY  1 to run only the vllm bench serve client (default 0)
+#   SERVE_EXTRA_ARGS / BENCH_EXTRA_ARGS  additional vLLM CLI flags
 #
 # PREFIX CACHING defaults OFF, and that is a methodology decision, not a tuning one.
 # sweep_client.py sends the SAME prompt to all NPROMPT requests of a cell (bench_speed.sh
@@ -27,7 +29,7 @@
 # default APC would serve 15 of the 16 out of cache, collapsing its TTFT and inflating its
 # throughput against an engine that cannot do the same thing. `PREFIX=on` re-runs with vLLM's
 # default so both numbers are on the record.
-set -u
+set -uo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="${VLLM_VENV:-/workspace/vllm26}"
 MODEL_DIR="${MODEL_DIR:-/workspace/models/gemma-4-12B-it}"
@@ -42,6 +44,13 @@ MAXLEN="${MAXLEN:-4096}"
 MNBT="${MNBT:-8192}"
 GPUMEM="${GPUMEM:-0.85}"
 CALIB="${CALIB:-1}"
+CALIB_ONLY="${CALIB_ONLY:-0}"
+BENCH_BACKEND="${BENCH_BACKEND:-openai-chat}"
+case "$BENCH_BACKEND" in
+  openai-chat) ENDPOINT=/v1/chat/completions ;;
+  openai) ENDPOINT=/v1/completions ;;
+  *) echo "FAIL: BENCH_BACKEND must be openai-chat or openai" >&2; exit 2 ;;
+esac
 CALIB_CONCS="${CALIB_CONCS:-$CONCS}"
 READY="${READY:-1800}"
 OUTDIR="${OUTDIR:-/tmp/vllm26_$TAG}"
@@ -58,6 +67,10 @@ PARGS=(--no-enable-prefix-caching); [ "$PREFIX" = on ] && PARGS=()
   "$VENV/bin/pip" list 2>/dev/null | grep -iE '^(vllm|amd-aiter|torch|triton) ' || true
   echo "rocm: $(cat /opt/rocm/.info/version 2>/dev/null || ls -d /opt/rocm-* 2>/dev/null | tr '\n' ' ')"
   echo "model_dir: $MODEL_DIR  quant: ${QUANT}  prefix_cache: ${PREFIX}"
+  echo "max_model_len: $MAXLEN  max_num_batched_tokens: $MNBT  gpu_memory_utilization: $GPUMEM"
+  echo "backend: $BENCH_BACKEND  input_lengths: $IN_LENS  concurrencies: $CALIB_CONCS  output_length: $OUTLEN  prompts: $NPROMPT"
+  echo "serve_extra_args: ${SERVE_EXTRA_ARGS:-}"
+  echo "bench_extra_args: ${BENCH_EXTRA_ARGS:-}"
 } | tee "$OUTDIR/provenance.txt"
 
 # --- server -------------------------------------------------------------------------------
@@ -71,6 +84,7 @@ setsid "$VENV/bin/vllm" serve "$MODEL_DIR" \
   --max-num-batched-tokens "$MNBT" \
   --gpu-memory-utilization "$GPUMEM" \
   "${QARGS[@]}" "${PARGS[@]}" \
+  ${SERVE_EXTRA_ARGS:-} \
   --port "$PORT" > "$LOG" 2>&1 &
 SPID=$!
 SPGID="$(ps -o pgid= "$SPID" 2>/dev/null | tr -d ' ')"
@@ -83,7 +97,7 @@ cleanup() {
 trap 'cleanup; exit 130' INT TERM
 trap 'cleanup' EXIT
 
-echo "starting vLLM 0.26 on :$PORT (quant=$QUANT prefix=$PREFIX)"
+echo "starting vLLM from $VENV on :$PORT (quant=$QUANT prefix=$PREFIX)"
 ok=0
 for _ in $(seq 1 "$READY"); do
   [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health")" = 200 ] \
@@ -100,35 +114,46 @@ grep -oiE "cudagraph (capture|sizes)[^)]*" "$LOG" | tail -3 || true
 grep -oiE "Capturing.*decode.*" "$LOG" | tail -2 || true
 
 # --- arm 1: the plow ladder's own client ---------------------------------------------------
+if [ "$CALIB_ONLY" != 1 ]; then
 BASE_URL="http://127.0.0.1:$PORT" MODEL="$SERVED" TAG="$TAG" \
 IN_LENS="$IN_LENS" CONCS="$CONCS" NPROMPT="$NPROMPT" OUTLEN="$OUTLEN" REPS="$REPS" \
 CSV="$OUTDIR/sweep_client.csv" \
   python3 "$WT/scripts/sweep_client.py" 2>&1 | tee "$OUTDIR/sweep_client.log"
+fi
 
 # --- arm 2: the reference client at the same points ----------------------------------------
-if [ "$CALIB" = 1 ]; then
+status=0
+if [ "$CALIB" = 1 ] || [ "$CALIB_ONLY" = 1 ]; then
   echo "in_len,conc,ttft_ms,tpot_ms,itl_ms,itl_p99,out_tok_s,ok_reqs,gen_toks" \
     | tee "$OUTDIR/vllm_bench.csv"
   for L in $IN_LENS; do for C in $CALIB_CONCS; do
     b="$OUTDIR/vb_in${L}_c${C}.log"
+    result="in${L}_c${C}.json"
+    if [ -e "$OUTDIR/$result" ]; then
+      echo "FAIL: refusing to overwrite $OUTDIR/$result" >&2
+      status=1; continue
+    fi
     HF_HUB_OFFLINE=1 HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}" \
-    "$VENV/bin/vllm" bench serve --backend openai-chat \
-      --base-url "http://127.0.0.1:$PORT" --endpoint /v1/chat/completions \
+    "$VENV/bin/vllm" bench serve --backend "$BENCH_BACKEND" \
+      --base-url "http://127.0.0.1:$PORT" --endpoint "$ENDPOINT" \
       --model "$SERVED" --tokenizer "$MODEL_DIR" \
       --dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" \
       --max-concurrency "$C" --num-prompts "$NPROMPT" --ignore-eos \
-      > "$b" 2>&1
-    python3 - "$L" "$C" "$b" <<'PY' | tee -a "$OUTDIR/vllm_bench.csv"
-import re,sys
-L,C,p=sys.argv[1],sys.argv[2],sys.argv[3]
-t=open(p).read()
-def g(pat):
-    m=re.search(pat+r"\D*([\d.]+)",t); return float(m.group(1)) if m else float('nan')
-print(f"{L},{C},{g(r'Mean TTFT .ms.:'):.2f},{g(r'Mean TPOT .ms.:'):.3f},"
-      f"{g(r'Mean ITL .ms.:'):.3f},{g(r'P99 ITL .ms.:'):.3f},"
-      f"{g(r'Output token throughput .tok/s.:'):.1f},"
-      f"{g(r'Successful requests:'):.0f},{g(r'Total generated tokens:'):.0f}")
+      ${BENCH_EXTRA_ARGS:-} \
+      --save-result --save-detailed --result-dir "$OUTDIR" --result-filename "$result" \
+      > "$b" 2>&1 || { echo "FAIL: client input=$L concurrency=$C; see $b" >&2; status=1; continue; }
+    python3 - "$L" "$C" "$OUTDIR/$result" "$NPROMPT" "$OUTLEN" <<'PY' | tee -a "$OUTDIR/vllm_bench.csv"
+import json, math, sys
+L, C, p, expected, outlen = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+r = json.load(open(p))
+if r["completed"] != expected or r["failed"] != 0 or r["total_output_tokens"] != expected * outlen:
+    raise SystemExit(f"FAIL: incomplete cell in {p}")
+metrics = [r[k] for k in ("mean_ttft_ms", "mean_tpot_ms", "mean_itl_ms", "p99_itl_ms", "output_throughput")]
+if not all(math.isfinite(v) and v > 0 for v in metrics):
+    raise SystemExit(f"FAIL: invalid latency/throughput in {p}")
+print(f"{L},{C}," + ",".join(f"{v:.6f}" for v in metrics) + f",{r['completed']},{r['total_output_tokens']}")
 PY
+    [ "$?" = 0 ] || status=1
   done; done
 fi
 
@@ -143,3 +168,4 @@ echo "== prefix cache (server-side) =="
 grep -oiE "[Pp]refix cache hit rate[^,)]*" "$LOG" | tail -5 || echo "  (none logged)"
 
 echo "results in $OUTDIR"
+exit "$status"

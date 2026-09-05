@@ -19,6 +19,10 @@
 #            ladder determines whether wider points batch or queue.
 #   NPROMPT  prompts per point (default 8)
 #   OUTLEN   output tokens per request (default 128)
+#   VLLM_VENV  use its native bin/vllm instead of Docker when set
+#   OUTDIR   raw client logs and JSON results (default /tmp/plowrt_bench_<port>)
+#   GATE_PROMPT  raw-completion coherence prompt, including any required special tokens
+#   SERVE_EXTRA_ARGS  additional plowrt serve arguments (for example queue capacity)
 set -euo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="${1:?assets}"; PORT="${2:?port}"; MODEL="${3:?model}"; TOKZ="${4:?tokenizer}"
@@ -47,6 +51,22 @@ TOKZ_MOUNT="${TOKZ_MOUNT:-}"
 IMAGE="${IMAGE:-rocm/vllm:rocm7.14.0_cdna_ubuntu24.04_py3.14_pytorch_2.11.0_vllm_0.23.0}"
 LOG="${LOG:-/tmp/plowrt_bench_$PORT.log}"
 DOCKER="${DOCKER:-docker}"
+OUTDIR="${OUTDIR:-/tmp/plowrt_bench_$PORT}"
+mkdir -p "$OUTDIR"
+OUTDIR="$(cd "$OUTDIR" && pwd)"
+if [ -n "${VLLM_VENV:-}" ]; then
+  CLIENT=(env HF_HUB_OFFLINE=1 HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+    "$VLLM_VENV/bin/vllm")
+  RESULT_DIR="$OUTDIR"
+else
+  read -r -a TOKZ_MOUNTS <<< "$TOKZ_MOUNT"
+  read -r -a DOCKER_ARGS <<< "$DOCKER"
+  CLIENT=("${DOCKER_ARGS[@]}" run --rm --network host
+    -e HF_HUB_OFFLINE=1 -e HF_HOME=/hf -e HF_MODULES_CACHE=/tmp/hf_modules
+    -v "${HF_HOME:-$HOME/.cache/huggingface}:/hf:ro" "${TOKZ_MOUNTS[@]}"
+    -v "$OUTDIR:/results" --entrypoint vllm "$IMAGE")
+  RESULT_DIR=/results
+fi
 
 case "$BENCH_BACKEND" in
   openai-chat) ENDPOINT=/v1/chat/completions ;;
@@ -54,15 +74,16 @@ case "$BENCH_BACKEND" in
   *) echo "FAIL: BENCH_BACKEND must be openai-chat or openai" >&2; exit 2 ;;
 esac
 case "$BENCH_TRUST_REMOTE_CODE" in
-  0) TRUST_ARGS="" ;;
-  1) TRUST_ARGS="--trust-remote-code" ;;
+  0) TRUST_ARGS=() ;;
+  1) TRUST_ARGS=(--trust-remote-code) ;;
   *) echo "FAIL: BENCH_TRUST_REMOTE_CODE must be 0 or 1" >&2; exit 2 ;;
 esac
 
 echo "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-<unset>}"
 cd "$WT" || exit 1
 
-setsid nix develop -c "$PLOWRT_BIN" serve --assets "$ASSETS" --port "$PORT" \
+read -r -a SERVE_ARGS <<< "${SERVE_EXTRA_ARGS:-}"
+setsid nix develop -c "$PLOWRT_BIN" serve --assets "$ASSETS" --port "$PORT" "${SERVE_ARGS[@]}" \
   >"$LOG" 2>&1 &
 SRV=$!
 cleanup() {
@@ -90,9 +111,11 @@ echo
 # Coherence gate BEFORE any timing — a fast wrong server is not a result.
 echo "== coherence gate =="
 if [ "$BENCH_BACKEND" = openai ]; then
+  GATE_BODY=$(python3 -c 'import json,sys; print(json.dumps({"model":sys.argv[1], "prompt":sys.argv[2], "max_tokens":32, "temperature":0}))' \
+    "$MODEL" "${GATE_PROMPT:-The capital of France is}")
   GATE=$(curl -s --max-time 300 "http://127.0.0.1:$PORT$ENDPOINT" \
     -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$MODEL\",\"prompt\":\"The capital of France is\",\"max_tokens\":32,\"temperature\":0}")
+    --data-binary "$GATE_BODY")
 else
   GATE=$(curl -s --max-time 300 "http://127.0.0.1:$PORT$ENDPOINT" \
     -H 'Content-Type: application/json' \
@@ -135,17 +158,16 @@ for L in $IN_LENS; do
     NP="$(pick "${NPROMPT_MAP:-}" "$L" "$NPROMPT")"
     NW="$(pick "${NWARM_MAP:-}" "$L" "")"
     WARM="${BENCH_EXTRA_ARGS:-}"; [ -n "$NW" ] && WARM="--num-warmups $NW"
-    blog="/tmp/vllmbench_${MODEL}_in${L}_c${C}.log"
-    $DOCKER run --rm --network host \
-      -e HF_HUB_OFFLINE=1 -e HF_HOME=/hf -e HF_MODULES_CACHE=/tmp/hf_modules \
-      -v "$HOME/.cache/huggingface":/hf:ro $TOKZ_MOUNT \
-      --entrypoint vllm "$IMAGE" \
+    read -r -a WARM_ARGS <<< "$WARM"
+    blog="$OUTDIR/in${L}_c${C}.log"
+    "${CLIENT[@]}" \
       bench serve --backend "$BENCH_BACKEND" \
       --base-url "http://127.0.0.1:$PORT" --endpoint "$ENDPOINT" \
-      --model "$MODEL" --tokenizer "$TOKZ" $TRUST_ARGS \
+      --model "$MODEL" --tokenizer "$TOKZ" "${TRUST_ARGS[@]}" \
       --dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" \
       --random-range-ratio 0 --request-rate inf --ignore-eos --temperature 0 \
-      --max-concurrency "$C" --num-prompts "$NP" $WARM \
+      --max-concurrency "$C" --num-prompts "$NP" "${WARM_ARGS[@]}" \
+      --save-result --result-dir "$RESULT_DIR" --result-filename "in${L}_c${C}.json" \
       > "$blog" 2>&1
     python3 - "$L" "$C" "$blog" "$NP" "$OUTLEN" <<'PY'
 import math,re,sys

@@ -130,6 +130,12 @@ struct Cli {
     #[arg(long)]
     block: Option<String>,
 
+    /// devblob+cubin: also build segmented prefill cubins (_pfseg, _pfgemm).
+    /// Implies NOT setting PLOW_UNISEG=1, so the emitted programs carry
+    /// wave-class segments the SegPf runtime dispatches per-class.
+    #[arg(long)]
+    segmented: bool,
+
     /// devblob only: expand the RoPE tables into the blob's init section instead
     /// of carrying them as recipes the runtime materialises at load.
     ///
@@ -534,7 +540,23 @@ struct VizCli {
 
 fn main() -> ExitCode {
     init_logging();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // DEFAULT ON FOR sm_120. The persistent sm_120 interpreter runs every op in one cooperative
+    // launch and implements the coarse single-segment path only, so a segmented blob is not
+    // something that target can express. Without this, a plain `--hf-dir --arch sm_120a` compile
+    // SUCCEEDS and the asset then fails at serve time, in a different binary, against
+    // `plowrt`'s `check_coarse_single_segment` gate — with a message that never names the flag
+    // that was missing. Defaulting it here moves the decision to the only place that knows the
+    // arch. `deny_uniseg` still wins downstream for targets that must read `seg` (AMD).
+    // Opt out with PLOW_UNISEG=0.
+    if cli.arch.starts_with("sm_120") && std::env::var_os("PLOW_UNISEG").is_none() {
+        // The real gate is `packet::devbuild::Builder`'s own `std::env::var("PLOW_UNISEG")` read,
+        // not this struct field — set both so the emitted manifest and the diagnostic agree.
+        std::env::set_var("PLOW_UNISEG", "1");
+        cli.emit_cfg.uniseg = true;
+    }
+    let cli = cli;
 
     // Log the parsed CLI arguments so every invocation is self-describing in logs.
     let source_desc = if let Some(ref m) = cli.model {
@@ -1021,6 +1043,9 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         .clone()
         .ok_or("--emit devblob requires --hf-dir <checkpoint>")?;
 
+    let config_json = std::fs::read_to_string(dir.join("config.json"))?;
+    ensure_devblob_arch_supported(&config_json)?;
+
     let slug = plowc::hf_config::dir_slug(&dir);
 
     // Two output shapes:
@@ -1243,7 +1268,13 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             l2_layout,
             gpu: cli.gpu.clone(),
             arch: cli.arch.clone(),
-            emit_cfg: Some(cli.emit_cfg.clone()),
+            emit_cfg: Some({
+                let mut cfg = cli.emit_cfg.clone();
+                if cli.segmented {
+                    cfg.uniseg = false;
+                }
+                cfg
+            }),
             whole_graph_fusions,
         },
         verify,
@@ -1254,7 +1285,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // the CLI's idea of what was emitted, which is the drift this whole change
     // exists to remove.
     if cli.emit() == EmitKind::DevblobCubin {
-        build_cubin_from_manifest(&pkt, &cli.arch)?;
+        build_cubin_from_manifest(&pkt, &cli.arch, cli.segmented)?;
     }
 
     // Bare-blob mode (`--out foo.pkt`) stops here: no manifest, exactly the
@@ -1308,6 +1339,18 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(pkt)
 }
 
+fn ensure_devblob_arch_supported(config_json: &str) -> Result<(), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(config_json).map_err(|e| format!("invalid config.json: {e}"))?;
+    if v["model_type"].as_str() == Some("qwen3_5")
+        && (v.get("quantization_config").is_some()
+            || v["text_config"].get("quantization_config").is_some())
+    {
+        return Err("qwen3_5 native checkpoint FP8 lowering is not implemented yet".into());
+    }
+    Ok(())
+}
+
 /// `--emit devblob+cubin`: drive the Phase-A CMake target with the defines the
 /// manifest asked for.
 ///
@@ -1323,6 +1366,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn build_cubin_from_manifest(
     pkt: &std::path::Path,
     arch: &str,
+    segmented: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mpath = pkt.with_file_name("build.json");
     let man: serde_json::Value = serde_json::from_slice(
@@ -1384,12 +1428,18 @@ fn build_cubin_from_manifest(
     // must reach every decode-family object from one place — that was bug #2),
     // so route it there rather than into the raw-append bucket.
     let mut args: Vec<String> = vec!["-DPLOW_SM120_CUBIN=ON".into()];
+    if !req.iter().any(|d| d.starts_with("PLOW_NV_GEMMA")) {
+        args.push("-DPLOW_CUBIN_GEMMA=OFF".into());
+    }
     if req.iter().any(|d| d.starts_with("PLOW_NV_W8A8")) {
         args.push("-DPLOW_NV_W8A8=ON".into());
     }
     if req.iter().any(|d| d.starts_with("PLOW_FP8_KV")) {
         args.push("-DPLOW_FP8_KV=ON".into());
         args.push("-DPLOW_SM120_CUBIN_FP8KV=ON".into());
+    }
+    if segmented {
+        args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
     let mut extra = Vec::new();
     for d in &rec {
@@ -2060,6 +2110,17 @@ mod cli_tests {
         let mut argv = vec!["plowc", "--hf-dir", "/tmp/x", "--emit", "devblob"];
         argv.extend_from_slice(extra);
         Cli::try_parse_from(argv).expect("parse")
+    }
+
+    #[test]
+    fn qwen35_devblob_routes_bf16_and_rejects_unimplemented_fp8() {
+        ensure_devblob_arch_supported(r#"{"model_type":"qwen3_5"}"#).unwrap();
+        ensure_devblob_arch_supported(r#"{"model_type":"qwen3"}"#).unwrap();
+        let err = ensure_devblob_arch_supported(
+            r#"{"model_type":"qwen3_5","quantization_config":{"quant_method":"fp8"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("FP8 lowering"));
     }
 
     /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be

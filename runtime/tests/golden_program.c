@@ -159,7 +159,8 @@ static void check_e2e_row_reduce(void) {
     float x[2] = {1, 1}, o[2] = {0, 0};
     uint8_t storage[256];
     Buf b = { storage, 0, sizeof(storage) };
-    PlowRowBody r = { 0, /*rows*/1, /*feat*/2, 0, /*out*/1, /*operands*/1, {0,0,0} };
+    PlowRowBody r = { .coord=0, .rows=1, .feat=2, .args={0,0,0,0},
+                      .br=0, .out=1, .operands=1, ._pad={0,0,0} };
     build_1inst(&b, PLOW_ROW_REDUCE, &r, sizeof(r));
 
     void* slots[2] = { x, o };
@@ -176,7 +177,8 @@ static void check_e2e_row_pointwise(void) {
     float a[3] = {-1, 0, 2}, o[3] = {0, 0, 0};
     uint8_t storage[256];
     Buf b = { storage, 0, sizeof(storage) };
-    PlowRowBody r = { 0, /*rows*/1, /*feat*/3, 0, /*out*/1, /*operands*/1, {0,0,0} };
+    PlowRowBody r = { .coord=0, .rows=1, .feat=3, .args={0,0,0,0},
+                      .br=0, .out=1, .operands=1, ._pad={0,0,0} };
     build_1inst(&b, PLOW_ROW_POINTWISE, &r, sizeof(r));
 
     void* slots[2] = { a, o };

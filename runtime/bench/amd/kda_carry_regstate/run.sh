@@ -17,7 +17,7 @@ resource() {
         grep -F "$2:" | head -1 | sed 's/^.*: *//; s/ .*$//'
 }
 
-for name in k_carry_control k_carry_regstate k_carry_regstate_hwcvt; do
+for name in k_carry_control k_carry_regstate k_carry_regstate_hwcvt k_carry_regstate_keyfeed; do
     vgpr=$(resource "$name" VGPRs); agpr=$(resource "$name" AGPRs)
     sgpr=$(resource "$name" TotalSGPRs)
     scratch=$(resource "$name" 'ScratchSize [bytes/lane]')
@@ -35,5 +35,5 @@ done
 [ "${COMPILE_ONLY:-0}" = 1 ] && exit 0
 
 "$ROOT/perf-data/tools/gpulease" -n 1 kda-carry-regstate \
-    "$OUT/bench" "${T:-8192}" "${H:-12}" "${SAMPLES:-21}" "${TIMERS:-1}" |
+    "$OUT/bench" "${T:-8192}" "${H:-12}" "${SAMPLES:-21}" "${TIMERS:-1}" "${MODE:-0}" |
     tee "$OUT/results.txt"

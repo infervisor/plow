@@ -50,6 +50,31 @@
 #ifndef PLOW_KDA_CONV_STEP_DB
 #define PLOW_KDA_CONV_STEP_DB 0
 #endif
+/* ---- F_B FOLD (-DPLOW_KDA_FB_FOLD=1, decode objects; default OFF) ----
+ * Lever L3: the forget-gate up-projection `f_b` (N = H*D, K = D) is a GEMV whose only consumer is
+ * op 112, so under PLOW_KDA_F_FB_FOLD the step computes its own head's D logits in its prologue
+ * from `f_a` (t4, [T, D]) and `W_fb` (j1, [H*D, D]) — with the GEMV's exact column routine
+ * (`gemv_cols_wave`, op_gemm.h) and `f2bf` rounding, so `bf2f(f2bf(t))` is the bf16 the GEMV
+ * would have stored. The packet requires `PLOW_KDA_FB_FOLD=1`; the loader refuses a folded
+ * packet on an object without `plow_kda_fb_fold_1` (an unarmed object would read `f_a` as the
+ * gate logits: finite, wrong). */
+#ifndef PLOW_KDA_FB_FOLD
+#define PLOW_KDA_FB_FOLD 0
+#endif
+/* Decode objects only: a packet-paired `plow_config.h` defaults the flag for every object, and the
+ * prefill build must stay byte-identical (its preprocessed digest keys the tune store). */
+#if PLOW_KDA_FB_FOLD && !PLOW_BUCKET_DECODE
+#undef PLOW_KDA_FB_FOLD
+#define PLOW_KDA_FB_FOLD 0
+#endif
+#if PLOW_KDA_FB_FOLD
+#include "op_gemm.h"
+extern "C" __device__ unsigned plow_kda_fb_fold_1 = 1;
+/* Columns issued per wave before any is reduced: PLOW_KDA_FB_CB weight rows in flight. */
+#ifndef PLOW_KDA_FB_CB
+#define PLOW_KDA_FB_CB 8
+#endif
+#endif
 
 /* Gate activation modes, mirroring [fla]'s `safe_gate` switch (fla/ops/kda/gate.py:118-124). */
 enum { PLOW_KDA_GATE_SOFTPLUS = 0, PLOW_KDA_GATE_LOWER_BOUND = 1 };
@@ -68,6 +93,9 @@ enum {
      * per-row state stride 0, the state pointer does not move, and the emitted code is unchanged.
      * See perf-data/archive/k3/k3-batched-decode-design.md §1. */
     PLOW_KDA_F_SEQ_ROWS = 2u,
+    /* op 112 only: t4 is `f_a` and j1 is `W_fb`; the step computes the gate logits itself
+     * (PLOW_KDA_FB_FOLD). */
+    PLOW_KDA_F_FB_FOLD = 4u,
 };
 
 __device__ __forceinline__ uint2 kda_chunk_desc(const uint2* chunks, unsigned chunk, unsigned T) {
@@ -1333,7 +1361,8 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                                    float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                    unsigned BV, unsigned flags, float scale, unsigned slice,
                                    unsigned nblk, float* __restrict__ lds, size_t bstride,
-                                   const unsigned* __restrict__ parked) {
+                                   const unsigned* __restrict__ parked,
+                                   const bf16* __restrict__ w_fb = nullptr) {
     const unsigned lane = threadIdx.x & (PLOW_WAVE - 1);
     const unsigned wave = threadIdx.x >> 6;
     const unsigned ntile = D / BV; /* column tiles per head */
@@ -1358,6 +1387,10 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
     float* l_q = lds;         /* [D] */
     float* l_k = lds + D;     /* [D] */
     float* l_g = lds + 2 * D; /* [D] */
+#if PLOW_KDA_FB_FOLD
+    float* l_fb = lds + 4 * D; /* [D] folded f_b logits; 3*D.. is block_sum's scratch */
+    const bool fb_fold = GATE && (flags & PLOW_KDA_F_FB_FOLD);
+#endif
 
     for (unsigned it = slice; it < nitem; it += nblk) {
         /* Row-major over (row, h, tile), so consecutive slices stay inside one row's state when
@@ -1400,6 +1433,29 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
              * participates, so forgetting to publish one is safe by construction. */
             if (parked && parked[t]) continue;
             const size_t hd = (size_t)t * H * D + (size_t)h * D;
+#if PLOW_KDA_FB_FOLD
+            if (fb_fold) {
+                /* This head's D columns of f_b: row h*D+d of W_fb against f_a's row t, column
+                 * d = wave + PLOW_WAVES*j, PLOW_KDA_FB_CB columns in flight per wave. */
+                const bf16* xrow = g_raw + (size_t)t * D;
+                const bf16* wh = w_fb + (size_t)h * D * D;
+                constexpr unsigned CPW = PL * PLOW_WAVE / PLOW_WAVES;
+                constexpr unsigned CB = PLOW_KDA_FB_CB < CPW ? PLOW_KDA_FB_CB : CPW;
+                static_assert(CPW % CB == 0, "fold column batch must tile the head");
+#pragma unroll
+                for (unsigned j0 = 0; j0 < CPW; j0 += CB) {
+                    float acc[CB];
+                    gemv_cols_wave<CB>(xrow, wh, D, wave + PLOW_WAVES * j0, PLOW_WAVES, lane,
+                                       acc);
+                    if (lane == 0) {
+#pragma unroll
+                        for (unsigned c = 0; c < CB; c++)
+                            l_fb[wave + PLOW_WAVES * (j0 + c)] = bf2f(f2bf(acc[c]));
+                    }
+                }
+                __syncthreads();
+            }
+#endif
             /* Stage this head's q, k, g once per (item, token) and share across the waves. The L2
              * norm is a whole-head reduction, so it happens here, once, not per column. */
             float qs = 0.0f, ks = 0.0f;
@@ -1410,7 +1466,12 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                 float gv;
                 if (GATE) {
                     /* op 89's body, verbatim, evaluated where its only consumer already is. */
-                    const float sgm = bf2f(g_raw[hd + d]) + dt_bias[dtb + d];
+#if PLOW_KDA_FB_FOLD
+                    const float graw = fb_fold ? l_fb[d] : bf2f(g_raw[hd + d]);
+#else
+                    const float graw = bf2f(g_raw[hd + d]);
+#endif
+                    const float sgm = graw + dt_bias[dtb + d];
                     gv = (gate_mode == PLOW_KDA_GATE_LOWER_BOUND) ? lb * kda_sigmoid(a_h * sgm)
                                                                   : -a_h * kda_softplus(sgm);
                 } else {
@@ -1505,15 +1566,15 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
     if (D == 128)                                                                                 \
         d_kda_state_step_t<2, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
                                      gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
-                                     nblk, lds, bstride, parked);                                                  \
+                                     nblk, lds, bstride, parked, w_fb);                                            \
     else if (D == 64)                                                                             \
         d_kda_state_step_t<1, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
                                      gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
-                                     nblk, lds, bstride, parked);                                                  \
+                                     nblk, lds, bstride, parked, w_fb);                                            \
     else if (D == 256)                                                                            \
         d_kda_state_step_t<4, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
                                      gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
-                                     nblk, lds, bstride, parked);
+                                     nblk, lds, bstride, parked, w_fb);
 
 __device__ void d_kda_state_step(bf16* __restrict__ o, const bf16* __restrict__ q,
                                  const bf16* __restrict__ k, const bf16* __restrict__ v,
@@ -1526,6 +1587,7 @@ __device__ void d_kda_state_step(bf16* __restrict__ o, const bf16* __restrict__ 
     const float *a_log = nullptr, *dt_bias = nullptr;
     const unsigned gate_mode = 0;
     const float lb = 0.0f;
+    const bf16* w_fb = nullptr;
     PLOW_KDA_STEP_RUNGS(false)
 }
 
@@ -1541,7 +1603,8 @@ __device__ void d_kda_state_step_g(bf16* __restrict__ o, const bf16* __restrict_
                                    float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                    unsigned BV, unsigned flags, float scale, unsigned slice,
                                    unsigned nblk, float* __restrict__ lds, size_t bstride,
-                                   const unsigned* __restrict__ parked) {
+                                   const unsigned* __restrict__ parked,
+                                   const bf16* __restrict__ w_fb = nullptr) {
     const float *g = nullptr, *beta = nullptr;
     PLOW_KDA_STEP_RUNGS(true)
 }
@@ -1761,5 +1824,286 @@ __device__ void d_kda_gated_norm(bf16* __restrict__ y, const bf16* __restrict__ 
             y[base + d] = f2bf(bf2f(o[base + d]) * inv * norm_w[d] * kda_sigmoid(bf2f(g_raw[base + d])));
     }
 }
+
+/* -------------------------------------------------------------------------------------------
+ * FUSED DECODE ARM (-DPLOW_KDA_DECODE_FUSED_ARM=1, decode objects; default OFF). Lever L7.
+ *
+ * One packet on op 112's own slice map (one workgroup per (head, value tile), H*D/BV slices)
+ * replaces the Conv3 -> StepG -> GatedNorm chain: per head, tile 0 runs the q/k conv for the
+ * whole head and every tile runs the conv of its own BV v channels and (under
+ * PLOW_KDA_F_FB_FOLD) its BV columns of the head's f_b projection; q, k and the fold are
+ * exchanged as TAGGED 8-byte words (32-bit round tag | bf16), the op_k3.h banded-AttnRes
+ * scheme: one relaxed agent-scope store per word, and a reader that sees the tag sees the
+ * value, so no fence sits between the tiles. Each tile stages q/k/g from the words into op
+ * 112's LDS layout and runs op 112's recurrence VERBATIM (same staging loop, same block_sum,
+ * same wave_sum order); the last tile of the head to finish (agent-scope counter) runs op
+ * 103's row body on the head's o words. Nothing is re-derived: each conv channel is
+ * `kda_conv_range`'s T=1 arithmetic, each fold column is L3's `gemv_cols_wave`, each gate/step
+ * line is `d_kda_state_step_t`'s, each norm line is `d_kda_gated_norm`'s, so y, state and the
+ * conv windows are bit-identical to the chain — and the microbench
+ * (`runtime/bench/amd/kda_decode_fused_arm_bench.hip`) checks that word for word.
+ *
+ * DEADLOCK: a tile waits on its head's tile 0 (q/k) and, under the fold, on every tile of its
+ * head (g), then on nothing after the last-arriver election. Every slice of the packet is on
+ * its own workgroup (the emitter's `supports_decode_fused_arm`), a global-queue workgroup
+ * claims a slice only when it can run it (PLOW_GQ_BATCH=1; a batch > 1 could hold a sibling
+ * unstarted while spinning on it, hence the #error; the L8 prefetch claims nothing ahead), and
+ * a static stream puts one slice per CU — so every sibling is running and publishes before it
+ * waits. The round tag is `fetch_add(head counter) / (2*ntile) + 1` (two bumps per tile per
+ * token, tokens strictly serial, loader-zeroed scratch, tag 0 never issued); a poll that never
+ * completes (2^20 polls) returns qNaN rather than hanging.
+ *
+ * Packet: op 112 with flags bit 3 (PLOW_KDA_F_FUSED_ARM): t0 = y (was o), t1..t3 = RAW q/k/v
+ * (was conv outputs), t7 = a u32 descriptor `[wq, wk, wv, csq, csk, csv, A_log, dt_bias,
+ * norm_w, g_raw, scratch, eps_bits, W]` (was A_log). The loader refuses such a packet on an
+ * object without `plow_kda_decode_fused_arm_1`. */
+#ifndef PLOW_KDA_DECODE_FUSED_ARM
+#define PLOW_KDA_DECODE_FUSED_ARM 0
+#endif
+#if PLOW_KDA_DECODE_FUSED_ARM && !PLOW_BUCKET_DECODE
+#undef PLOW_KDA_DECODE_FUSED_ARM
+#define PLOW_KDA_DECODE_FUSED_ARM 0
+#endif
+#if PLOW_KDA_DECODE_FUSED_ARM
+#if PLOW_GLOBAL_QUEUE && PLOW_GQ_BATCH > 1
+#error "PLOW_KDA_DECODE_FUSED_ARM waits on a lower slice of its own packet: PLOW_GQ_BATCH must be 1"
+#endif
+extern "C" __device__ unsigned plow_kda_decode_fused_arm_1 = 1;
+#define PLOW_KDA_F_FUSED_ARM 8u
+enum {
+    PLOW_KDA_FUSED_DESC_WQ = 0, PLOW_KDA_FUSED_DESC_WK = 1, PLOW_KDA_FUSED_DESC_WV = 2,
+    PLOW_KDA_FUSED_DESC_CSQ = 3, PLOW_KDA_FUSED_DESC_CSK = 4, PLOW_KDA_FUSED_DESC_CSV = 5,
+    PLOW_KDA_FUSED_DESC_ALOG = 6, PLOW_KDA_FUSED_DESC_DTB = 7, PLOW_KDA_FUSED_DESC_NORMW = 8,
+    PLOW_KDA_FUSED_DESC_GRAW = 9, PLOW_KDA_FUSED_DESC_SCRATCH = 10, PLOW_KDA_FUSED_DESC_EPS = 11,
+    PLOW_KDA_FUSED_DESC_W = 12, PLOW_KDA_FUSED_DESC_WORDS = 13,
+};
+/* Scratch words per head: [0] counter; [1 + d] q; [1 + D + d] k; [1 + 2D + d] g (folded f_b);
+ * [1 + 3D + d] o. devgen's `kda_fused_scratch_bytes` must match. */
+#define PLOW_KDA_FUSED_SCRATCH_WORDS(D) (1u + 4u * (D))
+
+__device__ __forceinline__ void kda_fu_put(uint64_t* w, unsigned tag, bf16 v) {
+    __hip_atomic_store(as_glob(w), ((uint64_t)tag << 32) | (uint64_t)v, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_AGENT);
+}
+__device__ __forceinline__ bf16 kda_fu_get(const uint64_t* w, unsigned tag) {
+    for (unsigned n = 0; n < (1u << 20); ++n) {
+        const uint64_t v =
+            __hip_atomic_load(as_glob(w), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        if ((unsigned)(v >> 32) == tag) return (bf16)(unsigned)v;
+    }
+    return (bf16)0x7fc1u;
+}
+/* One channel of `kda_conv_range`'s shared T=1 path, statement for statement: window and taps
+ * as PLOW_KDA_WMAX-wide fixed arrays zero-padded past W, roll, insert, ordered 8-term sum, silu
+ * (op 109 is always emitted with act = 1), window written back. */
+__device__ __forceinline__ bf16 kda_fu_conv_chan(const bf16* __restrict__ x,
+                                                 const float* __restrict__ w,
+                                                 float* __restrict__ state, unsigned c,
+                                                 unsigned W) {
+    enum { PLOW_KDA_WMAX = 8 };
+    float win[PLOW_KDA_WMAX], tap[PLOW_KDA_WMAX];
+    const unsigned Wc = W < PLOW_KDA_WMAX ? W : PLOW_KDA_WMAX;
+#pragma unroll
+    for (unsigned j = 0; j < PLOW_KDA_WMAX; j++) {
+        win[j] = j < Wc ? state[(size_t)c * W + j] : 0.0f;
+        tap[j] = j < Wc ? w[(size_t)c * W + j] : 0.0f;
+    }
+#pragma unroll
+    for (unsigned j = 0; j + 1 < PLOW_KDA_WMAX; j++) win[j] = win[j + 1];
+    win[Wc - 1] = bf2f(x[c]);
+    float y = 0.0f;
+#pragma unroll
+    for (unsigned j = 0; j < PLOW_KDA_WMAX; j++) y += win[j] * tap[j];
+    const bf16 r = f2bf(act_silu(y));
+#pragma unroll
+    for (unsigned j = 0; j < PLOW_KDA_WMAX; j++)
+        if (j < Wc) state[(size_t)c * W + j] = win[j];
+    return r;
+}
+
+template <unsigned PL>
+__device__ void d_kda_decode_fused_arm_t(
+    bf16* __restrict__ y, const bf16* __restrict__ q_raw, const bf16* __restrict__ k_raw,
+    const bf16* __restrict__ v_raw, const bf16* __restrict__ g_raw,
+    const bf16* __restrict__ beta_raw, float* __restrict__ state, const float* __restrict__ wq,
+    const float* __restrict__ wk, const float* __restrict__ wv, float* __restrict__ csq,
+    float* __restrict__ csk, float* __restrict__ csv, const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias, const float* __restrict__ norm_w,
+    const bf16* __restrict__ og_raw, uint64_t* __restrict__ scratch, unsigned H, unsigned D,
+    unsigned BV, unsigned W, unsigned flags, unsigned gate_mode, float scale, float lb,
+    float eps, unsigned slice, unsigned nblk, float* __restrict__ lds,
+    const bf16* __restrict__ w_fb) {
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & (PLOW_WAVE - 1);
+    const unsigned wave = tid >> 6;
+    const unsigned ntile = D / BV;
+    const unsigned items = H * ntile;
+    if (slice >= items) return;
+    const unsigned h = slice / ntile;
+    const unsigned tile = slice % ntile;
+    const size_t hd = (size_t)h * D; /* T = 1: row 0 */
+    const bool fb_fold = (flags & PLOW_KDA_F_FB_FOLD) != 0u;
+    /* Geometry outside the contract poisons the head rather than computing something finite. */
+    if (D != PL * PLOW_WAVE || BV != PLOW_WAVES || W == 0 || W > 8 ||
+        !(flags & PLOW_KDA_F_QK_L2NORM) || (flags & PLOW_KDA_F_SEQ_ROWS) || nblk < items ||
+        (fb_fold && w_fb == nullptr) || scratch == nullptr) {
+        for (unsigned d = tid; d < D; d += PLOW_THREADS) st_act1(&y[hd + d], (bf16)0x7fc1u);
+        return;
+    }
+#if !PLOW_KDA_FB_FOLD
+    if (fb_fold) __builtin_trap();
+#endif
+
+    float* l_q = lds;          /* [D] */
+    float* l_k = lds + D;      /* [D] */
+    float* l_g = lds + 2 * D;  /* [D] */
+    float* l_fb = lds + 4 * D; /* [D]  (3D.. is block_sum's scratch) */
+    float* l_v = lds + 5 * D;  /* [BV] */
+    unsigned* l_ob = (unsigned*)(lds + 5 * D + BV);  /* [D] o bf16 bits */
+    unsigned* l_ctl = (unsigned*)(lds + 6 * D + BV); /* [0] tag, [1] last */
+    uint64_t* const sh = scratch + (size_t)h * PLOW_KDA_FUSED_SCRATCH_WORDS(D);
+
+    /* Round tag; its round trip hides under the conv loads below. */
+    if (tid == 0) {
+        const unsigned old = __hip_atomic_fetch_add((unsigned*)as_glob(sh), 1u, __ATOMIC_RELAXED,
+                                                    __HIP_MEMORY_SCOPE_AGENT);
+        l_ctl[0] = old / (2u * ntile) + 1u;
+    }
+
+    /* The f_b fold (L3), one column per WAVE: this tile's BV columns `tile*BV + wave` of the
+     * head's D rows of W_fb against f_a, computed with the GEMV's own column routine and
+     * rounded as the GEMV stores, then exchanged like q/k so each column is computed once per
+     * head instead of ntile times. Issued before the conv so the two load rounds overlap. */
+    float fb_acc = 0.0f;
+#if PLOW_KDA_FB_FOLD
+    if (fb_fold) {
+        float acc[1];
+        gemv_cols_wave<1>(g_raw, w_fb + hd * D, D, tile * BV + wave, 1u, lane, acc);
+        fb_acc = acc[0];
+    }
+#endif
+    /* Conv: tile 0 owns the head's q and k channels (one per thread), every tile its BV v
+     * channels, so each channel's window is rolled exactly once. */
+    bf16 mine = (bf16)0;
+    if (tile == 0 && tid < 2u * D) {
+        const unsigned s = tid / D, d = tid - s * D;
+        mine = kda_fu_conv_chan(s == 0 ? q_raw : k_raw, s == 0 ? wq : wk, s == 0 ? csq : csk,
+                                (unsigned)hd + d, W);
+    }
+    if (tid < BV)
+        l_v[tid] = bf2f(kda_fu_conv_chan(v_raw, wv, csv, (unsigned)hd + tile * BV + tid, W));
+    const size_t dtb = hd;
+    const float a_h = __expf(a_log[h]);
+    __syncthreads();
+    const unsigned tag = l_ctl[0];
+    if (tile == 0 && tid < 2u * D) kda_fu_put(sh + 1u + tid, tag, mine);
+    if (fb_fold && lane == 0)
+        kda_fu_put(sh + 1u + 2u * D + tile * BV + wave, tag, f2bf(fb_acc));
+    /* Stage from the words: thread d polls q[d], thread D+d polls k[d], 2D+d the fold. */
+    if (tid < 2u * D) {
+        const float v = bf2f(kda_fu_get(sh + 1u + tid, tag));
+        if (tid < D)
+            l_q[tid] = v;
+        else
+            l_k[tid - D] = v;
+    } else if (fb_fold && tid < 3u * D) {
+        l_fb[tid - 2u * D] = bf2f(kda_fu_get(sh + 1u + tid, tag));
+    }
+    __syncthreads();
+
+    /* op 112's staging, statement for statement, with q/k/g read back from the words. */
+    float qs = 0.0f, ks = 0.0f;
+    for (unsigned d = tid; d < D; d += PLOW_THREADS) {
+        const float qv = l_q[d], kv = l_k[d];
+        const float graw = fb_fold ? l_fb[d] : bf2f(g_raw[hd + d]);
+        const float sgm = graw + dt_bias[dtb + d];
+        const float gv = (gate_mode == PLOW_KDA_GATE_LOWER_BOUND) ? lb * kda_sigmoid(a_h * sgm)
+                                                                  : -a_h * kda_softplus(sgm);
+        l_g[d] = __expf(gv);
+        qs += qv * qv;
+        ks += kv * kv;
+    }
+    qs = block_sum(qs, lds + 3 * D);
+    ks = block_sum(ks, lds + 3 * D + PLOW_WAVES);
+    const float rq = scale * rsqrtf(qs + 1e-6f), rk = rsqrtf(ks + 1e-6f);
+    for (unsigned d = tid; d < D; d += PLOW_THREADS) {
+        l_q[d] *= rq;
+        l_k[d] *= rk;
+    }
+    __syncthreads();
+
+    const float b = kda_sigmoid(bf2f(beta_raw[h]));
+    {
+        const unsigned j = tile * BV + wave; /* value column, one per wave (BV == PLOW_WAVES) */
+        float* col = state + hd * D + (size_t)j * D; /* V-FIRST: [v][k] */
+        float sc[PL];
+        float pk = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < PL; r++) {
+            const unsigned d = r * PLOW_WAVE + lane;
+            sc[r] = col[d] * l_g[d];
+            pk += sc[r] * l_k[d];
+        }
+        pk = wave_sum(pk);
+        const float u = l_v[wave] - pk;
+        const float bu = b * u;
+        float pq = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < PL; r++) {
+            const unsigned d = r * PLOW_WAVE + lane;
+            sc[r] += bu * l_k[d];
+            col[d] = sc[r];
+            pq += sc[r] * l_q[d];
+        }
+        pq = wave_sum(pq);
+        if (lane == 0) kda_fu_put(sh + 1u + 3u * D + j, tag, f2bf(pq));
+    }
+    __syncthreads();
+
+    /* Completion: the tile whose bump closes the head's 2*ntile bumps of this token runs
+     * op 103's row body over the head's o words. */
+    if (tid == 0) {
+        const unsigned old = __hip_atomic_fetch_add((unsigned*)as_glob(sh), 1u, __ATOMIC_RELAXED,
+                                                    __HIP_MEMORY_SCOPE_AGENT);
+        l_ctl[1] = (old % (2u * ntile)) == 2u * ntile - 1u;
+    }
+    __syncthreads();
+    if (l_ctl[1]) {
+        if (tid < D) l_ob[tid] = kda_fu_get(sh + 1u + 3u * D + tid, tag);
+        __syncthreads();
+        if (wave == 0) {
+            const size_t base = hd;
+            float ss = 0.0f;
+            for (unsigned d = lane; d < D; d += PLOW_WAVE) {
+                const float x = bf2f((bf16)l_ob[d]);
+                ss += x * x;
+            }
+            const float inv = rsqrtf(wave_sum(ss) / (float)D + eps);
+            for (unsigned d = lane; d < D; d += PLOW_WAVE)
+                y[base + d] = f2bf(bf2f((bf16)l_ob[d]) * inv * norm_w[d] *
+                                   kda_sigmoid(bf2f(og_raw[base + d])));
+        }
+    }
+    __syncthreads(); /* the arena is reused by the next packet */
+}
+
+__device__ void d_kda_decode_fused_arm(
+    bf16* y, const bf16* q_raw, const bf16* k_raw, const bf16* v_raw, const bf16* g_raw,
+    const bf16* beta_raw, float* state, const float* wq, const float* wk, const float* wv,
+    float* csq, float* csk, float* csv, const float* a_log, const float* dt_bias,
+    const float* norm_w, const bf16* og_raw, uint64_t* scratch, unsigned H, unsigned D,
+    unsigned BV, unsigned W, unsigned flags, unsigned gate_mode, float scale, float lb,
+    float eps, unsigned slice, unsigned nblk, float* lds, const bf16* w_fb) {
+    /* D = 128 is the one rung the arm carries (the K3 shape); the emitter keeps the chain for
+     * anything else. */
+    if (D == 128)
+        d_kda_decode_fused_arm_t<2>(y, q_raw, k_raw, v_raw, g_raw, beta_raw, state, wq, wk, wv,
+                                    csq, csk, csv, a_log, dt_bias, norm_w, og_raw, scratch, H, D,
+                                    BV, W, flags, gate_mode, scale, lb, eps, slice, nblk, lds,
+                                    w_fb);
+    else
+        __builtin_trap();
+}
+#endif /* PLOW_KDA_DECODE_FUSED_ARM */
 
 #endif /* PLOW_OP_KDA_H */

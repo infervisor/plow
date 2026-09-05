@@ -297,6 +297,14 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-dir", env = "PLOW_PF_SEG_DIR", global = true)]
     pub pf_seg_dir: Option<String>,
 
+    /// Experimental BF16 TMA object: ABI1 M<=128; ABI2 Gemma12 M128 o/down; ABI3 Gemma31.
+    #[arg(
+        long = "pf-seg-gemm-small",
+        env = "PLOW_PF_SEG_GEMM_SMALL",
+        global = true
+    )]
+    pub pf_seg_gemm_small: Option<String>,
+
     /// Serve-side segment classing, mirroring the emit-side PLOW_SEG_PURE_GEMM:
     /// "1" = every plain tiled GEMM is GEMM-class, "fp8" = only TMA-mapped fp8
     /// GEMMs (the ws-entry object's sole arm). Must match the blob's emit classing.

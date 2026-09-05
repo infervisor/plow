@@ -34,8 +34,9 @@ pub use tile::{lower_gemm, TileNode, TileSeq};
 pub use tilegraph::TileNode as GraphNode;
 pub use tilegraph::{
     assemble, consumer_thresholds, materialize_tile_deps, AxisCouple, Compute, ConcatGroup,
-    ConstraintSet, Handoff, HandoffKind, LayerPlan, LayoutSpec, LocalityReq, MatEdge, OpDesc,
-    OpKind, OpSpec, RelaxableHandoff, TileDep, TileDependency, TileGraph, LAYOUT_RANK,
+    ConstraintSet, Handoff, HandoffKind, LayerPlan, LayoutSpec, LocalityReq, MatEdge, ModelOp,
+    ModelOpKind, OpDesc, OpKind, OpSpec, RelaxableHandoff, TileDep, TileDependency, TileGraph,
+    LAYOUT_RANK,
 };
 
 use nn_graph::Graph;

@@ -14,7 +14,7 @@
 # `glm_build_block_pf` emits act.x-in/act.x-out programs with no Embed, no lm_head and no
 # act.logits (crates/devgen/src/mla.rs), so `plowrt amd-bench` cannot drive one — the only runner is
 # the TP1 C harness `runtime/tests/glm52_run.c`, which needs an HF oracle fixture and would measure
-# a TP1 geometry we do not serve. `PLOW_GLM_LAYERS=N` gives the same thing a block gives (a few real
+# a TP1 geometry we do not serve. `PLOW_LAYERS=N` gives the same thing a block gives (a few real
 # layers of the real megakernel) at the TP8 geometry that IS served, and it differences the fixed
 # overhead out exactly.
 #
@@ -189,7 +189,7 @@ for n in "$N_LO" "$N_DENSE" "$N_MOE"; do
   fi
   echo "  asset n=$n: emitting"
   # shellcheck disable=SC2086
-  env PLOW_GLM_LAYERS="$n" $EMIT_ENV "$NIX" develop "$ROOT" -c "$PLOWC" \
+  env PLOW_LAYERS="$n" $EMIT_ENV "$NIX" develop "$ROOT" -c "$PLOWC" \
       --emit devblob --hf-dir "$CKPT" --gpu MI300X --arch gfx942 \
       --num-gpus "$TP" --max-ctx "$MAXCTX" --out "$WORK/n$n" > "$WORK/emit_n$n.log" 2>&1 \
     || { echo "FAIL: emit n=$n (see $WORK/emit_n$n.log)"; tail -20 "$WORK/emit_n$n.log"; exit 1; }

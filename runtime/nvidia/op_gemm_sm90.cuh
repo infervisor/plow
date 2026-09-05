@@ -46,6 +46,20 @@
 
 #include "sm90_wgmma.cuh"
 
+#ifndef PLOW_NV_FP8_PF_SCALE_WFIRST
+#define PLOW_NV_FP8_PF_SCALE_WFIRST 0
+#endif
+
+#ifndef PLOW_NV_SEG_M64N64
+#define PLOW_NV_SEG_M64N64 0
+#endif
+#ifndef PLOW_NV_SEG_M64N128
+#define PLOW_NV_SEG_M64N128 0
+#endif
+#if PLOW_NV_SEG_M64N64 && PLOW_NV_SEG_M64N128
+#error "select one M64 segment tile"
+#endif
+
 /* ---- tile geometry (M/N deliberately equal to PGM_BM/PGM_BN) ---- */
 #define PGM90_BM 128
 #define PGM90_BN 128
@@ -580,7 +594,8 @@ static __device__ void d_gemm_glu_sm90_tma(__nv_bfloat16* C, const void* mA, con
 }
 #endif /* PGM90_TMA_HAS_GLU */
 
-#if PLOW_NV_W8A8
+/* The n256 and ws384 BF16 bodies share this TMA implementation with FP8. */
+#if PLOW_NV_W8A8 || PGM90_UNI_BN256 || PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
 /* w8a8 twin of d_gemm_sm90_tma: same uniform-TMA ring (stage bytes are IDENTICAL — 128 e4m3
  * = 64 bf16 = 128 B rows), e4m3 maps (GEN_TMAP_E4M3, inner box 128), m64n128k32 QGMMA, and
  * the two-scale epilogue + PGM90_FP8_PROMOTE two-level accumulation of d_gemm_w8a8_sm90. */
@@ -603,6 +618,7 @@ static __device__ void d_gemm_w8a8_sm90_tma(__nv_bfloat16* __restrict__ C, const
     if (tid < NS) {
         sm90_mbar_init(bfull + tid, 1);
         sm90_mbar_init(bempty + tid, 2);
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
     __syncthreads();
 
@@ -701,9 +717,14 @@ static __device__ void d_gemm_w8a8_sm90_tma(__nv_bfloat16* __restrict__ C, const
 #pragma unroll
                 for (int lo = 0; lo < 2; lo++) {
                     const int cc = c0 + 8 * g + lo;
-                    if (cc < (int)n)
-                        C[(size_t)rr * n + cc] =
-                            __float2bfloat16(acc[4 * g + 2 * hi + lo] * as * wscale[cc]);
+                    if (cc < (int)n) {
+                        const float v = acc[4 * g + 2 * hi + lo];
+#if PLOW_NV_FP8_PF_SCALE_WFIRST
+                        C[(size_t)rr * n + cc] = __float2bfloat16(__fmul_rn(as, __fmul_rn(wscale[cc], v)));
+#else
+                        C[(size_t)rr * n + cc] = __float2bfloat16(v * as * wscale[cc]);
+#endif
+                    }
                 }
             }
     }
@@ -1258,6 +1279,109 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
 }
 #endif /* PGM90_UNI_BN256 && PLOW_NV_SEG_WS384 */
 
+#if PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
+__device__ __forceinline__ void plow_wgmma_m64n64k16(float* d, uint64_t da, uint64_t db, int scale_d) {
+    asm volatile(
+        "{ .reg .pred p; setp.ne.b32 p, %34, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, "
+        "%32, %33, p, 1, 1, 0, 0; }\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+          "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+          "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]),
+          "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+        : "l"(da), "l"(db), "r"(scale_d) : "memory");
+}
+
+template <bool PROD, int BN>
+static __device__ void d_gemm_sm90_tma_m64_role(__nv_bfloat16* __restrict__ C,
+    const void* mapA, const void* mapB, unsigned m, unsigned n, unsigned k,
+    unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
+    static_assert(BN == 64 || BN == 128);
+    if (sm90_bad_k(k, 8u)) return;
+    if (n & 1u) { if (threadIdx.x == 0) __trap(); return; }
+    constexpr int NS = PGM90_TMA_STAGES;
+    // Preserve the full 128-row tensor-map transfer for either output tile.
+    constexpr int slab_bytes = 128 * 128;
+    uint64_t* full = (uint64_t*)arena;
+    uint64_t* empty = full + NS;
+    uint8_t* As = (uint8_t*)sm90_align1024(arena + PGM90_TMA_MBAR_BF16);
+    uint8_t* Bs = As + NS * slab_bytes;
+    const int tid = (int)threadIdx.x;
+    if (PROD && tid < NS) {
+        sm90_mbar_init(full + tid, 1);
+        sm90_mbar_init(empty + tid, 1);
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    const int tiles_m = ((int)m + 63) / 64, tiles_n = ((int)n + BN - 1) / BN;
+    const int ntiles = tiles_m * tiles_n, ksteps = ((int)k + 63) / 64;
+    if (PROD) {
+        if (tid == 0) {
+            int stage = 0;
+            for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
+                const int tm = (tile / tiles_n) * 64, tn = (tile % tiles_n) * BN;
+                for (int ks = 0; ks < ksteps; ks++, stage++) {
+                    const int slot = stage % NS;
+                    if (stage >= NS) sm90_mbar_wait(empty + slot, ((stage / NS) + 1) & 1);
+                    sm90_mbar_expect(full + slot, 2 * slab_bytes);
+                    const uint32_t bar = sm90_su32(full + slot);
+                    sm90_tma2d(sm90_su32(As + slot * slab_bytes), mapA, ks * 64, (int)a_row0 + tm, bar);
+                    sm90_tma2d(sm90_su32(Bs + slot * slab_bytes), mapB, ks * 64, tn, bar);
+                }
+            }
+        }
+    } else {
+        const int lt = tid & 127, warp = lt >> 5, lane = lt & 31;
+        int stage = 0;
+        for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
+            const int tm = (tile / tiles_n) * 64, tn = (tile % tiles_n) * BN;
+            float acc[BN / 2];
+            int prev = -1;
+            for (int ks = 0; ks < ksteps; ks++, stage++) {
+                const int slot = stage % NS;
+                sm90_mbar_wait(full + slot, (stage / NS) & 1);
+                const uint8_t* a = As + slot * slab_bytes;
+                const uint8_t* b = Bs + slot * slab_bytes;
+                sm90_wg_fence();
+#pragma unroll
+                for (int sub = 0; sub < 4; sub++) {
+                    const int sd = (ks == 0 && sub == 0) ? 0 : 1;
+                    if constexpr (BN == 64)
+                        plow_wgmma_m64n64k16(acc, sm90_desc(a + sub * 32), sm90_desc(b + sub * 32), sd);
+                    else
+                        wgmma_m64n128k16(acc, sm90_desc(a + sub * 32), sm90_desc(b + sub * 32), sd);
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<1>();
+                if (prev >= 0 && lt == 0) sm90_mbar_arrive(empty + prev);
+                prev = slot;
+            }
+            sm90_wg_wait<0>();
+            if (prev >= 0 && lt == 0) sm90_mbar_arrive(empty + prev);
+            const int row = tm + warp * 16 + (lane >> 2), col = tn + 2 * (lane & 3);
+#pragma unroll
+            for (int g = 0; g < BN / 8; g++)
+#pragma unroll
+                for (int hi = 0; hi < 2; hi++) {
+                    const int rr = row + 8 * hi, cc = col + 8 * g;
+                    if (rr < (int)m && cc + 1 < (int)n)
+                        *(__nv_bfloat162*)(C + (size_t)rr * n + cc) =
+                            __floats2bfloat162_rn(acc[4 * g + 2 * hi], acc[4 * g + 2 * hi + 1]);
+                }
+        }
+    }
+    __syncthreads();
+    if (PROD && tid < NS) {
+        sm90_mbar_inval(full + tid);
+        sm90_mbar_inval(empty + tid);
+    }
+    __syncthreads();
+}
+#endif
+
 #if PLOW_NV_SEG_GEMM
 /* ---- WARP-SPECIALIZED + setmaxnreg twin, LEAN SEG_GEMM OBJECT ONLY ------------------------
  * The probe's zero-spill occ-2 recipe (tma_ws_gemm_bf16.cu ws_tma_smr: entry 128, producer
@@ -1677,7 +1801,7 @@ static __device__ void d_gemm_glu_w8a8_sm90_tma(__nv_bfloat16* C, const void* mA
                                    arena);
 }
 #endif /* PGM90_TMA_HAS_GLU */
-#endif /* PLOW_NV_W8A8 */
+#endif /* PLOW_NV_W8A8 || PGM90_UNI_BN256 */
 
 #endif /* PLOW_NV_TMA_GEMM */
 
@@ -2003,5 +2127,246 @@ static __device__ void d_gemm_glu_w8a8_sm90(__nv_bfloat16* __restrict__ C,
 }
 
 #endif /* PGM90_FORK_GLU */
+
+
+#ifndef PLOW_NV_GEMV_XREG
+#define PLOW_NV_GEMV_XREG 0
+#endif
+#if PLOW_NV_GEMV_XREG
+template <unsigned K>
+__device__ __forceinline__ void d_gemv_sm90_xreg(__nv_bfloat16* C,
+    const __nv_bfloat16* x, const __nv_bfloat16* W, unsigned N,
+    unsigned slice, unsigned nblk) {
+    static_assert(K == 5120 || K == 6144);
+    constexpr unsigned chunks = K / GV_STEP;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    bf16v8 xv[chunks];
+#pragma unroll
+    for (unsigned c = 0; c < chunks; c++)
+        xv[c] = ld_glob8(x + c * GV_STEP + lane * 8u);
+    for (unsigned n = first + warp; n < end; n += blockDim.x / 32u) {
+        const __nv_bfloat16* row = W + (size_t)n * K;
+        float acc = 0.f;
+#pragma unroll
+        for (unsigned c = 0; c < chunks; c += GV_UNROLL) {
+            bf16v8 weights[GV_UNROLL];
+#pragma unroll
+            for (unsigned u = 0; u < GV_UNROLL; u++)
+                if (c + u < chunks)
+                    weights[u] = ld_glob8(row + (c + u) * GV_STEP + lane * 8u);
+#pragma unroll
+            for (unsigned u = 0; u < GV_UNROLL; u++)
+                if (c + u < chunks) acc = dot8(weights[u], xv[c + u], acc);
+        }
+        const float total = warp_sum32(acc);
+        if (lane == 0) C[n] = __float2bfloat16(total);
+    }
+}
+#endif
+
+
+
+#ifndef PLOW_NV_GEMV_KPANEL
+#define PLOW_NV_GEMV_KPANEL 0
+#endif
+#ifndef PLOW_NV_GEMV_KPANEL_F32
+#define PLOW_NV_GEMV_KPANEL_F32 0
+#endif
+#if PLOW_NV_GEMV_KPANEL
+__device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
+    const __nv_bfloat16* x, const __nv_bfloat16* W, unsigned slice, unsigned nblk) {
+    constexpr unsigned K = 17408, N = 5120, panel_chunks = 8;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    // Dispatch guarantees 256 threads and <=40 owned rows: at most five rows/warp.
+    float acc[5] = {};
+#pragma unroll 1
+    for (unsigned panel = 0; panel < K; panel += panel_chunks * GV_STEP) {
+#if PLOW_NV_GEMV_KPANEL_F32
+        float xv[panel_chunks][8];
+#pragma unroll
+        for (unsigned c = 0; c < panel_chunks; c++) {
+            if (panel + c * GV_STEP < K) {
+                const bf16v8 packed = ld_glob8(x + panel + c * GV_STEP + lane * 8u);
+#pragma unroll
+                for (unsigned i = 0; i < 8; i++) xv[c][i] = __bfloat162float(packed.x[i]);
+            }
+        }
+#else
+        bf16v8 xv[panel_chunks];
+#pragma unroll
+        for (unsigned c = 0; c < panel_chunks; c++)
+            if (panel + c * GV_STEP < K)
+                xv[c] = ld_glob8(x + panel + c * GV_STEP + lane * 8u);
+#endif
+#pragma unroll
+        for (unsigned r = 0; r < 5; r++) {
+            const unsigned n = first + warp + r * 8u;
+            if (n >= end) continue;
+            const __nv_bfloat16* row = W + (size_t)n * K + panel;
+#pragma unroll
+            for (unsigned c = 0; c < panel_chunks; c += 8) {
+                bf16v8 weights[8];
+#pragma unroll
+                for (unsigned u = 0; u < 8; u++)
+                    if (panel + (c + u) * GV_STEP < K)
+                        weights[u] = ld_glob8(row + (c + u) * GV_STEP + lane * 8u);
+#pragma unroll
+                for (unsigned u = 0; u < 8; u++)
+                    if (panel + (c + u) * GV_STEP < K) {
+#if PLOW_NV_GEMV_KPANEL_F32
+#pragma unroll
+                        for (unsigned i = 0; i < 8; i++)
+                            acc[r] = fmaf(__bfloat162float(weights[u].x[i]), xv[c + u][i], acc[r]);
+#else
+                        acc[r] = dot8(weights[u], xv[c + u], acc[r]);
+#endif
+                    }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < 5; r++) {
+        const unsigned n = first + warp + r * 8u;
+        if (n < end) {
+            const float total = warp_sum32(acc[r]);
+            if (lane == 0) C[n] = __float2bfloat16(total);
+        }
+    }
+}
+#endif
+
+
+#ifndef PLOW_NV_GEMV_M16_MMA
+#define PLOW_NV_GEMV_M16_MMA 0
+#endif
+#if PLOW_NV_GEMV_M16_MMA
+
+#ifndef PLOW_NV_GEMV_M16_PIPE
+#define PLOW_NV_GEMV_M16_PIPE 0
+#endif
+#if PLOW_NV_GEMV_M16_PIPE
+static __device__ void d_gemv_sm90_m16_pipeline(__nv_bfloat16* C, const __nv_bfloat16* x,
+    const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
+    unsigned nblk, __nv_bfloat16* arena) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    auto* memory = (__nv_bfloat16*)(((uintptr_t)arena + 15u) & ~(uintptr_t)15u) + warp * 768;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    for (unsigned col = first + warp * 8; col < end; col += 64) {
+        float acc[4] = {};
+        auto stage = [&](unsigned kb, unsigned buffer) {
+            auto* a = memory + buffer * 384;
+            auto* b = a + 256;
+            const unsigned row = lane / 2, k = (lane & 1) * 8;
+            sm90_cp16(a + row * 16 + k, x + (size_t)row * K + kb + k, 16);
+            if (lane < 16) {
+                const bool valid = col + row < end;
+                const auto* source = valid ? W + (size_t)(col + row) * K + kb + k : W;
+                sm90_cp16(b + row * 16 + k, source, valid ? 16 : 0);
+            }
+            sm90_cp_commit();
+        };
+        stage(0, 0);
+        for (unsigned kb = 0; kb < K; kb += 16) {
+            const unsigned current = (kb / 16) & 1u;
+            if (kb + 16 < K) stage(kb + 16, current ^ 1u);
+            // The empty tail group lets wait<1> retire the final data group.
+            else sm90_cp_commit();
+            sm90_cp_wait<1>();
+            __syncwarp();
+            auto* a = memory + current * 384;
+            auto* b = a + 256;
+            unsigned af[4], bf[2];
+            const unsigned ap = (unsigned)__cvta_generic_to_shared(
+                a + (lane % 16) * 16 + (lane / 16) * 8);
+            const unsigned bp = (unsigned)__cvta_generic_to_shared(
+                b + (lane & 7) * 16 + ((lane >> 3) & 1) * 8);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(af[0]), "=r"(af[1]), "=r"(af[2]), "=r"(af[3]) : "r"(ap));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                : "=r"(bf[0]), "=r"(bf[1]) : "r"(bp));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                : "r"(af[0]), "r"(af[1]), "r"(af[2]), "r"(af[3]), "r"(bf[0]), "r"(bf[1]));
+            __syncwarp();
+        }
+        sm90_cp_wait<0>();
+        const unsigned row = lane >> 2, column = col + (lane & 3) * 2;
+#pragma unroll
+        for (unsigned hi = 0; hi < 2; hi++)
+#pragma unroll
+            for (unsigned lo = 0; lo < 2; lo++)
+                if (column + lo < end)
+                    C[(size_t)(row + hi * 8) * N + column + lo] =
+                        __float2bfloat16(acc[hi * 2 + lo]);
+        __syncwarp();
+    }
+}
+#endif
+
+static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
+    const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
+    unsigned nblk, __nv_bfloat16* arena) {
+#if PLOW_NV_GEMV_M16_PIPE
+    d_gemv_sm90_m16_pipeline(C, x, W, N, K, slice, nblk, arena);
+#else
+    constexpr unsigned stride = 72;
+    auto* a = (__nv_bfloat16*)(((uintptr_t)arena + 15u) & ~(uintptr_t)15u);
+    auto* b = a + 16 * stride;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    for (unsigned col = first; col < end; col += 64) {
+        float acc[4] = {};
+        for (unsigned kb = 0; kb < K; kb += 64) {
+            for (unsigned v = tid; v < 16 * 8; v += 256) {
+                const unsigned row = v / 8, k = v % 8 * 8;
+                sm90_cp16(a + row * stride + k, x + (size_t)row * K + kb + k, 16);
+            }
+            for (unsigned v = tid; v < 64 * 8; v += 256) {
+                const unsigned row = v / 8, k = v % 8 * 8;
+                const bool valid = col + row < end;
+                const auto* source = valid ? W + (size_t)(col + row) * K + kb + k : W;
+                sm90_cp16(b + row * stride + k, source, valid ? 16 : 0);
+            }
+            sm90_cp_commit();
+            sm90_cp_wait<0>();
+            __syncthreads();
+#pragma unroll
+            for (unsigned kk = 0; kk < 64; kk += 16) {
+                unsigned af[4], bf[2];
+                const unsigned ap = (unsigned)__cvta_generic_to_shared(
+                    a + (lane % 16) * stride + kk + (lane / 16) * 8);
+                const unsigned bp = (unsigned)__cvta_generic_to_shared(
+                    b + (warp * 8 + (lane & 7)) * stride + kk + ((lane >> 3) & 1) * 8);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(af[0]), "=r"(af[1]), "=r"(af[2]), "=r"(af[3]) : "r"(ap));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                    : "=r"(bf[0]), "=r"(bf[1]) : "r"(bp));
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                    : "r"(af[0]), "r"(af[1]), "r"(af[2]), "r"(af[3]), "r"(bf[0]), "r"(bf[1]));
+            }
+            __syncthreads();
+        }
+        const unsigned row = lane >> 2, column = col + warp * 8 + (lane & 3) * 2;
+#pragma unroll
+        for (unsigned hi = 0; hi < 2; hi++)
+#pragma unroll
+            for (unsigned lo = 0; lo < 2; lo++)
+                if (column + lo < end)
+                    C[(size_t)(row + hi * 8) * N + column + lo] =
+                        __float2bfloat16(acc[hi * 2 + lo]);
+        __syncthreads();
+    }
+#endif
+}
+#endif
 
 #endif /* PLOW_OP_GEMM_SM90_CUH */

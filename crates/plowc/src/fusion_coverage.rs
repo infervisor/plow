@@ -97,7 +97,7 @@ impl FusionCoverage {
             .last()
             .ok_or_else(|| "emitted model has no decode program".to_string())?;
         // The egg graph is built from the full checkpoint config, while an
-        // intentional PLOW_K3_LAYERS truncation emits only a prefix.  Count the
+        // intentional PLOW_LAYERS truncation emits only a prefix.  Count the
         // emitted KDA layers from their unique checkpoint tensor instead of
         // imposing the full graph's obligation on a diagnostic artifact.
         let emitted_kda = model
@@ -129,7 +129,12 @@ impl FusionCoverage {
         // KdaDecodeFused subsumes the conv/state/gated-norm half, but the gate
         // projection still rides GemvQkvg. Either spelling covers the egg
         // target exactly; neither opcode covers it alone.
-        let gated_norm = count(DevOp::KdaGatedNorm) + count(DevOp::KdaDecodeFused);
+        // A KdaStateStepG with flags bit 3 (the L7 fused arm) carries the gated norm too.
+        let fused_arm = insts
+            .iter()
+            .filter(|i| i.op == DevOp::KdaStateStepG as u16 && i.i[4] & 8 != 0)
+            .count();
+        let gated_norm = count(DevOp::KdaGatedNorm) + count(DevOp::KdaDecodeFused) + fused_arm;
         if qkvg < expected_kda || gated_norm < expected_kda {
             return Err(format!(
                 "{KDA_GATE}: expected {expected_kda} of {} extracted, but decode carries GemvQkvg={qkvg} and \
@@ -231,6 +236,8 @@ mod tests {
                 blocks: vec![],
                 inputs: vec![],
                 outputs: vec![],
+                fp8_scale_bindings: vec![],
+                expert_bindings: vec![],
             },
             &fused,
             0,

@@ -258,9 +258,17 @@ fn body_for(
                     bq: tl.bq as u16,
                     bkv: tl.bkv as u16,
                     heads: a.heads as u16,
+                    kv_heads: a.kv_heads as u16,
+                    window: a.sliding_window as u32,
                     out,
                     tmem,
-                    variant: Opcode::VARIANT_FLASH_CAUSAL_BF16,
+                    variant: if a.sliding_window > 0 {
+                        Opcode::VARIANT_FLASH_SLIDING_BF16
+                    } else if a.causal {
+                        Opcode::VARIANT_FLASH_CAUSAL_BF16
+                    } else {
+                        Opcode::VARIANT_GOLDEN
+                    },
                 },
                 (Some(OpKind::Row(s)), _) => Body::Row {
                     reduce: s.reduce,
@@ -275,6 +283,21 @@ fn body_for(
                     } else {
                         Opcode::VARIANT_BF16
                     },
+                    args: [0; 4],
+                },
+                (Some(OpKind::Model(m)), _) => Body::Row {
+                    reduce: matches!(
+                        m.kind,
+                        rewrite::ModelOpKind::RmsNorm | rewrite::ModelOpKind::RmsNormZeroCentered
+                    ),
+                    coord: c0,
+                    rows: m.rows as u32,
+                    feat: m.feat as u32,
+                    operands: m.operands.clamp(0, 255) as u8,
+                    args: m.args,
+                    br: row_block(g, task.node),
+                    out,
+                    variant: Opcode::VARIANT_MODEL_BASE + m.kind as u8,
                 },
                 // Layout: a strided descriptor (transpose/broadcast/slice) when the
                 // bridge produced one, else a contiguous copy into `out`.

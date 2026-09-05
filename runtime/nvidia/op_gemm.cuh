@@ -734,6 +734,17 @@ static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16*
 #define PGM_BKSTRIDE (PGM_BK + PGM_BPAD) /* 40  B smem: [n][k], k contiguous (was [k][n] transposed) */
 #define PGM_ABUF (PGM_BM * PGM_ASTRIDE)  /* 5120 bf16 per stage */
 #define PGM_BBUF (PGM_BN * PGM_BKSTRIDE) /* 5120 bf16 per stage */
+/* GEMM_GLU's own N-tile, independent of the plain-GEMM PGM_BN above. GLU carries TWO
+ * accumulator sets (gate, up) instead of one, so its register cost per N-tile is double the
+ * plain body's at the same width — a narrower N-tile trades re-read bandwidth for register
+ * headroom specifically on this arm. Default equals PGM_BN (no behavioral change unless
+ * overridden). Must stay a multiple of PGM_WARPS_N*8 (one n-fragment per warp-column). */
+#ifndef PGM_BN_GLU
+#define PGM_BN_GLU PGM_BN
+#endif
+#define PGM_WN_GLU (PGM_BN_GLU / PGM_WARPS_N)
+#define PGM_NFRAG_GLU (PGM_WN_GLU / 8)
+#define PGM_BBUF_GLU (PGM_BN_GLU * PGM_BKSTRIDE)
 /* Pipeline depth. Plain GEMM rings STAGES buffers of (A,B); GEMM_GLU rings GLU_STAGES of (A,Bg,Bu).
  * Arena (bf16) = the max claim. STAGES=3 plain -> 3*(ABUF+BBUF)=30720; GLU_STAGES=2 -> 2*(ABUF+2*BBUF)
  * =30720. Both = 30720 bf16 (60.0 KiB). That is under flash-prefill's 77.5 KiB, so the megakernel's
@@ -749,7 +760,7 @@ static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16*
 #define PGM_GLU_STAGES 2
 #endif
 #define PGM_ARENA_PLAIN (PGM_STAGES * (PGM_ABUF + PGM_BBUF))
-#define PGM_ARENA_GLU (PGM_GLU_STAGES * (PGM_ABUF + 2 * PGM_BBUF))
+#define PGM_ARENA_GLU (PGM_GLU_STAGES * (PGM_ABUF + 2 * PGM_BBUF_GLU))
 #define PGM_ARENA_PGM (PGM_ARENA_PLAIN > PGM_ARENA_GLU ? PGM_ARENA_PLAIN : PGM_ARENA_GLU)
 /* sm_90a fork (op_gemm_sm90.cuh): the wgmma 128-BYTE-swizzle descriptor needs each logical smem
  * row to be exactly 128 B, so the K-tile deepens to 64 bf16 / 128 e4m3 and one pipeline stage is
@@ -847,12 +858,14 @@ __device__ __forceinline__ void pgm_stage_a(__nv_bfloat16* Ad, const __nv_bfloat
     }
 }
 /* cp.async-stage a [BN][BK] tile of B (weight [n][k], row n = output n) into its NATURAL [n][k] smem
- * layout — the mma B fragment is later read with ldmatrix.x2 non-.trans. */
-__device__ __forceinline__ void pgm_stage_b(__nv_bfloat16* Bd, const __nv_bfloat16* __restrict__ B,
+ * layout — the mma B fragment is later read with ldmatrix.x2 non-.trans. Templated on BN so
+ * GEMM_GLU can stage its own (narrower) N-tile through the same body — see PGM_BN_GLU. */
+template <int BN>
+__device__ __forceinline__ void pgm_stage_b_t(__nv_bfloat16* Bd, const __nv_bfloat16* __restrict__ B,
                                             int tid, int tn, int kbase, unsigned n, unsigned k,
                                             int kend) {
     const int KCH = PGM_BK / 8;
-    for (int L = tid; L < PGM_BN * KCH; L += (int)PLOW_NV_THREADS) {
+    for (int L = tid; L < BN * KCH; L += (int)PLOW_NV_THREADS) {
         const int row = L / KCH, kk8 = (L % KCH) * 8;
         const int nn = tn + row, kk = kbase + kk8;
         const bool in = (nn < (int)n) && (kk + 8 <= kend);
@@ -860,15 +873,26 @@ __device__ __forceinline__ void pgm_stage_b(__nv_bfloat16* Bd, const __nv_bfloat
         pgm_cp_async_cg16(&Bd[row * PGM_BKSTRIDE + kk8], g, in ? 16 : 0);
     }
 }
-/* Read one warp's B fragments (PGM_NFRAG of them) for k-slice kf out of a [n][k] stage buffer. */
-__device__ __forceinline__ void pgm_load_bfrags(unsigned (&bf)[PGM_NFRAG][2], __nv_bfloat16* Bd,
+__device__ __forceinline__ void pgm_stage_b(__nv_bfloat16* Bd, const __nv_bfloat16* __restrict__ B,
+                                            int tid, int tn, int kbase, unsigned n, unsigned k,
+                                            int kend) {
+    pgm_stage_b_t<PGM_BN>(Bd, B, tid, tn, kbase, n, k, kend);
+}
+/* Read one warp's B fragments for k-slice kf out of a [n][k] stage buffer. Templated on
+ * (WN, NFRAG) for the same reason as pgm_stage_b_t above. */
+template <int WN, int NFRAG>
+__device__ __forceinline__ void pgm_load_bfrags_t(unsigned (&bf)[NFRAG][2], __nv_bfloat16* Bd,
                                                 int wn, int kf, int lane) {
 #pragma unroll
-    for (int nj = 0; nj < PGM_NFRAG; nj++) {
-        const int n = wn * PGM_WN + nj * 8 + (lane & 7);
+    for (int nj = 0; nj < NFRAG; nj++) {
+        const int n = wn * WN + nj * 8 + (lane & 7);
         const int kcol = kf + ((lane >> 3) & 1) * 8;
         pgm_ldmatrix_x2(bf[nj], &Bd[n * PGM_BKSTRIDE + kcol]);
     }
+}
+__device__ __forceinline__ void pgm_load_bfrags(unsigned (&bf)[PGM_NFRAG][2], __nv_bfloat16* Bd,
+                                                int wn, int kf, int lane) {
+    pgm_load_bfrags_t<PGM_WN, PGM_NFRAG>(bf, Bd, wn, kf, lane);
 }
 /* Read one warp's A fragments (PGM_MFRAG) for k-slice kf out of a [m][k] stage buffer. */
 __device__ __forceinline__ void pgm_load_afrags(unsigned (&af)[PGM_MFRAG][4], __nv_bfloat16* Ad,
@@ -975,30 +999,31 @@ static __device__ void d_gemm_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
 #if PGM90_FORK_GLU
     d_gemm_glu_sm90(C, A, Wg, Wu, m, n, k, act, slice, nblk, arena);
 #else
-    /* Ring of GLU_STAGES buffers, each holding (A, Bg, Bu) for one K-tile. */
+    /* Ring of GLU_STAGES buffers, each holding (A, Bg, Bu) for one K-tile. Bg/Bu use the
+     * GLU-specific N-tile (PGM_BN_GLU), independent of the plain body's PGM_BN. */
     __nv_bfloat16* As = arena;                                    /* [GLU_STAGES][BM][ASTRIDE] */
-    __nv_bfloat16* Bgs0 = arena + PGM_GLU_STAGES * PGM_ABUF;      /* [GLU_STAGES][BN][BKSTRIDE] */
-    __nv_bfloat16* Bus0 = Bgs0 + PGM_GLU_STAGES * PGM_BBUF;       /* [GLU_STAGES][BN][BKSTRIDE] */
+    __nv_bfloat16* Bgs0 = arena + PGM_GLU_STAGES * PGM_ABUF;      /* [GLU_STAGES][BN_GLU][BKSTRIDE] */
+    __nv_bfloat16* Bus0 = Bgs0 + PGM_GLU_STAGES * PGM_BBUF_GLU;   /* [GLU_STAGES][BN_GLU][BKSTRIDE] */
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wm = warp / PGM_WARPS_N, wn = warp % PGM_WARPS_N;
     const int tiles_m = (m + PGM_BM - 1) / PGM_BM;
-    const int tiles_n = (n + PGM_BN - 1) / PGM_BN;
+    const int tiles_n = (n + PGM_BN_GLU - 1) / PGM_BN_GLU;
     const int ntiles = tiles_m * tiles_n;
     const int ksteps = (k + PGM_BK - 1) / PGM_BK;
 
     for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
         const int tm = (tile / tiles_n) * PGM_BM;
-        const int tn = (tile % tiles_n) * PGM_BN;
-        float accg[PGM_MFRAG][PGM_NFRAG][4], accu[PGM_MFRAG][PGM_NFRAG][4];
+        const int tn = (tile % tiles_n) * PGM_BN_GLU;
+        float accg[PGM_MFRAG][PGM_NFRAG_GLU][4], accu[PGM_MFRAG][PGM_NFRAG_GLU][4];
 #pragma unroll
         for (int i = 0; i < PGM_MFRAG; i++)
-            for (int j = 0; j < PGM_NFRAG; j++)
+            for (int j = 0; j < PGM_NFRAG_GLU; j++)
                 for (int e = 0; e < 4; e++) { accg[i][j][e] = 0.f; accu[i][j][e] = 0.f; }
 
         auto stage = [&](int ks, int buf) {
             pgm_stage_a(As + buf * PGM_ABUF, A, tid, tm, ks * PGM_BK, m, k, 0);
-            pgm_stage_b(Bgs0 + buf * PGM_BBUF, Wg, tid, tn, ks * PGM_BK, n, k, (int)k);
-            pgm_stage_b(Bus0 + buf * PGM_BBUF, Wu, tid, tn, ks * PGM_BK, n, k, (int)k);
+            pgm_stage_b_t<PGM_BN_GLU>(Bgs0 + buf * PGM_BBUF_GLU, Wg, tid, tn, ks * PGM_BK, n, k, (int)k);
+            pgm_stage_b_t<PGM_BN_GLU>(Bus0 + buf * PGM_BBUF_GLU, Wu, tid, tn, ks * PGM_BK, n, k, (int)k);
         };
 
 #pragma unroll
@@ -1014,19 +1039,19 @@ static __device__ void d_gemm_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
             __syncthreads();
             const int cb = ks % PGM_GLU_STAGES;
             __nv_bfloat16* Ad = As + cb * PGM_ABUF;
-            __nv_bfloat16* Bgd = Bgs0 + cb * PGM_BBUF;
-            __nv_bfloat16* Bud = Bus0 + cb * PGM_BBUF;
+            __nv_bfloat16* Bgd = Bgs0 + cb * PGM_BBUF_GLU;
+            __nv_bfloat16* Bud = Bus0 + cb * PGM_BBUF_GLU;
 #pragma unroll
             for (int kf = 0; kf < PGM_BK; kf += 16) {
                 unsigned af[PGM_MFRAG][4];
                 pgm_load_afrags(af, Ad, wm, kf, lane);
-                unsigned bg[PGM_NFRAG][2], bu[PGM_NFRAG][2];
-                pgm_load_bfrags(bg, Bgd, wn, kf, lane);
-                pgm_load_bfrags(bu, Bud, wn, kf, lane);
+                unsigned bg[PGM_NFRAG_GLU][2], bu[PGM_NFRAG_GLU][2];
+                pgm_load_bfrags_t<PGM_WN_GLU, PGM_NFRAG_GLU>(bg, Bgd, wn, kf, lane);
+                pgm_load_bfrags_t<PGM_WN_GLU, PGM_NFRAG_GLU>(bu, Bud, wn, kf, lane);
 #pragma unroll
                 for (int mi = 0; mi < PGM_MFRAG; mi++)
 #pragma unroll
-                    for (int nj = 0; nj < PGM_NFRAG; nj++) {
+                    for (int nj = 0; nj < PGM_NFRAG_GLU; nj++) {
                         pgm_mma(accg[mi][nj], af[mi], bg[nj], accg[mi][nj]);
                         pgm_mma(accu[mi][nj], af[mi], bu[nj], accu[mi][nj]);
                     }
@@ -1036,9 +1061,9 @@ static __device__ void d_gemm_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
 #pragma unroll
         for (int mi = 0; mi < PGM_MFRAG; mi++)
 #pragma unroll
-            for (int nj = 0; nj < PGM_NFRAG; nj++) {
+            for (int nj = 0; nj < PGM_NFRAG_GLU; nj++) {
                 int gr = wm * PGM_WM + mi * 16 + (lane / 4);
-                int gc = wn * PGM_WN + nj * 8 + (lane % 4) * 2;
+                int gc = wn * PGM_WN_GLU + nj * 8 + (lane % 4) * 2;
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     int rr = tm + gr + (e / 2) * 8;
@@ -1465,11 +1490,380 @@ __device__ __forceinline__ void pgm_load_bfrags_w8a8(unsigned (&bf)[NFRAG][2],
 
 /* w8a8 twin of d_gemm. A e4m3 [m][k] (t1) + a_scale f32[M] (t3), B e4m3 [n][k] (t2) + w_scale f32[N]
  * (t4). One k32 mma per BK tile; epilogue dequant acc*a_scale[m]*w_scale[n]. Store map == bf16 d_gemm. */
+
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1
+
+#ifndef PLOW_NV_FP8_M1_BLOCKED
+#define PLOW_NV_FP8_M1_BLOCKED 0
+#endif
+#ifndef PLOW_NV_FP8_M1_XCACHE
+#define PLOW_NV_FP8_M1_XCACHE 0
+#endif
+#if PLOW_NV_FP8_M1_XCACHE && (!defined(PLOW_NV_FP8_M1_BK1024) || !PLOW_NV_FP8_M1_BK1024 || PLOW_NV_FP8_M1_BLOCKED)
+#error "FP8 M1 activation cache requires BK1024 and cyclic ownership"
+#endif
+#if PLOW_NV_FP8_M1_BLOCKED && defined(PLOW_NV_FP8_M1_PIPE) && PLOW_NV_FP8_M1_PIPE
+#error "FP8 M1 blocked ownership excludes PIPE"
+#endif
+#ifndef PLOW_NV_FP8_M1_BK256
+#define PLOW_NV_FP8_M1_BK256 0
+#endif
+#ifndef PLOW_NV_FP8_M1_BK512
+#define PLOW_NV_FP8_M1_BK512 0
+#endif
+#ifndef PLOW_NV_FP8_M1_BK1024
+#define PLOW_NV_FP8_M1_BK1024 0
+#endif
+#if (PLOW_NV_FP8_M1_BK256 + PLOW_NV_FP8_M1_BK512 + PLOW_NV_FP8_M1_BK1024) > 1
+#error "FP8 M1 larger K tiles are separate comparison candidates"
+#endif
+#if (PLOW_NV_FP8_M1_BK256 || PLOW_NV_FP8_M1_BK512 || PLOW_NV_FP8_M1_BK1024) && (!defined(PLOW_NV_FP8_M1_FAST_ACCUM) || !PLOW_NV_FP8_M1_FAST_ACCUM || (defined(PLOW_NV_FP8_M1_PIPE) && PLOW_NV_FP8_M1_PIPE))
+#error "FP8 M1 larger K tiles require FAST_ACCUM and exclude PIPE"
+#endif
+#if defined(PLOW_NV_FP8_M1_PIPE) && PLOW_NV_FP8_M1_PIPE && defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+#error "FP8 M1 PIPE and FAST_ACCUM are separate comparison candidates"
+#endif
+#if defined(PLOW_NV_FP8_M1_PIPE) && PLOW_NV_FP8_M1_PIPE
+static __device__ __forceinline__ void pgm_m1_stage64(uint8_t* dst, const uint8_t* src,
+    unsigned rows, unsigned row0, unsigned kb, unsigned n, unsigned k) {
+    for (unsigned line = threadIdx.x; line < rows * 4; line += blockDim.x) {
+        const unsigned row = line / 4, col = (line % 4) * 16;
+        const unsigned linear = row * 64 + col;
+        const unsigned gr = row0 + row, gk = kb + col;
+        const bool valid = gr < n && gk < k;
+        const unsigned bytes = valid ? min(16u, k - gk) : 0;
+        sm90_cp16(dst + (linear ^ ((linear >> 3) & 0x30)),
+            valid ? src + (size_t)gr * k + gk : src, bytes);
+    }
+}
+static __device__ __forceinline__ uint64_t pgm_m1_desc64(const void* ptr) {
+    return (sm90_make_desc(ptr, 16, 512) & ~(3ull << 62)) | (2ull << 62);
+}
+/* Two 4608-byte stages. SW64 offsets match CUTLASS Layout_K_SW64_Atom.
+ * Promote after each 128 K elements, preserving the single-stage arithmetic. */
+static __device__ void d_gemm_w8a8_m1_pipe_sm90(__nv_bfloat16* C, const uint8_t* A,
+    const uint8_t* W, const float* ascale, const float* wscale, unsigned n, unsigned k,
+    unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
+    if (sm90_bad_k(k, 16u)) return;
+    const unsigned tid = threadIdx.x;
+    uint8_t* base = (uint8_t*)sm90_align1024(arena);
+    const uint8_t* x = A + (size_t)a_row0 * k;
+    const unsigned steps = (k + 63) / 64;
+    for (unsigned tile = slice; tile < (n + 63) / 64; tile += nblk) {
+        float total[4] = {}, partial[4] = {};
+        pgm_m1_stage64(base, W, 64, tile * 64, 0, n, k);
+        pgm_m1_stage64(base + 4096, x, 8, 0, 0, 1, k);
+        sm90_cp_commit();
+        for (unsigned step = 0; step < steps; ++step) {
+            if (step + 1 < steps) {
+                uint8_t* next = base + ((step + 1) & 1) * 4608;
+                pgm_m1_stage64(next, W, 64, tile * 64, (step + 1) * 64, n, k);
+                pgm_m1_stage64(next + 4096, x, 8, 0, (step + 1) * 64, 1, k);
+            }
+            sm90_cp_commit();
+            sm90_cp_wait<1>();
+            __syncthreads();
+            if (tid < 128) {
+                uint8_t* current = base + (step & 1) * 4608;
+                sm90_wg_fence();
+#pragma unroll
+                for (int sub = 0; sub < 2; ++sub) {
+                    const uint64_t dw = pgm_m1_desc64(current + sub * 32);
+                    const uint64_t dx = pgm_m1_desc64(current + 4096 + sub * 32);
+                    asm volatile(
+                        "{ .reg .pred p; setp.ne.b32 p, %6, 0;\n"
+                        "wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3 "
+                        "{%0,%1,%2,%3}, %4, %5, p, 1, 1; }\n"
+                        : "+f"(partial[0]), "+f"(partial[1]), "+f"(partial[2]), "+f"(partial[3])
+                        : "l"(dw), "l"(dx), "r"((int)((step & 1) || sub)));
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<0>();
+                if ((step & 1) || step + 1 == steps) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) total[i] += partial[i];
+                }
+            }
+            __syncthreads();
+        }
+        sm90_cp_wait<0>();
+        if (tid < 128 && (tid & 3) == 0) {
+            const unsigned r0 = tile * 64 + (tid >> 5) * 16 + ((tid & 31) >> 2);
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const unsigned row = r0 + hi * 8;
+                if (row < n)
+                    C[row] = __float2bfloat16(total[hi * 2] * ascale[0] * wscale[row]);
+            }
+        }
+        __syncthreads();
+    }
+}
+#endif
+
+/* W[64,K] x X[1,K]^T uses native m64n8 FP8 (the other seven columns are zero).
+ * The fragment matches CUTLASS MMA_64x8x32_F32E4M3E4M3_SS_TN. One 256-thread CTA
+ * needs 9216 bytes plus at most 1023 bytes of alignment padding. */
+static __device__ void d_gemm_w8a8_m1_sm90(__nv_bfloat16* C, const uint8_t* A,
+    const uint8_t* W, const float* ascale, const float* wscale, unsigned n, unsigned k,
+    unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
+    if (sm90_bad_k(k, 16u)) return;
+    const unsigned tid = threadIdx.x;
+    uint8_t* weights = (uint8_t*)sm90_align1024(arena);
+    constexpr unsigned panels = PLOW_NV_FP8_M1_BK1024 ? 8 : PLOW_NV_FP8_M1_BK512 ? 4 : PLOW_NV_FP8_M1_BK256 ? 2 : 1;
+#if PLOW_NV_FP8_M1_XCACHE
+    const bool cached = k <= 17408;
+    const unsigned panel_bytes = cached ? 64 * 128 : (64 + 8) * 128;
+    uint8_t* cached_x = weights + 8 * 64 * 128;
+#else
+    constexpr bool cached = false;
+    constexpr unsigned panel_bytes = (64 + 8) * 128;
+#endif
+    const uint8_t* x = A + (size_t)a_row0 * k;
+#if PLOW_NV_FP8_M1_BLOCKED
+    const bool blocked = n >= 1024;
+    const unsigned rows_per_slice = (n + nblk - 1) / nblk;
+    const unsigned first = blocked ? slice * rows_per_slice : slice * 64;
+    const unsigned end = blocked ? min(first + rows_per_slice, n) : n;
+    const unsigned stride = blocked ? 64 : nblk * 64;
+#else
+    const unsigned first = slice * 64, end = n, stride = nblk * 64;
+#endif
+#if PLOW_NV_FP8_M1_XCACHE
+    if (cached && first < end) {
+        const unsigned chunks = ((k + 127) / 128) * 64;
+        for (unsigned batch = 0; batch < chunks; batch += 8 * PLOW_NV_THREADS) {
+#pragma unroll
+            for (unsigned copy = 0; copy < 8; ++copy) {
+                const unsigned line = batch + copy * PLOW_NV_THREADS + tid;
+                if (line < chunks) {
+                    const unsigned panel = line / 64, row = (line % 64) / 8, col = line % 8;
+                    const unsigned gk = panel * 128 + col * 16;
+                    const bool valid = row == 0 && gk < k;
+                    sm90_cp16(cached_x + panel * 1024 + sm90_swz_off<128, 16>(row, col),
+                        valid ? x + gk : x, valid ? min(16u, k - gk) : 0);
+                }
+            }
+            sm90_cp_commit();
+            sm90_cp_wait<0>();
+        }
+        __syncthreads();
+    }
+#endif
+    for (unsigned row0 = first; row0 < end; row0 += stride) {
+        float total[4] = {}, partial[4] = {};
+        for (unsigned kb = 0; kb < k; kb += panels * 128) {
+#pragma unroll
+            for (unsigned panel = 0; panel < panels; ++panel) {
+                uint8_t* buffer = weights + panel * panel_bytes;
+                pgm90_stage_fp8(buffer, W, tid, 64, row0, kb + panel * 128, end, k);
+                if (!cached) pgm90_stage_fp8(buffer + 64 * 128, x, tid, 8, 0, kb + panel * 128, 1, k);
+            }
+            sm90_cp_commit();
+            sm90_cp_wait<0>();
+            __syncthreads();
+            if (tid < 128) {
+                sm90_wg_fence();
+#pragma unroll
+                for (unsigned sub = 0; sub < panels * 4; ++sub) {
+                    if (kb + (sub / 4) * 128 >= k) break;
+                    uint8_t* buffer = weights + (sub / 4) * panel_bytes;
+                    const uint64_t dw = sm90_desc(buffer + (sub % 4) * 32);
+#if PLOW_NV_FP8_M1_XCACHE
+                    const uint8_t* xp = cached ? cached_x + (kb / 128 + sub / 4) * 1024 : buffer + 64 * 128;
+#else
+                    const uint8_t* xp = buffer + 64 * 128;
+#endif
+                    const uint64_t dx = sm90_desc(xp + (sub % 4) * 32);
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    const int accumulate = kb != 0 || sub != 0;
+#else
+                    const int accumulate = sub != 0;
+#endif
+                    asm volatile(
+                        "{ .reg .pred p; setp.ne.b32 p, %6, 0;\n"
+                        "wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3 "
+                        "{%0,%1,%2,%3}, %4, %5, p, 1, 1; }\n"
+                        : "+f"(partial[0]), "+f"(partial[1]), "+f"(partial[2]), "+f"(partial[3])
+                        : "l"(dw), "l"(dx), "r"(accumulate));
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<0>();
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    total[i] = partial[i];
+#else
+                    total[i] += partial[i];
+#endif
+                }
+            }
+            __syncthreads();
+        }
+        if (tid < 128 && (tid & 3) == 0) {
+            const unsigned r0 = row0 + (tid >> 5) * 16 + ((tid & 31) >> 2);
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const unsigned row = r0 + hi * 8;
+                if (row < end) {
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    /* vLLM M<=16 swaps both operands and epilogue scales. */
+                    C[row] = __float2bfloat16(__fmul_rn(wscale[row],
+                        __fmul_rn(ascale[0], total[hi * 2])));
+#else
+                    C[row] = __float2bfloat16(total[hi * 2] * ascale[0] * wscale[row]);
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+#ifndef PLOW_NV_FP8_M1_TMA
+#define PLOW_NV_FP8_M1_TMA 0
+#endif
+#if PLOW_NV_FP8_M1_TMA
+#if !PLOW_NV_FP8_M1_XCACHE || !PLOW_NV_TMA_GEMM || !PLOW_NV_FP8_M1_FAST_ACCUM
+#error "FP8 M1 TMA requires XCACHE, FAST_ACCUM and TMA helpers"
+#endif
+static __device__ void d_gemm_w8a8_m1_tma_sm90(__nv_bfloat16* C, const uint8_t* A,
+    const uint8_t* W, const void* mapW, const float* ascale, const float* wscale, unsigned n, unsigned k,
+    unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
+    if (sm90_bad_k(k, 16u)) return;
+    const unsigned tid = threadIdx.x;
+    if (!mapW || k > 17408) {
+        d_gemm_w8a8_m1_sm90(C, A, W, ascale, wscale, n, k, a_row0, slice, nblk, arena);
+        return;
+    }
+    // Two barriers precede the aligned 64 KiB ring and 139264-byte activation cache.
+    uint64_t* ready = (uint64_t*)arena;
+    uint8_t* weights = (uint8_t*)sm90_align1024(arena + 8);
+    constexpr unsigned panels = 4;
+    constexpr bool cached = true;
+    constexpr unsigned panel_bytes = 8192;
+    uint8_t* cached_x = weights + 65536;
+    static_assert(16 + 1023 + 65536 + 139264 <= 205840, "FP8 M1 TMA arena");
+    static_assert(205840 + 2448 <= 232448, "FP8 M1 TMA shared-memory limit");
+    if (tid < 2) {
+        sm90_mbar_init(ready + tid, 1);
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    unsigned stage = 0;
+    const uint8_t* x = A + (size_t)a_row0 * k;
+    const unsigned first = slice * 64, end = n, stride = nblk * 64;
+    if (cached && first < end) {
+        const unsigned chunks = ((k + 127) / 128) * 64;
+        for (unsigned batch = 0; batch < chunks; batch += 8 * PLOW_NV_THREADS) {
+#pragma unroll
+            for (unsigned copy = 0; copy < 8; ++copy) {
+                const unsigned line = batch + copy * PLOW_NV_THREADS + tid;
+                if (line < chunks) {
+                    const unsigned panel = line / 64, row = (line % 64) / 8, col = line % 8;
+                    const unsigned gk = panel * 128 + col * 16;
+                    const bool valid = row == 0 && gk < k;
+                    sm90_cp16(cached_x + panel * 1024 + sm90_swz_off<128, 16>(row, col),
+                        valid ? x + gk : x, valid ? min(16u, k - gk) : 0);
+                }
+            }
+            sm90_cp_commit();
+            sm90_cp_wait<0>();
+        }
+        __syncthreads();
+    }
+    for (unsigned row0 = first; row0 < end; row0 += stride) {
+        float total[4] = {}, partial[4] = {};
+        const unsigned steps = (k + 511) / 512;
+        auto issue = [&](unsigned serial, unsigned kb) {
+            const unsigned slot = serial & 1;
+            sm90_mbar_expect(ready + slot, 32768);
+            for (unsigned panel = 0; panel < 4; ++panel)
+                sm90_tma2d(sm90_su32(weights + slot * 32768 + panel * 8192),
+                    mapW, kb + panel * 128, row0, sm90_su32(ready + slot));
+        };
+        if (tid == 0) {
+            issue(stage, 0);
+            if (steps > 1) issue(stage + 1, 512);
+        }
+        for (unsigned step = 0, kb = 0; step < steps; ++step, kb += 512, ++stage) {
+            const unsigned slot = stage & 1;
+            sm90_mbar_wait(ready + slot, (stage / 2) & 1);
+            if (tid < 128) {
+                sm90_wg_fence();
+#pragma unroll
+                for (unsigned sub = 0; sub < panels * 4; ++sub) {
+                    if (kb + (sub / 4) * 128 >= k) break;
+                    uint8_t* buffer = weights + slot * 32768 + (sub / 4) * panel_bytes;
+                    const uint64_t dw = sm90_desc(buffer + (sub % 4) * 32);
+                    const uint8_t* xp = cached_x + (kb / 128 + sub / 4) * 1024;
+                    const uint64_t dx = sm90_desc(xp + (sub % 4) * 32);
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    const int accumulate = kb != 0 || sub != 0;
+#else
+                    const int accumulate = sub != 0;
+#endif
+                    asm volatile(
+                        "{ .reg .pred p; setp.ne.b32 p, %6, 0;\n"
+                        "wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3 "
+                        "{%0,%1,%2,%3}, %4, %5, p, 1, 1; }\n"
+                        : "+f"(partial[0]), "+f"(partial[1]), "+f"(partial[2]), "+f"(partial[3])
+                        : "l"(dw), "l"(dx), "r"(accumulate));
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<0>();
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    total[i] = partial[i];
+#else
+                    total[i] += partial[i];
+#endif
+                }
+            }
+            __syncthreads();
+            if (tid == 0 && step + 2 < steps) issue(stage + 2, kb + 1024);
+        }
+        if (tid < 128 && (tid & 3) == 0) {
+            const unsigned r0 = row0 + (tid >> 5) * 16 + ((tid & 31) >> 2);
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const unsigned row = r0 + hi * 8;
+                if (row < end) {
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    /* vLLM M<=16 swaps both operands and epilogue scales. */
+                    C[row] = __float2bfloat16(__fmul_rn(wscale[row],
+                        __fmul_rn(ascale[0], total[hi * 2])));
+#else
+                    C[row] = __float2bfloat16(total[hi * 2] * ascale[0] * wscale[row]);
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if (tid < 2) sm90_mbar_inval(ready + tid);
+    __syncthreads();
+}
+#endif
+
+#endif
+
 static __device__ void d_gemm_w8a8(__nv_bfloat16* __restrict__ C, const uint8_t* __restrict__ A,
                        const uint8_t* __restrict__ B, const float* __restrict__ ascale,
                        const float* __restrict__ wscale, unsigned m, unsigned n, unsigned k,
                        unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
 #if defined(PLOW_NV_HOPPER)
+#if defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1
+    if (m == 1) {
+#if defined(PLOW_NV_FP8_M1_PIPE) && PLOW_NV_FP8_M1_PIPE
+        d_gemm_w8a8_m1_pipe_sm90(C, A, B, ascale, wscale, n, k, a_row0, slice, nblk, arena);
+#else
+        d_gemm_w8a8_m1_sm90(C, A, B, ascale, wscale, n, k, a_row0, slice, nblk, arena);
+#endif
+        return;
+    }
+#endif
     d_gemm_w8a8_sm90(C, A, B, ascale, wscale, m, n, k, a_row0, slice, nblk, arena);
 #else
     uint8_t* As = (uint8_t*)arena;                       /* [STAGES][BM][BK8] e4m3 */
@@ -1690,8 +2084,14 @@ static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __re
                 amax = fmaxf(amax, fabsf(__bfloat162float(x[row + kk])));
         }
         amax = warp_max32(amax);
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+        /* vLLM 2cf0a6915 dynamic_per_token_scaled_fp8_quant: true division,
+         * including under --use_fast_math; the floor is one E4M3 subnormal / 448. */
+        const float as = fmaxf(__fdiv_rn(amax, 448.0f), 1.0f / (448.0f * 512.0f));
+#else
         const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
         const float inv = 1.0f / as;
+#endif
         if (lane == 0) ascale[mm] = as;
         if (v8) {
             for (unsigned kk = lane * 8u; kk < K; kk += 256u) {
@@ -1699,14 +2099,24 @@ static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __re
                 uint8_t q8[8];
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+                    const float scaled = __fdiv_rn(__bfloat162float(v.x[j]), as);
+                    __nv_fp8_e4m3 q(fmaxf(-448.0f, fminf(scaled, 448.0f)));
+#else
                     __nv_fp8_e4m3 q(__bfloat162float(v.x[j]) * inv);
+#endif
                     q8[j] = *(const uint8_t*)&q;
                 }
                 *(uint2*)(xq + row + kk) = *(const uint2*)q8;
             }
         } else {
             for (unsigned kk = lane; kk < K; kk += 32u) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+                const float scaled = __fdiv_rn(__bfloat162float(x[row + kk]), as);
+                __nv_fp8_e4m3 q(fmaxf(-448.0f, fminf(scaled, 448.0f)));
+#else
                 __nv_fp8_e4m3 q(__bfloat162float(x[row + kk]) * inv);
+#endif
                 xq[row + kk] = *(const uint8_t*)&q;
             }
         }
@@ -1724,6 +2134,23 @@ static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __re
  * block count. */
 /* BATCH>1: gate|up weight rows loaded ONCE, dotted against all MM x-rows, GLU per (row,col).
  * C is [M][N]. MM==1 is byte-identical to the old scalar body (the B=1 serving path). */
+#ifndef PLOW_NV_GEMMA_GLU_BF16
+#define PLOW_NV_GEMMA_GLU_BF16 0
+#endif
+static __device__ __forceinline__ __nv_bfloat16 gemma_glu_epilogue(float gate, float up,
+                                                                 unsigned act) {
+#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && PLOW_NV_GEMMA_GLU_BF16
+    if (act != PLOW_ACT_SILU_) {
+        gate = __bfloat162float(__float2bfloat16(gate));
+        up = __bfloat162float(__float2bfloat16(up));
+        const float activated = __bfloat162float(__float2bfloat16(act_gelu_tanh(gate)));
+        return __float2bfloat16(activated * up);
+    }
+#endif
+    const float activated = (act == PLOW_ACT_SILU_) ? act_silu(gate) : act_gelu_tanh(gate);
+    return __float2bfloat16(activated * up);
+}
+
 template <int MM, int UN = gv_un_glu<MM>::v>
 __device__ __forceinline__ void gemv_glu_rows(__nv_bfloat16* C, const __nv_bfloat16* x,
                            const __nv_bfloat16* Wg, const __nv_bfloat16* Wu, unsigned M, unsigned N,
@@ -1769,8 +2196,7 @@ __device__ __forceinline__ void gemv_glu_rows(__nv_bfloat16* C, const __nv_bfloa
         for (int m = 0; m < MM; m++) {
             const float tg = warp_sum32(ag[m]), tu = warp_sum32(au[m]);
             if (lane == 0 && (unsigned)m < M) {
-                const float a = (act == PLOW_ACT_SILU_) ? act_silu(tg) : act_gelu_tanh(tg);
-                C[(size_t)m * N + n] = __float2bfloat16(a * tu);
+                C[(size_t)m * N + n] = gemma_glu_epilogue(tg, tu, act);
             }
         }
     }
@@ -1828,8 +2254,7 @@ static __device__ void d_gemv_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
         }
         const float tg = warp_sum32(ag), tu = warp_sum32(au);
         if (lane == 0 && M) {
-            const float a = (act == PLOW_ACT_SILU_) ? act_silu(tg) : act_gelu_tanh(tg);
-            C[n] = __float2bfloat16(a * tu);
+            C[n] = gemma_glu_epilogue(tg, tu, act);
         }
     }
 }

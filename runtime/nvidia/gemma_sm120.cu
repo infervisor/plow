@@ -24,6 +24,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #ifndef PLOW_SM120_SMS
 #define PLOW_SM120_SMS 188        /* RTX 6000 Pro Blackwell SM count (persistent grid) */
@@ -809,14 +811,25 @@ static inline int fa_prefill_smem() {
     return (int)((2*FA_BKV*(FA_HD+FA_PAD) + FA_BQ*(FA_HD+FA_PAD)) * sizeof(bf16));
 }
 
+static inline void fa_require_supported_geometry(const PlowFlashBody* f) {
+    if (f->head_dim != FA_HD || f->kv_heads == 0 || f->heads % f->kv_heads != 0) {
+        fprintf(stderr,
+                "RTX 6000 FlashAttention supports head_dim=%u with integral GQA; got head_dim=%u heads=%u kv_heads=%u\n",
+                (unsigned)FA_HD, (unsigned)f->head_dim, (unsigned)f->heads,
+                (unsigned)f->kv_heads);
+        abort();
+    }
+}
+
 extern "C" void cuda_flash_causal_bf16_sm120(const void* body, kctx* ctx) {
     const PlowFlashBody* f=(const PlowFlashBody*)body; const PlowBinding* bd=ctx->bind;
     if (!bd) return;
+    fa_require_supported_geometry(f);
     const bf16* Q=(const bf16*)ctx->slots[bd->in0];
     const bf16* K=(const bf16*)ctx->slots[bd->in1];
     const bf16* V=(const bf16*)ctx->slots[bd->in2];
     bf16* O=(bf16*)ctx->slots[f->out];
-    unsigned kvh = f->tmem ? f->tmem : (f->heads/4);   // NKV (GQA 4:1 default)
+    unsigned kvh = f->kv_heads;
     int sm=fa_prefill_smem();
     cudaFuncSetAttribute(gemma_flash_prefill_sm120, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     gemma_flash_prefill_sm120<<<sm120_grid(gemma_flash_prefill_sm120, FA_THREADS, sm), FA_THREADS, sm, (GPU_STREAM)ctx->stream>>>(
@@ -825,12 +838,13 @@ extern "C" void cuda_flash_causal_bf16_sm120(const void* body, kctx* ctx) {
 extern "C" void cuda_flash_sliding_bf16_sm120(const void* body, kctx* ctx) {
     const PlowFlashBody* f=(const PlowFlashBody*)body; const PlowBinding* bd=ctx->bind;
     if (!bd) return;
+    fa_require_supported_geometry(f);
     const bf16* Q=(const bf16*)ctx->slots[bd->in0];
     const bf16* K=(const bf16*)ctx->slots[bd->in1];
     const bf16* V=(const bf16*)ctx->slots[bd->in2];
     bf16* O=(bf16*)ctx->slots[f->out];
-    unsigned kvh = f->tmem ? f->tmem : (f->heads/4);
-    int window = (int)f->coord0;                       // sliding span in coord0
+    unsigned kvh = f->kv_heads;
+    int window = (int)f->window;
     int sm=fa_prefill_smem();
     cudaFuncSetAttribute(gemma_flash_prefill_sm120, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     gemma_flash_prefill_sm120<<<sm120_grid(gemma_flash_prefill_sm120, FA_THREADS, sm), FA_THREADS, sm, (GPU_STREAM)ctx->stream>>>(
@@ -839,11 +853,12 @@ extern "C" void cuda_flash_sliding_bf16_sm120(const void* body, kctx* ctx) {
 extern "C" void cuda_flash_decode_bf16_sm120(const void* body, kctx* ctx) {
     const PlowFlashBody* f=(const PlowFlashBody*)body; const PlowBinding* bd=ctx->bind;
     if (!bd) return;
+    fa_require_supported_geometry(f);
     const bf16* Q=(const bf16*)ctx->slots[bd->in0];
     const bf16* K=(const bf16*)ctx->slots[bd->in1];
     const bf16* V=(const bf16*)ctx->slots[bd->in2];
     bf16* O=(bf16*)ctx->slots[f->out];
-    unsigned kvh = f->tmem ? f->tmem : (f->heads/4);
+    unsigned kvh = f->kv_heads;
     int sm=(int)((2*FA_WARPS + FA_WARPS*FA_HD)*sizeof(float));
     cudaFuncSetAttribute(gemma_flash_decode_sm120, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     gemma_flash_decode_sm120<<<sm120_grid(gemma_flash_decode_sm120, FA_THREADS, sm), FA_THREADS, sm, (GPU_STREAM)ctx->stream>>>(

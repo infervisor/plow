@@ -2613,11 +2613,13 @@ fn gpu_prefill_advance(
         let mut toks = Vec::with_capacity(1);
         // Decode-only prompt consumption still gets prefix sharing: attach
         // maps the cached rows, so only the tail is fed token by token.
+        // `consume_prompt` overlaps host submit with the in-flight
+        // interpreter (one D2H+sync after the last token).
         let start = e.attach_prompt(slot_idx, &slot.prompt_ids)?;
         slot.cached_tokens = start;
-        for &t in &slot.prompt_ids[start..] {
-            e.step_slots(&[(slot_idx, t)], &mut toks)?;
-            tok = toks[0];
+        let tail = &slot.prompt_ids[start..];
+        if !tail.is_empty() {
+            tok = e.consume_prompt(slot_idx, tail, &mut toks)?;
         }
         slot.pf_pos = slot.prompt_ids.len();
         tok
@@ -3300,6 +3302,8 @@ mod tests {
                         bq: 1,
                         bkv: 1,
                         heads: 1,
+                        kv_heads: 1,
+                        window: 0,
                         out: 0,
                         tmem: 0,
                         variant: packet::Opcode::VARIANT_FLASH_CAUSAL_BF16,

@@ -269,6 +269,17 @@ struct Shapes {
     moe_pf_part16: bool,
     /// Any prefill GLU with `i[7]=1` — fp8 gathered activations (PLOW_MOE_PF_A8).
     moe_pf_a8: bool,
+    /// Any decode one-shot XReduce with `i[7]!=0` — the K3 latent MoeCombine folded into the
+    /// tagged publish (PLOW_XR_COMBINE_FOLD). An object without the arm publishes the unwritten
+    /// plain slot: finite, stale, wrong.
+    xr_combine_fold: bool,
+    /// Any `KdaStateStepG` with flags bit 2 — the f_b GEMV folded into the step's prologue
+    /// (PLOW_KDA_FB_FOLD). An object without the arm reads `f_a` as the gate logits.
+    kda_fb_fold: bool,
+    /// Any `KdaStateStepG` with flags bit 3 — the Conv3+StepG+GatedNorm chain as one packet
+    /// (PLOW_KDA_DECODE_FUSED_ARM). An object without the arm runs the recurrence on the RAW
+    /// projections and reads the descriptor as `A_log`.
+    kda_decode_fused_arm: bool,
     /// Any prefill DOWN with `i[4]!=0` — the fused 86->87 decomposition (PLOW_MOE_PF_ATOMIC):
     /// t[0] is a [T,H] f32 accumulator the DOWN epilogue atomically adds into, NOT the
     /// [T*k,H] `part` scatter. An object without the arm would overrun it k-fold.
@@ -333,6 +344,11 @@ fn shapes(m: &Model) -> Shapes {
             let Some(op) = op_of(inst.op) else { continue };
             s.ops_present.insert(op_name(op));
             match op {
+                DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
+                DevOp::KdaStateStepG if inst.i[4] & 12 != 0 => {
+                    s.kda_fb_fold |= inst.i[4] & 4 != 0;
+                    s.kda_decode_fused_arm |= inst.i[4] & 8 != 0;
+                }
                 // `i0=n_batch i1=n_head i2=n_kv_head … i6=hd`
                 DevOp::FlashDecode | DevOp::FlashDecodeFp8 => {
                     let (hd, nh, kvh, nb) = (inst.i[6], inst.i[1], inst.i[2], inst.i[0]);
@@ -557,6 +573,10 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     // w8a8 is the per-row ACTIVATION quant: `QuantFp8` exists only on that path.
     f.insert("w8a8".into(), json!(has("QuantFp8")));
     f.insert(
+        "qwen_gdn".into(),
+        json!(union.iter().any(|a| a.op.starts_with("Qwen"))),
+    );
+    f.insert(
         "moe".into(),
         json!(union.iter().any(|a| a.op.starts_with("Moe"))),
     );
@@ -686,6 +706,15 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("moe_pf_atomic".into(), json!(s.moe_pf_atomic));
     f.insert("moe_pf_det".into(), json!(s.moe_pf_det));
     f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
+    f.insert("xr_combine_fold".into(), json!(s.xr_combine_fold));
+    f.insert("kda_fb_fold".into(), json!(s.kda_fb_fold));
+    f.insert("kda_decode_fused_arm".into(), json!(s.kda_decode_fused_arm));
+    // L8 is packet-inert (loads only), so it is an EMIT setting surfaced here for the paired
+    // `plow_config.h`, not an instruction signature.
+    f.insert(
+        "gemv_prefetch".into(),
+        json!(crate::emit_config::active().gemv_prefetch),
+    );
     f.insert("moe_prefill_ep".into(), json!(!s.moe_prefill_ep.is_empty()));
     f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
@@ -754,17 +783,34 @@ pub enum Backend {
 /// like a driver bug.
 ///
 /// `recommends` = PERFORMANCE. Wrong here costs throughput, not correctness.
-fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>) -> Value {
+fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> Value {
     let on = |k: &str| f.get(k).and_then(Value::as_bool).unwrap_or(false);
-    let mut req = vec!["PLOW_NV_GEMMA=1".to_string()];
+    // PLOW_NV_GEMMA=1 only when the packet uses head dims > 128 (Gemma-family
+    // hd256/512). A Qwen-only (hd=128) packet must NOT carry this flag — the
+    // Gemma build drops the hd=128 arm entirely.
+    let mut req = Vec::new();
+    if s.hd.iter().any(|&h| h > 128) {
+        req.push("PLOW_NV_GEMMA=1".to_string());
+    }
+    if on("qwen_gdn") {
+        req.push("PLOW_NV_QWEN_GDN=1".into());
+        req.push("PLOW_NV_FA_GF=2".into());
+    }
     if on("w8a8") {
         req.push("PLOW_NV_W8A8=1".into());
+        if on("qwen_gdn") {
+            req.push("PLOW_NV_FP8_M1=1".into());
+            req.push("PLOW_NV_QUANT_FP8_VLLM=1".into());
+        }
     }
     if on("fp8_kv") {
         req.push("PLOW_FP8_KV=1".into());
     }
     if on("prefill") {
         req.push("PLOW_NV_PREFILL=1".into());
+        if on("qwen_gdn") {
+            req.push("PLOW_NV_PF_GEMV_HEAD=1".into());
+        }
     }
     let mut rec = Vec::new();
     if let Some(v) = t.get("gv_mm_max").and_then(Value::as_u64) {
@@ -798,7 +844,7 @@ fn backends(
     };
     let gf_full = t.get("gf_full").and_then(Value::as_u64);
     json!({
-        "nvcc": backend_nvcc(f, t),
+        "nvcc": backend_nvcc(f, t, s),
         amd_key: backend_amd(amd_key, f, s, union, gf_full),
     })
 }
@@ -895,6 +941,9 @@ fn backend_amd(
     if on("materialized_residual_input") {
         req.push("PLOW_MATERIALIZED_RESIDUAL_INPUT=1".into());
     }
+    if on("attnres_decode_mwg") {
+        req.push("PLOW_ATTNRES_DECODE_MWG=1".into());
+    }
     if has("KdaChunkPrepare") || has("KdaChunkIntra") || has("KdaChunkWu") || has("KdaChunkCarry") {
         req.push("PLOW_KDA_CHUNK=1".into());
     }
@@ -917,6 +966,18 @@ fn backend_amd(
     }
     if on("moe_pf_a8") {
         req.push("PLOW_MOE_PF_A8=1".into());
+    }
+    // L4 combine fold: a BUILD axis of the tagged decode object (`#if PLOW_XR_COMBINE_FOLD`).
+    if on("xr_combine_fold") {
+        req.push("PLOW_XR_COMBINE_FOLD=1".into());
+    }
+    // L3 f_b fold: a BUILD axis of the decode object (`#if PLOW_KDA_FB_FOLD`).
+    if on("kda_fb_fold") {
+        req.push("PLOW_KDA_FB_FOLD=1".into());
+    }
+    // L7 fused decode arm: a BUILD axis of the decode object (`#if PLOW_KDA_DECODE_FUSED_ARM`).
+    if on("kda_decode_fused_arm") {
+        req.push("PLOW_KDA_DECODE_FUSED_ARM=1".into());
     }
     // The fused 86->87 decomposition. Unlike the two above this is a BUILD axis (the atomic
     // branch is `#if PLOW_MOE_PF_ATOMIC`), so an object may genuinely not have it.
@@ -1398,6 +1459,18 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     objects["lean"]["kda_carry_regstate"] = json!({
         "required": kda_carry_regstate_required,
     });
+    let marked_wu = |keys: bool| {
+        m.progs.iter().any(|p| {
+            p.stream.iter().any(|e| {
+                e.flags & packet::dev::SE_KDA_WU_LEAN != 0
+                    && p.insts
+                        .get(e.inst as usize)
+                        .is_some_and(|d| d.op == DevOp::KdaChunkWu as u16 && (d.i[5] == 1) == keys)
+            })
+        })
+    };
+    objects["lean"]["kda_wu_lean"] = json!({ "required": marked_wu(false) });
+    objects["lean"]["kda_carry_keyfeed"] = json!({ "required": marked_wu(true) });
     let s = shapes(m);
     let mut ep_tables = BTreeSet::new();
     let ep_extra_resident_bytes_per_rank = m
@@ -1446,6 +1519,17 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
             "policy": "refuse",
         },
     });
+    // Opt-in lean MoE body variants: keys exist only when requested so the default
+    // manifest, pairing hash, and config header are unchanged.
+    let cfg = crate::emit_config::active();
+    if cfg.moe_stage1_body {
+        objects["lean"]["moe_stage1_body"] =
+            json!({ "required": true, "define": "PLOW_MOE1_BODY" });
+    }
+    if cfg.moe_stage2_body {
+        objects["lean"]["moe_stage2_body"] =
+            json!({ "required": true, "define": "PLOW_MOE2_BODY" });
+    }
     let mut f = features(&union);
     let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
         inst.op == DevOp::AttnRes as u16
@@ -1457,6 +1541,12 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         "materialized_residual_input".into(),
         json!(materialized_residual_input),
     );
+    let attnres_decode_mwg = m
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|inst| inst.op == DevOp::AttnRes as u16 && inst.i[6] != 0);
+    f.insert("attnres_decode_mwg".into(), json!(attnres_decode_mwg));
     encoding_features(&mut f, &s);
     let axes = precision_axes(&mut f, &s, &union);
     let t = tuning(&s);
@@ -1692,6 +1782,14 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/lean/kda_carry_regstate/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let kda_wu_lean_required = manifest
+        .pointer("/objects/lean/kda_wu_lean/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let kda_carry_keyfeed_required = manifest
+        .pointer("/objects/lean/kda_carry_keyfeed/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let moe_prefill_ep_required = manifest
         .pointer("/objects/lean/moe_prefill_ep/required")
         .and_then(Value::as_bool)
@@ -1721,9 +1819,29 @@ pub fn config_header(manifest: &Value) -> String {
         if kda_carry_regstate_required { 1 } else { 0 }
     ));
     out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_WU_LEAN {}\n",
+        if kda_wu_lean_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_CARRY_KEYFEED {}\n",
+        if kda_carry_keyfeed_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",
         if moe_prefill_ep_required { 1 } else { 0 }
     ));
+    for (key, macro_name) in [
+        ("moe_stage1_body", "PLOW_OBJECT_MOE_STAGE1_BODY"),
+        ("moe_stage2_body", "PLOW_OBJECT_MOE_STAGE2_BODY"),
+    ] {
+        if manifest
+            .pointer(&format!("/objects/lean/{key}/required"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            out.push_str(&format!("#define {macro_name} 1\n"));
+        }
+    }
     for o in DevOp::ALL {
         let name = op_name(*o);
         let present = ops.contains(&name);
@@ -1765,6 +1883,46 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str(&format!(
         "#ifndef PLOW_MATERIALIZED_RESIDUAL_INPUT\n#define PLOW_MATERIALIZED_RESIDUAL_INPUT {}\n#endif\n",
         if materialized_residual_input { 1 } else { 0 }
+    ));
+    let xr_combine_fold = manifest
+        .pointer("/features/xr_combine_fold")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD {0}\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD {0}\n#endif\n",
+        if xr_combine_fold { 1 } else { 0 }
+    ));
+    let attnres_decode_mwg = manifest
+        .pointer("/features/attnres_decode_mwg")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#ifndef PLOW_ATTNRES_DECODE_MWG\n#define PLOW_ATTNRES_DECODE_MWG {}\n#endif\n",
+        if attnres_decode_mwg { 1 } else { 0 }
+    ));
+    let kda_fb_fold = manifest
+        .pointer("/features/kda_fb_fold")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_FB_FOLD {0}\n#ifndef PLOW_KDA_FB_FOLD\n#define PLOW_KDA_FB_FOLD {0}\n#endif\n",
+        if kda_fb_fold { 1 } else { 0 }
+    ));
+    let kda_decode_fused_arm = manifest
+        .pointer("/features/kda_decode_fused_arm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_DECODE_FUSED_ARM {0}\n#ifndef PLOW_KDA_DECODE_FUSED_ARM\n#define PLOW_KDA_DECODE_FUSED_ARM {0}\n#endif\n",
+        if kda_decode_fused_arm { 1 } else { 0 }
+    ));
+    let gemv_prefetch = manifest
+        .pointer("/features/gemv_prefetch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#ifndef PLOW_GEMV_PREFETCH\n#define PLOW_GEMV_PREFETCH {}\n#endif\n",
+        if gemv_prefetch { 1 } else { 0 }
     ));
 
     // Head dims the flash family is instantiated at.
@@ -1927,6 +2085,132 @@ mod tests {
             false
         );
         assert!(config_header(&ordinary).contains("#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP 0"));
+    }
+
+    /// The opt-in lean MoE body variants are object requests carried by the config header;
+    /// the default manifest carries neither key nor macro, so its pairing hash is unchanged.
+    #[test]
+    fn moe_body_variants_are_opt_in_object_requests() {
+        let _guard = crate::test_env::env_guard();
+        let ordinary = build(&model(), "gfx950");
+        assert!(ordinary["objects"]["lean"].get("moe_stage1_body").is_none());
+        assert!(ordinary["objects"]["lean"].get("moe_stage2_body").is_none());
+        assert!(!config_header(&ordinary).contains("PLOW_OBJECT_MOE_STAGE"));
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_MOE_STAGE1_BODY", "1"),
+            ("PLOW_MOE_STAGE2_BODY", "1"),
+        ]);
+        let man = build(&model(), "gfx950");
+        assert_eq!(man["objects"]["lean"]["moe_stage1_body"]["required"], true);
+        assert_eq!(man["objects"]["lean"]["moe_stage2_body"]["required"], true);
+        let header = config_header(&man);
+        assert!(header.contains("#define PLOW_OBJECT_MOE_STAGE1_BODY 1\n"));
+        assert!(header.contains("#define PLOW_OBJECT_MOE_STAGE2_BODY 1\n"));
+        assert_ne!(man["pairing"]["hash"], ordinary["pairing"]["hash"]);
+    }
+
+    /// L4: a decode XReduce with `i7 != 0` (the folded latent combine) is a build axis of the
+    /// tagged decode object; the ordinary model must not carry it.
+    #[test]
+    fn xr_combine_fold_is_a_decode_object_requirement() {
+        let mut m = model();
+        m.progs[1]
+            .insts
+            .push(inst(DevOp::XReduce, [3584, 8, 0, 5, 0, 0, 0, 16]));
+        let man = build(&m, "gfx950");
+        assert_eq!(man["features"]["xr_combine_fold"], true);
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(req.contains(&"PLOW_XR_COMBINE_FOLD=1"), "{req:?}");
+        let hdr = config_header(&man);
+        assert!(hdr.contains("#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD 1\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD 1\n#endif\n"));
+
+        let ordinary = build(&model(), "gfx950");
+        assert_eq!(ordinary["features"]["xr_combine_fold"], false);
+        let req: Vec<&str> = ordinary["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!req.contains(&"PLOW_XR_COMBINE_FOLD=1"));
+        assert!(config_header(&ordinary).contains("#define PLOW_PACKET_REQUIRES_XR_COMBINE_FOLD 0\n#ifndef PLOW_XR_COMBINE_FOLD\n#define PLOW_XR_COMBINE_FOLD 0\n#endif\n"));
+    }
+
+    /// L3: a `KdaStateStepG` with flags bit 2 (the folded f_b GEMV) is a build axis of the
+    /// decode object; the ordinary model must not carry it.
+    #[test]
+    fn kda_fb_fold_is_a_decode_object_requirement() {
+        let mut m = model();
+        m.progs[1]
+            .insts
+            .push(inst(DevOp::KdaStateStepG, [1, 12, 128, 16, 5, 0, 1, 0]));
+        let man = build(&m, "gfx950");
+        assert_eq!(man["features"]["kda_fb_fold"], true);
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(req.contains(&"PLOW_KDA_FB_FOLD=1"), "{req:?}");
+        assert!(config_header(&man).contains("#define PLOW_PACKET_REQUIRES_KDA_FB_FOLD 1\n#ifndef PLOW_KDA_FB_FOLD\n#define PLOW_KDA_FB_FOLD 1\n#endif\n"));
+
+        let mut plain = model();
+        plain.progs[1]
+            .insts
+            .push(inst(DevOp::KdaStateStepG, [1, 12, 128, 16, 1, 0, 1, 0]));
+        let man = build(&plain, "gfx950");
+        assert_eq!(man["features"]["kda_fb_fold"], false);
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!req.contains(&"PLOW_KDA_FB_FOLD=1"));
+        assert!(config_header(&man).contains("#define PLOW_PACKET_REQUIRES_KDA_FB_FOLD 0\n#ifndef PLOW_KDA_FB_FOLD\n#define PLOW_KDA_FB_FOLD 0\n#endif\n"));
+    }
+
+    #[test]
+    fn kda_decode_fused_arm_is_a_decode_object_requirement() {
+        let mut m = model();
+        m.progs[1]
+            .insts
+            .push(inst(DevOp::KdaStateStepG, [1, 12, 128, 8, 9, 0, 1, 0]));
+        let man = build(&m, "gfx950");
+        assert_eq!(man["features"]["kda_decode_fused_arm"], true);
+        assert_eq!(man["features"]["kda_fb_fold"], false);
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(req.contains(&"PLOW_KDA_DECODE_FUSED_ARM=1"), "{req:?}");
+        assert!(!req.contains(&"PLOW_KDA_FB_FOLD=1"));
+        let h = config_header(&man);
+        assert!(h.contains("#define PLOW_PACKET_REQUIRES_KDA_DECODE_FUSED_ARM 1\n#ifndef PLOW_KDA_DECODE_FUSED_ARM\n#define PLOW_KDA_DECODE_FUSED_ARM 1\n#endif\n"));
+        // L8 is packet-inert and defaults off in the header unless the emit asked for it.
+        assert_eq!(man["features"]["gemv_prefetch"], false);
+        assert!(h.contains("#ifndef PLOW_GEMV_PREFETCH\n#define PLOW_GEMV_PREFETCH 0\n#endif\n"));
+
+        let mut both = model();
+        both.progs[1]
+            .insts
+            .push(inst(DevOp::KdaStateStepG, [1, 12, 128, 8, 13, 0, 1, 0]));
+        let man = build(&both, "gfx950");
+        assert_eq!(man["features"]["kda_decode_fused_arm"], true);
+        assert_eq!(man["features"]["kda_fb_fold"], true);
+
+        let plain = model();
+        let man = build(&plain, "gfx950");
+        assert_eq!(man["features"]["kda_decode_fused_arm"], false);
+        assert!(config_header(&man).contains("#define PLOW_PACKET_REQUIRES_KDA_DECODE_FUSED_ARM 0\n#ifndef PLOW_KDA_DECODE_FUSED_ARM\n#define PLOW_KDA_DECODE_FUSED_ARM 0\n#endif\n"));
     }
 
     /// One opcode, two bodies: hd is an instruction field, so hd256 and hd512

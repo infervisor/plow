@@ -12,17 +12,22 @@ q-precomputed operand. It compares the shipping V16/WG512 body
   and every chunk factor is prefetched from clamped addresses; two barriers per chunk.
 - `regstate_hwcvt_v16_wg256`: the same body with gfx950 `v_cvt_pk_bf16_f32` for every
   bf16 rounding (bench-only arm: NaN payloads may differ from the software `f2bf`).
-- `control_timed` / `regstate_timed`: `s_memtime` phase stamps accumulated by wave 0.
+- `regstate_keyfeed_v16_wg256`: the same body fed with the precomputed scaled-key hi/lo pair
+  (`k_key_precompute`, the `kda_chunk_key_factor` formula; in production the lean Wu emits it)
+  instead of rebuilding it from k and g each chunk.
+- `control_timed` / `regstate_timed` / `keyfeed_timed`: `s_memtime` phase stamps accumulated by
+  wave 0.
 
 The oracle requires bit equality for the complete BF16 output and FP32 final state and
 verifies that Aqk is unchanged; `run.sh` rejects private memory or register spills before
 acquiring one GPU. `KDA_DEBUG=1` prints the state mismatch pattern by `d` and `v`.
 
-Run inside `nix develop` (`T=8191` exercises the 63-row tail chunk):
+Run inside `nix develop` (`T=8191` exercises the 63-row tail chunk; `MODE` 0 structured,
+1 LCG uniform, 2 adversarial NaN/Inf/denormal/RNE-tie inputs with exp2 overflow gates):
 
 ```sh
 runtime/bench/amd/kda_carry_regstate/run.sh            # T=8192 H=12, 21 samples, timers
-T=8191 SAMPLES=3 TIMERS=0 runtime/bench/amd/kda_carry_regstate/run.sh
+T=8191 SAMPLES=3 TIMERS=0 MODE=2 runtime/bench/amd/kda_carry_regstate/run.sh
 ```
 
 ## MI355X result (2026-09-04)
@@ -35,10 +40,16 @@ Exact shape `T8192,H12,D128,V128,BT64`, 21 order-rotated samples; oracle also pa
 | control V16/WG512 | 1.916 ms | -- | VGPR 204, SGPR 68, occupancy 2, no spill |
 | regstate V16/WG256 | 0.726 ms | -62.1% (2.64x) | VGPR 235, SGPR 53, LDS 43,520 B, no spill |
 | regstate hwcvt V16/WG256 (bench-only) | 0.572 ms | -70.2% (3.36x) | VGPR 238, SGPR 48, LDS 43,520 B, no spill |
+| regstate keyfeed V16/WG256 (09-04 follow-up) | 0.507 ms | -73.7% (3.81x; 1.43x vs regstate) | VGPR 248, SGPR 49, LDS 43,520 B, no spill |
 
 Both candidate arms matched all 12,582,912 BF16 outputs and 196,608 FP32 state elements. The
 hardware-convert arm is exact on every finite input but may differ in NaN payload, so the
 shipped object uses the software RNE.
+
+The keyfeed arm (same 21-sample run: control 1.931, regstate 0.726, keyfeed 0.507 ms) is also
+bit-exact on MODE 1 and MODE 2 at T=8192 and T=8191. Its per-chunk `keys+loads` phase falls
+7,025 -> 1,803 cycles (total 12,948 -> 7,677); the pair costs the producing lean Wu 0.022 ms
+(`runtime/bench/amd/kda_wu_lean`).
 
 Per-chunk `s_memtime` attribution (wave 0, mean over 96 workgroups x 128 chunks):
 

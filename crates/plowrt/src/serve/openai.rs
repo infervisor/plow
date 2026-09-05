@@ -33,6 +33,8 @@ pub struct ChatRequest {
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: String,
+    #[serde(default = "default_add_special_tokens")]
+    pub add_special_tokens: bool,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -48,6 +50,10 @@ pub struct CompletionRequest {
     /// Plow parity extension. Available only for non-streaming requests.
     #[serde(default)]
     pub return_token_ids: bool,
+}
+
+fn default_add_special_tokens() -> bool {
+    true
 }
 
 /// OpenAI `stream_options`: `include_usage` opts the stream into a final

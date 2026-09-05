@@ -43,3 +43,6 @@ plow_profile.sqlite
 # GPU binary build outputs — never check in (bundles link them from build dirs)
 *.cubin
 *.hsaco
+
+# plowc/plowrt emitted serve-asset bundles for this campaign (model.pkt, weights.json, cubins)
+assets-run/

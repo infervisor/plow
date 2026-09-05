@@ -29,12 +29,7 @@ fn generate(e: &mut GpuEngine, ids: &[u32], max_new: usize) -> Vec<u32> {
     let mut t = if e.has_prefill() {
         e.prefill_slot(0, ids).expect("prefill_slot")
     } else {
-        let mut t = 0u32;
-        for &id in ids {
-            e.step_slots(&[(0, id)], &mut toks).expect("step");
-            t = toks[0];
-        }
-        t
+        e.consume_prompt(0, ids, &mut toks).expect("consume_prompt")
     };
     let stop = Arc::clone(e.stop_ids());
     let mut out = Vec::new();

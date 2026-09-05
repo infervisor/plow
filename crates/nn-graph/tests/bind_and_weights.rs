@@ -54,14 +54,14 @@ fn weight_manifest_lists_per_op_weights() {
 
     // Names a loader needs are present, tied to their op.
     let names: Vec<&str> = manifest.iter().map(|w| w.name).collect();
-    assert!(names.contains(&"embed_tokens.weight"));
-    assert!(names.contains(&"layers.0.self_attn.q_proj.weight"));
+    assert!(names.contains(&"model.embed_tokens.weight"));
+    assert!(names.contains(&"model.layers.0.self_attn.q_proj.weight"));
     assert!(names.iter().any(|n| n.ends_with("mlp.gate_proj.weight")));
 
     // Every linear weight is a rank-2 [out, in] tensor with a known dtype.
     let qproj = manifest
         .iter()
-        .find(|w| w.name == "layers.0.self_attn.q_proj.weight")
+        .find(|w| w.name == "model.layers.0.self_attn.q_proj.weight")
         .unwrap();
     assert_eq!(qproj.op, "linear");
     assert_eq!(qproj.shape.unwrap().rank(), 2);
@@ -73,7 +73,7 @@ fn weight_manifest_lists_per_op_weights() {
 fn blocks_group_per_layer() {
     let g = build_from_config_json(GEMMA).expect("build"); // num_hidden_layers = 2
     assert_eq!(g.blocks.len(), 2);
-    assert_eq!(g.block_label(0), Some("layers.0"));
+    assert_eq!(g.block_label(0), Some("model.layers.0"));
 
     // Every node in block 0 is tagged with block 0 and names that layer.
     let nodes: Vec<_> = g.block_nodes(0).collect();

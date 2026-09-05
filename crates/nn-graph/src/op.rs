@@ -11,6 +11,7 @@ pub enum ActKind {
     Silu,
     Gelu,
     GeluTanh,
+    Tanh,
     Relu,
     Sigmoid,
     QuickGelu,
@@ -46,8 +47,13 @@ pub enum Op {
     /// activations.
     MatMul,
 
-    /// RMSNorm over the last axis. Inputs `[x, weight]`. Shape-preserving.
+    /// RMSNorm over the last axis. Inputs `[x, weight]`, or `[x]` for a
+    /// weightless normalization. Shape-preserving.
     RmsNorm { eps: f32 },
+
+    /// RMSNorm with a zero-centered scale: `norm(x) * (1 + weight)`.
+    /// Inputs `[x, weight]`. Shape-preserving.
+    RmsNormZeroCentered { eps: f32 },
 
     /// LayerNorm over the last axis. Inputs `[x, weight, bias]`. Shape-preserving.
     LayerNorm { eps: f32 },
@@ -60,6 +66,9 @@ pub enum Op {
         dim: u32,
         theta: f32,
         interleave: bool,
+        /// Dimension used in the inverse-frequency exponent. Usually `dim`;
+        /// proportional partial RoPE keeps the full head dimension here.
+        frequency_dim: u32,
     },
 
     /// Pointwise activation. Inputs `[x]`. Shape-preserving.
@@ -156,6 +165,38 @@ pub enum Op {
         num_experts: u32,
         top_k: u32,
         group: Option<MoeGroups>,
+        scoring: MoeScoring,
+        norm_topk: bool,
+        route_scale: f32,
+        correction_bias: bool,
+    },
+
+    /// Data-dependent routed-expert SwiGLU dispatch and weighted combine.
+    /// Inputs `[x, routes]`; the exhaustive checkpoint names live in
+    /// `Graph::expert_bindings`, avoiding `3 * num_experts` compute nodes.
+    MoeExperts {
+        num_experts: u32,
+        top_k: u32,
+        intermediate_size: u32,
+        block_fp8: bool,
+    },
+
+    /// GLM DSA indexer. Inputs are hidden state, normalized query latent,
+    /// wq_b, wk, k_norm weight/bias, and per-head weights projection.
+    DsaIndexer {
+        num_heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        top_k: u32,
+        theta: f32,
+    },
+
+    /// Sparse causal MLA consuming DSA top-k positions as input 3.
+    DsaAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        top_k: u32,
     },
 
     /// Depthwise causal 1-D convolution over the sequence axis, `[B, S, C]`.
@@ -182,9 +223,11 @@ pub enum Op {
 
     /// Linear (sub-quadratic) attention with a carried recurrent state.
     ///
-    /// Inputs `[q, k, v, gate, beta, A_log, dt_bias]`: q/k/v/gate are rank-4
-    /// `[B, S, heads, head_dim]`, beta is `[B, S, heads]`, A_log is `[heads]`,
-    /// and dt_bias is `[heads * head_dim]`. Output has q's shape.
+    /// Inputs `[q, k, v, gate, beta, A_log, dt_bias]`: q/k/v are rank-4
+    /// `[B, S, heads, head_dim]`, beta and A_log are per-head, and output has
+    /// v's last dimension. Gate and dt_bias shapes depend on `kind`: Kimi uses
+    /// a rank-4 gate and `[heads * head_dim]` dt_bias; Qwen uses per-head gate
+    /// and dt_bias tensors.
     ///
     /// # Why the state is not an input, and why this is not [`Op::Attention`]
     ///
@@ -254,6 +297,12 @@ pub struct MoeGroups {
     pub topk_group: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoeScoring {
+    Softmax,
+    Sigmoid,
+}
+
 /// Which linear-attention recurrence [`Op::LinearAttention`] carries.
 ///
 /// One variant today. It exists as an enum rather than being implied by the op
@@ -266,6 +315,9 @@ pub enum LinearAttnKind {
     /// Kimi Delta Attention: a gated delta rule with a low-rank forget gate.
     /// `state <- state * decay(gate) + beta * (v - state·k) ⊗ k`.
     KimiDelta,
+    /// Qwen3.5 gated delta rule with L2-normalized q/k, per-value-head decay,
+    /// scalar A/dt parameters, and fp32 recurrence/state math.
+    QwenGatedDelta,
 }
 
 impl Op {
@@ -275,6 +327,7 @@ impl Op {
             Op::Linear { .. } => "linear",
             Op::MatMul => "matmul",
             Op::RmsNorm { .. } => "rmsnorm",
+            Op::RmsNormZeroCentered { .. } => "rmsnorm_zero_centered",
             Op::LayerNorm { .. } => "layernorm",
             Op::Rope { .. } => "rope",
             Op::Act(_) => "act",
@@ -293,6 +346,9 @@ impl Op {
             Op::Slice { .. } => "slice",
             Op::Reduce { .. } => "reduce",
             Op::MoeRouter { .. } => "moe_router",
+            Op::MoeExperts { .. } => "moe_experts",
+            Op::DsaIndexer { .. } => "dsa_indexer",
+            Op::DsaAttention { .. } => "dsa_attention",
             Op::Conv1dDepthwise { .. } => "conv1d_depthwise",
             Op::LinearAttention { .. } => "linear_attention",
             Op::SituGlu { .. } => "situ_glu",

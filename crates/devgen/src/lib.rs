@@ -57,6 +57,7 @@ pub mod kda;
 use config::*;
 mod ladder;
 mod mla;
+mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
@@ -104,7 +105,7 @@ pub mod tune_demand;
 //   `PLOW_FP8_KV`, `PLOW_FP8_KV_FULL`, `PLOW_MXFP4`, `PLOW_MLA_PREFILL`, `PLOW_MOE_PREFILL`,
 //   `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_ROUTER_OLD` (GLM arm), `GLM_GROUP`;
 // * tuning constants carried in an existing instruction field, read identically by both
-//   interpreters: `PLOW_NS_MUL`, `PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_GLM_GF`, `PLOW_GLM_NS`,
+//   interpreters: `PLOW_NS_MUL`, `PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_GLM_GF`, `PLOW_MLA_NS`,
 //   `PLOW_MAX_CHUNK`, `PLOW_DECODE_BATCH`. (`PLOW_NS_FULL_ABS`'s comment cites an sm_120 part —
 //   that records where it was MEASURED, not a target dependence.)
 // * structure, but geometry-driven rather than ISA-driven: `GLM_EP`, `GLM_MOE_CORESIDENT`,
@@ -392,16 +393,23 @@ pub(crate) fn pick_gemm_emit_plan(
     quant: kernelcaps::QuantScheme,
 ) -> (DevOp, u32, u32) {
     let c8 = tunedb::gemm_rung_emit_plan("128x384x64", quant);
+    // The tagged tile is DERIVED, not configured: an exact BF16 shape takes it when its qualified
+    // TuneDB measurement names c8 the winner AND its grid fills every CU AND it is the ladder-cap
+    // chunk (`MAX_CHUNK_MAX` rows). The row restriction is the network-gate boundary — the c8
+    // promotion (TP8 2026-09-04, exact) served the widest chunk; interior buckets such as
+    // `2048x6144x1536` also win in isolation but were never gated in the network, and an
+    // isolated win is not a promotion.
     let c8 = c8.filter(|plan| {
         let blocks = plan.blocks(m, n);
         emit_is_amd()
             && amd_target::active().1 == hwspec::IsaLevel::Gfx950
             && quant == kernelcaps::QuantScheme::None
+            && m == MAX_CHUNK_MAX
             && m.is_multiple_of(plan.bm)
             && n.is_multiple_of(plan.bn)
             && k.is_multiple_of(plan.bk)
             && blocks == n_cu
-            && emit_config::active().gemm_wide_c8_for(m, n, k)
+            && emit_config::active().gemm_wide_c8
             && gfx950_gemm_measurements().variant_is_winner(
                 m as i64,
                 n as i64,
@@ -2640,6 +2648,40 @@ fn emit_xreduce(
         slot,
         None,
     )
+}
+
+/// [`emit_xreduce`] for the decode one-shot with the K3 latent `MoeCombine` folded into the
+/// publish (lever L4, `PLOW_XR_COMBINE_FOLD`): the packet depends on the DOWN producers directly,
+/// carries the `[k, elems]` f32 slot partials in `t1` and `k` in `i7`, and the tagged publish
+/// sums them in the combine's fixed slot order before writing the words. Same gate and sizing
+/// rules as the plain one-shot; `d_xreduce_tag_publish_combine` in `op_collective.h`.
+#[allow(clippy::too_many_arguments)]
+fn emit_xreduce_combine_fold(
+    b: &mut Builder,
+    xgate: &mut u32,
+    xr_cus: &[u32],
+    deps: &[u32],
+    out: u32,
+    xr_elems: u32,
+    tp: u32,
+    slot: u32,
+    part: u32,
+    k: u32,
+) -> u32 {
+    assert!(k > 0, "combine fold needs at least one routed slot");
+    let need = (xr_elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
+    let xr_cus = &xr_cus[..need];
+    let gate = *xgate;
+    *xgate += 1;
+    b.emit(DevOp::XReduce, xr_cus.to_vec(), deps, |d| {
+        d.t[0] = out;
+        d.t[1] = part;
+        d.i[0] = xr_elems;
+        d.i[1] = tp;
+        d.i[2] = slot;
+        d.i[3] = gate;
+        d.i[7] = k;
+    })
 }
 
 /// ONE BAND of a row-banded prefill TP seam: a two-shot all-reduce over `elems` elements of
@@ -5875,6 +5917,25 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                     .map(str::to_string)
             })
             .unwrap_or_default();
+    if model_type == "qwen3_5" {
+        assert!(
+            embed_cubin.is_none() && embed_hsaco.is_none(),
+            "Qwen uses an external paired CUDA interpreter"
+        );
+        qwen35::run(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            block_spec.as_deref(),
+            rope_gen,
+            &arch,
+            &gpu,
+            verify.as_ref(),
+        );
+        return;
+    }
     // PLOW_L2_PLACE is wired only on the dense-GQA path below (b/bd builders). The
     // GLM/Kimi/DeepSeek/Nemotron emitters have their own builders and never call
     // set_l2_placement, so the flag would silently no-op there — say so rather
@@ -5973,6 +6034,14 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             return;
         }
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
+    }
+    if model_type == "glm5_next" {
+        assert!(
+            block_spec.is_none(),
+            "glm5_next currently emits the complete serving model"
+        );
+        mla::glm53_emit_full(&dir, ctx, &out, n_cu, tp, rope_gen, &arch, verify.as_ref());
+        return;
     }
     if model_type == "glm_moe_dsa" {
         // GLM `--block` (M2): single-block
@@ -6220,6 +6289,10 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ATTN_RES",
     "PLOW_DOP_ATTN_SELECT",
     "PLOW_DOP_DENSE_GLU_FP8_BLK",
+    "PLOW_DOP_DSA_POOL_COMPRESS",
+    "PLOW_DOP_DSA_POOL_EXPAND",
+    "PLOW_DOP_DSA_POOL_STASH",
+    "PLOW_DOP_DSA_Q_QUANT",
     "PLOW_DOP_EMBED",
     "PLOW_DOP_FLASH_DECODE",
     "PLOW_DOP_FLASH_DECODE_FP8",
@@ -6252,6 +6325,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_WIDE_FP8",
     "PLOW_DOP_GEMM_WIDE_MXFP4",
     "PLOW_DOP_GEMV",
+    "PLOW_DOP_GEMV_F32",
     "PLOW_DOP_GEMV_FP8",
     "PLOW_DOP_GEMV_FP8_BLK",
     "PLOW_DOP_GEMV_GLU",
@@ -6265,7 +6339,10 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GLU",
     "PLOW_DOP_HEADNORM_ROPE",
     "PLOW_DOP_HEADNORM_ROPE_FP8",
+    "PLOW_DOP_HYPER_CONN_POST",
+    "PLOW_DOP_HYPER_CONN_PRE",
     "PLOW_DOP_INDEX_SCORE",
+    "PLOW_DOP_INDEX_SCORE_KPOOL",
     "PLOW_DOP_INDEX_SELECT",
     "PLOW_DOP_INDEX_SCORE_PF",
     "PLOW_DOP_INDEX_SELECT_PF",
@@ -6908,7 +6985,6 @@ fn emit_dense_gqa(
         b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
         b.set_lean_moe_combine_segments(amd && emit_config::active().moe_combine_lean);
         b.set_moe_prefill_ep_degree((amd && emit_config::active().moe_prefill_ep).then_some(c.tp));
-        b.set_lean_kda_intra_segments(amd && emit_config::active().kda_intra_cached);
         b.set_kda_intra_wave_items_segments(
             amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
                 && emit_config::active().kda_intra_wave_items,
@@ -6926,6 +7002,12 @@ fn emit_dense_gqa(
                 && emit_config::active().kda_chunk_qpre
                 && emit_config::active().kda_carry_regstate,
         );
+        b.set_kda_wu_lean_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().kda_chunk_qpre
+                && (emit_config::active().kda_wu_lean || emit_config::active().kda_carry_keyfeed),
+        );
+        b.set_kda_carry_keyfeed_segments(emit_config::active().kda_carry_keyfeed);
         if amd {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }

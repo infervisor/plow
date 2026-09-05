@@ -266,6 +266,19 @@ fn fused_block_lowers_to_tile_graph() {
     // Same compute skeleton as the unfused path: 7 projections + 1 attention.
     assert_eq!(count_computes(&tg, |k| matches!(k, Compute::Gemm(_))), 7);
     assert_eq!(count_computes(&tg, |k| matches!(k, Compute::Flash(_))), 1);
+    let attention = plan
+        .ops
+        .iter()
+        .find_map(|op| match &op.kind {
+            rewrite::OpKind::Flash(shape) => Some(shape),
+            _ => None,
+        })
+        .expect("fused attention op");
+    assert_eq!(attention.heads, NH);
+    assert_eq!(attention.kv_heads, NKV);
+    assert_eq!(attention.head_dim, HD);
+    assert!(attention.causal);
+    assert_eq!(attention.sliding_window, 0);
 
     // Fusion reached tiling: q/k/v read the *raw block input* `x` directly —
     // their input RMSNorm was folded into the GEMM (FusedNormLinear), so there
@@ -286,16 +299,17 @@ fn fused_block_lowers_to_tile_graph() {
     // Fusion strictly reduced the number of row/elementwise tasks vs. the
     // unfused plan (the standalone norms are gone).
     let raw = plan_from_block(&g, 0).expect("raw plan");
-    let raw_rows = raw
-        .ops
-        .iter()
-        .filter(|o| matches!(o.kind, rewrite::OpKind::Row(_)))
-        .count();
-    let fused_rows = plan
-        .ops
-        .iter()
-        .filter(|o| matches!(o.kind, rewrite::OpKind::Row(_)))
-        .count();
+    // Model-semantic packets (Silu, Add, Mul, RoPE) still use row tiling but
+    // deliberately are not classified as generic Row ops. Compare physical
+    // row work, not the now-meaningful packet-semantic enum split.
+    let row_tiled = |p: &rewrite::LayerPlan| {
+        p.ops
+            .iter()
+            .filter(|o| matches!(o.kind, rewrite::OpKind::Row(_) | rewrite::OpKind::Model(_)))
+            .count()
+    };
+    let raw_rows = row_tiled(&raw);
+    let fused_rows = row_tiled(&plan);
     assert!(
         fused_rows < raw_rows,
         "fusion did not reduce row ops: {fused_rows} vs {raw_rows}"

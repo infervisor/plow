@@ -2418,6 +2418,48 @@ __device__ __forceinline__ void gemv_rows_rs(bf16* __restrict__ C, const bf16* _
         gemv_rows_r<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
 }
 
+/* Guarded so the prefill build digest (`kernelcaps::build::preprocessed_digest`, the tune
+ * store's staleness key) is untouched by a decode-only arm. */
+#ifndef PLOW_KDA_FB_FOLD
+#define PLOW_KDA_FB_FOLD 0
+#endif
+#if PLOW_KDA_FB_FOLD && PLOW_BUCKET_DECODE
+/* CB output columns `n0 + c*nstride` of one bf16 GEMV, each computed EXACTLY as `gemv_rows` /
+ * `gemv_rows_r` compute a column at M=1 — lane L holds the halves at k = chunk*512 + 8L, the
+ * buffer descriptor returns zero past K, `dot8` is seeded at +0.0f, chunks accumulate in order,
+ * then `wave_sum` — with the store left to the caller. The `x` row is read from global rather
+ * than the staged LDS copy; the bits are the same. Callers round with `f2bf` as the GEMV does.
+ * Used by the KDA f_b fold (op_kda.h, PLOW_KDA_FB_FOLD). */
+template <int CB>
+__device__ __forceinline__ void gemv_cols_wave(const bf16* __restrict__ x_,
+                                               const bf16* __restrict__ W_, unsigned K,
+                                               unsigned n0, unsigned nstride, unsigned lane,
+                                               float acc[CB]) {
+    const unsigned step = PLOW_WAVE * 8;
+    const unsigned nchunk = (K + step - 1) / step;
+    const auto* const x = as_glob(x_);
+    const auto* const W = as_glob(W_);
+    __amdgpu_buffer_rsrc_t wr[CB];
+#pragma unroll
+    for (int c = 0; c < CB; c++)
+        wr[c] = PLOW_GV_RSRC(W + (size_t)(n0 + (unsigned)c * nstride) * K, K);
+#pragma unroll
+    for (int c = 0; c < CB; c++) acc[c] = 0.0f;
+    for (unsigned ch = 0; ch < nchunk; ch++) {
+        bf16v8 wv[CB];
+#pragma unroll
+        for (int c = 0; c < CB; c++) wv[c] = buf_ld8(wr[c], (ch * step + lane * 8) * 2u);
+        const unsigned k = ch * step + lane * 8;
+        const unsigned kx = (k < K) ? k : 0u;
+        const bf16v8 xv = ld_glob8(x + kx);
+#pragma unroll
+        for (int c = 0; c < CB; c++) acc[c] += dot8(wv[c], xv, 0.0f);
+    }
+#pragma unroll
+    for (int c = 0; c < CB; c++) acc[c] = wave_sum(acc[c]);
+}
+#endif /* PLOW_KDA_FB_FOLD */
+
 /* ---- OPT-IN (PLOW_GEMV_LG=1): NARROW-K LANE-GROUP bf16 GEMV ----------- [BF16-GEMV-NARROWK-LG]
  *
  * THE SHAPE THIS FIXES, and it is the bf16 twin of `moe_down_lg_fp8_blk` (op_moe.h) one kernel
@@ -3939,6 +3981,57 @@ __device__ __forceinline__ void gemv_qkvg_rows(bf16* __restrict__ Cq_, bf16* __r
 #endif
 #define GV_CHUNK (PLOW_WAVE * 8) /* halves moved by ONE cp_async16: 64 lanes x 8 */
 
+/* ---- CLAIM-AHEAD WEIGHT PREFETCH (-DPLOW_GEMV_PREFETCH=1, decode objects; default OFF) ----
+ * Lever L8. Different from the DMA engine above, and from the three gate-prefetch attempts it
+ * autopsies: nothing here changes how the BODY loads. A workgroup that has claimed a `Gemv`
+ * packet issues that slice's weight rows as `global_load_lds` (no VGPRs, vmcnt-tracked) into a
+ * dead 1 KB slot per wave BEFORE it polls the packet's gate, so the rows are L2-resident when
+ * the body streams them and the per-packet fixed latency (descriptor + first HBM round trip)
+ * is paid under the gate wait instead of after it. Loads only: the body's arithmetic, order
+ * and bytes are untouched, so the result is exact by construction. The interpreter waits
+ * vmcnt(0) after the gate, before any op touches the arena the slots live in.
+ *
+ * `GV_BLOCKED` row ownership (`[slice*per, ...)`) — the same map every bf16 GEMV body uses. */
+#ifndef PLOW_GEMV_PREFETCH
+#define PLOW_GEMV_PREFETCH 0
+#endif
+#if PLOW_GEMV_PREFETCH && !PLOW_BUCKET_DECODE
+#undef PLOW_GEMV_PREFETCH
+#define PLOW_GEMV_PREFETCH 0
+#endif
+#if PLOW_GEMV_PREFETCH
+extern "C" __device__ unsigned plow_gemv_prefetch_1 = 1;
+/* Halves the dead slots occupy at the arena base (one GV_CHUNK per wave). */
+#define GV_PF_HALVES (PLOW_WAVES * GV_CHUNK)
+/* Largest slice (bytes per workgroup) that is prefetched; larger ones run as before. MEASURED
+ * (`runtime/bench/amd/gemv_prefetch_bench.hip`, K3 TP8 shapes): every slice <= 84 KB wins
+ * (o_proj 84 KB: body 9.8 -> 4.9 us; N=7168 K=768 42 KB: 7.7 -> 4.6), the 196 KB latent-up slice
+ * (32 workgroups x 196 KB = 6.3 MB per 4 MB XCD L2) loses even when only its first 96 KB are
+ * issued, so the cut is by slice bytes, not by a per-wave chunk count. 0 = no cap. */
+#ifndef PLOW_GEMV_PF_MAX_BYTES
+#define PLOW_GEMV_PF_MAX_BYTES (128u * 1024u)
+#endif
+__device__ __forceinline__ void gemv_prefetch_slice(const bf16* __restrict__ W_, unsigned N,
+                                                    unsigned K, unsigned slice, unsigned nblk,
+                                                    bf16* __restrict__ dead) {
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned n0 = slice * gv_per;
+    const unsigned n1 = (n0 + gv_per < N) ? (n0 + gv_per) : N;
+    if (n0 >= n1 || (K & 7u)) return;
+    if (PLOW_GEMV_PF_MAX_BYTES && (n1 - n0) * (size_t)K * 2u > (size_t)PLOW_GEMV_PF_MAX_BYTES)
+        return;
+    const auto* const W = as_glob(W_);
+    const unsigned lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
+    bf16* const slot = dead + wave * GV_CHUNK;
+    const unsigned nchunk = (K + GV_CHUNK - 1) / GV_CHUNK;
+    const unsigned total = (n1 - n0) * nchunk; /* (row, chunk) pairs, flattened */
+    for (unsigned g = wave; g < total; g += PLOW_WAVES) {
+        const unsigned row = n0 + g / nchunk, k = (g % nchunk) * GV_CHUNK + lane * 8;
+        if (k < K) cp_async16(W + (size_t)row * K + k, slot);
+    }
+}
+#endif /* PLOW_GEMV_PREFETCH */
+
 #if GV_DMA
 /* LDS the ring needs, in halves. Sits after the staged activation in the GEMM arena. */
 #define GV_RING_HALVES (PLOW_WAVES * GV_RING * GV_CHUNK)
@@ -4550,6 +4643,56 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
 #endif
     if (PLOW_GEMV_WALK) __syncthreads();
   });
+}
+
+/* fp32-OUTPUT GEMV — a small, separate, correctness-first op. NOT a variant of `d_gemv`/
+ * `d_gemv_t` above and must never be folded into that machinery: this codebase's decode
+ * hot path runs at a razor-thin register budget (`d_gemv`'s own header: `check decode`
+ * FAILS above 256 VGPR; the register allocator is "chaotic at this size"), and this op's
+ * one caller (GLM-5.3-Flash's DSA indexer, `index_kpool_compress_gate` projection) is a
+ * `[index_heads]`=32-wide output computed once per indexer token — nowhere near that
+ * path, and not worth threading through its UN/chunk/LDS-staging tuning.
+ *
+ * WHY fp32 output at all, when every other GEMV in this file rounds to bf16: the
+ * reference computes this exact weight in fp32 throughout (`_wp_fp32 = ...weight...
+ * .float()`, `weights = torch.mm(hidden_states.float(), self._wp_fp32)`,
+ * `glm5next_ref/nvidia/attention.py:327-336`) with an explicit comment that a bf16
+ * version "introduce[s] ~1e-2 logit error that flips near-tie pool rankings on hard
+ * long-context tasks" — i.e. this is a documented ACCURACY requirement of the reference
+ * model, not an implementation convenience to optimize away. `IndexScoreKpool` (op 127,
+ * op_attention.h) reads this op's output directly as `const float* W`.
+ *
+ * One wave per output column (grid-strided over N if N > PLOW_WAVES, and over M for a
+ * batched/prefill caller), lanes reduce over K via `wave_sum` — the same "one wave, one
+ * output, `wave_sum`-reduced" shape several other ops in this tree already use for a
+ * narrow N. No LDS staging: x is only ~4096 halves (8 KB) and this op does not run often
+ * enough for the extra vector-load slot to matter the way it does in `d_gemv_t`'s hot
+ * loop.
+ *
+ * VERIFIED on gfx950 hardware (2026-09-01) against an independently-written f64 CPU
+ * reference (no vLLM oracle needed — this is a plain dot product, not a quantization or
+ * exotic-reference algorithm): `runtime/tests/gemv_f32_gfx950_test.hip`, M=3/N=32/K=300
+ * random inputs, **0 mismatches** under a combined absolute+relative tolerance
+ * (atol=2e-4, rtol=1e-4 — a pure-relative check false-positives near zero, where ~3e-6 of
+ * legitimate fp32-vs-f64 reduction-order noise reads as a large relative error against a
+ * true value close to zero from ~300-term cancellation; the absolute differences across
+ * every output stayed under 4e-6). */
+__device__ void d_gemv_f32(float* __restrict__ C, const bf16* __restrict__ x,
+                           const float* __restrict__ W, unsigned M, unsigned N, unsigned K,
+                           unsigned slice, unsigned nblk) {
+    const unsigned wave = threadIdx.x / PLOW_WAVE;
+    const unsigned lane = threadIdx.x % PLOW_WAVE;
+    for (unsigned m = 0; m < M; m++) {
+        const bf16* const xm = x + (size_t)m * K;
+        float* const cm = C + (size_t)m * N;
+        for (unsigned n = slice * PLOW_WAVES + wave; n < N; n += nblk * PLOW_WAVES) {
+            const float* const wn = W + (size_t)n * K;
+            float acc = 0.0f;
+            for (unsigned k = lane; k < K; k += PLOW_WAVE) acc += bf2f(xm[k]) * wn[k];
+            acc = wave_sum(acc);
+            if (lane == 0) cm[n] = acc;
+        }
+    }
 }
 
 /* FP8 decode GEMV. x is staged in LDS when M*K fits (always true at decode M=1), leaving the whole

@@ -135,6 +135,10 @@ impl Ctx<'_> {
 
             // Shape-preserving ops with weight inputs.
             Op::RmsNorm { .. } => {
+                self.expect_arity_range(inputs, 1, 2)?;
+                self.input_shape(inputs, 0)
+            }
+            Op::RmsNormZeroCentered { .. } => {
                 self.expect_arity(inputs, 2)?;
                 self.input_shape(inputs, 0)
             }
@@ -352,9 +356,12 @@ impl Ctx<'_> {
             }
 
             Op::MoeRouter {
-                num_experts, group, ..
+                num_experts,
+                group,
+                correction_bias,
+                ..
             } => {
-                self.expect_arity(inputs, 2)?;
+                self.expect_arity(inputs, if *correction_bias { 3 } else { 2 })?;
                 let x = self.input_shape(inputs, 0)?;
                 if x.rank() == 0 {
                     return Err(self.err("moe_router input must have rank >= 1"));
@@ -381,6 +388,44 @@ impl Ctx<'_> {
                     }
                 }
                 Ok(replace_last(&x, Dim::stat(*num_experts as i64)))
+            }
+
+            Op::MoeExperts { .. } => {
+                self.expect_arity(inputs, 2)?;
+                self.input_shape(inputs, 0)
+            }
+
+            Op::DsaIndexer {
+                num_heads,
+                head_dim,
+                rope_dim,
+                top_k,
+                ..
+            } => {
+                self.expect_arity(inputs, 7)?;
+                let hidden = self.input_shape(inputs, 0)?;
+                if hidden.rank() != 3 {
+                    return Err(self.err("dsa_indexer hidden input must be [B,S,H]"));
+                }
+                if *num_heads == 0 || *head_dim == 0 || *top_k == 0 || *rope_dim > *head_dim {
+                    return Err(self.err("dsa_indexer has invalid head/rope/top-k geometry"));
+                }
+                Ok(replace_last(&hidden, Dim::stat(*top_k as i64)))
+            }
+
+            Op::DsaAttention { top_k, .. } => {
+                self.expect_arity(inputs, 4)?;
+                let q = self.input_shape(inputs, 0)?;
+                let k = self.input_shape(inputs, 1)?;
+                let v = self.input_shape(inputs, 2)?;
+                let indices = self.input_shape(inputs, 3)?;
+                if q.rank() != 4 || k.rank() != 4 || v.rank() != 4 || indices.rank() != 3 {
+                    return Err(self.err("dsa_attention expects q/k/v rank 4 and indices rank 3"));
+                }
+                if indices.dim(2).as_static() != Some(*top_k as i64) {
+                    return Err(self.err("dsa_attention index width does not match top_k"));
+                }
+                Ok(v.clone())
             }
 
             Op::Conv1dDepthwise { kernel } => {
@@ -419,22 +464,22 @@ impl Ctx<'_> {
             }
 
             Op::LinearAttention {
+                kind,
                 num_heads,
                 head_dim,
-                ..
             } => {
                 self.expect_arity(inputs, 7)?;
                 let q = self.input_shape(inputs, 0)?;
                 let k = self.input_shape(inputs, 1)?;
                 let v = self.input_shape(inputs, 2)?;
-                let g = self.input_shape(inputs, 3)?;
+                let gate = self.input_shape(inputs, 3)?;
                 let beta = self.input_shape(inputs, 4)?;
                 let a_log = self.input_shape(inputs, 5)?;
                 let dt_bias = self.input_shape(inputs, 6)?;
                 if q.rank() != 4 {
                     return Err(self.err("linear_attention q must be [B, S, heads, head_dim]"));
                 }
-                for (name, s) in [("k", &k), ("v", &v), ("gate", &g)] {
+                for (name, s) in [("k", &k), ("v", &v)] {
                     if s.rank() != 4 {
                         return Err(
                             self.err(format!("linear_attention {name} must be rank-4 like q"))
@@ -447,12 +492,42 @@ impl Ctx<'_> {
                             q.dim(3)
                         )));
                     }
+                    for axis in 0..3 {
+                        if s.dim(axis).provably_ne(q.dim(axis)) {
+                            return Err(self.err(format!(
+                                "linear_attention {name} axis {axis} differs from q"
+                            )));
+                        }
+                    }
+                }
+                let gate_rank = match kind {
+                    crate::op::LinearAttnKind::KimiDelta => 4,
+                    crate::op::LinearAttnKind::QwenGatedDelta => 3,
+                };
+                if gate.rank() != gate_rank {
+                    return Err(self.err(format!(
+                        "linear_attention gate must be rank {gate_rank} for {kind:?}"
+                    )));
+                }
+                for axis in 0..gate_rank {
+                    if gate.dim(axis).provably_ne(q.dim(axis)) {
+                        return Err(
+                            self.err(format!("linear_attention gate axis {axis} differs from q"))
+                        );
+                    }
                 }
                 // beta is ONE scalar per (token, head) — the delta-rule write
                 // strength. A [B,S,heads,head_dim] beta would be a per-channel
                 // gate, a different model.
                 if beta.rank() != 3 {
                     return Err(self.err("linear_attention beta must be [B, S, heads]"));
+                }
+                for axis in 0..3 {
+                    if beta.dim(axis).provably_ne(q.dim(axis)) {
+                        return Err(
+                            self.err(format!("linear_attention beta axis {axis} differs from q"))
+                        );
+                    }
                 }
                 let hd = req_static(self, q.dim(3), "head_dim")?;
                 if hd != *head_dim as i64 {
@@ -472,12 +547,15 @@ impl Ctx<'_> {
                         q.dim(2)
                     )));
                 }
-                let projection = nh * hd;
+                let dt_width = match kind {
+                    crate::op::LinearAttnKind::KimiDelta => nh * hd,
+                    crate::op::LinearAttnKind::QwenGatedDelta => nh,
+                };
                 if dt_bias.rank() != 1
-                    || req_static(self, dt_bias.dim(0), "dt_bias width")? != projection
+                    || req_static(self, dt_bias.dim(0), "dt_bias width")? != dt_width
                 {
                     return Err(self.err(format!(
-                        "linear_attention dt_bias shape {dt_bias} must be [num_heads * head_dim = {projection}]"
+                        "linear_attention dt_bias shape {dt_bias} must have width {dt_width}"
                     )));
                 }
                 // The KDA state is square ([head_dim, head_dim]), so the output

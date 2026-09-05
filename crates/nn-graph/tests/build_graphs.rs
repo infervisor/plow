@@ -29,6 +29,405 @@ fn output_shape_str(g: &Graph) -> String {
     shape.display_with(&g.syms)
 }
 
+fn qwen35_json() -> &'static str {
+    r#"{
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "vocab_size": 500,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "layer_types": [
+                "linear_attention", "linear_attention",
+                "linear_attention", "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 16,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 6,
+            "linear_value_head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 0.25,
+                "rope_type": "default",
+                "mrope_interleaved": true
+            },
+            "attention_bias": false,
+            "attn_output_gate": true,
+            "hidden_act": "silu",
+            "mamba_ssm_dtype": "float32",
+            "output_gate_type": "swish",
+            "tie_word_embeddings": false,
+            "dtype": "bfloat16"
+        }
+    }"#
+}
+
+#[test]
+fn qwen35_hybrid_decoder() {
+    let g = build_text_generation_from_config_json_at(qwen35_json(), &ShapeBucket::default())
+        .expect("build Qwen3.5/3.8 text decoder");
+    assert_fully_inferred(&g);
+    assert_eq!(output_shape_str(&g), "[B, S, 500]");
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. })),
+        1
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(
+            o,
+            nn_graph::Op::LinearAttention {
+                kind: nn_graph::LinearAttnKind::QwenGatedDelta,
+                ..
+            }
+        )),
+        3
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::Conv1dDepthwise { kernel: 4 })),
+        3
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::RmsNormZeroCentered { .. })),
+        11
+    );
+
+    let rotary_dims: Vec<u32> = g
+        .nodes
+        .iter()
+        .filter_map(|n| match n.op {
+            nn_graph::Op::Rope { dim, .. } => Some(dim),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rotary_dims, vec![8, 8]);
+}
+
+#[test]
+fn qwen25_uses_qkv_bias_without_qk_norm() {
+    let cfg = r#"{
+        "architectures":["Qwen2ForCausalLM"], "model_type":"qwen2",
+        "vocab_size":64, "hidden_size":32, "intermediate_size":64,
+        "num_hidden_layers":1, "num_attention_heads":4,
+        "num_key_value_heads":2, "rms_norm_eps":1e-6,
+        "rope_theta":1000000.0, "use_sliding_window":false,
+        "tie_word_embeddings":false, "torch_dtype":"bfloat16"
+    }"#;
+    let graph = build_text_generation_from_config_json_at(cfg, &ShapeBucket::default())
+        .expect("build Qwen2.5 decoder");
+    assert_fully_inferred(&graph);
+    let weights = graph
+        .checkpoint_manifest()
+        .into_iter()
+        .map(|weight| weight.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(weights.len(), 15);
+    for name in [
+        "model.layers.0.self_attn.q_proj.bias",
+        "model.layers.0.self_attn.k_proj.bias",
+        "model.layers.0.self_attn.v_proj.bias",
+    ] {
+        assert!(weights.contains(name), "missing Qwen2.5 tensor {name}");
+    }
+    assert!(!weights.iter().any(|name| name.ends_with("q_norm.weight")));
+    assert!(!weights.iter().any(|name| name.ends_with("k_norm.weight")));
+}
+
+#[test]
+fn qwen2_sliding_window_fails_closed() {
+    let cfg = r#"{
+        "model_type":"qwen2", "use_sliding_window":true,
+        "vocab_size":64, "hidden_size":32, "intermediate_size":64,
+        "num_hidden_layers":1, "num_attention_heads":4,
+        "num_key_value_heads":2
+    }"#;
+    let error = build_text_generation_from_config_json_at(cfg, &ShapeBucket::default())
+        .expect_err("unsupported Qwen2 sliding attention must not become full attention");
+    assert!(error.to_string().contains("sliding-window attention"));
+}
+
+#[test]
+fn qwen35_weight_manifest_matches_target_checkpoint_layout() {
+    let g = build_text_generation_from_config_json_at(qwen35_json(), &ShapeBucket::default())
+        .expect("build Qwen3.5/3.8 text decoder");
+    let manifest = g.weight_manifest();
+    assert_eq!(manifest.len(), 56);
+    let find = |name: &str| {
+        manifest
+            .iter()
+            .find(|w| w.name == name)
+            .unwrap_or_else(|| panic!("missing Qwen3.5 weight {name}"))
+    };
+
+    for (name, shape) in [
+        ("model.language_model.embed_tokens.weight", "[500, 128]"),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "[160, 128]",
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.conv1d.weight",
+            "[160, 1, 4]",
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+            "[96, 128]",
+        ),
+        ("model.language_model.layers.0.linear_attn.A_log", "[6]"),
+        ("model.language_model.layers.0.linear_attn.dt_bias", "[6]"),
+        (
+            "model.language_model.layers.0.linear_attn.norm.weight",
+            "[16]",
+        ),
+        (
+            "model.language_model.layers.3.self_attn.q_proj.weight",
+            "[256, 128]",
+        ),
+        (
+            "model.language_model.layers.3.self_attn.k_proj.weight",
+            "[32, 128]",
+        ),
+        ("lm_head.weight", "[500, 128]"),
+    ] {
+        let w = find(name);
+        assert_eq!(w.shape.unwrap().display_with(&g.syms), shape, "{name}");
+        assert_eq!(w.dtype, nn_graph::DType::BF16, "{name}");
+    }
+}
+
+#[test]
+fn qwen35_missing_geometry_is_rejected() {
+    let cfg = qwen35_json().replace("\"linear_value_head_dim\": 16,", "");
+    let err = build_text_generation_from_config_json_at(&cfg, &ShapeBucket::default())
+        .expect_err("required geometry must not default");
+    assert!(
+        err.to_string().contains("linear_value_head_dim"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn qwen35_multimodal_graph_is_not_silently_reduced_to_text() {
+    let with_vision = qwen35_json().replace(
+        "\"text_config\": {",
+        "\"vision_config\": {\"model_type\": \"qwen3_5\"}, \"text_config\": {",
+    );
+    let err = build_from_config_json(&with_vision).expect_err("vision tower is not implemented");
+    assert!(err.to_string().contains("multimodal graph"), "{err}");
+}
+
+fn qwen38_27b_config() -> String {
+    let layer_types = (0..64)
+        .map(|layer| {
+            if layer % 4 == 3 {
+                "\"full_attention\""
+            } else {
+                "\"linear_attention\""
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{
+          "architectures": ["Qwen3_5ForConditionalGeneration"],
+          "language_model_only": false,
+          "model_type": "qwen3_5",
+          "text_config": {{
+            "model_type": "qwen3_5_text",
+            "vocab_size": 248320, "hidden_size": 5120,
+            "intermediate_size": 17408, "num_hidden_layers": 64,
+            "num_attention_heads": 24, "num_key_value_heads": 4,
+            "head_dim": 256, "layer_types": [{layer_types}],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128, "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48, "linear_value_head_dim": 128,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {{
+              "rope_theta": 10000000.0, "partial_rotary_factor": 0.25,
+              "rope_type": "default", "mrope_interleaved": true
+            }},
+            "attention_bias": false, "attn_output_gate": true,
+            "hidden_act": "silu", "mamba_ssm_dtype": "float32",
+            "output_gate_type": "swish", "tie_word_embeddings": false,
+            "dtype": "bfloat16"
+          }},
+          "vision_config": {{"model_type": "qwen3_5"}}
+        }}"#
+    )
+}
+
+#[test]
+fn qwen38_27b_exact_text_manifest_contract() {
+    let cfg = qwen38_27b_config();
+    let g = build_text_generation_from_config_json_at(&cfg, &ShapeBucket::default())
+        .expect("build exact Qwen3.8-27B text endpoint");
+    assert_fully_inferred(&g);
+    assert_eq!(output_shape_str(&g), "[B, S, 248320]");
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. })),
+        16
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(
+            o,
+            nn_graph::Op::LinearAttention {
+                kind: nn_graph::LinearAttnKind::QwenGatedDelta,
+                ..
+            }
+        )),
+        48
+    );
+
+    let manifest = g.weight_manifest();
+    assert_eq!(manifest.len(), 851);
+    assert_eq!(
+        manifest
+            .iter()
+            .filter(|w| w.name.starts_with("model.language_model."))
+            .count(),
+        850
+    );
+    assert_eq!(
+        manifest
+            .iter()
+            .filter(|w| w.name == "lm_head.weight")
+            .count(),
+        1
+    );
+    assert!(manifest
+        .iter()
+        .all(|w| !w.name.contains("model.visual") && !w.name.contains(".mtp.")));
+}
+
+#[test]
+fn qwen38_27b_fp8_outer_metadata_and_scale_manifest() {
+    let mut cfg: serde_json::Value = serde_json::from_str(&qwen38_27b_config()).unwrap();
+    let mut ignored = vec![serde_json::Value::String("lm_head".into())];
+    for layer in 0..64 {
+        if layer % 4 != 3 {
+            for projection in ["in_proj_a", "in_proj_b"] {
+                ignored.push(serde_json::Value::String(format!(
+                    "model.language_model.layers.{layer}.linear_attn.{projection}"
+                )));
+            }
+        }
+    }
+    cfg["quantization_config"] = serde_json::json!({
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "modules_to_not_convert": ignored,
+        "weight_block_size": [128, 128]
+    });
+
+    let g = build_text_generation_from_config_json_at(&cfg.to_string(), &ShapeBucket::default())
+        .expect("build official Qwen3.8-27B-FP8 text endpoint metadata");
+    assert_eq!(g.weight_manifest().len(), 851);
+
+    let checkpoint = g.checkpoint_manifest();
+    assert_eq!(checkpoint.len(), 1251);
+    assert_eq!(g.fp8_scale_bindings.len(), 400);
+    assert!(g.fp8_scale_bindings.iter().all(|binding| {
+        binding.block_shape == [128, 128]
+            && binding.scale == binding.weight.replace(".weight", ".weight_scale_inv")
+    }));
+    assert_eq!(
+        checkpoint
+            .iter()
+            .filter(|w| w.dtype == nn_graph::DType::F8E4M3)
+            .count(),
+        400
+    );
+    assert_eq!(
+        checkpoint
+            .iter()
+            .filter(|w| w.dtype == nn_graph::DType::BF16)
+            .count(),
+        451
+    );
+    assert_eq!(
+        checkpoint
+            .iter()
+            .filter(|w| w.name.ends_with(".weight_scale_inv"))
+            .count(),
+        400
+    );
+    assert!(checkpoint
+        .iter()
+        .filter(|w| w.name.ends_with(".weight_scale_inv"))
+        .all(|w| w.dtype == nn_graph::DType::F32));
+
+    let find = |name: &str| {
+        checkpoint
+            .iter()
+            .find(|w| w.name == name)
+            .unwrap_or_else(|| panic!("missing FP8 checkpoint tensor {name}"))
+    };
+    assert_eq!(find("lm_head.weight").dtype, nn_graph::DType::BF16);
+    assert_eq!(
+        find("model.language_model.layers.0.linear_attn.in_proj_a.weight").dtype,
+        nn_graph::DType::BF16
+    );
+    assert_eq!(
+        find("model.language_model.layers.0.linear_attn.in_proj_qkv.weight").dtype,
+        nn_graph::DType::F8E4M3
+    );
+    assert_eq!(
+        find("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv")
+            .shape
+            .unwrap()
+            .display_with(&g.syms),
+        "[80, 40]"
+    );
+    assert_eq!(
+        find("model.language_model.layers.3.self_attn.q_proj.weight_scale_inv")
+            .shape
+            .unwrap()
+            .display_with(&g.syms),
+        "[96, 40]"
+    );
+}
+
+#[test]
+fn qwen35_semantic_near_variants_are_rejected() {
+    for (from, to, expected) in [
+        (
+            "\"hidden_act\": \"silu\"",
+            "\"hidden_act\": \"gelu\"",
+            "hidden_act",
+        ),
+        (
+            "\"mamba_ssm_dtype\": \"float32\"",
+            "\"mamba_ssm_dtype\": \"bfloat16\"",
+            "mamba_ssm_dtype",
+        ),
+        (
+            "\"attn_output_gate\": true",
+            "\"attn_output_gate\": false",
+            "attn_output_gate",
+        ),
+        (
+            "\"linear_num_value_heads\": 6",
+            "\"linear_num_value_heads\": 5",
+            "divisible",
+        ),
+    ] {
+        let cfg = qwen35_json().replace(from, to);
+        let err = build_text_generation_from_config_json_at(&cfg, &ShapeBucket::default())
+            .expect_err("unsupported semantic variant must fail closed");
+        assert!(
+            err.to_string().contains(expected),
+            "unexpected error: {err}"
+        );
+    }
+}
+
 #[test]
 fn gemma_decoder() {
     let cfg = r#"{
@@ -135,7 +534,10 @@ fn deepseek_without_q_lora() {
         "n_shared_experts": 0,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 64,
-        "first_k_dense_replace": 1
+        "first_k_dense_replace": 1,
+        "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+        "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+        "routed_scaling_factor": 2.827
     }"#;
     let g = build_from_config_json(cfg).expect("build deepseek-lite");
     assert_fully_inferred(&g);
@@ -236,6 +638,95 @@ fn gemma4_unified_per_layer_attention() {
 }
 
 #[test]
+fn gemma4_text_manifest_matches_official_projection_layout() {
+    let cfg = r#"{
+        "model_type": "gemma4",
+        "dtype": "bfloat16",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "vocab_size": 1000,
+            "hidden_size": 5376,
+            "intermediate_size": 512,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_global_key_value_heads": 1,
+            "head_dim": 64,
+            "global_head_dim": 128,
+            "attention_k_eq_v": true,
+            "tie_word_embeddings": true,
+            "final_logit_softcapping": 30.0,
+            "use_qk_norm": true,
+            "sliding_window": 512,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "rope_parameters": {
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional"
+                },
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+            }
+        }
+    }"#;
+    let g = build_text_generation_from_config_json_at(cfg, &ShapeBucket::default())
+        .expect("build Gemma 4 text tower");
+    let weights = g
+        .checkpoint_manifest()
+        .into_iter()
+        .map(|weight| weight.name)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for name in [
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.layers.0.self_attn.k_proj.weight",
+        "model.language_model.layers.0.self_attn.v_proj.weight",
+        "model.language_model.layers.0.layer_scalar",
+        "model.language_model.layers.1.self_attn.k_proj.weight",
+        "model.language_model.layers.1.layer_scalar",
+        "model.language_model.norm.weight",
+    ] {
+        assert!(weights.contains(name), "missing checkpoint tensor {name}");
+    }
+    assert!(!weights.contains("model.language_model.layers.1.self_attn.v_proj.weight"));
+    assert!(!weights.iter().any(|name| name.contains("kv_proj")));
+    assert!(!weights.contains("lm_head.weight"));
+
+    let weightless_norms = g
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.op, nn_graph::Op::RmsNorm { .. }) && node.inputs.len() == 1)
+        .count();
+    assert_eq!(weightless_norms, 2, "Gemma 4 normalizes V without a weight");
+
+    let rope_dims = g
+        .nodes
+        .iter()
+        .filter_map(|node| match node.op {
+            nn_graph::Op::Rope {
+                dim, frequency_dim, ..
+            } => Some((dim, frequency_dim)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rope_dims, vec![(64, 64), (64, 64), (32, 128), (32, 128)]);
+
+    let scales = g
+        .nodes
+        .iter()
+        .filter_map(|node| match node.op {
+            nn_graph::Op::Scale(scale) => Some(scale),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(scales, vec![73.5, 1.0 / 30.0, 30.0]);
+    assert_eq!(
+        g.count_ops(|op| matches!(op, nn_graph::Op::Act(nn_graph::ActKind::Tanh))),
+        1
+    );
+}
+
+#[test]
 fn qwen_image_vae_encoder() {
     let cfg = r#"{
         "_class_name": "AutoencoderKLQwenImage",
@@ -294,7 +785,8 @@ fn qwen_image_dit_mmdit() {
 
 #[test]
 fn gemma4_multimodal_dense() {
-    // Full multimodal Gemma 4: vision encoder + projector + text decoder.
+    // Full multimodal Gemma 4 is refused until its exact vision checkpoint
+    // contract is implemented. The endpoint-specific text frontend remains valid.
     let cfg = r#"{
         "model_type": "gemma4_unified",
         "vision_config": {
@@ -328,37 +820,24 @@ fn gemma4_multimodal_dense() {
             "layer_types": ["sliding_attention", "full_attention"]
         }
     }"#;
-    let g = build_from_config_json(cfg).expect("build gemma4 multimodal");
-    assert_fully_inferred(&g);
+    let error = build_from_config_json(cfg).unwrap_err().to_string();
+    assert!(error.contains("vision graph is not implemented"), "{error}");
 
-    // Vision: 56/14 = 4 patches per side → 16 patches total.
-    // Combined output: logits [B, 16+S, 500] (image tokens + text tokens).
-    let out_str = output_shape_str(&g);
-    assert!(
-        out_str.contains("500"),
-        "expected vocab dim 500 in output, got: {out_str}"
-    );
-
-    // Vision encoder has 2 attention layers (non-causal).
-    // Text decoder has 2 attention layers (causal).
-    let attn_count = g.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. }));
+    let text = build_text_generation_from_config_json_at(cfg, &ShapeBucket::default())
+        .expect("build Gemma 4 text-generation graph");
+    assert_fully_inferred(&text);
     assert_eq!(
-        attn_count, 4,
-        "expected 4 attention ops (2 vision + 2 text)"
+        text.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. })),
+        2
     );
-
-    // One conv2d for patch embedding.
-    assert_eq!(g.count_ops(|o| matches!(o, nn_graph::Op::Conv2d { .. })), 1);
-
-    // No MoE routers (dense model).
     assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
+        text.count_ops(|o| matches!(o, nn_graph::Op::Conv2d { .. })),
         0
     );
 }
 
 #[test]
-fn gemma4_multimodal_moe() {
+fn gemma4_multimodal_moe_fails_closed() {
     // Multimodal with MoE text decoder.
     let cfg = r#"{
         "model_type": "gemma4_unified",
@@ -394,23 +873,13 @@ fn gemma4_multimodal_moe() {
             "sliding_window": 256
         }
     }"#;
-    let g = build_from_config_json(cfg).expect("build gemma4 multimodal moe");
-    assert_fully_inferred(&g);
-
-    // 1 MoE layer ⇒ 1 router.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
-        1
-    );
-    // Vision (1 layer) + text (2 layers) = 3 attention ops.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. })),
-        3
-    );
+    let error = build_from_config_json(cfg).unwrap_err().to_string();
+    assert!(error.contains("Gemma 4 MoE"), "{error}");
+    assert!(error.contains("refusing"), "{error}");
 }
 
 #[test]
-fn gemma4_moe_sparse() {
+fn gemma4_moe_sparse_fails_closed() {
     // Gemma 4 MoE (gemma-4-26B-A4B style): some layers use MoE FFN, others dense.
     // Uses `moe_sliding_attention` / `moe_full_attention` in layer_types.
     let cfg = r#"{
@@ -441,34 +910,12 @@ fn gemma4_moe_sparse() {
             "sliding_attention": {"rope_theta": 10000.0}
         }
     }"#;
-    let g = build_from_config_json(cfg).expect("build gemma4 moe");
-    assert_fully_inferred(&g);
-    assert_eq!(output_shape_str(&g), "[B, S, 1000]");
-
-    // 2 out of 4 layers are MoE ⇒ 2 routers.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
-        2
-    );
-    // All 4 layers still have attention.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. })),
-        4
-    );
-    // Per-layer head dims: sliding layers use 64, global layers use 128.
-    let head_dims: Vec<u32> = g
-        .nodes
-        .iter()
-        .filter_map(|n| match n.op {
-            nn_graph::Op::Attention { head_dim, .. } => Some(head_dim),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(head_dims, vec![64, 64, 128, 128]);
+    let error = build_from_config_json(cfg).unwrap_err().to_string();
+    assert!(error.contains("Gemma 4 MoE"), "{error}");
 }
 
 #[test]
-fn gemma4_moe_all_layers() {
+fn gemma4_moe_all_layers_fails_closed() {
     // All layers MoE (simpler variant: no layer_types, all layers become MoE).
     let cfg = r#"{
         "model_type": "gemma4_unified_text",
@@ -485,15 +932,8 @@ fn gemma4_moe_all_layers() {
         "num_experts_per_tok": 1,
         "sliding_window_pattern": 1
     }"#;
-    let g = build_from_config_json(cfg).expect("build gemma4 all-moe");
-    assert_fully_inferred(&g);
-    assert_eq!(output_shape_str(&g), "[B, S, 500]");
-
-    // Both layers are MoE ⇒ 2 routers.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
-        2
-    );
+    let error = build_from_config_json(cfg).unwrap_err().to_string();
+    assert!(error.contains("Gemma 4 MoE"), "{error}");
 }
 
 #[test]
@@ -660,6 +1100,8 @@ fn glm_moe_dsa() {
         "num_key_value_heads": 4,
         "head_dim": 48,
         "rms_norm_eps": 1e-5,
+        "attention_bias": false,
+        "hidden_act": "silu",
         "q_lora_rank": 96,
         "kv_lora_rank": 64,
         "qk_head_dim": 64,
@@ -673,15 +1115,28 @@ fn glm_moe_dsa() {
         "n_shared_experts": 1,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 128,
+        "norm_topk_prob": true,
+        "routed_scaling_factor": 2.5,
+        "n_group": 1,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "moe_router_dtype": "float32",
         "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
         "indexer_types": ["full", "full", "full", "shared"],
         "index_head_dim": 32,
         "index_n_heads": 4,
         "index_topk": 64,
+        "index_topk_freq": 4,
+        "indexer_rope_interleave": true,
         "index_skip_topk_offset": 3,
         "num_nextn_predict_layers": 1,
+        "index_share_for_mtp_iteration": true,
         "scoring_func": "sigmoid",
-        "torch_dtype": "bfloat16"
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+          "activation_scheme":"dynamic", "fmt":"e4m3", "quant_method":"fp8",
+          "weight_block_size":[128,128]
+        }
     }"#;
     let g = build_from_config_json(cfg).expect("build glm");
     assert_fully_inferred(&g);
@@ -689,17 +1144,17 @@ fn glm_moe_dsa() {
     // Primary output: logits [B, S, vocab].
     assert_eq!(output_shape_str(&g), "[B, S, 1000]");
 
-    // MoE layers 1,2,3 ⇒ 3 routers.
+    // Base MoE layers 1,2,3 plus sparse MTP layer 4.
     assert_eq!(
         g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
-        3
-    );
-    // MLA broadcast of the shared rotary key: once per layer.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::Broadcast { .. })),
         4
     );
-    // Interleaved RoPE: 2 per layer (q + k) = 8 total.
+    // MLA broadcast of the shared rotary key: once per base/MTP layer.
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::Broadcast { .. })),
+        5
+    );
+    // Interleaved main RoPE: 2 per base/MTP layer = 10 total.
     let rope_count = g.count_ops(|o| {
         matches!(
             o,
@@ -709,7 +1164,33 @@ fn glm_moe_dsa() {
             }
         )
     });
-    assert_eq!(rope_count, 8);
+    assert_eq!(rope_count, 10);
+
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::DsaIndexer { .. })),
+        4
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::DsaAttention { .. })),
+        5
+    );
+    assert_eq!(g.expert_bindings.len(), 4);
+    assert!(g
+        .expert_bindings
+        .iter()
+        .all(|binding| binding.routed_experts.len() == 8));
+    assert_eq!(g.fp8_scale_bindings.len(), 144);
+    assert_eq!(g.checkpoint_manifest().len(), 335);
+    let names: std::collections::BTreeSet<_> = g
+        .checkpoint_manifest()
+        .into_iter()
+        .map(|weight| weight.name)
+        .collect();
+    assert!(names.contains("model.layers.0.self_attn.indexer.wq_b.weight"));
+    assert!(names.contains("model.layers.3.mlp.experts.7.down_proj.weight_scale_inv"));
+    assert!(names.contains("model.layers.4.eh_proj.weight"));
+    assert!(names.contains("model.layers.4.shared_head.norm.weight"));
+    assert!(!names.iter().any(|name| name.starts_with("mtp_heads.")));
 
     // Multi-token prediction: 2 outputs total (main + 1 MTP head).
     assert_eq!(g.outputs.len(), 2);
@@ -727,17 +1208,33 @@ fn glm_architecture_detection() {
         "num_attention_heads": 4,
         "num_key_value_heads": 4,
         "head_dim": 32,
+        "rms_norm_eps": 1e-5,
+        "attention_bias": false,
+        "hidden_act": "silu",
         "q_lora_rank": 48,
         "kv_lora_rank": 32,
         "qk_head_dim": 40,
         "qk_nope_head_dim": 32,
         "qk_rope_head_dim": 8,
         "v_head_dim": 32,
+        "rope_interleave": true,
+        "rope_parameters": {"rope_theta":8000000.0,"rope_type":"default"},
         "n_routed_experts": 4,
         "n_shared_experts": 0,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 64,
-        "first_k_dense_replace": 1
+        "first_k_dense_replace": 1,
+        "mlp_layer_types":["dense"],
+        "scoring_func":"sigmoid", "routed_scaling_factor":2.5,
+        "norm_topk_prob":true, "n_group":1, "topk_group":1,
+        "topk_method":"noaux_tc", "moe_router_dtype":"float32",
+        "indexer_types":["full"], "index_head_dim":16,
+        "index_n_heads":2, "index_topk":16, "index_topk_freq":4,
+        "indexer_rope_interleave":true, "index_skip_topk_offset":1,
+        "num_nextn_predict_layers":0, "index_share_for_mtp_iteration":true,
+        "dtype":"bfloat16",
+        "quantization_config":{"activation_scheme":"dynamic","fmt":"e4m3",
+          "quant_method":"fp8","weight_block_size":[128,128]}
     }"#;
     let g = build_from_config_json(cfg).expect("build glm via architectures[]");
     assert_fully_inferred(&g);
@@ -770,7 +1267,10 @@ fn kimi_k2_mla_moe() {
         "n_shared_experts": 1,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 64,
-        "first_k_dense_replace": 1
+        "first_k_dense_replace": 1,
+        "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+        "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+        "routed_scaling_factor": 2.827
     }"#;
     let g = build_from_config_json(cfg).expect("build kimi k2");
     assert_fully_inferred(&g);

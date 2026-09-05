@@ -3,6 +3,8 @@
 # END-TO-END step_bench TPOT. Implements perf-data/tuner-decode-sweep-design.md.
 #
 #   scripts/tune_decode_sweep.sh [options]
+#   Add --block L --block-bucket 128 --block-run /path/to/block_run for
+#   single-layer rankings using the same paired packet/kernel knob grid.
 #
 # WHY BASH AND NOT `plowc tune`. The job is cross-toolchain subprocess
 # orchestration and nothing else: nvcc must run under `env -i` (nix's CPATH
@@ -101,6 +103,9 @@ WORK=/dev/shm/plowtune/sweep
 RESULTS="$ROOT/perf-data/tune-decode-h100-26b-bf16.jsonl"
 PLOWC=""
 STEP_BENCH=""
+BLOCK=""
+BLOCK_RUN=""
+BLOCK_BUCKET=128
 OCC="1:132 2:264"
 NS_ABS="8 16 32 48"
 GV_UNROLL="8"
@@ -188,6 +193,9 @@ while [ $# -gt 0 ]; do
     --results) RESULTS="$2"; shift 2;;
     --plowc) PLOWC="$2"; shift 2;;
     --step-bench) STEP_BENCH="$2"; shift 2;;
+    --block) BLOCK="$2"; shift 2;;
+    --block-run) BLOCK_RUN="$2"; shift 2;;
+    --block-bucket) BLOCK_BUCKET="$2"; shift 2;;
     --occ) OCC="$2"; shift 2;;
     --ns-abs) NS_ABS="$2"; shift 2;;
     --gv-unroll) GV_UNROLL="$2"; shift 2;;
@@ -230,10 +238,10 @@ done
 # name cuobjdump prints registers for; getting it wrong yields an empty register
 # column rather than an error, so it is derived here and not guessed per-call.
 case "$ARCH" in
-  sm90a)  BUILD_SH=build_sm90a_cubin.sh; CUBIN=interp_sm90a.cubin
+  sm90a)  BUILD_SH=build_sm90a_cubin.sh; CUBIN=interp_sm90a.cubin; EMIT_ARCH=sm_90a
           CUBIN_PF=interp_sm90a_pf.cubin; KSYM='interp_sm90a11PlowProgram'
           DEF_HW="nvidia/sm_90a/h100-nvl"; DEF_GPU="H100 NVL";;
-  sm120a) BUILD_SH=build_sm120_cubin.sh; CUBIN=interp_sm120.cubin
+  sm120a) BUILD_SH=build_sm120_cubin.sh; CUBIN=interp_sm120.cubin; EMIT_ARCH=sm_120a
           CUBIN_PF=interp_sm120_pf.cubin; KSYM='interp_sm12011PlowProgram'
           DEF_HW="nvidia/sm_120a/rtx-5090"; DEF_GPU="RTX 5090";;
   *) echo "unknown --arch $ARCH (want sm90a|sm120a)" >&2; exit 2;;
@@ -255,13 +263,28 @@ case "$HARDWARE:$SMS" in
      exit 2;;
 esac
 
+for occupancy in $OCC; do
+  [[ "$occupancy" =~ ^[1-9][0-9]*:[1-9][0-9]*$ ]] || {
+    echo "--occ expects blocks-per-SM:grid pairs, e.g. 1:132 on H100" >&2; exit 2;
+  }
+done
+
 [ -n "$PLOWC" ] || PLOWC="$ROOT/target/release/plowc"
 [ -n "$STEP_BENCH" ] || STEP_BENCH="$ROOT/target/release/examples/step_bench"
+[ -n "$BLOCK_RUN" ] || BLOCK_RUN="$ROOT/target/release/examples/block_run"
+if [ -n "$BLOCK" ]; then
+  [[ "$BLOCK" =~ ^(0|[1-9][0-9]*)$ && "$BLOCK_BUCKET" =~ ^[1-9][0-9]*$ ]] || {
+    echo "--block requires one layer index and --block-bucket a positive row count" >&2; exit 2;
+  }
+  [ -x "$BLOCK_RUN" ] || { echo "no block_run at $BLOCK_RUN" >&2; exit 2; }
+fi
 [ -n "$MEM_RUN" ] || MEM_RUN="$MEM_IDLE"
 [ -n "$CHECKPOINT" ] || CHECKPOINT="$MODEL"
 [ -n "$MODEL_NAME" ] || MODEL_NAME="$(basename "$MODEL")"
 [ -x "$PLOWC" ] || { echo "no plowc at $PLOWC (--plowc)" >&2; exit 2; }
-[ -x "$STEP_BENCH" ] || { echo "no step_bench at $STEP_BENCH (--step-bench)" >&2; exit 2; }
+if [ -z "$BLOCK" ]; then
+  [ -x "$STEP_BENCH" ] || { echo "no step_bench at $STEP_BENCH (--step-bench)" >&2; exit 2; }
+fi
 [ -d "$MODEL" ] || { echo "no model dir $MODEL" >&2; exit 2; }
 
 # The lease helper lives in the repo. Calling it bare assumed it was on PATH,
@@ -290,9 +313,9 @@ mkdir -p "$WORK/cubin" "$WORK/pkt" "$WORK/assets" "$WORK/log" "$(dirname "$RESUL
 touch "$RESULTS"
 
 TOOLCHAIN="$(/usr/local/cuda/bin/nvcc --version | sed -n 's/.*release \([0-9.]*\).*/cuda-\1/p' | head -1)"
-IMPL="$(cat "$ROOT"/runtime/nvidia/interp_sm120.cu "$ROOT"/runtime/nvidia/interp_sm90a.cu \
-        "$ROOT"/runtime/nvidia/op_gemm.cuh "$ROOT"/runtime/nvidia/op_moe.cuh \
-        "$ROOT"/runtime/nvidia/op_attention.cuh 2>/dev/null | sha256sum | cut -c1-16)"
+IMPL="$(rg --files "$ROOT/runtime/nvidia" "$ROOT/runtime/common" \
+        -g '*.cu' -g '*.cuh' -g '*.c' -g '*.h' | LC_ALL=C sort | \
+        while IFS= read -r source_file; do cat "$source_file"; done | sha256sum | cut -c1-16)"
 
 echo "root       : $ROOT"
 echo "model      : $MODEL"
@@ -390,7 +413,7 @@ extra_json() {
 # $1 defines, $2 "" | "abl"  -> echoes dir
 build_cubin() {
   local defs="$1" kind="${2:-}"
-  local key; key="$(printf '%s|%s' "$defs" "$kind" | sha256sum | cut -c1-16)"
+  local key; key="$(printf '%s|%s|%s' "$defs" "$kind" "$IMPL" | sha256sum | cut -c1-16)"
   local dir="$WORK/cubin/$key"
   if [ -f "$dir/$CUBIN" ] && [ -f "$dir/$CUBIN_PF" ]; then
     echo "$dir"; return 0
@@ -429,13 +452,15 @@ emit_packet() {  # $1 n_cu  $2 ns_abs  $3 ns_full_abs  $4 batch  $5 gf_full -> e
   # GF_FULL likewise: the emitter sizes nsplit from `n_grp = heads/GF_FULL`, so
   # a packet built for one GF against an object built for another measures the
   # mismatch. It is a PAIR, like (FORCE_MINBLK, --n-cu).
-  local key="ncu${ncu}_ns${ns}_nsf${nsf}_b${bsz}_gff${gff:-d}"
+  local key="${ARCH}_ncu${ncu}_ns${ns}_nsf${nsf}_b${bsz}_gff${gff:-d}"
+  [ -z "$BLOCK" ] || key="${key}_block${BLOCK}_pf${BLOCK_BUCKET}"
   local dir="$WORK/pkt/$key"
   if [ -f "$dir/model.pkt" ]; then echo "$dir"; return 0; fi
   mkdir -p "$dir"
   echo "  [emit ] $key" >&2
-  if [ "$DRY" = "1" ]; then echo "$dir"; return 0; fi
   local env_kv=(PLOW_UNISEG=1 PLOW_DECODE_BATCH="$bsz")
+  # Qwen consumes its explicit bucket selector; dense emitters use --batch below.
+  [ -z "$BLOCK" ] || env_kv+=(PLOW_QWEN_PREFILL="$BLOCK_BUCKET")
   [ -z "$gff" ] || env_kv+=(PLOW_FA_GF_FULL="$gff")
   [ "$DTYPE" = "fp8" ] && env_kv+=(PLOW_FP8=1)
   [ "$ns" = "0" ] || env_kv+=(PLOW_NS_ABS="$ns")
@@ -445,9 +470,20 @@ emit_packet() {  # $1 n_cu  $2 ns_abs  $3 ns_full_abs  $4 batch  $5 gf_full -> e
   [ "$nsf" = "0" ] || env_kv+=(PLOW_NS_FULL_ABS="$nsf")
   local dtflag=()
   [ "$DTYPE" = "fp8" ] && dtflag=(--weight-dtype fp8)
+  local blockflag=()
+  [ -z "$BLOCK" ] || blockflag=(--block "$BLOCK" --batch "$BLOCK_BUCKET")
+  if [ "$DRY" = "1" ]; then
+    printf '  [emit-command] ' >&2
+    printf '%q ' env "${env_kv[@]}" "$PLOWC" --hf-dir "$CHECKPOINT" --emit devblob \
+      --max-ctx "$MAXCTX" --n-cu "$ncu" --arch "$EMIT_ARCH" --gpu "$GPU" \
+      "${dtflag[@]}" "${blockflag[@]}" --out "$dir" >&2
+    printf '\n' >&2
+    echo "$dir"; return 0
+  fi
   env "${env_kv[@]}" "$PLOWC" \
       --hf-dir "$CHECKPOINT" --emit devblob --max-ctx "$MAXCTX" --n-cu "$ncu" \
-      "${dtflag[@]}" --out "$dir" \
+      --arch "$EMIT_ARCH" --gpu "$GPU" \
+      "${dtflag[@]}" "${blockflag[@]}" --out "$dir" \
       >"$WORK/log/emit_$key.log" 2>&1 \
     || { echo "FATAL: packet emit failed for $key - see $WORK/log/emit_$key.log" >&2; exit 1; }
   echo "$dir"
@@ -463,6 +499,11 @@ assets_for() {  # $1 cubin dir  $2 pkt dir  $3 tag -> echoes dir
   ln -sfn "$CHECKPOINT" "$dir/checkpoint"
   ln -sfn "$MODEL/tokenizer.json" "$dir/tokenizer.json"
   ln -sfn "$pdir/model.pkt" "$dir/model.pkt"
+  if [ -n "$BLOCK" ]; then
+    for f in block.json weights.json build.json; do
+      ln -sfn "$pdir/$f" "$dir/$f"
+    done
+  fi
   ln -sfn "$cdir/$CUBIN" "$dir/$CUBIN"
   ln -sfn "$cdir/$CUBIN_PF" "$dir/$CUBIN_PF"
   echo "$dir"
@@ -479,6 +520,13 @@ run_once() {  # $1 assets  $2 ctx  $3 label  $4 batch -> echoes "ms vram" | "vra
   local adir="$1" ctx="$2" label="$3" bsz="${4:-1}" rc pre
   local log="$WORK/log/run_${label}.log"
   local vramf="$WORK/log/vram_${label}"
+  local run=("$STEP_BENCH" "$adir" "$bsz" "$ctx" "$STEPS")
+  local block_out="$WORK/log/block_${label}"
+  if [ -n "$BLOCK" ]; then
+    run=("$BLOCK_RUN" "$adir" bench --batch "$bsz" --ctx "$ctx"
+      --iters "$STEPS" --warmup 10 --prefill-iters 1 --pf-chunk "$BLOCK_BUCKET"
+      --out-dir "$block_out")
+  fi
 
   # A light pre-check so we do not queue behind a holder that never leaves; the
   # AUTHORITATIVE reading is taken after the lease is held, below.
@@ -495,7 +543,7 @@ run_once() {  # $1 assets  $2 ctx  $3 label  $4 batch -> echoes "ms vram" | "vra
   "$GPULEASE" "$label" bash -c '
       nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | tr -d " " > "$1"
       shift; exec "$@"
-    ' _ "$vramf" "$STEP_BENCH" "$adir" "$bsz" "$ctx" "$STEPS" >"$log" 2>&1
+    ' _ "$vramf" "${run[@]}" >"$log" 2>&1
   rc=$?
   set -e
   pre="$(tr -cd '0-9' < "$vramf" 2>/dev/null || true)"
@@ -514,6 +562,19 @@ run_once() {  # $1 assets  $2 ctx  $3 label  $4 batch -> echoes "ms vram" | "vra
   # Let our OWN allocation drain before the next rep reads memory.used, or the
   # driver mistakes its previous process for a foreign holder.
   sleep "$SETTLE_S"
+  if [ -n "$BLOCK" ]; then
+    python3 - "$block_out/sweep.json" "$ctx" "$bsz" "$pre" <<'PY'
+import json, math, sys
+rows = json.load(open(sys.argv[1]))["sweep"]
+assert len(rows) == 1, "block run must report exactly one requested cell"
+r = rows[0]
+assert r["ctx"] == int(sys.argv[2]) and r["batch"] == int(sys.argv[3])
+ms = r["latency_us_median"] / 1000
+assert math.isfinite(ms) and ms > 0
+print(ms, sys.argv[4], r["batch"])
+PY
+    return
+  fi
   local ms; ms="$(sed -n 's/.*RAW_STEP .*mean_ms=\([0-9.]*\).*/\1/p' "$log" | head -1)"
   # The batch step_bench ACTUALLY ran, read back off its own line rather than
   # assumed from the argument. `slots = want.min(engine.batch())` clamps
@@ -567,8 +628,11 @@ for occ in $OCC; do
     defs="$(defines_for "$mb" "$un" "$glu" "$mun" "$sg" "$w" "$g" "$gf" "$k" "$mm" "$xa")"
     xjson="$(extra_json "$xa")"
     cdir="$(build_cubin "$defs")"
-    [ -s "$cdir/registers" ] || registers_of "$cdir/$CUBIN" > "$cdir/registers"
-    regs="$(tr -cd '0-9' < "$cdir/registers" 2>/dev/null || true)"
+    if [ "$DRY" != "1" ] && [ ! -s "$cdir/registers" ]; then
+      registers_of "$cdir/$CUBIN" > "$cdir/registers" || true
+    fi
+    regs=""
+    [ ! -f "$cdir/registers" ] || regs="$(tr -cd '0-9' < "$cdir/registers")"
     [ -n "$regs" ] || regs=null
     csha="$(sha256sum "$cdir/$CUBIN" 2>/dev/null | cut -c1-16 || true)"
     abldir=""
@@ -582,6 +646,7 @@ for occ in $OCC; do
       psha="$(sha256sum "$pdir/model.pkt" 2>/dev/null | cut -c1-16 || true)"
       cfg="mb${mb}_ncu${ncu}_un${un}_glu${glu}_mun${mun}_sg${sg}_mm${mm:-d}_ns${ns}_nsf${nsf}"
       cfg="${cfg}_wpr${w:-d}_gf${g:-d}_gff${gf:-d}_kun${k:-d}_x${xa}"
+      [ -z "$BLOCK" ] || cfg="${cfg}_block${BLOCK}_pf${BLOCK_BUCKET}"
       adir="$(assets_for "$cdir" "$pdir" "${cfg}_b${bsz}")"
       for ctx in $CTXS; do
         done_n=$((done_n+1))
@@ -655,6 +720,10 @@ for occ in $OCC; do
           "$ABLATE_LO" "$ABLATE_HI" "$spread" "$stable" >>"$RESULTS"
         printf '"registers":%s,"toolchain":"%s","implementation":"%s",' \
           "$regs" "$TOOLCHAIN" "$IMPL" >>"$RESULTS"
+        if [ -n "$BLOCK" ]; then
+          printf '"scope":"single_block_ranking","block":%s,"prefill_bucket":%s,' \
+            "$BLOCK" "$BLOCK_BUCKET" >>"$RESULTS"
+        fi
         if [ "$worst_vram" -le "$MEM_IDLE" ]; then unc=true; else unc=false; fi
         printf '"cubin_sha":"%s","pkt_sha":"%s","vram_before_mib":%s,"uncontended":%s,"campaign":"%s","ts":"%s"}\n' \
           "$csha" "$psha" "$worst_vram" "$unc" "$CAMPAIGN" "$(date -Is)" >>"$RESULTS"
@@ -666,4 +735,8 @@ done
 
 echo
 echo "done. $RESULTS"
-echo "ingest with: tunedb-decode ingest --db tuning --results $RESULTS"
+if [ -n "$BLOCK" ]; then
+  echo "Single-block ranking only; confirm the shortlist on the full model before tunedb ingestion."
+else
+  echo "ingest with: tunedb-decode ingest --db tuning --results $RESULTS"
+fi

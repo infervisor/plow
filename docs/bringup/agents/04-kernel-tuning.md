@@ -184,7 +184,7 @@ exist on your target.
   (sweeps `PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, MoE knobs jointly,
   scored by end-to-end step TPOT), then `tunedb-decode ingest`.
 * **Decode-attention split count (packet grid):** when the model exposes a
-  split knob (K3: `PLOW_K3_NS`), emit matched packets across a geometric grid
+  split knob (K3: `PLOW_MLA_NS`), emit matched packets across a geometric grid
   such as 16/32/64/128 while reusing the exact weights and interpreter object.
   Confirm only attention/merge packets and scratch extents differ. Measure the
   shortest context, longest context, and enough crossover points to derive a
@@ -194,7 +194,7 @@ exist on your target.
   reduction association, so require rank/counter audits and the model quality
   gate rather than byte-identical cross-arm text. This is consumed as packet
   programs/runtime context selection, not a tune-store record. Screen the broad
-  grid first with `K3_FULL=1 PLOW_K3_LAYERS=single:3` and a truncated
+  grid first with `K3_FULL=1 PLOW_LAYERS=single:3` and a truncated
   real-model asset containing that MLA layer plus its production
   merge/output/residual tail; an isolated flash kernel omits the merge cost.
   Promote only the 2–3 finalists to full-model serving. Do not add a runtime

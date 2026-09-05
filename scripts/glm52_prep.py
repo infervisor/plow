@@ -119,10 +119,15 @@ def p_raw(idx, name):
     return (dt, list(shape), len(b), lambda f: f.write(b))
 
 # ---------------------------------------------------------------- config
-from transformers import AutoConfig
+try:
+    from transformers import AutoConfig
+except ModuleNotFoundError:
+    AutoConfig = None
 
 
 def load_cfg(path):
+    if AutoConfig is None:
+        raise RuntimeError("load_cfg requires the optional transformers package")
     """AutoConfig, RECONCILED against the checkpoint's own config.json.
 
     `GlmMoeDsaConfig` does not round-trip this checkpoint: it silently reports

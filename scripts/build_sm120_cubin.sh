@@ -26,6 +26,7 @@
 #   PLOW_ROOT              source root (a worktree builds its OWN source)
 #   PLOW_EXTRA_DEFINES     raw extra nvcc flags (the decode tuner's sweep knob)
 #   PLOW_BUILD_FP8KV=1     also emit <out>_fp8kv.cubin / <out>_pf_fp8kv.cubin
+#   PLOW_BUILD_SEG=1       also emit bf16-KV <out>_pfseg.cubin / <out>_pfgemm.cubin
 # Extra arguments are forwarded to cmake, so the README's
 #   build_sm120_cubin.sh <out> -DPLOW_NV_W8A8=ON -DPLOW_FP8_KV=ON
 # does what it reads like.
@@ -43,6 +44,7 @@ BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
 FP8KV="${PLOW_BUILD_FP8KV:-0}"
+SEG="${PLOW_BUILD_SEG:-0}"
 
 # PLOW_NVCC (the nix dev shell exports it) selects the toolchain, same knob as
 # build_sm90a_cubin.sh; an explicit -DPLOW_CUBIN_NVCC=... in "$@" still wins,
@@ -50,6 +52,7 @@ FP8KV="${PLOW_BUILD_FP8KV:-0}"
 "$CMAKE" -S "$HERE/runtime" -B "$BUILD_DIR" \
     -DPLOW_SM120_CUBIN=ON \
     -DPLOW_SM120_CUBIN_FP8KV="$([ "$FP8KV" = 1 ] && echo ON || echo OFF)" \
+    -DPLOW_SM120_CUBIN_SEG="$([ "$SEG" = 1 ] && echo ON || echo OFF)" \
     -DPLOW_CUBIN_DIR="$BUILD_DIR/cubin" \
     -DPLOW_CUBIN_NVCC="${PLOW_NVCC:-/usr/local/cuda/bin/nvcc}" \
     -DPLOW_EXTRA_DEFINES="${PLOW_EXTRA_DEFINES:-}" \
@@ -66,5 +69,9 @@ cp "$BUILD_DIR/cubin/interp_sm120_pf.cubin" "${OUT%.cubin}_pf.cubin"
 if [ "$FP8KV" = 1 ]; then
     cp "$BUILD_DIR/cubin/interp_sm120_fp8kv.cubin" "${OUT%.cubin}_fp8kv.cubin"
     cp "$BUILD_DIR/cubin/interp_sm120_pf_fp8kv.cubin" "${OUT%.cubin}_pf_fp8kv.cubin"
+fi
+if [ "$SEG" = 1 ]; then
+    cp "$BUILD_DIR/cubin/interp_sm120_pfseg.cubin" "${OUT%.cubin}_pfseg.cubin"
+    cp "$BUILD_DIR/cubin/interp_sm120_pfgemm.cubin" "${OUT%.cubin}_pfgemm.cubin"
 fi
 exit 0

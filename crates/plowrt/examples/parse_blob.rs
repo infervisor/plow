@@ -7,7 +7,11 @@
 //! so a blob whose XReduce operands are wrong reports the wrong world size here
 //! rather than at rendezvous time on eight GPUs.
 //!
-//!   cargo run -p plowrt --features hsa --example parse_blob -- <model.pkt>
+//!   cargo run -p plowrt --example parse_blob -- <model.pkt> [--dump [prog]]
+//!
+//! `--dump` prints every tensor and every instruction (opcode, tensor names,
+//! immediates). Pass a program index to dump one bucket (`0` = first prefill,
+//! last = decode). Stream/wait tables print as counts only.
 
 /// A stable 64-bit digest of one program's decoded instruction stream.
 ///
@@ -27,10 +31,86 @@ fn inst_digest(insts: &[packet::dev::DevInst64]) -> u64 {
     h.finish()
 }
 
+fn op_name(op: u16) -> String {
+    packet::dev::DevOp::from_u16(op)
+        .map(|o| format!("{o:?}"))
+        .unwrap_or_else(|| format!("op#{op}"))
+}
+
+fn tensor_name(blob: &plowrt::asset::devblob::DevBlob, h: u16) -> String {
+    if h == packet::dev::TENSOR_NONE16 {
+        return "-".into();
+    }
+    blob.tensors
+        .get(h as usize)
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| format!("t#{h}"))
+}
+
+fn dump_inst(blob: &plowrt::asset::devblob::DevBlob, i: usize, d: &packet::dev::DevInst64) {
+    let t: Vec<String> = d.t.iter().map(|&h| tensor_name(blob, h)).collect();
+    let i_slots: Vec<String> =
+        d.i.iter()
+            .enumerate()
+            .filter(|(_, v)| **v != 0)
+            .map(|(k, v)| format!("i[{k}]={v}"))
+            .collect();
+    let f0 = f32::from_bits(d.fj[0]);
+    let f1 = f32::from_bits(d.fj[1]);
+    let mut extra = i_slots;
+    if f0 != 0.0 {
+        extra.push(format!("f0={f0}"));
+    }
+    if f1 != 0.0 {
+        extra.push(format!("fj1={f1}"));
+    }
+    if d.fj[2] != 0 {
+        extra.push(format!("j1={}", d.fj[2]));
+    }
+    let extras = if extra.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", extra.join(" "))
+    };
+    println!(
+        "    [{i:>4}] {:<22} blocks={:<4} t=[{}]{extras}",
+        op_name(d.op),
+        d.blocks,
+        t.join(", "),
+    );
+}
+
+fn dump_prog(blob: &plowrt::asset::devblob::DevBlob, pi: usize) {
+    let p = &blob.progs[pi];
+    let last = blob.progs.len().saturating_sub(1);
+    let kind = if pi == last { "decode" } else { "prefill" };
+    println!(
+        "\n== prog[{pi}] T={} {kind}  insts={} stream={} waits={} succs={} counters={} l2_domains={}",
+        p.t,
+        p.insts.len(),
+        p.stream.len(),
+        p.waits.len(),
+        p.succs.len(),
+        p.n_counter,
+        p.l2_domains
+    );
+    for (i, d) in p.insts.iter().enumerate() {
+        dump_inst(blob, i, d);
+    }
+}
+
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: parse_blob <model.pkt>");
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
+        .expect("usage: parse_blob <model.pkt> [--dump [prog]]");
+    let dump = matches!(args.next().as_deref(), Some("--dump"));
+    let dump_prog_i: Option<usize> = if dump {
+        args.next().and_then(|s| s.parse().ok())
+    } else {
+        None
+    };
+
     let raw = std::fs::read(&path).expect("read blob");
     let blob = plowrt::asset::devblob::DevBlob::parse(&raw).expect("parse blob");
     println!("blob      {path} ({} bytes)", raw.len());
@@ -74,5 +154,38 @@ fn main() {
             tp.n_gpu, tp.hidden, tp.slot_bytes
         ),
         None => println!("TP        none (unsharded blob)"),
+    }
+    if !blob.sections.is_empty() {
+        println!("sections  {}", blob.sections.len());
+        for s in &blob.sections {
+            println!("  kind={} name={:?} size={}", s.kind, s.name, s.size);
+        }
+    }
+
+    if dump {
+        println!("\n== tensors ({}) ==", blob.tensors.len());
+        for (i, t) in blob.tensors.iter().enumerate() {
+            let init = t
+                .init
+                .as_ref()
+                .map(|r| format!(" init={r:?}"))
+                .unwrap_or_default();
+            println!("  [{i:>3}] {:>12} B  {}{init}", t.bytes, t.name);
+        }
+        match dump_prog_i {
+            Some(i) if i < blob.progs.len() => dump_prog(&blob, i),
+            Some(i) => {
+                eprintln!(
+                    "--dump {i}: program index out of range (0..{})",
+                    blob.progs.len()
+                );
+                std::process::exit(1);
+            }
+            None => {
+                for i in 0..blob.progs.len() {
+                    dump_prog(&blob, i);
+                }
+            }
+        }
     }
 }

@@ -34,10 +34,10 @@ fn build_inner(cfg: &Qwen3Config, encoder_taps: Option<&[u32]>) -> Graph {
     let s = nn.sym("S");
 
     let ids = nn.input("input_ids", nn.shape([b.clone(), s.clone()]), DType::I32);
-    let mut x = nn.embedding("embed_tokens", ids, cfg.vocab_size, h);
+    let mut x = nn.embedding("model.embed_tokens", ids, cfg.vocab_size, h);
 
     for layer in 0..cfg.num_hidden_layers {
-        let p = format!("layers.{layer}");
+        let p = format!("model.layers.{layer}");
         nn.begin_block(&p);
 
         // --- attention block (pre-norm residual) ---
@@ -60,13 +60,13 @@ fn build_inner(cfg: &Qwen3Config, encoder_taps: Option<&[u32]>) -> Graph {
     }
     nn.end_block();
 
-    x = nn.rmsnorm("norm", x, h, eps);
+    x = nn.rmsnorm("model.norm", x, h, eps);
     if encoder_taps.is_some() {
         nn.mark_output(x);
         return nn.finish();
     }
     let logits = if cfg.tie_word_embeddings {
-        nn.linear("embed_tokens", x, h, cfg.vocab_size, false)
+        nn.linear("model.embed_tokens", x, h, cfg.vocab_size, false)
     } else {
         nn.linear("lm_head", x, h, cfg.vocab_size, false)
     };
@@ -89,9 +89,27 @@ fn attention(
     let q_dim = nh as i64 * hd;
     let kv_dim = nkv as i64 * hd;
 
-    let q = nn.linear(&format!("{prefix}.self_attn.q_proj"), x, h, q_dim, false);
-    let k = nn.linear(&format!("{prefix}.self_attn.k_proj"), x, h, kv_dim, false);
-    let v = nn.linear(&format!("{prefix}.self_attn.v_proj"), x, h, kv_dim, false);
+    let q = nn.linear(
+        &format!("{prefix}.self_attn.q_proj"),
+        x,
+        h,
+        q_dim,
+        cfg.qkv_bias,
+    );
+    let k = nn.linear(
+        &format!("{prefix}.self_attn.k_proj"),
+        x,
+        h,
+        kv_dim,
+        cfg.qkv_bias,
+    );
+    let v = nn.linear(
+        &format!("{prefix}.self_attn.v_proj"),
+        x,
+        h,
+        kv_dim,
+        cfg.qkv_bias,
+    );
 
     // Split heads: [B, S, n*hd] -> [B, S, n, hd].
     let q = nn.reshape(
@@ -107,19 +125,25 @@ fn attention(
         [b.clone(), s.clone(), Dim::stat(nkv as i64), Dim::stat(hd)],
     );
 
-    // Qwen3 per-head qk-norm (RMSNorm over head_dim), then RoPE.
-    let q = nn.rmsnorm(
-        &format!("{prefix}.self_attn.q_norm"),
-        q,
-        hd,
-        cfg.rms_norm_eps,
-    );
-    let k = nn.rmsnorm(
-        &format!("{prefix}.self_attn.k_norm"),
-        k,
-        hd,
-        cfg.rms_norm_eps,
-    );
+    // Qwen3 adds per-head Q/K RMSNorm. Qwen2/Qwen2.5 goes directly to RoPE.
+    let (q, k) = if cfg.use_qk_norm {
+        (
+            nn.rmsnorm(
+                &format!("{prefix}.self_attn.q_norm"),
+                q,
+                hd,
+                cfg.rms_norm_eps,
+            ),
+            nn.rmsnorm(
+                &format!("{prefix}.self_attn.k_norm"),
+                k,
+                hd,
+                cfg.rms_norm_eps,
+            ),
+        )
+    } else {
+        (q, k)
+    };
     let q = nn.rope(q, hd as u32, cfg.rope_theta);
     let k = nn.rope(k, hd as u32, cfg.rope_theta);
 

@@ -94,14 +94,20 @@ static __device__ void d_glu(__nv_bfloat16* __restrict__ out, const __nv_bfloat1
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const float g = __bfloat162float(vg.x[j]);
-                const float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+                float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
+                if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
+#endif
                 vo.x[j] = __float2bfloat16(a * __bfloat162float(vu.x[j]));
             }
             st_glob8(out + i, vo);
         } else {
             for (unsigned j = i; j < n; j++) {
                 const float g = __bfloat162float(gate[j]);
-                const float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+                float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_GEMMA_GLU_BF16) && PLOW_NV_GEMMA_GLU_BF16
+                if (act != PLOW_ACT_SILU_) a = __bfloat162float(__float2bfloat16(a));
+#endif
                 out[j] = __float2bfloat16(a * __bfloat162float(up[j]));
             }
         }

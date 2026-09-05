@@ -2,7 +2,7 @@
 //! checks) and the multi-network `PipelineConfig` build path.
 
 use nn_graph::models::{build_encoder_graph, ModelConfig, PipelineConfig, ShapeBucket};
-use nn_graph::{infer_shapes, DType, Dim, Graph, Nn, Origin};
+use nn_graph::{infer_shapes, DType, Dim, Graph, LinearAttnKind, Nn, Origin};
 
 fn weight_names(g: &Graph) -> Vec<String> {
     g.tensors
@@ -25,6 +25,41 @@ fn reshape_rejects_provably_unequal_symbolic_counts() {
     let mut g = nn.finish();
     let err = infer_shapes(&mut g).expect_err("reshape must be rejected");
     assert!(err.to_string().contains("element count"), "got: {err}");
+}
+
+#[test]
+fn kimi_linear_attention_rejects_mismatched_gate_heads() {
+    let mut nn = Nn::new(DType::BF16, DType::BF16);
+    let b = nn.sym("B");
+    let s = nn.sym("S");
+    let qkv_shape = nn.shape([b.clone(), s.clone(), Dim::stat(4), Dim::stat(32)]);
+    let q = nn.input("q", qkv_shape.clone(), DType::BF16);
+    let k = nn.input("k", qkv_shape.clone(), DType::BF16);
+    let v = nn.input("v", qkv_shape, DType::BF16);
+    let gate = nn.input(
+        "gate",
+        nn.shape([b.clone(), s.clone(), Dim::stat(2), Dim::stat(32)]),
+        DType::BF16,
+    );
+    let beta = nn.input("beta", nn.shape([b, s, Dim::stat(4)]), DType::BF16);
+    let a_log = nn.param("A_log", [Dim::stat(4)]);
+    let dt_bias = nn.param("dt_bias", [Dim::stat(128)]);
+    let out = nn.linear_attention(
+        LinearAttnKind::KimiDelta,
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        a_log,
+        dt_bias,
+        4,
+        32,
+    );
+    nn.mark_output(out);
+    let mut g = nn.finish();
+    let err = infer_shapes(&mut g).expect_err("mismatched Kimi gate must be rejected");
+    assert!(err.to_string().contains("gate axis 2"), "got: {err}");
 }
 
 #[test]
@@ -104,7 +139,7 @@ fn qwen3_explicit_head_dim_and_qk_norm() {
     let q = g
         .tensors
         .iter()
-        .find(|t| t.name.as_deref() == Some("layers.0.self_attn.q_proj.weight"))
+        .find(|t| t.name.as_deref() == Some("model.layers.0.self_attn.q_proj.weight"))
         .expect("q_proj weight");
     let dims: Vec<i64> = q
         .shape
@@ -116,8 +151,12 @@ fn qwen3_explicit_head_dim_and_qk_norm() {
         .collect();
     assert_eq!(dims, vec![4096, 2560], "q_proj must use explicit head_dim");
     // Per-head qk-norm weights are consumed.
-    assert!(ws.iter().any(|w| w == "layers.0.self_attn.q_norm.weight"));
-    assert!(ws.iter().any(|w| w == "layers.1.self_attn.k_norm.weight"));
+    assert!(ws
+        .iter()
+        .any(|w| w == "model.layers.0.self_attn.q_norm.weight"));
+    assert!(ws
+        .iter()
+        .any(|w| w == "model.layers.1.self_attn.k_norm.weight"));
 }
 
 // ---- encoder taps + pipeline -------------------------------------------

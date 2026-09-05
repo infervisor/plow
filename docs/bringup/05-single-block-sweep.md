@@ -279,7 +279,7 @@ the step is graph-capturable on `$VENDOR = nvidia`.
 The MLA-family `--block` asset has no embed / lm_head, so `amd-bench` cannot
 drive it. Two options:
 
-* **Truncated-model TP sweep** (`PLOW_GLM_LAYERS=N` / `K3_NLAYERS=N`): emit a
+* **Truncated-model TP sweep** (`PLOW_LAYERS=N`): emit a
   few real layers of the real megakernel at the served TP geometry, and
   difference the fixed overhead out. This keeps the megakernel context an
   isolated kernel loses.

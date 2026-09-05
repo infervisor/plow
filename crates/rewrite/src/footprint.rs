@@ -141,6 +141,69 @@ pub fn footprints(kind: &OpKind, tile: &Compute, io: &OpIo, coord: &[i64]) -> Fo
                 reads: io.inputs.iter().map(|n| row(n)).collect(),
             }
         }
+        (OpKind::Model(m), Compute::Row(t)) => {
+            let r0 = coord[0] * t.br;
+            let r1 = (r0 + t.br).min(m.rows);
+            let row = |name: &str| TensorSlice {
+                tensor: name.into(),
+                ranges: vec![r0..r1, 0..m.feat],
+            };
+            if m.kind == crate::ModelOpKind::Embedding {
+                return Footprint {
+                    write: row(io.output),
+                    reads: vec![
+                        TensorSlice {
+                            tensor: io.inputs[0].clone(),
+                            ranges: vec![r0..r1],
+                        },
+                        // Runtime gathers arbitrary vocabulary rows, but the
+                        // transfer volume is one hidden row per token tile.
+                        TensorSlice {
+                            tensor: io.inputs[1].clone(),
+                            ranges: vec![r0..r1, 0..m.feat],
+                        },
+                    ],
+                };
+            }
+            let row_aligned = matches!(
+                m.kind,
+                crate::ModelOpKind::Silu
+                    | crate::ModelOpKind::Sigmoid
+                    | crate::ModelOpKind::Add
+                    | crate::ModelOpKind::Sub
+                    | crate::ModelOpKind::Mul
+                    | crate::ModelOpKind::Div
+                    | crate::ModelOpKind::Scale
+                    | crate::ModelOpKind::Tanh
+            );
+            Footprint {
+                write: row(io.output),
+                reads: io
+                    .inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, n)| {
+                        let norm_activation = idx == 0
+                            && matches!(
+                                m.kind,
+                                crate::ModelOpKind::RmsNorm
+                                    | crate::ModelOpKind::RmsNormZeroCentered
+                            );
+                        // Broadcast operands do not share the output's row indexing.
+                        let full_activation =
+                            m.input_row_aligned.get(idx).copied().unwrap_or(false);
+                        if (row_aligned && full_activation) || norm_activation {
+                            row(n)
+                        } else {
+                            TensorSlice {
+                                tensor: n.clone(),
+                                ranges: vec![],
+                            }
+                        }
+                    })
+                    .collect(),
+            }
+        }
         (OpKind::Flash(a), Compute::Flash(t)) => {
             let q0 = coord[1] * t.bq;
             let q1 = (q0 + t.bq).min(a.seq_q);

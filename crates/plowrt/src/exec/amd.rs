@@ -720,6 +720,52 @@ struct KdaChunkCarryRegstateArgs {
 
 const _: () = assert!(std::mem::size_of::<KdaChunkCarryRegstateArgs>() == 88);
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaChunkWuLeanArgs {
+    w: u64,
+    u: u64,
+    q: u64,
+    key_hi: u64,
+    key_lo: u64,
+    ainv: u64,
+    k: u64,
+    v: u64,
+    g: u64,
+    beta: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    value_dim: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkWuLeanArgs>() == 104);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaChunkCarryKeyfeedArgs {
+    out: u64,
+    state: u64,
+    q: u64,
+    k: u64,
+    w: u64,
+    u: u64,
+    aqk: u64,
+    g: u64,
+    key_hi: u64,
+    key_lo: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    value_dim: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkCarryKeyfeedArgs>() == 104);
+
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 struct XReduceAttnResArgs {
@@ -1006,6 +1052,18 @@ enum PrefillSegmentRoute {
         /// KV-slot-strided ones (the recurrent `state`) to the active slot.
         tens: [u16; 8],
     },
+    /// Lean four-wave Wu; `args.key_hi != 0` selects the key-emitting object.
+    KdaChunkWuLean {
+        args: KdaChunkWuLeanArgs,
+        grid: u32,
+        tens: [u16; 8],
+    },
+    /// The register-state carry fed with the preceding lean Wu's scaled-key pair.
+    KdaChunkCarryKeyfeed {
+        args: KdaChunkCarryKeyfeedArgs,
+        grid: u32,
+        tens: [u16; 8],
+    },
     MoeStage1Mxfp4(MoeStage1Mxfp4Route),
     MoeStage1A4Reuse(MoeStage1A4ReuseRoute),
     MoeStage2Mxfp4(MoeStage2Mxfp4Route),
@@ -1016,6 +1074,11 @@ enum PrefillSegmentRoute {
     MlaMaterializePack {
         args: MlaMaterializePackArgs,
         grid: u32,
+        /// Packet tensor id of `K_rope` (the `kv.*.krot` cache), so a launch can rebase it to
+        /// the active KV slot; the other three operands are transients.
+        k_rope_ten: u16,
+        /// Rows the K/V transients can hold — the bound on the per-chunk `kv_len` patch.
+        kv_rows_cap: u32,
     },
     MlaMaterializedPrefill {
         args: MlaMaterializedPrefillArgs,
@@ -1120,6 +1183,19 @@ fn mla_materialized_routes(
                     "materialized MLA pack segment {seg} has unsupported geometry"
                 )));
             }
+            let rows_of = |h: u16, width: u64| -> u32 {
+                let bytes = devp.get(h as usize).map_or(0, |m| m.len);
+                u32::try_from(bytes / (u64::from(d.i[1]) * width * 2)).unwrap_or(u32::MAX)
+            };
+            let kv_rows_cap = rows_of(d.t[0], 192)
+                .min(rows_of(d.t[1], 128))
+                .min(rows_of(d.t[2], 256));
+            if kv_rows_cap < prog.t {
+                return Err(RuntimeError::Device(format!(
+                    "materialized MLA pack segment {seg}: K/V transients hold {kv_rows_cap} rows, fewer than the bucket's {}",
+                    prog.t
+                )));
+            }
             routes[seg] = PrefillSegmentRoute::MlaMaterializePack {
                 args: MlaMaterializePackArgs {
                     k: addr(d.t[0], "K")?,
@@ -1133,6 +1209,8 @@ fn mla_materialized_routes(
                     v_head: d.i[4],
                 },
                 grid: u32::from(d.blocks),
+                k_rope_ten: d.t[3],
+                kv_rows_cap,
             };
         } else if d.op == DevOp::FlashMlaMaterializedPrefill as u16 {
             let (n, h, h_kv, d_qk, d_v, abi) = (d.i[0], d.i[1], d.i[2], d.i[3], d.i[4], d.i[5]);
@@ -1521,9 +1599,78 @@ fn rebase_kda_key_factor_routes(routes: &mut [PrefillSegmentRoute], t: u32) {
             PrefillSegmentRoute::KdaChunkKeyFactorWu { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkKeyFactorCarry { args, .. } => args.t = t,
             PrefillSegmentRoute::KdaChunkCarryRegstate { args, .. } => args.t = t,
+            PrefillSegmentRoute::KdaChunkWuLean { args, .. } => args.t = t,
+            PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. } => args.t = t,
             _ => {}
         }
     }
+}
+
+/// Per-chunk operands of the materialized MLA route.
+///
+/// `rows` is the chunk's query count (the bucket width, or `clen` under RAGGED-M) and
+/// `n_kv = c0 + rows` the cached rows its keys span — the same pair `in.kvlen` carries for the
+/// absorbed flash. A continuation chunk has no K/V for `[0, c0)` anywhere but the latent cache,
+/// so its projection (`kv.*.ckv[0, n_kv) · kv_b`, the GEMM writing `kv_materialized`), the pack
+/// (rope half from `kv.*.krot`) and the attention's `N_KV` all address `[0, n_kv)`. The
+/// standalone object aligns its causal mask bottom-right (`causal_offset = N_KV - N`), which puts
+/// query `i` at absolute position `c0 + i` — exactly `qpos = kv_len - n_tok + t` in
+/// `d_flash_mla_prefill`. Runs after [`rebase_chunk_rows`], whose RAGGED-M shrink would otherwise
+/// leave the projection at `clen` rows.
+fn rebase_mla_materialized_routes(
+    insts: &mut [DevInst64],
+    names: &[String],
+    routes: &mut [PrefillSegmentRoute],
+    rows: u32,
+    n_kv: u32,
+) -> Result<()> {
+    if !routes.iter().any(|r| {
+        matches!(
+            r,
+            PrefillSegmentRoute::MlaMaterializePack { .. }
+                | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
+        )
+    }) {
+        return Ok(());
+    }
+    for d in insts.iter_mut() {
+        if matches!(prefill_row_field(d.op), Some(RowField::Rows(0)))
+            && names
+                .get(d.t[0] as usize)
+                .is_some_and(|n| n.ends_with(".kv_materialized"))
+        {
+            d.i[0] = n_kv;
+        }
+    }
+    for route in routes {
+        match route {
+            PrefillSegmentRoute::MlaMaterializePack {
+                args, kv_rows_cap, ..
+            } => {
+                if n_kv > *kv_rows_cap {
+                    return Err(RuntimeError::Device(format!(
+                        "materialized MLA chunk spans {n_kv} cached rows, but the K/V transients hold {kv_rows_cap}"
+                    )));
+                }
+                args.t = n_kv;
+            }
+            PrefillSegmentRoute::MlaMaterializedPrefill { args, grid } => {
+                let n = i32::try_from(rows)
+                    .map_err(|_| RuntimeError::Device("chunk rows exceed i32".into()))?;
+                let nk = i32::try_from(n_kv)
+                    .map_err(|_| RuntimeError::Device("kv_len exceeds i32".into()))?;
+                args.n = n;
+                args.n_kv = nk;
+                args.stride_q_b = n * args.stride_q_n;
+                args.stride_o_b = n * args.stride_o_n;
+                args.stride_k_b = nk * args.stride_k_n;
+                args.stride_v_b = nk * args.stride_v_n;
+                *grid = mla_materialized_flat_grid(rows, args.h.unsigned_abs(), 1)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn promote_kda_intra_wave_items_routes(
@@ -1636,6 +1783,180 @@ fn promote_kda_carry_regstate_routes(
             },
             grid: kda_carry_regstate_grid(d.i[1]),
             tens: d.t,
+        };
+    }
+    Ok(())
+}
+
+fn kda_wu_lean_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::KdaChunkWu as u16
+        && d.blocks != 0
+        && d.i[0] >= 512
+        && d.i[1] != 0
+        && d.i[2] == 128
+        && d.i[3] == 128
+        && d.i[4] == 1
+        && d.i[5] <= 1
+        && d.i[6..].iter().all(|&v| v == 0)
+        && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && f32::from_bits(d.fj[0]).is_finite()
+        && f32::from_bits(d.fj[0]) > 0.0
+        && d.fj[1..].iter().all(|&v| v == 0)
+}
+
+/// One four-wave workgroup per (chunk, head) item, at most three per CU.
+fn kda_wu_lean_grid(t: u32, heads: u32) -> u32 {
+    (t.div_ceil(64) * heads).clamp(1, 768)
+}
+
+/// Widest `[T][H][D]` bf16 half of the reusable key-factor scratch pair the keyfeed Wu writes.
+fn kda_keyfeed_scratch_half_bytes(progs: &[DevProg]) -> Result<u64> {
+    let mut max_half = 0u64;
+    for prog in progs {
+        for d in &prog.insts {
+            if !(kda_wu_lean_inst(d) && d.i[5] == 1) {
+                continue;
+            }
+            let bytes = u64::from(d.i[0])
+                .checked_mul(u64::from(d.i[1]))
+                .and_then(|v| v.checked_mul(u64::from(d.i[2])))
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| RuntimeError::Device("KDA keyfeed scratch size overflows".into()))?;
+            max_half = max_half.max(bytes);
+        }
+    }
+    Ok(max_half)
+}
+
+/// Marked lean Wu segments; a key-emitting Wu (`i[5] == 1`) also converts the regstate carry
+/// route of the instruction that follows it into the key-fed carry. Runs after
+/// `promote_kda_carry_regstate_routes`.
+fn promote_kda_wu_lean_routes(
+    prog: &DevProg,
+    classes: &[u8],
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+    scratch: Option<(u64, u64)>,
+) -> Result<()> {
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KDA Wu lean operand `{what}` handle {h} is invalid"
+            ))
+        })
+    };
+    for (seg, &class) in classes.iter().enumerate() {
+        if class != 25 {
+            continue;
+        }
+        let mut inst = None;
+        for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
+            if e.wait_len != 0
+                || e.succ_len != 0
+                || e.flags & packet::dev::SE_KDA_WU_LEAN == 0
+                || inst.is_some_and(|i| i != e.inst as usize)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "KDA Wu lean segment {seg} has counter obligations or is not a singleton"
+                )));
+            }
+            inst = Some(e.inst as usize);
+        }
+        let Some((wi, d)) = inst
+            .and_then(|i| prog.insts.get(i).map(|d| (i, d)))
+            .filter(|(_, d)| kda_wu_lean_inst(d))
+        else {
+            return Err(RuntimeError::Device(format!(
+                "KDA Wu lean segment {seg} is not an exact qpre BT64/D128/V128 Wu"
+            )));
+        };
+        let keys = d.i[5] == 1;
+        let (key_hi, key_lo) = if keys {
+            let Some((key_hi, half_bytes)) = scratch else {
+                return Err(RuntimeError::Device(format!(
+                    "KDA carry keyfeed segment {seg} has no key-factor scratch pair"
+                )));
+            };
+            let need = u64::from(d.i[0]) * u64::from(d.i[1]) * u64::from(d.i[2]) * 2;
+            if need > half_bytes {
+                return Err(RuntimeError::Device(format!(
+                    "KDA carry keyfeed route needs {need} bytes per half, allocation has {half_bytes}"
+                )));
+            }
+            (key_hi, key_hi + half_bytes)
+        } else {
+            (0, 0)
+        };
+        routes[seg] = PrefillSegmentRoute::KdaChunkWuLean {
+            args: KdaChunkWuLeanArgs {
+                w: addr(d.t[0], "W")?,
+                u: addr(d.t[1], "U")?,
+                q: addr(d.t[7], "q")?,
+                key_hi,
+                key_lo,
+                ainv: addr(d.t[2], "Ainv")?,
+                k: addr(d.t[3], "k")?,
+                v: addr(d.t[4], "v")?,
+                g: addr(d.t[5], "g")?,
+                beta: addr(d.t[6], "beta")?,
+                t: d.i[0],
+                heads: d.i[1],
+                dim: d.i[2],
+                value_dim: d.i[3],
+                scale: f32::from_bits(d.fj[0]),
+                _pad: 0,
+            },
+            grid: kda_wu_lean_grid(d.i[0], d.i[1]),
+            tens: [
+                d.t[0], d.t[1], d.t[7], d.t[2], d.t[3], d.t[4], d.t[5], d.t[6],
+            ],
+        };
+        if !keys {
+            continue;
+        }
+        let carry_seg = prog
+            .stream
+            .iter()
+            .find(|e| e.inst as usize == wi + 1)
+            .map(|e| e.seg as usize);
+        let c = prog.insts.get(wi + 1);
+        let paired = c.is_some_and(|c| {
+            c.t[2] == d.t[7]
+                && c.t[3] == d.t[3]
+                && c.t[4] == d.t[0]
+                && c.t[5] == d.t[1]
+                && c.t[7] == d.t[5]
+                && c.i[0] == d.i[0]
+                && c.i[1] == d.i[1]
+        });
+        let Some((cs, PrefillSegmentRoute::KdaChunkCarryRegstate { args, grid, tens })) =
+            carry_seg.filter(|_| paired).map(|cs| (cs, routes[cs]))
+        else {
+            return Err(RuntimeError::Device(format!(
+                "KDA carry keyfeed Wu segment {seg} is not followed by its paired regstate carry"
+            )));
+        };
+        routes[cs] = PrefillSegmentRoute::KdaChunkCarryKeyfeed {
+            args: KdaChunkCarryKeyfeedArgs {
+                out: args.out,
+                state: args.state,
+                q: args.q,
+                k: args.k,
+                w: args.w,
+                u: args.u,
+                aqk: args.aqk,
+                g: args.g,
+                key_hi,
+                key_lo,
+                t: args.t,
+                heads: args.heads,
+                dim: args.dim,
+                value_dim: args.value_dim,
+                scale: args.scale,
+                _pad: 0,
+            },
+            grid,
+            tens,
         };
     }
     Ok(())
@@ -3090,6 +3411,22 @@ const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     // class, same treatment — and here the marker is genuinely load-bearing rather than a
     // vintage stamp, because the fold is a BUILD AXIS: an unarmed object has no fold body.
     ("PLOW_GLM_FUSE_QNORM", &["plow_glm_fuse_qnorm_arm"]),
+    // The K3 latent MoeCombine folded into the tagged one-shot publish (XReduce t1 = part,
+    // i7 = k). An object without the arm publishes the plain partial slot, which no packet
+    // wrote — stale data, no trap. A BUILD axis (`#if PLOW_XR_COMBINE_FOLD`).
+    ("PLOW_XR_COMBINE_FOLD", &["plow_xr_combine_fold_1"]),
+    // The K3 f_b GEMV folded into KdaStateStepG's prologue (flags bit 2, t4 = f_a, j1 = W_fb).
+    // An object without the arm reads f_a's 128 values as the head's gate logits — finite,
+    // no trap, wrong. A BUILD axis (`#if PLOW_KDA_FB_FOLD`).
+    ("PLOW_KDA_FB_FOLD", &["plow_kda_fb_fold_1"]),
+    // The K3 Conv3+StepG+GatedNorm chain as one KdaStateStepG packet (flags bit 3, t0 = y,
+    // t1..t3 raw q/k/v, t7 = descriptor). An object without the arm runs the recurrence on the
+    // raw projections with the descriptor as A_log — finite, no trap, wrong. A BUILD axis
+    // (`#if PLOW_KDA_DECODE_FUSED_ARM`).
+    (
+        "PLOW_KDA_DECODE_FUSED_ARM",
+        &["plow_kda_decode_fused_arm_1"],
+    ),
 ];
 
 fn required_moe_pf_accum(progs: &[DevProg], field: usize) -> bool {
@@ -3112,6 +3449,19 @@ fn check_decode_object(
     need_moe_pf_det: bool,
 ) -> Result<()> {
     if syms.is_empty() {
+        let needs_decode_arm = requires.iter().any(|req| {
+            let (flag, val) = req.split_once('=').unwrap_or((req.as_str(), "1"));
+            val != "0"
+                && DECODE_ARM_MARKERS
+                    .iter()
+                    .any(|(candidate, _)| *candidate == flag)
+        });
+        if needs_decode_arm {
+            return Err(RuntimeError::Device(format!(
+                "packet requires a specialised decode arm, but {} has no ELF symbol table; refusing an unverifiable packet/object pairing",
+                path.display()
+            )));
+        }
         tracing::warn!(
             object = %path.display(),
             "no ELF symbol table — the packet/object arm check cannot run on this file"
@@ -3241,6 +3591,26 @@ const KDA_CARRY_REGSTATE_MARKERS: [&str; 6] = [
 ];
 const KDA_CARRY_REGSTATE_LDS: u32 = 43_520;
 
+const KDA_WU_LEAN_MARKERS: [&str; 6] = [
+    "plow_kda_wu_lean_abi_1",
+    "plow_kda_wu_lean_bt64_d128_v128_qpre_1",
+    "plow_kda_wu_lean_wave64_1",
+    "plow_kda_wu_lean_no_spill_1",
+    "plow_kda_wu_lean_static_lds_46080",
+    "plow_kda_wu_lean_vgpr_le_256",
+];
+const KDA_WU_LEAN_LDS: u32 = 46_080;
+
+const KDA_CARRY_KEYFEED_MARKERS: [&str; 7] = [
+    "plow_kda_carry_keyfeed_abi_1",
+    "plow_kda_carry_keyfeed_bt64_d128_v128_qpre_1",
+    "plow_kda_carry_keyfeed_wave64_1",
+    "plow_kda_carry_keyfeed_no_spill_1",
+    "plow_kda_carry_keyfeed_static_lds_43520",
+    "plow_kda_carry_keyfeed_vgpr_le_256",
+    "plow_kda_carry_keyfeed_scratch_pair_bf16_1",
+];
+
 fn read_kda_carry_regstate_object(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| {
         RuntimeError::Device(format!(
@@ -3345,8 +3715,15 @@ fn check_moe_ep_symbols(syms: &[&str], path: &Path, markers: &[&str]) -> Result<
 
 fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
     let mpath = blob_path.with_file_name("build.json");
-    let Ok(raw) = std::fs::read(&mpath) else {
-        return Ok(None);
+    let raw = match std::fs::read(&mpath) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(RuntimeError::Device(format!(
+                "cannot read {}: {e}",
+                mpath.display()
+            )))
+        }
     };
     let man: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|e| RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display())))?;
@@ -3366,6 +3743,127 @@ fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect()
         }))
+}
+
+fn packet_decode_arm_requirements(progs: &[DevProg]) -> Vec<String> {
+    let insts = || progs.iter().flat_map(|p| &p.insts);
+    let mut requires = Vec::new();
+    if insts().any(|inst| inst.op == DevOp::KdaConvStateStepG as u16) {
+        requires.push("PLOW_KDA_CONV_STEP_DB=1".to_owned());
+    }
+    if required_moe_pf_accum(progs, 4) {
+        requires.push("PLOW_MOE_PF_ATOMIC=1".to_owned());
+    }
+    if required_moe_pf_accum(progs, 5) {
+        requires.push("PLOW_MOE_PF_DET=1".to_owned());
+    }
+    if insts().any(|inst| {
+        inst.op == DevOp::FlashMlaDecode as u16 && inst.t[7] != packet::dev::TENSOR_NONE16
+    }) {
+        requires.push("PLOW_GLM_FUSE_ROPE=1".to_owned());
+    }
+    if insts()
+        .any(|inst| inst.op == DevOp::GemvQkv as u16 && inst.t[7] != packet::dev::TENSOR_NONE16)
+    {
+        requires.push("PLOW_GLM_FUSE_QNORM=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::XReduce as u16 && inst.i[7] != 0) {
+        requires.push("PLOW_XR_COMBINE_FOLD=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::KdaStateStepG as u16 && inst.i[4] & 4 != 0) {
+        requires.push("PLOW_KDA_FB_FOLD=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::KdaStateStepG as u16 && inst.i[4] & 8 != 0) {
+        requires.push("PLOW_KDA_DECODE_FUSED_ARM=1".to_owned());
+    }
+    requires
+}
+
+fn packet_prefill_arm_requirements(progs: &[DevProg]) -> Vec<String> {
+    let insts = || progs.iter().flat_map(|p| &p.insts);
+    let mut requires = Vec::new();
+    if insts().any(|inst| {
+        matches!(
+            DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op),
+            Some(DevOp::FlashMlaPrefill | DevOp::FlashMlaPrefillFp8 | DevOp::FlashGatherPrefill)
+        )
+    }) {
+        requires.push("PLOW_MLA_PREFILL=1".to_owned());
+    }
+    if insts().any(|inst| {
+        matches!(
+            DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op),
+            Some(
+                DevOp::MoeRouterTopkPf
+                    | DevOp::MoeAlignPf
+                    | DevOp::MoeGroupGluPf
+                    | DevOp::MoeGroupDownPf
+                    | DevOp::MoeCombinePf
+            )
+        )
+    }) {
+        requires.push("PLOW_MOE_PREFILL=1".to_owned());
+    }
+    if insts().any(|inst| {
+        matches!(inst.op, op if op == DevOp::MoeGroupDownPf as u16 || op == DevOp::MoeCombinePf as u16)
+            && inst.i[7] != 0
+    }) {
+        requires.push("PLOW_MOE_PF_PART16=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0) {
+        requires.push("PLOW_MOE_PF_A8=1".to_owned());
+    }
+    if insts().any(|inst| {
+        inst.op == DevOp::FlashMlaPrefill as u16
+            && inst.t[7] == packet::dev::TENSOR_NONE16
+            && (inst.i[6] & 0xff) > 1
+    }) {
+        requires.push("PLOW_MLA_PF_NS=1".to_owned());
+    }
+    if insts()
+        .any(|inst| inst.op == DevOp::QuantFp8 as u16 && inst.t[3] != packet::dev::TENSOR_NONE16)
+    {
+        requires.push("PLOW_T11_GLUQUANT=1".to_owned());
+    }
+    if required_moe_pf_accum(progs, 4) {
+        requires.push("PLOW_MOE_PF_ATOMIC=1".to_owned());
+    }
+    if required_moe_pf_accum(progs, 5) {
+        requires.push("PLOW_MOE_PF_DET=1".to_owned());
+    }
+    if insts().any(|inst| {
+        matches!(
+            DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op),
+            Some(
+                DevOp::KdaChunkPrepare
+                    | DevOp::KdaChunkIntra
+                    | DevOp::KdaChunkWu
+                    | DevOp::KdaChunkCarry
+            )
+        )
+    }) {
+        requires.push("PLOW_KDA_CHUNK=1".to_owned());
+    }
+    if insts()
+        .any(|inst| inst.op == DevOp::XReduceScatter as u16 || inst.op == DevOp::XAllGather as u16)
+    {
+        requires.push("PLOW_SEQ_PAR_SEAMS=1".to_owned());
+    }
+    if insts().any(|inst| {
+        matches!(
+            DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op),
+            Some(
+                DevOp::AttnRes
+                    | DevOp::SituGlu
+                    | DevOp::MlaOutGate
+                    | DevOp::KdaStateStep
+                    | DevOp::KdaConv
+            )
+        )
+    }) {
+        requires.push("PLOW_K3=1".to_owned());
+    }
+    requires
 }
 
 fn graph_phase_xreduce_segments(
@@ -3762,6 +4260,19 @@ fn elf_symbol_u32(img: &[u8], wanted: &str) -> Option<u32> {
 /// more than a check that cannot fail.
 fn check_prefill_object(syms: &[&str], path: &Path, requires: &[String]) -> Result<()> {
     if syms.is_empty() {
+        let needs_prefill_arm = requires.iter().any(|req| {
+            let (flag, val) = req.split_once('=').unwrap_or((req.as_str(), "1"));
+            val != "0"
+                && PREFILL_ARM_MARKERS
+                    .iter()
+                    .any(|(candidate, _)| *candidate == flag)
+        });
+        if needs_prefill_arm {
+            return Err(RuntimeError::Device(format!(
+                "packet requires a specialised prefill arm, but {} has no ELF symbol table; refusing an unverifiable packet/object pairing",
+                path.display()
+            )));
+        }
         tracing::warn!(
             object = %path.display(),
             "no ELF symbol table — the packet/object arm check cannot run on this file"
@@ -3976,11 +4487,17 @@ const KDA_CONV_STEP_DB_REPLACED_OPS: &[DevOp] = &[
 /// Every opcode that reaches an arm behind `PLOW_K3` in `runtime/amd/interp.hip`.
 ///
 /// The KDA mixer ops — four decomposed plus the two FUSED ones the decode emitter actually uses —
-/// and the three K3 block-structure ops, and nothing else. This is the Rust half of the contract
-/// whose C half is the `#if PLOW_K3` region around those nine `case` labels;
-/// `k3_arm_ops_match_the_interpreter` reads `interp.hip` and asserts the two agree, so a future
-/// tenth arm added inside the guard cannot go unlisted here — which is exactly how `KdaConv3` and
-/// `KdaStateStepG` were forced onto this list rather than remembered onto it.
+/// the three K3 block-structure ops, and (added alongside GLM-5.3-Flash, which shares this same
+/// guard region rather than its own) the eight GLM-5.3 primitives: hyper-connections and the
+/// pooled DSA indexer. This is the Rust half of the contract whose C half is the `#if PLOW_K3`
+/// region around those `case` labels; `k3_arm_ops_match_the_interpreter` reads `interp.hip` and
+/// asserts the two agree, so a future arm added inside the guard cannot go unlisted here — which
+/// is exactly how `KdaConv3` and `KdaStateStepG` were forced onto this list rather than
+/// remembered onto it, and how the eight GLM-5.3 ops below were found missing: they NOPped
+/// silently on any object built without `PLOW_K3` with no load-time refusal, because this list
+/// was never updated when they were added to the interpreter — caught only by running this
+/// test under `--features hsa`, which this project's own documented verification recipes
+/// (`status.md`, `perf-data/vllm-k3-glm53-baseline.md`) never pass.
 const K3_ARM_OPS: &[DevOp] = &[
     DevOp::KdaConv,
     DevOp::KdaGate,
@@ -3996,6 +4513,14 @@ const K3_ARM_OPS: &[DevOp] = &[
     DevOp::AttnRes,
     DevOp::SituGlu,
     DevOp::MlaOutGate,
+    DevOp::HyperConnPre,
+    DevOp::HyperConnPost,
+    DevOp::DsaPoolCompress,
+    DevOp::DsaPoolExpand,
+    DevOp::DsaPoolStash,
+    DevOp::DsaQQuant,
+    DevOp::IndexScoreKpool,
+    DevOp::GemvF32,
 ];
 
 /// The first K3/KDA opcode in these programs, or `None` if the packet needs no K3 arm.
@@ -4521,11 +5046,13 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     let mut mla_pure = vec![v2; n_seg as usize];
     let mut needs_v2: Vec<(usize, u32)> = Vec::new();
     let mut mla_any = vec![false; n_seg as usize];
+    let mut mla_nope = vec![false; n_seg as usize];
     let mut xr_wave_any = vec![false; n_seg as usize];
     let mut xr_wave_pure = vec![true; n_seg as usize];
     let mut kda_wave_any = vec![false; n_seg as usize];
     let mut kda_wave_pure = vec![true; n_seg as usize];
     let mut kda_carry_pure = vec![true; n_seg as usize];
+    let mut kda_wu_pure = vec![true; n_seg as usize];
     for e in &prog.stream {
         let op = prog
             .insts
@@ -4546,6 +5073,7 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
         kda_wave_any[seg] |= kda_wave_marked;
         kda_wave_pure[seg] &= kda_wave_marked && op == DevOp::KdaChunkIntra as u16;
         kda_carry_pure[seg] &= kda_wave_marked && op == DevOp::KdaChunkCarry as u16;
+        kda_wu_pure[seg] &= kda_wave_marked && op == DevOp::KdaChunkWu as u16;
         if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
             class[e.seg as usize] = 4;
         } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
@@ -4554,6 +5082,7 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
             // fallback kernel writes the nsplit=1 layout — so the env/routing mismatches
             // that DEGRADE for plain V2 blobs must REFUSE here instead of corrupting.
             let d = &prog.insts[e.inst as usize];
+            mla_nope[seg] |= d.i[3] & 0x8000_0000 != 0;
             // DEFERRED to after the class pass, and that is the whole point. This used to
             // refuse on `!v2` -- the ENV -- which misses the case that actually corrupts:
             // PLOW_MLA_PF_V2=1 SET at serve against a blob emitted WITHOUT it. `PLOW_MLA_PF_V2`
@@ -4578,6 +5107,12 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
         if mla_any[s] && mla_pure[s] {
             class[s] = 4;
         }
+        if mla_nope[s] && class[s] == 4 {
+            return Err(RuntimeError::Device(format!(
+                "NoPE MLA prefill cannot run on the four-wave V2 kernel (segment {s}); \
+                 disable V2 routing or use a kernel supporting zero RoPE dimensions"
+            )));
+        }
         if xr_wave_any[s] {
             if !xr_wave_pure[s] {
                 return Err(RuntimeError::Device(format!(
@@ -4591,10 +5126,13 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
                 class[s] = 20;
             } else if kda_carry_pure[s] {
                 class[s] = 23;
+            } else if kda_wu_pure[s] {
+                class[s] = 25;
             } else {
                 return Err(RuntimeError::Device(format!(
                     "segment {s} carries SE_KDA_INTRA_WAVE_ITEMS but is not pure KdaChunkIntra \
-                     (nor SE_KDA_CARRY_REGSTATE on pure KdaChunkCarry)"
+                     (nor SE_KDA_CARRY_REGSTATE / SE_KDA_WU_LEAN on pure KdaChunkCarry / \
+                     KdaChunkWu)"
                 )));
             }
         }
@@ -4687,8 +5225,9 @@ fn derive_raw_mla_v2_segments(prog: &DevProg) -> Result<Vec<bool>> {
         let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
             RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
         })?;
-        let dense_bf16 =
-            inst.op == DevOp::FlashMlaPrefill as u16 && inst.t[7] == packet::dev::TENSOR_NONE16;
+        let dense_bf16 = inst.op == DevOp::FlashMlaPrefill as u16
+            && inst.t[7] == packet::dev::TENSOR_NONE16
+            && inst.i[3] & 0x8000_0000 == 0;
         eligible[e.seg as usize] &= dense_bf16;
         seen[e.seg as usize] |= dense_bf16;
     }
@@ -4734,6 +5273,16 @@ fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) 
         }
     });
     seen && covered
+}
+
+fn packed_mla_compatible(prog: &DevProg) -> bool {
+    !prog.insts.iter().any(|d| {
+        d.op == DevOp::FlashGatherPrefill as u16
+            || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
+                && (d.i[3] & 0x8000_0000 != 0
+                    || (d.t[7] != packet::dev::TENSOR_NONE16
+                        && d.op != DevOp::FlashMlaPrefillFp8 as u16)))
+    })
 }
 
 fn packed_kda_compatible(prog: &DevProg) -> bool {
@@ -6228,6 +6777,9 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
         // GLM/DeepSeek MLA: `kv_a_layernorm` -> `kv.{L}.ckv`, out_row0 in i[2]
         // (`runtime/amd/interp.hip`, PLOW_DOP_RMSNORM).
         Some(2)
+    } else if op == DevOp::DsaPoolCompress as u16 {
+        // GLM-5.3 pooled indexer: prefill pool-cache base in i[3].
+        Some(3)
     } else if op == DevOp::HeadNormRope as u16 || op == DevOp::HeadNormRopeFp8 as u16 {
         // Dense GQA k/v norm -> `kv.{L}.k`/`.v`, and MLA's k_rope -> `kv.{L}.krot`.
         // Both carry the write row in i[3].
@@ -6259,6 +6811,29 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
 /// * `FlashPrefill`/`FlashPrefillFp8` → `i[4] = c0` (q_pos0) and
 ///   `i[1] = c0 + clen` (n_kv, everything written so far, not just this chunk).
 /// * every **KDA op** ([`KDA_ROW_COUNT_OPS`]) → `i[0] = clen`, the REAL row count.
+/// * `DsaPoolCompress` (GLM-5.3's pooled indexer, prefill mode only — this
+///   function never sees a decode program) → `i[0] = clen / pool_size`, not the
+///   baked `t / pool_size`. Same reasoning as KDA: the pool cache is PERSISTENT
+///   (`kv.*`, addressed by [`kv_write_row_field`]'s `chunk_base` above), so a
+///   padded chunk's pool count must stop at the last pool `clen` actually
+///   completes — one pool further and the boundary pool mixes real tokens with
+///   pad-row garbage, silently corrupting a cache entry decode will later select.
+///   `clen == t` (the common, non-ragged case) reproduces the baked value exactly.
+/// * `DsaPoolStash` (its prefill TAIL-SEED twin) → carries the `clen % pool_size`
+///   real trailing rows `DsaPoolCompress`'s shrink above deliberately leaves
+///   uncompressed into the decode-side ring, so that boundary pool completes
+///   correctly once decode contributes the rest instead of starting from
+///   whatever the ring happened to hold. `devgen` bakes `pool_size - 1` of these
+///   at `row = t - 1 - k`; rebased here to `row = clen - 1 - k` (an offset from
+///   `clen`'s end instead of `t`'s) and disabled (`Nop`) once `row` would fall
+///   inside a pool `DsaPoolCompress` already compressed — a live "genuine" and
+///   "surplus" write can share a ring slot (`pos % pool_size` cycles every
+///   `pool_size` rows), and letting a stale already-cached row overwrite a real
+///   one is exactly the bug this rebase exists to prevent, not a rarer version
+///   of it. On a full chunk (`clen == t`) `complete == clen`, so every baked row
+///   is `< complete` by construction and all of them `Nop` — correctly: every
+///   pool in a full chunk, including its last, was already compressed directly
+///   by `DsaPoolCompress` itself, so there is nothing left for the ring to carry.
 ///
 /// # Why KDA needs a row count where attention needs only a bound
 ///
@@ -6446,6 +7021,7 @@ fn rebase_chunk_rows(
     names: &[String],
     c0: u32,
     clen: u32,
+    t: u32,
     bucket: Option<u32>,
 ) {
     for d in insts.iter_mut() {
@@ -6461,6 +7037,17 @@ fn rebase_chunk_rows(
             d.i[1] = c0 + clen;
         } else if KDA_ROW_COUNT_OPS.iter().any(|&k| op == k as u16) {
             d.i[0] = clen;
+        } else if op == DevOp::DsaPoolCompress as u16 {
+            let pool_size = d.i[1].max(1);
+            d.i[0] = clen / pool_size;
+        } else if op == DevOp::DsaPoolStash as u16 {
+            let pool_size = d.i[0].max(1);
+            let pad = t.saturating_sub(clen);
+            let complete = (clen / pool_size) * pool_size;
+            match d.i[2].checked_sub(pad) {
+                Some(row) if row >= complete && row < clen => d.i[2] = row,
+                _ => d.op = DevOp::Nop as u16,
+            }
         }
         let Some(t) = bucket.filter(|&t| t > 0 && clen < t) else {
             continue;
@@ -7079,6 +7666,11 @@ pub struct AmdEngine {
     k_kda_key_factor_carry: Option<HsaKernel>,
     /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
     _kda_key_factor_scratch: Option<DeviceMem>,
+    k_kda_chunk_wu_lean: Option<HsaKernel>,
+    k_kda_chunk_wu_lean_keys: Option<HsaKernel>,
+    k_kda_chunk_carry_keyfeed: Option<HsaKernel>,
+    /// The lean Wu's `[hi | lo]` scaled-key pair for the key-fed carry.
+    _kda_keyfeed_scratch: Option<DeviceMem>,
     k_moe_stage1_mxfp4: Option<HsaKernel>,
     k_moe_stage1_a4_quant: Option<HsaKernel>,
     k_moe_stage1_a4_reuse: Option<HsaKernel>,
@@ -7677,6 +8269,16 @@ impl AmdEngine {
         let need_kda_carry_regstate = blob.progs[..dec_ix]
             .iter()
             .any(|p| marked_op(p, DevOp::KdaChunkCarry));
+        let marked_wu = |p: &DevProg, keys: bool| {
+            p.stream.iter().any(|e| {
+                e.flags & packet::dev::SE_KDA_WU_LEAN != 0
+                    && p.insts
+                        .get(e.inst as usize)
+                        .is_some_and(|d| d.op == DevOp::KdaChunkWu as u16 && (d.i[5] == 1) == keys)
+            })
+        };
+        let need_kda_wu_lean = blob.progs[..dec_ix].iter().any(|p| marked_wu(p, false));
+        let need_kda_carry_keyfeed = blob.progs[..dec_ix].iter().any(|p| marked_wu(p, true));
         if let Some(p) = blob.progs[..dec_ix]
             .iter()
             .find(|p| p.insts.iter().any(|i| i.op == DevOp::KdaDecodeFused as u16))
@@ -7818,6 +8420,8 @@ impl AmdEngine {
         // Read once, here, so a broken manifest fails before any object is
         // loaded rather than between two of them.
         let requires = build_requires(blob_path)?;
+        let packet_decode_requires = packet_decode_arm_requirements(&blob.progs[dec_ix..]);
+        let packet_prefill_requires = packet_prefill_arm_requirements(&blob.progs[..dec_ix]);
         let mut modules = Vec::new();
         let mut k_xaudit = None;
         let mut k_state_clear = None;
@@ -7903,6 +8507,9 @@ impl AmdEngine {
             if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
                 check_prefill_object(&syms, &path, req)?;
             }
+            if phase == Phase::Prefill {
+                check_prefill_object(&syms, &path, &packet_prefill_requires)?;
+            }
             if let (Phase::Decode, Some(req)) = (phase, requires.as_ref()) {
                 check_decode_object(
                     &syms,
@@ -7912,11 +8519,37 @@ impl AmdEngine {
                     need_moe_pf_det_decode,
                 )?;
             }
-            if phase == Phase::Decode && syms.contains(&XR_TAGGED_SYM) && tp.is_some() {
+            if phase == Phase::Decode {
+                check_decode_object(
+                    &syms,
+                    &path,
+                    &packet_decode_requires,
+                    need_moe_pf_atomic_decode,
+                    need_moe_pf_det_decode,
+                )?;
+            }
+            if let (Phase::Decode, true, Some(bind)) = (phase, syms.contains(&XR_TAGGED_SYM), tp) {
                 // A tagged one-shot object spins on data tags instead of the xctr gate;
                 // it finds its region from the status id every collective carries and
-                // needs a blob whose XReduce packets keep the parity/width contract.
+                // needs a blob whose XReduce packets keep the parity/width contract, at
+                // most 8 peers (one tag word per rank), and the compact TP audit (the
+                // exact copy audit reads the counter gate the tagged arm never bumps).
                 // Refuse here rather than trap on the device.
+                if bind.n_gpu > 8 {
+                    return Err(RuntimeError::Device(format!(
+                        "{} ({XR_TAGGED_SYM}): tagged one-shot XReduce supports at most 8 \
+                         ranks, got TP{}",
+                        path.display(),
+                        bind.n_gpu
+                    )));
+                }
+                if !crate::config::RuntimeConfig::get().amd.tp_audit_compact {
+                    return Err(RuntimeError::Device(format!(
+                        "{} ({XR_TAGGED_SYM}): tagged one-shot XReduce requires the compact TP \
+                         audit; unset PLOW_TP_AUDIT_COMPACT=0 or build with PLOW_XR_TAGGED=OFF",
+                        path.display()
+                    )));
+                }
                 super::amd_tp::check_xr_tagged_blob(&blob.progs, blob.tp.map_or(0, |b| b.hidden))
                     .map_err(|e| {
                     RuntimeError::Device(format!("{} ({XR_TAGGED_SYM}): {e}", path.display()))
@@ -8746,6 +9379,90 @@ impl AmdEngine {
             Some(kernel)
         } else {
             None
+        };
+
+        let mut load_kda_lean = |name: &str,
+                                 symbol: &str,
+                                 what: &str,
+                                 markers: &[&str],
+                                 kernarg: u32,
+                                 lds: u32|
+         -> Result<HsaKernel> {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "marked {what} segments require gfx950, but this device is {arch}"
+                )));
+            }
+            let path = hsaco_dir.join(name);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "marked {what} segments require {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            for marker in markers {
+                if !syms.contains(marker) {
+                    return Err(RuntimeError::Device(format!(
+                        "{what} object {} lacks required ABI/resource marker `{marker}`",
+                        path.display()
+                    )));
+                }
+            }
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, symbol)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}")))?;
+            let got = kernel.kernarg_size();
+            if got != kernarg && got != kernarg + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: kernarg segment is {got} B; {what} ABI needs {kernarg} (or {} with COv5 implicit args)",
+                    kernarg + 256
+                )));
+            }
+            let got_lds = HsaBackend::kernel_lds_bytes(&kernel);
+            let private = kernel.private_segment_size();
+            if got_lds != lds || private != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: resource gate failed: LDS={got_lds} (required {lds}), private={private} (required 0)"
+                )));
+            }
+            tracing::info!(object = %path.display(), symbol, "{what} object accepted");
+            modules.push(module);
+            Ok(kernel)
+        };
+        let k_kda_chunk_wu_lean = if need_kda_wu_lean {
+            Some(load_kda_lean(
+                "kda_chunk_wu_lean_gfx950.elf",
+                "plow_kda_chunk_wu_lean_gfx950",
+                "KDA Wu lean",
+                &KDA_WU_LEAN_MARKERS,
+                std::mem::size_of::<KdaChunkWuLeanArgs>() as u32,
+                KDA_WU_LEAN_LDS,
+            )?)
+        } else {
+            None
+        };
+        let (k_kda_chunk_wu_lean_keys, k_kda_chunk_carry_keyfeed) = if need_kda_carry_keyfeed {
+            let wu = load_kda_lean(
+                "kda_chunk_wu_lean_keys_gfx950.elf",
+                "plow_kda_chunk_wu_lean_keys_gfx950",
+                "KDA Wu lean keys",
+                &KDA_WU_LEAN_MARKERS,
+                std::mem::size_of::<KdaChunkWuLeanArgs>() as u32,
+                KDA_WU_LEAN_LDS,
+            )?;
+            let carry = load_kda_lean(
+                "kda_chunk_carry_regstate_keyfeed_gfx950.elf",
+                "plow_kda_chunk_carry_regstate_keyfeed_gfx950",
+                "KDA carry keyfeed",
+                &KDA_CARRY_KEYFEED_MARKERS,
+                std::mem::size_of::<KdaChunkCarryKeyfeedArgs>() as u32,
+                KDA_CARRY_REGSTATE_LDS,
+            )?;
+            (Some(wu), Some(carry))
+        } else {
+            (None, None)
         };
 
         let need_kda_key_factor = arch == "gfx950"
@@ -9799,6 +10516,24 @@ impl AmdEngine {
         let kda_key_factor_scratch = d_kda_key_factor_scratch
             .as_ref()
             .map(|m| (m.base, kda_key_factor_half));
+        let kda_keyfeed_half =
+            if k_kda_chunk_wu_lean_keys.is_some() && k_kda_chunk_carry_keyfeed.is_some() {
+                kda_keyfeed_scratch_half_bytes(&blob.progs[..dec_ix])?
+            } else {
+                0
+            };
+        let d_kda_keyfeed_scratch = if kda_keyfeed_half != 0 {
+            let bytes = kda_keyfeed_half.checked_mul(2).ok_or_else(|| {
+                RuntimeError::Device("KDA keyfeed scratch pair size overflows".into())
+            })?;
+            tracing::info!(bytes, "allocating one reusable KDA keyfeed scratch pair");
+            Some(EngineDevice::alloc(&*be, bytes)?)
+        } else {
+            None
+        };
+        let kda_keyfeed_scratch = d_kda_keyfeed_scratch
+            .as_ref()
+            .map(|m| (m.base, kda_keyfeed_half));
         let (stage1_a4_payload, stage1_a4_scales) =
             if k_moe_stage1_a4_quant.is_some() && k_moe_stage1_a4_reuse.is_some() {
                 moe_stage1_a4_scratch_bytes(&blob.progs[..dec_ix], &blob.tensors)?
@@ -9861,6 +10596,13 @@ impl AmdEngine {
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
                 promote_kda_intra_wave_items_routes(p, &seg_class, &mut prefill_routes)?;
                 promote_kda_carry_regstate_routes(p, &seg_class, &devp, &mut prefill_routes)?;
+                promote_kda_wu_lean_routes(
+                    p,
+                    &seg_class,
+                    &devp,
+                    &mut prefill_routes,
+                    kda_keyfeed_scratch,
+                )?;
                 for (seg, &class) in seg_class.iter().enumerate() {
                     let graph_phase = graph_phase_segments[prog_ix].contains(&seg);
                     if class == 19 || graph_phase {
@@ -10034,13 +10776,7 @@ impl AmdEngine {
                         || d.op == DevOp::FlashMlaPrefill as u16
                         || d.op == DevOp::FlashMlaPrefillFp8 as u16
                 }),
-                packed_mla_compatible: !p.insts.iter().any(|d| {
-                    d.op == DevOp::FlashGatherPrefill as u16
-                        || ((d.op == DevOp::FlashMlaPrefill as u16
-                            || d.op == DevOp::FlashMlaPrefillFp8 as u16)
-                            && d.t[7] != packet::dev::TENSOR_NONE as u16
-                            && d.op != DevOp::FlashMlaPrefillFp8 as u16)
-                }),
+                packed_mla_compatible: packed_mla_compatible(p),
                 packed_mla_segmented,
                 packed_needs_kda: p.insts.iter().any(|d| {
                     d.op == DevOp::KdaConv3 as u16
@@ -10447,6 +11183,10 @@ impl AmdEngine {
             k_kda_key_factor_wu,
             k_kda_key_factor_carry,
             _kda_key_factor_scratch: d_kda_key_factor_scratch,
+            k_kda_chunk_wu_lean,
+            k_kda_chunk_wu_lean_keys,
+            k_kda_chunk_carry_keyfeed,
+            _kda_keyfeed_scratch: d_kda_keyfeed_scratch,
             k_moe_stage1_mxfp4,
             k_moe_stage1_a4_quant,
             k_moe_stage1_a4_reuse,
@@ -10631,7 +11371,7 @@ impl AmdEngine {
         if program.packed_needs_mla {
             if !program.packed_mla_compatible {
                 return Err(RuntimeError::Device(
-                    "packed-prefill MLA does not support gathered/per-query selector packets"
+                    "packed-prefill MLA does not support NoPE or gathered/per-query selector packets"
                         .into(),
                 ));
             }
@@ -10973,6 +11713,16 @@ impl AmdEngine {
                 PrefillSegmentRoute::KdaChunkCarryRegstate { .. } => {
                     return "kda_carry_regstate";
                 }
+                PrefillSegmentRoute::KdaChunkWuLean { args, .. } => {
+                    return if args.key_hi != 0 {
+                        "kda_wu_lean_keys"
+                    } else {
+                        "kda_wu_lean"
+                    };
+                }
+                PrefillSegmentRoute::KdaChunkCarryKeyfeed { .. } => {
+                    return "kda_carry_keyfeed";
+                }
                 PrefillSegmentRoute::KdaChunkKeyFactorWu { .. }
                     if self.k_kda_key_factor_wu.is_some() =>
                 {
@@ -11106,14 +11856,28 @@ impl AmdEngine {
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
-            if let Some(PrefillSegmentRoute::MlaMaterializePack { args, grid }) =
-                self.progs[p].prefill_routes.get(seg).copied()
+            if let Some(PrefillSegmentRoute::MlaMaterializePack {
+                args,
+                grid,
+                k_rope_ten,
+                ..
+            }) = self.progs[p].prefill_routes.get(seg).copied()
             {
                 let kernel = self.k_mla_materialize_pack.ok_or_else(|| {
                     RuntimeError::Device(
                         "materialized MLA pack segment has no validated object".into(),
                     )
                 })?;
+                let mut args = args;
+                if self.kv_slot != 0 {
+                    if let Some(&(_, stride)) = self
+                        .kv_slot_stride
+                        .iter()
+                        .find(|(i, _)| *i == k_rope_ten as usize)
+                    {
+                        args.k_rope += stride * self.kv_slot as u64;
+                    }
+                }
                 EngineDevice::launch_kernel(
                     &*self.be,
                     kernel,
@@ -11209,6 +11973,97 @@ impl AmdEngine {
                         &mut args.u,
                         &mut args.aqk,
                         &mut args.g,
+                    ];
+                    for (id, field) in tens.iter().zip(fields) {
+                        if let Some(&(_, stride)) =
+                            self.kv_slot_stride.iter().find(|(i, _)| *i == *id as usize)
+                        {
+                            *field += stride * self.kv_slot as u64;
+                        }
+                    }
+                }
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, grid, tens }) = self
+                .progs[p]
+                .prefill_routes
+                .get(seg)
+                .copied()
+                .filter(|r| {
+                    matches!(r, PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. } if args.t >= 512)
+                })
+            {
+                let kernel = self.k_kda_chunk_carry_keyfeed.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "marked KDA carry keyfeed segment has no validated object".into(),
+                    )
+                })?;
+                let mut args = args;
+                if self.kv_slot != 0 {
+                    let fields: [&mut u64; 8] = [
+                        &mut args.out,
+                        &mut args.state,
+                        &mut args.q,
+                        &mut args.k,
+                        &mut args.w,
+                        &mut args.u,
+                        &mut args.aqk,
+                        &mut args.g,
+                    ];
+                    for (id, field) in tens.iter().zip(fields) {
+                        if let Some(&(_, stride)) =
+                            self.kv_slot_stride.iter().find(|(i, _)| *i == *id as usize)
+                        {
+                            *field += stride * self.kv_slot as u64;
+                        }
+                    }
+                }
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::KdaChunkWuLean { args, grid, tens }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = if args.key_hi != 0 {
+                    self.k_kda_chunk_wu_lean_keys
+                } else {
+                    self.k_kda_chunk_wu_lean
+                }
+                .ok_or_else(|| {
+                    RuntimeError::Device(
+                        "marked KDA Wu lean segment has no validated object".into(),
+                    )
+                })?;
+                let mut args = args;
+                if self.kv_slot != 0 {
+                    let fields: [&mut u64; 8] = [
+                        &mut args.w,
+                        &mut args.u,
+                        &mut args.q,
+                        &mut args.ainv,
+                        &mut args.k,
+                        &mut args.v,
+                        &mut args.g,
+                        &mut args.beta,
                     ];
                     for (id, field) in tens.iter().zip(fields) {
                         if let Some(&(_, stride)) =
@@ -12061,8 +12916,28 @@ impl AmdEngine {
             std::slice::from_raw_parts_mut(self.h_pf_inst.as_mut_ptr() as *mut DevInst64, n)
         };
 
-        rebase_chunk_rows(insts, &self.tensor_names, c0, clen, bucket);
+        rebase_chunk_rows(
+            insts,
+            &self.tensor_names,
+            c0,
+            clen,
+            self.progs[prog].t,
+            self.ragged_bucket(prog),
+        );
         rebase_kda_key_factor_routes(&mut self.progs[prog].prefill_routes, clen);
+        // The same `rows`/`kv_len` pair [`AmdEngine::prefill_prepare`] uploads to `in.kvlen`.
+        let rows = if bucket.is_some_and(|t| clen < t) {
+            clen
+        } else {
+            self.progs[prog].t
+        };
+        rebase_mla_materialized_routes(
+            insts,
+            &self.tensor_names,
+            &mut self.progs[prog].prefill_routes,
+            rows,
+            c0 + rows,
+        )?;
 
         let mut lm = None;
         for (i, d) in insts.iter().enumerate() {
@@ -12157,19 +13032,6 @@ impl AmdEngine {
             self.kda_conv_alt_stale[self.kv_slot] = true;
         }
         let ch = self.progs[step.prog].t;
-        if self.progs[step.prog].prefill_routes.iter().any(|r| {
-            matches!(
-                r,
-                PrefillSegmentRoute::MlaMaterializePack { .. }
-                    | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
-            )
-        }) && (step.c0 != 0 || step.clen != ch)
-        {
-            return Err(RuntimeError::Device(format!(
-                "materialized MLA prefill requires one exact initial bucket (c0=0, clen=T); got c0={}, clen={}, T={ch}",
-                step.c0, step.clen
-            )));
-        }
         // in.kvlen FIRST, so it can borrow the head of the staging slab before
         // ids/pos fill it — the slab is sized for exactly `ids + pos` at the
         // widest bucket and has no spare word past them.
@@ -13263,10 +14125,84 @@ mod tests {
             gq_seg_ofs: Vec::new(),
             l2_domains: 0,
         };
-        let devp = (0..4)
-            .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 0x1000))
+        // K/V transients sized at a 16384-row cache capacity; `K_rope` is the krot cache.
+        let rows = 16384 * u64::from(heads) * 2;
+        let devp = [rows * 192, rows * 128, rows * 256, 16384 * 64 * 2]
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| DeviceMem::view(0x1000 + (i as u64) * 0x1000_0000, len))
             .collect();
         (prog, devp)
+    }
+
+    #[test]
+    fn materialized_mla_routes_follow_the_chunk() {
+        let (mut prog, devp) = materialized_mla_route_probe(256, 12);
+        // The kv_b projection over the latent cache, `M = T` at emit.
+        prog.insts.push(DevInst64 {
+            op: DevOp::Gemm as u16,
+            blocks: 256,
+            t: [4, 5, 6, 0, 0, 0, 0, 0],
+            i: [256, 12 * 256, 512, 0, 0, 0, 0, 0],
+            ..Default::default()
+        });
+        let names: Vec<String> = [
+            "act.pf.k_materialized",
+            "act.pf.v_materialized",
+            "act.pf.kv_materialized",
+            "kv.l3.krot",
+            "act.pf.kv_materialized",
+            "kv.l3.ckv",
+            "l3.kv_b",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        mla_materialized_routes(&prog, &devp, &mut routes).unwrap();
+        assert!(matches!(
+            routes[0],
+            PrefillSegmentRoute::MlaMaterializePack {
+                k_rope_ten: 3,
+                kv_rows_cap: 16384,
+                ..
+            }
+        ));
+
+        // Continuation chunk: 8192 cached rows, 208 real of a 256 bucket under RAGGED-M.
+        let mut insts = prog.insts.clone();
+        rebase_mla_materialized_routes(&mut insts, &names, &mut routes, 208, 8400).unwrap();
+        assert_eq!(insts[2].i[0], 8400, "projection spans every cached row");
+        assert_eq!(
+            insts[0].i[0], 256,
+            "raw instruction words are the route's, not patched"
+        );
+        let PrefillSegmentRoute::MlaMaterializePack { args, .. } = routes[0] else {
+            panic!()
+        };
+        assert_eq!(args.t, 8400);
+        let PrefillSegmentRoute::MlaMaterializedPrefill { args, grid } = routes[1] else {
+            panic!()
+        };
+        assert_eq!((args.n, args.n_kv), (208, 8400));
+        assert_eq!(grid, 12);
+        assert_eq!(args.stride_k_b, 8400 * 12 * 192);
+        assert_eq!(args.stride_q_b, 208 * 12 * 192);
+
+        // Back to an exact initial chunk: every patch is re-derived, none accumulates.
+        rebase_mla_materialized_routes(&mut insts, &names, &mut routes, 256, 256).unwrap();
+        let PrefillSegmentRoute::MlaMaterializedPrefill { args, grid } = routes[1] else {
+            panic!()
+        };
+        assert_eq!((args.n, args.n_kv, grid), (256, 256, 12));
+
+        // Past the transient capacity: refuse rather than overrun.
+        assert!(
+            rebase_mla_materialized_routes(&mut insts, &names, &mut routes, 256, 16385)
+                .unwrap_err()
+                .to_string()
+                .contains("hold 16384")
+        );
     }
 
     #[test]
@@ -13616,6 +14552,57 @@ mod tests {
             assert!(err.contains(marker), "{op:?} must require {marker}: {err}");
             assert!(check_compiled_opcode_marker_set(&[marker], path, [op]).is_ok());
         }
+    }
+
+    #[test]
+    fn specialised_decode_arms_require_a_build_manifest() {
+        let mut plain = segmented_prog(&[DevOp::KdaStateStepG], &[0]);
+        assert!(packet_decode_arm_requirements(std::slice::from_ref(&plain)).is_empty());
+
+        plain.insts[0].i[4] = 4;
+        assert_eq!(
+            packet_decode_arm_requirements(std::slice::from_ref(&plain)),
+            ["PLOW_KDA_FB_FOLD=1"]
+        );
+
+        let mut xr = segmented_prog(&[DevOp::XReduce], &[0]);
+        xr.insts[0].i[7] = 1;
+        assert_eq!(
+            packet_decode_arm_requirements(std::slice::from_ref(&xr)),
+            ["PLOW_XR_COMBINE_FOLD=1"]
+        );
+
+        let err = check_decode_object(
+            &[],
+            Path::new("stripped.elf"),
+            &packet_decode_arm_requirements(std::slice::from_ref(&plain)),
+            false,
+            false,
+        )
+        .expect_err("a specialised packet cannot use an unverifiable object");
+        assert!(err.to_string().contains("no ELF symbol table"));
+    }
+
+    #[test]
+    fn specialised_prefill_arms_are_derived_without_a_manifest() {
+        let mut down = segmented_prog(&[DevOp::MoeGroupDownPf], &[0]);
+        down.insts[0].i[4] = 3;
+        down.insts[0].i[7] = 1;
+        assert_eq!(
+            packet_prefill_arm_requirements(std::slice::from_ref(&down)),
+            [
+                "PLOW_MOE_PREFILL=1",
+                "PLOW_MOE_PF_PART16=1",
+                "PLOW_MOE_PF_ATOMIC=1"
+            ]
+        );
+        let err = check_prefill_object(
+            &[],
+            Path::new("stripped-prefill.elf"),
+            &packet_prefill_arm_requirements(std::slice::from_ref(&down)),
+        )
+        .expect_err("a specialised packet cannot use an unverifiable prefill object");
+        assert!(err.to_string().contains("no ELF symbol table"));
     }
 
     #[test]
@@ -14118,7 +15105,7 @@ mod tests {
             i: [8, 0, 0, 0, 0, 0, 0, 0],
             ..Default::default()
         };
-        rebase_chunk_rows(std::slice::from_mut(&mut inst), &[], 0, 5, Some(8));
+        rebase_chunk_rows(std::slice::from_mut(&mut inst), &[], 0, 5, 8, Some(8));
         assert_eq!(inst.i[0], 5);
     }
 
@@ -14971,6 +15958,37 @@ mod tests {
     }
 
     #[test]
+    fn nope_mla_prefill_rejects_rope_only_v2_routes() {
+        for op in [DevOp::FlashMlaPrefill, DevOp::FlashMlaPrefillFp8] {
+            let mut prog = segmented_prog(&[op], &[0]);
+            prog.insts[0].i[3] = 0x8000_0040;
+            prog.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+            assert!(!packed_mla_compatible(&prog));
+            let err = derive_segments_for(&prog, true).unwrap_err();
+            assert!(err.to_string().contains("NoPE MLA prefill"));
+            prog.insts[0].i[3] = 64;
+            assert_eq!(derive_segments_for(&prog, true).unwrap(), [4]);
+            assert!(packed_mla_compatible(&prog));
+            prog.insts[0].t[7] = 7;
+            assert_eq!(
+                packed_mla_compatible(&prog),
+                op == DevOp::FlashMlaPrefillFp8
+            );
+        }
+        let mut plain = segmented_prog(&[DevOp::FlashMlaPrefill], &[0]);
+        plain.insts[0].i[3] = 0x8000_0000;
+        plain.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        assert_eq!(derive_segments_for(&plain, false).unwrap(), [8]);
+        assert_eq!(derive_raw_mla_v2_segments(&plain).unwrap(), [false]);
+        plain.insts[0].i[6] = 2;
+        assert!(derive_segments_for(&plain, false).is_err());
+
+        let mut mixed = segmented_prog(&[DevOp::FlashPrefill, DevOp::FlashMlaPrefill], &[0, 0]);
+        mixed.insts[1].i[3] = 0x8000_0000;
+        assert!(derive_segments_for(&mixed, false).is_err());
+    }
+
+    #[test]
     fn xreduce_wave_rs_routes_only_a_marked_pure_segment() {
         let mut pure = segmented_prog(&[DevOp::XReduceTwoShot], &[0]);
         pure.stream[0].flags |= packet::dev::SE_XR_WAVE_RS;
@@ -15047,6 +16065,97 @@ mod tests {
             e.flags |= packet::dev::SE_KDA_CARRY_REGSTATE;
         }
         assert!(derive_segments_for(&mixed, false).is_err());
+    }
+
+    #[test]
+    fn kda_wu_lean_routes_the_marked_pair_and_feeds_the_regstate_carry() {
+        let mut prog = segmented_prog(&[DevOp::KdaChunkWu, DevOp::KdaChunkCarry], &[0, 1]);
+        prog.t = 8192;
+        for d in &mut prog.insts {
+            d.blocks = 256;
+            d.i = [8192, 12, 128, 128, 1, 0, 0, 0];
+            d.fj[0] = (1.0 / 128.0f32.sqrt()).to_bits();
+        }
+        prog.insts[0].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        prog.insts[0].i[5] = 1;
+        prog.insts[1].t = [8, 9, 7, 3, 0, 1, 10, 5];
+        prog.stream[0].flags |= packet::dev::SE_KDA_WU_LEAN;
+        prog.stream[1].flags |= packet::dev::SE_KDA_CARRY_REGSTATE;
+        let devp: Vec<_> = (0..11)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let classes = derive_segments_for(&prog, false).unwrap();
+        assert_eq!(classes, [25, 23]);
+        let half = kda_keyfeed_scratch_half_bytes(std::slice::from_ref(&prog)).unwrap();
+        assert_eq!(half, 8192 * 12 * 128 * 2);
+
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        promote_kda_carry_regstate_routes(&prog, &classes, &devp, &mut routes).unwrap();
+        promote_kda_wu_lean_routes(
+            &prog,
+            &classes,
+            &devp,
+            &mut routes,
+            Some((0x8000_0000, half)),
+        )
+        .unwrap();
+        let PrefillSegmentRoute::KdaChunkWuLean { args: wu, grid, .. } = routes[0] else {
+            panic!("a marked exact Wu must select the lean object")
+        };
+        assert_eq!(
+            (wu.w, wu.q, wu.beta, wu.key_hi, wu.key_lo, wu.t, grid),
+            (
+                0x1000,
+                0x1700,
+                0x1600,
+                0x8000_0000,
+                0x8000_0000 + half,
+                8192,
+                768
+            )
+        );
+        let PrefillSegmentRoute::KdaChunkCarryKeyfeed { args: c, grid, .. } = routes[1] else {
+            panic!("a key-emitting Wu must convert its regstate carry into the key-fed carry")
+        };
+        assert_eq!(
+            (c.out, c.g, c.key_hi, c.key_lo, c.t, grid),
+            (0x1800, 0x1500, 0x8000_0000, 0x8000_0000 + half, 8192, 96)
+        );
+        rebase_kda_key_factor_routes(&mut routes, 777);
+        assert!(
+            matches!(routes[0], PrefillSegmentRoute::KdaChunkWuLean { args, .. } if args.t == 777)
+        );
+        assert!(
+            matches!(routes[1], PrefillSegmentRoute::KdaChunkCarryKeyfeed { args, .. } if args.t == 777)
+        );
+
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        promote_kda_carry_regstate_routes(&prog, &classes, &devp, &mut routes).unwrap();
+        let err = promote_kda_wu_lean_routes(&prog, &classes, &devp, &mut routes, None)
+            .expect_err("a key-emitting Wu without a scratch pair must refuse");
+        assert!(err.to_string().contains("no key-factor scratch"));
+
+        prog.insts[0].i[5] = 0;
+        assert_eq!(
+            kda_keyfeed_scratch_half_bytes(std::slice::from_ref(&prog)).unwrap(),
+            0
+        );
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        promote_kda_carry_regstate_routes(&prog, &classes, &devp, &mut routes).unwrap();
+        promote_kda_wu_lean_routes(&prog, &classes, &devp, &mut routes, None).unwrap();
+        assert!(
+            matches!(routes[0], PrefillSegmentRoute::KdaChunkWuLean { args, .. } if args.key_hi == 0)
+        );
+        assert!(matches!(
+            routes[1],
+            PrefillSegmentRoute::KdaChunkCarryRegstate { .. }
+        ));
+
+        prog.insts[0].i[4] = 0;
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        let err = promote_kda_wu_lean_routes(&prog, &classes, &devp, &mut routes, None)
+            .expect_err("a non-qpre Wu must not reach the lean object");
+        assert!(err.to_string().contains("not an exact qpre"));
     }
 
     #[test]
@@ -16368,10 +17477,17 @@ mod tests {
     /// written at row 0, with no error anywhere.
     #[test]
     fn rebase_chunk_moves_only_the_kv_write_rows() {
-        let names: Vec<String> = ["kv.0.ckv", "act.xn", "kv.0.krot", "act.qr", "act.opart"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let names: Vec<String> = [
+            "kv.0.ckv",
+            "act.xn",
+            "kv.0.krot",
+            "act.qr",
+            "act.opart",
+            "kv.0.kidx_pool",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let inst = |op: DevOp, dst: u16| DevInst64 {
             op: op as u16,
             t: [dst, 0, 0, 0, 0, 0, 0, 0],
@@ -16379,21 +17495,27 @@ mod tests {
         };
         // 0 kv_a_layernorm -> kv.0.ckv (row in i[2]); 1 the input norm, same
         // opcode, i[2] means nothing there; 2 k_rope -> kv.0.krot (row in i[3]);
-        // 3 the QUERY rope, same opcode, must be left alone; 4 the flash.
+        // 3 the QUERY rope, same opcode, must be left alone; 4 the flash;
+        // 5 GLM-5.3's pooled indexer cache (pool-row base in i[3]).
         let mut insts = vec![
             inst(DevOp::RmsNorm, 0),
             inst(DevOp::RmsNorm, 1),
             inst(DevOp::HeadNormRope, 2),
             inst(DevOp::HeadNormRope, 3),
             inst(DevOp::FlashMlaPrefill, 4),
+            inst(DevOp::DsaPoolCompress, 5),
         ];
         insts[4].i = [1, 64, 8192, 0, 128, u32::MAX, 0, 7];
         let before = insts.clone();
 
-        rebase_chunk_rows(&mut insts, &names, 512, 128, None);
+        rebase_chunk_rows(&mut insts, &names, 512, 128, 128, None);
 
         assert_eq!(insts[0].i[2], 512, "kv.0.ckv out_row0 was not rebased");
         assert_eq!(insts[2].i[3], 512, "kv.0.krot out_row was not rebased");
+        assert_eq!(
+            insts[5].i[3], 512,
+            "kv.0.kidx_pool out-pool base was not rebased"
+        );
         // Everything else, field for field.
         assert_eq!(insts[0].i[..2], before[0].i[..2]);
         assert_eq!(insts[0].i[3..], before[0].i[3..]);
@@ -16444,7 +17566,7 @@ mod tests {
         ];
         let before = insts.clone();
 
-        rebase_chunk_rows(&mut insts, &names, 0, CLEN, Some(T));
+        rebase_chunk_rows(&mut insts, &names, 0, CLEN, T, Some(T));
 
         assert_eq!(insts[0].i[0], CLEN, "Embed ntok");
         assert_eq!(insts[0].i[1], H, "Embed hidden must not move");
@@ -16483,7 +17605,7 @@ mod tests {
             },
         ];
         let before = insts.clone();
-        rebase_chunk_rows(&mut insts, &names, 0, T, Some(T));
+        rebase_chunk_rows(&mut insts, &names, 0, T, T, Some(T));
         assert_eq!(insts[0].i, before[0].i);
         assert_eq!(insts[1].i, before[1].i);
     }
@@ -16561,7 +17683,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        rebase_chunk_rows(&mut insts, &names, 1024, 512, None);
+        rebase_chunk_rows(&mut insts, &names, 1024, 512, 512, None);
         assert_eq!(insts[0].i[3], 1024);
         assert_eq!(insts[1].i, [0; 8], "the query norm was patched");
         assert_eq!(insts[2].i[4], 1024, "q_pos0");
@@ -16596,7 +17718,7 @@ mod tests {
                 i: [t, 0, 0, 0, 0, 0, 0, 0],
                 ..Default::default()
             });
-            rebase_chunk_rows(&mut insts, &names, 1024, clen, None);
+            rebase_chunk_rows(&mut insts, &names, 1024, clen, t, None);
 
             for (d, &op) in insts.iter().zip(KDA_ROW_COUNT_OPS) {
                 assert_eq!(d.i[0], clen, "{op:?} still runs the padded bucket width");
@@ -16604,6 +17726,98 @@ mod tests {
                 assert_eq!((d.i[1], d.i[2]), (96, 128), "{op:?}: a live operand moved");
             }
             assert_eq!(insts.last().unwrap().i[0], t, "a non-KDA op was shortened");
+        }
+    }
+
+    /// GLM-5.3's pooled DSA indexer, non-pool-aligned tail: `DsaPoolCompress` must stop
+    /// at the last COMPLETE pool `clen` covers, and `DsaPoolStash`'s prefill tail-seed
+    /// instructions must fire on exactly the trailing real rows a padded chunk's
+    /// compress call now excludes — neither more (a stray write into a slot an
+    /// already-cached pool owns) nor fewer (a real trailing token silently never
+    /// becomes searchable).
+    ///
+    /// `T=512, CLEN=502, pool_size=4`: `complete = (502/4)*4 = 500`, so exactly the
+    /// last TWO real rows (500, 501) are the genuine trailing remainder and the third
+    /// baked stash (row 509 -> rebased 499, which is `< complete`, i.e. already inside
+    /// a pool `DsaPoolCompress` itself just compressed) must `Nop`.
+    #[test]
+    fn dsa_pool_tail_seed_shrinks_compress_and_rebases_exactly_the_real_remainder() {
+        let names: Vec<String> = Vec::new();
+        const T: u32 = 512;
+        const CLEN: u32 = 502;
+        const POOL_SIZE: u32 = 4;
+        let compress = DevInst64 {
+            op: DevOp::DsaPoolCompress as u16,
+            i: [T / POOL_SIZE, POOL_SIZE, 128, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        // Baked exactly as `emit_glm_dsa_prefill_select` bakes them: rows T-1, T-2, T-3.
+        let stash = |row: u32| DevInst64 {
+            op: DevOp::DsaPoolStash as u16,
+            i: [POOL_SIZE, 128, row, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let mut insts = vec![compress, stash(T - 1), stash(T - 2), stash(T - 3)];
+        rebase_chunk_rows(&mut insts, &names, 0, CLEN, T, None);
+
+        assert_eq!(
+            insts[0].i[0],
+            CLEN / POOL_SIZE,
+            "compress did not shrink to clen's pools"
+        );
+        assert_eq!(
+            (insts[0].i[1], insts[0].i[2]),
+            (POOL_SIZE, 128),
+            "a live compress operand moved"
+        );
+
+        assert_eq!(
+            insts[1].op,
+            DevOp::DsaPoolStash as u16,
+            "genuine trailing row #1 was dropped"
+        );
+        assert_eq!(
+            insts[1].i[2],
+            CLEN - 1,
+            "row was not rebased from t's end to clen's end"
+        );
+        assert_eq!(
+            insts[2].op,
+            DevOp::DsaPoolStash as u16,
+            "genuine trailing row #2 was dropped"
+        );
+        assert_eq!(insts[2].i[2], CLEN - 2);
+        assert_eq!(
+            insts[3].op,
+            DevOp::Nop as u16,
+            "surplus stash for an already-compressed row was left live -- it can race a \
+             genuine trailing write for the same ring slot (pos % pool_size repeats every \
+             pool_size rows) and clobber it with stale already-cached data"
+        );
+    }
+
+    /// A full/aligned chunk (`clen == t`, `t` always a multiple of `pool_size`) must
+    /// `Nop` every tail-seed stash: `complete == clen`, so every baked row is `<
+    /// complete` by construction — `DsaPoolCompress` itself already compressed the
+    /// chunk's last pool directly, and the ring has nothing left to carry.
+    #[test]
+    fn dsa_pool_tail_seed_is_a_full_nop_on_an_aligned_chunk() {
+        let names: Vec<String> = Vec::new();
+        const T: u32 = 512;
+        const POOL_SIZE: u32 = 4;
+        let stash = |row: u32| DevInst64 {
+            op: DevOp::DsaPoolStash as u16,
+            i: [POOL_SIZE, 128, row, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let mut insts = vec![stash(T - 1), stash(T - 2), stash(T - 3)];
+        rebase_chunk_rows(&mut insts, &names, 0, T, T, None);
+        for d in &insts {
+            assert_eq!(
+                d.op,
+                DevOp::Nop as u16,
+                "an aligned chunk's tail-seed stash must not fire"
+            );
         }
     }
 
@@ -16725,21 +17939,21 @@ mod tests {
         .is_ok());
     }
 
-    /// A file that is not an ELF64 yields no symbols — and therefore no
-    /// refusal. A parser miss must never be reported as a missing arm.
+    /// Junk stays bounded and cannot establish a required prefill capability.
     #[test]
     fn elf_reader_is_bounded_on_junk() {
         assert!(elf_symbol_names(b"").is_empty());
         assert!(elf_symbol_names(b"\x7fELF\x02\x01").is_empty());
         assert!(elf_symbol_names(&[0xffu8; 4096]).is_empty());
         let junk = elf_symbol_names(&[0u8; 128]);
+        let err = check_prefill_object(&junk, Path::new("x.elf"), &["PLOW_MLA_PREFILL=1".into()])
+            .expect_err("a required arm needs a verifiable symbol table");
+        assert!(err.to_string().contains("no ELF symbol table"));
+        assert!(check_prefill_object(&junk, Path::new("x.elf"), &[]).is_ok());
         assert!(
-            check_prefill_object(&junk, Path::new("x.elf"), &["PLOW_MLA_PREFILL=1".into()]).is_ok()
+            check_prefill_object(&junk, Path::new("x.elf"), &["PLOW_MLA_PREFILL=0".into()]).is_ok()
         );
-        // The GEMV capacity check reads the SAME empty list and reaches the
-        // opposite conclusion, on purpose: an arm it cannot see may simply be
-        // one this packet does not need, but a bucket it cannot see is a bucket
-        // that is almost certainly the default 1.
+        // Missing GEMV capacity metadata admits only the legacy B1 contract.
         assert!(check_gemv_capacity(&junk, Path::new("x.elf"), 1).is_ok());
         assert!(check_gemv_capacity(&junk, Path::new("x.elf"), 2).is_err());
     }

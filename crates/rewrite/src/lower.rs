@@ -69,7 +69,13 @@ fn term_for(
     Ok(match op {
         Op::Embedding => format!("(Embedding {} {})", e(0)?, e(1)?),
         Op::Scale(f) => format!("(Scale {} {})", e(0)?, f64lit(*f)),
+        Op::RmsNorm { eps } if inputs.len() == 1 => {
+            format!("(UnitRmsNorm {} {})", e(0)?, f64lit(*eps))
+        }
         Op::RmsNorm { eps } => format!("(RmsNorm {} {} {})", e(0)?, e(1)?, f64lit(*eps)),
+        Op::RmsNormZeroCentered { eps } => {
+            format!("(ZeroCenteredRmsNorm {} {} {})", e(0)?, e(1)?, f64lit(*eps))
+        }
         Op::LayerNorm { eps } => {
             format!("(LayerNorm {} {} {} {})", e(0)?, e(1)?, e(2)?, f64lit(*eps))
         }
@@ -96,6 +102,18 @@ fn term_for(
                 .join(",");
             format!("(Transpose {} {})", e(0)?, quote(&tok))
         }
+        Op::Rope {
+            dim,
+            theta,
+            frequency_dim,
+            ..
+        } if frequency_dim != dim => format!(
+            "(ProportionalRope {} {} {} {})",
+            e(0)?,
+            *dim,
+            f64lit(*theta),
+            *frequency_dim
+        ),
         Op::Rope { dim, theta, .. } => format!("(Rope {} {} {})", e(0)?, *dim, f64lit(*theta)),
         Op::Attention {
             num_heads,
@@ -206,6 +224,7 @@ fn term_for(
             num_experts,
             top_k,
             group: None,
+            ..
         } => {
             format!("(MoeRouter {} {} {} {})", e(0)?, e(1)?, num_experts, top_k)
         }
@@ -213,6 +232,27 @@ fn term_for(
             num_experts,
             top_k,
             group: Some(group),
+            scoring: nn_graph::op::MoeScoring::Sigmoid,
+            norm_topk,
+            route_scale,
+            correction_bias: true,
+        } => format!(
+            "(MoeRouterNoAux {} {} {} {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            num_experts,
+            top_k,
+            group.n_group,
+            group.topk_group,
+            i64::from(*norm_topk),
+            f64lit(*route_scale),
+        ),
+        Op::MoeRouter {
+            num_experts,
+            top_k,
+            group: Some(group),
+            ..
         } => format!(
             "(MoeRouterGrouped {} {} {} {} {} {})",
             e(0)?,
@@ -221,6 +261,55 @@ fn term_for(
             top_k,
             group.n_group,
             group.topk_group
+        ),
+        Op::MoeExperts {
+            num_experts,
+            top_k,
+            intermediate_size,
+            block_fp8,
+        } => format!(
+            "(MoeExperts {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            num_experts,
+            top_k,
+            intermediate_size,
+            i64::from(*block_fp8),
+        ),
+        Op::DsaIndexer {
+            num_heads,
+            head_dim,
+            rope_dim,
+            top_k,
+            theta,
+        } => format!(
+            "(DsaIndexer {} {} {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            e(3)?,
+            e(4)?,
+            e(5)?,
+            e(6)?,
+            quote(&format!(
+                "heads={num_heads};hd={head_dim};rope={rope_dim};topk={top_k};theta={}",
+                f64lit(*theta)
+            ))
+        ),
+        Op::DsaAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            top_k,
+        } => format!(
+            "(DsaAttention {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            e(3)?,
+            quote(&format!(
+                "heads={num_heads};kv={num_kv_heads};hd={head_dim};topk={top_k}"
+            ))
         ),
         // --- Kimi-K3 ---
         Op::Conv1dDepthwise { kernel } => {
@@ -243,6 +332,7 @@ fn term_for(
             // a token so a future second recurrence stays a distinct e-node.
             let k = match kind {
                 nn_graph::op::LinearAttnKind::KimiDelta => "kimi_delta",
+                nn_graph::op::LinearAttnKind::QwenGatedDelta => "qwen_gated_delta",
             };
             format!(
                 "(LinearAttention {} {} {} {} {} {} {} {} {} {})",
@@ -292,6 +382,7 @@ fn act(k: ActKind) -> &'static str {
         ActKind::Silu => "silu",
         ActKind::Gelu => "gelu",
         ActKind::GeluTanh => "gelu_tanh",
+        ActKind::Tanh => "tanh",
         ActKind::Relu => "relu",
         ActKind::Sigmoid => "sigmoid",
         ActKind::QuickGelu => "quick_gelu",

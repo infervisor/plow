@@ -12,6 +12,9 @@ use std::sync::Arc;
 /// tokenizer can be shared across the async request handlers.
 pub trait Tokenize: Send + Sync {
     fn encode(&self, text: &str) -> Vec<u32>;
+    fn encode_with_special_tokens(&self, text: &str, _add_special_tokens: bool) -> Vec<u32> {
+        self.encode(text)
+    }
     fn decode(&self, ids: &[u32]) -> String;
     /// Number of token ids accepted by the model embedding table.
     fn vocab_size(&self) -> usize;
@@ -80,8 +83,41 @@ pub struct HfTokenizer {
 impl HfTokenizer {
     /// Load a `tokenizer.json` from disk.
     pub fn from_file(path: &std::path::Path) -> crate::Result<Self> {
-        let inner = tokenizers::Tokenizer::from_file(path)
+        let mut inner = tokenizers::Tokenizer::from_file(path)
             .map_err(|e| crate::RuntimeError::Msg(format!("tokenizer load: {e}")))?;
+        if let Some(dir) = path.parent() {
+            let config = [
+                dir.join("tokenizer_config.json"),
+                dir.join("checkpoint/tokenizer_config.json"),
+            ]
+            .into_iter()
+            .find_map(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+            if let Some(config) = config.filter(|c| {
+                matches!(
+                    c["tokenizer_class"].as_str(),
+                    Some("Qwen2Tokenizer" | "Qwen2TokenizerFast")
+                )
+            }) {
+                use tokenizers::pre_tokenizers::{
+                    byte_level::ByteLevel,
+                    sequence::Sequence,
+                    split::{Split, SplitPattern},
+                };
+                // Transformers reconstructs Qwen2's processors from its class, overriding
+                // tokenizer.json's combining-mark regex. Match that reference API behavior.
+                let split = Split::new(
+                    SplitPattern::Regex(r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+".into()),
+                    tokenizers::SplitDelimiterBehavior::Isolated, false,
+                ).map_err(|e| crate::RuntimeError::Msg(format!("Qwen2 tokenizer: {e}")))?;
+                let prefix = config["add_prefix_space"].as_bool().unwrap_or(false);
+                inner.with_pre_tokenizer(Some(Sequence::new(vec![
+                    split.into(),
+                    ByteLevel::new(prefix, true, false).into(),
+                ])));
+                inner.with_decoder(Some(ByteLevel::default()));
+            }
+        }
         Ok(HfTokenizer { inner })
     }
 }
@@ -89,8 +125,12 @@ impl HfTokenizer {
 #[cfg(feature = "hf-tokenizer")]
 impl Tokenize for HfTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
+        self.encode_with_special_tokens(text, false)
+    }
+
+    fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> Vec<u32> {
         self.inner
-            .encode(text, false)
+            .encode(text, add_special_tokens)
             .map(|e| e.get_ids().to_vec())
             .unwrap_or_default()
     }

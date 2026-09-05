@@ -54,6 +54,10 @@ pub fn build(cfg: &KimiK3Config) -> Result<Graph, ConfigError> {
 
     let dt = parse_dtype(t.torch_dtype.as_deref());
     let mut nn = Nn::new(dt, dt);
+    let model_name = |name: &str| match t.weight_prefix.as_deref() {
+        Some(prefix) => format!("{prefix}.{name}"),
+        None => name.to_owned(),
+    };
 
     let h = t.hidden_size;
     let eps = t.rms_norm_eps;
@@ -61,7 +65,7 @@ pub fn build(cfg: &KimiK3Config) -> Result<Graph, ConfigError> {
     let s = nn.sym("S");
 
     let ids = nn.input("input_ids", nn.shape([b.clone(), s.clone()]), DType::I32);
-    let mut x = nn.embedding("embed_tokens", ids, t.vocab_size, h);
+    let mut x = nn.embedding(&model_name("embed_tokens"), ids, t.vocab_size, h);
 
     // THE BLOCK-RESIDUAL STATE, and why it is two variables.
     //
@@ -75,7 +79,7 @@ pub fn build(cfg: &KimiK3Config) -> Result<Graph, ConfigError> {
     let max_snap = 8;
 
     for layer in 0..t.num_hidden_layers {
-        let p = format!("layers.{layer}");
+        let p = model_name(&format!("layers.{layer}"));
         nn.begin_block(&p);
         let prefix_in = x;
 
@@ -137,8 +141,13 @@ pub fn build(cfg: &KimiK3Config) -> Result<Graph, ConfigError> {
     }
     nn.end_block();
 
-    x = nn.rmsnorm("norm", x, h, eps);
-    let logits = nn.linear("lm_head", x, h, t.vocab_size, false);
+    x = nn.rmsnorm(&model_name("norm"), x, h, eps);
+    let lm_head = t
+        .head_prefix
+        .as_deref()
+        .map(|prefix| format!("{prefix}.lm_head"))
+        .unwrap_or_else(|| "lm_head".to_owned());
+    let logits = nn.linear(&lm_head, x, h, t.vocab_size, false);
     nn.mark_output(logits);
     Ok(nn.finish())
 }

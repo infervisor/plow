@@ -44,12 +44,12 @@ fn llama3_8b_builds_and_infers_shapes() {
         weights.len()
     );
     // Verify key weight names exist.
-    assert!(weights.contains("embed_tokens.weight"));
+    assert!(weights.contains("model.embed_tokens.weight"));
     assert!(weights.contains("lm_head.weight"));
-    assert!(weights.contains("layers.0.self_attn.q_proj.weight"));
-    assert!(weights.contains("layers.0.mlp.gate_proj.weight"));
-    assert!(weights.contains("layers.1.self_attn.o_proj.weight"));
-    assert!(weights.contains("norm.weight"));
+    assert!(weights.contains("model.layers.0.self_attn.q_proj.weight"));
+    assert!(weights.contains("model.layers.0.mlp.gate_proj.weight"));
+    assert!(weights.contains("model.layers.1.self_attn.o_proj.weight"));
+    assert!(weights.contains("model.norm.weight"));
 }
 
 #[test]

@@ -38,9 +38,11 @@ fn glm_ref_cfg() -> GlmCfg {
         index_heads: 32,
         index_dim: 128,
         index_topk: 2048,
+        index_kpool: 1,
         // indexer_types[0..4] = full,full,full,shared (real GLM-5.2 pattern); irrelevant to these
         // ctx=512 offline tests (DSA is gated OFF at ctx<=2048) but set for completeness.
         indexer_full: vec![true, true, true, false],
+        softmax_layers: vec![],
         has_dsa: true,
     }
 }
@@ -438,6 +440,191 @@ fn glm_dsa_shared_layer_reuses_idx() {
     assert!(
         ops.contains(&(FlashGatherDecode as u16)),
         "shared layer still gathers"
+    );
+}
+
+fn emitted_dsa_pooled(ctx: u32, full: bool, index_kpool: u32) -> packet::devbuild::Program {
+    let mut c = glm_ref_cfg();
+    c.index_kpool = index_kpool;
+    c.indexer_full = vec![false, false, false, full];
+    let mut b = Builder::new(256);
+    let tn = declare_glm(&mut b, &c, ctx, &[3]);
+    let tensors = b.tensors();
+    let mut b2 = Builder::new(256);
+    b2.adopt_tensors(tensors);
+    let mut xgate = 0u32;
+    emit_glm_block(
+        &mut b2,
+        &c,
+        &tn,
+        0,
+        ctx,
+        1,
+        1,
+        MoeEnc::Fp8Blk,
+        tn.x,
+        tn.xnext,
+        &[],
+        &mut xgate,
+        &[],
+    );
+    b2.finish()
+}
+
+fn emitted_ops_dsa_pooled(ctx: u32, full: bool, index_kpool: u32) -> Vec<u16> {
+    emitted_dsa_pooled(ctx, full, index_kpool)
+        .insts
+        .iter()
+        .map(|d| d.op)
+        .collect()
+}
+
+#[test]
+fn glm_dsa_pool_size_one_is_byte_identical_to_dense() {
+    // index_kpool=1 is the explicit no-op path — same op multiset as the ordinary
+    // (unspecified-index_kpool, defaults to 1 in glm_ref_cfg) dense-indexer test above,
+    // for BOTH full and shared layers. This is the hard regression bar for the whole
+    // pool_size>1 composition: GLM-5.2 (which never sets index_kpool) must never reach
+    // the pooled branch at all.
+    let mut full_dense = emitted_ops_dsa(131072, true);
+    let mut full_pooled_1 = emitted_ops_dsa_pooled(131072, true, 1);
+    full_dense.sort_unstable();
+    full_pooled_1.sort_unstable();
+    assert_eq!(
+        full_dense, full_pooled_1,
+        "full layer, index_kpool=1 vs dense"
+    );
+
+    let mut shared_dense = emitted_ops_dsa(131072, false);
+    let mut shared_pooled_1 = emitted_ops_dsa_pooled(131072, false, 1);
+    shared_dense.sort_unstable();
+    shared_pooled_1.sort_unstable();
+    assert_eq!(
+        shared_dense, shared_pooled_1,
+        "shared layer, index_kpool=1 vs dense"
+    );
+}
+
+#[test]
+fn glm_dsa_pooled_full_layer_emits_the_kpool_chain_in_order() {
+    use DevOp::*;
+    // ctx>CROSSOVER, 'full', index_kpool=4: the pooled indexer chain, not plain IndexScore/
+    // IndexSelect — gate-score Gemv, iwp_f32 GemvF32, DsaPoolStash, DsaPoolCompress,
+    // DsaQQuant, IndexScoreKpool, IndexSelect (now pool_size-aware), DsaPoolExpand, in
+    // that relative order (not necessarily adjacent — MLA-side ops interleave).
+    let ops = emitted_ops_dsa_pooled(131072, true, 4);
+    assert!(
+        !ops.contains(&(IndexScore as u16)),
+        "pooled full layer does not use plain IndexScore"
+    );
+    assert!(
+        ops.contains(&(IndexScoreKpool as u16)),
+        "pooled full layer scores via the fp8 pooled variant"
+    );
+    assert!(
+        ops.contains(&(IndexSelect as u16)),
+        "pooled full layer still uses IndexSelect (now pool_size-aware)"
+    );
+    assert!(
+        ops.contains(&(DsaPoolStash as u16)),
+        "pooled full layer stashes into the decode ring"
+    );
+    assert!(
+        ops.contains(&(DsaPoolCompress as u16)),
+        "pooled full layer compresses at pool boundaries"
+    );
+    assert!(
+        ops.contains(&(DsaQQuant as u16)),
+        "pooled full layer quantizes q_idx"
+    );
+    assert!(
+        ops.contains(&(DsaPoolExpand as u16)),
+        "pooled full layer expands pool ids back to token ids"
+    );
+    assert!(
+        ops.contains(&(GemvF32 as u16)),
+        "pooled full layer projects weights_proj at fp32"
+    );
+    assert!(ops.contains(&(FlashGatherDecode as u16)), "gather flash");
+
+    let idx_of = |op: DevOp| ops.iter().position(|&o| o == op as u16);
+    let (i_stash, i_compress, i_qquant, i_score, i_select, i_expand) = (
+        idx_of(DsaPoolStash).expect("stash present"),
+        idx_of(DsaPoolCompress).expect("compress present"),
+        idx_of(DsaQQuant).expect("qquant present"),
+        idx_of(IndexScoreKpool).expect("score present"),
+        idx_of(IndexSelect).expect("select present"),
+        idx_of(DsaPoolExpand).expect("expand present"),
+    );
+    assert!(
+        i_stash < i_compress,
+        "stash before compress (compress reads the ring)"
+    );
+    assert!(
+        i_compress < i_score && i_qquant < i_score,
+        "compress and q-quant both feed the score"
+    );
+    assert!(i_score < i_select, "score before select");
+    assert!(i_select < i_expand, "select before expand");
+}
+
+#[test]
+fn glm_dsa_pooled_selection_width_matches_decode_and_prefill_geometry() {
+    const CTX: u32 = 131072;
+    const POOL: u32 = 4;
+    const WIDTH: u32 = 2051;
+
+    let decode = emitted_dsa_pooled(CTX, true, POOL);
+    let gather = decode
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::FlashGatherDecode as u16)
+        .expect("decode gather");
+    let expand = decode
+        .insts
+        .iter()
+        .find(|d| d.op == DevOp::DsaPoolExpand as u16)
+        .expect("decode pool expand");
+    assert_eq!(expand.i[1] * expand.i[2] + expand.i[2] - 1, WIDTH);
+    assert_eq!(
+        gather.i[6], WIDTH,
+        "decode gather must consume the appended tail"
+    );
+    let iidx = decode
+        .tensors
+        .iter()
+        .find(|t| t.name == "act.iidx")
+        .expect("decode index tensor");
+    assert_eq!(iidx.bytes, WIDTH as u64 * I32);
+
+    let mut c = glm_ref_cfg();
+    c.index_kpool = POOL;
+    assert_eq!(glm_dsa_select_width(&c, CTX), WIDTH);
+    assert_eq!(glm_dsa_pf_cap(&c, CTX), GLM_DSA_PF_PACK * WIDTH);
+}
+
+#[test]
+fn glm_dsa_pooled_shared_layer_reuses_the_pool_cache() {
+    use DevOp::*;
+    // 'shared' pooled layers reuse the last full layer's selection — no indexer ops of
+    // ANY kind (dense or pooled), same as the dense-indexer shared-layer case.
+    let ops = emitted_ops_dsa_pooled(131072, false, 4);
+    for op in [
+        IndexScore,
+        IndexScoreKpool,
+        DsaPoolStash,
+        DsaPoolCompress,
+        DsaQQuant,
+        DsaPoolExpand,
+    ] {
+        assert!(
+            !ops.contains(&(op as u16)),
+            "shared pooled layer emits no {op:?}"
+        );
+    }
+    assert!(
+        ops.contains(&(FlashGatherDecode as u16)),
+        "shared pooled layer still gathers"
     );
 }
 
@@ -1065,4 +1252,86 @@ fn glm_linear_fp8_prefill_refuses_a_weight_with_no_scale_grid() {
         msg.contains("weight_scale_inv"),
         "name the missing handle; got: {msg}"
     );
+}
+
+/// A synthetic GLM-5.3 config, trimmed to two all-KDA layers and dense FFN — the smallest
+/// shape that still exercises `emit_kda_mixer_ex`'s per-call scratch-tensor declarations
+/// (`x`, `q_raw`/`k_raw`/`v_raw`, ...), which is what the next test is about.
+fn glm53_ref_cfg() -> GlmCfg {
+    GlmCfg {
+        layers: 2,
+        hidden: 4096,
+        heads: 64,
+        kv_lora: 512,
+        q_lora: 1536,
+        qk_nope: 256,
+        qk_rope: 0,
+        v_head: 256,
+        vocab: 154880,
+        eps: 1e-6,
+        n_exp: 1,
+        top_k: 1,
+        n_group: 1,
+        topk_group: 1,
+        moe_inter: 64,
+        dense_inter: 512,
+        first_k_dense: 2, // both layers dense-FFN — no MoE routing to set up for this test
+        route_scale: 1.0,
+        attn_scale: (512f32).powf(-0.5),
+        rope_theta: None,
+        prefix: "model.language_model.".into(),
+        tp: 1,
+        ep: false,
+        group: false,
+        index_heads: 32,
+        index_dim: 128,
+        index_topk: 2048,
+        index_kpool: 1,
+        indexer_full: vec![true, true],
+        softmax_layers: vec![false, false], // both layers KDA, no MLA layer needed here
+        has_dsa: false,
+    }
+}
+
+/// **Regression for the EIGHTEENTH-PASS bug** (see `status.md`): `glm53_emit_full` used to
+/// capture the model's `tensors` list ONCE, before any program was built, then reuse that
+/// same pre-emission snapshot for every program AND for the final `Model`. But
+/// `emit_kda_mixer_ex` declares its own fresh scratch tensors (`x`, `q_raw`/`k_raw`/`v_raw`,
+/// ...) on the per-program `Builder` during emission — so those handles existed in the
+/// program's own instruction stream but never made it into the blob's tensor table. On real
+/// hardware this read past the end of the on-device tensor-pointer table and faulted with a
+/// null address, misreported by the async fault handler as a crash in whatever op happened
+/// to be dispatching next (`GemvQkv`) rather than the real culprit (`RmsNorm`, one op
+/// earlier). The fix threads `tensors` forward from each finished program's OWN tensor list
+/// (`prog.tensors`), mirroring `k3_build_model`'s identical pattern in `kimi_k3.rs` for the
+/// same emitter. This test rebuilds `glm53_emit_full`'s tensor/program assembly in
+/// miniature and asserts the invariant directly: every tensor handle any instruction
+/// references must be within the final table's bounds.
+#[test]
+fn glm53_program_assembly_keeps_every_tensor_handle_in_the_final_table() {
+    let c = glm53_ref_cfg();
+    let layers: Vec<u32> = (0..c.layers).collect();
+    let enc = MoeEnc::from_flags(false, false);
+    let mut tb = Builder::new(256);
+    let n = declare_glm_rows_batched(&mut tb, &c, 64, &layers, 1, 1, enc);
+    let s = declare_glm53(&mut tb, &c, 1, 1, n.pos);
+    let mut tensors = tb.tensors();
+
+    let mut b = Builder::new(256);
+    b.set_tensor_dedup(true);
+    b.adopt_tensors(tensors.clone());
+    emit_glm53_program(&mut b, &c, &n, &s, 64, 1, 1, enc, false);
+    let prog = b.finish();
+    tensors = prog.tensors.clone();
+
+    for inst in &prog.insts {
+        for &h in &inst.t {
+            assert!(
+                h == TENSOR_NONE || (h as usize) < tensors.len(),
+                "op {} references tensor handle {h}, but the final table has only {} entries",
+                inst.op,
+                tensors.len()
+            );
+        }
+    }
 }

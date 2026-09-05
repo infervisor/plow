@@ -16,7 +16,7 @@
 //! [`assemble`]: crate::assemble
 
 use crate::extract::{Arg, FNode, FusedGraph};
-use crate::tilegraph::{LayerPlan, LayoutSpec, OpKind, OpSpec, LAYOUT_RANK};
+use crate::tilegraph::{LayerPlan, LayoutSpec, ModelOp, ModelOpKind, OpKind, OpSpec, LAYOUT_RANK};
 use costmodel::{AttnShape, GemmShape, RowShape};
 use nn_graph::{Graph, Node, NodeId, Op, TensorId};
 use std::collections::HashMap;
@@ -33,6 +33,8 @@ pub enum BridgeError {
     },
     #[error("node {node}: op `{op}` is not supported in a transformer block")]
     Unsupported { node: usize, op: &'static str },
+    #[error("node {node}: attention batch {batch} is unsupported; tiling requires batch 1")]
+    AttentionBatch { node: usize, batch: i64 },
     #[error("fused node {node}: op `{op}` is not supported in a transformer block")]
     UnsupportedFused { node: usize, op: String },
     #[error("fused leaf `{name}` has no static-shaped tensor in the source graph")]
@@ -93,21 +95,24 @@ pub fn plan_from_block(g: &Graph, block: u32) -> Result<LayerPlan, BridgeError> 
 /// the voice pipeline `ASR → LLM → TTS`, or successive DiT denoising steps).
 pub fn plan_from_all_blocks(g: &Graph) -> Result<LayerPlan, BridgeError> {
     let mut ops = Vec::new();
-    for block in 0..(g.blocks.len() as u32) {
-        for (id, node) in g.block_nodes(block) {
-            let kind = op_kind(g, id, node)?;
-            let (weight_dtype, compute_dtype) = node_dtypes(g, node);
-            ops.push(OpSpec {
-                // Suffix the block index into the op name so cross-block
-                // counter ids and packet debug output are decipherable.
-                name: format!("{}{}_L{}", node.op.name(), id.0, block),
-                inputs: node.inputs.iter().map(|t| tname(g, *t)).collect(),
-                output: tname(g, node.output),
-                kind,
-                weight_dtype,
-                compute_dtype,
-            });
-        }
+    // Walk the graph itself, not only `block_nodes`: embedding and the final
+    // norm/lm_head intentionally sit outside transformer blocks. Skipping
+    // block-less nodes produced a syntactically valid but incomplete model.
+    for (i, node) in g.nodes.iter().enumerate() {
+        let id = NodeId(i as u32);
+        let kind = op_kind(g, id, node)?;
+        let (weight_dtype, compute_dtype) = node_dtypes(g, node);
+        let suffix = node
+            .block
+            .map_or_else(|| "_global".to_string(), |block| format!("_L{block}"));
+        ops.push(OpSpec {
+            name: format!("{}{}{}", node.op.name(), id.0, suffix),
+            inputs: node.inputs.iter().map(|t| tname(g, *t)).collect(),
+            output: tname(g, node.output),
+            kind,
+            weight_dtype,
+            compute_dtype,
+        });
     }
     Ok(LayerPlan { ops })
 }
@@ -328,11 +333,35 @@ fn concat_spec(in0: &[i64], axis: i32, out: &[i64], elem: u64) -> LayoutSpec {
     }
 }
 
+fn attention_seq(dims: &[i64], node: usize, op: &str) -> Result<i64, BridgeError> {
+    match dims {
+        [seq, _] | [seq, _, _] | [1, seq, _, _] => Ok(*seq),
+        [batch, _, _, _] => Err(BridgeError::AttentionBatch {
+            node,
+            batch: *batch,
+        }),
+        _ => Err(BridgeError::Rank {
+            node,
+            op: op.into(),
+            rank: dims.len(),
+            expected: "[seq, features], [seq, heads, dim], or [1, seq, heads, dim]",
+        }),
+    }
+}
+
 fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
     let ni = id.0 as usize;
     let name = node.op.name();
     let dims = |idx: usize| static_dims(g, node.inputs[idx], ni, name);
     let out = static_dims(g, node.output, ni, name)?;
+    let mut input_bytes = [0u64; 8];
+    let mut input_row_aligned = [false; 8];
+    for (idx, tensor) in node.inputs.iter().take(input_bytes.len()).enumerate() {
+        let shape = static_dims(g, *tensor, ni, name)?;
+        let elems = shape.iter().copied().product::<i64>().max(0) as u64;
+        input_bytes[idx] = g.tensor(*tensor).dtype.tile_bytes(elems);
+        input_row_aligned[idx] = shape == out;
+    }
     const ELEM: u64 = 2; // bf16 operands, matching the cost model.
 
     let row = |operands: i64, reduce: bool| {
@@ -342,6 +371,18 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             feat,
             operands,
             reduce,
+        })
+    };
+    let model = |kind: ModelOpKind, operands: i64, args: [u32; 4]| {
+        let (rows, feat) = rows_feat(&out);
+        OpKind::Model(ModelOp {
+            kind,
+            rows,
+            feat,
+            operands,
+            args,
+            input_bytes,
+            input_row_aligned,
         })
     };
 
@@ -366,25 +407,74 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             })
         }
         // Row-wise, with a reduction sweep (mean/var or normalizing sum).
-        Op::RmsNorm { .. } | Op::LayerNorm { .. } => row(node.inputs.len() as i64, true),
+        Op::RmsNorm { eps } => model(
+            ModelOpKind::RmsNorm,
+            node.inputs.len() as i64,
+            [eps.to_bits(), 0, 0, 0],
+        ),
+        Op::LayerNorm { .. } => row(node.inputs.len() as i64, true),
+        Op::RmsNormZeroCentered { eps } => model(
+            ModelOpKind::RmsNormZeroCentered,
+            node.inputs.len() as i64,
+            [eps.to_bits(), 0, 0, 0],
+        ),
         Op::Softmax { .. } => row(1, true),
         // Row-wise, single pass (no cross-row reduction).
-        Op::Act(_) | Op::Scale(_) | Op::Rope { .. } => row(1, false),
-        Op::Elementwise(_) => row(2, false),
+        Op::Act(kind) => model(
+            match kind {
+                nn_graph::op::ActKind::Silu => ModelOpKind::Silu,
+                nn_graph::op::ActKind::Sigmoid => ModelOpKind::Sigmoid,
+                nn_graph::op::ActKind::Tanh => ModelOpKind::Tanh,
+                _ => return Ok(row(1, false)),
+            },
+            1,
+            [0; 4],
+        ),
+        Op::Scale(factor) => model(ModelOpKind::Scale, 1, [factor.to_bits(), 0, 0, 0]),
+        Op::Rope {
+            dim,
+            theta,
+            interleave,
+            frequency_dim,
+        } => model(
+            ModelOpKind::Rope,
+            1,
+            [
+                *dim,
+                theta.to_bits(),
+                u32::from(*interleave),
+                *frequency_dim,
+            ],
+        ),
+        Op::Elementwise(kind) => model(
+            match kind {
+                nn_graph::op::EwKind::Add => ModelOpKind::Add,
+                nn_graph::op::EwKind::Sub => ModelOpKind::Sub,
+                nn_graph::op::EwKind::Mul => ModelOpKind::Mul,
+                nn_graph::op::EwKind::Div => ModelOpKind::Div,
+            },
+            2,
+            [0; 4],
+        ),
         Op::Attention {
             num_heads,
+            num_kv_heads,
             head_dim,
+            causal,
+            sliding_window,
             ..
         } => {
-            // Convention: q/k are token-major ([seq, .., head_dim]), so the
-            // token axis is tensor axis 0.
-            let q = dims(0)?;
-            let k = dims(1)?;
+            let seq_q = attention_seq(&dims(0)?, ni, name)?;
+            let seq_kv = attention_seq(&dims(1)?, ni, name)?;
+            attention_seq(&dims(2)?, ni, name)?;
             OpKind::Flash(AttnShape {
                 heads: *num_heads as i64,
-                seq_q: *q.first().unwrap_or(&1),
-                seq_kv: *k.first().unwrap_or(&1),
+                kv_heads: *num_kv_heads as i64,
+                seq_q,
+                seq_kv,
                 head_dim: *head_dim as i64,
+                causal: *causal,
+                sliding_window: sliding_window.unwrap_or(0),
             })
         }
         // Pure layout / data movement → a strided descriptor (or a copy fallback).
@@ -396,8 +486,96 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             let in0 = dims(0)?;
             OpKind::Layout(concat_spec(&in0, *axis, &out, ELEM))
         }
-        // MoE router: softmax(x·W) → topk. Row-wise reduction (2 inputs: x + weight).
-        Op::MoeRouter { .. } => row(2, true),
+        Op::Embedding => {
+            let table = dims(1)?;
+            model(
+                ModelOpKind::Embedding,
+                2,
+                [table.first().copied().unwrap_or(0) as u32, 0, 0, 0],
+            )
+        }
+        Op::Conv1dDepthwise { kernel } => model(
+            ModelOpKind::CausalDepthwiseConv1d,
+            node.inputs.len() as i64,
+            [*kernel, out.last().copied().unwrap_or(0) as u32, 0, 0],
+        ),
+        Op::LinearAttention {
+            kind: nn_graph::op::LinearAttnKind::QwenGatedDelta,
+            num_heads,
+            head_dim,
+        } => model(
+            ModelOpKind::QwenGatedDelta,
+            node.inputs.len() as i64,
+            [*num_heads, *head_dim, 1, 0], // arg2: fp32 recurrent state/math
+        ),
+        Op::MoeRouter {
+            num_experts,
+            top_k,
+            group,
+            scoring,
+            norm_topk,
+            route_scale,
+            correction_bias,
+        } => {
+            let group = group.unwrap_or(nn_graph::op::MoeGroups {
+                n_group: 1,
+                topk_group: 1,
+            });
+            let flags = u32::from(matches!(scoring, nn_graph::op::MoeScoring::Sigmoid))
+                | (u32::from(*norm_topk) << 1)
+                | (u32::from(*correction_bias) << 2);
+            model(
+                ModelOpKind::MoeRouter,
+                node.inputs.len() as i64,
+                [
+                    *num_experts,
+                    *top_k,
+                    group.n_group | (group.topk_group << 16) | (flags << 24),
+                    route_scale.to_bits(),
+                ],
+            )
+        }
+        Op::MoeExperts {
+            num_experts,
+            top_k,
+            intermediate_size,
+            block_fp8,
+        } => model(
+            ModelOpKind::MoeExperts,
+            2,
+            [
+                *num_experts,
+                *top_k,
+                *intermediate_size,
+                u32::from(*block_fp8),
+            ],
+        ),
+        Op::DsaIndexer {
+            num_heads,
+            head_dim,
+            rope_dim,
+            top_k,
+            theta,
+        } => model(
+            ModelOpKind::DsaIndexer,
+            7,
+            [
+                *num_heads | (*head_dim << 16),
+                *rope_dim,
+                *top_k,
+                theta.to_bits(),
+            ],
+        ),
+        Op::DsaAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            top_k,
+        } => model(
+            ModelOpKind::DsaAttention,
+            4,
+            [*num_heads, *num_kv_heads, *head_dim, *top_k],
+        ),
         _ => return Err(BridgeError::Unsupported { node: ni, op: name }),
     })
 }
@@ -627,6 +805,7 @@ fn fused_shape(
         "Linear"
         | "LinearBias"
         | "FusedNormLinear"
+        | "FusedZeroCenteredNormLinear"
         | "FusedNormLinearBias"
         | "FusedLayerNormLinear"
         | "FusedLayerNormLinearBias"
@@ -637,19 +816,26 @@ fn fused_shape(
         "Attention" => replace_last(&child(0), *child(2).last().unwrap_or(&1)),
         // shape-preserving (activation is the first child)
         "RmsNorm"
+        | "UnitRmsNorm"
+        | "ZeroCenteredRmsNorm"
         | "LayerNorm"
         | "Rope"
+        | "ProportionalRope"
         | "Act"
         | "Scale"
         | "Softmax"
         | "FusedNormRope"
+        | "FusedZeroCenteredNormRope"
         | "FusedNormRopeScale"
         | "SwiGLU"
         | "FusedAdaLN"
         | "FusedGatedResidual"
         | "FusedResidualNorm"
+        | "FusedResidualZeroCenteredNorm"
         | "FusedResidualLayerNorm"
-        | "FusedGroupNormAct" => child(0),
+        | "FusedGroupNormAct"
+        | "FusedRmsNormSiluGate"
+        | "FusedPackedAttnGate" => child(0),
         // Embedding: output is [..ids_shape, hidden] where hidden = table's last dim.
         "Embedding" | "FusedEmbeddingScale" => {
             let mut d = child(0);
@@ -752,6 +938,7 @@ fn fused_op_kind(fused: &FusedGraph, shapes: &[Vec<i64>], i: usize) -> Result<Op
         "Linear"
         | "LinearBias"
         | "FusedNormLinear"
+        | "FusedZeroCenteredNormLinear"
         | "FusedNormLinearBias"
         | "FusedLayerNormLinear"
         | "FusedLayerNormLinearBias"
@@ -772,20 +959,26 @@ fn fused_op_kind(fused: &FusedGraph, shapes: &[Vec<i64>], i: usize) -> Result<Op
                 k,
             })
         }
-        "RmsNorm" | "LayerNorm" => row(na.len() as i64, true),
+        "RmsNorm" | "UnitRmsNorm" | "ZeroCenteredRmsNorm" | "LayerNorm" => {
+            row(na.len() as i64, true)
+        }
         // GroupNorm+Act without a following conv: a norm kernel — row-wise with
         // a per-group reduction sweep over (x, w, b).
         "FusedGroupNormAct" => row(na.len() as i64, true),
         // Residual+norm: 3 operands (a, b, normw), reduction sweep.
         "FusedResidualNorm" => row(3, true),
+        "FusedResidualZeroCenteredNorm" => row(3, true),
         "FusedResidualLayerNorm" => row(4, true),
         "Softmax" => row(1, true),
-        "Act" | "Scale" | "Rope" => row(1, false),
+        "Act" | "Scale" | "Rope" | "ProportionalRope" => row(1, false),
         // Embedding/FusedEmbeddingScale: memory-bound row-wise lookup.
         "Embedding" | "FusedEmbeddingScale" => row(1, false),
         // norm+rope keeps the norm's reduction; elementwise/gated combines do not.
-        "FusedNormRope" | "FusedNormRopeScale" => row(2, true),
-        "Ew" | "SwiGLU" | "FusedAdaLN" | "FusedGatedResidual" => row(na.len() as i64, false),
+        "FusedNormRope" | "FusedZeroCenteredNormRope" | "FusedNormRopeScale" => row(2, true),
+        "FusedRmsNormSiluGate" => row(na.len() as i64, true),
+        "Ew" | "SwiGLU" | "FusedAdaLN" | "FusedGatedResidual" | "FusedPackedAttnGate" => {
+            row(na.len() as i64, false)
+        }
         // GroupNorm+Act+Conv3d: model as layout (conv-dominated, same cost as Conv3d).
         "FusedGroupNormActConv3d" | "FusedGroupNormActConv3dBias" => OpKind::Layout(
             LayoutSpec::copy(out.iter().product::<i64>().max(0) as u64 * ELEM),
@@ -796,32 +989,62 @@ fn fused_op_kind(fused: &FusedGraph, shapes: &[Vec<i64>], i: usize) -> Result<Op
             let q = &shapes[na[0]];
             let k = &shapes[na[1]];
             let tok = str_arg(n).unwrap_or("");
-            let field = |key: &str| -> Option<i64> {
-                tok.split(';')
-                    .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+            let raw_field = |key: &str| -> Option<&str> {
+                tok.split(';').find_map(|part| {
+                    let (name, value) = part.split_once('=')?;
+                    (name == key).then_some(value)
+                })
             };
-            let (Some(heads), Some(head_dim)) = (field("heads"), field("hd")) else {
+            let int_field = |key: &str| raw_field(key)?.parse::<i64>().ok();
+            let (Some(heads), Some(kv_heads), Some(head_dim), Some(causal)) = (
+                int_field("heads"),
+                int_field("kv"),
+                int_field("hd"),
+                int_field("causal"),
+            ) else {
                 return Err(BridgeError::BadToken {
                     node: i,
                     op: n.op.clone(),
                     token: tok.into(),
                 });
             };
-            // Convention: q/k are token-major ([seq, ..., head_dim]); anything
-            // deeper than rank 3 would misread the token axis — error instead.
-            if q.len() > 3 || k.len() > 3 {
-                return Err(BridgeError::Rank {
+            let causal = match causal {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(BridgeError::BadToken {
+                        node: i,
+                        op: n.op.clone(),
+                        token: tok.into(),
+                    })
+                }
+            };
+            let sliding_window = match raw_field("win") {
+                Some("") => 0,
+                Some(value) => value.parse::<u32>().map_err(|_| BridgeError::BadToken {
                     node: i,
                     op: n.op.clone(),
-                    rank: q.len().max(k.len()),
-                    expected: "token-major q/k of rank <= 3 ([seq, heads, head_dim])",
-                });
-            }
+                    token: tok.into(),
+                })?,
+                None => {
+                    return Err(BridgeError::BadToken {
+                        node: i,
+                        op: n.op.clone(),
+                        token: tok.into(),
+                    })
+                }
+            };
+            let seq_q = attention_seq(q, i, &n.op)?;
+            let seq_kv = attention_seq(k, i, &n.op)?;
+            attention_seq(&shapes[na[2]], i, &n.op)?;
             OpKind::Flash(AttnShape {
                 heads,
-                seq_q: *q.first().unwrap_or(&1),
-                seq_kv: *k.first().unwrap_or(&1),
+                kv_heads,
+                seq_q,
+                seq_kv,
                 head_dim,
+                causal,
+                sliding_window,
             })
         }
         "Reshape" | "Transpose" | "Broadcast" | "Concat" | "Slice" => {

@@ -105,10 +105,10 @@ fn gemma4_shared_kv_and_norm_rope_fusion() {
     );
     assert!(fused.contains("SwiGLU"), "act·mul fusion did not fire");
 
-    // Norm→Rope fusions fire on qk_norm paths.
+    // Q/K norm→RoPE fusion fires; Gemma 4 applies no extra query scaling.
     assert!(
-        fused.contains("FusedNormRopeScale"),
-        "norm→rope→scale fusion did not fire on Q path"
+        fused.contains("FusedNormRope"),
+        "norm→rope fusion did not fire on Q/K paths"
     );
 
     // Fusion reduced ops.
@@ -119,23 +119,22 @@ fn gemma4_shared_kv_and_norm_rope_fusion() {
         stats.ops_after
     );
 
-    // Shared kv_proj: the weight "layers.0.self_attn.kv_proj.weight" should
-    // appear exactly once in the fused weight leaves (not duplicated).
+    // Full-attention Gemma 4 shares the k_proj result with V. The checkpoint
+    // carries one k_proj tensor and no v_proj/kv_proj tensor for this layer.
     let weights = fused_weights(&fused);
-    let kv_weights: Vec<_> = weights.iter().filter(|w| w.contains("kv_proj")).collect();
+    let k_weights: Vec<_> = weights.iter().filter(|w| w.contains("k_proj")).collect();
     assert_eq!(
-        kv_weights.len(),
+        k_weights.len(),
         1,
-        "expected exactly 1 kv_proj weight, got {:?}",
-        kv_weights
+        "expected exactly 1 k_proj weight, got {:?}",
+        k_weights
     );
 
-    // No separate k_proj/v_proj weights should exist (only kv_proj).
     assert!(
         !weights
             .iter()
-            .any(|w| w.contains(".k_proj.") || w.contains(".v_proj.")),
-        "separate k_proj/v_proj should not exist with attention_k_eq_v"
+            .any(|w| w.contains(".v_proj.") || w.contains("kv_proj")),
+        "full-attention shared K/V should not declare v_proj or kv_proj"
     );
 
     // Weight completeness: no weights lost in fusion.
@@ -147,30 +146,16 @@ fn gemma4_shared_kv_and_norm_rope_fusion() {
 }
 
 #[test]
-fn gemma4_has_fewer_norm_linear_fusions_than_gemma3() {
-    // Gemma 3 with 1 layer: q/k/v/gate/up + lm_head = 6 FusedNormLinear.
+fn gemma4_full_attention_reuses_k_projection_for_v() {
     let g3 = build_from_config_json(GEMMA).expect("build gemma3");
-    let (fused3, _) = rewrite::rewrite_graph(&g3).expect("rewrite gemma3");
-    let fnl3 = fused3
-        .nodes
-        .iter()
-        .filter(|n| n.op == "FusedNormLinear")
-        .count();
-
-    // Gemma 4 with 1 layer and k_eq_v: q/kv/gate/up + lm_head = 5 FusedNormLinear.
     let g4 = build_from_config_json(GEMMA4).expect("build gemma4");
-    let (fused4, _) = rewrite::rewrite_graph(&g4).expect("rewrite gemma4");
-    let fnl4 = fused4
-        .nodes
-        .iter()
-        .filter(|n| n.op == "FusedNormLinear")
-        .count();
+    let g3_weights = graph_weights(&g3);
+    let g4_weights = graph_weights(&g4);
 
-    // Gemma 4 shared K/V should produce one fewer FusedNormLinear per block.
-    assert!(
-        fnl4 < fnl3,
-        "expected gemma4 ({fnl4}) to have fewer FusedNormLinear than gemma3 ({fnl3})"
-    );
+    assert!(g3_weights.contains("model.layers.0.self_attn.v_proj.weight"));
+    assert!(g4_weights.contains("model.layers.0.self_attn.k_proj.weight"));
+    assert!(!g4_weights.contains("model.layers.0.self_attn.v_proj.weight"));
+    assert!(!g4_weights.iter().any(|name| name.contains("kv_proj")));
 }
 
 /// The 48-layer unroll must EXTRACT, not abort.

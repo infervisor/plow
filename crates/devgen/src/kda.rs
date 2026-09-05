@@ -87,6 +87,19 @@ pub struct KdaCfg {
     pub eps: f32,
     /// Value columns per workgroup in [`DevOp::KdaStateStep`]. See [`KdaCfg::state_step_blocks`].
     pub bv: u32,
+    /// `linear_attn_config.use_full_rank_gate`. `true` (K3): the output gate is one
+    /// `[H*D, hidden]` projection, `g_proj`. `false` (GLM5-Next): the output gate is
+    /// low-rank, two sequential projections `g_a_proj` (down to `head_dim`) then
+    /// `g_b_proj` (up to `H*D`) — the SAME shape family as the forget gate's own
+    /// `f_a_proj`/`f_b_proj` bottleneck, not a new mechanism. See [`OutputGate`].
+    pub full_rank_gate: bool,
+}
+
+/// KDA's output gate, full-rank or low-rank — see [`KdaCfg::full_rank_gate`].
+#[derive(Clone, Copy, Debug)]
+pub enum OutputGate {
+    FullRank { g_proj: u32 },
+    LowRank { g_a_proj: u32, g_b_proj: u32 },
 }
 
 impl KdaCfg {
@@ -144,6 +157,26 @@ impl KdaCfg {
             && self.gate_lower_bound.is_some_and(f32::is_finite)
             && self.eps.is_finite()
             && self.eps > 0.0
+    }
+
+    /// Whether the in-interpreter fused decode arm (L7, `PLOW_KDA_DECODE_FUSED_ARM`) carries
+    /// this shape: the one D rung the arm instantiates, one value column per wave, a
+    /// register-bounded conv width, and EVERY (head, tile) slice on its own workgroup — the
+    /// tiles of a head rendezvous inside the packet, so a workgroup walking two of them would
+    /// wait on itself.
+    pub fn supports_decode_fused_arm(&self, n_cu: u32) -> bool {
+        self.heads > 0
+            && self.head_dim == 128
+            && self.bv == WG_WAVES
+            && (1..=8).contains(&self.conv_w)
+            && self.proj() / self.bv <= n_cu
+            && self.eps.is_finite()
+    }
+
+    /// Bytes of the fused arm's per-layer rendezvous scratch: per head one counter word plus
+    /// q, k, g and o words (`PLOW_KDA_FUSED_SCRATCH_WORDS`, op_kda.h), 8 bytes each.
+    pub fn fused_arm_scratch_bytes(&self) -> u64 {
+        self.heads as u64 * (1 + 4 * self.head_dim as u64) * 8
     }
 
     /// Workgroups for [`DevOp::KdaStateStep`] — `H * D / BV` work items, capped at the CU count.
@@ -224,7 +257,7 @@ pub struct KdaWeights {
     pub q_proj: u32,
     pub k_proj: u32,
     pub v_proj: u32,
-    pub g_proj: u32,
+    pub gate: OutputGate,
     pub o_proj: u32,
     pub f_a_proj: u32,
     pub f_b_proj: u32,
@@ -270,16 +303,27 @@ pub fn declare_kda_weights(
         c.proj() as u64,
         c.conv_w as u64,
     );
+    // Output gate. `use_full_rank_gate: true` (K3) is a change relative to the Kimi Linear
+    // paper, which parameterises the OUTPUT gate low-rank (the GLM5-Next branch here). K3's
+    // checkpoint has `g_proj [12288,7168]` and no `g_a_proj`/`g_b_proj` anywhere; GLM5-Next's
+    // has `g_a_proj [128,4096]`/`g_b_proj [8192,128]` and no `g_proj`. Note the asymmetry that
+    // is easy to get backwards on the K3 side: the output gate is full-rank there, the FORGET
+    // gate is still low-rank 128 (`f_a_proj` -> `f_b_proj`) regardless of the flag.
+    let gate = if c.full_rank_gate {
+        OutputGate::FullRank {
+            g_proj: bf(b, format!("{prefix}g_proj.weight"), p * h),
+        }
+    } else {
+        OutputGate::LowRank {
+            g_a_proj: bf(b, format!("{prefix}g_a_proj.weight"), hd * h),
+            g_b_proj: bf(b, format!("{prefix}g_b_proj.weight"), p * hd),
+        }
+    };
     KdaWeights {
         q_proj: bf(b, format!("{prefix}q_proj.weight"), p * h),
         k_proj: bf(b, format!("{prefix}k_proj.weight"), p * h),
         v_proj: bf(b, format!("{prefix}v_proj.weight"), p * h),
-        // Full-rank output gate. `use_full_rank_gate: true` is a K3 change relative to the Kimi
-        // Linear paper, which parameterises the OUTPUT gate low-rank. The checkpoint has
-        // `g_proj [12288,7168]` and no `g_a_proj`/`g_b_proj` anywhere. Note the asymmetry that is
-        // easy to get backwards: the output gate is full-rank, the FORGET gate is still low-rank
-        // 128 (`f_a_proj` -> `f_b_proj`) regardless of the flag.
-        g_proj: bf(b, format!("{prefix}g_proj.weight"), p * h),
+        gate,
         o_proj: bf(b, format!("{prefix}o_proj.weight"), h * p),
         f_a_proj: bf(b, format!("{prefix}f_a_proj.weight"), hd * h),
         f_b_proj: bf(b, format!("{prefix}f_b_proj.weight"), p * hd),
@@ -634,6 +678,32 @@ fn emit_kda_mixer_ex(
     let (hi, p, hd, nh) = (c.hidden, c.proj(), c.head_dim, c.heads);
     let (tt, pu, hiu) = (t as u64, p as u64, hi as u64);
     let a = act_prefix;
+    let chunk = chunk_enable && t >= 512 && !seq_rows && matches!(hd, 64 | 128);
+    let decode_fused = fused_decode_enable
+        && fuse
+        && !chunk
+        && st.conv_state_alt.is_none()
+        && c.supports_decode_fused(t, n_cu, seq_rows);
+    // L3 (`PLOW_KDA_FB_FOLD`): at decode the f_b GEMV folds into `KdaStateStepG`'s prologue.
+    // Only the plain Conv3 -> StepG chain carries the arm; f_a's row rides the step's `t4`, the
+    // weight its `j1`, and `f_raw` is never declared.
+    let fb_fold = t == 1
+        && !seq_rows
+        && fuse
+        && !chunk
+        && !decode_fused
+        && st.conv_state_alt.is_none()
+        && crate::emit_config::active().kda_fb_fold;
+    // L7 (`PLOW_KDA_DECODE_FUSED_ARM`): the same chain as ONE packet on the step's slice map.
+    // Composes with the f_b fold (bit 2 + bit 3); everything else the fold excludes, it excludes.
+    let fused_arm = t == 1
+        && !seq_rows
+        && fuse
+        && !chunk
+        && !decode_fused
+        && st.conv_state_alt.is_none()
+        && crate::emit_config::active().kda_decode_fused_arm
+        && c.supports_decode_fused_arm(n_cu);
 
     // Activations. q, k and v stay three separate [T, H*D] buffers all the way through: the three
     // projections are independent packets, the three convs are independent packets, and the state
@@ -660,12 +730,15 @@ fn emit_kda_mixer_ex(
     ];
     let g_raw = bft(b, format!("{a}g_raw"), tt * pu);
     let fa = bft(b, format!("{a}f_a"), tt * hd as u64);
-    let f_raw = bft(b, format!("{a}f_raw"), tt * pu);
+    let f_raw = if fb_fold {
+        fa
+    } else {
+        bft(b, format!("{a}f_raw"), tt * pu)
+    };
     let b_raw = bft(b, format!("{a}b_raw"), tt * nh as u64);
     // `gate`/`beta` exist ONLY on the unfused path. A declared handle nothing writes is the
     // `Mamba2Scan` smell — 69 layers x 49 KiB of arena that no op touches — and an emitter that
     // allocates it anyway is one refactor away from an op reading it.
-    let chunk = chunk_enable && t >= 512 && !seq_rows && matches!(hd, 64 | 128);
     let (gate, beta) = if fuse && !chunk {
         (u32::MAX, u32::MAX)
     } else {
@@ -721,34 +794,70 @@ fn emit_kda_mixer_ex(
     // safe direction and the LDS bound that decides it; P5/P6 stay separate because their weights
     // (`[128,7168]` and `[96,7168]`) are 1/128th and 1/96th of a projection each — concatenating
     // them onto a 49152-wide sweep would buy two gates and hand two of the 256 CUs a ragged tail.
-    let (c_q, c_k, c_v, c_g) = if fuse_qkvg(t, hi) {
-        let f = b.emit(DevOp::GemvQkvg, all.clone(), &[c_ln], |d| {
-            d.t[0] = raw[0];
-            d.t[1] = x;
-            d.t[2] = w.q_proj;
-            d.t[3] = raw[1];
-            d.t[4] = w.k_proj;
-            d.t[5] = raw[2];
-            d.t[6] = w.v_proj;
-            d.t[7] = g_raw;
-            d.i[0] = t;
-            d.i[1] = p;
-            d.i[2] = hi;
-            d.i[3] = p;
-            d.i[4] = p;
-            d.i[5] = p;
-            // The ninth pointer. `t[8]` is full; `DevOp::GemvQkvg` states why the demoted
-            // operand is a weight and not an output.
-            d.i[6] = w.g_proj;
-        });
-        (f, f, f, f)
-    } else {
-        (
+    let (c_q, c_k, c_v, c_g) = match (w.gate, fuse_qkvg(t, hi)) {
+        (OutputGate::FullRank { g_proj }, true) => {
+            let f = b.emit(DevOp::GemvQkvg, all.clone(), &[c_ln], |d| {
+                d.t[0] = raw[0];
+                d.t[1] = x;
+                d.t[2] = w.q_proj;
+                d.t[3] = raw[1];
+                d.t[4] = w.k_proj;
+                d.t[5] = raw[2];
+                d.t[6] = w.v_proj;
+                d.t[7] = g_raw;
+                d.i[0] = t;
+                d.i[1] = p;
+                d.i[2] = hi;
+                d.i[3] = p;
+                d.i[4] = p;
+                d.i[5] = p;
+                // The ninth pointer. `t[8]` is full; `DevOp::GemvQkvg` states why the demoted
+                // operand is a weight and not an output.
+                d.i[6] = g_proj;
+            });
+            (f, f, f, f)
+        }
+        (OutputGate::FullRank { g_proj }, false) => (
             gemv(b, raw[0], x, w.q_proj, p, hi, c_ln),
             gemv(b, raw[1], x, w.k_proj, p, hi, c_ln),
             gemv(b, raw[2], x, w.v_proj, p, hi, c_ln),
-            gemv(b, g_raw, x, w.g_proj, p, hi, c_ln),
-        )
+            gemv(b, g_raw, x, g_proj, p, hi, c_ln),
+        ),
+        (OutputGate::LowRank { g_a_proj, g_b_proj }, fuse_qkv) => {
+            // No fourth (gate) stream to fuse — GLM5-Next's gate is low-rank, so it rides the
+            // same two-GEMV shape as the forget gate (P5/P7) below, not the QKV fusion. q/k/v
+            // still fuse into ONE [`DevOp::GemvQkv`] under the same decode-only/LDS-arena bound
+            // `fuse_qkvg` already checks — GemvQkv's arena is a strict subset of GemvQkvg's
+            // (three streams, not four), so the same gate is conservative, not approximate.
+            let (cq, ck, cv) = if fuse_qkv {
+                let f = b.emit(DevOp::GemvQkv, all.clone(), &[c_ln], |d| {
+                    d.t[0] = raw[0];
+                    d.t[1] = x;
+                    d.t[2] = w.q_proj;
+                    d.t[3] = raw[1];
+                    d.t[4] = w.k_proj;
+                    d.t[5] = raw[2];
+                    d.t[6] = w.v_proj;
+                    d.i[0] = t;
+                    d.i[1] = p;
+                    d.i[2] = hi;
+                    d.i[3] = p;
+                    d.i[4] = p;
+                });
+                (f, f, f)
+            } else {
+                (
+                    gemv(b, raw[0], x, w.q_proj, p, hi, c_ln),
+                    gemv(b, raw[1], x, w.k_proj, p, hi, c_ln),
+                    gemv(b, raw[2], x, w.v_proj, p, hi, c_ln),
+                )
+            };
+            // g_a: down-projection to head_dim, mirrors `fa`/`c_fa` below exactly.
+            let ga = bft(b, format!("{a}g_a"), tt * hd as u64);
+            let c_ga = gemv(b, ga, x, g_a_proj, hd, hi, c_ln);
+            let c_gb = gemv(b, g_raw, ga, g_b_proj, p, hd, c_ga);
+            (cq, ck, cv, c_gb)
+        }
     };
     let (c_fa, c_bb) = emit_control_linears(
         b,
@@ -768,7 +877,11 @@ fn emit_kda_mixer_ex(
     );
     // P7 — forget-gate up-projection. The forget gate stays LOW RANK 128 even though the output
     // gate is full rank; that asymmetry is `use_full_rank_gate`'s and it is easy to get backwards.
-    let c_fb = gemv(b, f_raw, fa, w.f_b_proj, p, hd, c_fa);
+    let c_fb = if fb_fold {
+        c_fa
+    } else {
+        gemv(b, f_raw, fa, w.f_b_proj, p, hd, c_fa)
+    };
 
     // P8/P9/P10 — the K3-specific chain, SIX packets decomposed and THREE fused. `fuse_kda`
     // argues the direction; both spellings of the graph are emitted from here so the fusion stays
@@ -783,12 +896,72 @@ fn emit_kda_mixer_ex(
     // scale = D^-0.5, applied to q AFTER the L2 norm; k is NOT scaled.
     let scale = (c.head_dim as f32).powf(-0.5);
 
-    if fused_decode_enable
-        && fuse
-        && chunk_tmp.is_none()
-        && st.conv_state_alt.is_none()
-        && c.supports_decode_fused(t, n_cu, seq_rows)
-    {
+    if fused_arm {
+        // One op-112 packet on the step's own slices: tile 0 of each head convs q/k, every tile
+        // its v columns, the tiles exchange through the loader-zeroed scratch and the last one
+        // to finish runs the gated norm (op_kda.h `d_kda_decode_fused_arm`). `mix` and `o` are
+        // declared above and never written: the exchange carries them.
+        let scratch = b.tensor(
+            &format!("{a}kda.fused.scratch"),
+            c.fused_arm_scratch_bytes(),
+        );
+        let handles = [
+            w.conv_w[0],
+            w.conv_w[1],
+            w.conv_w[2],
+            st.conv_state[0],
+            st.conv_state[1],
+            st.conv_state[2],
+            w.a_log,
+            w.dt_bias,
+            w.o_norm,
+            g_raw,
+            scratch,
+            c.eps.to_bits(),
+            c.conv_w,
+        ];
+        let mut descriptor = Vec::with_capacity(handles.len() * 4);
+        for word in handles {
+            descriptor.extend_from_slice(&word.to_le_bytes());
+        }
+        let desc = b.tensor_init(&format!("{a}kda.fused.desc"), descriptor);
+        let mut fused_deps = vec![c_q, c_k, c_v, c_g, c_fb, c_bb];
+        fused_deps.sort_unstable();
+        fused_deps.dedup();
+        assert_eq!(
+            nb,
+            c.proj() / c.bv,
+            "every (head, tile) on its own workgroup"
+        );
+        let c_fused = b.emit(DevOp::KdaStateStepG, cus, &fused_deps, |d| {
+            d.t[0] = y;
+            d.t[1] = raw[0];
+            d.t[2] = raw[1];
+            d.t[3] = raw[2];
+            d.t[4] = f_raw;
+            d.t[5] = b_raw;
+            d.t[6] = st.state;
+            d.t[7] = desc;
+            d.i[0] = t;
+            d.i[1] = nh;
+            d.i[2] = hd;
+            d.i[3] = c.bv;
+            // bit0 l2norm, bit2 (PLOW_KDA_F_FB_FOLD) t4 = f_a / j1 = W_fb, bit3
+            // (PLOW_KDA_F_FUSED_ARM) the fused chain with t7 = the descriptor.
+            d.i[4] = 1 | if fb_fold { 4 } else { 0 } | 8;
+            d.i[5] = w.dt_bias;
+            d.i[6] = gate_mode;
+            d.f[0] = scale;
+            d.f[1] = lower_bound;
+            if fb_fold {
+                d.j[1] = w.f_b_proj;
+            }
+        });
+        let c_o = gemv(b, attn, y, w.o_proj, hi, p, c_fused);
+        return (c_o, attn);
+    }
+
+    if decode_fused {
         let handles = [
             w.conv_w[0],
             w.conv_w[1],
@@ -1036,7 +1209,8 @@ fn emit_kda_mixer_ex(
             // bit0: L2-normalize q and k in kernel, eps INSIDE the sqrt.
             // bit1 (PLOW_KDA_F_SEQ_ROWS): the rows are INDEPENDENT SEQUENCES, so the recurrence
             // strides its carried state per row instead of threading them all through one.
-            d.i[4] = 1 | if seq_rows { 2 } else { 0 };
+            // bit2 (PLOW_KDA_F_FB_FOLD): t4 is f_a and j1 the f_b weight; the step projects.
+            d.i[4] = 1 | if seq_rows { 2 } else { 0 } | if fb_fold { 4 } else { 0 };
             d.i[5] = w.dt_bias;
             d.i[6] = gate_mode;
             // `i[7]`, the one free integer slot. Read only when the flags word carries
@@ -1045,6 +1219,10 @@ fn emit_kda_mixer_ex(
             d.i[7] = parked;
             d.f[0] = scale;
             d.f[1] = lower_bound;
+            // `j[1]` (= `fj[2]`), read only under bit2 for the same reason as `i[7]`.
+            if fb_fold {
+                d.j[1] = w.f_b_proj;
+            }
         })
     } else {
         // P8a-c — the three short convs, one per stream, each over H*D = 12288 channels and each
@@ -1106,6 +1284,7 @@ fn emit_kda_mixer_ex(
         )
     };
 
+    let _ = all;
     // P11 — output gate. Gated on P4 (whose GEMV has had the whole conv+gate+state chain to hide
     // under) and P10.
     let norm_cus: Vec<u32> = (0..c.gated_norm_blocks_rows(n_cu, t)).collect();
@@ -1121,7 +1300,6 @@ fn emit_kda_mixer_ex(
     });
 
     // P12 — out projection. The residual is NOT here: see `emit_kda_layer`.
-    let _ = all;
     let c_o = gemv(b, attn, y, w.o_proj, hi, p, c_norm);
     (c_o, attn)
 }
@@ -1175,12 +1353,11 @@ pub fn emit_kda_layer(
 ///
 /// The three `*_conv1d.weight` tensors are consumed into one concatenated handle, so they are
 /// listed here explicitly rather than derived from the declared names.
-pub fn kda_checkpoint_names(prefix: &str) -> Vec<String> {
-    [
+pub fn kda_checkpoint_names(prefix: &str, full_rank_gate: bool) -> Vec<String> {
+    let mut names: Vec<&str> = vec![
         "q_proj.weight",
         "k_proj.weight",
         "v_proj.weight",
-        "g_proj.weight",
         "o_proj.weight",
         "f_a_proj.weight",
         "f_b_proj.weight",
@@ -1191,10 +1368,14 @@ pub fn kda_checkpoint_names(prefix: &str) -> Vec<String> {
         "A_log",
         "dt_bias",
         "o_norm.weight",
-    ]
-    .iter()
-    .map(|n| format!("{prefix}{n}"))
-    .collect()
+    ];
+    if full_rank_gate {
+        names.push("g_proj.weight");
+    } else {
+        names.push("g_a_proj.weight");
+        names.push("g_b_proj.weight");
+    }
+    names.iter().map(|n| format!("{prefix}{n}")).collect()
 }
 
 /// TP sharding class for a KDA tensor, by suffix.
@@ -1213,7 +1394,10 @@ pub fn kda_shard_class(suffix: &str) -> &'static str {
         | "f_b_proj.weight" | "b_proj.weight" | "q_conv1d.weight" | "k_conv1d.weight"
         | "v_conv1d.weight" | "A_log" | "dt_bias" => "column",
         "o_proj.weight" => "row",
-        "f_a_proj.weight" | "o_norm.weight" => "replicated",
+        // g_a_proj mirrors f_a_proj: the rank bottleneck, not per-head, so replicated.
+        // g_b_proj mirrors f_b_proj: up-projects back to H*D, column-parallel.
+        "f_a_proj.weight" | "o_norm.weight" | "g_a_proj.weight" => "replicated",
+        "g_b_proj.weight" => "column",
         _ => panic!(
             "KDA: unclassified tensor `{suffix}` — shard.rs defaults to REPLICATE, which \
                      for KDA is not a crash, just wrong math on >1 GPU"
@@ -1234,6 +1418,7 @@ mod tests {
             gate_lower_bound: Some(-5.0),
             eps: 1e-5,
             bv: 16,
+            full_rank_gate: true,
         }
     }
 
@@ -1387,20 +1572,34 @@ mod tests {
         assert_eq!(kda_shard_class("o_norm.weight"), "replicated");
         assert_eq!(kda_shard_class("f_b_proj.weight"), "column");
         assert_eq!(kda_shard_class("o_proj.weight"), "row");
-        for n in kda_checkpoint_names("") {
-            let _ = kda_shard_class(&n); // panics on anything unclassified
+        assert_eq!(kda_shard_class("g_a_proj.weight"), "replicated");
+        assert_eq!(kda_shard_class("g_b_proj.weight"), "column");
+        for full_rank in [true, false] {
+            for n in kda_checkpoint_names("", full_rank) {
+                let _ = kda_shard_class(&n); // panics on anything unclassified
+            }
         }
     }
 
     #[test]
     fn coverage_lists_all_fourteen_checkpoint_tensors() {
-        let n = kda_checkpoint_names("language_model.model.layers.0.self_attn.");
+        let n = kda_checkpoint_names("language_model.model.layers.0.self_attn.", true);
         assert_eq!(n.len(), 14);
         assert!(
             n.iter().all(|s| s.starts_with("language_model.")),
             "K3 has ZERO `model.` tensors"
         );
         assert!(n.contains(&"language_model.model.layers.0.self_attn.A_log".to_string()));
+    }
+
+    /// GLM5-Next's low-rank gate lists 15 tensors (swap `g_proj` for `g_a_proj`+`g_b_proj`).
+    #[test]
+    fn low_rank_gate_lists_fifteen_checkpoint_tensors() {
+        let n = kda_checkpoint_names("l.self_attn.", false);
+        assert_eq!(n.len(), 15);
+        assert!(n.contains(&"l.self_attn.g_a_proj.weight".to_string()));
+        assert!(n.contains(&"l.self_attn.g_b_proj.weight".to_string()));
+        assert!(!n.iter().any(|s| s.ends_with(".g_proj.weight")));
     }
 
     /// The fusion gate is a REFUSAL at emit time, not a runtime fallback: past the LDS arena the
@@ -1496,6 +1695,229 @@ mod tests {
                 assert_eq!(n(DevOp::KdaChunkPrepare), 0);
             }
         }
+    }
+
+    /// L3 (`PLOW_KDA_FB_FOLD`): the decode f_b GEMV folds into `KdaStateStepG`. Unset and "0"
+    /// emit the same bytes; on, the layer loses exactly the f_b packet and the step carries
+    /// `t4 = f_a`, `j1 = W_fb`, flags bit 2. Prefill rows are untouched either way.
+    #[test]
+    fn fb_fold_removes_the_f_b_gemv_and_leaves_the_default_packet_byte_identical() {
+        let _guard = crate::test_env::env_guard();
+        let build = |t: u32| {
+            let c = KdaCfg {
+                heads: 12,
+                bv: 8,
+                ..k3()
+            };
+            let mut b = Builder::new(256);
+            let hidden = b.tensor("in.hidden", t as u64 * c.hidden as u64 * 2);
+            let w = declare_kda_weights(&mut b, &c, "p.", "l.");
+            let st = declare_kda_state(&mut b, &c, "kv.0.", 1);
+            let seed = b.emit(DevOp::Nop, (0..256).collect(), &[], |_| {});
+            emit_kda_mixer_ex(
+                &mut b,
+                &c,
+                &w,
+                &st,
+                "act.",
+                t,
+                hidden,
+                None,
+                256,
+                false,
+                &[seed],
+                true,
+                false,
+                false,
+                false,
+            );
+            (b.finish(), w)
+        };
+        let packed = |p: &packet::devbuild::Program| -> Vec<packet::dev::DevInst64> {
+            p.insts.iter().map(|i| i.pack()).collect()
+        };
+        let (unset, _) = build(1);
+        let (off, w_off) = {
+            let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "0")]);
+            build(1)
+        };
+        assert_eq!(packed(&unset), packed(&off), "unset == off, byte for byte");
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        let step_off = off
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step_off.i[4] & 4, 0);
+        assert_eq!(step_off.j[1], 0);
+        assert!(off
+            .insts
+            .iter()
+            .any(|i| i.op == DevOp::Gemv as u16 && i.t[2] == w_off.f_b_proj));
+
+        let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "1")]);
+        let (on, w_on) = build(1);
+        assert_eq!(
+            on.insts.len(),
+            off.insts.len() - 1,
+            "exactly the f_b packet"
+        );
+        assert_eq!(n(&on, DevOp::Gemv), n(&off, DevOp::Gemv) - 1);
+        assert!(!on
+            .insts
+            .iter()
+            .any(|i| i.op == DevOp::Gemv as u16 && i.t[2] == w_on.f_b_proj));
+        assert_eq!(n(&on, DevOp::KdaStateStepG), 1);
+        let step = on
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step.i[4], 1 | 4, "l2norm + fold");
+        assert_eq!(on.tensors[step.t[4] as usize].name, "act.f_a");
+        assert_eq!(step.j[1], w_on.f_b_proj);
+        assert_eq!(
+            step.blocks, step_off.blocks,
+            "the fold never narrows the step"
+        );
+        assert!(
+            !on.tensors.iter().any(|t| t.name == "act.f_raw"),
+            "no unwritten f_raw"
+        );
+        // Prefill rows keep the GEMM chain untouched.
+        let (pf, _) = build(128);
+        let (pf_off, _) = {
+            let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "0")]);
+            build(128)
+        };
+        assert_eq!(packed(&pf), packed(&pf_off));
+    }
+
+    /// L7 (`PLOW_KDA_DECODE_FUSED_ARM`): Conv3 + StepG + GatedNorm become one op-112 packet
+    /// on the step's slices, flags bit 3, `t7` the descriptor; composes with the f_b fold.
+    #[test]
+    fn fused_arm_replaces_the_chain_and_leaves_the_default_packet_byte_identical() {
+        let _guard = crate::test_env::env_guard();
+        let build = |t: u32| {
+            let c = KdaCfg {
+                heads: 12,
+                bv: 8,
+                ..k3()
+            };
+            let mut b = Builder::new(256);
+            let hidden = b.tensor("in.hidden", t as u64 * c.hidden as u64 * 2);
+            let w = declare_kda_weights(&mut b, &c, "p.", "l.");
+            let st = declare_kda_state(&mut b, &c, "kv.0.", 1);
+            let seed = b.emit(DevOp::Nop, (0..256).collect(), &[], |_| {});
+            emit_kda_mixer_ex(
+                &mut b,
+                &c,
+                &w,
+                &st,
+                "act.",
+                t,
+                hidden,
+                None,
+                256,
+                false,
+                &[seed],
+                true,
+                false,
+                false,
+                false,
+            );
+            (b.finish(), w)
+        };
+        let packed = |p: &packet::devbuild::Program| -> Vec<packet::dev::DevInst64> {
+            p.insts.iter().map(|i| i.pack()).collect()
+        };
+        let n = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+        let (unset, _) = build(1);
+        let (off, _) = {
+            let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_FUSED_ARM", "0")]);
+            build(1)
+        };
+        assert_eq!(packed(&unset), packed(&off), "unset == off, byte for byte");
+        assert_eq!(n(&off, DevOp::KdaConv3), 1);
+        assert_eq!(n(&off, DevOp::KdaGatedNorm), 1);
+        let step_off = off
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step_off.i[4] & 8, 0);
+
+        let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_FUSED_ARM", "1")]);
+        let (on, w_on) = build(1);
+        assert_eq!(on.insts.len(), off.insts.len() - 2, "Conv3 and GatedNorm");
+        assert_eq!(n(&on, DevOp::KdaConv3), 0);
+        assert_eq!(n(&on, DevOp::KdaGatedNorm), 0);
+        assert_eq!(n(&on, DevOp::KdaStateStepG), 1);
+        let step = on
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step.i[4], 1 | 8, "l2norm + fused arm");
+        assert_eq!(step.blocks, step_off.blocks, "the step's own slice map");
+        assert_eq!(step.blocks, 192, "every (head, tile) on its own workgroup");
+        assert_eq!(on.tensors[step.t[0] as usize].name, "act.y");
+        assert_eq!(on.tensors[step.t[1] as usize].name, "act.q_raw");
+        assert_eq!(on.tensors[step.t[3] as usize].name, "act.v_raw");
+        assert_eq!(on.tensors[step.t[4] as usize].name, "act.f_raw");
+        let desc = &on.tensors[step.t[7] as usize];
+        assert_eq!(desc.name, "act.kda.fused.desc");
+        let words: Vec<u32> = desc
+            .init
+            .as_ref()
+            .unwrap()
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(words.len(), 13);
+        assert_eq!(&words[..3], &w_on.conv_w);
+        assert_eq!(words[6], w_on.a_log);
+        assert_eq!(words[7], w_on.dt_bias);
+        assert_eq!(words[8], w_on.o_norm);
+        assert_eq!(on.tensors[words[9] as usize].name, "act.g_raw");
+        let scratch = &on.tensors[words[10] as usize];
+        assert_eq!(scratch.name, "act.kda.fused.scratch");
+        assert_eq!(scratch.bytes, 12 * (1 + 4 * 128) * 8);
+        assert!(scratch.init.is_none(), "loader-zeroed, not carried");
+        assert_eq!(words[11], k3().eps.to_bits(), "norm eps bits");
+        assert_eq!(words[12], 4, "conv width");
+        // The o_proj GEMV reads y and gates on the fused packet.
+        assert!(on
+            .insts
+            .iter()
+            .any(|i| i.op == DevOp::Gemv as u16 && i.t[1] == step.t[0]));
+
+        // With the f_b fold: bit 2 + bit 3, t4 = f_a, j1 = W_fb, one packet fewer again.
+        let (both, w_both) = {
+            let _f = crate::test_env::EnvScope::set(&[("PLOW_KDA_FB_FOLD", "1")]);
+            build(1)
+        };
+        assert_eq!(both.insts.len(), on.insts.len() - 1);
+        let step = both
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(step.i[4], 1 | 4 | 8);
+        assert_eq!(both.tensors[step.t[4] as usize].name, "act.f_a");
+        assert_eq!(step.j[1], w_both.f_b_proj);
+
+        // Prefill rows keep the chain untouched.
+        let (pf, _) = build(128);
+        let (pf_off, _) = {
+            let _s = crate::test_env::EnvScope::set(&[("PLOW_KDA_DECODE_FUSED_ARM", "0")]);
+            build(128)
+        };
+        assert_eq!(packed(&pf), packed(&pf_off));
     }
 
     #[test]
@@ -1624,8 +2046,11 @@ mod tests {
             [w.q_proj, w.k_proj, w.v_proj],
             "W_q/W_k/W_v"
         );
+        let OutputGate::FullRank { g_proj } = w.gate else {
+            panic!("k3() is full-rank")
+        };
         assert_eq!(
-            f.i[6], w.g_proj,
+            f.i[6], g_proj,
             "the ninth pointer is the W_g HANDLE, not an integer"
         );
         assert_ne!(
@@ -1680,6 +2105,109 @@ mod tests {
             let i = p.insts.iter().find(|i| i.op == op as u16).unwrap();
             assert_eq!(i.blocks, 256, "{op:?}");
         }
+    }
+
+    fn glm53() -> KdaCfg {
+        KdaCfg {
+            hidden: 4096,
+            heads: 64,
+            head_dim: 128,
+            conv_w: 4,
+            gate_lower_bound: Some(-5.0),
+            eps: 1e-6,
+            bv: 16,
+            full_rank_gate: false,
+        }
+    }
+
+    /// GLM5-Next's low-rank gate: q/k/v fuse into [`DevOp::GemvQkv`] (not `GemvQkvg` — there is
+    /// no fourth stream to fuse), and the gate itself is two plain `Gemv`s (down to `head_dim`,
+    /// up to `H*D`), the same shape as the forget gate's own `f_a_proj`/`f_b_proj` pair.
+    #[test]
+    fn low_rank_gate_emits_gemv_qkv_and_mirrors_the_forget_gate_shape() {
+        let c = glm53();
+        let mut b = Builder::new(256);
+        let all: Vec<u32> = (0..256).collect();
+        let hidden = b.tensor("in.hidden", c.hidden as u64 * 2);
+        let next = b.tensor("act.next", c.hidden as u64 * 2);
+        let w = declare_kda_weights(
+            &mut b,
+            &c,
+            "language_model.model.layers.0.self_attn.",
+            "language_model.model.layers.0.",
+        );
+        let OutputGate::LowRank { g_a_proj, g_b_proj } = w.gate else {
+            panic!("glm53() is low-rank")
+        };
+        let st = declare_kda_state(&mut b, &c, "kda.0.", 1);
+        let seed = b.emit(DevOp::Nop, all, &[], |_| {});
+        emit_kda_layer(
+            &mut b,
+            &c,
+            &w,
+            &st,
+            "act.kda0.",
+            1,
+            hidden,
+            next,
+            256,
+            &[seed],
+        );
+        let p = b.finish();
+        let ops: Vec<u16> = p.insts.iter().map(|i| i.op).collect();
+
+        assert!(
+            !ops.contains(&(DevOp::GemvQkvg as u16)),
+            "low-rank gate has no fourth stream to fuse into GemvQkvg"
+        );
+        let qkv = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::GemvQkv as u16)
+            .expect("q/k/v must still fuse into GemvQkv at t=1");
+        assert_eq!(qkv.blocks, 256, "the fused projection must stay chip-wide");
+        assert_eq!(
+            [qkv.t[2], qkv.t[4], qkv.t[6]],
+            [w.q_proj, w.k_proj, w.v_proj],
+            "W_q/W_k/W_v"
+        );
+        assert_eq!([qkv.i[1], qkv.i[3], qkv.i[4]], [c.proj(); 3], "Nq/Nk/Nv");
+        assert_eq!(qkv.i[2], c.hidden, "K");
+
+        // The gate: SIX plain GEMVs now (f_a, beta, f_b, o_proj, g_a, g_b) — the low-rank gate
+        // adds two over the full-rank K3 count of four, rather than fusing into the QKV op.
+        let gemvs: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::Gemv as u16)
+            .collect();
+        assert_eq!(gemvs.len(), 6, "f_a, beta, f_b, o_proj, g_a, g_b");
+        let g_down = gemvs
+            .iter()
+            .find(|i| i.t[2] == g_a_proj)
+            .expect("g_a_proj must be consumed by a Gemv");
+        assert_eq!(g_down.i[1], c.head_dim, "g_a down-projects to head_dim");
+        let g_up = gemvs
+            .iter()
+            .find(|i| i.t[2] == g_b_proj)
+            .expect("g_b_proj must be consumed by a Gemv");
+        assert_eq!(g_up.i[1], c.proj(), "g_b up-projects to H*D");
+        assert_eq!(
+            g_up.t[1], g_down.t[0],
+            "g_b reads g_a's output, same chain shape as f_a -> f_b"
+        );
+
+        // KdaGatedNorm must depend on the gate chain's LAST op (g_b), not q/k/v's fused packet.
+        let norm = p
+            .insts
+            .iter()
+            .position(|i| i.op == DevOp::KdaGatedNorm as u16)
+            .expect("gated norm must be emitted");
+        let g_up_idx = p.insts.iter().position(|i| i.t[2] == g_b_proj).unwrap();
+        assert!(
+            g_up_idx < norm,
+            "the gate chain must complete before the gated norm reads it"
+        );
     }
 
     /// The fusion moves PACKETS, not work, and both halves of that are checkable here.

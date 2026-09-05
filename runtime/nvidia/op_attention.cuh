@@ -69,6 +69,9 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #ifndef PLOW_NV_FA_QGLOB
 #define PLOW_NV_FA_QGLOB 0
 #endif
+#ifndef PLOW_NV_FA_QREG
+#define PLOW_NV_FA_QREG 0
+#endif
 /* Rows a warp carries CONCURRENTLY in the warp-per-row score phase. With nsplit=32 a work item
  * owns ~32 of the 256 tile rows, so each of the 8 warps gets ~4 -- and processing them one at a
  * time leaves ~1 load in flight, which is why flash measured 688 GB/s against a 3269 ceiling
@@ -477,6 +480,24 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         __syncthreads();
 #endif
 
+#if PLOW_NV_FA_WPR && PLOW_NV_FA_QREG
+        /* Hoist invariant Q fragments across KV rows; GF>4 keeps the lower-register path. */
+        bf16v8 qreg[GF][D >= 256 ? D / 256 : 1];
+        if constexpr (!SZKV && !FP8KV && D == 512 && GF <= 4) {
+#pragma unroll
+            for (int g = 0; g < GF; g++)
+#pragma unroll
+                for (int c = 0; c < D / 256; c++) {
+                    const unsigned off = (unsigned)c * 256u + lane * 8u;
+#if PLOW_NV_FA_QGLOB
+                    qreg[g][c] = ld_glob8(Q + ((size_t)b * n_head + h0 + (unsigned)g) * D + off);
+#else
+                    qreg[g][c] = ld_smem8(qsm + g * D + off);
+#endif
+                }
+        }
+#endif
+
         float m_st[GF], l_st[GF];
 #pragma unroll
         for (int g = 0; g < GF; g++) { m_st[g] = FA_NEG_INF; l_st[g] = 0.0f; }
@@ -506,7 +527,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
            * score back out of Ssm so the softmax/PV code below is untouched.
            * Only the plain bf16 KV layout takes this path; SZ/fp8 KV keep the default body. The K
            * reduction order changes, so scores are numerically equivalent, not bit-identical. */
-          if constexpr (!SZKV && !FP8KV) {
+          if constexpr (!SZKV && !FP8KV && D >= 256) {
             constexpr int NC = D / 256; /* 256 = 32 lanes * 8 elems */
             /* Only [0,rmax) of the tile has live rows -- at nsplit=8 a work item owns 128 rows
              * against a 256-row tile, so half the sweep was pure loop+store overhead. Fill the
@@ -551,6 +572,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                             const unsigned off = (unsigned)c * 256u + lane * 8u;
 #pragma unroll
                             for (int g = 0; g < GF; g++)
+#if PLOW_NV_FA_QREG
+                                if constexpr (D == 512 && GF <= 4)
+                                    dt[g] = dot8(k8[t][c], qreg[g][c], dt[g]);
+                                else
+#endif
 #if PLOW_NV_FA_QGLOB
                                 dt[g] = dot8(k8[t][c],
                                              ld_glob8(Q + ((size_t)b * n_head + h0 + (unsigned)g) * D + off),
@@ -1166,9 +1192,12 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     constexpr int KSTEPS_PV = BKV / 16;                /* k16 contraction over kv */
     static_assert(WPV_M * WPV_N == (int)PLOW_NV_WARPS, "P.V grid must use all warps");
     static_assert(HD % WPV_N == 0 && HDW % 8 == 0, "hd slice must be a multiple of 8");
-    /* Softmax phase: each warp owns RPW_S query rows; one lane per kv column (needs BKV <= warp). */
+    /* Softmax phase: each warp owns RPW_S query rows. BKV <= 32: one lane per kv column.
+     * BKV > 32: each lane owns BKV/32 columns spaced by 32, reduced locally before the warp op. */
     constexpr int RPW_S = BQ / (int)PLOW_NV_WARPS;
-    static_assert(BKV <= 32, "softmax lane-per-kv reduction needs BKV <= 32");
+    constexpr int SOFT_COLS = BKV > 32 ? BKV / 32 : 1;
+    static_assert(BKV <= 64, "softmax reduction supports at most 2 kv cols per lane");
+    static_assert(BKV <= 32 || BKV % 32 == 0, "BKV > 32 must be a multiple of 32");
 
     float* Ss = lds;                                       /* [BQ][BKV] scaled scores */
     float* m_arr = Ss + BQ * BKV;                          /* [BQ] running max (log2 domain) */
@@ -1315,28 +1344,45 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 
             const unsigned rmax = (hi - kv0 < (unsigned)BKV) ? (hi - kv0) : (unsigned)BKV;
 
-            /* SOFTMAX phase: each warp owns RPW_S query rows; lane == kv column. Compute the row max
-             * over the (masked) tile, update the running (m,l), and emit P = exp(S - m_new) as bf16
-             * into Ps for the P.V mma. corr = exp(m_old - m_new) rescales O in the P.V phase below. */
+            /* SOFTMAX phase: each warp owns RPW_S query rows. When BKV <= 32, lane == kv column
+             * (original path). When BKV == 64, each lane owns 2 kv columns (lane and lane+32),
+             * reduced locally before the warp max/sum. */
 #pragma unroll
             for (int rr = 0; rr < RPW_S; rr++) {
                 const int row = warp * RPW_S + rr;
                 const int qabs = (int)(q_pos0 + q0 + row);
-                float sv = FA_NEG_INF;
-                bool active = false;
-                if ((unsigned)lane < rmax) {
-                    const int kv = (int)kv0 + lane;
-                    bool masked = (kv > qabs);
-                    if (window) masked |= ((unsigned)(qabs - kv) >= window);
-                    if (!masked) { sv = Ss[row * BKV + lane]; active = true; }
+                float sv[SOFT_COLS];
+                bool active[SOFT_COLS];
+#pragma unroll
+                for (int sc = 0; sc < SOFT_COLS; sc++) {
+                    sv[sc] = FA_NEG_INF;
+                    active[sc] = false;
+                    const unsigned col = lane + sc * 32;
+                    if (col < rmax) {
+                        const int kv = (int)kv0 + col;
+                        bool masked = (kv > qabs);
+                        if (window) masked |= ((unsigned)(qabs - kv) >= window);
+                        if (!masked) { sv[sc] = Ss[row * BKV + col]; active[sc] = true; }
+                    }
                 }
-                const float rowmax = warp_max32(sv);
+                float local_max = sv[0];
+#pragma unroll
+                for (int sc = 1; sc < SOFT_COLS; sc++) local_max = fmaxf(local_max, sv[sc]);
+                const float rowmax = warp_max32(local_max);
                 const float m_old = m_arr[row];
                 const float m_new = fmaxf(m_old, rowmax);
                 const float corr = (m_old == FA_NEG_INF) ? 0.0f : FA_EXP(m_old - m_new);
-                const float p = (active && m_new != FA_NEG_INF) ? FA_EXP(sv - m_new) : 0.0f;
-                if (lane < BKV) Ps[row * (BKV + PAD) + lane] = __float2bfloat16(p);
-                const float rowsum = warp_sum32(p);
+                float psum = 0.0f;
+#pragma unroll
+                for (int sc = 0; sc < SOFT_COLS; sc++) {
+                    const unsigned col = lane + sc * 32;
+                    const float p = (active[sc] && m_new != FA_NEG_INF)
+                                      ? FA_EXP(sv[sc] - m_new) : 0.0f;
+                    if (col < (unsigned)BKV)
+                        Ps[row * (BKV + PAD) + col] = __float2bfloat16(p);
+                    psum += p;
+                }
+                const float rowsum = warp_sum32(psum);
                 if (lane == 0) {
                     l_arr[row] = l_arr[row] * corr + rowsum;
                     m_arr[row] = m_new;
@@ -2940,7 +2986,9 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     static_assert(WPV_M * WPV_N == (int)PLOW_NV_WARPS, "P.V grid must use all warps");
     static_assert(HD % WPV_N == 0 && HDW % 8 == 0, "hd slice must be a multiple of 8");
     constexpr int RPW_S = BQ / (int)PLOW_NV_WARPS;
-    static_assert(BKV <= 32, "softmax lane-per-kv reduction needs BKV <= 32");
+    constexpr int SOFT_COLS = BKV > 32 ? BKV / 32 : 1;
+    static_assert(BKV <= 64, "softmax reduction supports at most 2 kv cols per lane");
+    static_assert(BKV <= 32 || BKV % 32 == 0, "BKV > 32 must be a multiple of 32");
     constexpr int HCH = HD / 8; /* 16B cp.async lines per K/V row */
     constexpr int VBUF = FA_PRE_VBUF(HD); /* T7 L1: 2 on hd512 (V double-buffer), 1 on hd256 */
     constexpr int VBSZ = BKV * (HD + PAD); /* one V buffer's bf16 count */
@@ -3144,21 +3192,38 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
             for (int rr = 0; rr < RPW_S; rr++) {
                 const int row = warp * RPW_S + rr;
                 const int qabs = (int)(qp0 + q0 + row);
-                float sv = FA_NEG_INF;
-                bool active = false;
-                if ((unsigned)lane < rmax) {
-                    const int kv = (int)kv0 + lane;
-                    bool masked = (kv > qabs);
-                    if (window) masked |= ((unsigned)(qabs - kv) >= window);
-                    if (!masked) { sv = Ss[row * BKV + lane]; active = true; }
+                float sv[SOFT_COLS];
+                bool active[SOFT_COLS];
+#pragma unroll
+                for (int sc = 0; sc < SOFT_COLS; sc++) {
+                    sv[sc] = FA_NEG_INF;
+                    active[sc] = false;
+                    const unsigned col = lane + sc * 32;
+                    if (col < rmax) {
+                        const int kv = (int)kv0 + col;
+                        bool masked = (kv > qabs);
+                        if (window) masked |= ((unsigned)(qabs - kv) >= window);
+                        if (!masked) { sv[sc] = Ss[row * BKV + col]; active[sc] = true; }
+                    }
                 }
-                const float rowmax = warp_max32(sv);
+                float local_max = sv[0];
+#pragma unroll
+                for (int sc = 1; sc < SOFT_COLS; sc++) local_max = fmaxf(local_max, sv[sc]);
+                const float rowmax = warp_max32(local_max);
                 const float m_old = m_arr[row];
                 const float m_new = fmaxf(m_old, rowmax);
                 const float corr = (m_old == FA_NEG_INF) ? 0.0f : FA_EXP(m_old - m_new);
-                const float p = (active && m_new != FA_NEG_INF) ? FA_EXP(sv - m_new) : 0.0f;
-                if (lane < BKV) Ps[row * (BKV + PAD) + lane] = __float2bfloat16(p);
-                const float rowsum = warp_sum32(p);
+                float psum = 0.0f;
+#pragma unroll
+                for (int sc = 0; sc < SOFT_COLS; sc++) {
+                    const unsigned col = lane + sc * 32;
+                    const float p = (active[sc] && m_new != FA_NEG_INF)
+                                      ? FA_EXP(sv[sc] - m_new) : 0.0f;
+                    if (col < (unsigned)BKV)
+                        Ps[row * (BKV + PAD) + col] = __float2bfloat16(p);
+                    psum += p;
+                }
+                const float rowsum = warp_sum32(psum);
                 if (lane == 0) {
                     l_arr[row] = l_arr[row] * corr + rowsum;
                     m_arr[row] = m_new;
