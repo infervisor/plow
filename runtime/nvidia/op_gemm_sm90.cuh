@@ -50,6 +50,10 @@
 #define PLOW_NV_FP8_PF_SCALE_WFIRST 0
 #endif
 
+#ifndef PGM90_FP8_TMA_ISSUE_CURSOR
+#define PGM90_FP8_TMA_ISSUE_CURSOR 0
+#endif
+
 #ifndef PLOW_NV_SEG_M64N64
 #define PLOW_NV_SEG_M64N64 0
 #endif
@@ -628,29 +632,54 @@ static __device__ void d_gemm_w8a8_sm90_tma(__nv_bfloat16* __restrict__ C, const
     const int ksteps = ((int)k + PGM90_BK8 - 1) / PGM90_BK8;
 
     int ist = 0;
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+    int issue_tile = (int)slice, issue_ks = 0, issue_tm = 0, issue_tn = 0;
+    auto issue = [&]() {
+#else
     auto issue = [&](int tile, int ks) {
+#endif
         const int s = ist % NS;
         if (ist >= NS) sm90_mbar_wait(bempty + s, ((ist / NS) + 1) & 1);
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+        if (issue_ks == 0)
+            sm90_tile_remap(issue_tile, tiles_m, tiles_n, &issue_tm, &issue_tn);
+        const int ks = issue_ks;
+        const int tm = issue_tm * PGM90_BM;
+        const int tn = issue_tn * PGM90_BN;
+#else
         int tmi, tni;
         sm90_tile_remap(tile, tiles_m, tiles_n, &tmi, &tni);
         const int tm = tmi * PGM90_BM;
         const int tn = tni * PGM90_BN;
+#endif
         sm90_mbar_expect(bfull + s, PGM90_TMA_TXB);
         const uint32_t bar = sm90_su32(bfull + s);
         sm90_tma2d(sm90_su32(As + s * PGM90_A8BUF), mapA, ks * PGM90_BK8, (int)a_row0 + tm, bar);
         sm90_tma2d(sm90_su32(Bs + s * PGM90_B8BUF), mapB, ks * PGM90_BK8, tn, bar);
         ist++;
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+        if (++issue_ks == ksteps) {
+            issue_ks = 0;
+            issue_tile += (int)nblk;
+        }
+#endif
     };
+#if !PGM90_FP8_TMA_ISSUE_CURSOR
     auto stage_at = [&](int i, int& tile, int& ks) {
         tile = (int)slice + (i / ksteps) * (int)nblk;
         ks = i % ksteps;
     };
+#endif
     const int total = ((ntiles - (int)slice) + (int)nblk - 1) / (int)nblk * ksteps;
     if (tid == 0) {
         for (int i = 0; i < NS - 1 && i < total; i++) {
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+            issue();
+#else
             int tl, ks;
             stage_at(i, tl, ks);
             issue(tl, ks);
+#endif
         }
     }
 
@@ -693,9 +722,13 @@ static __device__ void d_gemm_w8a8_sm90_tma(__nv_bfloat16* __restrict__ C, const
             if (prev >= 0 && (tid & 127) == 0) sm90_mbar_arrive(bempty + prev);
             prev = s;
             if (tid == 0 && st + NS - 1 < total) {
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+                issue();
+#else
                 int tl, kk;
                 stage_at(st + NS - 1, tl, kk);
                 issue(tl, kk);
+#endif
             }
         }
         sm90_wg_wait<0>();
