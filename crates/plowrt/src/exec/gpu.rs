@@ -714,13 +714,12 @@ struct PrefillBucket {
     fp8_gemm_segments: Vec<bool>,
     /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
-    /// Device instruction stream (patched per chunk over `[inst_lo..=inst_hi]`).
+    /// Device instruction stream (patched per chunk over `inst_range`).
     d_inst: DeviceMem,
     /// Host copy of the instructions for the per-chunk patch.
     h_inst: Vec<DevInst64>,
     /// Contiguous instruction window covering every patch site.
-    inst_lo: usize,
-    inst_hi: usize,
+    inst_range: std::ops::Range<usize>,
     /// KV-writing `HeadNormRope` sites (`j[0] != 0`): patch `i[3] = c0`.
     rope_sites: Vec<usize>,
     /// `FlashPrefill` sites: patch `i[1] = c0+real`, `i[4] = c0`.
@@ -744,6 +743,16 @@ struct PrefillBucket {
     ctr_bytes: usize,
     /// The bucket's other tables, kept alive for the engine's lifetime.
     _tables: Vec<DeviceMem>,
+}
+
+fn prefill_patch_range(sites: impl Iterator<Item = usize>) -> std::ops::Range<usize> {
+    sites.fold(0..0, |range, ix| {
+        if range.is_empty() {
+            ix..ix + 1
+        } else {
+            range.start.min(ix)..range.end.max(ix + 1)
+        }
+    })
 }
 
 fn qwen_prefill_segments(
@@ -5321,11 +5330,6 @@ impl GpuEngine {
             // (PX-1 batched mode) the FlashMerge sites to neuter.
             let (mut rope, mut flash, mut lmhead, mut merge) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            let (mut lo, mut hi) = (g.insts.len().saturating_sub(1), 0usize);
-            let mut mark = |ix: usize| {
-                lo = lo.min(ix);
-                hi = hi.max(ix);
-            };
             // fp8-KV packets emit the Fp8 TWINS of these opcodes. They carry the
             // SAME operands at the same indices (rope: i[3]=out_row0,
             // fj[1]=out_stride; flash: i[1]=seq_kv, i[4]=q_pos0 — see the
@@ -5345,23 +5349,19 @@ impl GpuEngine {
                 {
                     fp8_kv |= inst.op == DevOp::HeadNormRopeFp8 as u16;
                     rope.push(ix);
-                    mark(ix);
                 } else if inst.op == DevOp::FlashPrefill as u16
                     || inst.op == DevOp::FlashPrefillFp8 as u16
                 {
                     fp8_kv |= inst.op == DevOp::FlashPrefillFp8 as u16;
                     flash.push(ix);
-                    mark(ix);
                 } else if inst.op == DevOp::FlashMerge as u16 {
                     merge.push(ix);
-                    mark(ix);
                 } else if (inst.op == DevOp::Gemm as u16
                     || inst.op == DevOp::GemmSmall as u16
                     || inst.op == DevOp::GemmMed as u16)
                     && inst.i[0] == 1
                 {
                     lmhead.push(ix);
-                    mark(ix);
                 }
             }
 
@@ -5374,8 +5374,13 @@ impl GpuEngine {
                 kernarg,
                 d_inst,
                 h_inst,
-                inst_lo: lo,
-                inst_hi: hi,
+                inst_range: prefill_patch_range(
+                    rope.iter()
+                        .chain(&flash)
+                        .chain(&lmhead)
+                        .chain(&merge)
+                        .copied(),
+                ),
                 rope_sites: rope,
                 flash_sites: flash,
                 lmhead_sites: lmhead,
@@ -5659,7 +5664,7 @@ impl GpuEngine {
         }
 
         // Patch this bucket's instruction stream for the chunk, then enqueue
-        // the covering [lo..=hi] window as an async H2D on the engine stream.
+        // the covering window as an async H2D on the engine stream.
         {
             let b = &mut self.prefill[bi];
             for &ix in &b.rope_sites {
@@ -5672,15 +5677,16 @@ impl GpuEngine {
             for &ix in &b.lmhead_sites {
                 b.h_inst[ix].i[4] = (real - 1) as u32;
             }
-            let lo = b.inst_lo;
-            let cnt = b.inst_hi - lo + 1;
-            // SAFETY: DevInst64 is a #[repr(C)] POD mirror; range within
-            // h_inst which lives on self past the stream_synchronize below.
-            unsafe {
-                let bytes =
-                    std::slice::from_raw_parts(b.h_inst[lo..].as_ptr() as *const u8, cnt * sz);
-                self.be
-                    .memcpy_htod_async(b.d_inst.base + (lo * sz) as u64, bytes, &self.stream)?;
+            if !b.inst_range.is_empty() {
+                let bytes = pod_bytes(&b.h_inst[b.inst_range.clone()]);
+                // SAFETY: h_inst lives on self past the stream_synchronize below.
+                unsafe {
+                    self.be.memcpy_htod_async(
+                        b.d_inst.base + (b.inst_range.start * sz) as u64,
+                        bytes,
+                        &self.stream,
+                    )?;
+                }
             }
         }
 
@@ -6025,13 +6031,11 @@ impl GpuEngine {
         for &ix in &b.lmhead_sites {
             b.h_inst[ix].i[4] = 0;
         }
-        let lo = b.inst_lo;
-        let cnt = b.inst_hi - lo + 1;
-        // SAFETY: DevInst64 is a #[repr(C)] POD mirror; range within h_inst.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(b.h_inst[lo..].as_ptr() as *const u8, cnt * sz) };
-        self.be
-            .memcpy_htod(b.d_inst.base + (lo * sz) as u64, bytes)?;
+        if !b.inst_range.is_empty() {
+            let bytes = pod_bytes(&b.h_inst[b.inst_range.clone()]);
+            self.be
+                .memcpy_htod(b.d_inst.base + (b.inst_range.start * sz) as u64, bytes)?;
+        }
         b.batch_patched = true;
         Ok(())
     }
@@ -6613,6 +6617,42 @@ impl Drop for GpuEngine {
         }
         if let Err(e) = self.be.module_unload(&self.module) {
             report(&e, "unload decode module");
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefill_patch_tests {
+    use super::*;
+
+    #[test]
+    fn no_patch_sites_produce_an_empty_upload_range() {
+        for n_inst in [0, 1, 23] {
+            let insts = vec![DevInst64::default(); n_inst];
+            let range = prefill_patch_range(std::iter::empty());
+            assert_eq!(range, 0..0);
+            assert!(pod_bytes(&insts[range]).is_empty());
+        }
+    }
+
+    #[test]
+    fn patch_upload_covers_only_the_first_through_last_site() {
+        let insts: Vec<_> = (0..23)
+            .map(|i| DevInst64 {
+                i: [i; 8],
+                ..Default::default()
+            })
+            .collect();
+        for (sites, expected) in [
+            (vec![0], 0..1),
+            (vec![22], 22..23),
+            (vec![8, 2, 20, 8, 4], 2..21),
+        ] {
+            let range = prefill_patch_range(sites.into_iter());
+            assert_eq!(range, expected);
+            let bytes = pod_bytes(&insts[range.clone()]);
+            assert_eq!(bytes.len(), range.len() * 64);
+            assert_eq!(bytes, &pod_bytes(&insts)[range.start * 64..range.end * 64]);
         }
     }
 }
