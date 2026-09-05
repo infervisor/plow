@@ -71,15 +71,18 @@ int plow_cpu_init(int isa_cap) {
     plow_cpu_table_reset();
     memcpy(before, tab, sizeof(before));
     plow_cpu_register_golden(tab);
+    plow_cpu_register_golden_fp8(tab);
     plow_cpu_table_mark(before, PLOW_CPU_ISA_SCALAR);
     if (isa >= PLOW_CPU_ISA_AVX512) {
         memcpy(before, tab, sizeof(before));
         plow_cpu_register_avx512(tab);
+        plow_cpu_register_avx512_fp8(tab);
         plow_cpu_table_mark(before, PLOW_CPU_ISA_AVX512);
     }
     if (isa >= PLOW_CPU_ISA_AMX) {
         memcpy(before, tab, sizeof(before));
         plow_cpu_register_amx(tab);
+        plow_cpu_register_amx_fp8(tab);
         plow_cpu_table_mark(before, PLOW_CPU_ISA_AMX);
     }
     /* Debug bisection: PLOW_CPU_GOLDEN_OPS="1,16,20" pins the listed ops back to their

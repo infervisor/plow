@@ -17,6 +17,11 @@ void plow_cpu_table_reset(void);
 void plow_cpu_register_golden(plow_cpu_kernel_fn* tab);
 void plow_cpu_register_avx512(plow_cpu_kernel_fn* tab);
 void plow_cpu_register_amx(plow_cpu_kernel_fn* tab);
+/* fp8 (e4m3) weight family, one registrar per tier (golden/fp8.c, avx512/fp8.c, amx/fp8.c);
+ * called right after the tier's base registrar. */
+void plow_cpu_register_golden_fp8(plow_cpu_kernel_fn* tab);
+void plow_cpu_register_avx512_fp8(plow_cpu_kernel_fn* tab);
+void plow_cpu_register_amx_fp8(plow_cpu_kernel_fn* tab);
 /* Per-thread AMX setup (LDTILECFG palette 1, 8 tiles of 16x64 B). 0 or -errno. */
 int plow_cpu_thread_init_amx(PlowCpuCtx* ctx);
 
