@@ -84,6 +84,27 @@ add_executable(memmap_test tests/memmap_test.c)
 target_link_libraries(memmap_test PRIVATE plow_runtime)
 add_test(NAME memmap_test COMMAND memmap_test)
 
+# --- CPU device-ISA kernel library (runtime/cpu/dev): golden tier + cpuid dispatch ----------
+# plowrt's build.rs compiles the same sources through `cc`; this target exists so the kernels
+# have a Rust-free build and their own ctest.
+file(GLOB PLOW_CPU_DEV_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/*.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/golden/*.c)
+add_library(plow_cpu_dev STATIC ${PLOW_CPU_DEV_SRC})
+target_include_directories(plow_cpu_dev PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev)
+target_compile_options(plow_cpu_dev PRIVATE -Wall -Wextra -Werror -O2)
+set_target_properties(plow_cpu_dev PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT WIN32)
+    target_link_libraries(plow_cpu_dev PUBLIC m)
+endif()
+
+add_executable(cpu_dev_golden_test tests/cpu_dev_golden_test.c)
+target_compile_options(cpu_dev_golden_test PRIVATE -Wall -Wextra -Werror -O2)
+target_link_libraries(cpu_dev_golden_test PRIVATE plow_cpu_dev)
+add_test(NAME cpu_dev_golden COMMAND cpu_dev_golden_test)
+
 # --- GPU backends (build-gated; unrunnable without a toolchain) ---------------
 #
 # These are SHARED plugins, not static libs: nothing in the host links them, and

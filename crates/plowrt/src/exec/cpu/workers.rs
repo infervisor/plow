@@ -48,7 +48,7 @@ struct Inflight {
     gen: u32,
     _prog: Arc<LoadedProgram>,
     _pool: Arc<CounterPool>,
-    cursors: Arc<Vec<CachePadded<AtomicU32>>>,
+    _cursors: Arc<Vec<CachePadded<AtomicU32>>>,
 }
 
 pub struct WorkerPool {
@@ -217,7 +217,7 @@ impl WorkerPool {
             gen,
             _prog: prog.clone(),
             _pool: counters.clone(),
-            cursors,
+            _cursors: cursors,
         });
         gen
     }
@@ -313,10 +313,7 @@ impl Drop for WorkerPool {
 
 /// The host never parks (nobody would wake it); a parker with no registrants
 /// makes `wait_until` degrade to spin + bounded sleeps.
-static HOST_PARKER: Parker = Parker {
-    sleepers: CachePadded::new(AtomicU32::new(0)),
-    threads: Mutex::new(Vec::new()),
-};
+static HOST_PARKER: Parker = Parker::new();
 
 #[cfg(all(feature = "cpu", target_os = "linux"))]
 fn pin_to_cpu(cpu: u32) {

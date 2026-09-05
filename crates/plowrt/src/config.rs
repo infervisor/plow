@@ -132,6 +132,65 @@ pub struct RuntimeConfig {
     // ──────────────────────────────────────────────────────────────────────────
     #[command(flatten)]
     pub amd: AmdRuntimeConfig,
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // CPU engine (feature = "cpu")
+    // ──────────────────────────────────────────────────────────────────────────
+    #[command(flatten)]
+    pub cpu: CpuRuntimeConfig,
+}
+
+/// Kernel-tier ceiling for the CPU engine (`--cpu-isa`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "lowercase")]
+pub enum CpuIsa {
+    /// Highest tier cpuid reports.
+    Auto,
+    Amx,
+    Avx512,
+    Scalar,
+}
+
+/// CPU engine knobs. See `plans/cpu-backend.md` §2.1.
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "CPU runtime")]
+pub struct CpuRuntimeConfig {
+    /// Persistent worker threads (= virtual executors). 0 = one per physical core.
+    #[arg(
+        long = "cpu-threads",
+        env = "PLOW_CPU_THREADS",
+        default_value_t = 0,
+        global = true
+    )]
+    pub threads: u32,
+
+    /// NUMA placement: `auto` (all nodes), `off`, or a node list (`0,1`).
+    #[arg(
+        long = "cpu-numa",
+        env = "PLOW_CPU_NUMA",
+        default_value = "auto",
+        global = true
+    )]
+    pub numa: crate::exec::cpu::topology::NumaMode,
+
+    /// Kernel tier ceiling (for A/B and hosts without AMX).
+    #[arg(
+        long = "cpu-isa",
+        env = "PLOW_CPU_ISA",
+        default_value = "auto",
+        value_enum,
+        global = true
+    )]
+    pub isa: CpuIsa,
+
+    /// Spin budget (µs) before a blocked worker yields/parks.
+    #[arg(
+        long = "cpu-spin-us",
+        env = "PLOW_CPU_SPIN_US",
+        default_value_t = 50,
+        global = true
+    )]
+    pub spin_us: u32,
 }
 
 /// NVIDIA / sm_120 runtime knobs.

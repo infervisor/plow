@@ -122,14 +122,18 @@ pub struct Parker {
 
 impl Default for Parker {
     fn default() -> Self {
+        Parker::new()
+    }
+}
+
+impl Parker {
+    pub const fn new() -> Parker {
         Parker {
             sleepers: CachePadded::new(AtomicU32::new(0)),
             threads: Mutex::new(Vec::new()),
         }
     }
-}
 
-impl Parker {
     /// Register the calling thread (once, at worker start).
     pub fn register(&self) {
         self.threads.lock().push(std::thread::current());
