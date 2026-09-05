@@ -120,6 +120,11 @@ struct Emitter<'a> {
     batch: u32,
     decode_slots: u32,
     decode_lt: bool,
+    fuse_ab: bool,
+    ab_blocks: u32,
+    projection_dag: bool,
+    share_quant: bool,
+    quant_input: Option<(u32, u32)>,
     ctx: u32,
     active: u32,
     pos: u32,
@@ -155,10 +160,15 @@ impl Emitter<'_> {
             let xq = self.b.tensor(&format!("act.fp8.x{k}"), u64::from(k));
             let ascale = self.b.tensor("act.fp8.scale", 4);
             // Projections are chained, so each quant waits for the previous scratch consumer.
-            let dq = self.b.emit(DevOp::QuantFp8, vec![0], &[dep], |d| {
-                d.t[..3].copy_from_slice(&[xq, src, ascale]);
-                d.i[..2].copy_from_slice(&[1, k]);
-            });
+            let dq = if self.share_quant && self.quant_input == Some((src, k)) {
+                dep
+            } else {
+                self.quant_input = Some((src, k));
+                self.b.emit(DevOp::QuantFp8, vec![0], &[dep], |d| {
+                    d.t[..3].copy_from_slice(&[xq, src, ascale]);
+                    d.i[..2].copy_from_slice(&[1, k]);
+                })
+            };
             return self.b.emit(DevOp::GemmFp8, self.b.all(), &[dq], |d| {
                 d.t[..5].copy_from_slice(&[out, xq, w, ascale, scale]);
                 d.i[..3].copy_from_slice(&[1, n, k]);
@@ -202,6 +212,8 @@ impl Emitter<'_> {
         done
     }
     fn norm(&mut self, out: u32, src: u32, name: &str, dep: u32) -> u32 {
+        // The next norm overwrites the shared hn arena, ending its quantized input lifetime.
+        self.quant_input = None;
         let gamma = self.weight(name, self.c.hidden as u64);
         self.b.emit(
             DevOp::QwenRmsNorm,
@@ -271,16 +283,51 @@ impl Emitter<'_> {
             d.t[..5].copy_from_slice(&[conv, raw, cw, history, self.active]);
             d.i[..3].copy_from_slice(&[channels, c.conv, self.batch]);
         });
-        let dz = self.proj(z, hn, &format!("{p}.in_proj_z.weight"), value, c.hidden, dc);
-        let da = self.proj(a, hn, &format!("{p}.in_proj_a.weight"), c.hv, c.hidden, dz);
-        let db = self.proj(
-            beta,
+        let dz = self.proj(
+            z,
             hn,
-            &format!("{p}.in_proj_b.weight"),
-            c.hv,
+            &format!("{p}.in_proj_z.weight"),
+            value,
             c.hidden,
-            da,
+            if self.projection_dag { dq } else { dc },
         );
+        let ab_dep = if self.projection_dag { dep } else { dz };
+        let db = if self.fuse_ab {
+            let wa = self.weight(
+                &format!("{p}.in_proj_a.weight"),
+                c.hv as u64 * c.hidden as u64,
+            );
+            let wb = self.weight(
+                &format!("{p}.in_proj_b.weight"),
+                c.hv as u64 * c.hidden as u64,
+            );
+            self.b.emit(
+                DevOp::GemvQkv,
+                (0..self.ab_blocks).collect(),
+                &[ab_dep],
+                |d| {
+                    d.t[..7].copy_from_slice(&[a, hn, wa, beta, wb, TENSOR_NONE, TENSOR_NONE]);
+                    d.i[..5].copy_from_slice(&[self.batch, c.hv, c.hidden, c.hv, 0]);
+                },
+            )
+        } else {
+            let da = self.proj(
+                a,
+                hn,
+                &format!("{p}.in_proj_a.weight"),
+                c.hv,
+                c.hidden,
+                ab_dep,
+            );
+            self.proj(
+                beta,
+                hn,
+                &format!("{p}.in_proj_b.weight"),
+                c.hv,
+                c.hidden,
+                da,
+            )
+        };
         let ds = if self.prefill {
             let q = self.act("gdn.q", c.hk * c.dk);
             let k = self.act("gdn.k", c.hk * c.dk);
@@ -314,14 +361,24 @@ impl Emitter<'_> {
                 d.f[0] = 1.0 / (c.dk as f32).sqrt();
             })
         } else {
-            self.b.emit(DevOp::QwenGdnStep, self.b.all(), &[db], |d| {
+            let deps = if self.projection_dag {
+                vec![dc, db]
+            } else {
+                vec![db]
+            };
+            self.b.emit(DevOp::QwenGdnStep, self.b.all(), &deps, |d| {
                 d.t.copy_from_slice(&[core, conv, a, beta, alog, dt, state, self.active]);
                 d.i[..5].copy_from_slice(&[c.hk, c.hv, c.dk, c.dv, self.batch]);
                 d.f[0] = 1.0 / (c.dk as f32).sqrt();
                 d.f[1] = 1e-6;
             })
         };
-        let dn = self.b.emit(DevOp::QwenGatedNorm, self.b.all(), &[ds], |d| {
+        let deps = if self.projection_dag {
+            vec![ds, dz]
+        } else {
+            vec![ds]
+        };
+        let dn = self.b.emit(DevOp::QwenGatedNorm, self.b.all(), &deps, |d| {
             d.t[..5].copy_from_slice(&[gated, core, z, gamma, self.active]);
             d.i[..3].copy_from_slice(&[c.hv, c.dv, self.batch]);
             d.f[0] = c.eps;
@@ -406,9 +463,23 @@ impl Emitter<'_> {
                 d.i[..3].copy_from_slice(&[c.heads, c.hd, self.batch]);
             });
         let dq = self.headnorm(q, qg, qn, c.heads, false, true, dq);
-        let dk = self.proj(kg, hn, &format!("{p}.k_proj.weight"), kd, c.hidden, dq);
+        let dk = self.proj(
+            kg,
+            hn,
+            &format!("{p}.k_proj.weight"),
+            kd,
+            c.hidden,
+            if self.projection_dag { dep } else { dq },
+        );
         let dk = self.headnorm(kc, kg, kn, c.kv_heads, true, true, dk);
-        let dv = self.proj(vg, hn, &format!("{p}.v_proj.weight"), kd, c.hidden, dk);
+        let dv = self.proj(
+            vg,
+            hn,
+            &format!("{p}.v_proj.weight"),
+            kd,
+            c.hidden,
+            if self.projection_dag { dep } else { dk },
+        );
         let dv = self.headnorm(vc, vg, TENSOR_NONE, c.kv_heads, true, false, dv);
         // HD256 uses the slide GF selector in the Hopper interpreter even for full attention.
         let ns = if self.prefill {
@@ -426,6 +497,11 @@ impl Emitter<'_> {
             "act.mlpart",
             self.batch as u64 * c.heads as u64 * ns as u64 * 8,
         );
+        let attention_deps = if self.projection_dag {
+            vec![dq, dk, dv]
+        } else {
+            vec![dv]
+        };
         let da = if self.prefill {
             self.b.emit(DevOp::FlashPrefill, self.b.all(), &[dv], |d| {
                 d.t[..5].copy_from_slice(&[opart, mlpart, q, kc, vc]);
@@ -435,20 +511,21 @@ impl Emitter<'_> {
                 d.f[0] = 1.0 / (c.hd as f32).sqrt();
             })
         } else {
-            self.b.emit(DevOp::FlashDecode, self.b.all(), &[dv], |d| {
-                d.t[..6].copy_from_slice(&[opart, mlpart, q, kc, vc, self.kvlen]);
-                d.i.copy_from_slice(&[
-                    self.batch,
-                    c.heads,
-                    c.kv_heads,
-                    self.ctx,
-                    0,
-                    ns,
-                    c.hd,
-                    u32::MAX,
-                ]);
-                d.f[0] = 1.0 / (c.hd as f32).sqrt();
-            })
+            self.b
+                .emit(DevOp::FlashDecode, self.b.all(), &attention_deps, |d| {
+                    d.t[..6].copy_from_slice(&[opart, mlpart, q, kc, vc, self.kvlen]);
+                    d.i.copy_from_slice(&[
+                        self.batch,
+                        c.heads,
+                        c.kv_heads,
+                        self.ctx,
+                        0,
+                        ns,
+                        c.hd,
+                        u32::MAX,
+                    ]);
+                    d.f[0] = 1.0 / (c.hd as f32).sqrt();
+                })
         };
         let dm = self.b.emit(
             DevOp::FlashMerge,
@@ -566,7 +643,31 @@ fn phase(
     let cos = b.tensor_gen("in.cos_full", gc.byte_len(), gc);
     let sin = b.tensor_gen("in.sin_full", gs.byte_len(), gs);
     let decode_lt = !prefill && std::env::var("PLOW_QWEN_DECODE_LT").ok().as_deref() == Some("1");
+    let fuse_ab = !prefill && std::env::var("PLOW_QWEN_FUSE_AB").ok().as_deref() == Some("1");
+    let projection_dag =
+        !prefill && std::env::var("PLOW_QWEN_PROJECTION_DAG").ok().as_deref() == Some("1");
+    assert!(
+        !projection_dag || (!fp8 && !decode_lt),
+        "Qwen projection DAG requires native BF16 decode"
+    );
+    assert!(
+        !fuse_ab || (!fp8 && !decode_lt),
+        "Qwen a/b fusion requires native BF16 decode"
+    );
+    let ab_blocks = if fuse_ab {
+        std::env::var("PLOW_QWEN_AB_BLOCKS")
+            .map(|v| v.parse::<u32>().expect("Qwen a/b block count"))
+            .unwrap_or(n_cu)
+    } else {
+        n_cu
+    };
+    assert!(
+        ab_blocks > 0 && ab_blocks <= n_cu,
+        "Qwen a/b blocks must fit the compiled grid"
+    );
     let w8a8 = emit_config::active().w8a8;
+    let share_quant = std::env::var("PLOW_QWEN_SHARE_QUANT").ok().as_deref() == Some("1");
+    assert!(!share_quant || w8a8, "Qwen quant sharing requires W8A8");
     assert!(
         !w8a8 || (fp8 && !prefill && batch == 1),
         "Qwen W8A8 currently requires FP8 batch-1 decode without prefill"
@@ -584,6 +685,11 @@ fn phase(
         batch,
         decode_slots,
         decode_lt,
+        fuse_ab,
+        ab_blocks,
+        projection_dag,
+        share_quant,
+        quant_input: None,
         ctx,
         active,
         pos,
@@ -797,6 +903,202 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn check_operand_dependencies(g: &packet::devbuild::Program) {
+        use std::collections::{BTreeSet, HashMap};
+        let mut producers: HashMap<u32, BTreeSet<usize>> = HashMap::new();
+        for (i, d) in g.insts.iter().enumerate() {
+            for id in &g.succs[d.succ_ofs as usize..(d.succ_ofs + u32::from(d.succ_len)) as usize] {
+                producers.entry(*id).or_default().insert(i);
+            }
+        }
+        let mut ancestors: Vec<BTreeSet<usize>> = Vec::new();
+        let mut writers = HashMap::new();
+        let mut readers: HashMap<u32, BTreeSet<usize>> = HashMap::new();
+        for (i, d) in g.insts.iter().enumerate() {
+            let mut prior = BTreeSet::new();
+            for wait in &g.waits[d.wait_ofs as usize..(d.wait_ofs + u32::from(d.wait_len)) as usize]
+            {
+                for &p in &producers[&wait.id] {
+                    assert!(p < i);
+                    prior.insert(p);
+                    prior.extend(ancestors[p].iter().copied());
+                }
+            }
+            let mut output_slots = vec![0];
+            if d.op == DevOp::GemvQkv as u16 {
+                output_slots.extend([3, 5]);
+            }
+            if d.op == DevOp::FlashDecode as u16 || d.op == DevOp::QwenQGateSplit as u16 {
+                output_slots.push(1);
+            }
+            if d.op == DevOp::QuantFp8 as u16 {
+                output_slots.push(2);
+            }
+            let state_slot = if d.op == DevOp::QwenGdnConv as u16 {
+                Some(3)
+            } else if d.op == DevOp::QwenGdnStep as u16 {
+                Some(6)
+            } else {
+                None
+            };
+            let mut reads: BTreeSet<_> =
+                d.t.iter()
+                    .enumerate()
+                    .filter(|(slot, t)| !output_slots.contains(slot) && **t != TENSOR_NONE)
+                    .map(|(_, t)| *t)
+                    .collect();
+            if let Some(slot) = state_slot {
+                reads.insert(d.t[slot]);
+                output_slots.push(slot);
+            }
+            let writes: BTreeSet<_> = output_slots
+                .iter()
+                .map(|&slot| d.t[slot])
+                .filter(|&t| t != TENSOR_NONE)
+                .collect();
+            for &t in &reads {
+                if let Some(p) = writers.get(&t) {
+                    assert!(prior.contains(p), "missing RAW tensor{t}: {p}->{i}");
+                }
+            }
+            for &t in &writes {
+                if let Some(p) = writers.get(&t) {
+                    assert!(prior.contains(p), "missing WAW tensor{t}: {p}->{i}");
+                }
+                for p in readers.get(&t).into_iter().flatten() {
+                    assert!(prior.contains(p), "missing WAR tensor{t}: {p}->{i}");
+                }
+                readers.remove(&t);
+                writers.insert(t, i);
+            }
+            for t in reads {
+                readers.entry(t).or_default().insert(i);
+            }
+            ancestors.push(prior);
+        }
+    }
+    #[test]
+    fn projection_dag_covers_operand_joins_and_reused_arenas() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_QWEN_PROJECTION_DAG", "1"),
+            ("PLOW_QWEN_FUSE_AB", "0"),
+        ]);
+        let c = Config::parse(&fixture());
+        for batch in [1, 4] {
+            for fuse in ["0", "1"] {
+                std::env::set_var("PLOW_QWEN_FUSE_AB", fuse);
+                let m = model(&c, 8192, 132, 0, false, batch);
+                check_operand_dependencies(&m.progs[0]);
+            }
+        }
+    }
+    #[test]
+    fn shared_quant_preserves_consumers_and_invalidates_at_every_norm() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_QWEN_SHARE_QUANT", "0")]);
+        struct Restore(emit_config::EmitConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                emit_config::install(self.0.clone());
+            }
+        }
+        let restore = Restore(emit_config::active().clone());
+        let mut cfg = restore.0.clone();
+        cfg.fp8 = true;
+        cfg.w8a8 = true;
+        emit_config::install(cfg);
+        let mut c = Config::parse(&fixture());
+        c.layers = (0..64).map(|i| i % 4 == 3).collect();
+        let plain = model(&c, 8192, 132, 0, true, 1);
+        std::env::set_var("PLOW_QWEN_SHARE_QUANT", "1");
+        let shared = model(&c, 8192, 132, 0, true, 1);
+        let count = |m: &Model| {
+            m.progs[0]
+                .insts
+                .iter()
+                .filter(|d| d.op == DevOp::QuantFp8 as u16)
+                .count()
+        };
+        assert_eq!(count(&plain), 496);
+        assert_eq!(count(&shared), 256);
+        let plain_body: Vec<_> = plain.progs[0]
+            .insts
+            .iter()
+            .filter(|d| d.op != DevOp::QuantFp8 as u16)
+            .collect();
+        let shared_body: Vec<_> = shared.progs[0]
+            .insts
+            .iter()
+            .filter(|d| d.op != DevOp::QuantFp8 as u16)
+            .collect();
+        assert_eq!(plain_body.len(), shared_body.len());
+        for (a, b) in plain_body.iter().zip(&shared_body) {
+            assert_eq!(
+                (a.op, a.blocks, a.t, a.i, a.f, a.j),
+                (b.op, b.blocks, b.t, b.i, b.f, b.j)
+            );
+        }
+        let mut quant = None;
+        for d in &shared.progs[0].insts {
+            if d.op == DevOp::QwenRmsNorm as u16 {
+                quant = None;
+            }
+            if d.op == DevOp::QuantFp8 as u16 {
+                quant = Some((d.t[0], d.t[2], d.i[1]));
+            }
+            if d.op == DevOp::GemmFp8 as u16 {
+                assert_eq!(quant, Some((d.t[1], d.t[3], d.i[2])));
+            }
+        }
+        check_operand_dependencies(&shared.progs[0]);
+    }
+    #[test]
+    fn fused_ab_preserves_two_bf16_outputs_and_batch_geometry() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_QWEN_FUSE_AB", "0"),
+            ("PLOW_QWEN_AB_BLOCKS", "12"),
+        ]);
+        let c = Config::parse(&fixture());
+        for batch in [1, 4] {
+            std::env::set_var("PLOW_QWEN_FUSE_AB", "0");
+            let plain = model_prefill(&c, 8192, 132, 0, &[128], batch);
+            std::env::set_var("PLOW_QWEN_FUSE_AB", "1");
+            let fused = model_prefill(&c, 8192, 132, 0, &[128], batch);
+            assert_eq!(plain.progs[0].insts, fused.progs[0].insts);
+            assert_eq!(plain.progs[1].insts.len(), fused.progs[1].insts.len() + 3);
+            let ops: Vec<_> = fused.progs[1]
+                .insts
+                .iter()
+                .filter(|d| d.op == DevOp::GemvQkv as u16)
+                .collect();
+            assert_eq!(ops.len(), 3);
+            for d in ops {
+                assert_eq!(d.blocks, 12);
+                assert_eq!(&d.i[..5], &[batch, 48, 5120, 48, 0]);
+                assert_eq!(&d.t[5..7], &[TENSOR_NONE, TENSOR_NONE]);
+                for (out, weight, suffix) in [(d.t[0], d.t[2], "a"), (d.t[3], d.t[4], "b")] {
+                    assert_eq!(
+                        fused.tensors[out as usize].name,
+                        format!("act.gdn.{suffix}")
+                    );
+                    assert_eq!(
+                        fused.tensors[out as usize].bytes,
+                        plain.tensors[out as usize].bytes
+                    );
+                    assert!(fused.tensors[out as usize].bytes >= u64::from(batch) * 48 * 2);
+                    assert!(fused.tensors[weight as usize]
+                        .name
+                        .ends_with(&format!("in_proj_{suffix}.weight")));
+                    assert_eq!(fused.tensors[weight as usize].bytes, 48 * 5120 * 2);
+                }
+            }
+        }
+    }
     fn fixture() -> Value {
         serde_json::json!({"model_type":"qwen3_5", "text_config": {
             "hidden_size":5120,"intermediate_size":17408,"vocab_size":248320,

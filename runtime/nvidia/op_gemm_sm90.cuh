@@ -2048,6 +2048,9 @@ __device__ __forceinline__ void d_gemv_sm90_xreg(__nv_bfloat16* C,
 #ifndef PLOW_NV_GEMV_KPANEL
 #define PLOW_NV_GEMV_KPANEL 0
 #endif
+#ifndef PLOW_NV_GEMV_KPANEL_F32
+#define PLOW_NV_GEMV_KPANEL_F32 0
+#endif
 #if PLOW_NV_GEMV_KPANEL
 __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
     const __nv_bfloat16* x, const __nv_bfloat16* W, unsigned slice, unsigned nblk) {
@@ -2059,11 +2062,23 @@ __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
     float acc[5] = {};
 #pragma unroll 1
     for (unsigned panel = 0; panel < K; panel += panel_chunks * GV_STEP) {
+#if PLOW_NV_GEMV_KPANEL_F32
+        float xv[panel_chunks][8];
+#pragma unroll
+        for (unsigned c = 0; c < panel_chunks; c++) {
+            if (panel + c * GV_STEP < K) {
+                const bf16v8 packed = ld_glob8(x + panel + c * GV_STEP + lane * 8u);
+#pragma unroll
+                for (unsigned i = 0; i < 8; i++) xv[c][i] = __bfloat162float(packed.x[i]);
+            }
+        }
+#else
         bf16v8 xv[panel_chunks];
 #pragma unroll
         for (unsigned c = 0; c < panel_chunks; c++)
             if (panel + c * GV_STEP < K)
                 xv[c] = ld_glob8(x + panel + c * GV_STEP + lane * 8u);
+#endif
 #pragma unroll
         for (unsigned r = 0; r < 5; r++) {
             const unsigned n = first + warp + r * 8u;
@@ -2078,8 +2093,15 @@ __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
                         weights[u] = ld_glob8(row + (c + u) * GV_STEP + lane * 8u);
 #pragma unroll
                 for (unsigned u = 0; u < 8; u++)
-                    if (panel + (c + u) * GV_STEP < K)
+                    if (panel + (c + u) * GV_STEP < K) {
+#if PLOW_NV_GEMV_KPANEL_F32
+#pragma unroll
+                        for (unsigned i = 0; i < 8; i++)
+                            acc[r] = fmaf(__bfloat162float(weights[u].x[i]), xv[c + u][i], acc[r]);
+#else
                         acc[r] = dot8(weights[u], xv[c + u], acc[r]);
+#endif
+                    }
             }
         }
     }

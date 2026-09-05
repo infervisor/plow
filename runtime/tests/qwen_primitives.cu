@@ -2,6 +2,7 @@
 #include "../common/dev_isa.h"
 #include "../nvidia/op_qwen_gdn.cuh"
 #include "../nvidia/op_gemm.cuh"
+#include "../nvidia/op_norm.cuh"
 #ifndef PLOW_NV_FP8_M1_XCACHE
 #define PLOW_NV_FP8_M1_XCACHE 0
 #endif
@@ -20,6 +21,22 @@ __global__ void run(unsigned op, Args args) {
 extern __shared__ __nv_bfloat16 arena[];
 const Args* in=&args; unsigned slice=blockIdx.x,nblk=gridDim.x;
 switch(op) {
+    case PLOW_DOP_RMSNORM:
+        d_rmsnorm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->fj[0].f,
+            0, slice, nblk, (float*)arena);
+        break;
+    case PLOW_DOP_NORM_RESIDUAL:
+        d_norm_residual((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+            in->i[0], in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)arena);
+        break;
+    case PLOW_DOP_NORM_RESIDUAL_NORM:
+        d_norm_residual_norm((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+            (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(5),
+            in->i[0], in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)arena);
+        break;
 #if defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1
     case PLOW_DOP_GEMM_FP8:
         d_gemm_w8a8((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1), (const uint8_t*)TEN(2),
@@ -91,5 +108,5 @@ static const cudaError_t configured = cudaFuncSetAttribute(run, cudaFuncAttribut
 if (configured != cudaSuccess) return (int)configured;
 #endif
 Args a={}; for(int i=0;i<8;i++)a.t[i]=tensors[i]; for(int i=0;i<8;i++)a.i[i]=integers[i]; for(int i=0;i<2;i++)a.fj[i].f=floats[i];
-run<<<132,256,op == PLOW_DOP_GEMM_FP8 ? (PLOW_NV_FP8_M1_XCACHE ? 205824 : PLOW_NV_FP8_M1_BK1024 ? 74752 : PLOW_NV_FP8_M1_BK512 ? 37888 : PLOW_NV_FP8_M1_BK256 ? 19456 : 12352) : 0,(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
+run<<<132,256,op == PLOW_DOP_GEMM_FP8 ? (PLOW_NV_FP8_M1_XCACHE ? 205824 : PLOW_NV_FP8_M1_BK1024 ? 74752 : PLOW_NV_FP8_M1_BK512 ? 37888 : PLOW_NV_FP8_M1_BK256 ? 19456 : 12352) : (op == PLOW_DOP_RMSNORM || op == PLOW_DOP_NORM_RESIDUAL || op == PLOW_DOP_NORM_RESIDUAL_NORM ? 32 : 0),(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
 }

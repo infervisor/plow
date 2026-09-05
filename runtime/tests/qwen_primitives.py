@@ -7,6 +7,7 @@ p.add_argument("--gdn-library")
 p.add_argument("--fp8-interpreter-only", action="store_true", help="run interpreter FP8 M1 body vs vLLM CUTLASS")
 p.add_argument("--fp8-gemm-only", action="store_true", help="run cuBLASLt FP8 M1 vs vLLM CUTLASS")
 p.add_argument("--fp8-only", action="store_true", help="report exact activation quantization parity; exit 1 on any mismatch")
+p.add_argument("--gemma-nrn-only", action="store_true", help="compare fused prefill NRN against native NormResidual plus RMSNorm")
 p.add_argument("--output", help="FP8 comparison JSON, written even when parity fails")
 args=p.parse_args()
 if not args.run_gpu: p.error("requires --run-gpu and an exclusive GPU slot")
@@ -19,6 +20,63 @@ def run(op,ts,ints,floats=(0.,0.)):
     code=lib.qwen_test(op,(C.c_void_p*8)(*[t.data_ptr() if t is not None else 0 for t in ts]),(C.c_int*8)(*ints),(C.c_float*2)(*floats),torch.cuda.current_stream().cuda_stream)
     assert code==0,code
 def rand(*shape):return torch.randn(*shape,device="cuda",dtype=torch.bfloat16)*0.2
+def check_gemma_nrn():
+    from pathlib import Path
+    import statistics
+    torch.manual_seed(1729)
+    records=[]
+    def timing(fn):
+        for _ in range(5):fn()
+        torch.cuda.synchronize()
+        graph=torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(30):fn()
+        for _ in range(5):graph.replay()
+        start,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+        times=[]
+        for _ in range(3):
+            start.record()
+            graph.replay()
+            end.record();end.synchronize()
+            times.append(start.elapsed_time(end)*1000/30)
+        return statistics.median(times)
+    for feat in (3840,5376):
+        for rows in (32,128,1024,4096):
+            for scale in (1.,0.052978515625):
+                a,b=rand(rows,feat),rand(rows,feat)
+                gb,gn=rand(feat)+1,rand(feat)+1
+                for weighted in ((True,False) if rows==32 else (True,)):
+                    wb,wn=(gb,gn) if weighted else (None,None)
+                    residual,out=torch.empty_like(a),torch.empty_like(a)
+                    fused_residual,fused_out=torch.empty_like(a),torch.empty_like(a)
+                    def split():
+                        run(16,[residual,a,b,wb],[rows,feat],[1e-6,scale])
+                        run(1,[out,residual,wn],[rows,feat],[1e-6,0.])
+                    def fused():
+                        run(23,[fused_out,fused_residual,a,b,wb,wn],[rows,feat],[1e-6,scale])
+                    split();fused();torch.cuda.synchronize()
+                    exact=bool(torch.equal(residual,fused_residual) and torch.equal(out,fused_out))
+                    finite=bool(torch.isfinite(out).all() and torch.isfinite(fused_out).all())
+                    aliased=a.clone();aliased_out=torch.empty_like(a)
+                    run(23,[aliased_out,aliased,aliased,b,wb,wn],[rows,feat],[1e-6,scale])
+                    torch.cuda.synchronize()
+                    alias_exact=bool(torch.equal(residual,aliased) and torch.equal(out,aliased_out))
+                    record=dict(rows=rows,feat=feat,scale=scale,weighted=weighted,
+                        bit_exact=exact,alias_bit_exact=alias_exact,finite=finite,
+                        residual_mismatches=int((residual!=fused_residual).sum()),
+                        output_mismatches=int((out!=fused_out).sum()),
+                        split_us=timing(split),fused_us=timing(fused),passed=exact and alias_exact and finite)
+                    records.append(record)
+    report=dict(candidate="native fused NormResidualNorm",reference="native NormResidual + RMSNorm",
+        timing="median3 CUDA-event graph replays of30 calls,5graph warmups; capture, allocation and correctness outside timing",
+        passed=all(r["passed"] for r in records),cases=records)
+    if args.output:Path(args.output).write_text(json.dumps(report,indent=2)+"\n")
+    print(json.dumps(report,indent=2))
+    return report["passed"]
+
+if args.gemma_nrn_only:
+    raise SystemExit(0 if check_gemma_nrn() else 1)
+
 def check_fp8_gemm():
     from vllm import _custom_ops as ops
     from pathlib import Path

@@ -231,6 +231,9 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
   if [ "${PLOW_BUILD_GEMM_WS384:-0}" = "1" ]; then
     GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPGM90_UNI_BN256=1 -DPLOW_NV_SEG_WS384=1"
   fi
+  if [ "${PLOW_BUILD_GEMM_SMALL_BF16:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPLOW_NV_SEG_OCC1=1 -DPLOW_NV_TMA_GEMM=1 -DPLOW_NV_SEG_SMALL_BF16=1"
+  fi
   "${NVENV[@]}" \
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \

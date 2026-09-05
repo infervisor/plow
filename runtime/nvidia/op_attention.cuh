@@ -69,6 +69,9 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #ifndef PLOW_NV_FA_QGLOB
 #define PLOW_NV_FA_QGLOB 0
 #endif
+#ifndef PLOW_NV_FA_QREG
+#define PLOW_NV_FA_QREG 0
+#endif
 /* Rows a warp carries CONCURRENTLY in the warp-per-row score phase. With nsplit=32 a work item
  * owns ~32 of the 256 tile rows, so each of the 8 warps gets ~4 -- and processing them one at a
  * time leaves ~1 load in flight, which is why flash measured 688 GB/s against a 3269 ceiling
@@ -477,6 +480,24 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         __syncthreads();
 #endif
 
+#if PLOW_NV_FA_WPR && PLOW_NV_FA_QREG
+        /* Hoist invariant Q fragments across KV rows; GF>4 keeps the lower-register path. */
+        bf16v8 qreg[GF][D >= 256 ? D / 256 : 1];
+        if constexpr (!SZKV && !FP8KV && D == 512 && GF <= 4) {
+#pragma unroll
+            for (int g = 0; g < GF; g++)
+#pragma unroll
+                for (int c = 0; c < D / 256; c++) {
+                    const unsigned off = (unsigned)c * 256u + lane * 8u;
+#if PLOW_NV_FA_QGLOB
+                    qreg[g][c] = ld_glob8(Q + ((size_t)b * n_head + h0 + (unsigned)g) * D + off);
+#else
+                    qreg[g][c] = ld_smem8(qsm + g * D + off);
+#endif
+                }
+        }
+#endif
+
         float m_st[GF], l_st[GF];
 #pragma unroll
         for (int g = 0; g < GF; g++) { m_st[g] = FA_NEG_INF; l_st[g] = 0.0f; }
@@ -551,6 +572,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                             const unsigned off = (unsigned)c * 256u + lane * 8u;
 #pragma unroll
                             for (int g = 0; g < GF; g++)
+#if PLOW_NV_FA_QREG
+                                if constexpr (D == 512 && GF <= 4)
+                                    dt[g] = dot8(k8[t][c], qreg[g][c], dt[g]);
+                                else
+#endif
 #if PLOW_NV_FA_QGLOB
                                 dt[g] = dot8(k8[t][c],
                                              ld_glob8(Q + ((size_t)b * n_head + h0 + (unsigned)g) * D + off),

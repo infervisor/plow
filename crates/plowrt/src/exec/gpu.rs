@@ -418,6 +418,14 @@ use crate::asset::checkpoint::Checkpoint;
 /// the lean `_pfgemm` object (flash arms compiled out, 128 regs, occ-2). Segments of one
 /// chunk launch SEQUENTIALLY on the engine stream — dependencies only point backward, so
 /// stream order replaces cross-segment gating; counters are re-armed once per chunk.
+struct SegGemm {
+    function: KernelFn,
+    smem: u32,
+    grid: u32,
+    block: u32,
+    _module: Module,
+}
+
 struct SegPf {
     f_flash: KernelFn,
     smem_flash: u32,
@@ -427,6 +435,7 @@ struct SegPf {
     grid_gemm: u32,
     /// T31: the GEMM object's launch block size (`plow_block_pfgemm` global; 256 = legacy).
     block_gemm: u32,
+    small_gemm: Option<SegGemm>,
     /// T12: dedicated hd512 flash object (`interp_<tag>_pffa.cubin` in the pair dir,
     /// optional). Class-2 segments (PLOW_PF_SEG_FA512) launch here.
     fa512: Option<(KernelFn, u32, u32)>,
@@ -435,12 +444,31 @@ struct SegPf {
     _m_fa512: Option<Module>,
 }
 
+impl SegPf {
+    fn gemm(&self, small: bool) -> (KernelFn, u32, u32, u32) {
+        if small {
+            let alt = self
+                .small_gemm
+                .as_ref()
+                .expect("validated small GEMM segment");
+            (alt.function, alt.grid, alt.block, alt.smem)
+        } else {
+            (self.f_gemm, self.grid_gemm, self.block_gemm, self.smem_gemm)
+        }
+    }
+}
+
+#[path = "gpu_seg_gemm.rs"]
+mod seg_gemm;
+use seg_gemm::small_gemm_segments;
+
 struct PrefillBucket {
     /// Chunk size this bucket was compiled for.
     t: u32,
     /// Per-segment wave class (8 = GEMM-class, 4 = flash-class) when the program is
     /// wave-class segmented AND the SegPf pair is loaded; empty = single launch.
     seg_class: Vec<u8>,
+    small_gemm_segments: Vec<bool>,
     qwen_segments: Vec<Option<DevInst64>>,
     /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
@@ -4573,6 +4601,21 @@ impl GpuEngine {
         // holding interp_<tag>_pfseg.cubin + interp_<tag>_pfgemm.cubin;
         // packets must be emitted WITHOUT
         // PLOW_UNISEG. Next step: promote to the asset manifest once the A/B settles.
+        let small_gemm_path = crate::config::RuntimeConfig::get()
+            .nv
+            .pf_seg_gemm_small
+            .as_deref();
+        if small_gemm_path.is_some()
+            && crate::config::RuntimeConfig::get()
+                .nv
+                .pf_seg_dir
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err(RuntimeError::Rejected(
+                "PLOW_PF_SEG_GEMM_SMALL requires PLOW_PF_SEG_DIR".into(),
+            ));
+        }
         let seg_pf = match crate::config::RuntimeConfig::get().nv.pf_seg_dir.clone() {
             Some(dir) if !dir.is_empty() => {
                 // Segmented objects currently have only bf16-KV variants. Loading one for an
@@ -4615,6 +4658,50 @@ impl GpuEngine {
                     .module_global_u32(&m2, "plow_block_pfgemm")?
                     .unwrap_or(BLOCK);
                 let g2 = be.occupancy_blocks_per_sm(f2, blk2, s2 as usize)? * be.sm_count();
+                let small_gemm = if let Some(path) = small_gemm_path {
+                    if blk2 != 384 {
+                        return Err(RuntimeError::Rejected(
+                            "small GEMM selection requires a WS384 default GEMM object".into(),
+                        ));
+                    }
+                    let img = std::fs::read(path).map_err(|e| {
+                        RuntimeError::Device(format!("PLOW_PF_SEG_GEMM_SMALL: read {path}: {e}"))
+                    })?;
+                    let module = be.module_load(&img)?;
+                    if be.module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")? != Some(1)
+                        || be.module_global_u32(&module, "plow_block_pfgemm")? != Some(BLOCK)
+                    {
+                        return Err(RuntimeError::Rejected(
+                            "small GEMM object requires native BF16 m128n128 TMA ABI 1 and 256 threads".into()));
+                    }
+                    let function = be.get_function(&module, &gemm_sym)?;
+                    let smem = be
+                        .module_global_u32(&module, "plow_arena_bytes_pfgemm")?
+                        .filter(|v| *v > 0)
+                        .ok_or_else(|| {
+                            RuntimeError::Rejected(
+                                "small GEMM object is missing its shared-memory requirement".into(),
+                            )
+                        })?;
+                    be.set_max_dynamic_smem(function, smem)?;
+                    let grid =
+                        be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count();
+                    if grid == 0 {
+                        return Err(RuntimeError::Rejected(
+                            "small GEMM object has no resident blocks".into(),
+                        ));
+                    }
+                    tracing::info!(path, grid, smem, "experimental small GEMM object loaded");
+                    Some(SegGemm {
+                        function,
+                        smem,
+                        grid,
+                        block: BLOCK,
+                        _module: module,
+                    })
+                } else {
+                    None
+                };
                 // Optional third object (T12): dedicated hd512 flash. Only loaded when the
                 // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
                 // segments are emitted at all.
@@ -4668,6 +4755,7 @@ impl GpuEngine {
                     smem_gemm: s2,
                     grid_gemm: g2,
                     block_gemm: blk2,
+                    small_gemm,
                     fa512,
                     _m_flash: m1,
                     _m_gemm: m2,
@@ -4681,6 +4769,9 @@ impl GpuEngine {
                 // (the fat object drops to occ-1 — measured neutral on its latency-bound rows).
                 if crate::config::RuntimeConfig::get().nv.pf_seg_eqsmem {
                     let mut mx = sp.smem_flash.max(sp.smem_gemm);
+                    if let Some(small) = &sp.small_gemm {
+                        mx = mx.max(small.smem);
+                    }
                     if let Some((_, s3, _)) = sp.fa512 {
                         mx = mx.max(s3);
                     }
@@ -4697,6 +4788,10 @@ impl GpuEngine {
                     sp.smem_flash = mx;
                     sp.grid_gemm = requery(sp.f_gemm, sp.block_gemm)?;
                     sp.smem_gemm = mx;
+                    if let Some(small) = &mut sp.small_gemm {
+                        small.grid = requery(small.function, small.block)?;
+                        small.smem = mx;
+                    }
                     if let Some((f3, _, _)) = sp.fa512 {
                         let g3 = requery(f3, BLOCK)?;
                         sp.fa512 = Some((f3, mx, g3));
@@ -4754,6 +4849,18 @@ impl GpuEngine {
                 g.seg_classes()?
             } else {
                 g.check_coarse_single_segment()?;
+                Vec::new()
+            };
+            let small_gemm_segments = if seg_pf.as_ref().is_some_and(|s| s.small_gemm.is_some()) {
+                let selected = small_gemm_segments(g, &seg_class)?;
+                tracing::info!(
+                    bucket = g.t,
+                    selected = selected.iter().filter(|&&s| s).count(),
+                    total = selected.len(),
+                    "small GEMM segment selection"
+                );
+                selected
+            } else {
                 Vec::new()
             };
             let want_seg = if g.l2_domains != 0 {
@@ -4880,6 +4987,7 @@ impl GpuEngine {
             buckets.push(PrefillBucket {
                 t: g.t,
                 seg_class: seg_class.clone(),
+                small_gemm_segments,
                 qwen_segments,
                 kernarg,
                 d_inst,
@@ -5305,7 +5413,8 @@ impl GpuEngine {
                         .collect();
                     let nodes: Vec<(KernelFn, u32, u32, u32)> = seg_class
                         .iter()
-                        .map(|&cls| {
+                        .enumerate()
+                        .map(|(seg, &cls)| {
                             Ok(match cls {
                                 4 => (sp.f_flash, sp.grid_flash, BLOCK, sp.smem_flash),
                                 2 => {
@@ -5316,7 +5425,9 @@ impl GpuEngine {
                                     })?;
                                     (f3, g3, BLOCK, s3)
                                 }
-                                _ => (sp.f_gemm, sp.grid_gemm, sp.block_gemm, sp.smem_gemm),
+                                _ => sp.gemm(
+                                    self.prefill[bi].small_gemm_segments.get(seg) == Some(&true),
+                                ),
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -5382,7 +5493,9 @@ impl GpuEngine {
                     })?;
                     (f3, g3, s3, BLOCK)
                 } else {
-                    (sp.f_gemm, sp.grid_gemm, sp.smem_gemm, sp.block_gemm)
+                    let (f, gr, blk, sm) =
+                        sp.gemm(self.prefill[bi].small_gemm_segments.get(seg) == Some(&true));
+                    (f, gr, sm, blk)
                 };
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
                 let go = |params: &mut [*mut std::ffi::c_void]| -> Result<()> {
@@ -6097,6 +6210,11 @@ impl Drop for GpuEngine {
             self.be.graph_destroy(g);
         }
         if let Some(sp) = self.seg_pf.take() {
+            if let Some(small) = sp.small_gemm {
+                if let Err(e) = self.be.module_unload(&small._module) {
+                    report(&e, "unload small GEMM object");
+                }
+            }
             if let Err(e) = self.be.module_unload(&sp._m_flash) {
                 report(&e, "unload seg flash module");
             }

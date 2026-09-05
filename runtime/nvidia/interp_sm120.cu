@@ -417,6 +417,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * SEG_GEMM object). With only the GEMM arms in the TU the same body compiles probe-shaped and
  * the 128-reg cap yields a REAL occ-2 grid. Requires the serve-side mirror PLOW_PF_SEG_PURE=1
  * (devblob.rs seg_classes), or a light-op segment lands here and hits the __trap(). */
+#ifndef PLOW_NV_SEG_SMALL_BF16
+#define PLOW_NV_SEG_SMALL_BF16 0
+#endif
 #ifndef PLOW_NV_GEMM_ONLY
 #define PLOW_NV_GEMM_ONLY 0
 #endif
@@ -735,6 +738,12 @@ extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS
 extern "C" __device__ unsigned PLOW_SYM(plow_gemv_mm_cap) = GV_MM_MAX;
 /* T31: this object's launch block size (the segmented launcher reads it; absent/256 = legacy). */
 extern "C" __device__ unsigned PLOW_SYM(plow_block) = PLOW_NV_SEG_WS384 ? 384u : 256u;
+#if PLOW_NV_SEG_SMALL_BF16
+#if !defined(PLOW_NV_HOPPER) || !PLOW_NV_GEMM_ONLY || !PLOW_NV_TMA_GEMM || !PLOW_NV_SEG_OCC1 || PGM90_UNI_BN256 || PLOW_NV_SEG_WS || PLOW_NV_SEG_WS384 || PLOW_NV_W8A8
+#error "small BF16 segment requires plain m128n128 TMA occ1"
+#endif
+extern "C" __device__ unsigned PLOW_SYM(plow_gemm_shape_abi) = 1;
+#endif
 /* Capability flag (cuModuleGetGlobal, like plow_arena_bytes): this object's
  * HeadNormRope derives the KV write row from pos[t] whenever n_batch_kv != 0
  * — so the engine may set i[6]=1 on a B=1 decode program's KV-write sites at
@@ -935,8 +944,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
+#if PLOW_NV_SEG_SMALL_BF16
+        __trap();
+#else
         d_gemm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
                in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk, (__nv_bfloat16*)arena);
+#endif
         break;
 #endif /* !(GEMM_ONLY && WS_ENTRY) (bf16 GEMM) */
 

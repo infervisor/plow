@@ -71,10 +71,19 @@
         }                                                                                      \
     } while (0)
 
-static const int D = 512;                 /* full-layer head dim */
-static const int NH = 16;                 /* q heads */
-static const int KVH = 2;                 /* full-layer kv heads -> GQA = 8 */
-static const float SCALE = 0.0441941738f; /* 1/sqrt(512) */
+#ifndef PLOW_FA_BENCH_HD
+#define PLOW_FA_BENCH_HD 512
+#endif
+#ifndef PLOW_FA_BENCH_NH
+#define PLOW_FA_BENCH_NH 16
+#endif
+#ifndef PLOW_FA_BENCH_KVH
+#define PLOW_FA_BENCH_KVH 2
+#endif
+static const int D = PLOW_FA_BENCH_HD;
+static const int NH = PLOW_FA_BENCH_NH;
+static const int KVH = PLOW_FA_BENCH_KVH;
+static const float SCALE = 1.0f / sqrtf((float)D);
 static const double REL_GATE = 3e-3;
 
 /* ---- launch wrappers: production-faithful persistent grid ------------------------------------
@@ -117,9 +126,9 @@ static DecKern dec_kern(int gf) {
                    : (gf == 4 ? (DecKern)decode_launch<4> : (DecKern)decode_launch<8>);
 }
 static size_t dec_smem(int gf) {
-    return (size_t)(gf == 2   ? FA_DEC_SMEM_FLOATS(512, 2)
-                    : gf == 4 ? FA_DEC_SMEM_FLOATS(512, 4)
-                              : FA_DEC_SMEM_FLOATS(512, 8)) *
+    return (size_t)(gf == 2   ? FA_DEC_SMEM_FLOATS(D, 2)
+                    : gf == 4 ? FA_DEC_SMEM_FLOATS(D, 4)
+                              : FA_DEC_SMEM_FLOATS(D, 8)) *
            4;
 }
 
@@ -196,7 +205,7 @@ struct CtxBuf {
 struct Cell { double cold, hot, rel; bool ok; };
 
 /* Validate + time one (GF, nsplit) cell. `trial` re-seeds nothing; call repeatedly for spread. */
-static Cell bench(CtxBuf& c, int GF, int nsplit, int NCU) {
+static Cell bench(CtxBuf& c, int GF, int nsplit, int NCU, const char* dump = nullptr) {
     const size_t smem = dec_smem(GF);
     DecKern kern = dec_kern(GF);
     if (smem > 48 * 1024)
@@ -219,6 +228,18 @@ static Cell bench(CtxBuf& c, int GF, int nsplit, int NCU) {
     CK(cudaDeviceSynchronize());
     std::vector<__nv_bfloat16> hO((size_t)NH * D);
     CK(cudaMemcpy(hO.data(), c.dO, hO.size() * 2, cudaMemcpyDeviceToHost));
+    if (dump) {
+        std::vector<float> op((size_t)NH * nsplit * D), ml((size_t)NH * nsplit * 2);
+        CK(cudaMemcpy(op.data(), dOp, op.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(ml.data(), dMl, ml.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        FILE* f = fopen(dump, "wb");
+        if (!f) { perror(dump); exit(1); }
+        bool ok = fwrite(hO.data(), sizeof(__nv_bfloat16), hO.size(), f) == hO.size();
+        ok &= fwrite(op.data(), sizeof(float), op.size(), f) == op.size();
+        ok &= fwrite(ml.data(), sizeof(float), ml.size(), f) == ml.size();
+        ok &= fclose(f) == 0;
+        if (!ok) { fprintf(stderr, "attention dump failed: %s\n", dump); exit(1); }
+    }
     double num = 0, den = 0;
     for (size_t i = 0; i < hO.size(); i++) {
         const double o = __bfloat162float(hO[i]), r = c.ref[i];
@@ -260,7 +281,7 @@ static Cell bench(CtxBuf& c, int GF, int nsplit, int NCU) {
     return out;
 }
 
-int main() {
+int main(int argc, char** argv) {
     srand(1234);
 
     cudaDeviceProp prop;
@@ -269,6 +290,32 @@ int main() {
     const size_t L2 = (size_t)prop.l2CacheSize;
     printf("device: %s  SM=%d  L2=%.1f MB  smem/SM=%zu KiB  cc=%d.%d\n", prop.name, NCU,
            L2 / 1048576.0, (size_t)prop.sharedMemPerMultiprocessor / 1024, prop.major, prop.minor);
+
+    if (argc != 1) {
+        if (argc != 6) {
+            fprintf(stderr, "usage: %s [context gf nsplit trials dump]\n", argv[0]);
+            return 2;
+        }
+        const int ctx = atoi(argv[1]), gf = atoi(argv[2]);
+        const int ns = atoi(argv[3]), trials = atoi(argv[4]);
+        if (ctx <= 0 || ns <= 0 || trials <= 0 || (gf != 2 && gf != 4 && gf != 8) ||
+            NH % KVH || (NH / KVH) % gf) {
+            fprintf(stderr, "invalid attention shape or sweep arguments\n");
+            return 2;
+        }
+        CtxBuf c;
+        c.init(ctx);
+        int fails = 0;
+        for (int trial = 0; trial < trials; trial++) {
+            Cell r = bench(c, gf, ns, NCU, trial == 0 ? argv[5] : nullptr);
+            printf("D=%d NH=%d KVH=%d ctx=%d gf=%d ns=%d trial=%d cold_ms=%.6f "
+                   "hot_ms=%.6f relL2=%.9g %s\n", D, NH, KVH, ctx, gf, ns, trial,
+                   r.cold, r.hot, r.rel, r.ok ? "PASS" : "FAIL");
+            fails += !r.ok;
+        }
+        c.free_all();
+        return fails ? 1 : 0;
+    }
 
     /* ---- register / spill report per GF instantiation (sm_90a) ---- */
     printf("\n=== registers / local (spill) bytes per GF instantiation, sm_90a ===\n");

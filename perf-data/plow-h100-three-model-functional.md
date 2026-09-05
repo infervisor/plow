@@ -126,9 +126,13 @@ Both native stock and the decoder-only HNR+NRN+GLU variant match vLLM's leading 
 
 The corresponding vLLM BF16 serving baseline (context16384, input8192/output128, C1, max-num-seqs1, max-num-batched-tokens8192, default graphs, prefix cache off, 32 measured requests/16 warmups/seed42) completed32/32 with262144 input and4096 output tokens, zero failures. TTFT350.20ms, TPOT10.637ms, p99ITL11.547ms, meanE2E1701.10ms, output75.23tok/s. Raw: `vllm-gemma12b-bf16-ctx16384-i8192-o128-c1-r1/in8192_c1.json` under the campaign directory. Native timing is not yet a qualified comparison.
 
+The corresponding stock native run also completed32/32 with262144 input and4096 output tokens, zero failures. The same context/input/output/concurrency/request/warmup/seed settings give TTFT636.80ms, TPOT12.865ms, p99ITL12.931ms, meanE2E2270.71ms and output56.36tok/s. It uses resident batch1, native decode, WS384 segmented prefill, and the frozen `plowrt-qwen-w8a8-candidate1` host. Plow is slower on this cell; the unresolved output discrepancy below makes this a provisional performance comparison. Raw: `gemma12b-bf16-native-ctx16384-b1-i8192-o128-c1-r1/in8192_c1.json` under the campaign directory. The initial launch used an incorrect served model ID and stopped at its404 correctness gate; these numbers come from the successful retry with the asset ID `checkpoint`.
+
 The oracle now supports multiple output tokens from one request, recording the actual generated-prefix hash for every raw row. This distinguishes real decode from recomputing each prefix. Seven CPU tests cover suppression, history mapping, context bounds and preservation of distinct invalid-row diagnostics.
 
 At this8192-token history, eager vLLM prefill plus two decode steps generates `[4284,9885,13512]`, matching all native variants; both requests repeat bit-exactly. Compiled/default-graph vLLM instead generates `[4284,9885,9885]`, also with bit-exact repeats. The third compiled raw row differs substantially from the native/reference rows. The installed FlatLogprobs export was checked for indexing/copy errors; none were found. A compile-on/graphs-off control is required before attributing this discrepancy or treating the default-graph timing as a qualified model comparison. Artifacts: `/tmp/plow-gemma-long-context/vllm-bf16-{compiled,eager}-decode/`.
+
+The subsequent compile-on/graphs-off control completed successfully with effective mode `VLLM_COMPILE`, Inductor backend, custom ops `none`, and graph mode `NONE`. Both requests still generate `[4284,9885,9885]`; all six raw rows are byte-identical to the default-graph run. CUDA graph replay therefore does not explain this observed discrepancy. The remaining investigation concerns compiled execution and its selected operators/fusions; no vLLM bug is established. Evidence: `/tmp/plow-gemma-long-context/vllm-bf16-compiled-nographs-decode/manifest.json` and `/tmp/plow-model-support-checks/gemma-compiled-graph-control.json`.
 
 An isolated installed-forward probe also confirms a narrower distinction: eager execution rounds the residual sum to BF16 before applying the layer scalar, whereas default Inductor fusion matches Plow's FP32 sum followed by scaling. All six captured rows agree with those respective forms. No scalar-rounding production change was made. Evidence: `/tmp/plow-model-support-checks/vllm-gemma-layer-scalar-boundary.json`.
 
@@ -137,3 +141,20 @@ The standalone prefill GELU activation rounding was added under the same opt-in 
 ## Gemma31 short vLLM reference
 
 The corrected native HNR+NRN+GLU decoder was compared against six identical teacher-forced prefixes in vLLM, repeated twice. All six vLLM repeats are bit-exact and all native leading tokens match. Centered full-row errors are0.85%,4.94%,2.80%,3.04%,2.77%,2.65%; head64 errors are0.33–1.49%. Unlike this Gemma12 checkpoint, Gemma31 declares no suppressed IDs and its full raw vocabulary is finite; no entries are masked in this comparison. Short-prefix agreement does not qualify all contexts. Evidence: `/tmp/plow-model-support-checks/gemma31-vllm-glu-quality.json` and `/tmp/plow-gemma31-vllm-short/manifest.json`.
+
+## Query caching: kernel gain without a serving gain
+
+The default-off `PLOW_NV_FA_QREG` caches invariant BF16 query fragments in registers. SASS confirms query shared loads move outside the KV-row loop, with unchanged arithmetic/reduction order. The final candidate is restricted to D512/GF≤4 because the Qwen D256/GF2 experiment regresses91.57→97.73µs. The full Gemma interpreter uses200→207 registers with zero stack/spills/local memory.
+
+At context8192, GF4, nsplit33, the actual Gemma12 NH16/KV1/D512 shape improves mean cold decode+merge67.35→49.89µs across three trials; Gemma31 NH32/KV4/D512 improves128.00→91.94µs. Both pass the unchanged CPU softmax reference gate and exact A/B output/partial-state comparison. Earlier NH8 tests labelled Gemma12 were synthetic; their69.05→49.69µs result must not be substituted for the actual NH16 shape.
+
+Full Gemma12 prefill8192 plus two decode steps produces identical logit rows for both full cubins, and the control also matches the prior stock decoder byte for byte. A fresh serving pair uses the same frozen host, context16384/B1 asset, WS384 prefill, input8192/output128/C1, 32 requests, 16 warmups, seed42 and detailed metrics. Both complete32/32 with zero failures:
+
+| Decoder | TTFT ms | TPOT ms | p99 ITL ms | Mean E2E ms | Output tok/s |
+|---|---:|---:|---:|---:|---:|
+| QREG off | 637.57 | 12.878 | 13.001 | 2273.02 | 56.307 |
+| QREG HD512 | 637.56 | 12.879 | 12.972 | 2273.24 | 56.301 |
+
+There is no measured serving gain in this pair; the candidate remains experimental. An initial control launch omitted the existing BOS-prefixed coherence prompt and stopped at that gate without timing. The successful pair restores `GATE_PROMPT="<bos>The capital of France is"`, matching the earlier stock run. Raw results: `gemma12b-qreg{0,1}-ctx16384-i8192-o128-c1-r1/in8192_c1.json` under the campaign directory. Cubin/primitive provenance and full-logit comparisons: `/tmp/plow-attention-qreg/`.
+
+The subsequent AOT packet-fusion, dependency, shared-quantization, prefill-norm and object-selection experiments are recorded in [the compiler experiment report](h100-aot-compiler-experiments.md).
