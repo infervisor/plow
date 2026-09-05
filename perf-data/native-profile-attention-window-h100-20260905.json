@@ -1,0 +1,193 @@
+{
+  "source_queue": "/tmp/plow-model-support-checks/native-profile-attention-window-20260905/queue.json",
+  "source_sha256": "544f1e6ce829cd15d948a067ddb2308c0c9298948216881098bbabb9c7e119dd",
+  "driver_sha256": "1d4a1beb4326b76b049d5a896dd2727f7d78395cb2ae858440588c0c25162d9b",
+  "source_commit": "9d541b4",
+  "scope": "Existing harnesses: repairedG31 blocks; currentFP8Qwen full grouping gates and repairedblocks; deployedFP8 profiling. No serving promotion until independent quality addressed.",
+  "jobs": [
+    {
+      "name": "gemma31-control-block-r1-retry",
+      "kind": "blockbench",
+      "output": "/tmp/plow-model-support-checks/attention-block-retry-20260905/gemma31-control-block-r1-retry/sweep.json",
+      "requires": []
+    },
+    {
+      "name": "gemma31-candidate-block-r1-retry",
+      "kind": "blockbench",
+      "output": "/tmp/plow-model-support-checks/attention-block-retry-20260905/gemma31-candidate-block-r1-retry/sweep.json",
+      "requires": []
+    },
+    {
+      "name": "gemma31-candidate-block-r2-retry",
+      "kind": "blockbench",
+      "output": "/tmp/plow-model-support-checks/attention-block-retry-20260905/gemma31-candidate-block-r2-retry/sweep.json",
+      "requires": []
+    },
+    {
+      "name": "gemma31-control-block-r2-retry",
+      "kind": "blockbench",
+      "output": "/tmp/plow-model-support-checks/attention-block-retry-20260905/gemma31-control-block-r2-retry/sweep.json",
+      "requires": []
+    },
+    {
+      "name": "qwen-fp8-current-ns11-logits-1024",
+      "kind": "full_control",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-current-ns11-logits-1024",
+      "requires": []
+    },
+    {
+      "name": "qwen-fp8-control-ns33-logits-1024",
+      "kind": "full_control",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-control-ns33-logits-1024",
+      "requires": []
+    },
+    {
+      "name": "qwen-fp8-gf6-ns33-logits-1024",
+      "kind": "full",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-gf6-ns33-logits-1024",
+      "requires": [
+        "qwen-fp8-control-ns33-logits-1024"
+      ]
+    },
+    {
+      "name": "qwen-fp8-current-ns11-logits-4096",
+      "kind": "full_control",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-current-ns11-logits-4096",
+      "requires": []
+    },
+    {
+      "name": "qwen-fp8-control-ns33-logits-4096",
+      "kind": "full_control",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-control-ns33-logits-4096",
+      "requires": []
+    },
+    {
+      "name": "qwen-fp8-gf6-ns33-logits-4096",
+      "kind": "full",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-gf6-ns33-logits-4096",
+      "requires": [
+        "qwen-fp8-control-ns33-logits-4096"
+      ]
+    },
+    {
+      "name": "qwen-fp8-current-ns11-logits-8192",
+      "kind": "full_control",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-current-ns11-logits-8192",
+      "requires": []
+    },
+    {
+      "name": "qwen-fp8-control-ns33-logits-8192",
+      "kind": "full_control",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-control-ns33-logits-8192",
+      "requires": []
+    },
+    {
+      "name": "qwen-fp8-gf6-ns33-logits-8192",
+      "kind": "full",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-gf6-ns33-logits-8192",
+      "requires": [
+        "qwen-fp8-control-ns33-logits-8192"
+      ]
+    },
+    {
+      "name": "qwen-fp8-current-ns11-logits-32768",
+      "kind": "full_control",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-current-ns11-logits-32768",
+      "requires": []
+    },
+    {
+      "name": "qwen-fp8-control-ns33-logits-32768",
+      "kind": "full_control",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-control-ns33-logits-32768",
+      "requires": []
+    },
+    {
+      "name": "qwen-fp8-gf6-ns33-logits-32768",
+      "kind": "full",
+      "output": "/tmp/plow-model-support-checks/attention-gqa-interpreter/qwen-fp8-current/results/qwen-fp8-gf6-ns33-logits-32768",
+      "requires": [
+        "qwen-fp8-control-ns33-logits-32768"
+      ]
+    },
+    {
+      "name": "qwen-fp8-block-control-ns33-r1-retry",
+      "kind": "blockbench",
+      "output": "/tmp/plow-model-support-checks/attention-block-retry-20260905/qwen-fp8-block-control-ns33-r1-retry/sweep.json",
+      "requires": [
+        "qwen-fp8-gf6-ns33-logits-1024",
+        "qwen-fp8-gf6-ns33-logits-4096",
+        "qwen-fp8-gf6-ns33-logits-8192",
+        "qwen-fp8-gf6-ns33-logits-32768"
+      ]
+    },
+    {
+      "name": "qwen-fp8-block-gf6-ns33-r1-retry",
+      "kind": "blockbench",
+      "output": "/tmp/plow-model-support-checks/attention-block-retry-20260905/qwen-fp8-block-gf6-ns33-r1-retry/sweep.json",
+      "requires": [
+        "qwen-fp8-gf6-ns33-logits-1024",
+        "qwen-fp8-gf6-ns33-logits-4096",
+        "qwen-fp8-gf6-ns33-logits-8192",
+        "qwen-fp8-gf6-ns33-logits-32768"
+      ]
+    },
+    {
+      "name": "qwen-fp8-block-gf6-ns33-r2-retry",
+      "kind": "blockbench",
+      "output": "/tmp/plow-model-support-checks/attention-block-retry-20260905/qwen-fp8-block-gf6-ns33-r2-retry/sweep.json",
+      "requires": [
+        "qwen-fp8-gf6-ns33-logits-1024",
+        "qwen-fp8-gf6-ns33-logits-4096",
+        "qwen-fp8-gf6-ns33-logits-8192",
+        "qwen-fp8-gf6-ns33-logits-32768"
+      ]
+    },
+    {
+      "name": "qwen-fp8-block-control-ns33-r2-retry",
+      "kind": "blockbench",
+      "output": "/tmp/plow-model-support-checks/attention-block-retry-20260905/qwen-fp8-block-control-ns33-r2-retry/sweep.json",
+      "requires": [
+        "qwen-fp8-gf6-ns33-logits-1024",
+        "qwen-fp8-gf6-ns33-logits-4096",
+        "qwen-fp8-gf6-ns33-logits-8192",
+        "qwen-fp8-gf6-ns33-logits-32768"
+      ]
+    },
+    {
+      "name": "current-fp8-broad-block",
+      "kind": "profile",
+      "output": "/tmp/plow-model-support-checks/qwen-current-fp8-m1-audit/broad-block.ncu-rep",
+      "requires": []
+    },
+    {
+      "name": "current-fp8-qkv-native",
+      "kind": "profile",
+      "output": "/tmp/plow-model-support-checks/qwen-current-fp8-m1-audit/qkv-native.ncu-rep",
+      "requires": []
+    },
+    {
+      "name": "current-fp8-broad-full",
+      "kind": "profile",
+      "output": "/tmp/plow-model-support-checks/qwen-current-fp8-m1-audit/broad-full.ncu-rep",
+      "requires": []
+    },
+    {
+      "name": "current-fp8-down-native",
+      "kind": "profile",
+      "output": "/tmp/plow-model-support-checks/qwen-current-fp8-m1-audit/down-native.ncu-rep",
+      "requires": []
+    },
+    {
+      "name": "current-fp8-qkv-cutlass",
+      "kind": "profile",
+      "output": "/tmp/plow-model-support-checks/qwen-current-fp8-m1-audit/qkv-cutlass.ncu-rep",
+      "requires": []
+    },
+    {
+      "name": "current-fp8-down-cutlass",
+      "kind": "profile",
+      "output": "/tmp/plow-model-support-checks/qwen-current-fp8-m1-audit/down-cutlass.ncu-rep",
+      "requires": []
+    }
+  ]
+}

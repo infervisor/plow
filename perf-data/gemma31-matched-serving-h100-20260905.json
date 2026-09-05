@@ -1,0 +1,67 @@
+{
+  "scope": "Gemma31 BF16 C1 screening:4 measured requests+1 warmup,512 output,seed42,vllm bench serve. Plow qualified decode rung host. vLLM0.28 MNBT2048,maxlen65536,maxseq16,GPUMEM.90. Exact individual lengths; independent quality separate. Runs not interleaved.",
+  "rows": [
+    {
+      "context": 1024,
+      "plow": {
+        "mean_ttft_ms": 186.04592799965758,
+        "mean_tpot_ms": 28.688932717712863,
+        "output_throughput": 34.48650803318675
+      },
+      "vllm": {
+        "mean_ttft_ms": 102.68727425136603,
+        "mean_tpot_ms": 23.632041887985498,
+        "output_throughput": 42.03979235245778
+      }
+    },
+    {
+      "context": 4096,
+      "plow": {
+        "mean_ttft_ms": 876.1609299835982,
+        "mean_tpot_ms": 28.95892147064107,
+        "output_throughput": 32.66460766281307
+      },
+      "vllm": {
+        "mean_ttft_ms": 425.03033149114344,
+        "mean_tpot_ms": 23.731561644818843,
+        "output_throughput": 40.78982888596702
+      }
+    },
+    {
+      "context": 8192,
+      "plow": {
+        "mean_ttft_ms": 2026.307232270483,
+        "mean_tpot_ms": 29.309852313622326,
+        "output_throughput": 30.110687282516434
+      },
+      "vllm": {
+        "mean_ttft_ms": 906.978997765691,
+        "mean_tpot_ms": 23.836960528327705,
+        "output_throughput": 39.11996814860589
+      }
+    },
+    {
+      "context": 32768,
+      "plow": {
+        "mean_ttft_ms": 13899.355023517273,
+        "mean_tpot_ms": 31.46900254399233,
+        "output_throughput": 17.077882157607934
+      },
+      "vllm": {
+        "mean_ttft_ms": 4565.956014761468,
+        "mean_tpot_ms": 24.416878999499314,
+        "output_throughput": 30.041210605471807
+      }
+    }
+  ],
+  "sha256": {
+    "/tmp/plow-model-support-checks/m16-next-window-20260905/gemma31b-rung-screen-c1/in1024_c1.json": "fc9f6cdfcb3ebe8e6ea422172fe1b1264efa0f873252c7635dc70dd5b1a3f799",
+    "/tmp/plow-model-support-checks/native-quality-next-window-20260905/gemma31-vllm-c1/in1024_c1.json": "d82995ea7d130a20d14c92686969726bed1e7b03c65551cda1c84d12b237657a",
+    "/tmp/plow-model-support-checks/m16-next-window-20260905/gemma31b-rung-screen-c1/in4096_c1.json": "691fe30e6c62d59b6a53d3cd0b0358d0dbe21124bf4f042c68c0441339728b6f",
+    "/tmp/plow-model-support-checks/native-quality-next-window-20260905/gemma31-vllm-c1/in4096_c1.json": "cd7b94077042ac528fbb2d53f280da10e74865c200835dfd060d2039a4ae7135",
+    "/tmp/plow-model-support-checks/m16-next-window-20260905/gemma31b-rung-screen-c1/in8192_c1.json": "420c91c279ddd14ee80b6e0f8ebb10c9412220baffabe2fbb00b5721efaf4610",
+    "/tmp/plow-model-support-checks/native-quality-next-window-20260905/gemma31-vllm-c1/in8192_c1.json": "aa69670f3b0bdf67f58f3b4b88598c0c2bb3d146c9d031f2f9adcd9c05019f72",
+    "/tmp/plow-model-support-checks/m16-next-window-20260905/gemma31b-rung-screen-c1/in32768_c1.json": "7187330150fbaaff076558bf437326e08c8f40d4427ba4c634450d934c68f34c",
+    "/tmp/plow-model-support-checks/native-quality-next-window-20260905/gemma31-vllm-c1/in32768_c1.json": "5a07c9d85269413ce92fcec0d0f64486f144dfc9198693a358d7ae1fbc0604d5"
+  }
+}
