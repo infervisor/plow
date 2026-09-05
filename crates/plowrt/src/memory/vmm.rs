@@ -305,11 +305,6 @@ impl LiveKvLayout {
                 return Err(reject("cache has generated contents"));
             }
             if generated.kind == packet::rope::GEN_TMAP_KV_PAIR {
-                if batch != 1 {
-                    return Err(reject(
-                        "KV tensormaps require batch 1; per-slot descriptors are unsupported",
-                    ));
-                }
                 let pair = [generated.aux as usize, generated.scale as usize];
                 let &(heads, hd, stride, _, _) = caches
                     .get(&pair)
@@ -1826,38 +1821,62 @@ mod tests {
     }
 
     #[test]
-    fn live_geometry_validates_tensormaps_and_rejects_unshifted_batch_maps() {
+    fn live_geometry_validates_tensormaps_across_batch_sizes() {
         use crate::asset::devblob::DevTensor;
-        let mut blob = live_blob();
-        blob.progs.pop();
-        blob.tensors[3].bytes = 4;
-        for id in [1, 2] {
-            blob.tensors[id].bytes /= 4;
+        for batch in [1, 4, 16] {
+            let fixture = || {
+                let mut blob = live_blob();
+                if batch == 1 {
+                    blob.progs.pop();
+                }
+                let decode = blob.progs.last_mut().unwrap();
+                decode.t = batch;
+                for writer in &mut decode.insts[..2] {
+                    writer.i[0] = batch;
+                    writer.i[6] = batch;
+                }
+                decode.insts[2].i[0] = batch;
+                blob.tensors[3].bytes = u64::from(batch) * 4;
+                for id in [1, 2] {
+                    blob.tensors[id].bytes = u64::from(batch) * 1024 * 256 * 2;
+                }
+                blob.tensors.push(DevTensor {
+                    name: "tmap.cache".into(),
+                    bytes: 256,
+                    init: None,
+                });
+                let mut map = packet::rope::GenTensor::tmap_kv_pair(1, 2, 1024, 256, 1);
+                map.tensor = 4;
+                blob.gen.push(map);
+                blob.progs[0].insts[2].t[7] = 4;
+                blob
+            };
+            let blob = fixture();
+            let layout = LiveKvLayout::from_blob(&blob).unwrap();
+            assert_eq!(layout.geometry.batch, batch);
+            assert_eq!(layout.full_tensors, [[1, 2]]);
+            let mutations: &[fn(&mut crate::asset::devblob::DevBlob)] = &[
+                |b| b.gen[0].ctx = 512,
+                |b| b.gen[0].hd = 128,
+                |b| b.gen[0].frac = 2.0,
+                |b| b.gen[0].scale = 1,
+                |b| b.tensors[4].bytes = 128,
+                |b| b.tensors[1].bytes /= 2,
+                |b| b.progs[0].insts[2].t[7] = 3,
+                |b| {
+                    b.progs.last_mut().unwrap().insts[2].op =
+                        packet::dev::DevOp::FlashDecodeFp8 as u16
+                },
+            ];
+            for (case, mutate) in mutations.iter().enumerate() {
+                let mut invalid = fixture();
+                mutate(&mut invalid);
+                assert!(
+                    LiveKvLayout::from_blob(&invalid).is_err(),
+                    "batch={batch} case={case}"
+                );
+            }
         }
-        blob.tensors.push(DevTensor {
-            name: "tmap.cache".into(),
-            bytes: 256,
-            init: None,
-        });
-        let mut map = packet::rope::GenTensor::tmap_kv_pair(1, 2, 1024, 256, 1);
-        map.tensor = 4;
-        blob.gen.push(map);
-        blob.progs[0].insts[2].t[7] = 4;
-        assert!(LiveKvLayout::from_blob(&blob).is_ok());
-        blob.gen[0].ctx = 512;
-        assert!(LiveKvLayout::from_blob(&blob).is_err());
-        blob.gen[0].ctx = 1024;
-        blob.gen[0].scale = 1;
-        assert!(LiveKvLayout::from_blob(&blob).is_err());
-        let mut batched = live_blob();
-        batched.tensors.push(DevTensor {
-            name: "tmap.cache".into(),
-            bytes: 256,
-            init: None,
-        });
-        batched.gen.push(map);
-        let error = LiveKvLayout::from_blob(&batched).err().unwrap().to_string();
-        assert!(error.contains("per-slot descriptors"), "{error}");
     }
 
     #[test]
@@ -1868,6 +1887,8 @@ mod tests {
         assert!(!p.prefix_reuse());
         for _ in 0..2 {
             p.ensure_rows(0, 17).unwrap();
+            p.ensure_rows(1, 9).unwrap();
+            let other_rows = p.mapped_rows(1);
             assert!(p.try_attach(1, &prompt(17)).unwrap().is_none());
             assert!(p
                 .publish(0, &prompt(17), 4, |_| panic!("snapshot must not run"))
@@ -1881,6 +1902,10 @@ mod tests {
                 .all(|s| s.hashes.is_empty() && s.tokens.is_empty()));
             drop(inner);
             p.begin_seq(0);
+            assert_eq!(p.mapped_rows(0), 0);
+            assert_eq!(p.mapped_rows(1), other_rows);
+            assert!(p.stats().blocks_live > 0);
+            p.begin_seq(1);
             assert_eq!(p.stats().blocks_live, 0);
         }
         assert_eq!(p.stats().attach_hits, 0);

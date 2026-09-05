@@ -14,17 +14,26 @@ fn live_geometry_actual_packet() {
 }
 
 #[test]
-#[ignore = "CPU-only negative packet check; set PLOW_VMM_PACKET_TEST to a batched TMA blob"]
-fn live_geometry_rejects_actual_batched_tma_packet() {
+#[ignore = "CPU-only batched TMA packet check; set PLOW_VMM_PACKET_TEST to a blob path"]
+fn live_geometry_accepts_actual_batched_tma_packet() {
     let path = std::env::var("PLOW_VMM_PACKET_TEST").expect("packet path");
     let bytes = std::fs::read(&path).unwrap();
     let blob = plowrt::asset::devblob::DevBlob::parse(&bytes).unwrap();
-    let error = LiveKvLayout::from_blob(&blob)
-        .err()
-        .expect("unsupported batched TMA");
-    assert!(
-        error.to_string().contains("per-slot descriptors"),
-        "{error}"
+    assert!(blob.decode_prog().unwrap().t > 1);
+    assert!(blob
+        .prefill_progs()
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|inst| {
+            inst.op == packet::dev::DevOp::FlashPrefill as u16
+                && blob.gen.iter().any(|g| {
+                    g.kind == packet::rope::GEN_TMAP_KV_PAIR && g.tensor == u32::from(inst.t[7])
+                })
+        }));
+    let layout = LiveKvLayout::from_blob(&blob).unwrap();
+    assert_eq!(layout.geometry.batch, blob.decode_prog().unwrap().t);
+    eprintln!(
+        "{path}: {:?}; full pairs {:?}",
+        layout.geometry, layout.full_tensors
     );
-    eprintln!("{path}: {error}");
 }

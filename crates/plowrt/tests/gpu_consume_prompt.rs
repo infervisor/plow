@@ -103,6 +103,15 @@ fn compare_snapshot(actual: LogitSnapshot, expected: &LogitSnapshot, case: &str)
 
 #[test]
 fn serialized_tma_slots_match_isolated_full_logits() {
+    serialized_tma_slot_parity(false);
+}
+
+#[test]
+fn live_tma_all_slots_match_flat_full_logits() {
+    serialized_tma_slot_parity(true);
+}
+
+fn serialized_tma_slot_parity(all_slots_live: bool) {
     let _env = common::env_guard();
     if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
         eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + B>=2 TMA assets)");
@@ -113,6 +122,8 @@ fn serialized_tma_slots_match_isolated_full_logits() {
         ("PLOW_VMM_PREFIX", "0"),
         ("PLOW_PREFIX_CACHE", "0"),
         ("PLOW_PF_BATCH", "0"),
+        ("PLOW_VMM_BLOCK_MIB", "2"),
+        ("PLOW_KV_POOL_MIB", "0"),
     ]);
     let _ = tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "plowrt=info".into()))
@@ -143,14 +154,21 @@ fn serialized_tma_slots_match_isolated_full_logits() {
         blob.prefill_progs().iter().all(|p| p.t % 32 == 0),
         "use prefill buckets with partial padding for the +1-token cases"
     );
+    let short_rows = blob.prefill_progs().iter().map(|p| p.t).min().unwrap() as usize;
+    if all_slots_live {
+        plowrt::memory::vmm::LiveKvLayout::from_blob(&blob).expect("live packet geometry");
+    }
     drop(blob);
 
     let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
-    let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).expect("engine load");
+    let mut e =
+        GpuEngine::load(Arc::clone(&be), &assets, &assets.join("checkpoint")).expect("engine load");
     assert!(e.batch() >= 2 && e.has_prefill() && e.max_ctx() >= 16400);
     assert!(e.vmm_stats().is_none(), "gate requires flat KV allocation");
+    let slots = if all_slots_live { e.batch() } else { 2 };
     let prompts: Vec<Vec<u32>> = [8192, 16384, 8193, 16385]
         .into_iter()
+        .chain(std::iter::repeat_n(short_rows, slots - 2))
         .enumerate()
         .map(|(case, len)| {
             (0..len)
@@ -161,10 +179,12 @@ fn serialized_tma_slots_match_isolated_full_logits() {
     let mut reference = Vec::new();
     let mut decoded = Vec::new();
     for (case, prompt) in prompts.iter().enumerate() {
-        e.begin_slot(0, prompt.len() + 9).expect("baseline reset");
+        let decode_steps = if case < 4 { 8 } else { 12 };
+        e.begin_slot(0, prompt.len() + decode_steps + 1)
+            .expect("baseline reset");
         let mut token = e.prefill_slot(0, prompt).expect("baseline prefill");
         let mut trajectory = vec![snapshot(&mut e, 0, token)];
-        for _ in 0..8 {
+        for _ in 0..decode_steps {
             e.step_slots(&[(0, token)], &mut decoded)
                 .expect("baseline decode");
             token = decoded[0];
@@ -172,59 +192,95 @@ fn serialized_tma_slots_match_isolated_full_logits() {
         }
         reference.push(trajectory);
         eprintln!(
-            "isolated case={case} prompt={} full-logit snapshots=9",
-            prompt.len()
+            "isolated case={case} prompt={} full-logit snapshots={}",
+            prompt.len(),
+            decode_steps + 1
         );
     }
-    for slot in 0..e.batch() {
-        e.begin_slot(slot, 1).expect("clear baseline positions");
-    }
+    for live in [false, true]
+        .into_iter()
+        .take(if all_slots_live { 2 } else { 1 })
+    {
+        if live {
+            drop(e);
+            std::env::set_var("PLOW_VMM_LIVE", "1");
+            e = GpuEngine::load(Arc::clone(&be), &assets, &assets.join("checkpoint"))
+                .expect("live engine load");
+            assert_eq!(e.batch(), slots);
+        }
+        for slot in 0..e.batch() {
+            e.begin_slot(slot, 1).expect("clear baseline positions");
+        }
 
-    let mut active = [0usize, 1usize];
-    let mut steps = [0usize; 2];
-    let mut tokens = [0u32; 2];
-    for slot in 0..2 {
-        e.begin_slot(slot, prompts[slot].len() + 9)
-            .expect("candidate reset");
-        tokens[slot] = e
-            .prefill_slot(slot, &prompts[slot])
-            .expect("candidate prefill");
-        // Serialized prefill's M=1 head always writes row 0, regardless of slot.
-        compare_snapshot(
-            snapshot(&mut e, 0, tokens[slot]),
-            &reference[slot][0],
-            &format!("initial slot={slot} prefill"),
-        );
-    }
-    for phase in 0..3 {
-        if phase > 0 {
-            let slot = if phase == 1 { 1 } else { 0 };
-            let case = phase + 1;
-            active[slot] = case;
-            steps[slot] = 0;
-            e.begin_slot(slot, prompts[case].len() + 9)
-                .expect("interleaved reset");
-            tokens[slot] = e.prefill_slot(slot, &prompts[case]).expect("reset prefill");
+        let mut active: Vec<usize> = (0..slots)
+            .map(|slot| if slot < 2 { slot } else { slot + 2 })
+            .collect();
+        let mut steps = vec![0usize; slots];
+        let mut tokens = vec![0u32; slots];
+        for slot in 0..slots {
+            let case = active[slot];
+            e.begin_slot(slot, prompts[case].len() + 13)
+                .expect("candidate reset");
+            tokens[slot] = e
+                .prefill_slot(slot, &prompts[case])
+                .expect("candidate prefill");
+            // Serialized prefill's M=1 head always writes row 0, regardless of slot.
             compare_snapshot(
                 snapshot(&mut e, 0, tokens[slot]),
                 &reference[case][0],
-                &format!("reset slot={slot} case={case} prefill"),
+                &format!("live={live} initial slot={slot} prefill"),
             );
         }
-        for _ in 0..4 {
-            e.step_slots(&[(0, tokens[0]), (1, tokens[1])], &mut decoded)
-                .expect("interleaved decode");
-            for slot in 0..2 {
-                tokens[slot] = decoded[slot];
-                steps[slot] += 1;
-                let case = active[slot];
+        for phase in 0..3 {
+            if phase > 0 {
+                let slot = if phase == 1 { 1 } else { 0 };
+                let case = phase + 1;
+                active[slot] = case;
+                steps[slot] = 0;
+                e.begin_slot(slot, prompts[case].len() + 9)
+                    .expect("interleaved reset");
+                tokens[slot] = e.prefill_slot(slot, &prompts[case]).expect("reset prefill");
                 compare_snapshot(
-                    snapshot(&mut e, slot, tokens[slot]),
-                    &reference[case][steps[slot]],
-                    &format!("slot={slot} case={case} decode={}", steps[slot]),
+                    snapshot(&mut e, 0, tokens[slot]),
+                    &reference[case][0],
+                    &format!("live={live} reset slot={slot} case={case} prefill"),
                 );
             }
+            for _ in 0..4 {
+                let inputs: Vec<_> = tokens.iter().copied().enumerate().collect();
+                e.step_slots(&inputs, &mut decoded)
+                    .expect("interleaved decode");
+                for slot in 0..slots {
+                    tokens[slot] = decoded[slot];
+                    steps[slot] += 1;
+                    let case = active[slot];
+                    compare_snapshot(
+                        snapshot(&mut e, slot, tokens[slot]),
+                        &reference[case][steps[slot]],
+                        &format!("live={live} slot={slot} case={case} decode={}", steps[slot]),
+                    );
+                }
+            }
+            for slot in 0..e.batch() {
+                assert_eq!(e.attached_rows(slot), 0);
+            }
+            if live {
+                let stats = e.vmm_stats().expect("live allocator enabled");
+                assert_eq!(stats.attach_hits + stats.attach_misses, 0);
+                assert_eq!(stats.tokens_attached + stats.blocks_shared_mapped, 0);
+                assert_eq!(
+                    stats.cache_blocks + stats.blocks_pooled + stats.blocks_reused,
+                    0
+                );
+                assert!(stats.blocks_live > 0);
+                eprintln!("live phase={phase} stats={stats:?}");
+            } else {
+                assert!(e.vmm_stats().is_none());
+            }
+            eprintln!("live={live} interleaved phase={phase} cases={active:?} steps={steps:?}: full logits exact");
         }
-        eprintln!("interleaved phase={phase} cases={active:?} steps={steps:?}: full logits exact");
+        for slot in 0..e.batch() {
+            e.begin_slot(slot, 1).expect("release active slots");
+        }
     }
 }
