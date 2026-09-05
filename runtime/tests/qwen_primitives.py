@@ -4,6 +4,9 @@ p=argparse.ArgumentParser()
 p.add_argument("--run-gpu", action="store_true")
 p.add_argument("--library", required=True)
 p.add_argument("--gdn-library")
+p.add_argument("--fp8-prefill-only", action="store_true", help="run native FP8 TMA prefill vs installed CUTLASS")
+p.add_argument("--fp8-prefill-rows", type=int, choices=(128,1024,4096,8192), default=128, help="runtime M for the native TMA prefill comparator")
+p.add_argument("--fp8-rows", type=int, choices=(1,4,16,128), help="row count for the separate exact quantization gate")
 p.add_argument("--fp8-tma", action="store_true", help="encode a 64-row FP8 weight map before timing")
 p.add_argument("--fp8-interpreter-only", action="store_true", help="run interpreter FP8 M1 body vs vLLM CUTLASS")
 p.add_argument("--fp8-gemm-only", action="store_true", help="run cuBLASLt FP8 M1 vs vLLM CUTLASS")
@@ -11,6 +14,9 @@ p.add_argument("--fp8-only", action="store_true", help="report exact activation 
 p.add_argument("--gemma-nrn-only", action="store_true", help="compare fused prefill NRN against native NormResidual plus RMSNorm")
 p.add_argument("--output", help="FP8 comparison JSON, written even when parity fails")
 args=p.parse_args()
+if args.fp8_prefill_only:
+    if args.fp8_gemm_only:p.error("prefill comparison uses the native interpreter")
+    args.fp8_interpreter_only=True
 if not args.run_gpu: p.error("requires --run-gpu and an exclusive GPU slot")
 import torch
 lib=C.CDLL(args.library)
@@ -88,6 +94,10 @@ def check_fp8_gemm():
         ("fused_ba",96,5120),("fused_qkvz",16384,5120),
         ("fused_qkv",14336,5120),("fused_gtup",34816,5120),
         ("k_tail_128",1024,640),("k_tail_16",1024,528)]
+    logical_m=args.fp8_prefill_rows if args.fp8_prefill_only else 1
+    if args.fp8_prefill_only:
+        shapes=[shape for shape in shapes if shape[0] not in
+            ("lm_head","fused_ba","fused_qkvz","fused_qkv","fused_gtup")]
     if not args.fp8_interpreter_only:
         lib.plow_fp8_m1_create.argtypes=[C.c_int,C.c_int,C.c_int,C.c_void_p,C.c_void_p,C.POINTER(C.c_void_p)]
         lib.plow_fp8_m1_create.restype=C.c_int
@@ -111,24 +121,28 @@ def check_fp8_gemm():
             times.append(start.elapsed_time(end)*1000)
         return statistics.median(times)
     for name,N,K in shapes:
-        record=dict(name=name,N=N,K=K,logical_M=1,lm_head_bf16_island=name=="lm_head")
+        record=dict(name=name,N=N,K=K,logical_M=logical_m,lm_head_bf16_island=name=="lm_head")
         handle=C.c_void_p()
         try:
-            x=rand(1,K)
+            x=rand(logical_m,K)
             w=rand(N,K)
             ws=(w.float().abs().amax()/448).reshape(1)
             wq,_=ops.scaled_fp8_quant(w,scale=ws)
             aq,asc=ops.scaled_fp8_quant(x,use_per_token_if_dynamic=True)
             del w
             if args.fp8_interpreter_only:
-                physical_m=1
+                physical_m=logical_m
                 record["descriptor_attempts"]=[]
                 checked=torch.empty_like(aq)
                 checked_scale=torch.empty_like(asc)
-                run(32,[checked,x,checked_scale],[1,K])
+                run(32,[checked,x,checked_scale],[logical_m,K])
                 torch.cuda.synchronize()
                 record["activation_bytes_scales_exact"]=bool(torch.equal(checked.view(torch.uint8),aq.view(torch.uint8)) and torch.equal(checked_scale.view(torch.int32),asc.view(torch.int32)))
-                aq,asc=checked,checked_scale
+                record["quantized_bytes_exact"]=bool(torch.equal(checked.view(torch.uint8),aq.view(torch.uint8)))
+                record["scale_bits_exact"]=bool(torch.equal(checked_scale.view(torch.int32),asc.view(torch.int32)))
+                record["quantized_byte_mismatches"]=int((checked.view(torch.uint8)!=aq.view(torch.uint8)).sum())
+                record["scale_bit_mismatches"]=int((checked_scale.view(torch.int32)!=asc.view(torch.int32)).sum())
+                if not args.fp8_prefill_only:aq,asc=checked,checked_scale
             else:
                 attempts=[]
                 for physical_m in (1,16):
@@ -141,13 +155,20 @@ def check_fp8_gemm():
                     records.append(record)
                     continue
             ap=torch.zeros(physical_m,K,device="cuda",dtype=torch.float8_e4m3fn)
-            ap[:1].copy_(aq)
-            out=torch.empty(physical_m,N,device="cuda",dtype=torch.bfloat16)
-            ref=torch.empty(1,N,device="cuda",dtype=torch.bfloat16)
+            ap[:logical_m].copy_(aq)
+            guarded_out=None
+            if args.fp8_prefill_only:
+                guarded_out=torch.full((physical_m*N+16,),-123.,device="cuda",dtype=torch.bfloat16)
+                out=guarded_out[8:-8].view(physical_m,N)
+            else:out=torch.empty(physical_m,N,device="cuda",dtype=torch.bfloat16)
+            ref=torch.empty(logical_m,N,device="cuda",dtype=torch.bfloat16)
             wt=wq.t()
             ws_vector=ws.expand(N).contiguous()
-            weight_map=None
-            if args.fp8_tma:
+            if args.fp8_prefill_only:
+                ws_vector=ws_vector*torch.linspace(.5,1.5,N,device="cuda",dtype=torch.float32)
+            ref_ws=ws_vector if args.fp8_prefill_only else ws
+            weight_map=activation_map=None
+            if args.fp8_tma or args.fp8_prefill_only:
                 assert args.fp8_interpreter_only
                 driver=C.CDLL("libcuda.so.1")
                 encode=driver.cuTensorMapEncodeTiled
@@ -155,32 +176,37 @@ def check_fp8_gemm():
                     C.POINTER(C.c_uint64),C.POINTER(C.c_uint64),
                     C.POINTER(C.c_uint),C.POINTER(C.c_uint),C.c_int,C.c_int,C.c_int,C.c_int]
                 encode.restype=C.c_int
-                storage=C.create_string_buffer(255)
-                aligned=(C.addressof(storage)+127)&~127
-                rc=encode(aligned,0,2,wq.data_ptr(),(C.c_uint64*2)(K,N),
-                    (C.c_uint64*1)(K),(C.c_uint*2)(128,64),(C.c_uint*2)(1,1),0,3,2,0)
-                assert rc==0, f"cuTensorMapEncodeTiled status {rc}"
-                weight_map=torch.tensor(list(C.string_at(aligned,128)),device="cuda",dtype=torch.uint8)
-                assert weight_map.data_ptr()%128==0
-                record["descriptor_attempts"]=[dict(rows=N,k=K,box_rows=64,status=rc)]
+                def tensor_map(tensor,rows,box_rows):
+                    storage=C.create_string_buffer(255)
+                    aligned=(C.addressof(storage)+127)&~127
+                    rc=encode(aligned,0,2,tensor.data_ptr(),(C.c_uint64*2)(K,rows),
+                        (C.c_uint64*1)(K),(C.c_uint*2)(128,box_rows),(C.c_uint*2)(1,1),0,3,2,0)
+                    record["descriptor_attempts"].append(dict(rows=rows,k=K,box_rows=box_rows,status=rc))
+                    assert rc==0, f"cuTensorMapEncodeTiled status {rc}"
+                    result=torch.tensor(list(C.string_at(aligned,128)),device="cuda",dtype=torch.uint8)
+                    assert result.data_ptr()%128==0
+                    return result
+                weight_map=tensor_map(wq,N,128 if args.fp8_prefill_only else 64)
+                if args.fp8_prefill_only:activation_map=tensor_map(ap,logical_m,128)
 
             def native():
                 if args.fp8_interpreter_only:
-                    run(33,[out,ap,wq,asc,ws_vector,None,None,weight_map],[1,N,K])
+                    run(33,[out,ap,wq,asc,ws_vector,None,activation_map,weight_map],[logical_m,N,K])
                 else:
                     rc=lib.plow_fp8_m1_run(handle,wq.data_ptr(),ap.data_ptr(),out.data_ptr(),torch.cuda.current_stream().cuda_stream)
                     if rc:raise RuntimeError(f"cublasLtMatmul status {rc}")
             def reference():
-                torch.ops._C.cutlass_scaled_mm(ref,aq,wt,asc,ws,None)
+                torch.ops._C.cutlass_scaled_mm(ref,aq,wt,asc,ref_ws,None)
             native();reference();torch.cuda.synchronize()
-            a=out[:1].float();b=ref.float()
+            a=out[:logical_m].float();b=ref.float()
             finite=bool(torch.isfinite(a).all() and torch.isfinite(b).all())
             rel=float(torch.linalg.vector_norm(a-b)/torch.linalg.vector_norm(b).clamp_min(1e-30))
             max_abs=float((a-b).abs().max());max_ref=float(b.abs().max())
             # Reuse the existing GEMM comparator gate; retain exact-byte evidence.
-            passed=finite and rel<=.006 and max_abs<=.05+.02*max_ref and record.get("activation_bytes_scales_exact",True)
+            record["output_canaries_pass"]=guarded_out is None or bool((guarded_out[:8]==-123).all() and (guarded_out[-8:]==-123).all())
+            passed=record["output_canaries_pass"] and finite and rel<=.006 and max_abs<=.05+.02*max_ref and record.get("activation_bytes_scales_exact",True)
             record.update(physical_M=physical_m,finite=finite,rel_l2=rel,max_abs=max_abs,
-                bit_exact=bool(torch.equal(out[:1],ref)),passed=passed,
+                bit_exact=bool(torch.equal(out[:logical_m],ref)),passed=passed,
                 candidate_cold_us=timing(native),vllm_cutlass_cold_us=timing(reference))
         except Exception as exc:
             record.update(passed=False,error=repr(exc))
@@ -188,12 +214,12 @@ def check_fp8_gemm():
             torch.cuda.synchronize()
             if not args.fp8_interpreter_only:lib.plow_fp8_m1_destroy(handle)
         records.append(record)
-    report=dict(backend="Plow interpreter d_gemm_w8a8 M1" if args.fp8_interpreter_only else "cuBLASLt comparison",
+    report=dict(backend=f"Plow native uniform TMA M{logical_m}" if args.fp8_prefill_only else "Plow interpreter d_gemm_w8a8 M1" if args.fp8_interpreter_only else "cuBLASLt comparison",
         mode="true FP8 E4M3 x E4M3, FP32 accumulation, BF16 output",
-        weight_scale="one FP32 scalar per synthetic packed matrix",
-        activation_scale="vLLM CUDA per-token; one scalar at logical M1",
+        weight_scale="heterogeneous FP32 per-N scales" if args.fp8_prefill_only else "one FP32 scalar per synthetic packed matrix",
+        activation_scale="vLLM CUDA per-token; quant byte/scale parity checked separately, GEMM shares reference-quantized operands" if args.fp8_prefill_only else "vLLM CUDA per-token; one scalar at logical M1",
         timing="median30 CUDA-event samples,5warmups;700MiB L2 eviction outside eachsample; no quantization/padding/setup allocation timed",
-        note="lm_head shape is a synthetic kernel stress case; model lm_head remains BF16",
+        note=f"M{logical_m} actual projection shapes plus K528/640 tails; BF16 model head excluded" if args.fp8_prefill_only else "lm_head shape is a synthetic kernel stress case; model lm_head remains BF16",
         passed=all(r["passed"] for r in records),cases=records)
     if args.output:Path(args.output).write_text(json.dumps(report,indent=2)+"\n")
     print(json.dumps(report,indent=2))
@@ -208,8 +234,8 @@ def check_fp8():
     from pathlib import Path
     records=[]
     torch.manual_seed(1729)
-    for M in (1,4,16):
-        for K in (3840,5120,17408):
+    for M in ((args.fp8_rows,) if args.fp8_rows is not None else (1,4,16)):
+        for K in ((5120,6144,17408,528,640) if M==128 else (3840,5120,17408)):
             for case in ("random", "zeros", "subtiny", "near_floor", "extreme_finite"):
                 x=torch.randn(M,K,device="cuda",dtype=torch.float32)
                 if case=="random":

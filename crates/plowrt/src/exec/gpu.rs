@@ -765,6 +765,22 @@ fn lt_counter_seed(
         .collect())
 }
 
+fn check_qwen_w8a8_capability(prefill: bool, rows: u32, capability: Option<u32>) -> Result<()> {
+    let supported_rows = if prefill {
+        matches!(rows, 128 | 1024 | 4096 | 8192)
+    } else {
+        rows == 1
+    };
+    if !supported_rows || capability != Some(1) {
+        return Err(RuntimeError::Rejected(if prefill {
+            "Qwen W8A8 prefill requires a supported bucket and paired native FP8 prefill interpreter".into()
+        } else {
+            "Qwen W8A8 requires batch-1 decode and the paired native FP8 M1 interpreter".into()
+        }));
+    }
+    Ok(())
+}
+
 fn qwen_state_slot(state: &DeviceMem, slot: usize, batch: usize) -> Result<DeviceMem> {
     const STRIDE: u64 = 48 * 128 * 128 * 4;
     if batch == 0 || slot >= batch || state.len != batch as u64 * STRIDE {
@@ -784,6 +800,19 @@ fn recurrent_state_layout(
     tensors: &[crate::asset::devblob::DevTensor],
     batch: usize,
 ) -> Result<Option<RecurrentState>> {
+    recurrent_state_layout_with_block(tensors, batch, false)
+}
+
+fn recurrent_state_layout_with_block(
+    tensors: &[crate::asset::devblob::DevTensor],
+    batch: usize,
+    qwen_block: bool,
+) -> Result<Option<RecurrentState>> {
+    if qwen_block && batch != 1 {
+        return Err(RuntimeError::Rejected(
+            "Qwen block currently requires B1".into(),
+        ));
+    }
     let mut states = Vec::new();
     for (index, tensor) in tensors.iter().enumerate() {
         if !tensor.name.starts_with("state.") {
@@ -803,7 +832,7 @@ fn recurrent_state_layout(
         }
         states.push((index, tensor.bytes / batch as u64));
     }
-    if states.is_empty() {
+    if states.is_empty() && !qwen_block {
         return Ok(None);
     }
     let active = tensors
@@ -1840,7 +1869,17 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
-        let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
+        let qwen_block = blob
+            .section_data_named(&raw, packet::devbuild::SECT_METADATA, "block.json")
+            .map(|bytes| serde_json::from_slice::<plow_asset::BlockDescriptor>(bytes))
+            .transpose()
+            .map_err(|e| RuntimeError::Device(format!("invalid block descriptor: {e}")))?
+            .is_some_and(|desc| desc.arch == "qwen3_5");
+        let recurrent = if qwen_block {
+            recurrent_state_layout_with_block(&blob.tensors, blob.decode_prog()?.t as usize, true)?
+        } else {
+            recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?
+        };
         if recurrent.is_some() {
             let config = RuntimeConfig::get();
             if RuntimeConfig::env_bool_or("PLOW_VMM_PREFIX", config.nv.vmm_prefix)
@@ -1850,7 +1889,8 @@ impl GpuEngine {
                     "Qwen recurrent state does not support prefix caching".into(),
                 ));
             }
-            if !blob.prefill_progs().is_empty()
+            if !(qwen_block && recurrent.as_ref().unwrap().tensors.is_empty())
+                && !blob.prefill_progs().is_empty()
                 && (blob
                     .prefill_progs()
                     .iter()
@@ -1971,17 +2011,16 @@ impl GpuEngine {
         let gemv_mm_cap = be.module_global_u32(&module, "plow_gemv_mm_cap")?;
         if recurrent.is_some()
             && blob
-                .progs
+                .decode_prog()?
+                .insts
                 .iter()
-                .flat_map(|p| &p.insts)
                 .any(|d| d.op == DevOp::GemmFp8 as u16)
-            && (blob.decode_prog()?.t != 1
-                || !blob.prefill_progs().is_empty()
-                || be.module_global_u32(&module, "plow_fp8_m1_arm")? != Some(1))
         {
-            return Err(RuntimeError::Rejected(
-                "Qwen W8A8 requires batch-1 decode and the paired native FP8 M1 interpreter".into(),
-            ));
+            check_qwen_w8a8_capability(
+                false,
+                blob.decode_prog()?.t,
+                be.module_global_u32(&module, "plow_fp8_m1_arm")?,
+            )?;
         }
         if gemv_mm_cap == Some(0) {
             return Err(RuntimeError::Device(
@@ -4843,7 +4882,15 @@ impl GpuEngine {
             // loaded: segments launch per class in order. Otherwise the coarse
             // single-segment contract holds as before.
             let qwen_segments = qwen_prefill_segments(g, &blob.tensors)?;
-            if !qwen_segments.is_empty()
+            let qwen_program = g.insts.iter().any(|d| d.op == DevOp::QwenRmsNorm as u16);
+            if qwen_program && g.insts.iter().any(|d| d.op == DevOp::GemmFp8 as u16) {
+                check_qwen_w8a8_capability(
+                    true,
+                    g.t,
+                    be.module_global_u32(&module, "plow_qwen_w8a8_prefill_arm")?,
+                )?;
+            }
+            if (qwen_program || !qwen_segments.is_empty())
                 && be.module_global_u32(&module, "plow_qwen_prefill_arm")? != Some(1)
             {
                 return Err(RuntimeError::Rejected(
@@ -6327,6 +6374,34 @@ mod recurrent_tests {
             bytes,
             init: None,
         }
+    }
+
+    #[test]
+    fn qwen_w8a8_decode_and_prefill_require_separate_capabilities() {
+        assert!(check_qwen_w8a8_capability(false, 1, Some(1)).is_ok());
+        assert!(check_qwen_w8a8_capability(false, 4, Some(1)).is_err());
+        for rows in [128, 1024, 4096, 8192] {
+            assert!(check_qwen_w8a8_capability(true, rows, Some(1)).is_ok());
+            assert!(check_qwen_w8a8_capability(true, rows, None).is_err());
+            assert!(check_qwen_w8a8_capability(true, rows, Some(0)).is_err());
+        }
+        for rows in [1, 256, 16384] {
+            assert!(check_qwen_w8a8_capability(true, rows, Some(1)).is_err());
+        }
+        assert!(check_qwen_w8a8_capability(false, 1, None).is_err());
+    }
+
+    #[test]
+    fn qwen_full_attention_block_uses_active_lifecycle_without_fake_state() {
+        let tensors = [tensor("in.active", 4)];
+        let block = recurrent_state_layout_with_block(&tensors, 1, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.active, 0);
+        assert!(block.tensors.is_empty());
+        assert!(recurrent_state_layout(&tensors, 1).unwrap().is_none());
+        assert!(recurrent_state_layout_with_block(&[], 1, true).is_err());
+        assert!(recurrent_state_layout_with_block(&tensors, 4, true).is_err());
     }
 
     #[test]

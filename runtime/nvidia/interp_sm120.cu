@@ -2150,6 +2150,11 @@ extern "C" __device__ unsigned plow_qwen_prefill_arm = 1;
 #else
 extern "C" __device__ unsigned plow_qwen_prefill_arm = 0;
 #endif
+#if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON && defined(PLOW_NV_HOPPER) && PLOW_NV_TMA_GEMM && PLOW_NV_W8A8 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_FP8_PF_SCALE_WFIRST && !PGM90_FP8_PROMOTE && PLOW_NV_PF_GEMV_HEAD && PLOW_NV_THREADS == 256 && !PGM90_UNI_BN256 && !PLOW_NV_SEG_GEMM
+extern "C" __device__ unsigned plow_qwen_w8a8_prefill_arm = 1;
+#else
+extern "C" __device__ unsigned plow_qwen_w8a8_prefill_arm = 0;
+#endif
 #if PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
 extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 1;
 #else

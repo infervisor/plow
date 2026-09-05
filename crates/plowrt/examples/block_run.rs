@@ -436,7 +436,9 @@ mod cuda {
             }
         }
 
-        let out_dir = PathBuf::from("/dev/shm/block-asset/bench");
+        let out_dir = flag("--out-dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/dev/shm/block-asset/bench"));
         std::fs::create_dir_all(&out_dir)?;
         let out = out_dir.join("sweep.json");
         std::fs::write(

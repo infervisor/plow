@@ -83,7 +83,10 @@
 static const int D = PLOW_FA_BENCH_HD;
 static const int NH = PLOW_FA_BENCH_NH;
 static const int KVH = PLOW_FA_BENCH_KVH;
-static const float SCALE = 1.0f / sqrtf((float)D);
+#ifndef PLOW_FA_BENCH_SCALE
+#define PLOW_FA_BENCH_SCALE (1.0f / sqrtf((float)D))
+#endif
+static const float SCALE = PLOW_FA_BENCH_SCALE;
 static const double REL_GATE = 3e-3;
 
 /* ---- launch wrappers: production-faithful persistent grid ------------------------------------
@@ -290,6 +293,9 @@ int main(int argc, char** argv) {
     const size_t L2 = (size_t)prop.l2CacheSize;
     printf("device: %s  SM=%d  L2=%.1f MB  smem/SM=%zu KiB  cc=%d.%d\n", prop.name, NCU,
            L2 / 1048576.0, (size_t)prop.sharedMemPerMultiprocessor / 1024, prop.major, prop.minor);
+
+    printf("attention: D=%d NH=%d KVH=%d scale=%.9g QREG=%d seed=1234\n",
+           D, NH, KVH, SCALE, PLOW_NV_FA_QREG);
 
     if (argc != 1) {
         if (argc != 6) {

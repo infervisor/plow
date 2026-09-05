@@ -46,6 +46,10 @@
 
 #include "sm90_wgmma.cuh"
 
+#ifndef PLOW_NV_FP8_PF_SCALE_WFIRST
+#define PLOW_NV_FP8_PF_SCALE_WFIRST 0
+#endif
+
 #ifndef PLOW_NV_SEG_M64N64
 #define PLOW_NV_SEG_M64N64 0
 #endif
@@ -614,6 +618,7 @@ static __device__ void d_gemm_w8a8_sm90_tma(__nv_bfloat16* __restrict__ C, const
     if (tid < NS) {
         sm90_mbar_init(bfull + tid, 1);
         sm90_mbar_init(bempty + tid, 2);
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
     __syncthreads();
 
@@ -712,9 +717,14 @@ static __device__ void d_gemm_w8a8_sm90_tma(__nv_bfloat16* __restrict__ C, const
 #pragma unroll
                 for (int lo = 0; lo < 2; lo++) {
                     const int cc = c0 + 8 * g + lo;
-                    if (cc < (int)n)
-                        C[(size_t)rr * n + cc] =
-                            __float2bfloat16(acc[4 * g + 2 * hi + lo] * as * wscale[cc]);
+                    if (cc < (int)n) {
+                        const float v = acc[4 * g + 2 * hi + lo];
+#if PLOW_NV_FP8_PF_SCALE_WFIRST
+                        C[(size_t)rr * n + cc] = __float2bfloat16(__fmul_rn(as, __fmul_rn(wscale[cc], v)));
+#else
+                        C[(size_t)rr * n + cc] = __float2bfloat16(v * as * wscale[cc]);
+#endif
+                    }
                 }
             }
     }

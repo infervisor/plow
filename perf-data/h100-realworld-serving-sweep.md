@@ -62,9 +62,32 @@ every individual request had the specified input/output lengths.
 |---:|---:|---:|---:|---:|---:|
 |1|351.644|10.533478|11.431093|5734.251|89.284154|
 |4|996.197|11.632726|11.979480|6940.520|294.970504|
+|16|2304.410|18.585268|326.336441|11801.482|691.562909|
 
-Raw: campaign `gemma12b-1k-32k-r1/in8192_c{1,4}.json` under the manifest directory.
+Raw: campaign `gemma12b-1k-32k-r1/in8192_c{1,4,16}.json` under the manifest directory.
 These are individual vLLM reference cells, not an aggregate or a Plow comparison.
+
+## Fast experiment preparation
+
+`scripts/tune_decode_sweep.sh --block L --block-bucket ROWS --block-run PATH` now
+reuses the architecture-aware packet/cubin grid with the existing `block_run`
+runner. Qwen layers0/3 dry-run successfully at8K/32K, B1, PF1024 and context65536;
+dry-runs emit no timing rows. The compiler selects the real GDN/full-attention
+layer, its weights/state and BF16 `act.x` input/output. Cubin cache keys include
+the native source hash, and each block result has a separate output directory.
+
+Six Gemma12 full-attention layer5 packets are emitted and verified offline for
+GF4/8 × NS16/33/64, context65536, prefill ladder128/512/1024. Actual layer geometry
+is D512/NH16/KV1/scale1. GF is an explicit cubin constant; the generated manifest's
+recommendation8 does not replace the required GF4/GF8 build flags. Artifact recipes
+and instruction checks: `/tmp/plow-model-support-checks/gemma12-realworld-block-grid/`.
+
+Qwen FP8 prefill requires independent decoder and prefill capability markers.
+The runtime rejects an unpaired prefill cubin before launch; the new marked object
+has byte-identical CUDA text sections to its preceding candidate. These builds and
+offline checks do not replace GPU model qualification. Block benchmarks use
+synthetic inputs for ranking; numeric checks require captured decode inputs or one
+exact prefill bucket, with inputs explicitly refreshed between chunks.
 
 ## First larger-shape kernel check
 
