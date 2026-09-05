@@ -1,0 +1,167 @@
+{
+  "scope": "Instrumented block0 cycles, dynamic queue allocation underrepresents small ops; not full per-op wall-time. Full-row numerical gates pass. One diagnostic run percontext; repeat timing qualification pending.",
+  "decode_profiles": [
+    {
+      "job": "decode-budget-1024-decode-trace-r1-retry2",
+      "packets": 991,
+      "capped_or_possibly_incomplete": false,
+      "gate_pct": 14.9,
+      "body_pct": 82.3,
+      "signal_pct": 2.8,
+      "total_kcyc": 91484,
+      "ops": [
+        {
+          "op": "Gemv",
+          "n": 420,
+          "gate_kcyc": 5363,
+          "body_kcyc": 34933,
+          "signal_kcyc": 1170,
+          "waits": 420
+        },
+        {
+          "op": "GemvGlu",
+          "n": 192,
+          "gate_kcyc": 2208,
+          "body_kcyc": 29246,
+          "signal_kcyc": 724,
+          "waits": 192
+        },
+        {
+          "op": "GemvQkv",
+          "n": 160,
+          "gate_kcyc": 3767,
+          "body_kcyc": 7288,
+          "signal_kcyc": 396,
+          "waits": 160
+        },
+        {
+          "op": "FlashDecode",
+          "n": 192,
+          "gate_kcyc": 1383,
+          "body_kcyc": 3669,
+          "signal_kcyc": 264,
+          "waits": 576
+        },
+        {
+          "op": "HeadNormRope",
+          "n": 18,
+          "gate_kcyc": 613,
+          "body_kcyc": 83,
+          "signal_kcyc": 25,
+          "waits": 18
+        },
+        {
+          "op": "NormResidualNorm",
+          "n": 1,
+          "gate_kcyc": 128,
+          "body_kcyc": 9,
+          "signal_kcyc": 1,
+          "waits": 1
+        },
+        {
+          "op": "Argmax",
+          "n": 4,
+          "gate_kcyc": 84,
+          "body_kcyc": 18,
+          "signal_kcyc": 5,
+          "waits": 4
+        },
+        {
+          "op": "FlashMerge",
+          "n": 4,
+          "gate_kcyc": 72,
+          "body_kcyc": 21,
+          "signal_kcyc": 5,
+          "waits": 4
+        }
+      ]
+    },
+    {
+      "job": "decode-budget-32768-decode-trace-r1-retry2",
+      "packets": 997,
+      "capped_or_possibly_incomplete": false,
+      "gate_pct": 14.7,
+      "body_pct": 82.8,
+      "signal_pct": 2.5,
+      "total_kcyc": 99461,
+      "ops": [
+        {
+          "op": "Gemv",
+          "n": 420,
+          "gate_kcyc": 5649,
+          "body_kcyc": 33990,
+          "signal_kcyc": 1124,
+          "waits": 420
+        },
+        {
+          "op": "GemvGlu",
+          "n": 192,
+          "gate_kcyc": 2190,
+          "body_kcyc": 29246,
+          "signal_kcyc": 687,
+          "waits": 192
+        },
+        {
+          "op": "FlashDecode",
+          "n": 192,
+          "gate_kcyc": 1435,
+          "body_kcyc": 11429,
+          "signal_kcyc": 264,
+          "waits": 576
+        },
+        {
+          "op": "GemvQkv",
+          "n": 160,
+          "gate_kcyc": 4378,
+          "body_kcyc": 7448,
+          "signal_kcyc": 407,
+          "waits": 160
+        },
+        {
+          "op": "HeadNormRope",
+          "n": 12,
+          "gate_kcyc": 381,
+          "body_kcyc": 59,
+          "signal_kcyc": 16,
+          "waits": 12
+        },
+        {
+          "op": "FlashMerge",
+          "n": 14,
+          "gate_kcyc": 225,
+          "body_kcyc": 86,
+          "signal_kcyc": 19,
+          "waits": 14
+        },
+        {
+          "op": "NormResidualNorm",
+          "n": 3,
+          "gate_kcyc": 281,
+          "body_kcyc": 29,
+          "signal_kcyc": 4,
+          "waits": 3
+        },
+        {
+          "op": "SoftCap",
+          "n": 3,
+          "gate_kcyc": 56,
+          "body_kcyc": 15,
+          "signal_kcyc": 4,
+          "waits": 3
+        },
+        {
+          "op": "Argmax",
+          "n": 1,
+          "gate_kcyc": 19,
+          "body_kcyc": 4,
+          "signal_kcyc": 1,
+          "waits": 1
+        }
+      ]
+    }
+  ],
+  "prefill_complete_budget": false,
+  "prefill_limit": "Non-graph event class analysis pending. Cumulative block0 non-attention trace capped4096 and excludes WS384. Nsight graph-node run failedcheckpointpermissions.",
+  "raw_analysis": "/tmp/plow-model-support-checks/e0-h100-rebaseline/e0-trace-retry2-window-20260905-analysis.json",
+  "sha256": "f0fb0416753011065622ac2f9adcd43cdd67de77011a44e40c2dbbb2488d9b2f"
+}

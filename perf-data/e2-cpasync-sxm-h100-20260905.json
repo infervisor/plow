@@ -1,0 +1,6 @@
+{
+  "scope": "NineactualGemma12scalarprojectiongeometries,256threads/132slices,depth2/4/6,twoalternating40samplepairs perarm,192MiBeviction,clock/powerlogging.54 exactoutput cells passed. Not fusedprojection/interpreter/serving.",
+  "decision": "No productionport:depth2/4regress acrossshapes,depth6roughlyflat to3%gain. Currentbaseline reaches2.74TB/s forlm_head.",
+  "source": "/tmp/plow-model-support-checks/e2-cpasync-current/result.csv",
+  "sha256": "8f8c14385a4b9cc2355f7c666d9a81c1b6fb5dac1d42cabf1f984bb826eb3084"
+}

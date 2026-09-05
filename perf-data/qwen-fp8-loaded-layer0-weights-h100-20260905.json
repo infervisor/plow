@@ -1,0 +1,31 @@
+{
+  "groups": 5,
+  "logical_fp8_bytes": 383221760,
+  "mismatched_weight_bytes": 0,
+  "all_scale_bits_exact": true,
+  "rows": [
+    {
+      "id": "m1024-step1023-r1",
+      "floats": 248320,
+      "all_finite": true,
+      "bitexact_original": true,
+      "sha256": "104b96445725d9573b80da4d84d60330846a74a558c4a5d52d1ad8dd2dbeef6e",
+      "argmax": 248046
+    },
+    {
+      "id": "m1024-step1023-r2",
+      "floats": 248320,
+      "all_finite": true,
+      "bitexact_original": true,
+      "sha256": "104b96445725d9573b80da4d84d60330846a74a558c4a5d52d1ad8dd2dbeef6e",
+      "argmax": 248046
+    }
+  ],
+  "repeat_bitexact": true,
+  "conclusion": "Layer0 loaded FP8 payload/scales match exactly; callback preserves normal compiled reference logits. Independent Plow quality discrepancy remains unexplained.",
+  "raw_validation": {
+    "path": "/tmp/plow-model-support-checks/qwen-fp8-long-quality-20260905/diagnostic/ipc-retry/validation.json",
+    "sha256": "1a4726e18da625a6c5012b3983982534fb2ca98eac3d7ee1918746937dd97e9e"
+  },
+  "scope": "Eight layer0 matrices in five packed groups; later layers and activation/recurrent computation remain unqualified."
+}

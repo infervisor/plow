@@ -1,0 +1,219 @@
+{
+  "hardware": {
+    "product": "NVIDIA H100 80GB HBM3",
+    "SMs": 132,
+    "L2_MiB": 50,
+    "memory_clock_MHz": 2619,
+    "memory_bus_bits": 5120,
+    "configured_power_limit_W": 700,
+    "MIG": "Disabled"
+  },
+  "hardware_derived_peak_GBps": 3352.32,
+  "paired_best_GBps": 3153.8190000000004,
+  "paired_best_cell": [
+    3,
+    8
+  ],
+  "best_fraction_spec": 0.9407869773768615,
+  "one_cta_un8_GBps": 2752.0765,
+  "one_cta_fraction_best": 0.8726171349719181,
+  "maximum_paired_cell_spread_pct": 0.1644353543642302,
+  "dmon": [
+    {
+      "repeat": 1,
+      "samples": [
+        {
+          "date": "20260905",
+          "time": "21:42:37",
+          "power_W": 154,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:38",
+          "power_W": 224,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:39",
+          "power_W": 316,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:40",
+          "power_W": 358,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:41",
+          "power_W": 401,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:42",
+          "power_W": 400,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:43",
+          "power_W": 410,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:44",
+          "power_W": 416,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:45",
+          "power_W": 417,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:46",
+          "power_W": 417,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        }
+      ],
+      "memory_MHz": [
+        2619
+      ],
+      "sm_MHz": [
+        1830
+      ],
+      "power_min_W": 154,
+      "power_max_W": 417
+    },
+    {
+      "repeat": 2,
+      "samples": [
+        {
+          "date": "20260905",
+          "time": "21:42:47",
+          "power_W": 186,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:48",
+          "power_W": 368,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:49",
+          "power_W": 418,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:50",
+          "power_W": 417,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:51",
+          "power_W": 420,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:52",
+          "power_W": 413,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:53",
+          "power_W": 404,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:54",
+          "power_W": 394,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:55",
+          "power_W": 361,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        },
+        {
+          "date": "20260905",
+          "time": "21:42:56",
+          "power_W": 316,
+          "memory_MHz": 2619,
+          "sm_MHz": 1830
+        }
+      ],
+      "memory_MHz": [
+        2619
+      ],
+      "sm_MHz": [
+        1830
+      ],
+      "power_min_W": 186,
+      "power_max_W": 420
+    }
+  ],
+  "matrix_only_floors": {
+    "gemma12": {
+      "matrix_bytes_per_decode_pass": 23813160960,
+      "matrix_GiB": 22.177734375,
+      "minimum_matrix_read_ms_at_measured_peak": 7.550579459379247,
+      "minimum_matrix_read_ms_at_1cta_un8": 8.652797609368779,
+      "caveat": "Synthetic read-only lower bound, no KV/activation/scale/norm traffic, output/reduction/launch/scheduler cost. Qwen actualnativeW8A8 math is different fromlegacytransportdiagnostic."
+    },
+    "gemma31": {
+      "matrix_bytes_per_decode_pass": 61392027648,
+      "matrix_GiB": 57.17578125,
+      "minimum_matrix_read_ms_at_measured_peak": 19.4659324609307,
+      "minimum_matrix_read_ms_at_1cta_un8": 22.307529477469107,
+      "caveat": "Synthetic read-only lower bound, no KV/activation/scale/norm traffic, output/reduction/launch/scheduler cost. Qwen actualnativeW8A8 math is different fromlegacytransportdiagnostic."
+    },
+    "qwen27": {
+      "matrix_bytes_per_decode_pass": 26893352960,
+      "matrix_GiB": 25.04638671875,
+      "minimum_matrix_read_ms_at_measured_peak": 8.527234112040038,
+      "minimum_matrix_read_ms_at_1cta_un8": 9.772022311153052,
+      "caveat": "Synthetic read-only lower bound, no KV/activation/scale/norm traffic, output/reduction/launch/scheduler cost. Qwen actualnativeW8A8 math is different fromlegacytransportdiagnostic."
+    }
+  },
+  "validation": "memcheck+all24checks passed beforetiming; bothoppositeorder24cells passed",
+  "rejected_attempt": "first Nix CUDA12.9/glibc loader terminated beforeinstrumentedCUDAcall, timings skipped; no HBM sample",
+  "raw_analysis": {
+    "path": "/tmp/plow-model-support-checks/e0-h100-rebaseline/hbm-analysis.json",
+    "sha256": "5d84d71f7cd8d1722cd5c0e51a54d3d588a59604271ac6b8c8e00e760d2f0374"
+  },
+  "qualification": "24 checksum/memcheck cases; two opposite-order 24-cell cold timing sweeps; contemporaneous dmon. Synthetic read ceiling, not native GEMV or serving throughput."
+}

@@ -22,5 +22,6 @@
       "path": "qwen-current-fp8-m1-audit/qkv-native.ncu-rep",
       "sha256": "247242da2fc369c14fbf112e10e44c94ce61f843b956abcad95054c74715ea7a"
     }
-  ]
+  ],
+  "incremental_resync": "Completed after E0/PV/occupancy and loaded-weight/ring results; newer live trace/capture files require later incremental copy."
 }
