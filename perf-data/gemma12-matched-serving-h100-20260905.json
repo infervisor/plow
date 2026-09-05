@@ -1,0 +1,67 @@
+{
+  "scope": "Gemma12 BF16 C1 screening:4 measured requests+1 warmup,512 output,seed42,vllm bench serve. Plow qualified decode rung host. vLLM0.28 MNBT8192,maxlen65536,maxseq16,GPUMEM.90. Exact individual lengths; independent quality separate. Runs not interleaved.",
+  "rows": [
+    {
+      "context": 1024,
+      "plow": {
+        "mean_ttft_ms": 81.80881346925162,
+        "mean_tpot_ms": 12.650073141399762,
+        "output_throughput": 78.21223788613342
+      },
+      "vllm": {
+        "mean_ttft_ms": 48.974720761179924,
+        "mean_tpot_ms": 10.469347021999038,
+        "output_throughput": 94.83078901746869
+      }
+    },
+    {
+      "context": 4096,
+      "plow": {
+        "mean_ttft_ms": 377.63773374899756,
+        "mean_tpot_ms": 12.752351240704197,
+        "output_throughput": 74.26353188850148
+      },
+      "vllm": {
+        "mean_ttft_ms": 172.77116248442326,
+        "mean_tpot_ms": 10.499894000973038,
+        "output_throughput": 92.44375434474375
+      }
+    },
+    {
+      "context": 8192,
+      "plow": {
+        "mean_ttft_ms": 882.6970719965175,
+        "mean_tpot_ms": 12.896590212821584,
+        "output_throughput": 68.51211445446282
+      },
+      "vllm": {
+        "mean_ttft_ms": 353.6222902475856,
+        "mean_tpot_ms": 10.518481339537129,
+        "output_throughput": 89.37207987658292
+      }
+    },
+    {
+      "context": 32768,
+      "plow": {
+        "mean_ttft_ms": 5898.920010004076,
+        "mean_tpot_ms": 13.734577124301161,
+        "output_throughput": 39.63592485018546
+      },
+      "vllm": {
+        "mean_ttft_ms": 1751.786929758964,
+        "mean_tpot_ms": 10.632320326816066,
+        "output_throughput": 71.2577843711885
+      }
+    }
+  ],
+  "sha256": {
+    "/tmp/plow-model-support-checks/m16-next-window-20260905/gemma12b-rung-screen-c1/in1024_c1.json": "2a53914daa4ce4963a9938e19a2de47d688caa5148747200eecf9a3649bd53be",
+    "/tmp/plow-model-support-checks/native-quality-next-window-20260905/gemma12-vllm-c1/in1024_c1.json": "38e973f617865fe9a1f09675b09a3e03966e17c051e4aaa359810e7efed1e5cb",
+    "/tmp/plow-model-support-checks/m16-next-window-20260905/gemma12b-rung-screen-c1/in4096_c1.json": "f8bb54ffe49e28c1cb9f5735e8a3fef23d8c8e0891539235551cd1ef8e22c242",
+    "/tmp/plow-model-support-checks/native-quality-next-window-20260905/gemma12-vllm-c1/in4096_c1.json": "ef467f5678cac1a6521e07d443c2ca0750a68f9ac208f3c6eb111c4cf4ddbba8",
+    "/tmp/plow-model-support-checks/m16-next-window-20260905/gemma12b-rung-screen-c1/in8192_c1.json": "48a1011e4bd58fbb8749a780d26c1378f47cfbd1d99cc6eb8decc4af76cc996a",
+    "/tmp/plow-model-support-checks/native-quality-next-window-20260905/gemma12-vllm-c1/in8192_c1.json": "a1dc7a73eb2befe5f85195c80660f7780e734b4bf7466db0e3bc603abfab3b5d",
+    "/tmp/plow-model-support-checks/m16-next-window-20260905/gemma12b-rung-screen-c1/in32768_c1.json": "ece702f021bb027d0e9243ac1e8a43df7a786f4b76fc28d8cbf72a3ff901c698",
+    "/tmp/plow-model-support-checks/native-quality-next-window-20260905/gemma12-vllm-c1/in32768_c1.json": "74a3eedc6784140004ee6cf09c87470fa7f8153b415cc0937fe3a63d175afb02"
+  }
+}

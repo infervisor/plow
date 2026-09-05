@@ -1,0 +1,79 @@
+{
+  "scope": "One full-attention transformer block, current FP8 checkpoint/cubin family, GF2/GF6 sameNS33;1K/4K/8K/32K contexts,B1,100timeddecode20warmups,two reversedarmorders,synthetic hiddeninputs,PFchunk8192. Full-logit exactness vs sameNS33 control passed allfourcontexts; independent originalNS11vLLMquality remains unqualified. Not serving or vLLM block latency.",
+  "rows": [
+    {
+      "batch": 1,
+      "context": 1024,
+      "control_us": 497.445,
+      "candidate_us": 492.45000000000005,
+      "speedup": 1.0101431617423087,
+      "raw_pair_medians": {
+        "control": [
+          497.63,
+          497.26
+        ],
+        "gf6": [
+          492.97,
+          491.93
+        ]
+      }
+    },
+    {
+      "batch": 1,
+      "context": 4096,
+      "control_us": 523.495,
+      "candidate_us": 502.12,
+      "speedup": 1.0425695052975383,
+      "raw_pair_medians": {
+        "control": [
+          523.75,
+          523.24
+        ],
+        "gf6": [
+          501.44,
+          502.8
+        ]
+      }
+    },
+    {
+      "batch": 1,
+      "context": 8192,
+      "control_us": 557.99,
+      "candidate_us": 516.855,
+      "speedup": 1.079587118243995,
+      "raw_pair_medians": {
+        "control": [
+          559.1,
+          556.88
+        ],
+        "gf6": [
+          516.31,
+          517.4
+        ]
+      }
+    },
+    {
+      "batch": 1,
+      "context": 32768,
+      "control_us": 765.175,
+      "candidate_us": 610.8050000000001,
+      "speedup": 1.2527320503270272,
+      "raw_pair_medians": {
+        "control": [
+          765.51,
+          764.84
+        ],
+        "gf6": [
+          610.14,
+          611.47
+        ]
+      }
+    }
+  ],
+  "sha256": {
+    "/tmp/plow-model-support-checks/attention-block-retry-20260905/qwen-fp8-block-control-ns33-r1-retry/sweep.json": "5b512be8db4eb2b9cc48be7d3a6c4f0d2b9bfff127a31d51e2395b9e1641a562",
+    "/tmp/plow-model-support-checks/attention-block-retry-20260905/qwen-fp8-block-control-ns33-r2-retry/sweep.json": "671936bab8e2417c6517bda8f2344042c16f2eccb2739725a1b97a081ac36e4c",
+    "/tmp/plow-model-support-checks/attention-block-retry-20260905/qwen-fp8-block-gf6-ns33-r1-retry/sweep.json": "5bb875d847c8cc503adaf04e7c32dd6e59f730e3cf833e359d9d343dc5e6778a",
+    "/tmp/plow-model-support-checks/attention-block-retry-20260905/qwen-fp8-block-gf6-ns33-r2-retry/sweep.json": "8a37fea286363e4e23fd34fd30828eedcaa4da3df962d05526456ec03ada5f09"
+  }
+}

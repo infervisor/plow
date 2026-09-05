@@ -1,0 +1,48 @@
+{
+  "source_commit": "6c88761",
+  "scope": "Generic opt-in whole-slot lazy sliding rings. GPU gate pending; no performance or admission claim.",
+  "agent_checks": {
+    "vmm": {
+      "passed": 26,
+      "ignored_actual_packet": 1
+    },
+    "config": {
+      "passed": 1
+    },
+    "decode_rungs": {
+      "passed": 3,
+      "ignored": 2
+    },
+    "kv_tmap": {
+      "passed": 4,
+      "ignored": 1
+    },
+    "actual_packet_checks": {
+      "passed": 6
+    },
+    "gpu_gate_build": "passed",
+    "release_build": "passed",
+    "rustfmt": "passed",
+    "git_diff_check": "passed",
+    "script_bash_n": "10 passed",
+    "source_freeze_vs_workspace": "identical",
+    "gpu": "not run",
+    "commit": "not performed",
+    "host_sha256": "c08e1cd62bf5da90c4b85b3e585830e37b27b25e0f2a3150f9d6b3848428a813",
+    "gate_sha256": "a08f35a1fbc65b06a689ee4841432de2a76830941d98cb7d7ac5ea720e36d96b"
+  },
+  "root_checks": {
+    "workspace_passed": 1329,
+    "workspace_ignored": 55,
+    "cuda_hub_lib_passed": 251,
+    "cuda_hub_lib_ignored": 7,
+    "format": "passed",
+    "diff_check": "passed",
+    "source_review": "Owner cleanup/stableVA/hotprefix/PFphysicalslot/teardown reviewed; no blocker found."
+  },
+  "frozen_handoff": "/tmp/plow-model-support-checks/lazy-ring-prefix/HANDOFF.md",
+  "root_log_sha256": {
+    "/tmp/plow-model-support-checks/lazy-ring-prefix/workspace-merge-check.log": "492b06ad439700aa7894e98a588e5ab689eb26ea2e58ef3e7b63654179c45f02",
+    "/tmp/plow-model-support-checks/lazy-ring-prefix/full-cuda-hub-suite.log": "e78ecd4a682ec006251424501fc85641d27fac3c3b88dcfde203032ed42bde66"
+  }
+}
