@@ -90,7 +90,15 @@ add_test(NAME memmap_test COMMAND memmap_test)
 file(GLOB PLOW_CPU_DEV_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/*.c
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/golden/*.c)
-add_library(plow_cpu_dev STATIC ${PLOW_CPU_DEV_SRC})
+# Tier sources carry their own -m flags (runtime cpuid picks the tier, so the base
+# library must stay runnable on a non-AVX-512 host). Mirrors plowrt/build.rs.
+file(GLOB PLOW_CPU_DEV_AVX512_SRC ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/avx512/*.c)
+file(GLOB PLOW_CPU_DEV_AMX_SRC ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/amx/*.c)
+set_source_files_properties(${PLOW_CPU_DEV_AVX512_SRC} PROPERTIES COMPILE_OPTIONS
+    "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mavx512vnni;-mavx512fp16")
+set_source_files_properties(${PLOW_CPU_DEV_AMX_SRC} PROPERTIES COMPILE_OPTIONS
+    "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mavx512vnni;-mavx512fp16;-mamx-tile;-mamx-bf16;-mamx-int8")
+add_library(plow_cpu_dev STATIC ${PLOW_CPU_DEV_SRC} ${PLOW_CPU_DEV_AVX512_SRC} ${PLOW_CPU_DEV_AMX_SRC})
 target_include_directories(plow_cpu_dev PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev)
@@ -104,6 +112,17 @@ add_executable(cpu_dev_golden_test tests/cpu_dev_golden_test.c)
 target_compile_options(cpu_dev_golden_test PRIVATE -Wall -Wextra -Werror -O2)
 target_link_libraries(cpu_dev_golden_test PRIVATE plow_cpu_dev)
 add_test(NAME cpu_dev_golden COMMAND cpu_dev_golden_test)
+
+# Tier tests: each compares its tier's kernels against the golden tier on random inputs.
+# Guarded so the tree configures before a tier's test exists.
+foreach(tier avx512 amx)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_dev_${tier}_test.c)
+        add_executable(cpu_dev_${tier}_test tests/cpu_dev_${tier}_test.c)
+        target_compile_options(cpu_dev_${tier}_test PRIVATE -Wall -Wextra -Werror -O2)
+        target_link_libraries(cpu_dev_${tier}_test PRIVATE plow_cpu_dev)
+        add_test(NAME cpu_dev_${tier} COMMAND cpu_dev_${tier}_test)
+    endif()
+endforeach()
 
 # --- GPU backends (build-gated; unrunnable without a toolchain) ---------------
 #

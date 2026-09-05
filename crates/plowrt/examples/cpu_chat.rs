@@ -36,6 +36,13 @@ fn main() {
                 }
             }
             "--prompt" => prompt = args.next().unwrap(),
+            // Gemma chat template (text-only subset of chat_template.jinja), as serve/chat.rs builds it.
+            "--chat" => {
+                let q = args.next().unwrap();
+                prompt = format!(
+                    "<bos><start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n"
+                );
+            }
             other => panic!("unknown arg {other}"),
         }
     }
