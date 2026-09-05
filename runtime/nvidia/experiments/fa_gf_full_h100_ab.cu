@@ -553,6 +553,26 @@ extern "C" int plow_attention(void** tensors, const int* integers, float scale, 
     return a.i[1]==512 ? attention_run<512,4>(a,(cudaStream_t)stream)
                        : attention_run<256,2>(a,(cudaStream_t)stream);
 }
+extern "C" int plow_attention_gf(void** tensors, const int* integers, float scale, void* stream, unsigned gf) {
+    AttentionArgs a = {};
+    for (int i=0; i<8; ++i) a.t[i]=tensors[i];
+    for (int i=0; i<12; ++i) a.i[i]=integers[i];
+    a.scale=scale;
+    if (a.i[0]!=0 || a.i[2]<1 || a.i[3]!=1 || a.i[4]<1 || a.i[5]<1 || a.i[6]<1 ||
+        a.i[5]%a.i[6] || gf==0 || (a.i[5]/a.i[6])%gf || a.i[8]<1 || a.i[11]<a.i[4])
+        return (int)cudaErrorInvalidValue;
+    if (a.i[1]==256) {
+        if (gf==2) return attention_run<256,2>(a,(cudaStream_t)stream);
+        if (gf==6) return attention_run<256,6>(a,(cudaStream_t)stream);
+    } else if (a.i[1]==512) {
+        if (gf==4) return attention_run<512,4>(a,(cudaStream_t)stream);
+        if (gf==8) return attention_run<512,8>(a,(cudaStream_t)stream);
+#if PLOW_NV_FA_GF16_BENCH
+        if (gf==16) return attention_run<512,16>(a,(cudaStream_t)stream);
+#endif
+    }
+    return (int)cudaErrorInvalidValue;
+}
 extern "C" int plow_attention_maps(void* output, void* k, void* v, int hd, int rows, int heads) {
     if ((hd!=256 && hd!=512) || rows<1 || heads<1) return -1;
     alignas(64) CUtensorMap maps[2];

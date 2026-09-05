@@ -93,8 +93,16 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #define FA_DEC_NG(D) ((int)PLOW_NV_THREADS / FA_DEC_NDT(D)) /* row-groups: 16 at D=128 */
 /* smem floats: Ssm[GF][TILE] + hmax[WARPS] + hsum[WARPS] + qsm[GF][D] bf16 + osm[NG][D].
  * D=128,GF=2 -> 512 + 16 + 128 + 2048 floats = 10.6 KiB, well inside the 48 KiB default. */
+#ifndef PLOW_NV_FA_GF16_BENCH
+#define PLOW_NV_FA_GF16_BENCH 0
+#endif
+#if PLOW_NV_FA_GF16_BENCH
+#define FA_DEC_REDUCTION_HEADS(GF) ((GF) > (int)PLOW_NV_WARPS ? (GF) : (int)PLOW_NV_WARPS)
+#else
+#define FA_DEC_REDUCTION_HEADS(GF) ((int)PLOW_NV_WARPS)
+#endif
 #define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
-    ((GF) * FA_DEC_TILE + 2 * (int)PLOW_NV_WARPS + (GF) * ((D) / 2) + FA_DEC_NG(D) * (D))
+    ((GF) * FA_DEC_TILE + 2 * FA_DEC_REDUCTION_HEADS(GF) + (GF) * ((D) / 2) + FA_DEC_NG(D) * (D))
 
 /* V rows in flight per thread. A fused row feeds GF accumulators, so arithmetic per load
  * grows with GF and the unroll can shrink before the 255-register cliff. */
@@ -411,6 +419,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                const float* __restrict__ v_scale = nullptr) {
     /* A work item carries GF CONSECUTIVE query heads sharing one KV head (needs GF | gqa).
      * Indexing by head-GROUP, not by kv_head, is what makes GF < gqa correct. */
+    static_assert(GF <= (int)PLOW_NV_WARPS || (PLOW_NV_FA_GF16_BENCH && GF == 16), "unsupported decode GQA grouping");
     const unsigned gqa = n_head / n_kv_head;
     const unsigned n_grp = n_head / GF;
     const unsigned n_work = n_batch * n_grp * nsplit;
@@ -419,8 +428,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 
     float* Ssm = lds;
     float* hmax = lds + GF * FA_DEC_TILE;
-    float* hsum = hmax + PLOW_NV_WARPS;
-    __nv_bfloat16* qsm = (__nv_bfloat16*)(hsum + PLOW_NV_WARPS);
+    float* hsum = hmax + FA_DEC_REDUCTION_HEADS(GF);
+    __nv_bfloat16* qsm = (__nv_bfloat16*)(hsum + FA_DEC_REDUCTION_HEADS(GF));
     float* osm = (float*)(qsm + GF * D);
 
     constexpr int NDT = FA_DEC_NDT(D);
@@ -706,6 +715,22 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 
             /* GF softmax reductions, ONE PER WARP, so they run concurrently: the tile costs 3
              * barriers, not 3*GF. (8 warps, GF <= 8.) */
+#if PLOW_NV_FA_GF16_BENCH
+            if constexpr (GF > (int)PLOW_NV_WARPS) {
+            for (unsigned g = warp; g < GF; g += PLOW_NV_WARPS) {
+                float mx = FA_NEG_INF;
+#if PLOW_NV_FA_REDBOUND
+                for (int i = lane; i < (int)rmax_t; i += 32)
+#else
+                for (int i = lane; i < FA_DEC_TILE; i += 32)
+#endif
+                    mx = fmaxf(mx, Ssm[g * FA_DEC_TILE + i]);
+                mx = warp_max32(mx);
+                if (lane == 0) hmax[g] = mx;
+            }
+            } else
+#endif
+            {
             if (warp < GF) {
                 float mx = FA_NEG_INF;
 #if PLOW_NV_FA_REDBOUND
@@ -716,6 +741,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                     mx = fmaxf(mx, Ssm[warp * FA_DEC_TILE + i]);
                 mx = warp_max32(mx);
                 if (lane == 0) hmax[warp] = mx;
+            }
             }
             __syncthreads();
 
@@ -739,6 +765,21 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + tid] = pe[g];
             __syncthreads();
 
+#if PLOW_NV_FA_GF16_BENCH
+            if constexpr (GF > (int)PLOW_NV_WARPS) {
+            for (unsigned g = warp; g < GF; g += PLOW_NV_WARPS) {
+                float sm = 0.0f;
+#if PLOW_NV_FA_REDBOUND
+                for (int i = lane; i < (int)rmax_t; i += 32) sm += Ssm[g * FA_DEC_TILE + i];
+#else
+                for (int i = lane; i < FA_DEC_TILE; i += 32) sm += Ssm[g * FA_DEC_TILE + i];
+#endif
+                sm = warp_sum32(sm);
+                if (lane == 0) hsum[g] = sm;
+            }
+            } else
+#endif
+            {
             if (warp < GF) {
                 float sm = 0.0f;
 #if PLOW_NV_FA_REDBOUND
@@ -748,6 +789,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #endif
                 sm = warp_sum32(sm);
                 if (lane == 0) hsum[warp] = sm;
+            }
             }
             __syncthreads();
 

@@ -6,6 +6,9 @@ p.add_argument("--library", required=True)
 p.add_argument("--gdn-library")
 p.add_argument("--gdn-timing-only", action="store_true", help="native recurrent step vs reachable vLLM FLA packed decode, batches1/4/16")
 p.add_argument("--attention-only", action="store_true", help="native attention vs installed serving FA3/FA4; excludes projections/cache writes")
+p.add_argument("--attention-gf", type=int, choices=(0,2,4,6,8,16), default=0, help="benchmark-only native decode grouping; 0 preserves fixed controls")
+p.add_argument("--attention-native-splits", default="baseline", help="baseline, fill, fill2, fill4, or positive integer; fill targets132 work items")
+p.add_argument("--attention-kind", choices=("all","full","sliding"), default="all")
 p.add_argument("--attention-contexts", default="1024,4096,8192,32768")
 p.add_argument("--attention-batches", default="1,4,16", help="active decode batch; distinct from serving concurrency")
 p.add_argument("--attention-model", choices=("all","gemma12","gemma31","qwen27"), default="all")
@@ -60,6 +63,14 @@ def check_attention():
     if any(b not in (1,4,16) for b in batches):p.error("attention decode batches must be 1,4,16")
     lib.plow_attention.argtypes=[C.POINTER(C.c_void_p),C.POINTER(C.c_int),C.c_float,C.c_void_p]
     lib.plow_attention.restype=C.c_int
+    if args.attention_gf:
+        if args.attention_phases!="decode":p.error("--attention-gf requires --attention-phases decode")
+        lib.plow_attention_gf.argtypes=lib.plow_attention.argtypes+[C.c_uint]
+        lib.plow_attention_gf.restype=C.c_int
+    if args.attention_native_splits not in ("baseline","fill","fill2","fill4"):
+        try:valid_splits=int(args.attention_native_splits)>0
+        except ValueError:valid_splits=False
+        if not valid_splits:p.error("invalid native split policy")
     lib.plow_attention_maps.argtypes=[C.c_void_p,C.c_void_p,C.c_void_p,C.c_int,C.c_int,C.c_int]
     lib.plow_attention_maps.restype=C.c_int
     source=Path(inspect.getsourcefile(flash))
@@ -107,6 +118,9 @@ def check_attention():
         return results
     for model,kind,hd,nh,nkv,window,scale,version,decode_splits in shapes:
         if args.attention_model not in ("all",model):continue
+        if args.attention_kind not in ("all",kind):continue
+        gf=args.attention_gf or (4 if hd==512 else 2)
+        if (nh//nkv)%gf:p.error(f"GF{gf} does not divide {model} {kind} GQA{nh//nkv}")
         page_size=args.attention_page_size or (784 if model=="qwen27" else 16)
         for ctx in contexts:
             cases=[]
@@ -114,17 +128,26 @@ def check_attention():
             if args.attention_phases!="decode":cases.extend(("prefill",1,q) for q in sorted({min(ctx,x) if x else ctx for x in chunks}))
             for phase,batch,rows in cases:
                 fa_splits=args.attention_fa_splits if args.attention_fa_splits>=0 else (32 if version==3 and phase=="decode" else 0)
+                native_splits=decode_splits
+                if args.attention_native_splits.startswith("fill"):
+                    waves=int(args.attention_native_splits[4:] or "1")
+                    groups=batch*(nh//gf)
+                    native_splits=(132*waves+groups-1)//groups
+                elif args.attention_native_splits!="baseline":native_splits=int(args.attention_native_splits)
                 row=dict(model=model,kind=kind,phase=phase,batch=batch,query_rows=rows,context=ctx,
                     head_dim=hd,q_heads=nh,kv_heads=nkv,gqa=nh//nkv,window=window,scale=scale,
                     causal=True,query_position=ctx-rows,dtype="bfloat16",fa_version=version,
                     reference="vllm.vllm_flash_attn.flash_attn_interface.flash_attn_varlen_func",
                     reference_layout="paged [pages,KVH,page,2HD] transposed/split views",
                     native_layout="separate contiguous [B,KVH,context,HD]",page_size=page_size,
-                    native_grid=132,native_threads=256,native_gf=4 if hd==512 else 2,
+                    native_grid=132,native_threads=256,native_gf=gf,
+                    native_decode_registers={(256,2):72,(256,6):113,(512,4):82,(512,8):138,(512,16):234}.get((hd,gf)),
+                    native_decode_smem_bytes=4*(gf*256+2*max(8,gf)+gf*hd//2+2048),
                     native_prefill_smem_bytes=201728 if hd==512 else 103424,
                     native_prefill_registers=194 if hd==512 else 124,
-                    native_policy="fixed GF2/4 and splits17(sliding)/33(Gemma full)/11(Qwen); audit packet policy separately",
-                    native_splits=decode_splits if phase=="decode" else 1,
+                    native_policy=args.attention_native_splits,
+                    native_work_items=batch*(nh//gf)*native_splits if phase=="decode" else None,
+                    native_splits=native_splits if phase=="decode" else 1,
                     native_prefill_tile=[64,32],native_prefill_tma=phase=="prefill",
                     fa_num_splits=fa_splits,scheduler_metadata="FA3 AOT" if version==3 else None,
                     precision_gate="relative L2 <= 0.003; finite outputs; output/partial canaries",
@@ -166,19 +189,35 @@ def check_attention():
                     tensors=(C.c_void_p*8)(*[t.data_ptr() for t in (q,k,v,out,op,ml,lengths,maps)])
                     ints=(C.c_int*12)(phase=="prefill",hd,batch,rows,ctx,nh,nkv,window,ns,ctx-rows,-1,ctx)
                     def native():
-                        rc=lib.plow_attention(tensors,ints,scale,torch.cuda.current_stream().cuda_stream)
+                        if args.attention_gf:
+                            rc=lib.plow_attention_gf(tensors,ints,scale,torch.cuda.current_stream().cuda_stream,gf)
+                        else:
+                            rc=lib.plow_attention(tensors,ints,scale,torch.cuda.current_stream().cuda_stream)
                         if rc:raise RuntimeError(f"native attention launch failed: {rc}")
                     def reference():
                         return flash(q,kc,vc,rows,cuq,ctx,seqused_k=lengths,out=ref,
                             softmax_scale=scale,causal=True,window_size=(window-1,0) if window else (-1,-1),
                             block_table=table,fa_version=version,num_splits=fa_splits,scheduler_metadata=scheduler)
                     native();reference();torch.cuda.synchronize()
+                    grouping_pass=True
+                    if args.attention_gf:
+                        control,cb=guarded(q.shape,torch.bfloat16)
+                        control_tensors=(C.c_void_p*8)(*tensors)
+                        control_tensors[3]=control.data_ptr()
+                        rc=lib.plow_attention(control_tensors,ints,scale,torch.cuda.current_stream().cuda_stream)
+                        if rc:raise RuntimeError(f"native grouping control failed: {rc}")
+                        torch.cuda.synchronize()
+                        relative=((out.float()-control.float()).norm()/control.float().norm().clamp_min(1e-30)).item()
+                        grouping_pass=bool(torch.isfinite(control).all() and (cb[:128]==37).all() and (cb[-128:]==37).all()) and relative<=.003
+                        row.update(native_grouping_control_gf=4 if hd==512 else 2,
+                            native_grouping_control_exact=torch.equal(out,control),native_grouping_control_relative_l2=relative,
+                            native_grouping_control_passed=grouping_pass)
                     delta=out.float()-ref.float()
                     row.update(relative_l2=(delta.norm()/ref.float().norm().clamp_min(1e-30)).item(),
                         max_abs=delta.abs().max().item(),exact=torch.equal(out,ref))
                     finite=bool(torch.isfinite(out).all() and torch.isfinite(ref).all())
                     canaries=all(bool((buf[:128]==37).all() and (buf[-128:]==37).all()) for buf in (ob,rb,pb,mb))
-                    row.update(finite=finite,canaries=canaries,passed=finite and canaries and row["relative_l2"]<=.003)
+                    row.update(finite=finite,canaries=canaries,passed=finite and canaries and grouping_pass and row["relative_l2"]<=.003)
                     if not row["passed"]:raise AssertionError("attention numerical/canary gate failed")
                     row.update(timing(native,reference))
                     print(json.dumps(row),flush=True);save()
@@ -453,6 +492,7 @@ if args.gdn_timing_only:
         reference=str(source),reference_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         library_sha256=hashlib.sha256(Path(args.library).read_bytes()).hexdigest(),
         initial_state="random FP32, identical reset before each untimed pair; not a captured context checkpoint",
+        reference_state_indices="1..B; FLA index0 is reserved NULL_BLOCK_ID",
         context="fixed recurrent state dimensions; 1K/4K/8K/32K histories require separately captured states",
         rows=[])
     for B in (1,4,16):
@@ -460,14 +500,17 @@ if args.gdn_timing_only:
         mixed=rand(B,10240);a=rand(B,48);b=rand(B,48);alog=rand(48);bias=rand(48)
         alog32=alog.float()
         initial=torch.randn(B,48,128,128,device="cuda")*.01
-        state=initial.clone();reference=initial.clone()
-        indices=torch.arange(B,device="cuda",dtype=torch.int32)
+        state=initial.clone()
+        reference_initial=torch.cat([torch.zeros_like(initial[:1]),initial])
+        reference=reference_initial.clone()
+        indices=torch.arange(1,B+1,device="cuda",dtype=torch.int32)
         out=torch.empty(B,1,48,128,device="cuda",dtype=torch.bfloat16);ref=torch.empty_like(out)
         def native():run(137,[out,mixed,a,b,alog,bias,state,active],[16,48,128,128,B,0],[128**-.5,1e-6])
         def reference_step():oracle(mixed,a,b,alog32,bias,128**-.5,reference,ref,indices,True)
         native();reference_step();torch.cuda.synchronize()
         torch.testing.assert_close(out,ref,rtol=.01,atol=1e-5)
-        torch.testing.assert_close(state,reference,rtol=1e-4,atol=1e-6)
+        torch.testing.assert_close(state,reference[1:],rtol=1e-4,atol=1e-6)
+        torch.testing.assert_close(reference[0],reference_initial[0],rtol=0,atol=0)
         graphs={}
         for name,fn in (("native",native),("vllm_fla",reference_step)):
             for _ in range(3):fn()
@@ -481,7 +524,7 @@ if args.gdn_timing_only:
             order=list(graphs)
             if rep%2:order.reverse()
             for name in order:
-                state.copy_(initial);reference.copy_(initial)
+                state.copy_(initial);reference.copy_(reference_initial)
                 start.record();graphs[name].replay();end.record();end.synchronize()
                 times[name].append(start.elapsed_time(end)*1000)
         row=dict(batch=B,HK=16,HV=48,DK=128,DV=128,passed=True,

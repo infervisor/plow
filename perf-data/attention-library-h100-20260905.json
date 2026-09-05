@@ -1,0 +1,23 @@
+{
+  "boundary": "standalone native operation bodies vs vLLM library kernels; not interpreter-role or transformer-block timing; native decode includes merge; excludes QKV projection, norm/RoPE, cache write/packing, output projection/gate",
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "vllm": "0.28.0",
+  "torch": "2.13.0+cu130",
+  "source_directory": "/tmp/plow-model-support-checks/attention-library-window-20260905",
+  "qualified_dense_sweep_cells": 95,
+  "native_wins": 0,
+  "timing_policy": "Same BF16 inputs; fixed native GF/split controls; symmetric CUDA graphs; 20 alternating timing pairs; hot and 256 MiB evicted cache. Packing and FA3 scheduler metadata untimed.",
+  "recurrent_comparison": {
+    "passed": false,
+    "reason": "Reference used slot zero, reserved as inactive by installed FLA; corrected harness pending rerun. No valid timing."
+  },
+  "sha256": {
+    "/tmp/plow-model-support-checks/attention-library-window-20260905/results.json": "eedd3bdcfb5d56412528afacbc1945a6c7a5b3e9813068e910f937184f4b724b",
+    "/tmp/plow-model-support-checks/attention-library-window-20260905/gemma12-decode.json": "13b3090367b994835c084266f8f38d4be45873d687a45d775af76327e96277ca",
+    "/tmp/plow-model-support-checks/attention-library-window-20260905/gemma12-prefill.json": "77dbcf45359eebed19922961641d9743264305053278c41b1d2acb053f387108",
+    "/tmp/plow-model-support-checks/attention-library-window-20260905/gemma31-decode.json": "f4fb636f0cb9207100be171a10b3cf3e9b35fca5592e02bb49f791946894fa80",
+    "/tmp/plow-model-support-checks/attention-library-window-20260905/gemma31-prefill.json": "c7bd80c5025a4f341396afa686e1302df0c97573a7fe6a6e63c8803deb6f0c90",
+    "/tmp/plow-model-support-checks/attention-library-window-20260905/qwen27-decode.json": "3a630ac05b37dec366727b617c74e87c2a2f8bfd13c4725f9f88d32df03cb4b2",
+    "/tmp/plow-model-support-checks/attention-library-window-20260905/qwen27-prefill.json": "71a32eb34b9cabaadeed8715b0bc366e0baeb3dd13dc9174c7e0d8c760fcd863"
+  }
+}
