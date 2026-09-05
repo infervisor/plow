@@ -1,8 +1,8 @@
 {
   "recorded_utc": "2026-09-05T19:24:13.745387+00:00",
-  "session_id": 25347,
+  "session_id": 87754,
   "source_commit": "103c9e2",
-  "status": "waiting_for_final_qwen_screen_boundary",
+  "status": "waiting_for_uninterrupted_qwen_attention_screen",
   "queue": "/tmp/plow-model-support-checks/native-followup-window-20260905/queue.json",
   "driver": "/tmp/plow-model-support-checks/native-followup-window-20260905/driver.py",
   "parent_driver_pid": 873447,
@@ -89,7 +89,7 @@
     }
   ],
   "sha256": {
-    "/tmp/plow-model-support-checks/native-followup-window-20260905/queue.json": "dec6c3dde2ca71c85769f37963c6f3c50552380dbef841ee996475542c3b7095",
+    "/tmp/plow-model-support-checks/native-followup-window-20260905/queue.json": "cc50dc96fdbc1dc2c762367932db8e7d76ec4f457d6accd7cee5d8dbe142542e",
     "/tmp/plow-model-support-checks/native-followup-window-20260905/driver.py": "d16fa47b26babc780dc919a1e4cada50ceaee6bd5c1a55a77fdae47461f1f68a"
   },
   "gates": {
@@ -102,5 +102,14 @@
     "Screening results cannot establish final p99/throughput wins.",
     "Existing multistep live-KV idle-slot frontier mapping risk is outside rung change; qualify separately before enabling that combination.",
     "Raw client prompt counts versus actual server token sequences are under CPU audit before final apples-to-apples claims."
-  ]
+  ],
+  "superseded_waiting_session": 25347,
+  "reason_for_supervisor_replacement": "Enable --save-detailed in existing Plow serving harness and update frozen hash before any follow-up GPU job; active child unchanged.",
+  "release_host": {
+    "source_commit": "103c9e2",
+    "binary": "/tmp/plow-model-support-checks/decode-rung-gpu-gate/plowrt-release-103c9e2",
+    "sha256": "de9f2096736625c4b9323a8dc42ac5de755bdf08c0d47aaf4a16bb3d2e3928f5",
+    "build": "nix develop -c cargo build --release -p plowrt --features cuda,hub --bin plowrt",
+    "gpu_qualified": false
+  }
 }

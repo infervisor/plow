@@ -167,7 +167,7 @@ for L in $IN_LENS; do
       --dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" \
       --random-range-ratio 0 --request-rate inf --ignore-eos --temperature 0 \
       --max-concurrency "$C" --num-prompts "$NP" "${WARM_ARGS[@]}" \
-      --save-result --result-dir "$RESULT_DIR" --result-filename "in${L}_c${C}.json" \
+      --save-result --save-detailed --result-dir "$RESULT_DIR" --result-filename "in${L}_c${C}.json" \
       > "$blog" 2>&1
     python3 - "$L" "$C" "$blog" "$NP" "$OUTLEN" <<'PY'
 import math,re,sys
