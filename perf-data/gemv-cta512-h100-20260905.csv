@@ -1,0 +1,13 @@
+shape,threads_control,threads_candidate,slices,control_us,candidate_us,speedup,control_logical_weight_GBs,candidate_logical_weight_GBs,bit_exact,finite,guards
+q_local,256,512,132,26.912,22.368,1.2031,1168.9,1406.4,True,True,True
+q_full,256,512,132,42.56,36.192,1.176,1478.3,1738.4,True,True,True
+k_full,256,512,132,13.184,10.912,1.2082,298.3,360.4,True,True,True
+o_local,256,512,132,27.392,22.752,1.2039,1148.4,1382.6,True,True,True
+o_full,256,512,132,49.696,46.816,1.0615,1266.0,1343.9,True,True,True
+down,256,512,132,92.224,77.568,1.1889,1279.1,1520.8,True,True,True
+qkv_local,256,512,132,43.136,36.48,1.1825,1458.5,1724.6,True,True,True
+qkv_full,256,512,132,46.176,40.608,1.1371,1532.8,1743.0,True,True,True
+glu,256,512,132,102.048,94.624,1.0785,2311.9,2493.3,True,True,True
+tail,256,512,132,6.752,6.464,1.0446,197.9,206.7,True,True,True
+qkv_tail,256,512,132,6.752,6.56,1.0293,197.9,203.7,True,True,True
+glu_tail,256,512,132,7.584,7.424,1.0216,352.4,360.0,True,True,True
