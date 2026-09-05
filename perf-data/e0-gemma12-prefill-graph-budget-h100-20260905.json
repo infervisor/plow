@@ -1,0 +1,413 @@
+{
+  "database": "/tmp/plow-model-support-checks/e0-h100-rebaseline/prefill-32768-nsys-node-budget-retry3.sqlite",
+  "validated_nodes": 15456,
+  "chunks": [
+    {
+      "chunk": 0,
+      "sum_kernel_ms": 76.030966,
+      "elapsed_ms": 76.045572
+    },
+    {
+      "chunk": 1,
+      "sum_kernel_ms": 87.032801,
+      "elapsed_ms": 87.048772
+    },
+    {
+      "chunk": 2,
+      "sum_kernel_ms": 94.027333,
+      "elapsed_ms": 94.040292
+    },
+    {
+      "chunk": 3,
+      "sum_kernel_ms": 104.655943,
+      "elapsed_ms": 104.671596
+    },
+    {
+      "chunk": 4,
+      "sum_kernel_ms": 113.193964,
+      "elapsed_ms": 113.208209
+    },
+    {
+      "chunk": 5,
+      "sum_kernel_ms": 119.828838,
+      "elapsed_ms": 119.837041
+    },
+    {
+      "chunk": 6,
+      "sum_kernel_ms": 125.86465199999999,
+      "elapsed_ms": 125.874547
+    },
+    {
+      "chunk": 7,
+      "sum_kernel_ms": 132.02085,
+      "elapsed_ms": 132.198867
+    },
+    {
+      "chunk": 8,
+      "sum_kernel_ms": 137.971828,
+      "elapsed_ms": 138.147796
+    },
+    {
+      "chunk": 9,
+      "sum_kernel_ms": 144.015861,
+      "elapsed_ms": 144.193493
+    },
+    {
+      "chunk": 10,
+      "sum_kernel_ms": 149.753782,
+      "elapsed_ms": 149.93151
+    },
+    {
+      "chunk": 11,
+      "sum_kernel_ms": 155.516535,
+      "elapsed_ms": 155.694871
+    },
+    {
+      "chunk": 12,
+      "sum_kernel_ms": 161.537367,
+      "elapsed_ms": 161.717495
+    },
+    {
+      "chunk": 13,
+      "sum_kernel_ms": 167.415385,
+      "elapsed_ms": 167.591961
+    },
+    {
+      "chunk": 14,
+      "sum_kernel_ms": 173.278712,
+      "elapsed_ms": 173.456985
+    },
+    {
+      "chunk": 15,
+      "sum_kernel_ms": 179.301466,
+      "elapsed_ms": 179.47913
+    },
+    {
+      "chunk": 16,
+      "sum_kernel_ms": 185.220863,
+      "elapsed_ms": 185.397343
+    },
+    {
+      "chunk": 17,
+      "sum_kernel_ms": 191.313647,
+      "elapsed_ms": 191.492495
+    },
+    {
+      "chunk": 18,
+      "sum_kernel_ms": 197.241488,
+      "elapsed_ms": 197.417936
+    },
+    {
+      "chunk": 19,
+      "sum_kernel_ms": 203.00616,
+      "elapsed_ms": 203.183121
+    },
+    {
+      "chunk": 20,
+      "sum_kernel_ms": 208.861843,
+      "elapsed_ms": 209.041331
+    },
+    {
+      "chunk": 21,
+      "sum_kernel_ms": 214.863061,
+      "elapsed_ms": 215.041813
+    },
+    {
+      "chunk": 22,
+      "sum_kernel_ms": 220.369238,
+      "elapsed_ms": 220.548566
+    },
+    {
+      "chunk": 23,
+      "sum_kernel_ms": 226.602872,
+      "elapsed_ms": 226.778616
+    },
+    {
+      "chunk": 24,
+      "sum_kernel_ms": 232.415641,
+      "elapsed_ms": 232.593849
+    },
+    {
+      "chunk": 25,
+      "sum_kernel_ms": 238.32444,
+      "elapsed_ms": 238.50265
+    },
+    {
+      "chunk": 26,
+      "sum_kernel_ms": 244.130294,
+      "elapsed_ms": 244.307414
+    },
+    {
+      "chunk": 27,
+      "sum_kernel_ms": 250.283611,
+      "elapsed_ms": 250.460572
+    },
+    {
+      "chunk": 28,
+      "sum_kernel_ms": 256.254911,
+      "elapsed_ms": 256.434367
+    },
+    {
+      "chunk": 29,
+      "sum_kernel_ms": 261.548417,
+      "elapsed_ms": 261.726817
+    },
+    {
+      "chunk": 30,
+      "sum_kernel_ms": 267.786243,
+      "elapsed_ms": 267.967107
+    },
+    {
+      "chunk": 31,
+      "sum_kernel_ms": 273.835141,
+      "elapsed_ms": 274.012165
+    }
+  ],
+  "kernel_union_ms": 5793.335097,
+  "adjacent_overlap_ns": 169056,
+  "max_adjacent_overlap_ns": 448,
+  "kernel_sum_ms": 5793.504153,
+  "prefill_span_ms": 5821.121265,
+  "classes": {
+    "pfseg": {
+      "nodes": 7744,
+      "ms": 756.198919000003
+    },
+    "pfgemm": {
+      "nodes": 6176,
+      "ms": 1210.4049929999987
+    },
+    "pffa": {
+      "nodes": 1536,
+      "ms": 3826.9002410000035
+    }
+  },
+  "op_groups": {
+    "Embed+RmsNorm": {
+      "nodes": 32,
+      "ms": 1.028672,
+      "kernel_fraction_pct": 0.01775560995269731
+    },
+    "Gemm+Gemm+Gemm": {
+      "nodes": 1280,
+      "ms": 137.96549299999992,
+      "kernel_fraction_pct": 2.381382482112461
+    },
+    "HeadNormRope+HeadNormRope+HeadNormRope": {
+      "nodes": 1536,
+      "ms": 76.30606400000008,
+      "kernel_fraction_pct": 1.317096906895064
+    },
+    "FlashPrefill_sliding_HD256": {
+      "nodes": 1280,
+      "ms": 623.9137969999992,
+      "kernel_fraction_pct": 10.769195646074118
+    },
+    "FlashMerge": {
+      "nodes": 1536,
+      "ms": 436.0793410000001,
+      "kernel_fraction_pct": 7.5270394131708525
+    },
+    "Gemm": {
+      "nodes": 3104,
+      "ms": 405.0708129999997,
+      "kernel_fraction_pct": 6.991810177442359
+    },
+    "NormResidual+RmsNorm": {
+      "nodes": 3072,
+      "ms": 121.04573300000037,
+      "kernel_fraction_pct": 2.0893353970812347
+    },
+    "Gemm+Gemm": {
+      "nodes": 1792,
+      "ms": 667.3686869999985,
+      "kernel_fraction_pct": 11.519257937433615
+    },
+    "Glu": {
+      "nodes": 1536,
+      "ms": 121.08573299999998,
+      "kernel_fraction_pct": 2.090025825515275
+    },
+    "FlashPrefill_full_HD512": {
+      "nodes": 256,
+      "ms": 3202.986443999999,
+      "kernel_fraction_pct": 55.285822870109186
+    },
+    "Gemv+SoftCap+Argmax": {
+      "nodes": 32,
+      "ms": 0.6533760000000001,
+      "kernel_fraction_pct": 0.011277734213095681
+    }
+  },
+  "top_segments": [
+    {
+      "chunk": 31,
+      "segment": 353,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 24.031945,
+      "start": 11448839933,
+      "end": 11472871878
+    },
+    {
+      "chunk": 31,
+      "segment": 293,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.997768,
+      "start": 11414662769,
+      "end": 11438660537
+    },
+    {
+      "chunk": 31,
+      "segment": 113,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.954473,
+      "start": 11312270603,
+      "end": 11336225076
+    },
+    {
+      "chunk": 31,
+      "segment": 53,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.952073,
+      "start": 11278069598,
+      "end": 11302021671
+    },
+    {
+      "chunk": 31,
+      "segment": 473,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.94948,
+      "start": 11517179959,
+      "end": 11541129439
+    },
+    {
+      "chunk": 31,
+      "segment": 173,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.926409,
+      "start": 11346414807,
+      "end": 11370341216
+    },
+    {
+      "chunk": 31,
+      "segment": 233,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.921769,
+      "start": 11380508964,
+      "end": 11404430733
+    },
+    {
+      "chunk": 31,
+      "segment": 413,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.893385,
+      "start": 11483119786,
+      "end": 11507013171
+    },
+    {
+      "chunk": 30,
+      "segment": 413,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.33716,
+      "start": 11209566597,
+      "end": 11232903757
+    },
+    {
+      "chunk": 30,
+      "segment": 473,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.273033,
+      "start": 11243098705,
+      "end": 11266371738
+    },
+    {
+      "chunk": 30,
+      "segment": 353,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.245289,
+      "start": 11176135832,
+      "end": 11199381121
+    },
+    {
+      "chunk": 30,
+      "segment": 173,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.243817,
+      "start": 11076042291,
+      "end": 11099286108
+    },
+    {
+      "chunk": 30,
+      "segment": 293,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.208776,
+      "start": 11142770828,
+      "end": 11165979604
+    },
+    {
+      "chunk": 30,
+      "segment": 53,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.161705,
+      "start": 11009345018,
+      "end": 11032506723
+    },
+    {
+      "chunk": 30,
+      "segment": 113,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.133832,
+      "start": 11042738983,
+      "end": 11065872815
+    },
+    {
+      "chunk": 30,
+      "segment": 233,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 23.114824,
+      "start": 11109439712,
+      "end": 11132554536
+    },
+    {
+      "chunk": 29,
+      "segment": 233,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 22.478088,
+      "start": 10844687966,
+      "end": 10867166054
+    },
+    {
+      "chunk": 29,
+      "segment": 173,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 22.444585,
+      "start": 10812088561,
+      "end": 10834533146
+    },
+    {
+      "chunk": 29,
+      "segment": 293,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 22.441864,
+      "start": 10877362954,
+      "end": 10899804818
+    },
+    {
+      "chunk": 29,
+      "segment": 473,
+      "op_group": "FlashPrefill_full_HD512",
+      "ms": 22.438696,
+      "start": 10975149102,
+      "end": 10997587798
+    }
+  ],
+  "notes": [
+    "Normal untraced math/graph under Nsight; profiler overhead remains.",
+    "Node count/order/class matches exact packet2 segments across32chunks; inclusive durations and interval union reported separately for small timestamp overlaps.",
+    "Mixed segments retained as groups. Decode20warm/timed kernels excluded."
+  ],
+  "raw_analysis": {
+    "path": "/tmp/plow-model-support-checks/e0-h100-rebaseline/pf-nsys-budget-retry3.json",
+    "sha256": "09d112fbd94f2137a203fb2e33d4d47698fcb5366665202fd51f2c2ad4b28f02"
+  }
+}
