@@ -492,7 +492,14 @@ static void bench_cublas(unsigned M) {
     cublasLtDestroy(lt);
 }
 
+#ifdef PLOW_BENCH_GEMV_CTA
+#include "bf16_gemv_cta_probe.cuh"
+#endif
+
 int main(int argc, char** argv) {
+#ifdef PLOW_BENCH_GEMV_CTA
+    return bench_gemv_cta(argc, argv);
+#endif
     int dev; CK(cudaGetDevice(&dev));
     cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, dev));
     int P = prop.multiProcessorCount;
