@@ -57,9 +57,16 @@ fn shard_files(dir: &Path) -> Vec<PathBuf> {
         };
         sets.entry((t, partial)).or_default().push((i, ent.path()));
     }
+    // Complete = exactly 1..=t (HF's 1-based `model-0000i-of-0000N`) or exactly 0..=t (OpenAI's
+    // 0-based numbering: gpt-oss ships model-00000..00002-of-00002, N+1 files).
     let mut complete: Vec<_> = sets
         .iter()
-        .filter(|((t, _), v)| v.len() as u32 == *t)
+        .filter(|((t, _), v)| {
+            let mut ix: Vec<u32> = v.iter().map(|(i, _)| *i).collect();
+            ix.sort_unstable();
+            ix.dedup();
+            ix == (1..=*t).collect::<Vec<_>>() || ix == (0..=*t).collect::<Vec<_>>()
+        })
         .collect();
     // Prefer the non-partial set when both are complete at the same total.
     complete.sort_by_key(|((t, p), _)| (*p, *t));

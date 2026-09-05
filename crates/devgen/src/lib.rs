@@ -55,6 +55,7 @@ pub mod emit_config;
 pub mod k3;
 pub mod kda;
 use config::*;
+mod gptoss;
 mod ladder;
 mod mla;
 mod qwen35;
@@ -5917,6 +5918,27 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                     .map(str::to_string)
             })
             .unwrap_or_default();
+    // GPT-OSS: its own emitter (gptoss.rs) over the CPU-tier contracts; `cfg_from` would panic
+    // on its config and the dense path has no MoE-with-bias/sinks arm.
+    if model_type == "gpt_oss" {
+        assert!(
+            embed_cubin.is_none() && embed_hsaco.is_none(),
+            "gpt_oss has no GPU interpreter object to embed (CPU-tier ops only)"
+        );
+        gptoss::run(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            block_spec.as_deref(),
+            rope_gen,
+            &arch,
+            &gpu,
+            verify.as_ref(),
+        );
+        return;
+    }
     if model_type == "qwen3_5" {
         assert!(
             embed_cubin.is_none() && embed_hsaco.is_none(),

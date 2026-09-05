@@ -136,6 +136,10 @@ PLOW_SASSERT(sizeof(PlowProgHeader) == 24, "PlowProgHeader size");
 /* PlowGenTensor.scale */
 #define PLOW_ROPE_SCALE_NONE   0u
 #define PLOW_ROPE_SCALE_LLAMA3 1u
+/* YaRN (GPT-OSS): factor, orig = original_max_position_embeddings, low = beta_fast,
+ * high = beta_slow, aux bit0 = truncate; cos AND sin are multiplied by
+ * mscale = 0.1*ln(factor)+1. Math in crates/packet/src/rope.rs (RopeScale::Yarn). */
+#define PLOW_ROPE_SCALE_YARN   2u
 
 /* Mirrors `packet::rope::GenTensor`; locked by crates/packet/tests/dev_abi.rs.
  * Flat union across every kind — slots a kind does not use are zero. */
@@ -144,11 +148,11 @@ typedef struct {
     uint32_t kind;    /* PLOW_GEN_* */
     uint32_t ctx;     /* rows */
     uint32_t hd;      /* head_dim; index_dim for the IDX kinds */
-    uint32_t aux;     /* rope_hd for the IDX kinds, else 0 */
+    uint32_t aux;     /* rope_hd for the IDX kinds; YaRN truncate flag (bit0) for ROPE kinds */
     uint32_t scale;   /* PLOW_ROPE_SCALE_* */
     double   theta;
     double   frac;    /* partial-rotary fraction; 1.0 = fully rotated */
-    double   factor;  /* Llama-3 scaling; all zero when scale == NONE */
+    double   factor;  /* Llama-3 / YaRN scaling; all zero when scale == NONE */
     double   low;
     double   high;
     double   orig;
