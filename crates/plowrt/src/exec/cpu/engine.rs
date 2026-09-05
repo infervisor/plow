@@ -344,7 +344,7 @@ use crate::exec::cpu::ffi::{Isa, KernelFn, PlowCpuCtx};
 use crate::exec::cpu::interp::{Exec, LoadedProgram, WorkerCtx};
 use crate::exec::cpu::topology::{NumaMode, Topology};
 use crate::exec::cpu::workers::WorkerPool;
-use crate::exec::kvrow::rebase_chunk_rows;
+use crate::exec::kvrow::{place_lm_head_row, rebase_chunk_rows};
 
 /// One worker's kernel context: the C `PlowCpuCtx` plus its scratch arena.
 /// `thread_init` (AMX tile config) must run ON the worker thread, so it is done
@@ -649,6 +649,11 @@ impl CpuEngine {
             let lp = Arc::make_mut(&mut self.progs[ch.prog]);
             lp.insts.copy_from_slice(&self.model.blob.progs[ch.prog].insts);
             rebase_chunk_rows(&mut lp.insts, &self.model.names, ch.c0, ch.clen, t, Some(t));
+            if place_lm_head_row(&mut lp.insts, self.model.wk.logits, ch.clen - 1).is_none()
+                && self.model.wk.logits.is_some()
+            {
+                tracing::warn!(prog = ch.prog, "act.logits declared but no matmul writes it");
+            }
             self.run_prog(ch.prog)?;
         }
         Ok(self.model.read_u32(t_ids))

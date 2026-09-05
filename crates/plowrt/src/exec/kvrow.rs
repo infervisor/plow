@@ -359,3 +359,47 @@ pub(crate) fn rebase_chunk_rows(
         }
     }
 }
+
+pub(crate) const LM_HEAD_MATMUL_OPS: &[DevOp] = &[
+    DevOp::Gemv,
+    // bf16
+    DevOp::Gemm,
+    DevOp::GemmMed,
+    DevOp::GemmSmall,
+    DevOp::GemmWide,
+    DevOp::GemmC5,
+    // fp8 (w8a8 / w8a16)
+    DevOp::GemmFp8,
+    DevOp::GemmMedFp8,
+    DevOp::GemmSmallFp8,
+    DevOp::GemmWideFp8,
+    DevOp::GemmC5Fp8,
+    // MXFP4 (w4a16)
+    DevOp::GemmMxfp4,
+    DevOp::GemmMedMxfp4,
+    DevOp::GemmSmallMxfp4,
+    DevOp::GemmWideMxfp4,
+    DevOp::GemmC5Mxfp4,
+];
+
+/// Whether `op` can be the instruction that writes the logits tensor.
+pub(crate) fn is_lm_head_matmul(op: u16) -> bool {
+    LM_HEAD_MATMUL_OPS.iter().any(|&o| o as u16 == op)
+}
+
+/// Point the prefill lm_head at the chunk's LAST real row: the compiled bucket
+/// samples row `T - 1`, a ragged chunk must sample `clen - 1` (a padding row is
+/// zeros, so leaving it gives all-zero logits and token 0). Returns the patched
+/// instruction index, `None` when no matmul writes `t_logits`.
+pub(crate) fn place_lm_head_row(
+    insts: &mut [DevInst64],
+    t_logits: Option<usize>,
+    row: u32,
+) -> Option<usize> {
+    let t = t_logits?;
+    let lm = insts
+        .iter()
+        .position(|d| d.t[0] as usize == t && is_lm_head_matmul(d.op))?;
+    insts[lm].i[4] = row;
+    Some(lm)
+}

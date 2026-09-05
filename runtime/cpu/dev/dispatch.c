@@ -20,3 +20,9 @@ int plow_cpu_exec(const PlowDevInst* in, uint32_t slice, uint32_t nblk, void* co
     fn(in, slice, nblk, tensors, ctx);
     return 0;
 }
+
+/* Weak defaults: the golden-only library links and runs before the AVX-512/AMX
+ * tiers exist; the avx512 and amx sources provide the strong definitions. */
+__attribute__((weak)) void plow_cpu_register_avx512(plow_cpu_kernel_fn* tab) { (void)tab; }
+__attribute__((weak)) void plow_cpu_register_amx(plow_cpu_kernel_fn* tab) { (void)tab; }
+__attribute__((weak)) int plow_cpu_thread_init_amx(PlowCpuCtx* ctx) { (void)ctx; return 0; }

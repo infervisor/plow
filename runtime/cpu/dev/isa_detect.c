@@ -66,7 +66,8 @@ int plow_cpu_init(int isa_cap) {
     if (isa > isa_cap) isa = isa_cap;
     plow_cpu_table_reset();
     plow_cpu_register_golden(plow_cpu_table());
-    /* AVX-512 / AMX registrars override entries here once those tiers exist. */
+    if (isa >= PLOW_CPU_ISA_AVX512) plow_cpu_register_avx512(plow_cpu_table());
+    if (isa >= PLOW_CPU_ISA_AMX) plow_cpu_register_amx(plow_cpu_table());
     g_isa = isa;
     return g_isa;
 }
@@ -77,6 +78,7 @@ int plow_cpu_thread_init(PlowCpuCtx* ctx) {
     if (!ctx) return -EINVAL;
     if (g_isa < 0) return -EAGAIN;
     ctx->isa = (uint32_t)g_isa;
+    if (g_isa >= PLOW_CPU_ISA_AMX) return plow_cpu_thread_init_amx(ctx);
     return 0;
 }
 

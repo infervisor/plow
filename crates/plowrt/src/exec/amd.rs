@@ -134,7 +134,9 @@ use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
 use crate::exec::device_api::EngineDevice;
-use crate::exec::kvrow::{derive_kvrow, kvrow_span, prefill_row_field, rebase_chunk_rows, RowField};
+use crate::exec::kvrow::{
+    derive_kvrow, is_lm_head_matmul, kvrow_span, prefill_row_field, rebase_chunk_rows, RowField,
+};
 use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
 use crate::{Result, RuntimeError};
 
@@ -4440,33 +4442,6 @@ fn required_gemv_m(progs: &[DevProg]) -> u32 {
 /// a warning nobody reads. Not reachable today (Gemma emits lm_head at M=1, which picks a small
 /// tile, and the GLM/MLA tail uses `Gemv`) — but it is latent, and it is exactly the drift the
 /// identity-based `kv_write_row_field` refactor was introduced to end.
-const LM_HEAD_MATMUL_OPS: &[DevOp] = &[
-    DevOp::Gemv,
-    // bf16
-    DevOp::Gemm,
-    DevOp::GemmMed,
-    DevOp::GemmSmall,
-    DevOp::GemmWide,
-    DevOp::GemmC5,
-    // fp8 (w8a8 / w8a16)
-    DevOp::GemmFp8,
-    DevOp::GemmMedFp8,
-    DevOp::GemmSmallFp8,
-    DevOp::GemmWideFp8,
-    DevOp::GemmC5Fp8,
-    // MXFP4 (w4a16)
-    DevOp::GemmMxfp4,
-    DevOp::GemmMedMxfp4,
-    DevOp::GemmSmallMxfp4,
-    DevOp::GemmWideMxfp4,
-    DevOp::GemmC5Mxfp4,
-];
-
-/// Whether `op` can be the instruction that writes the logits tensor.
-fn is_lm_head_matmul(op: u16) -> bool {
-    LM_HEAD_MATMUL_OPS.iter().any(|&o| o as u16 == op)
-}
-
 /// The `extern "C" __device__` marker `runtime/amd/interp.hip` emits when it was compiled with
 /// `PLOW_K3=1` — the seven Kimi-K3 / KDA arms.
 ///
