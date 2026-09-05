@@ -24,6 +24,8 @@ fn main() {
     let mut decode_steps = 0usize;
     let mut prompt_tokens = 0usize;
     let mut dump_logits: Option<PathBuf> = None;
+    let mut dump_dir: Option<PathBuf> = None;
+    let mut seeds: Vec<String> = Vec::new();
     let mut opts = CpuEngineOpts::default();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -33,6 +35,11 @@ fn main() {
             // Same synthetic prompt as cpu_bench (<bos> + repeated sentence), for tier A/B.
             "--prompt-tokens" => prompt_tokens = args.next().unwrap().parse().unwrap(),
             "--dump-logits" => dump_logits = Some(args.next().unwrap().into()),
+            // Dump every tensor matching --filter (raw bytes, one file per tensor) for tier A/B diffs.
+            "--dump-dir" => dump_dir = Some(args.next().unwrap().into()),
+            // `--seed act.x:1.0`: fill a tensor with deterministic Gaussian bf16 (std) before the run —
+            // block assets take the residual stream as input instead of token ids.
+            "--seed" => seeds.push(args.next().unwrap()),
             "--threads" => opts.threads = args.next().unwrap().parse().unwrap(),
             "--isa" => {
                 opts.isa = match args.next().unwrap().as_str() {
@@ -62,6 +69,23 @@ fn main() {
     println!("prompt ids ({}): {:?}", ids.len(), &ids[..ids.len().min(16)]);
     let mut eng = CpuEngine::load(&blob, &ckpt, &opts).expect("load");
     println!("isa={:?} threads={}", eng.isa, eng.threads);
+    for sd in &seeds {
+        let (name, std) = sd.split_once(':').unwrap_or((sd.as_str(), "1.0"));
+        let std: f32 = std.parse().unwrap();
+        let m = eng.model();
+        let h = m.names.iter().position(|n| n == name).expect("seed tensor name");
+        // SAFETY: quiescent (no run in flight).
+        let bytes = unsafe { m.tensor(h).as_mut_slice() };
+        let mut st: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; (st >> 11) as f64 / 9007199254740992.0 };
+        for c in bytes.chunks_exact_mut(2) {
+            let (u, v) = (next().max(1e-12), next());
+            let g = ((-2.0 * u.ln()).sqrt() * (6.283185307 * v).cos()) as f32 * std;
+            let b = (g.to_bits() + 0x7FFF + ((g.to_bits() >> 16) & 1)) >> 16;
+            c.copy_from_slice(&(b as u16).to_le_bytes());
+        }
+        println!("seeded {name} ({} bytes) with N(0,{std})", bytes.len());
+    }
     let first = eng.prefill(&ids).expect("prefill");
     println!("prefill -> token {first} {:?}", tok.decode(&[first]));
     if let Some(p) = &dump_logits {
@@ -72,6 +96,19 @@ fn main() {
         println!("dumped {} bytes of act.logits to {}", bytes.len(), p.display());
     }
     dump(eng.model(), &filter);
+    if let Some(dir) = &dump_dir {
+        std::fs::create_dir_all(dir).expect("dump dir");
+        let m = eng.model();
+        for (h, name) in m.names.iter().enumerate() {
+            if !name.starts_with(filter.as_str()) {
+                continue;
+            }
+            // SAFETY: quiescent.
+            let bytes = unsafe { m.tensor(h).as_slice() };
+            std::fs::write(dir.join(name.replace('/', "_")), bytes).expect("write tensor");
+        }
+        println!("dumped tensors matching {filter:?} to {}", dir.display());
+    }
     let mut pos = ids.len() as u32;
     for s in 0..decode_steps {
         let t = eng.decode_step(pos, pos + 1).expect("decode");
