@@ -1,44 +1,64 @@
 use super::*;
 use std::path::Path;
 
-fn fp8_segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
-    let role = emit_config::active().fp8_pf_gemm_role;
-    let isolated = emit_config::active().fp8_pf_isolate;
-    if !role && !isolated {
+fn prefill_segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
+    let cfg = emit_config::active();
+    let fp8 = cfg.fp8_pf_gemm_role || cfg.fp8_pf_isolate;
+    let attention = cfg.attention_pf_role || cfg.attention_pf_isolate;
+    if !fp8 && !attention {
         return None;
     }
     let mut programs = Vec::new();
+    let mut used = [false; 3];
     for (index, p) in m.progs.iter().enumerate().take(m.progs.len() - 1) {
         let mut roles = vec![0_u8; p.gq_seg_ofs.len() - 1];
-        let mut found = false;
+        let mut found_fp8 = false;
         for (ix, d) in p.insts.iter().enumerate() {
-            if d.op != DevOp::GemmFp8 as u16 {
+            let role = if fp8 && d.op == DevOp::GemmFp8 as u16 {
+                assert!(
+                    d.i[6] != 0 && d.i[7] != 0,
+                    "FP8 role needs mapped prefill GEMMs"
+                );
+                found_fp8 = true;
+                u8::from(cfg.fp8_pf_gemm_role)
+            } else if attention && d.op == DevOp::FlashPrefill as u16 {
+                assert_eq!(d.i[6], 256, "attention role requires HD256");
+                assert!(d.t[5..8].iter().all(|&t| t == TENSOR_NONE));
+                2 * u8::from(cfg.attention_pf_role)
+            } else if attention && d.op == DevOp::FlashMerge as u16 {
+                assert_eq!(d.i[3], 256, "attention role requires HD256");
+                2 * u8::from(cfg.attention_pf_role)
+            } else {
                 continue;
-            }
-            assert!(
-                d.i[6] != 0 && d.i[7] != 0,
-                "FP8 role needs mapped prefill GEMMs"
-            );
+            };
             let seg = p.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg as usize;
             assert!(p
                 .stream
                 .iter()
                 .all(|e| (e.inst as usize == ix) == (e.seg as usize == seg)));
-            roles[seg] = u8::from(role);
-            found = true;
+            roles[seg] = role;
+            used[role as usize] = true;
         }
-        assert!(found, "FP8 role metadata requires FP8 prefill programs");
+        assert!(
+            !fp8 || found_fp8,
+            "FP8 role metadata requires FP8 prefill programs"
+        );
         programs.push(serde_json::json!({"index":index,"roles":roles}));
     }
     assert!(
         !programs.is_empty(),
-        "FP8 prefill roles require prefill programs"
+        "prefill roles require prefill programs"
     );
-    let objects = if role {
-        serde_json::json!({"1":{"abi":"fp8_gemm_tma128_v1","file":"interp_sm90a_pfgemm_fp8.cubin"}})
-    } else {
-        serde_json::json!({})
-    };
+    let mut objects = serde_json::Map::new();
+    if used[1] {
+        objects.insert(
+            "1".into(),
+            serde_json::json!({"abi":"fp8_gemm_tma128_v1","file":"interp_sm90a_pfgemm_fp8.cubin"}),
+        );
+    }
+    if used[2] {
+        objects.insert("2".into(), serde_json::json!({"abi":"attention_sm90_hd256_v1","file":"interp_sm90a_pfattn_hd256.cubin"}));
+    }
     Some(packet::devbuild::SectionData {
         kind: packet::devbuild::SECT_METADATA,
         name: "segment_roles.json".into(),
@@ -615,6 +635,13 @@ impl Emitter<'_> {
                 d.i[..4].copy_from_slice(&[self.batch, c.heads, ns, c.hd]);
             },
         );
+        if self.prefill
+            && (emit_config::active().attention_pf_isolate
+                || emit_config::active().attention_pf_role)
+        {
+            self.b.isolate(da);
+            self.b.isolate(dm);
+        }
         let dg = self
             .b
             .emit(DevOp::QwenSigmoidGate, self.b.all(), &[dm], |d| {
@@ -994,7 +1021,7 @@ pub(super) fn run(
     let man = manifest::build(&m, arch, &lean);
     let out = Path::new(out);
     let mut sections = Vec::new();
-    if let Some(section) = fp8_segment_roles(&m) {
+    if let Some(section) = prefill_segment_roles(&m) {
         sections.push(section);
     }
     let bytes = if let Some(layer) = c.block {
@@ -1894,6 +1921,81 @@ mod tests {
         Config::parse(&v);
     }
     #[test]
+    fn attention_role_preserves_packets_and_combines_with_fp8_role() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let original = emit_config::active().clone();
+        let c = Config::parse(&fixture());
+        for fp8 in [false, true] {
+            let mut cfg = original.clone();
+            cfg.fp8 = fp8;
+            cfg.w8a8 = fp8;
+            cfg.qwen_w8a8_prefill = fp8;
+            cfg.fp8_pf_gemm_role = fp8;
+            cfg.fp8_pf_isolate = false;
+            cfg.attention_pf_role = false;
+            cfg.attention_pf_isolate = false;
+            emit_config::install(cfg.clone());
+            let plain = model_prefill(&c, 65536, 132, 0, &[128, 1024, 4096, 8192], 1, fp8);
+            cfg.attention_pf_isolate = true;
+            emit_config::install(cfg.clone());
+            let control = model_prefill(&c, 65536, 132, 0, &[128, 1024, 4096, 8192], 1, fp8);
+            let meta = prefill_segment_roles(&control).unwrap();
+            let meta: Value = serde_json::from_slice(&meta.data).unwrap();
+            assert!(meta["objects"].get("2").is_none());
+            cfg.attention_pf_role = true;
+            cfg.attention_pf_isolate = false;
+            emit_config::install(cfg);
+            let candidate = model_prefill(&c, 65536, 132, 0, &[128, 1024, 4096, 8192], 1, fp8);
+            let meta = prefill_segment_roles(&candidate).unwrap();
+            let meta: Value = serde_json::from_slice(&meta.data).unwrap();
+            assert_eq!(meta["objects"]["2"]["abi"], "attention_sm90_hd256_v1");
+            assert_eq!(meta["objects"].get("1").is_some(), fp8);
+            for (index, ((a, b), c)) in plain
+                .progs
+                .iter()
+                .zip(&control.progs)
+                .zip(&candidate.progs)
+                .enumerate()
+            {
+                assert_eq!(a.insts, b.insts);
+                assert_eq!(a.waits, b.waits);
+                assert_eq!(a.succs, b.succs);
+                assert_eq!(a.n_counter, b.n_counter);
+                assert_eq!(b.insts, c.insts);
+                assert_eq!(b.stream, c.stream);
+                assert_eq!(b.gq_seg_ofs, c.gq_seg_ofs);
+                check_operand_dependencies(c);
+                if index == 4 {
+                    assert_eq!(a.stream, c.stream);
+                    assert_eq!(a.gq_seg_ofs, c.gq_seg_ofs);
+                    continue;
+                }
+                let roles = meta["programs"][index]["roles"].as_array().unwrap();
+                assert_eq!(roles.len(), c.gq_seg_ofs.len() - 1);
+                assert_eq!(roles.iter().filter(|r| **r == 2).count(), 2);
+                for (ix, d) in c.insts.iter().enumerate().filter(|(_, d)| {
+                    d.op == DevOp::FlashPrefill as u16 || d.op == DevOp::FlashMerge as u16
+                }) {
+                    let entries: Vec<_> =
+                        c.stream.iter().filter(|e| e.inst as usize == ix).collect();
+                    assert_eq!(entries.len(), d.blocks as usize);
+                    let seg = entries[0].seg;
+                    assert_eq!(roles[seg as usize], 2);
+                    assert!(c
+                        .stream
+                        .iter()
+                        .all(|e| (e.inst as usize == ix) == (e.seg == seg)));
+                    let mut slices: Vec<_> = entries.iter().map(|e| e.slice).collect();
+                    slices.sort_unstable();
+                    assert_eq!(slices, (0..u32::from(d.blocks)).collect::<Vec<_>>());
+                }
+            }
+        }
+        emit_config::install(original);
+    }
+
+    #[test]
     fn w8a8_prefill_isolation_preserves_arithmetic_and_dependencies() {
         let _env = crate::test_env::env_guard();
         let _target = EmitAmdGuard::set(false);
@@ -1922,7 +2024,7 @@ mod tests {
         cfg.fp8_pf_isolate = true;
         emit_config::install(cfg.clone());
         let isolated = model_prefill(&c, 32768, 132, 0, &[128, 1024, 4096, 8192], 1, true);
-        let control = fp8_segment_roles(&isolated).unwrap();
+        let control = prefill_segment_roles(&isolated).unwrap();
         let control: Value = serde_json::from_slice(&control.data).unwrap();
         assert!(control["objects"].as_object().unwrap().is_empty());
         assert!(control["programs"]
@@ -1932,7 +2034,7 @@ mod tests {
             .all(|p| p["roles"].as_array().unwrap().iter().all(|r| r == 0)));
         cfg.fp8_pf_gemm_role = true;
         emit_config::install(cfg.clone());
-        let candidate = fp8_segment_roles(&isolated).unwrap();
+        let candidate = prefill_segment_roles(&isolated).unwrap();
         let candidate: Value = serde_json::from_slice(&candidate.data).unwrap();
         assert_eq!(candidate["objects"]["1"]["abi"], "fp8_gemm_tma128_v1");
         assert!(candidate["programs"]
@@ -1949,7 +2051,7 @@ mod tests {
         cfg.fp8_pf_gemm_role = false;
         cfg.fp8_pf_isolate = false;
         emit_config::install(cfg);
-        assert!(fp8_segment_roles(&plain).is_none());
+        assert!(prefill_segment_roles(&plain).is_none());
         emit_config::install(original);
         for (a, b) in plain.progs.iter().zip(&isolated.progs) {
             assert_eq!(a.insts, b.insts);

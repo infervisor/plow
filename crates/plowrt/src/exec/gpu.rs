@@ -516,22 +516,31 @@ impl SegmentRoles {
             .filter(|(_, g)| blob.prefill_progs().iter().any(|p| std::ptr::eq(p, *g)))
             .map(|(i, _)| i)
             .collect();
-        value.validate(&blob.progs, &indices)?;
+        value.validate(&blob.progs, &indices, &blob.tensors)?;
         Ok(value)
     }
     fn validate(
         &self,
         programs: &[crate::asset::devblob::DevProg],
         prefill: &[usize],
+        tensors: &[crate::asset::devblob::DevTensor],
     ) -> Result<()> {
-        if self.version != 1 || self.programs.is_empty() || self.objects.keys().any(|&id| id != 1) {
+        if self.version != 1
+            || self.programs.is_empty()
+            || self.objects.keys().any(|&id| !matches!(id, 1 | 2))
+        {
             return Err(RuntimeError::Rejected(
                 "unsupported packet segment roles".into(),
             ));
         }
-        if let Some(object) = self.objects.get(&1) {
+        for (&id, object) in &self.objects {
             let path = std::path::Path::new(&object.file);
-            if object.abi != "fp8_gemm_tma128_v1"
+            let abi = if id == 1 {
+                "fp8_gemm_tma128_v1"
+            } else {
+                "attention_sm90_hd256_v1"
+            };
+            if object.abi != abi
                 || object.file.is_empty()
                 || path
                     .components()
@@ -543,7 +552,7 @@ impl SegmentRoles {
             }
         }
         let mut seen = std::collections::BTreeSet::new();
-        let mut used = false;
+        let mut used = std::collections::BTreeSet::new();
         for p in &self.programs {
             let g = programs.get(p.index).ok_or_else(|| {
                 RuntimeError::Rejected("packet role program index out of bounds".into())
@@ -553,10 +562,10 @@ impl SegmentRoles {
                     "duplicate or non-prefill packet role program".into(),
                 ));
             }
-            fp8_role_segments(g, &p.roles)?;
-            used |= p.roles.contains(&1);
+            packet_role_segments(g, &p.roles, tensors)?;
+            used.extend(p.roles.iter().copied().filter(|&role| role != 0));
         }
-        if used != self.objects.contains_key(&1) {
+        if used != self.objects.keys().copied().collect() {
             return Err(RuntimeError::Rejected(
                 "packet role object declaration does not match use".into(),
             ));
@@ -568,7 +577,7 @@ impl SegmentRoles {
     }
 }
 
-struct Fp8GemmRole {
+struct PacketRole {
     function: KernelFn,
     smem: u32,
     _module: Module,
@@ -577,6 +586,87 @@ struct Fp8GemmRole {
 fn check_fp8_gemm_role(capability: Option<u32>, block: Option<u32>) -> Result<()> {
     if capability != Some(1) || block != Some(BLOCK) {
         return Err(RuntimeError::Rejected("incompatible FP8 GEMM role".into()));
+    }
+    Ok(())
+}
+
+fn check_attention_role(arch: &str, capability: Option<u32>, block: Option<u32>) -> Result<()> {
+    if arch != "sm90a" || capability != Some(1) || block != Some(BLOCK) {
+        return Err(RuntimeError::Rejected(
+            "incompatible HD256 attention role".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attention_role_inst(
+    d: &DevInst64,
+    rows: u32,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<()> {
+    let reject =
+        || RuntimeError::Rejected("unsupported HD256 attention role operands or geometry".into());
+    let prefill = d.op == DevOp::FlashPrefill as u16;
+    let (heads, splits, hd) = if prefill {
+        (d.i[2], d.i[7], d.i[6])
+    } else if d.op == DevOp::FlashMerge as u16 {
+        (d.i[1], d.i[2], d.i[3])
+    } else {
+        return Err(reject());
+    };
+    if rows == 0 || d.i[0] != rows || heads == 0 || splits == 0 || hd != 256 {
+        return Err(reject());
+    }
+    let work = rows.checked_mul(heads).ok_or_else(reject)?;
+    let partials = u64::from(work)
+        .checked_mul(u64::from(splits))
+        .ok_or_else(reject)?;
+    let output_bytes = u64::from(work) * 256 * 2;
+    let partial_bytes = partials.checked_mul(256 * 4).ok_or_else(reject)?;
+    let ml_bytes = partials.checked_mul(8).ok_or_else(reject)?;
+    let extent = |slot: usize, bytes: u64| -> Result<()> {
+        if d.t[slot] == TENSOR_NONE16
+            || tensors
+                .get(d.t[slot] as usize)
+                .is_none_or(|t| t.bytes < bytes)
+        {
+            return Err(reject());
+        }
+        Ok(())
+    };
+    for output in 0..if prefill { 2 } else { 1 } {
+        if (0..if prefill { 5 } else { 3 }).any(|i| i != output && d.t[i] == d.t[output]) {
+            return Err(reject());
+        }
+    }
+    if prefill {
+        if d.i[1] == 0
+            || d.i[3] == 0
+            || heads % d.i[3] != 0
+            || d.t[5..].iter().any(|&t| t != TENSOR_NONE16)
+            || !f32::from_bits(d.fj[0]).is_finite()
+            || rows
+                .div_ceil(64)
+                .checked_mul(heads)
+                .and_then(|v| v.checked_mul(splits))
+                .is_none()
+        {
+            return Err(reject());
+        }
+        let stride = if d.fj[1] == 0 { d.i[1] } else { d.fj[1] };
+        let kv_bytes = u64::from(stride)
+            .checked_mul(u64::from(d.i[3]))
+            .and_then(|bytes| bytes.checked_mul(256 * 2))
+            .ok_or_else(reject)?;
+        extent(0, partial_bytes)?;
+        extent(1, ml_bytes)?;
+        extent(2, output_bytes)?;
+        extent(3, kv_bytes)?;
+        extent(4, kv_bytes)?;
+    } else {
+        extent(0, output_bytes)?;
+        extent(1, partial_bytes)?;
+        extent(2, ml_bytes)?;
     }
     Ok(())
 }
@@ -592,9 +682,16 @@ fn segment_window(arg: &mut DevProgram, base: &DevProgram, seg: usize, role: boo
         };
 }
 
-fn fp8_role_segments(g: &crate::asset::devblob::DevProg, roles: &[u8]) -> Result<Vec<bool>> {
+fn packet_role_segments(
+    g: &crate::asset::devblob::DevProg,
+    roles: &[u8],
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<Vec<u8>> {
     validate_segment_windows(g)?;
-    if roles.len() + 1 != g.gq_seg_ofs.len() || roles.iter().any(|&r| r > 1) {
+    if roles.len() + 1 != g.gq_seg_ofs.len()
+        || roles.iter().any(|&r| r > 2)
+        || (g.packed_prefill_only && roles.contains(&2))
+    {
         return Err(RuntimeError::Rejected(
             "invalid packet segment role count or id".into(),
         ));
@@ -604,25 +701,21 @@ fn fp8_role_segments(g: &crate::asset::devblob::DevProg, roles: &[u8]) -> Result
         let entries = g
             .gq_stream
             .get(bounds[0] as usize..bounds[1] as usize)
-            .ok_or_else(|| RuntimeError::Rejected("invalid FP8 role queue window".into()))?;
+            .ok_or_else(|| RuntimeError::Rejected("invalid packet role queue window".into()))?;
         if entries.is_empty()
             || entries
                 .iter()
                 .any(|e| e.seg as usize != seg || e.inst as usize >= g.insts.len())
         {
             return Err(RuntimeError::Rejected(
-                "invalid FP8 role stream entry".into(),
+                "invalid packet role stream entry".into(),
             ));
         }
-        let fp8 = roles[seg] == 1;
-        if fp8 {
+        let role = roles[seg];
+        if role != 0 {
             let ix = entries[0].inst;
             let d = &g.insts[ix as usize];
-            if d.op != DevOp::GemmFp8 as u16
-                || d.i[0] != g.t
-                || d.i[6] == 0
-                || d.i[7] == 0
-                || entries.iter().any(|e| e.inst != ix)
+            if entries.iter().any(|e| e.inst != ix)
                 || g.gq_stream
                     .iter()
                     .any(|e| (e.inst == ix) != (e.seg as usize == seg))
@@ -631,8 +724,17 @@ fn fp8_role_segments(g: &crate::asset::devblob::DevProg, roles: &[u8]) -> Result
                     .any(|e| (e.inst == ix) != (e.seg as usize == seg))
             {
                 return Err(RuntimeError::Rejected(
-                    "FP8 GEMM role requires complete isolated mapped GEMMs".into(),
+                    "packet role requires one complete isolated instruction".into(),
                 ));
+            }
+            if role == 1 {
+                if d.op != DevOp::GemmFp8 as u16 || d.i[0] != g.t || d.i[6] == 0 || d.i[7] == 0 {
+                    return Err(RuntimeError::Rejected(
+                        "FP8 GEMM role requires mapped GEMMs".into(),
+                    ));
+                }
+            } else {
+                validate_attention_role_inst(d, g.t, tensors)?;
             }
             let mut queue: Vec<_> = entries
                 .iter()
@@ -660,11 +762,11 @@ fn fp8_role_segments(g: &crate::asset::devblob::DevProg, roles: &[u8]) -> Result
             slices.sort_unstable();
             if slices != (0..u32::from(d.blocks)).collect::<Vec<_>>() || queue != stream {
                 return Err(RuntimeError::Rejected(
-                    "FP8 GEMM role queue omits or duplicates packet work".into(),
+                    "packet role queue omits or duplicates packet work".into(),
                 ));
             }
         }
-        selected.push(fp8);
+        selected.push(role);
     }
     Ok(selected)
 }
@@ -831,7 +933,7 @@ struct PrefillBucket {
     seg_class: Vec<u8>,
     small_gemm_segments: Vec<bool>,
     qwen_segments: Vec<Option<DevInst64>>,
-    fp8_gemm_segments: Vec<bool>,
+    packet_segment_roles: Vec<u8>,
     /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
     /// Device instruction stream (patched per chunk over `inst_range`).
@@ -1249,7 +1351,7 @@ pub struct GpuEngine {
     /// Segmented-prefill object pair (PLOW_PF_SEG_DIR); None = single-object prefill.
     seg_pf: Option<SegPf>,
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
-    fp8_gemm_role: Option<Fp8GemmRole>,
+    packet_roles: [Option<PacketRole>; 2],
     lt_decode: Vec<Option<LtDecodeRoute>>,
     lt_decode_graph: Option<crate::device::cuda::GraphExec>,
     lt_decode_capture: bool,
@@ -3356,42 +3458,61 @@ impl GpuEngine {
             (None, SMEM_PF, None, Vec::new(), None)
         };
 
-        let fp8_gemm_role = if let Some(object) =
-            segment_roles.as_ref().and_then(|r| r.objects.get(&1))
-        {
+        let mut packet_roles = [None, None];
+        for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
             if prefill.is_empty() || seg_pf.is_some() {
                 return Err(RuntimeError::Rejected(
                     "packet roles require prefill without a legacy role pair".into(),
                 ));
             }
+            if id == 2 && profile.tag != "sm90a" {
+                return Err(RuntimeError::Rejected(
+                    "HD256 attention role requires SM90".into(),
+                ));
+            }
+            let (marker, block, entry, arena) = if id == 1 {
+                (
+                    "plow_fp8_gemm_tma128_abi",
+                    "plow_block_pfgemm",
+                    "_Z19interp_sm90a_pfgemm11PlowProgram",
+                    "plow_arena_bytes_pfgemm",
+                )
+            } else {
+                (
+                    "plow_attention_sm90_hd256_abi",
+                    "plow_block_pffa",
+                    "_Z17interp_sm90a_pffa11PlowProgram",
+                    "plow_arena_bytes_pffa",
+                )
+            };
             let path = assets_dir.join(&object.file);
             let image = std::fs::read(&path)
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
             let module = be.module_load(&image)?;
-            check_fp8_gemm_role(
-                be.module_global_u32(&module, "plow_fp8_gemm_tma128_abi")?,
-                be.module_global_u32(&module, "plow_block_pfgemm")?,
-            )?;
-            let function = be.get_function(&module, "_Z19interp_sm90a_pfgemm11PlowProgram")?;
+            let capability = be.module_global_u32(&module, marker)?;
+            let block = be.module_global_u32(&module, block)?;
+            if id == 1 {
+                check_fp8_gemm_role(capability, block)?;
+            } else {
+                check_attention_role(profile.tag, capability, block)?;
+            }
+            let function = be.get_function(&module, entry)?;
             let smem = be
-                .module_global_u32(&module, "plow_arena_bytes_pfgemm")?
-                .ok_or_else(|| {
-                    RuntimeError::Rejected("FP8 GEMM role lacks arena metadata".into())
-                })?;
+                .module_global_u32(&module, arena)?
+                .filter(|&bytes| bytes > 0)
+                .ok_or_else(|| RuntimeError::Rejected("packet role lacks arena metadata".into()))?;
             be.set_max_dynamic_smem(function, smem)?;
             if be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count() != grid {
                 return Err(RuntimeError::Rejected(
-                    "FP8 GEMM role occupancy must equal packet grid".into(),
+                    "packet role occupancy must equal packet grid".into(),
                 ));
             }
-            Some(Fp8GemmRole {
+            packet_roles[id as usize - 1] = Some(PacketRole {
                 function,
                 smem,
                 _module: module,
-            })
-        } else {
-            None
-        };
+            });
+        }
 
         let qwen_prefill = if prefill
             .iter()
@@ -3561,7 +3682,7 @@ impl GpuEngine {
             f_pf,
             seg_pf,
             qwen_prefill,
-            fp8_gemm_role,
+            packet_roles,
             lt_decode,
             lt_decode_graph: None,
             lt_decode_seed,
@@ -5388,7 +5509,7 @@ impl GpuEngine {
                 .expect("prefill belongs to blob");
             let declared_roles = segment_roles.and_then(|r| r.program(program_index));
             let mut qwen_segments = qwen_prefill_segments(g, &blob.tensors)?;
-            let fp8_gemm_segments = if let Some(p) = declared_roles {
+            let packet_segment_roles = if let Some(p) = declared_roles {
                 if seg_mode {
                     return Err(RuntimeError::Rejected(
                         "packet roles cannot mix with legacy role pair".into(),
@@ -5397,11 +5518,12 @@ impl GpuEngine {
                 if qwen_segments.is_empty() {
                     qwen_segments = vec![None; p.roles.len()];
                 }
-                let selected = fp8_role_segments(g, &p.roles)?;
+                let selected = packet_role_segments(g, &p.roles, &blob.tensors)?;
                 tracing::info!(
                     program_index,
                     launches = p.roles.len(),
-                    gemm_launches = selected.iter().filter(|&&x| x).count(),
+                    gemm_launches = selected.iter().filter(|&&x| x == 1).count(),
+                    attention_launches = selected.iter().filter(|&&x| x == 2).count(),
                     "packet segment roles loaded"
                 );
                 selected
@@ -5565,7 +5687,7 @@ impl GpuEngine {
                 seg_class: seg_class.clone(),
                 small_gemm_segments,
                 qwen_segments,
-                fp8_gemm_segments,
+                packet_segment_roles,
                 kernarg,
                 d_inst,
                 h_inst,
@@ -5964,12 +6086,15 @@ impl GpuEngine {
                         native.launch(tensors, inst.i[0] as usize, &self.stream)?;
                     }
                 }
-                let role = self.fp8_gemm_role.as_ref().filter(|_| {
-                    self.prefill[bi]
-                        .fp8_gemm_segments
-                        .get(seg)
-                        .copied()
-                        .unwrap_or(false)
+                let role_id = self.prefill[bi]
+                    .packet_segment_roles
+                    .get(seg)
+                    .copied()
+                    .unwrap_or(0);
+                let role = role_id.checked_sub(1).map(|id| {
+                    self.packet_roles[id as usize]
+                        .as_ref()
+                        .expect("validated packet role object")
                 });
                 segment_window(&mut arg, &self.prefill[bi].kernarg, seg, role.is_some());
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
@@ -6797,6 +6922,13 @@ impl Drop for GpuEngine {
         for (_, g) in self.seg_graphs.drain() {
             self.be.graph_destroy(g);
         }
+        for role in &mut self.packet_roles {
+            if let Some(role) = role.take() {
+                if let Err(e) = self.be.module_unload(&role._module) {
+                    report(&e, "unload packet role module");
+                }
+            }
+        }
         if let Some(sp) = self.seg_pf.take() {
             if let Some(small) = sp.small_gemm {
                 if let Err(e) = self.be.module_unload(&small._module) {
@@ -6824,6 +6956,10 @@ impl Drop for GpuEngine {
 #[cfg(test)]
 #[path = "gpu_kv_tmap_tests.rs"]
 mod kv_tmap_tests;
+
+#[cfg(test)]
+#[path = "gpu_attention_role_tests.rs"]
+mod attention_role_tests;
 
 #[cfg(test)]
 mod prefill_patch_tests {
@@ -6986,8 +7122,13 @@ mod recurrent_tests {
             let roles = SegmentRoles::parse(metadata, &blob).unwrap();
             assert_eq!(roles.program(0).unwrap().roles, [0, role, 0]);
             assert_eq!(
-                fp8_role_segments(&blob.progs[0], &roles.program(0).unwrap().roles).unwrap(),
-                [false, role == 1, false]
+                packet_role_segments(
+                    &blob.progs[0],
+                    &roles.program(0).unwrap().roles,
+                    &blob.tensors
+                )
+                .unwrap(),
+                [0, role, 0]
             );
             assert!(qwen_prefill_segments(&blob.progs[0], &[])
                 .unwrap()
@@ -7072,14 +7213,14 @@ mod recurrent_tests {
             gq_seg_ofs: vec![0, 1, 3],
             l2_domains: 0,
         };
-        assert_eq!(fp8_role_segments(&g, &[0, 1]).unwrap(), [false, true]);
-        assert_eq!(fp8_role_segments(&g, &[0, 0]).unwrap(), [false, false]);
+        assert_eq!(packet_role_segments(&g, &[0, 1], &[]).unwrap(), [0, 1]);
+        assert_eq!(packet_role_segments(&g, &[0, 0], &[]).unwrap(), [0, 0]);
         let control =
             serde_json::json!({"version":1,"objects":{},"programs":[{"index":0,"roles":[0,0]}]});
         let candidate = serde_json::json!({"version":1,"objects":{"1":{"abi":"fp8_gemm_tma128_v1","file":"role.cubin"}},"programs":[{"index":0,"roles":[0,1]}]});
         let validate = |v: serde_json::Value| -> bool {
             serde_json::from_value::<SegmentRoles>(v)
-                .is_ok_and(|r| r.validate(std::slice::from_ref(&g), &[0]).is_ok())
+                .is_ok_and(|r| r.validate(std::slice::from_ref(&g), &[0], &[]).is_ok())
         };
         assert!(validate(control.clone()));
         assert!(validate(candidate.clone()));
@@ -7114,19 +7255,19 @@ mod recurrent_tests {
         bad["objects"] = serde_json::json!({"2":{"abi":"fp8_gemm_tma128_v1","file":"role.cubin"}});
         assert!(!validate(bad));
         g.gq_stream[2].inst = 0;
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
         g.gq_stream[2].inst = 1;
         g.gq_stream[2].slice = 0;
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
         g.gq_stream[2].slice = 1;
         g.stream.pop();
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
         g.stream = g.gq_stream.clone();
         g.insts[1].i[6] = 0;
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
         g.insts[1].i[6] = 1;
         g.gq_seg_ofs = vec![0, 3];
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
     }
 
     #[test]

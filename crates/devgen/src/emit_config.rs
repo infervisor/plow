@@ -651,6 +651,14 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_QWEN_FP8_PF_ISOLATE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fp8_pf_isolate: bool,
 
+    /// Select the packet-declared native HD256 prefill attention role.
+    #[arg(long, env = "PLOW_ATTENTION_PF_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub attention_pf_role: bool,
+
+    /// Isolate prefill attention while retaining the broad interpreter role.
+    #[arg(long, env = "PLOW_ATTENTION_PF_ISOLATE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub attention_pf_isolate: bool,
+
     #[arg(long, env = "PLOW_QWEN_FP8_M1_TMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_fp8_m1_tma: bool,
 
@@ -895,6 +903,8 @@ impl EmitConfig {
             tma_gemm: env_bool("PLOW_TMA_GEMM"),
             fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
+            attention_pf_role: env_bool("PLOW_ATTENTION_PF_ROLE"),
+            attention_pf_isolate: env_bool("PLOW_ATTENTION_PF_ISOLATE"),
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             qwen_decode_lt: env_bool("PLOW_QWEN_DECODE_LT"),
