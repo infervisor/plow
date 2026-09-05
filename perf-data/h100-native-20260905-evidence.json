@@ -1,0 +1,39 @@
+{
+  "qwen_reference": {
+    "cells": 15,
+    "requests": 480,
+    "failed": 0,
+    "input_lengths_verified": true,
+    "output_lengths_verified": true,
+    "output_tokens": 245760
+  },
+  "fp8_stages": {
+    "cases": 60,
+    "all_bit_exact": true,
+    "stage2_decision": "rejected: slower on all 30 paired shapes",
+    "timing": "median30 CUDA-event samples,5warmups;700MiB L2 eviction outside eachsample; no quantization/padding/setup allocation timed"
+  },
+  "raw_sha256": {
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in1024_c1.json": "a0f671b4840d436fc79fa9e253856ba7607b35dc60f4479351211b9dee74203f",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in1024_c4.json": "edc0e88443226f671f14828ffa395482a06ae04c7042a11c1c89733993f0c556",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in1024_c16.json": "46afe1d5c230a0712940176a1f2e8725bf5273197b48198994a3ba09fd560cde",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in4096_c1.json": "531887253827bc0e3fa6ccaf49a83a03ac45203337e98a151f4348319a02e387",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in4096_c4.json": "a7b5c93992d15d07200edb265d7b3541fe4699ffdbfbbe19268054f6799b258c",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in4096_c16.json": "5856bbce2ad83e1daa3609c74e7fdb61091d6497dbca49e20b1d7f2b5fd4189d",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in8192_c1.json": "9130da85287edb71c4b92d57205dc491f00aeef661abb5ca6d0eb8070fec969e",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in8192_c4.json": "177f53d3d437948f89cd592f16bc063d79b97918228ef8cc4d9d1c608032fadd",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in8192_c16.json": "1522e8e21350ca121894fba1255733dd63d9680a8fd1f008e06e334c60b3e9bf",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in16384_c1.json": "d2c58dfd02b4fc40987449b8c03fd8d41d75760e9c7ee97ffd2c39067a26b43f",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in16384_c4.json": "eab6ab1f35d7c3b2b4072d6932cbddba3b363c4ac730114ba44d175dc3a666ec",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in16384_c16.json": "ea67aa829f82331655762f28f38f4710ccfa08ed597d9aec101a6368c39bbbd0",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in32768_c1.json": "64587c1d83b0b736ea5b50db1394bb907c2f1ec1b547cfbfa4cb02fcba4511dd",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in32768_c4.json": "5088a9773f958fe55ab4fc3140d6515a8fe39a2cdbcfa0ca64491c49cb1a2bc6",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/qwen27b-1k-32k-r1/in32768_c16.json": "bf222c8e3209aa193858ecdf3ebb099d242c25a2da786d66840fcd5906207dba",
+    "/tmp/plow-model-support-checks/qwen-fp8-tma-stages/m1024-stage3.json": "97574daef7656436d36324c650269decc1318fbd29f29b200f23c03e0110dfba",
+    "/tmp/plow-model-support-checks/qwen-fp8-tma-stages/m1024-stage2.json": "cfa414801b67cd7f800ccdf4b077c56d983fe6a86d77329882ddd79220ee2b4b",
+    "/tmp/plow-model-support-checks/qwen-fp8-tma-stages/m4096-stage3.json": "4704e557e9d015ccde1a2c5c7fcfb05af149569d9a3f94e90e7953532e3d93d4",
+    "/tmp/plow-model-support-checks/qwen-fp8-tma-stages/m4096-stage2.json": "720e5d11fe781de521cbf2674219bdb708ecbcfdef62a9860ba9df6474aabf9e",
+    "/tmp/plow-model-support-checks/qwen-fp8-tma-stages/m8192-stage3.json": "13cc3eddc02871329ba416823e6bbad4ef517691e981d4409340db18febd3c91",
+    "/tmp/plow-model-support-checks/qwen-fp8-tma-stages/m8192-stage2.json": "d3e2a30190f1181fe8982703d4ab8cf6cdfc9a71e82756c5918f2a1eb29e9687"
+  }
+}

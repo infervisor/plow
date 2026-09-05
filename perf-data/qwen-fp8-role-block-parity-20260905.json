@@ -1,0 +1,259 @@
+{
+  "binary": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/bin/block_run-empty-range-fix",
+  "binary_sha256": "ee9863904e87c3c51c67d3546650ad114c42e158044c204939d1b222fa3aeda8",
+  "scope": "Fresh synthetic hidden input, one exact prefill bucket; output parity only, no HF/state/continuation qualification",
+  "cases": [
+    {
+      "layer": 0,
+      "M": 1024,
+      "mode": "coarse",
+      "finite": true,
+      "shape": [
+        1024,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "d5087af24aee865ccf92253436d0f9388ae4239ead00b63314af4778e9ea96ee",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer0-coarse-m1024-fixed.log"
+    },
+    {
+      "layer": 0,
+      "M": 1024,
+      "mode": "isolated",
+      "finite": true,
+      "shape": [
+        1024,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "d5087af24aee865ccf92253436d0f9388ae4239ead00b63314af4778e9ea96ee",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer0-isolated-m1024-fixed.log"
+    },
+    {
+      "layer": 0,
+      "M": 1024,
+      "mode": "role",
+      "finite": true,
+      "shape": [
+        1024,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "d5087af24aee865ccf92253436d0f9388ae4239ead00b63314af4778e9ea96ee",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer0-role-m1024-fixed.log"
+    },
+    {
+      "layer": 0,
+      "M": 4096,
+      "mode": "coarse",
+      "finite": true,
+      "shape": [
+        4096,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "0cecaa73d971d34ab5f93ef6dee6a3d523a525036aba57bd4e316750dcb7ca7d",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer0-coarse-m4096-fixed.log"
+    },
+    {
+      "layer": 0,
+      "M": 4096,
+      "mode": "isolated",
+      "finite": true,
+      "shape": [
+        4096,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "0cecaa73d971d34ab5f93ef6dee6a3d523a525036aba57bd4e316750dcb7ca7d",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer0-isolated-m4096-fixed.log"
+    },
+    {
+      "layer": 0,
+      "M": 4096,
+      "mode": "role",
+      "finite": true,
+      "shape": [
+        4096,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "0cecaa73d971d34ab5f93ef6dee6a3d523a525036aba57bd4e316750dcb7ca7d",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer0-role-m4096-fixed.log"
+    },
+    {
+      "layer": 0,
+      "M": 8192,
+      "mode": "coarse",
+      "finite": true,
+      "shape": [
+        8192,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "a67d0e7abcb7bd22deb6fe6bc5d449540e83b00a36ba5351718d425feb68a1b9",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer0-coarse-m8192-fixed.log"
+    },
+    {
+      "layer": 0,
+      "M": 8192,
+      "mode": "isolated",
+      "finite": true,
+      "shape": [
+        8192,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "a67d0e7abcb7bd22deb6fe6bc5d449540e83b00a36ba5351718d425feb68a1b9",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer0-isolated-m8192-fixed.log"
+    },
+    {
+      "layer": 0,
+      "M": 8192,
+      "mode": "role",
+      "finite": true,
+      "shape": [
+        8192,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "a67d0e7abcb7bd22deb6fe6bc5d449540e83b00a36ba5351718d425feb68a1b9",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer0-role-m8192-fixed.log"
+    },
+    {
+      "layer": 3,
+      "M": 1024,
+      "mode": "coarse",
+      "finite": true,
+      "shape": [
+        1024,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "a8b8fb927a7f8a3eb112dcd4fc63a0b6e732d7eee2bbbd52250ca2479eb293db",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer3-coarse-m1024-fixed.log"
+    },
+    {
+      "layer": 3,
+      "M": 1024,
+      "mode": "isolated",
+      "finite": true,
+      "shape": [
+        1024,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "a8b8fb927a7f8a3eb112dcd4fc63a0b6e732d7eee2bbbd52250ca2479eb293db",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer3-isolated-m1024-fixed.log"
+    },
+    {
+      "layer": 3,
+      "M": 1024,
+      "mode": "role",
+      "finite": true,
+      "shape": [
+        1024,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "a8b8fb927a7f8a3eb112dcd4fc63a0b6e732d7eee2bbbd52250ca2479eb293db",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer3-role-m1024-fixed.log"
+    },
+    {
+      "layer": 3,
+      "M": 4096,
+      "mode": "coarse",
+      "finite": true,
+      "shape": [
+        4096,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "63be3be552cba67f82a280531ca02a1a919f58fbbdd10938667555ddbe529d77",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer3-coarse-m4096-fixed.log"
+    },
+    {
+      "layer": 3,
+      "M": 4096,
+      "mode": "isolated",
+      "finite": true,
+      "shape": [
+        4096,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "63be3be552cba67f82a280531ca02a1a919f58fbbdd10938667555ddbe529d77",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer3-isolated-m4096-fixed.log"
+    },
+    {
+      "layer": 3,
+      "M": 4096,
+      "mode": "role",
+      "finite": true,
+      "shape": [
+        4096,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "63be3be552cba67f82a280531ca02a1a919f58fbbdd10938667555ddbe529d77",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer3-role-m4096-fixed.log"
+    },
+    {
+      "layer": 3,
+      "M": 8192,
+      "mode": "coarse",
+      "finite": true,
+      "shape": [
+        8192,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "844ebac6fea468af639ea06467fa22bba607aa1c354ff4ac3121c0fc45405efb",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer3-coarse-m8192-fixed.log"
+    },
+    {
+      "layer": 3,
+      "M": 8192,
+      "mode": "isolated",
+      "finite": true,
+      "shape": [
+        8192,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "844ebac6fea468af639ea06467fa22bba607aa1c354ff4ac3121c0fc45405efb",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer3-isolated-m8192-fixed.log"
+    },
+    {
+      "layer": 3,
+      "M": 8192,
+      "mode": "role",
+      "finite": true,
+      "shape": [
+        8192,
+        5120
+      ],
+      "bit_exact_coarse": true,
+      "max_abs_coarse": 0.0,
+      "output_sha256": "844ebac6fea468af639ea06467fa22bba607aa1c354ff4ac3121c0fc45405efb",
+      "log": "/tmp/plow-model-support-checks/qwen-fp8-role-31c2185/layer3-role-m8192-fixed.log"
+    }
+  ]
+}

@@ -216,6 +216,81 @@ fn shared_prefix_token_identity_and_dedup() {
     }
 }
 
+#[test]
+fn live_kv_matches_flat_without_prefix_reuse() {
+    let Some(assets) = gated() else { return };
+    let _env = common::env_guard();
+    let _config = common::EnvScope::set(&[
+        ("PLOW_VMM_PREFIX", "0"),
+        ("PLOW_PREFIX_CACHE", "0"),
+        ("PLOW_VMM_LIVE", "0"),
+        ("PLOW_VMM_BLOCK_MIB", "2"),
+        ("PLOW_KV_POOL_MIB", "0"),
+    ]);
+    let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
+    let ckpt = assets.join("checkpoint");
+    let contexts = [8192, 32768, 8193, 8192];
+    let mut reference: Vec<(Vec<u32>, Vec<Vec<u32>>)> = Vec::new();
+    let mut load_bytes = Vec::new();
+    for live in [false, true] {
+        std::env::set_var("PLOW_VMM_LIVE", if live { "1" } else { "0" });
+        let mut engine = GpuEngine::load(Arc::clone(&be), &assets, &ckpt).expect("load");
+        assert_eq!(engine.batch(), 1, "use a B1 packet for the live KV gate");
+        assert!(engine.has_prefill() && engine.max_ctx() >= 32784);
+        load_bytes.push(used(&be));
+        eprintln!("live={live} load_bytes={}", load_bytes.last().unwrap());
+        for (case, &ctx) in contexts.iter().enumerate() {
+            let prompt: Vec<u32> = (0..ctx).map(|i| 100 + (i % 1000) as u32).collect();
+            engine.begin_slot(0, ctx + 5).expect("reset");
+            let mut token = engine.prefill_slot(0, &prompt).expect("prefill");
+            let mut tokens = vec![token];
+            let mut rows = Vec::new();
+            let mut logits = Vec::new();
+            let mut decoded = Vec::new();
+            for step in 0..5 {
+                if step != 0 {
+                    engine
+                        .step_slots(&[(0, token)], &mut decoded)
+                        .expect("decode");
+                    token = decoded[0];
+                    tokens.push(token);
+                }
+                engine.logits_row(0, &mut logits).expect("logits");
+                assert!(
+                    logits.iter().all(|v| v.is_finite()),
+                    "live={live} ctx={ctx}"
+                );
+                rows.push(logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+            }
+            assert_eq!(engine.attached_rows(0), 0);
+            if live {
+                assert_eq!(tokens, reference[case].0, "ctx={ctx} tokens");
+                assert!(rows == reference[case].1, "ctx={ctx} logit bits differ");
+                let stats = engine.vmm_stats().expect("live allocator enabled");
+                assert_eq!(stats.attach_hits + stats.attach_misses, 0);
+                assert_eq!(stats.tokens_attached + stats.blocks_shared_mapped, 0);
+                assert_eq!(stats.cache_blocks + stats.blocks_pooled, 0);
+                eprintln!(
+                    "live={live} ctx={ctx} used_bytes={} stats={stats:?}",
+                    used(&be)
+                );
+            } else {
+                assert!(engine.vmm_stats().is_none());
+                reference.push((tokens, rows));
+                eprintln!("live={live} ctx={ctx} used_bytes={}", used(&be));
+            }
+        }
+        assert!(
+            reference[0] == reference[3],
+            "repeated prompt after reset differs"
+        );
+    }
+    assert!(
+        load_bytes[1] < load_bytes[0],
+        "live KV did not reduce load residency"
+    );
+}
+
 /// Pool-level remap cycle: map, release the sequence (unmap + handle
 /// release), map again at the same VA — the begin_slot path.
 #[test]

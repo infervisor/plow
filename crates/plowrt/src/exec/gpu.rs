@@ -365,13 +365,15 @@ const STAGE: usize = 64 << 20;
 /// the launch loudly (never silent), so a stale value here cannot corrupt.
 const SMEM_PF: u32 = 21312 * 4;
 
-/// VMM prefix-sharing state (`PLOW_VMM_PREFIX=1`): the pool
+/// VMM live allocation or prefix-sharing state: the pool
 /// backing every FULL layer's `kv.{l}.k/v` tensor with per-sequence VA
 /// windows, plus the sliding-ring metadata the boundary snapshots need
 /// (sliding layers stay on cudaMalloc; their last `window` rows are
 /// D2D-copied to/from a snapshot buffer at publish/attach — plan §8).
 struct VmmServe {
     kv: crate::memory::vmm::VmmKv,
+    tensor_tracks: Vec<(usize, u32, u32)>,
+    cache_tensors: Vec<usize>,
     /// Per sliding layer: (devp index of `kv.{l}.k`, of `kv.{l}.v`,
     /// per-slot byte stride). K and V share one stride.
     slide: Vec<(usize, usize, u64)>,
@@ -514,22 +516,31 @@ impl SegmentRoles {
             .filter(|(_, g)| blob.prefill_progs().iter().any(|p| std::ptr::eq(p, *g)))
             .map(|(i, _)| i)
             .collect();
-        value.validate(&blob.progs, &indices)?;
+        value.validate(&blob.progs, &indices, &blob.tensors)?;
         Ok(value)
     }
     fn validate(
         &self,
         programs: &[crate::asset::devblob::DevProg],
         prefill: &[usize],
+        tensors: &[crate::asset::devblob::DevTensor],
     ) -> Result<()> {
-        if self.version != 1 || self.programs.is_empty() || self.objects.keys().any(|&id| id != 1) {
+        if self.version != 1
+            || self.programs.is_empty()
+            || self.objects.keys().any(|&id| !matches!(id, 1 | 2))
+        {
             return Err(RuntimeError::Rejected(
                 "unsupported packet segment roles".into(),
             ));
         }
-        if let Some(object) = self.objects.get(&1) {
+        for (&id, object) in &self.objects {
             let path = std::path::Path::new(&object.file);
-            if object.abi != "fp8_gemm_tma128_v1"
+            let abi = if id == 1 {
+                "fp8_gemm_tma128_v1"
+            } else {
+                "attention_sm90_hd256_v1"
+            };
+            if object.abi != abi
                 || object.file.is_empty()
                 || path
                     .components()
@@ -541,7 +552,7 @@ impl SegmentRoles {
             }
         }
         let mut seen = std::collections::BTreeSet::new();
-        let mut used = false;
+        let mut used = std::collections::BTreeSet::new();
         for p in &self.programs {
             let g = programs.get(p.index).ok_or_else(|| {
                 RuntimeError::Rejected("packet role program index out of bounds".into())
@@ -551,10 +562,10 @@ impl SegmentRoles {
                     "duplicate or non-prefill packet role program".into(),
                 ));
             }
-            fp8_role_segments(g, &p.roles)?;
-            used |= p.roles.contains(&1);
+            packet_role_segments(g, &p.roles, tensors)?;
+            used.extend(p.roles.iter().copied().filter(|&role| role != 0));
         }
-        if used != self.objects.contains_key(&1) {
+        if used != self.objects.keys().copied().collect() {
             return Err(RuntimeError::Rejected(
                 "packet role object declaration does not match use".into(),
             ));
@@ -566,7 +577,7 @@ impl SegmentRoles {
     }
 }
 
-struct Fp8GemmRole {
+struct PacketRole {
     function: KernelFn,
     smem: u32,
     _module: Module,
@@ -575,6 +586,87 @@ struct Fp8GemmRole {
 fn check_fp8_gemm_role(capability: Option<u32>, block: Option<u32>) -> Result<()> {
     if capability != Some(1) || block != Some(BLOCK) {
         return Err(RuntimeError::Rejected("incompatible FP8 GEMM role".into()));
+    }
+    Ok(())
+}
+
+fn check_attention_role(arch: &str, capability: Option<u32>, block: Option<u32>) -> Result<()> {
+    if arch != "sm90a" || capability != Some(1) || block != Some(BLOCK) {
+        return Err(RuntimeError::Rejected(
+            "incompatible HD256 attention role".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attention_role_inst(
+    d: &DevInst64,
+    rows: u32,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<()> {
+    let reject =
+        || RuntimeError::Rejected("unsupported HD256 attention role operands or geometry".into());
+    let prefill = d.op == DevOp::FlashPrefill as u16;
+    let (heads, splits, hd) = if prefill {
+        (d.i[2], d.i[7], d.i[6])
+    } else if d.op == DevOp::FlashMerge as u16 {
+        (d.i[1], d.i[2], d.i[3])
+    } else {
+        return Err(reject());
+    };
+    if rows == 0 || d.i[0] != rows || heads == 0 || splits == 0 || hd != 256 {
+        return Err(reject());
+    }
+    let work = rows.checked_mul(heads).ok_or_else(reject)?;
+    let partials = u64::from(work)
+        .checked_mul(u64::from(splits))
+        .ok_or_else(reject)?;
+    let output_bytes = u64::from(work) * 256 * 2;
+    let partial_bytes = partials.checked_mul(256 * 4).ok_or_else(reject)?;
+    let ml_bytes = partials.checked_mul(8).ok_or_else(reject)?;
+    let extent = |slot: usize, bytes: u64| -> Result<()> {
+        if d.t[slot] == TENSOR_NONE16
+            || tensors
+                .get(d.t[slot] as usize)
+                .is_none_or(|t| t.bytes < bytes)
+        {
+            return Err(reject());
+        }
+        Ok(())
+    };
+    for output in 0..if prefill { 2 } else { 1 } {
+        if (0..if prefill { 5 } else { 3 }).any(|i| i != output && d.t[i] == d.t[output]) {
+            return Err(reject());
+        }
+    }
+    if prefill {
+        if d.i[1] == 0
+            || d.i[3] == 0
+            || heads % d.i[3] != 0
+            || d.t[5..].iter().any(|&t| t != TENSOR_NONE16)
+            || !f32::from_bits(d.fj[0]).is_finite()
+            || rows
+                .div_ceil(64)
+                .checked_mul(heads)
+                .and_then(|v| v.checked_mul(splits))
+                .is_none()
+        {
+            return Err(reject());
+        }
+        let stride = if d.fj[1] == 0 { d.i[1] } else { d.fj[1] };
+        let kv_bytes = u64::from(stride)
+            .checked_mul(u64::from(d.i[3]))
+            .and_then(|bytes| bytes.checked_mul(256 * 2))
+            .ok_or_else(reject)?;
+        extent(0, partial_bytes)?;
+        extent(1, ml_bytes)?;
+        extent(2, output_bytes)?;
+        extent(3, kv_bytes)?;
+        extent(4, kv_bytes)?;
+    } else {
+        extent(0, output_bytes)?;
+        extent(1, partial_bytes)?;
+        extent(2, ml_bytes)?;
     }
     Ok(())
 }
@@ -590,9 +682,16 @@ fn segment_window(arg: &mut DevProgram, base: &DevProgram, seg: usize, role: boo
         };
 }
 
-fn fp8_role_segments(g: &crate::asset::devblob::DevProg, roles: &[u8]) -> Result<Vec<bool>> {
+fn packet_role_segments(
+    g: &crate::asset::devblob::DevProg,
+    roles: &[u8],
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<Vec<u8>> {
     validate_segment_windows(g)?;
-    if roles.len() + 1 != g.gq_seg_ofs.len() || roles.iter().any(|&r| r > 1) {
+    if roles.len() + 1 != g.gq_seg_ofs.len()
+        || roles.iter().any(|&r| r > 2)
+        || (g.packed_prefill_only && roles.contains(&2))
+    {
         return Err(RuntimeError::Rejected(
             "invalid packet segment role count or id".into(),
         ));
@@ -602,25 +701,21 @@ fn fp8_role_segments(g: &crate::asset::devblob::DevProg, roles: &[u8]) -> Result
         let entries = g
             .gq_stream
             .get(bounds[0] as usize..bounds[1] as usize)
-            .ok_or_else(|| RuntimeError::Rejected("invalid FP8 role queue window".into()))?;
+            .ok_or_else(|| RuntimeError::Rejected("invalid packet role queue window".into()))?;
         if entries.is_empty()
             || entries
                 .iter()
                 .any(|e| e.seg as usize != seg || e.inst as usize >= g.insts.len())
         {
             return Err(RuntimeError::Rejected(
-                "invalid FP8 role stream entry".into(),
+                "invalid packet role stream entry".into(),
             ));
         }
-        let fp8 = roles[seg] == 1;
-        if fp8 {
+        let role = roles[seg];
+        if role != 0 {
             let ix = entries[0].inst;
             let d = &g.insts[ix as usize];
-            if d.op != DevOp::GemmFp8 as u16
-                || d.i[0] != g.t
-                || d.i[6] == 0
-                || d.i[7] == 0
-                || entries.iter().any(|e| e.inst != ix)
+            if entries.iter().any(|e| e.inst != ix)
                 || g.gq_stream
                     .iter()
                     .any(|e| (e.inst == ix) != (e.seg as usize == seg))
@@ -629,8 +724,17 @@ fn fp8_role_segments(g: &crate::asset::devblob::DevProg, roles: &[u8]) -> Result
                     .any(|e| (e.inst == ix) != (e.seg as usize == seg))
             {
                 return Err(RuntimeError::Rejected(
-                    "FP8 GEMM role requires complete isolated mapped GEMMs".into(),
+                    "packet role requires one complete isolated instruction".into(),
                 ));
+            }
+            if role == 1 {
+                if d.op != DevOp::GemmFp8 as u16 || d.i[0] != g.t || d.i[6] == 0 || d.i[7] == 0 {
+                    return Err(RuntimeError::Rejected(
+                        "FP8 GEMM role requires mapped GEMMs".into(),
+                    ));
+                }
+            } else {
+                validate_attention_role_inst(d, g.t, tensors)?;
             }
             let mut queue: Vec<_> = entries
                 .iter()
@@ -658,11 +762,11 @@ fn fp8_role_segments(g: &crate::asset::devblob::DevProg, roles: &[u8]) -> Result
             slices.sort_unstable();
             if slices != (0..u32::from(d.blocks)).collect::<Vec<_>>() || queue != stream {
                 return Err(RuntimeError::Rejected(
-                    "FP8 GEMM role queue omits or duplicates packet work".into(),
+                    "packet role queue omits or duplicates packet work".into(),
                 ));
             }
         }
-        selected.push(fp8);
+        selected.push(role);
     }
     Ok(selected)
 }
@@ -703,6 +807,124 @@ impl SegPf {
 mod seg_gemm;
 use seg_gemm::small_gemm_segments;
 
+struct KvTensorMap {
+    tensor: usize,
+    pair: [usize; 2],
+    rows: u32,
+    hd: u32,
+    heads: u32,
+    stride: u64,
+    batch: usize,
+}
+
+fn kv_tensor_maps(
+    tensors: &[crate::asset::devblob::DevTensor],
+    recipes: &[packet::rope::GenTensor],
+    batch: usize,
+) -> Result<Vec<KvTensorMap>> {
+    let mut maps: Vec<KvTensorMap> = Vec::new();
+    for g in recipes
+        .iter()
+        .filter(|g| g.kind == packet::rope::GEN_TMAP_KV_PAIR)
+    {
+        let reject = || {
+            RuntimeError::Rejected(format!(
+                "GEN_TMAP_KV_PAIR tensor {} has invalid targets, extent or geometry",
+                g.tensor
+            ))
+        };
+        let tensor = g.tensor as usize;
+        let pair = [g.aux as usize, g.scale as usize];
+        if batch == 0
+            || g.ctx == 0
+            || g.hd == 0
+            || g.hd % 64 != 0
+            || !g.frac.is_finite()
+            || g.frac < 1.0
+            || g.frac > u32::MAX as f64
+            || g.frac.fract() != 0.0
+            || pair[0] == pair[1]
+            || pair.contains(&tensor)
+            || tensors.get(tensor).is_none_or(|t| t.bytes != 256)
+            || recipes.iter().filter(|r| r.tensor == g.tensor).count() != 1
+            || recipes.iter().any(|r| pair.contains(&(r.tensor as usize)))
+        {
+            return Err(reject());
+        }
+        let heads = g.frac as u32;
+        let stride = u64::from(g.ctx)
+            .checked_mul(u64::from(g.hd))
+            .and_then(|bytes| bytes.checked_mul(u64::from(heads)))
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(reject)?;
+        let bytes = stride.checked_mul(batch as u64).ok_or_else(reject)?;
+        if pair.iter().any(|&id| {
+            tensors
+                .get(id)
+                .is_none_or(|t| t.bytes % batch as u64 != 0 || t.bytes != bytes)
+        }) || maps.iter().any(|map| {
+            map.pair.iter().any(|id| pair.contains(id))
+                && (map.pair != pair || map.rows != g.ctx || map.hd != g.hd || map.heads != heads)
+        }) {
+            return Err(reject());
+        }
+        maps.push(KvTensorMap {
+            tensor,
+            pair,
+            rows: g.ctx,
+            hd: g.hd,
+            heads,
+            stride,
+            batch,
+        });
+    }
+    Ok(maps)
+}
+
+impl KvTensorMap {
+    fn slot_bindings(
+        &self,
+        ptrs: &[u64],
+        slot: usize,
+        descriptor: u64,
+    ) -> Result<[(usize, u64); 3]> {
+        let reject = || RuntimeError::Rejected("invalid per-slot KV tensormap address".into());
+        if slot >= self.batch || descriptor == 0 || descriptor % 128 != 0 {
+            return Err(reject());
+        }
+        let offset = self.stride.checked_mul(slot as u64).ok_or_else(reject)?;
+        let mut bindings = [
+            (self.tensor, descriptor),
+            (self.pair[0], 0),
+            (self.pair[1], 0),
+        ];
+        for (id, address) in &mut bindings[1..] {
+            let base = *ptrs.get(*id).ok_or_else(reject)?;
+            if base == 0 || base % 16 != 0 {
+                return Err(reject());
+            }
+            *address = base.checked_add(offset).ok_or_else(reject)?;
+            address.checked_add(self.stride).ok_or_else(reject)?;
+        }
+        Ok(bindings)
+    }
+
+    fn encode_slot(
+        &self,
+        be: &CudaBackend,
+        ptrs: &[u64],
+        slot: usize,
+        descriptor: &DeviceMem,
+    ) -> Result<[(usize, u64); 3]> {
+        let bindings = self.slot_bindings(ptrs, slot, descriptor.base)?;
+        for (i, &(_, base)) in bindings[1..].iter().enumerate() {
+            let bytes = be.encode_tmap_kv3(base, self.rows, self.hd, self.heads, 32)?;
+            be.upload(descriptor, (i * 128) as u64, &bytes)?;
+        }
+        Ok(bindings)
+    }
+}
+
 struct PrefillBucket {
     /// Chunk size this bucket was compiled for.
     t: u32,
@@ -711,7 +933,7 @@ struct PrefillBucket {
     seg_class: Vec<u8>,
     small_gemm_segments: Vec<bool>,
     qwen_segments: Vec<Option<DevInst64>>,
-    fp8_gemm_segments: Vec<bool>,
+    packet_segment_roles: Vec<u8>,
     /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
     /// Device instruction stream (patched per chunk over `inst_range`).
@@ -1129,7 +1351,7 @@ pub struct GpuEngine {
     /// Segmented-prefill object pair (PLOW_PF_SEG_DIR); None = single-object prefill.
     seg_pf: Option<SegPf>,
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
-    fp8_gemm_role: Option<Fp8GemmRole>,
+    packet_roles: [Option<PacketRole>; 2],
     lt_decode: Vec<Option<LtDecodeRoute>>,
     lt_decode_graph: Option<crate::device::cuda::GraphExec>,
     lt_decode_capture: bool,
@@ -1198,11 +1420,13 @@ pub struct GpuEngine {
     /// bases decode expects. Immutable after load.
     d_tens: DeviceMem,
     /// Per-slot prefill tables (index b-1 = slot b; slot 0 is `d_tens`): the
-    /// same table with every `kv.*` base shifted to that slot's ring, since
-    /// the prefill programs address the cache slot-relative. A per-slot
+    /// same table with KV bases and rank-3 descriptors bound to that slot,
+    /// since the prefill programs address the cache slot-relative. A per-slot
     /// launch selects its table through the kernarg (`tens_slot_base`) —
     /// nothing is rewritten or restored. Empty at B == 1.
     d_tens_slots: Vec<DeviceMem>,
+    /// Rank-3 KV descriptors bind slot-specific addresses and outlive every slot table use.
+    _kv_tmap_slots: Vec<DeviceMem>,
     /// The other decode tables live for the engine's lifetime and are never
     /// re-uploaded; their device pointers are baked into `kernarg`.
     _tables: Vec<DeviceMem>,
@@ -2120,6 +2344,7 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
+        let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let qwen_block = blob
             .section_data_named(&raw, packet::devbuild::SECT_METADATA, "block.json")
             .map(|bytes| serde_json::from_slice::<plow_asset::BlockDescriptor>(bytes))
@@ -2297,7 +2522,21 @@ impl GpuEngine {
 
         // ---- VMM prefix sharing (PLOW_VMM_PREFIX=1; default off) ----
         let vmm = {
-            let run = || Self::vmm_bringup(&be, &blob, checkpoint_dir);
+            let run = || {
+                let config = RuntimeConfig::get();
+                if RuntimeConfig::env_bool_or("PLOW_VMM_LIVE", config.nv.vmm_live) {
+                    if RuntimeConfig::env_bool_or("PLOW_VMM_PREFIX", config.nv.vmm_prefix)
+                        || RuntimeConfig::env_bool_or("PLOW_PREFIX_CACHE", config.nv.prefix_cache)
+                    {
+                        return Err(RuntimeError::Rejected(
+                            "live KV allocation requires prefix caching off".into(),
+                        ));
+                    }
+                    Self::vmm_live_bringup(&be, &blob).map(Some)
+                } else {
+                    Ok(Self::vmm_bringup(&be, &blob, checkpoint_dir))
+                }
+            };
             if let Some(tm) = load_tim.as_mut() {
                 let (v, ms) = tm.phase("vmm_bringup", run);
                 tm.vmm_ms = ms;
@@ -2305,21 +2544,22 @@ impl GpuEngine {
             } else {
                 run()
             }
-        };
+        }?;
 
         // ---- weight slab ----
         // Where a tensor's storage comes from, decided once so the sizing pass
         // and the upload loop cannot disagree about it.
-        let vmm_va_of = |name: &str| -> Option<u64> {
+        let vmm_va_of = |id: usize| -> Option<u64> {
             let v = vmm.as_ref()?;
-            let (l, t) = kv_tensor_name(name)?;
-            v.kv.tensor_va(l, t)
+            let &(_, layer, tensor) = v.tensor_tracks.iter().find(|&&(i, _, _)| i == id)?;
+            v.kv.tensor_va(layer, tensor)
         };
         let slab_bytes: u64 = blob
             .tensors
             .iter()
-            .filter(|td| vmm_va_of(&td.name).is_none())
-            .map(|td| slab_pad(td.bytes))
+            .enumerate()
+            .filter(|(id, _)| vmm_va_of(*id).is_none())
+            .map(|(_, td)| slab_pad(td.bytes))
             .sum();
         // Brought up BEFORE the checkpoint opens: the VMM reserve returns in
         // µs and its mapper then commits pages concurrently with the open,
@@ -2474,7 +2714,8 @@ impl GpuEngine {
         let (mut wb, mut kvb, mut nw) = (0u64, 0u64, 0usize);
         let mut upload_all = || -> Result<()> {
             for (i, td) in blob.tensors.iter().enumerate() {
-                let vmm_va = vmm_va_of(&td.name);
+                let vmm_va = vmm_va_of(i);
+                let packet_cache = vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(&i));
                 let t_alloc =
                     (load_prof && vmm_va.is_none() && matches!(weight_slab, WeightSlab::PerTensor))
                         .then(std::time::Instant::now);
@@ -2502,7 +2743,7 @@ impl GpuEngine {
                     "act.logits" => t_logits = Some(i),
                     _ => {}
                 }
-                if td.name.starts_with("kv.") {
+                if td.name.starts_with("kv.") || packet_cache {
                     kvb += td.bytes;
                 }
                 if packet::names::is_host_filled_table(&td.name) {
@@ -2514,7 +2755,7 @@ impl GpuEngine {
                         td.name
                     )));
                 }
-                if packet::names::is_checkpoint_weight(&td.name) {
+                if !packet_cache && packet::names::is_checkpoint_weight(&td.name) {
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {
                         RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name))
                     })?;
@@ -2594,7 +2835,7 @@ impl GpuEngine {
                         tensor = %td.name, bytes = td.bytes, kind = g.kind,
                         "materialised generated tensor"
                     );
-                } else if vmm_va.is_none() && !td.name.starts_with("kv.") {
+                } else if vmm_va.is_none() && !packet_cache && !td.name.starts_with("kv.") {
                     slab_commit_wait(&weight_slab, mem.base + td.bytes, &mut slab_wait_ms)?;
                     let t_ms = load_prof.then(std::time::Instant::now);
                     be.memset_d8(mem.base, 0, td.bytes as usize)?;
@@ -2828,9 +3069,7 @@ impl GpuEngine {
         // the packet carries in i[6]/i[7] resolves to finished bytes. A TMA-bearing
         // packet on a driver that cannot encode fails HERE, loudly, not on first prefill.
         for g in blob.gen.iter().filter(|g| {
-            g.kind == packet::rope::GEN_TMAP_BF16
-                || g.kind == packet::rope::GEN_TMAP_E4M3
-                || g.kind == packet::rope::GEN_TMAP_KV_PAIR
+            g.kind == packet::rope::GEN_TMAP_BF16 || g.kind == packet::rope::GEN_TMAP_E4M3
         }) {
             let (map, tgt) = (g.tensor as usize, g.aux as usize);
             if tgt >= devp.len() || map >= devp.len() {
@@ -2845,23 +3084,6 @@ impl GpuEngine {
                 devp[map].base % 128 == 0,
                 "tensormap tensor not 128 B aligned"
             );
-            if g.kind == packet::rope::GEN_TMAP_KV_PAIR {
-                // K's rank-3 map at +0, V's at +128; V handle rides in `scale`, kv heads in
-                // `frac` (see GEN_TMAP_KV_PAIR). Box rows = the wgmma arm's BKV = 32.
-                let vtgt = g.scale as usize;
-                if vtgt >= devp.len() {
-                    return Err(RuntimeError::Device(format!(
-                        "GEN_TMAP_KV_PAIR tensor {} V-handle {} out of range",
-                        g.tensor, g.scale
-                    )));
-                }
-                let nkv = g.frac as u32;
-                let kb = be.encode_tmap_kv3(devp[tgt].base, g.ctx, g.hd, nkv, 32)?;
-                let vb = be.encode_tmap_kv3(devp[vtgt].base, g.ctx, g.hd, nkv, 32)?;
-                be.upload(&devp[map], 0, &kb)?;
-                be.upload(&devp[map], 128, &vb)?;
-                continue;
-            }
             let bytes = if g.kind == packet::rope::GEN_TMAP_E4M3 {
                 be.encode_tmap_e4m3(devp[tgt].base, g.ctx, g.hd, g.scale)?
             } else {
@@ -2875,6 +3097,9 @@ impl GpuEngine {
         }
 
         let mut ptrs: Vec<u64> = devp.iter().map(|m| m.base).collect();
+        for map in &kv_maps {
+            map.encode_slot(&be, &ptrs, 0, &devp[map.tensor])?;
+        }
         let pf_handles = pf_bufs.as_ref().map(|(s, r)| {
             let h_slot = ptrs.len() as u32;
             // These runtime-appended handles are patched into u16 wire slots
@@ -3104,7 +3329,11 @@ impl GpuEngine {
             .tensors
             .iter()
             .enumerate()
-            .filter(|(_, td)| td.name.starts_with("kv.") || td.name.starts_with("state.qwen."))
+            .filter(|(id, td)| {
+                td.name.starts_with("kv.")
+                    || td.name.starts_with("state.qwen.")
+                    || vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(id))
+            })
             .map(|(i, td)| (i, td.bytes / batch as u64))
             .collect();
 
@@ -3115,11 +3344,19 @@ impl GpuEngine {
         // tables never change after this point, and decode can never observe
         // a shifted table. A few KiB per slot.
         let mut d_tens_slots: Vec<DeviceMem> = Vec::new();
-        if batch > 1 && !kv_slots.is_empty() {
+        let mut kv_tmap_slots: Vec<DeviceMem> = Vec::new();
+        if batch > 1 && (!kv_slots.is_empty() || !kv_maps.is_empty()) {
             let mut shifted = ptrs.clone();
             for b in 1..batch {
                 for &(i, stride) in &kv_slots {
                     shifted[i] = ptrs[i] + b as u64 * stride;
+                }
+                for map in &kv_maps {
+                    let descriptor = be.alloc(0, 256)?;
+                    for (id, base) in map.encode_slot(&be, &ptrs, b, &descriptor)? {
+                        shifted[id] = base;
+                    }
+                    kv_tmap_slots.push(descriptor);
                 }
                 let mem = be.alloc(0, (shifted.len() * 8) as u64)?;
                 be.upload(&mem, 0, bytemuck::cast_slice(&shifted))?;
@@ -3221,42 +3458,61 @@ impl GpuEngine {
             (None, SMEM_PF, None, Vec::new(), None)
         };
 
-        let fp8_gemm_role = if let Some(object) =
-            segment_roles.as_ref().and_then(|r| r.objects.get(&1))
-        {
+        let mut packet_roles = [None, None];
+        for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
             if prefill.is_empty() || seg_pf.is_some() {
                 return Err(RuntimeError::Rejected(
                     "packet roles require prefill without a legacy role pair".into(),
                 ));
             }
+            if id == 2 && profile.tag != "sm90a" {
+                return Err(RuntimeError::Rejected(
+                    "HD256 attention role requires SM90".into(),
+                ));
+            }
+            let (marker, block, entry, arena) = if id == 1 {
+                (
+                    "plow_fp8_gemm_tma128_abi",
+                    "plow_block_pfgemm",
+                    "_Z19interp_sm90a_pfgemm11PlowProgram",
+                    "plow_arena_bytes_pfgemm",
+                )
+            } else {
+                (
+                    "plow_attention_sm90_hd256_abi",
+                    "plow_block_pffa",
+                    "_Z17interp_sm90a_pffa11PlowProgram",
+                    "plow_arena_bytes_pffa",
+                )
+            };
             let path = assets_dir.join(&object.file);
             let image = std::fs::read(&path)
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
             let module = be.module_load(&image)?;
-            check_fp8_gemm_role(
-                be.module_global_u32(&module, "plow_fp8_gemm_tma128_abi")?,
-                be.module_global_u32(&module, "plow_block_pfgemm")?,
-            )?;
-            let function = be.get_function(&module, "_Z19interp_sm90a_pfgemm11PlowProgram")?;
+            let capability = be.module_global_u32(&module, marker)?;
+            let block = be.module_global_u32(&module, block)?;
+            if id == 1 {
+                check_fp8_gemm_role(capability, block)?;
+            } else {
+                check_attention_role(profile.tag, capability, block)?;
+            }
+            let function = be.get_function(&module, entry)?;
             let smem = be
-                .module_global_u32(&module, "plow_arena_bytes_pfgemm")?
-                .ok_or_else(|| {
-                    RuntimeError::Rejected("FP8 GEMM role lacks arena metadata".into())
-                })?;
+                .module_global_u32(&module, arena)?
+                .filter(|&bytes| bytes > 0)
+                .ok_or_else(|| RuntimeError::Rejected("packet role lacks arena metadata".into()))?;
             be.set_max_dynamic_smem(function, smem)?;
             if be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count() != grid {
                 return Err(RuntimeError::Rejected(
-                    "FP8 GEMM role occupancy must equal packet grid".into(),
+                    "packet role occupancy must equal packet grid".into(),
                 ));
             }
-            Some(Fp8GemmRole {
+            packet_roles[id as usize - 1] = Some(PacketRole {
                 function,
                 smem,
                 _module: module,
-            })
-        } else {
-            None
-        };
+            });
+        }
 
         let qwen_prefill = if prefill
             .iter()
@@ -3280,7 +3536,7 @@ impl GpuEngine {
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
                 if vmm.is_some() {
-                    tracing::warn!("PLOW_PF_BATCH=1 ignored: incompatible with PLOW_VMM_PREFIX=1");
+                    tracing::warn!("PLOW_PF_BATCH=1 ignored: incompatible with VMM KV allocation");
                     None
                 } else {
                     let fused = prefill.iter().find(|b| {
@@ -3354,7 +3610,8 @@ impl GpuEngine {
             batch,
             prefill_buckets = prefill.len(),
             stop_ids = ?stop_ids,
-            vmm_prefix = vmm.is_some(),
+            vmm_prefix = vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse()),
+            vmm_live = vmm.as_ref().is_some_and(|v| !v.kv.prefix_reuse()),
             elapsed_s = t0.elapsed().as_secs_f32(),
             // Was a hardcoded "sm_120" from the sm120-only era. On a Hopper card it
             // printed sm_120 while running the sm90a object, which reads as a
@@ -3425,7 +3682,7 @@ impl GpuEngine {
             f_pf,
             seg_pf,
             qwen_prefill,
-            fp8_gemm_role,
+            packet_roles,
             lt_decode,
             lt_decode_graph: None,
             lt_decode_seed,
@@ -3451,6 +3708,7 @@ impl GpuEngine {
             _d_gq_cursor: d_gq_cursor,
             d_tens,
             d_tens_slots,
+            _kv_tmap_slots: kv_tmap_slots,
             _tables: vec![
                 d_stream,
                 d_sofs,
@@ -3567,6 +3825,42 @@ impl GpuEngine {
             "specialised interpreter paired"
         );
         Ok(())
+    }
+
+    fn vmm_live_bringup(be: &Arc<CudaBackend>, blob: &DevBlob) -> Result<VmmServe> {
+        let layout = crate::memory::vmm::LiveKvLayout::from_blob(blob)?;
+        let config = RuntimeConfig::get();
+        let block_hint =
+            RuntimeConfig::env_parse_or("PLOW_VMM_BLOCK_MIB", config.nv.vmm_block_mib as u64) << 20;
+        let kv = crate::memory::vmm::VmmKv::new_live(
+            Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
+            layout.geometry,
+            block_hint,
+        )?;
+        let tensor_tracks = layout
+            .full_tensors
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, pair)| {
+                pair.iter()
+                    .enumerate()
+                    .map(move |(which, &id)| (id, layer as u32, which as u32))
+            })
+            .collect();
+        Ok(VmmServe {
+            kv,
+            tensor_tracks,
+            cache_tensors: layout.cache_tensors,
+            slide: Vec::new(),
+            slide_scale: Vec::new(),
+            full_scale: Vec::new(),
+            ring: 0,
+            snap_bytes: 0,
+        })
+    }
+
+    fn vmm_prefix_enabled(&self) -> bool {
+        self.vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
     }
 
     /// Bring up VMM prefix sharing when `--vmm-prefix` / `PLOW_VMM_PREFIX=1`
@@ -3734,6 +4028,16 @@ impl GpuEngine {
             cache_cap,
         ) {
             Ok(mut kv) => Some(VmmServe {
+                tensor_tracks: blob
+                    .tensors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, tensor)| {
+                        let (layer, which) = kv_tensor_name(&tensor.name)?;
+                        kv.tensor_va(layer, which).map(|_| (id, layer, which))
+                    })
+                    .collect(),
+                cache_tensors: Vec::new(),
                 kv: {
                     kv.enable_block_pool(crate::memory::vmm::kv_pool_cap_from_env());
                     kv
@@ -4022,7 +4326,9 @@ impl GpuEngine {
     /// windows from the boundary snapshot, and advance the prefill frontier
     /// so the tail (< one sharing block) is recomputed by normal prefill.
     fn vmm_attach(&mut self, b: usize, prompt: &[u32]) -> Result<()> {
-        let Some(v) = &self.vmm else { return Ok(()) };
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+            return Ok(());
+        };
         let Some(a) = v.kv.try_attach(b, prompt)? else {
             return Ok(());
         };
@@ -4084,7 +4390,7 @@ impl GpuEngine {
     /// already mapped, so only the tail goes through per-token decode steps.
     /// A no-op (returns 0) with VMM off or on a warm slot.
     pub fn attach_prompt(&mut self, b: usize, prompt: &[u32]) -> Result<usize> {
-        if self.pos[b] == 0 && self.vmm.is_some() {
+        if self.pos[b] == 0 && self.vmm_prefix_enabled() {
             self.vmm_attach(b, prompt)?;
         }
         Ok(self.pos[b] as usize)
@@ -4156,7 +4462,9 @@ impl GpuEngine {
     /// hold the boundary's window rows (`rows - p_a > ring - window`:
     /// wrapped past, unrecoverable).
     fn vmm_tail_publish(&self, b: usize) {
-        let Some(v) = &self.vmm else { return };
+        let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
+            return;
+        };
         let rows = self.pos[b];
         let toks = &self.seq_tokens[b];
         if rows == 0 || toks.len() != rows as usize {
@@ -4434,7 +4742,9 @@ impl GpuEngine {
         for &(b, tok) in feeds {
             toks.push(self.stage.token(b));
             self.pos[b] += 1;
-            self.seq_tokens[b].push(tok);
+            if self.vmm_prefix_enabled() {
+                self.seq_tokens[b].push(tok);
+            }
         }
         // VMM: hint the pre-mapper so the next block is mapped before the
         // frontier reaches it (map-during-decode is safe — probe [5]).
@@ -4520,7 +4830,9 @@ impl GpuEngine {
                 self.retire_prompt_token(slot, token, toks)?;
             } else {
                 self.pos[slot] += 1;
-                self.seq_tokens[slot].push(token);
+                if self.vmm_prefix_enabled() {
+                    self.seq_tokens[slot].push(token);
+                }
                 if let Some(v) = &self.vmm {
                     v.kv.advise(slot, self.pos[slot]);
                 }
@@ -4672,7 +4984,9 @@ impl GpuEngine {
         toks.clear();
         toks.push(self.stage.token(slot));
         self.pos[slot] += 1;
-        self.seq_tokens[slot].push(token);
+        if self.vmm_prefix_enabled() {
+            self.seq_tokens[slot].push(token);
+        }
         if let Some(v) = &self.vmm {
             v.kv.advise(slot, self.pos[slot]);
         }
@@ -4846,8 +5160,10 @@ impl GpuEngine {
             self.pos[b] += k as u32;
             // Rows written this quantum: the fed token, then the device's own
             // feed chain (the first k-1 produced tokens).
-            self.seq_tokens[b].push(tok);
-            self.seq_tokens[b].extend_from_slice(&out[ri * k..ri * k + (k - 1)]);
+            if self.vmm_prefix_enabled() {
+                self.seq_tokens[b].push(tok);
+                self.seq_tokens[b].extend_from_slice(&out[ri * k..ri * k + (k - 1)]);
+            }
             if let Some(v) = &self.vmm {
                 v.kv.advise(b, self.pos[b]);
             }
@@ -5193,7 +5509,7 @@ impl GpuEngine {
                 .expect("prefill belongs to blob");
             let declared_roles = segment_roles.and_then(|r| r.program(program_index));
             let mut qwen_segments = qwen_prefill_segments(g, &blob.tensors)?;
-            let fp8_gemm_segments = if let Some(p) = declared_roles {
+            let packet_segment_roles = if let Some(p) = declared_roles {
                 if seg_mode {
                     return Err(RuntimeError::Rejected(
                         "packet roles cannot mix with legacy role pair".into(),
@@ -5202,11 +5518,12 @@ impl GpuEngine {
                 if qwen_segments.is_empty() {
                     qwen_segments = vec![None; p.roles.len()];
                 }
-                let selected = fp8_role_segments(g, &p.roles)?;
+                let selected = packet_role_segments(g, &p.roles, &blob.tensors)?;
                 tracing::info!(
                     program_index,
                     launches = p.roles.len(),
-                    gemm_launches = selected.iter().filter(|&&x| x).count(),
+                    gemm_launches = selected.iter().filter(|&&x| x == 1).count(),
+                    attention_launches = selected.iter().filter(|&&x| x == 2).count(),
                     "packet segment roles loaded"
                 );
                 selected
@@ -5370,7 +5687,7 @@ impl GpuEngine {
                 seg_class: seg_class.clone(),
                 small_gemm_segments,
                 qwen_segments,
-                fp8_gemm_segments,
+                packet_segment_roles,
                 kernarg,
                 d_inst,
                 h_inst,
@@ -5474,7 +5791,7 @@ impl GpuEngine {
         }
         // VMM: first chunk of a fresh sequence consults the prefix cache —
         // a hit shares the whole-block prefix and moves the frontier there.
-        if self.pos[b] == 0 && self.vmm.is_some() {
+        if self.pos[b] == 0 && self.vmm_prefix_enabled() {
             self.vmm_attach(b, prompt)?;
         }
         let c0 = self.pos[b] as usize;
@@ -5509,11 +5826,11 @@ impl GpuEngine {
         // and the boundary's sliding-window snapshot into the prefix cache.
         // The consumed prompt also seeds the slot's row-token record so the
         // sequence's GENERATED blocks can publish at the next begin_slot.
-        if self.vmm.is_some() {
+        if self.vmm_prefix_enabled() {
             self.seq_tokens[b].clear();
             self.seq_tokens[b].extend_from_slice(prompt);
         }
-        if let Some(v) = &self.vmm {
+        if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
             let bt = v.kv.block_rows();
             let p_a = (n as u32 / bt) * bt;
             if p_a >= v.kv.geometry().window.max(bt) {
@@ -5660,6 +5977,11 @@ impl GpuEngine {
         // VMM: the bucket writes all tc rows (pad rows write garbage past
         // `real`) — map the chunk's full row span before launching.
         if let Some(v) = &self.vmm {
+            if !v.kv.prefix_reuse() && c0 + tc > self.max_ctx {
+                return Err(RuntimeError::Rejected(
+                    "live KV prefill padding exceeds the reserved context".into(),
+                ));
+            }
             v.kv.ensure_rows(b, ((c0 + tc) as u32).min(self.max_ctx as u32))?;
         }
 
@@ -5764,12 +6086,15 @@ impl GpuEngine {
                         native.launch(tensors, inst.i[0] as usize, &self.stream)?;
                     }
                 }
-                let role = self.fp8_gemm_role.as_ref().filter(|_| {
-                    self.prefill[bi]
-                        .fp8_gemm_segments
-                        .get(seg)
-                        .copied()
-                        .unwrap_or(false)
+                let role_id = self.prefill[bi]
+                    .packet_segment_roles
+                    .get(seg)
+                    .copied()
+                    .unwrap_or(0);
+                let role = role_id.checked_sub(1).map(|id| {
+                    self.packet_roles[id as usize]
+                        .as_ref()
+                        .expect("validated packet role object")
                 });
                 segment_window(&mut arg, &self.prefill[bi].kernarg, seg, role.is_some());
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
@@ -6597,6 +6922,13 @@ impl Drop for GpuEngine {
         for (_, g) in self.seg_graphs.drain() {
             self.be.graph_destroy(g);
         }
+        for role in &mut self.packet_roles {
+            if let Some(role) = role.take() {
+                if let Err(e) = self.be.module_unload(&role._module) {
+                    report(&e, "unload packet role module");
+                }
+            }
+        }
         if let Some(sp) = self.seg_pf.take() {
             if let Some(small) = sp.small_gemm {
                 if let Err(e) = self.be.module_unload(&small._module) {
@@ -6620,6 +6952,14 @@ impl Drop for GpuEngine {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gpu_kv_tmap_tests.rs"]
+mod kv_tmap_tests;
+
+#[cfg(test)]
+#[path = "gpu_attention_role_tests.rs"]
+mod attention_role_tests;
 
 #[cfg(test)]
 mod prefill_patch_tests {
@@ -6782,8 +7122,13 @@ mod recurrent_tests {
             let roles = SegmentRoles::parse(metadata, &blob).unwrap();
             assert_eq!(roles.program(0).unwrap().roles, [0, role, 0]);
             assert_eq!(
-                fp8_role_segments(&blob.progs[0], &roles.program(0).unwrap().roles).unwrap(),
-                [false, role == 1, false]
+                packet_role_segments(
+                    &blob.progs[0],
+                    &roles.program(0).unwrap().roles,
+                    &blob.tensors
+                )
+                .unwrap(),
+                [0, role, 0]
             );
             assert!(qwen_prefill_segments(&blob.progs[0], &[])
                 .unwrap()
@@ -6868,14 +7213,14 @@ mod recurrent_tests {
             gq_seg_ofs: vec![0, 1, 3],
             l2_domains: 0,
         };
-        assert_eq!(fp8_role_segments(&g, &[0, 1]).unwrap(), [false, true]);
-        assert_eq!(fp8_role_segments(&g, &[0, 0]).unwrap(), [false, false]);
+        assert_eq!(packet_role_segments(&g, &[0, 1], &[]).unwrap(), [0, 1]);
+        assert_eq!(packet_role_segments(&g, &[0, 0], &[]).unwrap(), [0, 0]);
         let control =
             serde_json::json!({"version":1,"objects":{},"programs":[{"index":0,"roles":[0,0]}]});
         let candidate = serde_json::json!({"version":1,"objects":{"1":{"abi":"fp8_gemm_tma128_v1","file":"role.cubin"}},"programs":[{"index":0,"roles":[0,1]}]});
         let validate = |v: serde_json::Value| -> bool {
             serde_json::from_value::<SegmentRoles>(v)
-                .is_ok_and(|r| r.validate(std::slice::from_ref(&g), &[0]).is_ok())
+                .is_ok_and(|r| r.validate(std::slice::from_ref(&g), &[0], &[]).is_ok())
         };
         assert!(validate(control.clone()));
         assert!(validate(candidate.clone()));
@@ -6910,19 +7255,19 @@ mod recurrent_tests {
         bad["objects"] = serde_json::json!({"2":{"abi":"fp8_gemm_tma128_v1","file":"role.cubin"}});
         assert!(!validate(bad));
         g.gq_stream[2].inst = 0;
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
         g.gq_stream[2].inst = 1;
         g.gq_stream[2].slice = 0;
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
         g.gq_stream[2].slice = 1;
         g.stream.pop();
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
         g.stream = g.gq_stream.clone();
         g.insts[1].i[6] = 0;
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
         g.insts[1].i[6] = 1;
         g.gq_seg_ofs = vec![0, 3];
-        assert!(fp8_role_segments(&g, &[0, 1]).is_err());
+        assert!(packet_role_segments(&g, &[0, 1], &[]).is_err());
     }
 
     #[test]

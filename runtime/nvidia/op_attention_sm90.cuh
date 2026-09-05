@@ -66,6 +66,10 @@
  * (the buffer index is a parity flip, not a modulo ring) — this is a layout constant, not a knob. */
 #define FA_SM90_NS 2
 
+#ifndef PLOW_NV_FA_SPLIT_OUTER
+#define PLOW_NV_FA_SPLIT_OUTER 0
+#endif
+
 /* Which <HD,BQ,BKV> instantiations take the wgmma arm. BQ must be the wgmma m64; HD must split
  * into an even number of n64 tiles (one half per warpgroup); BKV=32 is the n32 score tile and the
  * width of the swizzle-0 Ps tile. Today this is exactly d_flash_prefill_mux<256,64,32>, the
@@ -631,9 +635,20 @@ __device__ void d_flash_prefill_sm90(float* __restrict__ Opart, float* __restric
             qoff = (size_t)rq0 * n_head * HD;
             kvoff = (size_t)slot * n_kv_head * (size_t)kv_stride * HD;
         } else {
-            sp = witem % nsplit;
-            h = (witem / nsplit) % n_head;
-            q0 = (witem / (nsplit * n_head)) * BQ;
+#if PLOW_NV_FA_SPLIT_OUTER
+            if constexpr (HD == 256 && BQ == 64 && BKV == 32) {
+                const unsigned head_tiles = ((seq_q + BQ - 1) / BQ) * n_head;
+                sp = witem / head_tiles;
+                const unsigned qh = witem % head_tiles;
+                h = qh % n_head;
+                q0 = (qh / n_head) * BQ;
+            } else
+#endif
+            {
+                sp = witem % nsplit;
+                h = (witem / nsplit) % n_head;
+                q0 = (witem / (nsplit * n_head)) * BQ;
+            }
         }
         const unsigned hkv = h / gqa;
 

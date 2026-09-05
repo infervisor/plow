@@ -109,9 +109,8 @@ pub trait VmmOps: Send + Sync {
     }
 }
 
-/// KV geometry of the model the engine loaded, resolved from the checkpoint's
-/// `config.json` (the blob carries only names+bytes) and validated against
-/// the blob's tensor sizes before VMM is enabled.
+/// Uniform full-KV allocation geometry. Prefix mode resolves checkpoint
+/// metadata; live allocation validates packet operands with [`LiveKvLayout`].
 #[derive(Clone, Debug)]
 pub struct VmmGeometry {
     /// Layer indices with full attention (VMM-backed).
@@ -206,6 +205,264 @@ impl VmmGeometry {
     /// One token row's bytes in a full-layer head window.
     pub fn row_bytes(&self) -> u64 {
         self.hd_full as u64 * self.elem as u64
+    }
+}
+
+pub struct LiveKvLayout {
+    pub geometry: VmmGeometry,
+    /// Synthetic allocator track index → actual packet K/V handles.
+    pub full_tensors: Vec<[usize; 2]>,
+    pub cache_tensors: Vec<usize>,
+}
+
+impl LiveKvLayout {
+    pub fn from_blob(blob: &crate::asset::devblob::DevBlob) -> Result<Self> {
+        use packet::dev::{DevOp, TENSOR_NONE16};
+        use std::collections::BTreeMap;
+
+        let reject = |reason: &str| RuntimeError::Rejected(format!("live KV: {reason}"));
+        let batch = blob.decode_prog()?.t;
+        let position = blob
+            .tensors
+            .iter()
+            .position(|t| t.name == "in.pos")
+            .ok_or_else(|| reject("missing runtime position tensor"))?;
+        let max_ctx = u32::try_from(blob.tensors[position].bytes / 4)
+            .ok()
+            .filter(|&n| n > 0 && blob.tensors[position].bytes == n as u64 * 4)
+            .ok_or_else(|| reject("invalid position capacity"))?;
+        let kv_length = blob
+            .tensors
+            .iter()
+            .position(|t| t.name == "in.kvlen")
+            .filter(|&id| blob.tensors[id].bytes == batch as u64 * 4)
+            .ok_or_else(|| reject("invalid runtime KV length tensor"))?;
+        // (K,V) → (heads, dimension, stride, window, mask). Decode rung width
+        // changes the active slots, never the allocation's batch stride.
+        let mut caches = BTreeMap::new();
+        for inst in &blob.decode_prog()?.insts {
+            if inst.op != DevOp::FlashDecode as u16 {
+                continue;
+            }
+            let pair = [inst.t[3] as usize, inst.t[4] as usize];
+            let shape = (inst.i[2], inst.i[6], inst.i[3], inst.i[4], inst.i[7]);
+            let (heads, hd, stride, window, mask) = shape;
+            if pair[0] == pair[1]
+                || pair.contains(&position)
+                || pair.contains(&kv_length)
+                || heads == 0
+                || !matches!(hd, 256 | 512)
+                || stride == 0
+                || inst.i[0] != batch
+                || (window == 0 && (stride != max_ctx || mask != u32::MAX))
+                || (window != 0
+                    && (!stride.is_power_of_two() || window > stride || mask != stride - 1))
+            {
+                return Err(reject("unsupported decode cache geometry"));
+            }
+            let bytes = (batch as u64)
+                .checked_mul(heads as u64)
+                .and_then(|n| n.checked_mul(stride as u64))
+                .and_then(|n| n.checked_mul(hd as u64 * 2))
+                .ok_or_else(|| reject("cache size overflow"))?;
+            for &id in &pair {
+                let tensor = blob
+                    .tensors
+                    .get(id)
+                    .ok_or_else(|| reject("invalid cache handle"))?;
+                if tensor.bytes != bytes || tensor.init.is_some() {
+                    return Err(reject(
+                        "cache must be uninitialized BF16 with exact declared extent",
+                    ));
+                }
+            }
+            if caches.insert(pair, shape).is_some() {
+                return Err(reject("repeated cache pair in widest decode program"));
+            }
+        }
+        let mut full_tensors = Vec::new();
+        let mut full_shape = None;
+        let mut cache_tensors = Vec::new();
+        for (&pair, &(heads, hd, _, window, _)) in &caches {
+            for id in pair {
+                if cache_tensors.contains(&id) {
+                    return Err(reject("aliased cache pairs"));
+                }
+                cache_tensors.push(id);
+            }
+            if window == 0 {
+                if full_shape.is_some_and(|shape| shape != (heads, hd)) {
+                    return Err(reject("full caches require uniform head geometry"));
+                }
+                full_shape = Some((heads, hd));
+                full_tensors.push(pair);
+            }
+        }
+        let (kvh_full, hd_full) = full_shape.ok_or_else(|| reject("no supported full KV cache"))?;
+        let mut kv_maps = BTreeMap::new();
+        for generated in &blob.gen {
+            if cache_tensors.contains(&(generated.tensor as usize)) {
+                return Err(reject("cache has generated contents"));
+            }
+            if generated.kind == packet::rope::GEN_TMAP_KV_PAIR {
+                let pair = [generated.aux as usize, generated.scale as usize];
+                let &(heads, hd, stride, _, _) = caches
+                    .get(&pair)
+                    .ok_or_else(|| reject("KV tensormap targets an unknown cache pair"))?;
+                if generated.ctx != stride
+                    || generated.hd != hd
+                    || generated.frac != heads as f64
+                    || stride % 32 != 0
+                    || blob
+                        .tensors
+                        .get(generated.tensor as usize)
+                        .is_none_or(|tensor| tensor.bytes != 256)
+                    || kv_maps.insert(generated.tensor as usize, pair).is_some()
+                {
+                    return Err(reject(
+                        "KV tensormap geometry conflicts with attention packets",
+                    ));
+                }
+            } else if matches!(
+                generated.kind,
+                packet::rope::GEN_TMAP_BF16 | packet::rope::GEN_TMAP_E4M3
+            ) && cache_tensors.contains(&(generated.aux as usize))
+            {
+                return Err(reject("unsupported indirect cache access"));
+            }
+        }
+        let prefill_count = blob.prefill_progs().len();
+        for (program_index, program) in blob.progs.iter().enumerate() {
+            let prefill = program_index < prefill_count;
+            if program.packed_prefill_only || program.t == 0 || program.t > max_ctx {
+                return Err(reject("unsupported program row contract"));
+            }
+            let mut reads = BTreeMap::new();
+            let mut writes = BTreeMap::new();
+            for (ix, inst) in program.insts.iter().enumerate() {
+                let op = DevOp::from_u16(inst.op).ok_or_else(|| reject("unknown opcode"))?;
+                // Only audited direct-operand packet families. Other modes can carry
+                // hidden cache handles or different frontier/addressing contracts.
+                if !matches!(
+                    op,
+                    DevOp::Nop
+                        | DevOp::RmsNorm
+                        | DevOp::RowRms
+                        | DevOp::HeadNormRope
+                        | DevOp::Residual
+                        | DevOp::Glu
+                        | DevOp::Gemm
+                        | DevOp::GemmNorm
+                        | DevOp::Gemv
+                        | DevOp::FlashPrefill
+                        | DevOp::FlashDecode
+                        | DevOp::FlashMerge
+                        | DevOp::NormResidual
+                        | DevOp::NormResidualNorm
+                        | DevOp::AddNorm
+                        | DevOp::GemmGlu
+                        | DevOp::GemvGlu
+                        | DevOp::GemvQkv
+                        | DevOp::Embed
+                        | DevOp::Argmax
+                        | DevOp::ArgmaxFin
+                        | DevOp::SoftCap
+                ) {
+                    return Err(reject(&format!("unsupported opcode {op:?}")));
+                }
+                if matches!(op, DevOp::FlashDecode | DevOp::FlashPrefill) {
+                    let pair = [inst.t[3] as usize, inst.t[4] as usize];
+                    let &(heads, hd, stride, window, mask) = caches
+                        .get(&pair)
+                        .ok_or_else(|| reject("cache pair changes across programs"))?;
+                    let query_heads = inst.i[if prefill { 2 } else { 1 }];
+                    if query_heads == 0 || query_heads % heads != 0 {
+                        return Err(reject("query heads must group evenly onto KV heads"));
+                    }
+                    let valid = if prefill {
+                        op == DevOp::FlashPrefill
+                            && inst.t[6] == TENSOR_NONE16
+                            && (inst.t[7] == TENSOR_NONE16
+                                || kv_maps.get(&(inst.t[7] as usize)) == Some(&pair))
+                            && inst.i[0] == program.t
+                            && inst.i[1] == program.t
+                            && inst.i[3] == heads
+                            && inst.i[4] == 0
+                            && inst.i[5] == window
+                            && inst.i[6] == hd
+                            && inst.fj[1] == stride
+                            && inst.fj[2] == mask
+                    } else {
+                        op == DevOp::FlashDecode
+                            && inst.t[5] as usize == kv_length
+                            && inst.i[0] == program.t
+                            && (inst.i[2], inst.i[6], inst.i[3], inst.i[4], inst.i[7])
+                                == (heads, hd, stride, window, mask)
+                    };
+                    if !valid || reads.insert(pair, ()).is_some() {
+                        return Err(reject("conflicting attention reader geometry"));
+                    }
+                }
+                for (slot, &tensor) in inst.t.iter().enumerate() {
+                    let id = tensor as usize;
+                    if kv_maps.contains_key(&id) && !(op == DevOp::FlashPrefill && slot == 7) {
+                        return Err(reject("unsupported KV tensormap operand access"));
+                    }
+                    if !cache_tensors.contains(&id) {
+                        continue;
+                    }
+                    match op {
+                        DevOp::FlashDecode | DevOp::FlashPrefill if slot == 3 || slot == 4 => {}
+                        DevOp::HeadNormRope if slot == 0 => {
+                            let (_, &(heads, hd, stride, _, mask)) =
+                                caches.iter().find(|(pair, _)| pair.contains(&id)).unwrap();
+                            let legacy_patch = program_index + 1 == blob.progs.len()
+                                && program.t == 1
+                                && blob.kvrow.contains(&(ix as u32));
+                            if inst.i[0] != program.t
+                                || inst.i[1] != heads
+                                || inst.i[2] != hd
+                                || inst.i[3] != 0
+                                || inst.fj[1] != stride
+                                || inst.fj[2] != mask
+                                || inst.t[5] as usize != position
+                                || inst.t[7] != TENSOR_NONE16
+                                || (prefill && inst.i[6] != 0)
+                                || (!prefill
+                                    && inst.i[6] != program.t
+                                    && !(inst.i[6] == 0 && legacy_patch))
+                                || writes.insert(id, ()).is_some()
+                            {
+                                return Err(reject("unsupported cache writer or position patch"));
+                            }
+                        }
+                        _ => return Err(reject("unsupported cache operand access")),
+                    }
+                }
+            }
+            if reads.len() != caches.len() || writes.len() != cache_tensors.len() {
+                return Err(reject(
+                    "every program must read and write the same cache set",
+                ));
+            }
+        }
+        Ok(Self {
+            geometry: VmmGeometry {
+                full_layers: (0..full_tensors.len() as u32).collect(),
+                kvh_full,
+                hd_full,
+                slide_layers: Vec::new(),
+                kvh_slide: 0,
+                hd_slide: 0,
+                window: 0,
+                elem: 2,
+                elem_slide: 2,
+                max_ctx,
+                batch,
+            },
+            full_tensors,
+            cache_tensors,
+        })
     }
 }
 
@@ -347,6 +604,7 @@ struct Shared {
 /// reservations, the physical block slab, the radix cache and the pre-mapper
 /// thread. Everything is reclaimed on Drop (the lifecycle-test contract).
 pub struct VmmKv {
+    prefix_reuse: bool,
     shared: Arc<Shared>,
     premap_tx: Option<std::sync::mpsc::Sender<(u32, u32)>>,
     premap_join: Option<std::thread::JoinHandle<()>>,
@@ -370,6 +628,24 @@ impl VmmKv {
         geo: VmmGeometry,
         block_hint: u64,
         cache_cap: u64,
+    ) -> Result<Self> {
+        Self::new_with_policy(ops, geo, block_hint, cache_cap, true)
+    }
+
+    pub fn new_live(ops: Arc<dyn VmmOps>, geo: VmmGeometry, block_hint: u64) -> Result<Self> {
+        Self::new_with_policy(ops, geo, block_hint, 0, false)
+    }
+
+    pub fn prefix_reuse(&self) -> bool {
+        self.prefix_reuse
+    }
+
+    fn new_with_policy(
+        ops: Arc<dyn VmmOps>,
+        geo: VmmGeometry,
+        block_hint: u64,
+        cache_cap: u64,
+        prefix_reuse: bool,
     ) -> Result<Self> {
         let gran = ops.granularity()?;
         let row_bytes = geo.row_bytes();
@@ -488,6 +764,7 @@ impl VmmKv {
             "vmm kv pool up (full layers VMM-backed, sliding on cudaMalloc)"
         );
         Ok(VmmKv {
+            prefix_reuse,
             shared,
             premap_tx: Some(tx),
             premap_join: Some(join),
@@ -613,6 +890,9 @@ impl VmmKv {
     /// blocks are multi-mapped (refcounted) and the snapshot handle returned.
     /// On miss the prompt's hashes are still recorded for `publish`.
     pub fn try_attach(&self, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
+        if !self.prefix_reuse {
+            return Ok(None);
+        }
         let s = &self.shared;
         let hashes = hash_blocks(prompt, s.block_rows);
         let aligned = &prompt[..hashes.len() * s.block_rows as usize];
@@ -813,6 +1093,11 @@ impl VmmKv {
         snap_bytes: u64,
         fill: impl FnOnce(u64) -> Result<()>,
     ) -> Result<()> {
+        if !self.prefix_reuse {
+            return Err(RuntimeError::Rejected(
+                "live KV allocation cannot publish prefixes".into(),
+            ));
+        }
         let s = &self.shared;
         let hashes = hash_blocks(tokens, s.block_rows);
         let aligned = &tokens[..hashes.len() * s.block_rows as usize];
@@ -1402,6 +1687,231 @@ pub fn hash_blocks(prompt: &[u32], block_rows: u32) -> Vec<BlockHash> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, AtomicU64};
+
+    fn live_blob() -> crate::asset::devblob::DevBlob {
+        use crate::asset::devblob::{DevBlob, DevProg, DevTensor};
+        use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
+        let program = |rows, prefill| {
+            let mut insts = Vec::new();
+            for id in [1, 2] {
+                let mut writer = DevInst64 {
+                    op: DevOp::HeadNormRope as u16,
+                    t: [TENSOR_NONE16; 8],
+                    ..Default::default()
+                };
+                writer.t[0] = id;
+                writer.t[5] = 0;
+                writer.i = [rows, 1, 256, 0, 0, 0, if prefill { 0 } else { rows }, 0];
+                writer.fj = [0, 1024, u32::MAX];
+                insts.push(writer);
+            }
+            let mut reader = DevInst64 {
+                op: if prefill {
+                    DevOp::FlashPrefill
+                } else {
+                    DevOp::FlashDecode
+                } as u16,
+                t: [TENSOR_NONE16; 8],
+                ..Default::default()
+            };
+            reader.t[3] = 1;
+            reader.t[4] = 2;
+            if !prefill {
+                reader.t[5] = 3;
+            }
+            reader.i = if prefill {
+                [rows, rows, 8, 1, 0, 0, 256, 1]
+            } else {
+                [rows, 8, 1, 1024, 0, 33, 256, u32::MAX]
+            };
+            if prefill {
+                reader.fj = [0, 1024, u32::MAX];
+            }
+            insts.push(reader);
+            DevProg {
+                t: rows,
+                packed_prefill_only: false,
+                n_counter: 0,
+                insts,
+                stream: Vec::new(),
+                stream_ofs: Vec::new(),
+                stream_len: Vec::new(),
+                waits: Vec::new(),
+                succs: Vec::new(),
+                gq_stream: Vec::new(),
+                gq_seg_ofs: Vec::new(),
+                l2_domains: 0,
+            }
+        };
+        DevBlob {
+            n_cu: 1,
+            flags: 0,
+            target: 0,
+            tensors: vec![
+                DevTensor {
+                    name: "in.pos".into(),
+                    bytes: 4096,
+                    init: None,
+                },
+                DevTensor {
+                    name: "cache.key".into(),
+                    bytes: 4 * 1024 * 256 * 2,
+                    init: None,
+                },
+                DevTensor {
+                    name: "cache.value".into(),
+                    bytes: 4 * 1024 * 256 * 2,
+                    init: None,
+                },
+                DevTensor {
+                    name: "in.kvlen".into(),
+                    bytes: 16,
+                    init: None,
+                },
+            ],
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            progs: vec![program(128, true), program(1, false), program(4, false)],
+            sections: Vec::new(),
+            gen: Vec::new(),
+            tp: None,
+        }
+    }
+
+    #[test]
+    fn live_geometry_comes_from_packet_handles_and_all_rungs() {
+        let layout = LiveKvLayout::from_blob(&live_blob()).unwrap();
+        assert_eq!(layout.full_tensors, [[1, 2]]);
+        assert_eq!(layout.cache_tensors, [1, 2]);
+        assert_eq!(layout.geometry.batch, 4);
+        assert_eq!(layout.geometry.max_ctx, 1024);
+        assert_eq!(layout.geometry.kvh_full, 1);
+        assert_eq!(layout.geometry.hd_full, 256);
+        assert_eq!(layout.geometry.full_tensor_bytes(), 4 * 1024 * 256 * 2);
+    }
+
+    #[test]
+    fn live_geometry_rejects_conflicting_or_unbounded_access() {
+        use packet::dev::DevOp;
+        let mutations: &[fn(&mut crate::asset::devblob::DevBlob)] = &[
+            |b| b.tensors[1].bytes /= 2,
+            |b| b.tensors[3].bytes = 4,
+            |b| b.progs[1].insts[2].t[5] = 0,
+            |b| b.progs[1].insts[2].i[1] = 0,
+            |b| b.tensors[2].init = Some(0..1),
+            |b| b.progs[0].insts[2].fj[1] = 512,
+            |b| b.progs[1].insts[2].i[6] = 512,
+            |b| b.progs[1].insts[0].i[6] = 0,
+            |b| b.progs[2].insts[0].fj[2] = 1023,
+            |b| b.progs[0].insts[0].i[6] = 128,
+            |b| b.progs[0].insts[0].t[7] = 0,
+            |b| b.progs[2].insts[2].i[7] = 0,
+            |b| b.progs[2].insts[0].t[1] = 2,
+            |b| {
+                b.progs[1].insts.pop();
+            },
+            |b| b.progs[0].packed_prefill_only = true,
+            |b| b.progs[2].insts[2].op = DevOp::FlashDecodeFp8 as u16,
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut blob = live_blob();
+            mutate(&mut blob);
+            assert!(LiveKvLayout::from_blob(&blob).is_err(), "mutation {i}");
+        }
+    }
+
+    #[test]
+    fn live_geometry_validates_tensormaps_across_batch_sizes() {
+        use crate::asset::devblob::DevTensor;
+        for batch in [1, 4, 16] {
+            let fixture = || {
+                let mut blob = live_blob();
+                if batch == 1 {
+                    blob.progs.pop();
+                }
+                let decode = blob.progs.last_mut().unwrap();
+                decode.t = batch;
+                for writer in &mut decode.insts[..2] {
+                    writer.i[0] = batch;
+                    writer.i[6] = batch;
+                }
+                decode.insts[2].i[0] = batch;
+                blob.tensors[3].bytes = u64::from(batch) * 4;
+                for id in [1, 2] {
+                    blob.tensors[id].bytes = u64::from(batch) * 1024 * 256 * 2;
+                }
+                blob.tensors.push(DevTensor {
+                    name: "tmap.cache".into(),
+                    bytes: 256,
+                    init: None,
+                });
+                let mut map = packet::rope::GenTensor::tmap_kv_pair(1, 2, 1024, 256, 1);
+                map.tensor = 4;
+                blob.gen.push(map);
+                blob.progs[0].insts[2].t[7] = 4;
+                blob
+            };
+            let blob = fixture();
+            let layout = LiveKvLayout::from_blob(&blob).unwrap();
+            assert_eq!(layout.geometry.batch, batch);
+            assert_eq!(layout.full_tensors, [[1, 2]]);
+            let mutations: &[fn(&mut crate::asset::devblob::DevBlob)] = &[
+                |b| b.gen[0].ctx = 512,
+                |b| b.gen[0].hd = 128,
+                |b| b.gen[0].frac = 2.0,
+                |b| b.gen[0].scale = 1,
+                |b| b.tensors[4].bytes = 128,
+                |b| b.tensors[1].bytes /= 2,
+                |b| b.progs[0].insts[2].t[7] = 3,
+                |b| {
+                    b.progs.last_mut().unwrap().insts[2].op =
+                        packet::dev::DevOp::FlashDecodeFp8 as u16
+                },
+            ];
+            for (case, mutate) in mutations.iter().enumerate() {
+                let mut invalid = fixture();
+                mutate(&mut invalid);
+                assert!(
+                    LiveKvLayout::from_blob(&invalid).is_err(),
+                    "batch={batch} case={case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_allocator_never_hashes_attaches_or_publishes_and_releases_on_reset() {
+        let ops = Arc::new(MockVmm::default());
+        let geo = uniform_pool(ops.clone()).geometry().clone();
+        let p = VmmKv::new_live(ops.clone(), geo, 64).unwrap();
+        assert!(!p.prefix_reuse());
+        for _ in 0..2 {
+            p.ensure_rows(0, 17).unwrap();
+            p.ensure_rows(1, 9).unwrap();
+            let other_rows = p.mapped_rows(1);
+            assert!(p.try_attach(1, &prompt(17)).unwrap().is_none());
+            assert!(p
+                .publish(0, &prompt(17), 4, |_| panic!("snapshot must not run"))
+                .is_err());
+            let inner = p.shared.inner.lock();
+            assert!(inner.published.is_empty());
+            assert!(inner.node_blocks.is_empty());
+            assert!(inner
+                .seqs
+                .iter()
+                .all(|s| s.hashes.is_empty() && s.tokens.is_empty()));
+            drop(inner);
+            p.begin_seq(0);
+            assert_eq!(p.mapped_rows(0), 0);
+            assert_eq!(p.mapped_rows(1), other_rows);
+            assert!(p.stats().blocks_live > 0);
+            p.begin_seq(1);
+            assert_eq!(p.stats().blocks_live, 0);
+        }
+        assert_eq!(p.stats().attach_hits, 0);
+        assert_eq!(p.stats().attach_misses, 0);
+        assert_eq!(ops.allocs.load(Ordering::SeqCst), 0);
+    }
 
     /// Records every driver call; `fail_creates` makes the next N creates
     /// fail (the OOM path).
