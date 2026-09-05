@@ -112,14 +112,15 @@ mod cuda {
             let pad = (64 - total % 64) % 64;
             hdr.push_str(&" ".repeat(pad));
             hdr.push('\n');
-            let mut f = std::fs::File::create(path)?;
+            let mut f =
+                std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(path)?);
             f.write_all(b"\x93NUMPY\x01\x00")?;
             f.write_all(&(hdr.len() as u16).to_le_bytes())?;
             f.write_all(hdr.as_bytes())?;
             for &v in data {
                 f.write_all(&v.to_le_bytes())?;
             }
-            Ok(())
+            f.flush()
         }
     }
 
