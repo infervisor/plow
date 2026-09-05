@@ -345,34 +345,112 @@ pub fn run_static(
     }
 }
 
-/// Global-queue walk: claim from my domain's window for `seg`, then steal.
-/// Returns when every window of `seg` is exhausted, or on cancel.
-pub fn run_gq(sh: &RunShared<'_>, exec: &dyn Exec, me: &WorkerCtx, parker: &Parker) {
+/// Per-worker GQ state, preallocated at spawn.
+pub struct GqState {
+    /// Claimed entries (indices into `gq.stream`) whose gates were closed.
+    pending: Vec<u32>,
+}
+
+/// Bound on claimed-but-blocked entries per worker. When full the worker waits
+/// on its pending set instead of claiming more.
+pub const GQ_PENDING_CAP: usize = 256;
+
+impl GqState {
+    pub fn new() -> GqState {
+        GqState {
+            pending: Vec::with_capacity(GQ_PENDING_CAP),
+        }
+    }
+}
+
+impl Default for GqState {
+    fn default() -> Self {
+        GqState::new()
+    }
+}
+
+/// Global-queue walk for `seg`. Claims from my domain's window; a claimed entry
+/// whose gates are closed goes to `pending` and the next claim rotates to the
+/// next window, so every window is served even when a domain has no worker of
+/// its own. Waits only when pending is full or every window is drained.
+///
+/// Progress argument: windows are op-major, so the globally earliest unclaimed
+/// entry has every producer already claimed; the earliest claimed-unfired entry
+/// has every producer fired, hence is ready, and its claimant rescans pending
+/// on every iteration. Cancel abandons pending (the host re-zeroes counters and
+/// cursors before the next run).
+pub fn run_gq(
+    st: &mut GqState,
+    sh: &RunShared<'_>,
+    exec: &dyn Exec,
+    me: &WorkerCtx,
+    parker: &Parker,
+) {
     let prog = sh.prog;
     let Some(gq) = prog.gq.as_ref() else {
         return;
     };
+    st.pending.clear();
     let domains = gq.domains.max(1);
     let base = sh.seg as usize * domains as usize;
     let mut d = me.domain % domains;
-    let mut exhausted = 0u32;
-    while exhausted < domains {
-        let w = base + d as usize;
-        let (lo, hi) = (gq.seg_ofs[w], gq.seg_ofs[w + 1]);
-        let idx = lo + sh.cursors[w].fetch_add(1, Ordering::AcqRel);
-        if idx >= hi {
-            // Window drained; cursor stays saturated (host resets per run).
-            exhausted += 1;
-            d = (d + 1) % domains;
+    let mut drained = 0u32; // consecutive windows found exhausted
+    loop {
+        // 1. Fire whatever became ready.
+        let mut k = 0;
+        while k < st.pending.len() {
+            let e = &gq.stream[st.pending[k] as usize];
+            if sh.gates_open(e) {
+                sh.fire(e, exec, me);
+                st.pending.swap_remove(k);
+                if sh.cancelled() {
+                    return;
+                }
+            } else {
+                k += 1;
+            }
+        }
+        // 2. Claim, unless pending is full.
+        let mut claimed = false;
+        if st.pending.len() < GQ_PENDING_CAP && drained < domains {
+            let w = base + d as usize;
+            let (lo, hi) = (gq.seg_ofs[w], gq.seg_ofs[w + 1]);
+            let idx = lo + sh.cursors[w].fetch_add(1, Ordering::AcqRel);
+            if idx < hi {
+                claimed = true;
+                drained = 0;
+                let e = &gq.stream[idx as usize];
+                if sh.gates_open(e) {
+                    sh.fire(e, exec, me);
+                    if sh.cancelled() {
+                        return;
+                    }
+                } else {
+                    st.pending.push(idx);
+                    // Blocked: serve the next window on the next claim.
+                    d = (d + 1) % domains;
+                }
+            } else {
+                drained += 1;
+                d = (d + 1) % domains;
+                continue;
+            }
+        }
+        if claimed {
             continue;
         }
-        exhausted = 0;
-        let e = &gq.stream[idx as usize];
-        if !wait_until(parker, sh.spin_us, || sh.gates_open(e), || sh.cancelled()) {
-            return;
+        if st.pending.is_empty() {
+            return; // every window drained, nothing outstanding
         }
-        sh.fire(e, exec, me);
-        if sh.cancelled() {
+        // 3. Nothing to claim (or pending full): wait for any pending gate.
+        let pending = &st.pending;
+        let ok = wait_until(
+            parker,
+            sh.spin_us,
+            || pending.iter().any(|&i| sh.gates_open(&gq.stream[i as usize])),
+            || sh.cancelled(),
+        );
+        if !ok {
             return;
         }
     }

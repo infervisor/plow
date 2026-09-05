@@ -16,8 +16,8 @@ use crate::exec::cpu::control::{
     Cmd, ControlRing, Feedback, CMD_BARRIER, CMD_CANCEL, CMD_RESET_SLOT, CMD_RUN, CMD_STOP,
 };
 use crate::exec::cpu::interp::{
-    run_gq, run_static, wait_until, Exec, LoadedProgram, Parker, RunShared, StaticState,
-    WorkerCtx,
+    run_gq, run_static, wait_until, Exec, GqState, LoadedProgram, Parker, RunShared,
+    StaticState, WorkerCtx,
 };
 use crate::exec::cpu::topology::{NumaMode, Topology};
 
@@ -339,6 +339,7 @@ fn worker_main(init: WorkerInit, sh: Arc<Shared>, exec: Arc<dyn Exec>) {
         domain: init.node_pos,
     };
     let mut st = StaticState::new(init.cus);
+    let mut gq = GqState::new();
     let mut seen = 0u64;
     let exec: &dyn Exec = &*exec;
     loop {
@@ -368,10 +369,18 @@ fn worker_main(init: WorkerInit, sh: Arc<Shared>, exec: Arc<dyn Exec>) {
                     spin_us: sh.spin_us,
                     cursors: &cursors,
                 };
-                if prog.gq.is_some() {
-                    run_gq(&run, exec, &me, parker);
-                } else {
-                    run_static(&mut st, &run, exec, &me, parker);
+                // A panicking kernel must not kill a persistent worker: record
+                // it as a fault and stay in the loop (release builds abort on
+                // panic anyway; this matters for the Rust test mocks).
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if prog.gq.is_some() {
+                        run_gq(&mut gq, &run, exec, &me, parker);
+                    } else {
+                        run_static(&mut st, &run, exec, &me, parker);
+                    }
+                }));
+                if r.is_err() {
+                    sh.fb.fault(u16::MAX, u32::MAX, init.idx as u16);
                 }
                 sh.fb.done.fetch_add(1, Ordering::AcqRel);
             }

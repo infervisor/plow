@@ -72,7 +72,7 @@ default = []
 # (`runtime/cpu/dev/`, golden / AVX-512 / AMX tiers) built by build.rs and
 # reached through `exec::cpu::ffi`. Real-weight loading (safetensors, tokenizer)
 # joins this feature in P2 — see `plans/cpu-backend.md`.
-cpu = ["dep:cc", "dep:libc"]
+cpu = ["dep:cc", "dep:libc", "dep:safetensors", "hf-tokenizer"]
 # Real Hugging Face tokenizer (loads a model's `tokenizer.json`). Enable this
 # alone for tokenization without pulling the checkpoint/download deps.
 hf-tokenizer = ["dep:tokenizers"]

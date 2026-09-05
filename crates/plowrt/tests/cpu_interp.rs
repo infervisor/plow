@@ -126,6 +126,8 @@ struct Recorder {
     violations: AtomicUsize,
     count: AtomicUsize,
     delay: Duration,
+    /// `insts.as_ptr()` of the program being run, to recover an inst's index.
+    base: AtomicUsize,
 }
 
 impl Recorder {
@@ -140,6 +142,7 @@ impl Recorder {
             violations: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
             delay,
+            base: AtomicUsize::new(0),
         }
     }
     fn reset(&self) {
@@ -175,23 +178,21 @@ impl Recorder {
     /// The interpreter passes `&insts[k]`; recover `k` from the instruction's
     /// address relative to the program's table (set per run via `base`).
     fn locate(&self, inst: &DevInst64) -> usize {
-        let base = BASE.load(Ordering::Acquire) as *const DevInst64;
+        let base = self.base.load(Ordering::Acquire) as *const DevInst64;
         let p = inst as *const DevInst64;
         // SAFETY: both point into the same `insts` Vec of the running program.
         unsafe { p.offset_from(base) as usize }
     }
 }
 
-static BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 fn pool(threads: usize, n_cu: u32, exec: Arc<dyn Exec>) -> WorkerPool {
     let topo = Topology::detect();
     WorkerPool::spawn(&topo, threads, &NumaMode::Off, 20, n_cu, exec)
 }
 
-fn run_once(p: &WorkerPool, prog: &Arc<LoadedProgram>, pool: &Arc<CounterPool>, seg: u32) {
+fn run_once(p: &WorkerPool, prog: &Arc<LoadedProgram>, pool: &Arc<CounterPool>, seg: u32, rec: &Recorder) {
     pool.reset_all();
-    BASE.store(prog.insts.as_ptr() as usize, Ordering::Release);
+    rec.base.store(prog.insts.as_ptr() as usize, Ordering::Release);
     let gen = p.run(prog, seg, pool);
     assert_eq!(p.wait_done(gen), None, "fault");
 }
@@ -236,7 +237,7 @@ fn static_mode_orders_dependencies_on_every_thread_count() {
             let p = pool(threads, 16, rec.clone());
             for _ in 0..20 {
                 rec.reset();
-                run_once(&p, &prog, &ctr, 0);
+                run_once(&p, &prog, &ctr, 0, &rec);
                 assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
             }
             assert_eq!(rec.violations.load(Ordering::Relaxed), 0, "threads={threads}");
@@ -255,7 +256,7 @@ fn threads_fewer_than_cus_does_not_deadlock() {
     let p = pool(2, 16, rec.clone());
     for _ in 0..50 {
         rec.reset();
-        run_once(&p, &prog, &ctr, 0);
+        run_once(&p, &prog, &ctr, 0, &rec);
         assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
     }
     assert_eq!(rec.violations.load(Ordering::Relaxed), 0);
@@ -273,7 +274,7 @@ fn global_queue_two_domains_orders_dependencies() {
         let p = pool(threads, 16, rec.clone());
         for _ in 0..20 {
             rec.reset();
-            run_once(&p, &prog, &ctr, 0);
+            run_once(&p, &prog, &ctr, 0, &rec);
             assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
         }
         assert_eq!(rec.violations.load(Ordering::Relaxed), 0, "threads={threads}");
@@ -296,7 +297,7 @@ fn segments_run_one_at_a_time_with_seg_filter() {
     let p = pool(4, 8, rec.clone());
     rec.reset();
     ctr.reset_all();
-    BASE.store(prog.insts.as_ptr() as usize, Ordering::Release);
+    rec.base.store(prog.insts.as_ptr() as usize, Ordering::Release);
     let g = p.run(&prog, 0, &ctr);
     assert_eq!(p.wait_done(g), None);
     assert_eq!(rec.count.load(Ordering::Relaxed), 8, "only seg 0 ran");
@@ -320,7 +321,7 @@ fn cancel_returns_pool_to_idle_and_next_run_completes() {
     let p = pool(4, 4, rec.clone());
     rec.reset();
     ctr.reset_all();
-    BASE.store(prog.insts.as_ptr() as usize, Ordering::Release);
+    rec.base.store(prog.insts.as_ptr() as usize, Ordering::Release);
     let g = p.run(&prog, 0, &ctr);
     std::thread::sleep(Duration::from_millis(5));
     p.cancel(g);
@@ -329,7 +330,7 @@ fn cancel_returns_pool_to_idle_and_next_run_completes() {
     assert!(partial < 64, "cancel should stop the chain early, ran {partial}");
     // Pool is idle and reusable.
     rec.reset();
-    run_once(&p, &prog, &ctr, 0);
+    run_once(&p, &prog, &ctr, 0, &rec);
     assert_eq!(rec.count.load(Ordering::Relaxed), 64);
     assert_eq!(rec.violations.load(Ordering::Relaxed), 0);
 }
@@ -359,7 +360,7 @@ fn pool_persists_across_many_runs() {
     let p = pool(8, 8, rec.clone());
     for i in 0..1000 {
         rec.reset();
-        run_once(&p, &prog, &ctr, 0);
+        run_once(&p, &prog, &ctr, 0, &rec);
         assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops), "run {i}");
         // Every worker reported done ⇒ every thread is still alive.
         assert_eq!(p.feedback().done.load(Ordering::Acquire), 8);

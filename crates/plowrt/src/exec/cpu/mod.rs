@@ -8,6 +8,8 @@
 //!   build and test without the C library.
 
 #[cfg(feature = "cpu")]
+pub mod engine;
+#[cfg(feature = "cpu")]
 pub mod ffi;
 
 pub mod control;
