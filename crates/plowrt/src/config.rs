@@ -183,11 +183,12 @@ pub struct CpuRuntimeConfig {
     )]
     pub isa: CpuIsa,
 
-    /// Spin budget (µs) before a blocked worker yields/parks.
+    /// Spin budget (µs) before a blocked worker yields/parks. Decode packets are
+    /// 100-500 µs apart; parking on every gap measured +17% TPOT at 50 µs vs 1000.
     #[arg(
         long = "cpu-spin-us",
         env = "PLOW_CPU_SPIN_US",
-        default_value_t = 50,
+        default_value_t = 2000,
         global = true
     )]
     pub spin_us: u32,
