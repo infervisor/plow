@@ -36,7 +36,14 @@ fn main() {
                 }
             }
             "--prompt" => prompt = args.next().unwrap(),
+            "--prompt-file" => prompt = std::fs::read_to_string(args.next().unwrap()).expect("prompt file"),
             // Gemma chat template (text-only subset of chat_template.jinja), as serve/chat.rs builds it.
+            "--chat-file" => {
+                let q = std::fs::read_to_string(args.next().unwrap()).expect("chat file");
+                prompt = format!(
+                    "<bos><start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n"
+                );
+            }
             "--chat" => {
                 let q = args.next().unwrap();
                 prompt = format!(

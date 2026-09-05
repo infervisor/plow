@@ -137,7 +137,7 @@ impl ServeEngine {
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.batch(),
             #[cfg(feature = "cpu")]
-            ServeEngine::Cpu(_) => 1,
+            ServeEngine::Cpu(e) => e.batch(),
         }
     }
 

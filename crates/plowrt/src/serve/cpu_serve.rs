@@ -69,6 +69,11 @@ impl CpuServe {
         &self.decode_rungs
     }
 
+    /// Sequence slots the mux may admit concurrently (the blob's decode batch).
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
     pub fn engine(&self) -> &CpuEngine {
         &self.eng
     }
