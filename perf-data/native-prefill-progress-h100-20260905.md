@@ -54,5 +54,7 @@ setup omitted the segmented prefill directory. It did not test live-KV
 parity or memory savings. Corrected fixture qualification remains required.
 
 Gemma12 vLLM 0.28 repeat 2 completed all 15 cells, 480/480 requests and exact
-input/output lengths. Gemma31's separate BF16 MBNT2048 capacity probe is
-running; its original MBNT8192 startup failure remains recorded.
+input/output lengths. Gemma31's separate BF16 MBNT2048 capacity probe completed 32/32 exact-length
+requests at 32K/C1: TTFT4577.47ms, TPOT24.42ms, output30.02tokens/s. Its
+original MBNT8192 startup failure remains recorded. See the separate
+Gemma31 MBNT2048 CSV and evidence JSON.
