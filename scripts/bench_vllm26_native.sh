@@ -20,6 +20,8 @@
 #   PORT      default 8477
 #   CONCS NPROMPT OUTLEN IN_LENS REPS   as sweep_client.py
 #   CALIB     1 to also run `vllm bench serve` at the same points (default 1)
+#   CALIB_ONLY  1 to run only the vllm bench serve client (default 0)
+#   SERVE_EXTRA_ARGS / BENCH_EXTRA_ARGS  additional vLLM CLI flags
 #
 # PREFIX CACHING defaults OFF, and that is a methodology decision, not a tuning one.
 # sweep_client.py sends the SAME prompt to all NPROMPT requests of a cell (bench_speed.sh
@@ -42,6 +44,7 @@ MAXLEN="${MAXLEN:-4096}"
 MNBT="${MNBT:-8192}"
 GPUMEM="${GPUMEM:-0.85}"
 CALIB="${CALIB:-1}"
+CALIB_ONLY="${CALIB_ONLY:-0}"
 CALIB_CONCS="${CALIB_CONCS:-$CONCS}"
 READY="${READY:-1800}"
 OUTDIR="${OUTDIR:-/tmp/vllm26_$TAG}"
@@ -71,6 +74,7 @@ setsid "$VENV/bin/vllm" serve "$MODEL_DIR" \
   --max-num-batched-tokens "$MNBT" \
   --gpu-memory-utilization "$GPUMEM" \
   "${QARGS[@]}" "${PARGS[@]}" \
+  ${SERVE_EXTRA_ARGS:-} \
   --port "$PORT" > "$LOG" 2>&1 &
 SPID=$!
 SPGID="$(ps -o pgid= "$SPID" 2>/dev/null | tr -d ' ')"
@@ -83,7 +87,7 @@ cleanup() {
 trap 'cleanup; exit 130' INT TERM
 trap 'cleanup' EXIT
 
-echo "starting vLLM 0.26 on :$PORT (quant=$QUANT prefix=$PREFIX)"
+echo "starting vLLM from $VENV on :$PORT (quant=$QUANT prefix=$PREFIX)"
 ok=0
 for _ in $(seq 1 "$READY"); do
   [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health")" = 200 ] \
@@ -100,13 +104,15 @@ grep -oiE "cudagraph (capture|sizes)[^)]*" "$LOG" | tail -3 || true
 grep -oiE "Capturing.*decode.*" "$LOG" | tail -2 || true
 
 # --- arm 1: the plow ladder's own client ---------------------------------------------------
+if [ "$CALIB_ONLY" != 1 ]; then
 BASE_URL="http://127.0.0.1:$PORT" MODEL="$SERVED" TAG="$TAG" \
 IN_LENS="$IN_LENS" CONCS="$CONCS" NPROMPT="$NPROMPT" OUTLEN="$OUTLEN" REPS="$REPS" \
 CSV="$OUTDIR/sweep_client.csv" \
   python3 "$WT/scripts/sweep_client.py" 2>&1 | tee "$OUTDIR/sweep_client.log"
+fi
 
 # --- arm 2: the reference client at the same points ----------------------------------------
-if [ "$CALIB" = 1 ]; then
+if [ "$CALIB" = 1 ] || [ "$CALIB_ONLY" = 1 ]; then
   echo "in_len,conc,ttft_ms,tpot_ms,itl_ms,itl_p99,out_tok_s,ok_reqs,gen_toks" \
     | tee "$OUTDIR/vllm_bench.csv"
   for L in $IN_LENS; do for C in $CALIB_CONCS; do
@@ -117,6 +123,7 @@ if [ "$CALIB" = 1 ]; then
       --model "$SERVED" --tokenizer "$MODEL_DIR" \
       --dataset-name random --random-input-len "$L" --random-output-len "$OUTLEN" \
       --max-concurrency "$C" --num-prompts "$NPROMPT" --ignore-eos \
+      ${BENCH_EXTRA_ARGS:-} \
       > "$b" 2>&1
     python3 - "$L" "$C" "$b" <<'PY' | tee -a "$OUTDIR/vllm_bench.csv"
 import re,sys

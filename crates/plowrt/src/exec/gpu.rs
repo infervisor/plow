@@ -441,6 +441,7 @@ struct PrefillBucket {
     /// Per-segment wave class (8 = GEMM-class, 4 = flash-class) when the program is
     /// wave-class segmented AND the SegPf pair is loaded; empty = single launch.
     seg_class: Vec<u8>,
+    qwen_segments: Vec<Option<DevInst64>>,
     /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
     /// Device instruction stream (patched per chunk over `[inst_lo..=inst_hi]`).
@@ -475,6 +476,320 @@ struct PrefillBucket {
     _tables: Vec<DeviceMem>,
 }
 
+fn qwen_prefill_segments(
+    program: &crate::asset::devblob::DevProg,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<Vec<Option<DevInst64>>> {
+    if !program
+        .insts
+        .iter()
+        .any(|i| i.op == DevOp::QwenGdnPrefill as u16)
+    {
+        return Ok(Vec::new());
+    }
+    if program.l2_domains != 0 || !(1..=8192).contains(&program.t) {
+        return Err(RuntimeError::Rejected(
+            "unsupported Qwen prefill topology".into(),
+        ));
+    }
+    let segments = program
+        .stream
+        .iter()
+        .map(|e| e.seg as usize + 1)
+        .max()
+        .unwrap_or(0);
+    if segments == 0 || segments > 2048 {
+        return Err(RuntimeError::Rejected(
+            "invalid Qwen prefill segment count".into(),
+        ));
+    }
+    if program.gq_seg_ofs.len() != segments + 1
+        || program.gq_seg_ofs.first() != Some(&0)
+        || program.gq_seg_ofs.last().copied() != Some(program.gq_stream.len() as u32)
+    {
+        return Err(RuntimeError::Rejected(
+            "invalid native GDN queue windows".into(),
+        ));
+    }
+    for (seg, bounds) in program.gq_seg_ofs.windows(2).enumerate() {
+        let entries = program
+            .gq_stream
+            .get(bounds[0] as usize..bounds[1] as usize)
+            .ok_or_else(|| RuntimeError::Rejected("invalid native GDN queue range".into()))?;
+        if entries.iter().any(|e| e.seg as usize != seg) {
+            return Err(RuntimeError::Rejected(
+                "native GDN queue crosses segment boundaries".into(),
+            ));
+        }
+    }
+    let mut external = vec![None; segments];
+    for (ix, inst) in program.insts.iter().enumerate() {
+        if inst.op != DevOp::QwenGdnPrefill as u16 {
+            continue;
+        }
+        if inst.i[..5] != [program.t, 16, 48, 128, 128]
+            || !f32::from_bits(inst.fj[0]).is_finite()
+            || (f32::from_bits(inst.fj[0]) - 1.0 / 128_f32.sqrt()).abs() > f32::EPSILON
+        {
+            return Err(RuntimeError::Rejected(
+                "unsupported native GDN geometry".into(),
+            ));
+        }
+        let rows = u64::from(program.t);
+        let required = [
+            rows * 12288,
+            rows * 4096,
+            rows * 4096,
+            rows * 12288,
+            rows * 192,
+            rows * 192,
+            48 * 128 * 128 * 4,
+            48 * 128 * 128 * 4,
+        ];
+        for (&handle, bytes) in inst.t.iter().zip(required) {
+            if tensors.get(handle as usize).is_none_or(|t| t.bytes < bytes) {
+                return Err(RuntimeError::Rejected(
+                    "native GDN tensor is missing or undersized".into(),
+                ));
+            }
+        }
+        let seg = program
+            .stream
+            .iter()
+            .find(|e| e.inst as usize == ix)
+            .ok_or_else(|| {
+                RuntimeError::Rejected("native GDN instruction has no stream entry".into())
+            })?
+            .seg as usize;
+        if program
+            .stream
+            .iter()
+            .any(|e| (e.inst as usize == ix) != (e.seg as usize == seg))
+            || external[seg].is_some()
+        {
+            return Err(RuntimeError::Rejected(
+                "native GDN must occupy one isolated segment".into(),
+            ));
+        }
+        if !program.gq_stream.iter().any(|e| e.inst as usize == ix)
+            || program
+                .gq_stream
+                .iter()
+                .any(|e| (e.inst as usize == ix) != (e.seg as usize == seg))
+        {
+            return Err(RuntimeError::Rejected(
+                "native GDN queue segment is not isolated".into(),
+            ));
+        }
+        external[seg] = Some(*inst);
+    }
+    Ok(external)
+}
+
+struct LtDecodeRoute {
+    plan: Arc<crate::device::cuda::lt::Plan>,
+    input: u64,
+    weight: u64,
+    output: u64,
+}
+
+fn lt_decode_segments(
+    g: &crate::asset::devblob::DevProg,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<Vec<Option<usize>>> {
+    let fail =
+        || RuntimeError::Rejected("Lt decode requires isolated BF16 Qwen GEMV segments".into());
+    if !matches!(g.t, 1 | 4) || g.l2_domains != 0 || g.gq_stream.is_empty() {
+        return Err(fail());
+    }
+    let count = g.gq_seg_ofs.len().checked_sub(1).ok_or_else(fail)?;
+    if count == 0
+        || g.gq_seg_ofs.first() != Some(&0)
+        || g.gq_seg_ofs.last().copied() != Some(g.gq_stream.len() as u32)
+    {
+        return Err(fail());
+    }
+    let mut routes = vec![None; count];
+    for (seg, bounds) in g.gq_seg_ofs.windows(2).enumerate() {
+        let entries = g
+            .gq_stream
+            .get(bounds[0] as usize..bounds[1] as usize)
+            .ok_or_else(fail)?;
+        if entries.is_empty() || entries.iter().any(|e| e.seg as usize != seg) {
+            return Err(fail());
+        }
+        for entry in entries {
+            let ix = entry.inst as usize;
+            let d = g.insts.get(ix).ok_or_else(fail)?;
+            if d.op == DevOp::GemvFp8 as u16 {
+                return Err(fail());
+            }
+            if d.op != DevOp::Gemv as u16 {
+                continue;
+            }
+            let w = tensors.get(d.t[2] as usize).ok_or_else(fail)?;
+            if !w.name.starts_with("model.language_model.layers.") {
+                continue;
+            }
+            if !w.name.ends_with(".weight")
+                || d.i[0] != g.t
+                || d.i[1] == 0
+                || d.i[2] == 0
+                || d.i[3..].iter().any(|&x| x != 0)
+                || entries.iter().any(|e| e.inst as usize != ix)
+                || g.stream
+                    .iter()
+                    .any(|e| (e.inst as usize == ix) != (e.seg as usize == seg))
+            {
+                return Err(fail());
+            }
+            let [m, n, k] = [u64::from(d.i[0]), u64::from(d.i[1]), u64::from(d.i[2])];
+            for (h, need) in [
+                (d.t[0], m * n * 2),
+                (d.t[1], m * k * 2),
+                (d.t[2], n * k * 2),
+            ] {
+                if tensors.get(h as usize).is_none_or(|t| t.bytes < need) {
+                    return Err(fail());
+                }
+            }
+            if d.t[0] == d.t[1] || d.t[0] == d.t[2] {
+                return Err(fail());
+            }
+            routes[seg] = Some(ix);
+        }
+    }
+    if !routes.iter().any(Option::is_some) {
+        return Err(fail());
+    }
+    Ok(routes)
+}
+
+fn lt_counter_seed(
+    g: &crate::asset::devblob::DevProg,
+    routes: &[Option<usize>],
+) -> Result<Vec<u32>> {
+    let fail =
+        || RuntimeError::Rejected("Lt preseed counter graph is not stream-order safe".into());
+    if routes.is_empty() || g.l2_domains != 0 {
+        return Err(fail());
+    }
+    let n = g.n_counter as usize;
+    let mut totals = vec![0u32; n];
+    let mut external = vec![None; n];
+    let mut ordinary = vec![false; n];
+    let mut last_producer = vec![None; n];
+    for e in &g.gq_stream {
+        let seg = e.seg as usize;
+        let route = routes.get(seg).ok_or_else(fail)?;
+        if e.flags & !packet::dev::SE_FINE != 0 || route.is_some_and(|ix| ix != e.inst as usize) {
+            return Err(fail());
+        }
+        let succ = g
+            .succs
+            .get(e.succ_ofs as usize..e.succ_ofs as usize + e.succ_len as usize)
+            .ok_or_else(fail)?;
+        for &id in succ {
+            let id = id as usize;
+            let total = totals.get_mut(id).ok_or_else(fail)?;
+            *total = total.checked_add(1).ok_or_else(fail)?;
+            last_producer[id] = Some(last_producer[id].map_or(seg, |old: usize| old.max(seg)));
+            if route.is_some() {
+                if ordinary[id] || external[id].is_some_and(|old| old != seg) {
+                    return Err(fail());
+                }
+                external[id] = Some(seg);
+            } else {
+                if external[id].is_some() {
+                    return Err(fail());
+                }
+                ordinary[id] = true;
+            }
+        }
+    }
+    for e in &g.gq_stream {
+        let seg = e.seg as usize;
+        let waits = g
+            .waits
+            .get(e.wait_ofs as usize..e.wait_ofs as usize + e.wait_len as usize)
+            .ok_or_else(fail)?;
+        for w in waits {
+            let id = w.id as usize;
+            let total = *totals.get(id).ok_or_else(fail)?;
+            let last = last_producer[id].ok_or_else(fail)?;
+            if w.threshold == 0
+                || w.threshold > total
+                || last > seg
+                || external[id].is_some_and(|producer| producer >= seg)
+                || (routes[seg].is_some() && last >= seg)
+            {
+                return Err(fail());
+            }
+        }
+    }
+    // Only already-ordered external contributions are pre-satisfied. Ordinary
+    // producers retain their counters, including same-window fine dependencies.
+    Ok(totals
+        .into_iter()
+        .enumerate()
+        .map(|(id, total)| if external[id].is_some() { total } else { 0 })
+        .collect())
+}
+
+fn qwen_state_slot(state: &DeviceMem, slot: usize, batch: usize) -> Result<DeviceMem> {
+    const STRIDE: u64 = 48 * 128 * 128 * 4;
+    if batch == 0 || slot >= batch || state.len != batch as u64 * STRIDE {
+        return Err(RuntimeError::Rejected(
+            "invalid Qwen prefill state slot extent".into(),
+        ));
+    }
+    Ok(DeviceMem::view(state.base + slot as u64 * STRIDE, STRIDE))
+}
+
+struct RecurrentState {
+    active: usize,
+    tensors: Vec<(usize, u64)>,
+}
+
+fn recurrent_state_layout(
+    tensors: &[crate::asset::devblob::DevTensor],
+    batch: usize,
+) -> Result<Option<RecurrentState>> {
+    let mut states = Vec::new();
+    for (index, tensor) in tensors.iter().enumerate() {
+        if !tensor.name.starts_with("state.") {
+            continue;
+        }
+        if !tensor.name.starts_with("state.qwen.")
+            || !(tensor.name.ends_with(".conv") || tensor.name.ends_with(".gdn"))
+            || batch == 0
+            || tensor.bytes == 0
+            || tensor.bytes % batch as u64 != 0
+            || tensor.init.is_some()
+        {
+            return Err(RuntimeError::Device(format!(
+                "invalid recurrent state tensor {} for batch {batch}",
+                tensor.name
+            )));
+        }
+        states.push((index, tensor.bytes / batch as u64));
+    }
+    if states.is_empty() {
+        return Ok(None);
+    }
+    let active = tensors
+        .iter()
+        .position(|t| t.name == "in.active")
+        .filter(|&i| tensors[i].bytes == batch as u64 * 4 && tensors[i].init.is_none())
+        .ok_or_else(|| {
+            RuntimeError::Device("recurrent state requires in.active i32[batch]".into())
+        })?;
+    Ok(Some(RecurrentState {
+        active,
+        tensors: states,
+    }))
+}
+
 /// The per-model GPU engine: the widest decode program, one KV cache, and its
 /// sequence slots. A packet may advertise narrower decode rungs; loading those
 /// as execution states is a separate scheduling optimization.
@@ -505,6 +820,11 @@ pub struct GpuEngine {
     f_pf: Option<KernelFn>,
     /// Segmented-prefill object pair (PLOW_PF_SEG_DIR); None = single-object prefill.
     seg_pf: Option<SegPf>,
+    qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
+    lt_decode: Vec<Option<LtDecodeRoute>>,
+    lt_decode_graph: Option<crate::device::cuda::GraphExec>,
+    lt_decode_capture: bool,
+    lt_decode_seed: Option<DeviceMem>,
     /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
     /// (bucket, slot-tensor-base) — one cuGraphLaunch replaces ~480 kernel submits.
     seg_graphs: std::collections::HashMap<(usize, u64), crate::device::cuda::GraphExec>,
@@ -595,6 +915,7 @@ pub struct GpuEngine {
     t_pos: usize,
     t_kvlen: usize,
     t_logits: usize,
+    recurrent: Option<RecurrentState>,
     /// Blob tensor names, indexed by handle (same order as `devp`). Lets the
     /// block harness resolve an activation handle by name — see
     /// [`Self::handle_of`] / [`Self::download_activation`] /
@@ -1234,7 +1555,8 @@ impl<'a> UploadPipe<'a> {
 }
 
 /// Pinned per-step staging slab: `[ids B][pos B][kvlen B]` i32, uploaded with
-/// three async H2D copies on the engine stream. `ids` doubles as the token
+/// three async H2D copies on the engine stream, plus an optional active-slot mask
+/// for recurrent models. `ids` doubles as the token
 /// readback destination — the same `in.ids` tensor round-trips (`ARGMAX_FIN`
 /// writes the next token there), so no separate download buffer exists.
 struct StepStage {
@@ -1243,9 +1565,9 @@ struct StepStage {
 }
 
 impl StepStage {
-    fn new(be: &CudaBackend, batch: usize) -> Result<StepStage> {
+    fn new(be: &CudaBackend, batch: usize, recurrent: bool) -> Result<StepStage> {
         Ok(StepStage {
-            slab: be.host_alloc_pinned(3 * batch * 4)?,
+            slab: be.host_alloc_pinned((3 + usize::from(recurrent)) * batch * 4)?,
             batch,
         })
     }
@@ -1254,7 +1576,8 @@ impl StepStage {
     fn parts_mut(&mut self) -> (&mut [i32], &mut [i32], &mut [i32]) {
         let all: &mut [i32] = bytemuck::cast_slice_mut(self.slab.as_mut_slice());
         let (ids, rest) = all.split_at_mut(self.batch);
-        let (pos, kvlen) = rest.split_at_mut(self.batch);
+        let (pos, rest) = rest.split_at_mut(self.batch);
+        let kvlen = &mut rest[..self.batch];
         (ids, pos, kvlen)
     }
 
@@ -1488,6 +1811,27 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
+        let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
+        if recurrent.is_some() {
+            let config = RuntimeConfig::get();
+            if RuntimeConfig::env_bool_or("PLOW_VMM_PREFIX", config.nv.vmm_prefix)
+                || config.nv.prefix_cache
+            {
+                return Err(RuntimeError::Rejected(
+                    "Qwen recurrent state does not support prefix caching".into(),
+                ));
+            }
+            if !blob.prefill_progs().is_empty()
+                && (blob
+                    .prefill_progs()
+                    .iter()
+                    .any(|p| !p.insts.iter().any(|i| i.op == DevOp::QwenGdnPrefill as u16)))
+            {
+                return Err(RuntimeError::Rejected(
+                    "Qwen recurrent state currently requires decode-only prompt consumption".into(),
+                ));
+            }
+        }
         let unsupported_hd128_fp8_kv = blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
             (inst.op == DevOp::HeadNormRopeFp8 as u16 && inst.i[2] == 128)
                 || (matches!(
@@ -2226,10 +2570,25 @@ impl GpuEngine {
                 batch * 4
             )));
         }
-        g.check_coarse_single_segment()?;
+        let lt_enabled = RuntimeConfig::env_bool_or("PLOW_QWEN_DECODE_LT", false);
+        let lt_segments = if lt_enabled {
+            if recurrent.is_none()
+                || be.module_global_u32(&module, "plow_qwen_decode_lt_arm")? != Some(1)
+            {
+                return Err(RuntimeError::Rejected(
+                    "Lt decode requires a paired Qwen GQ interpreter".into(),
+                ));
+            }
+            lt_decode_segments(g, &blob.tensors)?
+        } else {
+            g.check_coarse_single_segment()?;
+            Vec::new()
+        };
         // Single segment normally; an L2-PLACED program (l2_domains != 0) carries one
         // window per domain and the placed interpreter picks its window by physical SM.
-        let want_seg = if g.l2_domains != 0 {
+        let want_seg = if !lt_segments.is_empty() {
+            lt_segments.len() + 1
+        } else if g.l2_domains != 0 {
             g.l2_domains as usize + 1
         } else {
             2
@@ -2242,6 +2601,11 @@ impl GpuEngine {
             )));
         }
         g.check_gq_topological()?;
+        let seed_counts = if RuntimeConfig::env_bool_or("PLOW_QWEN_DECODE_LT_PRESEED", false) {
+            Some(lt_counter_seed(g, &lt_segments)?)
+        } else {
+            None
+        };
 
         let upload_pod = |bytes: &[u8]| -> Result<DeviceMem> {
             let mem = be.alloc(0, bytes.len().max(4) as u64)?;
@@ -2270,6 +2634,54 @@ impl GpuEngine {
             kvrow.clear();
             tracing::info!("decode: dynamic B=1 KV row — immutable instruction stream");
         }
+        let mut lt_decode = Vec::new();
+        if !lt_segments.is_empty() {
+            let lt = crate::device::cuda::lt::Lt::load(&be)?;
+            let mut plans = std::collections::HashMap::new();
+            for ix in lt_segments {
+                let route = if let Some(ix) = ix {
+                    let d = &mut insts[ix];
+                    let key = (d.i[0], d.i[1], d.i[2]);
+                    let [output, input, weight] = [
+                        devp[d.t[0] as usize].base,
+                        devp[d.t[1] as usize].base,
+                        devp[d.t[2] as usize].base,
+                    ];
+                    let [m, n, k] = [u64::from(key.0), u64::from(key.1), u64::from(key.2)];
+                    if [input, weight, output].iter().any(|p| p % 16 != 0)
+                        || [(input, m * k * 2), (weight, n * k * 2)]
+                            .iter()
+                            .any(|&(p, len)| output < p + len && p < output + m * n * 2)
+                    {
+                        return Err(RuntimeError::Rejected(
+                            "Lt decode requires aligned, nonaliasing tensors".into(),
+                        ));
+                    }
+                    let plan = match plans.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.get()),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            Arc::clone(e.insert(lt.plan(key.0, key.1, key.2, weight)?))
+                        }
+                    };
+                    d.op = DevOp::Nop as u16;
+                    Some(LtDecodeRoute {
+                        plan,
+                        input,
+                        weight,
+                        output,
+                    })
+                } else {
+                    None
+                };
+                lt_decode.push(route);
+            }
+            tracing::info!(
+                segments = lt_decode.len(),
+                projections = lt_decode.iter().flatten().count(),
+                plans = plans.len(),
+                "Lt decode routes prepared"
+            );
+        }
         let d_inst = upload_pod(pod_bytes(&insts))?;
         let d_stream = upload_pod(pod_bytes(&g.stream))?;
         let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
@@ -2286,6 +2698,22 @@ impl GpuEngine {
         // an L2-placed blob's interpreter fetch-adds PLOW_CTR(gq_cursor, domain).
         let cursor_bytes = g.gq_seg_ofs.len().saturating_sub(1).max(1) * CTR_STRIDE as usize * 4;
         let ctr_block = be.alloc(0, (ctr_bytes.max(4) + cursor_bytes) as u64)?;
+        let lt_decode_seed = if let Some(counts) = seed_counts {
+            let mut image = vec![0u8; ctr_bytes.max(4) + cursor_bytes];
+            for (id, count) in counts.iter().enumerate() {
+                let offset = id * CTR_STRIDE as usize * 4;
+                image[offset..offset + 4].copy_from_slice(&count.to_le_bytes());
+            }
+            tracing::info!(
+                seeded_counters = counts.iter().filter(|&&n| n != 0).count(),
+                bytes = image.len(),
+                "Lt external counter seed prepared"
+            );
+            Some(upload_pod(&image)?)
+        } else {
+            None
+        };
+
         // Two aliased views of the one owned block; `ctr_block` is stored in
         // the engine so the storage outlives both.
         let d_ctr = DeviceMem::view(ctr_block.base, ctr_bytes.max(4) as u64);
@@ -2337,13 +2765,13 @@ impl GpuEngine {
         let vocab = (blob.tensors[t_logits].bytes / 2) as usize / batch;
         let max_ctx = (blob.tensors[t_pos].bytes / 4) as usize;
 
-        // Per-slot stride of every batch-major `kv.*` tensor (slot b of
+        // Per-slot stride of every batch-major KV or recurrent-state tensor (slot b of
         // tensor i lives at base + b*stride). B==1: strides never used.
         let kv_slots: Vec<(usize, u64)> = blob
             .tensors
             .iter()
             .enumerate()
-            .filter(|(_, td)| td.name.starts_with("kv."))
+            .filter(|(_, td)| td.name.starts_with("kv.") || td.name.starts_with("state.qwen."))
             .map(|(i, td)| (i, td.bytes / batch as u64))
             .collect();
 
@@ -2446,6 +2874,15 @@ impl GpuEngine {
                 "no prefill object for sm_{want_sm} — decode-only prompt consumption"
             );
             (None, SMEM_PF, None, Vec::new(), None)
+        };
+
+        let qwen_prefill = if prefill.iter().any(|p| !p.qwen_segments.is_empty()) {
+            Some(crate::device::cuda::qwen_gdn::NativeGdn::load(
+                be.clone(),
+                &assets_dir.join("libplow_gdn_prefill.so"),
+            )?)
+        } else {
+            None
         };
 
         // ---- PX-1 batched-prefill mode (finalized once the prefill object is up) ----
@@ -2552,7 +2989,7 @@ impl GpuEngine {
         // flag-gated (`--step-time` / PLOW_STEP_TIME=1) CUDA-event timing
         // (plan stage 1: async submission path).
         let stream = be.stream_create()?;
-        let stage = StepStage::new(&be, batch)?;
+        let stage = StepStage::new(&be, batch, recurrent.is_some())?;
         let h2d_ev = be.event_create(false)?;
         let timing = match crate::config::RuntimeConfig::get().nv.step_time {
             true => Some(StepTiming::new(&be)?),
@@ -2573,11 +3010,14 @@ impl GpuEngine {
         // dynamic-kvrow arm fired (the local `kvrow` was cleared above). A B==1
         // legacy cubin still host-patches i[3] each step, so multi-step is off.
         let dyn_kvrow = batch > 1 || kvrow.is_empty();
-        let multistep =
+        let multistep = if recurrent.is_some() {
+            None
+        } else {
             Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "multi-step disabled");
                 None
-            });
+            })
+        };
 
         if let Some(tm) = load_tim.as_mut() {
             let ms = t_final.elapsed().as_secs_f64() * 1e3;
@@ -2599,6 +3039,12 @@ impl GpuEngine {
             module,
             f_pf,
             seg_pf,
+            qwen_prefill,
+            lt_decode,
+            lt_decode_graph: None,
+            lt_decode_seed,
+            lt_decode_capture: lt_enabled
+                && RuntimeConfig::env_bool_or("PLOW_QWEN_DECODE_LT_GRAPH", true),
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
             prefill,
@@ -2633,6 +3079,7 @@ impl GpuEngine {
             t_pos,
             t_kvlen,
             t_logits,
+            recurrent,
             tensor_names: blob.tensors.iter().map(|t| t.name.clone()).collect(),
             vocab,
             max_ctx,
@@ -3290,6 +3737,16 @@ impl GpuEngine {
                 self.max_ctx
             )));
         }
+        if let Some(state) = &self.recurrent {
+            for &(index, stride) in &state.tensors {
+                self.be.memset_d8_async(
+                    self.devp[index].base + b as u64 * stride,
+                    0,
+                    stride as usize,
+                    &self.stream,
+                )?;
+            }
+        }
         // VMM: publish the finished sequence's generated whole blocks first —
         // a follow-up turn embedding this turn's output then attaches instead
         // of re-prefilling it — then drop the previous sequence's mappings/
@@ -3334,6 +3791,26 @@ impl GpuEngine {
         }) {
             tracing::debug!(error = %e, slot = b, "vmm: tail publish skipped");
         }
+    }
+
+    fn upload_active_slots(&mut self, slots: impl Iterator<Item = usize>) -> Result<()> {
+        let Some(state) = &self.recurrent else {
+            return Ok(());
+        };
+        let mask: &mut [i32] = bytemuck::cast_slice_mut(self.stage.section_mut(3));
+        mask.fill(0);
+        for slot in slots {
+            mask[slot] = 1;
+        }
+        // The pinned mask survives until the step sync or prompt H2D event.
+        unsafe {
+            self.be.memcpy_htod_async(
+                self.devp[state.active].base,
+                self.stage.section(3),
+                &self.stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// One batched decode step: feed `(slot, token)` for every live slot,
@@ -3462,28 +3939,15 @@ impl GpuEngine {
                 &self.stream,
             )?;
         }
+        self.upload_active_slots(feeds.iter().map(|&(slot, _)| slot))?;
         // Counters and the GQ cursor have the same lifecycle (one launch
         // consumes them) and share one allocation — one fill re-arms both.
-        self.be.memset_d8_async(
-            self.d_ctr.base,
-            0,
-            self.ctr_bytes.max(4) + self.cursor_bytes,
-            &self.stream,
-        )?;
+        self.reset_decode_counters()?;
         if let Some(t) = &self.timing {
             self.be.event_record(&t.ev[1], &self.stream)?;
         }
 
-        let mut arg = self.kernarg;
-        let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-        self.be.launch_cooperative(
-            self.f,
-            self.grid,
-            BLOCK,
-            self.smem,
-            &mut params,
-            Some(&self.stream),
-        )?;
+        self.launch_decode()?;
         if let Some(t) = &self.timing {
             self.be.event_record(&t.ev[2], &self.stream)?;
         }
@@ -3733,24 +4197,70 @@ impl GpuEngine {
                 &self.stream,
             )?;
         }
+        self.upload_active_slots(std::iter::once(slot))?;
         self.be.event_record(&self.h2d_ev, &self.stream)?;
-        self.be.memset_d8_async(
-            self.d_ctr.base,
-            0,
-            self.ctr_bytes.max(4) + self.cursor_bytes,
-            &self.stream,
-        )?;
-        let mut arg = self.kernarg;
-        let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-        self.be.launch_cooperative(
-            self.f,
-            self.grid,
-            BLOCK,
-            self.smem,
-            &mut params,
-            Some(&self.stream),
-        )?;
+        self.reset_decode_counters()?;
+        self.launch_decode()?;
         Ok(())
+    }
+
+    fn reset_decode_counters(&self) -> Result<()> {
+        let bytes = self.ctr_bytes.max(4) + self.cursor_bytes;
+        if let Some(seed) = &self.lt_decode_seed {
+            // Seed and counter slab are engine-owned; every access shares this stream.
+            unsafe {
+                self.be
+                    .memcpy_dtod_async(self.d_ctr.base, seed.base, bytes, &self.stream)
+            }
+        } else {
+            self.be
+                .memset_d8_async(self.d_ctr.base, 0, bytes, &self.stream)
+        }
+    }
+
+    fn enqueue_decode_chain(&self) -> Result<()> {
+        let segments = self.lt_decode.len().max(1);
+        for seg in 0..segments {
+            if let Some(Some(route)) = self.lt_decode.get(seg) {
+                route
+                    .plan
+                    .run(route.input, route.weight, route.output, &self.stream)?;
+                if self.lt_decode_seed.is_some() {
+                    continue;
+                }
+            }
+            let mut arg = self.kernarg;
+            if !self.lt_decode.is_empty() {
+                arg.cur_seg = 0;
+                arg.gq_seg_ofs += (seg * 4) as u64;
+                arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
+            }
+            let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+            self.be.launch_cooperative(
+                self.f,
+                self.grid,
+                BLOCK,
+                self.smem,
+                &mut params,
+                Some(&self.stream),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn launch_decode(&mut self) -> Result<()> {
+        if self.lt_decode.is_empty() || !self.lt_decode_capture {
+            return self.enqueue_decode_chain();
+        }
+        if self.lt_decode_graph.is_none() {
+            let be = Arc::clone(&self.be);
+            self.lt_decode_graph =
+                Some(be.graph_capture(&self.stream, || self.enqueue_decode_chain())?);
+        }
+        self.be.graph_launch(
+            self.lt_decode_graph.as_ref().expect("captured"),
+            &self.stream,
+        )
     }
 
     fn retire_prompt_token(&mut self, slot: usize, token: u32, toks: &mut Vec<u32>) -> Result<()> {
@@ -4216,7 +4726,17 @@ impl GpuEngine {
             // Wave-class segmented programs are legal exactly when the SegPf pair is
             // loaded: segments launch per class in order. Otherwise the coarse
             // single-segment contract holds as before.
-            let seg_class = if seg_mode {
+            let qwen_segments = qwen_prefill_segments(g, &blob.tensors)?;
+            if !qwen_segments.is_empty()
+                && be.module_global_u32(&module, "plow_qwen_prefill_arm")? != Some(1)
+            {
+                return Err(RuntimeError::Rejected(
+                    "Qwen prefill requires a paired prefill interpreter".into(),
+                ));
+            }
+            let seg_class = if !qwen_segments.is_empty() {
+                vec![4; qwen_segments.len()]
+            } else if seg_mode {
                 g.seg_classes()?
             } else {
                 g.check_coarse_single_segment()?;
@@ -4224,7 +4744,7 @@ impl GpuEngine {
             };
             let want_seg = if g.l2_domains != 0 {
                 g.l2_domains as usize + 1
-            } else if seg_mode {
+            } else if seg_mode || !qwen_segments.is_empty() {
                 seg_class.len().max(1) + 1
             } else {
                 2
@@ -4238,7 +4758,13 @@ impl GpuEngine {
             }
             g.check_gq_topological()?;
 
-            let d_inst = upload_pod(pod_bytes(&g.insts))?;
+            let mut h_inst = g.insts.clone();
+            for inst in &mut h_inst {
+                if inst.op == DevOp::QwenGdnPrefill as u16 {
+                    inst.op = DevOp::Nop as u16;
+                }
+            }
+            let d_inst = upload_pod(pod_bytes(&h_inst))?;
             let d_stream = upload_pod(pod_bytes(&g.stream))?;
             let d_sofs = upload_pod(pod_bytes(&g.stream_ofs))?;
             let d_slen = upload_pod(pod_bytes(&g.stream_len))?;
@@ -4340,9 +4866,10 @@ impl GpuEngine {
             buckets.push(PrefillBucket {
                 t: g.t,
                 seg_class: seg_class.clone(),
+                qwen_segments,
                 kernarg,
                 d_inst,
-                h_inst: g.insts.clone(),
+                h_inst,
                 inst_lo: lo,
                 inst_hi: hi,
                 rope_sites: rope,
@@ -4443,6 +4970,22 @@ impl GpuEngine {
         }
         let c0 = self.pos[b] as usize;
         debug_assert!(c0 < n, "prefill_chunk past the prompt end");
+
+        if self.qwen_prefill.is_some()
+            && !self
+                .prefill
+                .iter()
+                .any(|p| p.t as usize <= (n - c0).min(cap))
+        {
+            let end = c0.saturating_add(cap.max(1)).min(n);
+            let mut tokens = Vec::with_capacity(1);
+            let token = self.consume_prompt(b, &prompt[c0..end], &mut tokens)?;
+            return Ok(if end == n {
+                PrefillStep::Done(token)
+            } else {
+                PrefillStep::Progress(end)
+            });
+        }
 
         // The chunk launches against slot b's prebuilt tensor table (the
         // kernarg selects it) — the shared table is never touched, so decode
@@ -4592,7 +5135,16 @@ impl GpuEngine {
         let rem = n - c0;
         let sz = std::mem::size_of::<DevInst64>();
 
-        let bi = self.pick_prefill_bucket(rem, cap);
+        let bi = if self.qwen_prefill.is_some() {
+            self.prefill
+                .iter()
+                .rposition(|p| p.t as usize <= rem.min(cap))
+                .ok_or_else(|| {
+                    RuntimeError::Rejected("Qwen prefill requires an exact chunk".into())
+                })?
+        } else {
+            self.pick_prefill_bucket(rem, cap)
+        };
         let tc = self.prefill[bi].t as usize;
         let real = rem.min(tc);
 
@@ -4677,7 +5229,48 @@ impl GpuEngine {
         let seg_class = self.prefill[bi].seg_class.clone();
         // len 1 = a force_uniseg small bucket: ONE launch on the full fat _pf object beats
         // ~480 segment launches (T18) — take the single-launch path below.
-        if seg_class.len() > 1 && self.seg_pf.is_some() {
+        if !self.prefill[bi].qwen_segments.is_empty() {
+            let native = self
+                .qwen_prefill
+                .as_mut()
+                .expect("validated Qwen prefill adapter");
+            for (seg, external) in self.prefill[bi].qwen_segments.iter().enumerate() {
+                if let Some(inst) = external {
+                    let t = &inst.t;
+                    let state = &self.devp[t[6] as usize];
+                    let slot_state = qwen_state_slot(state, b, self.batch)?;
+                    let tensors = [
+                        &self.devp[t[1] as usize],
+                        &self.devp[t[2] as usize],
+                        &self.devp[t[3] as usize],
+                        &self.devp[t[0] as usize],
+                        &self.devp[t[4] as usize],
+                        &self.devp[t[5] as usize],
+                        &self.devp[t[7] as usize],
+                        &slot_state,
+                    ];
+                    // Packet loading validates tensor extents and fixed kernel geometry.
+                    unsafe {
+                        native.launch(tensors, inst.i[0] as usize, &self.stream)?;
+                    }
+                }
+                // The ordinary GQ object reads window zero; select this segment's
+                // window and independent cursor before retiring its dependencies.
+                arg.cur_seg = 0;
+                arg.gq_seg_ofs = self.prefill[bi].kernarg.gq_seg_ofs + (seg * 4) as u64;
+                arg.gq_cursor =
+                    self.prefill[bi].kernarg.gq_cursor + (seg * CTR_STRIDE as usize * 4) as u64;
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                self.be.launch_cooperative(
+                    f_pf,
+                    self.grid,
+                    BLOCK,
+                    self.smem_pf,
+                    &mut params,
+                    Some(&self.stream),
+                )?;
+            }
+        } else if seg_class.len() > 1 && self.seg_pf.is_some() {
             let sp = self.seg_pf.as_ref().expect("checked");
             // T35 (PLOW_PF_SEG_GRAPH=1): submit the whole per-chunk segment chain as ONE
             // CUDA graph. Per-node kernargs (cur_seg baked per node) are copied at build;
@@ -5182,6 +5775,19 @@ impl GpuEngine {
         self.tensor_names.iter().position(|n| n == name)
     }
 
+    /// Read a named tensor as raw bytes for diagnostics.
+    pub fn read_tensor(&self, name: &str, dst: &mut [u8]) -> Result<()> {
+        let i = self.handle_of(name).ok_or_else(|| {
+            RuntimeError::Rejected(format!("no tensor named {name:?} in the blob"))
+        })?;
+        self.be.download(&self.devp[i], 0, dst)
+    }
+
+    /// Byte size of a named tensor's device allocation.
+    pub fn tensor_bytes(&self, name: &str) -> Option<u64> {
+        self.handle_of(name).map(|i| self.devp[i].len)
+    }
+
     /// Download an activation tensor by name as f32 (bf16 → f32, the same
     /// widening [`Self::logits_row`] does). Length = the tensor's byte size / 2
     /// (bf16). Used by the block harness to read `act.x` out. Not a hot path.
@@ -5448,6 +6054,7 @@ impl Drop for GpuEngine {
         if let Err(e) = self.be.synchronize() {
             report(&e, "synchronize at engine unload");
         }
+        drop(self.qwen_prefill.take());
         if let Some(m) = self.module_pf.take() {
             if let Err(e) = self.be.module_unload(&m) {
                 report(&e, "unload prefill module");
@@ -5468,6 +6075,10 @@ impl Drop for GpuEngine {
         // backend-drop drain never runs during a serving session — without
         // these, every S1 model swap pins three cubins and leaks one
         // instantiated graph per (bucket, slot) until process exit.
+        if let Some(g) = self.lt_decode_graph.take() {
+            self.be.graph_destroy(g);
+        }
+        self.lt_decode.clear();
         for (_, g) in self.seg_graphs.drain() {
             self.be.graph_destroy(g);
         }
@@ -5558,5 +6169,299 @@ mod profile_tests {
         assert_eq!(p.prefill_symbol, "_Z15interp_sm120_pf11PlowProgram");
         assert!(interpreter_profile((8, 9)).is_none());
         assert!(interpreter_profile((10, 0)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod recurrent_tests {
+    use super::*;
+    use crate::asset::devblob::DevTensor;
+
+    fn tensor(name: &str, bytes: u64) -> DevTensor {
+        DevTensor {
+            name: name.into(),
+            bytes,
+            init: None,
+        }
+    }
+
+    #[test]
+    fn dense_models_need_no_recurrent_mask() {
+        assert!(recurrent_state_layout(&[tensor("kv.0.k", 4096)], 1)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn state_regions_preserve_physical_slots() {
+        let tensors = [
+            tensor("state.qwen.0.conv", 4 * 10240 * 3 * 2),
+            tensor("state.qwen.0.gdn", 4 * 48 * 128 * 128 * 4),
+            tensor("in.active", 16),
+        ];
+        let state = recurrent_state_layout(&tensors, 4).unwrap().unwrap();
+        assert_eq!(state.active, 2);
+        assert_eq!(state.tensors, [(0, 10240 * 3 * 2), (1, 48 * 128 * 128 * 4)]);
+        for &(index, stride) in &state.tensors {
+            for slot in 0..4 {
+                assert!((slot + 1) * stride <= tensors[index].bytes);
+            }
+            assert_eq!(4 * stride, tensors[index].bytes);
+        }
+    }
+
+    #[test]
+    fn invalid_state_or_missing_mask_is_rejected() {
+        assert!(recurrent_state_layout(&[tensor("state.qwen.0.gdn", 64)], 4).is_err());
+        for (name, bytes) in [
+            ("state.other.0.gdn", 64),
+            ("state.qwen.0.unknown", 64),
+            ("state.qwen.0.gdn", 63),
+            ("state.qwen.0.gdn", 0),
+        ] {
+            assert!(
+                recurrent_state_layout(&[tensor(name, bytes), tensor("in.active", 16)], 4).is_err()
+            );
+        }
+        assert!(recurrent_state_layout(
+            &[tensor("state.qwen.0.gdn", 64), tensor("in.active", 4)],
+            4
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+#[path = "gpu_qwen_tests.rs"]
+mod gpu_qwen_tests;
+
+#[cfg(test)]
+#[test]
+fn qwen_prefill_state_views_select_exact_batch_slots() {
+    const STRIDE: u64 = 48 * 128 * 128 * 4;
+    let state = DeviceMem::view(4096, 4 * STRIDE);
+    for slot in 0..4 {
+        let view = qwen_state_slot(&state, slot, 4).unwrap();
+        assert_eq!(view.base, 4096 + slot as u64 * STRIDE);
+        assert_eq!(view.len, STRIDE);
+    }
+    assert!(qwen_state_slot(&state, 4, 4).is_err());
+    assert!(qwen_state_slot(&state, 0, 1).is_err());
+    assert!(qwen_state_slot(&state, 0, 0).is_err());
+    assert_eq!(
+        qwen_state_slot(&DeviceMem::view(4096, STRIDE), 0, 1)
+            .unwrap()
+            .base,
+        4096
+    );
+}
+
+#[cfg(test)]
+mod lt_decode_tests {
+    use super::*;
+    use crate::asset::devblob::{DevProg, DevTensor};
+    use packet::dev::StreamEnt;
+
+    fn fixture(batch: u32) -> (DevProg, Vec<DevTensor>) {
+        let ordinary = DevInst64 {
+            op: DevOp::Nop as u16,
+            blocks: 1,
+            ..Default::default()
+        };
+        let mut gemv = ordinary;
+        gemv.op = DevOp::Gemv as u16;
+        gemv.t[..3].copy_from_slice(&[0, 1, 2]);
+        gemv.i[..3].copy_from_slice(&[batch, 48, 5120]);
+        let stream: Vec<_> = (0..3)
+            .map(|i| StreamEnt {
+                inst: i,
+                seg: i as u16,
+                ..Default::default()
+            })
+            .collect();
+        let tensors = [
+            ("act.out", batch as u64 * 48 * 2),
+            ("act.in", batch as u64 * 5120 * 2),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+                48 * 5120 * 2,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, bytes)| DevTensor {
+            name: name.into(),
+            bytes,
+            init: None,
+        })
+        .collect();
+        (
+            DevProg {
+                t: batch,
+                packed_prefill_only: false,
+                n_counter: 0,
+                insts: vec![ordinary, gemv, ordinary],
+                stream: stream.clone(),
+                stream_ofs: vec![0],
+                stream_len: vec![3],
+                waits: vec![],
+                succs: vec![],
+                gq_stream: stream,
+                gq_seg_ofs: vec![0, 1, 2, 3],
+                l2_domains: 0,
+            },
+            tensors,
+        )
+    }
+
+    fn seed_fixture() -> DevProg {
+        let (mut g, _) = fixture(1);
+        g.n_counter = 5;
+        g.insts[1].blocks = 2;
+        g.waits = vec![
+            packet::dev::Wait {
+                id: 0,
+                threshold: 1,
+            },
+            packet::dev::Wait {
+                id: 1,
+                threshold: 2,
+            },
+            packet::dev::Wait {
+                id: 3,
+                threshold: 1,
+            },
+            packet::dev::Wait {
+                id: 4,
+                threshold: 1,
+            },
+        ];
+        g.succs = vec![0, 1, 3, 1, 4, 2];
+        g.gq_stream = vec![
+            StreamEnt {
+                inst: 0,
+                seg: 0,
+                succ_ofs: 0,
+                succ_len: 1,
+                ..Default::default()
+            },
+            StreamEnt {
+                inst: 1,
+                seg: 1,
+                slice: 0,
+                wait_ofs: 0,
+                wait_len: 1,
+                succ_ofs: 1,
+                succ_len: 2,
+                flags: packet::dev::SE_FINE,
+                ..Default::default()
+            },
+            StreamEnt {
+                inst: 1,
+                seg: 1,
+                slice: 1,
+                wait_ofs: 0,
+                wait_len: 1,
+                succ_ofs: 3,
+                succ_len: 2,
+                flags: packet::dev::SE_FINE,
+                ..Default::default()
+            },
+            StreamEnt {
+                inst: 2,
+                seg: 2,
+                wait_ofs: 1,
+                wait_len: 3,
+                succ_ofs: 5,
+                succ_len: 1,
+                ..Default::default()
+            },
+        ];
+        g.stream = g.gq_stream.clone();
+        g.gq_seg_ofs = vec![0, 1, 3, 4];
+        g
+    }
+
+    #[test]
+    fn preseed_sums_coarse_and_fine_external_contributions_only() {
+        let g = seed_fixture();
+        assert_eq!(
+            lt_counter_seed(&g, &[None, Some(1), None]).unwrap(),
+            vec![0, 2, 0, 1, 1]
+        );
+    }
+
+    #[test]
+    fn preseed_rejects_mixed_ownership_and_future_dependencies() {
+        let routes = [None, Some(1), None];
+        let mut g = seed_fixture();
+        g.succs[5] = 1;
+        assert!(lt_counter_seed(&g, &routes).is_err());
+        let mut g = seed_fixture();
+        g.waits[0].id = 2;
+        assert!(lt_counter_seed(&g, &routes).is_err());
+        let mut g = seed_fixture();
+        g.gq_stream[0].wait_ofs = 1;
+        g.gq_stream[0].wait_len = 1;
+        assert!(lt_counter_seed(&g, &routes).is_err());
+        let mut g = seed_fixture();
+        g.gq_stream[1].flags = packet::dev::SE_XCTR;
+        assert!(lt_counter_seed(&g, &routes).is_err());
+        let mut g = seed_fixture();
+        g.waits[1].threshold = 3;
+        assert!(lt_counter_seed(&g, &routes).is_err());
+        let mut g = seed_fixture();
+        g.succs[1] = 5;
+        assert!(lt_counter_seed(&g, &routes).is_err());
+    }
+
+    #[test]
+    fn accepts_bf16_batch_one_and_four_small_projections() {
+        for batch in [1, 4] {
+            let (g, t) = fixture(batch);
+            assert_eq!(
+                lt_decode_segments(&g, &t).unwrap(),
+                vec![None, Some(1), None]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_precision_geometry_extent_and_head_only() {
+        let (g, t) = fixture(4);
+        let (mut bad, _) = fixture(g.t);
+        bad.insts[1].op = DevOp::GemvFp8 as u16;
+        assert!(lt_decode_segments(&bad, &t).is_err());
+        let (mut bad, _) = fixture(g.t);
+        bad.insts[1].i[4] = 1;
+        assert!(lt_decode_segments(&bad, &t).is_err());
+        let (mut bad, _) = fixture(g.t);
+        bad.insts[1].i[0] = 1;
+        assert!(lt_decode_segments(&bad, &t).is_err());
+        let (mut bad, _) = fixture(g.t);
+        bad.insts[1].t[0] = 1;
+        assert!(lt_decode_segments(&bad, &t).is_err());
+        let (_, mut small) = fixture(g.t);
+        small[0].bytes -= 1;
+        assert!(lt_decode_segments(&g, &small).is_err());
+        let (_, mut head) = fixture(g.t);
+        head[2].name = "lm_head.weight".into();
+        assert!(lt_decode_segments(&g, &head).is_err());
+    }
+
+    #[test]
+    fn rejects_mixed_segments_and_invalid_queue_windows() {
+        let (g, t) = fixture(1);
+        let (mut bad, _) = fixture(g.t);
+        bad.gq_stream[0].seg = 1;
+        assert!(lt_decode_segments(&bad, &t).is_err());
+        let (mut bad, _) = fixture(g.t);
+        bad.stream[0].seg = 1;
+        assert!(lt_decode_segments(&bad, &t).is_err());
+        let (mut bad, _) = fixture(g.t);
+        bad.gq_seg_ofs[1] = 4;
+        assert!(lt_decode_segments(&bad, &t).is_err());
+        let (mut bad, _) = fixture(g.t);
+        bad.l2_domains = 1;
+        assert!(lt_decode_segments(&bad, &t).is_err());
     }
 }

@@ -506,7 +506,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
            * score back out of Ssm so the softmax/PV code below is untouched.
            * Only the plain bf16 KV layout takes this path; SZ/fp8 KV keep the default body. The K
            * reduction order changes, so scores are numerically equivalent, not bit-identical. */
-          if constexpr (!SZKV && !FP8KV) {
+          if constexpr (!SZKV && !FP8KV && D >= 256) {
             constexpr int NC = D / 256; /* 256 = 32 lanes * 8 elems */
             /* Only [0,rmax) of the tile has live rows -- at nsplit=8 a work item owns 128 rows
              * against a 256-row tile, so half the sweep was pure loop+store overhead. Fill the

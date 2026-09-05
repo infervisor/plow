@@ -14,6 +14,9 @@
  * the template below for why the layout used here is correct at 128/256/512 alike.
  */
 #pragma once
+#ifndef PLOW_NV_GEMMA_HNR_BF16
+#define PLOW_NV_GEMMA_HNR_BF16 0
+#endif
 #include "sm120_common.cuh"
 #include <cuda_fp8.h> /* __nv_fp8_e4m3 — the T11 fused activation quant */
 
@@ -649,6 +652,12 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
 #pragma unroll
             for (unsigned e = 0; e < 4 * C; e++) v[e] = v[e] * inv * g[e];
             if (cosb) {
+#if PLOW_NV_GEMMA && PLOW_NV_GEMMA_HNR_BF16
+                // Match separate BF16 Q/K normalization before the rotary kernel.
+#pragma unroll
+                for (unsigned e = 0; e < 4 * C; e++)
+                    v[e] = __bfloat162float(__float2bfloat16(v[e]));
+#endif
                 const size_t p = (size_t)pos[t] * (HD / 2);
                 float r[4 * C];
 #pragma unroll
@@ -661,8 +670,15 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
 #pragma unroll
                     for (int k = 0; k < 4; k++) {
                         const unsigned lo = 4 * c + k, hi = 4 * (c + CH) + k;
+#if PLOW_NV_GEMMA && PLOW_NV_GEMMA_HNR_BF16
+                        const float cr = __bfloat162float(__float2bfloat16(cp[k]));
+                        const float sr = __bfloat162float(__float2bfloat16(sp[k]));
+                        r[lo] = v[lo] * cr - v[hi] * sr;
+                        r[hi] = v[hi] * cr + v[lo] * sr;
+#else
                         r[lo] = v[lo] * cp[k] - v[hi] * sp[k];
                         r[hi] = v[hi] * cp[k] + v[lo] * sp[k];
+#endif
                     }
                 }
 #pragma unroll

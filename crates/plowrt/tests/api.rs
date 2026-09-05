@@ -20,11 +20,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn make_app() -> axum::Router {
+    make_app_with_tokenizer(None)
+}
+
+fn make_app_with_tokenizer(tokenizer_json: Option<&str>) -> axum::Router {
     // Unique dir per call — the tests run in parallel and must not share assets.
     let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("plowrt_api_{}_{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     common::write_bundle(&dir, "api-model");
+    if let Some(json) = tokenizer_json {
+        std::fs::write(dir.join("tokenizer.json"), json).unwrap();
+    }
 
     let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
     let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
@@ -283,4 +290,99 @@ async fn unknown_model_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[cfg(feature = "hf-tokenizer")]
+#[tokio::test]
+async fn completion_and_tokenize_apply_requested_special_tokens() {
+    use plowrt::text::tokenizer::{HfTokenizer, Tokenize};
+    use tokenizers::{models::wordlevel::WordLevel, processors::template::TemplateProcessing};
+
+    let model = WordLevel::builder()
+        .vocab(
+            [
+                ("hello".to_string(), 0),
+                ("[UNK]".to_string(), 1),
+                ("<bos>".to_string(), 2),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unk_token("[UNK]".to_string())
+        .build()
+        .unwrap();
+    let mut tokenizer = tokenizers::Tokenizer::new(model);
+    tokenizer.with_post_processor(Some(
+        TemplateProcessing::builder()
+            .try_single("<bos> $A")
+            .unwrap()
+            .special_tokens(vec![("<bos>", 2)])
+            .build()
+            .unwrap(),
+    ));
+    let json = tokenizer.to_string(false).unwrap();
+    let app = make_app_with_tokenizer(Some(&json));
+    for (special, expected) in [
+        (None, vec![2, 0]),
+        (Some(true), vec![2, 0]),
+        (Some(false), vec![0]),
+    ] {
+        let mut body = serde_json::json!({"model":"api-model", "prompt":"hello",
+            "max_tokens":1, "return_token_ids":true});
+        if let Some(value) = special {
+            body["add_special_tokens"] = value.into();
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(result["token_ids"]["prompt"], serde_json::json!(expected));
+        assert_eq!(result["usage"]["prompt_tokens"], expected.len());
+    }
+    for (special, expected) in [
+        (None, vec![0]),
+        (Some(true), vec![2, 0]),
+        (Some(false), vec![0]),
+    ] {
+        let mut body = serde_json::json!({"model":"api-model", "prompt":"hello"});
+        if let Some(value) = special {
+            body["add_special_tokens"] = value.into();
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tokenize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(result["tokens"], serde_json::json!(expected));
+    }
+    // Chat renders its own special tokens and continues to use plain encode.
+    let dir = std::env::temp_dir().join(format!("plowrt_api_plain_encode_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tokenizer.json"), json).unwrap();
+    let tokenizer = HfTokenizer::from_file(&dir.join("tokenizer.json")).unwrap();
+    assert_eq!(tokenizer.encode("hello"), vec![0]);
+    assert_eq!(
+        tokenizer.encode_with_special_tokens("hello", true),
+        vec![2, 0]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

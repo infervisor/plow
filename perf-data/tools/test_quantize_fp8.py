@@ -89,5 +89,85 @@ class QuantizeFp8Test(unittest.TestCase):
                 self.assertTrue(torch.all(err <= scale * 16.01 + 1e-7), (err, scale))
 
 
+
+import contextlib
+import importlib.util
+import io
+from pathlib import Path
+from unittest.mock import patch
+from safetensors.torch import load_file, save_file
+
+spec = importlib.util.spec_from_file_location("quantize_fp8", Path(__file__).with_name("quantize_fp8.py"))
+quant = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(quant)
+
+
+class PackedQuantizationTests(unittest.TestCase):
+    def export(self, mode):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source, out = root / "source", root / "out"
+        source.mkdir()
+        (source / "config.json").write_text("{}")
+        prefix = "model.language_model.layers.0."
+        weights = {
+            prefix + "linear_attn.in_proj_qkv.weight": torch.tensor([[1., -2.], [0.25, 0.5]], dtype=torch.bfloat16),
+            prefix + "linear_attn.in_proj_z.weight": torch.tensor([[7., -8.]], dtype=torch.bfloat16),
+            prefix + "linear_attn.in_proj_a.weight": torch.tensor([[2., 0.]], dtype=torch.bfloat16),
+            prefix + "linear_attn.in_proj_b.weight": torch.tensor([[0.125, -0.25]], dtype=torch.bfloat16),
+        }
+        entries = list(weights.items())
+        save_file(dict(entries[::2]), source / "part1.safetensors")
+        save_file(dict(entries[1::2]), source / "part2.safetensors")
+        mapping = {k: "part1.safetensors" if i % 2 == 0 else "part2.safetensors" for i, (k, _) in enumerate(entries)}
+        (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": mapping}))
+        args = ["quantize_fp8.py", str(source), str(out)]
+        if mode is not None:
+            args += ["--scale-mode", mode]
+        with patch("sys.argv", args), contextlib.redirect_stdout(io.StringIO()):
+            quant.main()
+        return source, out, weights, load_file(out / "model.safetensors")
+
+    def test_default_preserves_per_channel_quantization(self):
+        _, out, weights, actual = self.export(None)
+        self.assertFalse((out / "quantization.json").exists())
+        for name, weight in weights.items():
+            w = weight.float()
+            scale = w.abs().amax(dim=1) / 448
+            expected = (w / scale[:, None]).to(torch.float8_e4m3fn)
+            self.assertTrue(torch.equal(actual["fp8/" + name].view(torch.uint8), expected.view(torch.uint8)))
+            self.assertTrue(torch.equal(actual["fp8/" + name + "_scale"], scale))
+
+    def test_packed_scales_match_concatenated_matrix(self):
+        source, out, weights, actual = self.export("packed-tensor")
+        meta = json.loads((out / "quantization.json").read_text())
+        self.assertEqual(len(meta["groups"]), 2)
+        for group, info in meta["groups"].items():
+            names = [m["source"] for m in info["members"]]
+            combined = torch.cat([weights[n].float() for n in names])
+            scale = combined.abs().max() / 448
+            expected = (combined * scale.reciprocal()).clamp(-448, 448).to(torch.float8_e4m3fn)
+            observed = torch.cat([actual["fp8/" + n] for n in names])
+            self.assertTrue(torch.equal(observed.view(torch.uint8), expected.view(torch.uint8)))
+            for name in names:
+                self.assertTrue(torch.all(actual["fp8/" + name + "_scale"] == scale))
+            if group.endswith("in_proj_ba.weight"):
+                self.assertTrue(names[0].endswith("in_proj_b.weight"))
+                self.assertEqual(info["members"][1]["packed_row_offset"], 1)
+        prior = (out / "model.safetensors").read_bytes()
+        with patch("sys.argv", ["q", str(source), str(out), "--scale-mode", "packed-tensor"]):
+            with self.assertRaises(FileExistsError):
+                quant.main()
+        self.assertEqual((out / "model.safetensors").read_bytes(), prior)
+
+    def test_packed_groups_do_not_cross_layers_or_projection_families(self):
+        group, order = quant.packed_group("model.layers.7.self_attn.k_proj.weight")
+        self.assertEqual((group, order), ("model.layers.7.self_attn.qkv_proj.weight", 1))
+        self.assertNotEqual(group, quant.packed_group("model.layers.8.self_attn.k_proj.weight")[0])
+        self.assertEqual(quant.packed_group("model.layers.7.self_attn.o_proj.weight")[0],
+                         "model.layers.7.self_attn.o_proj.weight")
+
+
 if __name__ == "__main__":
     unittest.main()

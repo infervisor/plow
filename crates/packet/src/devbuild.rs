@@ -218,6 +218,7 @@ struct LocalityCensus {
 /// One op, before flattening.
 struct Op {
     inst: DevInst,
+    isolated: bool,
     cus: Vec<u32>,
     deps: Vec<Dep>,
     counter: u32,   // the coarse counter this op bumps
@@ -880,6 +881,11 @@ impl Builder {
         self.emit_dep(op, cus, d, f)
     }
 
+    /// Preserve an operation as its own segment without dropping dependency edges.
+    pub fn isolate(&mut self, counter: u32) {
+        self.ops[counter as usize].isolated = true;
+    }
+
     /// As [`Builder::emit`], but the dependencies may be [`Dep::Fine`] — so a slice waits
     /// only on the producer slices that actually feed it, instead of on the whole op.
     pub fn emit_dep(
@@ -920,6 +926,7 @@ impl Builder {
         let work = vec![1u32; cus.len()];
         self.ops.push(Op {
             inst,
+            isolated: false,
             cus,
             deps,
             counter,
@@ -2040,7 +2047,9 @@ impl Builder {
         let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
         let wave_class = |i: usize| -> u8 {
             let op = self.ops[i].inst.op;
-            if op == DevOp::KdaDecodeFused as u16 {
+            if op == DevOp::QwenGdnPrefill as u16 {
+                21
+            } else if op == DevOp::KdaDecodeFused as u16 {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
                 // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
                 3
@@ -2214,7 +2223,13 @@ impl Builder {
                 seg_of[i] = cur_seg;
                 continue;
             }
-            if i > 0 && wave_class(i) != wave_class(i - 1) {
+            if i > 0
+                && (wave_class(i) != wave_class(i - 1)
+                    || self.ops[i].inst.op == DevOp::QwenGdnPrefill as u16
+                    || self.ops[i - 1].inst.op == DevOp::QwenGdnPrefill as u16
+                    || self.ops[i].isolated
+                    || self.ops[i - 1].isolated)
+            {
                 cur_seg += 1;
             }
             seg_of[i] = cur_seg;
@@ -5651,5 +5666,43 @@ mod v6_tests {
         assert_eq!(xargmax_value_lines(17), Some(2));
         assert_eq!(xargmax_value_lines(128), Some(8));
         assert_eq!(xargmax_value_lines(129), None);
+    }
+}
+
+#[cfg(test)]
+mod isolated_segment_tests {
+    use super::*;
+
+    fn program(isolate: bool) -> Program {
+        let mut b = Builder::new(4);
+        b.force_uniseg();
+        let mut prior = None;
+        for i in 0..5 {
+            let deps: Vec<_> = prior.into_iter().collect();
+            let counter = b.emit(DevOp::Nop, b.all(), &deps, |_| {});
+            if isolate && i == 2 {
+                b.isolate(counter);
+            }
+            prior = Some(counter);
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn explicit_isolation_preserves_cross_segment_counter_edges() {
+        let plain = program(false);
+        let isolated = program(true);
+        assert_eq!(plain.n_counter, isolated.n_counter);
+        assert_eq!(plain.waits, isolated.waits);
+        assert_eq!(plain.succs, isolated.succs);
+        for (ix, expected) in [0, 0, 1, 2, 2].into_iter().enumerate() {
+            assert!(isolated
+                .gq_stream
+                .iter()
+                .filter(|e| e.inst == ix as u32)
+                .all(|e| e.seg == expected));
+        }
+        assert_eq!(isolated.gq_seg_ofs.len(), 4);
+        assert!(plain.gq_stream.iter().all(|e| e.seg == 0));
     }
 }

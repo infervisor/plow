@@ -22,10 +22,12 @@ def parse_args():
     p.add_argument("--cases", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--tp", type=int, default=1)
+    p.add_argument("--max-model-len", type=int)
     p.add_argument("--max-num-batched-tokens", type=int, default=4096)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--language-model-only", action="store_true")
     return p.parse_args()
 
 
@@ -41,7 +43,7 @@ def prompt_digest(ids):
     return hashlib.sha256(a.tobytes()).hexdigest()
 
 
-def dense_scores(position, vocab_size):
+def dense_scores(position, vocab_size, diagnostic_prefix=None):
     # Offline outputs use either the compatibility dict or FlatLogprobs.  Both
     # expose token IDs, unlike the OpenAI JSON surface where decoded-token keys
     # can collide.
@@ -50,15 +52,27 @@ def dense_scores(position, vocab_size):
     else:
         pairs = ((token_id, entry.logprob) for token_id, entry in position.items())
     out = np.full(vocab_size, np.nan, dtype=np.float32)
+    seen = np.zeros(vocab_size, dtype=bool)
     for token_id, score in pairs:
         token_id = int(token_id)
         if 0 <= token_id < vocab_size:
             out[token_id] = float(score)
-    missing = int(np.isnan(out).sum())
-    if missing:
-        raise RuntimeError(f"vLLM returned {vocab_size - missing}/{vocab_size} logits")
-    if not np.isfinite(out).all():
-        raise RuntimeError("vLLM returned non-finite logits")
+            seen[token_id] = True
+    missing = int((~seen).sum())
+    if missing or not np.isfinite(out).all():
+        diagnostic = {
+            "vocab_size": vocab_size,
+            "missing_indices": np.flatnonzero(~seen).tolist(),
+            "nan_indices": np.flatnonzero(np.isnan(out) & seen).tolist(),
+            "negative_inf_indices": np.flatnonzero(np.isneginf(out)).tolist(),
+            "positive_inf_indices": np.flatnonzero(np.isposinf(out)).tolist(),
+            "finite_count": int(np.isfinite(out).sum()),
+        }
+        if diagnostic_prefix is not None:
+            diagnostic_prefix.with_suffix(".invalid.f32").write_bytes(out.astype("<f4").tobytes())
+            diagnostic_prefix.with_suffix(".invalid.json").write_text(json.dumps(diagnostic, indent=2))
+        counts = {key: len(value) for key, value in diagnostic.items() if isinstance(value, list)}
+        raise RuntimeError(f"vLLM returned invalid logits: {counts}")
     return out
 
 
@@ -88,7 +102,7 @@ def main():
     cases = request.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError("cases JSON needs a non-empty `cases` array")
-    max_len = max(len(c["prompt_token_ids"]) for c in cases) + 1
+    max_len = max(max(len(c["prompt_token_ids"]) for c in cases) + 1, args.max_model_len or 0)
 
     from vllm import LLM, SamplingParams, __version__ as vllm_version
 
@@ -106,6 +120,7 @@ def main():
         enforce_eager=args.enforce_eager,
         max_logprobs=-1,
         logprobs_mode="raw_logits",
+        language_model_only=args.language_model_only,
     )
     vocab_size = int(llm.model_config.get_vocab_size())
     sampling = SamplingParams(
@@ -127,9 +142,16 @@ def main():
         "vocab_size": vocab_size,
         "logprobs_mode": "raw_logits",
         "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_model_len": max_len,
+        "enforce_eager": args.enforce_eager,
+        "language_model_only": args.language_model_only,
+        "hf_vocab_size": llm.model_config.hf_text_config.vocab_size,
+        "final_logit_softcapping": getattr(llm.model_config.hf_text_config, "final_logit_softcapping", None),
         "cases": [],
         "repeat_checks": [],
+        "invalid_cases": [],
     }
+    (args.output / "invocation.json").write_text(json.dumps(manifest, indent=2) + "\n")
     seen = {}
     for raw_case in cases:
         cid = case_id(raw_case["id"])
@@ -142,7 +164,11 @@ def main():
         completion = result.outputs[0]
         if not completion.logprobs or len(completion.logprobs) != 1:
             raise RuntimeError(f"case {cid}: missing one-step logprobs")
-        scores = dense_scores(completion.logprobs[0], vocab_size)
+        try:
+            scores = dense_scores(completion.logprobs[0], vocab_size, args.output / cid)
+        except RuntimeError as error:
+            manifest["invalid_cases"].append({"id": cid, "error": str(error)})
+            continue
         filename = f"logits_{cid}.f32"
         scores.astype("<f4", copy=False).tofile(args.output / filename)
         sha = prompt_digest(ids)
@@ -168,6 +194,8 @@ def main():
             }
         )
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    if manifest["invalid_cases"]:
+        raise RuntimeError(f"{len(manifest['invalid_cases'])} cases rejected; see manifest.json")
 
 
 if __name__ == "__main__":

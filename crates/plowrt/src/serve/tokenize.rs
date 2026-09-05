@@ -37,16 +37,11 @@ pub async fn tokenize(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TokenizeRequest>,
 ) -> Response {
-    if req.add_special_tokens {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "add_special_tokens=true is not supported"})),
-        )
-            .into_response();
-    }
     match state.registry.get(&req.model) {
         Ok(bundle) => Json(TokenizeResponse {
-            tokens: bundle.tokenizer().encode(&req.prompt),
+            tokens: bundle
+                .tokenizer()
+                .encode_with_special_tokens(&req.prompt, req.add_special_tokens),
         })
         .into_response(),
         Err(_) => (

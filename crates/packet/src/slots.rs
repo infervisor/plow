@@ -118,6 +118,17 @@ fn slot(raw: &'static str) -> Option<Slot> {
 /// comments and checked against them by `table_matches_doc_comments`.
 #[rustfmt::skip]
 const DOC: &[S] = &[
+    S { op: DevOp::QwenGdnConv, t: &["out", "x", "weight", "history", "active?"], i: &["C", "W", "B"], f: &[], j: &[] },
+    S { op: DevOp::QwenGdnStep, t: &["out", "qkv", "a", "b", "A_log", "dt_bias", "state", "active?"], i: &["HK", "HV", "K", "V", "B", "alog_f32"], f: &["q_scale", "l2_eps"], j: &[] },
+    S { op: DevOp::QwenGatedNorm, t: &["out", "core", "z", "gamma", "active?"], i: &["HV", "V", "B"], f: &["eps"], j: &[] },
+    S { op: DevOp::QwenQGateSplit, t: &["Q", "gate", "packed", "active?"], i: &["H", "D", "B"], f: &[], j: &[] },
+    S { op: DevOp::QwenSigmoidGate, t: &["out", "x", "gate", "active?"], i: &["width", "B"], f: &[], j: &[] },
+    S { op: DevOp::QwenRmsNorm, t: &["out", "x", "gamma", "active?"], i: &["width", "B"], f: &["eps", "gamma_offset"], j: &[] },
+    S { op: DevOp::QwenHeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos?", "active?"], i: &["H", "D", "rotary", "rows", "ctx", "normalize", "prefill"], f: &["eps", "gamma_offset"], j: &[] },
+    S { op: DevOp::QwenGdnConvPrefill, t: &["out", "x", "weight", "history"], i: &["C", "W", "T"], f: &[], j: &[] },
+    S { op: DevOp::QwenGdnQkvPrep, t: &["Q", "K", "V", "packed"], i: &["HK", "HV", "K", "V", "T"], f: &["l2_eps"], j: &[] },
+    S { op: DevOp::QwenGdnGatePrep, t: &["alpha", "beta", "a", "b", "A_log", "dt_bias"], i: &["HV", "T"], f: &[], j: &[] },
+    S { op: DevOp::QwenGdnPrefill, t: &["core", "Q", "K", "V", "alpha", "beta", "state", "outstate"], i: &["T", "HK", "HV", "K", "V"], f: &["q_scale"], j: &[] },
     S { op: DevOp::RmsNorm, t: &["out", "x", "gamma?", "xq?", "ascale?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::RowRms, t: &["rms", "x"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },

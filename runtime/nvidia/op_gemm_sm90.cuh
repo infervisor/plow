@@ -580,7 +580,8 @@ static __device__ void d_gemm_glu_sm90_tma(__nv_bfloat16* C, const void* mA, con
 }
 #endif /* PGM90_TMA_HAS_GLU */
 
-#if PLOW_NV_W8A8
+/* The n256 and ws384 BF16 bodies share this TMA implementation with FP8. */
+#if PLOW_NV_W8A8 || PGM90_UNI_BN256
 /* w8a8 twin of d_gemm_sm90_tma: same uniform-TMA ring (stage bytes are IDENTICAL — 128 e4m3
  * = 64 bf16 = 128 B rows), e4m3 maps (GEN_TMAP_E4M3, inner box 128), m64n128k32 QGMMA, and
  * the two-scale epilogue + PGM90_FP8_PROMOTE two-level accumulation of d_gemm_w8a8_sm90. */
@@ -1677,7 +1678,7 @@ static __device__ void d_gemm_glu_w8a8_sm90_tma(__nv_bfloat16* C, const void* mA
                                    arena);
 }
 #endif /* PGM90_TMA_HAS_GLU */
-#endif /* PLOW_NV_W8A8 */
+#endif /* PLOW_NV_W8A8 || PGM90_UNI_BN256 */
 
 #endif /* PLOW_NV_TMA_GEMM */
 

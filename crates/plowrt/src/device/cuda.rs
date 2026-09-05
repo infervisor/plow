@@ -39,6 +39,9 @@ use rustc_hash::FxHashMap;
 use crate::device::{Backend, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module};
 use crate::{DeviceErrorInfo, Result, RuntimeError};
 
+pub(crate) mod lt;
+pub(crate) mod qwen_gdn;
+
 // Driver ABI types (bindgen-equivalent, transcribed from cuda.h).
 type CUresult = i32;
 type CUdevice = i32;
@@ -214,6 +217,7 @@ driver_api! {
     cuStreamCreate: fn(*mut CUstream, u32) -> CUresult,
     cuStreamDestroy_v2: fn(CUstream) -> CUresult,
     cuStreamSynchronize: fn(CUstream) -> CUresult,
+    cuMemcpyDtoDAsync_v2: fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
     cuMemcpyHtoDAsync_v2: fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
     cuMemcpyDtoHAsync_v2: fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
     cuMemsetD8Async: fn(CUdeviceptr, u8, usize, CUstream) -> CUresult,
@@ -226,6 +230,8 @@ driver_api! {
     // T35: CUDA graphs — batch the ~480 per-chunk segment launches into ONE submit.
     // All present since CUDA 10; kernel nodes take the same CUDA_KERNEL_NODE_PARAMS
     // as cuLaunchKernel.
+    cuStreamBeginCapture: fn(CUstream, i32) -> CUresult,
+    cuStreamEndCapture: fn(CUstream, *mut CUgraph) -> CUresult,
     cuGraphCreate: fn(*mut CUgraph, u32) -> CUresult,
     cuGraphAddKernelNode_v2: fn(*mut CUgraphNode, CUgraph, *const CUgraphNode, usize, *const CudaKernelNodeParams) -> CUresult,
     cuGraphInstantiateWithFlags: fn(*mut CUgraphExec, CUgraph, u64) -> CUresult,
@@ -1216,6 +1222,41 @@ impl CudaBackend {
         })
     }
 
+    pub(crate) fn graph_capture(
+        &self,
+        stream: &CudaStream,
+        enqueue: impl FnOnce() -> Result<()>,
+    ) -> Result<GraphExec> {
+        self.bind()?;
+        // Thread-local capture; callers enqueue only immutable same-stream operations.
+        self.check(
+            unsafe { (self.api.cuStreamBeginCapture)(stream.raw as CUstream, 1) },
+            "cuStreamBeginCapture",
+        )?;
+        let result = enqueue();
+        let mut graph = std::ptr::null_mut();
+        let ended = unsafe { (self.api.cuStreamEndCapture)(stream.raw as CUstream, &mut graph) };
+        if let Err(e) = result {
+            if !graph.is_null() {
+                unsafe {
+                    (self.api.cuGraphDestroy)(graph);
+                }
+            }
+            return Err(e);
+        }
+        self.check(ended, "cuStreamEndCapture")?;
+        let mut exec = std::ptr::null_mut();
+        let status = unsafe { (self.api.cuGraphInstantiateWithFlags)(&mut exec, graph, 0) };
+        unsafe {
+            (self.api.cuGraphDestroy)(graph);
+        }
+        self.check(status, "cuGraphInstantiateWithFlags")?;
+        Ok(GraphExec {
+            exec,
+            api: self.api.as_ref() as *const _ as *const c_void,
+        })
+    }
+
     pub fn graph_launch(&self, g: &GraphExec, stream: &CudaStream) -> Result<()> {
         self.bind()?;
         self.check(
@@ -1516,6 +1557,21 @@ impl CudaBackend {
     }
 
     /// Raw D2D copy (`cuMemcpyDtoD`) between two live device ranges.
+    // Both ranges must remain live until the stream retires; overlap is not supported.
+    pub(crate) unsafe fn memcpy_dtod_async(
+        &self,
+        dst: u64,
+        src: u64,
+        bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.bind()?;
+        self.check(
+            unsafe { (self.api.cuMemcpyDtoDAsync_v2)(dst, src, bytes, stream.raw as CUstream) },
+            "cuMemcpyDtoDAsync",
+        )
+    }
+
     pub fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
         self.bind()?;
         // SAFETY: both ranges inside live (mapped) allocations — caller contract.

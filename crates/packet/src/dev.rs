@@ -1677,6 +1677,50 @@ pub enum DevOp {
     ///
     /// `t0=C(out,f32[M][N]) t1=x(in,bf16[M][K]) t2=W(in,f32[N][K])` · `i0=M i1=N i2=K`.
     GemvF32 = 135,
+    /// Packed causal convolution plus SiLU. BF16 x/out[B,C], weight[C,W], and mutable history[B,C,W-1] (oldest first); optional I32 active[B] masks writes.
+    ///
+    /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B`.
+    QwenGdnConv = 136,
+    /// Recurrent GDN with K=128 and HV divisible by HK. BF16 out[B,HV,V], packed qkv[B,2*HK*K+HV*V], a/b[B,HV], and dt_bias[HV]. A_log[HV] is BF16 unless alog_f32 is nonzero. Mutable FP32 state[B,HV,V,K]; optional I32 active[B] masks writes. Beta rounds to BF16 before recurrence.
+    ///
+    /// `t0=out t1=qkv t2=a t3=b t4=A_log t5=dt_bias t6=state t7=active?` · `i0=HK i1=HV i2=K i3=V i4=B i5=alog_f32` · `f0=q_scale f1=l2_eps`.
+    QwenGdnStep = 137,
+    /// Ordinary per-head RMSNorm(core) times SiLU(z). BF16 core/z/out[B,HV,V] and gamma[V]; optional I32 active[B].
+    ///
+    /// `t0=out t1=core t2=z t3=gamma t4=active?` · `i0=HV i1=V i2=B` · `f0=eps`.
+    QwenGatedNorm = 138,
+    /// Deinterleave each head of BF16 packed[B,H,2*D] into Q/gate[B,H,D]; optional I32 active[B].
+    ///
+    /// `t0=Q t1=gate t2=packed t3=active?` · `i0=H i1=D i2=B`.
+    QwenQGateSplit = 139,
+    /// BF16 out[B,width] = x times sigmoid(gate), with sigmoid rounded to BF16 before multiplication. Output may alias x; optional I32 active[B].
+    ///
+    /// `t0=out t1=x t2=gate t3=active?` · `i0=width i1=B`.
+    QwenSigmoidGate = 140,
+    /// BF16 RMSNorm over width with FP32 (gamma + gamma_offset); gamma[width], x/out[B,width], optional I32 active[B].
+    ///
+    /// `t0=out t1=x t2=gamma t3=active?` · `i0=width i1=B` · `f0=eps f1=gamma_offset`.
+    QwenRmsNorm = 141,
+    /// D=256; rotary is 0 or 64. BF16 x[rows,H,D] and optional gamma[D]. FP32 cos/sin tables are required when rotary is nonzero and round to BF16 before rotation; normalization also rounds to BF16 first. Optional I32 pos[rows] defaults to zero; optional I32 active[rows] masks writes. ctx=0 writes contiguous output; otherwise writes KV[slot,H,ctx,D]. prefill=1 treats rows as query tokens and writes the single selected KV slot, while decode uses one slot per row.
+    ///
+    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill` · `f0=eps f1=gamma_offset`.
+    QwenHeadNormRope = 142,
+    /// BF16 causal convolution plus SiLU for exactly T valid tokens: x/out[T,C], weight[C,W], mutable oldest-first history[1,C,W-1]. Updates history after the chunk.
+    ///
+    /// `t0=out t1=x t2=weight t3=history` · `i0=C i1=W i2=T`.
+    QwenGdnConvPrefill = 143,
+    /// Unpack BF16 packed[T,2*HK*K+HV*V]; normalize Q/K[T,HK,K] and round to BF16, copy V[T,HV,V]. No Q scaling.
+    ///
+    /// `t0=Q t1=K t2=V t3=packed` · `i0=HK i1=HV i2=K i3=V i4=T` · `f0=l2_eps`.
+    QwenGdnQkvPrep = 144,
+    /// Prepare FP32 alpha/beta[T,HV] from BF16 a/b[T,HV] and A_log/dt_bias[HV]. Alpha is the exponential decay; beta rounds to BF16 before widening to FP32.
+    ///
+    /// `t0=alpha t1=beta t2=a t3=b t4=A_log t5=dt_bias` · `i0=HV i1=T`.
+    QwenGdnGatePrep = 145,
+    /// External native GDN segment, HK=16, HV=48, K=V=128 and T<=8192. BF16 Q/K[T,HK,K], V/core[T,HV,V]; FP32 alpha/beta[T,HV] and distinct state/outstate[1,HV,V,K]. Host launch copies outstate to persistent state on the same stream, then executes a Nop dependency epilogue.
+    ///
+    /// `t0=core t1=Q t2=K t3=V t4=alpha t5=beta t6=state t7=outstate` · `i0=T i1=HK i2=HV i3=K i4=V` · `f0=q_scale`.
+    QwenGdnPrefill = 146,
 }
 
 impl DevOp {
@@ -1822,6 +1866,17 @@ impl DevOp {
         DevOp::DsaQQuant,
         DevOp::IndexScoreKpool,
         DevOp::GemvF32,
+        DevOp::QwenGdnConv,
+        DevOp::QwenGdnStep,
+        DevOp::QwenGatedNorm,
+        DevOp::QwenQGateSplit,
+        DevOp::QwenSigmoidGate,
+        DevOp::QwenRmsNorm,
+        DevOp::QwenHeadNormRope,
+        DevOp::QwenGdnConvPrefill,
+        DevOp::QwenGdnQkvPrep,
+        DevOp::QwenGdnGatePrep,
+        DevOp::QwenGdnPrefill,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1978,6 +2033,17 @@ impl DevOp {
             DevOp::DsaQQuant => "PLOW_DOP_DSA_Q_QUANT",
             DevOp::IndexScoreKpool => "PLOW_DOP_INDEX_SCORE_KPOOL",
             DevOp::GemvF32 => "PLOW_DOP_GEMV_F32",
+            DevOp::QwenGdnConv => "PLOW_DOP_QWEN_GDN_CONV",
+            DevOp::QwenGdnStep => "PLOW_DOP_QWEN_GDN_STEP",
+            DevOp::QwenGatedNorm => "PLOW_DOP_QWEN_GATED_NORM",
+            DevOp::QwenQGateSplit => "PLOW_DOP_QWEN_Q_GATE_SPLIT",
+            DevOp::QwenSigmoidGate => "PLOW_DOP_QWEN_SIGMOID_GATE",
+            DevOp::QwenRmsNorm => "PLOW_DOP_QWEN_RMSNORM",
+            DevOp::QwenHeadNormRope => "PLOW_DOP_QWEN_HEADNORM_ROPE",
+            DevOp::QwenGdnConvPrefill => "PLOW_DOP_QWEN_GDN_CONV_PREFILL",
+            DevOp::QwenGdnQkvPrep => "PLOW_DOP_QWEN_GDN_QKV_PREP",
+            DevOp::QwenGdnGatePrep => "PLOW_DOP_QWEN_GDN_GATE_PREP",
+            DevOp::QwenGdnPrefill => "PLOW_DOP_QWEN_GDN_PREFILL",
         }
     }
 
@@ -2014,7 +2080,7 @@ impl DevOp {
     /// as 121-128 in parallel with the KdaChunk/Mla pair above, which claimed the same
     /// range independently — the collision surfaced only at merge, same as 111 -> 113
     /// above; renumbering the later-merged pair (this one) was the resolution.
-    pub const COUNT: u16 = 136;
+    pub const COUNT: u16 = 147;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

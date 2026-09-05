@@ -106,6 +106,12 @@
 #include "op_elementwise.cuh"
 #include "op_gemm.cuh"
 #include "op_norm.cuh"
+#ifndef PLOW_NV_QWEN_GDN
+#define PLOW_NV_QWEN_GDN 0
+#endif
+#if PLOW_NV_QWEN_GDN
+#include "op_qwen_gdn.cuh"
+#endif
 #include "op_moe.cuh"        /* Gemma-4 26B-A4B bf16 MoE decode bodies (router/glu/down/combine) */
 #include "op_mamba.cuh"      /* Nemotron-3 Mamba-2 SSD mixer (UNVERIFIED on GPU; nvcc-compile only) */
 
@@ -710,6 +716,7 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #endif
 #if PLOW_NV_EMBED_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS * sizeof(float);
+
 /* Widest row block instantiated by gemv_walk. This is a throughput capacity, not a
  * correctness ceiling: M > GV_MM_MAX walks multiple weight passes. The decode loader reads
  * it to report the packet/object pairing and refuses zero, which would make the walk stall. */
@@ -790,6 +797,62 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     }
 #endif
     switch (in->op) {
+#if PLOW_NV_QWEN_GDN && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY
+    case PLOW_DOP_QWEN_GDN_CONV:
+        d_qwen_gdn_conv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), (const int*)TEN(4),
+            in->i[0], in->i[1], in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_GDN_STEP:
+        d_qwen_gdn_step((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), TEN(4),
+            (const __nv_bfloat16*)TEN(5), (float*)TEN(6), (const int*)TEN(7),
+            in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
+            in->fj[1].f, in->i[5], slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_GATED_NORM:
+        d_qwen_gated_norm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), (const int*)TEN(4),
+            in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_Q_GATE_SPLIT:
+        d_qwen_q_gate_split((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (const int*)TEN(3),
+            in->i[0], in->i[1], in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_SIGMOID_GATE:
+        d_qwen_sigmoid_gate((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1], slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_RMSNORM:
+        d_qwen_rmsnorm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
+            in->fj[0].f, in->fj[1].f, slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_HEADNORM_ROPE:
+        d_qwen_headnorm_rope((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
+            (const int*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1], in->i[2],
+            in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6]);
+        break;
+    case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
+        d_qwen_gdn_conv_prefill((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), in->i[0], in->i[1],
+            in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_GDN_QKV_PREP:
+        d_qwen_gdn_qkv_prep((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1),
+            (__nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), in->i[0], in->i[1],
+            in->i[2], in->i[3], in->i[4], in->fj[0].f, slice, nblk);
+        break;
+    case PLOW_DOP_QWEN_GDN_GATE_PREP:
+        d_qwen_gdn_gate_prep((float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+            (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
+            (const __nv_bfloat16*)TEN(5), in->i[0], in->i[1], slice, nblk);
+        break;
+
+#endif
+
 #if !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY /* lean objects: light arms live on the fat object */
     /* ---- norms ---- */
     case PLOW_DOP_RMSNORM:
@@ -1969,6 +2032,16 @@ __device__ __forceinline__ void plow_ws_role_loop(const PlowProgram& prog, uint3
 #endif
 #ifndef PLOW_NV_SKELETON
 #define PLOW_NV_SKELETON 0
+#endif
+#if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
+extern "C" __device__ unsigned plow_qwen_prefill_arm = 1;
+#else
+extern "C" __device__ unsigned plow_qwen_prefill_arm = 0;
+#endif
+#if PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
+extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 1;
+#else
+extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 0;
 #endif
 /* Backoff inside the counter-gate poll. 64 ns is the shipped value; 0 spins flat out. */
 #ifndef PLOW_NV_GATE_SLEEP

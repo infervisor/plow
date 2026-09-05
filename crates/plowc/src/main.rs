@@ -1342,16 +1342,11 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn ensure_devblob_arch_supported(config_json: &str) -> Result<(), String> {
     let v: serde_json::Value =
         serde_json::from_str(config_json).map_err(|e| format!("invalid config.json: {e}"))?;
-    if v["model_type"].as_str() == Some("qwen3_5") {
-        return Err(
-            "qwen3_5 frontend/rewrite support is available, but devblob emission is not yet \
-             faithful: Qwen Gated DeltaNet has unequal Q/K and V head geometry, one shared \
-             qkv+depthwise-conv stream, and recurrent state; its full-attention layers pack \
-             a sigmoid output gate into q_proj. The current device packet ABI/interpreter \
-             cannot represent those semantics, so plowc refuses emission instead of producing \
-             a silently-wrong dense-Qwen blob."
-                .into(),
-        );
+    if v["model_type"].as_str() == Some("qwen3_5")
+        && (v.get("quantization_config").is_some()
+            || v["text_config"].get("quantization_config").is_some())
+    {
+        return Err("qwen3_5 native checkpoint FP8 lowering is not implemented yet".into());
     }
     Ok(())
 }
@@ -2118,12 +2113,14 @@ mod cli_tests {
     }
 
     #[test]
-    fn qwen35_devblob_is_rejected_before_dense_dispatch() {
-        let err = ensure_devblob_arch_supported(r#"{"model_type":"qwen3_5"}"#).unwrap_err();
-        assert!(err.contains("Gated DeltaNet"), "{err}");
-        assert!(err.contains("output gate into q_proj"), "{err}");
-        assert!(err.contains("refuses emission"), "{err}");
+    fn qwen35_devblob_routes_bf16_and_rejects_unimplemented_fp8() {
+        ensure_devblob_arch_supported(r#"{"model_type":"qwen3_5"}"#).unwrap();
         ensure_devblob_arch_supported(r#"{"model_type":"qwen3"}"#).unwrap();
+        let err = ensure_devblob_arch_supported(
+            r#"{"model_type":"qwen3_5","quantization_config":{"quant_method":"fp8"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("FP8 lowering"));
     }
 
     /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be

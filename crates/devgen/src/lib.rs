@@ -57,6 +57,7 @@ pub mod kda;
 use config::*;
 mod ladder;
 mod mla;
+mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
@@ -5917,13 +5918,23 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             })
             .unwrap_or_default();
     if model_type == "qwen3_5" {
-        panic!(
-            "qwen3_5 devblob emission is unsupported: Qwen Gated DeltaNet uses unequal \
-             key/value heads and a shared qkv+depthwise-conv stream, while full-attention \
-             layers use a packed q_proj output gate. The semantic packet opcodes exist, but \
-             the CUDA interpreter and devblob lowering do not implement them yet; use the \
-             nn-graph/rewrite packet path until runtime support lands."
+        assert!(
+            embed_cubin.is_none() && embed_hsaco.is_none(),
+            "Qwen uses an external paired CUDA interpreter"
         );
+        qwen35::run(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            block_spec.as_deref(),
+            rope_gen,
+            &arch,
+            &gpu,
+            verify.as_ref(),
+        );
+        return;
     }
     // PLOW_L2_PLACE is wired only on the dense-GQA path below (b/bd builders). The
     // GLM/Kimi/DeepSeek/Nemotron emitters have their own builders and never call

@@ -1715,8 +1715,14 @@ static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __re
                 amax = fmaxf(amax, fabsf(__bfloat162float(x[row + kk])));
         }
         amax = warp_max32(amax);
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+        /* vLLM 2cf0a6915 dynamic_per_token_scaled_fp8_quant: true division,
+         * including under --use_fast_math; the floor is one E4M3 subnormal / 448. */
+        const float as = fmaxf(__fdiv_rn(amax, 448.0f), 1.0f / (448.0f * 512.0f));
+#else
         const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
         const float inv = 1.0f / as;
+#endif
         if (lane == 0) ascale[mm] = as;
         if (v8) {
             for (unsigned kk = lane * 8u; kk < K; kk += 256u) {
@@ -1724,14 +1730,24 @@ static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __re
                 uint8_t q8[8];
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+                    const float scaled = __fdiv_rn(__bfloat162float(v.x[j]), as);
+                    __nv_fp8_e4m3 q(fmaxf(-448.0f, fminf(scaled, 448.0f)));
+#else
                     __nv_fp8_e4m3 q(__bfloat162float(v.x[j]) * inv);
+#endif
                     q8[j] = *(const uint8_t*)&q;
                 }
                 *(uint2*)(xq + row + kk) = *(const uint2*)q8;
             }
         } else {
             for (unsigned kk = lane; kk < K; kk += 32u) {
+#if defined(PLOW_NV_QUANT_FP8_VLLM) && PLOW_NV_QUANT_FP8_VLLM
+                const float scaled = __fdiv_rn(__bfloat162float(x[row + kk]), as);
+                __nv_fp8_e4m3 q(fmaxf(-448.0f, fminf(scaled, 448.0f)));
+#else
                 __nv_fp8_e4m3 q(__bfloat162float(x[row + kk]) * inv);
+#endif
                 xq[row + kk] = *(const uint8_t*)&q;
             }
         }

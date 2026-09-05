@@ -573,6 +573,10 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     // w8a8 is the per-row ACTIVATION quant: `QuantFp8` exists only on that path.
     f.insert("w8a8".into(), json!(has("QuantFp8")));
     f.insert(
+        "qwen_gdn".into(),
+        json!(union.iter().any(|a| a.op.starts_with("Qwen"))),
+    );
+    f.insert(
         "moe".into(),
         json!(union.iter().any(|a| a.op.starts_with("Moe"))),
     );
@@ -788,6 +792,10 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     if s.hd.iter().any(|&h| h > 128) {
         req.push("PLOW_NV_GEMMA=1".to_string());
     }
+    if on("qwen_gdn") {
+        req.push("PLOW_NV_QWEN_GDN=1".into());
+        req.push("PLOW_NV_FA_GF=2".into());
+    }
     if on("w8a8") {
         req.push("PLOW_NV_W8A8=1".into());
     }
@@ -796,6 +804,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("prefill") {
         req.push("PLOW_NV_PREFILL=1".into());
+        if on("qwen_gdn") {
+            req.push("PLOW_NV_PF_GEMV_HEAD=1".into());
+        }
     }
     let mut rec = Vec::new();
     if let Some(v) = t.get("gv_mm_max").and_then(Value::as_u64) {

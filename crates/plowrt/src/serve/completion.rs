@@ -86,7 +86,9 @@ pub async fn completions(
             .into_response();
     };
     let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
-        bundle.tokenizer().encode(&req.prompt)
+        bundle
+            .tokenizer()
+            .encode_with_special_tokens(&req.prompt, req.add_special_tokens)
     });
     if prompt_ids.is_empty() {
         return (

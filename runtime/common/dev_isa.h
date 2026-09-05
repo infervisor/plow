@@ -1175,6 +1175,30 @@ enum {
      *   t0=C(out,f32[M][N]) t1=x(in,bf16[M][K]) t2=W(in,f32[N][K])
      *   i0=M i1=N i2=K */
     PLOW_DOP_GEMV_F32 = 135,
+    /* Packed causal convolution + SiLU. t0=out,t1=in,t2=weight[Bf16,C,W],t3=history[Bf16,B,C,W-1],t4=active[I32,B]; i0=C,i1=W,i2=B. History is oldest-first. */
+    PLOW_DOP_QWEN_GDN_CONV = 136,
+    /* Qwen recurrence. t0=out[Bf16,B,HV,V],t1=packed QKV,t2=a,t3=b,t4=A_log,t5=dt_bias,t6=state[F32,B,HV,V,K],t7=active[I32,B]. i0=HK,i1=HV,i2=K(128),i3=V,i4=B,i5=A_log F32 flag (else Bf16); f0=Q scale,f1=L2 eps. Other inputs Bf16; beta rounds Bf16. */
+    PLOW_DOP_QWEN_GDN_STEP = 137,
+    /* Ordinary per-head RMSNorm(core)*SiLU(z). t0=out,t1=core,t2=z,t3=gamma[Bf16,V],t4=active[I32,B]; i0=HV,i1=V,i2=B; f0=eps. */
+    PLOW_DOP_QWEN_GATED_NORM = 138,
+    /* Split per-head [Q,gate]. t0=Q,t1=gate,t2=packed[Bf16,B,H,2D],t3=active[I32,B]; i0=H,i1=D,i2=B. */
+    PLOW_DOP_QWEN_Q_GATE_SPLIT = 139,
+    /* out=in*sigmoid(gate), Bf16. t0=out,t1=in,t2=gate,t3=active[I32,B]; i0=width,i1=B. Output may alias input. */
+    PLOW_DOP_QWEN_SIGMOID_GATE = 140,
+    /* Zero-centered RMSNorm. t0=out,t1=in,t2=gamma(Bf16),t3=active[I32,B]; i0=width,i1=B; f0=eps,f1=gamma offset. */
+    PLOW_DOP_QWEN_RMSNORM = 141,
+    /* HD256 norm then partial RoPE. t0=out,t1=in,t2=gamma(Bf16),t3=cos,t4=sin(F32),t5=pos,t6=active(I32). i0=H,i1=D(256),i2=rotary(0/64),i3=B,i4=cache ctx(0=contiguous),i5=normalize; f0=eps,f1=gamma offset. Cache layout[B,H,ctx,D]; norm rounds Bf16 before RoPE. */
+    PLOW_DOP_QWEN_HEADNORM_ROPE = 142,
+    /* t0=conv[T,C],t1=raw,t2=weight[C,W],t3=history[1,C,W-1]; i0=C,i1=W,i2=T. */
+    PLOW_DOP_QWEN_GDN_CONV_PREFILL = 143,
+    /* t0=Q,t1=K,t2=V,t3=packed; i0=HK,i1=HV,i2=K,i3=V,i4=T; f0=L2 eps. BF16 output, no Q scale. */
+    PLOW_DOP_QWEN_GDN_QKV_PREP = 144,
+    /* t0=alphaF32,t1=betaF32,t2=aBF16,t3=bBF16,t4=AlogBF16,t5=dtBF16; i0=HV,i1=T. */
+    PLOW_DOP_QWEN_GDN_GATE_PREP = 145,
+    /* External native GDN segment: t0=core,t1=Q,t2=K,t3=V,t4=alphaF32,t5=betaF32,t6=state,t7=outstate; i0=T,i1=HK,i2=HV,i3=K,i4=V; f0=Qscale. Host launches and copies outstate to state before a Nop dependency epilogue. */
+    PLOW_DOP_QWEN_GDN_PREFILL = 146,
+
+
 
     PLOW_DOP__COUNT
 };
