@@ -41,20 +41,47 @@ Values are medians of the two per-run medians. Raw timings and evidence:
 `fp8-producer-cursor-blocks-h100-20260905.csv`, and
 `native-next-measurements-20260905-evidence.json`.
 
-## Remaining gates
+## Packet-selected attention role
 
-Long-context attention dominates the attention block. A packet-selected
-HD256 attention object is the next controlled experiment: the broad
-interpreter spills score accumulators and waits inside the score MMA loop;
-the unchanged attention-only body avoids those spills and waits. GPU
-correctness and timing are required before selecting it for serving.
+`7e7728f` adds a default-off compiler-selected HD256 attention role. Runtime
+selection follows packet metadata. The broad interpreter spills score
+accumulators and waits inside the score MMA loop; the unchanged
+attention-only body avoids those spills and waits. No tiling, split count,
+precision or optional operand changes were combined with this experiment.
 
-The live-KV GPU gate stopped during flat-engine loading because the test
-setup omitted the segmented prefill directory. It did not test live-KV
-parity or memory savings. Corrected fixture qualification remains required.
+All nine coarse/isolated/role fresh-bucket checks passed bit equality.
+The newly emitted default packet is byte-identical to the prior packet.
+
+| Context | Broad prefill ms | Isolated broad ms | Attention role ms | Speedup vs broad |
+|---:|---:|---:|---:|---:|
+| 1024 | 5.486 | 5.552 | 4.255 | 1.29x |
+| 4096 | 34.591 | 34.574 | 17.296 | 2.00x |
+| 8192 | 107.017 | 107.212 | 39.157 | 2.73x |
+| 32768 | 1349.088 | 1350.756 | 245.028 | 5.51x |
+
+Values are medians of two per-run medians, with reversed ordering in run 2.
+Decode is approximately unchanged. These runs retain the control FP8 GEMM
+object; the producer cursor experiment is not combined here. Raw results:
+`qwen-attention-role-block-h100-20260905.csv` and its evidence JSON.
+Whole-model quality and matched serving comparisons remain required.
+
+## KV correctness and capacity
+
+The first live-KV gate stopped at loading because the fixture omitted the
+segmented prefill directory. The corrected fixture passed full-logit bit
+equality between live and flat allocation at 8192/32768/8193/8192 tokens,
+including four decode steps and reset/repeat checks. Live allocation used
+864,026,624 fewer bytes at load (824 MiB), with prefix reuse disabled.
+
+The B16 flat packet passed two interleaved active slots, distinct 8K/16K
+prompts, resets and decode continuation against isolated full logits.
+This does not qualify B16 live allocation or serving throughput. Evidence:
+`gemma12-live-kv-and-slot-parity-h100-20260905.json`.
+
+## vLLM references
 
 Gemma12 vLLM 0.28 repeat 2 completed all 15 cells, 480/480 requests and exact
 input/output lengths. Gemma31's separate BF16 MBNT2048 capacity probe completed 32/32 exact-length
-requests at 32K/C1: TTFT4577.47ms, TPOT24.42ms, output30.02tokens/s. Its
+requests at 32K/C1: TTFT 4577.47 ms, TPOT 24.42 ms, output 30.02 tokens/s. Its
 original MBNT8192 startup failure remains recorded. See the separate
 Gemma31 MBNT2048 CSV and evidence JSON.

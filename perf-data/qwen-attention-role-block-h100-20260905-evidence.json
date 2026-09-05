@@ -1,0 +1,96 @@
+{
+  "source_commit": "1404f5ddf825b05cae193094faa11fc0b191321c",
+  "checks": {
+    "coarse-m1024": {
+      "passed": true,
+      "returncode": 0,
+      "finite": true,
+      "bit_exact": true
+    },
+    "coarse-m4096": {
+      "passed": true,
+      "returncode": 0,
+      "finite": true,
+      "bit_exact": true
+    },
+    "coarse-m8192": {
+      "passed": true,
+      "returncode": 0,
+      "finite": true,
+      "bit_exact": true
+    },
+    "isolated-m1024": {
+      "passed": true,
+      "returncode": 0,
+      "finite": true,
+      "bit_exact": true
+    },
+    "isolated-m4096": {
+      "passed": true,
+      "returncode": 0,
+      "finite": true,
+      "bit_exact": true
+    },
+    "isolated-m8192": {
+      "passed": true,
+      "returncode": 0,
+      "finite": true,
+      "bit_exact": true
+    },
+    "role-m1024": {
+      "passed": true,
+      "returncode": 0,
+      "finite": true,
+      "bit_exact": true
+    },
+    "role-m4096": {
+      "passed": true,
+      "returncode": 0,
+      "finite": true,
+      "bit_exact": true
+    },
+    "role-m8192": {
+      "passed": true,
+      "returncode": 0,
+      "finite": true,
+      "bit_exact": true
+    }
+  },
+  "cpu_tests": {
+    "devgen": 336,
+    "plowrt_cuda_hsa": 388,
+    "actual_packet_attention_segments": 8,
+    "marker_preprocessor_cases": 25
+  },
+  "scope": "Qwen layer3 synthetic block, B1, frozen FP8 GEMM role1 control; attention role2 alone changes, no cursor flag. Fresh exact-bucket parity M1024/4096/8192; two repeats timing I1024/4096/8192/32768 chunk8192. No whole-model HF quality or serving qualification.",
+  "artifact_sha256": {
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-coarse/interp_sm90a_pf.cubin": "0668047efdef5a1ca3dd5ae9ad5da703043436eecacc3528c567f76f6c710ce4",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-coarse/libplow_gdn_prefill.so": "ad622b8b5d9c71f5942e00febe1c8b4befebf4b1f0649f32a36bc6598578b67b",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-coarse/model.pkt": "87d938339f0ab57f6f2bdef85fb0b9b23d9d2f115d0b21246113d0f1c4a75e7f",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-coarse/weights.json": "ff90ed54ee89caa9e2a87c583ce55e9dc2507e02506e30b9bfbfda9ff9e051a1",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-coarse/interp_sm90a_pfgemm_fp8.cubin": "245f1eb6e1a47cef3773e02aea3cf9e0dc55e2af2a4e4fadf54b8e139c923cc7",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-coarse/interp_sm90a.cubin": "ab3ab39206abe75ab3ba6bb01c89a062a797e71b8103396fb1ad496b1f4db7a8",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-isolated/interp_sm90a_pf.cubin": "0668047efdef5a1ca3dd5ae9ad5da703043436eecacc3528c567f76f6c710ce4",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-isolated/libplow_gdn_prefill.so": "ad622b8b5d9c71f5942e00febe1c8b4befebf4b1f0649f32a36bc6598578b67b",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-isolated/model.pkt": "5febb01ff1a1694828443330eb626e178f49fe7b989bbfd642f0e4adcf8139fc",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-isolated/weights.json": "ff90ed54ee89caa9e2a87c583ce55e9dc2507e02506e30b9bfbfda9ff9e051a1",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-isolated/interp_sm90a_pfgemm_fp8.cubin": "245f1eb6e1a47cef3773e02aea3cf9e0dc55e2af2a4e4fadf54b8e139c923cc7",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-isolated/interp_sm90a.cubin": "ab3ab39206abe75ab3ba6bb01c89a062a797e71b8103396fb1ad496b1f4db7a8",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-role/interp_sm90a_pf.cubin": "0668047efdef5a1ca3dd5ae9ad5da703043436eecacc3528c567f76f6c710ce4",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-role/libplow_gdn_prefill.so": "ad622b8b5d9c71f5942e00febe1c8b4befebf4b1f0649f32a36bc6598578b67b",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-role/model.pkt": "742b0ee7369050e1f5fbb2b76de48933452bf66372345906816e583ee9334d0e",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-role/interp_sm90a_pfattn_hd256.cubin": "79ab40037c873d42830eacb6151a50f2e8f079597e73c1e86e0d7716fbb707cb",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-role/weights.json": "ff90ed54ee89caa9e2a87c583ce55e9dc2507e02506e30b9bfbfda9ff9e051a1",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-role/interp_sm90a_pfgemm_fp8.cubin": "245f1eb6e1a47cef3773e02aea3cf9e0dc55e2af2a4e4fadf54b8e139c923cc7",
+    "/tmp/plow-model-support-checks/qwen-attention-role/layer3-role/interp_sm90a.cubin": "ab3ab39206abe75ab3ba6bb01c89a062a797e71b8103396fb1ad496b1f4db7a8",
+    "/tmp/plow-model-support-checks/qwen-attention-role/bin/block_run": "452da8b2f846e3e69363f48b6870b08f707ddaa99692dbb9813a83a8f0b21903"
+  },
+  "raw_sha256": {
+    "/tmp/plow-model-support-checks/attention-next-window-20260905/bench-r1-coarse/sweep.json": "af0eed21c1bb74845b04c50fb0e818021758d600708df0ef81fdd747d2036da9",
+    "/tmp/plow-model-support-checks/attention-next-window-20260905/bench-r1-role/sweep.json": "d46f28c0aedbcd7e7e1ff1842d35fd2bf7cd3c2e6a7f4ebe78effb4cdfd0ef39",
+    "/tmp/plow-model-support-checks/attention-next-window-20260905/bench-r2-role/sweep.json": "432638ad6214dcf6457139d58cdf3272c490948e7a21cb2cd22e1f6e28cd12ed",
+    "/tmp/plow-model-support-checks/attention-next-window-20260905/bench-r2-isolated/sweep.json": "33fae36e132b43861a901b2c4c8df50c507563b50235964d933b74d419859987",
+    "/tmp/plow-model-support-checks/attention-next-window-20260905/bench-r2-coarse/sweep.json": "16364079700ab14dfbe945bafb97f6ba24aed63ba810ecd5dca839552670e6b2",
+    "/tmp/plow-model-support-checks/attention-next-window-20260905/bench-r1-isolated/sweep.json": "5d8eac63745a5305086ec4c29d409084361879dadc93c1815855bbdca6e4c670"
+  }
+}
