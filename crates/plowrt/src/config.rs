@@ -297,7 +297,7 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "pf-seg-dir", env = "PLOW_PF_SEG_DIR", global = true)]
     pub pf_seg_dir: Option<String>,
 
-    /// Experimental m128n128 TMA object for pure BF16 GEMM segments with M<=128.
+    /// Experimental BF16 TMA object: ABI1 M<=128; ABI2 Gemma12 M128 o/down; ABI3 Gemma31.
     #[arg(
         long = "pf-seg-gemm-small",
         env = "PLOW_PF_SEG_GEMM_SMALL",

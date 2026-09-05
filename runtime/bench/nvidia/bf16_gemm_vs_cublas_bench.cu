@@ -21,6 +21,12 @@
 #include <algorithm>
 
 /* Opt-in Hopper: -DPLOW_BENCH_WS384=1 -gencode arch=compute_90a,code=sm_90a -lcuda. */
+#ifdef PLOW_BENCH_M64N64
+#define PLOW_NV_SEG_M64N64 1
+#endif
+#ifdef PLOW_BENCH_M64N128
+#define PLOW_NV_SEG_M64N128 1
+#endif
 #ifdef PLOW_BENCH_WS384
 #define PLOW_NV_HOPPER 1
 #define PLOW_NV_TMA_GEMM 1
@@ -39,7 +45,11 @@ typedef __nv_bfloat16 bf16;
     printf("cublasLt %s @%d: %d\n",#x,__LINE__,(int)s_); exit(2);} } while(0)
 
 static const int WARM = 5, ITERS = 30;
+#ifdef PLOW_BENCH_GEMM_ODOWN
+static const size_t COLD_MB = 2048;
+#else
 static const size_t COLD_MB = 700; /* PX-9's own L2-cold budget */
+#endif
 
 static int oracle_grid(unsigned T, int P) {
     for (int g = std::min<int>(P, (int)T); g >= 1; g--) if (T % (unsigned)g == 0) return g;
@@ -58,7 +68,11 @@ __global__ void k_gemm_glu(bf16* C, const bf16* A, const bf16* Wg, const bf16* W
 
 struct Shape { const char* name; unsigned N, K; int glu; };
 static const Shape SHAPES[] = {
-#ifdef PLOW_BENCH_QWEN_GEMV
+#ifdef PLOW_BENCH_GEMM_ODOWN
+    {"g12_o_local",3840,4096,0}, {"g12_o_full",3840,8192,0}, {"g12_down",3840,15360,0},
+    {"g31_o_local",5376,8192,0}, {"g31_o_full",5376,16384,0}, {"g31_down",5376,21504,0},
+    {"qwen_o",5120,6144,0}, {"qwen_down",5120,17408,0}, {"tail",3906,648,0},
+#elif defined(PLOW_BENCH_QWEN_GEMV)
 #ifdef PLOW_BENCH_GEMV_M16
     {"gemma_down",3840,15360,0}, {"gemma_q",8192,3840,0}, {"gemma_o",3840,8192,0},
 #endif
@@ -89,6 +103,19 @@ __global__ void init_nonconstant(bf16* d, size_t n, unsigned seed) {
     }
 }
 #ifdef PLOW_BENCH_WS384
+#if defined(PLOW_BENCH_M64N64) || defined(PLOW_BENCH_M64N128)
+__global__ __maxnreg__(128) void k_m64(bf16* C, const void* ma, const void* mb,
+                                       unsigned m, unsigned n, unsigned k) {
+    extern __shared__ bf16 arena[];
+    if (threadIdx.x < 128) {
+        sm90_reg_dec(32);
+        d_gemm_sm90_tma_m64_role<true, PLOW_NV_SEG_M64N128 ? 128 : 64>(C, ma, mb, m, n, k, 0, blockIdx.x, gridDim.x, arena);
+    } else {
+        sm90_reg_inc(224);
+        d_gemm_sm90_tma_m64_role<false, PLOW_NV_SEG_M64N128 ? 128 : 64>(C, ma, mb, m, n, k, 0, blockIdx.x, gridDim.x, arena);
+    }
+}
+#endif
 __global__ __maxnreg__(160) void k_ws384(bf16* C, const void* ma, const void* mb,
                                        unsigned m, unsigned n, unsigned k) {
     extern __shared__ bf16 arena[];
@@ -143,6 +170,9 @@ __global__ void k_decode_gemv(bf16* c, const bf16* a, const bf16* w, unsigned m,
         d_gemv(c, a, w, m, n, k, blockIdx.x, gridDim.x, arena);
     else d_gemv(c, a, w, m, n, k, blockIdx.x, gridDim.x);
 }
+#endif
+
+#if defined(PLOW_BENCH_QWEN_GEMV) || defined(PLOW_BENCH_GEMM_ODOWN)
 __global__ void evict_l2(unsigned* p, size_t n) {
     for (size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(size_t)gridDim.x*blockDim.x)
         p[i] += 1;
@@ -311,15 +341,27 @@ static void bench_cublas(unsigned M) {
             k_decode_gemv<<<prop.multiProcessorCount,256,12352>>>(cp,A,Bv[it%nrep],M,s.N,s.K);
         };
 #else
+#if defined(PLOW_BENCH_M64N64) || defined(PLOW_BENCH_M64N128)
+        const unsigned smem = PGM90_TMA_ARENA * sizeof(bf16);
+        CK(cudaFuncSetAttribute(k_m64, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+#else
         const unsigned smem = PGM90_U256_ARENA * sizeof(bf16);
         CK(cudaFuncSetAttribute(k_ws384, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+#endif
         std::vector<CUtensorMap> maps{bf16_map(A, M, s.K)};
         for (auto b : Bv) maps.push_back(bf16_map(b, s.N, s.K));
         CUtensorMap* dm; CK(cudaMalloc(&dm, maps.size() * sizeof(CUtensorMap)));
         CK(cudaMemcpy(dm, maps.data(), maps.size() * sizeof(CUtensorMap), cudaMemcpyHostToDevice));
-        bf16* cp; CK(cudaMalloc(&cp, (size_t)M * s.N * sizeof(bf16)));
+        bf16* cp_alloc;
+        CK(cudaMalloc(&cp_alloc, ((size_t)M * s.N + 16) * sizeof(bf16)));
+        CK(cudaMemset(cp_alloc, 0xa5, ((size_t)M * s.N + 16) * sizeof(bf16)));
+        bf16* cp = cp_alloc + 8;
         auto run_plow = [&](int it) {
+#if defined(PLOW_BENCH_M64N64) || defined(PLOW_BENCH_M64N128)
+            k_m64<<<prop.multiProcessorCount, 256, smem>>>(cp, dm, dm + 1 + it % nrep, M, s.N, s.K);
+#else
             k_ws384<<<prop.multiProcessorCount, 384, smem>>>(cp, dm, dm + 1 + it % nrep, M, s.N, s.K);
+#endif
         };
 #endif
         run(0, 0); run_plow(0);
@@ -327,6 +369,12 @@ static void bench_cublas(unsigned M) {
         std::vector<bf16> ref((size_t)M * s.N), got(ref.size());
         CK(cudaMemcpy(ref.data(), C, ref.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(got.data(), cp, got.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
+#ifdef PLOW_BENCH_WS384
+        uint16_t guards[16];
+        CK(cudaMemcpy(guards, cp_alloc, 8 * sizeof(bf16), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(guards + 8, cp + (size_t)M * s.N, 8 * sizeof(bf16), cudaMemcpyDeviceToHost));
+        for (auto guard : guards) if (guard != 0xa5a5) { printf("output guard overwritten\n"); exit(3); }
+#endif
         double err2 = 0, ref2 = 0, maxerr = 0, maxref = 0;
         for (size_t i = 0; i < ref.size(); i++) {
             double r = __bfloat162float(ref[i]), v = __bfloat162float(got[i]);
@@ -351,7 +399,11 @@ static void bench_cublas(unsigned M) {
 #else
         CK(cudaFree(dm));
 #endif
+#ifdef PLOW_BENCH_WS384
+        CK(cudaFree(cp_alloc));
+#else
         CK(cudaFree(cp));
+#endif
 #endif
 
 

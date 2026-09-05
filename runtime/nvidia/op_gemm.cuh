@@ -1719,6 +1719,134 @@ static __device__ void d_gemm_w8a8_m1_sm90(__nv_bfloat16* C, const uint8_t* A,
         __syncthreads();
     }
 }
+#ifndef PLOW_NV_FP8_M1_TMA
+#define PLOW_NV_FP8_M1_TMA 0
+#endif
+#if PLOW_NV_FP8_M1_TMA
+#if !PLOW_NV_FP8_M1_XCACHE || !PLOW_NV_TMA_GEMM || !PLOW_NV_FP8_M1_FAST_ACCUM
+#error "FP8 M1 TMA requires XCACHE, FAST_ACCUM and TMA helpers"
+#endif
+static __device__ void d_gemm_w8a8_m1_tma_sm90(__nv_bfloat16* C, const uint8_t* A,
+    const uint8_t* W, const void* mapW, const float* ascale, const float* wscale, unsigned n, unsigned k,
+    unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
+    if (sm90_bad_k(k, 16u)) return;
+    const unsigned tid = threadIdx.x;
+    if (!mapW || k > 17408) {
+        d_gemm_w8a8_m1_sm90(C, A, W, ascale, wscale, n, k, a_row0, slice, nblk, arena);
+        return;
+    }
+    // Two barriers precede the aligned 64 KiB ring and 139264-byte activation cache.
+    uint64_t* ready = (uint64_t*)arena;
+    uint8_t* weights = (uint8_t*)sm90_align1024(arena + 8);
+    constexpr unsigned panels = 4;
+    constexpr bool cached = true;
+    constexpr unsigned panel_bytes = 8192;
+    uint8_t* cached_x = weights + 65536;
+    static_assert(16 + 1023 + 65536 + 139264 <= 205840, "FP8 M1 TMA arena");
+    static_assert(205840 + 2448 <= 232448, "FP8 M1 TMA shared-memory limit");
+    if (tid < 2) {
+        sm90_mbar_init(ready + tid, 1);
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    unsigned stage = 0;
+    const uint8_t* x = A + (size_t)a_row0 * k;
+    const unsigned first = slice * 64, end = n, stride = nblk * 64;
+    if (cached && first < end) {
+        const unsigned chunks = ((k + 127) / 128) * 64;
+        for (unsigned batch = 0; batch < chunks; batch += 8 * PLOW_NV_THREADS) {
+#pragma unroll
+            for (unsigned copy = 0; copy < 8; ++copy) {
+                const unsigned line = batch + copy * PLOW_NV_THREADS + tid;
+                if (line < chunks) {
+                    const unsigned panel = line / 64, row = (line % 64) / 8, col = line % 8;
+                    const unsigned gk = panel * 128 + col * 16;
+                    const bool valid = row == 0 && gk < k;
+                    sm90_cp16(cached_x + panel * 1024 + sm90_swz_off<128, 16>(row, col),
+                        valid ? x + gk : x, valid ? min(16u, k - gk) : 0);
+                }
+            }
+            sm90_cp_commit();
+            sm90_cp_wait<0>();
+        }
+        __syncthreads();
+    }
+    for (unsigned row0 = first; row0 < end; row0 += stride) {
+        float total[4] = {}, partial[4] = {};
+        const unsigned steps = (k + 511) / 512;
+        auto issue = [&](unsigned serial, unsigned kb) {
+            const unsigned slot = serial & 1;
+            sm90_mbar_expect(ready + slot, 32768);
+            for (unsigned panel = 0; panel < 4; ++panel)
+                sm90_tma2d(sm90_su32(weights + slot * 32768 + panel * 8192),
+                    mapW, kb + panel * 128, row0, sm90_su32(ready + slot));
+        };
+        if (tid == 0) {
+            issue(stage, 0);
+            if (steps > 1) issue(stage + 1, 512);
+        }
+        for (unsigned step = 0, kb = 0; step < steps; ++step, kb += 512, ++stage) {
+            const unsigned slot = stage & 1;
+            sm90_mbar_wait(ready + slot, (stage / 2) & 1);
+            if (tid < 128) {
+                sm90_wg_fence();
+#pragma unroll
+                for (unsigned sub = 0; sub < panels * 4; ++sub) {
+                    if (kb + (sub / 4) * 128 >= k) break;
+                    uint8_t* buffer = weights + slot * 32768 + (sub / 4) * panel_bytes;
+                    const uint64_t dw = sm90_desc(buffer + (sub % 4) * 32);
+                    const uint8_t* xp = cached_x + (kb / 128 + sub / 4) * 1024;
+                    const uint64_t dx = sm90_desc(xp + (sub % 4) * 32);
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    const int accumulate = kb != 0 || sub != 0;
+#else
+                    const int accumulate = sub != 0;
+#endif
+                    asm volatile(
+                        "{ .reg .pred p; setp.ne.b32 p, %6, 0;\n"
+                        "wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3 "
+                        "{%0,%1,%2,%3}, %4, %5, p, 1, 1; }\n"
+                        : "+f"(partial[0]), "+f"(partial[1]), "+f"(partial[2]), "+f"(partial[3])
+                        : "l"(dw), "l"(dx), "r"(accumulate));
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<0>();
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    total[i] = partial[i];
+#else
+                    total[i] += partial[i];
+#endif
+                }
+            }
+            __syncthreads();
+            if (tid == 0 && step + 2 < steps) issue(stage + 2, kb + 1024);
+        }
+        if (tid < 128 && (tid & 3) == 0) {
+            const unsigned r0 = row0 + (tid >> 5) * 16 + ((tid & 31) >> 2);
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const unsigned row = r0 + hi * 8;
+                if (row < end) {
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    /* vLLM M<=16 swaps both operands and epilogue scales. */
+                    C[row] = __float2bfloat16(__fmul_rn(wscale[row],
+                        __fmul_rn(ascale[0], total[hi * 2])));
+#else
+                    C[row] = __float2bfloat16(total[hi * 2] * ascale[0] * wscale[row]);
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+    if (tid < 2) sm90_mbar_inval(ready + tid);
+    __syncthreads();
+}
+#endif
+
 #endif
 
 static __device__ void d_gemm_w8a8(__nv_bfloat16* __restrict__ C, const uint8_t* __restrict__ A,

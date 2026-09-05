@@ -3,6 +3,9 @@
 #include "../nvidia/op_qwen_gdn.cuh"
 #include "../nvidia/op_gemm.cuh"
 #include "../nvidia/op_norm.cuh"
+#ifndef PLOW_NV_FP8_M1_TMA
+#define PLOW_NV_FP8_M1_TMA 0
+#endif
 #ifndef PLOW_NV_FP8_M1_XCACHE
 #define PLOW_NV_FP8_M1_XCACHE 0
 #endif
@@ -39,9 +42,15 @@ switch(op) {
         break;
 #if defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1
     case PLOW_DOP_GEMM_FP8:
+#if PLOW_NV_FP8_M1_TMA
+        d_gemm_w8a8_m1_tma_sm90((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1), (const uint8_t*)TEN(2),
+            TEN(7), (const float*)TEN(3), (const float*)TEN(4), in->i[1], in->i[2],
+            0, slice, nblk, arena);
+#else
         d_gemm_w8a8((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1), (const uint8_t*)TEN(2),
             (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2],
             0, slice, nblk, arena);
+#endif
         break;
 #endif
     case PLOW_DOP_QUANT_FP8:
@@ -104,9 +113,9 @@ switch(op) {
 }}
 extern "C" int qwen_test(unsigned op, void** tensors, const int* integers, const float* floats, void* stream) {
 #if PLOW_NV_FP8_M1_BK1024
-static const cudaError_t configured = cudaFuncSetAttribute(run, cudaFuncAttributeMaxDynamicSharedMemorySize, PLOW_NV_FP8_M1_XCACHE ? 205824 : 74752);
+static const cudaError_t configured = cudaFuncSetAttribute(run, cudaFuncAttributeMaxDynamicSharedMemorySize, PLOW_NV_FP8_M1_XCACHE ? (PLOW_NV_FP8_M1_TMA ? 205840 : 205824) : 74752);
 if (configured != cudaSuccess) return (int)configured;
 #endif
 Args a={}; for(int i=0;i<8;i++)a.t[i]=tensors[i]; for(int i=0;i<8;i++)a.i[i]=integers[i]; for(int i=0;i<2;i++)a.fj[i].f=floats[i];
-run<<<132,256,op == PLOW_DOP_GEMM_FP8 ? (PLOW_NV_FP8_M1_XCACHE ? 205824 : PLOW_NV_FP8_M1_BK1024 ? 74752 : PLOW_NV_FP8_M1_BK512 ? 37888 : PLOW_NV_FP8_M1_BK256 ? 19456 : 12352) : (op == PLOW_DOP_RMSNORM || op == PLOW_DOP_NORM_RESIDUAL || op == PLOW_DOP_NORM_RESIDUAL_NORM ? 32 : 0),(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
+run<<<132,256,op == PLOW_DOP_GEMM_FP8 ? (PLOW_NV_FP8_M1_XCACHE ? (PLOW_NV_FP8_M1_TMA ? 205840 : 205824) : PLOW_NV_FP8_M1_BK1024 ? 74752 : PLOW_NV_FP8_M1_BK512 ? 37888 : PLOW_NV_FP8_M1_BK256 ? 19456 : 12352) : (op == PLOW_DOP_RMSNORM || op == PLOW_DOP_NORM_RESIDUAL || op == PLOW_DOP_NORM_RESIDUAL_NORM ? 32 : 0),(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
 }

@@ -4,6 +4,7 @@ p=argparse.ArgumentParser()
 p.add_argument("--run-gpu", action="store_true")
 p.add_argument("--library", required=True)
 p.add_argument("--gdn-library")
+p.add_argument("--fp8-tma", action="store_true", help="encode a 64-row FP8 weight map before timing")
 p.add_argument("--fp8-interpreter-only", action="store_true", help="run interpreter FP8 M1 body vs vLLM CUTLASS")
 p.add_argument("--fp8-gemm-only", action="store_true", help="run cuBLASLt FP8 M1 vs vLLM CUTLASS")
 p.add_argument("--fp8-only", action="store_true", help="report exact activation quantization parity; exit 1 on any mismatch")
@@ -145,9 +146,27 @@ def check_fp8_gemm():
             ref=torch.empty(1,N,device="cuda",dtype=torch.bfloat16)
             wt=wq.t()
             ws_vector=ws.expand(N).contiguous()
+            weight_map=None
+            if args.fp8_tma:
+                assert args.fp8_interpreter_only
+                driver=C.CDLL("libcuda.so.1")
+                encode=driver.cuTensorMapEncodeTiled
+                encode.argtypes=[C.c_void_p,C.c_int,C.c_uint,C.c_void_p,
+                    C.POINTER(C.c_uint64),C.POINTER(C.c_uint64),
+                    C.POINTER(C.c_uint),C.POINTER(C.c_uint),C.c_int,C.c_int,C.c_int,C.c_int]
+                encode.restype=C.c_int
+                storage=C.create_string_buffer(255)
+                aligned=(C.addressof(storage)+127)&~127
+                rc=encode(aligned,0,2,wq.data_ptr(),(C.c_uint64*2)(K,N),
+                    (C.c_uint64*1)(K),(C.c_uint*2)(128,64),(C.c_uint*2)(1,1),0,3,2,0)
+                assert rc==0, f"cuTensorMapEncodeTiled status {rc}"
+                weight_map=torch.tensor(list(C.string_at(aligned,128)),device="cuda",dtype=torch.uint8)
+                assert weight_map.data_ptr()%128==0
+                record["descriptor_attempts"]=[dict(rows=N,k=K,box_rows=64,status=rc)]
+
             def native():
                 if args.fp8_interpreter_only:
-                    run(33,[out,ap,wq,asc,ws_vector],[1,N,K])
+                    run(33,[out,ap,wq,asc,ws_vector,None,None,weight_map],[1,N,K])
                 else:
                     rc=lib.plow_fp8_m1_run(handle,wq.data_ptr(),ap.data_ptr(),out.data_ptr(),torch.cuda.current_stream().cuda_stream)
                     if rc:raise RuntimeError(f"cublasLtMatmul status {rc}")

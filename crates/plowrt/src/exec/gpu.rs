@@ -419,6 +419,7 @@ use crate::asset::checkpoint::Checkpoint;
 /// chunk launch SEQUENTIALLY on the engine stream — dependencies only point backward, so
 /// stream order replaces cross-segment gating; counters are re-armed once per chunk.
 struct SegGemm {
+    abi: u32,
     function: KernelFn,
     smem: u32,
     grid: u32,
@@ -4668,11 +4669,16 @@ impl GpuEngine {
                         RuntimeError::Device(format!("PLOW_PF_SEG_GEMM_SMALL: read {path}: {e}"))
                     })?;
                     let module = be.module_load(&img)?;
-                    if be.module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")? != Some(1)
+                    let abi = be
+                        .module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")?
+                        .unwrap_or(0);
+                    if !matches!(abi, 1 | 2 | 3)
                         || be.module_global_u32(&module, "plow_block_pfgemm")? != Some(BLOCK)
                     {
                         return Err(RuntimeError::Rejected(
-                            "small GEMM object requires native BF16 m128n128 TMA ABI 1 and 256 threads".into()));
+                            "small GEMM object requires native BF16 TMA ABI 1, 2 or 3 and 256 threads"
+                                .into(),
+                        ));
                     }
                     let function = be.get_function(&module, &gemm_sym)?;
                     let smem = be
@@ -4693,6 +4699,7 @@ impl GpuEngine {
                     }
                     tracing::info!(path, grid, smem, "experimental small GEMM object loaded");
                     Some(SegGemm {
+                        abi,
                         function,
                         smem,
                         grid,
@@ -4852,7 +4859,12 @@ impl GpuEngine {
                 Vec::new()
             };
             let small_gemm_segments = if seg_pf.as_ref().is_some_and(|s| s.small_gemm.is_some()) {
-                let selected = small_gemm_segments(g, &seg_class)?;
+                let abi = seg_pf
+                    .as_ref()
+                    .and_then(|s| s.small_gemm.as_ref())
+                    .expect("checked")
+                    .abi;
+                let selected = small_gemm_segments(g, &seg_class, abi)?;
                 tracing::info!(
                     bucket = g.t,
                     selected = selected.iter().filter(|&&s| s).count(),

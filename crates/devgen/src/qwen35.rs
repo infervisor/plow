@@ -169,9 +169,16 @@ impl Emitter<'_> {
                     d.i[..2].copy_from_slice(&[1, k]);
                 })
             };
+            let weight_map = if std::env::var("PLOW_QWEN_FP8_M1_TMA").ok().as_deref() == Some("1") {
+                let g = GenTensor::tmap_e4m3(w, n, k, 64);
+                self.b.tensor_gen(&format!("tmap.fp8.{w}"), g.byte_len(), g)
+            } else {
+                0
+            };
             return self.b.emit(DevOp::GemmFp8, self.b.all(), &[dq], |d| {
                 d.t[..5].copy_from_slice(&[out, xq, w, ascale, scale]);
                 d.i[..3].copy_from_slice(&[1, n, k]);
+                d.i[7] = weight_map;
             });
         }
         let op = if self.prefill {
@@ -644,6 +651,11 @@ fn phase(
     let sin = b.tensor_gen("in.sin_full", gs.byte_len(), gs);
     let decode_lt = !prefill && std::env::var("PLOW_QWEN_DECODE_LT").ok().as_deref() == Some("1");
     let fuse_ab = !prefill && std::env::var("PLOW_QWEN_FUSE_AB").ok().as_deref() == Some("1");
+    let fuse_mlp = !prefill && std::env::var("PLOW_QWEN_FUSE_MLP").ok().as_deref() == Some("1");
+    assert!(
+        !fuse_mlp || (!fp8 && !decode_lt),
+        "Qwen MLP projection fusion requires native BF16 decode"
+    );
     let projection_dag =
         !prefill && std::env::var("PLOW_QWEN_PROJECTION_DAG").ok().as_deref() == Some("1");
     assert!(
@@ -666,6 +678,10 @@ fn phase(
         "Qwen a/b blocks must fit the compiled grid"
     );
     let w8a8 = emit_config::active().w8a8;
+    assert!(
+        std::env::var("PLOW_QWEN_FP8_M1_TMA").ok().as_deref() != Some("1") || w8a8,
+        "Qwen FP8 M1 TMA maps require W8A8"
+    );
     let share_quant = std::env::var("PLOW_QWEN_SHARE_QUANT").ok().as_deref() == Some("1");
     assert!(!share_quant || w8a8, "Qwen quant sharing requires W8A8");
     assert!(
@@ -727,22 +743,37 @@ fn phase(
         };
         dep = e.residual(x, mixed, dep);
         dep = e.norm(hn, x, &format!("{p}.post_attention_layernorm.weight"), dep);
-        dep = e.proj(
-            gate,
-            hn,
-            &format!("{p}.mlp.gate_proj.weight"),
-            c.inter,
-            c.hidden,
-            dep,
-        );
-        dep = e.proj(
-            up,
-            hn,
-            &format!("{p}.mlp.up_proj.weight"),
-            c.inter,
-            c.hidden,
-            dep,
-        );
+        dep = if fuse_mlp {
+            let wg = e.weight(
+                &format!("{p}.mlp.gate_proj.weight"),
+                c.inter as u64 * c.hidden as u64,
+            );
+            let wu = e.weight(
+                &format!("{p}.mlp.up_proj.weight"),
+                c.inter as u64 * c.hidden as u64,
+            );
+            e.b.emit(DevOp::GemvQkv, e.b.all(), &[dep], |d| {
+                d.t[..7].copy_from_slice(&[gate, hn, wg, up, wu, TENSOR_NONE, TENSOR_NONE]);
+                d.i[..5].copy_from_slice(&[batch, c.inter, c.hidden, c.inter, 0]);
+            })
+        } else {
+            let gate_dep = e.proj(
+                gate,
+                hn,
+                &format!("{p}.mlp.gate_proj.weight"),
+                c.inter,
+                c.hidden,
+                dep,
+            );
+            e.proj(
+                up,
+                hn,
+                &format!("{p}.mlp.up_proj.weight"),
+                c.inter,
+                c.hidden,
+                gate_dep,
+            )
+        };
         dep = e.b.emit(DevOp::Glu, e.b.all(), &[dep], |d| {
             d.t[..3].copy_from_slice(&[fu, gate, up]);
             d.i[..2].copy_from_slice(&[batch * c.inter, 1]);
@@ -903,6 +934,70 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fused_mlp_keeps_bf16_gate_up_and_separate_silu() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_QWEN_FUSE_MLP", "0"),
+            ("PLOW_QWEN_FUSE_AB", "0"),
+            ("PLOW_QWEN_PROJECTION_DAG", "0"),
+            ("PLOW_QWEN_AB_BLOCKS", "12"),
+        ]);
+        let c = Config::parse(&fixture());
+        let plain_pf = model_prefill(&c, 8192, 132, 0, &[128], 1);
+        std::env::set_var("PLOW_QWEN_FUSE_MLP", "1");
+        let fused_pf = model_prefill(&c, 8192, 132, 0, &[128], 1);
+        assert_eq!(plain_pf.progs[0].insts, fused_pf.progs[0].insts);
+        let mut c = c;
+        c.layers = (0..64).map(|i| i % 4 == 3).collect();
+        for batch in [1, 4] {
+            for other in ["0", "1"] {
+                std::env::set_var("PLOW_QWEN_FUSE_AB", other);
+                std::env::set_var("PLOW_QWEN_PROJECTION_DAG", other);
+                std::env::set_var("PLOW_QWEN_FUSE_MLP", "0");
+                let plain = model(&c, 8192, 132, 0, false, batch);
+                std::env::set_var("PLOW_QWEN_FUSE_MLP", "1");
+                let fused = model(&c, 8192, 132, 0, false, batch);
+                let g = &fused.progs[0];
+                assert_eq!(plain.progs[0].insts.len(), g.insts.len() + 64);
+                let mut mlp = 0;
+                let mut ab = 0;
+                for (i, d) in g.insts.iter().enumerate() {
+                    if d.op != DevOp::GemvQkv as u16 {
+                        continue;
+                    }
+                    if d.i[1] == 48 {
+                        ab += 1;
+                        continue;
+                    }
+                    mlp += 1;
+                    assert_eq!(d.blocks, 132);
+                    assert_eq!(&d.i[..5], &[batch, 17408, 5120, 17408, 0]);
+                    assert_eq!(&d.t[5..7], &[TENSOR_NONE, TENSOR_NONE]);
+                    for (out, weight, act, suffix) in [
+                        (d.t[0], d.t[2], "act.gt", "gate_proj.weight"),
+                        (d.t[3], d.t[4], "act.ut", "up_proj.weight"),
+                    ] {
+                        assert_eq!(fused.tensors[out as usize].name, act);
+                        assert_eq!(
+                            fused.tensors[out as usize].bytes,
+                            u64::from(batch) * 17408 * 2
+                        );
+                        assert!(fused.tensors[weight as usize].name.ends_with(suffix));
+                        assert_eq!(fused.tensors[weight as usize].bytes, 17408 * 5120 * 2);
+                    }
+                    let glu = &g.insts[i + 1];
+                    assert_eq!(glu.op, DevOp::Glu as u16);
+                    assert_eq!(&glu.t[1..3], &[d.t[0], d.t[3]]);
+                    assert_eq!(&glu.i[..2], &[batch * 17408, 1]);
+                }
+                assert_eq!(mlp, 64);
+                assert_eq!(ab, if other == "1" { 48 } else { 0 });
+                check_operand_dependencies(g);
+            }
+        }
+    }
     fn check_operand_dependencies(g: &packet::devbuild::Program) {
         use std::collections::{BTreeSet, HashMap};
         let mut producers: HashMap<u32, BTreeSet<usize>> = HashMap::new();
@@ -1519,6 +1614,45 @@ mod tests {
         v["quantization_config"] = serde_json::json!({"quant_method":"fp8"});
         Config::parse(&v);
     }
+    #[test]
+    fn w8a8_m1_tma_maps_describe_exact_weight_layout() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let original = emit_config::active().clone();
+        let mut cfg = original.clone();
+        cfg.fp8 = true;
+        cfg.w8a8 = true;
+        emit_config::install(cfg);
+        let c = Config::parse(&fixture());
+        let plain = model(&c, 8192, 132, 0, true, 1);
+        unsafe { std::env::set_var("PLOW_QWEN_FP8_M1_TMA", "1") };
+        let mapped = model(&c, 8192, 132, 0, true, 1);
+        unsafe { std::env::remove_var("PLOW_QWEN_FP8_M1_TMA") };
+        emit_config::install(original);
+        let mut count = 0;
+        for (a, b) in plain.progs[0].insts.iter().zip(&mapped.progs[0].insts) {
+            assert_eq!(a.op, b.op);
+            if b.op == DevOp::GemmFp8 as u16 {
+                count += 1;
+                assert_eq!(a.i[7], 0);
+                let g = mapped.gen.iter().find(|g| g.tensor == b.i[7]).unwrap();
+                assert_eq!(
+                    (g.kind, g.aux, g.ctx, g.hd, g.scale),
+                    (
+                        packet::rope::GEN_TMAP_E4M3,
+                        b.t[2] as u32,
+                        b.i[1],
+                        b.i[2],
+                        64
+                    )
+                );
+                assert_eq!(mapped.tensors[b.i[7] as usize].bytes, 128);
+            }
+        }
+        assert_eq!(count, 31);
+        check_operand_dependencies(&mapped.progs[0]);
+    }
+
     #[test]
     fn w8a8_decode_quantizes_body_inputs_and_keeps_head_wide() {
         let _env = crate::test_env::env_guard();

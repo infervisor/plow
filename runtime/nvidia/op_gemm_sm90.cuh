@@ -46,6 +46,16 @@
 
 #include "sm90_wgmma.cuh"
 
+#ifndef PLOW_NV_SEG_M64N64
+#define PLOW_NV_SEG_M64N64 0
+#endif
+#ifndef PLOW_NV_SEG_M64N128
+#define PLOW_NV_SEG_M64N128 0
+#endif
+#if PLOW_NV_SEG_M64N64 && PLOW_NV_SEG_M64N128
+#error "select one M64 segment tile"
+#endif
+
 /* ---- tile geometry (M/N deliberately equal to PGM_BM/PGM_BN) ---- */
 #define PGM90_BM 128
 #define PGM90_BN 128
@@ -581,7 +591,7 @@ static __device__ void d_gemm_glu_sm90_tma(__nv_bfloat16* C, const void* mA, con
 #endif /* PGM90_TMA_HAS_GLU */
 
 /* The n256 and ws384 BF16 bodies share this TMA implementation with FP8. */
-#if PLOW_NV_W8A8 || PGM90_UNI_BN256
+#if PLOW_NV_W8A8 || PGM90_UNI_BN256 || PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
 /* w8a8 twin of d_gemm_sm90_tma: same uniform-TMA ring (stage bytes are IDENTICAL — 128 e4m3
  * = 64 bf16 = 128 B rows), e4m3 maps (GEN_TMAP_E4M3, inner box 128), m64n128k32 QGMMA, and
  * the two-scale epilogue + PGM90_FP8_PROMOTE two-level accumulation of d_gemm_w8a8_sm90. */
@@ -1258,6 +1268,109 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
     __syncthreads();
 }
 #endif /* PGM90_UNI_BN256 && PLOW_NV_SEG_WS384 */
+
+#if PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
+__device__ __forceinline__ void plow_wgmma_m64n64k16(float* d, uint64_t da, uint64_t db, int scale_d) {
+    asm volatile(
+        "{ .reg .pred p; setp.ne.b32 p, %34, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, "
+        "%32, %33, p, 1, 1, 0, 0; }\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+          "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+          "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]),
+          "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+        : "l"(da), "l"(db), "r"(scale_d) : "memory");
+}
+
+template <bool PROD, int BN>
+static __device__ void d_gemm_sm90_tma_m64_role(__nv_bfloat16* __restrict__ C,
+    const void* mapA, const void* mapB, unsigned m, unsigned n, unsigned k,
+    unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
+    static_assert(BN == 64 || BN == 128);
+    if (sm90_bad_k(k, 8u)) return;
+    if (n & 1u) { if (threadIdx.x == 0) __trap(); return; }
+    constexpr int NS = PGM90_TMA_STAGES;
+    // Preserve the full 128-row tensor-map transfer for either output tile.
+    constexpr int slab_bytes = 128 * 128;
+    uint64_t* full = (uint64_t*)arena;
+    uint64_t* empty = full + NS;
+    uint8_t* As = (uint8_t*)sm90_align1024(arena + PGM90_TMA_MBAR_BF16);
+    uint8_t* Bs = As + NS * slab_bytes;
+    const int tid = (int)threadIdx.x;
+    if (PROD && tid < NS) {
+        sm90_mbar_init(full + tid, 1);
+        sm90_mbar_init(empty + tid, 1);
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    const int tiles_m = ((int)m + 63) / 64, tiles_n = ((int)n + BN - 1) / BN;
+    const int ntiles = tiles_m * tiles_n, ksteps = ((int)k + 63) / 64;
+    if (PROD) {
+        if (tid == 0) {
+            int stage = 0;
+            for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
+                const int tm = (tile / tiles_n) * 64, tn = (tile % tiles_n) * BN;
+                for (int ks = 0; ks < ksteps; ks++, stage++) {
+                    const int slot = stage % NS;
+                    if (stage >= NS) sm90_mbar_wait(empty + slot, ((stage / NS) + 1) & 1);
+                    sm90_mbar_expect(full + slot, 2 * slab_bytes);
+                    const uint32_t bar = sm90_su32(full + slot);
+                    sm90_tma2d(sm90_su32(As + slot * slab_bytes), mapA, ks * 64, (int)a_row0 + tm, bar);
+                    sm90_tma2d(sm90_su32(Bs + slot * slab_bytes), mapB, ks * 64, tn, bar);
+                }
+            }
+        }
+    } else {
+        const int lt = tid & 127, warp = lt >> 5, lane = lt & 31;
+        int stage = 0;
+        for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
+            const int tm = (tile / tiles_n) * 64, tn = (tile % tiles_n) * BN;
+            float acc[BN / 2];
+            int prev = -1;
+            for (int ks = 0; ks < ksteps; ks++, stage++) {
+                const int slot = stage % NS;
+                sm90_mbar_wait(full + slot, (stage / NS) & 1);
+                const uint8_t* a = As + slot * slab_bytes;
+                const uint8_t* b = Bs + slot * slab_bytes;
+                sm90_wg_fence();
+#pragma unroll
+                for (int sub = 0; sub < 4; sub++) {
+                    const int sd = (ks == 0 && sub == 0) ? 0 : 1;
+                    if constexpr (BN == 64)
+                        plow_wgmma_m64n64k16(acc, sm90_desc(a + sub * 32), sm90_desc(b + sub * 32), sd);
+                    else
+                        wgmma_m64n128k16(acc, sm90_desc(a + sub * 32), sm90_desc(b + sub * 32), sd);
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<1>();
+                if (prev >= 0 && lt == 0) sm90_mbar_arrive(empty + prev);
+                prev = slot;
+            }
+            sm90_wg_wait<0>();
+            if (prev >= 0 && lt == 0) sm90_mbar_arrive(empty + prev);
+            const int row = tm + warp * 16 + (lane >> 2), col = tn + 2 * (lane & 3);
+#pragma unroll
+            for (int g = 0; g < BN / 8; g++)
+#pragma unroll
+                for (int hi = 0; hi < 2; hi++) {
+                    const int rr = row + 8 * hi, cc = col + 8 * g;
+                    if (rr < (int)m && cc + 1 < (int)n)
+                        *(__nv_bfloat162*)(C + (size_t)rr * n + cc) =
+                            __floats2bfloat162_rn(acc[4 * g + 2 * hi], acc[4 * g + 2 * hi + 1]);
+                }
+        }
+    }
+    __syncthreads();
+    if (PROD && tid < NS) {
+        sm90_mbar_inval(full + tid);
+        sm90_mbar_inval(empty + tid);
+    }
+    __syncthreads();
+}
+#endif
 
 #if PLOW_NV_SEG_GEMM
 /* ---- WARP-SPECIALIZED + setmaxnreg twin, LEAN SEG_GEMM OBJECT ONLY ------------------------

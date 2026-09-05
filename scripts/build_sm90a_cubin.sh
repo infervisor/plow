@@ -123,6 +123,12 @@ GEMV_RB="-DPLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPL
 # away from this file. Empty by default, so every normal build — and every
 # sm_120 build, which uses a different translation unit anyway — is unchanged.
 EXTRA="${PLOW_EXTRA_DEFINES:-}"
+# Decoder-only native FP8 M1 TMA experiment; requires AOT weight-map handles.
+if [ "${PLOW_BUILD_FP8_M1_TMA:-0}" = "1" ]; then
+  EXTRA="$EXTRA -DPLOW_NV_TMA_GEMM=1 -DPLOW_NV_FP8_M1=1 -DPLOW_NV_FP8_M1_FAST_ACCUM=1 -DPLOW_NV_FP8_M1_BK1024=1 -DPLOW_NV_FP8_M1_XCACHE=1 -DPLOW_NV_FP8_M1_TMA=1 -DPLOW_NV_QUANT_FP8_VLLM=1"
+  export PLOW_BUILD_TMA_GEMM=1
+fi
+
 
 # PLOW_BUILD_TMA_GEMM=1: opt-in TMA + warp-specialized prefill GEMM (op_gemm_sm90.cuh,
 # port of tma_ws_gemm_bf16.cu's ws_tma winner). Prefill object only — decode never
@@ -233,6 +239,12 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
   fi
   if [ "${PLOW_BUILD_GEMM_SMALL_BF16:-0}" = "1" ]; then
     GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPLOW_NV_SEG_OCC1=1 -DPLOW_NV_TMA_GEMM=1 -DPLOW_NV_SEG_SMALL_BF16=1"
+  fi
+  if [ "${PLOW_BUILD_GEMM_M64N64:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPLOW_NV_TMA_GEMM=1 -DPLOW_NV_SEG_M64N64=1"
+  fi
+  if [ "${PLOW_BUILD_GEMM_M64N128:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPLOW_NV_TMA_GEMM=1 -DPLOW_NV_SEG_M64N128=1"
   fi
   "${NVENV[@]}" \
     "$NVCC" -arch=sm_90a -O3 -cubin \
