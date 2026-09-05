@@ -87,6 +87,7 @@ extern "C" {
     fn plow_cpu_thread_init(ctx: *mut PlowCpuCtx) -> i32;
     fn plow_cpu_scratch_bytes() -> u32;
     fn plow_cpu_has(op: u16) -> i32;
+    fn plow_cpu_tier_of(op: u16) -> i32;
     fn plow_cpu_kernel(op: u16) -> Option<KernelFn>;
     fn plow_cpu_exec(
         inst: *const DevInst64,
@@ -143,6 +144,12 @@ pub fn scratch_bytes() -> u32 {
 pub fn has(op: u16) -> bool {
     // SAFETY: plain FFI.
     unsafe { plow_cpu_has(op) != 0 }
+}
+
+/// The tier `op` resolves to, or `None` when no kernel is registered.
+pub fn tier_of(op: u16) -> Option<Isa> {
+    // SAFETY: pure table read.
+    Isa::from_i32(unsafe { plow_cpu_tier_of(op) })
 }
 
 /// Resolve `op` to its kernel. Load-time only — see [`KernelTable`] for the

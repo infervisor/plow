@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include "cpu_dev_internal.h"
 #include <errno.h>
+#include <string.h>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
@@ -64,10 +65,22 @@ int plow_cpu_init(int isa_cap) {
     if (g_isa >= 0) return g_isa;
     int isa = detect_isa();
     if (isa > isa_cap) isa = isa_cap;
+    plow_cpu_kernel_fn* tab = plow_cpu_table();
+    plow_cpu_kernel_fn before[PLOW_CPU_DOP_TABLE];
     plow_cpu_table_reset();
-    plow_cpu_register_golden(plow_cpu_table());
-    if (isa >= PLOW_CPU_ISA_AVX512) plow_cpu_register_avx512(plow_cpu_table());
-    if (isa >= PLOW_CPU_ISA_AMX) plow_cpu_register_amx(plow_cpu_table());
+    memcpy(before, tab, sizeof(before));
+    plow_cpu_register_golden(tab);
+    plow_cpu_table_mark(before, PLOW_CPU_ISA_SCALAR);
+    if (isa >= PLOW_CPU_ISA_AVX512) {
+        memcpy(before, tab, sizeof(before));
+        plow_cpu_register_avx512(tab);
+        plow_cpu_table_mark(before, PLOW_CPU_ISA_AVX512);
+    }
+    if (isa >= PLOW_CPU_ISA_AMX) {
+        memcpy(before, tab, sizeof(before));
+        plow_cpu_register_amx(tab);
+        plow_cpu_table_mark(before, PLOW_CPU_ISA_AMX);
+    }
     g_isa = isa;
     return g_isa;
 }

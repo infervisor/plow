@@ -130,7 +130,7 @@ static void test_shape(uint16_t op, uint32_t M, uint32_t N, uint32_t K, PlowCpuC
     in.i[0] = M; in.i[1] = N; in.i[2] = K;
     if (!norm && !glu) { in.i[4] = a_row0; in.i[5] = c_row0; }
 
-    memset(Cg, 0, (size_t)(M + c_row0) * N * 2);
+    memset(C, 0, (size_t)(M + c_row0) * N * 2);
     run_all(golden_of(op), &in, 1, T, ctx); /* golden reference into C */
     memcpy(Cg, C, (size_t)(M + c_row0) * N * 2);
     kfn f = plow_cpu_kernel(op);
@@ -170,6 +170,28 @@ static void bench(PlowCpuCtx* ctx) {
         f(&in, 0, 1, T, ctx);
         const double dt = now() - t0;
         if (dt < best) best = dt;
+    }
+    /* Where the time goes: strip packing vs the raw 2x2 K loop on scratch-resident data. */
+    {
+        extern void plow_cpu_amx_pack_b_strip(void*, const plow_bf16*, uint32_t, uint32_t,
+                                              uint32_t, uint32_t, uint32_t);
+        extern double plow_cpu_amx_debug_kloop(uint32_t iters, PlowCpuCtx* ctx);
+        const double t0 = now();
+        for (uint32_t s = 0; s < N / 32; s++)
+            for (uint32_t k0 = 0; k0 < K; k0 += 1024)
+                plow_cpu_amx_pack_b_strip(ctx->scratch, W, N, K, s * 32, k0,
+                                          K - k0 < 1024 ? K - k0 : 1024);
+        const double tp = now() - t0;
+        printf("pack all of W (%u x %u bf16 = %.1f MB): %.2f ms = %.1f GB/s\n", N, K,
+               (double)N * K * 2 / 1e6, tp * 1e3, (double)N * K * 2 / tp / 1e9);
+        const uint32_t iters = 2000;
+        const double tk = plow_cpu_amx_debug_kloop(iters, ctx);
+        printf("raw 2x2 K loop (one panel, data in scratch): %.1f GFLOPS\n",
+               2.0 * 32 * 32 * 512 * iters / tk / 1e9);
+        extern double plow_cpu_amx_debug_tdp(uint32_t iters, PlowCpuCtx* ctx);
+        const double tt = plow_cpu_amx_debug_tdp(200000, ctx);
+        printf("pure TDPBF16PS (no loads): %.1f GFLOPS = TMUL ceiling on this core\n",
+               2.0 * 16 * 16 * 32 * 4 * 200000 / tt / 1e9);
     }
     const double flops = 2.0 * M * N * K;
     printf("bench GEMM M=%u N=%u K=%u: %.2f ms, %.1f GFLOPS on 1 thread "

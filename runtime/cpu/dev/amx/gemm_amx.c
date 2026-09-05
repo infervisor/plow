@@ -8,18 +8,26 @@
  *
  * K is paneled (KP) so a strip set + A pad + C partials fit the 1 MiB scratch for any K; C
  * partials live in scratch as fp32 tiles between panels (TILESTORED/TILELOADD, never AVX stores,
- * so ORM 20.15 does not apply to them). */
+ * so ORM 20.15 does not apply to them).
+ *
+ * Cache blocking (measured here, Xeon 8581C): a 2x2 block consumes 4 KiB of tiles per 64 TDP
+ * cycles, which is the L2->L1 fill rate, so operands must come from L1. KP=512 keeps one packed
+ * B strip (32 KiB) L1-resident while the strip loop is OUTER and the M-block loop INNER; A is
+ * the streamed operand and uses TILELOADDT1 so it does not evict the strip (ORM 20.8.1). */
+#define _POSIX_C_SOURCE 199309L /* clock_gettime under the cc build's -std=c11 */
 #include <errno.h>
 #include <immintrin.h>
 #include <string.h>
+#include <time.h>
 #include "cpu_dev_internal.h"
 #include "golden/golden.h"
 
-#define KP 1024u /* K panel, bf16 elements (32 tile steps) */
+#define KP 512u   /* K panel, bf16 elements (16 tile steps); one strip = 32 KiB < L1 */
 #define NSTRIP 8u /* strips per tile: BN <= 256 (GLU: 4 output strips x {gate, up}) */
 #define MBLK 8u   /* 32-row blocks per tile: BM <= 256 */
 #define STRIP_BYTES (KP * 64u)      /* 2 x 1 KiB tiles per 32 K */
-#define AP_BYTES (32u * KP * 2u)    /* 32 padded/normed A rows of one panel */
+#define ABLK_BYTES (32u * KP * 2u)  /* 32 padded/normed A rows of one panel */
+#define AP_BYTES (MBLK * ABLK_BYTES) /* every M block of the tile, staged once per panel */
 #define CP_BYTES (MBLK * NSTRIP * 4096u) /* fp32 32x32 partials, one per (mb, strip) */
 #define CB_BYTES (2u * 2u * 4096u)  /* ping-pong x {gate, up} final blocks */
 #define BP_OFF 0u
@@ -184,13 +192,13 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
     const uint32_t per = pend ? (pend->rows + nkb - 1u) / nkb : 0u;
     for (uint32_t kb = 0; kb < nkb; kb++) {
         const uint8_t* b = bp + (size_t)kb * 2048u;
-        _tile_loadd(4, A0 + kb * 32u, lda);
+        _tile_stream_loadd(4, A0 + kb * 32u, lda); /* A streams (T1 hint), B stays in L1 */
         _tile_loadd(6, b, 64);
         _tile_dpbf16ps(0, 4, 6);
         _tile_loadd(7, b + 1024, 64);
         _tile_dpbf16ps(1, 4, 7);
         if (A1) {
-            _tile_loadd(5, A1 + kb * 32u, lda);
+            _tile_stream_loadd(5, A1 + kb * 32u, lda);
             _tile_dpbf16ps(2, 5, 6);
             _tile_dpbf16ps(3, 5, 7);
         }
@@ -236,30 +244,38 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
                 plow_cpu_amx_pack_b_strip(bp + (2 * s + 1) * STRIP_BYTES, g->Wu, g->N, g->K, n0 + s * 32u, k0, kp);
             }
         }
+        /* A operands for every M block of this panel, staged once (norm fold / row tails). */
+        const plow_bf16* A0s[MBLK];
+        const plow_bf16* A1s[MBLK];
+        size_t ldas[MBLK];
         for (uint32_t mb = 0; mb < mb_n; mb++) {
             const uint32_t m = m0 + mb * 32u, rows = m1 - m < 32u ? m1 - m : 32u;
-            const plow_bf16 *A0, *A1;
-            size_t lda;
             if (g->rms || (rows != 32u && rows != 16u)) {
-                stage_a(ap, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL,
+                plow_bf16* a = ap + (size_t)mb * (ABLK_BYTES / 2u);
+                stage_a(a, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL,
                         g->gamma);
-                A0 = ap;
-                A1 = rows > 16u ? ap + 16u * KP : NULL;
-                lda = KP * 2u;
+                A0s[mb] = a;
+                A1s[mb] = rows > 16u ? a + 16u * KP : NULL;
+                ldas[mb] = KP * 2u;
             } else {
-                A0 = g->A + (size_t)m * g->K + k0;
-                A1 = rows == 32u ? A0 + 16u * g->K : NULL;
-                lda = (size_t)g->K * 2u;
+                A0s[mb] = g->A + (size_t)m * g->K + k0;
+                A1s[mb] = rows == 32u ? A0s[mb] + 16u * g->K : NULL;
+                ldas[mb] = (size_t)g->K * 2u;
             }
-            for (uint32_t s = 0; s < nb; s++) {
-                const uint32_t n = n0 + s * 32u, cols = n1 - n < 32u ? n1 - n : 32u;
-                float* part = cp + ((size_t)mb * NSTRIP + s) * (glu ? 2u : 1u) * 1024u;
+        }
+        /* Strip outer, M block inner: the strip stays in L1, A streams through (§1.2 blocking). */
+        for (uint32_t s = 0; s < nb; s++) {
+            const uint32_t n = n0 + s * 32u, cols = n1 - n < 32u ? n1 - n : 32u;
+            const uint8_t* bs = bp + (glu ? 2 * s : s) * STRIP_BYTES;
+            for (uint32_t mb = 0; mb < mb_n; mb++) {
+                const uint32_t m = m0 + mb * 32u, rows = m1 - m < 32u ? m1 - m : 32u;
+                /* 8 partial slots per M block: strips, or {gate, up} pairs for GLU's 4 strips. */
+                float* part = cp + ((size_t)mb * NSTRIP + (glu ? 2u * s : s)) * 1024u;
                 const float* in_part = first ? NULL : part;
                 float* out = last ? cb + (size_t)cur * 2048u : part;
-                block(A0, A1, lda, bp + (glu ? 2 * s : s) * STRIP_BYTES, nkb, in_part, out,
-                      pend.rows ? &pend : NULL);
+                block(A0s[mb], A1s[mb], ldas[mb], bs, nkb, in_part, out, pend.rows ? &pend : NULL);
                 if (glu)
-                    block(A0, A1, lda, bp + (2 * s + 1) * STRIP_BYTES, nkb,
+                    block(A0s[mb], A1s[mb], ldas[mb], bs + STRIP_BYTES, nkb,
                           in_part ? in_part + 1024 : NULL, out + 1024, pend.rows ? &pend : NULL);
                 if (last) {
                     ils_drain(&pend);
@@ -341,6 +357,43 @@ X_K(x_gemm_glu) {
                    .Wu = PLOW_CPU_TEN(in, T, 5), .M = in->i[0], .N = in->i[1], .K = K, .BM = 256,
                    .BN = 128, .act = in->i[5]};
     run_tiles(&g, slice, nblk, ctx);
+}
+
+/* Test/bench probe: `iters` 32x32xKP blocks over scratch-resident A/B, no pack, no epilogue. */
+double plow_cpu_amx_debug_kloop(uint32_t iters, PlowCpuCtx* ctx) {
+    uint8_t* sc = ctx->scratch;
+    const plow_bf16* ap = (const plow_bf16*)(sc + AP_OFF);
+    float* cb = (float*)(sc + CB_OFF);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (uint32_t i = 0; i < iters; i++)
+        block(ap, ap + 16u * KP, KP * 2u, sc + BP_OFF, KP / 32u, NULL, cb, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
+}
+
+/* Test/bench probe: TMUL ceiling — `iters` x 4 TDPBF16PS on resident tiles, no loads. */
+double plow_cpu_amx_debug_tdp(uint32_t iters, PlowCpuCtx* ctx) {
+    uint8_t* sc = ctx->scratch;
+    _tile_loadd(4, sc, 64);
+    _tile_loadd(5, sc + 1024, 64);
+    _tile_loadd(6, sc + 2048, 64);
+    _tile_loadd(7, sc + 3072, 64);
+    _tile_zero(0);
+    _tile_zero(1);
+    _tile_zero(2);
+    _tile_zero(3);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (uint32_t i = 0; i < iters; i++) {
+        _tile_dpbf16ps(0, 4, 6);
+        _tile_dpbf16ps(1, 4, 7);
+        _tile_dpbf16ps(2, 5, 6);
+        _tile_dpbf16ps(3, 5, 7);
+    }
+    _tile_stored(0, sc + CB_OFF, 64);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
 }
 
 void plow_cpu_register_amx(plow_cpu_kernel_fn* tab) {

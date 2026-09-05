@@ -73,6 +73,10 @@ uint32_t plow_cpu_scratch_bytes(void);
 /* Coverage: 1 if `op` has a kernel at the active tier (golden counts), else 0. */
 int plow_cpu_has(uint16_t op);
 
+/* Which tier's kernel `op` resolves to (PLOW_CPU_ISA_*), or -1 if none. Lets a caller
+ * assert that a fast tier is actually live rather than a silent golden fallback. */
+int plow_cpu_tier_of(uint16_t op);
+
 /* Resolve `op` to its kernel, or NULL. Resolve once per program at load; do not
  * look up per packet. */
 plow_cpu_kernel_fn plow_cpu_kernel(uint16_t op);

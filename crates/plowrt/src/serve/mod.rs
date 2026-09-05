@@ -5,8 +5,10 @@ pub mod chat;
 pub mod completion;
 /// The loaded device engine behind a slug, as one type over both backends —
 /// the seam that lets `serve` stop being CUDA-only.
-#[cfg(any(feature = "cuda", feature = "hsa"))]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub mod engine;
+#[cfg(feature = "cpu")]
+pub mod cpu_serve;
 #[cfg(feature = "cuda")]
 pub mod manager;
 pub mod models;
@@ -291,7 +293,7 @@ pub struct AppState {
     /// Per-slug GPU engines ([`engine::ServeEngine`] — sm_120 or gfx950).
     /// Installed at startup for bundles that ship a device blob; when present
     /// the mux drives real GPU decode steps instead of the CPU reference.
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     gpu: RwLock<FxHashMap<String, Arc<Mutex<engine::ServeEngine>>>>,
     /// Engine-lock-free VMM stats readers for `/metrics` (one per slug with
     /// prefix sharing up) — a scrape must never queue behind a tick.
@@ -318,7 +320,7 @@ impl AppState {
             execset,
             metrics: Arc::new(Metrics::default()),
             muxes: RwLock::new(FxHashMap::default()),
-            #[cfg(any(feature = "cuda", feature = "hsa"))]
+            #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
             gpu: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
             vmm_stats: RwLock::new(FxHashMap::default()),
@@ -330,7 +332,7 @@ impl AppState {
     }
 
     /// Register a GPU engine for a model slug. Called once at startup.
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub fn install_gpu_engine(&self, slug: String, engine: engine::ServeEngine) {
         #[cfg(feature = "cuda")]
         if let Some(h) = engine.vmm_stats_handle() {
@@ -340,7 +342,7 @@ impl AppState {
     }
 
     /// The GPU engine serving `slug`, when one was installed.
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     pub(crate) fn gpu_engine(&self, slug: &str) -> Option<Arc<Mutex<engine::ServeEngine>>> {
         self.gpu.read().get(slug).cloned()
     }
@@ -348,11 +350,11 @@ impl AppState {
     /// Whether `slug` is served by a GPU engine (drives e.g. the chat-template
     /// choice). Always `false` without a vendor backend feature.
     pub fn has_gpu_engine(&self, slug: &str) -> bool {
-        #[cfg(any(feature = "cuda", feature = "hsa"))]
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         {
             return self.gpu.read().contains_key(slug);
         }
-        #[cfg(not(any(feature = "cuda", feature = "hsa")))]
+        #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         {
             let _ = slug;
             false

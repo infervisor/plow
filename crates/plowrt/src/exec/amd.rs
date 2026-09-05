@@ -13681,6 +13681,7 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::kvrow::KDA_ROW_COUNT_OPS;
 
     #[test]
     fn materialized_mla_flat_grid_covers_every_qblock_head_and_batch_once() {
