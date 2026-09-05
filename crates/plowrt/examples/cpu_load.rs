@@ -45,6 +45,15 @@ fn main() {
         "wellknown: ids={:?} pos={:?} kvlen={:?} logits={:?}",
         m.wk.ids, m.wk.pos, m.wk.kvlen, m.wk.logits
     );
+    // Which tier each op actually resolved to — a golden entry on a hot op is a perf bug.
+    let mut ops: Vec<u16> = m.blob.progs.iter().flat_map(|p| p.insts.iter().map(|d| d.op)).collect();
+    ops.sort_unstable();
+    ops.dedup();
+    println!("kernel tiers:");
+    for op in ops {
+        let name = packet::dev::DevOp::from_u16(op).map(|o| o.c_name()).unwrap_or("?");
+        println!("  {:>4} {:<32} {:?}", op, name, ffi::tier_of(op));
+    }
 }
 
 #[cfg(not(feature = "cpu"))]
