@@ -2044,6 +2044,57 @@ __device__ __forceinline__ void d_gemv_sm90_xreg(__nv_bfloat16* C,
 #endif
 
 
+
+#ifndef PLOW_NV_GEMV_KPANEL
+#define PLOW_NV_GEMV_KPANEL 0
+#endif
+#if PLOW_NV_GEMV_KPANEL
+__device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
+    const __nv_bfloat16* x, const __nv_bfloat16* W, unsigned slice, unsigned nblk) {
+    constexpr unsigned K = 17408, N = 5120, panel_chunks = 8;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    // Dispatch guarantees 256 threads and <=40 owned rows: at most five rows/warp.
+    float acc[5] = {};
+#pragma unroll 1
+    for (unsigned panel = 0; panel < K; panel += panel_chunks * GV_STEP) {
+        bf16v8 xv[panel_chunks];
+#pragma unroll
+        for (unsigned c = 0; c < panel_chunks; c++)
+            if (panel + c * GV_STEP < K)
+                xv[c] = ld_glob8(x + panel + c * GV_STEP + lane * 8u);
+#pragma unroll
+        for (unsigned r = 0; r < 5; r++) {
+            const unsigned n = first + warp + r * 8u;
+            if (n >= end) continue;
+            const __nv_bfloat16* row = W + (size_t)n * K + panel;
+#pragma unroll
+            for (unsigned c = 0; c < panel_chunks; c += 8) {
+                bf16v8 weights[8];
+#pragma unroll
+                for (unsigned u = 0; u < 8; u++)
+                    if (panel + (c + u) * GV_STEP < K)
+                        weights[u] = ld_glob8(row + (c + u) * GV_STEP + lane * 8u);
+#pragma unroll
+                for (unsigned u = 0; u < 8; u++)
+                    if (panel + (c + u) * GV_STEP < K)
+                        acc[r] = dot8(weights[u], xv[c + u], acc[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < 5; r++) {
+        const unsigned n = first + warp + r * 8u;
+        if (n < end) {
+            const float total = warp_sum32(acc[r]);
+            if (lane == 0) C[n] = __float2bfloat16(total);
+        }
+    }
+}
+#endif
+
+
 #ifndef PLOW_NV_GEMV_M16_MMA
 #define PLOW_NV_GEMV_M16_MMA 0
 #endif

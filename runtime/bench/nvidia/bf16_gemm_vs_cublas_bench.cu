@@ -125,6 +125,13 @@ __global__ void k_decode_gemv(bf16* c, const bf16* a, const bf16* w, unsigned m,
         return;
     }
 #endif
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_KPANEL
+    if (m == 1 && n == 5120 && k == 17408 && blockDim.x == 256 &&
+        (5120u + gridDim.x - 1u) / gridDim.x <= 40u) {
+        d_gemv_sm90_kpanel(c, a, w, blockIdx.x, gridDim.x);
+        return;
+    }
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
     if (m == 1 && n >= 1024 && (k == 5120 || k == 6144)) {
         if (k == 5120) d_gemv_sm90_xreg<5120>(c, a, w, n, blockIdx.x, gridDim.x);

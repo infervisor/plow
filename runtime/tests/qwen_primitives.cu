@@ -2,6 +2,15 @@
 #include "../common/dev_isa.h"
 #include "../nvidia/op_qwen_gdn.cuh"
 #include "../nvidia/op_gemm.cuh"
+#ifndef PLOW_NV_FP8_M1_BK256
+#define PLOW_NV_FP8_M1_BK256 0
+#endif
+#ifndef PLOW_NV_FP8_M1_BK512
+#define PLOW_NV_FP8_M1_BK512 0
+#endif
+#ifndef PLOW_NV_FP8_M1_BK1024
+#define PLOW_NV_FP8_M1_BK1024 0
+#endif
 struct Args { void* t[8]; int i[8]; union {float f; int j;} fj[2]; };
 #define TEN(n) in->t[n]
 __global__ void run(unsigned op, Args args) {
@@ -74,6 +83,10 @@ switch(op) {
 
 }}
 extern "C" int qwen_test(unsigned op, void** tensors, const int* integers, const float* floats, void* stream) {
+#if PLOW_NV_FP8_M1_BK1024
+static const cudaError_t configured = cudaFuncSetAttribute(run, cudaFuncAttributeMaxDynamicSharedMemorySize, 74752);
+if (configured != cudaSuccess) return (int)configured;
+#endif
 Args a={}; for(int i=0;i<8;i++)a.t[i]=tensors[i]; for(int i=0;i<8;i++)a.i[i]=integers[i]; for(int i=0;i<2;i++)a.fj[i].f=floats[i];
-run<<<132,256,op == PLOW_DOP_GEMM_FP8 ? 12352 : 0,(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
+run<<<132,256,op == PLOW_DOP_GEMM_FP8 ? (PLOW_NV_FP8_M1_BK1024 ? 74752 : PLOW_NV_FP8_M1_BK512 ? 37888 : PLOW_NV_FP8_M1_BK256 ? 19456 : 12352) : 0,(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
 }

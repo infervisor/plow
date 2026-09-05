@@ -697,8 +697,18 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #else
 #define PLOW_NV_FA_ARENA FA_DEC_SMEM_FLOATS(PLOW_NV_FA_HD, PLOW_NV_FA_GF)
 #endif
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_BK1024 && !PLOW_NV_PREFILL
+#define PLOW_NV_FP8_M1_ARENA 18688
+#elif defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_BK512 && !PLOW_NV_PREFILL
+#define PLOW_NV_FP8_M1_ARENA 9472
+#elif defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_BK256 && !PLOW_NV_PREFILL
+#define PLOW_NV_FP8_M1_ARENA 4864
+#else
+#define PLOW_NV_FP8_M1_ARENA 0
+#endif
+#define PLOW_NV_OP_ARENA (PLOW_NV_FA_ARENA > PLOW_NV_FP8_M1_ARENA ? PLOW_NV_FA_ARENA : PLOW_NV_FP8_M1_ARENA)
 #define PLOW_NV_ARENA_FLOATS                                                                   \
-    (PLOW_NV_FA_ARENA > 2 * (int)PLOW_NV_WARPS ? PLOW_NV_FA_ARENA : 2 * (int)PLOW_NV_WARPS)
+    (PLOW_NV_OP_ARENA > 2 * (int)PLOW_NV_WARPS ? PLOW_NV_OP_ARENA : 2 * (int)PLOW_NV_WARPS)
 /* block_max_u64 needs PLOW_NV_WARPS u64 = 2*WARPS floats; block_sum needs WARPS floats. Both
  * fit inside the flash claim at any supported head dim, but the max above keeps that true if
  * flash is ever compiled out. */
@@ -1423,6 +1433,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                 (const __nv_bfloat16*)TEN(2), in->i[1], in->i[2], slice, nblk,
                 (__nv_bfloat16*)arena);
+            break;
+        }
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_KPANEL
+        if (in->i[0] == 1 && in->i[1] == 5120 && in->i[2] == 17408 &&
+            blockDim.x == 256 && (5120u + nblk - 1u) / nblk <= 40u) {
+            d_gemv_sm90_kpanel((__nv_bfloat16*)TEN(0),
+                (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                (const __nv_bfloat16*)TEN(2), slice, nblk);
             break;
         }
 #endif

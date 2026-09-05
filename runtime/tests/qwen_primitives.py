@@ -27,7 +27,8 @@ def check_fp8_gemm():
         ("gdn_out",5120,6144),("q_full",12288,5120),("k_or_v",1024,5120),
         ("gate_or_up",17408,5120),("down",5120,17408),("lm_head",248320,5120),
         ("fused_ba",96,5120),("fused_qkvz",16384,5120),
-        ("fused_qkv",14336,5120),("fused_gtup",34816,5120)]
+        ("fused_qkv",14336,5120),("fused_gtup",34816,5120),
+        ("k_tail_128",1024,640),("k_tail_16",1024,528)]
     if not args.fp8_interpreter_only:
         lib.plow_fp8_m1_create.argtypes=[C.c_int,C.c_int,C.c_int,C.c_void_p,C.c_void_p,C.POINTER(C.c_void_p)]
         lib.plow_fp8_m1_create.restype=C.c_int
