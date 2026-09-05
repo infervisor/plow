@@ -1,0 +1,24 @@
+{
+  "cells": 15,
+  "completed": 480,
+  "failed": 0,
+  "exact_lengths": true,
+  "output_tokens": 245760,
+  "raw_sha256": {
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in1024_c1.json": "050b668e4da7b3f3537f7cc52b5658fbcae3096c67b8fd819a5d1e71d340e12d",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in1024_c4.json": "7ff090b090a2545fba4816daf049adb1f0243e193262990cee2356f970c30849",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in1024_c16.json": "254e0ac308e225bb6b3bc11a91ed020693a53e52b9d2a78f1e598d93eb834650",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in4096_c1.json": "73c3734451f170b3143ce5e0c466598b8a24d6474d8eb6910729d210fca4aa83",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in4096_c4.json": "8b7a9a3b10e12dfdc4011ef070d05001b1c03eb08af3e952a655f9b3fa6b10f4",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in4096_c16.json": "5bc54e678104e33e81b2626db8ff593d65b3473d768a3a75d661dfed02b71ddd",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in8192_c1.json": "01edc5de7878e4cfe4c929feab3c05df87e2c07cd3ef29e388d95c395b11283b",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in8192_c4.json": "78b23397e88d135777df1a67d90af82f7daef7fc204969b15ea4369ae9ada742",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in8192_c16.json": "9c943db89ed45209e8d9c85194e8fb9dc7155d7d354b4326ca3f54732254dd45",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in16384_c1.json": "e7c02140d48c710fb2c163f5b2578d96e1e5494be11190a722e1cbfae6f3b8bd",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in16384_c4.json": "36cb93d46cae3f31ea6192bfa70592ffc3a02462e2768264d7eb8685a446fd0f",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in16384_c16.json": "7f9e82affc6af2fff88d4e4c03d138a23f8b9128a1cd642753726f223dfa0f69",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in32768_c1.json": "68209cf5d948731189bcfcd26f9344b3c675f8cb21657a6189857cac7468c559",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in32768_c4.json": "b51553eca0358d9569d01f6c0a41df14a4ea276449b05d214df59c1d71e1b527",
+    "/opt/dlami/nvme/tmp/plow-h100-campaign/realworld-vllm-bf16-20260905/gemma12b-1k-32k-r2/in32768_c16.json": "4a97b17797faee3bf607a5b3e4057b50000e9941578ddd97f6537c48c5fd630c"
+  }
+}
