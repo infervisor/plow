@@ -1,0 +1,170 @@
+{
+  "server": "http://localhost:8094",
+  "model": "gemma-4-12b-it",
+  "vllm_version": "0.28.0",
+  "torch_version": "2.13.0+cpu",
+  "machine": {
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "nproc": "16",
+    "cores_threads": "Thread(s) per core: 2;Core(s) per socket: 8;Socket(s): 1",
+    "isa": "amx_bf16,amx_int8,amx_tile,avx512_bf16,avx512_vnni",
+    "free_g": "Mem:              58          35           0           0          23          23",
+    "kernel": "7.0.0-1011-gcp"
+  },
+  "method": "OpenAI chat/completions stream, temperature=0, 1 warmup + 3 runs; TTFT = first content chunk, TPOT = mean gap between chunks",
+  "results": [
+    {
+      "target_prompt_tokens": 32,
+      "raw_prompt_tokens": 46,
+      "server_prompt_tokens": 58,
+      "max_tokens": 32,
+      "ttft_ms_mean": 734.0202349999648,
+      "ttft_ms_min": 731.5909690005356,
+      "tpot_ms_mean": 545.3298569784863,
+      "tpot_ms_min": 540.5257493548561,
+      "decode_tok_per_s": 1.8337525209800694,
+      "e2e_s_mean": 17.639351811332745,
+      "runs": [
+        {
+          "ttft_s": 0.7352270600003976,
+          "tpot_s": 0.5540884500967349,
+          "e2e_s": 17.912077854998643,
+          "chunks": 32,
+          "completion_tokens": 32,
+          "prompt_tokens": 58,
+          "contention": {
+            "loadavg": "4.60 4.62 6.50",
+            "other_big_procs": ""
+          }
+        },
+        {
+          "ttft_s": 0.7352426759989612,
+          "tpot_s": 0.5405257493548561,
+          "e2e_s": 17.49164624200057,
+          "chunks": 32,
+          "completion_tokens": 32,
+          "prompt_tokens": 58,
+          "contention": {
+            "loadavg": "5.85 4.91 6.55",
+            "other_big_procs": ""
+          }
+        },
+        {
+          "ttft_s": 0.7315909690005356,
+          "tpot_s": 0.5413753714838682,
+          "e2e_s": 17.51433133699902,
+          "chunks": 32,
+          "completion_tokens": 32,
+          "prompt_tokens": 58,
+          "contention": {
+            "loadavg": "6.55 5.11 6.59",
+            "other_big_procs": ""
+          }
+        }
+      ],
+      "sample_output": "It looks like you've shared a classic pangram (a sentence that contains every letter of the alphabet) repeated three times!\n\nIs there anything specific you"
+    },
+    {
+      "target_prompt_tokens": 128,
+      "raw_prompt_tokens": 136,
+      "server_prompt_tokens": 148,
+      "max_tokens": 32,
+      "ttft_ms_mean": 765.7684353331812,
+      "ttft_ms_min": 760.5788439996104,
+      "tpot_ms_mean": 520.7393454516169,
+      "tpot_ms_min": 485.31403174192457,
+      "decode_tok_per_s": 1.9203465394625385,
+      "e2e_s_mean": 16.90879208899969,
+      "runs": [
+        {
+          "ttft_s": 0.7710100530002819,
+          "tpot_s": 0.5442046959354728,
+          "e2e_s": 17.641461121000248,
+          "chunks": 32,
+          "completion_tokens": 32,
+          "prompt_tokens": 148,
+          "contention": {
+            "loadavg": "7.63 5.54 6.68",
+            "other_big_procs": ""
+          }
+        },
+        {
+          "ttft_s": 0.7657164089996513,
+          "tpot_s": 0.5326993086774535,
+          "e2e_s": 17.27949772899956,
+          "chunks": 32,
+          "completion_tokens": 32,
+          "prompt_tokens": 148,
+          "contention": {
+            "loadavg": "8.02 5.76 6.73",
+            "other_big_procs": ""
+          }
+        },
+        {
+          "ttft_s": 0.7605788439996104,
+          "tpot_s": 0.48531403174192456,
+          "e2e_s": 15.805417416999262,
+          "chunks": 32,
+          "completion_tokens": 32,
+          "prompt_tokens": 148,
+          "contention": {
+            "loadavg": "8.24 5.92 6.77",
+            "other_big_procs": ""
+          }
+        }
+      ],
+      "sample_output": "It looks like you've provided a repeated version of a classic pangram (a sentence that contains every letter of the alphabet). \n\nIs there something specific"
+    },
+    {
+      "target_prompt_tokens": 512,
+      "raw_prompt_tokens": 526,
+      "server_prompt_tokens": 538,
+      "max_tokens": 32,
+      "ttft_ms_mean": 749.642800666455,
+      "ttft_ms_min": 747.1641329993872,
+      "tpot_ms_mean": 453.9510230967793,
+      "tpot_ms_min": 453.301910677422,
+      "decode_tok_per_s": 2.202880815595842,
+      "e2e_s_mean": 14.822239372666445,
+      "runs": [
+        {
+          "ttft_s": 0.7522875609993207,
+          "tpot_s": 0.453301910677422,
+          "e2e_s": 14.804760766999607,
+          "chunks": 32,
+          "completion_tokens": 32,
+          "prompt_tokens": 538,
+          "contention": {
+            "loadavg": "8.54 6.22 6.84",
+            "other_big_procs": ""
+          }
+        },
+        {
+          "ttft_s": 0.7471641329993872,
+          "tpot_s": 0.4539092841935804,
+          "e2e_s": 14.81846898799995,
+          "chunks": 32,
+          "completion_tokens": 32,
+          "prompt_tokens": 538,
+          "contention": {
+            "loadavg": "8.64 6.36 6.88",
+            "other_big_procs": ""
+          }
+        },
+        {
+          "ttft_s": 0.7494767080006568,
+          "tpot_s": 0.4546418744193356,
+          "e2e_s": 14.843488362999778,
+          "chunks": 32,
+          "completion_tokens": 32,
+          "prompt_tokens": 538,
+          "contention": {
+            "loadavg": "8.80 6.50 6.92",
+            "other_big_procs": ""
+          }
+        }
+      ],
+      "sample_output": "It looks like you've provided a repeated version of a famous pangram (a sentence that contains every letter of the alphabet).\n\nThe sentence **\"The"
+    }
+  ]
+}
