@@ -1,0 +1,6 @@
+{
+  "source": "/tmp/plow-model-support-checks/attention-reuse-full-window-20260905",
+  "scope": "Standalone full-attention decode,1K/4K/8K/32K,B1/4/16,20alternating pairs per cell,two reversed experiment orders.144 qualified cells; exact against original native GF at same NS.",
+  "decision": "Gemma12 B1 GF16/NS132 regresses1K:0.564x and4K:0.931x, improves8K:1.247x and32K:2.018x; do not promote unconditionally. G12B4/16,G31all,Qwenall testedcontexts improve. Packet/cubin integration pending.",
+  "native_library_wins": 0
+}
