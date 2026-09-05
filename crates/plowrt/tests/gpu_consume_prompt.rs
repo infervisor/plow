@@ -7,6 +7,8 @@
 
 #![cfg(feature = "cuda")]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,6 +41,7 @@ fn generate_from_prompt(e: &mut GpuEngine, prompt: &[u32], n_gen: usize, fused: 
 
 #[test]
 fn consume_prompt_matches_step_slots_greedy() {
+    let _env = common::env_guard();
     if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
         eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + assets)");
         return;
@@ -67,4 +70,161 @@ fn consume_prompt_matches_step_slots_greedy() {
         prompt.len(),
         &single[..single.len().min(8)]
     );
+}
+
+struct LogitSnapshot {
+    token: u32,
+    bits: Vec<u32>,
+}
+
+fn snapshot(e: &mut GpuEngine, row: usize, token: u32) -> LogitSnapshot {
+    let mut logits = Vec::new();
+    e.logits_row(row, &mut logits).expect("full logits");
+    assert!(!logits.is_empty() && logits.iter().all(|v| v.is_finite()));
+    LogitSnapshot {
+        token,
+        bits: logits.into_iter().map(f32::to_bits).collect(),
+    }
+}
+
+fn compare_snapshot(actual: LogitSnapshot, expected: &LogitSnapshot, case: &str) {
+    assert_eq!(actual.token, expected.token, "{case}: greedy token");
+    assert_eq!(actual.bits.len(), expected.bits.len(), "{case}: vocabulary");
+    if let Some((i, (&got, &want))) = actual
+        .bits
+        .iter()
+        .zip(&expected.bits)
+        .enumerate()
+        .find(|(_, (got, want))| got != want)
+    {
+        panic!("{case}: logit {i} differs: got {got:#010x}, expected {want:#010x}");
+    }
+}
+
+#[test]
+fn serialized_tma_slots_match_isolated_full_logits() {
+    let _env = common::env_guard();
+    if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + B>=2 TMA assets)");
+        return;
+    }
+    let _config = common::EnvScope::set(&[
+        ("PLOW_VMM_LIVE", "0"),
+        ("PLOW_VMM_PREFIX", "0"),
+        ("PLOW_PREFIX_CACHE", "0"),
+        ("PLOW_PF_BATCH", "0"),
+    ]);
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "plowrt=info".into()))
+        .try_init();
+    let assets = PathBuf::from(std::env::var("PLOW_GPU_ASSETS").expect("PLOW_GPU_ASSETS"));
+    let packet = plowrt::asset::devblob::DevBlob::find_in_dir(&assets)
+        .expect("find packet")
+        .expect("packet required");
+    let blob = plowrt::asset::devblob::DevBlob::parse(&std::fs::read(packet).unwrap())
+        .expect("parse packet");
+    let referenced_maps = blob
+        .prefill_progs()
+        .iter()
+        .flat_map(|p| &p.insts)
+        .filter(|inst| inst.op == packet::dev::DevOp::FlashPrefill as u16)
+        .filter(|inst| {
+            inst.t[6] == packet::dev::TENSOR_NONE16
+                && blob.gen.iter().any(|g| {
+                    g.kind == packet::rope::GEN_TMAP_KV_PAIR && g.tensor == u32::from(inst.t[7])
+                })
+        })
+        .count();
+    assert!(
+        referenced_maps > 0,
+        "packet requires serialized KV TMA consumers"
+    );
+    assert!(
+        blob.prefill_progs().iter().all(|p| p.t % 32 == 0),
+        "use prefill buckets with partial padding for the +1-token cases"
+    );
+    drop(blob);
+
+    let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
+    let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).expect("engine load");
+    assert!(e.batch() >= 2 && e.has_prefill() && e.max_ctx() >= 16400);
+    assert!(e.vmm_stats().is_none(), "gate requires flat KV allocation");
+    let prompts: Vec<Vec<u32>> = [8192, 16384, 8193, 16385]
+        .into_iter()
+        .enumerate()
+        .map(|(case, len)| {
+            (0..len)
+                .map(|i| 100 + ((i * (2 * case + 1) + case * 173) % 1000) as u32)
+                .collect()
+        })
+        .collect();
+    let mut reference = Vec::new();
+    let mut decoded = Vec::new();
+    for (case, prompt) in prompts.iter().enumerate() {
+        e.begin_slot(0, prompt.len() + 9).expect("baseline reset");
+        let mut token = e.prefill_slot(0, prompt).expect("baseline prefill");
+        let mut trajectory = vec![snapshot(&mut e, 0, token)];
+        for _ in 0..8 {
+            e.step_slots(&[(0, token)], &mut decoded)
+                .expect("baseline decode");
+            token = decoded[0];
+            trajectory.push(snapshot(&mut e, 0, token));
+        }
+        reference.push(trajectory);
+        eprintln!(
+            "isolated case={case} prompt={} full-logit snapshots=9",
+            prompt.len()
+        );
+    }
+    for slot in 0..e.batch() {
+        e.begin_slot(slot, 1).expect("clear baseline positions");
+    }
+
+    let mut active = [0usize, 1usize];
+    let mut steps = [0usize; 2];
+    let mut tokens = [0u32; 2];
+    for slot in 0..2 {
+        e.begin_slot(slot, prompts[slot].len() + 9)
+            .expect("candidate reset");
+        tokens[slot] = e
+            .prefill_slot(slot, &prompts[slot])
+            .expect("candidate prefill");
+        // Serialized prefill's M=1 head always writes row 0, regardless of slot.
+        compare_snapshot(
+            snapshot(&mut e, 0, tokens[slot]),
+            &reference[slot][0],
+            &format!("initial slot={slot} prefill"),
+        );
+    }
+    for phase in 0..3 {
+        if phase > 0 {
+            let slot = if phase == 1 { 1 } else { 0 };
+            let case = phase + 1;
+            active[slot] = case;
+            steps[slot] = 0;
+            e.begin_slot(slot, prompts[case].len() + 9)
+                .expect("interleaved reset");
+            tokens[slot] = e.prefill_slot(slot, &prompts[case]).expect("reset prefill");
+            compare_snapshot(
+                snapshot(&mut e, 0, tokens[slot]),
+                &reference[case][0],
+                &format!("reset slot={slot} case={case} prefill"),
+            );
+        }
+        for _ in 0..4 {
+            e.step_slots(&[(0, tokens[0]), (1, tokens[1])], &mut decoded)
+                .expect("interleaved decode");
+            for slot in 0..2 {
+                tokens[slot] = decoded[slot];
+                steps[slot] += 1;
+                let case = active[slot];
+                compare_snapshot(
+                    snapshot(&mut e, slot, tokens[slot]),
+                    &reference[case][steps[slot]],
+                    &format!("slot={slot} case={case} decode={}", steps[slot]),
+                );
+            }
+        }
+        eprintln!("interleaved phase={phase} cases={active:?} steps={steps:?}: full logits exact");
+    }
 }
