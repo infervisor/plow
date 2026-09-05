@@ -115,6 +115,7 @@ struct Emitter<'a> {
     b: Builder,
     c: &'a Config,
     fp8: bool,
+    w8a8: bool,
     prefill: bool,
     batch: u32,
     decode_slots: u32,
@@ -150,6 +151,19 @@ impl Emitter<'_> {
                 TENSOR_NONE,
             )
         };
+        if quantized && self.w8a8 {
+            let xq = self.b.tensor(&format!("act.fp8.x{k}"), u64::from(k));
+            let ascale = self.b.tensor("act.fp8.scale", 4);
+            // Projections are chained, so each quant waits for the previous scratch consumer.
+            let dq = self.b.emit(DevOp::QuantFp8, vec![0], &[dep], |d| {
+                d.t[..3].copy_from_slice(&[xq, src, ascale]);
+                d.i[..2].copy_from_slice(&[1, k]);
+            });
+            return self.b.emit(DevOp::GemmFp8, self.b.all(), &[dq], |d| {
+                d.t[..5].copy_from_slice(&[out, xq, w, ascale, scale]);
+                d.i[..3].copy_from_slice(&[1, n, k]);
+            });
+        }
         let op = if self.prefill {
             assert!(
                 !quantized,
@@ -552,6 +566,11 @@ fn phase(
     let cos = b.tensor_gen("in.cos_full", gc.byte_len(), gc);
     let sin = b.tensor_gen("in.sin_full", gs.byte_len(), gs);
     let decode_lt = !prefill && std::env::var("PLOW_QWEN_DECODE_LT").ok().as_deref() == Some("1");
+    let w8a8 = emit_config::active().w8a8;
+    assert!(
+        !w8a8 || (fp8 && !prefill && batch == 1),
+        "Qwen W8A8 currently requires FP8 batch-1 decode without prefill"
+    );
     assert!(
         !decode_lt || !fp8,
         "Qwen decode Lt requires BF16 projections"
@@ -560,6 +579,7 @@ fn phase(
         b,
         c,
         fp8,
+        w8a8,
         prefill,
         batch,
         decode_slots,
@@ -693,10 +713,6 @@ pub(super) fn run(
         "qwen3_5 block extraction is not implemented"
     );
     let fp8 = emit_config::active().fp8;
-    assert!(
-        !emit_config::active().w8a8,
-        "Qwen prefill activation FP8 is not implemented"
-    );
     let batch = emit_config::active().decode_batch;
     assert!(matches!(batch, 1 | 4), "Qwen decode supports batch 1 or 4");
     assert!(ctx >= batch && n_cu >= AMAX_BLOCKS);
@@ -764,10 +780,16 @@ pub(super) fn run(
     )
     .expect("Qwen build manifest");
     eprintln!(
-        "qwen3_5: {} layers, {} full, {} batch1 decode -> {}",
+        "qwen3_5: {} layers, {} full, {} batch{batch} decode -> {}",
         c.layers.len(),
         c.layers.iter().filter(|x| **x).count(),
-        if fp8 { "W8A16" } else { "BF16" },
+        if emit_config::active().w8a8 {
+            "W8A8"
+        } else if fp8 {
+            "W8A16"
+        } else {
+            "BF16"
+        },
         out.display()
     );
 }
@@ -1194,6 +1216,56 @@ mod tests {
         let mut v = fixture();
         v["quantization_config"] = serde_json::json!({"quant_method":"fp8"});
         Config::parse(&v);
+    }
+    #[test]
+    fn w8a8_decode_quantizes_body_inputs_and_keeps_head_wide() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        struct Restore(emit_config::EmitConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                emit_config::install(self.0.clone());
+            }
+        }
+        let restore = Restore(emit_config::active().clone());
+        let mut cfg = restore.0.clone();
+        cfg.fp8 = true;
+        cfg.w8a8 = true;
+        emit_config::install(cfg);
+        let c = Config::parse(&fixture());
+        let m = model(&c, 8192, 132, 0, true, 1);
+        let g = &m.progs[0];
+        assert_eq!(g.gq_seg_ofs.len(), 2);
+        let mut count = 0;
+        for (ix, d) in g.insts.iter().enumerate() {
+            if d.op != DevOp::GemmFp8 as u16 {
+                continue;
+            }
+            count += 1;
+            let q = &g.insts[ix - 1];
+            assert_eq!(q.op, DevOp::QuantFp8 as u16);
+            assert_eq!((q.t[0], q.t[2]), (d.t[1], d.t[3]));
+            assert_eq!(&q.i[..2], &[1, d.i[2]]);
+            assert_eq!(m.tensors[d.t[1] as usize].bytes, u64::from(d.i[2]));
+            assert_eq!(m.tensors[d.t[3] as usize].bytes, 4);
+            assert_eq!(m.tensors[d.t[4] as usize].bytes, u64::from(d.i[1]) * 4);
+            assert!(m.tensors[d.t[2] as usize].name.starts_with("fp8/"));
+        }
+        assert_eq!(count, 31);
+        let head = g.insts.iter().find(|d| d.op == DevOp::Gemv as u16).unwrap();
+        assert_eq!(m.tensors[head.t[2] as usize].name, "lm_head.weight");
+        let man = manifest::build(&m, "sm_90a", &LeanReport::skipped("fixture"));
+        assert_eq!(man["features"]["w8a8"], true);
+        let req = man["backends"]["nvcc"]["requires"].as_array().unwrap();
+        for flag in [
+            "PLOW_NV_W8A8=1",
+            "PLOW_NV_FP8_M1=1",
+            "PLOW_NV_QUANT_FP8_VLLM=1",
+        ] {
+            assert!(req.contains(&serde_json::json!(flag)));
+        }
+        assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, true, 4)).is_err());
+        assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, false, 1)).is_err());
     }
     #[test]
     #[should_panic(expected = "unsupported layer type")]

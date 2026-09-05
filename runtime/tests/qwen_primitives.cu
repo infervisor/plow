@@ -5,8 +5,16 @@
 struct Args { void* t[8]; int i[8]; union {float f; int j;} fj[2]; };
 #define TEN(n) in->t[n]
 __global__ void run(unsigned op, Args args) {
+extern __shared__ __nv_bfloat16 arena[];
 const Args* in=&args; unsigned slice=blockIdx.x,nblk=gridDim.x;
 switch(op) {
+#if defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1
+    case PLOW_DOP_GEMM_FP8:
+        d_gemm_w8a8((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1), (const uint8_t*)TEN(2),
+            (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2],
+            0, slice, nblk, arena);
+        break;
+#endif
     case PLOW_DOP_QUANT_FP8:
         d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2),
             in->i[0], in->i[1], slice, nblk);
@@ -67,5 +75,5 @@ switch(op) {
 }}
 extern "C" int qwen_test(unsigned op, void** tensors, const int* integers, const float* floats, void* stream) {
 Args a={}; for(int i=0;i<8;i++)a.t[i]=tensors[i]; for(int i=0;i<8;i++)a.i[i]=integers[i]; for(int i=0;i<2;i++)a.fj[i].f=floats[i];
-run<<<132,256,0,(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
+run<<<132,256,op == PLOW_DOP_GEMM_FP8 ? 12352 : 0,(cudaStream_t)stream>>>(op,a);return (int)cudaGetLastError();
 }

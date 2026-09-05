@@ -1940,6 +1940,20 @@ impl GpuEngine {
             }
         };
         let gemv_mm_cap = be.module_global_u32(&module, "plow_gemv_mm_cap")?;
+        if recurrent.is_some()
+            && blob
+                .progs
+                .iter()
+                .flat_map(|p| &p.insts)
+                .any(|d| d.op == DevOp::GemmFp8 as u16)
+            && (blob.decode_prog()?.t != 1
+                || !blob.prefill_progs().is_empty()
+                || be.module_global_u32(&module, "plow_fp8_m1_arm")? != Some(1))
+        {
+            return Err(RuntimeError::Rejected(
+                "Qwen W8A8 requires batch-1 decode and the paired native FP8 M1 interpreter".into(),
+            ));
+        }
         if gemv_mm_cap == Some(0) {
             return Err(RuntimeError::Device(
                 "decode interpreter advertises GV_MM_MAX=0 — its GEMV row walk cannot make progress"

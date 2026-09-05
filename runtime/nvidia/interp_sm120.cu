@@ -1394,12 +1394,51 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif /* !PLOW_NV_GEMM_ONLY (pointwise + lm_head GEMV) */
 
 #if !PLOW_NV_PREFILL
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM
+    case PLOW_DOP_QUANT_FP8:
+        if (in->i[0] != 1) { __trap(); break; }
+        d_quant_fp8((uint8_t*)TEN(0), (__nv_bfloat16*)TEN(1), (float*)TEN(2),
+            in->i[0], in->i[1], slice, nblk);
+        break;
+    case PLOW_DOP_GEMM_FP8:
+    case PLOW_DOP_GEMM_MED_FP8:
+    case PLOW_DOP_GEMM_SMALL_FP8:
+        if (in->i[0] != 1) { __trap(); break; }
+        d_gemm_w8a8((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1), (const uint8_t*)TEN(2),
+            (const float*)TEN(3), (const float*)TEN(4), 1, in->i[1], in->i[2],
+            in->i[4], slice, nblk, (__nv_bfloat16*)arena);
+        break;
+#endif
     /* ---- GEMV family (DECODE object only; the prefill object uses the tiled GEMM arms above) ----
      * i4=a_row0 is a row offset applied to x in units of K (undocumented in dev.rs; 0 on
      * every Qwen packet). i3=norm_flag selects the fused-norm GEMV, which this build does
      * NOT carry — trapped rather than silently skipping the norm. */
     case PLOW_DOP_GEMV:
         if (in->i[3] != 0) { __trap(); break; }
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA
+        static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >=
+            (PLOW_NV_GEMV_M16_PIPE ? 12304 : 11536));
+        if (in->i[0] == 16 && in->i[1] >= 1024 && in->i[2] && !(in->i[2] % 64)) {
+            d_gemv_sm90_m16((__nv_bfloat16*)TEN(0),
+                (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                (const __nv_bfloat16*)TEN(2), in->i[1], in->i[2], slice, nblk,
+                (__nv_bfloat16*)arena);
+            break;
+        }
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
+        if (in->i[0] == 1 && in->i[1] >= 1024 &&
+            (in->i[2] == 5120 || in->i[2] == 6144)) {
+            auto* x = (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2];
+            if (in->i[2] == 5120)
+                d_gemv_sm90_xreg<5120>((__nv_bfloat16*)TEN(0), x,
+                    (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk);
+            else
+                d_gemv_sm90_xreg<6144>((__nv_bfloat16*)TEN(0), x,
+                    (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk);
+            break;
+        }
+#endif
         if (in->i[2] <= PLOW_NV_ARENA_FLOATS * 2u)
             d_gemv((__nv_bfloat16*)TEN(0),
                    (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
@@ -2042,6 +2081,11 @@ extern "C" __device__ unsigned plow_qwen_prefill_arm = 0;
 extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 1;
 #else
 extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 0;
+#endif
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
+extern "C" __device__ unsigned plow_fp8_m1_arm = 1;
+#else
+extern "C" __device__ unsigned plow_fp8_m1_arm = 0;
 #endif
 /* Backoff inside the counter-gate poll. 64 ns is the shipped value; 0 spins flat out. */
 #ifndef PLOW_NV_GATE_SLEEP

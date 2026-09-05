@@ -2005,4 +2005,172 @@ static __device__ void d_gemm_glu_w8a8_sm90(__nv_bfloat16* __restrict__ C,
 
 #endif /* PGM90_FORK_GLU */
 
+
+#ifndef PLOW_NV_GEMV_XREG
+#define PLOW_NV_GEMV_XREG 0
+#endif
+#if PLOW_NV_GEMV_XREG
+template <unsigned K>
+__device__ __forceinline__ void d_gemv_sm90_xreg(__nv_bfloat16* C,
+    const __nv_bfloat16* x, const __nv_bfloat16* W, unsigned N,
+    unsigned slice, unsigned nblk) {
+    static_assert(K == 5120 || K == 6144);
+    constexpr unsigned chunks = K / GV_STEP;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    bf16v8 xv[chunks];
+#pragma unroll
+    for (unsigned c = 0; c < chunks; c++)
+        xv[c] = ld_glob8(x + c * GV_STEP + lane * 8u);
+    for (unsigned n = first + warp; n < end; n += blockDim.x / 32u) {
+        const __nv_bfloat16* row = W + (size_t)n * K;
+        float acc = 0.f;
+#pragma unroll
+        for (unsigned c = 0; c < chunks; c += GV_UNROLL) {
+            bf16v8 weights[GV_UNROLL];
+#pragma unroll
+            for (unsigned u = 0; u < GV_UNROLL; u++)
+                if (c + u < chunks)
+                    weights[u] = ld_glob8(row + (c + u) * GV_STEP + lane * 8u);
+#pragma unroll
+            for (unsigned u = 0; u < GV_UNROLL; u++)
+                if (c + u < chunks) acc = dot8(weights[u], xv[c + u], acc);
+        }
+        const float total = warp_sum32(acc);
+        if (lane == 0) C[n] = __float2bfloat16(total);
+    }
+}
+#endif
+
+
+#ifndef PLOW_NV_GEMV_M16_MMA
+#define PLOW_NV_GEMV_M16_MMA 0
+#endif
+#if PLOW_NV_GEMV_M16_MMA
+
+#ifndef PLOW_NV_GEMV_M16_PIPE
+#define PLOW_NV_GEMV_M16_PIPE 0
+#endif
+#if PLOW_NV_GEMV_M16_PIPE
+static __device__ void d_gemv_sm90_m16_pipeline(__nv_bfloat16* C, const __nv_bfloat16* x,
+    const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
+    unsigned nblk, __nv_bfloat16* arena) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    auto* memory = (__nv_bfloat16*)(((uintptr_t)arena + 15u) & ~(uintptr_t)15u) + warp * 768;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    for (unsigned col = first + warp * 8; col < end; col += 64) {
+        float acc[4] = {};
+        auto stage = [&](unsigned kb, unsigned buffer) {
+            auto* a = memory + buffer * 384;
+            auto* b = a + 256;
+            const unsigned row = lane / 2, k = (lane & 1) * 8;
+            sm90_cp16(a + row * 16 + k, x + (size_t)row * K + kb + k, 16);
+            if (lane < 16) {
+                const bool valid = col + row < end;
+                const auto* source = valid ? W + (size_t)(col + row) * K + kb + k : W;
+                sm90_cp16(b + row * 16 + k, source, valid ? 16 : 0);
+            }
+            sm90_cp_commit();
+        };
+        stage(0, 0);
+        for (unsigned kb = 0; kb < K; kb += 16) {
+            const unsigned current = (kb / 16) & 1u;
+            if (kb + 16 < K) stage(kb + 16, current ^ 1u);
+            // The empty tail group lets wait<1> retire the final data group.
+            else sm90_cp_commit();
+            sm90_cp_wait<1>();
+            __syncwarp();
+            auto* a = memory + current * 384;
+            auto* b = a + 256;
+            unsigned af[4], bf[2];
+            const unsigned ap = (unsigned)__cvta_generic_to_shared(
+                a + (lane % 16) * 16 + (lane / 16) * 8);
+            const unsigned bp = (unsigned)__cvta_generic_to_shared(
+                b + (lane & 7) * 16 + ((lane >> 3) & 1) * 8);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(af[0]), "=r"(af[1]), "=r"(af[2]), "=r"(af[3]) : "r"(ap));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                : "=r"(bf[0]), "=r"(bf[1]) : "r"(bp));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                : "r"(af[0]), "r"(af[1]), "r"(af[2]), "r"(af[3]), "r"(bf[0]), "r"(bf[1]));
+            __syncwarp();
+        }
+        sm90_cp_wait<0>();
+        const unsigned row = lane >> 2, column = col + (lane & 3) * 2;
+#pragma unroll
+        for (unsigned hi = 0; hi < 2; hi++)
+#pragma unroll
+            for (unsigned lo = 0; lo < 2; lo++)
+                if (column + lo < end)
+                    C[(size_t)(row + hi * 8) * N + column + lo] =
+                        __float2bfloat16(acc[hi * 2 + lo]);
+        __syncwarp();
+    }
+}
+#endif
+
+static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
+    const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
+    unsigned nblk, __nv_bfloat16* arena) {
+#if PLOW_NV_GEMV_M16_PIPE
+    d_gemv_sm90_m16_pipeline(C, x, W, N, K, slice, nblk, arena);
+#else
+    constexpr unsigned stride = 72;
+    auto* a = (__nv_bfloat16*)(((uintptr_t)arena + 15u) & ~(uintptr_t)15u);
+    auto* b = a + 16 * stride;
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned first = slice * per, end = min(first + per, N);
+    for (unsigned col = first; col < end; col += 64) {
+        float acc[4] = {};
+        for (unsigned kb = 0; kb < K; kb += 64) {
+            for (unsigned v = tid; v < 16 * 8; v += 256) {
+                const unsigned row = v / 8, k = v % 8 * 8;
+                sm90_cp16(a + row * stride + k, x + (size_t)row * K + kb + k, 16);
+            }
+            for (unsigned v = tid; v < 64 * 8; v += 256) {
+                const unsigned row = v / 8, k = v % 8 * 8;
+                const bool valid = col + row < end;
+                const auto* source = valid ? W + (size_t)(col + row) * K + kb + k : W;
+                sm90_cp16(b + row * stride + k, source, valid ? 16 : 0);
+            }
+            sm90_cp_commit();
+            sm90_cp_wait<0>();
+            __syncthreads();
+#pragma unroll
+            for (unsigned kk = 0; kk < 64; kk += 16) {
+                unsigned af[4], bf[2];
+                const unsigned ap = (unsigned)__cvta_generic_to_shared(
+                    a + (lane % 16) * stride + kk + (lane / 16) * 8);
+                const unsigned bp = (unsigned)__cvta_generic_to_shared(
+                    b + (warp * 8 + (lane & 7)) * stride + kk + ((lane >> 3) & 1) * 8);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(af[0]), "=r"(af[1]), "=r"(af[2]), "=r"(af[3]) : "r"(ap));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                    : "=r"(bf[0]), "=r"(bf[1]) : "r"(bp));
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                    : "r"(af[0]), "r"(af[1]), "r"(af[2]), "r"(af[3]), "r"(bf[0]), "r"(bf[1]));
+            }
+            __syncthreads();
+        }
+        const unsigned row = lane >> 2, column = col + warp * 8 + (lane & 3) * 2;
+#pragma unroll
+        for (unsigned hi = 0; hi < 2; hi++)
+#pragma unroll
+            for (unsigned lo = 0; lo < 2; lo++)
+                if (column + lo < end)
+                    C[(size_t)(row + hi * 8) * N + column + lo] =
+                        __float2bfloat16(acc[hi * 2 + lo]);
+        __syncthreads();
+    }
+#endif
+}
+#endif
+
 #endif /* PLOW_OP_GEMM_SM90_CUH */

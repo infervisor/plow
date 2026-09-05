@@ -28,6 +28,7 @@ def parse_args():
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--enforce-eager", action="store_true")
     p.add_argument("--language-model-only", action="store_true")
+    p.add_argument("--quantization", choices=["fp8"])
     return p.parse_args()
 
 
@@ -121,6 +122,7 @@ def main():
         max_logprobs=-1,
         logprobs_mode="raw_logits",
         language_model_only=args.language_model_only,
+        quantization=args.quantization,
     )
     vocab_size = int(llm.model_config.get_vocab_size())
     sampling = SamplingParams(
@@ -145,6 +147,7 @@ def main():
         "max_model_len": max_len,
         "enforce_eager": args.enforce_eager,
         "language_model_only": args.language_model_only,
+        "quantization": args.quantization,
         "hf_vocab_size": llm.model_config.hf_text_config.vocab_size,
         "final_logit_softcapping": getattr(llm.model_config.hf_text_config, "final_logit_softcapping", None),
         "cases": [],

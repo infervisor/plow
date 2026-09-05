@@ -45,7 +45,7 @@ TMA repeat (same seed 42/settings) completed 32/32: TTFT 87.28 ms, TPOT 35.36 ms
 
 - Qwen native prefill with batch capacity 4 passed 42 exact comparisons against batch-1 native references at prefixes 128, 130 and 256, including inactive KV/state preservation and slot reset. Serving performance is pending.
 - `PLOW_QWEN_DECODE_LT=1` routes body BF16 projections through cuBLASLt. Graph and non-graph outputs matched exactly on five checked prefixes. A four-request serving smoke measured TPOT 33.84 ms, versus 35.37 ms for the native decoder; a full repeated comparison is pending. `PLOW_QWEN_DECODE_LT_PRESEED=1` skips external NOP windows after validating counter ownership and ordering. Its five CPU tests passed; GPU correctness and timing remain pending.
-- Packed-tensor FP8 weight export and opt-in `PLOW_NV_QUANT_FP8_VLLM=1` activation quantization prepare matching W8A8 arithmetic. Activation bytes and scale bits matched vLLM in all 45 checked GPU cases. Full-model W8A8 execution is not implemented; the isolated FP8 M1 cuBLASLt prototype is compiled but awaits GPU qualification.
+- Packed-tensor FP8 weight export and opt-in `PLOW_NV_QUANT_FP8_VLLM=1` activation quantization prepare matching W8A8 arithmetic. Activation bytes and scale bits matched vLLM in all 45 checked GPU cases. Native full-model W8A8 batch-1 decode is now implemented behind the existing FP8/W8A8 emitter flags; numerical qualification and optimization remain in progress.
 - Gemma B16 MM8/MM16 decoder variants produced identical logits on the checked three-token history; comparative serving timing is pending. The opt-in `PLOW_NV_GEMMA_HNR_BF16=1` norm/RoPE rounding change improves the checked Gemma12B prefix-6 relative logit error from 18.89% to 13.59%, but the leading token still differs from vLLM. It is not a complete quality fix, and segmented prefill needs a matching build before whole-serving evaluation.
 
 These switches remain opt-in. Long-context Qwen and Gemma numerical qualification remains open. The existing baseline matrix does not cover all supported contexts or end-to-end latency percentiles.
@@ -62,3 +62,29 @@ Both variants execute inside the Plow interpreter and share the same segmented p
 | MM16 | 32 | 321.41 | 48.22 | 74.47 | 6445.56 | 7200.21 | 309.51 |
 
 MM16 reduces TPOT by 11.6% in this single comparison, but still trails the corresponding vLLM baseline (about 11.00 ms TPOT and 1364–1367 output tok/s). This supports investigating a small-batch tensor-core implementation; it does not qualify a default change or resolve Gemma numerical differences. Each process built 16 prefill graphs, one per slot. Raw results: `gemma12b-mm{8,16}-128-c16-r1/in128_c16.json` under the campaign directory, including end-to-end percentiles and detailed request data.
+
+## Native kernel checkpoint
+
+The cuBLASLt runtime flag remains available; optimization work prioritizes kernels inside the packet interpreter. Native BF16 activation caching passed isolated and full-model checks and improved the measured Qwen decode time; see [kernel comparison](qwen-h100-bf16-decode-kernel-comparison.md).
+
+Qwen W8A8 batch-1 decode now uses explicit QuantFp8 packets and a native Hopper FP8 tensor-core projection arm. Weight scales come from the packed-tensor sidecar, activation scales are per token, output head/KV remain BF16 and recurrent state remains FP32. The loader rejects an unpaired interpreter or unsupported batch/prefill configuration. Ten emitter tests, the CUDA/HSA/hub workspace check, 213 runtime tests and release compilation passed. All 13 isolated FP8 shape gates passed, and the full model completed five teacher-forced tokens plus two exact request resets.
+
+The initial FP8 kernel is slower than CUTLASS (QKV82.64 vs30.45µs). Its two-stage pipeline passed correctness but regressed QKV to86.45µs and remains disabled. Full-model leading tokens matched vLLM on all five prefixes, but centered logit error was2.8–4.5% and vLLM's first-prefix repeats themselves differed; qualification remains open. The initial kernel promotes accumulators every128K, whereas the installed CUTLASS M1 route uses fast accumulation; a separate matching-accumulation candidate is being checked. Raw evidence: `qwen-fp8-m1-native.json`, `qwen-fp8-m1-pipe.json`, `qwen-w8a8-native-quality.json` under `/tmp/plow-model-support-checks`, and `/tmp/plow-qwen-w8a8-vllm-short/manifest.json`.
+
+A second Gemma rounding boundary was isolated by cutting the block0 packet after its post-attention normalization. Rounding that normalization's result to BF16 before residual addition reproduces the CPU BOS residual and following norm exactly. The opt-in `PLOW_NV_GEMMA_NRN_BF16=1` candidate, combined with HNR BF16 rounding, reduces the checked full-model prefix-6 error against vLLM from18.89% to4.73% and corrects its leading token496→9079. Prefix2 still differs (236747 vs575), so this is partial qualification only. Both block and full-model diagnostics completed, with exact request resets; decoder remains200registers with no stack/local memory. Evidence: `gemma12-nrn-replay.json` and `gemma12-hnr-nrn-quality.json` under `/tmp/plow-model-support-checks`.
+
+The matching FP8 fast-accumulation primitive subsequently produced bit-exact outputs against installed CUTLASS on all13shapes, with exact activation bytes/scales. It remains slower (QKV82.48 vs30.43µs); full-model qualification with this arithmetic is next. Evidence: `/tmp/plow-model-support-checks/qwen-fp8-m1-fastaccum.json`.
+
+Native batch-16 tensor-core GEMV variants retain packet slice ownership and the existing12352-byte shared arena. Both passed16isolated shape checks. Their stronger control is native SIMD MM16, which already loads each weight once:
+
+| Projection | SIMD MM16 µs | Tensor-core v1 µs | Warp-pipeline v2 µs |
+|---|---:|---:|---:|
+| gemma_down | 336.4 | 203.3 | 303.2 |
+| gemma_q | 115.9 | 61.2 | 133.4 |
+| gemma_o | 133.4 | 108.2 | 153.4 |
+| qkv | 213.6 | 142.7 | 229.1 |
+| k_or_v | 24.3 | 64.9 | 94.3 |
+| down | 531.9 | 240.8 | 369.0 |
+| lm_head | 4905.9 | 2253.8 | 3092.7 |
+
+The warp-pipeline revision regresses every routed shape against v1 and remains disabled. No tensor-core variant is promoted for serving; full-model qualification and shape-specific selection remain necessary. Raw logs: `gemv-m16-mma/result1.log` and `gemv-m16-mma-pipeline/result{,-mm16-control}.log` under `/tmp/plow-model-support-checks`.

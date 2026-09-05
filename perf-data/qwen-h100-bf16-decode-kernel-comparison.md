@@ -21,3 +21,22 @@ Existing `runtime/bench/nvidia/bf16_gemm_vs_cublas_bench.cu`, built with `PLOW_B
 | fused_gtup | 119.20 | 140.70 | 127.09 | 1.18× |
 
 Raw log: `/tmp/plow-model-support-checks/qwen-m1-vs-cublas-result.log`. Executable: `/tmp/plow-model-support-checks/qwen-m1-vs-cublas 1`.
+
+## Native activation register cache
+
+The opt-in `PLOW_NV_GEMV_XREG=1` candidate keeps BF16 activation fragments in registers for M1, N >= 1024, K5120/6144. Other shapes use the original kernel. It preserves packet scheduling and reduction order. The persistent decoder compiles at 205 registers with no stack or local memory; its shared-memory requirement is unchanged.
+
+| Projection | Original Plow µs | Register-cache Plow µs |
+|---|---:|---:|
+| qkv | 51.0 | 38.5 |
+| z | 35.8 | 25.0 |
+| gdn_out | 35.3 | 25.6 |
+| full Q | 58.9 | 45.6 |
+| K/V | 11.7 | 7.6 |
+| gate/up | 78.3 | 61.7 |
+| down (fallback) | 94.1 | 94.0 |
+| output head | 923.7 | 806.7 |
+
+Both isolated variants passed all 13 shape checks. Full-model logits matched byte-for-byte on five teacher-forced prefixes and two request resets per variant. In one serving run with unchanged TMA prefill, input/output 128, C1, 32 measured requests, 16 warmups and seed42, the candidate completed32/32 with TTFT88.72ms, TPOT32.46ms and output30.40tok/s. Previous native repeats measured TPOT35.36–35.37ms; the cuBLASLt dispatch smoke measured33.84ms. The native improvement is about8%, not an overall win: contemporaryvLLM measured19.99ms TPOT and48.61tok/s. This run used a different frozen host binary from the older native repeats, so an immediate same-binary control remains useful before promotion.
+
+Raw kernel logs: `/tmp/plow-model-support-checks/qwen-bf16-xreg/result{0,1}.log`. Quality: `/tmp/plow-model-support-checks/qwen-xreg-quality.json`. Serving: `/opt/dlami/nvme/tmp/plow-h100-campaign/qwen-xreg-128-c1-r1/in128_c1.json`.

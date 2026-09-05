@@ -1490,11 +1490,176 @@ __device__ __forceinline__ void pgm_load_bfrags_w8a8(unsigned (&bf)[NFRAG][2],
 
 /* w8a8 twin of d_gemm. A e4m3 [m][k] (t1) + a_scale f32[M] (t3), B e4m3 [n][k] (t2) + w_scale f32[N]
  * (t4). One k32 mma per BK tile; epilogue dequant acc*a_scale[m]*w_scale[n]. Store map == bf16 d_gemm. */
+
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1
+
+#if defined(PLOW_NV_FP8_M1_PIPE) && PLOW_NV_FP8_M1_PIPE && defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+#error "FP8 M1 PIPE and FAST_ACCUM are separate comparison candidates"
+#endif
+#if defined(PLOW_NV_FP8_M1_PIPE) && PLOW_NV_FP8_M1_PIPE
+static __device__ __forceinline__ void pgm_m1_stage64(uint8_t* dst, const uint8_t* src,
+    unsigned rows, unsigned row0, unsigned kb, unsigned n, unsigned k) {
+    for (unsigned line = threadIdx.x; line < rows * 4; line += blockDim.x) {
+        const unsigned row = line / 4, col = (line % 4) * 16;
+        const unsigned linear = row * 64 + col;
+        const unsigned gr = row0 + row, gk = kb + col;
+        const bool valid = gr < n && gk < k;
+        const unsigned bytes = valid ? min(16u, k - gk) : 0;
+        sm90_cp16(dst + (linear ^ ((linear >> 3) & 0x30)),
+            valid ? src + (size_t)gr * k + gk : src, bytes);
+    }
+}
+static __device__ __forceinline__ uint64_t pgm_m1_desc64(const void* ptr) {
+    return (sm90_make_desc(ptr, 16, 512) & ~(3ull << 62)) | (2ull << 62);
+}
+/* Two 4608-byte stages. SW64 offsets match CUTLASS Layout_K_SW64_Atom.
+ * Promote after each 128 K elements, preserving the single-stage arithmetic. */
+static __device__ void d_gemm_w8a8_m1_pipe_sm90(__nv_bfloat16* C, const uint8_t* A,
+    const uint8_t* W, const float* ascale, const float* wscale, unsigned n, unsigned k,
+    unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
+    if (sm90_bad_k(k, 16u)) return;
+    const unsigned tid = threadIdx.x;
+    uint8_t* base = (uint8_t*)sm90_align1024(arena);
+    const uint8_t* x = A + (size_t)a_row0 * k;
+    const unsigned steps = (k + 63) / 64;
+    for (unsigned tile = slice; tile < (n + 63) / 64; tile += nblk) {
+        float total[4] = {}, partial[4] = {};
+        pgm_m1_stage64(base, W, 64, tile * 64, 0, n, k);
+        pgm_m1_stage64(base + 4096, x, 8, 0, 0, 1, k);
+        sm90_cp_commit();
+        for (unsigned step = 0; step < steps; ++step) {
+            if (step + 1 < steps) {
+                uint8_t* next = base + ((step + 1) & 1) * 4608;
+                pgm_m1_stage64(next, W, 64, tile * 64, (step + 1) * 64, n, k);
+                pgm_m1_stage64(next + 4096, x, 8, 0, (step + 1) * 64, 1, k);
+            }
+            sm90_cp_commit();
+            sm90_cp_wait<1>();
+            __syncthreads();
+            if (tid < 128) {
+                uint8_t* current = base + (step & 1) * 4608;
+                sm90_wg_fence();
+#pragma unroll
+                for (int sub = 0; sub < 2; ++sub) {
+                    const uint64_t dw = pgm_m1_desc64(current + sub * 32);
+                    const uint64_t dx = pgm_m1_desc64(current + 4096 + sub * 32);
+                    asm volatile(
+                        "{ .reg .pred p; setp.ne.b32 p, %6, 0;\n"
+                        "wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3 "
+                        "{%0,%1,%2,%3}, %4, %5, p, 1, 1; }\n"
+                        : "+f"(partial[0]), "+f"(partial[1]), "+f"(partial[2]), "+f"(partial[3])
+                        : "l"(dw), "l"(dx), "r"((int)((step & 1) || sub)));
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<0>();
+                if ((step & 1) || step + 1 == steps) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) total[i] += partial[i];
+                }
+            }
+            __syncthreads();
+        }
+        sm90_cp_wait<0>();
+        if (tid < 128 && (tid & 3) == 0) {
+            const unsigned r0 = tile * 64 + (tid >> 5) * 16 + ((tid & 31) >> 2);
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const unsigned row = r0 + hi * 8;
+                if (row < n)
+                    C[row] = __float2bfloat16(total[hi * 2] * ascale[0] * wscale[row]);
+            }
+        }
+        __syncthreads();
+    }
+}
+#endif
+
+/* W[64,K] x X[1,K]^T uses native m64n8 FP8 (the other seven columns are zero).
+ * The fragment matches CUTLASS MMA_64x8x32_F32E4M3E4M3_SS_TN. One 256-thread CTA
+ * needs 9216 bytes plus at most 1023 bytes of alignment padding. */
+static __device__ void d_gemm_w8a8_m1_sm90(__nv_bfloat16* C, const uint8_t* A,
+    const uint8_t* W, const float* ascale, const float* wscale, unsigned n, unsigned k,
+    unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
+    if (sm90_bad_k(k, 16u)) return;
+    const unsigned tid = threadIdx.x;
+    uint8_t* weights = (uint8_t*)sm90_align1024(arena);
+    uint8_t* activation = weights + 64 * 128;
+    const uint8_t* x = A + (size_t)a_row0 * k;
+    for (unsigned tile = slice; tile < (n + 63) / 64; tile += nblk) {
+        float total[4] = {}, partial[4] = {};
+        for (unsigned kb = 0; kb < k; kb += 128) {
+            pgm90_stage_fp8(weights, W, tid, 64, tile * 64, kb, n, k);
+            pgm90_stage_fp8(activation, x, tid, 8, 0, kb, 1, k);
+            sm90_cp_commit();
+            sm90_cp_wait<0>();
+            __syncthreads();
+            if (tid < 128) {
+                sm90_wg_fence();
+#pragma unroll
+                for (int sub = 0; sub < 4; ++sub) {
+                    const uint64_t dw = sm90_desc(weights + sub * 32);
+                    const uint64_t dx = sm90_desc(activation + sub * 32);
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    const int accumulate = kb != 0 || sub != 0;
+#else
+                    const int accumulate = sub != 0;
+#endif
+                    asm volatile(
+                        "{ .reg .pred p; setp.ne.b32 p, %6, 0;\n"
+                        "wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3 "
+                        "{%0,%1,%2,%3}, %4, %5, p, 1, 1; }\n"
+                        : "+f"(partial[0]), "+f"(partial[1]), "+f"(partial[2]), "+f"(partial[3])
+                        : "l"(dw), "l"(dx), "r"(accumulate));
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<0>();
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    total[i] = partial[i];
+#else
+                    total[i] += partial[i];
+#endif
+                }
+            }
+            __syncthreads();
+        }
+        if (tid < 128 && (tid & 3) == 0) {
+            const unsigned r0 = tile * 64 + (tid >> 5) * 16 + ((tid & 31) >> 2);
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const unsigned row = r0 + hi * 8;
+                if (row < n) {
+#if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
+                    /* vLLM M<=16 swaps both operands and epilogue scales. */
+                    C[row] = __float2bfloat16(__fmul_rn(wscale[row],
+                        __fmul_rn(ascale[0], total[hi * 2])));
+#else
+                    C[row] = __float2bfloat16(total[hi * 2] * ascale[0] * wscale[row]);
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+#endif
+
 static __device__ void d_gemm_w8a8(__nv_bfloat16* __restrict__ C, const uint8_t* __restrict__ A,
                        const uint8_t* __restrict__ B, const float* __restrict__ ascale,
                        const float* __restrict__ wscale, unsigned m, unsigned n, unsigned k,
                        unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
 #if defined(PLOW_NV_HOPPER)
+#if defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1
+    if (m == 1) {
+#if defined(PLOW_NV_FP8_M1_PIPE) && PLOW_NV_FP8_M1_PIPE
+        d_gemm_w8a8_m1_pipe_sm90(C, A, B, ascale, wscale, n, k, a_row0, slice, nblk, arena);
+#else
+        d_gemm_w8a8_m1_sm90(C, A, B, ascale, wscale, n, k, a_row0, slice, nblk, arena);
+#endif
+        return;
+    }
+#endif
     d_gemm_w8a8_sm90(C, A, B, ascale, wscale, m, n, k, a_row0, slice, nblk, arena);
 #else
     uint8_t* As = (uint8_t*)arena;                       /* [STAGES][BM][BK8] e4m3 */

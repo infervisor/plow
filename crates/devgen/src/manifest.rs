@@ -798,6 +798,10 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("w8a8") {
         req.push("PLOW_NV_W8A8=1".into());
+        if on("qwen_gdn") {
+            req.push("PLOW_NV_FP8_M1=1".into());
+            req.push("PLOW_NV_QUANT_FP8_VLLM=1".into());
+        }
     }
     if on("fp8_kv") {
         req.push("PLOW_FP8_KV=1".into());

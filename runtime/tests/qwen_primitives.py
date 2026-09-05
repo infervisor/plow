@@ -4,6 +4,7 @@ p=argparse.ArgumentParser()
 p.add_argument("--run-gpu", action="store_true")
 p.add_argument("--library", required=True)
 p.add_argument("--gdn-library")
+p.add_argument("--fp8-interpreter-only", action="store_true", help="run interpreter FP8 M1 body vs vLLM CUTLASS")
 p.add_argument("--fp8-gemm-only", action="store_true", help="run cuBLASLt FP8 M1 vs vLLM CUTLASS")
 p.add_argument("--fp8-only", action="store_true", help="report exact activation quantization parity; exit 1 on any mismatch")
 p.add_argument("--output", help="FP8 comparison JSON, written even when parity fails")
@@ -27,12 +28,13 @@ def check_fp8_gemm():
         ("gate_or_up",17408,5120),("down",5120,17408),("lm_head",248320,5120),
         ("fused_ba",96,5120),("fused_qkvz",16384,5120),
         ("fused_qkv",14336,5120),("fused_gtup",34816,5120)]
-    lib.plow_fp8_m1_create.argtypes=[C.c_int,C.c_int,C.c_int,C.c_void_p,C.c_void_p,C.POINTER(C.c_void_p)]
-    lib.plow_fp8_m1_create.restype=C.c_int
-    lib.plow_fp8_m1_run.argtypes=[C.c_void_p]*5
-    lib.plow_fp8_m1_run.restype=C.c_int
-    lib.plow_fp8_m1_destroy.argtypes=[C.c_void_p]
-    lib.plow_fp8_m1_destroy.restype=None
+    if not args.fp8_interpreter_only:
+        lib.plow_fp8_m1_create.argtypes=[C.c_int,C.c_int,C.c_int,C.c_void_p,C.c_void_p,C.POINTER(C.c_void_p)]
+        lib.plow_fp8_m1_create.restype=C.c_int
+        lib.plow_fp8_m1_run.argtypes=[C.c_void_p]*5
+        lib.plow_fp8_m1_run.restype=C.c_int
+        lib.plow_fp8_m1_destroy.argtypes=[C.c_void_p]
+        lib.plow_fp8_m1_destroy.restype=None
     torch.manual_seed(1729)
     records=[]
     # Flush is outside the timed region; every iteration rereads the same weight
@@ -58,24 +60,38 @@ def check_fp8_gemm():
             wq,_=ops.scaled_fp8_quant(w,scale=ws)
             aq,asc=ops.scaled_fp8_quant(x,use_per_token_if_dynamic=True)
             del w
-            attempts=[]
-            for physical_m in (1,16):
-                rc=lib.plow_fp8_m1_create(N,K,physical_m,ws.data_ptr(),asc.data_ptr(),C.byref(handle))
-                attempts.append(dict(physical_M=physical_m,status=rc))
-                if rc==0:break
-            record["descriptor_attempts"]=attempts
-            if not handle.value:
-                record.update(passed=False,error="No cuBLASLt FP8 algorithm for M1 or padded16")
-                records.append(record)
-                continue
+            if args.fp8_interpreter_only:
+                physical_m=1
+                record["descriptor_attempts"]=[]
+                checked=torch.empty_like(aq)
+                checked_scale=torch.empty_like(asc)
+                run(32,[checked,x,checked_scale],[1,K])
+                torch.cuda.synchronize()
+                record["activation_bytes_scales_exact"]=bool(torch.equal(checked.view(torch.uint8),aq.view(torch.uint8)) and torch.equal(checked_scale.view(torch.int32),asc.view(torch.int32)))
+                aq,asc=checked,checked_scale
+            else:
+                attempts=[]
+                for physical_m in (1,16):
+                    rc=lib.plow_fp8_m1_create(N,K,physical_m,ws.data_ptr(),asc.data_ptr(),C.byref(handle))
+                    attempts.append(dict(physical_M=physical_m,status=rc))
+                    if rc==0:break
+                record["descriptor_attempts"]=attempts
+                if not handle.value:
+                    record.update(passed=False,error="No cuBLASLt FP8 algorithm for M1 or padded16")
+                    records.append(record)
+                    continue
             ap=torch.zeros(physical_m,K,device="cuda",dtype=torch.float8_e4m3fn)
             ap[:1].copy_(aq)
             out=torch.empty(physical_m,N,device="cuda",dtype=torch.bfloat16)
             ref=torch.empty(1,N,device="cuda",dtype=torch.bfloat16)
             wt=wq.t()
+            ws_vector=ws.expand(N).contiguous()
             def native():
-                rc=lib.plow_fp8_m1_run(handle,wq.data_ptr(),ap.data_ptr(),out.data_ptr(),torch.cuda.current_stream().cuda_stream)
-                if rc:raise RuntimeError(f"cublasLtMatmul status {rc}")
+                if args.fp8_interpreter_only:
+                    run(33,[out,ap,wq,asc,ws_vector],[1,N,K])
+                else:
+                    rc=lib.plow_fp8_m1_run(handle,wq.data_ptr(),ap.data_ptr(),out.data_ptr(),torch.cuda.current_stream().cuda_stream)
+                    if rc:raise RuntimeError(f"cublasLtMatmul status {rc}")
             def reference():
                 torch.ops._C.cutlass_scaled_mm(ref,aq,wt,asc,ws,None)
             native();reference();torch.cuda.synchronize()
@@ -84,17 +100,18 @@ def check_fp8_gemm():
             rel=float(torch.linalg.vector_norm(a-b)/torch.linalg.vector_norm(b).clamp_min(1e-30))
             max_abs=float((a-b).abs().max());max_ref=float(b.abs().max())
             # Reuse the existing GEMM comparator gate; retain exact-byte evidence.
-            passed=finite and rel<=.006 and max_abs<=.05+.02*max_ref
+            passed=finite and rel<=.006 and max_abs<=.05+.02*max_ref and record.get("activation_bytes_scales_exact",True)
             record.update(physical_M=physical_m,finite=finite,rel_l2=rel,max_abs=max_abs,
                 bit_exact=bool(torch.equal(out[:1],ref)),passed=passed,
-                cublasLt_cold_us=timing(native),vllm_cutlass_cold_us=timing(reference))
+                candidate_cold_us=timing(native),vllm_cutlass_cold_us=timing(reference))
         except Exception as exc:
             record.update(passed=False,error=repr(exc))
         finally:
             torch.cuda.synchronize()
-            lib.plow_fp8_m1_destroy(handle)
+            if not args.fp8_interpreter_only:lib.plow_fp8_m1_destroy(handle)
         records.append(record)
-    report=dict(mode="true FP8 E4M3 x E4M3, FP32 accumulation, BF16 output",
+    report=dict(backend="Plow interpreter d_gemm_w8a8 M1" if args.fp8_interpreter_only else "cuBLASLt comparison",
+        mode="true FP8 E4M3 x E4M3, FP32 accumulation, BF16 output",
         weight_scale="one FP32 scalar per synthetic packed matrix",
         activation_scale="vLLM CUDA per-token; one scalar at logical M1",
         timing="median30 CUDA-event samples,5warmups;700MiB L2 eviction outside eachsample; no quantization/padding/setup allocation timed",
@@ -104,7 +121,7 @@ def check_fp8_gemm():
     print(json.dumps(report,indent=2))
     return report["passed"]
 
-if args.fp8_gemm_only:
+if args.fp8_gemm_only or args.fp8_interpreter_only:
     raise SystemExit(0 if check_fp8_gemm() else 1)
 
 def check_fp8():

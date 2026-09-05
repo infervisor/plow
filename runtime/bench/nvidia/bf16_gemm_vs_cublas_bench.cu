@@ -59,6 +59,9 @@ __global__ void k_gemm_glu(bf16* C, const bf16* A, const bf16* Wg, const bf16* W
 struct Shape { const char* name; unsigned N, K; int glu; };
 static const Shape SHAPES[] = {
 #ifdef PLOW_BENCH_QWEN_GEMV
+#ifdef PLOW_BENCH_GEMV_M16
+    {"gemma_down",3840,15360,0}, {"gemma_q",8192,3840,0}, {"gemma_o",3840,8192,0},
+#endif
     {"a_or_b", 48, 5120, 0}, {"qkv", 10240, 5120, 0},
     {"z", 6144, 5120, 0}, {"gdn_out", 5120, 6144, 0},
     {"q_full", 12288, 5120, 0}, {"k_or_v", 1024, 5120, 0},
@@ -114,11 +117,24 @@ static CUtensorMap bf16_map(void* base, unsigned rows, unsigned k) {
 #endif
 
 #ifdef PLOW_BENCH_QWEN_GEMV
-__global__ void k_decode_gemv(bf16* c, const bf16* a, const bf16* w, unsigned n, unsigned k) {
+__global__ void k_decode_gemv(bf16* c, const bf16* a, const bf16* w, unsigned m, unsigned n, unsigned k) {
     extern __shared__ bf16 arena[];
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA
+    if (m == 16 && n >= 1024 && k && !(k % 64)) {
+        d_gemv_sm90_m16(c, a, w, n, k, blockIdx.x, gridDim.x, arena);
+        return;
+    }
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
+    if (m == 1 && n >= 1024 && (k == 5120 || k == 6144)) {
+        if (k == 5120) d_gemv_sm90_xreg<5120>(c, a, w, n, blockIdx.x, gridDim.x);
+        else d_gemv_sm90_xreg<6144>(c, a, w, n, blockIdx.x, gridDim.x);
+        return;
+    }
+#endif
     if (k * sizeof(bf16) <= 12352)
-        d_gemv(c, a, w, 1, n, k, blockIdx.x, gridDim.x, arena);
-    else d_gemv(c, a, w, 1, n, k, blockIdx.x, gridDim.x);
+        d_gemv(c, a, w, m, n, k, blockIdx.x, gridDim.x, arena);
+    else d_gemv(c, a, w, m, n, k, blockIdx.x, gridDim.x);
 }
 __global__ void evict_l2(unsigned* p, size_t n) {
     for (size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=(size_t)gridDim.x*blockDim.x)
@@ -285,7 +301,7 @@ static void bench_cublas(unsigned M) {
 #ifdef PLOW_BENCH_QWEN_GEMV
         bf16* cp; CK(cudaMalloc(&cp, (size_t)M*s.N*sizeof(bf16)));
         auto run_plow = [&](int it) {
-            k_decode_gemv<<<prop.multiProcessorCount,256,12352>>>(cp,A,Bv[it%nrep],s.N,s.K);
+            k_decode_gemv<<<prop.multiProcessorCount,256,12352>>>(cp,A,Bv[it%nrep],M,s.N,s.K);
         };
 #else
         const unsigned smem = PGM90_U256_ARENA * sizeof(bf16);
@@ -323,8 +339,8 @@ static void bench_cublas(unsigned M) {
         printf("%-9s %6u %8.4f %9.1f Plow speedup=%.4f cold_MiB=%.1f\n", s.name, M, pms,
                fl / (pms * 1e-3) / 1e12, ms / pms, (double)nrep * wn * sizeof(bf16) / (1024 * 1024));
 #ifdef PLOW_BENCH_QWEN_GEMV
-        printf("bandwidth %s Lt_GBs=%.1f Plow_GBs=%.1f arena=12352 M=1\n",
-            s.name, 2.0*wn/(ms*1e6), 2.0*wn/(pms*1e6));
+        printf("bandwidth %s Lt_GBs=%.1f Plow_GBs=%.1f arena=12352 M=%u\n",
+            s.name, 2.0*wn/(ms*1e6), 2.0*wn/(pms*1e6), M);
 #else
         CK(cudaFree(dm));
 #endif
@@ -341,11 +357,11 @@ static void bench_cublas(unsigned M) {
                 &beta,cb,CUDA_R_16BF,s.N,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
         };
         run(0,0); run_blas(0); CK(cudaDeviceSynchronize());
-        std::vector<bf16> br(s.N), bg(s.N);
-        CK(cudaMemcpy(br.data(),C,s.N*sizeof(bf16),cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(bg.data(),cb,s.N*sizeof(bf16),cudaMemcpyDeviceToHost));
+        std::vector<bf16> br((size_t)M*s.N), bg(br.size());
+        CK(cudaMemcpy(br.data(),C,br.size()*sizeof(bf16),cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(bg.data(),cb,bg.size()*sizeof(bf16),cudaMemcpyDeviceToHost));
         double be=0, bn=0;
-        for (unsigned i=0;i<s.N;i++) {
+        for (size_t i=0;i<br.size();i++) {
             double x=__bfloat162float(br[i]), y=__bfloat162float(bg[i]);
             if (!std::isfinite(x)||!std::isfinite(y)) exit(3);
             be+=(x-y)*(x-y); bn+=x*x;
@@ -358,7 +374,7 @@ static void bench_cublas(unsigned M) {
         for (int i=0;i<ITERS;i++) run_blas(i);
         CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
         float bms; CK(cudaEventElapsedTime(&bms,e0,e1)); bms/=ITERS;
-        printf("cuBLAS %s M=1 ms=%.6f GBs=%.1f\n",s.name,bms,2.0*wn/(bms*1e6));
+        printf("cuBLAS %s M=%u ms=%.6f GBs=%.1f\n",s.name,M,bms,2.0*wn/(bms*1e6));
         CK(cudaFree(cb)); LTK(cublasDestroy(blas));
 #endif
 
@@ -379,10 +395,15 @@ int main(int argc, char** argv) {
     int P = prop.multiProcessorCount;
     unsigned M = argc > 1 ? (unsigned)atoi(argv[1]) : 8192;
 #ifdef PLOW_BENCH_QWEN_GEMV
-    if (argc > 1 && M != 1) { printf("Qwen GEMV mode requires M=1\n"); return 2; }
-    if (prop.major != 9) { printf("Qwen GEMV comparison requires Hopper\n"); return 2; }
-    printf("Qwen M1 BF16 GEMV vs cuBLASLt SMs=%d GV_UNROLL=%d\n", P, GV_UNROLL);
-    bench_cublas(1);
+#ifdef PLOW_BENCH_GEMV_M16
+    const unsigned rows = 16;
+#else
+    const unsigned rows = 1;
+#endif
+    if (argc > 1 && M != rows) { printf("GEMV mode requires M=%u\n", rows); return 2; }
+    if (prop.major != 9) { printf("GEMV comparison requires Hopper\n"); return 2; }
+    printf("BF16 GEMV vs cuBLASLt M=%u SMs=%d GV_UNROLL=%d\n", rows, P, GV_UNROLL);
+    bench_cublas(rows);
     return 0;
 #endif
 #if defined(PLOW_BENCH_WS384) || defined(PLOW_BENCH_QWEN_GEMV)

@@ -17,8 +17,19 @@
 #ifndef PLOW_NV_GEMMA_HNR_BF16
 #define PLOW_NV_GEMMA_HNR_BF16 0
 #endif
+#ifndef PLOW_NV_GEMMA_NRN_BF16
+#define PLOW_NV_GEMMA_NRN_BF16 0
+#endif
 #include "sm120_common.cuh"
 #include <cuda_fp8.h> /* __nv_fp8_e4m3 — the T11 fused activation quant */
+
+static __device__ __forceinline__ float gemma_postnorm_round(float x) {
+#if defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && PLOW_NV_GEMMA_NRN_BF16
+    return __bfloat162float(__float2bfloat16(x));
+#else
+    return x;
+#endif
+}
 
 /* Elements one thread holds when the row fits in registers, as 16-byte vector loads.
  * RN_REG * 256 threads = 6144 covers every decode hidden the family uses: Qwen3 2560,
@@ -364,7 +375,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
                 for (int j = 0; j < 8; j++) {
                     const float g = gamma ? __bfloat162float(w.x[j]) : 1.0f;
                     o.x[j] = __float2bfloat16(
-                        (__bfloat162float(av.x[j]) + __bfloat162float(v.x[j]) * inv * g) * scale);
+                        (__bfloat162float(av.x[j]) + gemma_postnorm_round(__bfloat162float(v.x[j]) * inv * g)) * scale);
                 }
                 st_glob8(out + base + i, o);
             }
@@ -406,7 +417,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
                     for (int j = 0; j < 8; j++) {
                         const float g = gamma ? __bfloat162float(w[c].x[j]) : 1.0f;
                         o.x[j] = __float2bfloat16(
-                            (__bfloat162float(av[c].x[j]) + __bfloat162float(v[c].x[j]) * inv * g) *
+                            (__bfloat162float(av[c].x[j]) + gemma_postnorm_round(__bfloat162float(v[c].x[j]) * inv * g)) *
                             scale);
                     }
                     st_glob8(out + base + i, o);
@@ -422,7 +433,7 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
                 const float g = gamma ? __bfloat162float(gamma[i]) : 1.0f;
                 out[base + i] = __float2bfloat16(
-                    (__bfloat162float(a[base + i]) + __bfloat162float(b[base + i]) * inv * g) *
+                    (__bfloat162float(a[base + i]) + gemma_postnorm_round(__bfloat162float(b[base + i]) * inv * g)) *
                     scale);
             }
         }
@@ -483,7 +494,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
                 for (int j = 0; j < 8; j++) {
                     const float g = gb ? __bfloat162float(wb[c].x[j]) : 1.0f;
                     const float f =
-                        (__bfloat162float(av[c].x[j]) + __bfloat162float(bv[c].x[j]) * invb * g) *
+                        (__bfloat162float(av[c].x[j]) + gemma_postnorm_round(__bfloat162float(bv[c].x[j]) * invb * g)) *
                         scale;
                     r.x[j] = __float2bfloat16(f);
                     const float rf = __bfloat162float(r.x[j]);
@@ -517,7 +528,7 @@ static __device__ void d_norm_residual_norm(__nv_bfloat16* __restrict__ out, __n
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
                 const float g = gb ? __bfloat162float(gb[i]) : 1.0f;
                 const __nv_bfloat16 rb = __float2bfloat16(
-                    (__bfloat162float(a[base + i]) + __bfloat162float(b[base + i]) * invb * g) *
+                    (__bfloat162float(a[base + i]) + gemma_postnorm_round(__bfloat162float(b[base + i]) * invb * g)) *
                     scale);
                 resid[base + i] = rb;
                 const float rf = __bfloat162float(rb);
