@@ -1,0 +1,12 @@
+{
+  "source_directory": "/tmp/plow-model-support-checks/attention-reuse-window-20260905",
+  "scope": "Standalone decode bodies.27quick cells+42screen cells, all exact against original nativeGF at sameNS and withinFA3/FA4 numerical gate. Screen32K B1/4/16,8alternating timing pairs. No packet/interpreter promotion.",
+  "passed_cells": 69,
+  "same_ns_native_exact_cells": 69,
+  "library_wins": 0,
+  "decision": "Fullcontext two-order qualification of GF16 Gemma12 NS132(B1)/33(B4,B16),GF8 Gemma31 NS33,GF6 Qwen NS33. Balance work count against132persistentCTAs; ceilfill caused longer work tails.",
+  "recurrent": "Corrected index mapping passes output/state B1/4/16. Initial timings have asymmetric cache-reset order; symmetric hot/evicted rerun queued separately. Do not use initial timings as final library comparison.",
+  "sha256": {
+    "/tmp/plow-model-support-checks/attention-reuse-window-20260905/results.json": "01ac97f59d5c5e9856f636f6dda8f45a1655831ba03be256e76ae3486e43c9fd"
+  }
+}
