@@ -115,7 +115,7 @@ add_test(NAME cpu_dev_golden COMMAND cpu_dev_golden_test)
 
 # Tier tests: each compares its tier's kernels against the golden tier on random inputs.
 # Guarded so the tree configures before a tier's test exists.
-foreach(tier avx512 avx512_attn amx fp8 gptoss)
+foreach(tier avx512 avx512_attn amx fp8 gptoss route)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_dev_${tier}_test.c)
         add_executable(cpu_dev_${tier}_test tests/cpu_dev_${tier}_test.c)
         target_compile_options(cpu_dev_${tier}_test PRIVATE -Wall -Wextra -Werror -O2)

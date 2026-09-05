@@ -25,5 +25,9 @@ G_K(g_moe_glu_mx);
 G_K(g_moe_down_mx);
 G_K(g_moe_glu_mx_pf);
 G_K(g_moe_down_mx_pf);
+/* moe_route.c — routing ops 83/84/87 (op_moe.h ports); 84 runs on slice 0 only. */
+G_K(g_moe_router_topk_pf);
+G_K(g_moe_align_pf);
+G_K(g_moe_combine_pf);
 
 #endif /* PLOW_CPU_GOLDEN_GPTOSS_H */

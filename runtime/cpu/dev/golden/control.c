@@ -40,4 +40,7 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_MOE_DOWN_MX] = g_moe_down_mx;
     tab[PLOW_DOP_MOE_GLU_MX_PF] = g_moe_glu_mx_pf;
     tab[PLOW_DOP_MOE_DOWN_MX_PF] = g_moe_down_mx_pf;
+    tab[PLOW_DOP_MOE_ROUTER_TOPK_PF] = g_moe_router_topk_pf;
+    tab[PLOW_DOP_MOE_ALIGN_PF] = g_moe_align_pf;
+    tab[PLOW_DOP_MOE_COMBINE_PF] = g_moe_combine_pf;
 }
