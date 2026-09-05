@@ -527,7 +527,7 @@ impl SegmentRoles {
     ) -> Result<()> {
         if self.version != 1
             || self.programs.is_empty()
-            || self.objects.keys().any(|&id| !matches!(id, 1 | 2))
+            || self.objects.keys().any(|&id| !matches!(id, 1 | 2 | 3))
         {
             return Err(RuntimeError::Rejected(
                 "unsupported packet segment roles".into(),
@@ -535,10 +535,10 @@ impl SegmentRoles {
         }
         for (&id, object) in &self.objects {
             let path = std::path::Path::new(&object.file);
-            let abi = if id == 1 {
-                "fp8_gemm_tma128_v1"
-            } else {
-                "attention_sm90_hd256_v1"
+            let abi = match id {
+                1 => "fp8_gemm_tma128_v1",
+                2 => "attention_sm90_hd256_v1",
+                _ => "gemv_sm90_cta512_v1",
             };
             if object.abi != abi
                 || object.file.is_empty()
@@ -557,9 +557,29 @@ impl SegmentRoles {
             let g = programs.get(p.index).ok_or_else(|| {
                 RuntimeError::Rejected("packet role program index out of bounds".into())
             })?;
-            if !seen.insert(p.index) || !prefill.contains(&p.index) {
+            let decode = !prefill.contains(&p.index);
+            if !seen.insert(p.index)
+                || (decode
+                    && (g.t != 1
+                        || p.index + 1 != programs.len()
+                        || programs.len() != prefill.len() + 1
+                        || !p.roles.contains(&3)
+                        || p.roles.iter().any(|&r| r != 0 && r != 3)))
+                || (!decode && p.roles.contains(&3))
+            {
                 return Err(RuntimeError::Rejected(
-                    "duplicate or non-prefill packet role program".into(),
+                    "invalid packet role program; GEMV decode role requires one M1 rung".into(),
+                ));
+            }
+            if decode
+                && (g
+                    .stream
+                    .iter()
+                    .any(|e| e.flags & (packet::dev::SE_FINE | packet::dev::SE_XCTR) != 0)
+                    || !g.gq_stream.windows(2).all(|w| w[0].inst <= w[1].inst))
+            {
+                return Err(RuntimeError::Rejected(
+                    "GEMV decode role requires coarse local counters".into(),
                 ));
             }
             packet_role_segments(g, &p.roles, tensors)?;
@@ -580,6 +600,7 @@ impl SegmentRoles {
 struct PacketRole {
     function: KernelFn,
     smem: u32,
+    block: u32,
     _module: Module,
 }
 
@@ -595,6 +616,64 @@ fn check_attention_role(arch: &str, capability: Option<u32>, block: Option<u32>)
         return Err(RuntimeError::Rejected(
             "incompatible HD256 attention role".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_gemv_decode_role_inst(
+    d: &DevInst64,
+    rows: u32,
+    slices: usize,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<()> {
+    let reject = || RuntimeError::Rejected("invalid BF16 M1 GEMV512 role geometry".into());
+    let k = u64::from(d.i[2]);
+    if rows != 1
+        || d.i[0] != 1
+        || k == 0
+        || k > 32768
+        || k % 8 != 0
+        || usize::from(d.blocks) != slices
+        || d.i[1] == 0
+    {
+        return Err(reject());
+    }
+    let extent = |slot: usize, elements: u64| -> Result<()> {
+        if elements == 0 {
+            return Ok(());
+        }
+        let bytes = elements.checked_mul(2).ok_or_else(reject)?;
+        if tensors
+            .get(d.t[slot] as usize)
+            .is_none_or(|t| t.bytes < bytes)
+        {
+            return Err(reject());
+        }
+        Ok(())
+    };
+    let n = u64::from(d.i[1]);
+    extent(0, n)?;
+    extent(2, n * k)?;
+    match DevOp::from_u16(d.op) {
+        Some(DevOp::Gemv) if d.i[3] == 0 => {
+            extent(1, (u64::from(d.i[4]) + 1) * k)?;
+        }
+        Some(DevOp::GemvQkv) => {
+            extent(1, k)?;
+            extent(3, u64::from(d.i[3]))?;
+            extent(4, u64::from(d.i[3]) * k)?;
+            extent(5, u64::from(d.i[4]))?;
+            extent(6, u64::from(d.i[4]) * k)?;
+            n.checked_add(u64::from(d.i[3]))
+                .and_then(|n| n.checked_add(u64::from(d.i[4])))
+                .filter(|&n| n <= u64::from(u32::MAX))
+                .ok_or_else(reject)?;
+        }
+        Some(DevOp::GemvGlu) if d.i[5] <= 2 => {
+            extent(1, k)?;
+            extent(5, n * k)?;
+        }
+        _ => return Err(reject()),
     }
     Ok(())
 }
@@ -689,7 +768,7 @@ fn packet_role_segments(
 ) -> Result<Vec<u8>> {
     validate_segment_windows(g)?;
     if roles.len() + 1 != g.gq_seg_ofs.len()
-        || roles.iter().any(|&r| r > 2)
+        || roles.iter().any(|&r| r > 3)
         || (g.packed_prefill_only && roles.contains(&2))
     {
         return Err(RuntimeError::Rejected(
@@ -733,8 +812,10 @@ fn packet_role_segments(
                         "FP8 GEMM role requires mapped GEMMs".into(),
                     ));
                 }
-            } else {
+            } else if role == 2 {
                 validate_attention_role_inst(d, g.t, tensors)?;
+            } else {
+                validate_gemv_decode_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
             }
             let mut queue: Vec<_> = entries
                 .iter()
@@ -1686,7 +1767,8 @@ pub struct GpuEngine {
     /// Segmented-prefill object pair (PLOW_PF_SEG_DIR); None = single-object prefill.
     seg_pf: Option<SegPf>,
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
-    packet_roles: [Option<PacketRole>; 2],
+    packet_roles: [Option<PacketRole>; 3],
+    decode_packet_roles: Vec<u8>,
     lt_decode: Vec<Option<LtDecodeRoute>>,
     lt_decode_graph: Option<crate::device::cuda::GraphExec>,
     lt_decode_capture: bool,
@@ -2680,6 +2762,16 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
+        let segment_roles = blob
+            .section_data_named(&raw, packet::devbuild::SECT_METADATA, "segment_roles.json")
+            .map(|bytes| SegmentRoles::parse(bytes, &blob))
+            .transpose()?;
+        let decode_packet_roles = segment_roles
+            .as_ref()
+            .and_then(|r| r.program(blob.progs.len() - 1))
+            .filter(|p| p.roles.contains(&3))
+            .map(|p| p.roles.clone())
+            .unwrap_or_default();
         let mut select_decode_rungs = validate_decode_ladder(&blob)?;
         let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let qwen_block = blob
@@ -3478,6 +3570,15 @@ impl GpuEngine {
             )));
         }
         let lt_enabled = RuntimeConfig::env_bool_or("PLOW_QWEN_DECODE_LT", false);
+        if !decode_packet_roles.is_empty()
+            && (lt_enabled
+                || be.module_global_u32(&module, "plow_segment_gq_abi")? != Some(1)
+                || be.module_global_u32(&module, "plow_dyn_kvrow")? != Some(1))
+        {
+            return Err(RuntimeError::Rejected(
+                "GEMV decode role requires a dynamic-row GQ interpreter without Lt decode".into(),
+            ));
+        }
         let lt_segments = if lt_enabled {
             if recurrent.is_none()
                 || be.module_global_u32(&module, "plow_qwen_decode_lt_arm")? != Some(1)
@@ -3488,12 +3589,16 @@ impl GpuEngine {
             }
             lt_decode_segments(g, &blob.tensors)?
         } else {
-            g.check_coarse_single_segment()?;
+            if decode_packet_roles.is_empty() {
+                g.check_coarse_single_segment()?;
+            }
             Vec::new()
         };
         // Single segment normally; an L2-PLACED program (l2_domains != 0) carries one
         // window per domain and the placed interpreter picks its window by physical SM.
-        let want_seg = if !lt_segments.is_empty() {
+        let want_seg = if !decode_packet_roles.is_empty() {
+            decode_packet_roles.len() + 1
+        } else if !lt_segments.is_empty() {
             lt_segments.len() + 1
         } else if g.l2_domains != 0 {
             g.l2_domains as usize + 1
@@ -3644,7 +3749,7 @@ impl GpuEngine {
             // Hierarchy off: this engine never sets `l2_domains`, and the
             // two-level maintenance scratch is meaningless without it.
             hier_base: 0,
-            n_seg: 1,
+            n_seg: decode_packet_roles.len().max(1) as u32,
             gq_stream: d_gq_stream.base,
             gq_seg_ofs: d_gq_seg.base,
             gq_cursor: d_gq_cursor.base,
@@ -3766,10 +3871,6 @@ impl GpuEngine {
         // swapped on disk no longer costs the prefill path (it used to load the
         // DECODE image here and fail on the missing `_pf` symbol).
         let pf = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
-        let segment_roles = blob
-            .section_data_named(&raw, packet::devbuild::SECT_METADATA, "segment_roles.json")
-            .map(|bytes| SegmentRoles::parse(bytes, &blob))
-            .transpose()?;
         let (f_pf, smem_pf, module_pf, prefill, seg_pf) = if let Some(pf) = pf {
             let pf_src = pf.source.clone();
             match Self::load_prefill(
@@ -3822,14 +3923,14 @@ impl GpuEngine {
             (None, SMEM_PF, None, Vec::new(), None)
         };
 
-        let mut packet_roles = [None, None];
+        let mut packet_roles = [None, None, None];
         for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
-            if prefill.is_empty() || seg_pf.is_some() {
+            if id != 3 && (prefill.is_empty() || seg_pf.is_some()) {
                 return Err(RuntimeError::Rejected(
                     "packet roles require prefill without a legacy role pair".into(),
                 ));
             }
-            if id == 2 && profile.tag != "sm90a" {
+            if id >= 2 && profile.tag != "sm90a" {
                 return Err(RuntimeError::Rejected(
                     "HD256 attention role requires SM90".into(),
                 ));
@@ -3841,12 +3942,19 @@ impl GpuEngine {
                     "_Z19interp_sm90a_pfgemm11PlowProgram",
                     "plow_arena_bytes_pfgemm",
                 )
-            } else {
+            } else if id == 2 {
                 (
                     "plow_attention_sm90_hd256_abi",
                     "plow_block_pffa",
                     "_Z17interp_sm90a_pffa11PlowProgram",
                     "plow_arena_bytes_pffa",
+                )
+            } else {
+                (
+                    "plow_gemv_sm90_cta512_abi",
+                    "plow_block_gemv512",
+                    "_Z20interp_sm90a_gemv51211PlowProgram",
+                    "plow_arena_bytes_gemv512",
                 )
             };
             let path = assets_dir.join(&object.file);
@@ -3857,16 +3965,26 @@ impl GpuEngine {
             let block = be.module_global_u32(&module, block)?;
             if id == 1 {
                 check_fp8_gemm_role(capability, block)?;
-            } else {
+            } else if id == 2 {
                 check_attention_role(profile.tag, capability, block)?;
+            } else if capability != Some(1) || block != Some(512) {
+                return Err(RuntimeError::Rejected("incompatible GEMV512 role".into()));
             }
+            let block = block.expect("validated role block");
             let function = be.get_function(&module, entry)?;
             let smem = be
                 .module_global_u32(&module, arena)?
                 .filter(|&bytes| bytes > 0)
                 .ok_or_else(|| RuntimeError::Rejected("packet role lacks arena metadata".into()))?;
             be.set_max_dynamic_smem(function, smem)?;
-            if be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count() != grid {
+            if id == 3 && smem != 65536 {
+                return Err(RuntimeError::Rejected(
+                    "GEMV512 role requires the full 64 KiB arena".into(),
+                ));
+            }
+            let capacity =
+                be.occupancy_blocks_per_sm(function, block, smem as usize)? * be.sm_count();
+            if (id == 3 && capacity < grid) || (id != 3 && capacity != grid) {
                 return Err(RuntimeError::Rejected(
                     "packet role occupancy must equal packet grid".into(),
                 ));
@@ -3874,6 +3992,7 @@ impl GpuEngine {
             packet_roles[id as usize - 1] = Some(PacketRole {
                 function,
                 smem,
+                block,
                 _module: module,
             });
         }
@@ -4016,7 +4135,7 @@ impl GpuEngine {
         // dynamic-kvrow arm fired (the local `kvrow` was cleared above). A B==1
         // legacy cubin still host-patches i[3] each step, so multi-step is off.
         let dyn_kvrow = batch > 1 || kvrow.is_empty();
-        let multistep = if recurrent.is_some() {
+        let multistep = if recurrent.is_some() || !decode_packet_roles.is_empty() {
             None
         } else {
             Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow).unwrap_or_else(|e| {
@@ -4036,7 +4155,7 @@ impl GpuEngine {
             tm.print_flame(total);
         }
 
-        Ok(GpuEngine {
+        let mut engine = GpuEngine {
             be,
             f,
             grid,
@@ -4050,8 +4169,9 @@ impl GpuEngine {
             lt_decode,
             lt_decode_graph: None,
             lt_decode_seed,
-            lt_decode_capture: lt_enabled
-                && RuntimeConfig::env_bool_or("PLOW_QWEN_DECODE_LT_GRAPH", true),
+            lt_decode_capture: !decode_packet_roles.is_empty()
+                || (lt_enabled && RuntimeConfig::env_bool_or("PLOW_QWEN_DECODE_LT_GRAPH", true)),
+            decode_packet_roles,
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
             prefill,
@@ -4106,7 +4226,13 @@ impl GpuEngine {
             timing,
             vmm,
             pf_batch,
-        })
+        };
+        if !engine.decode_packet_roles.is_empty() {
+            let be = Arc::clone(&engine.be);
+            engine.lt_decode_graph =
+                Some(be.graph_capture(&engine.stream, || engine.enqueue_decode_chain())?);
+        }
+        Ok(engine)
     }
 
     /// Refuse a specialised interpreter object paired with a different packet.
@@ -5321,7 +5447,11 @@ impl GpuEngine {
     }
 
     fn enqueue_decode_chain(&self) -> Result<()> {
-        let segments = self.lt_decode.len().max(1);
+        let segments = self
+            .lt_decode
+            .len()
+            .max(self.decode_packet_roles.len())
+            .max(1);
         for seg in 0..segments {
             if let Some(Some(route)) = self.lt_decode.get(seg) {
                 route
@@ -5332,17 +5462,25 @@ impl GpuEngine {
                 }
             }
             let mut arg = self.kernarg;
-            if !self.lt_decode.is_empty() {
+            let role = self
+                .decode_packet_roles
+                .get(seg)
+                .copied()
+                .filter(|&id| id != 0)
+                .and_then(|id| self.packet_roles[id as usize - 1].as_ref());
+            if !self.decode_packet_roles.is_empty() {
+                segment_window(&mut arg, &self.kernarg, seg, role.is_some());
+            } else if !self.lt_decode.is_empty() {
                 arg.cur_seg = 0;
                 arg.gq_seg_ofs += (seg * 4) as u64;
                 arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
             }
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
             self.be.launch_cooperative(
-                self.f,
+                role.map_or(self.f, |r| r.function),
                 self.grid,
-                BLOCK,
-                self.smem,
+                role.map_or(BLOCK, |r| r.block),
+                role.map_or(self.smem, |r| r.smem),
                 &mut params,
                 Some(&self.stream),
             )?;
@@ -5351,7 +5489,9 @@ impl GpuEngine {
     }
 
     fn launch_decode(&mut self) -> Result<()> {
-        if self.lt_decode.is_empty() || !self.lt_decode_capture {
+        if (self.lt_decode.is_empty() && self.decode_packet_roles.is_empty())
+            || !self.lt_decode_capture
+        {
             return self.enqueue_decode_chain();
         }
         if self.lt_decode_graph.is_none() {
@@ -7986,3 +8126,7 @@ mod lt_decode_tests {
 #[cfg(test)]
 #[path = "gpu_decode_rung_tests.rs"]
 mod decode_rung_tests;
+
+#[cfg(test)]
+#[path = "gpu_gemv_role_tests.rs"]
+mod gemv_role_tests;

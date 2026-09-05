@@ -587,7 +587,15 @@ impl Emitter<'_> {
                 .div_ceil(self.batch.div_ceil(64) * c.heads)
                 .max(2)
         } else {
-            self.b.n_cu().div_ceil(c.heads / 2).max(1)
+            let fallback = self.b.n_cu().div_ceil(c.heads / 2).max(1);
+            let ns = crate::attention_decode_ns(
+                self.batch,
+                c.heads,
+                c.kv_heads,
+                self.b.n_cu(),
+                fallback,
+            );
+            emit_config::active().ns_full_abs.unwrap_or(ns)
         };
         let opart = self
             .b
@@ -1114,6 +1122,68 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decode_balanced_splits_size_partials_and_preserve_prefill() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        struct Restore(emit_config::EmitConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                emit_config::install(self.0.clone());
+            }
+        }
+        let restore = Restore(emit_config::active().clone());
+        let mut cfg = restore.0.clone();
+        cfg.attention_decode_balance_gf = None;
+        cfg.ns_full_abs = None;
+        emit_config::install(cfg.clone());
+        let mut c = Config::parse(&fixture());
+        c.heads = 24;
+        c.kv_heads = 4;
+        c.hd = 256;
+        let plain = model_prefill(&c, 32768, 132, 0, &[128], 1, false);
+        for batch in [1, 4] {
+            for (gf, pin, expected) in [
+                (None, None, 11),
+                (Some(6), None, 33),
+                (Some(6), Some(11), 11),
+            ] {
+                cfg.attention_decode_balance_gf = gf;
+                cfg.ns_full_abs = pin;
+                emit_config::install(cfg.clone());
+                let m = model(&c, 32768, 132, 0, false, batch);
+                for d in m.progs[0]
+                    .insts
+                    .iter()
+                    .filter(|d| d.op == DevOp::FlashDecode as u16)
+                {
+                    assert_eq!(d.i[5], expected);
+                    assert_eq!(
+                        m.tensors[d.t[0] as usize].bytes,
+                        u64::from(batch * 24 * 256 * expected * 4)
+                    );
+                    assert_eq!(
+                        m.tensors[d.t[1] as usize].bytes,
+                        u64::from(batch * 24 * expected * 8)
+                    );
+                    let merge = m.progs[0]
+                        .insts
+                        .iter()
+                        .find(|x| x.op == DevOp::FlashMerge as u16 && x.t[1] == d.t[0])
+                        .unwrap();
+                    assert_eq!(&merge.i[..4], &[batch, 24, expected, 256]);
+                }
+            }
+        }
+        cfg.attention_decode_balance_gf = Some(6);
+        cfg.ns_full_abs = None;
+        emit_config::install(cfg);
+        let balanced = model_prefill(&c, 32768, 132, 0, &[128], 1, false);
+        assert_eq!(plain.progs[0].insts, balanced.progs[0].insts);
+        assert_eq!(plain.progs[0].waits, balanced.progs[0].waits);
+        assert_eq!(plain.progs[0].succs, balanced.progs[0].succs);
+    }
+
     #[test]
     fn block_emission_checks_only_selected_checkpoint_layers() {
         let _env = crate::test_env::env_guard();

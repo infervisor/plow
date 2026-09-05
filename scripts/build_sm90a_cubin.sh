@@ -73,6 +73,16 @@ KSYM=_Z12interp_sm90a11PlowProgram
 OUT_PF="${OUT%.cubin}_pf.cubin"
 KSYM_PF=_Z15interp_sm90a_pf11PlowProgram
 
+if [ "${PLOW_BUILD_GEMV_CTA512_ROLE:-0}" = "1" ]; then
+  "${NVENV[@]}" "$NVCC" -arch=sm_90a -O3 -cubin \
+    -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+    -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF_FULL=4 \
+    -DPLOW_NV_MLA=0 -DPLOW_NV_DSA=0 -DPLOW_NV_MAMBA=0 \
+    -o "$OUT" "$HERE/runtime/nvidia/interp_sm90a_gemv512.cu"
+  "${NVENV[@]}" cuobjdump -symbols "$OUT" | grep -q _Z20interp_sm90a_gemv51211PlowProgram
+  exit 0
+fi
+
 # DEAD-ARM GATING (h100-interp arm-ablation). MLA (DeepSeek/GLM/Kimi latent attn), MAMBA (Nemotron
 # SSD) and DSA (GLM sparse indexer) are op families a Gemma model NEVER emits. Compiling them OUT of
 # these Gemma serving objects (the flags default ON in the source, so every OTHER build — the sm_120

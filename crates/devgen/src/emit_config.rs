@@ -185,6 +185,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FA_GF_FULL")]
     pub fa_gf_full: Option<u32>,
 
+    /// Experimental full-attention decode GF with batch-aware balanced split counts.
+    #[arg(long, env = "PLOW_ATTENTION_DECODE_BALANCE_GF")]
+    pub attention_decode_balance_gf: Option<u32>,
+
     /// Widen the flash-merge dispatch by this factor (diagnostic; measured no effect).
     #[arg(long, env = "PLOW_FLASH_MERGE_DSPLIT", hide = true)]
     pub flash_merge_dsplit: Option<u32>,
@@ -659,6 +663,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_ATTENTION_PF_ISOLATE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub attention_pf_isolate: bool,
 
+    /// Select the isolated BF16 M1 GEMV decode role with 512 threads.
+    #[arg(long, env = "PLOW_GEMV_DECODE_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub gemv_decode_role: bool,
+
     #[arg(long, env = "PLOW_QWEN_FP8_M1_TMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_fp8_m1_tma: bool,
 
@@ -787,6 +795,7 @@ impl EmitConfig {
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
+            attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),
@@ -905,6 +914,7 @@ impl EmitConfig {
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
             attention_pf_role: env_bool("PLOW_ATTENTION_PF_ROLE"),
             attention_pf_isolate: env_bool("PLOW_ATTENTION_PF_ISOLATE"),
+            gemv_decode_role: env_bool("PLOW_GEMV_DECODE_ROLE"),
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             qwen_decode_lt: env_bool("PLOW_QWEN_DECODE_LT"),

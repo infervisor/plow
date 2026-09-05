@@ -29,6 +29,13 @@ static __device__ void d_qwen_gdn_conv(__nv_bfloat16* out, const __nv_bfloat16* 
     }
 }
 
+#ifndef PLOW_NV_GDN_STEP_VROWS8
+#define PLOW_NV_GDN_STEP_VROWS8 0
+#endif
+#if PLOW_NV_GDN_STEP_VROWS8 != 0 && PLOW_NV_GDN_STEP_VROWS8 != 1
+#error "PLOW_NV_GDN_STEP_VROWS8 must be 0 or 1"
+#endif
+
 static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* qkv,
     const __nv_bfloat16* a, const __nv_bfloat16* b, const void* a_log,
     const __nv_bfloat16* dt_bias, float* state, const int* active,
@@ -40,11 +47,20 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned warps = blockDim.x >> 5;
     const unsigned packed = 2 * hk * kdim + hv * vdim;
+#if PLOW_NV_GDN_STEP_VROWS8
+    const unsigned tiles = (vdim + 7u) / 8u;
+    for (unsigned tile = slice * warps + warp; tile < batch * hv * tiles; tile += nblk * warps) {
+        const unsigned slot = tile / (hv * tiles);
+        if (active && active[slot] <= 0) continue;
+        const unsigned head = tile / tiles % hv, first_v = (tile % tiles) * 8u;
+        const unsigned qhead = head / (hv / hk);
+#else
     // A warp owns one V row of the V-first state, so no state writers overlap.
     for (unsigned row = slice * warps + warp; row < batch * hv * vdim; row += nblk * warps) {
         const unsigned slot = row / (hv * vdim);
         if (active && active[slot] <= 0) continue;
         const unsigned head = row / vdim % hv, vcol = row % vdim, qhead = head / (hv / hk);
+#endif
         const __nv_bfloat16* x = qkv + (size_t)slot * packed;
         float q[4], k[4], h[4], qq = 0.f, kk = 0.f;
 #pragma unroll
@@ -63,10 +79,19 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
         const float decay = expf(-expf(al) * softplus);
         // vLLM's packed decode rounds beta to the projection dtype before recurrence.
         const float beta = __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(b[gate])))));
+#if PLOW_NV_GDN_STEP_VROWS8
+#pragma unroll
+        for (unsigned j = 0; j < 4; j++) { q[j] *= qs; k[j] *= ks; }
+#pragma unroll 1
+        for (unsigned vcol = first_v; vcol < vdim && vcol < first_v + 8u; vcol++) {
+        const unsigned row = (slot * hv + head) * vdim + vcol;
+#endif
         float projection = 0.f;
 #pragma unroll
         for (unsigned j = 0; j < 4; j++) {
+#if !PLOW_NV_GDN_STEP_VROWS8
             q[j] *= qs; k[j] *= ks;
+#endif
             h[j] = state[(size_t)row * kdim + lane + 32 * j] * decay;
             projection += h[j] * k[j];
         }
@@ -81,6 +106,9 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
         }
         result = qwen_warp_sum(result);
         if (lane == 0) out[row] = __float2bfloat16(result);
+#if PLOW_NV_GDN_STEP_VROWS8
+        }
+#endif
     }
 }
 

@@ -323,8 +323,14 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_NV_FA_GF_FULL PLOW_NV_FA_GF
 #endif
 #if PLOW_NV_FA_GF_FULL != 1 && PLOW_NV_FA_GF_FULL != 2 && PLOW_NV_FA_GF_FULL != 4 && \
-    PLOW_NV_FA_GF_FULL != 8
-#error "PLOW_NV_FA_GF_FULL must be one of {1,2,4,8}"
+    PLOW_NV_FA_GF_FULL != 8 && !(PLOW_NV_FA_GF_FULL == 16 && PLOW_NV_FA_GF16_BENCH)
+#error "PLOW_NV_FA_GF_FULL requires {1,2,4,8}, or16 with wide softmax reductions"
+#endif
+#ifndef PLOW_NV_FA_GF_HD256
+#define PLOW_NV_FA_GF_HD256 2
+#endif
+#if PLOW_NV_FA_GF_HD256 != 2 && PLOW_NV_FA_GF_HD256 != 6
+#error "PLOW_NV_FA_GF_HD256 must be2 or6; incompatible GQA retainsGF2"
 #endif
 #define PLOW_NV_FA_HD 128 /* Qwen3 head_dim; the only instantiation the DEFAULT build carries */
 
@@ -476,6 +482,12 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #ifndef PLOW_NV_LEAN_DECODE
 #define PLOW_NV_LEAN_DECODE 0
 #endif
+#ifndef PLOW_NV_GEMV512_ROLE
+#define PLOW_NV_GEMV512_ROLE 0
+#endif
+#if PLOW_NV_GEMV512_ROLE && (PLOW_NV_PREFILL || PLOW_NV_LEAN_DECODE || PLOW_NV_THREADS != 512)
+#error "GEMV512 role requires a dedicated 512-thread decode object with the full arena"
+#endif
 #if PLOW_NV_LEAN_DECODE && PLOW_NV_PREFILL
 #error "PLOW_NV_LEAN_DECODE is a DECODE object (no prefill arms); do not combine with PLOW_NV_PREFILL"
 #endif
@@ -568,7 +580,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #endif
 #define PLOW_NV_CAT_I(a, b) a##b
 #define PLOW_NV_CAT(a, b) PLOW_NV_CAT_I(a, b)
-#if PLOW_NV_PREFILL && PLOW_NV_SEG_GEMM
+#if PLOW_NV_GEMV512_ROLE
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _gemv512)
+#elif PLOW_NV_PREFILL && PLOW_NV_SEG_GEMM
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pfgemm)
 #elif PLOW_NV_PREFILL && PLOW_NV_FA_ONLY
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pffa)
@@ -670,7 +684,7 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_NV_SLIDE_ARENA 0
 #else
 #define PLOW_NV_FULL_ARENA FA_DEC_SMEM_FLOATS(512, PLOW_NV_FA_GF_FULL)
-#define PLOW_NV_SLIDE_ARENA FA_DEC_SMEM_FLOATS(256, 2)
+#define PLOW_NV_SLIDE_ARENA FA_DEC_SMEM_FLOATS(256, PLOW_NV_FA_GF_HD256)
 #endif
 /* MLA latent decode (P1/P2). The GF ladder instantiates GF={2,4,8} unconditionally (GF=8 is the
  * emitter default for ctx>4096, 1.5-1.9x faster — P2 §7), so the arena must cover the GF=8 claim
@@ -715,16 +729,28 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #else
 #define PLOW_NV_FP8_M1_ARENA 0
 #endif
-#define PLOW_NV_OP_ARENA (PLOW_NV_FA_ARENA > PLOW_NV_FP8_M1_ARENA ? PLOW_NV_FA_ARENA : PLOW_NV_FP8_M1_ARENA)
+#ifndef PLOW_NV_ARENA_MIN_BYTES
+#define PLOW_NV_ARENA_MIN_BYTES 0
+#endif
+#define PLOW_NV_KERNEL_ARENA (PLOW_NV_FA_ARENA > PLOW_NV_FP8_M1_ARENA ? PLOW_NV_FA_ARENA : PLOW_NV_FP8_M1_ARENA)
+#define PLOW_NV_OP_ARENA (PLOW_NV_KERNEL_ARENA > (PLOW_NV_ARENA_MIN_BYTES + 3u) / 4u ? PLOW_NV_KERNEL_ARENA : (PLOW_NV_ARENA_MIN_BYTES + 3u) / 4u)
 #define PLOW_NV_BASE_ARENA_FLOATS                                                              \
     (PLOW_NV_OP_ARENA > 2 * (int)PLOW_NV_WARPS ? PLOW_NV_OP_ARENA : 2 * (int)PLOW_NV_WARPS)
+#ifndef PLOW_NV_GEMV_STAGING_BYTES
+#define PLOW_NV_GEMV_STAGING_BYTES (PLOW_NV_BASE_ARENA_FLOATS * sizeof(float))
+#endif
+static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(float));
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_M16_MMA && !PLOW_NV_PREFILL
 #define PLOW_NV_M16_ARENA_FLOATS ((PLOW_NV_GEMV_M16_ARENA_BYTES + 3u) / 4u)
 #else
 #define PLOW_NV_M16_ARENA_FLOATS 0u
 #endif
+#if PLOW_NV_GEMV512_ROLE
+#define PLOW_NV_ARENA_FLOATS 16384u
+#else
 #define PLOW_NV_ARENA_FLOATS                                                                  \
     (PLOW_NV_BASE_ARENA_FLOATS > PLOW_NV_M16_ARENA_FLOATS ? PLOW_NV_BASE_ARENA_FLOATS : PLOW_NV_M16_ARENA_FLOATS)
+#endif
 /* block_max_u64 needs PLOW_NV_WARPS u64 = 2*WARPS floats; block_sum needs WARPS floats. Both
  * fit inside the flash claim at any supported head dim, but the max above keeps that true if
  * flash is ever compiled out. */
@@ -748,7 +774,7 @@ extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS
  * it to report the packet/object pairing and refuses zero, which would make the walk stall. */
 extern "C" __device__ unsigned PLOW_SYM(plow_gemv_mm_cap) = GV_MM_MAX;
 /* T31: this object's launch block size (the segmented launcher reads it; absent/256 = legacy). */
-extern "C" __device__ unsigned PLOW_SYM(plow_block) = PLOW_NV_SEG_WS384 ? 384u : 256u;
+extern "C" __device__ unsigned PLOW_SYM(plow_block) = PLOW_NV_SEG_WS384 ? 384u : PLOW_NV_THREADS;
 #if PLOW_NV_SEG_M64N64 || PLOW_NV_SEG_M64N128
 #if !defined(PLOW_NV_HOPPER) || !PLOW_NV_GEMM_ONLY || !PLOW_NV_TMA_GEMM || PGM90_UNI_BN256 || PLOW_NV_SEG_WS || PLOW_NV_SEG_WS384 || PLOW_NV_W8A8 || PLOW_NV_SEG_SMALL_BF16
 #error "M64 segment requires a dedicated plain BF16 TMA object"
@@ -817,6 +843,35 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                           unsigned nblk, float* arena) {
     const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
     const unsigned tw_[4] = {tv_.x, tv_.y, tv_.z, tv_.w};
+#if PLOW_NV_GEMV512_ROLE
+    if (in->i[0] != 1 || !in->i[2] || in->i[2] > 32768u) { __trap(); return; }
+    switch (in->op) {
+    case PLOW_DOP_GEMV:
+        if (in->i[3]) { __trap(); break; }
+        if (in->i[2] <= PLOW_NV_GEMV_STAGING_BYTES / 2u)
+            d_gemv((__nv_bfloat16*)TEN(0),
+                   (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                   (const __nv_bfloat16*)TEN(2), 1, in->i[1], in->i[2], slice, nblk,
+                   (__nv_bfloat16*)arena);
+        else
+            d_gemv((__nv_bfloat16*)TEN(0),
+                   (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                   (const __nv_bfloat16*)TEN(2), 1, in->i[1], in->i[2], slice, nblk);
+        break;
+    case PLOW_DOP_GEMV_QKV:
+        d_gemv_qkv((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3), (__nv_bfloat16*)TEN(5),
+                   (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                   (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(6), 1, in->i[1],
+                   in->i[3], in->i[4], in->i[2], slice, nblk, (__nv_bfloat16*)arena);
+        break;
+    case PLOW_DOP_GEMV_GLU:
+        d_gemv_glu((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                   (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), 1, in->i[1],
+                   in->i[2], in->i[5], slice, nblk, (__nv_bfloat16*)arena);
+        break;
+    default: __trap(); break;
+    }
+#else
 #if defined(PLOW_NV_ABLATE_LO) || defined(PLOW_NV_ABLATE_HI)
     /* MEASUREMENT ONLY (produces garbage logits, like PLOW_NV_SKELETON). Skip the BODY of any
      * opcode in the 128-bit mask while keeping every gate and signal intact, so the TPOT delta
@@ -1495,7 +1550,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
-        if (in->i[2] <= PLOW_NV_BASE_ARENA_FLOATS * 2u)
+        if (in->i[2] <= PLOW_NV_GEMV_STAGING_BYTES / 2u)
             d_gemv((__nv_bfloat16*)TEN(0),
                    (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                    (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk,
@@ -1552,7 +1607,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * GEMV_GLU_FP8 t0=fu t1=x t2=Wg(fp8) t5=Wu(fp8) t3=g_scale t4=u_scale  i0=M i1=N i2=K i5=act. */
 #if PLOW_HAS_GEMV_FP8
     case PLOW_DOP_GEMV_FP8:
-        if (in->i[2] <= PLOW_NV_BASE_ARENA_FLOATS * 2u)
+        if (in->i[2] <= PLOW_NV_GEMV_STAGING_BYTES / 2u)
             d_gemv_fp8((__nv_bfloat16*)TEN(0),
                        (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                        (const uint8_t*)TEN(2), (const float*)TEN(5), in->i[0], in->i[1], in->i[2],
@@ -1628,6 +1683,16 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
                 slice, nblk, arena, in->fj[1].u);
         } else if (in->i[6] == 256) {
+#if PLOW_NV_FA_GF_HD256 != 2
+            if (gqa % PLOW_NV_FA_GF_HD256 == 0) {
+                d_flash_decode<256, PLOW_NV_FA_GF_HD256>(
+                    (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                    (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
+                    in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
+                    slice, nblk, arena, in->fj[1].u);
+                break;
+            }
+#endif
             if ((gqa % 2u) != 0) { __trap(); break; }
             d_flash_decode<256, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
@@ -1945,6 +2010,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         __trap();
         break;
     }
+#endif // PLOW_NV_GEMV512_ROLE
 }
 #undef TEN
 
@@ -2151,6 +2217,17 @@ __device__ __forceinline__ void plow_ws_role_loop(const PlowProgram& prog, uint3
 #ifndef PLOW_NV_SKELETON
 #define PLOW_NV_SKELETON 0
 #endif
+#if PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_SKELETON
+extern "C" __device__ unsigned PLOW_SYM(plow_segment_gq_abi) = 1;
+#else
+extern "C" __device__ unsigned PLOW_SYM(plow_segment_gq_abi) = 0;
+#endif
+#if PLOW_NV_GEMV512_ROLE
+#if PLOW_NV_SCHED != 1 || PLOW_NV_PLACE_DISPATCH || PLOW_NV_SKELETON || !PLOW_NV_SEGMENTS
+#error "GEMV512 role requires the segmented global queue scheduler"
+#endif
+extern "C" __device__ unsigned plow_gemv_sm90_cta512_abi = 1;
+#endif
 #if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
 extern "C" __device__ unsigned plow_qwen_prefill_arm = 1;
 #else
@@ -2204,7 +2281,7 @@ __global__ __maxnreg__(128) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
  * full 255-reg budget for the 128-acc slab. */
 __global__ __maxnreg__(128) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
 #else
-__global__ __launch_bounds__(256, PLOW_NV_MINBLK) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
+__global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(interp_sm120)(PlowProgram prog) {
 #endif
     extern __shared__ float arena[];
 #if PLOW_NV_SKELETON

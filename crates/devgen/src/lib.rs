@@ -61,6 +61,7 @@ mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
+mod gemv_decode_role;
 pub mod manifest;
 pub mod tune_demand;
 
@@ -156,10 +157,82 @@ const FA_GF_FULL: u32 = 2;
 /// `(PLOW_NV_FORCE_MINBLK, --n-cu)` already is, and `DecodeKnobs::emit_env`
 /// renders both halves together. Unset leaves every packet byte-identical.
 pub(crate) fn fa_gf_full() -> u32 {
+    if let Some(gf) = emit_config::active().attention_decode_balance_gf {
+        assert!(
+            matches!(gf, 2 | 4 | 8 | 16),
+            "unsupported full-HD attention GF {gf}"
+        );
+        return gf;
+    }
     emit_config::active()
         .fa_gf_full
         .filter(|v| matches!(v, 1 | 2 | 4 | 8 | 16))
         .unwrap_or(FA_GF_FULL)
+}
+
+pub(crate) fn attention_decode_ns(
+    batch: u32,
+    heads: u32,
+    kv_heads: u32,
+    n_cu: u32,
+    fallback: u32,
+) -> u32 {
+    let Some(gf) = emit_config::active().attention_decode_balance_gf else {
+        return fallback;
+    };
+    balanced_attention_ns(batch, heads, kv_heads, n_cu, gf)
+}
+
+fn balanced_attention_ns(batch: u32, heads: u32, kv_heads: u32, n_cu: u32, gf: u32) -> u32 {
+    assert!(
+        matches!(gf, 2 | 4 | 6 | 8 | 16),
+        "unsupported attention decode GF {gf}"
+    );
+    assert!(batch > 0 && heads > 0 && kv_heads > 0 && n_cu > 0);
+    assert_eq!(heads % kv_heads, 0);
+    assert_eq!((heads / kv_heads) % gf, 0, "attention GF must divide GQA");
+    let groups = batch
+        .checked_mul(heads / gf)
+        .expect("attention work overflow");
+    n_cu / gcd(groups, n_cu)
+}
+
+#[cfg(test)]
+mod attention_decode_balance_tests {
+    use super::*;
+
+    #[test]
+    fn complete_waves_for_actual_head_groups_and_decode_rungs() {
+        for batch in [1, 2, 4, 8, 16] {
+            for (heads, kv_heads, gf, expected) in [
+                (
+                    16,
+                    1,
+                    16,
+                    if batch == 1 {
+                        132
+                    } else if batch == 2 {
+                        66
+                    } else {
+                        33
+                    },
+                ),
+                (32, 4, 8, 33),
+                (24, 4, 6, 33),
+            ] {
+                let ns = balanced_attention_ns(batch, heads, kv_heads, 132, gf);
+                assert_eq!(ns, expected);
+                assert_eq!(batch * (heads / gf) * ns % 132, 0);
+                assert!((1..ns).all(|smaller| batch * (heads / gf) * smaller % 132 != 0));
+            }
+        }
+    }
+
+    #[test]
+    fn incompatible_sliding_gqa_is_rejected() {
+        assert!(std::panic::catch_unwind(|| balanced_attention_ns(1, 16, 8, 132, 6)).is_err());
+        assert!(std::panic::catch_unwind(|| balanced_attention_ns(1, 16, 0, 132, 2)).is_err());
+    }
 }
 
 /// Greatest common divisor (Euclid). Used to grid-align the full-layer flash-decode
@@ -3462,7 +3535,7 @@ fn emit_phase(
         // kernel must agree (dev_isa.h). GF=2 fuses sliding layers fully (GQA 2) and full layers
         // partially (GQA 8 -> reads each row 4x). Under tp=8 shared-kv-head replication a full layer
         // is GQA 4 locally, still a clean multiple of GF=2. The binding invariant is gqa_local % GF.
-        let gf = fa_gf_full(); // MUST track the kernel's PLOW_NV_FA_GF_FULL; see fa_gf_full()
+        let gf = if full { fa_gf_full() } else { 2 };
         assert_eq!(
             (heads / kvh) % gf,
             0,
@@ -3624,6 +3697,11 @@ fn emit_phase(
             ns
         };
         // DECODE nsplit ABSOLUTE OVERRIDE (occupancy tuning). PLOW_NS_MUL scales the CU-fill target;
+        let ns = if gemv_family && full {
+            attention_decode_ns(t, heads, kvh, n_cu, ns)
+        } else {
+            ns
+        };
         // PLOW_NS_ABS pins nsplit directly. MEASURED on Qwen3-4B (all-global, GQA 4, MI350X):
         // the default mul=2 (ns=16) OVER-SPLITS flash_decode — each split's fixed overhead (Q
         // re-staging + the flash_merge partial + its barriers) dominates the tiny per-split KV
@@ -5917,6 +5995,24 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                     .map(str::to_string)
             })
             .unwrap_or_default();
+    assert!(
+        !emit_config::active().gemv_decode_role
+            || !matches!(
+                model_type.as_str(),
+                "qwen3_5"
+                    | "kimi_k3"
+                    | "glm5_next"
+                    | "glm_moe_dsa"
+                    | "kimi_k2"
+                    | "kimi"
+                    | "deepseek_v3"
+                    | "deepseek_v2"
+                    | "nemotron_h"
+                    | "nemotron3"
+                    | "nemotron"
+            ),
+        "GEMV decode role currently requires the dense BF16 emitter"
+    );
     if model_type == "qwen3_5" {
         assert!(
             embed_cubin.is_none() && embed_hsaco.is_none(),
@@ -7106,6 +7202,13 @@ fn emit_dense_gqa(
 
     // Emit v6 with sections when --embed-cubin/--embed-hsaco given, else v5.
     let mut sections = Vec::new();
+    if ecfg.gemv_decode_role {
+        assert!(
+            !amd && arch == "sm_90a" && !fp8 && !c.moe && rungs == [1],
+            "GEMV decode role requires plain BF16 SM90 with one M1 decode program"
+        );
+        sections.push(gemv_decode_role::apply(&mut m));
+    }
     // BLOCK MODE: embed the block.json descriptor
     // as SECT_METADATA — this also forces the to_blob_v6 path — and drop a
     // sibling block.json next to the blob for the record / the harness loader.
