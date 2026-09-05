@@ -27,7 +27,19 @@ The existing `step_bench` runs the same release host, Qwen BF16 checkpoint, nati
 | DAG + a/b fusion, 12 blocks | 30.101 | 30.105 |
 | Existing PTX synchronization mode3, stock packets | 31.313 | 31.315 |
 
-The combined compiler candidate reduces this direct-step mean by3.80%. The combined candidate also preserves all four logit rows from native128-token prefill plus three decode steps byte for byte. A matched serving pair is running; broader numerical/context coverage remains necessary. The contemporary vLLM serving reference is19.99ms TPOT at input/output128/C1; Plow remains behind. Synchronization mode3 preserves five logit rows and two resets but shows no direct-step gain here.
+The combined compiler candidate reduces this direct-step mean by3.80%. It also preserves all four logit rows from native128-token prefill plus three decode steps byte for byte. The contemporary vLLM serving reference is19.99ms TPOT at input/output128/C1; Plow remains behind. Synchronization mode3 preserves five logit rows and two resets but shows no direct-step gain here.
+
+The subsequent matched `vllm bench serve` pair uses the same frozen `plowrt-aot-candidates1`, XREG+KPANEL cubin, checkpoint, native TMA prefill, input/output128, C1, 32 measured requests, 16 warmups, seed42 and detailed latency metrics. Only the compiled packet asset changes. Both complete32/32 with4096 output tokens and zero failures:
+
+| Metric | AOT control | DAG + a/b fusion, 12 blocks |
+|---|---:|---:|
+| Mean TTFT ms | 87.150 | 87.207 |
+| Mean TPOT ms | 31.333 | 30.143 |
+| p99 ITL ms | 31.436 | 30.255 |
+| Mean E2E ms | 4066.38 | 3915.43 |
+| Output tok/s | 31.476 | 32.689 |
+
+TPOT improves3.79% and output throughput3.86% in this pair; mean TTFT increases0.057ms. This is an AOT decode gain, not an all-metrics win. Repetition, B4/B16 serving and longer histories remain open. Raw: `qwen-aot-{control,dag-ab12}-128-c1-r1/in128_c1.json` under the campaign directory.
 
 Raw evidence: `/tmp/plow-model-support-checks/qwen-aot-*-step.log`, `qwen-aot-bf16-quality.json`, `qwen-aot-prefill-fp8-quality.json`, and `/tmp/plow-qwen-kpanel/ptxsync3-quality.json`. Assets are under `/opt/dlami/nvme/tmp/plow-h100-campaign/qwen27b-aot-*`; each carries the exact compiler invocation, flags and binary hash in `experiment.json`. Host binaries are frozen as `plowc-aot-candidates1`, `plowrt-aot-candidates1`, `decode-dump-aot-candidates1` and `step-bench-aot-candidates1`.
 
