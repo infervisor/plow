@@ -4,6 +4,7 @@ p=argparse.ArgumentParser()
 p.add_argument("--run-gpu", action="store_true")
 p.add_argument("--library", required=True)
 p.add_argument("--gdn-library")
+p.add_argument("--gdn-step-library", help="benchmark-only recurrent candidate; exact native state/output gate before timing")
 p.add_argument("--gdn-timing-only", action="store_true", help="native recurrent step vs reachable vLLM FLA packed decode, batches1/4/16")
 p.add_argument("--attention-only", action="store_true", help="native attention vs installed serving FA3/FA4; excludes projections/cache writes")
 p.add_argument("--attention-gf", type=int, choices=(0,2,4,6,8,16), default=0, help="benchmark-only native decode grouping; 0 preserves fixed controls")
@@ -486,14 +487,21 @@ from vllm.third_party.flash_linear_attention.ops.fused_recurrent import fused_re
 if args.gdn_timing_only:
     import hashlib, inspect, statistics
     from pathlib import Path
+    candidate_lib=C.CDLL(args.gdn_step_library) if args.gdn_step_library else None
+    if candidate_lib:
+        candidate_lib.qwen_test.argtypes=lib.qwen_test.argtypes
+        candidate_lib.qwen_test.restype=C.c_int
     torch.manual_seed(1729)
     source=Path(inspect.getsourcefile(oracle))
     report=dict(boundary="recurrent step only; excludes causal conv, projections, gated output norm",
         reference=str(source),reference_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         library_sha256=hashlib.sha256(Path(args.library).read_bytes()).hexdigest(),
-        initial_state="random FP32, identical reset before each untimed pair; not a captured context checkpoint",
+        initial_state="random FP32, reset only the measured arm before each replay; not a captured context checkpoint",
+        cache_regimes=["hot: own logical state reset immediately before replay", "evicted: own state reset then 256 MiB flush before replay"],
         reference_state_indices="1..B; FLA index0 is reserved NULL_BLOCK_ID",
         context="fixed recurrent state dimensions; 1K/4K/8K/32K histories require separately captured states",
+        candidate_library=args.gdn_step_library,
+        candidate_sha256=hashlib.sha256(Path(args.gdn_step_library).read_bytes()).hexdigest() if candidate_lib else None,
         rows=[])
     for B in (1,4,16):
         active=torch.ones(B,device="cuda",dtype=torch.int32)
@@ -511,26 +519,57 @@ if args.gdn_timing_only:
         torch.testing.assert_close(out,ref,rtol=.01,atol=1e-5)
         torch.testing.assert_close(state,reference[1:],rtol=1e-4,atol=1e-6)
         torch.testing.assert_close(reference[0],reference_initial[0],rtol=0,atol=0)
+        arms=[("native",native),("vllm_fla",reference_step)]
+        states={"native":state,"vllm_fla":reference[1:]}
+        if candidate_lib:
+            candidate_state=initial.clone();candidate_out=torch.empty_like(out)
+            def candidate_step():
+                ts=[candidate_out,mixed,a,b,alog,bias,candidate_state,active]
+                code=candidate_lib.qwen_test(137,(C.c_void_p*8)(*[t.data_ptr() for t in ts]),
+                    (C.c_int*8)(16,48,128,128,B,0),(C.c_float*2)(128**-.5,1e-6),torch.cuda.current_stream().cuda_stream)
+                assert code==0,code
+            for pattern in ("all","alternating","last"):
+                active.fill_(1)
+                if pattern=="alternating":active[::2]=0
+                if pattern=="last":active.zero_();active[-1]=1
+                state.copy_(initial);candidate_state.copy_(initial)
+                out.fill_(7);candidate_out.fill_(7)
+                for _ in range(3):
+                    native();candidate_step();torch.cuda.synchronize()
+                    torch.testing.assert_close(candidate_out,out,rtol=0,atol=0)
+                    torch.testing.assert_close(candidate_state,state,rtol=0,atol=0)
+                inactive=active==0
+                torch.testing.assert_close(state[inactive],initial[inactive],rtol=0,atol=0)
+                torch.testing.assert_close(out[inactive],torch.full_like(out[inactive],7),rtol=0,atol=0)
+            active.fill_(1)
+            arms.append(("candidate",candidate_step));states["candidate"]=candidate_state
         graphs={}
-        for name,fn in (("native",native),("vllm_fla",reference_step)):
+        for name,fn in arms:
             for _ in range(3):fn()
             torch.cuda.synchronize()
             g=torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):fn()
             graphs[name]=g
         start,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
-        times={name:[] for name in graphs}
-        for rep in range(max(3,args.attention_iters)):
-            order=list(graphs)
-            if rep%2:order.reverse()
-            for name in order:
-                state.copy_(initial);reference.copy_(reference_initial)
-                start.record();graphs[name].replay();end.record();end.synchronize()
-                times[name].append(start.elapsed_time(end)*1000)
-        row=dict(batch=B,HK=16,HV=48,DK=128,DV=128,passed=True,
-            native_us=statistics.median(times["native"]),vllm_fla_us=statistics.median(times["vllm_fla"]))
-        report["rows"].append(row);print(json.dumps(row),flush=True)
-        if args.output:Path(args.output).write_text(json.dumps(report,indent=2)+"\n")
+        flush=torch.empty(256*1024*1024,device="cuda",dtype=torch.uint8)
+        for cache in ("hot","evicted"):
+            times={name:[] for name in graphs}
+            for rep in range(max(3,args.attention_iters)):
+                order=list(graphs)
+                if rep%2:order.reverse()
+                for name in order:
+                    states[name].copy_(initial)
+                    if cache=="evicted":flush.zero_()
+                    start.record();graphs[name].replay();end.record();end.synchronize()
+                    times[name].append(start.elapsed_time(end)*1000)
+            row=dict(batch=B,HK=16,HV=48,DK=128,DV=128,passed=True,cache=cache,
+                pairs=max(3,args.attention_iters),flush_mib=256 if cache=="evicted" else 0,
+                native_us=statistics.median(times["native"]),vllm_fla_us=statistics.median(times["vllm_fla"]))
+            if candidate_lib:
+                row.update(candidate_us=statistics.median(times["candidate"]),candidate_exact=True,
+                    candidate_gate="3 continuation steps each: all active, alternating inactive, last physical slot only")
+            report["rows"].append(row);print(json.dumps(row),flush=True)
+            if args.output:Path(args.output).write_text(json.dumps(report,indent=2)+"\n")
     raise SystemExit(0)
 results=[]
 def check(name,out,ref,rtol=.01,atol=1e-5):
