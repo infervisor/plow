@@ -1493,6 +1493,18 @@ __device__ __forceinline__ void pgm_load_bfrags_w8a8(unsigned (&bf)[NFRAG][2],
 
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1
 
+#ifndef PLOW_NV_FP8_M1_BLOCKED
+#define PLOW_NV_FP8_M1_BLOCKED 0
+#endif
+#ifndef PLOW_NV_FP8_M1_XCACHE
+#define PLOW_NV_FP8_M1_XCACHE 0
+#endif
+#if PLOW_NV_FP8_M1_XCACHE && (!defined(PLOW_NV_FP8_M1_BK1024) || !PLOW_NV_FP8_M1_BK1024 || PLOW_NV_FP8_M1_BLOCKED)
+#error "FP8 M1 activation cache requires BK1024 and cyclic ownership"
+#endif
+#if PLOW_NV_FP8_M1_BLOCKED && defined(PLOW_NV_FP8_M1_PIPE) && PLOW_NV_FP8_M1_PIPE
+#error "FP8 M1 blocked ownership excludes PIPE"
+#endif
 #ifndef PLOW_NV_FP8_M1_BK256
 #define PLOW_NV_FP8_M1_BK256 0
 #endif
@@ -1599,16 +1611,53 @@ static __device__ void d_gemm_w8a8_m1_sm90(__nv_bfloat16* C, const uint8_t* A,
     const unsigned tid = threadIdx.x;
     uint8_t* weights = (uint8_t*)sm90_align1024(arena);
     constexpr unsigned panels = PLOW_NV_FP8_M1_BK1024 ? 8 : PLOW_NV_FP8_M1_BK512 ? 4 : PLOW_NV_FP8_M1_BK256 ? 2 : 1;
+#if PLOW_NV_FP8_M1_XCACHE
+    const bool cached = k <= 17408;
+    const unsigned panel_bytes = cached ? 64 * 128 : (64 + 8) * 128;
+    uint8_t* cached_x = weights + 8 * 64 * 128;
+#else
+    constexpr bool cached = false;
     constexpr unsigned panel_bytes = (64 + 8) * 128;
+#endif
     const uint8_t* x = A + (size_t)a_row0 * k;
-    for (unsigned tile = slice; tile < (n + 63) / 64; tile += nblk) {
+#if PLOW_NV_FP8_M1_BLOCKED
+    const bool blocked = n >= 1024;
+    const unsigned rows_per_slice = (n + nblk - 1) / nblk;
+    const unsigned first = blocked ? slice * rows_per_slice : slice * 64;
+    const unsigned end = blocked ? min(first + rows_per_slice, n) : n;
+    const unsigned stride = blocked ? 64 : nblk * 64;
+#else
+    const unsigned first = slice * 64, end = n, stride = nblk * 64;
+#endif
+#if PLOW_NV_FP8_M1_XCACHE
+    if (cached && first < end) {
+        const unsigned chunks = ((k + 127) / 128) * 64;
+        for (unsigned batch = 0; batch < chunks; batch += 8 * PLOW_NV_THREADS) {
+#pragma unroll
+            for (unsigned copy = 0; copy < 8; ++copy) {
+                const unsigned line = batch + copy * PLOW_NV_THREADS + tid;
+                if (line < chunks) {
+                    const unsigned panel = line / 64, row = (line % 64) / 8, col = line % 8;
+                    const unsigned gk = panel * 128 + col * 16;
+                    const bool valid = row == 0 && gk < k;
+                    sm90_cp16(cached_x + panel * 1024 + sm90_swz_off<128, 16>(row, col),
+                        valid ? x + gk : x, valid ? min(16u, k - gk) : 0);
+                }
+            }
+            sm90_cp_commit();
+            sm90_cp_wait<0>();
+        }
+        __syncthreads();
+    }
+#endif
+    for (unsigned row0 = first; row0 < end; row0 += stride) {
         float total[4] = {}, partial[4] = {};
         for (unsigned kb = 0; kb < k; kb += panels * 128) {
 #pragma unroll
             for (unsigned panel = 0; panel < panels; ++panel) {
                 uint8_t* buffer = weights + panel * panel_bytes;
-                pgm90_stage_fp8(buffer, W, tid, 64, tile * 64, kb + panel * 128, n, k);
-                pgm90_stage_fp8(buffer + 64 * 128, x, tid, 8, 0, kb + panel * 128, 1, k);
+                pgm90_stage_fp8(buffer, W, tid, 64, row0, kb + panel * 128, end, k);
+                if (!cached) pgm90_stage_fp8(buffer + 64 * 128, x, tid, 8, 0, kb + panel * 128, 1, k);
             }
             sm90_cp_commit();
             sm90_cp_wait<0>();
@@ -1620,7 +1669,12 @@ static __device__ void d_gemm_w8a8_m1_sm90(__nv_bfloat16* C, const uint8_t* A,
                     if (kb + (sub / 4) * 128 >= k) break;
                     uint8_t* buffer = weights + (sub / 4) * panel_bytes;
                     const uint64_t dw = sm90_desc(buffer + (sub % 4) * 32);
-                    const uint64_t dx = sm90_desc(buffer + 64 * 128 + (sub % 4) * 32);
+#if PLOW_NV_FP8_M1_XCACHE
+                    const uint8_t* xp = cached ? cached_x + (kb / 128 + sub / 4) * 1024 : buffer + 64 * 128;
+#else
+                    const uint8_t* xp = buffer + 64 * 128;
+#endif
+                    const uint64_t dx = sm90_desc(xp + (sub % 4) * 32);
 #if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
                     const int accumulate = kb != 0 || sub != 0;
 #else
@@ -1647,11 +1701,11 @@ static __device__ void d_gemm_w8a8_m1_sm90(__nv_bfloat16* C, const uint8_t* A,
             __syncthreads();
         }
         if (tid < 128 && (tid & 3) == 0) {
-            const unsigned r0 = tile * 64 + (tid >> 5) * 16 + ((tid & 31) >> 2);
+            const unsigned r0 = row0 + (tid >> 5) * 16 + ((tid & 31) >> 2);
 #pragma unroll
             for (int hi = 0; hi < 2; ++hi) {
                 const unsigned row = r0 + hi * 8;
-                if (row < n) {
+                if (row < end) {
 #if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
                     /* vLLM M<=16 swaps both operands and epilogue scales. */
                     C[row] = __float2bfloat16(__fmul_rn(wscale[row],

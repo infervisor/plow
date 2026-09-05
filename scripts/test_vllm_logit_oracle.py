@@ -1,9 +1,12 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import numpy as np
 
-from vllm_logit_oracle import dense_scores, repeat_metrics, suppression_metadata
+from vllm_logit_oracle import (dense_scores, repeat_metrics, suppression_metadata,
+                               generation_rows, required_model_length, prompt_digest)
 
 
 class SuppressionTests(unittest.TestCase):
@@ -34,6 +37,45 @@ class SuppressionTests(unittest.TestCase):
         config = SimpleNamespace(try_get_generation_config=lambda: {"suppress_tokens": [1, 1]})
         self.assertEqual(suppression_metadata(config, 2)["token_ids"], [1])
         np.testing.assert_array_equal(dense_scores(self.row([1.0, 2.0]), 2), [1.0, 2.0])
+
+    def test_invalid_decode_rows_keep_distinct_diagnostics(self):
+        with TemporaryDirectory() as directory:
+            for step, value in enumerate([np.nan, np.inf]):
+                prefix = Path(directory) / f"request.step{step:04d}"
+                with self.assertRaises(RuntimeError):
+                    dense_scores(self.row([value]), 1, prefix)
+            first = np.fromfile(Path(directory) / "request.step0000.invalid.f32", dtype="<f4")
+            second = np.fromfile(Path(directory) / "request.step0001.invalid.f32", dtype="<f4")
+            self.assertTrue(np.isnan(first[0]))
+            self.assertTrue(np.isposinf(second[0]))
+
+
+class GenerationRowsTests(unittest.TestCase):
+    def test_actual_generated_history_and_stable_row_ids(self):
+        rows = generation_rows("base", [2, 10], [31, 44, 55], 3)
+        self.assertEqual([r["id"] for r in rows], ["base.step0000", "base.step0001", "base.step0002"])
+        self.assertEqual([r["prompt_len"] for r in rows], [2, 3, 4])
+        self.assertEqual([r["prompt_sha256_u32le"] for r in rows],
+                         [prompt_digest(x) for x in ([2, 10], [2, 10, 31], [2, 10, 31, 44])])
+        self.assertEqual([r["sampled_token_id"] for r in rows], [31, 44, 55])
+        self.assertEqual([r["execution_phase"] for r in rows],
+                         ["prefill_output", "decode_output", "decode_output"])
+        self.assertEqual(generation_rows("legacy", [2, 10], [31], 1)[0]["id"], "legacy")
+
+    def test_generation_length_must_match_request(self):
+        for count, tokens in [(0, []), (3, [1, 2]), (1, [1, 2])]:
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                generation_rows("x", [2], tokens, count)
+
+    def test_context_bound_includes_all_output_tokens(self):
+        cases = [{"prompt_token_ids": [2] * 8192}]
+        self.assertEqual(required_model_length(cases, 3), 8195)
+        self.assertEqual(required_model_length(cases, 3, 8192), 8195)
+        self.assertEqual(required_model_length(cases, 3, 16384), 16384)
+        with self.assertRaises(ValueError):
+            required_model_length(cases, 0)
+        with self.assertRaises(ValueError):
+            required_model_length([{"prompt_token_ids": []}], 3)
 
 
 if __name__ == "__main__":

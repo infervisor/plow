@@ -23,10 +23,12 @@ def parse_args():
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--max-model-len", type=int)
+    p.add_argument("--max-output-tokens", type=int, default=1)
     p.add_argument("--max-num-batched-tokens", type=int, default=4096)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--trust-remote-code", action="store_true")
     p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--disable-cuda-graphs", action="store_true")
     p.add_argument("--language-model-only", action="store_true")
     p.add_argument("--quantization", choices=["fp8"])
     return p.parse_args()
@@ -89,8 +91,8 @@ def dense_scores(position, vocab_size, diagnostic_prefix=None, suppressed_ids=()
             "finite_count": int(np.isfinite(out).sum()),
         }
         if diagnostic_prefix is not None:
-            diagnostic_prefix.with_suffix(".invalid.f32").write_bytes(out.astype("<f4").tobytes())
-            diagnostic_prefix.with_suffix(".invalid.json").write_text(json.dumps(diagnostic, indent=2))
+            Path(f"{diagnostic_prefix}.invalid.f32").write_bytes(out.astype("<f4").tobytes())
+            Path(f"{diagnostic_prefix}.invalid.json").write_text(json.dumps(diagnostic, indent=2))
         counts = {key: len(value) for key, value in diagnostic.items() if isinstance(value, list)}
         raise RuntimeError(f"vLLM returned invalid logits: {counts}")
     return out
@@ -120,13 +122,44 @@ def repeat_metrics(current, prior, suppressed_ids=()):
     }
 
 
+def required_model_length(cases, output_tokens, requested=None):
+    if output_tokens < 1:
+        raise ValueError("max-output-tokens must be positive")
+    lengths = [len(case["prompt_token_ids"]) for case in cases]
+    if not lengths or min(lengths) < 1:
+        raise ValueError("cases must contain non-empty prompts")
+    return max(max(lengths) + output_tokens, requested or 0)
+
+
+def generation_rows(cid, prompt_ids, generated_ids, output_tokens):
+    if output_tokens < 1 or len(generated_ids) != output_tokens:
+        raise ValueError("generated token count must match max-output-tokens")
+    prefix = list(prompt_ids)
+    rows = []
+    for step, token in enumerate(generated_ids):
+        rows.append({
+            "id": cid if output_tokens == 1 else f"{cid}.step{step:04d}",
+            "prompt_len": len(prefix),
+            "prompt_sha256_u32le": prompt_digest(prefix),
+            "sampled_token_id": int(token),
+            "request_case_id": cid,
+            "generation_step": step,
+            "execution_phase": "prefill_output" if step == 0 else "decode_output",
+        })
+        prefix.append(int(token))
+    return rows
+
+
 def main():
     args = parse_args()
     request = json.loads(args.cases.read_text())
     cases = request.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError("cases JSON needs a non-empty `cases` array")
-    max_len = max(max(len(c["prompt_token_ids"]) for c in cases) + 1, args.max_model_len or 0)
+    max_len = required_model_length(cases, args.max_output_tokens, args.max_model_len)
+    case_ids = [case_id(case["id"]) for case in cases]
+    if len(case_ids) != len(set(case_ids)):
+        raise ValueError("case IDs must be unique")
 
     from vllm import LLM, SamplingParams, __version__ as vllm_version
 
@@ -146,13 +179,16 @@ def main():
         logprobs_mode="raw_logits",
         language_model_only=args.language_model_only,
         quantization=args.quantization,
+        **({"compilation_config": {"cudagraph_mode": "NONE"}}
+           if args.disable_cuda_graphs else {}),
     )
+    effective_compile = llm.llm_engine.vllm_config.compilation_config
     vocab_size = int(llm.model_config.get_vocab_size())
     suppression = suppression_metadata(llm.model_config, vocab_size)
     suppressed_ids = suppression["token_ids"]
     sampling = SamplingParams(
         temperature=0.0,
-        max_tokens=1,
+        max_tokens=args.max_output_tokens,
         ignore_eos=True,
         logprobs=-1,
         flat_logprobs=True,
@@ -169,13 +205,24 @@ def main():
         "vocab_size": vocab_size,
         "logprobs_mode": "raw_logits",
         "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_num_seqs": 1,
+        "enable_prefix_caching": False,
         "max_model_len": max_len,
+        "max_output_tokens": args.max_output_tokens,
         "enforce_eager": args.enforce_eager,
+        "disable_cuda_graphs": args.disable_cuda_graphs,
+        "effective_compilation_config": {
+            "mode": getattr(effective_compile.mode, "name", str(effective_compile.mode)),
+            "cudagraph_mode": getattr(effective_compile.cudagraph_mode, "name", str(effective_compile.cudagraph_mode)),
+            "backend": effective_compile.backend,
+            "custom_ops": list(effective_compile.custom_ops),
+        },
         "language_model_only": args.language_model_only,
         "quantization": args.quantization,
         "hf_vocab_size": llm.model_config.hf_text_config.vocab_size,
         "final_logit_softcapping": getattr(llm.model_config.hf_text_config, "final_logit_softcapping", None),
         "suppression": suppression,
+        "requests": [],
         "cases": [],
         "repeat_checks": [],
         "invalid_cases": [],
@@ -191,38 +238,43 @@ def main():
             {"prompt_token_ids": ids}, sampling, use_tqdm=False
         )[0]
         completion = result.outputs[0]
-        if not completion.logprobs or len(completion.logprobs) != 1:
-            raise RuntimeError(f"case {cid}: missing one-step logprobs")
-        try:
-            scores = dense_scores(completion.logprobs[0], vocab_size, args.output / cid, suppressed_ids)
-        except RuntimeError as error:
-            manifest["invalid_cases"].append({"id": cid, "error": str(error)})
-            continue
-        filename = f"logits_{cid}.f32"
-        scores.astype("<f4", copy=False).tofile(args.output / filename)
-        sha = prompt_digest(ids)
-        if sha in seen:
-            prior_id, prior_scores = seen[sha]
-            manifest["repeat_checks"].append(
-                {
+        generated_ids = [int(token) for token in completion.token_ids]
+        manifest["requests"].append({
+            "id": cid,
+            "prompt_token_ids": ids,
+            "prompt_sha256_u32le": prompt_digest(ids),
+            "generated_token_ids": generated_ids,
+            "finish_reason": completion.finish_reason,
+            "request_id": result.request_id,
+        })
+        rows = generation_rows(cid, ids, generated_ids, args.max_output_tokens)
+        if not completion.logprobs or len(completion.logprobs) != len(rows):
+            raise RuntimeError(f"case {cid}: missing per-token logprobs")
+        for row, position in zip(rows, completion.logprobs):
+            row_id = row["id"]
+            try:
+                scores = dense_scores(position, vocab_size, args.output / row_id, suppressed_ids)
+            except RuntimeError as error:
+                manifest["invalid_cases"].append({"id": row_id, "error": str(error)})
+                continue
+            filename = f"logits_{row_id}.f32"
+            scores.astype("<f4", copy=False).tofile(args.output / filename)
+            sha = row["prompt_sha256_u32le"]
+            if sha in seen:
+                prior_id, prior_scores = seen[sha]
+                manifest["repeat_checks"].append({
                     "first_case": prior_id,
-                    "repeat_case": cid,
+                    "repeat_case": row_id,
                     "prompt_sha256_u32le": sha,
                     **repeat_metrics(scores, prior_scores, suppressed_ids),
-                }
-            )
-        else:
-            seen[sha] = (cid, scores.copy())
-        manifest["cases"].append(
-            {
-                "id": cid,
+                })
+            else:
+                seen[sha] = (row_id, scores.copy())
+            manifest["cases"].append({
+                **row,
                 "file": filename,
-                "prompt_len": len(ids),
-                "prompt_sha256_u32le": sha,
-                "sampled_token_id": int(completion.token_ids[0]),
                 "negative_inf_token_ids": np.flatnonzero(np.isneginf(scores)).tolist(),
-            }
-        )
+            })
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     if manifest["invalid_cases"]:
         raise RuntimeError(f"{len(manifest['invalid_cases'])} cases rejected; see manifest.json")

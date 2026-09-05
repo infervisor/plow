@@ -697,7 +697,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #else
 #define PLOW_NV_FA_ARENA FA_DEC_SMEM_FLOATS(PLOW_NV_FA_HD, PLOW_NV_FA_GF)
 #endif
-#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_BK1024 && !PLOW_NV_PREFILL
+#if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_XCACHE && !PLOW_NV_PREFILL
+#define PLOW_NV_FP8_M1_ARENA 51456
+#elif defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_BK1024 && !PLOW_NV_PREFILL
 #define PLOW_NV_FP8_M1_ARENA 18688
 #elif defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_BK512 && !PLOW_NV_PREFILL
 #define PLOW_NV_FP8_M1_ARENA 9472

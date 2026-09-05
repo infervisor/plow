@@ -50,3 +50,15 @@ The opt-in `PLOW_NV_GEMV_KPANEL=1` candidate covers only M1/N5120/K17408 with256
 The fresh primitive pair passes all13 shape checks. Down projection measures86.2µs control versus66.4µs candidate, with cuBLASLt63.9µs. Both variants report the same error against Lt (relativeL2 .000178396, max_abs .125). The historical94.3µs control above is a different, M1-only harness binary; the fresh generalized harness takes M as an argument. Both use GV_UNROLL8, so86.2→66.4 is the relevant matched comparison.
 
 The full interpreter pair enables the existing XREG optimization in both arms and varies only KPANEL. Control uses205 registers, candidate241; both use the12352-byte arena and no stack/local memory. All five teacher-forced full-model logit rows are bit-exact between the variants, and two exact reset repetitions pass for each. Whole-serving measurement remains necessary because increased register allocation applies to the persistent interpreter. Artifacts and frozen build recipes: `/tmp/plow-qwen-kpanel/`, including `full-quality.json`, `control-result.log` and `candidate-k2048-result.log`.
+
+The fresh serving pair subsequently completed32/32 requests per arm with zero failures. Both use `plowrt-qwen-w8a8-candidate1`, identical native TMA prefill, input/output128, C1, 16 warmups, seed42 and detailed latency output. Only the frozen XREG/KPANEL decoder cubin differs:
+
+| Metric | XREG control | XREG + KPANEL |
+|---|---:|---:|
+| TTFT ms | 87.190 | 87.156 |
+| TPOT ms | 32.182 | 31.334 |
+| p99 ITL ms | 32.289 | 31.444 |
+| Mean E2E ms | 4174.30 | 4066.57 |
+| Output tok/s | 30.662 | 31.474 |
+
+KPANEL reduces TPOT2.64% and increases throughput2.65% in this pair. Native decode still trails the contemporary vLLM19.99ms reference; repetitions and broader contexts remain open. Raw results: `qwen-kpanel{,-control}-128-c1-r1/in128_c1.json` under the campaign directory.
