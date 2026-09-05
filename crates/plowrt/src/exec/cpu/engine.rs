@@ -588,7 +588,7 @@ fn loaded(p: &DevProg, n_cu: u32) -> LoadedProgram {
 /// Worker-pool knobs (`CpuRuntimeConfig` resolved).
 #[derive(Clone, Debug)]
 pub struct CpuEngineOpts {
-    /// 0 = one per physical core.
+    /// 0 = one per online logical cpu.
     pub threads: usize,
     pub numa: NumaMode,
     pub isa: Isa,
@@ -658,9 +658,11 @@ impl CpuEngine {
         // node placement the pool will use (same rule: round-robin over nodes).
         let nodes = topo.select_nodes(&opts.numa);
         let threads = if opts.threads == 0 {
+            // Every online logical cpu (SMT siblings add bandwidth here) — mirrors
+            // WorkerPool::spawn's placement list.
             nodes
                 .iter()
-                .map(|&n| topo.cores_on_node(n).count())
+                .map(|&n| topo.cores_on_node(n).map(|c| c.siblings.len().max(1)).sum::<usize>())
                 .sum::<usize>()
                 .max(1)
         } else {

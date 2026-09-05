@@ -155,7 +155,7 @@ pub enum CpuIsa {
 #[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "CPU runtime")]
 pub struct CpuRuntimeConfig {
-    /// Persistent worker threads (= virtual executors). 0 = one per physical core.
+    /// Persistent worker threads (= virtual executors). 0 = one per online logical cpu (SMT siblings add bandwidth).
     #[arg(
         long = "cpu-threads",
         env = "PLOW_CPU_THREADS",

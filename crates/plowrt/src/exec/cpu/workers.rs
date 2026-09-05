@@ -68,7 +68,7 @@ struct Host {
 }
 
 impl WorkerPool {
-    /// Spawn `threads` persistent workers (0 = one per physical core on the
+    /// Spawn `threads` persistent workers (0 = one per online logical cpu on the
     /// selected nodes). Virtual executor `cu` is placed on node `cu % nodes`,
     /// round-robin across that node's workers, so `n_cu` need not equal the
     /// thread count.
@@ -81,16 +81,36 @@ impl WorkerPool {
         exec: Arc<dyn Exec>,
     ) -> WorkerPool {
         let nodes = topo.select_nodes(numa);
-        let mut cores: Vec<(u32, u32)> = Vec::new(); // (cpu, node)
-        for &n in &nodes {
-            cores.extend(topo.cores_on_node(n).map(|c| (c.cpu, n)));
+        // Logical cpus, physical cores first then their SMT siblings, so `k` threads
+        // pin to `k` distinct logical cpus and low counts spread across cores. On this
+        // class of Xeon the siblings ADD read bandwidth (measured 114 -> 219 GB/s at 8 -> 16
+        // threads), which is why the default is every online cpu, not physical cores.
+        let mut cpus: Vec<(u32, u32)> = Vec::new(); // (cpu, node)
+        let max_sib = nodes
+            .iter()
+            .flat_map(|&n| topo.cores_on_node(n).map(|c| c.siblings.len().max(1)))
+            .max()
+            .unwrap_or(1);
+        for rank in 0..max_sib {
+            for &n in &nodes {
+                for c in topo.cores_on_node(n) {
+                    let cpu = if rank == 0 {
+                        Some(c.cpu)
+                    } else {
+                        c.siblings.iter().copied().filter(|&x| x != c.cpu).nth(rank - 1)
+                    };
+                    if let Some(cpu) = cpu {
+                        cpus.push((cpu, n));
+                    }
+                }
+            }
         }
-        if cores.is_empty() {
-            cores.push((0, nodes[0]));
+        if cpus.is_empty() {
+            cpus.push((0, nodes[0]));
         }
-        let threads = if threads == 0 { cores.len() } else { threads.max(1) };
-        // Round-robin over cores when oversubscribed.
-        let placement: Vec<(u32, u32)> = (0..threads).map(|k| cores[k % cores.len()]).collect();
+        let threads = if threads == 0 { cpus.len() } else { threads.max(1) };
+        // Round-robin over logical cpus when oversubscribed.
+        let placement: Vec<(u32, u32)> = (0..threads).map(|k| cpus[k % cpus.len()]).collect();
         let node_pos = |n: u32| nodes.iter().position(|&x| x == n).unwrap_or(0) as u32;
 
         // cu → worker: node = cu % nodes, then round-robin within the node.
