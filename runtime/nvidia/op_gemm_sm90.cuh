@@ -1120,6 +1120,9 @@ static __device__ void d_quant_fp8_ws384(uint8_t* __restrict__ xq, __nv_bfloat16
 #ifndef PGM90_WS384_SMEPI
 #define PGM90_WS384_SMEPI 0
 #endif
+#ifndef PGM90_WS384_ISSUE_CURSOR
+#define PGM90_WS384_ISSUE_CURSOR 0
+#endif
 __device__ __forceinline__ void ws384_wg_bar(int cwg) {
     asm volatile("bar.sync %0, %1;" ::"r"(cwg + 1), "r"(128) : "memory");
 }
@@ -1170,6 +1173,16 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
     if (PROD) {
         if (tid == 0) {
             int ist = 0;
+#if PGM90_WS384_ISSUE_CURSOR
+            for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
+                int tmi, tni;
+                sm90_tile_remap(tile, tiles_m, tiles_n, &tmi, &tni);
+                const int tm = tmi * PGM90_BM;
+                const int tn = tni * PGM90_U256_BN;
+                for (int ks = 0; ks < ksteps; ks++) {
+                const int st = ist % NS;
+                if (ist >= NS) sm90_mbar_wait(bempty + st, ((ist / NS) + 1) & 1);
+#else
             const int total = ((ntiles - (int)slice) + (int)nblk - 1) / (int)nblk * ksteps;
             for (int i = 0; i < total; i++) {
                 const int tile = (int)slice + (i / ksteps) * (int)nblk;
@@ -1180,6 +1193,7 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
                 sm90_tile_remap(tile, tiles_m, tiles_n, &tmi, &tni);
                 const int tm = tmi * PGM90_BM;
                 const int tn = tni * PGM90_U256_BN;
+#endif
                 sm90_mbar_expect(bfull + st, PGM90_U256_TXB);
                 const uint32_t bar = sm90_su32(bfull + st);
                 sm90_tma2d(sm90_su32(As + st * PGM90_A8BUF), mapA, ks * kelem, (int)a_row0 + tm,
@@ -1189,6 +1203,9 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
                 sm90_tma2d(sm90_su32(bs + 128 * BKB), mapB, ks * kelem, tn + 128, bar);
                 ist++;
             }
+#if PGM90_WS384_ISSUE_CURSOR
+            }
+#endif
         }
     } else {
         const int cwg = (tid >> 7) - 1; /* consumer warpgroup 0/1 -> m64 slab */

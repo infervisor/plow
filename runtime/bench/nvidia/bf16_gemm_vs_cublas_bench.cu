@@ -72,6 +72,10 @@ static const Shape SHAPES[] = {
     {"g12_o_local",3840,4096,0}, {"g12_o_full",3840,8192,0}, {"g12_down",3840,15360,0},
     {"g31_o_local",5376,8192,0}, {"g31_o_full",5376,16384,0}, {"g31_down",5376,21504,0},
     {"qwen_o",5120,6144,0}, {"qwen_down",5120,17408,0}, {"tail",3906,648,0},
+#ifdef PLOW_BENCH_GEMMA_QGATE
+    {"g12_q_local",4096,3840,0}, {"g12_q_full",8192,3840,0}, {"g12_gate",15360,3840,0},
+    {"g31_q_local",8192,5376,0}, {"g31_q_full",16384,5376,0}, {"g31_gate",21504,5376,0},
+#endif
 #elif defined(PLOW_BENCH_QWEN_GEMV)
 #ifdef PLOW_BENCH_GEMV_M16
     {"gemma_down",3840,15360,0}, {"gemma_q",8192,3840,0}, {"gemma_o",3840,8192,0},
