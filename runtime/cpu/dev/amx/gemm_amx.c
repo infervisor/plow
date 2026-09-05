@@ -21,6 +21,8 @@
 #include <time.h>
 #include "cpu_dev_internal.h"
 #include "golden/golden.h"
+#include "amx_common.h"
+#include "../fp8_common.h"
 
 #define KP 512u   /* K panel, bf16 elements (16 tile steps); one strip = 32 KiB < L1 */
 #define NSTRIP 8u /* strips per tile: BN <= 256 (GLU: 4 output strips x {gate, up}) */
@@ -108,6 +110,31 @@ void plow_cpu_amx_pack_b_strip(void* dst, const plow_bf16* W, uint32_t N, uint32
     }
 }
 
+/* Same strip from an e4m3 weight: dequant 32 bytes -> 32 bf16 (exact) ahead of the transpose. */
+plow_fp8_vlut plow_amx_fp8_lut;
+
+static void pack_b_strip_fp8(void* dst, const uint8_t* W, uint32_t N, uint32_t K, uint32_t n0,
+                             uint32_t k0, uint32_t kp) {
+    uint8_t* out = dst;
+    const uint32_t nkb = kp / 32u;
+    for (uint32_t kb = 0; kb < nkb; kb++) {
+        const uint32_t k = k0 + kb * 32u;
+        for (uint32_t t = 0; t < 2; t++) {
+            __m512i r[16];
+            for (uint32_t j = 0; j < 16; j++) {
+                const uint32_t n = n0 + t * 16u + j;
+                r[j] = (n < N && k + 32u <= K)
+                           ? plow_fp8x32_to_bf16(&plow_amx_fp8_lut,
+                                                 _mm256_loadu_si256((const __m256i*)(W + (size_t)n * K + k)))
+                           : _mm512_setzero_si512();
+            }
+            tr16x16_epi32(r);
+            uint8_t* tile = out + ((size_t)kb * 2u + t) * 1024u;
+            for (uint32_t rr = 0; rr < 16; rr++) _mm512_storeu_si512((void*)(tile + rr * 64u), r[rr]);
+        }
+    }
+}
+
 /* ---- A staging (tail rows / RMSNorm fold): 32 rows x kp bf16 at stride KP, zero padded ---- */
 
 static inline __m512 bf16x16_to_f32(const plow_bf16* p) {
@@ -147,6 +174,8 @@ typedef struct {
     const float* cb;    /* [32][32] fp32, gate (or plain) */
     const float* cb_up; /* GLU only */
     plow_bf16* dst;     /* C + m*N + n */
+    const float* sc;    /* fp8: per-column w_scale for these 32 columns, else NULL */
+    const float* sc_up; /* fp8 GLU: up scale */
     uint32_t ldc, rows, cols, done, act;
 } ils_t;
 
@@ -154,13 +183,24 @@ static inline void ils_row(const ils_t* e, uint32_t r) {
     const float* c = e->cb + (size_t)r * 32u;
     plow_bf16* d = e->dst + (size_t)r * e->ldc;
     if (!e->cb_up) {
-        const __m512i v = (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(c + 16), _mm512_loadu_ps(c));
+        __m512 lo = _mm512_loadu_ps(c), hi = _mm512_loadu_ps(c + 16);
+        if (e->sc) {
+            const __mmask16 mlo = e->cols >= 16u ? 0xFFFF : (__mmask16)((1u << e->cols) - 1u);
+            const __mmask16 mhi = e->cols >= 32u ? 0xFFFF
+                                  : e->cols > 16u ? (__mmask16)((1u << (e->cols - 16u)) - 1u) : 0;
+            lo = _mm512_mul_ps(lo, _mm512_maskz_loadu_ps(mlo, e->sc));
+            hi = _mm512_mul_ps(hi, _mm512_maskz_loadu_ps(mhi, e->sc + 16));
+        }
+        const __m512i v = (__m512i)_mm512_cvtne2ps_pbh(hi, lo);
         if (e->cols == 32u) _mm512_storeu_si512((void*)d, v);
         else _mm512_mask_storeu_epi16((void*)d, (__mmask32)((1u << e->cols) - 1u), v);
     } else {
         const float* u = e->cb_up + (size_t)r * 32u;
-        for (uint32_t j = 0; j < e->cols; j++)
-            d[j] = plow_f2bf(g_act_gate_only(c[j], e->act) * u[j]);
+        for (uint32_t j = 0; j < e->cols; j++) {
+            const float g = e->sc ? c[j] * e->sc[j] : c[j];
+            const float uu = e->sc_up ? u[j] * e->sc_up[j] : u[j];
+            d[j] = plow_f2bf(g_act_gate_only(g, e->act) * uu);
+        }
     }
 }
 
@@ -212,23 +252,13 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
 
 /* ---- Tile driver shared by every op --------------------------------------------------- */
 
-typedef struct {
-    plow_bf16* C;
-    const plow_bf16* A;
-    const plow_bf16* W;  /* GEMM: weight; GLU: gate weight */
-    const plow_bf16* Wu; /* GLU up weight, else NULL */
-    const float* rms;    /* GEMM_NORM */
-    const plow_bf16* gamma;
-    uint32_t M, N, K, BM, BN, act;
-} gemm_args;
-
 static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, uint32_t n1,
                      uint8_t* scratch) {
     uint8_t* bp = scratch + BP_OFF;
     plow_bf16* ap = (plow_bf16*)(scratch + AP_OFF);
     float* cp = (float*)(scratch + CP_OFF);
     float* cb = (float*)(scratch + CB_OFF);
-    const int glu = g->Wu != NULL;
+    const int glu = g->Wu != NULL || g->Wuq != NULL;
     const uint32_t nb = (n1 - n0 + 31u) / 32u, mb_n = (m1 - m0 + 31u) / 32u;
     const uint32_t npanel = (g->K + KP - 1u) / KP;
     ils_t pend = {0};
@@ -237,11 +267,19 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
         const uint32_t k0 = p * KP, kp = g->K - k0 < KP ? g->K - k0 : KP, nkb = kp / 32u;
         const int first = p == 0, last = p + 1 == npanel;
         for (uint32_t s = 0; s < nb; s++) {
-            if (!glu) {
-                plow_cpu_amx_pack_b_strip(bp + s * STRIP_BYTES, g->W, g->N, g->K, n0 + s * 32u, k0, kp);
+            const uint32_t n = n0 + s * 32u;
+            if (g->Wq) {
+                if (!glu) {
+                    pack_b_strip_fp8(bp + s * STRIP_BYTES, g->Wq, g->N, g->K, n, k0, kp);
+                } else {
+                    pack_b_strip_fp8(bp + (2 * s) * STRIP_BYTES, g->Wq, g->N, g->K, n, k0, kp);
+                    pack_b_strip_fp8(bp + (2 * s + 1) * STRIP_BYTES, g->Wuq, g->N, g->K, n, k0, kp);
+                }
+            } else if (!glu) {
+                plow_cpu_amx_pack_b_strip(bp + s * STRIP_BYTES, g->W, g->N, g->K, n, k0, kp);
             } else {
-                plow_cpu_amx_pack_b_strip(bp + (2 * s) * STRIP_BYTES, g->W, g->N, g->K, n0 + s * 32u, k0, kp);
-                plow_cpu_amx_pack_b_strip(bp + (2 * s + 1) * STRIP_BYTES, g->Wu, g->N, g->K, n0 + s * 32u, k0, kp);
+                plow_cpu_amx_pack_b_strip(bp + (2 * s) * STRIP_BYTES, g->W, g->N, g->K, n, k0, kp);
+                plow_cpu_amx_pack_b_strip(bp + (2 * s + 1) * STRIP_BYTES, g->Wu, g->N, g->K, n, k0, kp);
             }
         }
         /* A operands for every M block of this panel, staged once (norm fold / row tails). */
@@ -282,6 +320,8 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
                     pend = (ils_t){.cb = out,
                                    .cb_up = glu ? out + 1024 : NULL,
                                    .dst = g->C + (size_t)m * g->N + n,
+                                   .sc = g->ws ? g->ws + n : NULL,
+                                   .sc_up = g->us ? g->us + n : NULL,
                                    .ldc = g->N,
                                    .rows = rows,
                                    .cols = cols,
@@ -295,11 +335,11 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
     ils_drain(&pend);
 }
 
-static int usable(const PlowCpuCtx* ctx, uint32_t K) {
+int plow_amx_usable(const PlowCpuCtx* ctx, uint32_t K) {
     return ctx && ctx->scratch && ctx->scratch_bytes >= SCRATCH_NEED && (K % 32u) == 0u && K > 0;
 }
 
-static void run_tiles(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
+void plow_amx_run_tiles(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
     const uint32_t tm = (g->M + g->BM - 1u) / g->BM, tn = (g->N + g->BN - 1u) / g->BN;
     for (uint32_t lin = slice; lin < tm * tn; lin += nblk) {
         const uint32_t m0 = (lin / tn) * g->BM, n0 = (lin % tn) * g->BN;
@@ -313,7 +353,7 @@ static void run_tiles(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpu
 static void gemm_op(const PlowDevInst* in, void* const* T, PlowCpuCtx* ctx, uint32_t BM,
                     uint32_t BN, uint32_t slice, uint32_t nblk, void (*fallback)(const PlowDevInst*, uint32_t, uint32_t, void* const*, PlowCpuCtx*)) {
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2];
-    if (!usable(ctx, K)) {
+    if (!plow_amx_usable(ctx, K)) {
         fallback(in, slice, nblk, T, ctx);
         return;
     }
@@ -321,7 +361,7 @@ static void gemm_op(const PlowDevInst* in, void* const* T, PlowCpuCtx* ctx, uint
                    .A = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K,
                    .W = PLOW_CPU_TEN(in, T, 2),
                    .M = M, .N = N, .K = K, .BM = BM, .BN = BN};
-    run_tiles(&g, slice, nblk, ctx);
+    plow_amx_run_tiles(&g, slice, nblk, ctx);
 }
 
 #define X_K(name) \
@@ -336,27 +376,27 @@ X_K(x_gemm_c5)    { gemm_op(in, T, ctx, 192, 256, slice, nblk, g_gemm_c5); }
 /* t0=C t1=A t2=B t3=rms(f32) t4=gamma  i0=M i1=N i2=K */
 X_K(x_gemm_norm) {
     const uint32_t K = in->i[2];
-    if (!usable(ctx, K) || !PLOW_CPU_TEN(in, T, 3) || !PLOW_CPU_TEN(in, T, 4)) {
+    if (!plow_amx_usable(ctx, K) || !PLOW_CPU_TEN(in, T, 3) || !PLOW_CPU_TEN(in, T, 4)) {
         g_gemm_norm(in, slice, nblk, T, ctx);
         return;
     }
     gemm_args g = {.C = PLOW_CPU_TEN(in, T, 0), .A = PLOW_CPU_TEN(in, T, 1), .W = PLOW_CPU_TEN(in, T, 2),
                    .rms = PLOW_CPU_TEN(in, T, 3), .gamma = PLOW_CPU_TEN(in, T, 4),
                    .M = in->i[0], .N = in->i[1], .K = K, .BM = 256, .BN = 256};
-    run_tiles(&g, slice, nblk, ctx);
+    plow_amx_run_tiles(&g, slice, nblk, ctx);
 }
 
 /* t0=fu t1=x t2=W_gate t5=W_up  i0=M i1=N i2=K i5=act; nominal 256x128 output tile. */
 X_K(x_gemm_glu) {
     const uint32_t K = in->i[2];
-    if (!usable(ctx, K) || in->i[5] == 2u) { /* situ pairs poison in golden too */
+    if (!plow_amx_usable(ctx, K) || in->i[5] == 2u) { /* situ pairs poison in golden too */
         g_gemm_glu(in, slice, nblk, T, ctx);
         return;
     }
     gemm_args g = {.C = PLOW_CPU_TEN(in, T, 0), .A = PLOW_CPU_TEN(in, T, 1), .W = PLOW_CPU_TEN(in, T, 2),
                    .Wu = PLOW_CPU_TEN(in, T, 5), .M = in->i[0], .N = in->i[1], .K = K, .BM = 256,
                    .BN = 128, .act = in->i[5]};
-    run_tiles(&g, slice, nblk, ctx);
+    plow_amx_run_tiles(&g, slice, nblk, ctx);
 }
 
 /* Test/bench probe: `iters` 32x32xKP blocks over scratch-resident A/B, no pack, no epilogue. */
@@ -397,6 +437,7 @@ double plow_cpu_amx_debug_tdp(uint32_t iters, PlowCpuCtx* ctx) {
 }
 
 void plow_cpu_register_amx(plow_cpu_kernel_fn* tab) {
+    plow_fp8_vlut_init(&plow_amx_fp8_lut);
     tab[PLOW_DOP_GEMM] = x_gemm;
     tab[PLOW_DOP_GEMM_SMALL] = x_gemm_small;
     tab[PLOW_DOP_GEMM_MED] = x_gemm_med;

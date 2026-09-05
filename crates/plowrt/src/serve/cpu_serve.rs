@@ -1,6 +1,7 @@
-//! The CPU engine behind a served slug: one sequence slot, whole-prompt
-//! prefill, greedy on-device argmax — the same shape as the single-GPU AMD
-//! engine, so it rides the mux's [`SeqEngine`] tick unchanged.
+//! The CPU engine behind a served slug: `batch` sequence slots, whole-prompt
+//! prefill into a slot, one batched greedy decode step per tick — the same
+//! shape as the single-GPU AMD engine, so it rides the mux's [`SeqEngine`] tick
+//! unchanged. Slot `i` of the mux IS engine slot `i`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,9 +16,16 @@ pub struct CpuServe {
     eng: CpuEngine,
     stop_ids: Arc<Vec<u32>>,
     decode_rungs: Box<[u32]>,
-    /// KV rows written for slot 0; the next token embeds at this position.
-    pos: u32,
-    live: bool,
+    batch: usize,
+    /// KV rows written per slot; the next token embeds at this position.
+    pos: Vec<u32>,
+    live: Vec<bool>,
+    /// The token each slot embeds on its next step (the mux's last output).
+    next_id: Vec<u32>,
+    /// Staging for the batched step, reused across ticks.
+    pos_stage: Vec<u32>,
+    kvlen_stage: Vec<u32>,
+    last_rung: u32,
     max_ctx: usize,
 }
 
@@ -27,8 +35,12 @@ impl CpuServe {
         ids.extend(crate::asset::checkpoint::chat_stop_ids(checkpoint, &ids));
         let eng = CpuEngine::load(blob, checkpoint, opts)?;
         let max_ctx = eng.max_ctx();
+        let batch = eng.batch();
+        let decode_rungs = eng.decode_rungs().into_boxed_slice();
         tracing::info!(
             max_ctx,
+            batch,
+            rungs = ?decode_rungs,
             threads = eng.threads,
             isa = ?eng.isa,
             stop_ids = ?ids,
@@ -37,9 +49,14 @@ impl CpuServe {
         Ok(CpuServe {
             eng,
             stop_ids: Arc::new(ids),
-            decode_rungs: Box::new([1]),
-            pos: 0,
-            live: false,
+            decode_rungs,
+            batch,
+            pos: vec![0; batch],
+            live: vec![false; batch],
+            next_id: vec![0; batch],
+            pos_stage: vec![0; batch],
+            kvlen_stage: vec![1; batch],
+            last_rung: 0,
             max_ctx,
         })
     }
@@ -57,15 +74,16 @@ impl CpuServe {
     }
 
     fn check_slot(&self, slot: usize) -> Result<()> {
-        if slot != 0 {
+        if slot >= self.batch {
             return Err(RuntimeError::Rejected(format!(
-                "slot {slot} past engine batch 1"
+                "slot {slot} past engine batch {}",
+                self.batch
             )));
         }
         Ok(())
     }
 
-    /// Whole-prompt prefill into slot 0; returns the first generated token.
+    /// Whole-prompt prefill into `slot`; returns the first generated token.
     pub fn prefill(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
         self.check_slot(slot)?;
         if prompt.is_empty() {
@@ -78,36 +96,76 @@ impl CpuServe {
                 self.max_ctx
             )));
         }
-        let tok = self.eng.prefill(prompt)?;
-        self.pos = prompt.len() as u32;
-        self.live = true;
+        let tok = self.eng.prefill_slot(slot, prompt)?;
+        self.pos[slot] = prompt.len() as u32;
+        self.live[slot] = true;
+        self.next_id[slot] = tok;
         Ok(tok)
     }
 
-    /// Embed `id` at the slot's position and return the greedy next token.
+    /// Embed `id` at the slot's position and return the greedy next token
+    /// (single-slot convenience; the mux uses [`SeqEngine::step_batch`]).
     pub fn step(&mut self, slot: usize, id: u32) -> Result<u32> {
-        self.check_slot(slot)?;
-        if !self.live {
-            return Err(RuntimeError::Rejected("step on a slot with no prefill".into()));
-        }
-        if self.pos as usize >= self.max_ctx {
-            return Err(RuntimeError::Rejected(format!(
-                "position {} past max_ctx {}",
-                self.pos, self.max_ctx
-            )));
-        }
-        // The mux feeds the token it streamed; the engine left its own sample in
-        // `in.ids[0]`, which is the same id in the greedy case — write it anyway.
-        self.eng.set_token(id)?;
-        let tok = self.eng.decode_step(self.pos, self.pos + 1)?;
-        self.pos += 1;
-        Ok(tok)
+        let out = SeqEngine::step_batch(self, &[(slot, id)])?;
+        Ok(out[0].1)
     }
 
+    /// One batched step advancing `feeds`' slots. Every live slot is stepped
+    /// (its KV row at `pos` is rewritten identically if it is not fed), idle
+    /// slots carry `(pos 0, kvlen 1)`, and the rung is the narrowest covering
+    /// the highest live slot — exactly the AMD `dispatch_all` protocol.
+    fn dispatch(&mut self, feeds: &[(usize, u32)]) -> Result<Vec<(usize, u32)>> {
+        for &(s, id) in feeds {
+            self.check_slot(s)?;
+            if !self.live[s] {
+                return Err(RuntimeError::Rejected(format!(
+                    "step on slot {s} with no prefill"
+                )));
+            }
+            if self.pos[s] as usize >= self.max_ctx {
+                return Err(RuntimeError::Rejected(format!(
+                    "slot {s} position {} past max_ctx {}",
+                    self.pos[s], self.max_ctx
+                )));
+            }
+            self.next_id[s] = id;
+        }
+        for s in 0..self.batch {
+            let (p, k) = if self.live[s] {
+                (self.pos[s], self.pos[s] + 1)
+            } else {
+                (0, 1)
+            };
+            self.pos_stage[s] = p;
+            self.kvlen_stage[s] = k;
+        }
+        let rows = (0..self.batch)
+            .filter(|&s| self.live[s])
+            .map(|s| s + 1)
+            .max()
+            .unwrap_or(1);
+        let dp = self.eng.model().decode_prog_for(rows);
+        let rung = self.eng.model().blob.progs[dp].t;
+        if rung != self.last_rung {
+            tracing::info!(rung, occupied = rows, "cpu: decode ladder rung");
+            self.last_rung = rung;
+        }
+        let out = self
+            .eng
+            .decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, &self.next_id, dp)?;
+        for &(s, _) in feeds {
+            self.pos[s] += 1;
+            self.next_id[s] = out[s];
+        }
+        Ok(feeds.iter().map(|&(s, _)| (s, out[s])).collect())
+    }
+
+    /// Free a slot: the KV block is fixed and preallocated, so this only stops
+    /// the slot being fed; the next request rewrites every row it reads.
     pub fn release(&mut self, slot: usize) {
-        if slot == 0 {
-            self.live = false;
-            self.pos = 0;
+        if slot < self.batch {
+            self.live[slot] = false;
+            self.pos[slot] = 0;
         }
     }
 }
@@ -118,7 +176,7 @@ impl SeqEngine for CpuServe {
     }
 
     fn batch(&self) -> usize {
-        1
+        self.batch
     }
 
     fn release(&mut self, slot: usize) {
@@ -174,10 +232,9 @@ impl SeqEngine for CpuServe {
     }
 
     fn step_batch(&mut self, feeds: &[(usize, u32)]) -> Result<Vec<(usize, u32)>> {
-        let mut out = Vec::with_capacity(feeds.len());
-        for &(slot, id) in feeds {
-            out.push((slot, self.step(slot, id)?));
+        if feeds.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        self.dispatch(feeds)
     }
 }

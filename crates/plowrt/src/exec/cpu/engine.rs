@@ -89,6 +89,60 @@ impl Drop for HostTensor {
     }
 }
 
+/// The flat host-pointer table every kernel indexes by tensor handle, shared by
+/// the model (which owns the allocations) and the worker pool's `KernelExec`.
+///
+/// Entries change only through [`CpuModel::kv_rebase`], and only while no run is
+/// in flight — the host is the sole writer and workers read it only inside a run
+/// (the `RUN` command's Release/Acquire handoff orders the writes), so plain
+/// cells suffice; no per-packet atomic on the hot path.
+pub struct TensorTable {
+    cells: Box<[std::cell::UnsafeCell<*mut c_void>]>,
+}
+
+// SAFETY: see the type doc — written only at quiescent points by one thread.
+unsafe impl Send for TensorTable {}
+unsafe impl Sync for TensorTable {}
+
+impl TensorTable {
+    pub fn new(ptrs: Vec<*mut c_void>) -> Self {
+        TensorTable {
+            cells: ptrs.into_iter().map(std::cell::UnsafeCell::new).collect(),
+        }
+    }
+
+    /// Base of the `*mut c_void[]` kernels receive (`UnsafeCell<T>` is `repr(transparent)`).
+    #[inline]
+    pub fn as_ptr(&self) -> *const *mut c_void {
+        self.cells.as_ptr() as *const *mut c_void
+    }
+
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    #[inline]
+    pub fn get(&self, h: usize) -> *mut c_void {
+        // SAFETY: quiescent read (no concurrent `set`); see the type doc.
+        unsafe { *self.cells[h].get() }
+    }
+
+    /// # Safety
+    /// No run in flight (no worker may be reading the table).
+    pub unsafe fn set(&self, h: usize, p: *mut c_void) {
+        *self.cells[h].get() = p;
+    }
+}
+
+/// Index of the narrowest rung (ascending widths) covering `rows` sequences,
+/// or the widest when none does — the AMD ladder rule (`decode_prog_for`).
+pub fn rung_for(rungs: &[u32], rows: usize) -> usize {
+    rungs
+        .iter()
+        .position(|&t| t as usize >= rows)
+        .unwrap_or(rungs.len().saturating_sub(1))
+}
+
 /// Well-known runtime tensors the step protocol writes/reads by name.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Wellknown {
@@ -102,9 +156,18 @@ pub struct Wellknown {
 pub struct CpuModel {
     pub blob: DevBlob,
     tensors: Vec<HostTensor>,
-    /// `tensors[h].ptr` as the flat table every kernel indexes by handle.
-    ptrs: Vec<*mut c_void>,
+    /// `tensors[h].ptr` as the flat table every kernel indexes by handle; shared
+    /// with the worker pool so [`CpuModel::kv_rebase`] is visible to kernels.
+    table: Arc<TensorTable>,
     pub names: Vec<String>,
+    /// Decode sequence slots (`in.kvlen` entries). Per-slot KV blocks are
+    /// `[batch][...]` in every `kv.*` tensor; the prefill program is single-
+    /// sequence and reaches slot `s` by [`CpuModel::kv_rebase`].
+    pub batch: usize,
+    /// `(handle, per-slot bytes)` for every per-slot KV tensor (empty at batch 1).
+    kv_slot_stride: Vec<(usize, u64)>,
+    /// Slot the KV pointer table is currently rebased onto (0 = base).
+    kv_slot: usize,
     pub wk: Wellknown,
     /// Index of the first decode program (`packet::devbuild::decode_rung_lo`).
     pub dec_ix: usize,
@@ -132,7 +195,9 @@ impl CpuModel {
         // domain window itself (`exec::cpu::interp`), so the mis-dispatch the
         // flag guards against cannot happen here.
         let blob = DevBlob::parse_l2(&raw, true)?;
-        let ckpt = Checkpoint::open(checkpoint)?;
+        // PLOW_FP8_DIR (the `--fp8-dir` runtime flag) names the fp8 weight-twin directory.
+        let twin = std::env::var_os("PLOW_FP8_DIR").map(std::path::PathBuf::from);
+        let ckpt = Checkpoint::open_with_twin(checkpoint, twin.as_deref())?;
 
         // Kernels first: a missing op is a cheap, loud failure — before 20 GiB of copies.
         let mut kernels = Vec::with_capacity(blob.progs.len());
@@ -230,7 +295,33 @@ impl CpuModel {
             tensors.push(t);
             names.push(td.name.clone());
         }
-        let ptrs: Vec<*mut c_void> = tensors.iter().map(|t| t.as_ptr() as *mut c_void).collect();
+        let table = Arc::new(TensorTable::new(
+            tensors.iter().map(|t| t.as_ptr() as *mut c_void).collect(),
+        ));
+        // Mirrors `exec::amd`: the batch is the `in.kvlen` width, and every `kv.*`
+        // tensor (except block-residual scratch) is `[batch]` slot blocks.
+        let batch = wk
+            .kvlen
+            .map(|h| (tensors[h].bytes / 4).max(1))
+            .unwrap_or(1);
+        let mut kv_slot_stride = Vec::new();
+        if batch > 1 {
+            if let Some(t) = names
+                .iter()
+                .find(|n| n.starts_with("kv.") && n.contains("state"))
+            {
+                return Err(RuntimeError::Device(format!(
+                    "batch {batch} with recurrent-state tensor `{t}`: per-slot carried state \
+                     is not supported by the CPU engine yet"
+                )));
+            }
+            kv_slot_stride = names
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.starts_with("kv.") && !n.contains("blkres"))
+                .map(|(h, _)| (h, tensors[h].bytes as u64 / batch as u64))
+                .collect();
+        }
 
         let dec_ix = {
             let pt: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
@@ -259,8 +350,11 @@ impl CpuModel {
         Ok(CpuModel {
             blob,
             tensors,
-            ptrs,
+            table,
             names,
+            batch,
+            kv_slot_stride,
+            kv_slot: 0,
             wk,
             dec_ix,
             kvrow,
@@ -272,8 +366,49 @@ impl CpuModel {
 
     /// The flat host pointer table kernels index by handle.
     #[inline]
-    pub fn tensor_table(&self) -> &[*mut c_void] {
-        &self.ptrs
+    pub fn tensor_table(&self) -> &Arc<TensorTable> {
+        &self.table
+    }
+
+    /// Point every per-slot KV tensor at slot `slot`'s block, so the single-
+    /// sequence prefill program writes that slot. The decode programs derive
+    /// each sequence's block themselves (`i[6] = n_batch_kv`) and must run at
+    /// slot 0 — callers restore the base before any decode ([`CpuEngine::prefill_slot`]).
+    ///
+    /// Must be called between runs: the table is read by kernels during a run.
+    pub fn kv_rebase(&mut self, slot: usize) -> Result<()> {
+        if self.kv_slot == slot || self.kv_slot_stride.is_empty() {
+            return Ok(());
+        }
+        if slot >= self.batch {
+            return Err(RuntimeError::Device(format!(
+                "kv_rebase to slot {slot} past batch {}",
+                self.batch
+            )));
+        }
+        for &(h, stride) in &self.kv_slot_stride {
+            let base = self.tensors[h].as_ptr() as usize + (stride as usize) * slot;
+            // SAFETY: quiescent point (caller contract); `base` stays inside `tensors[h]`.
+            unsafe { self.table.set(h, base as *mut c_void) };
+        }
+        self.kv_slot = slot;
+        Ok(())
+    }
+
+    pub fn kv_slot(&self) -> usize {
+        self.kv_slot
+    }
+
+    /// Decode rungs (sequence widths), ascending, one per decode program.
+    pub fn decode_rungs(&self) -> Vec<u32> {
+        self.blob.progs[self.dec_ix..].iter().map(|p| p.t).collect()
+    }
+
+    /// The narrowest decode program covering `rows` sequence slots (the widest
+    /// when none does).
+    pub fn decode_prog_for(&self, rows: usize) -> usize {
+        let rungs = self.decode_rungs();
+        self.dec_ix + rung_for(&rungs, rows)
     }
 
     pub fn tensor(&self, h: usize) -> &HostTensor {
@@ -363,11 +498,11 @@ unsafe impl Sync for WorkerSlot {}
 /// calls it with the model's host pointer table.
 pub struct KernelExec {
     table: Vec<Option<KernelFn>>,
-    tensors: Vec<*mut c_void>,
+    tensors: Arc<TensorTable>,
     slots: Vec<WorkerSlot>,
 }
 
-// SAFETY: `tensors` are pointers into the model's allocations, which outlive
+// SAFETY: `tensors` holds pointers into the model's allocations, which outlive
 // the pool (the engine drops the pool first).
 unsafe impl Send for KernelExec {}
 unsafe impl Sync for KernelExec {}
@@ -398,7 +533,7 @@ impl KernelExec {
         }
         Ok(KernelExec {
             table,
-            tensors: model.ptrs.clone(),
+            tensors: Arc::clone(&model.table),
             slots,
         })
     }
@@ -659,32 +794,114 @@ impl CpuEngine {
         Ok(self.model.read_u32(t_ids))
     }
 
-    /// One decode step: the token in `in.ids[0]` (the previous sample) is
-    /// embedded at `pos`, attends over `kvlen` rows, and the greedy next token
-    /// is written back to `in.ids[0]` and returned.
-    pub fn decode_step(&mut self, pos: u32, kvlen: u32) -> Result<u32> {
-        if pos as usize >= self.max_ctx {
+    /// Decode sequence slots.
+    pub fn batch(&self) -> usize {
+        self.model.batch
+    }
+
+    pub fn decode_rungs(&self) -> Vec<u32> {
+        self.model.decode_rungs()
+    }
+
+    /// Prefill `prompt` into slot `slot`'s KV block (the `exec::amd` invariant:
+    /// rebase, run the single-sequence prefill, restore the base — even on
+    /// failure, since a table left on slot `s` would fold every decode into it).
+    pub fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+        self.model.kv_rebase(slot)?;
+        let r = self.prefill(prompt);
+        self.model.kv_rebase(0)?;
+        r
+    }
+
+    /// One decode step for `pos.len()` sequence slots on the narrowest rung
+    /// covering the highest slot the caller marks live. `pos`/`kvlen`/`ids` are
+    /// per slot and may be ragged; idle slots carry `(0, 1, any id)` like the AMD
+    /// path. Returns every slot's sampled token (slots past the rung's rows read 0).
+    pub fn decode_step_batched(&mut self, pos: &[u32], kvlen: &[u32], ids: &[u32]) -> Result<Vec<u32>> {
+        let rows = pos.len();
+        let dp = self.model.decode_prog_for(rows);
+        self.decode_step_batched_at(pos, kvlen, ids, dp)
+    }
+
+    /// [`Self::decode_step_batched`] on a named decode program.
+    pub fn decode_step_batched_at(
+        &mut self,
+        pos: &[u32],
+        kvlen: &[u32],
+        ids: &[u32],
+        dp: usize,
+    ) -> Result<Vec<u32>> {
+        let b = self.model.batch;
+        if pos.len() != b || kvlen.len() != b || ids.len() != b {
             return Err(RuntimeError::Device(format!(
-                "position {pos} past max_ctx {}",
+                "decode_step_batched wants {b} pos/kvlen/ids, got {}/{}/{}",
+                pos.len(),
+                kvlen.len(),
+                ids.len()
+            )));
+        }
+        if let Some(&p) = pos.iter().find(|&&p| p as usize >= self.max_ctx) {
+            return Err(RuntimeError::Device(format!(
+                "position {p} past max_ctx {}",
                 self.max_ctx
             )));
         }
-        let dp = self.model.dec_ix;
+        if self.model.kv_slot != 0 {
+            return Err(RuntimeError::Device(format!(
+                "decode with the KV table rebased onto slot {} — prefill_slot must restore it",
+                self.model.kv_slot
+            )));
+        }
+        if dp < self.model.dec_ix || dp >= self.model.blob.progs.len() {
+            return Err(RuntimeError::Device(format!("program {dp} is not a decode rung")));
+        }
         let (t_ids, t_pos, t_kvlen) = (
             self.need(self.model.wk.ids, "in.ids")?,
             self.need(self.model.wk.pos, "in.pos")?,
             self.need(self.model.wk.kvlen, "in.kvlen")?,
         );
-        {
+        // Only a batch-1 program takes the KV write row from the host-patched
+        // `i[3]`; laddered / batched blobs arm `i[6] = n_batch_kv` and read `pos[t]`.
+        if b == 1 {
             let lp = Arc::make_mut(&mut self.progs[dp]);
             for &i in &self.model.kvrow {
-                lp.insts[i as usize].i[3] = pos;
+                lp.insts[i as usize].i[3] = pos[0];
             }
         }
-        self.model.write_u32(t_pos, pos);
-        self.model.write_u32(t_kvlen, kvlen);
+        // SAFETY: no run in flight (host-only window between steps).
+        unsafe {
+            let s_ids = self.model.tensor(t_ids).as_mut_slice();
+            let s_pos = self.model.tensor(t_pos).as_mut_slice();
+            let s_kv = self.model.tensor(t_kvlen).as_mut_slice();
+            for i in 0..b {
+                s_ids[i * 4..i * 4 + 4].copy_from_slice(&ids[i].to_le_bytes());
+                s_pos[i * 4..i * 4 + 4].copy_from_slice(&pos[i].to_le_bytes());
+                s_kv[i * 4..i * 4 + 4].copy_from_slice(&kvlen[i].to_le_bytes());
+            }
+        }
         self.run_prog(dp)?;
-        Ok(self.model.read_u32(t_ids))
+        let rows = (self.model.blob.progs[dp].t as usize).min(b);
+        let mut out = self.read_ids(rows);
+        out.resize(b, 0);
+        Ok(out)
+    }
+
+    /// One decode step of slot 0: the token in `in.ids[0]` (the previous sample)
+    /// is embedded at `pos`, attends over `kvlen` rows, and the greedy next token
+    /// is written back to `in.ids[0]` and returned. Other slots idle.
+    pub fn decode_step(&mut self, pos: u32, kvlen: u32) -> Result<u32> {
+        let b = self.model.batch;
+        let t_ids = self.need(self.model.wk.ids, "in.ids")?;
+        let mut ids = self.read_ids(b);
+        ids.resize(b, 0);
+        let mut ps = vec![0u32; b];
+        let mut ks = vec![1u32; b];
+        ps[0] = pos;
+        ks[0] = kvlen;
+        let dp = self.model.decode_prog_for(1);
+        let out = self.decode_step_batched_at(&ps, &ks, &ids, dp)?;
+        debug_assert_eq!(out[0], self.model.read_u32(t_ids));
+        Ok(out[0])
     }
 
     /// Seed `in.ids[0]` (e.g. to decode from a given token without a prefill).
@@ -692,5 +909,18 @@ impl CpuEngine {
         let t_ids = self.need(self.model.wk.ids, "in.ids")?;
         self.model.write_u32(t_ids, id);
         Ok(())
+    }
+
+    /// The first `n` entries of `in.ids` (the device-sampled tokens per slot).
+    pub fn read_ids(&self, n: usize) -> Vec<u32> {
+        let Some(h) = self.model.wk.ids else {
+            return vec![0; n];
+        };
+        // SAFETY: quiescent point.
+        let s = unsafe { self.model.tensor(h).as_slice() };
+        s.chunks_exact(4)
+            .take(n)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 }

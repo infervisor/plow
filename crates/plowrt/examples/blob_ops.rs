@@ -24,12 +24,17 @@ fn main() {
             e.1 += d.blocks as usize;
             *union.entry(d.op).or_default() += 1;
         }
+        let fine = p.stream.iter().filter(|e| e.flags & packet::dev::SE_FINE != 0).count();
+        let segs = p.stream.iter().map(|e| e.seg).max().map_or(0, |m| m as usize + 1);
         println!(
-            "prog[{pi}] T={} insts={} stream={} gq={}",
+            "prog[{pi}] T={} insts={} stream={} gq={} fine_entries={} segs={} counters={}",
             p.t,
             p.insts.len(),
             p.stream.len(),
-            p.gq_stream.len()
+            p.gq_stream.len(),
+            fine,
+            segs,
+            p.n_counter
         );
         for (op, (n, slices)) in &hist {
             println!("  {:>4} {:<32} insts={:<5} slices={}", op, name(*op), n, slices);
