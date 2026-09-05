@@ -67,6 +67,14 @@ every individual request had the specified input/output lengths.
 Raw: campaign `gemma12b-1k-32k-r1/in8192_c{1,4,16}.json` under the manifest directory.
 These are individual vLLM reference cells, not an aggregate or a Plow comparison.
 
+The complete first Gemma12 grid (1K/4K/8K/16K/32K × C1/4/16) subsequently finished:
+480/480 requests, zero failures,245760 output tokens, with every input/output
+length checked. [All15 cells](vllm-028-h100-realworld-gemma12-r1.csv) retain separate
+mean/median metrics. At32K/C16, TTFT is9671.675ms, TPOT46.535611ms, p99ITL490.444421ms
+and output243.538065tok/s. The larger concurrent workloads expose queueing and
+prefill interference that the128-token screen does not describe. Qwen's first
+reference group is now running; repeats and the other groups remain pending.
+
 ## Fast experiment preparation
 
 `scripts/tune_decode_sweep.sh --block L --block-bucket ROWS --block-run PATH` now
@@ -106,3 +114,60 @@ Raw evidence:
 `/tmp/plow-model-support-checks/qwen-fp8-m128/m1024-candidate.json`.
 Frozen sources, builds, SASS, resources and the implemented/missing CUTLASS technique
 table are in the same directory's `HANDOFF.md` and `provenance.json`.
+
+## Larger-workload candidates prepared after the first cells
+
+The existing uniform FP8 TMA kernel has frozen stage2/stage3 pairs for M1024,
+4096 and8192. Both primitives use137 registers without spills. The full stage2
+prefill interpreter reports1432 stack bytes,2320 spill-store bytes and5792 spill-load
+bytes, versus1856/4248/10600 for stage3. Its advertised shared arena remains103424
+bytes. Stage2 also excludes an unused generic TMA GLU arm through an existing
+capacity guard, so the whole-object resource change is not solely the loop's
+code generation. Qwen emits a separate GLU. No GPU result or occupancy gain is
+claimed. Recipes and six existing-comparator commands:
+`/tmp/plow-model-support-checks/qwen-fp8-tma-stages/`.
+
+A separate default-off compiler experiment isolates mapped FP8 GEMMs into native
+interpreter segments. `PLOW_QWEN_FP8_PF_ISOLATE=1` changes the frontend's segmentation
+while preserving instructions, operands, waits, successors and decode. Kernel-role
+selection belongs in the compiled packet's generic `segment_roles.json` descriptor;
+the runtime executes that descriptor and validates capabilities and cooperative
+residency. The initially proposed model-specific runtime option was removed before
+consolidation. `PLOW_FP8_PF_GEMM_ROLE=1` is a compiler experiment switch.
+Quantization, BF16 head, attention, norms and the existing GDN path stay unchanged.
+The specialized object uses180 registers and zero stack/spills; the broad object
+uses255 registers with spills. The arithmetic headers are identical.
+
+The cost is substantial: full-model native launches increase from97 to929 per
+chunk, with496 GEMMs routed and48 GDN calls unchanged. First compare the same
+isolated packet with role routing off/on; then compare against the original
+97-launch packet. Neither spill removal nor CPU ordering tests establish a speed
+gain. Source/build/SASS evidence:
+`/tmp/plow-model-support-checks/fp8-prefill-gemm-role/`. The role advertises generic
+ABI `plow_fp8_gemm_tma128_abi=1` and compiles without a Qwen flag. Its four kernel
+text sections are byte-identical to the earlier role object.
+
+### Existing Gemma chunk-size tradeoff
+
+Ten full-model packets were emitted with the existing `PLOW_MAX_CHUNK` setting,
+holding the other compiler flags fixed. Active Lean ordering checks passed for
+every program. The1024 setting gives a2048-row sliding KV ring;4096 gives8192.
+Both satisfy `ring >= window + chunk - 1`. Smaller chunks require more prefill
+launches, so this is a memory/performance experiment, not an assumed improvement.
+
+| Model | Context capacity | Resident batch | Total declared GiB, chunk4096 | Chunk1024 |
+|---|---:|---:|---:|---:|
+|Gemma12|65536|1|26.681|24.259|
+|Gemma12|65536|16|79.188|48.641|
+|Gemma31|65536|1|69.962|64.328|
+|Gemma31|65536|2|81.212|70.891|
+|Gemma31|262144|1|85.525|79.892|
+
+These totals sum the actual packet tensor table, including weights/KV/other
+buffers. They exclude allocator alignment, programs, counters, graphs and workspace;
+they are not measured high-water usage or successful startup. The device reports
+81559MiB (79.647GiB), so even the smaller Gemma31/262144 packet exceeds capacity
+before overhead. The smaller-ring assets materially change the capacity experiment
+for Gemma12/B16 and Gemma31/B2. GPU startup, chunk-boundary correctness and serving
+remain pending. Exact packets, commands, hashes, tensor disassembly and totals:
+`/tmp/plow-model-support-checks/gemma-realworld-chunk-capacity/`.

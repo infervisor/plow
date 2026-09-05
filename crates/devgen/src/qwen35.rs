@@ -1,6 +1,54 @@
 use super::*;
 use std::path::Path;
 
+fn fp8_segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
+    let role = emit_config::active().fp8_pf_gemm_role;
+    let isolated = emit_config::active().fp8_pf_isolate;
+    if !role && !isolated {
+        return None;
+    }
+    let mut programs = Vec::new();
+    for (index, p) in m.progs.iter().enumerate().take(m.progs.len() - 1) {
+        let mut roles = vec![0_u8; p.gq_seg_ofs.len() - 1];
+        let mut found = false;
+        for (ix, d) in p.insts.iter().enumerate() {
+            if d.op != DevOp::GemmFp8 as u16 {
+                continue;
+            }
+            assert!(
+                d.i[6] != 0 && d.i[7] != 0,
+                "FP8 role needs mapped prefill GEMMs"
+            );
+            let seg = p.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg as usize;
+            assert!(p
+                .stream
+                .iter()
+                .all(|e| (e.inst as usize == ix) == (e.seg as usize == seg)));
+            roles[seg] = u8::from(role);
+            found = true;
+        }
+        assert!(found, "FP8 role metadata requires FP8 prefill programs");
+        programs.push(serde_json::json!({"index":index,"roles":roles}));
+    }
+    assert!(
+        !programs.is_empty(),
+        "FP8 prefill roles require prefill programs"
+    );
+    let objects = if role {
+        serde_json::json!({"1":{"abi":"fp8_gemm_tma128_v1","file":"interp_sm90a_pfgemm_fp8.cubin"}})
+    } else {
+        serde_json::json!({})
+    };
+    Some(packet::devbuild::SectionData {
+        kind: packet::devbuild::SECT_METADATA,
+        name: "segment_roles.json".into(),
+        data: serde_json::to_vec(
+            &serde_json::json!({"version":1,"objects":objects,"programs":programs}),
+        )
+        .unwrap(),
+    })
+}
+
 struct Config {
     hidden: u32,
     inter: u32,
@@ -186,18 +234,24 @@ impl Emitter<'_> {
                 let g = GenTensor::tmap_e4m3(w, n, k, 128);
                 self.b
                     .tensor_gen(&format!("tmap.fp8.pf.w{w}"), g.byte_len(), g)
-            } else if std::env::var("PLOW_QWEN_FP8_M1_TMA").ok().as_deref() == Some("1") {
+            } else if emit_config::active().qwen_fp8_m1_tma {
                 let g = GenTensor::tmap_e4m3(w, n, k, 64);
                 self.b.tensor_gen(&format!("tmap.fp8.{w}"), g.byte_len(), g)
             } else {
                 0
             };
-            return self.b.emit(DevOp::GemmFp8, self.b.all(), &[dq], |d| {
+            let done = self.b.emit(DevOp::GemmFp8, self.b.all(), &[dq], |d| {
                 d.t[..5].copy_from_slice(&[out, xq, w, ascale, scale]);
                 d.i[..3].copy_from_slice(&[rows, n, k]);
                 d.i[6] = input_map;
                 d.i[7] = weight_map;
             });
+            if self.prefill
+                && (emit_config::active().fp8_pf_isolate || emit_config::active().fp8_pf_gemm_role)
+            {
+                self.b.isolate(done);
+            }
+            return done;
         }
         let op = if self.prefill {
             assert!(
@@ -589,7 +643,7 @@ fn model_prefill(
     assert!(!buckets.is_empty());
     assert!(
         !fp8 || (emit_config::active().w8a8
-            && std::env::var("PLOW_QWEN_W8A8_PREFILL").ok().as_deref() == Some("1")
+            && emit_config::active().qwen_w8a8_prefill
             && decode_slots == 1
             && buckets
                 .iter()
@@ -667,15 +721,14 @@ fn phase(
     let [gc, gs] = GenTensor::rope_pair(ctx, c.rotary, c.theta, 1.0, RopeScale::None);
     let cos = b.tensor_gen("in.cos_full", gc.byte_len(), gc);
     let sin = b.tensor_gen("in.sin_full", gs.byte_len(), gs);
-    let decode_lt = !prefill && std::env::var("PLOW_QWEN_DECODE_LT").ok().as_deref() == Some("1");
-    let fuse_ab = !prefill && std::env::var("PLOW_QWEN_FUSE_AB").ok().as_deref() == Some("1");
-    let fuse_mlp = !prefill && std::env::var("PLOW_QWEN_FUSE_MLP").ok().as_deref() == Some("1");
+    let decode_lt = !prefill && emit_config::active().qwen_decode_lt;
+    let fuse_ab = !prefill && emit_config::active().qwen_fuse_ab;
+    let fuse_mlp = !prefill && emit_config::active().qwen_fuse_mlp;
     assert!(
         !fuse_mlp || (!fp8 && !decode_lt),
         "Qwen MLP projection fusion requires native BF16 decode"
     );
-    let projection_dag =
-        !prefill && std::env::var("PLOW_QWEN_PROJECTION_DAG").ok().as_deref() == Some("1");
+    let projection_dag = !prefill && emit_config::active().qwen_projection_dag;
     assert!(
         !projection_dag || (!fp8 && !decode_lt),
         "Qwen projection DAG requires native BF16 decode"
@@ -685,9 +738,7 @@ fn phase(
         "Qwen a/b fusion requires native BF16 decode"
     );
     let ab_blocks = if fuse_ab {
-        std::env::var("PLOW_QWEN_AB_BLOCKS")
-            .map(|v| v.parse::<u32>().expect("Qwen a/b block count"))
-            .unwrap_or(n_cu)
+        emit_config::active().qwen_ab_blocks.unwrap_or(n_cu)
     } else {
         n_cu
     };
@@ -697,10 +748,10 @@ fn phase(
     );
     let w8a8 = emit_config::active().w8a8;
     assert!(
-        std::env::var("PLOW_QWEN_FP8_M1_TMA").ok().as_deref() != Some("1") || w8a8,
+        !emit_config::active().qwen_fp8_m1_tma || w8a8,
         "Qwen FP8 M1 TMA maps require W8A8"
     );
-    let share_quant = std::env::var("PLOW_QWEN_SHARE_QUANT").ok().as_deref() == Some("1");
+    let share_quant = emit_config::active().qwen_share_quant;
     assert!(!share_quant || w8a8, "Qwen quant sharing requires W8A8");
     assert!(
         !w8a8
@@ -709,7 +760,7 @@ fn phase(
                 && ((!prefill && batch == 1)
                     || (prefill
                         && matches!(batch, 128 | 1024 | 4096 | 8192)
-                        && std::env::var("PLOW_QWEN_W8A8_PREFILL").ok().as_deref() == Some("1")))),
+                        && emit_config::active().qwen_w8a8_prefill))),
         "Qwen W8A8 requires B1 decode or explicit supported prefill buckets"
     );
     assert!(
@@ -897,7 +948,7 @@ pub(super) fn run(
     }
     let target = packet::devbuild::gpu_fingerprint(gpu);
     let _target = EmitAmdGuard::set(false);
-    let mut m = match std::env::var("PLOW_QWEN_PREFILL").ok().as_deref() {
+    let mut m = match emit_config::active().qwen_prefill.as_deref() {
         None | Some("0") => model(&c, ctx, n_cu, target, fp8, batch),
         Some(value) => {
             let mut buckets: Vec<u32> = if value == "1" {
@@ -942,6 +993,10 @@ pub(super) fn run(
     let lean = apply_verify_gate(&m, verify);
     let man = manifest::build(&m, arch, &lean);
     let out = Path::new(out);
+    let mut sections = Vec::new();
+    if let Some(section) = fp8_segment_roles(&m) {
+        sections.push(section);
+    }
     let bytes = if let Some(layer) = c.block {
         use plow_asset::*;
         let full = c.layers[layer];
@@ -999,7 +1054,10 @@ pub(super) fn run(
         };
         let section =
             crate::block::write_block_descriptor(out.to_str().expect("output path"), &desc);
-        m.to_blob_v6(&[section])
+        sections.push(section);
+        m.to_blob_v6(&sections)
+    } else if !sections.is_empty() {
+        m.to_blob_v6(&sections)
     } else {
         m.to_blob()
     };
@@ -1042,6 +1100,11 @@ mod tests {
         let c = Config::parse(&fixture());
         let plain_pf = model_prefill(&c, 8192, 132, 0, &[128], 1, false);
         std::env::set_var("PLOW_QWEN_FUSE_MLP", "1");
+        {
+            let mut config = emit_config::active().clone();
+            config.qwen_fuse_mlp = true;
+            emit_config::install(config);
+        }
         let fused_pf = model_prefill(&c, 8192, 132, 0, &[128], 1, false);
         assert_eq!(plain_pf.progs[0].insts, fused_pf.progs[0].insts);
         let mut c = c;
@@ -1049,10 +1112,30 @@ mod tests {
         for batch in [1, 4] {
             for other in ["0", "1"] {
                 std::env::set_var("PLOW_QWEN_FUSE_AB", other);
+                {
+                    let mut config = emit_config::active().clone();
+                    config.qwen_fuse_ab = other == "1";
+                    emit_config::install(config);
+                }
                 std::env::set_var("PLOW_QWEN_PROJECTION_DAG", other);
+                {
+                    let mut config = emit_config::active().clone();
+                    config.qwen_projection_dag = other == "1";
+                    emit_config::install(config);
+                }
                 std::env::set_var("PLOW_QWEN_FUSE_MLP", "0");
+                {
+                    let mut config = emit_config::active().clone();
+                    config.qwen_fuse_mlp = false;
+                    emit_config::install(config);
+                }
                 let plain = model(&c, 8192, 132, 0, false, batch);
                 std::env::set_var("PLOW_QWEN_FUSE_MLP", "1");
+                {
+                    let mut config = emit_config::active().clone();
+                    config.qwen_fuse_mlp = true;
+                    emit_config::install(config);
+                }
                 let fused = model(&c, 8192, 132, 0, false, batch);
                 let g = &fused.progs[0];
                 assert_eq!(plain.progs[0].insts.len(), g.insts.len() + 64);
@@ -1190,6 +1273,11 @@ mod tests {
         for batch in [1, 4] {
             for fuse in ["0", "1"] {
                 std::env::set_var("PLOW_QWEN_FUSE_AB", fuse);
+                {
+                    let mut config = emit_config::active().clone();
+                    config.qwen_fuse_ab = fuse == "1";
+                    emit_config::install(config);
+                }
                 let m = model(&c, 8192, 132, 0, false, batch);
                 check_operand_dependencies(&m.progs[0]);
             }
@@ -1215,6 +1303,11 @@ mod tests {
         c.layers = (0..64).map(|i| i % 4 == 3).collect();
         let plain = model(&c, 8192, 132, 0, true, 1);
         std::env::set_var("PLOW_QWEN_SHARE_QUANT", "1");
+        {
+            let mut config = emit_config::active().clone();
+            config.qwen_share_quant = true;
+            emit_config::install(config);
+        }
         let shared = model(&c, 8192, 132, 0, true, 1);
         let count = |m: &Model| {
             m.progs[0]
@@ -1267,8 +1360,18 @@ mod tests {
         let c = Config::parse(&fixture());
         for batch in [1, 4] {
             std::env::set_var("PLOW_QWEN_FUSE_AB", "0");
+            {
+                let mut config = emit_config::active().clone();
+                config.qwen_fuse_ab = false;
+                emit_config::install(config);
+            }
             let plain = model_prefill(&c, 8192, 132, 0, &[128], batch, false);
             std::env::set_var("PLOW_QWEN_FUSE_AB", "1");
+            {
+                let mut config = emit_config::active().clone();
+                config.qwen_fuse_ab = true;
+                emit_config::install(config);
+            }
             let fused = model_prefill(&c, 8192, 132, 0, &[128], batch, false);
             assert_eq!(plain.progs[0].insts, fused.progs[0].insts);
             assert_eq!(plain.progs[1].insts.len(), fused.progs[1].insts.len() + 3);
@@ -1562,8 +1665,18 @@ mod tests {
         let c = Config::parse(&fixture());
         for batch in [1, 4] {
             std::env::set_var("PLOW_QWEN_DECODE_LT", "0");
+            {
+                let mut config = emit_config::active().clone();
+                config.qwen_decode_lt = false;
+                emit_config::install(config);
+            }
             let plain = model_prefill(&c, 8192, 132, 0, &[128], batch, false);
             std::env::set_var("PLOW_QWEN_DECODE_LT", "1");
+            {
+                let mut config = emit_config::active().clone();
+                config.qwen_decode_lt = true;
+                emit_config::install(config);
+            }
             let isolated = model_prefill(&c, 8192, 132, 0, &[128], batch, false);
             assert_eq!(plain.progs[0].gq_seg_ofs, isolated.progs[0].gq_seg_ofs);
             assert_eq!(plain.progs[0].waits, isolated.progs[0].waits);
@@ -1721,6 +1834,102 @@ mod tests {
         Config::parse(&v);
     }
     #[test]
+    fn w8a8_prefill_isolation_preserves_arithmetic_and_dependencies() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_QWEN_W8A8_PREFILL", "1"),
+            ("PLOW_QWEN_SHARE_QUANT", "1"),
+        ]);
+        let original = emit_config::active().clone();
+        let mut cfg = original.clone();
+        cfg.fp8 = true;
+        cfg.w8a8 = true;
+        cfg.fp8_pf_isolate = false;
+        cfg.fp8_pf_gemm_role = false;
+        emit_config::install(cfg.clone());
+        let mut v = fixture();
+        v["text_config"]["num_hidden_layers"] = serde_json::json!(64);
+        v["text_config"]["layer_types"] = serde_json::json!((0..64)
+            .map(|l| if l % 4 == 3 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            })
+            .collect::<Vec<_>>());
+        let c = Config::parse(&v);
+        let plain = model_prefill(&c, 32768, 132, 0, &[128, 1024, 4096, 8192], 1, true);
+        cfg.fp8_pf_isolate = true;
+        emit_config::install(cfg.clone());
+        let isolated = model_prefill(&c, 32768, 132, 0, &[128, 1024, 4096, 8192], 1, true);
+        let control = fp8_segment_roles(&isolated).unwrap();
+        let control: Value = serde_json::from_slice(&control.data).unwrap();
+        assert!(control["objects"].as_object().unwrap().is_empty());
+        assert!(control["programs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["roles"].as_array().unwrap().iter().all(|r| r == 0)));
+        cfg.fp8_pf_gemm_role = true;
+        emit_config::install(cfg.clone());
+        let candidate = fp8_segment_roles(&isolated).unwrap();
+        let candidate: Value = serde_json::from_slice(&candidate.data).unwrap();
+        assert_eq!(candidate["objects"]["1"]["abi"], "fp8_gemm_tma128_v1");
+        assert!(candidate["programs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["roles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| *r == 1)
+                .count()
+                == 496));
+        cfg.fp8_pf_gemm_role = false;
+        cfg.fp8_pf_isolate = false;
+        emit_config::install(cfg);
+        assert!(fp8_segment_roles(&plain).is_none());
+        emit_config::install(original);
+        for (a, b) in plain.progs.iter().zip(&isolated.progs) {
+            assert_eq!(a.insts, b.insts);
+            assert_eq!(a.waits, b.waits);
+            assert_eq!(a.succs, b.succs);
+            assert_eq!(a.n_counter, b.n_counter);
+            check_operand_dependencies(b);
+        }
+        assert_eq!(
+            plain.progs.last().unwrap().gq_seg_ofs,
+            isolated.progs.last().unwrap().gq_seg_ofs
+        );
+        for (a, b) in plain.progs[..4].iter().zip(&isolated.progs[..4]) {
+            let mut count = 0;
+            for (ix, d) in b.insts.iter().enumerate() {
+                if d.op != DevOp::GemmFp8 as u16 {
+                    continue;
+                }
+                let seg = b.stream.iter().find(|e| e.inst as usize == ix).unwrap().seg;
+                assert!(b
+                    .stream
+                    .iter()
+                    .all(|e| (e.inst as usize == ix) == (e.seg == seg)));
+                count += 1;
+            }
+            eprintln!(
+                "FP8 PF rows={} GEMMs={} launches {} -> {}",
+                b.insts
+                    .iter()
+                    .find(|d| d.op == DevOp::GemmFp8 as u16)
+                    .unwrap()
+                    .i[0],
+                count,
+                a.gq_seg_ofs.len() - 1,
+                b.gq_seg_ofs.len() - 1
+            );
+        }
+    }
+
+    #[test]
     fn w8a8_prefill_bucket_maps_keep_global_rows_and_maximum_capacity() {
         let _env = crate::test_env::env_guard();
         let _target = EmitAmdGuard::set(false);
@@ -1791,7 +2000,7 @@ mod tests {
             let mut cfg = original.clone();
             cfg.fp8 = fp8;
             cfg.w8a8 = fp8;
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_QWEN_W8A8_PREFILL", "1")]);
+            cfg.qwen_w8a8_prefill = true;
             emit_config::install(cfg);
             for layer in [0, 3] {
                 let mut c = Config::parse(&fixture());
@@ -1876,10 +2085,25 @@ mod tests {
         emit_config::install(cfg);
         unsafe {
             std::env::set_var("PLOW_QWEN_W8A8_PREFILL", "1");
+            {
+                let mut config = emit_config::active().clone();
+                config.qwen_w8a8_prefill = true;
+                emit_config::install(config);
+            }
             std::env::set_var("PLOW_QWEN_FP8_M1_TMA", "1");
+            {
+                let mut config = emit_config::active().clone();
+                config.qwen_fp8_m1_tma = true;
+                emit_config::install(config);
+            }
         }
         for shared in ["0", "1"] {
             unsafe { std::env::set_var("PLOW_QWEN_SHARE_QUANT", shared) };
+            {
+                let mut config = emit_config::active().clone();
+                config.qwen_share_quant = shared == "1";
+                emit_config::install(config);
+            }
             let m = model_prefill(&c, 8192, 132, 0, &[128], 1, true);
             assert_eq!(m.prog_t, [128, 1]);
             for (g, rows) in m.progs.iter().zip([128, 1]) {
@@ -1964,6 +2188,11 @@ mod tests {
             std::panic::catch_unwind(|| model_prefill(&c, 8192, 132, 0, &[128], 4, true)).is_err()
         );
         unsafe { std::env::remove_var("PLOW_QWEN_W8A8_PREFILL") };
+        {
+            let mut config = emit_config::active().clone();
+            config.qwen_w8a8_prefill = false;
+            emit_config::install(config);
+        }
         assert!(
             std::panic::catch_unwind(|| model_prefill(&c, 8192, 132, 0, &[128], 1, true)).is_err()
         );
@@ -1981,8 +2210,18 @@ mod tests {
         let c = Config::parse(&fixture());
         let plain = model(&c, 8192, 132, 0, true, 1);
         unsafe { std::env::set_var("PLOW_QWEN_FP8_M1_TMA", "1") };
+        {
+            let mut config = emit_config::active().clone();
+            config.qwen_fp8_m1_tma = true;
+            emit_config::install(config);
+        }
         let mapped = model(&c, 8192, 132, 0, true, 1);
         unsafe { std::env::remove_var("PLOW_QWEN_FP8_M1_TMA") };
+        {
+            let mut config = emit_config::active().clone();
+            config.qwen_fp8_m1_tma = false;
+            emit_config::install(config);
+        }
         emit_config::install(original);
         let mut count = 0;
         for (a, b) in plain.progs[0].insts.iter().zip(&mapped.progs[0].insts) {

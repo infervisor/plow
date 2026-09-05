@@ -2155,6 +2155,11 @@ extern "C" __device__ unsigned plow_qwen_w8a8_prefill_arm = 1;
 #else
 extern "C" __device__ unsigned plow_qwen_w8a8_prefill_arm = 0;
 #endif
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && PLOW_NV_SEG_GEMM && PLOW_NV_GEMM_ONLY && PLOW_NV_SEG_OCC1 && PLOW_NV_MINBLK == 1 && PLOW_NV_THREADS == 256 && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_SKELETON && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE && PLOW_NV_TMA_GEMM && PLOW_NV_W8A8 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_FP8_PF_SCALE_WFIRST && !PGM90_FP8_PROMOTE && PGM90_TMA_STAGES == 3 && !PGM90_UNI_BN256 && !defined(PLOW_NV_SEG_WS) && !PLOW_NV_SEG_WS_ENTRY && !PLOW_NV_SEG_WS384 && !PLOW_NV_SEG_SMALL_BF16 && !PLOW_NV_SEG_M64N64 && !PLOW_NV_SEG_M64N128
+extern "C" __device__ unsigned plow_fp8_gemm_tma128_abi = 1;
+#else
+extern "C" __device__ unsigned plow_fp8_gemm_tma128_abi = 0;
+#endif
 #if PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
 extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 1;
 #else

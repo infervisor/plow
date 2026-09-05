@@ -33,6 +33,8 @@ pub enum BridgeError {
     },
     #[error("node {node}: op `{op}` is not supported in a transformer block")]
     Unsupported { node: usize, op: &'static str },
+    #[error("node {node}: attention batch {batch} is unsupported; tiling requires batch 1")]
+    AttentionBatch { node: usize, batch: i64 },
     #[error("fused node {node}: op `{op}` is not supported in a transformer block")]
     UnsupportedFused { node: usize, op: String },
     #[error("fused leaf `{name}` has no static-shaped tensor in the source graph")]
@@ -331,16 +333,34 @@ fn concat_spec(in0: &[i64], axis: i32, out: &[i64], elem: u64) -> LayoutSpec {
     }
 }
 
+fn attention_seq(dims: &[i64], node: usize, op: &str) -> Result<i64, BridgeError> {
+    match dims {
+        [seq, _] | [seq, _, _] | [1, seq, _, _] => Ok(*seq),
+        [batch, _, _, _] => Err(BridgeError::AttentionBatch {
+            node,
+            batch: *batch,
+        }),
+        _ => Err(BridgeError::Rank {
+            node,
+            op: op.into(),
+            rank: dims.len(),
+            expected: "[seq, features], [seq, heads, dim], or [1, seq, heads, dim]",
+        }),
+    }
+}
+
 fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
     let ni = id.0 as usize;
     let name = node.op.name();
     let dims = |idx: usize| static_dims(g, node.inputs[idx], ni, name);
     let out = static_dims(g, node.output, ni, name)?;
     let mut input_bytes = [0u64; 8];
+    let mut input_row_aligned = [false; 8];
     for (idx, tensor) in node.inputs.iter().take(input_bytes.len()).enumerate() {
         let shape = static_dims(g, *tensor, ni, name)?;
         let elems = shape.iter().copied().product::<i64>().max(0) as u64;
         input_bytes[idx] = g.tensor(*tensor).dtype.tile_bytes(elems);
+        input_row_aligned[idx] = shape == out;
     }
     const ELEM: u64 = 2; // bf16 operands, matching the cost model.
 
@@ -362,6 +382,7 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             operands,
             args,
             input_bytes,
+            input_row_aligned,
         })
     };
 
@@ -443,15 +464,14 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             sliding_window,
             ..
         } => {
-            // Convention: q/k are token-major ([seq, .., head_dim]), so the
-            // token axis is tensor axis 0.
-            let q = dims(0)?;
-            let k = dims(1)?;
+            let seq_q = attention_seq(&dims(0)?, ni, name)?;
+            let seq_kv = attention_seq(&dims(1)?, ni, name)?;
+            attention_seq(&dims(2)?, ni, name)?;
             OpKind::Flash(AttnShape {
                 heads: *num_heads as i64,
                 kv_heads: *num_kv_heads as i64,
-                seq_q: *q.first().unwrap_or(&1),
-                seq_kv: *k.first().unwrap_or(&1),
+                seq_q,
+                seq_kv,
                 head_dim: *head_dim as i64,
                 causal: *causal,
                 sliding_window: sliding_window.unwrap_or(0),
@@ -1014,21 +1034,14 @@ fn fused_op_kind(fused: &FusedGraph, shapes: &[Vec<i64>], i: usize) -> Result<Op
                     })
                 }
             };
-            // Convention: q/k are token-major ([seq, ..., head_dim]); anything
-            // deeper than rank 3 would misread the token axis — error instead.
-            if q.len() > 3 || k.len() > 3 {
-                return Err(BridgeError::Rank {
-                    node: i,
-                    op: n.op.clone(),
-                    rank: q.len().max(k.len()),
-                    expected: "token-major q/k of rank <= 3 ([seq, heads, head_dim])",
-                });
-            }
+            let seq_q = attention_seq(q, i, &n.op)?;
+            let seq_kv = attention_seq(k, i, &n.op)?;
+            attention_seq(&shapes[na[2]], i, &n.op)?;
             OpKind::Flash(AttnShape {
                 heads,
                 kv_heads,
-                seq_q: *q.first().unwrap_or(&1),
-                seq_kv: *k.first().unwrap_or(&1),
+                seq_q,
+                seq_kv,
                 head_dim,
                 causal,
                 sliding_window,

@@ -5046,6 +5046,7 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     let mut mla_pure = vec![v2; n_seg as usize];
     let mut needs_v2: Vec<(usize, u32)> = Vec::new();
     let mut mla_any = vec![false; n_seg as usize];
+    let mut mla_nope = vec![false; n_seg as usize];
     let mut xr_wave_any = vec![false; n_seg as usize];
     let mut xr_wave_pure = vec![true; n_seg as usize];
     let mut kda_wave_any = vec![false; n_seg as usize];
@@ -5081,6 +5082,7 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
             // fallback kernel writes the nsplit=1 layout — so the env/routing mismatches
             // that DEGRADE for plain V2 blobs must REFUSE here instead of corrupting.
             let d = &prog.insts[e.inst as usize];
+            mla_nope[seg] |= d.i[3] & 0x8000_0000 != 0;
             // DEFERRED to after the class pass, and that is the whole point. This used to
             // refuse on `!v2` -- the ENV -- which misses the case that actually corrupts:
             // PLOW_MLA_PF_V2=1 SET at serve against a blob emitted WITHOUT it. `PLOW_MLA_PF_V2`
@@ -5104,6 +5106,12 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     for s in 0..n_seg as usize {
         if mla_any[s] && mla_pure[s] {
             class[s] = 4;
+        }
+        if mla_nope[s] && class[s] == 4 {
+            return Err(RuntimeError::Device(format!(
+                "NoPE MLA prefill cannot run on the four-wave V2 kernel (segment {s}); \
+                 disable V2 routing or use a kernel supporting zero RoPE dimensions"
+            )));
         }
         if xr_wave_any[s] {
             if !xr_wave_pure[s] {
@@ -5217,8 +5225,9 @@ fn derive_raw_mla_v2_segments(prog: &DevProg) -> Result<Vec<bool>> {
         let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
             RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
         })?;
-        let dense_bf16 =
-            inst.op == DevOp::FlashMlaPrefill as u16 && inst.t[7] == packet::dev::TENSOR_NONE16;
+        let dense_bf16 = inst.op == DevOp::FlashMlaPrefill as u16
+            && inst.t[7] == packet::dev::TENSOR_NONE16
+            && inst.i[3] & 0x8000_0000 == 0;
         eligible[e.seg as usize] &= dense_bf16;
         seen[e.seg as usize] |= dense_bf16;
     }
@@ -5264,6 +5273,16 @@ fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) 
         }
     });
     seen && covered
+}
+
+fn packed_mla_compatible(prog: &DevProg) -> bool {
+    !prog.insts.iter().any(|d| {
+        d.op == DevOp::FlashGatherPrefill as u16
+            || ((d.op == DevOp::FlashMlaPrefill as u16 || d.op == DevOp::FlashMlaPrefillFp8 as u16)
+                && (d.i[3] & 0x8000_0000 != 0
+                    || (d.t[7] != packet::dev::TENSOR_NONE16
+                        && d.op != DevOp::FlashMlaPrefillFp8 as u16)))
+    })
 }
 
 fn packed_kda_compatible(prog: &DevProg) -> bool {
@@ -10757,13 +10776,7 @@ impl AmdEngine {
                         || d.op == DevOp::FlashMlaPrefill as u16
                         || d.op == DevOp::FlashMlaPrefillFp8 as u16
                 }),
-                packed_mla_compatible: !p.insts.iter().any(|d| {
-                    d.op == DevOp::FlashGatherPrefill as u16
-                        || ((d.op == DevOp::FlashMlaPrefill as u16
-                            || d.op == DevOp::FlashMlaPrefillFp8 as u16)
-                            && d.t[7] != packet::dev::TENSOR_NONE as u16
-                            && d.op != DevOp::FlashMlaPrefillFp8 as u16)
-                }),
+                packed_mla_compatible: packed_mla_compatible(p),
                 packed_mla_segmented,
                 packed_needs_kda: p.insts.iter().any(|d| {
                     d.op == DevOp::KdaConv3 as u16
@@ -11358,7 +11371,7 @@ impl AmdEngine {
         if program.packed_needs_mla {
             if !program.packed_mla_compatible {
                 return Err(RuntimeError::Device(
-                    "packed-prefill MLA does not support gathered/per-query selector packets"
+                    "packed-prefill MLA does not support NoPE or gathered/per-query selector packets"
                         .into(),
                 ));
             }
@@ -15945,6 +15958,37 @@ mod tests {
     }
 
     #[test]
+    fn nope_mla_prefill_rejects_rope_only_v2_routes() {
+        for op in [DevOp::FlashMlaPrefill, DevOp::FlashMlaPrefillFp8] {
+            let mut prog = segmented_prog(&[op], &[0]);
+            prog.insts[0].i[3] = 0x8000_0040;
+            prog.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+            assert!(!packed_mla_compatible(&prog));
+            let err = derive_segments_for(&prog, true).unwrap_err();
+            assert!(err.to_string().contains("NoPE MLA prefill"));
+            prog.insts[0].i[3] = 64;
+            assert_eq!(derive_segments_for(&prog, true).unwrap(), [4]);
+            assert!(packed_mla_compatible(&prog));
+            prog.insts[0].t[7] = 7;
+            assert_eq!(
+                packed_mla_compatible(&prog),
+                op == DevOp::FlashMlaPrefillFp8
+            );
+        }
+        let mut plain = segmented_prog(&[DevOp::FlashMlaPrefill], &[0]);
+        plain.insts[0].i[3] = 0x8000_0000;
+        plain.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        assert_eq!(derive_segments_for(&plain, false).unwrap(), [8]);
+        assert_eq!(derive_raw_mla_v2_segments(&plain).unwrap(), [false]);
+        plain.insts[0].i[6] = 2;
+        assert!(derive_segments_for(&plain, false).is_err());
+
+        let mut mixed = segmented_prog(&[DevOp::FlashPrefill, DevOp::FlashMlaPrefill], &[0, 0]);
+        mixed.insts[1].i[3] = 0x8000_0000;
+        assert!(derive_segments_for(&mixed, false).is_err());
+    }
+
+    #[test]
     fn xreduce_wave_rs_routes_only_a_marked_pure_segment() {
         let mut pure = segmented_prog(&[DevOp::XReduceTwoShot], &[0]);
         pure.stream[0].flags |= packet::dev::SE_XR_WAVE_RS;
@@ -17895,21 +17939,21 @@ mod tests {
         .is_ok());
     }
 
-    /// A file that is not an ELF64 yields no symbols — and therefore no
-    /// refusal. A parser miss must never be reported as a missing arm.
+    /// Junk stays bounded and cannot establish a required prefill capability.
     #[test]
     fn elf_reader_is_bounded_on_junk() {
         assert!(elf_symbol_names(b"").is_empty());
         assert!(elf_symbol_names(b"\x7fELF\x02\x01").is_empty());
         assert!(elf_symbol_names(&[0xffu8; 4096]).is_empty());
         let junk = elf_symbol_names(&[0u8; 128]);
+        let err = check_prefill_object(&junk, Path::new("x.elf"), &["PLOW_MLA_PREFILL=1".into()])
+            .expect_err("a required arm needs a verifiable symbol table");
+        assert!(err.to_string().contains("no ELF symbol table"));
+        assert!(check_prefill_object(&junk, Path::new("x.elf"), &[]).is_ok());
         assert!(
-            check_prefill_object(&junk, Path::new("x.elf"), &["PLOW_MLA_PREFILL=1".into()]).is_ok()
+            check_prefill_object(&junk, Path::new("x.elf"), &["PLOW_MLA_PREFILL=0".into()]).is_ok()
         );
-        // The GEMV capacity check reads the SAME empty list and reaches the
-        // opposite conclusion, on purpose: an arm it cannot see may simply be
-        // one this packet does not need, but a bucket it cannot see is a bucket
-        // that is almost certainly the default 1.
+        // Missing GEMV capacity metadata admits only the legacy B1 contract.
         assert!(check_gemv_capacity(&junk, Path::new("x.elf"), 1).is_ok());
         assert!(check_gemv_capacity(&junk, Path::new("x.elf"), 2).is_err());
     }

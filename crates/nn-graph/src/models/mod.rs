@@ -144,6 +144,18 @@ pub fn build_text_generation_from_config_json_at(
     );
     if let Some(mut text) = outer.get_mut("text_config").map(serde_json::Value::take) {
         if let serde_json::Value::Object(fields) = &mut text {
+            if !fields.contains_key("model_type") && !fields.contains_key("architectures") {
+                let text_type = match wrapper_type.as_str() {
+                    "gemma3" => Some("gemma3_text"),
+                    "gemma4" | "gemma4_unified" => Some("gemma4_text"),
+                    "qwen3_5" => Some("qwen3_5_text"),
+                    "kimi_k3" => Some("kimi_linear"),
+                    _ => None,
+                };
+                if let Some(text_type) = text_type {
+                    fields.insert("model_type".into(), text_type.into());
+                }
+            }
             if !fields.contains_key("dtype") && !fields.contains_key("torch_dtype") {
                 for key in ["dtype", "torch_dtype"] {
                     if let Some(dtype) = outer.get(key) {

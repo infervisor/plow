@@ -160,10 +160,14 @@ fn hf_dir_fails_on_missing_checkpoint_tensor() {
     let err = compile(&Source::HfDir(dir.clone()), &opts(dir.join("out")))
         .expect_err("missing tensor must fail the compile");
     match err {
-        PlowcError::InvalidDim(msg) => {
-            assert!(msg.contains("k_norm"), "unexpected message: {msg}")
+        PlowcError::Hub(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("1 missing") && msg.contains("k_norm"),
+                "unexpected message: {msg}"
+            )
         }
-        other => panic!("expected InvalidDim, got {other:?}"),
+        other => panic!("expected checkpoint metadata error, got {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -181,10 +185,14 @@ fn hf_dir_fails_on_uncovered_checkpoint_tensor() {
     let err = compile(&Source::HfDir(dir.clone()), &opts(dir.join("out")))
         .expect_err("uncovered tensor must fail the compile");
     match err {
-        PlowcError::InvalidDim(msg) => {
-            assert!(msg.contains("NOT covered"), "unexpected message: {msg}")
+        PlowcError::Hub(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("1 unexpected") && msg.contains("secret_extra_proj"),
+                "unexpected message: {msg}"
+            )
         }
-        other => panic!("expected InvalidDim, got {other:?}"),
+        other => panic!("expected checkpoint metadata error, got {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

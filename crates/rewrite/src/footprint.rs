@@ -189,7 +189,10 @@ pub fn footprints(kind: &OpKind, tile: &Compute, io: &OpIo, coord: &[i64]) -> Fo
                                 crate::ModelOpKind::RmsNorm
                                     | crate::ModelOpKind::RmsNormZeroCentered
                             );
-                        if row_aligned || norm_activation {
+                        // Broadcast operands do not share the output's row indexing.
+                        let full_activation =
+                            m.input_row_aligned.get(idx).copied().unwrap_or(false);
+                        if (row_aligned && full_activation) || norm_activation {
                             row(n)
                         } else {
                             TensorSlice {

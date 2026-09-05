@@ -121,6 +121,8 @@ pub struct ModelOp {
     /// (embedding tables, depthwise kernels, scalar/head parameters) that
     /// cannot be inferred from the output row shape.
     pub input_bytes: [u64; 8],
+    /// Inputs with the same shape as the output; broadcasts require whole-input footprints.
+    pub input_row_aligned: [bool; 8],
 }
 
 impl ModelOp {

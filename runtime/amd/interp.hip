@@ -2111,6 +2111,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
      * afford (op_attention.h d_flash_mla_prefill_v2).
      *   t0=Opart t1=mlpart t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len
      *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=n_tok i5=kv_mask f0=scale */
+    if ((in->op == PLOW_DOP_FLASH_MLA_PREFILL || in->op == PLOW_DOP_FLASH_MLA_PREFILL_FP8) &&
+        (in->i[3] & 0x80000000u))
+        __builtin_trap();
     static_assert(PLOW_WAVES == 4, "the V2 MLA prefill arm is shaped for the 4-wave object");
     static_assert(FA_MLA_PF2_LDS_BYTES(512, 64) <= (int)sizeof(((plow_smem*)nullptr)->fa),
                   "V2 MLA prefill LDS exceeds the flash arena");

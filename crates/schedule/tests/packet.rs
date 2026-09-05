@@ -365,3 +365,43 @@ fn qwen_plan_is_complete_and_emits_semantic_packets_for_both_nvidia_targets() {
         assert!(decoded.insts.iter().all(|i| i.unit < spec.sm_count as u8));
     }
 }
+
+#[test]
+fn broadcast_scalar_dma_reads_only_the_scalar_allocation() {
+    use nn_graph::{DType, Dim, Nn};
+    for scalar_first in [false, true] {
+        let mut nn = Nn::new(DType::BF16, DType::BF16);
+        let x = nn.input(
+            "x",
+            nn_graph::Shape::new([Dim::stat(128), Dim::stat(64)]),
+            DType::BF16,
+        );
+        let scalar = nn.param("layer_scalar", [Dim::stat(1)]);
+        nn.begin_block("scaled_residual");
+        let out = if scalar_first {
+            nn.mul(scalar, x)
+        } else {
+            nn.mul(x, scalar)
+        };
+        nn.mark_output(out);
+        let mut graph = nn.finish();
+        nn_graph::infer_shapes(&mut graph).unwrap();
+        let plan = plan_from_all_blocks(&graph).unwrap();
+        let soc = Soc::single(h100(), DEFAULT_PAGE_BYTES);
+        let (g, cons) = assemble(&soc, &plan, SramPolicy::Stream, None).unwrap();
+        let s = schedule(&soc, &g, &cons, &Config::default());
+        let reads: Vec<_> = s
+            .tasks
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.kind == schedule::TaskKind::DmaIn && t.tensor.as_deref() == Some("layer_scalar")
+            })
+            .collect();
+        assert!(!reads.is_empty());
+        assert!(
+            reads.iter().all(|t| t.bytes == 2 && t.tensor_bytes == 2),
+            "{reads:?}"
+        );
+    }
+}

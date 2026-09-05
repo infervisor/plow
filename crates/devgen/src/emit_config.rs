@@ -643,6 +643,41 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_TMA_GEMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub tma_gemm: bool,
 
+    /// Select the packet-declared native FP8 prefill GEMM role.
+    #[arg(long, env = "PLOW_FP8_PF_GEMM_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fp8_pf_gemm_role: bool,
+
+    /// Isolate FP8 prefill GEMMs while retaining the broad interpreter role.
+    #[arg(long, env = "PLOW_QWEN_FP8_PF_ISOLATE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fp8_pf_isolate: bool,
+
+    #[arg(long, env = "PLOW_QWEN_FP8_M1_TMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_fp8_m1_tma: bool,
+
+    #[arg(long, env = "PLOW_QWEN_W8A8_PREFILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_w8a8_prefill: bool,
+
+    #[arg(long, env = "PLOW_QWEN_DECODE_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_decode_lt: bool,
+
+    #[arg(long, env = "PLOW_QWEN_FUSE_AB", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_fuse_ab: bool,
+
+    #[arg(long, env = "PLOW_QWEN_FUSE_MLP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_fuse_mlp: bool,
+
+    #[arg(long, env = "PLOW_QWEN_PROJECTION_DAG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_projection_dag: bool,
+
+    #[arg(long, env = "PLOW_QWEN_SHARE_QUANT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub qwen_share_quant: bool,
+
+    #[arg(long, env = "PLOW_QWEN_AB_BLOCKS")]
+    pub qwen_ab_blocks: Option<u32>,
+
+    #[arg(long, env = "PLOW_QWEN_PREFILL")]
+    pub qwen_prefill: Option<String>,
+
     /// Fuse the prefill norm pair on Gemma-4 even off the gemv family.
     #[arg(long, env = "PLOW_PF_GFUSE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub pf_gfuse: bool,
@@ -858,6 +893,19 @@ impl EmitConfig {
             moe_stage2_body: env_bool("PLOW_MOE_STAGE2_BODY"),
             no_glu_fuse: env_bool("PLOW_NO_GLU_FUSE"),
             tma_gemm: env_bool("PLOW_TMA_GEMM"),
+            fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
+            fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
+            qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
+            qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
+            qwen_decode_lt: env_bool("PLOW_QWEN_DECODE_LT"),
+            qwen_fuse_ab: env_bool("PLOW_QWEN_FUSE_AB"),
+            qwen_fuse_mlp: env_bool("PLOW_QWEN_FUSE_MLP"),
+            qwen_projection_dag: env_bool("PLOW_QWEN_PROJECTION_DAG"),
+            qwen_share_quant: env_bool("PLOW_QWEN_SHARE_QUANT"),
+            qwen_ab_blocks: std::env::var("PLOW_QWEN_AB_BLOCKS")
+                .ok()
+                .map(|v| v.parse().expect("Qwen a/b block count")),
+            qwen_prefill: std::env::var("PLOW_QWEN_PREFILL").ok(),
             pf_gfuse: env_bool("PLOW_PF_GFUSE"),
             uniseg_max_t: env_u32("PLOW_UNISEG_MAX_T"),
             glm_wgfit: env_opt_out("PLOW_GLM_WGFIT"),
