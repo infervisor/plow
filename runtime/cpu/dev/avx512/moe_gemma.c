@@ -1,9 +1,9 @@
 /* avx512/moe_gemma.c — Gemma-4 26B-A4B hybrid MoE, AVX-512 BF16 tier: decode 69 (router score),
- * 71 (fused-norm expert GLU), 63 (expert down) — per slot at B = 1, grouped by expert at B >= 2 —
- * and prefill 75/76 (grouped expert GLU / down).
+ * 68 (router top-k), 71 (fused-norm expert GLU), 63 (expert down) — per slot at B = 1, grouped by
+ * expert at B >= 2 — and prefill 73 (fused router) and 75/76 (grouped expert GLU / down).
  * Same slice partitions as golden/moe_gemma.c (contiguous g_range over the flat item span); the
- * expert weights are reached through the host-filled `ewt` table. Router top-k, align and the
- * combine-norms stay golden (per-row scalar work). */
+ * expert weights are reached through the host-filled `ewt` table. Align and the combine-norms stay
+ * golden (per-row scalar work). */
 #include "avx512.h"
 #include "../golden/gptoss.h"
 
@@ -98,8 +98,61 @@ static inline float row_invrms(const plow_bf16* r, uint32_t H, float eps) {
     return g_rsqrt(v_row_ss(r, H) / (float)H + eps);
 }
 
-/* 69: t0=score(f32 [B][E]) t1=resid t2=proj([E][H]) t3=scale  i0=H i1=E i2=B  f0=root f1=eps.
- * h2 = resid * invrms * scale * root staged once per row in scratch (f32), 4 experts per pass. */
+/* h2 = resid * invrms * root * scale (f32), staged once per row; shared by 69 and 73 so the two
+ * paths produce bit-identical scores (the prefill chain must reproduce the decode chain). */
+static inline void stage_h2(float* h2, const plow_bf16* rr, const plow_bf16* scale, uint32_t H, float root,
+                            float eps) {
+    const __m512 sc = _mm512_set1_ps(row_invrms(rr, H, eps) * root);
+    for (uint32_t h = 0; h < H; h += 16u)
+        _mm512_storeu_ps(h2 + h, _mm512_mul_ps(_mm512_mul_ps(v_load_bf16(rr + h), sc), v_load_bf16(scale + h)));
+}
+
+/* srow[e] = proj[e] . h2 for e in [e0, e1), 4 experts per pass. dotf_r4 keeps one accumulator per
+ * row, so a score does not depend on which experts share its pass (or on the slice split). */
+static void score_experts(float* srow, const plow_bf16* proj, const float* h2, uint32_t H, uint32_t e0,
+                          uint32_t e1) {
+    uint32_t e = e0;
+    for (; e + 4u <= e1; e += 4u)
+        dotf_r4(proj + (size_t)e * H, proj + (size_t)(e + 1) * H, proj + (size_t)(e + 2) * H,
+                proj + (size_t)(e + 3) * H, h2, H, srow + e);
+    for (; e < e1; e++) {
+        const plow_bf16* pr = proj + (size_t)e * H;
+        float o[4];
+        dotf_r4(pr, pr, pr, pr, h2, H, o);
+        srow[e] = o[0];
+    }
+}
+
+/* golden gm_topk_tail with the k selection passes vectorized. Softmax, gate normalisation and the
+ * ordered key are golden's, so the winners and the gates are bit-identical; only the scan for the
+ * best key is a 16-lane vpmaxud + masked equality (see v_topk_u32). sc and key are scratch. */
+static void v_topk_tail(plow_moe_route* tab, float* sc, const plow_bf16* pes, uint32_t n_exp, uint32_t k,
+                        uint32_t* key, uint32_t* wl) {
+    float m = -1e30f;
+    for (uint32_t e = 0; e < n_exp; e++) m = fmaxf(m, sc[e]);
+    float s = 0.0f;
+    for (uint32_t e = 0; e < n_exp; e++) { sc[e] = expf(sc[e] - m); s += sc[e]; }
+    for (uint32_t e = 0; e < n_exp; e++) sc[e] /= s;
+    v_key_row(key, sc, n_exp);
+    v_topk_u32(key, n_exp, k, wl);
+    float gs = 0.0f;
+    for (uint32_t j = 0; j < k; j++) { tab[j].eid = wl[j]; tab[j].gate = sc[wl[j]]; gs += tab[j].gate; }
+    for (uint32_t j = 0; j < k; j++) {
+        float g = tab[j].gate;
+        if (gs != 0.0f) g /= gs;
+        tab[j].gate = g * plow_bf2f(pes[tab[j].eid]);
+    }
+}
+
+/* Vector top-k needs E <= V_TOPK_MAX_E and k <= E (golden's k > E fallback keeps re-picking a
+ * poisoned score); scratch holds sc[E] + key[E] + wl[k]. */
+#define GM_TOPK_SCRATCH(E, k) (((size_t)(E) * 2u + (size_t)(k)) * 4u)
+static inline int topk_vec_ok(const PlowCpuCtx* ctx, uint32_t E, uint32_t k, size_t extra) {
+    return E && k <= E && E <= V_TOPK_MAX_E && ctx && ctx->scratch &&
+           ctx->scratch_bytes >= extra + GM_TOPK_SCRATCH(E, k);
+}
+
+/* 69: t0=score(f32 [B][E]) t1=resid t2=proj([E][H]) t3=scale  i0=H i1=E i2=B  f0=root f1=eps. */
 V_K(v_moe_router_gemma_score_fast) {
     const uint32_t H = in->i[0], E = in->i[1], nrow = in->i[2] ? in->i[2] : 1u;
     if ((H & 15u) || !ctx || !ctx->scratch || ctx->scratch_bytes < (size_t)H * 4u) {
@@ -119,23 +172,52 @@ V_K(v_moe_router_gemma_score_fast) {
         const uint32_t row = idx / E, e0 = idx - row * E;
         const uint32_t e1 = e0 + (hi - idx) < E ? e0 + (hi - idx) : E;
         idx += e1 - e0;
-        if (row != cur) {
-            const plow_bf16* rr = resid + (size_t)row * H;
-            const __m512 sc = _mm512_set1_ps(row_invrms(rr, H, eps) * root);
-            for (uint32_t h = 0; h < H; h += 16u)
-                _mm512_storeu_ps(h2 + h, _mm512_mul_ps(_mm512_mul_ps(v_load_bf16(rr + h), sc), v_load_bf16(scale + h)));
-            cur = row;
-        }
-        float* srow = score + (size_t)row * E;
-        uint32_t e = e0;
-        for (; e + 4u <= e1; e += 4u)
-            dotf_r4(proj + (size_t)e * H, proj + (size_t)(e + 1) * H, proj + (size_t)(e + 2) * H, proj + (size_t)(e + 3) * H, h2, H, srow + e);
-        for (; e < e1; e++) {
-            const plow_bf16* pr = proj + (size_t)e * H;
-            float o[4];
-            dotf_r4(pr, pr, pr, pr, h2, H, o);
-            srow[e] = o[0];
-        }
+        if (row != cur) { stage_h2(h2, resid + (size_t)row * H, scale, H, root, eps); cur = row; }
+        score_experts(score + (size_t)row * E, proj, h2, H, e0, e1);
+    }
+}
+
+/* 68: t0=table([B][k]) t1=score(f32 [B][E]) t2=pes(bf16 [E])  i1=E i2=k i3=B. Row per slice. */
+V_K(v_moe_router_gemma_topk) {
+    const uint32_t E = in->i[1], k = in->i[2], nrow = in->i[3] ? in->i[3] : 1u;
+    if (!topk_vec_ok(ctx, E, k, 0)) { g_moe_router_gemma_topk(in, slice, nblk, T, ctx); return; }
+    plow_moe_route* table = PLOW_CPU_TEN(in, T, 0);
+    const float* score = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* pes = PLOW_CPU_TEN(in, T, 2);
+    float* sc = ctx->scratch;
+    uint32_t* key = (uint32_t*)(sc + E);
+    uint32_t* wl = key + E;
+    const uint32_t nb = nblk ? nblk : 1u;
+    for (uint32_t row = slice; row < nrow; row += nb) {
+        memcpy(sc, score + (size_t)row * E, (size_t)E * 4u);
+        v_topk_tail(table + (size_t)row * k, sc, pes, E, k, key, wl);
+    }
+}
+
+/* 73: t0=table([T][k]) t1=resid([T][H]) t2=proj t3=scale t4=pes  i0=H i1=E i2=k i3=T  f0=root f1=eps.
+ * The golden arm scores 128 experts x H per token with scalar fmaf, which dominates prefill; here
+ * the score is the same staged h2 and dotf_r4 pass as 69 and the tail is v_topk_tail. */
+V_K(v_moe_router_gemma_pf) {
+    const uint32_t H = in->i[0], E = in->i[1], k = in->i[2], nt = in->i[3] ? in->i[3] : 1u;
+    if ((H & 15u) || !topk_vec_ok(ctx, E, k, (size_t)H * 4u)) {
+        g_moe_router_gemma_pf(in, slice, nblk, T, ctx);
+        return;
+    }
+    plow_moe_route* table = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* resid = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* proj = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* scale = PLOW_CPU_TEN(in, T, 3);
+    const plow_bf16* pes = PLOW_CPU_TEN(in, T, 4);
+    const float root = in->fj[0].f, eps = in->fj[1].f;
+    float* h2 = ctx->scratch;
+    float* sc = h2 + H;
+    uint32_t* key = (uint32_t*)(sc + E);
+    uint32_t* wl = key + E;
+    const uint32_t nb = nblk ? nblk : 1u;
+    for (uint32_t tok = slice; tok < nt; tok += nb) {
+        stage_h2(h2, resid + (size_t)tok * H, scale, H, root, eps);
+        score_experts(sc, proj, h2, H, 0, E);
+        v_topk_tail(table + (size_t)tok * k, sc, pes, E, k, key, wl);
     }
 }
 
@@ -579,6 +661,8 @@ void v_register_moe_gemma(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_MOE_COMBINE_NORM_GEMMA] = v_moe_combine_norm_gemma;
     tab[PLOW_DOP_MOE_COMBINE_NORM_GEMMA_PF] = v_moe_combine_norm_gemma_pf;
     tab[PLOW_DOP_MOE_ROUTER_GEMMA_SCORE_FAST] = v_moe_router_gemma_score_fast;
+    tab[PLOW_DOP_MOE_ROUTER_GEMMA_TOPK] = v_moe_router_gemma_topk;
+    tab[PLOW_DOP_MOE_ROUTER_GEMMA_PF] = v_moe_router_gemma_pf;
     tab[PLOW_DOP_MOE_EXPERT_GLU_NORM_GEMMA] = v_moe_expert_glu_norm_gemma_b;
     tab[PLOW_DOP_MOE_EXPERT_DOWN_GEMMA] = v_moe_expert_down_gemma_b;
     tab[PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF] = v_moe_group_glu_gemma_pf;

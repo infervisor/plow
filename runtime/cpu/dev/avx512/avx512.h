@@ -47,6 +47,7 @@ void v_register_gptoss(plow_cpu_kernel_fn* tab);
 void v_register_moe_gemma(plow_cpu_kernel_fn* tab); /* moe_gemma.c: Gemma-4 26B-A4B MoE ops */
 /* route.c */
 V_K(v_moe_combine_pf);
+V_K(v_moe_router_topk_pf);
 void v_register_route(plow_cpu_kernel_fn* tab);
 
 /* --- bf16 <-> f32 (spec §5: explicit widen, cvtneps_pbh on store) ------------------- */
@@ -210,6 +211,59 @@ static inline uint64_t v_amax_fold(__m512i keys, __m512i idx, uint64_t best) {
         best = p > best ? p : best;
     }
     return best;
+}
+
+/* --- MoE selection key / top-k (golden route.c f32_key + moe_gemma.c gm_topk_tail) ------- */
+
+/* The golden selection key is ((ordered u32 of the f32 score) << 20) | ((n_exp - 1 - e) & 0xFFFFF),
+ * ranked by descending key: the ordered score decides, and on an equal score the LOWER expert id
+ * wins. The low 20 bits are a pure function of e, so ranking the u32 scores alone and breaking a
+ * tie by the lowest lane index reproduces that order exactly. */
+#define V_TOPK_MAX_E 1024u
+
+/* Order-preserving u32 of 16 f32 lanes (golden f32_key / gm_topk_tail's sb). */
+static inline __m512i v_key32(__m512 v) {
+    const __m512i u = _mm512_castps_si512(v);
+    const __m512i sign = _mm512_set1_epi32((int)0x80000000u);
+    return _mm512_mask_blend_epi32(_mm512_test_epi32_mask(u, sign), _mm512_or_si512(u, sign),
+                                   _mm512_xor_si512(u, _mm512_set1_epi32(-1)));
+}
+
+/* out[j] = index of the j-th largest key, ties to the lowest index; k <= n <= V_TOPK_MAX_E.
+ * Retired lanes leave `alive`, so they cannot win a later pass; a masked-off lane reads as 0, which
+ * can only lower a max, and the equality scan is masked by `alive` too — so a genuine all-zero key
+ * still resolves to its lowest live index, as in golden. */
+static inline void v_topk_u32(const uint32_t* key, uint32_t n, uint32_t k, uint32_t* out) {
+    __mmask16 alive[V_TOPK_MAX_E / 16u];
+    const uint32_t nc = (n + 15u) >> 4;
+    for (uint32_t c = 0; c < nc; c++)
+        alive[c] = (c + 1u) * 16u <= n ? (__mmask16)0xFFFFu : v_tail16(n - c * 16u);
+    for (uint32_t j = 0; j < k; j++) {
+        __m512i mx = _mm512_setzero_si512();
+        for (uint32_t c = 0; c < nc; c++)
+            mx = _mm512_max_epu32(mx, _mm512_maskz_loadu_epi32(alive[c], key + c * 16u));
+        const __m512i bv = _mm512_set1_epi32((int)_mm512_reduce_max_epu32(mx));
+        for (uint32_t c = 0; c < nc; c++) {
+            const __mmask16 hit =
+                _mm512_mask_cmpeq_epu32_mask(alive[c], _mm512_maskz_loadu_epi32(alive[c], key + c * 16u), bv);
+            if (hit) {
+                const uint32_t l = (uint32_t)__builtin_ctz((unsigned)hit);
+                alive[c] = (__mmask16)(alive[c] & (__mmask16)~(1u << l));
+                out[j] = c * 16u + l;
+                break;
+            }
+        }
+    }
+}
+
+/* key[e] = ordered u32 of v[e] (f32), e < n. */
+static inline void v_key_row(uint32_t* key, const float* v, uint32_t n) {
+    uint32_t e = 0;
+    for (; e + 16u <= n; e += 16u) _mm512_storeu_si512(key + e, v_key32(_mm512_loadu_ps(v + e)));
+    if (e < n) {
+        const __mmask16 m = v_tail16(n - e);
+        _mm512_mask_storeu_epi32(key + e, m, v_key32(_mm512_maskz_loadu_ps(m, v + e)));
+    }
 }
 
 #endif /* PLOW_CPU_AVX512_H */

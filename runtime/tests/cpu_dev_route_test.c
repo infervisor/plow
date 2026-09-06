@@ -18,18 +18,34 @@ static void run_op(plow_cpu_kernel_fn f, PlowDevInst* in, void** T, uint32_t nbl
     for (uint32_t s = 0; s < nblk; s++) f(in, s, nblk, T, ctx);
 }
 
-static void test_route(uint32_t E, uint32_t k, uint32_t T, uint32_t flags, int with_bias, uint32_t nblk, PlowCpuCtx* ctx) {
+/* `ties`: snap the logits to a few levels (or one) so that many packed selection keys are EXACTLY
+ * equal — the case where a rank computed another way silently picks a different expert. */
+static void test_route(uint32_t E, uint32_t k, uint32_t T, uint32_t flags, int with_bias, uint32_t nblk, PlowCpuCtx* ctx,
+                       int ties) {
     plow_bf16* logit = malloc((size_t)T * E * 2);
     float* bias = malloc(E * 4);
     plow_moe_route* tab = calloc((size_t)T * k, sizeof(plow_moe_route));
-    for (size_t i = 0; i < (size_t)T * E; i++) logit[i] = plow_f2bf((float)(nr() * 2.0));
-    for (uint32_t e = 0; e < E; e++) bias[e] = (float)(nr() * 0.05);
+    for (size_t i = 0; i < (size_t)T * E; i++) {
+        double v = nr() * 2.0;
+        if (ties == 1) v = (double)(int)v;
+        if (ties == 2) v = 0.5;
+        logit[i] = plow_f2bf((float)v);
+    }
+    for (uint32_t e = 0; e < E; e++) bias[e] = ties ? 0.0f : (float)(nr() * 0.05);
     void* Tt[4] = {tab, logit, NULL, with_bias ? bias : NULL};
     PlowDevInst in; memset(&in, 0, sizeof in);
     in.op = PLOW_DOP_MOE_ROUTER_TOPK_PF; in.t[0] = 0; in.t[1] = 1; in.t[2] = PLOW_TENSOR_NONE; in.t[3] = with_bias ? 3 : PLOW_TENSOR_NONE;
     for (int i = 4; i < 8; i++) in.t[i] = PLOW_TENSOR_NONE;
     in.i[1] = E; in.i[2] = k; in.i[3] = flags; in.i[4] = T; in.fj[0].f = 1.0f;
     run_op(plow_cpu_kernel(PLOW_DOP_MOE_ROUTER_TOPK_PF), &in, Tt, nblk, ctx);
+    /* The live arm keeps golden's scores, keys and gate tail, so the whole table must match bit
+     * for bit — the check that survives ties, where the f64 reference below cannot discriminate. */
+    plow_moe_route* gtab = calloc((size_t)T * k, sizeof(plow_moe_route));
+    void* Tgo[4] = {gtab, logit, NULL, with_bias ? bias : NULL};
+    run_op(g_moe_router_topk_pf, &in, Tgo, nblk, ctx);
+    CHECK(memcmp(tab, gtab, (size_t)T * k * sizeof(plow_moe_route)) == 0,
+          "route E=%u k=%u ties=%d nblk=%u: table differs from golden", E, k, ties, nblk);
+    free(gtab);
     double* sc = malloc(E * 8);
     for (uint32_t t = 0; t < T; t++) {
         const plow_bf16* lg = logit + (size_t)t * E;
@@ -110,10 +126,13 @@ int main(void) {
     ctx.scratch_bytes = plow_cpu_scratch_bytes(); ctx.scratch = aligned_alloc(64, ctx.scratch_bytes);
     plow_cpu_thread_init(&ctx);
     for (uint32_t nblk = 1; nblk <= 16; nblk *= 4) {
-        test_route(32, 4, 1, 2, 0, nblk, &ctx);      /* GPT-OSS decode: softmax + norm_topk */
-        test_route(32, 4, 37, 2, 0, nblk, &ctx);     /* GPT-OSS prefill */
-        test_route(256, 8, 5, 1, 1, nblk, &ctx);     /* GLM-style: sigmoid + selection bias */
-        test_route(64, 2, 129, 0, 0, nblk, &ctx);    /* plain softmax, unnormalised */
+        test_route(32, 4, 1, 2, 0, nblk, &ctx, 0);      /* GPT-OSS decode: softmax + norm_topk */
+        test_route(32, 4, 37, 2, 0, nblk, &ctx, 0);     /* GPT-OSS prefill */
+        test_route(256, 8, 5, 1, 1, nblk, &ctx, 0);     /* GLM-style: sigmoid + selection bias */
+        test_route(64, 2, 129, 0, 0, nblk, &ctx, 0);    /* plain softmax, unnormalised */
+        test_route(32, 4, 37, 2, 0, nblk, &ctx, 1);     /* few distinct logits: heavy ties */
+        test_route(128, 8, 9, 1, 1, nblk, &ctx, 1);     /* ties + sigmoid + bias */
+        test_route(33, 4, 3, 2, 0, nblk, &ctx, 2);      /* every logit equal, ragged E */
     }
     printf(fails ? "cpu_dev_route: %d failures\n" : "cpu_dev_route: all passed\n", fails);
     return fails ? 1 : 0;

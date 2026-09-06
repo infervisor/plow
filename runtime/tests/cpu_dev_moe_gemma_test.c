@@ -194,16 +194,164 @@ static int bench(void) {
     return 0;
 }
 
+/* ---- --bench-router: op 73 at the 26B-A4B prefill shape (E=128, k=8, H=2816, T=512), golden vs
+ * the live tier, 1 thread and NTHR pinned. Also reports how many of the T*k selected experts the
+ * two arms disagree on (the vector score reassociates the E x H dot). ---- */
+enum { RB_H = 2816, RB_E = 128, RB_K = 8, RB_T = 512, RB_NTHR = 8, RB_MAXIT = 33 };
+typedef struct {
+    pthread_barrier_t bar;
+    PlowDevInst in;
+    void* T[8];
+    plow_cpu_kernel_fn fn;
+    uint32_t nthr, iters;
+    double t[RB_MAXIT];
+} rbench_t;
+static void* rbench_thread(void* arg) {
+    rbench_t* b = (rbench_t*)((uintptr_t)arg & ~(uintptr_t)0xFF);
+    const uint32_t t = (uint32_t)((uintptr_t)arg & 0xFF);
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(t, &cs); pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
+    PlowCpuCtx ctx; memset(&ctx, 0, sizeof ctx);
+    ctx.scratch_bytes = plow_cpu_scratch_bytes(); ctx.scratch = aligned_alloc(64, ctx.scratch_bytes);
+    plow_cpu_thread_init(&ctx);
+    for (uint32_t it = 0; it < b->iters; it++) {
+        pthread_barrier_wait(&b->bar);
+        const double t0 = now_s();
+        b->fn(&b->in, t, b->nthr, b->T, &ctx);
+        pthread_barrier_wait(&b->bar);
+        if (t == 0) b->t[it] = now_s() - t0;
+    }
+    free(ctx.scratch);
+    return NULL;
+}
+static double rbench_run(plow_cpu_kernel_fn fn, const PlowDevInst* in, void** Tt, uint32_t nthr, uint32_t iters) {
+    rbench_t* b = aligned_alloc(256, (sizeof *b + 255) & ~(size_t)255); memset(b, 0, sizeof *b);
+    b->fn = fn; b->nthr = nthr; b->iters = iters;
+    b->in = *in; b->in.blocks = (uint16_t)nthr;
+    for (int i = 0; i < 5; i++) b->T[i] = Tt[i];
+    pthread_barrier_init(&b->bar, NULL, nthr);
+    pthread_t th[RB_NTHR];
+    for (uint32_t t = 0; t < nthr; t++) pthread_create(&th[t], NULL, rbench_thread, (void*)((uintptr_t)b | t));
+    for (uint32_t t = 0; t < nthr; t++) pthread_join(th[t], NULL);
+    pthread_barrier_destroy(&b->bar);
+    qsort(b->t + 1, iters - 1, sizeof(double), cmp_dbl);
+    const double med = b->t[1 + (iters - 1) / 2];
+    free(b);
+    return med;
+}
+static void rbench_pair(const char* what, uint16_t op, plow_cpu_kernel_fn gold, const PlowDevInst* in,
+                        void** Tg, void** Tv, uint32_t gold_it) {
+    plow_cpu_kernel_fn live = plow_cpu_kernel(op);
+    const uint32_t nt[2] = {1, RB_NTHR};
+    for (int i = 0; i < 2; i++) {
+        const double g = rbench_run(gold, in, Tg, nt[i], gold_it);
+        const double v = rbench_run(live, in, Tv, nt[i], RB_MAXIT);
+        printf("  %-14s %2u thr | golden %8.3f ms (%8.0f tok/s) | live %7.3f ms (%9.0f tok/s) | %5.1fx\n",
+               what, nt[i], g * 1e3, RB_T / g, v * 1e3, RB_T / v, g / v);
+    }
+}
+static int bench_router(void) {
+    plow_cpu_init(PLOW_CPU_ISA_AMX);
+    printf("bench-router: 73/69/68 on tier %d %d %d, H=%d E=%d k=%d T=%d\n", plow_cpu_tier_of(73),
+           plow_cpu_tier_of(69), plow_cpu_tier_of(68), RB_H, RB_E, RB_K, RB_T);
+    plow_bf16* resid = malloc((size_t)RB_T * RB_H * 2); fill_fast(resid, (size_t)RB_T * RB_H, 1.0f);
+    plow_bf16* proj = aligned_alloc(64, (size_t)RB_E * RB_H * 2); fill_fast(proj, (size_t)RB_E * RB_H, 0.05f);
+    plow_bf16* scale = malloc(RB_H * 2); fill_fast(scale, RB_H, 1.0f);
+    plow_bf16* pes = malloc(RB_E * 2); for (int e = 0; e < RB_E; e++) pes[e] = plow_f2bf(1.0f);
+    plow_moe_route* gtab = calloc((size_t)RB_T * RB_K, sizeof *gtab);
+    plow_moe_route* vtab = calloc((size_t)RB_T * RB_K, sizeof *vtab);
+    float* score = malloc((size_t)RB_T * RB_E * 4);
+    const float root = 1.0f / sqrtf((float)RB_H), eps = 1e-6f;
+
+    /* 73 = fused score + top-k */
+    PlowDevInst i73 = inst(); i73.op = PLOW_DOP_MOE_ROUTER_GEMMA_PF;
+    for (int i = 0; i < 5; i++) i73.t[i] = (uint16_t)i;
+    i73.i[0] = RB_H; i73.i[1] = RB_E; i73.i[2] = RB_K; i73.i[3] = RB_T; i73.fj[0].f = root; i73.fj[1].f = eps;
+    void* Tg[5] = {gtab, resid, proj, scale, pes};
+    void* Tv[5] = {vtab, resid, proj, scale, pes};
+    rbench_pair("73 router", PLOW_DOP_MOE_ROUTER_GEMMA_PF, g_moe_router_gemma_pf, &i73, Tg, Tv, 5);
+    uint32_t diff = 0;
+    for (uint32_t s = 0; s < (uint32_t)RB_T * RB_K; s++) diff += gtab[s].eid != vtab[s].eid;
+    printf("  selected experts: %u/%u differ from golden (score reassociation)\n", diff, RB_T * RB_K);
+
+    /* the same work split: 69 = the E x H score GEMV, 68 = the top-k tail alone */
+    PlowDevInst i69 = inst(); i69.op = PLOW_DOP_MOE_ROUTER_GEMMA_SCORE_FAST;
+    for (int i = 0; i < 4; i++) i69.t[i] = (uint16_t)i;
+    i69.i[0] = RB_H; i69.i[1] = RB_E; i69.i[2] = RB_T; i69.fj[0].f = root; i69.fj[1].f = eps;
+    void* Ts[5] = {score, resid, proj, scale, NULL};
+    rbench_pair("69 score", PLOW_DOP_MOE_ROUTER_GEMMA_SCORE_FAST, g_moe_router_gemma_score_fast, &i69, Ts, Ts, 5);
+    PlowDevInst i68 = inst(); i68.op = PLOW_DOP_MOE_ROUTER_GEMMA_TOPK;
+    for (int i = 0; i < 3; i++) i68.t[i] = (uint16_t)i;
+    i68.i[1] = RB_E; i68.i[2] = RB_K; i68.i[3] = RB_T;
+    void* Tk[5] = {gtab, score, pes, NULL, NULL};
+    void* Tk2[5] = {vtab, score, pes, NULL, NULL};
+    rbench_pair("68 top-k", PLOW_DOP_MOE_ROUTER_GEMMA_TOPK, g_moe_router_gemma_topk, &i68, Tk, Tk2, RB_MAXIT);
+    diff = 0;
+    for (uint32_t s = 0; s < (uint32_t)RB_T * RB_K; s++) diff += memcmp(&gtab[s], &vtab[s], sizeof *gtab) != 0;
+    printf("  68 table: %u/%u slots differ from golden\n", diff, RB_T * RB_K);
+    free(resid); free(proj); free(scale); free(pes); free(gtab); free(vtab); free(score);
+    return 0;
+}
+
+/* ---- Top-k tie order: op 68 golden vs the live tier at the shipping shape and at a ragged E, on
+ * scores with many EXACTLY equal values — the case a differently-computed rank gets wrong. The
+ * kernels share the softmax and gate math, so eids AND gate bits must agree exactly. ---- */
+static void test_topk_ties(PlowCpuCtx* ctx) {
+    enum { TE = 128, TR = 24 };
+    const uint32_t Es[3] = {TE, 31, 8}, ks[3] = {8, 8, 8};
+    float* sc = malloc(TR * TE * 4);
+    plow_bf16* pes = malloc(TE * 2);
+    plow_moe_route* gt = malloc((size_t)TR * 16 * sizeof *gt);
+    plow_moe_route* vt = malloc((size_t)TR * 16 * sizeof *vt);
+    for (int e = 0; e < TE; e++) pes[e] = plow_f2bf((float)(0.8 + 0.4 * ur()));
+    for (int cfg = 0; cfg < 3; cfg++) {
+        const uint32_t E_ = Es[cfg], k_ = ks[cfg] < Es[cfg] ? ks[cfg] : Es[cfg];
+        for (int mode = 0; mode < 3; mode++) {
+            for (uint32_t r = 0; r < TR; r++)
+                for (uint32_t e = 0; e < E_; e++) {
+                    double v = nr();
+                    if (mode == 1) v = (double)(int)(v * 2.0);  /* a handful of levels: heavy ties */
+                    if (mode == 2) v = 0.25;                    /* every score identical */
+                    sc[r * E_ + e] = (float)v;
+                }
+
+            for (uint32_t nblk = 1; nblk <= 8; nblk *= 8) {
+                PlowDevInst in = inst();
+                in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.i[1] = E_; in.i[2] = k_; in.i[3] = TR;
+                void* Tg[8] = {gt, sc, pes, NULL, NULL, NULL, NULL, NULL};
+                void* Tv[8] = {vt, sc, pes, NULL, NULL, NULL, NULL, NULL};
+                memset(gt, 0, (size_t)TR * k_ * sizeof *gt); memset(vt, 0, (size_t)TR * k_ * sizeof *vt);
+                in.op = PLOW_DOP_MOE_ROUTER_GEMMA_TOPK; in.blocks = (uint16_t)nblk;
+                for (uint32_t s = 0; s < nblk; s++) g_moe_router_gemma_topk(&in, s, nblk, Tg, ctx);
+                run_op(PLOW_DOP_MOE_ROUTER_GEMMA_TOPK, &in, Tv, nblk, ctx);
+                const int eq = memcmp(gt, vt, (size_t)TR * k_ * sizeof *gt) == 0;
+                CHECK(eq, "topk ties E=%u k=%u mode %d nblk %u: table differs from golden", E_, k_, mode, nblk);
+                if (!eq)
+                    for (uint32_t r = 0; r < TR; r++)
+                        for (uint32_t j = 0; j < k_; j++)
+                            if (gt[r * k_ + j].eid != vt[r * k_ + j].eid)
+                                printf("  row %u slot %u: eid %u want %u\n", r, j, vt[r * k_ + j].eid, gt[r * k_ + j].eid);
+                if (mode == 2) /* all scores equal -> the lowest ids win, in order */
+                    for (uint32_t j = 0; j < k_; j++)
+                        CHECK(vt[j].eid == j, "topk all-tied E=%u slot %u: eid %u want %u", E_, j, vt[j].eid, j);
+            }
+        }
+    }
+    free(sc); free(pes); free(gt); free(vt);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "--bench")) return bench();
+    if (argc > 1 && !strcmp(argv[1], "--bench-router")) return bench_router();
     const int tier = plow_cpu_init(PLOW_CPU_ISA_AMX);
-    printf("tier %d: 69/71/63/75/76 on tier %d %d %d %d %d\n", tier, plow_cpu_tier_of(69), plow_cpu_tier_of(71),
-           plow_cpu_tier_of(63), plow_cpu_tier_of(75), plow_cpu_tier_of(76));
+    printf("tier %d: 68/69/73/71/63/75/76 on tier %d %d %d %d %d %d %d\n", tier, plow_cpu_tier_of(68),
+           plow_cpu_tier_of(69), plow_cpu_tier_of(73), plow_cpu_tier_of(71), plow_cpu_tier_of(63),
+           plow_cpu_tier_of(75), plow_cpu_tier_of(76));
     PlowCpuCtx ctx; memset(&ctx, 0, sizeof ctx);
     ctx.scratch_bytes = plow_cpu_scratch_bytes(); ctx.scratch = aligned_alloc(64, ctx.scratch_bytes);
     plow_cpu_thread_init(&ctx);
     const uint16_t need[] = {63, 68, 69, 70, 71, 73, 74, 75, 76, 77};
     for (size_t i = 0; i < sizeof(need) / sizeof(*need); i++) if (!plow_cpu_has(need[i])) { printf("missing op %u\n", need[i]); fails++; }
+    test_topk_ties(&ctx);
     weights_t w; make_weights(&w);
     const float root = 1.0f / sqrtf((float)H), eps = 1e-6f;
 
