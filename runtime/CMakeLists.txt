@@ -124,6 +124,14 @@ foreach(tier avx512 avx512_attn amx fp8 gptoss route moe_gemma)
     endif()
 endforeach()
 
+# Same MoE test at AMX-shaped geometry (K % 32 == 0, > 32 rows per expert, partial weight tiles).
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_dev_moe_gemma_test.c)
+    add_executable(cpu_dev_moe_gemma_big_test tests/cpu_dev_moe_gemma_test.c)
+    target_compile_options(cpu_dev_moe_gemma_big_test PRIVATE -Wall -Wextra -Werror -O2 -DMOE_BIG=1)
+    target_link_libraries(cpu_dev_moe_gemma_big_test PRIVATE plow_cpu_dev)
+    add_test(NAME cpu_dev_moe_gemma_big COMMAND cpu_dev_moe_gemma_big_test)
+endif()
+
 # --- GPU backends (build-gated; unrunnable without a toolchain) ---------------
 #
 # These are SHARED plugins, not static libs: nothing in the host links them, and

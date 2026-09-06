@@ -26,7 +26,11 @@ static double b2d(plow_bf16 v) { return plow_bf2f(v); }
 static double gelu(double x) { return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x))); }
 
 /* ---- geometry ---- */
+#ifndef MOE_BIG
 enum { H = 64, I = 24, E = 6, K_ = 2, B = 3, T_ = 5 };
+#else /* AMX grouped prefill: K % 32 == 0, > 32 rows per expert, partial weight tiles */
+enum { H = 64, I = 32, E = 4, K_ = 2, B = 3, T_ = 72 };
+#endif
 
 typedef struct {
     plow_bf16 *gu[E], *dn[E];   /* fused gate_up [2I][H], down [H][I] */

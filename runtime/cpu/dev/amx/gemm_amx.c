@@ -497,10 +497,12 @@ double plow_cpu_amx_debug_tdp(uint32_t iters, PlowCpuCtx* ctx) {
 }
 
 void plow_cpu_register_amx_gemv(plow_cpu_kernel_fn* tab); /* gemv_amx.c: batched decode M >= 5 */
+void plow_cpu_register_amx_moe(plow_cpu_kernel_fn* tab);  /* moe_amx.c: Gemma grouped prefill 75/76 */
 
 void plow_cpu_register_amx(plow_cpu_kernel_fn* tab) {
     plow_fp8_vlut_init(&plow_amx_fp8_lut);
     plow_cpu_register_amx_gemv(tab);
+    plow_cpu_register_amx_moe(tab);
     tab[PLOW_DOP_GEMM] = x_gemm;
     tab[PLOW_DOP_GEMM_SMALL] = x_gemm_small;
     tab[PLOW_DOP_GEMM_MED] = x_gemm_med;

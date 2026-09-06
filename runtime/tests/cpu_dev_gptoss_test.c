@@ -821,6 +821,7 @@ int main(int argc, char** argv) {
     test_moe_prefill(37, 4, 32, 352, 2880, 320, 0);  /* 37 tokens: segments of 1..8+ rows, pads */
     test_moe_prefill(9, 4, 8, 2880, 2880, 2880, 0);  /* layer shape */
     test_moe_prefill(20, 4, 16, 352, 2912, 320, 1);
+    test_moe_prefill(200, 4, 8, 352, 2880, 320, 0); /* ~100 rows per expert: 32-row AMX chunks */
     printf(fails ? "FAILED (%d)\n" : "all passed\n", fails);
     return fails ? 1 : 0;
 }
