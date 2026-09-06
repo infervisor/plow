@@ -73,7 +73,7 @@ fn packed_prefill_compiled_packet_contract() {
         assert!(blob.with_packet_view(|p| bad.validate(p, &live)).is_err());
     }
     blob.with_packet_view(|packet| {
-        for case in 0..4 {
+        for case in 0..6 {
             let mut programs = packet.programs.to_vec();
             let mut insts = programs[0].insts.to_vec();
             let mut stream = programs[0].gq_stream.to_vec();
@@ -91,13 +91,15 @@ fn packed_prefill_compiled_packet_contract() {
                         .unwrap();
                     merge.i[2] += 1;
                 }
-                _ => {
+                3 => {
                     let e = stream
                         .iter_mut()
                         .find(|e| e.inst as usize == pc && e.slice == 1)
                         .unwrap();
                     e.slice = 0;
                 }
+                4 => insts[pc].op = packet::dev::DevOp::FlashPrefillFp8 as u16,
+                _ => insts[pc].op = packet::dev::DevOp::KdaConv as u16,
             }
             programs[0].insts = &insts;
             programs[0].gq_stream = &stream;
