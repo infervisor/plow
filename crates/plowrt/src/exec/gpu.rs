@@ -2741,8 +2741,28 @@ impl GpuEngine {
             })
             .then(|| decode_roles.clone())
             .unwrap_or_default();
+        let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
+        let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
+        let configured_multistep = RuntimeConfig::get().nv_multistep();
+        let multistep_disabled_by_decode = decode_objects.is_some()
+            || prepared_contexts.is_some()
+            || !decode_packet_roles.is_empty()
+            || cublaslt_enabled
+            || recurrent.is_some()
+            || nv_config.vmm_live;
+        let effective_multistep = if multistep_disabled_by_decode {
+            if configured_multistep > 1 {
+                tracing::info!(
+                    configured = configured_multistep,
+                    "multistep disabled by incompatible decode mode"
+                );
+            }
+            0
+        } else {
+            configured_multistep
+        };
         if decode_packet_roles.contains(&plow_asset::segment_roles::FP8_M1) {
-            plow_asset::fp8_m1_role::options(nv_config.multistep, cublaslt_enabled, false)
+            plow_asset::fp8_m1_role::options(effective_multistep, cublaslt_enabled, false)
                 .map_err(RuntimeError::Rejected)?;
         }
         if decode_objects.is_some() || prepared_contexts.is_some() {
@@ -2754,13 +2774,11 @@ impl GpuEngine {
                         .any(|program| program.index >= blob.prefill_progs().len())
                 }),
                 cublaslt_enabled,
-                nv_config.multistep as usize,
+                effective_multistep as usize,
                 nv_config.cubin.is_some() || nv_config.kernel.is_some() || nv_config.smem.is_some(),
             )?;
         }
         let mut select_decode_rungs = validate_decode_ladder(&blob)?;
-        let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
-        let recurrent = recurrent_state_layout(&blob.tensors, blob.decode_prog()?.t as usize)?;
         if recurrent.is_some() {
             let config = RuntimeConfig::get();
             if config.nv_vmm_prefix() || config.nv.prefix_cache {
@@ -3592,7 +3610,7 @@ impl GpuEngine {
         }
         if decode_packet_roles.contains(&plow_asset::segment_roles::FP8_M1) {
             plow_asset::fp8_m1_role::options(
-                0,
+                effective_multistep,
                 false,
                 be.module_global_u32(&module, "plow_packet_hash_lo")?
                     .is_some()
@@ -4245,19 +4263,12 @@ impl GpuEngine {
         // dynamic-kvrow arm fired (the local `kvrow` was cleared above). A B==1
         // legacy cubin still host-patches i[3] each step, so multi-step is off.
         let dyn_kvrow = batch > 1 || kvrow.is_empty();
-        let multistep = if recurrent.is_some()
-            || !decode_packet_roles.is_empty()
-            || cublaslt_enabled
-            // Multi-step maps fed rows, but its widest launch also writes idle rows.
-            || vmm.as_ref().is_some_and(|v| !v.kv.prefix_reuse())
-        {
-            None
-        } else {
-            Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "multi-step disabled");
-                None
-            })
-        };
+        let multistep =
+            Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow, effective_multistep)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "multi-step disabled");
+                    None
+                });
 
         if let Some(tm) = load_tim.as_mut() {
             let ms = t_final.elapsed().as_secs_f64() * 1e3;
@@ -4740,6 +4751,7 @@ impl GpuEngine {
         assets_dir: &Path,
         batch: usize,
         dyn_kvrow: bool,
+        k: u32,
     ) -> Result<Option<MultiStep>> {
         // DEFAULT ON at K=8 (`PLOW_MULTISTEP=0` or `=1` opts out). K=8 captures
         // nearly all of the win — measured 179.18 tok/s vs 185.60 at K=32, i.e.
@@ -4749,7 +4761,7 @@ impl GpuEngine {
         // the default is not the throughput-optimal 32.
         //
         let rt = crate::config::RuntimeConfig::get();
-        let k = rt.nv_multistep() as usize;
+        let k = k as usize;
         match k {
             0 | 1 => return Ok(None),
             2..=64 => {}

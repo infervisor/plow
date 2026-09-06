@@ -778,7 +778,7 @@ values cost.
 | `PLOW_GLOBAL_QUEUE=0` | on | force the static per-block-stream scheduler (AMD runtime read; build-time A/B otherwise). |
 | `PLOW_STATIC` / `PLOW_STATIC_DECODE` / `PLOW_STATIC_PREFILL` | off | force the static scheduler for both phases / decode only / prefill only. |
 | `PLOW_SEG_WINDOW` | on | AMD segment enqueue/drain windowing (A/B; `=0` off). |
-| `PLOW_MULTISTEP=K` | 8 (K∈[2,64]) | bounded device multi-step decode (K steps/launch); needs the dynamic-kvrow decode cubin + sampler. `0`/`1` opts out. |
+| `PLOW_MULTISTEP=K` / `--multistep K` | 8 (K∈[2,64]) | bounded device multi-step decode (K steps/launch); needs the dynamic-kvrow decode cubin + sampler. `0`/`1` opts out. Packet-selected decode objects/roles, context packets, recurrent decode, cuBLASLt segments, and live VMM force single-step and log the decision. |
 | `PLOW_LAUNCH_ROWS=N` | `LAUNCH_ROWS` | override the prefill pad/launch-rows tradeoff. |
 | `PLOW_PREFETCH=N` | 256 | checkpoint prefetch depth in tensors. `PLOW_PREFETCH_THREADS=N` (16) sets prefetch threads/rank; `0` disables prefetch. |
 | `PLOW_WEIGHT_SLAB` | on | single-allocation weight slab; `=0` turns it off (both backends). |
