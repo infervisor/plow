@@ -1162,7 +1162,7 @@ pub(super) fn run(
 mod tests {
     use super::*;
     #[test]
-    fn decode_balanced_splits_size_partials_and_preserve_prefill() {
+    fn decode_balanced_splits_reject_gf6_and_preserve_prefill() {
         let _env = crate::test_env::env_guard();
         let _target = EmitAmdGuard::set(false);
         struct Restore(emit_config::EmitConfig);
@@ -1181,14 +1181,12 @@ mod tests {
         c.kv_heads = 4;
         c.hd = 256;
         let plain = model_prefill(&c, 32768, 132, 0, &[128], 1, false);
+        cfg.attention_decode_balance_gf = Some(6);
+        emit_config::install(cfg.clone());
+        assert!(std::panic::catch_unwind(|| model(&c, 32768, 132, 0, false, 1)).is_err());
         for batch in [1, 4] {
-            for (gf, pin, expected) in [
-                (None, None, 11),
-                (Some(6), None, 33),
-                (Some(6), Some(11), 11),
-            ] {
+            for (gf, expected) in [(None, 11), (Some(2), 11)] {
                 cfg.attention_decode_balance_gf = gf;
-                cfg.ns_full_abs = pin;
                 emit_config::install(cfg.clone());
                 let m = model(&c, 32768, 132, 0, false, batch);
                 for d in m.progs[0]
@@ -1214,7 +1212,7 @@ mod tests {
                 }
             }
         }
-        cfg.attention_decode_balance_gf = Some(6);
+        cfg.attention_decode_balance_gf = Some(2);
         cfg.ns_full_abs = None;
         emit_config::install(cfg);
         let balanced = model_prefill(&c, 32768, 132, 0, &[128], 1, false);
