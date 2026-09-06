@@ -1,0 +1,27 @@
+{
+  "e3-zg0-h100/performance-analysis.json": {
+    "sha256": "f3ac0ad8ab0e9128abaa6ba0b361a816dd3a2aa0c459e488e2df844701ab78da",
+    "committed_copy": "e3-zg0-skinny-gemm-h100-20260906.json"
+  },
+  "e3-zg0-h100/result-validation.json": {
+    "sha256": "fb38f4435de7aab02302f1916722267cfd84a7663481c8bc466d34582297cf99",
+    "committed_copy": "e3-zg0-validation-h100-20260906.json"
+  },
+  "e3-zg0-h100/e3-real-gemma-m4-32.csv": {
+    "sha256": "bf57aea86cc749981a4d3beb16f1b897a013849bae30533fdf07a40116458608",
+    "committed_copy": "e3-zg0-timings-h100-20260906.csv"
+  },
+  "attention-e4-hd512-20260905/analysis/results.json": {
+    "sha256": "b472c444024a53a57fca307e19ccfcaaf5dd65ed768c6d94d9a92dc9925cc227",
+    "committed_copy": "e4-hd512-prefill-h100-20260906.json"
+  },
+  "attention-e4-hd512-20260905/analysis/results.md": {
+    "sha256": "fd9fa9240ba85394b74650bcffc0974b5f44b528fd0d0ebd9e83e429ceb79b62",
+    "committed_copy": "e4-hd512-prefill-h100-20260906.md"
+  },
+  "qwen-fp8-long-quality-20260905/diagnostic/layer0-capture/opaque-retry/comparison.json": {
+    "sha256": "ba9df079291fe90917f463d15ae40564982e3d0ef079156a436fc0cb17d4add8",
+    "committed_copy": "qwen-fp8-layer0-capture-h100-20260906.json"
+  },
+  "notes": "Raw artifacts copied without modifying results; instance-local NVMe archive also preserves source, logs and binaries. E3 splits selected posthoc. E4 standalone role resources differ from deployed interpreter. No serving promotion."
+}
