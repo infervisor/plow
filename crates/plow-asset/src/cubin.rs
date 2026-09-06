@@ -111,16 +111,22 @@ pub fn inspect(image: &[u8]) -> Option<CubinInfo> {
     if !is_elf64_le(image) {
         return None;
     }
-    // Elf64_Ehdr: e_flags at 0x30, e_shoff at 0x28, e_shentsize/num at 0x3a/0x3c.
+    // Elf64_Ehdr: e_version at 0x14, e_flags at 0x30, e_shoff at 0x28,
+    // e_shentsize/num at 0x3a/0x3c.
+    let e_version = u32_at(image, 0x14)?;
     let e_flags = u32_at(image, 0x30)?;
     let e_shoff = u64_at(image, 0x28)? as usize;
     let e_shentsize = u16_at(image, 0x3a)? as usize;
     let e_shnum = u16_at(image, 0x3c)? as usize;
 
-    // NVIDIA packs the SM number into byte 1 of e_flags: 0x…5a04 → sm_90,
-    // 0x…7802 → sm_120 (byte 0 is the cubin ABI version). Verified against
-    // nvcc -arch={sm_80,sm_90,sm_90a,sm_120}.
-    let sm = (e_flags >> 8) & 0xff;
+    // CUDA 12.9 uses the extended ELF version for sm_80/sm_90 and stores the
+    // real SM in byte 0 (also repeated as the virtual SM in byte 2). Legacy
+    // cubins and current sm_100+ cubins use ELF version 1 and byte 1.
+    let sm = match e_version {
+        1 => (e_flags >> 8) & 0xff,
+        0x81 if e_flags & 0xff == (e_flags >> 16) & 0xff => e_flags & 0xff,
+        _ => return None,
+    };
 
     // Elf64_Shdr: sh_type at 4, sh_offset at 0x18, sh_size at 0x20, sh_link at
     // 0x28 (the symtab's string table).
@@ -279,6 +285,7 @@ pub fn synthetic_elf(entry: &str, globals: &[(&str, u32)], sm: u32) -> Vec<u8> {
         .collect();
     let mut image = vec![0u8; 320];
     image[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    image[20..24].copy_from_slice(&1u32.to_le_bytes());
     image[40..48].copy_from_slice(&64u64.to_le_bytes());
     image[48..52].copy_from_slice(&(sm << 8).to_le_bytes());
     image[58..60].copy_from_slice(&64u16.to_le_bytes());
@@ -361,11 +368,40 @@ mod tests {
             e[..4].copy_from_slice(b"\x7fELF");
             e[4] = 2;
             e[5] = 1;
+            e[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
             e[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
             // e_shoff = 0, e_shnum = 0: header-only, no sections to walk.
             let info = inspect(&e).expect("header-only ELF64 parses");
             assert_eq!(info.sm, sm);
             assert!(info.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn reads_sm_from_extended_e_flags() {
+        for (flags, sm) in [(0x0050_0550u32, 80), (0x005a_055a, 90), (0x005a_0d5a, 90)] {
+            let mut e = vec![0u8; 0x40];
+            e[..4].copy_from_slice(b"\x7fELF");
+            e[4] = 2;
+            e[5] = 1;
+            e[0x14..0x18].copy_from_slice(&0x81u32.to_le_bytes());
+            e[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            let info = inspect(&e).expect("extended header-only ELF64 parses");
+            assert_eq!(info.sm, sm);
+            assert!(info.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_or_inconsistent_elf_flags() {
+        for (version, flags) in [(0u32, 0x0600_5a04u32), (0x81, 0x0050_055a)] {
+            let mut e = vec![0u8; 0x40];
+            e[..4].copy_from_slice(b"\x7fELF");
+            e[4] = 2;
+            e[5] = 1;
+            e[0x14..0x18].copy_from_slice(&version.to_le_bytes());
+            e[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            assert!(inspect(&e).is_none());
         }
     }
 }
