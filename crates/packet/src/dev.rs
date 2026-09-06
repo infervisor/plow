@@ -1721,6 +1721,12 @@ pub enum DevOp {
     ///
     /// `t0=core t1=Q t2=K t3=V t4=alpha t5=beta t6=state t7=outstate` · `i0=T i1=HK i2=HV i3=K i4=V` · `f0=q_scale`.
     QwenGdnPrefill = 146,
+    /// `t0=P` · `i0=M i1=N`
+    ZeroF32 = 147,
+    /// `t0=P t1=A t2=W` · `i0=M i1=N i2=K i3=S`
+    GemmSplitK = 148,
+    /// `t0=C t1=P` · `i0=M i1=N`
+    CastF32Bf16 = 149,
 }
 
 impl DevOp {
@@ -1877,6 +1883,9 @@ impl DevOp {
         DevOp::QwenGdnQkvPrep,
         DevOp::QwenGdnGatePrep,
         DevOp::QwenGdnPrefill,
+        DevOp::ZeroF32,
+        DevOp::GemmSplitK,
+        DevOp::CastF32Bf16,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2044,6 +2053,9 @@ impl DevOp {
             DevOp::QwenGdnQkvPrep => "PLOW_DOP_QWEN_GDN_QKV_PREP",
             DevOp::QwenGdnGatePrep => "PLOW_DOP_QWEN_GDN_GATE_PREP",
             DevOp::QwenGdnPrefill => "PLOW_DOP_QWEN_GDN_PREFILL",
+            DevOp::ZeroF32 => "PLOW_DOP_ZERO_F32",
+            DevOp::GemmSplitK => "PLOW_DOP_GEMM_SPLITK",
+            DevOp::CastF32Bf16 => "PLOW_DOP_CAST_F32_BF16",
         }
     }
 
@@ -2080,7 +2092,7 @@ impl DevOp {
     /// as 121-128 in parallel with the KdaChunk/Mla pair above, which claimed the same
     /// range independently — the collision surfaced only at merge, same as 111 -> 113
     /// above; renumbering the later-merged pair (this one) was the resolution.
-    pub const COUNT: u16 = 147;
+    pub const COUNT: u16 = 150;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

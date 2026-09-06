@@ -4,7 +4,7 @@
 #
 #   scripts/tune_decode_block_sweep.sh --asset /root/plow-out/blk-slide \
 #     --arms "none GV_MM_MAX=16" --batch 1,4,8 --ctx 1024,32768 \
-#     --out perf-data/px15-block-slide.jsonl
+#     --out /dev/shm/plowtune/block/results.jsonl
 #
 # WHY THIS IS NOT THE `gemv_lab` MISTAKE. tuning/README-decode-tuner.md §2 bans
 # scoring a knob on an isolated microbench, because

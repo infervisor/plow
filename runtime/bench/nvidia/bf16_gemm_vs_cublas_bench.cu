@@ -224,6 +224,8 @@ static void bench_plow(unsigned M, unsigned P) {
     printf("%-9s %6s %6s %6s %5s %6s %8s %9s\n","shape","M","T","G*","u","arm","ms","TFLOP/s");
     for (int si = 0; si < NSHAPE; si++) {
         const Shape& s = SHAPES[si];
+        const char* filter = getenv("PLOW_BENCH_SHAPE");
+        if (filter && strcmp(filter, s.name)) continue;
         unsigned bn = s.glu ? (unsigned)PGM_BN_GLU : (unsigned)PGM_BN;
         unsigned tm = (M + PGM_BM - 1)/PGM_BM, tn = (s.N + bn - 1)/bn;
         unsigned T = tm*tn;
@@ -280,6 +282,8 @@ static void bench_cublas(unsigned M) {
     printf("\n%-9s %6s %8s %9s\n","shape(cuBLASLt)","M","ms","TFLOP/s");
     for (int si = 0; si < NSHAPE; si++) {
         const Shape& s = SHAPES[si];
+        const char* filter = getenv("PLOW_BENCH_SHAPE");
+        if (filter && strcmp(filter, s.name)) continue;
         /* GLU shape measured as ONE bf16xbf16 matmul at its (N,K) — same simplification px9's
          * own k_bf16 control used; the two-B-stream GLU cost is ~2x this by construction (same
          * A ring, same mma throughput, just two independent accumulations) so this is still a

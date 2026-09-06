@@ -49,10 +49,10 @@
 # serve and scoring them here would measure a path nothing runs.
 set -euo pipefail
 
-MATRIX="${1:?usage: tune_block_sweep.sh <matrix-file> [out.tsv]}"
-OUT="${2:-block-sweep.tsv}"
 ROOT="${PLOW_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 WORK="${WORK:-/dev/shm/block-sweep}"
+MATRIX="${1:?usage: tune_block_sweep.sh <matrix-file> [out.tsv]}"
+OUT="${2:-$WORK/results.tsv}"
 JOBS="${JOBS:-6}"
 
 # Block assets, one per layer kind. Emit them with the SAME decode batch you
@@ -72,7 +72,7 @@ BASE_D="-DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_EMB
 NVCC=/usr/local/cuda/bin/nvcc
 SRC="$ROOT/runtime/nvidia/interp_sm120.cu"
 BLOCK_RUN="$ROOT/target/release/examples/block_run"
-mkdir -p "$WORK"
+mkdir -p "$WORK" "$(dirname "$OUT")"
 
 [ -x "$BLOCK_RUN" ] || { echo "FATAL: build it first: cargo build --release -p plowrt --features cuda --example block_run" >&2; exit 1; }
 for a in "$SLIDE_ASSET" "$FULL_ASSET"; do

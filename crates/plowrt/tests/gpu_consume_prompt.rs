@@ -123,16 +123,19 @@ fn serialized_tma_slot_parity(all_slots_live: bool, lazy_rings: bool) {
         eprintln!("skipped: set PLOW_GPU_TEST=1 (needs GPU + B>=2 TMA assets)");
         return;
     }
-    let _config = common::EnvScope::set(&[
+    let mut settings = vec![
         ("PLOW_VMM_LIVE", if lazy_rings { "1" } else { "0" }),
         ("PLOW_VMM_LIVE_RINGS", "0"),
-        ("PLOW_MULTISTEP", "0"),
         ("PLOW_VMM_PREFIX", "0"),
         ("PLOW_PREFIX_CACHE", "0"),
         ("PLOW_PF_BATCH", "0"),
         ("PLOW_VMM_BLOCK_MIB", "2"),
         ("PLOW_KV_POOL_MIB", "0"),
-    ]);
+    ];
+    if !lazy_rings {
+        settings.push(("PLOW_MULTISTEP", "0"));
+    }
+    let _config = common::EnvScope::set(&settings);
     let _ = tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "plowrt=info".into()))
         .try_init();

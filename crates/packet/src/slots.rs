@@ -118,6 +118,9 @@ fn slot(raw: &'static str) -> Option<Slot> {
 /// comments and checked against them by `table_matches_doc_comments`.
 #[rustfmt::skip]
 const DOC: &[S] = &[
+    S { op: DevOp::ZeroF32, t: &["P"], i: &["M", "N"], f: &[], j: &[] },
+    S { op: DevOp::GemmSplitK, t: &["P", "A", "W"], i: &["M", "N", "K", "S"], f: &[], j: &[] },
+    S { op: DevOp::CastF32Bf16, t: &["C", "P"], i: &["M", "N"], f: &[], j: &[] },
     S { op: DevOp::QwenGdnConv, t: &["out", "x", "weight", "history", "active?"], i: &["C", "W", "B"], f: &[], j: &[] },
     S { op: DevOp::QwenGdnStep, t: &["out", "qkv", "a", "b", "A_log", "dt_bias", "state", "active?"], i: &["HK", "HV", "K", "V", "B", "alog_f32"], f: &["q_scale", "l2_eps"], j: &[] },
     S { op: DevOp::QwenGatedNorm, t: &["out", "core", "z", "gamma", "active?"], i: &["HV", "V", "B"], f: &["eps"], j: &[] },

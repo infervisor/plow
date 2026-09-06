@@ -21,6 +21,15 @@
  * Occupancy/spill gate (must show 0 bytes spill and >= 1 block/SM):
  *   nvcc -arch=sm_120a -I ../common -I . -Xptxas -v -c interp_sm120.cu
  */
+#ifndef PLOW_NV_FP8_M1_ROLE
+#define PLOW_NV_FP8_M1_ROLE 0
+#endif
+#if PLOW_NV_FP8_M1_ROLE != 0 && PLOW_NV_FP8_M1_ROLE != 1
+#error "PLOW_NV_FP8_M1_ROLE must be0 or1"
+#endif
+#if PLOW_NV_FP8_M1_ROLE && defined(PLOW_NV_THREADS) && PLOW_NV_THREADS != 256
+#error "FP8 M1 role requires256 threads"
+#endif
 #include "dev_isa.h"
 
 /* ---- OPTIONAL per-packet arm selection (plow_config.h) ---------------------------------
@@ -101,10 +110,22 @@
 #endif
 
 #include "op_attention.cuh" /* validated: d_flash_decode / d_flash_merge (harvested) */
+#if PLOW_NV_PACKED_REQUEST
+#define PLOW_PF_REQ_ARG , (const int*)TEN(3)
+#if !defined(PLOW_NV_HOPPER) || !PLOW_NV_HOPPER || !PLOW_NV_PREFILL || PLOW_FP8_KV
+#error "packed request ABI requires Hopper BF16 prefill"
+#endif
+extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 1;
+#else
+#define PLOW_PF_REQ_ARG
+#endif
 #include "op_mla.cuh"        /* MLA (DeepSeek/GLM/Kimi) latent decode + fused merge-fold (P1) */
 #include "op_dsa.cuh"        /* GLM DSA indexer: score (mma.sync) + top-k select (P3) */
 #include "op_elementwise.cuh"
 #include "op_gemm.cuh"
+#if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK
+#include "op_gemm_splitk.cuh"
+#endif
 #include "op_norm.cuh"
 #ifndef PLOW_NV_QWEN_GDN
 #define PLOW_NV_QWEN_GDN 0
@@ -580,7 +601,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #endif
 #define PLOW_NV_CAT_I(a, b) a##b
 #define PLOW_NV_CAT(a, b) PLOW_NV_CAT_I(a, b)
-#if PLOW_NV_GEMV512_ROLE
+#if PLOW_NV_FP8_M1_ROLE
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _fp8m1)
+#elif PLOW_NV_GEMV512_ROLE
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gemv512)
 #elif PLOW_NV_PREFILL && PLOW_NV_SEG_GEMM
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pfgemm)
@@ -736,6 +759,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_NV_OP_ARENA (PLOW_NV_KERNEL_ARENA > (PLOW_NV_ARENA_MIN_BYTES + 3u) / 4u ? PLOW_NV_KERNEL_ARENA : (PLOW_NV_ARENA_MIN_BYTES + 3u) / 4u)
 #define PLOW_NV_BASE_ARENA_FLOATS                                                              \
     (PLOW_NV_OP_ARENA > 2 * (int)PLOW_NV_WARPS ? PLOW_NV_OP_ARENA : 2 * (int)PLOW_NV_WARPS)
+#if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK && !defined(PLOW_NV_GEMV_STAGING_BYTES)
+#error Split-K objects must retain an explicit qualified GEMV staging capacity
+#endif
 #ifndef PLOW_NV_GEMV_STAGING_BYTES
 #define PLOW_NV_GEMV_STAGING_BYTES (PLOW_NV_BASE_ARENA_FLOATS * sizeof(float))
 #endif
@@ -766,8 +792,17 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #ifndef PLOW_NV_EMBED_SMEM
 #define PLOW_NV_EMBED_SMEM 0
 #endif
+#if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK
+#if !defined(PLOW_NV_HOPPER) || PLOW_NV_PREFILL || !PLOW_NV_EMBED_SMEM
+#error Split-K capability requires Hopper decode with an embedded arena
+#endif
+static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= 82944);
+static_assert(PLOW_NV_THREADS == 256);
+extern "C" __device__ unsigned PLOW_SYM(plow_gemm_splitk_abi) = 1;
+#endif
 #if PLOW_NV_EMBED_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS * sizeof(float);
+
 
 /* Widest row block instantiated by gemv_walk. This is a throughput capacity, not a
  * correctness ceiling: M > GV_MM_MAX walks multiple weight passes. The decode loader reads
@@ -843,7 +878,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                           unsigned nblk, float* arena) {
     const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
     const unsigned tw_[4] = {tv_.x, tv_.y, tv_.z, tv_.w};
-#if PLOW_NV_GEMV512_ROLE
+#if PLOW_NV_FP8_M1_ROLE
+    if (in->op != PLOW_DOP_GEMM_FP8 || in->i[0] != 1 || !in->i[1] ||
+        !in->i[2] || in->i[2] > 17408 || (in->i[2] & 15u) || in->i[4] ||
+        !in->i[7] || in->i[7] == PLOW_TENSOR_NONE || !T[in->i[7]] ||
+        !TEN(0) || !TEN(1) || !TEN(2) || !TEN(3) || !TEN(4)) { __trap(); return; }
+    d_gemm_w8a8_m1_tma_sm90((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1),
+        (const uint8_t*)TEN(2), T[in->i[7]], (const float*)TEN(3), (const float*)TEN(4),
+        in->i[1], in->i[2], in->i[4], slice, nblk, (__nv_bfloat16*)arena);
+#elif PLOW_NV_GEMV512_ROLE
     if (in->i[0] != 1 || !in->i[2] || in->i[2] > 32768u) { __trap(); return; }
     switch (in->op) {
     case PLOW_DOP_GEMV:
@@ -1512,6 +1555,21 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
         break;
 #endif
+#if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK
+    case PLOW_DOP_ZERO_F32:
+        d_zero_f32((float*)TEN(0), (size_t)in->i[0] * in->i[1], slice, nblk);
+        break;
+    case PLOW_DOP_GEMM_SPLITK:
+        if ((in->i[0] != 4 && in->i[0] != 8 && in->i[0] != 16) || !in->i[1] ||
+            !in->i[2] || (in->i[2] & 7) || !in->i[3] || in->i[3] > 16 || (in->i[3] & (in->i[3] - 1))) { __trap(); break; }
+        d_gemm_splitk<16,128,64,8,4>((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk, (char*)arena);
+        break;
+    case PLOW_DOP_CAST_F32_BF16:
+        d_cast_f32_bf16((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
+            (size_t)in->i[0] * in->i[1], slice, nblk);
+        break;
+#endif
     /* ---- GEMV family (DECODE object only; the prefill object uses the tiled GEMM arms above) ----
      * i4=a_row0 is a row offset applied to x in units of K (undocumented in dev.rs; 0 on
      * every Qwen packet). i3=norm_flag selects the fused-norm GEMV, which this build does
@@ -1844,20 +1902,20 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #elif PLOW_NV_GEMMA
         if (in->i[3] == 128)
             d_flash_merge<128>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
-                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
+                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
         else if (in->i[3] == 256)
             d_flash_merge<256>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
-                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
+                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
         else if (in->i[3] == 512)
             d_flash_merge<512>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
-                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
+                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
         else
             __trap();
 #else
         if (in->i[3] != PLOW_NV_FA_HD) { __trap(); break; }
         d_flash_merge<PLOW_NV_FA_HD>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                      (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice,
-                                     nblk);
+                                     nblk PLOW_PF_REQ_ARG);
 #endif
         break;
 
@@ -2222,6 +2280,26 @@ extern "C" __device__ unsigned PLOW_SYM(plow_segment_gq_abi) = 1;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_segment_gq_abi) = 0;
 #endif
+/* Whole-object dense BF16 contract. These constants describe compiled branches, not
+ * a packet-supplied inventory. Adding an opcode requires extending the shared validator. */
+#if !PLOW_NV_PREFILL && PLOW_NV_GEMMA && !PLOW_NV_LEAN_DECODE && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SEGMENTS && !PLOW_NV_GEMV512_ROLE && !PLOW_NV_TRACE && !PLOW_NV_SKELETON && !PLOW_NV_PLACE_DISPATCH && PLOW_NV_SCHED == 1 && PLOW_NV_THREADS == 256 && !defined(PLOW_NV_ABLATE_LO) && !defined(PLOW_NV_ABLATE_HI) && !defined(FA_NV_WAVE64_NEGCTRL)
+extern "C" __device__ unsigned PLOW_SYM(plow_decode_bf16_abi) = 1;
+#else
+extern "C" __device__ unsigned PLOW_SYM(plow_decode_bf16_abi) = 0;
+#endif
+extern "C" __device__ unsigned PLOW_SYM(plow_decode_gf256) = PLOW_NV_FA_GF_HD256;
+extern "C" __device__ unsigned PLOW_SYM(plow_decode_gf512) = PLOW_NV_FA_GF_FULL;
+extern "C" __device__ unsigned PLOW_SYM(plow_decode_staging_bytes) = PLOW_NV_GEMV_STAGING_BYTES;
+#if PLOW_NV_FP8_M1_ROLE
+#if !defined(PLOW_NV_HOPPER) || PLOW_NV_PREFILL || !PLOW_NV_SEGMENTS || PLOW_NV_THREADS != 256 || PLOW_NV_GEMV512_ROLE || PLOW_NV_SCHED != 1 || PLOW_NV_PLACE_DISPATCH || PLOW_NV_SKELETON || PLOW_NV_GEMM_ONLY || PLOW_NV_FA_ONLY || PLOW_NV_LEAN_DECODE || !PLOW_NV_FP8_M1 || !PLOW_NV_FP8_M1_TMA || !PLOW_NV_FP8_M1_XCACHE || !PLOW_NV_FP8_M1_FAST_ACCUM || !PLOW_NV_QUANT_FP8_VLLM
+#error "FP8 M1 role requires Hopper segmented256-thread GQ TMA/XCACHE/FAST_ACCUM decode"
+#endif
+static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) == 205840, "FP8 M1 role arena");
+extern "C" __device__ unsigned plow_fp8_gemm_m1_tma_abi = 1;
+extern "C" __device__ unsigned plow_fp8_m1_promote_k512 = PLOW_NV_FP8_M1_PROMOTE_K512;
+extern "C" __device__ unsigned plow_fp8_m1_max_k = 17408;
+extern "C" __device__ unsigned plow_fp8_m1_k_multiple = 16;
+#endif
 #if PLOW_NV_GEMV512_ROLE
 #if PLOW_NV_SCHED != 1 || PLOW_NV_PLACE_DISPATCH || PLOW_NV_SKELETON || !PLOW_NV_SEGMENTS
 #error "GEMV512 role requires the segmented global queue scheduler"
@@ -2248,10 +2326,10 @@ extern "C" __device__ unsigned plow_attention_sm90_hd256_abi = 1;
 #else
 extern "C" __device__ unsigned plow_attention_sm90_hd256_abi = 0;
 #endif
-#if PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
-extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 1;
+#if !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
+extern "C" __device__ unsigned plow_cublaslt_decode_abi = 1;
 #else
-extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 0;
+extern "C" __device__ unsigned plow_cublaslt_decode_abi = 0;
 #endif
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
 extern "C" __device__ unsigned plow_fp8_m1_arm = 1;

@@ -1,16 +1,23 @@
 use super::*;
 use std::path::Path;
 
-fn prefill_segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
+fn segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
     let cfg = emit_config::active();
     let fp8 = cfg.fp8_pf_gemm_role || cfg.fp8_pf_isolate;
     let attention = cfg.attention_pf_role || cfg.attention_pf_isolate;
-    if !fp8 && !attention {
+    let decode_cublaslt = cfg.decode_cublaslt;
+    if !fp8 && !attention && !decode_cublaslt {
         return None;
     }
     let mut programs = Vec::new();
     let mut used = [false; 3];
-    for (index, p) in m.progs.iter().enumerate().take(m.progs.len() - 1) {
+    for (index, p) in m
+        .progs
+        .iter()
+        .enumerate()
+        .take(m.progs.len() - 1)
+        .filter(|_| fp8 || attention)
+    {
         let mut roles = vec![0_u8; p.gq_seg_ofs.len() - 1];
         let mut found_fp8 = false;
         for (ix, d) in p.insts.iter().enumerate() {
@@ -20,14 +27,14 @@ fn prefill_segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
                     "FP8 role needs mapped prefill GEMMs"
                 );
                 found_fp8 = true;
-                u8::from(cfg.fp8_pf_gemm_role)
+                plow_asset::segment_roles::FP8_PREFILL_GEMM * u8::from(cfg.fp8_pf_gemm_role)
             } else if attention && d.op == DevOp::FlashPrefill as u16 {
                 assert_eq!(d.i[6], 256, "attention role requires HD256");
                 assert!(d.t[5..8].iter().all(|&t| t == TENSOR_NONE));
-                2 * u8::from(cfg.attention_pf_role)
+                plow_asset::segment_roles::PREFILL_ATTENTION * u8::from(cfg.attention_pf_role)
             } else if attention && d.op == DevOp::FlashMerge as u16 {
                 assert_eq!(d.i[3], 256, "attention role requires HD256");
-                2 * u8::from(cfg.attention_pf_role)
+                plow_asset::segment_roles::PREFILL_ATTENTION * u8::from(cfg.attention_pf_role)
             } else {
                 continue;
             };
@@ -45,10 +52,34 @@ fn prefill_segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
         );
         programs.push(serde_json::json!({"index":index,"roles":roles}));
     }
-    assert!(
-        !programs.is_empty(),
-        "prefill roles require prefill programs"
-    );
+    if decode_cublaslt {
+        let index = m.progs.len() - 1;
+        let p = &m.progs[index];
+        let mut roles = vec![plow_asset::segment_roles::INTERPRETER; p.gq_seg_ofs.len() - 1];
+        for (ix, inst) in p.insts.iter().enumerate() {
+            if inst.op != DevOp::Gemv as u16
+                || !m.tensors[inst.t[2] as usize].name.contains(".layers.")
+            {
+                continue;
+            }
+            let seg = p
+                .stream
+                .iter()
+                .find(|entry| entry.inst as usize == ix)
+                .expect("cuBLASLt projection stream entry")
+                .seg as usize;
+            assert!(p
+                .stream
+                .iter()
+                .all(|entry| (entry.inst as usize == ix) == (entry.seg as usize == seg)));
+            roles[seg] = plow_asset::segment_roles::CUBLASLT;
+        }
+        assert!(
+            roles.contains(&plow_asset::segment_roles::CUBLASLT),
+            "cuBLASLt metadata requires eligible decode projections"
+        );
+        programs.push(serde_json::json!({"index":index,"roles":roles}));
+    }
     let mut objects = serde_json::Map::new();
     if used[1] {
         objects.insert(
@@ -189,7 +220,7 @@ struct Emitter<'a> {
     prefill: bool,
     batch: u32,
     decode_slots: u32,
-    decode_lt: bool,
+    decode_cublaslt: bool,
     fuse_ab: bool,
     ab_blocks: u32,
     projection_dag: bool,
@@ -305,7 +336,7 @@ impl Emitter<'_> {
                 d.i[7] = w;
             }
         });
-        if self.decode_lt && name.contains(".layers.") {
+        if self.decode_cublaslt && name.contains(".layers.") {
             self.b.isolate(done);
         }
         done
@@ -756,20 +787,20 @@ fn phase(
     let [gc, gs] = GenTensor::rope_pair(ctx, c.rotary, c.theta, 1.0, RopeScale::None);
     let cos = b.tensor_gen("in.cos_full", gc.byte_len(), gc);
     let sin = b.tensor_gen("in.sin_full", gs.byte_len(), gs);
-    let decode_lt = !prefill && emit_config::active().qwen_decode_lt;
+    let decode_cublaslt = !prefill && emit_config::active().decode_cublaslt;
     let fuse_ab = !prefill && emit_config::active().qwen_fuse_ab;
     let fuse_mlp = !prefill && emit_config::active().qwen_fuse_mlp;
     assert!(
-        !fuse_mlp || (!fp8 && !decode_lt),
+        !fuse_mlp || (!fp8 && !decode_cublaslt),
         "Qwen MLP projection fusion requires native BF16 decode"
     );
     let projection_dag = !prefill && emit_config::active().qwen_projection_dag;
     assert!(
-        !projection_dag || (!fp8 && !decode_lt),
+        !projection_dag || (!fp8 && !decode_cublaslt),
         "Qwen projection DAG requires native BF16 decode"
     );
     assert!(
-        !fuse_ab || (!fp8 && !decode_lt),
+        !fuse_ab || (!fp8 && !decode_cublaslt),
         "Qwen a/b fusion requires native BF16 decode"
     );
     let ab_blocks = if fuse_ab {
@@ -799,7 +830,7 @@ fn phase(
         "Qwen W8A8 requires B1 decode or explicit supported prefill buckets"
     );
     assert!(
-        !decode_lt || !fp8,
+        !decode_cublaslt || !fp8,
         "Qwen decode Lt requires BF16 projections"
     );
     let mut e = Emitter {
@@ -810,7 +841,7 @@ fn phase(
         prefill,
         batch,
         decode_slots,
-        decode_lt,
+        decode_cublaslt,
         fuse_ab,
         ab_blocks,
         projection_dag,
@@ -1029,9 +1060,17 @@ pub(super) fn run(
     let man = manifest::build(&m, arch, &lean);
     let out = Path::new(out);
     let mut sections = Vec::new();
-    if let Some(section) = prefill_segment_roles(&m) {
+    if let Some(section) = segment_roles(&m) {
         sections.push(section);
     }
+    crate::decode_objects::append(
+        &m,
+        &mut sections,
+        crate::emit_config::active().decode_objects.as_deref(),
+        arch,
+        out,
+    )
+    .unwrap_or_else(|error| panic!("decode objects: {error}"));
     let bytes = if let Some(layer) = c.block {
         use plow_asset::*;
         let full = c.layers[layer];
@@ -1123,7 +1162,7 @@ pub(super) fn run(
 mod tests {
     use super::*;
     #[test]
-    fn decode_balanced_splits_size_partials_and_preserve_prefill() {
+    fn decode_balanced_splits_reject_gf6_and_preserve_prefill() {
         let _env = crate::test_env::env_guard();
         let _target = EmitAmdGuard::set(false);
         struct Restore(emit_config::EmitConfig);
@@ -1142,14 +1181,12 @@ mod tests {
         c.kv_heads = 4;
         c.hd = 256;
         let plain = model_prefill(&c, 32768, 132, 0, &[128], 1, false);
+        cfg.attention_decode_balance_gf = Some(6);
+        emit_config::install(cfg.clone());
+        assert!(std::panic::catch_unwind(|| model(&c, 32768, 132, 0, false, 1)).is_err());
         for batch in [1, 4] {
-            for (gf, pin, expected) in [
-                (None, None, 11),
-                (Some(6), None, 33),
-                (Some(6), Some(11), 11),
-            ] {
+            for (gf, expected) in [(None, 11), (Some(2), 11)] {
                 cfg.attention_decode_balance_gf = gf;
-                cfg.ns_full_abs = pin;
                 emit_config::install(cfg.clone());
                 let m = model(&c, 32768, 132, 0, false, batch);
                 for d in m.progs[0]
@@ -1175,7 +1212,7 @@ mod tests {
                 }
             }
         }
-        cfg.attention_decode_balance_gf = Some(6);
+        cfg.attention_decode_balance_gf = Some(2);
         cfg.ns_full_abs = None;
         emit_config::install(cfg);
         let balanced = model_prefill(&c, 32768, 132, 0, &[128], 1, false);
@@ -1815,26 +1852,32 @@ mod tests {
     }
 
     #[test]
-    fn decode_lt_isolates_only_bf16_body_projections() {
+    fn decode_cublaslt_isolates_only_bf16_body_projections() {
         let _env = crate::test_env::env_guard();
         let _target = EmitAmdGuard::set(false);
-        let _scope = crate::test_env::EnvScope::set(&[("PLOW_QWEN_DECODE_LT", "0")]);
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_EMIT_DECODE_CUBLASLT", "0")]);
         let c = Config::parse(&fixture());
         for batch in [1, 4] {
-            std::env::set_var("PLOW_QWEN_DECODE_LT", "0");
+            std::env::set_var("PLOW_EMIT_DECODE_CUBLASLT", "0");
             {
                 let mut config = emit_config::active().clone();
-                config.qwen_decode_lt = false;
+                config.decode_cublaslt = false;
                 emit_config::install(config);
             }
             let plain = model_prefill(&c, 8192, 132, 0, &[128], batch, false);
-            std::env::set_var("PLOW_QWEN_DECODE_LT", "1");
+            std::env::set_var("PLOW_EMIT_DECODE_CUBLASLT", "1");
             {
                 let mut config = emit_config::active().clone();
-                config.qwen_decode_lt = true;
+                config.decode_cublaslt = true;
                 emit_config::install(config);
             }
             let isolated = model_prefill(&c, 8192, 132, 0, &[128], batch, false);
+            let metadata = segment_roles(&isolated).unwrap();
+            let metadata: plow_asset::segment_roles::SegmentRoles =
+                plow_asset::segment_roles::SegmentRoles::from_bytes(&metadata.data).unwrap();
+            let decode_roles = &metadata.programs.last().unwrap().roles;
+            assert!(metadata.objects.is_empty());
+            assert!(decode_roles.contains(&plow_asset::segment_roles::CUBLASLT));
             assert_eq!(plain.progs[0].gq_seg_ofs, isolated.progs[0].gq_seg_ofs);
             assert_eq!(plain.progs[0].waits, isolated.progs[0].waits);
             let a = &plain.progs[1];
@@ -2010,14 +2053,14 @@ mod tests {
             cfg.attention_pf_isolate = true;
             emit_config::install(cfg.clone());
             let control = model_prefill(&c, 65536, 132, 0, &[128, 1024, 4096, 8192], 1, fp8);
-            let meta = prefill_segment_roles(&control).unwrap();
+            let meta = segment_roles(&control).unwrap();
             let meta: Value = serde_json::from_slice(&meta.data).unwrap();
             assert!(meta["objects"].get("2").is_none());
             cfg.attention_pf_role = true;
             cfg.attention_pf_isolate = false;
             emit_config::install(cfg);
             let candidate = model_prefill(&c, 65536, 132, 0, &[128, 1024, 4096, 8192], 1, fp8);
-            let meta = prefill_segment_roles(&candidate).unwrap();
+            let meta = segment_roles(&candidate).unwrap();
             let meta: Value = serde_json::from_slice(&meta.data).unwrap();
             assert_eq!(meta["objects"]["2"]["abi"], "attention_sm90_hd256_v1");
             assert_eq!(meta["objects"].get("1").is_some(), fp8);
@@ -2094,7 +2137,7 @@ mod tests {
         cfg.fp8_pf_isolate = true;
         emit_config::install(cfg.clone());
         let isolated = model_prefill(&c, 32768, 132, 0, &[128, 1024, 4096, 8192], 1, true);
-        let control = prefill_segment_roles(&isolated).unwrap();
+        let control = segment_roles(&isolated).unwrap();
         let control: Value = serde_json::from_slice(&control.data).unwrap();
         assert!(control["objects"].as_object().unwrap().is_empty());
         assert!(control["programs"]
@@ -2104,7 +2147,7 @@ mod tests {
             .all(|p| p["roles"].as_array().unwrap().iter().all(|r| r == 0)));
         cfg.fp8_pf_gemm_role = true;
         emit_config::install(cfg.clone());
-        let candidate = prefill_segment_roles(&isolated).unwrap();
+        let candidate = segment_roles(&isolated).unwrap();
         let candidate: Value = serde_json::from_slice(&candidate.data).unwrap();
         assert_eq!(candidate["objects"]["1"]["abi"], "fp8_gemm_tma128_v1");
         assert!(candidate["programs"]
@@ -2121,7 +2164,7 @@ mod tests {
         cfg.fp8_pf_gemm_role = false;
         cfg.fp8_pf_isolate = false;
         emit_config::install(cfg);
-        assert!(prefill_segment_roles(&plain).is_none());
+        assert!(segment_roles(&plain).is_none());
         emit_config::install(original);
         for (a, b) in plain.progs.iter().zip(&isolated.progs) {
             assert_eq!(a.insts, b.insts);

@@ -82,6 +82,52 @@ impl TuneStore {
         self.root.join(hardware).join("attention_measurement.jsonl")
     }
 
+    fn projection_path(&self, hardware: &str) -> PathBuf {
+        self.root
+            .join(hardware)
+            .join("projection_measurement.jsonl")
+    }
+    pub fn load_projection(
+        &self,
+        hardware: &str,
+    ) -> Result<Vec<crate::projection::ProjectionMeasurement>, StoreError> {
+        let path = self.projection_path(hardware);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for line in BufReader::new(File::open(path)?).lines() {
+            let line = line?;
+            if !line.trim().is_empty() {
+                records.push(serde_json::from_str(&line)?);
+            }
+        }
+        Ok(records)
+    }
+    pub fn publish_projection(
+        &self,
+        hardware: &str,
+        mut records: Vec<crate::projection::ProjectionMeasurement>,
+    ) -> Result<usize, StoreError> {
+        for r in &records {
+            let mut blockers = r.qualification_blockers();
+            if r.cell.hardware != hardware {
+                blockers.push("hardware directory differs from record".into());
+            }
+            if !blockers.is_empty() {
+                return Err(StoreError::NotQualifiable {
+                    kernel: r.cell.key(),
+                    blockers,
+                });
+            }
+        }
+        for r in &mut records {
+            r.state = RecordState::Qualified;
+        }
+        self.append_jsonl(&self.projection_path(hardware), &records)?;
+        Ok(records.len())
+    }
+
     /// Every hardware cell that has a `kernel_measurement.jsonl`, as `vendor/isa/sku`.
     ///
     /// Exists so an empty cell can be reported as a MISMATCH rather than a cold start: the cell is
@@ -580,6 +626,30 @@ mod tests {
     }
 
     const HW: &str = "nvidia/sm_90a/h100-nvl";
+
+    #[test]
+    fn projection_publication_is_atomic_and_requires_matching_hardware() {
+        let root = tmpdir("projection");
+        let store = TuneStore::new(&root);
+        let r = crate::projection::tests::record();
+        let mut bad = r.clone();
+        bad.correctness = Correctness::Unchecked;
+        assert!(store
+            .publish_projection(&r.cell.hardware, vec![r.clone(), bad])
+            .is_err());
+        assert!(store.load_projection(&r.cell.hardware).unwrap().is_empty());
+        assert!(store
+            .publish_projection("wrong-target", vec![r.clone()])
+            .is_err());
+        assert_eq!(
+            store
+                .publish_projection(&r.cell.hardware, vec![r.clone()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.load_projection(&r.cell.hardware).unwrap(), [r]);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn publish_then_read_back() {

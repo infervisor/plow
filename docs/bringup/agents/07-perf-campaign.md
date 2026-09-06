@@ -20,7 +20,7 @@ into a command.**
 | `$BUILD` | | `scripts/build_<isa>.sh` for `$ISA` |
 | `$FEATURES` | | `--features hsa` (amd) or `--features cuda` (nvidia) |
 | `$BW_BOUND` / `$COMPUTE_CEIL` | | from Stage 4 — **state for each whether it is measured on `$GPU` or a datasheet fallback** |
-| `$RESULTS` | | `perf-data/plow-<isa>/` if it exists for `$ISA`, else `perf-data/` |
+| `$RESULTS` | | campaign NVMe, or `/dev/shm` for disposable screens; raw output is not committed |
 
 You are executing **Stage 7** of the model-bringup playbook — the final stage.
 Your job: run one clean, reproducible end-to-end performance campaign for a model
@@ -28,8 +28,8 @@ that already has a serving recipe (Stage 6), behind a correctness battery, and
 write it up honestly in `$RESULTS`. Read
 [`docs/bringup/07-perf-campaign.md`](../07-perf-campaign.md) first — it is
 authoritative and holds the full harness, commands, and pitfalls; the scripts
-themselves are described in `perf-data/tools/README.md`. This prompt is the
-executable checklist.
+under `perf-data/tools/` expose their current arguments in their usage text.
+This prompt is the executable checklist.
 
 **Nothing here recompiles or re-tunes.** A campaign measures the gated recipe and
 documents it. If a run suggests a new lever, record it as open work and finish
@@ -180,15 +180,12 @@ ctx blob that cannot hold `input+output` **refuses** the request (`tok/req`
 collapses, `TPOT 0.000`) — that is a size error, flag the row `valid: false` and
 recompile, do not re-run.
 
-### 6. Consolidate + write the results doc
+### 6. Consolidate the result
 
-Transcribe every number verbatim from the tool's report JSON. Consolidators build
-the `*.json`; **you write the markdown by hand** from those JSONs with the prose
-and caveats. Write under `$RESULTS`; do not commit unless explicitly requested (per-ISA home `perf-data/plow-<isa>/` —
-`perf-data/plow-gfx942/` is the only one in the tree today; cross-arch capacity
-reports at the `perf-data/` root). If `$ISA` has no home yet, create one on the
-same pattern rather than filing under another ISA's directory. Match the
-established structure:
+Keep raw JSON/JSONL, logs, command manifests, and binaries in `$RESULTS` on
+campaign storage. Update `perf-data/SUMMARY.md` with the reviewed decision and
+retain only compact CSV inputs that directly support it. Do not commit a new
+per-experiment Markdown or JSON report. Match this structure:
 
 * header (date, branch@commit, the filled target block — `$GPU`, `$ISA`,
   `$NCU`, `$NGPU`/`$PARALLEL`, `$MAXCTX`, driver, `$TOOLCHAIN` — both engine
@@ -215,8 +212,8 @@ Passes when **all** hold; otherwise the model is blocked with a specific blocker
 3. Same-session and uncontended: both engines one lease, every run `gpulease`
    rc=0, no stored baseline quoted as same-session.
 4. Swept: a concurrency ladder and a context ladder, not one cell.
-5. Documented in `$RESULTS` in the established format, every cell traceable to
-   a JSON + a command, neutral tone, no win/loss framing.
+5. Consolidated in `perf-data/SUMMARY.md`; raw evidence and commands remain
+   traceable in external `$RESULTS`, and any retained CSV supports the summary.
 6. The write-up names `$GPU`, `$ISA`, `$NCU`, `$NGPU`/`$PARALLEL`, `$MAXCTX`,
    the provenance of every denominator, and a `Scope:` line. An unscoped number
    will be reused on a part it was never measured on.
@@ -286,8 +283,8 @@ Passes when **all** hold; otherwise the model is blocked with a specific blocker
   trend, not a served point).
 * **Roofline**: `$COMPUTE_CEIL` / `$BW_BOUND` with their provenance and the
   achieved fraction of each; the honest per-model limiter.
-* **The write-up**: path to the committed `$RESULTS` doc + its JSONs, and the
-  reproduction command per table.
+* **The record**: updated `perf-data/SUMMARY.md`, external `$RESULTS` location,
+  and the reproduction command per table.
 * **Real-vs-ideal caveats**: contention, stored-vs-same-session baselines,
   chat-route inflation, any comparator that could not be reproduced — everything
   that bounds how far a reader should trust a number.

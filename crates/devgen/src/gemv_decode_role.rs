@@ -24,13 +24,23 @@ pub(crate) fn apply(model: &mut Model) -> SectionData {
             && d.i[2] % 8 == 0
             && u32::from(d.blocks) == model.n_cu
             && (d.op != DevOp::Gemv as u16 || d.i[3] == 0);
-        let role = if eligible { 3 } else { 0 };
-        if roles.is_empty() || role != 0 || roles.last() != Some(&0) {
+        let role = if eligible {
+            plow_asset::segment_roles::GEMV_CTA512
+        } else {
+            plow_asset::segment_roles::INTERPRETER
+        };
+        if roles.is_empty()
+            || role != plow_asset::segment_roles::INTERPRETER
+            || roles.last() != Some(&plow_asset::segment_roles::INTERPRETER)
+        {
             roles.push(role);
         }
         segments.push(u16::try_from(roles.len() - 1).expect("too many decode segments"));
     }
-    assert!(roles.contains(&3), "no eligible BF16 M1 GEMV instructions");
+    assert!(
+        roles.contains(&plow_asset::segment_roles::GEMV_CTA512),
+        "no eligible BF16 M1 GEMV instructions"
+    );
     for e in p.stream.iter_mut().chain(&mut p.gq_stream) {
         e.seg = segments[e.inst as usize];
     }

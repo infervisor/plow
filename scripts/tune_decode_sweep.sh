@@ -85,7 +85,7 @@
 #   scripts/tune_decode_sweep.sh \
 #     --model /workspace/models/gemma-4-26B-A4B-it \
 #     --work /dev/shm/plowtune/sweep \
-#     --results perf-data/tune-decode-h100-26b-bf16.jsonl \
+#     --results /dev/shm/plowtune/tune-decode-h100-26b-bf16.jsonl \
 #     --occ "1:132 2:264" --ns-abs "8 16 32 48" \
 #     --gv-unroll "4 8" --gv-moe-un "2 4" --moe-down-sg "4 8" \
 #     --ctx "1024 8192 32768" --reps 3
@@ -100,7 +100,7 @@ MODEL=/workspace/models/gemma-4-26B-A4B-it
 CHECKPOINT=""
 MODEL_NAME=""
 WORK=/dev/shm/plowtune/sweep
-RESULTS="$ROOT/perf-data/tune-decode-h100-26b-bf16.jsonl"
+RESULTS=""
 PLOWC=""
 STEP_BENCH=""
 BLOCK=""
@@ -233,6 +233,10 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option $1" >&2; usage 2;;
   esac
 done
+
+# Raw sweep rows are transient campaign evidence. Keep the default outside the
+# repository; callers may point --results at durable campaign NVMe.
+RESULTS="${RESULTS:-$WORK/results.jsonl}"
 
 # Everything arch-specific, resolved once. `KSYM` is the mangled decode-kernel
 # name cuobjdump prints registers for; getting it wrong yields an empty register

@@ -1230,8 +1230,8 @@ fn k3_build_model(
     decode_build_order.extend_from_slice(&rungs[..rungs.len() - 1]);
 
     let mut decode = Vec::with_capacity(rungs.len());
-    let packed_prefill_topology = crate::emit_is_amd()
-        && std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1");
+    let packed_prefill_topology =
+        crate::emit_is_amd() && crate::emit_config::active().emit_packed_prefill;
     let mut prefill = Vec::with_capacity(pf.len() * (1 + usize::from(packed_prefill_topology)));
     for (i, &t) in decode_build_order.iter().enumerate() {
         let fallback_ns = k3_nsplit_fallback(ctx);
@@ -2086,7 +2086,7 @@ mod kimi_k3_tests {
     fn packed_prefill_segmentation_does_not_split_decode_rungs() {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[
-            ("PLOW_SEG_PACKED_PREFILL", "1"),
+            ("PLOW_EMIT_PACKED_PREFILL", "1"),
             ("PLOW_DECODE_BATCH_LADDER", "1,4,8"),
             ("PLOW_GEMV_WALK", "1"),
         ]);
