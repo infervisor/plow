@@ -39,11 +39,7 @@ fn reject(message: &str) -> RuntimeError {
     RuntimeError::Rejected(format!("decode objects: {message}"))
 }
 pub(super) fn parse(blob: &DevBlob, raw: &[u8]) -> Result<Option<DecodeObjects>> {
-    if blob
-        .sections
-        .iter()
-        .any(|s| s.name == plow_asset::decode_context::SECTION)
-    {
+    if decode_context::metadata(blob, raw)?.is_some() {
         return Err(reject("context alternatives require validated auxiliary-program loading; this engine supports the base ladder only"));
     }
     let count = blob
@@ -163,6 +159,23 @@ pub(super) fn capacity(spec: &DecodeObject, sms: u32, occupancy: u32) -> Result<
     }
     Ok(())
 }
+#[cfg(test)]
+pub(super) fn bind_module(
+    spec: &DecodeObject,
+    be: &Arc<CudaBackend>,
+    module: Arc<DecodeModule>,
+) -> Result<Arc<BoundDecodeObject>> {
+    let function = be.get_function(&module, &spec.entry)?;
+    check_loaded(spec, be, &module, function)?;
+    Ok(Arc::new(BoundDecodeObject {
+        function,
+        grid: spec.grid,
+        block: spec.threads,
+        smem: spec.arena_bytes,
+        _module: module,
+    }))
+}
+
 pub(super) fn initial_grid(
     metadata: Option<&DecodeObjects>,
     packet_grid: u32,
@@ -381,7 +394,7 @@ mod tests {
                 section.name = plow_asset::decode_context::SECTION.into();
             }
             let error = parse(&blob, &raw).unwrap_err().to_string();
-            assert!(error.contains("validated auxiliary-program loading"));
+            assert!(error.contains("decode context") || error.contains("unknown field"));
             blob.sections[0].kind = 0;
             assert!(parse(&blob, &raw).is_err());
         }

@@ -45,6 +45,8 @@ use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHo
 use crate::device::{Backend, DeviceMem, Module};
 use crate::{Result, RuntimeError};
 
+#[path = "gpu_decode_context.rs"]
+mod decode_context;
 #[path = "gpu_decode_object.rs"]
 mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
