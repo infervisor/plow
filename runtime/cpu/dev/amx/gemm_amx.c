@@ -22,6 +22,7 @@
 #include "cpu_dev_internal.h"
 #include "golden/golden.h"
 #include "amx_common.h"
+#include "../avx512/avx512.h" /* v_glu_pair / v_load_bf16_mask for the GLU epilogue */
 #include "../fp8_common.h"
 
 #define KP 512u   /* K panel, bf16 elements (16 tile steps); one strip = 32 KiB < L1 */
@@ -206,13 +207,19 @@ static inline void ils_row(const ils_t* e, uint32_t r) {
         if (e->cols == 32u) _mm512_storeu_si512((void*)d, v);
         else _mm512_mask_storeu_epi16((void*)d, (__mmask32)((1u << e->cols) - 1u), v);
     } else {
+        /* Vector GLU epilogue: the scalar tanhf/expf loop cost ~20 us per 32x32 block against
+         * ~1 us of tile math (GEMM_GLU was 386 ms/thr at T=128, 1356 at T=512). */
         const float* u = e->cb_up + (size_t)r * 32u;
-        for (uint32_t j = 0; j < e->cols; j++) {
-            float g = e->sc ? c[j] * e->sc[j] : c[j];
-            float uu = e->sc_up ? u[j] * e->sc_up[j] : u[j];
-            if (e->bias) g += plow_bf2f(e->bias[j]);
-            if (e->bias_up) uu += plow_bf2f(e->bias_up[j]);
-            d[j] = plow_f2bf(g_glu_pair(g, uu, e->act, e->f0, e->f1));
+        for (uint32_t j = 0; j < e->cols; j += 16u) {
+            const __mmask16 m = e->cols - j >= 16u ? 0xFFFF : (__mmask16)((1u << (e->cols - j)) - 1u);
+            __m512 g = _mm512_maskz_loadu_ps(m, c + j);
+            __m512 uu = _mm512_maskz_loadu_ps(m, u + j);
+            if (e->sc) g = _mm512_mul_ps(g, _mm512_maskz_loadu_ps(m, e->sc + j));
+            if (e->sc_up) uu = _mm512_mul_ps(uu, _mm512_maskz_loadu_ps(m, e->sc_up + j));
+            if (e->bias) g = _mm512_add_ps(g, v_load_bf16_mask(e->bias + j, m));
+            if (e->bias_up) uu = _mm512_add_ps(uu, v_load_bf16_mask(e->bias_up + j, m));
+            const __m512 o = v_glu_pair(g, uu, e->act, e->f0, e->f1);
+            _mm256_mask_storeu_epi16((void*)(d + j), m, (__m256i)_mm512_cvtneps_pbh(o));
         }
     }
 }

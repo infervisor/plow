@@ -1,6 +1,6 @@
-//! The CPU engine behind a served slug: `batch` sequence slots, chunked prefill
-//! into a slot (one compiled bucket per tick, capped by the mux's interleave
-//! budget and `PLOW_CPU_PF_CHUNK`), one batched greedy decode step per tick —
+//! The CPU engine behind a served slug: `batch` sequence slots, prefill into a
+//! slot (whole prompt by default; `PLOW_CPU_PF_CHUNK=n` caps a tick to one
+//! compiled bucket of <= n rows), one batched greedy decode step per tick —
 //! the same shape as the single-GPU AMD engine, so it rides the mux's
 //! [`SeqEngine`] tick unchanged. Slot `i` of the mux IS engine slot `i`.
 
@@ -32,8 +32,11 @@ pub struct CpuServe {
     pf_pos: Vec<u32>,
     /// Compiled prefill buckets `(program, rows)`.
     buckets: Vec<(usize, u32)>,
-    /// Largest chunk one tick may prefill while other slots decode (`PLOW_CPU_PF_CHUNK`,
-    /// default 256): bounds the decode stall of the live slots to one chunk's prefill.
+    /// Largest chunk one tick may prefill while other slots decode (`PLOW_CPU_PF_CHUNK`;
+    /// 0 = whole prompt, the default). MEASURED OFF: at 256 the summarize c=8 cell went from
+    /// TTFT 32 s / TPOT 1005 ms to 48 s / 1268 — every chunk re-streams all weights and a
+    /// rung-8 decode step (~400 ms) runs between chunks, while live slots still stall for a
+    /// whole chunk. Only faster prefill or packing slots into one program helps here.
     pf_chunk: u32,
 }
 
@@ -49,8 +52,7 @@ impl CpuServe {
         let pf_chunk = std::env::var("PLOW_CPU_PF_CHUNK")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(256);
+            .unwrap_or(0);
         tracing::info!(
             max_ctx,
             batch,
@@ -279,7 +281,7 @@ impl SeqEngine for CpuServe {
         prompt: &[u32],
         tick_max_bucket: u32,
     ) -> Result<Option<u32>> {
-        let cap = if tick_max_bucket == u32::MAX {
+        let cap = if tick_max_bucket == u32::MAX || self.pf_chunk == 0 {
             u32::MAX
         } else {
             tick_max_bucket.min(self.pf_chunk)
