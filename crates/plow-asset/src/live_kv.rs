@@ -363,10 +363,12 @@ impl Manifest {
                                 d.i[0] == p.rows
                                     && d.i[1] == c.heads
                                     && d.i[2] == c.hd
-                                    && matches!(
-                                        (c.hd, d.i[5]),
-                                        (64, ROPE_PAIR_HALF) | (256 | 512, 0)
-                                    )
+                                    && d.i[5]
+                                        == if c.hd == 64 && h == c.pair[0] {
+                                            ROPE_PAIR_HALF
+                                        } else {
+                                            0
+                                        }
                                     && d.i[3] == 0
                                     && d.fj[1] == c.stride
                                     && d.fj[2] == c.mask
@@ -423,6 +425,13 @@ fn direct_operands(op: DevOp) -> Result<()> {
                 | DevOp::ZeroF32
                 | DevOp::GemmSplitK
                 | DevOp::CastF32Bf16
+                | DevOp::MoeRouterTopkPf
+                | DevOp::MoeAlignPf
+                | DevOp::MoeCombinePf
+                | DevOp::MoeGluMx
+                | DevOp::MoeDownMx
+                | DevOp::MoeGluMxPf
+                | DevOp::MoeDownMxPf
         ),
         "opcode has no audited direct-operand access contract",
     )
