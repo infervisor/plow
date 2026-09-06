@@ -1,0 +1,4475 @@
+{
+  "qualification": {
+    "device_memory_check_qualified_with_expected_api_probes": true,
+    "tool_exit_zero": false,
+    "host_sha256": "12bf0ef317f1ddb903baf7260aaffa069c47478322905f0fd16f96c0c6d6b25c",
+    "records": [
+      {
+        "api_error_count": 2,
+        "api": "cuModuleGetGlobal_v2",
+        "error": "CUDA_ERROR_NOT_FOUND",
+        "result": 500,
+        "reported_call_instruction_offsets": [
+          "0x16502b",
+          "0x165073"
+        ],
+        "other_sanitizer_records": 0,
+        "xml": {
+          "records": 2,
+          "all_api_probes": true
+        },
+        "raw_returncode": 99,
+        "tool_exit_zero": false,
+        "log": "/tmp/plow-model-support-checks/e3-rung-memory-window-20260906/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck.log",
+        "log_sha256": "3a7e18d70686c83ca201e495101cf4c771320f478fd0e92d5a180c933ae5ff93",
+        "xml_sha256": "3dcc1c602abbb032b53c6bf3ee9ee3eff693915367918b58b2b9cd69bb396ae5",
+        "job": "e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck"
+      },
+      {
+        "api_error_count": 2,
+        "api": "cuModuleGetGlobal_v2",
+        "error": "CUDA_ERROR_NOT_FOUND",
+        "result": 500,
+        "reported_call_instruction_offsets": [
+          "0x16502b",
+          "0x165073"
+        ],
+        "other_sanitizer_records": 0,
+        "xml": {
+          "records": 2,
+          "all_api_probes": true
+        },
+        "raw_returncode": 99,
+        "tool_exit_zero": false,
+        "log": "/tmp/plow-model-support-checks/e3-rung-memory-window-20260906/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck.log",
+        "log_sha256": "d7a14fdcd3346884c71504267987da81799ff2561438ab1b3215c7a4da884b6f",
+        "xml_sha256": "3dcc1c602abbb032b53c6bf3ee9ee3eff693915367918b58b2b9cd69bb396ae5",
+        "job": "e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck"
+      },
+      {
+        "api_error_count": 2,
+        "api": "cuModuleGetGlobal_v2",
+        "error": "CUDA_ERROR_NOT_FOUND",
+        "result": 500,
+        "reported_call_instruction_offsets": [
+          "0x16502b",
+          "0x165073"
+        ],
+        "other_sanitizer_records": 0,
+        "xml": {
+          "records": 2,
+          "all_api_probes": true
+        },
+        "raw_returncode": 99,
+        "tool_exit_zero": false,
+        "log": "/tmp/plow-model-support-checks/e3-rung-memory-window-20260906/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck.log",
+        "log_sha256": "94b6c96d62f55d8f6ab02bc10606359710c9e9882dce3b14b185cb6ace71283f",
+        "xml_sha256": "3dcc1c602abbb032b53c6bf3ee9ee3eff693915367918b58b2b9cd69bb396ae5",
+        "job": "e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck"
+      },
+      {
+        "api_error_count": 2,
+        "api": "cuModuleGetGlobal_v2",
+        "error": "CUDA_ERROR_NOT_FOUND",
+        "result": 500,
+        "reported_call_instruction_offsets": [
+          "0x16502b",
+          "0x165073"
+        ],
+        "other_sanitizer_records": 0,
+        "xml": {
+          "records": 2,
+          "all_api_probes": true
+        },
+        "raw_returncode": 99,
+        "tool_exit_zero": false,
+        "log": "/tmp/plow-model-support-checks/e3-rung-memory-window-20260906/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck.log",
+        "log_sha256": "0ac4988267c746370316d3706ce7cd917447cfb23345e2179143b27c8873e198",
+        "xml_sha256": "3dcc1c602abbb032b53c6bf3ee9ee3eff693915367918b58b2b9cd69bb396ae5",
+        "job": "e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck"
+      }
+    ],
+    "physical_row_cross_arm_comparisons": 144,
+    "physical_row_instrumented_baseline_comparisons": 288,
+    "scratch_guard_and_exact_cast_checks": 12,
+    "reset_histories_pass": true,
+    "cross_arm_records": [
+      {
+        "M": 4,
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 2.488537863352069e-05,
+        "max_abs": 0.03125,
+        "max_ref": 256.0
+      },
+      {
+        "M": 4,
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 3.3004362851116165e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 253.0
+      },
+      {
+        "M": 4,
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 6.759846453572347e-05,
+        "max_abs": 0.25,
+        "max_ref": 480.0
+      },
+      {
+        "M": 4,
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 2.855088037477656e-05,
+        "max_abs": 0.125,
+        "max_ref": 320.0
+      },
+      {
+        "M": 4,
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 2.1237080396771058e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 17.5
+      },
+      {
+        "M": 4,
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 4,
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 2.4061313241096292e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 16.0
+      },
+      {
+        "M": 4,
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 3.098233859757772e-05,
+        "max_abs": 0.0029296875,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 4,
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 8.40403860552959e-06,
+        "max_abs": 0.015625,
+        "max_ref": 346.0
+      },
+      {
+        "M": 4,
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001328111415641412,
+        "max_abs": 0.5,
+        "max_ref": 720.0
+      },
+      {
+        "M": 4,
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 2.640805944140131e-05,
+        "max_abs": 0.125,
+        "max_ref": 648.0
+      },
+      {
+        "M": 4,
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 1.514308384060462e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 700.0
+      },
+      {
+        "M": 4,
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 1.544370678437413e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 25.5
+      },
+      {
+        "M": 4,
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 6.519883333289216e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 21.5
+      },
+      {
+        "M": 4,
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 8.826080277592265e-06,
+        "max_abs": 0.00048828125,
+        "max_ref": 20.625
+      },
+      {
+        "M": 4,
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 4,
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 1.4516111172505871e-05,
+        "max_abs": 0.03125,
+        "max_ref": 388.0
+      },
+      {
+        "M": 4,
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.00018801122753832388,
+        "max_abs": 0.5,
+        "max_ref": 292.0
+      },
+      {
+        "M": 4,
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 8.948706573436856e-05,
+        "max_abs": 0.25,
+        "max_ref": 237.0
+      },
+      {
+        "M": 4,
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001264633202177507,
+        "max_abs": 0.5,
+        "max_ref": 856.0
+      },
+      {
+        "M": 4,
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 7.638927349793947e-07,
+        "max_abs": 6.103515625e-05,
+        "max_ref": 22.625
+      },
+      {
+        "M": 4,
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0002549947920037621,
+        "max_abs": 0.015625,
+        "max_ref": 16.875
+      },
+      {
+        "M": 4,
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 4,
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.000127269319859666,
+        "max_abs": 0.0078125,
+        "max_ref": 15.875
+      },
+      {
+        "M": 4,
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 2.488537863352069e-05,
+        "max_abs": 0.03125,
+        "max_ref": 256.0
+      },
+      {
+        "M": 4,
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 3.3005158204046075e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 253.0
+      },
+      {
+        "M": 4,
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 6.759855718706423e-05,
+        "max_abs": 0.25,
+        "max_ref": 480.0
+      },
+      {
+        "M": 4,
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 2.855088037477656e-05,
+        "max_abs": 0.125,
+        "max_ref": 320.0
+      },
+      {
+        "M": 4,
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 2.1237080396771058e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 17.5
+      },
+      {
+        "M": 4,
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 4,
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 2.4061313241096292e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 16.0
+      },
+      {
+        "M": 4,
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 3.098233859757772e-05,
+        "max_abs": 0.0029296875,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 4,
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 8.40403860552959e-06,
+        "max_abs": 0.015625,
+        "max_ref": 346.0
+      },
+      {
+        "M": 4,
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001328111444870073,
+        "max_abs": 0.5,
+        "max_ref": 720.0
+      },
+      {
+        "M": 4,
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 2.640805944140131e-05,
+        "max_abs": 0.125,
+        "max_ref": 648.0
+      },
+      {
+        "M": 4,
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 1.514308384060462e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 700.0
+      },
+      {
+        "M": 4,
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 1.544370678437413e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 25.5
+      },
+      {
+        "M": 4,
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 6.519883333289216e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 21.5
+      },
+      {
+        "M": 4,
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 8.826080277592265e-06,
+        "max_abs": 0.00048828125,
+        "max_ref": 20.625
+      },
+      {
+        "M": 4,
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 4,
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 1.4085908312883846e-05,
+        "max_abs": 0.03125,
+        "max_ref": 388.0
+      },
+      {
+        "M": 4,
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.00018800554151429335,
+        "max_abs": 0.5,
+        "max_ref": 292.0
+      },
+      {
+        "M": 4,
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 8.948706573436856e-05,
+        "max_abs": 0.25,
+        "max_ref": 237.0
+      },
+      {
+        "M": 4,
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001264633202177507,
+        "max_abs": 0.5,
+        "max_ref": 856.0
+      },
+      {
+        "M": 4,
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 3.416232165864316e-07,
+        "max_abs": 3.0517578125e-05,
+        "max_ref": 22.625
+      },
+      {
+        "M": 4,
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0002549947920037621,
+        "max_abs": 0.015625,
+        "max_ref": 16.875
+      },
+      {
+        "M": 4,
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 4,
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.000127269319859666,
+        "max_abs": 0.0078125,
+        "max_ref": 15.875
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 2.488537863352069e-05,
+        "max_abs": 0.03125,
+        "max_ref": 256.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 3.3005158204046075e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 253.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 6.759855718706423e-05,
+        "max_abs": 0.25,
+        "max_ref": 480.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 2.855088037477656e-05,
+        "max_abs": 0.125,
+        "max_ref": 320.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 1.0348072110219698e-05,
+        "max_abs": 0.0625,
+        "max_ref": 438.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 1.4422806385619688e-05,
+        "max_abs": 0.125,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.00011525427739682692,
+        "max_abs": 1.0,
+        "max_ref": 1272.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.00016101680677804725,
+        "max_abs": 1.0,
+        "max_ref": 928.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 2.1237080396771058e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 17.5
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 2.4061313241096292e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 3.098233859757772e-05,
+        "max_abs": 0.0029296875,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 12.875
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 2.1085387072150698e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 14.0625
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 6.250816511568742e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 14.625
+      },
+      {
+        "M": 8,
+        "step": 0,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.00012632442836949125,
+        "max_abs": 0.0078125,
+        "max_ref": 9.375
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 8.40403860552959e-06,
+        "max_abs": 0.015625,
+        "max_ref": 346.0
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001328111444870073,
+        "max_abs": 0.5,
+        "max_ref": 720.0
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 2.640805944140131e-05,
+        "max_abs": 0.125,
+        "max_ref": 648.0
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 1.514308384060462e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 700.0
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 1.6271665156089698e-07,
+        "max_abs": 0.0009765625,
+        "max_ref": 664.0
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 9.035865700371934e-06,
+        "max_abs": 0.0625,
+        "max_ref": 752.0
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 6.623848453891134e-06,
+        "max_abs": 0.0625,
+        "max_ref": 1480.0
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 3.0424880582859976e-05,
+        "max_abs": 0.25,
+        "max_ref": 1352.0
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 1.544370678437413e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 25.5
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 6.519883333289216e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 21.5
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 8.826080277592265e-06,
+        "max_abs": 0.00048828125,
+        "max_ref": 20.625
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 11.0625
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 4.11447801776796e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 19.25
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 2.628285389251371e-06,
+        "max_abs": 0.000244140625,
+        "max_ref": 25.125
+      },
+      {
+        "M": 8,
+        "step": 1,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 5.417726168322982e-06,
+        "max_abs": 0.00048828125,
+        "max_ref": 7.28125
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 1.4058583537758045e-05,
+        "max_abs": 0.03125,
+        "max_ref": 388.0
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.00018801122753832388,
+        "max_abs": 0.5,
+        "max_ref": 292.0
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 8.948706573436856e-05,
+        "max_abs": 0.25,
+        "max_ref": 237.0
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001264633202177507,
+        "max_abs": 0.5,
+        "max_ref": 856.0
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 4.308334504982163e-05,
+        "max_abs": 0.25,
+        "max_ref": 748.0
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 2.7631334149188584e-05,
+        "max_abs": 0.25,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 1.7820783652031e-05,
+        "max_abs": 0.125,
+        "max_ref": 482.0
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 6.965450348372577e-07,
+        "max_abs": 0.0078125,
+        "max_ref": 1512.0
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 3.416232165864316e-07,
+        "max_abs": 3.0517578125e-05,
+        "max_ref": 22.625
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0002549947920037621,
+        "max_abs": 0.015625,
+        "max_ref": 16.875
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.000127269319859666,
+        "max_abs": 0.0078125,
+        "max_ref": 15.875
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 4.233446849002555e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 23.5
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.00016717248080888017,
+        "max_abs": 0.015625,
+        "max_ref": 10.375
+      },
+      {
+        "M": 8,
+        "step": 2,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.125
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 2.488537863352069e-05,
+        "max_abs": 0.03125,
+        "max_ref": 256.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 3.3005158204046075e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 253.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 6.759855718706423e-05,
+        "max_abs": 0.25,
+        "max_ref": 480.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 2.855088037477656e-05,
+        "max_abs": 0.125,
+        "max_ref": 320.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 1.0353123642004071e-05,
+        "max_abs": 0.0625,
+        "max_ref": 438.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 1.4422806385619688e-05,
+        "max_abs": 0.125,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.00011525427739682692,
+        "max_abs": 1.0,
+        "max_ref": 1272.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.00016140106741581838,
+        "max_abs": 1.0,
+        "max_ref": 928.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 2.1237080396771058e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 17.5
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 2.4061313241096292e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 3.098233859757772e-05,
+        "max_abs": 0.0029296875,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 12.875
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 2.1085387072150698e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 14.0625
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 6.250816511568742e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 14.625
+      },
+      {
+        "M": 8,
+        "step": 3,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.00012806390831474344,
+        "max_abs": 0.0078125,
+        "max_ref": 9.375
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 8.40403860552959e-06,
+        "max_abs": 0.015625,
+        "max_ref": 346.0
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001328111415641412,
+        "max_abs": 0.5,
+        "max_ref": 720.0
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 2.640805944140131e-05,
+        "max_abs": 0.125,
+        "max_ref": 648.0
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 1.514308384060462e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 700.0
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 1.6271665156089698e-07,
+        "max_abs": 0.0009765625,
+        "max_ref": 664.0
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 9.035865700371934e-06,
+        "max_abs": 0.0625,
+        "max_ref": 752.0
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 6.623848453891134e-06,
+        "max_abs": 0.0625,
+        "max_ref": 1480.0
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 3.0424880582859976e-05,
+        "max_abs": 0.25,
+        "max_ref": 1352.0
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 1.544370678437413e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 25.5
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 6.519883333289216e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 21.5
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 8.826080277592265e-06,
+        "max_abs": 0.00048828125,
+        "max_ref": 20.625
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 11.0625
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 4.11447801776796e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 19.25
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 2.628285389251371e-06,
+        "max_abs": 0.000244140625,
+        "max_ref": 25.125
+      },
+      {
+        "M": 8,
+        "step": 4,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 5.417726168322982e-06,
+        "max_abs": 0.00048828125,
+        "max_ref": 7.28125
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 1.4058583537758045e-05,
+        "max_abs": 0.03125,
+        "max_ref": 388.0
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.00018801122753832388,
+        "max_abs": 0.5,
+        "max_ref": 292.0
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 8.948706573436856e-05,
+        "max_abs": 0.25,
+        "max_ref": 237.0
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 9.451999367622576e-05,
+        "max_abs": 0.5,
+        "max_ref": 856.0
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 4.308334504982163e-05,
+        "max_abs": 0.25,
+        "max_ref": 748.0
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 2.7631334149188584e-05,
+        "max_abs": 0.25,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 1.7820783652031e-05,
+        "max_abs": 0.125,
+        "max_ref": 482.0
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 6.965450348372577e-07,
+        "max_abs": 0.0078125,
+        "max_ref": 1512.0
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 3.416232165864316e-07,
+        "max_abs": 3.0517578125e-05,
+        "max_ref": 22.625
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0002549947920037621,
+        "max_abs": 0.015625,
+        "max_ref": 16.875
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 9.435926034604753e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 15.875
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 4.233446849002555e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 23.5
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.00016717248080888017,
+        "max_abs": 0.015625,
+        "max_ref": 10.375
+      },
+      {
+        "M": 8,
+        "step": 5,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.125
+      }
+    ],
+    "instrumented_baseline_records": [
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 256.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 253.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 480.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 320.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 346.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 720.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 648.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 700.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.5
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 21.5
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 20.625
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 388.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 292.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 237.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 856.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 22.625
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.875
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 15.875
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 256.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 253.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 480.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 320.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 346.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 720.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 648.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 700.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.5
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 21.5
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 20.625
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 388.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 292.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 237.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 856.0
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 22.625
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.875
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 4,
+        "arm": "control",
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 15.875
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 256.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 253.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 480.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 320.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 346.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 720.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 648.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 700.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.5
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 21.5
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 20.625
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 3.5078012624722503e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 388.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 292.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 237.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 8.401757302698909e-05,
+        "max_abs": 0.5,
+        "max_ref": 856.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 6.832464331526492e-07,
+        "max_abs": 6.103515625e-05,
+        "max_ref": 22.625
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.875
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 8.540385681137857e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 15.875
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 256.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 253.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 1.1192049957131258e-07,
+        "max_abs": 0.00048828125,
+        "max_ref": 480.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 320.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 346.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 720.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 648.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 700.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.5
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 21.5
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 20.625
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 388.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 1.46221106728025e-06,
+        "max_abs": 0.00390625,
+        "max_ref": 292.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 237.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 856.0
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 22.625
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.875
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 4,
+        "arm": "s8",
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 15.875
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 256.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 253.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 480.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 320.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 438.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1272.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 928.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 12.875
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.0625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 0,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 9.375
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 346.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 720.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 648.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 700.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 664.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 752.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1480.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1352.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.5
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 21.5
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 20.625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 11.0625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.25
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.125
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 1,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.28125
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 388.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 292.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 237.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 856.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 748.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 482.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1512.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 22.625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.875
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 15.875
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 23.5
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 10.375
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 2,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.125
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 256.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 253.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 480.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 320.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 438.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1272.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 928.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 12.875
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.0625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 3,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 9.375
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 346.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 720.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 648.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 700.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 664.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 752.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1480.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1352.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.5
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 21.5
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 20.625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 11.0625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.25
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.125
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 4,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.28125
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 388.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 292.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 237.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 856.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 748.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 482.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1512.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 22.625
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.875
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 15.875
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 23.5
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 10.375
+      },
+      {
+        "M": 8,
+        "arm": "control",
+        "step": 5,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.125
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 256.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 3.666090782062441e-07,
+        "max_abs": 0.0009765625,
+        "max_ref": 253.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 1.1192049957131258e-07,
+        "max_abs": 0.00048828125,
+        "max_ref": 480.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 320.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 3.23377093195897e-07,
+        "max_abs": 0.001953125,
+        "max_ref": 438.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 3.4907267360771633e-06,
+        "max_abs": 0.03125,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1272.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 2.1739718506388894e-08,
+        "max_abs": 0.000244140625,
+        "max_ref": 928.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 12.875
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 2.6153201253133567e-06,
+        "max_abs": 0.000244140625,
+        "max_ref": 14.0625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 0,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 9.375
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 346.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 1.6087093820299777e-08,
+        "max_abs": 6.103515625e-05,
+        "max_ref": 720.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 648.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 700.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 664.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 752.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1480.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1352.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.5
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 21.5
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 20.625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 11.0625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.25
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.125
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 1,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.28125
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 388.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 292.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 237.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 8.401758304263718e-05,
+        "max_abs": 0.5,
+        "max_ref": 856.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 748.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 482.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1512.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 22.625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.875
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 8.540385681137857e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 15.875
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 23.5
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 10.375
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 2,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.125
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 256.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 3.666090782062441e-07,
+        "max_abs": 0.0009765625,
+        "max_ref": 253.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 1.1192049957131258e-07,
+        "max_abs": 0.00048828125,
+        "max_ref": 480.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 320.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 438.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1272.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 1.1130757105443451e-05,
+        "max_abs": 0.125,
+        "max_ref": 928.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 13.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.5625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 12.875
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.0625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 14.625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 3,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 2.1035822175518525e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 9.375
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 346.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 720.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 648.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 700.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 664.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 752.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1480.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 3.7737143707906995e-06,
+        "max_abs": 0.03125,
+        "max_ref": 1352.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.5
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 21.5
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 20.625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 18.625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 11.0625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.25
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 25.125
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 4,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 5.417726168322982e-06,
+        "max_abs": 0.00048828125,
+        "max_ref": 7.28125
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 388.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 292.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 237.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 856.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 748.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1392.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 482.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 1512.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 22.625
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.875
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.46875
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 15.875
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.0
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 23.5
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 10.375
+      },
+      {
+        "M": 8,
+        "arm": "s8",
+        "step": 5,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 19.125
+      }
+    ],
+    "capture_sha256": {
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/manifest.json": "6ef5e37ced32f6aca82221555c9a6b49878f5f70e3a1a4bf13a45c259abe8d47",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0000-tensor000.raw": "500b130dac687534e70ff5b852316c1025adf1377b2f835fc70872f522feea59",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0000-tensor001.raw": "77aab0ff6ee0b7d52355408f523e7d35175b81f719eaed623ac3df39d6421fd6",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0000-tensor002.raw": "949aeb8664bd3626d093ff38df93d0a2b609e97a004374cd3deecdc969734032",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0001-tensor000.raw": "f701941979c52b3489d88b51c1b19319addf3539f9809ef39a40a4e3929c8c5f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0001-tensor001.raw": "d575b8ae716a214dc44e9026755d16739c2e7b0808c60234cc2de2a61ec79767",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0001-tensor002.raw": "71c49d457e9d8b93b2c980230bcf19e91dd14b60770bce2c765240c1be6beb59",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0002-tensor000.raw": "9bb527131934575b1c56742d2e6fef02fdf2b8bd08469d2a8b492936ca87d1e5",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0002-tensor001.raw": "238a772e002e214d5e82c1105400f0ea5054c74079709ea041462fc3657396b2",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0002-tensor002.raw": "3022874e0b2ad274ae3d8583d9523d04b94b4a6cd51d3e3e13891007a9888499",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0003-tensor000.raw": "500b130dac687534e70ff5b852316c1025adf1377b2f835fc70872f522feea59",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0003-tensor001.raw": "77aab0ff6ee0b7d52355408f523e7d35175b81f719eaed623ac3df39d6421fd6",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0003-tensor002.raw": "949aeb8664bd3626d093ff38df93d0a2b609e97a004374cd3deecdc969734032",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0004-tensor000.raw": "f701941979c52b3489d88b51c1b19319addf3539f9809ef39a40a4e3929c8c5f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0004-tensor001.raw": "d575b8ae716a214dc44e9026755d16739c2e7b0808c60234cc2de2a61ec79767",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0004-tensor002.raw": "71c49d457e9d8b93b2c980230bcf19e91dd14b60770bce2c765240c1be6beb59",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0005-tensor000.raw": "9bb527131934575b1c56742d2e6fef02fdf2b8bd08469d2a8b492936ca87d1e5",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0005-tensor001.raw": "238a772e002e214d5e82c1105400f0ea5054c74079709ea041462fc3657396b2",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck/step0005-tensor002.raw": "3022874e0b2ad274ae3d8583d9523d04b94b4a6cd51d3e3e13891007a9888499",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/manifest.json": "6fdae0a8578c7ffeebf48a573c264be9fa9d755262b102f6a237971a3036735e",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0000-tensor000.raw": "500b130dac687534e70ff5b852316c1025adf1377b2f835fc70872f522feea59",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0000-tensor001.raw": "f32eb7b9790265ba14c7a94f85d6eb6e6a194baf8475aece19855dbf77183b2c",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0000-tensor002.raw": "c39ccf16459154a969f9e33860735be8f52ef70ad5da95657921d6baea8a2611",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0000-tensor003.raw": "43738922f33fb2609fbbb49653725f9be40bc6a28c19d455b6a2a5ffcaef7f07",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0001-tensor000.raw": "f701941979c52b3489d88b51c1b19319addf3539f9809ef39a40a4e3929c8c5f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0001-tensor001.raw": "f131da7566e1984ed1eeb46d69a073d63a7684a29e32a66bde3a28ccbb3e00f0",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0001-tensor002.raw": "0daf3bea88531f5531a69fd9f71212f79eb0c0100a0ab163d578d603c0a32fe5",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0001-tensor003.raw": "e35bfc7ff20e22d81212f0353eeaec38b025da1e0c4f54def92a52959a252e34",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0002-tensor000.raw": "9bb527131934575b1c56742d2e6fef02fdf2b8bd08469d2a8b492936ca87d1e5",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0002-tensor001.raw": "0ab6fb7b58a1f039c697a0ff0d834cecd0e0d8f4139ba10b031de210a104dfd9",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0002-tensor002.raw": "ffcd1e69985060cb318df6ca9572afd12ab7bf612effc026156780cb70ef9912",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0002-tensor003.raw": "3840573f92bb1f4e49a129a96399f5790d159adc70fff5fd9e133b91d00ad2c0",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0003-tensor000.raw": "500b130dac687534e70ff5b852316c1025adf1377b2f835fc70872f522feea59",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0003-tensor001.raw": "17b5d7d037acf0e6b0e3d9bacb2518ea084c92b3ffc7996d16b3cbe99fd82d87",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0003-tensor002.raw": "c39ccf16459154a969f9e33860735be8f52ef70ad5da95657921d6baea8a2611",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0003-tensor003.raw": "f182c8524a3e4402270b8c97e8fe2dbc9e40a519673f33871807544bc3864799",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0004-tensor000.raw": "f701941979c52b3489d88b51c1b19319addf3539f9809ef39a40a4e3929c8c5f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0004-tensor001.raw": "c11d743abb631f4d8c92f29a7667db203251dccce97a22a9bf74d8fc9d0e6a54",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0004-tensor002.raw": "0daf3bea88531f5531a69fd9f71212f79eb0c0100a0ab163d578d603c0a32fe5",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0004-tensor003.raw": "b07d586225a883a465d21da9a231491ebed23360e52845a38f04bea70482ef6d",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0005-tensor000.raw": "9bb527131934575b1c56742d2e6fef02fdf2b8bd08469d2a8b492936ca87d1e5",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0005-tensor001.raw": "5dc344aa6e0076ed7c9e7fe67c35c70164c66529b3071f92378ec89bc8edfe9f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0005-tensor002.raw": "bee97feda1dc931f189d5d55cc6d7131a04e0b6a8ed146475e413f3c448a25a8",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck/step0005-tensor003.raw": "36a33e7f1f55962f2d458d66f668c3d3ab4835d5319fb60f63e09bacbac63348",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/manifest.json": "04349a0219b0d83194e4f526ddb69aaaa4ed5eb15bd128105a04b91ed1f4cc26",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0000-tensor000.raw": "c2f1a6c1bda6fc45654de903f765957af35c5d631e2fe5e788ddb9c50635018f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0000-tensor001.raw": "8d88ed58dae543f421c220adb233f09a320a45bce21d0ba5e7bd2689b9c5010e",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0000-tensor002.raw": "43d37786387cc9bd8b5154d3ae92dbb873f916a2f8a0d284279e35a982c18834",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0001-tensor000.raw": "c91f6a3939cc7a779f44c3fa495c335f4c510def6c3323f6186b28414ac56fd8",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0001-tensor001.raw": "3a59d3ff8c1de46e3c2359adbc0b5e56928ace475dac8ee88d40aa445ae40f81",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0001-tensor002.raw": "b2e2eda7fe37e0b984651110ca4469d78766c581db0b512723ce0b5acbe975cb",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0002-tensor000.raw": "6662c045d35410e0efd45f126fa32b6ff48691feb14cac4988165789ed0242ca",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0002-tensor001.raw": "461e085d1bde3a4d3d8b876c22405c62eebabcc09f70087d8c9991791e7f60d6",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0002-tensor002.raw": "b629a7018447bf54259f1f95329fee912c2b5a6810cffb8c233cf83230557f72",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0003-tensor000.raw": "c2f1a6c1bda6fc45654de903f765957af35c5d631e2fe5e788ddb9c50635018f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0003-tensor001.raw": "8d88ed58dae543f421c220adb233f09a320a45bce21d0ba5e7bd2689b9c5010e",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0003-tensor002.raw": "43d37786387cc9bd8b5154d3ae92dbb873f916a2f8a0d284279e35a982c18834",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0004-tensor000.raw": "c91f6a3939cc7a779f44c3fa495c335f4c510def6c3323f6186b28414ac56fd8",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0004-tensor001.raw": "3a59d3ff8c1de46e3c2359adbc0b5e56928ace475dac8ee88d40aa445ae40f81",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0004-tensor002.raw": "b2e2eda7fe37e0b984651110ca4469d78766c581db0b512723ce0b5acbe975cb",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0005-tensor000.raw": "6662c045d35410e0efd45f126fa32b6ff48691feb14cac4988165789ed0242ca",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0005-tensor001.raw": "461e085d1bde3a4d3d8b876c22405c62eebabcc09f70087d8c9991791e7f60d6",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck/step0005-tensor002.raw": "b629a7018447bf54259f1f95329fee912c2b5a6810cffb8c233cf83230557f72",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/manifest.json": "c732845b6da014633983d750faaef4aa1e47c169f92450d5bbd6e5fbf32739f0",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0000-tensor000.raw": "c2f1a6c1bda6fc45654de903f765957af35c5d631e2fe5e788ddb9c50635018f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0000-tensor001.raw": "ee3f7799e50aecf0a2b84a024b783fced8df7ead87ef47007ec1db3bebe023f8",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0000-tensor002.raw": "868713ff70608b66f40b89a88b7b6450df08a1f9161e91b9889b8056c9b02be2",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0000-tensor003.raw": "0742fbc4f3f8940fd8333df6bbf138c9b7081f04a710b23398d5382a28ae9ce0",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0001-tensor000.raw": "c91f6a3939cc7a779f44c3fa495c335f4c510def6c3323f6186b28414ac56fd8",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0001-tensor001.raw": "7f4b7307fb97ec411f2b8576b0e2ccd1a1b09cc828798b0d65a8be7fd30aa83d",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0001-tensor002.raw": "067eb0bfb93e04f2dad43a55866bf14f8eb6af6aed5a3b98ef7bbcd29094fced",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0001-tensor003.raw": "52f2de0f8ce14ead2270c9f761dddc83c0a8f7a924e9bcd6b33c97d593654784",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0002-tensor000.raw": "6662c045d35410e0efd45f126fa32b6ff48691feb14cac4988165789ed0242ca",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0002-tensor001.raw": "37cf40aa7478c7e7b233b2407fad00fa665d9c101eef6936e05ccb90afd05eaf",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0002-tensor002.raw": "7fda3335235437cf825d770e1afb0dfa6d0e871114b615a2e2a99640f35b4a41",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0002-tensor003.raw": "4f6a300a1ff8ce99211870237ef9cafe52ec5d93f85d3496af9d1087da8cb763",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0003-tensor000.raw": "c2f1a6c1bda6fc45654de903f765957af35c5d631e2fe5e788ddb9c50635018f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0003-tensor001.raw": "1be4de29c6decf70699658d6082b36ad343ef6762ea2f11bfb2215719479aaf3",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0003-tensor002.raw": "2430c8463c63f8c77dbdb0df3f385fcc5580b2b2ded1ed682e2a2ba09c316a9a",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0003-tensor003.raw": "a6749637af119b81d46f5e7cb757420fe69f18212181368093fcc54cf9ceca1f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0004-tensor000.raw": "c91f6a3939cc7a779f44c3fa495c335f4c510def6c3323f6186b28414ac56fd8",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0004-tensor001.raw": "0aff46ded0e9db1888f66523dfec191c88caface0f49170fd79f537e3ad67c81",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0004-tensor002.raw": "067eb0bfb93e04f2dad43a55866bf14f8eb6af6aed5a3b98ef7bbcd29094fced",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0004-tensor003.raw": "dd1c648d5f30ee5f3ecb9f16bb6aef34899e1e15df474a516f15b0a3f5d4fd8b",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0005-tensor000.raw": "6662c045d35410e0efd45f126fa32b6ff48691feb14cac4988165789ed0242ca",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0005-tensor001.raw": "1216054b738335f40d7747d41bbccd57a8aef122c683be22987cc47bf265e6e7",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0005-tensor002.raw": "226faeb67c6ac4b86e904acbe4643e610502cedea1d6627532f704aa706e47f1",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/memory-gates/results/e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck/step0005-tensor003.raw": "bcbaa3139d0018640f8f977409139d1742e6153735ca06b1e3d9230ec6f0aa88"
+    },
+    "scope": "M4/M8 native block5, six steps each with reset, LIVE1 and132CTA cooperative occupancy. Exactly two statically bound optional packet-hash API500 probes per process retained as raw99; no other sanitizer records. Not tool exit0, per-op cold timing, full-model or serving qualification."
+  },
+  "cpu_tests": {
+    "log_mutations_rejected": 10,
+    "xml_mutations_rejected": 5,
+    "existing_numeric_guard_mutations_pass": true
+  },
+  "callsite_proof": {
+    "host_sha256": "12bf0ef317f1ddb903baf7260aaffa069c47478322905f0fd16f96c0c6d6b25c",
+    "records": [
+      {
+        "reported_offset": "0x1662cc",
+        "call_instruction": "0x1662ca",
+        "bytes": "ff5078",
+        "assembly": "  1662c1:\t4c 89 ee             \tmov    rsi,r13\n  1662c4:\t4c 89 e2             \tmov    rdx,r12\n  1662c7:\t4c 89 f9             \tmov    rcx,r15\n  1662ca:\tff 50 78             \tcall   QWORD PTR [rax+0x78]\n  1662cd:\t85 c0                \ttest   eax,eax\n  1662cf:\t0f 84 4c 01 00 00    \tje     166421 <__cxa_finalize@plt+0x12d3e1>"
+      },
+      {
+        "reported_offset": "0x16502b",
+        "call_instruction": "0x165027",
+        "bytes": "e874100000",
+        "assembly": "  16501d:\t00 \n  16501e:\t41 b8 13 00 00 00    \tmov    r8d,0x13\n  165024:\t4c 89 ee             \tmov    rsi,r13\n  165027:\te8 74 10 00 00       \tcall   1660a0 <__cxa_finalize@plt+0x12d060>\n  16502c:\t48 8b 6c 24 20       \tmov    rbp,QWORD PTR [rsp+0x20]\n  165031:\t8b 44 24 28          \tmov    eax,DWORD PTR [rsp+0x28]"
+      },
+      {
+        "reported_offset": "0x165073",
+        "call_instruction": "0x16506f",
+        "bytes": "e82c100000",
+        "assembly": "  165065:\t00 \n  165066:\t41 b8 13 00 00 00    \tmov    r8d,0x13\n  16506c:\t4c 89 ee             \tmov    rsi,r13\n  16506f:\te8 2c 10 00 00       \tcall   1660a0 <__cxa_finalize@plt+0x12d060>\n  165074:\t48 8b b4 24 a8 00 00 \tmov    rsi,QWORD PTR [rsp+0xa8]\n  16507b:\t00 "
+      },
+      {
+        "reported_offset": "0x1416ee",
+        "call_instruction": "0x1416ea",
+        "bytes": "e8812d0200",
+        "assembly": "  1416df:\t48 8d b4 24 c8 21 00 \tlea    rsi,[rsp+0x21c8]\n  1416e6:\t00 \n  1416e7:\t48 89 df             \tmov    rdi,rbx\n  1416ea:\te8 81 2d 02 00       \tcall   164470 <__cxa_finalize@plt+0x12b430>\n  1416ef:\t4c 8b 84 24 e0 06 00 \tmov    r8,QWORD PTR [rsp+0x6e0]\n  1416f6:\t00 "
+      },
+      {
+        "reported_offset": "0x7a3c0",
+        "call_instruction": "0x7a3bc",
+        "bytes": "e8df350c00",
+        "assembly": "   7a3af:\t48 89 c6             \tmov    rsi,rax\n   7a3b2:\t48 8b 54 24 28       \tmov    rdx,QWORD PTR [rsp+0x28]\n   7a3b7:\t48 8b 4c 24 20       \tmov    rcx,QWORD PTR [rsp+0x20]\n   7a3bc:\te8 df 35 0c 00       \tcall   13d9a0 <__cxa_finalize@plt+0x104960>\n   7a3c1:\t4c 8b a4 24 80 07 00 \tmov    r12,QWORD PTR [rsp+0x780]\n   7a3c8:\t00 "
+      },
+      {
+        "reported_offset": "0x7dfa2",
+        "call_instruction": "0x7dfa1",
+        "bytes": "ffd7",
+        "assembly": "   7df96:\t66 2e 0f 1f 84 00 00 \tcs nop WORD PTR [rax+rax*1+0x0]\n   7df9d:\t00 00 00 \n   7dfa0:\t50                   \tpush   rax\n   7dfa1:\tff d7                \tcall   rdi\n   7dfa3:\t59                   \tpop    rcx\n   7dfa4:\tc3                   \tret"
+      },
+      {
+        "reported_offset": "0x907ea",
+        "call_instruction": "0x907e6",
+        "bytes": "e8b5d7feff",
+        "assembly": "   907d1:\t48 89 05 58 7e 29 00 \tmov    QWORD PTR [rip+0x297e58],rax        # 328630 <__cxa_finalize@plt+0x2ef5f0>\n   907d8:\t4c 89 2d 59 7e 29 00 \tmov    QWORD PTR [rip+0x297e59],r13        # 328638 <__cxa_finalize@plt+0x2ef5f8>\n   907df:\t48 8d 3d 4a 46 fe ff \tlea    rdi,[rip+0xfffffffffffe464a]        # 74e30 <__cxa_finalize@plt+0x3bdf0>\n   907e6:\te8 b5 d7 fe ff       \tcall   7dfa0 <__cxa_finalize@plt+0x44f60>\n   907eb:\t48 85 c0             \ttest   rax,rax\n   907ee:\t0f 84 28 01 00 00    \tje     9091c <__cxa_finalize@plt+0x578dc>"
+      },
+      {
+        "reported_offset": "0x5b1a4",
+        "call_instruction": "0x5b19f",
+        "bytes": "ff1503ae2c00",
+        "assembly": "   5b193:\t45 31 c0             \txor    r8d,r8d\n   5b196:\t31 c9                \txor    ecx,ecx\n   5b198:\t48 8d 3d e1 51 03 00 \tlea    rdi,[rip+0x351e1]        # 90380 <__cxa_finalize@plt+0x57340>\n   5b19f:\tff 15 03 ae 2c 00    \tcall   QWORD PTR [rip+0x2cae03]        # 325fa8 <__cxa_finalize@plt+0x2ecf68>\n   5b1a5:\tf4                   \thlt\n   5b1a6:\t66 2e 0f 1f 84 00 00 \tcs nop WORD PTR [rax+rax*1+0x0]"
+      }
+    ]
+  },
+  "symbol_proof": {
+    "host_sha256": "12bf0ef317f1ddb903baf7260aaffa069c47478322905f0fd16f96c0c6d6b25c",
+    "references": [
+      {
+        "name": "plow_packet_hash_lo",
+        "file_offset": 2627741,
+        "virtual_address": "0x28189d",
+        "call_instruction": "0x165027",
+        "reported_last_byte": "0x16502b",
+        "assembly": "  164ffb:\t48 8b 84 24 48 01 00 \tmov    rax,QWORD PTR [rsp+0x148]\n  165002:\t00 \n  165003:\t4c 8b 28             \tmov    r13,QWORD PTR [rax]\n  165006:\t49 83 c5 10          \tadd    r13,0x10\n  16500a:\t48 8d 0d 8c c8 11 00 \tlea    rcx,[rip+0x11c88c]        # 28189d <__cxa_finalize@plt+0x24885d>\n  165011:\t48 8d 7c 24 20       \tlea    rdi,[rsp+0x20]\n  165016:\t48 8d 94 24 00 01 00 \tlea    rdx,[rsp+0x100]\n  16501d:\t00 \n  16501e:\t41 b8 13 00 00 00    \tmov    r8d,0x13\n  165024:\t4c 89 ee             \tmov    rsi,r13\n  165027:\te8 74 10 00 00       \tcall   1660a0 <__cxa_finalize@plt+0x12d060>\n  16502c:\t48 8b 6c 24 20       \tmov    rbp,QWORD PTR [rsp+0x20]\n  165031:\t8b 44 24 28          \tmov    eax,DWORD PTR [rsp+0x28]\n  165035:\t8b 5c 24 2c          \tmov    ebx,DWORD PTR [rsp+0x2c]\n  165039:\t48 3b ac 24 a8 00 00 \tcmp    rbp,QWORD PTR [rsp+0xa8]\n  165040:\t00 \n  165041:\t0f 85 65 01 00 00    \tjne    1651ac <__cxa_finalize@plt+0x12c16c>\n  165047:\t4c 89 b4 24 e8 00 00 \tmov    QWORD PTR [rsp+0xe8],r14\n  16504e:\t00 \n  16504f:\t49 89 c6             \tmov    r14,rax\n  165052:\t48 8d 0d 57 c8 11 00 \tlea    rcx,[rip+0x11c857]        # 2818b0 <__cxa_finalize@plt+0x248870>\n  165059:\t48 8d 7c 24 20       \tlea    rdi,[rsp+0x20]"
+      },
+      {
+        "name": "plow_packet_hash_hi",
+        "file_offset": 2627760,
+        "virtual_address": "0x2818b0",
+        "call_instruction": "0x16506f",
+        "reported_last_byte": "0x165073",
+        "assembly": "  165041:\t0f 85 65 01 00 00    \tjne    1651ac <__cxa_finalize@plt+0x12c16c>\n  165047:\t4c 89 b4 24 e8 00 00 \tmov    QWORD PTR [rsp+0xe8],r14\n  16504e:\t00 \n  16504f:\t49 89 c6             \tmov    r14,rax\n  165052:\t48 8d 0d 57 c8 11 00 \tlea    rcx,[rip+0x11c857]        # 2818b0 <__cxa_finalize@plt+0x248870>\n  165059:\t48 8d 7c 24 20       \tlea    rdi,[rsp+0x20]\n  16505e:\t48 8d 94 24 00 01 00 \tlea    rdx,[rsp+0x100]\n  165065:\t00 \n  165066:\t41 b8 13 00 00 00    \tmov    r8d,0x13\n  16506c:\t4c 89 ee             \tmov    rsi,r13\n  16506f:\te8 2c 10 00 00       \tcall   1660a0 <__cxa_finalize@plt+0x12d060>\n  165074:\t48 8b b4 24 a8 00 00 \tmov    rsi,QWORD PTR [rsp+0xa8]\n  16507b:\t00 \n  16507c:\t48 8b 6c 24 20       \tmov    rbp,QWORD PTR [rsp+0x20]\n  165081:\t8b 4c 24 28          \tmov    ecx,DWORD PTR [rsp+0x28]\n  165085:\t8b 44 24 2c          \tmov    eax,DWORD PTR [rsp+0x2c]\n  165089:\t48 39 f5             \tcmp    rbp,rsi\n  16508c:\t0f 85 4f 01 00 00    \tjne    1651e1 <__cxa_finalize@plt+0x12c1a1>\n  165092:\t44 85 f1             \ttest   ecx,r14d\n  165095:\t0f 84 0f 09 00 00    \tje     1659aa <__cxa_finalize@plt+0x12c96a>\n  16509b:\t48 c1 e0 20          \tshl    rax,0x20\n  16509f:\t48 09 d8             \tor     rax,rbx"
+      }
+    ],
+    "scope": "Exact current ordered host expected optional callsites derived from new binary before sanitizer; other stack frames require fresh report audit."
+  },
+  "raw_logs": {
+    "e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck.log": "========= COMPUTE-SANITIZER\n\u001b[2m2026-09-06T05:13:33.593271Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::device::cuda\u001b[0m\u001b[2m:\u001b[0m CUDA device ready \u001b[3mname\u001b[0m\u001b[2m=\u001b[0mNVIDIA H100 80GB HBM3 \u001b[3msm_count\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem_optin\u001b[0m\u001b[2m=\u001b[0m232448 \u001b[3mcc_major\u001b[0m\u001b[2m=\u001b[0m9 \u001b[3mcc_minor\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mcoherent_host_dma\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mdriver\u001b[0m\u001b[2m=\u001b[0m13.2\n\u001b[2m2026-09-06T05:13:33.593312Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m loading model onto GPU... \u001b[3massets\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control \u001b[3mcheckpoint\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/checkpoint \u001b[3mdevice\u001b[0m\u001b[2m=\u001b[0mNVIDIA H100 80GB HBM3\n\u001b[2m2026-09-06T05:13:34.962366Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::devblob\u001b[0m\u001b[2m:\u001b[0m devblob: assets compiled for a specific GPU target \u2014 a backend that resolves its device can cross-check this fingerprint (Gap 4) \u001b[3mtarget_fp\u001b[0m\u001b[2m=\u001b[0m0xcc013c47 \u001b[3mn_cu\u001b[0m\u001b[2m=\u001b[0m132\n\u001b[2m2026-09-06T05:13:34.962394Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m parsed PLOWDEV blob \u001b[3mblob\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/model.pkt \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m39 \u001b[3mn_cu\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mprograms\u001b[0m\u001b[2m=\u001b[0m8\n========= Program hit CUDA_ERROR_NOT_FOUND (error 500) due to \"named symbol not found\" on CUDA API call to cuModuleGetGlobal_v2.\n=========     Saved host backtrace up to driver entry point at error\n=========         Host Frame:  [0x1662cc] in decode_dump\n=========         Host Frame:  [0x16502b] in decode_dump\n=========         Host Frame:  [0x1416ee] in decode_dump\n=========         Host Frame:  [0x7a3c0] in decode_dump\n=========         Host Frame:  [0x7dfa2] in decode_dump\n=========         Host Frame:  [0x907ea] in decode_dump\n=========         Host Frame: __libc_start_call_main [0x2b284] in libc.so.6\n=========         Host Frame: __libc_start_main [0x2b337] in libc.so.6\n=========         Host Frame:  [0x5b1a4] in decode_dump\n========= \n========= Program hit CUDA_ERROR_NOT_FOUND (error 500) due to \"named symbol not found\" on CUDA API call to cuModuleGetGlobal_v2.\n=========     Saved host backtrace up to driver entry point at error\n=========         Host Frame:  [0x1662cc] in decode_dump\n=========         Host Frame:  [0x165073] in decode_dump\n=========         Host Frame:  [0x1416ee] in decode_dump\n=========         Host Frame:  [0x7a3c0] in decode_dump\n=========         Host Frame:  [0x7dfa2] in decode_dump\n=========         Host Frame:  [0x907ea] in decode_dump\n=========         Host Frame: __libc_start_call_main [0x2b284] in libc.so.6\n=========         Host Frame: __libc_start_main [0x2b337] in libc.so.6\n=========         Host Frame:  [0x5b1a4] in decode_dump\n========= \n\u001b[2m2026-09-06T05:13:35.002631Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m interpreter module loaded \u001b[3mprofile\u001b[0m\u001b[2m=\u001b[0m\"sm90a\" \u001b[3msource\u001b[0m\u001b[2m=\u001b[0mPLOW_NV_CUBIN=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a.cubin \u001b[3mkernel\u001b[0m\u001b[2m=\u001b[0m_Z12interp_sm90a11PlowProgram \u001b[3mgrid\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem\u001b[0m\u001b[2m=\u001b[0m16448 \u001b[3mocc_per_sm\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mcubin_bytes\u001b[0m\u001b[2m=\u001b[0m5640400\n\u001b[2m2026-09-06T05:13:35.002745Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m NVIDIA decode capacity metadata \u001b[3mdecode_rungs\u001b[0m\u001b[2m=\u001b[0m[1, 2, 4, 8, 16] \u001b[3mgemv_mm_cap\u001b[0m\u001b[2m=\u001b[0m8 \u001b[3mgemv_weight_passes\u001b[0m\u001b[2m=\u001b[0m2\n\u001b[2m2026-09-06T05:13:35.002867Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::memory::vmm\u001b[0m\u001b[2m:\u001b[0m vmm kv pool up (full layers VMM-backed, sliding on cudaMalloc) \u001b[3mfull_layers\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mkv_elem\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mkv_elem_slide\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mblock_mib\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mblock_rows\u001b[0m\u001b[2m=\u001b[0m2048 \u001b[3mbph\u001b[0m\u001b[2m=\u001b[0m32 \u001b[3mva_gib\u001b[0m\u001b[2m=\u001b[0m2.0\n\u001b[2m2026-09-06T05:13:35.002916Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m opening safetensors checkpoint... \u001b[3mdir\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/checkpoint\n\u001b[2m2026-09-06T05:13:35.002999Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m found safetensors shards \u001b[3mshards\u001b[0m\u001b[2m=\u001b[0m1\n\u001b[2m2026-09-06T05:13:35.003550Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m checkpoint ready (all shards mmap'd) \u001b[3mshards\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m677 \u001b[3mms\u001b[0m\u001b[2m=\u001b[0m\"1\"\n\u001b[2m2026-09-06T05:13:35.003556Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m checkpoint opened, starting weight upload to GPU... \u001b[3mcheckpoint\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/checkpoint\n\u001b[2m2026-09-06T05:13:35.080939Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m upload pipe mode \u001b[3mdirect\u001b[0m\u001b[2m=\u001b[0mfalse\n\u001b[2m2026-09-06T05:13:36.690424Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m checkpoint weights uploaded to GPU \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mweight_gib\u001b[0m\u001b[2m=\u001b[0m\"2.33\" \u001b[3mkv_gib\u001b[0m\u001b[2m=\u001b[0m\"2.00\" \u001b[3melapsed_s\u001b[0m\u001b[2m=\u001b[0m\"1.7\" \u001b[3mthroughput_gib_s\u001b[0m\u001b[2m=\u001b[0m\"1.38\"\n\u001b[2m2026-09-06T05:13:36.691791Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m packet decode rung selection enabled \u001b[3mrungs\u001b[0m\u001b[2m=\u001b[0m5\n\u001b[2m2026-09-06T05:13:36.725163Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m segmented prefill pair loaded \u001b[3mgrid_flash\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mgrid_gemm\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem_flash\u001b[0m\u001b[2m=\u001b[0m132160 \u001b[3msmem_gemm\u001b[0m\u001b[2m=\u001b[0m197696 \u001b[3mblock_gemm\u001b[0m\u001b[2m=\u001b[0m384 \u001b[3mfa512\u001b[0m\u001b[2m=\u001b[0mtrue\n\u001b[2m2026-09-06T05:13:36.726163Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m prefill object loaded \u001b[3mpf_cubin\u001b[0m\u001b[2m=\u001b[0mPLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin \u001b[3mbuckets\u001b[0m\u001b[2m=\u001b[0m3 \u001b[3msmem_pf\u001b[0m\u001b[2m=\u001b[0m132160 \u001b[3msegmented\u001b[0m\u001b[2m=\u001b[0mtrue\n\u001b[2m2026-09-06T05:13:36.726174Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m GPU engine loaded (decode program) \u001b[3mpkt\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/model.pkt \u001b[3mgrid\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mweights_gib\u001b[0m\u001b[2m=\u001b[0m2.325477123260498 \u001b[3mkv_gib\u001b[0m\u001b[2m=\u001b[0m2.0 \u001b[3mn_weights\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mvocab\u001b[0m\u001b[2m=\u001b[0m262144 \u001b[3mmax_ctx\u001b[0m\u001b[2m=\u001b[0m65536 \u001b[3mbatch\u001b[0m\u001b[2m=\u001b[0m16 \u001b[3mprefill_buckets\u001b[0m\u001b[2m=\u001b[0m3 \u001b[3mstop_ids\u001b[0m\u001b[2m=\u001b[0m[1, 106, 50] \u001b[3mvmm_prefix\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mvmm_live\u001b[0m\u001b[2m=\u001b[0mtrue \u001b[3melapsed_s\u001b[0m\u001b[2m=\u001b[0m3.132861614227295 \u001b[3minterp\u001b[0m\u001b[2m=\u001b[0m\"sm90a\"\n========= ERROR SUMMARY: 2 errors\n",
+    "e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck.log": "========= COMPUTE-SANITIZER\n\u001b[2m2026-09-06T05:13:46.325490Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::device::cuda\u001b[0m\u001b[2m:\u001b[0m CUDA device ready \u001b[3mname\u001b[0m\u001b[2m=\u001b[0mNVIDIA H100 80GB HBM3 \u001b[3msm_count\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem_optin\u001b[0m\u001b[2m=\u001b[0m232448 \u001b[3mcc_major\u001b[0m\u001b[2m=\u001b[0m9 \u001b[3mcc_minor\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mcoherent_host_dma\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mdriver\u001b[0m\u001b[2m=\u001b[0m13.2\n\u001b[2m2026-09-06T05:13:46.325531Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m loading model onto GPU... \u001b[3massets\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control \u001b[3mcheckpoint\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/checkpoint \u001b[3mdevice\u001b[0m\u001b[2m=\u001b[0mNVIDIA H100 80GB HBM3\n\u001b[2m2026-09-06T05:13:47.696203Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::devblob\u001b[0m\u001b[2m:\u001b[0m devblob: assets compiled for a specific GPU target \u2014 a backend that resolves its device can cross-check this fingerprint (Gap 4) \u001b[3mtarget_fp\u001b[0m\u001b[2m=\u001b[0m0xcc013c47 \u001b[3mn_cu\u001b[0m\u001b[2m=\u001b[0m132\n\u001b[2m2026-09-06T05:13:47.696230Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m parsed PLOWDEV blob \u001b[3mblob\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/model.pkt \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m39 \u001b[3mn_cu\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mprograms\u001b[0m\u001b[2m=\u001b[0m8\n========= Program hit CUDA_ERROR_NOT_FOUND (error 500) due to \"named symbol not found\" on CUDA API call to cuModuleGetGlobal_v2.\n=========     Saved host backtrace up to driver entry point at error\n=========         Host Frame:  [0x1662cc] in decode_dump\n=========         Host Frame:  [0x16502b] in decode_dump\n=========         Host Frame:  [0x1416ee] in decode_dump\n=========         Host Frame:  [0x7a3c0] in decode_dump\n=========         Host Frame:  [0x7dfa2] in decode_dump\n=========         Host Frame:  [0x907ea] in decode_dump\n=========         Host Frame: __libc_start_call_main [0x2b284] in libc.so.6\n=========         Host Frame: __libc_start_main [0x2b337] in libc.so.6\n=========         Host Frame:  [0x5b1a4] in decode_dump\n========= \n========= Program hit CUDA_ERROR_NOT_FOUND (error 500) due to \"named symbol not found\" on CUDA API call to cuModuleGetGlobal_v2.\n=========     Saved host backtrace up to driver entry point at error\n=========         Host Frame:  [0x1662cc] in decode_dump\n=========         Host Frame:  [0x165073] in decode_dump\n=========         Host Frame:  [0x1416ee] in decode_dump\n=========         Host Frame:  [0x7a3c0] in decode_dump\n=========         Host Frame:  [0x7dfa2] in decode_dump\n=========         Host Frame:  [0x907ea] in decode_dump\n=========         Host Frame: __libc_start_call_main [0x2b284] in libc.so.6\n=========         Host Frame: __libc_start_main [0x2b337] in libc.so.6\n=========         Host Frame:  [0x5b1a4] in decode_dump\n========= \n\u001b[2m2026-09-06T05:13:47.736835Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m interpreter module loaded \u001b[3mprofile\u001b[0m\u001b[2m=\u001b[0m\"sm90a\" \u001b[3msource\u001b[0m\u001b[2m=\u001b[0mPLOW_NV_CUBIN=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a.cubin \u001b[3mkernel\u001b[0m\u001b[2m=\u001b[0m_Z12interp_sm90a11PlowProgram \u001b[3mgrid\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem\u001b[0m\u001b[2m=\u001b[0m16448 \u001b[3mocc_per_sm\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mcubin_bytes\u001b[0m\u001b[2m=\u001b[0m5640400\n\u001b[2m2026-09-06T05:13:47.736938Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m NVIDIA decode capacity metadata \u001b[3mdecode_rungs\u001b[0m\u001b[2m=\u001b[0m[1, 2, 4, 8, 16] \u001b[3mgemv_mm_cap\u001b[0m\u001b[2m=\u001b[0m8 \u001b[3mgemv_weight_passes\u001b[0m\u001b[2m=\u001b[0m2\n\u001b[2m2026-09-06T05:13:47.737053Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::memory::vmm\u001b[0m\u001b[2m:\u001b[0m vmm kv pool up (full layers VMM-backed, sliding on cudaMalloc) \u001b[3mfull_layers\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mkv_elem\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mkv_elem_slide\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mblock_mib\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mblock_rows\u001b[0m\u001b[2m=\u001b[0m2048 \u001b[3mbph\u001b[0m\u001b[2m=\u001b[0m32 \u001b[3mva_gib\u001b[0m\u001b[2m=\u001b[0m2.0\n\u001b[2m2026-09-06T05:13:47.737103Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m opening safetensors checkpoint... \u001b[3mdir\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/checkpoint\n\u001b[2m2026-09-06T05:13:47.737185Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m found safetensors shards \u001b[3mshards\u001b[0m\u001b[2m=\u001b[0m1\n\u001b[2m2026-09-06T05:13:47.737741Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m checkpoint ready (all shards mmap'd) \u001b[3mshards\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m677 \u001b[3mms\u001b[0m\u001b[2m=\u001b[0m\"1\"\n\u001b[2m2026-09-06T05:13:47.737750Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m checkpoint opened, starting weight upload to GPU... \u001b[3mcheckpoint\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/checkpoint\n\u001b[2m2026-09-06T05:13:47.813612Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m upload pipe mode \u001b[3mdirect\u001b[0m\u001b[2m=\u001b[0mfalse\n\u001b[2m2026-09-06T05:13:49.421457Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m checkpoint weights uploaded to GPU \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mweight_gib\u001b[0m\u001b[2m=\u001b[0m\"2.33\" \u001b[3mkv_gib\u001b[0m\u001b[2m=\u001b[0m\"2.00\" \u001b[3melapsed_s\u001b[0m\u001b[2m=\u001b[0m\"1.7\" \u001b[3mthroughput_gib_s\u001b[0m\u001b[2m=\u001b[0m\"1.38\"\n\u001b[2m2026-09-06T05:13:49.422964Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m packet decode rung selection enabled \u001b[3mrungs\u001b[0m\u001b[2m=\u001b[0m5\n\u001b[2m2026-09-06T05:13:49.456146Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m segmented prefill pair loaded \u001b[3mgrid_flash\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mgrid_gemm\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem_flash\u001b[0m\u001b[2m=\u001b[0m132160 \u001b[3msmem_gemm\u001b[0m\u001b[2m=\u001b[0m197696 \u001b[3mblock_gemm\u001b[0m\u001b[2m=\u001b[0m384 \u001b[3mfa512\u001b[0m\u001b[2m=\u001b[0mtrue\n\u001b[2m2026-09-06T05:13:49.457149Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m prefill object loaded \u001b[3mpf_cubin\u001b[0m\u001b[2m=\u001b[0mPLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin \u001b[3mbuckets\u001b[0m\u001b[2m=\u001b[0m3 \u001b[3msmem_pf\u001b[0m\u001b[2m=\u001b[0m132160 \u001b[3msegmented\u001b[0m\u001b[2m=\u001b[0mtrue\n\u001b[2m2026-09-06T05:13:49.457160Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m GPU engine loaded (decode program) \u001b[3mpkt\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/model.pkt \u001b[3mgrid\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mweights_gib\u001b[0m\u001b[2m=\u001b[0m2.325477123260498 \u001b[3mkv_gib\u001b[0m\u001b[2m=\u001b[0m2.0 \u001b[3mn_weights\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mvocab\u001b[0m\u001b[2m=\u001b[0m262144 \u001b[3mmax_ctx\u001b[0m\u001b[2m=\u001b[0m65536 \u001b[3mbatch\u001b[0m\u001b[2m=\u001b[0m16 \u001b[3mprefill_buckets\u001b[0m\u001b[2m=\u001b[0m3 \u001b[3mstop_ids\u001b[0m\u001b[2m=\u001b[0m[1, 106, 50] \u001b[3mvmm_prefix\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mvmm_live\u001b[0m\u001b[2m=\u001b[0mtrue \u001b[3melapsed_s\u001b[0m\u001b[2m=\u001b[0m3.131629467010498 \u001b[3minterp\u001b[0m\u001b[2m=\u001b[0m\"sm90a\"\n========= ERROR SUMMARY: 2 errors\n",
+    "e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck.log": "========= COMPUTE-SANITIZER\n\u001b[2m2026-09-06T05:13:39.933110Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::device::cuda\u001b[0m\u001b[2m:\u001b[0m CUDA device ready \u001b[3mname\u001b[0m\u001b[2m=\u001b[0mNVIDIA H100 80GB HBM3 \u001b[3msm_count\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem_optin\u001b[0m\u001b[2m=\u001b[0m232448 \u001b[3mcc_major\u001b[0m\u001b[2m=\u001b[0m9 \u001b[3mcc_minor\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mcoherent_host_dma\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mdriver\u001b[0m\u001b[2m=\u001b[0m13.2\n\u001b[2m2026-09-06T05:13:39.933148Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m loading model onto GPU... \u001b[3massets\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8 \u001b[3mcheckpoint\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/checkpoint \u001b[3mdevice\u001b[0m\u001b[2m=\u001b[0mNVIDIA H100 80GB HBM3\n\u001b[2m2026-09-06T05:13:41.303285Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::devblob\u001b[0m\u001b[2m:\u001b[0m devblob: assets compiled for a specific GPU target \u2014 a backend that resolves its device can cross-check this fingerprint (Gap 4) \u001b[3mtarget_fp\u001b[0m\u001b[2m=\u001b[0m0xcc013c47 \u001b[3mn_cu\u001b[0m\u001b[2m=\u001b[0m132\n\u001b[2m2026-09-06T05:13:41.303311Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m parsed PLOWDEV blob \u001b[3mblob\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/model.pkt \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m40 \u001b[3mn_cu\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mprograms\u001b[0m\u001b[2m=\u001b[0m8\n========= Program hit CUDA_ERROR_NOT_FOUND (error 500) due to \"named symbol not found\" on CUDA API call to cuModuleGetGlobal_v2.\n=========     Saved host backtrace up to driver entry point at error\n=========         Host Frame:  [0x1662cc] in decode_dump\n=========         Host Frame:  [0x16502b] in decode_dump\n=========         Host Frame:  [0x1416ee] in decode_dump\n=========         Host Frame:  [0x7a3c0] in decode_dump\n=========         Host Frame:  [0x7dfa2] in decode_dump\n=========         Host Frame:  [0x907ea] in decode_dump\n=========         Host Frame: __libc_start_call_main [0x2b284] in libc.so.6\n=========         Host Frame: __libc_start_main [0x2b337] in libc.so.6\n=========         Host Frame:  [0x5b1a4] in decode_dump\n========= \n========= Program hit CUDA_ERROR_NOT_FOUND (error 500) due to \"named symbol not found\" on CUDA API call to cuModuleGetGlobal_v2.\n=========     Saved host backtrace up to driver entry point at error\n=========         Host Frame:  [0x1662cc] in decode_dump\n=========         Host Frame:  [0x165073] in decode_dump\n=========         Host Frame:  [0x1416ee] in decode_dump\n=========         Host Frame:  [0x7a3c0] in decode_dump\n=========         Host Frame:  [0x7dfa2] in decode_dump\n=========         Host Frame:  [0x907ea] in decode_dump\n=========         Host Frame: __libc_start_call_main [0x2b284] in libc.so.6\n=========         Host Frame: __libc_start_main [0x2b337] in libc.so.6\n=========         Host Frame:  [0x5b1a4] in decode_dump\n========= \n\u001b[2m2026-09-06T05:13:41.348734Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m interpreter module loaded \u001b[3mprofile\u001b[0m\u001b[2m=\u001b[0m\"sm90a\" \u001b[3msource\u001b[0m\u001b[2m=\u001b[0mPLOW_NV_CUBIN=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/interp_sm90a.cubin \u001b[3mkernel\u001b[0m\u001b[2m=\u001b[0m_Z12interp_sm90a11PlowProgram \u001b[3mgrid\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem\u001b[0m\u001b[2m=\u001b[0m82944 \u001b[3mocc_per_sm\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mcubin_bytes\u001b[0m\u001b[2m=\u001b[0m5711440\n\u001b[2m2026-09-06T05:13:41.348832Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m NVIDIA decode capacity metadata \u001b[3mdecode_rungs\u001b[0m\u001b[2m=\u001b[0m[1, 2, 4, 8, 16] \u001b[3mgemv_mm_cap\u001b[0m\u001b[2m=\u001b[0m8 \u001b[3mgemv_weight_passes\u001b[0m\u001b[2m=\u001b[0m2\n\u001b[2m2026-09-06T05:13:41.348937Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::memory::vmm\u001b[0m\u001b[2m:\u001b[0m vmm kv pool up (full layers VMM-backed, sliding on cudaMalloc) \u001b[3mfull_layers\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mkv_elem\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mkv_elem_slide\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mblock_mib\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mblock_rows\u001b[0m\u001b[2m=\u001b[0m2048 \u001b[3mbph\u001b[0m\u001b[2m=\u001b[0m32 \u001b[3mva_gib\u001b[0m\u001b[2m=\u001b[0m2.0\n\u001b[2m2026-09-06T05:13:41.348990Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m opening safetensors checkpoint... \u001b[3mdir\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/checkpoint\n\u001b[2m2026-09-06T05:13:41.349075Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m found safetensors shards \u001b[3mshards\u001b[0m\u001b[2m=\u001b[0m1\n\u001b[2m2026-09-06T05:13:41.349617Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m checkpoint ready (all shards mmap'd) \u001b[3mshards\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m677 \u001b[3mms\u001b[0m\u001b[2m=\u001b[0m\"1\"\n\u001b[2m2026-09-06T05:13:41.349622Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m checkpoint opened, starting weight upload to GPU... \u001b[3mcheckpoint\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/checkpoint\n\u001b[2m2026-09-06T05:13:41.426099Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m upload pipe mode \u001b[3mdirect\u001b[0m\u001b[2m=\u001b[0mfalse\n\u001b[2m2026-09-06T05:13:43.033381Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m checkpoint weights uploaded to GPU \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mweight_gib\u001b[0m\u001b[2m=\u001b[0m\"2.33\" \u001b[3mkv_gib\u001b[0m\u001b[2m=\u001b[0m\"2.00\" \u001b[3melapsed_s\u001b[0m\u001b[2m=\u001b[0m\"1.7\" \u001b[3mthroughput_gib_s\u001b[0m\u001b[2m=\u001b[0m\"1.38\"\n\u001b[2m2026-09-06T05:13:43.034718Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m packet decode rung selection enabled \u001b[3mrungs\u001b[0m\u001b[2m=\u001b[0m5\n\u001b[2m2026-09-06T05:13:43.066877Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m segmented prefill pair loaded \u001b[3mgrid_flash\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mgrid_gemm\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem_flash\u001b[0m\u001b[2m=\u001b[0m132160 \u001b[3msmem_gemm\u001b[0m\u001b[2m=\u001b[0m197696 \u001b[3mblock_gemm\u001b[0m\u001b[2m=\u001b[0m384 \u001b[3mfa512\u001b[0m\u001b[2m=\u001b[0mtrue\n\u001b[2m2026-09-06T05:13:43.067898Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m prefill object loaded \u001b[3mpf_cubin\u001b[0m\u001b[2m=\u001b[0mPLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/interp_sm90a_pf.cubin \u001b[3mbuckets\u001b[0m\u001b[2m=\u001b[0m3 \u001b[3msmem_pf\u001b[0m\u001b[2m=\u001b[0m132160 \u001b[3msegmented\u001b[0m\u001b[2m=\u001b[0mtrue\n\u001b[2m2026-09-06T05:13:43.067908Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m GPU engine loaded (decode program) \u001b[3mpkt\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/model.pkt \u001b[3mgrid\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mweights_gib\u001b[0m\u001b[2m=\u001b[0m2.325477123260498 \u001b[3mkv_gib\u001b[0m\u001b[2m=\u001b[0m2.0 \u001b[3mn_weights\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mvocab\u001b[0m\u001b[2m=\u001b[0m262144 \u001b[3mmax_ctx\u001b[0m\u001b[2m=\u001b[0m65536 \u001b[3mbatch\u001b[0m\u001b[2m=\u001b[0m16 \u001b[3mprefill_buckets\u001b[0m\u001b[2m=\u001b[0m3 \u001b[3mstop_ids\u001b[0m\u001b[2m=\u001b[0m[1, 106, 50] \u001b[3mvmm_prefix\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mvmm_live\u001b[0m\u001b[2m=\u001b[0mtrue \u001b[3melapsed_s\u001b[0m\u001b[2m=\u001b[0m3.1347603797912598 \u001b[3minterp\u001b[0m\u001b[2m=\u001b[0m\"sm90a\"\n========= ERROR SUMMARY: 2 errors\n",
+    "e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck.log": "========= COMPUTE-SANITIZER\n\u001b[2m2026-09-06T05:13:54.731535Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::device::cuda\u001b[0m\u001b[2m:\u001b[0m CUDA device ready \u001b[3mname\u001b[0m\u001b[2m=\u001b[0mNVIDIA H100 80GB HBM3 \u001b[3msm_count\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem_optin\u001b[0m\u001b[2m=\u001b[0m232448 \u001b[3mcc_major\u001b[0m\u001b[2m=\u001b[0m9 \u001b[3mcc_minor\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mcoherent_host_dma\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mdriver\u001b[0m\u001b[2m=\u001b[0m13.2\n\u001b[2m2026-09-06T05:13:54.731570Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m loading model onto GPU... \u001b[3massets\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8 \u001b[3mcheckpoint\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/checkpoint \u001b[3mdevice\u001b[0m\u001b[2m=\u001b[0mNVIDIA H100 80GB HBM3\n\u001b[2m2026-09-06T05:13:56.116423Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::devblob\u001b[0m\u001b[2m:\u001b[0m devblob: assets compiled for a specific GPU target \u2014 a backend that resolves its device can cross-check this fingerprint (Gap 4) \u001b[3mtarget_fp\u001b[0m\u001b[2m=\u001b[0m0xcc013c47 \u001b[3mn_cu\u001b[0m\u001b[2m=\u001b[0m132\n\u001b[2m2026-09-06T05:13:56.116452Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m parsed PLOWDEV blob \u001b[3mblob\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/model.pkt \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m40 \u001b[3mn_cu\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mprograms\u001b[0m\u001b[2m=\u001b[0m8\n========= Program hit CUDA_ERROR_NOT_FOUND (error 500) due to \"named symbol not found\" on CUDA API call to cuModuleGetGlobal_v2.\n=========     Saved host backtrace up to driver entry point at error\n=========         Host Frame:  [0x1662cc] in decode_dump\n=========         Host Frame:  [0x16502b] in decode_dump\n=========         Host Frame:  [0x1416ee] in decode_dump\n=========         Host Frame:  [0x7a3c0] in decode_dump\n=========         Host Frame:  [0x7dfa2] in decode_dump\n=========         Host Frame:  [0x907ea] in decode_dump\n=========         Host Frame: __libc_start_call_main [0x2b284] in libc.so.6\n=========         Host Frame: __libc_start_main [0x2b337] in libc.so.6\n=========         Host Frame:  [0x5b1a4] in decode_dump\n========= \n========= Program hit CUDA_ERROR_NOT_FOUND (error 500) due to \"named symbol not found\" on CUDA API call to cuModuleGetGlobal_v2.\n=========     Saved host backtrace up to driver entry point at error\n=========         Host Frame:  [0x1662cc] in decode_dump\n=========         Host Frame:  [0x165073] in decode_dump\n=========         Host Frame:  [0x1416ee] in decode_dump\n=========         Host Frame:  [0x7a3c0] in decode_dump\n=========         Host Frame:  [0x7dfa2] in decode_dump\n=========         Host Frame:  [0x907ea] in decode_dump\n=========         Host Frame: __libc_start_call_main [0x2b284] in libc.so.6\n=========         Host Frame: __libc_start_main [0x2b337] in libc.so.6\n=========         Host Frame:  [0x5b1a4] in decode_dump\n========= \n\u001b[2m2026-09-06T05:13:56.161825Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m interpreter module loaded \u001b[3mprofile\u001b[0m\u001b[2m=\u001b[0m\"sm90a\" \u001b[3msource\u001b[0m\u001b[2m=\u001b[0mPLOW_NV_CUBIN=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/interp_sm90a.cubin \u001b[3mkernel\u001b[0m\u001b[2m=\u001b[0m_Z12interp_sm90a11PlowProgram \u001b[3mgrid\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem\u001b[0m\u001b[2m=\u001b[0m82944 \u001b[3mocc_per_sm\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mcubin_bytes\u001b[0m\u001b[2m=\u001b[0m5711440\n\u001b[2m2026-09-06T05:13:56.161923Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m NVIDIA decode capacity metadata \u001b[3mdecode_rungs\u001b[0m\u001b[2m=\u001b[0m[1, 2, 4, 8, 16] \u001b[3mgemv_mm_cap\u001b[0m\u001b[2m=\u001b[0m8 \u001b[3mgemv_weight_passes\u001b[0m\u001b[2m=\u001b[0m2\n\u001b[2m2026-09-06T05:13:56.162028Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::memory::vmm\u001b[0m\u001b[2m:\u001b[0m vmm kv pool up (full layers VMM-backed, sliding on cudaMalloc) \u001b[3mfull_layers\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mkv_elem\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mkv_elem_slide\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mblock_mib\u001b[0m\u001b[2m=\u001b[0m2 \u001b[3mblock_rows\u001b[0m\u001b[2m=\u001b[0m2048 \u001b[3mbph\u001b[0m\u001b[2m=\u001b[0m32 \u001b[3mva_gib\u001b[0m\u001b[2m=\u001b[0m2.0\n\u001b[2m2026-09-06T05:13:56.162073Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m opening safetensors checkpoint... \u001b[3mdir\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/checkpoint\n\u001b[2m2026-09-06T05:13:56.162159Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m found safetensors shards \u001b[3mshards\u001b[0m\u001b[2m=\u001b[0m1\n\u001b[2m2026-09-06T05:13:56.162745Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::asset::checkpoint\u001b[0m\u001b[2m:\u001b[0m checkpoint ready (all shards mmap'd) \u001b[3mshards\u001b[0m\u001b[2m=\u001b[0m1 \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m677 \u001b[3mms\u001b[0m\u001b[2m=\u001b[0m\"1\"\n\u001b[2m2026-09-06T05:13:56.162754Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m checkpoint opened, starting weight upload to GPU... \u001b[3mcheckpoint\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/checkpoint\n\u001b[2m2026-09-06T05:13:56.239634Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m upload pipe mode \u001b[3mdirect\u001b[0m\u001b[2m=\u001b[0mfalse\n\u001b[2m2026-09-06T05:13:57.828197Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m checkpoint weights uploaded to GPU \u001b[3mtensors\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mweight_gib\u001b[0m\u001b[2m=\u001b[0m\"2.33\" \u001b[3mkv_gib\u001b[0m\u001b[2m=\u001b[0m\"2.00\" \u001b[3melapsed_s\u001b[0m\u001b[2m=\u001b[0m\"1.7\" \u001b[3mthroughput_gib_s\u001b[0m\u001b[2m=\u001b[0m\"1.40\"\n\u001b[2m2026-09-06T05:13:57.829590Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m packet decode rung selection enabled \u001b[3mrungs\u001b[0m\u001b[2m=\u001b[0m5\n\u001b[2m2026-09-06T05:13:57.863023Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m segmented prefill pair loaded \u001b[3mgrid_flash\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mgrid_gemm\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3msmem_flash\u001b[0m\u001b[2m=\u001b[0m132160 \u001b[3msmem_gemm\u001b[0m\u001b[2m=\u001b[0m197696 \u001b[3mblock_gemm\u001b[0m\u001b[2m=\u001b[0m384 \u001b[3mfa512\u001b[0m\u001b[2m=\u001b[0mtrue\n\u001b[2m2026-09-06T05:13:57.864032Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m prefill object loaded \u001b[3mpf_cubin\u001b[0m\u001b[2m=\u001b[0mPLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/interp_sm90a_pf.cubin \u001b[3mbuckets\u001b[0m\u001b[2m=\u001b[0m3 \u001b[3msmem_pf\u001b[0m\u001b[2m=\u001b[0m132160 \u001b[3msegmented\u001b[0m\u001b[2m=\u001b[0mtrue\n\u001b[2m2026-09-06T05:13:57.864042Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2mplowrt::exec::gpu\u001b[0m\u001b[2m:\u001b[0m GPU engine loaded (decode program) \u001b[3mpkt\u001b[0m\u001b[2m=\u001b[0m/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-s8/model.pkt \u001b[3mgrid\u001b[0m\u001b[2m=\u001b[0m132 \u001b[3mweights_gib\u001b[0m\u001b[2m=\u001b[0m2.325477123260498 \u001b[3mkv_gib\u001b[0m\u001b[2m=\u001b[0m2.0 \u001b[3mn_weights\u001b[0m\u001b[2m=\u001b[0m14 \u001b[3mvocab\u001b[0m\u001b[2m=\u001b[0m262144 \u001b[3mmax_ctx\u001b[0m\u001b[2m=\u001b[0m65536 \u001b[3mbatch\u001b[0m\u001b[2m=\u001b[0m16 \u001b[3mprefill_buckets\u001b[0m\u001b[2m=\u001b[0m3 \u001b[3mstop_ids\u001b[0m\u001b[2m=\u001b[0m[1, 106, 50] \u001b[3mvmm_prefix\u001b[0m\u001b[2m=\u001b[0mfalse \u001b[3mvmm_live\u001b[0m\u001b[2m=\u001b[0mtrue \u001b[3melapsed_s\u001b[0m\u001b[2m=\u001b[0m3.132472515106201 \u001b[3minterp\u001b[0m\u001b[2m=\u001b[0m\"sm90a\"\n========= ERROR SUMMARY: 2 errors\n"
+  },
+  "original_execution": {
+    "e3-phaseB-control-m4-ctx1024-seed0-ordered-memcheck": {
+      "passed": false,
+      "returncode": 99
+    },
+    "e3-phaseB-s8-m4-ctx1024-seed0-ordered-memcheck": {
+      "passed": false,
+      "returncode": 99
+    },
+    "e3-phaseB-control-m8-ctx1024-seed0-ordered-memcheck": {
+      "passed": false,
+      "returncode": 99
+    },
+    "e3-phaseB-s8-m8-ctx1024-seed0-ordered-memcheck": {
+      "passed": false,
+      "returncode": 99
+    }
+  },
+  "classifier": "import argparse,hashlib,json,pathlib,re,struct,importlib.util,xml.etree.ElementTree as ET\nP=pathlib.Path(__file__).parent\nE3=P.parent\nHOST_SHA='12bf0ef317f1ddb903baf7260aaffa069c47478322905f0fd16f96c0c6d6b25c'\nAPI='Program hit CUDA_ERROR_NOT_FOUND (error 500) due to \"named symbol not found\" on CUDA API call to cuModuleGetGlobal_v2.'\nEXPECTED=[['1662cc','16502b','1416ee','7a3c0','7dfa2','907ea','2b284','2b337','5b1a4'],['1662cc','165073','1416ee','7a3c0','7dfa2','907ea','2b284','2b337','5b1a4']]\ndef require(ok,msg):\n if not ok:raise ValueError(msg)\ndef sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()\ndef inspect_log(text):\n lines=[line[len('========='):].strip() for line in text.splitlines() if line.startswith('=========')]\n require(lines.count('COMPUTE-SANITIZER')==1,'missing/duplicate sanitizer header')\n require(lines.count('ERROR SUMMARY: 2 errors')==1,'summary is not exactly2errors')\n rec=[];active=None;offsets=[];headers=0\n for line in lines:\n  if not line or line in ['COMPUTE-SANITIZER','ERROR SUMMARY: 2 errors']:continue\n  if line==API:\n   if active is not None:rec.append(offsets)\n   active=line;offsets=[];continue\n  if line=='Saved host backtrace up to driver entry point at error':\n   require(active is not None,'stack header without record');headers+=1;continue\n  if line.startswith('Host Frame:'):\n   require(active is not None,'frame without record')\n   m=re.fullmatch(r'Host Frame: (.*?)\\[0x([0-9a-f]+)\\] in (decode_dump|libc\\.so\\.6)',line)\n   require(m is not None,'unknown host frame')\n   k=len(offsets);require(k<9,'extra stack frame')\n   expected_func={6:'__libc_start_call_main',7:'__libc_start_main'}.get(k,'')\n   require(m.group(1).strip()==expected_func,'unexpected host function')\n   require(m.group(3)==('libc.so.6' if k in [6,7] else 'decode_dump'),'unexpected host module')\n   offsets.append(m.group(2));continue\n  raise ValueError('unknown sanitizer record/line: '+line)\n if active is not None:rec.append(offsets)\n require(rec==EXPECTED and headers==2,'known optional-probe callsites/record count differ')\n return dict(api_error_count=2,api='cuModuleGetGlobal_v2',error='CUDA_ERROR_NOT_FOUND',result=500,reported_call_instruction_offsets=['0x16502b','0x165073'],other_sanitizer_records=0)\n\ndef inspect_xml(path):\n root=ET.parse(path).getroot();require(root.tag=='ComputeSanitizerOutput' and len(root)==2,'unexpected XML root/record count')\n for n,rec in enumerate(root):\n  require(rec.tag=='record' and [x.tag for x in rec]==['kind','what','hostStack'],'unknown XML record')\n  require(rec.findtext('kind')=='Api','non-API sanitizer record')\n  what=rec.find('what');require([x.tag for x in what]==['text','api','error','message','result'],'unexpected XML API fields');require({x.tag:x.text for x in what}==dict(text=API,api='cuModuleGetGlobal_v2',error='CUDA_ERROR_NOT_FOUND',message='named symbol not found',result='500'),'unknown API details')\n  stack=rec.find('hostStack');require([x.tag for x in stack]==['saveLocation']+['frame']*10 and stack.findtext('saveLocation')=='error','unknown XML stack')\n  frames=stack.findall('frame')\n  driver=dict(func='cuModuleGetGlobal_v2',pc='0x313b99',module='/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only/libcuda.so.1')\n  require(len(frames[0])==len(driver) and {x.tag:x.text for x in frames[0]}==driver,'unknown driver frame')\n  for k,(frame,off) in enumerate(zip(frames[1:],EXPECTED[n])):\n   expected=dict(pc='0x'+off,module=str(E3/'bin/decode_dump'))\n   if k in [6,7]:expected.update(func=['__libc_start_call_main','__libc_start_main'][k-6],module='/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61/lib/libc.so.6')\n   require(len(frame)==len(expected) and {x.tag:x.text for x in frame}==expected,'unknown XML host frame')\n return dict(records=2,all_api_probes=True)\n\nimport math,copy\nspec=importlib.util.spec_from_file_location('numerical',E3/'extended-gates/validate-block-numerical.py');V=importlib.util.module_from_spec(spec);spec.loader.exec_module(V)\n\ndef capture(path,m,arm):\n j=json.loads((path/'manifest.json').read_text())\n require(j['batch']==16 and j['input_batch']==m and j['reset_at']==3 and j['block_prefix']==1024,'capture geometry mismatch')\n require(j['live_kv_enabled'] is True and j['block'] is True,'LIVE/block absent')\n require(j['assets']==str(E3.parent/f'e3-splitk-interpreter-phaseB/block-{arm}'),'asset mismatch')\n require(j['token_ids']==[2,42,43,2,42,43] and len(j['steps'])==6,'history mismatch')\n require(j['scratch_canary']==(None if arm=='control' else ['act.e3.partial.22',245760,256]),'scratch poisoning differs')\n rows=[];files={str(path/'manifest.json'):sha(path/'manifest.json')}\n for ix,step in enumerate(j['steps']):\n  require(step['step']==ix and step['input_token']==[2,42,43,2,42,43][ix],'step mismatch')\n  require([t['name'] for t in step['tensors']]==['act.fu','act.dg','act.x']+([] if arm=='control' else ['act.e3.partial.22']),'tensor list mismatch')\n  row={}\n  for k,t in enumerate(step['tensors']):\n   require(t['file']==f'step{ix:04}-tensor{k:03}.raw','filename mismatch');p=path/t['file'];row[t['name']]=p.read_bytes();files[str(p)]=sha(p)\n  for name,width in [('act.fu',15360),('act.dg',3840),('act.x',3840)]:\n   require(len(row[name])>=16*width*2,'short tensor');row[name]=row[name][:m*width*2]\n   require(all(math.isfinite(v) for v in V.A.bf(row[name])),'nonfinite output')\n  if arm=='s8':V.scratch(row,m)\n  rows.append(row)\n return rows,files\n\ndef compare_histories(rows,base,m,arm):\n rec=[]\n for step,(a,b) in enumerate(zip(rows,base)):\n  require(a['act.fu']==b['act.fu'],'instrumented upstream differs')\n  for name,limit in [('act.dg',.006),('act.x',.01)]:\n   if arm=='control':require(a[name]==b[name],'instrumented control differs')\n   aa=V.A.bf(b[name]);bb=V.A.bf(a[name])\n   for slot in range(m):rec.append(dict(step=step,slot=slot,tensor=name,**V.A.compare(aa[slot*3840:(slot+1)*3840],bb[slot*3840:(slot+1)*3840],limit)))\n  if step>=3:\n   require(a['act.fu']==rows[step-3]['act.fu'],'upstream reset differs')\n   for name,limit in [('act.dg',.006),('act.x',.01)]:\n    if arm=='control':require(a[name]==rows[step-3][name],'control reset differs')\n    V.A.compare(V.A.bf(rows[step-3][name]),V.A.bf(a[name]),limit)\n return rec\n\ndef run(window):\n original=json.loads((P/'queue.json').read_text());q=json.loads((window/'queue.json').read_text());status=json.loads((window/'results.json').read_text())\n for path,h in json.loads((P/'FREEZE.json').read_text())['sha256'].items():require(sha(pathlib.Path(path))==h,'changed frozen input '+path)\n require(sha(E3/'bin/decode_dump')==HOST_SHA,'host changed')\n proof=json.loads((P/'stack-callsite-proof.json').read_text());require(proof['host_sha256']==HOST_SHA,'proof host mismatch');binary=(E3/'bin/decode_dump').read_bytes()\n for r in proof['records']:\n  a=int(r['call_instruction'],16);b=bytes.fromhex(r['bytes']);require(binary[a:a+len(b)]==b,'call bytes mismatch');require(a+len(b)-1==int(r['reported_offset'],16),'call offset convention differs')\n refs=json.loads((P/'probe-references.json').read_text());require(refs['host_sha256']==HOST_SHA,'string proof host differs')\n require([r['reported_last_byte'] for r in refs['references']]==['0x16502b','0x165073'],'optional probe offsets differ')\n for r in refs['references']:require(binary[r['file_offset']:r['file_offset']+len(r['name'])]==r['name'].encode(),'symbol string differs')\n reports=[];captures={};bindings={};baseline_records=[]\n for expected in original['jobs']:\n  name=expected['name'];job=next(j for j in q['jobs'] if j['name']==name);require(job['command']==expected['command'] and job['env']==expected['env'],'command/env differs')\n  require(status[name]==dict(passed=False,returncode=99),'raw status not expected99; audit required')\n  cmd=job['command'];require(cmd[cmd.index('--tool')+1]=='memcheck' and cmd[cmd.index('--report-api-errors')+1]=='all' and cmd[cmd.index('--error-exitcode')+1]=='99','sanitizer scope differs')\n  require(not any(v.startswith(('--suppressions','--kernel-name','--launch-count','--launch-skip')) for v in cmd),'suppression/filter present')\n  log=pathlib.Path(job['log']);report=inspect_log(log.read_text());xml=pathlib.Path(cmd[cmd.index('--save')+1]);report.update(xml=inspect_xml(xml),raw_returncode=99,tool_exit_zero=False,log=str(log),log_sha256=sha(log),xml_sha256=sha(xml),job=name);reports.append(report)\n  clean=re.sub(r'\\x1b\\[[0-9;]*m','',log.read_text());require('vmm_live=true' in clean,'LIVE load missing');require(re.search(r'grid=132.*smem=(?:16448|82944).*occ_per_sm=1',clean) is not None,'cooperative occupancy missing')\n  m=expected['M'];arm=expected['arm'];rows,files=capture(P/'results'/name,m,arm);bindings.update(files)\n  base,_=capture(E3/'extended-gates/results'/name.removesuffix('-memcheck'),m,arm);baseline_records.extend(dict(M=m,arm=arm,**r) for r in compare_histories(rows,base,m,arm));captures[m,arm]=rows\n cross=[]\n for m in [4,8]:\n  for step,(a,b) in enumerate(zip(captures[m,'control'],captures[m,'s8'])):\n   require(a['act.fu']==b['act.fu'],'instrumented arms upstream differs')\n   for name,limit in [('act.dg',.006),('act.x',.01)]:\n    aa=V.A.bf(a[name]);bb=V.A.bf(b[name])\n    for slot in range(m):cross.append(dict(M=m,step=step,slot=slot,tensor=name,**V.A.compare(aa[slot*3840:(slot+1)*3840],bb[slot*3840:(slot+1)*3840],limit)))\n result=dict(device_memory_check_qualified_with_expected_api_probes=True,tool_exit_zero=False,host_sha256=HOST_SHA,records=reports,physical_row_cross_arm_comparisons=len(cross),physical_row_instrumented_baseline_comparisons=len(baseline_records),scratch_guard_and_exact_cast_checks=12,reset_histories_pass=True,cross_arm_records=cross,instrumented_baseline_records=baseline_records,capture_sha256=bindings,scope='M4/M8 native block5, six steps each with reset, LIVE1 and132CTA cooperative occupancy. Exactly two statically bound optional packet-hash API500 probes per process retained as raw99; no other sanitizer records. Not tool exit0, per-op cold timing, full-model or serving qualification.')\n (P/'qualification.json').write_text(json.dumps(result,indent=2)+'\\n');print('PASS strict current-host memory classification:',len(reports),'raw99 processes;',len(cross),'cross-arm rows;',len(baseline_records),'baseline rows;12 scratch/cast checks')\n\ndef self_test(window):\n q=json.loads((window/'queue.json').read_text());job=q['jobs'][0];text=pathlib.Path(job['log']).read_text();inspect_log(text)\n mutants=[text.replace('error 500','error 700',1),text.replace('cuModuleGetGlobal_v2','cuMemAlloc_v2',1),text.replace('1662cc','1662cd',1),text.replace('16502b','16502c',1),text.replace('1416ee','1416ef',1),text.replace('ERROR SUMMARY: 2 errors','ERROR SUMMARY: 0 errors'),text.replace(API+'\\n','',1),text+'\\n========= Invalid __global__ read of size4 bytes\\n',text.replace(' in decode_dump',' in other_host',1),text.replace('COMPUTE-SANITIZER','',1)]\n rejected=0\n for t in mutants:\n  try:inspect_log(t)\n  except ValueError:rejected+=1\n require(rejected==len(mutants),'log mutation accepted')\n xml=pathlib.Path(job['command'][job['command'].index('--save')+1]).read_text();inspect_xml(pathlib.Path(job['command'][job['command'].index('--save')+1]))\n muts=[xml.replace('<kind>Api</kind>','<kind>Memory</kind>',1),xml.replace('0x16502b','0x16502c',1),xml.replace('<result>500</result>','<result>700</result>',1),xml.replace('</ComputeSanitizerOutput>','<record><kind>Memory</kind></record></ComputeSanitizerOutput>'),xml.replace('<pc>0x1416ee</pc>','<pc>0x1416ef</pc>',1)]\n tmp=P/'negative-case.xml';xr=0\n for t in muts:\n  tmp.write_text(t)\n  try:inspect_xml(tmp)\n  except ValueError:xr+=1\n tmp.unlink();require(xr==len(muts),'XML mutation accepted')\n V.self_test()\n (P/'cpu-tests.json').write_text(json.dumps(dict(log_mutations_rejected=rejected,xml_mutations_rejected=xr,existing_numeric_guard_mutations_pass=True),indent=2)+'\\n');print('PASS10 log+5 XML mutations rejected, numerical guard tests pass')\n\nif __name__=='__main__':\n ap=argparse.ArgumentParser();ap.add_argument('--window',type=pathlib.Path,default=pathlib.Path('/tmp/plow-model-support-checks/e3-rung-memory-window-20260906'));ap.add_argument('--self-test',action='store_true');a=ap.parse_args()\n if a.self_test:self_test(a.window)\n else:run(a.window)\n",
+  "scope": "Native Gemma12 block5M4/M8, exact frozen host and cubins. Raw99 retained, only two proven optional symbol probes per process; no device access reports.",
+  "archive": "/opt/dlami/nvme/tmp/plow-h100-campaign/raw-checks-20260905/e3-splitk-interpreter-upload-order/memory-gates"
+}
