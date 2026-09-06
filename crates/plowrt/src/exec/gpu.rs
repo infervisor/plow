@@ -435,25 +435,7 @@ struct SegGemm {
     _module: Module,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SegmentRoles {
-    version: u32,
-    objects: std::collections::BTreeMap<u8, SegmentObject>,
-    programs: Vec<ProgramRoles>,
-}
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SegmentObject {
-    abi: String,
-    file: String,
-}
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProgramRoles {
-    index: usize,
-    roles: Vec<u8>,
-}
+use plow_asset::segment_roles::{ProgramRoles, SegmentObject, SegmentRoles};
 
 fn validate_segment_windows(g: &crate::asset::devblob::DevProg) -> Result<()> {
     if g.l2_domains != 0
@@ -511,9 +493,44 @@ fn validate_segment_windows(g: &crate::asset::devblob::DevProg) -> Result<()> {
     Ok(())
 }
 
-impl SegmentRoles {
+fn segment_role_metadata(blob: &DevBlob, raw: &[u8]) -> Result<Option<SegmentRoles>> {
+    let sections: Vec<_> = blob
+        .sections
+        .iter()
+        .filter(|s| s.name == plow_asset::segment_roles::SECTION)
+        .collect();
+    if sections.is_empty() {
+        return Ok(None);
+    }
+    if sections.len() != 1 || sections[0].kind != packet::devbuild::SECT_METADATA {
+        return Err(RuntimeError::Rejected(
+            "segment_roles.json requires exactly one metadata section".into(),
+        ));
+    }
+    let section = sections[0];
+    let end = section
+        .offset
+        .checked_add(section.size)
+        .ok_or_else(|| RuntimeError::Rejected("segment role section range overflow".into()))?;
+    let bytes = raw
+        .get(section.offset..end)
+        .ok_or_else(|| RuntimeError::Rejected("segment role section outside packet".into()))?;
+    SegmentRoles::parse(bytes, blob).map(Some)
+}
+
+trait SegmentRoleValidation: Sized {
+    fn parse(bytes: &[u8], blob: &DevBlob) -> Result<Self>;
+    fn validate(
+        &self,
+        programs: &[crate::asset::devblob::DevProg],
+        prefill: &[usize],
+        tensors: &[crate::asset::devblob::DevTensor],
+    ) -> Result<()>;
+    fn program(&self, index: usize) -> Option<&ProgramRoles>;
+}
+impl SegmentRoleValidation for SegmentRoles {
     fn parse(bytes: &[u8], blob: &DevBlob) -> Result<Self> {
-        let value: Self = serde_json::from_slice(bytes)
+        let value = Self::from_bytes(bytes)
             .map_err(|e| RuntimeError::Rejected(format!("segment_roles.json: {e}")))?;
         let indices: Vec<_> = blob
             .progs
@@ -523,6 +540,18 @@ impl SegmentRoles {
             .map(|(i, _)| i)
             .collect();
         value.validate(&blob.progs, &indices, &blob.tensors)?;
+        for program in &value.programs {
+            for (seg, &role) in program.roles.iter().enumerate() {
+                if role == 4 {
+                    let g = &blob.progs[program.index];
+                    let pc = g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize;
+                    blob.with_packet_view(|p| {
+                        plow_asset::fp8_m1_role::validate(p, program.index, pc)
+                    })
+                    .map_err(RuntimeError::Rejected)?;
+                }
+            }
+        }
         Ok(value)
     }
     fn validate(
@@ -531,32 +560,7 @@ impl SegmentRoles {
         prefill: &[usize],
         tensors: &[crate::asset::devblob::DevTensor],
     ) -> Result<()> {
-        if self.version != 1
-            || self.programs.is_empty()
-            || self.objects.keys().any(|&id| !matches!(id, 1 | 2 | 3))
-        {
-            return Err(RuntimeError::Rejected(
-                "unsupported packet segment roles".into(),
-            ));
-        }
-        for (&id, object) in &self.objects {
-            let path = std::path::Path::new(&object.file);
-            let abi = match id {
-                1 => "fp8_gemm_tma128_v1",
-                2 => "attention_sm90_hd256_v1",
-                _ => "gemv_sm90_cta512_v1",
-            };
-            if object.abi != abi
-                || object.file.is_empty()
-                || path
-                    .components()
-                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            {
-                return Err(RuntimeError::Rejected(
-                    "invalid packet role ABI or asset-relative filename".into(),
-                ));
-            }
-        }
+        self.validate_schema().map_err(RuntimeError::Rejected)?;
         let mut seen = std::collections::BTreeSet::new();
         let mut used = std::collections::BTreeSet::new();
         for p in &self.programs {
@@ -565,13 +569,14 @@ impl SegmentRoles {
             })?;
             let decode = !prefill.contains(&p.index);
             if !seen.insert(p.index)
+                || (p.roles.contains(&4) && p.roles.contains(&3))
                 || (decode
                     && (g.t != 1
                         || p.index + 1 != programs.len()
                         || programs.len() != prefill.len() + 1
-                        || !p.roles.contains(&3)
-                        || p.roles.iter().any(|&r| r != 0 && r != 3)))
-                || (!decode && p.roles.contains(&3))
+                        || !p.roles.iter().any(|&r| r == 3 || r == 4)
+                        || p.roles.iter().any(|&r| r != 0 && r != 3 && r != 4)))
+                || (!decode && p.roles.iter().any(|&r| r == 3 || r == 4))
             {
                 return Err(RuntimeError::Rejected(
                     "invalid packet role program; GEMV decode role requires one M1 rung".into(),
@@ -607,7 +612,8 @@ struct PacketRole {
     function: KernelFn,
     smem: u32,
     block: u32,
-    _module: Module,
+    _module: Option<Module>,
+    _owned_module: Option<Arc<DecodeModule>>,
 }
 
 fn check_fp8_gemm_role(capability: Option<u32>, block: Option<u32>) -> Result<()> {
@@ -774,7 +780,7 @@ fn packet_role_segments(
 ) -> Result<Vec<u8>> {
     validate_segment_windows(g)?;
     if roles.len() + 1 != g.gq_seg_ofs.len()
-        || roles.iter().any(|&r| r > 3)
+        || roles.iter().any(|&r| r > 4)
         || (g.packed_prefill_only && roles.contains(&2))
     {
         return Err(RuntimeError::Rejected(
@@ -820,8 +826,12 @@ fn packet_role_segments(
                 }
             } else if role == 2 {
                 validate_attention_role_inst(d, g.t, tensors)?;
-            } else {
+            } else if role == 3 {
                 validate_gemv_decode_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
+            } else if g.t != 1 || d.op != DevOp::GemmFp8 as u16 {
+                return Err(RuntimeError::Rejected(
+                    "invalid FP8 M1 role instruction".into(),
+                ));
             }
             let mut queue: Vec<_> = entries
                 .iter()
@@ -1810,7 +1820,7 @@ pub struct GpuEngine {
     /// Segmented-prefill object pair (PLOW_PF_SEG_DIR); None = single-object prefill.
     seg_pf: Option<SegPf>,
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
-    packet_roles: [Option<PacketRole>; 3],
+    packet_roles: [Option<PacketRole>; 4],
     decode_packet_roles: Vec<u8>,
     lt_decode: Vec<Option<LtDecodeRoute>>,
     lt_decode_graph: Option<crate::device::cuda::GraphExec>,
@@ -2819,16 +2829,26 @@ impl GpuEngine {
                 "splitK packets require compiled decode object and LIVE KV manifests".into(),
             ));
         }
-        let segment_roles = blob
-            .section_data_named(&raw, packet::devbuild::SECT_METADATA, "segment_roles.json")
-            .map(|bytes| SegmentRoles::parse(bytes, &blob))
-            .transpose()?;
+        let segment_roles = segment_role_metadata(&blob, &raw)?;
         let decode_packet_roles = segment_roles
             .as_ref()
             .and_then(|r| r.program(blob.progs.len() - 1))
-            .filter(|p| p.roles.contains(&3))
+            .filter(|p| p.roles.iter().any(|&r| r == 3 || r == 4))
             .map(|p| p.roles.clone())
             .unwrap_or_default();
+        if decode_packet_roles.contains(&4) {
+            let steps = RuntimeConfig::env_str_or("PLOW_MULTISTEP", None)
+                .map(|v| v.parse::<u32>())
+                .transpose()
+                .map_err(|_| RuntimeError::Rejected("invalid multistep".into()))?
+                .unwrap_or(RuntimeConfig::get().nv.multistep);
+            plow_asset::fp8_m1_role::options(
+                steps,
+                RuntimeConfig::env_bool_or("PLOW_QWEN_DECODE_LT", false),
+                false,
+            )
+            .map_err(RuntimeError::Rejected)?;
+        }
         if decode_objects.is_some() || prepared_contexts.is_some() {
             let nv = &RuntimeConfig::get().nv;
             let multistep = RuntimeConfig::env_str_or("PLOW_MULTISTEP", None)
@@ -3180,6 +3200,13 @@ impl GpuEngine {
                 Checkpoint::open(checkpoint_dir).map(std::sync::Arc::new)?
             }
         };
+        if decode_packet_roles.contains(&4) {
+            validate_fp8_role_checkpoint(
+                segment_roles.as_ref().expect("role metadata"),
+                &blob,
+                &ckpt,
+            )?;
+        }
         tracing::info!(
             checkpoint = %checkpoint_dir.display(),
             "checkpoint opened, starting weight upload to GPU..."
@@ -3683,6 +3710,18 @@ impl GpuEngine {
             )));
         }
         let lt_enabled = RuntimeConfig::env_bool_or("PLOW_QWEN_DECODE_LT", false);
+        if decode_packet_roles.contains(&4) {
+            plow_asset::fp8_m1_role::options(
+                0,
+                false,
+                be.module_global_u32(&module, "plow_packet_hash_lo")?
+                    .is_some()
+                    || be
+                        .module_global_u32(&module, "plow_packet_hash_hi")?
+                        .is_some(),
+            )
+            .map_err(RuntimeError::Rejected)?;
+        }
         if !decode_packet_roles.is_empty()
             && (lt_enabled
                 || be.module_global_u32(&module, "plow_segment_gq_abi")? != Some(1)
@@ -4051,8 +4090,18 @@ impl GpuEngine {
             (None, SMEM_PF, None, Vec::new(), None)
         };
 
-        let mut packet_roles = [None, None, None];
+        let mut packet_roles = [None, None, None, None];
         for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
+            if id == 4 {
+                packet_roles[3] = Some(load_fp8_m1_role(
+                    &be,
+                    assets_dir,
+                    object,
+                    profile.tag,
+                    grid,
+                )?);
+                continue;
+            }
             if id != 3 && (prefill.is_empty() || seg_pf.is_some()) {
                 return Err(RuntimeError::Rejected(
                     "packet roles require prefill without a legacy role pair".into(),
@@ -4121,7 +4170,8 @@ impl GpuEngine {
                 function,
                 smem,
                 block,
-                _module: module,
+                _module: Some(module),
+                _owned_module: None,
             });
         }
 
@@ -7682,8 +7732,10 @@ impl Drop for GpuEngine {
         }
         for role in &mut self.packet_roles {
             if let Some(role) = role.take() {
-                if let Err(e) = self.be.module_unload(&role._module) {
-                    report(&e, "unload packet role module");
+                if let Some(module) = role._module {
+                    if let Err(e) = self.be.module_unload(&module) {
+                        report(&e, "unload packet role module");
+                    }
                 }
             }
         }
@@ -8341,3 +8393,7 @@ mod decode_rung_tests;
 #[cfg(test)]
 #[path = "gpu_gemv_role_tests.rs"]
 mod gemv_role_tests;
+
+#[path = "gpu_fp8_m1_role.rs"]
+mod fp8_m1_role;
+use fp8_m1_role::{load_fp8_m1_role, validate_fp8_role_checkpoint};

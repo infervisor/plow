@@ -7563,3 +7563,5 @@ mod pick_tile_tests;
 #[cfg(test)]
 #[path = "lib_tests/chunk_default.rs"]
 mod chunk_default_tests;
+
+pub mod fp8_m1_role;

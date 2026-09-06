@@ -21,6 +21,15 @@
  * Occupancy/spill gate (must show 0 bytes spill and >= 1 block/SM):
  *   nvcc -arch=sm_120a -I ../common -I . -Xptxas -v -c interp_sm120.cu
  */
+#ifndef PLOW_NV_FP8_M1_ROLE
+#define PLOW_NV_FP8_M1_ROLE 0
+#endif
+#if PLOW_NV_FP8_M1_ROLE != 0 && PLOW_NV_FP8_M1_ROLE != 1
+#error "PLOW_NV_FP8_M1_ROLE must be0 or1"
+#endif
+#if PLOW_NV_FP8_M1_ROLE && defined(PLOW_NV_THREADS) && PLOW_NV_THREADS != 256
+#error "FP8 M1 role requires256 threads"
+#endif
 #include "dev_isa.h"
 
 /* ---- OPTIONAL per-packet arm selection (plow_config.h) ---------------------------------
@@ -583,7 +592,9 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #endif
 #define PLOW_NV_CAT_I(a, b) a##b
 #define PLOW_NV_CAT(a, b) PLOW_NV_CAT_I(a, b)
-#if PLOW_NV_GEMV512_ROLE
+#if PLOW_NV_FP8_M1_ROLE
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _fp8m1)
+#elif PLOW_NV_GEMV512_ROLE
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gemv512)
 #elif PLOW_NV_PREFILL && PLOW_NV_SEG_GEMM
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pfgemm)
@@ -858,7 +869,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                                           unsigned nblk, float* arena) {
     const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
     const unsigned tw_[4] = {tv_.x, tv_.y, tv_.z, tv_.w};
-#if PLOW_NV_GEMV512_ROLE
+#if PLOW_NV_FP8_M1_ROLE
+    if (in->op != PLOW_DOP_GEMM_FP8 || in->i[0] != 1 || !in->i[1] ||
+        !in->i[2] || in->i[2] > 17408 || (in->i[2] & 15u) || in->i[4] ||
+        !in->i[7] || in->i[7] == PLOW_TENSOR_NONE || !T[in->i[7]] ||
+        !TEN(0) || !TEN(1) || !TEN(2) || !TEN(3) || !TEN(4)) { __trap(); return; }
+    d_gemm_w8a8_m1_tma_sm90((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1),
+        (const uint8_t*)TEN(2), T[in->i[7]], (const float*)TEN(3), (const float*)TEN(4),
+        in->i[1], in->i[2], in->i[4], slice, nblk, (__nv_bfloat16*)arena);
+#elif PLOW_NV_GEMV512_ROLE
     if (in->i[0] != 1 || !in->i[2] || in->i[2] > 32768u) { __trap(); return; }
     switch (in->op) {
     case PLOW_DOP_GEMV:
@@ -2262,6 +2281,16 @@ extern "C" __device__ unsigned PLOW_SYM(plow_decode_bf16_abi) = 0;
 extern "C" __device__ unsigned PLOW_SYM(plow_decode_gf256) = PLOW_NV_FA_GF_HD256;
 extern "C" __device__ unsigned PLOW_SYM(plow_decode_gf512) = PLOW_NV_FA_GF_FULL;
 extern "C" __device__ unsigned PLOW_SYM(plow_decode_staging_bytes) = PLOW_NV_GEMV_STAGING_BYTES;
+#if PLOW_NV_FP8_M1_ROLE
+#if !defined(PLOW_NV_HOPPER) || PLOW_NV_PREFILL || !PLOW_NV_SEGMENTS || PLOW_NV_THREADS != 256 || PLOW_NV_GEMV512_ROLE || PLOW_NV_SCHED != 1 || PLOW_NV_PLACE_DISPATCH || PLOW_NV_SKELETON || PLOW_NV_GEMM_ONLY || PLOW_NV_FA_ONLY || PLOW_NV_LEAN_DECODE || !PLOW_NV_FP8_M1 || !PLOW_NV_FP8_M1_TMA || !PLOW_NV_FP8_M1_XCACHE || !PLOW_NV_FP8_M1_FAST_ACCUM || !PLOW_NV_QUANT_FP8_VLLM
+#error "FP8 M1 role requires Hopper segmented256-thread GQ TMA/XCACHE/FAST_ACCUM decode"
+#endif
+static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) == 205840, "FP8 M1 role arena");
+extern "C" __device__ unsigned plow_fp8_gemm_m1_tma_abi = 1;
+extern "C" __device__ unsigned plow_fp8_m1_promote_k512 = PLOW_NV_FP8_M1_PROMOTE_K512;
+extern "C" __device__ unsigned plow_fp8_m1_max_k = 17408;
+extern "C" __device__ unsigned plow_fp8_m1_k_multiple = 16;
+#endif
 #if PLOW_NV_GEMV512_ROLE
 #if PLOW_NV_SCHED != 1 || PLOW_NV_PLACE_DISPATCH || PLOW_NV_SKELETON || !PLOW_NV_SEGMENTS
 #error "GEMV512 role requires the segmented global queue scheduler"
