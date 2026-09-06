@@ -1706,6 +1706,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                    in->i[3], in->i[4], in->i[2], slice, nblk, (__nv_bfloat16*)arena);
         break;
 
+    case PLOW_DOP_GEMV_MXFP4:
+        d_gemv_mxfp4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                      (const uint8_t*)TEN(2), (const uint8_t*)TEN(3),
+                      (const __nv_bfloat16*)TEN(7), in->i[0], in->i[1], in->i[2], slice, nblk);
+        break;
+
     case PLOW_DOP_GEMV_GLU:
         d_gemv_glu((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[0], in->i[1],
