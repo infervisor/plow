@@ -185,3 +185,41 @@ plow wins **all 32 cells against llama.cpp**. Against vLLM it wins 11 of 16 TTFT
 TPOT cells: every c=1 and c=2 cell except summarize TTFT at c=1 and TPOT at c=2. vLLM still wins at
 c>=4 on long prompts, where it runs prefill chunks and decode rows in one mixed forward so decode
 never queues behind a prompt; that scheduling change is the remaining structural item.
+
+## Final: one worker per physical core (commit f51cd35, 15:4x)
+
+SMT siblings share one TMUL and one pair of 512-bit FMA ports, so the default worker count moved
+from logical cpus (16) to physical cores (8). No other change. Prefill at 512 tokens went 399 ->
+455 tok/s and batch-1 decode 25.5 -> 24.0 ms. Fresh prompts, one server at a time, bold = best of
+the three. Raw: `plow/gptoss-t8-*.md`.
+
+| workload | conc | plow TTFT | llama TTFT | vLLM TTFT | plow TPOT | llama TPOT | vLLM TPOT |
+|---|---|---|---|---|---|---|---|
+| chat_short | 1 | **358** | 748 | 637 | **25** | 41 | 71 |
+| chat_short | 2 | **513** | 1625 | 1220 | **47** | 65 | 95 |
+| chat_short | 4 | **862** | 3059 | 1657 | **84** | 104 | 103 |
+| chat_short | 8 | **1840** | 5260 | 2120 | 142 | 177 | **136** |
+| chat_long | 1 | **978** | 4823 | 1346 | **24** | 51 | 71 |
+| chat_long | 2 | **1438** | 9520 | 1962 | **60** | 81 | 80 |
+| chat_long | 4 | **2468** | 14432 | 2550 | **100** | 133 | 102 |
+| chat_long | 8 | **4545** | 35666 | 4591 | 195 | 215 | **137** |
+| code | 1 | **893** | 4212 | 1253 | **25** | 50 | 76 |
+| code | 2 | **1405** | 8780 | 2151 | **50** | 73 | 81 |
+| code | 4 | **2062** | 18762 | 2944 | **103** | 123 | 115 |
+| code | 8 | **4017** | 35120 | 4156 | 176 | 207 | **152** |
+| summarize | 1 | 2577 | 10693 | **1829** | **25** | 59 | 71 |
+| summarize | 2 | **3014** | 23777 | 3593 | 87 | 113 | **85** |
+| summarize | 4 | **4838** | 57888 | 6735 | 164 | 195 | **116** |
+| summarize | 8 | 11320 | 73138 | **7219** | 288 | 430 | **153** |
+
+plow wins **all 32 cells against llama.cpp** and **24 of 32 against both baselines at once**:
+14 of 16 TTFT cells and 10 of 16 TPOT cells. Every c=1 and c=2 cell is a win, and the physical-core
+default newly took chat_long at c=4 (TPOT 100 vs vLLM's 102) and c=8 (TTFT 4545 vs 4591).
+
+What still loses to vLLM, all at c >= 4 on long prompts: summarize TTFT at c=1 and c=8, and TPOT at
+c=8 across the board plus summarize from c=2. The cause is unchanged and is not kernel speed -- vLLM
+runs prefill chunks and decode rows in ONE forward, so a decoding request never waits behind another
+prompt, while ours alternates. For chat_long at c=8 our 3512 prefill tokens cost 8.7 s at 403 tok/s and
+64 rung-8 decode steps cost 9.7 s, which serialize to 18.4 s against vLLM's 13.25 s; fusing the decode
+rows into the prefill pass gives max(8.7, 9.7) = 9.7 s, i.e. 1.37x ahead. That remains the one
+structural item, and a GEMM does not care about sequence boundaries -- only attention needs the split.

@@ -1,0 +1,1278 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8096",
+  "model": "6cee5e81ee83917806bbde320786a8fb61efebee",
+  "server_models": [
+   "6cee5e81ee83917806bbde320786a8fb61efebee"
+  ],
+  "timestamp": "2026-09-06T15:39:22+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8096",
+   "--model",
+   "6cee5e81ee83917806bbde320786a8fb61efebee",
+   "--workload",
+   "chat_long,summarize",
+   "--concurrency",
+   "4,8",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee",
+   "--out",
+   "perf-data/cpu-gptoss/plow/gptoss-t8-hot.json",
+   "--md",
+   "perf-data/cpu-gptoss/plow/gptoss-t8-hot.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "chat_long",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 17.492611284993473,
+    "ttft_s": {
+     "mean": 2.4678460293744138,
+     "p50": 2.957897754997248,
+     "p90": 3.3365820290055126,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.09954341197661137,
+     "p50": 0.10832793782543694,
+     "p90": 0.11535023138091514,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 8.623361502248372,
+     "p50": 8.625864378991537,
+     "p90": 8.794599172993912,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 391.875,
+     "p50": 464,
+     "p90": 506,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 62.75,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 502,
+    "output_tok_per_s": 28.697830862488484,
+    "req_per_s": 0.45733594999981647,
+    "finish_reasons": {
+     "length": 6,
+     "stop": 2
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 17.492611284993473,
+     "ttft_s": {
+      "mean": 2.4678460293744138,
+      "p50": 2.957897754997248,
+      "p90": 3.3365820290055126,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.09954341197661137,
+      "p50": 0.10832793782543694,
+      "p90": 0.11535023138091514,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 8.623361502248372,
+      "p50": 8.625864378991537,
+      "p90": 8.794599172993912,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 391.875,
+      "p50": 464,
+      "p90": 506,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 62.75,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 502,
+     "output_tok_per_s": 28.697830862488484,
+     "req_per_s": 0.45733594999981647,
+     "finish_reasons": {
+      "length": 6,
+      "stop": 2
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.286114105998422,
+     "tpot_s": 0.11535023138091514,
+     "latency_s": 8.553280658001313,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 515,
+      "completion_tokens": 64,
+      "total_tokens": 579,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Where to keep it**  \nThe passage says the emergency fund should be kept \u201csomew",
+     "text_chars": 310,
+     "index": 0,
+     "kind": "chat_long",
+     "t_start": 1788709164.705378,
+     "prompt_tokens_client": 506,
+     "prompt_tokens_server": 515,
+     "prompt_chars": 2651,
+     "prompt_tokens": 506
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.957897754997248,
+     "tpot_s": 0.10832793782543694,
+     "latency_s": 9.782628159999149,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 392,
+      "completion_tokens": 64,
+      "total_tokens": 456,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Answer**  \nAn escapement is a mechanical device that transfers the energy of a",
+     "text_chars": 301,
+     "index": 1,
+     "kind": "chat_long",
+     "t_start": 1788709164.7055767,
+     "prompt_tokens_client": 383,
+     "prompt_tokens_server": 392,
+     "prompt_chars": 1824,
+     "prompt_tokens": 383
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.9880866409948794,
+     "tpot_s": 0.10536046841275132,
+     "latency_s": 8.625864378991537,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 236,
+      "completion_tokens": 64,
+      "total_tokens": 300,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Below is a practical, step\u2011by\u2011step plan for the two colonies you have, plus a qu",
+     "text_chars": 261,
+     "index": 2,
+     "kind": "chat_long",
+     "t_start": 1788709164.7060301,
+     "prompt_tokens_client": 227,
+     "prompt_tokens_server": 236,
+     "prompt_chars": 1035,
+     "prompt_tokens": 227
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.101021017995663,
+     "tpot_s": 0.07293324053340863,
+     "latency_s": 8.554860895004822,
+     "output_tokens": 61,
+     "content_chunks": 60,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 473,
+      "completion_tokens": 61,
+      "total_tokens": 534,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage does not explain how the swarm decides where to move. It only descri",
+     "text_chars": 324,
+     "index": 3,
+     "kind": "chat_long",
+     "t_start": 1788709164.7063706,
+     "prompt_tokens_client": 464,
+     "prompt_tokens_server": 473,
+     "prompt_chars": 2273,
+     "prompt_tokens": 464
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.154112955002347,
+     "tpot_s": 0.1239790532319083,
+     "latency_s": 8.179502198996488,
+     "output_tokens": 57,
+     "content_chunks": 56,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 491,
+      "completion_tokens": 57,
+      "total_tokens": 548,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage does not describe any tidal influence on the lower river.  The text ",
+     "text_chars": 259,
+     "index": 4,
+     "kind": "chat_long",
+     "t_start": 1788709173.260594,
+     "prompt_tokens_client": 482,
+     "prompt_tokens_server": 491,
+     "prompt_chars": 2148,
+     "prompt_tokens": 482
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.942380691994913,
+     "tpot_s": 0.1086716741110505,
+     "latency_s": 8.788790833001258,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 244,
+      "completion_tokens": 64,
+      "total_tokens": 308,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\n| What you\u2019re doing | Why it\u2019s hurting the coffee | What to ch",
+     "text_chars": 273,
+     "index": 5,
+     "kind": "chat_long",
+     "t_start": 1788709173.2628405,
+     "prompt_tokens_client": 235,
+     "prompt_tokens_server": 244,
+     "prompt_chars": 1105,
+     "prompt_tokens": 235
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.3365820290055126,
+     "tpot_s": 0.0866341613332874,
+     "latency_s": 8.794599172993912,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 611,
+      "completion_tokens": 64,
+      "total_tokens": 675,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Spring tides** are the high\u2011range tides that occur when the Sun and Moon lie o",
+     "text_chars": 273,
+     "index": 6,
+     "kind": "chat_long",
+     "t_start": 1788709173.3325593,
+     "prompt_tokens_client": 602,
+     "prompt_tokens_server": 611,
+     "prompt_chars": 2855,
+     "prompt_tokens": 602
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.9765730390063254,
+     "tpot_s": 0.07509052898413279,
+     "latency_s": 7.707365720998496,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 245,
+      "completion_tokens": 64,
+      "total_tokens": 309,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Why \u201cfreshness\u201d matters**\n\nWhen coffee is roasted, the beans start to *age* th",
+     "text_chars": 262,
+     "index": 7,
+     "kind": "chat_long",
+     "t_start": 1788709174.4897046,
+     "prompt_tokens_client": 236,
+     "prompt_tokens_server": 245,
+     "prompt_chars": 1085,
+     "prompt_tokens": 236
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 17.091133113994147,
+    "ttft_s": {
+     "mean": 4.544949385748623,
+     "p50": 4.603182674996788,
+     "p90": 7.462915161988349,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.19537985289996596,
+     "p50": 0.2205841569047484,
+     "p90": 0.2314256343262336,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 16.378705706629262,
+     "p50": 16.721002935009892,
+     "p90": 16.969839683995815,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 439.25,
+     "p50": 473,
+     "p90": 596,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 61.875,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 495,
+    "output_tok_per_s": 28.962386326199525,
+    "req_per_s": 0.46807897092847717,
+    "finish_reasons": {
+     "length": 7,
+     "stop": 1
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 17.091133113994147,
+     "ttft_s": {
+      "mean": 4.544949385748623,
+      "p50": 4.603182674996788,
+      "p90": 7.462915161988349,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.19537985289996596,
+      "p50": 0.2205841569047484,
+      "p90": 0.2314256343262336,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 16.378705706629262,
+      "p50": 16.721002935009892,
+      "p90": 16.969839683995815,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 439.25,
+      "p50": 473,
+      "p90": 596,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 61.875,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 495,
+     "output_tok_per_s": 28.962386326199525,
+     "req_per_s": 0.46807897092847717,
+     "finish_reasons": {
+      "length": 7,
+      "stop": 1
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 7.462915161988349,
+     "tpot_s": 0.15090260152392726,
+     "latency_s": 16.969839683995815,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 510,
+      "completion_tokens": 64,
+      "total_tokens": 574,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Answer**\n\nSpring tides are the highest and lowest tides that occur when the Su",
+     "text_chars": 309,
+     "index": 8,
+     "kind": "chat_long",
+     "t_start": 1788709184.5848043,
+     "prompt_tokens_client": 501,
+     "prompt_tokens_server": 510,
+     "prompt_chars": 2383,
+     "prompt_tokens": 501
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0737445699924137,
+     "tpot_s": 0.2402058148732139,
+     "latency_s": 16.20678257200052,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 482,
+      "completion_tokens": 64,
+      "total_tokens": 546,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A halo is a bright ring that appears around the Sun or Moon. It is caused by the",
+     "text_chars": 295,
+     "index": 9,
+     "kind": "chat_long",
+     "t_start": 1788709184.5850124,
+     "prompt_tokens_client": 473,
+     "prompt_tokens_server": 482,
+     "prompt_chars": 2229,
+     "prompt_tokens": 473
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.5765413119952427,
+     "tpot_s": 0.2205841569047484,
+     "latency_s": 16.473407711004256,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 245,
+      "completion_tokens": 64,
+      "total_tokens": 309,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Why \u201cfreshness\u201d matters**\n\nWhen coffee is roasted, the beans start to *age* th",
+     "text_chars": 262,
+     "index": 10,
+     "kind": "chat_long",
+     "t_start": 1788709184.5851111,
+     "prompt_tokens_client": 236,
+     "prompt_tokens_server": 245,
+     "prompt_chars": 1085,
+     "prompt_tokens": 236
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 8.96455064699694,
+     "tpot_s": 0.12895662290490387,
+     "latency_s": 17.088901821000036,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 605,
+      "completion_tokens": 64,
+      "total_tokens": 669,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Till** and **eskers** are both deposits left behind by glaciers, but they\u2019re m",
+     "text_chars": 256,
+     "index": 11,
+     "kind": "chat_long",
+     "t_start": 1788709184.58521,
+     "prompt_tokens_client": 596,
+     "prompt_tokens_server": 605,
+     "prompt_chars": 2868,
+     "prompt_tokens": 596
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.603182674996788,
+     "tpot_s": 0.1923452143969443,
+     "latency_s": 16.721002935009892,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 387,
+      "completion_tokens": 64,
+      "total_tokens": 451,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Why can\u2019t we just calculate the tides from physics?**\n\nThink of the Earth\u2019s oc",
+     "text_chars": 261,
+     "index": 12,
+     "kind": "chat_long",
+     "t_start": 1788709184.5858023,
+     "prompt_tokens_client": 378,
+     "prompt_tokens_server": 387,
+     "prompt_chars": 1783,
+     "prompt_tokens": 378
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.603060656998423,
+     "tpot_s": 0.2314256343262336,
+     "latency_s": 14.380990114004817,
+     "output_tokens": 47,
+     "content_chunks": 46,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 404,
+      "completion_tokens": 47,
+      "total_tokens": 451,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage does not explain why there are two high tides a day; it only describ",
+     "text_chars": 221,
+     "index": 13,
+     "kind": "chat_long",
+     "t_start": 1788709184.5859034,
+     "prompt_tokens_client": 395,
+     "prompt_tokens_server": 404,
+     "prompt_chars": 1868,
+     "prompt_tokens": 395
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8353672930097673,
+     "tpot_s": 0.23029752376180748,
+     "latency_s": 16.34418219800864,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 272,
+      "completion_tokens": 64,
+      "total_tokens": 336,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Below is a \u201cfield\u2011guide\u201d you can use while you\u2019re in the archive.  It lists the ",
+     "text_chars": 274,
+     "index": 14,
+     "kind": "chat_long",
+     "t_start": 1788709184.5860963,
+     "prompt_tokens_client": 263,
+     "prompt_tokens_server": 272,
+     "prompt_chars": 1157,
+     "prompt_tokens": 263
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.240232770011062,
+     "tpot_s": 0.16832125450794896,
+     "latency_s": 16.84453861801012,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 681,
+      "completion_tokens": 64,
+      "total_tokens": 745,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**A halo around the sun or moon indicates an approaching warm front.**  \nThe pas",
+     "text_chars": 261,
+     "index": 15,
+     "kind": "chat_long",
+     "t_start": 1788709184.5861907,
+     "prompt_tokens_client": 672,
+     "prompt_tokens_server": 681,
+     "prompt_chars": 3159,
+     "prompt_tokens": 672
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 30.551174498992623,
+    "ttft_s": {
+     "mean": 4.838291919375479,
+     "p50": 4.664585179998539,
+     "p90": 6.542741608005599,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.16399072375197504,
+     "p50": 0.17600793758728764,
+     "p90": 0.20042408966655206,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 15.169788244125812,
+     "p50": 15.753147417999571,
+     "p90": 17.45823814900359,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1111.25,
+     "p50": 1243,
+     "p90": 1434,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 16.75876650885819,
+    "req_per_s": 0.26185572670090923,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 30.551174498992623,
+     "ttft_s": {
+      "mean": 4.838291919375479,
+      "p50": 4.664585179998539,
+      "p90": 6.542741608005599,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.16399072375197504,
+      "p50": 0.17600793758728764,
+      "p90": 0.20042408966655206,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 15.169788244125812,
+      "p50": 15.753147417999571,
+      "p90": 17.45823814900359,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1111.25,
+      "p50": 1243,
+      "p90": 1434,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 16.75876650885819,
+     "req_per_s": 0.26185572670090923,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.782849012000952,
+     "tpot_s": 0.20042408966655206,
+     "latency_s": 14.409681179997278,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 822,
+      "completion_tokens": 64,
+      "total_tokens": 886,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- **Early time\u2011keeping**:  \n  * Sundials and water clocks were the first devices",
+     "text_chars": 263,
+     "index": 0,
+     "kind": "summarize",
+     "t_start": 1788709206.550339,
+     "prompt_tokens_client": 813,
+     "prompt_tokens_server": 822,
+     "prompt_chars": 3908,
+     "prompt_tokens": 813
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 9.946877041002153,
+     "tpot_s": 0.1817547750954021,
+     "latency_s": 21.397500945007778,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1443,
+      "completion_tokens": 64,
+      "total_tokens": 1507,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nGlaciers erode valleys by sliding, plucking, and melt\u2011water action",
+     "text_chars": 270,
+     "index": 1,
+     "kind": "summarize",
+     "t_start": 1788709206.5506008,
+     "prompt_tokens_client": 1434,
+     "prompt_tokens_server": 1443,
+     "prompt_chars": 7075,
+     "prompt_tokens": 1434
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.542741608005599,
+     "tpot_s": 0.17326075830154994,
+     "latency_s": 17.45823814900359,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1337,
+      "completion_tokens": 64,
+      "total_tokens": 1401,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Honeybee colony cycle** \u2013 In late winter the queen resumes laying, raising bro",
+     "text_chars": 245,
+     "index": 2,
+     "kind": "summarize",
+     "t_start": 1788709206.5507958,
+     "prompt_tokens_client": 1328,
+     "prompt_tokens_server": 1337,
+     "prompt_chars": 6348,
+     "prompt_tokens": 1328
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.403466051997384,
+     "tpot_s": 0.17599959298413956,
+     "latency_s": 14.491503400990041,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 706,
+      "completion_tokens": 64,
+      "total_tokens": 770,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Two\u2011sentence summary**  \nCoffee is harvested by hand, processed either by wash",
+     "text_chars": 315,
+     "index": 3,
+     "kind": "summarize",
+     "t_start": 1788709206.5509555,
+     "prompt_tokens_client": 697,
+     "prompt_tokens_server": 706,
+     "prompt_chars": 3460,
+     "prompt_tokens": 697
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.9688296539970906,
+     "tpot_s": 0.20303686544445107,
+     "latency_s": 15.760222463999526,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1153,
+      "completion_tokens": 64,
+      "total_tokens": 1217,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe article explains the coffee production process from harvest to ",
+     "text_chars": 332,
+     "index": 4,
+     "kind": "summarize",
+     "t_start": 1788709220.9625263,
+     "prompt_tokens_client": 1144,
+     "prompt_tokens_server": 1153,
+     "prompt_chars": 5429,
+     "prompt_tokens": 1144
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.664585179998539,
+     "tpot_s": 0.17600793758728764,
+     "latency_s": 15.753147417999571,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 783,
+      "completion_tokens": 64,
+      "total_tokens": 847,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Headline:**  \n**How a Honeybee Colony Cycles Through the Seasons**\n\n**Key Take",
+     "text_chars": 295,
+     "index": 5,
+     "kind": "summarize",
+     "t_start": 1788709221.0455117,
+     "prompt_tokens_client": 774,
+     "prompt_tokens_server": 783,
+     "prompt_chars": 3759,
+     "prompt_tokens": 774
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.124526508006966,
+     "tpot_s": 0.12409317028562775,
+     "latency_s": 12.942502823003451,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1466,
+      "completion_tokens": 64,
+      "total_tokens": 1530,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Honeybee colony cycle** \u2013 In late winter the queen resumes laying, raising a b",
+     "text_chars": 256,
+     "index": 6,
+     "kind": "summarize",
+     "t_start": 1788709224.013391,
+     "prompt_tokens_client": 1457,
+     "prompt_tokens_server": 1466,
+     "prompt_chars": 7044,
+     "prompt_tokens": 1457
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.272460299995146,
+     "tpot_s": 0.07734860065079013,
+     "latency_s": 9.145509573005256,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1252,
+      "completion_tokens": 64,
+      "total_tokens": 1316,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The article traces the evolution of time\u2011keeping from ancient water clocks to mo",
+     "text_chars": 358,
+     "index": 7,
+     "kind": "summarize",
+     "t_start": 1788709227.9530857,
+     "prompt_tokens_client": 1243,
+     "prompt_tokens_server": 1252,
+     "prompt_chars": 6126,
+     "prompt_tokens": 1243
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 30.249448442002176,
+    "ttft_s": {
+     "mean": 11.320174809750824,
+     "p50": 12.004271971993148,
+     "p90": 18.2910517519922,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.28794665685116283,
+     "p50": 0.32259266061887576,
+     "p90": 0.38448227798411,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 29.46091201487434,
+     "p50": 29.498607613000786,
+     "p90": 30.00705674100027,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1123.875,
+     "p50": 1190,
+     "p90": 1228,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 16.925928450618432,
+    "req_per_s": 0.264467632040913,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 30.249448442002176,
+     "ttft_s": {
+      "mean": 11.320174809750824,
+      "p50": 12.004271971993148,
+      "p90": 18.2910517519922,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.28794665685116283,
+      "p50": 0.32259266061887576,
+      "p90": 0.38448227798411,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 29.46091201487434,
+      "p50": 29.498607613000786,
+      "p90": 30.00705674100027,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1123.875,
+      "p50": 1190,
+      "p90": 1228,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 16.925928450618432,
+     "req_per_s": 0.264467632040913,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 18.2910517519922,
+     "tpot_s": 0.1859668011588621,
+     "latency_s": 30.00705674100027,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1224,
+      "completion_tokens": 64,
+      "total_tokens": 1288,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Household budgeting**: A household budget plans money before it arrives. Start",
+     "text_chars": 282,
+     "index": 8,
+     "kind": "summarize",
+     "t_start": 1788709241.9798594,
+     "prompt_tokens_client": 1215,
+     "prompt_tokens_server": 1224,
+     "prompt_chars": 6181,
+     "prompt_tokens": 1215
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.8887563419993967,
+     "tpot_s": 0.4119402757778372,
+     "latency_s": 28.841114167997148,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1199,
+      "completion_tokens": 64,
+      "total_tokens": 1263,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- **Keeper duties and conditions** \u2013 A lighthouse keeper\u2019s routine involved main",
+     "text_chars": 308,
+     "index": 9,
+     "kind": "summarize",
+     "t_start": 1788709241.9801414,
+     "prompt_tokens_client": 1190,
+     "prompt_tokens_server": 1199,
+     "prompt_chars": 5793,
+     "prompt_tokens": 1190
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 8.921086886999547,
+     "tpot_s": 0.32259266061887576,
+     "latency_s": 29.244487274991116,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 959,
+      "completion_tokens": 64,
+      "total_tokens": 1023,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe article traces the evolution of time\u2011keeping from ancient water",
+     "text_chars": 347,
+     "index": 10,
+     "kind": "summarize",
+     "t_start": 1788709241.9803255,
+     "prompt_tokens_client": 950,
+     "prompt_tokens_server": 959,
+     "prompt_chars": 4566,
+     "prompt_tokens": 950
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 15.109162303997437,
+     "tpot_s": 0.2324041566984277,
+     "latency_s": 29.75069537399395,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1178,
+      "completion_tokens": 64,
+      "total_tokens": 1242,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Headline:**  \n**From Sun\u2011Dials to Atomic Clocks: How Timekeeping Evolved from ",
+     "text_chars": 284,
+     "index": 11,
+     "kind": "summarize",
+     "t_start": 1788709241.9805112,
+     "prompt_tokens_client": 1169,
+     "prompt_tokens_server": 1178,
+     "prompt_chars": 5720,
+     "prompt_tokens": 1169
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.873933751005097,
+     "tpot_s": 0.3530520516189484,
+     "latency_s": 29.11632679500326,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1018,
+      "completion_tokens": 64,
+      "total_tokens": 1082,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nBread is made by mixing flour, water, salt, and yeast (or a sourdo",
+     "text_chars": 294,
+     "index": 12,
+     "kind": "summarize",
+     "t_start": 1788709241.9812262,
+     "prompt_tokens_client": 1009,
+     "prompt_tokens_server": 1018,
+     "prompt_chars": 4942,
+     "prompt_tokens": 1009
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.004271971993148,
+     "tpot_s": 0.2776861450475981,
+     "latency_s": 29.498607613000786,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1237,
+      "completion_tokens": 64,
+      "total_tokens": 1301,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- Glaciers erode valleys by sliding, plucking, and melt\u2011water action, producing ",
+     "text_chars": 243,
+     "index": 13,
+     "kind": "summarize",
+     "t_start": 1788709241.9814131,
+     "prompt_tokens_client": 1228,
+     "prompt_tokens_server": 1237,
+     "prompt_chars": 5923,
+     "prompt_tokens": 1228
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 21.7110906260059,
+     "tpot_s": 0.13544888590464355,
+     "latency_s": 30.24446505100059,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1369,
+      "completion_tokens": 64,
+      "total_tokens": 1433,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nTides are caused by the differential gravitational pull of the Moo",
+     "text_chars": 315,
+     "index": 14,
+     "kind": "summarize",
+     "t_start": 1788709241.981598,
+     "prompt_tokens_client": 1360,
+     "prompt_tokens_server": 1369,
+     "prompt_chars": 6617,
+     "prompt_tokens": 1360
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.762044844013872,
+     "tpot_s": 0.38448227798411,
+     "latency_s": 28.984543102007592,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 879,
+      "completion_tokens": 64,
+      "total_tokens": 943,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nBread dough relies on gluten to trap gas, and fermentation\u2014whether",
+     "text_chars": 321,
+     "index": 15,
+     "kind": "summarize",
+     "t_start": 1788709241.981743,
+     "prompt_tokens_client": 870,
+     "prompt_tokens_server": 879,
+     "prompt_chars": 4337,
+     "prompt_tokens": 870
+    }
+   ]
+  }
+ ]
+}
