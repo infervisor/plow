@@ -14,6 +14,7 @@
  * the template below for why the layout used here is correct at 128/256/512 alike.
  */
 #pragma once
+#include "mixed_step.h"
 #ifndef PLOW_NV_GEMMA_HNR_BF16
 #define PLOW_NV_GEMMA_HNR_BF16 0
 #endif
@@ -643,7 +644,11 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
                                 float eps, unsigned out_row0, unsigned out_stride,
                                 unsigned kv_mask, unsigned skip_norm, unsigned slice,
                                 unsigned nblk, unsigned n_batch_kv = 0,
-                                const int* __restrict__ pfslot = nullptr) {
+                                const int* __restrict__ pfslot = nullptr
+#if PLOW_MIXED_STEP
+                                , const PlowProgram* mixed = nullptr
+#endif
+                                ) {
     static_assert(HD % 64 == 0,
                   "head_dim must be a multiple of 64 so the half-split RoPE partner (i, i+HD/2) "
                   "stays inside one 32-lane warp — otherwise the rotate needs cross-lane traffic "
@@ -664,6 +669,13 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
             const unsigned nsh = 31u - (unsigned)__clz((int)nhead);
             t = w >> nsh; hh = w & (nhead - 1u);
         } else { t = w / nhead; hh = w % nhead; }
+#if PLOW_MIXED_STEP
+        PlowMixedRow mixed_row = {nullptr, 0u, 0u, 0u, 0u};
+        if (out_stride && mixed) {
+            mixed_row = plow_mixed_row(mixed, pfslot, pos, t);
+            if (!mixed_row.active) continue;
+        }
+#endif
         const size_t ibase = ((size_t)t * nhead + hh) * hd;
         /* KV write (out_stride!=0): per-row slot map (batched prefill), per-batch ring when
          * n_batch_kv!=0 (the row index derives from pos[t] — at n_batch_kv==1 this is the
@@ -672,7 +684,14 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ out,
          * legacy host-patched single-ring. */
         const size_t obase =
             out_stride
-                ? (pfslot
+                ? (
+#if PLOW_MIXED_STEP
+                   mixed
+                       ? ((size_t)(mixed_row.slot * nhead + hh) * out_stride +
+                          (mixed_row.position & kv_mask)) * hd
+                       :
+#endif
+                   pfslot
                        ? ((size_t)((unsigned)pfslot[t] * nhead + hh) * out_stride +
                           ((unsigned)pos[t] & kv_mask)) *
                              hd

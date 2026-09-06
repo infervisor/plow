@@ -29,6 +29,15 @@ pub struct MixedStepStaging {
     pending: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalDeviceMetadata<'a> {
+    pub decode_slots: &'a [i32],
+    pub prefill_spans: &'a [packet::dev::PrefillSpan],
+    pub parked: &'a [u32],
+    pub rows: u32,
+    pub decode_rows: u32,
+}
+
 impl MixedStepStaging {
     pub fn with_capacity(
         row_capacity: usize,
@@ -69,6 +78,19 @@ impl MixedStepStaging {
 
     pub fn pending_plan(&self) -> Option<&Plan> {
         self.pending.then_some(&self.plan)
+    }
+
+    /// The three canonical host images an adapter uploads for a selected mixed
+    /// program. Prefill consumers read the span/mask pair through `PlowProgram`;
+    /// only the compact decode-slot image is a packet tensor.
+    pub fn pending_device_metadata(&self) -> Option<CanonicalDeviceMetadata<'_>> {
+        self.pending.then(|| CanonicalDeviceMetadata {
+            decode_slots: &self.plan.decode_slots,
+            prefill_spans: &self.plan.prefill_spans,
+            parked: &self.plan.parked,
+            rows: self.plan.rows.len() as u32,
+            decode_rows: self.plan.decode_rows,
+        })
     }
 
     /// Publish the logical KV progress after the staged device work succeeds.

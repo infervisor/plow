@@ -31,6 +31,14 @@
 #error "FP8 M1 role requires256 threads"
 #endif
 #include "dev_isa.h"
+#include "mixed_step.h"
+#if PLOW_MIXED_STEP
+#if PLOW_FP8_KV
+#error "mixed dense consumer supports BF16 direct KV only"
+#endif
+extern "C" __device__ unsigned plow_mixed_interpreter
+    = 1;
+#endif
 
 /* ---- OPTIONAL per-packet arm selection (plow_config.h) ---------------------------------
  * -DPLOW_CONFIG='"plow_config.h"' includes a header devgen generated FROM THE EMITTED
@@ -875,7 +883,11 @@ extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_hi) =
 #define TEN(k) (PLOW_T(k) == PLOW_TENSOR_NONE ? nullptr : T[PLOW_T(k)])
 
 __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T, unsigned slice,
-                                          unsigned nblk, float* arena) {
+                                          unsigned nblk, float* arena
+#if PLOW_MIXED_STEP
+                                          , const PlowProgram* mixed
+#endif
+                                          ) {
     const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
     const unsigned tw_[4] = {tv_.x, tv_.y, tv_.z, tv_.w};
 #if PLOW_NV_FP8_M1_ROLE
@@ -1261,6 +1273,44 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * t6 (NONE on every legacy bf16 packet; host-patched in PX-1 batched-prefill mode) is the
      * packed chunk's request table — see d_flash_prefill_mux. */
 #if !PLOW_NV_SEG_GEMM && !PLOW_NV_FATLITE /* lean GEMM + FATLITE objects never run flash */
+#if PLOW_MIXED_STEP
+    case PLOW_DOP_FLASH_PREFILL:
+#if !PLOW_NV_FA_ONLY
+        if (in->i[6] == 128)
+            d_flash_prefill_mixed<128, 64, PLOW_NV_FA128_BKV>(
+                mixed, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
+                (__nv_bfloat16*)TEN(5), in->i[0], in->i[2], in->i[3], in->i[5], in->i[7],
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
+        else
+#endif
+#if PLOW_NV_GEMMA
+#if !PLOW_NV_FA_ONLY || PLOW_NV_FA_ONLY_HD256
+        if (in->i[6] == 256)
+            d_flash_prefill_mixed<256, 64, PLOW_NV_FA256_BKV>(
+                mixed, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
+                (__nv_bfloat16*)TEN(5), in->i[0], in->i[2], in->i[3], in->i[5], in->i[7],
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
+        else
+#endif
+        if (in->i[6] == 512)
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_FA512_WG
+            d_flash_prefill_mixed<512, 64, PLOW_NV_FA512_BKV>(
+#else
+            d_flash_prefill_mixed<512, 32, 16>(
+#endif
+                mixed, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
+                (__nv_bfloat16*)TEN(5), in->i[0], in->i[2], in->i[3], in->i[5], in->i[7],
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
+        else
+            __trap();
+#else
+        __trap();
+#endif
+        break;
+#else
     case PLOW_DOP_FLASH_PREFILL:
 #if !PLOW_NV_FA_ONLY /* lean hd512-only FA object does not carry the Qwen arm */
         if (in->i[6] == 128)
@@ -1307,6 +1357,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         __trap();
 #endif
         break;
+#endif
 
 #if PLOW_FP8_KV
     /* fp8-KV prefill READ: dequant the e4m3 cache (t3=K t4=V) ×per-row scale (t6=k_scale t7=v_scale)
@@ -1385,7 +1436,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
          * PREFILL object only: t6 (NONE on legacy bf16 packets; host-patched in PX-1 batched
          * mode on KV-write sites) is the per-row seq-slot map — see d_headnorm_rope. The decode
          * object never passes it, keeping its SASS byte-identical. */
-#if PLOW_NV_PREFILL
+#if PLOW_MIXED_STEP
+#define PLOW_HNR_SLOT , (const int*)TEN(6), mixed
+#elif PLOW_NV_PREFILL
 #define PLOW_HNR_SLOT , (const int*)TEN(6)
 #else
 #define PLOW_HNR_SLOT
@@ -1430,7 +1483,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             __trap();
 #undef PLOW_HNR_SLOT
 #else
-#if PLOW_NV_PREFILL
+#if PLOW_MIXED_STEP
+#define PLOW_HNR_SLOT , (const int*)TEN(6), mixed
+#elif PLOW_NV_PREFILL
 #define PLOW_HNR_SLOT , (const int*)TEN(6)
 #else
 #define PLOW_HNR_SLOT
@@ -1533,7 +1588,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif /* PLOW_NV_PREFILL && PLOW_NV_PF_GEMV_HEAD */
 #endif /* !PLOW_NV_GEMM_ONLY (pointwise + lm_head GEMV) */
 
-#if !PLOW_NV_PREFILL
+#if !PLOW_NV_PREFILL || PLOW_MIXED_STEP
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM
     case PLOW_DOP_QUANT_FP8:
         if (in->i[0] != 1) { __trap(); break; }
@@ -1890,7 +1945,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif /* PLOW_NV_DSA */
 #endif /* PLOW_NV_GEMMA */
-#endif /* !PLOW_NV_PREFILL */
+#endif /* !PLOW_NV_PREFILL || PLOW_MIXED_STEP */
 
 #if !PLOW_NV_GEMM_ONLY
     case PLOW_DOP_FLASH_MERGE:
@@ -2519,7 +2574,11 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
          * on the REAL 401-packet / 32493-entry decode program. Output is garbage. */
         (void)nblk_grid;
 #else
-        plow_exec(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena);
+        plow_exec(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena
+#if PLOW_MIXED_STEP
+                  , &prog
+#endif
+                  );
 #endif
 
         __syncthreads(); /* retire this block's stores before the release */

@@ -9,7 +9,7 @@ type Result<T> = std::result::Result<T, String>;
 pub const SECTION: &str = "mixed_step";
 pub const VERSION: u32 = 1;
 pub const PROGRAM_CAPABILITY: &str = aux_program::CAPABILITY;
-pub const OBJECT_CAPABILITY: &str = "plow.mixed.interpreter";
+pub const OBJECT_CAPABILITY: &str = "plow_mixed_interpreter";
 pub const DECODE_SLOT_TENSOR: &str = "in.decode_slot";
 
 #[derive(Clone, Copy)]
@@ -554,6 +554,7 @@ impl Variant {
                 && plan.decode_rows == self.decode_rows
                 && plan.decode_rows <= plan.real_rows
                 && plan.real_rows <= self.rows
+                && !plan.prefill_spans.is_empty()
                 && plan
                     .prefill_spans
                     .len()
@@ -820,6 +821,62 @@ pub fn flash_decode_slot_operand(
         }
     }
     Ok(operand.flatten())
+}
+
+/// Validate the row-sensitive operands required by a BF16 direct-KV mixed
+/// program. Canonical prefill spans are supplied through `PlowProgram`; no
+/// instruction tensor carries a second request-table encoding.
+pub fn dense_consumer_contract(
+    program: &aux_program::Program,
+    decode_rows: u32,
+    tensors: &[TensorContract<'_>],
+) -> Result<u16> {
+    require(
+        decode_rows > 0 && decode_rows < program.rows,
+        "mixed dense row geometry",
+    )?;
+    let decode_slot = flash_decode_slot_operand(program, decode_rows, tensors)?
+        .ok_or("mixed step: dense FlashDecode requires a slot map")?;
+    let mut decode_attention = 0usize;
+    let mut prefill_attention = 0usize;
+    let mut kv_writers = 0usize;
+    for inst in &program.insts {
+        let op = DevOp::from_u16(inst.op).ok_or("mixed step: unknown opcode")?;
+        match op {
+            DevOp::FlashDecode if inst.i[1] & (1 << 16) == 0 => {
+                decode_attention += 1;
+            }
+            DevOp::FlashPrefill => {
+                require(
+                    inst.i[0] == program.rows
+                        && inst.i[1] == program.rows
+                        && inst.i[7] == 1
+                        && inst.t[5] != TENSOR_NONE16
+                        && inst.t[6] == TENSOR_NONE16,
+                    "mixed dense FlashPrefill span contract",
+                )?;
+                prefill_attention += 1;
+            }
+            DevOp::HeadNormRope if inst.fj[1] != 0 => {
+                require(
+                    inst.i[0] == program.rows
+                        && inst.t[6] == decode_slot
+                        && inst.t[7] == TENSOR_NONE16,
+                    "mixed dense HeadNormRope row contract",
+                )?;
+                kv_writers += 1;
+            }
+            DevOp::FlashDecodeFp8 | DevOp::FlashPrefillFp8 | DevOp::HeadNormRopeFp8 => {
+                return Err("mixed step: dense consumer requires BF16 direct KV".into());
+            }
+            _ => {}
+        }
+    }
+    require(
+        decode_attention > 0 && prefill_attention > 0 && kv_writers > 0,
+        "mixed dense attention or KV writer coverage",
+    )?;
+    Ok(decode_slot)
 }
 
 fn record_payload(
