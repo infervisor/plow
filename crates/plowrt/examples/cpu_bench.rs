@@ -102,7 +102,11 @@ fn main() {
             let toks = if b == 1 && batch == 1 {
                 vec![eng.decode_step(pos_v[0], kv_v[0]).expect("decode")]
             } else {
-                eng.decode_step_batched(&pos_v, &kv_v, &ids_v).expect("decode batched")
+                // Rung by LIVE slots (`batch`), not by the staging arrays' length (`b`): the
+                // latter always picked the widest rung on a ladder blob and made every
+                // "batch=1" number a rung-8 measurement.
+                let dp = eng.model().decode_prog_for(batch);
+                eng.decode_step_batched_at(&pos_v, &kv_v, &ids_v, dp).expect("decode batched")
             };
             steps.push(t.elapsed().as_secs_f64() * 1e3);
             out.push(toks[0]);

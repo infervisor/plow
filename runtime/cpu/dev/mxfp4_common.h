@@ -142,11 +142,16 @@ static inline __attribute__((always_inline)) void plow_mx_dot_rm(
     const uint32_t nb = K / PLOW_MX_BLK, nc = K / 64u;
     for (uint32_t r = 0; r < RB; r++) plow_mx_scale_row(sf[r], S + r * lds, nb);
     const __m512 zero = _mm512_setzero_ps();
+    /* Packed rows are short (K/2 bytes: 1.9 KiB at K=3840), so a fixed 1 KiB lead never covers the
+     * jump to the next row block and every block restarts cold (measured: cache-warm 13 GB/s vs
+     * DRAM-streaming 6 per thread). A slice's rows are contiguous, so prefetching the same chunk of
+     * row r+RB (one row block ahead, at least 4 KiB) keeps one continuous stream per row. */
+    const size_t lead = (size_t)RB * ldw > 4096u ? (size_t)RB * ldw : 4096u;
     for (uint32_t c = 0; c < nc; c++) {
         __m512i ev[4], od[4];
         PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++) {
             const uint8_t* w = W + r * ldw + (size_t)c * 32u;
-            _mm_prefetch((const char*)(w + PLOW_MX_PF_DIST), _MM_HINT_T0);
+            _mm_prefetch((const char*)(w + lead), _MM_HINT_T0);
             plow_mx_dequant64(v, w, &ev[r], &od[r]);
         }
         PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++) {
