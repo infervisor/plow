@@ -27,6 +27,7 @@ pub mod gpu;
 pub mod health;
 pub mod host;
 pub mod indirection;
+pub mod mixed_step_staging;
 pub mod oob;
 pub mod queue;
 /// Multi-GPU (tensor-parallel) device group: peer buffers, cross-GPU counters,
