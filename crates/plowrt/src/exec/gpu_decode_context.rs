@@ -390,7 +390,6 @@ pub(super) fn prepare(
         )?;
         require_dynamic_kv(
             &blob.progs[band.program.index],
-            &blob,
             plow_asset::cubin::global_u32(&image, "plow_dyn_kvrow"),
         )?;
         variants.push(PreparedVariant { blob, image });
@@ -398,7 +397,7 @@ pub(super) fn prepare(
     Ok(Some(PreparedContexts { table, variants }))
 }
 
-fn require_dynamic_kv(g: &DevProg, _blob: &DevBlob, capability: Option<u32>) -> Result<()> {
+fn require_dynamic_kv(g: &DevProg, capability: Option<u32>) -> Result<()> {
     require(
         capability == Some(1),
         "context object requires dynamic KV ABI1",
@@ -467,7 +466,6 @@ impl PreparedContexts {
                 let program = &variant.blob.progs[band.program.index];
                 require_dynamic_kv(
                     program,
-                    &variant.blob,
                     plow_asset::cubin::global_u32(&variant.image, "plow_dyn_kvrow"),
                 )?;
                 let mut rung = DecodeRung::upload(be, program, base)?;
@@ -905,15 +903,15 @@ mod tests {
     fn dynamic_b1_does_not_patch_immutable_auxiliary_instructions() {
         let base = blob(2);
         let before = pod_bytes(&base.progs[0].insts).to_vec();
-        require_dynamic_kv(&base.progs[0], &base, Some(1)).unwrap();
+        require_dynamic_kv(&base.progs[0], Some(1)).unwrap();
         assert_eq!(before, pod_bytes(&base.progs[0].insts));
         for cap in [None, Some(0), Some(2)] {
-            assert!(require_dynamic_kv(&base.progs[0], &base, cap).is_err());
+            assert!(require_dynamic_kv(&base.progs[0], cap).is_err());
         }
         for (field, value) in [(6, 0), (6, 4), (3, 7)] {
             let mut changed = blob(2);
             changed.progs[0].insts[0].i[field] = value;
-            assert!(require_dynamic_kv(&changed.progs[0], &changed, Some(1)).is_err());
+            assert!(require_dynamic_kv(&changed.progs[0], Some(1)).is_err());
         }
     }
 

@@ -127,54 +127,18 @@ mod tests {
     use plow_asset::decode_objects::{image_sha256, DecodeObject, DecodeProgramObject};
     use std::collections::BTreeMap;
     fn capability_elf() -> Vec<u8> {
-        let names = [
+        plow_asset::cubin::synthetic_elf(
             "_Z12interp_sm90a11PlowProgram",
-            "plow_decode_bf16_abi",
-            "plow_decode_gf256",
-            "plow_decode_gf512",
-            "plow_decode_staging_bytes",
-            "plow_gemv_mm_cap",
-            "plow_arena_bytes",
-        ];
-        let constants = [1u32, 2, 8, 16384, 16, 16384];
-        let mut strings = vec![0u8];
-        let mut symbols = Vec::new();
-        for (index, name) in names.iter().enumerate() {
-            let mut symbol = [0u8; 24];
-            symbol[..4].copy_from_slice(&(strings.len() as u32).to_le_bytes());
-            symbol[4] = if index == 0 { 0x12 } else { 0x11 };
-            symbol[6..8].copy_from_slice(&3u16.to_le_bytes());
-            symbol[8..16].copy_from_slice(&((index.saturating_sub(1) * 4) as u64).to_le_bytes());
-            symbol[16..24].copy_from_slice(&4u64.to_le_bytes());
-            strings.extend_from_slice(name.as_bytes());
-            strings.push(0);
-            symbols.extend_from_slice(&symbol);
-        }
-        let mut image = vec![0u8; 320];
-        image[..6].copy_from_slice(b"\x7fELF\x02\x01");
-        image[40..48].copy_from_slice(&64u64.to_le_bytes());
-        image[48..52].copy_from_slice(&(90u32 << 8).to_le_bytes());
-        image[58..60].copy_from_slice(&64u16.to_le_bytes());
-        image[60..62].copy_from_slice(&4u16.to_le_bytes());
-        for (index, kind, data) in [
-            (1usize, 2u32, symbols),
-            (2, 3, strings),
-            (
-                3,
-                1,
-                constants.into_iter().flat_map(u32::to_le_bytes).collect(),
-            ),
-        ] {
-            let header = 64 + index * 64;
-            image[header + 4..header + 8].copy_from_slice(&kind.to_le_bytes());
-            let offset = image.len() as u64;
-            image[header + 24..header + 32].copy_from_slice(&offset.to_le_bytes());
-            image[header + 32..header + 40].copy_from_slice(&(data.len() as u64).to_le_bytes());
-            image.extend_from_slice(&data);
-        }
-        image[168..172].copy_from_slice(&2u32.to_le_bytes());
-        image[184..192].copy_from_slice(&24u64.to_le_bytes());
-        image
+            &[
+                ("plow_decode_bf16_abi", 1),
+                ("plow_decode_gf256", 2),
+                ("plow_decode_gf512", 8),
+                ("plow_decode_staging_bytes", 16384),
+                ("plow_gemv_mm_cap", 16),
+                ("plow_arena_bytes", 16384),
+            ],
+            90,
+        )
     }
     fn model() -> Model {
         let progs = [128, 1, 2]

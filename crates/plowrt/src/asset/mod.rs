@@ -23,7 +23,6 @@ mod bucket;
 // which is unconditional.
 #[cfg(any(feature = "cuda", feature = "hsa"))]
 pub(crate) mod checkpoint;
-pub mod cubin;
 pub mod devblob;
 /// Megatron weight sharding. Gated with `checkpoint` — it is the rule for which
 /// slice of a checkpoint tensor a rank binds, and useless without one.

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+test-util = []
+
 # Shared, deserialize-able schema for the compiled artifacts `plowc` emits
 # (`weights.json`, `*.map.json`, and the `*.request_io.json` / `*.blocks.json` /
 # `*.experts.json` sidecars). `plowc`'s own structs are `Serialize`-only and use
