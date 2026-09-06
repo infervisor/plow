@@ -293,16 +293,18 @@ fn exact_section<'a>(
     kind: u32,
     name: &str,
 ) -> Result<PacketSection<'a>> {
-    let mut named = sections.iter().filter(|section| section.name == name);
-    let section = named
-        .next()
-        .copied()
-        .ok_or_else(|| reject(format!("missing section {name}")))?;
-    if named.next().is_some() {
+    let mut exact = sections
+        .iter()
+        .filter(|section| section.kind == kind && section.name == name);
+    let section = exact.next().copied().ok_or_else(|| {
+        if sections.iter().any(|section| section.name == name) {
+            reject(format!("section {name} kind mismatch"))
+        } else {
+            reject(format!("missing section {name}"))
+        }
+    })?;
+    if exact.next().is_some() {
         return Err(reject(format!("duplicate section {name}")));
-    }
-    if section.kind != kind {
-        return Err(reject(format!("section {name} kind mismatch")));
     }
     Ok(section)
 }

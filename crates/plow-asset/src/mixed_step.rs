@@ -482,13 +482,16 @@ impl Manifest {
             )?;
             variant.program.payload.validate()?;
             record_payload(&mut payloads, &variant.program.payload)?;
+            require(!variant.objects.is_empty(), "variant has no backend object")?;
             let mut objects = std::collections::BTreeSet::new();
+            let mut backends = std::collections::BTreeSet::new();
             for object in &variant.objects {
                 require(
                     matches!(object.kind, PayloadKind::Cubin | PayloadKind::Hsaco)
                         && object.version == VERSION
                         && object.capability.name == OBJECT_CAPABILITY
                         && object.capability.version == VERSION
+                        && backends.insert(object.kind.section_kind())
                         && objects.insert((object.kind.section_kind(), object.section.as_str())),
                     "object kind or duplicate",
                 )?;

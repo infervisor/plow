@@ -291,6 +291,25 @@ fn rejects_unsafe_programs_duplicate_sections_and_capability_bytes() {
 
     let packed: Vec<_> = owned.insts.iter().map(|inst| inst.pack()).collect();
     let programs = [one_program(&owned, &packed, 8)];
+    assert!(append(&model, &mut sections, &inputs(&programs, &[], &variant)).is_err());
+    assert!(sections.is_empty());
+
+    let two_cuda = [
+        object(mixed_step::PayloadKind::Cubin, "cuda_a", EM_CUDA),
+        object(mixed_step::PayloadKind::Cubin, "cuda_b", EM_CUDA),
+    ];
+    let two_cuda_variant = [Variant {
+        object_indices: &[0, 1],
+        ..variant[0]
+    }];
+    assert!(append(
+        &model,
+        &mut sections,
+        &inputs(&programs, &two_cuda, &two_cuda_variant)
+    )
+    .is_err());
+    assert!(sections.is_empty());
+
     let placed = [program::Program {
         l2_domains: 2,
         ..programs[0]

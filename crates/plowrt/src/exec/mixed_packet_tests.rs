@@ -213,6 +213,52 @@ fn binds_exact_variant_and_selects_without_revalidation() {
 }
 
 #[test]
+fn payload_identity_includes_kind_when_section_names_match() {
+    let programs = program_payload();
+    let cubin = b"same-name cubin";
+    let hsaco = b"same-name hsaco";
+    let shared_name = "mixed_payload";
+    let metadata = serde_json::to_vec(&Manifest {
+        version: VERSION,
+        n_cu: N_CU,
+        max_active_requests: 4,
+        physical_slot_capacity: 16,
+        variants: vec![Variant {
+            rows: ROWS,
+            decode_rows: DECODE_ROWS,
+            program: ProgramBinding {
+                index: 0,
+                payload: binding(shared_name, mixed_step::PayloadKind::Programs, &programs),
+            },
+            objects: vec![
+                binding(shared_name, mixed_step::PayloadKind::Cubin, cubin),
+                binding(shared_name, mixed_step::PayloadKind::Hsaco, hsaco),
+            ],
+        }],
+    })
+    .unwrap();
+    let sections = [
+        section(SECT_METADATA, mixed_step::SECTION, &metadata),
+        section(SECT_PROGRAMS, shared_name, &programs),
+        section(SECT_CUBIN, shared_name, cubin),
+        section(SECT_HSACO, shared_name, hsaco),
+    ];
+
+    for (backend, expected) in [
+        (mixed_step::PayloadKind::Cubin, cubin.as_slice()),
+        (mixed_step::PayloadKind::Hsaco, hsaco.as_slice()),
+    ] {
+        let loaded = load(&sections, N_CU, 0, backend, |_, _| Ok(Some(VERSION)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.select(ROWS, DECODE_ROWS).unwrap().object().bytes,
+            expected
+        );
+    }
+}
+
+#[test]
 fn stock_packet_without_metadata_is_ignored() {
     let sections = [section(SECT_CUBIN, "ordinary", b"ordinary object")];
     let loaded = load(
