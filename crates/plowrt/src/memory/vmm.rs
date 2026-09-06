@@ -109,9 +109,8 @@ pub trait VmmOps: Send + Sync {
     }
 }
 
-/// KV geometry of the model the engine loaded, resolved from the checkpoint's
-/// `config.json` (the blob carries only names+bytes) and validated against
-/// the blob's tensor sizes before VMM is enabled.
+/// Uniform full-KV allocation geometry. Prefix mode resolves checkpoint
+/// metadata; live allocation validates packet operands with [`LiveKvLayout`].
 #[derive(Clone, Debug)]
 pub struct VmmGeometry {
     /// Layer indices with full attention (VMM-backed).
@@ -206,6 +205,301 @@ impl VmmGeometry {
     /// One token row's bytes in a full-layer head window.
     pub fn row_bytes(&self) -> u64 {
         self.hd_full as u64 * self.elem as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveRingTensor {
+    pub tensor: usize,
+    pub slot_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveRingStats {
+    pub reserved_bytes: u64,
+    pub resident_bytes: u64,
+    pub mapped_slots: usize,
+    pub mapped_prefix: usize,
+}
+
+struct RingWindow {
+    tensor: usize,
+    va: u64,
+    bytes: u64,
+    slot_bytes: u64,
+    map_bytes: u64,
+    handles: Vec<Option<u64>>,
+}
+
+/// Whole-slot ring backing is retained until teardown; absolute token frontiers do not apply.
+pub struct VmmRings {
+    ops: Arc<dyn VmmOps>,
+    windows: Vec<RingWindow>,
+    mapped: Vec<bool>,
+    prefix: usize,
+    stats: LiveRingStats,
+}
+
+impl VmmRings {
+    pub fn new(ops: Arc<dyn VmmOps>, tensors: &[LiveRingTensor], batch: usize) -> Result<Self> {
+        let reject = |slot_bytes: u64, granularity: u64| {
+            RuntimeError::Rejected(format!(
+                "invalid live ring allocation geometry: slot_bytes={slot_bytes}, granularity={granularity}"
+            ))
+        };
+        if batch == 0 {
+            return Err(reject(0, 0));
+        }
+        let granularity = ops.granularity()?;
+        if granularity == 0 {
+            return Err(reject(0, granularity));
+        }
+        let mut reserved_bytes = 0u64;
+        for (i, t) in tensors.iter().enumerate() {
+            if t.slot_bytes == 0 || tensors[..i].iter().any(|p| p.tensor == t.tensor) {
+                return Err(reject(t.slot_bytes, granularity));
+            }
+            let logical_bytes = t
+                .slot_bytes
+                .checked_mul(batch as u64)
+                .ok_or_else(|| reject(t.slot_bytes, granularity))?;
+            let bytes = logical_bytes
+                .checked_add(granularity - 1)
+                .map(|n| n / granularity * granularity)
+                .ok_or_else(|| reject(t.slot_bytes, granularity))?;
+            reserved_bytes = reserved_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| reject(t.slot_bytes, granularity))?;
+        }
+        let mut rings = Self {
+            ops,
+            windows: Vec::with_capacity(tensors.len()),
+            mapped: vec![false; batch],
+            prefix: 0,
+            stats: LiveRingStats {
+                reserved_bytes,
+                resident_bytes: 0,
+                mapped_slots: 0,
+                mapped_prefix: 0,
+            },
+        };
+        for t in tensors {
+            let logical_bytes = t.slot_bytes * batch as u64;
+            let bytes = (logical_bytes + granularity - 1) / granularity * granularity;
+            let map_bytes = if t.slot_bytes % granularity == 0 {
+                t.slot_bytes
+            } else {
+                granularity
+            };
+            let va = rings.ops.reserve(bytes)?;
+            if va == 0 || va % granularity != 0 || va.checked_add(bytes).is_none() {
+                rings.ops.address_free(va, bytes);
+                return Err(reject(t.slot_bytes, granularity));
+            }
+            rings.windows.push(RingWindow {
+                tensor: t.tensor,
+                va,
+                bytes,
+                slot_bytes: t.slot_bytes,
+                map_bytes,
+                handles: vec![None; (bytes / map_bytes) as usize],
+            });
+        }
+        Ok(rings)
+    }
+
+    pub fn tensor_va(&self, tensor: usize) -> Option<u64> {
+        self.windows
+            .iter()
+            .find(|w| w.tensor == tensor)
+            .map(|w| w.va)
+    }
+
+    pub fn stats(&self) -> LiveRingStats {
+        self.stats
+    }
+
+    pub fn ensure_slot(&mut self, slot: usize) -> Result<()> {
+        if slot >= self.mapped.len() {
+            return Err(RuntimeError::Rejected(
+                "live ring slot out of bounds".into(),
+            ));
+        }
+        if self.mapped[slot] {
+            return Ok(());
+        }
+        let mut added = Vec::new();
+        for i in 0..self.windows.len() {
+            let va_base = self.windows[i].va;
+            let slot_bytes = self.windows[i].slot_bytes;
+            let map_bytes = self.windows[i].map_bytes;
+            let first = slot as u64 * slot_bytes / map_bytes;
+            let end = (slot as u64 + 1) * slot_bytes;
+            let last = (end + map_bytes - 1) / map_bytes;
+            for unit in first..last {
+                if self.windows[i].handles[unit as usize].is_some() {
+                    continue;
+                }
+                let va = va_base + unit * map_bytes;
+                let result = (|| {
+                    let handle = self.ops.create(map_bytes)?;
+                    if let Err(e) = self.ops.map(va, map_bytes, handle) {
+                        self.ops.release(handle);
+                        return Err(e);
+                    }
+                    if let Err(e) = self.ops.set_access(va, map_bytes) {
+                        self.ops.unmap(va, map_bytes);
+                        self.ops.release(handle);
+                        return Err(e);
+                    }
+                    Ok(handle)
+                })();
+                match result {
+                    Ok(handle) => {
+                        self.windows[i].handles[unit as usize] = Some(handle);
+                        added.push((i, unit as usize));
+                    }
+                    Err(e) => {
+                        for &(window, unit) in added.iter().rev() {
+                            let w = &mut self.windows[window];
+                            let handle = w.handles[unit].take().unwrap();
+                            self.ops
+                                .unmap(w.va + unit as u64 * w.map_bytes, w.map_bytes);
+                            self.ops.release(handle);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        self.mapped[slot] = true;
+        while self.prefix < self.mapped.len() && self.mapped[self.prefix] {
+            self.prefix += 1;
+        }
+        self.stats.mapped_slots += 1;
+        self.stats.mapped_prefix = self.prefix;
+        self.stats.resident_bytes += added
+            .iter()
+            .map(|&(window, _)| self.windows[window].map_bytes)
+            .sum::<u64>();
+        Ok(())
+    }
+
+    pub fn ensure_prefix(&mut self, rows: usize) -> Result<()> {
+        if rows > self.mapped.len() {
+            return Err(RuntimeError::Rejected(
+                "live ring prefix out of bounds".into(),
+            ));
+        }
+        while self.prefix < rows {
+            self.ensure_slot(self.prefix)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VmmRings {
+    fn drop(&mut self) {
+        for w in &mut self.windows {
+            for (slot, handle) in w.handles.iter_mut().enumerate() {
+                if let Some(handle) = handle.take() {
+                    self.ops
+                        .unmap(w.va + slot as u64 * w.map_bytes, w.map_bytes);
+                    self.ops.release(handle);
+                }
+            }
+            self.ops.address_free(w.va, w.bytes);
+        }
+    }
+}
+
+pub struct LiveKvLayout {
+    pub geometry: VmmGeometry,
+    /// Synthetic allocator track index → actual packet K/V handles.
+    pub full_tensors: Vec<[usize; 2]>,
+    pub ring_tensors: Vec<LiveRingTensor>,
+    pub cache_tensors: Vec<usize>,
+}
+
+impl LiveKvLayout {
+    pub fn manifest(
+        blob: &crate::asset::devblob::DevBlob,
+        raw: &[u8],
+    ) -> Result<Option<plow_asset::live_kv::Manifest>> {
+        let Some(bytes) = blob.reserved_metadata(raw, plow_asset::live_kv::SECTION)? else {
+            return Ok(None);
+        };
+        let m: plow_asset::live_kv::Manifest = serde_json::from_slice(bytes)
+            .map_err(|e| RuntimeError::Rejected(format!("invalid LIVE KV manifest: {e}")))?;
+        blob.with_packet_view(|packet| m.validate(packet))
+            .map_err(RuntimeError::Rejected)?;
+        Ok(Some(m))
+    }
+    pub fn from_manifest(
+        blob: &crate::asset::devblob::DevBlob,
+        m: &plow_asset::live_kv::Manifest,
+    ) -> Result<Self> {
+        blob.with_packet_view(|packet| m.validate(packet))
+            .map_err(RuntimeError::Rejected)?;
+        Self::from_validated_manifest(blob, m)
+    }
+    fn from_validated_manifest(
+        blob: &crate::asset::devblob::DevBlob,
+        m: &plow_asset::live_kv::Manifest,
+    ) -> Result<Self> {
+        let mut full_tensors = Vec::new();
+        let mut ring_tensors = Vec::new();
+        let mut cache_tensors = Vec::new();
+        let mut full_shape = None;
+        for c in &m.caches {
+            cache_tensors.extend(c.pair.map(usize::from));
+            if c.window == 0 {
+                if full_shape.is_some_and(|shape| shape != (c.heads, c.hd)) {
+                    return Err(RuntimeError::Rejected(
+                        "LIVE allocator requires uniform full-cache head geometry".into(),
+                    ));
+                }
+                full_shape = Some((c.heads, c.hd));
+                full_tensors.push(c.pair.map(usize::from));
+            } else {
+                for tensor in c.pair.map(usize::from) {
+                    ring_tensors.push(LiveRingTensor {
+                        tensor,
+                        slot_bytes: blob.tensors[tensor].bytes / u64::from(m.batch),
+                    });
+                }
+            }
+        }
+        let full_shape = full_shape.ok_or_else(|| {
+            RuntimeError::Rejected(
+                "LIVE allocator does not support sliding-only packets; declared geometry is valid"
+                    .into(),
+            )
+        })?;
+        Ok(Self {
+            geometry: VmmGeometry {
+                full_layers: (0..full_tensors.len() as u32).collect(),
+                kvh_full: full_shape.0,
+                hd_full: full_shape.1,
+                slide_layers: Vec::new(),
+                kvh_slide: 0,
+                hd_slide: 0,
+                window: 0,
+                elem: 2,
+                elem_slide: 2,
+                max_ctx: m.max_ctx,
+                batch: m.batch,
+            },
+            full_tensors,
+            ring_tensors,
+            cache_tensors,
+        })
+    }
+    pub fn from_blob(blob: &crate::asset::devblob::DevBlob) -> Result<Self> {
+        let manifest = blob
+            .with_packet_view(plow_asset::live_kv::emit)
+            .map_err(RuntimeError::Rejected)?;
+        Self::from_validated_manifest(blob, &manifest)
     }
 }
 
@@ -347,6 +641,7 @@ struct Shared {
 /// reservations, the physical block slab, the radix cache and the pre-mapper
 /// thread. Everything is reclaimed on Drop (the lifecycle-test contract).
 pub struct VmmKv {
+    prefix_reuse: bool,
     shared: Arc<Shared>,
     premap_tx: Option<std::sync::mpsc::Sender<(u32, u32)>>,
     premap_join: Option<std::thread::JoinHandle<()>>,
@@ -370,6 +665,24 @@ impl VmmKv {
         geo: VmmGeometry,
         block_hint: u64,
         cache_cap: u64,
+    ) -> Result<Self> {
+        Self::new_with_policy(ops, geo, block_hint, cache_cap, true)
+    }
+
+    pub fn new_live(ops: Arc<dyn VmmOps>, geo: VmmGeometry, block_hint: u64) -> Result<Self> {
+        Self::new_with_policy(ops, geo, block_hint, 0, false)
+    }
+
+    pub fn prefix_reuse(&self) -> bool {
+        self.prefix_reuse
+    }
+
+    fn new_with_policy(
+        ops: Arc<dyn VmmOps>,
+        geo: VmmGeometry,
+        block_hint: u64,
+        cache_cap: u64,
+        prefix_reuse: bool,
     ) -> Result<Self> {
         let gran = ops.granularity()?;
         let row_bytes = geo.row_bytes();
@@ -488,6 +801,7 @@ impl VmmKv {
             "vmm kv pool up (full layers VMM-backed, sliding on cudaMalloc)"
         );
         Ok(VmmKv {
+            prefix_reuse,
             shared,
             premap_tx: Some(tx),
             premap_join: Some(join),
@@ -613,6 +927,9 @@ impl VmmKv {
     /// blocks are multi-mapped (refcounted) and the snapshot handle returned.
     /// On miss the prompt's hashes are still recorded for `publish`.
     pub fn try_attach(&self, seq: usize, prompt: &[u32]) -> Result<Option<Attach>> {
+        if !self.prefix_reuse {
+            return Ok(None);
+        }
         let s = &self.shared;
         let hashes = hash_blocks(prompt, s.block_rows);
         let aligned = &prompt[..hashes.len() * s.block_rows as usize];
@@ -813,6 +1130,11 @@ impl VmmKv {
         snap_bytes: u64,
         fill: impl FnOnce(u64) -> Result<()>,
     ) -> Result<()> {
+        if !self.prefix_reuse {
+            return Err(RuntimeError::Rejected(
+                "live KV allocation cannot publish prefixes".into(),
+            ));
+        }
         let s = &self.shared;
         let hashes = hash_blocks(tokens, s.block_rows);
         let aligned = &tokens[..hashes.len() * s.block_rows as usize];
@@ -995,8 +1317,15 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32) -> Result<()> {
                 let id = create_block(s, &mut inner)?;
                 let va = slot_va(s, &inner.tracks[t], seq, h, k);
                 let handle = inner.blocks[id as usize].handle;
-                s.ops.map(va, s.block_bytes, handle)?;
-                s.ops.set_access(va, s.block_bytes)?;
+                if let Err(error) = s.ops.map(va, s.block_bytes, handle) {
+                    deref_block(s, &mut inner, id);
+                    return Err(error);
+                }
+                if let Err(error) = s.ops.set_access(va, s.block_bytes) {
+                    s.ops.unmap(va, s.block_bytes);
+                    deref_block(s, &mut inner, id);
+                    return Err(error);
+                }
                 let slot = slot_index(s, seq, h, k);
                 debug_assert!(inner.tracks[t].slots[slot].is_none());
                 inner.tracks[t].slots[slot] = Some(id);
@@ -1135,18 +1464,12 @@ fn release_window(s: &Shared, inner: &mut Inner, seq: usize) {
 /// load). The manager flips the process default on when it manages more than
 /// one model ([`set_slab_keep_default`]); everything else — single-model
 /// serves, the lifecycle tests' return-to-baseline assert — keeps the
-/// release-on-drop behavior. `PLOW_SLAB_KEEP=1`/`0` force-overrides either
-/// way. The env is read per-drop — BEFORE the cached config — because the
-/// lifecycle tests flip it mid-process; `--rt-slab-keep` lands via the config
-/// fallback (opt-in only, so the manager's default still decides when unset).
+/// release-on-drop behavior. `PLOW_SLAB_KEEP=1`/`0` or `--rt-slab-keep`
+/// force-overrides either way.
 fn slab_keep_enabled() -> bool {
-    match crate::config::RuntimeConfig::env_bool("PLOW_SLAB_KEEP") {
-        Some(v) => v,
-        None => {
-            crate::config::RuntimeConfig::get().slab_keep
-                || SLAB_KEEP_DEFAULT.load(Ordering::Relaxed)
-        }
-    }
+    crate::config::RuntimeConfig::get()
+        .slab_keep_override()
+        .unwrap_or_else(|| SLAB_KEEP_DEFAULT.load(Ordering::Relaxed))
 }
 
 static SLAB_KEEP_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1161,11 +1484,9 @@ pub fn set_slab_keep_default(on: bool) {
 /// `--kv-pool-mib` / `PLOW_KV_POOL_MIB` — cap (MiB) for the KV physical-block
 /// reuse pool the engines hand to [`VmmKv::enable_block_pool`]. Default 512;
 /// 0 disables pooling entirely (every zero-ref block released, pre-creator
-/// not spawned). Env read first so a mid-process flip in tests still lands;
-/// engine load is cold path.
-pub fn kv_pool_cap_from_env() -> u64 {
-    let cfg = crate::config::RuntimeConfig::get().kv_pool_mib;
-    crate::config::RuntimeConfig::env_parse_or::<u64>("PLOW_KV_POOL_MIB", cfg) << 20
+/// not spawned).
+pub fn kv_pool_cap() -> u64 {
+    crate::config::RuntimeConfig::get().kv_pool_mib() << 20
 }
 
 /// Physical-commit chunk for [`VmmSlab`]-backed weight slabs. The CUDA driver
@@ -1403,6 +1724,288 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, AtomicU64};
 
+    fn live_blob() -> crate::asset::devblob::DevBlob {
+        use crate::asset::devblob::{DevBlob, DevProg, DevTensor};
+        use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
+        let program = |rows, prefill| {
+            let mut insts = Vec::new();
+            for id in [1, 2] {
+                let mut writer = DevInst64 {
+                    op: DevOp::HeadNormRope as u16,
+                    t: [TENSOR_NONE16; 8],
+                    ..Default::default()
+                };
+                writer.t[0] = id;
+                writer.t[5] = 0;
+                writer.i = [rows, 1, 256, 0, 0, 0, if prefill { 0 } else { rows }, 0];
+                writer.fj = [0, 1024, u32::MAX];
+                insts.push(writer);
+            }
+            let mut reader = DevInst64 {
+                op: if prefill {
+                    DevOp::FlashPrefill
+                } else {
+                    DevOp::FlashDecode
+                } as u16,
+                t: [TENSOR_NONE16; 8],
+                ..Default::default()
+            };
+            reader.t[3] = 1;
+            reader.t[4] = 2;
+            if !prefill {
+                reader.t[5] = 3;
+            }
+            reader.i = if prefill {
+                [rows, rows, 8, 1, 0, 0, 256, 1]
+            } else {
+                [rows, 8, 1, 1024, 0, 33, 256, u32::MAX]
+            };
+            if prefill {
+                reader.fj = [0, 1024, u32::MAX];
+            }
+            insts.push(reader);
+            DevProg {
+                t: rows,
+                packed_prefill_only: false,
+                n_counter: 0,
+                insts,
+                stream: Vec::new(),
+                stream_ofs: Vec::new(),
+                stream_len: Vec::new(),
+                waits: Vec::new(),
+                succs: Vec::new(),
+                gq_stream: Vec::new(),
+                gq_seg_ofs: Vec::new(),
+                l2_domains: 0,
+            }
+        };
+        DevBlob {
+            n_cu: 1,
+            flags: 0,
+            target: 0,
+            tensors: vec![
+                DevTensor {
+                    name: "in.pos".into(),
+                    bytes: 4096,
+                    init: None,
+                },
+                DevTensor {
+                    name: "cache.key".into(),
+                    bytes: 4 * 1024 * 256 * 2,
+                    init: None,
+                },
+                DevTensor {
+                    name: "cache.value".into(),
+                    bytes: 4 * 1024 * 256 * 2,
+                    init: None,
+                },
+                DevTensor {
+                    name: "in.kvlen".into(),
+                    bytes: 16,
+                    init: None,
+                },
+            ],
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            progs: vec![program(128, true), program(1, false), program(4, false)],
+            sections: Vec::new(),
+            gen: Vec::new(),
+            tp: None,
+        }
+    }
+
+    #[test]
+    fn declared_geometry_matches_legacy_and_rejects_stale_accesses() {
+        let mut blob = live_blob();
+        let m = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+        let legacy = LiveKvLayout::from_blob(&blob).unwrap();
+        let declared = LiveKvLayout::from_manifest(&blob, &m).unwrap();
+        assert_eq!(legacy.full_tensors, declared.full_tensors);
+        assert_eq!(legacy.cache_tensors, declared.cache_tensors);
+        assert_eq!(legacy.geometry.batch, declared.geometry.batch);
+        assert_eq!(legacy.geometry.max_ctx, declared.geometry.max_ctx);
+        assert_eq!(legacy.geometry.kvh_full, declared.geometry.kvh_full);
+        blob.progs[1].insts[0].fj[1] += 32;
+        assert!(blob.with_packet_view(|p| m.validate(p)).is_err());
+        let mut bad = m.clone();
+        bad.programs[1] =
+            blob.with_packet_view(|p| plow_asset::live_kv::program_digest(&p.programs[1]));
+        assert!(blob.with_packet_view(|p| bad.validate(p)).is_err());
+    }
+    #[test]
+    fn sliding_only_manifest_is_valid_but_allocator_limitation_is_explicit() {
+        let mut blob = live_blob();
+        for p in &mut blob.progs {
+            for d in &mut p.insts {
+                if d.op == packet::dev::DevOp::HeadNormRope as u16 {
+                    d.fj[2] = 1023;
+                }
+                if d.op == packet::dev::DevOp::FlashPrefill as u16 {
+                    d.i[5] = 512;
+                    d.fj[2] = 1023;
+                }
+                if d.op == packet::dev::DevOp::FlashDecode as u16 {
+                    d.i[4] = 512;
+                    d.i[7] = 1023;
+                }
+            }
+        }
+        let manifest = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+        assert!(blob.with_packet_view(|p| manifest.validate(p)).is_ok());
+        let error = LiveKvLayout::from_manifest(&blob, &manifest)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("allocator does not support sliding-only"));
+    }
+    #[test]
+    fn malformed_present_manifest_cannot_fall_back() {
+        let mut blob = live_blob();
+        assert!(LiveKvLayout::manifest(&blob, &[]).unwrap().is_none());
+        blob.sections.push(crate::asset::devblob::DevSection {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::live_kv::SECTION.into(),
+            offset: 0,
+            size: 2,
+        });
+        assert!(LiveKvLayout::manifest(&blob, b"{}").is_err());
+    }
+
+    #[test]
+    fn live_geometry_comes_from_packet_handles_and_all_rungs() {
+        let layout = LiveKvLayout::from_blob(&live_blob()).unwrap();
+        assert_eq!(layout.full_tensors, [[1, 2]]);
+        assert_eq!(layout.cache_tensors, [1, 2]);
+        assert_eq!(layout.geometry.batch, 4);
+        assert_eq!(layout.geometry.max_ctx, 1024);
+        assert_eq!(layout.geometry.kvh_full, 1);
+        assert_eq!(layout.geometry.hd_full, 256);
+        assert_eq!(layout.geometry.full_tensor_bytes(), 4 * 1024 * 256 * 2);
+    }
+
+    #[test]
+    fn live_geometry_rejects_conflicting_or_unbounded_access() {
+        use packet::dev::DevOp;
+        let mutations: &[fn(&mut crate::asset::devblob::DevBlob)] = &[
+            |b| b.tensors[1].bytes /= 2,
+            |b| b.tensors[3].bytes = 4,
+            |b| b.progs[1].insts[2].t[5] = 0,
+            |b| b.progs[1].insts[2].i[1] = 0,
+            |b| b.tensors[2].init = Some(0..1),
+            |b| b.progs[0].insts[2].fj[1] = 512,
+            |b| b.progs[1].insts[2].i[6] = 512,
+            |b| b.progs[1].insts[0].i[6] = 0,
+            |b| b.progs[2].insts[0].fj[2] = 1023,
+            |b| b.progs[0].insts[0].i[6] = 128,
+            |b| b.progs[0].insts[0].t[7] = 0,
+            |b| b.progs[2].insts[2].i[7] = 0,
+            |b| b.progs[2].insts[0].t[1] = 2,
+            |b| {
+                b.progs[1].insts.pop();
+            },
+            |b| b.progs[0].packed_prefill_only = true,
+            |b| b.progs[2].insts[2].op = DevOp::FlashDecodeFp8 as u16,
+        ];
+        for (i, mutate) in mutations.iter().enumerate() {
+            let mut blob = live_blob();
+            mutate(&mut blob);
+            assert!(LiveKvLayout::from_blob(&blob).is_err(), "mutation {i}");
+        }
+    }
+
+    #[test]
+    fn live_geometry_validates_tensormaps_across_batch_sizes() {
+        use crate::asset::devblob::DevTensor;
+        for batch in [1, 4, 16] {
+            let fixture = || {
+                let mut blob = live_blob();
+                if batch == 1 {
+                    blob.progs.pop();
+                }
+                let decode = blob.progs.last_mut().unwrap();
+                decode.t = batch;
+                for writer in &mut decode.insts[..2] {
+                    writer.i[0] = batch;
+                    writer.i[6] = batch;
+                }
+                decode.insts[2].i[0] = batch;
+                blob.tensors[3].bytes = u64::from(batch) * 4;
+                for id in [1, 2] {
+                    blob.tensors[id].bytes = u64::from(batch) * 1024 * 256 * 2;
+                }
+                blob.tensors.push(DevTensor {
+                    name: "tmap.cache".into(),
+                    bytes: 256,
+                    init: None,
+                });
+                let mut map = packet::rope::GenTensor::tmap_kv_pair(1, 2, 1024, 256, 1);
+                map.tensor = 4;
+                blob.gen.push(map);
+                blob.progs[0].insts[2].t[7] = 4;
+                blob
+            };
+            let blob = fixture();
+            let layout = LiveKvLayout::from_blob(&blob).unwrap();
+            assert_eq!(layout.geometry.batch, batch);
+            assert_eq!(layout.full_tensors, [[1, 2]]);
+            let mutations: &[fn(&mut crate::asset::devblob::DevBlob)] = &[
+                |b| b.gen[0].ctx = 512,
+                |b| b.gen[0].hd = 128,
+                |b| b.gen[0].frac = 2.0,
+                |b| b.gen[0].scale = 1,
+                |b| b.tensors[4].bytes = 128,
+                |b| b.tensors[1].bytes /= 2,
+                |b| b.progs[0].insts[2].t[7] = 3,
+                |b| {
+                    b.progs.last_mut().unwrap().insts[2].op =
+                        packet::dev::DevOp::FlashDecodeFp8 as u16
+                },
+            ];
+            for (case, mutate) in mutations.iter().enumerate() {
+                let mut invalid = fixture();
+                mutate(&mut invalid);
+                assert!(
+                    LiveKvLayout::from_blob(&invalid).is_err(),
+                    "batch={batch} case={case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_allocator_never_hashes_attaches_or_publishes_and_releases_on_reset() {
+        let ops = Arc::new(MockVmm::default());
+        let geo = uniform_pool(ops.clone()).geometry().clone();
+        let p = VmmKv::new_live(ops.clone(), geo, 64).unwrap();
+        assert!(!p.prefix_reuse());
+        for _ in 0..2 {
+            p.ensure_rows(0, 17).unwrap();
+            p.ensure_rows(1, 9).unwrap();
+            let other_rows = p.mapped_rows(1);
+            assert!(p.try_attach(1, &prompt(17)).unwrap().is_none());
+            assert!(p
+                .publish(0, &prompt(17), 4, |_| panic!("snapshot must not run"))
+                .is_err());
+            let inner = p.shared.inner.lock();
+            assert!(inner.published.is_empty());
+            assert!(inner.node_blocks.is_empty());
+            assert!(inner
+                .seqs
+                .iter()
+                .all(|s| s.hashes.is_empty() && s.tokens.is_empty()));
+            drop(inner);
+            p.begin_seq(0);
+            assert_eq!(p.mapped_rows(0), 0);
+            assert_eq!(p.mapped_rows(1), other_rows);
+            assert!(p.stats().blocks_live > 0);
+            p.begin_seq(1);
+            assert_eq!(p.stats().blocks_live, 0);
+        }
+        assert_eq!(p.stats().attach_hits, 0);
+        assert_eq!(p.stats().attach_misses, 0);
+        assert_eq!(ops.allocs.load(Ordering::SeqCst), 0);
+    }
+
     /// Records every driver call; `fail_creates` makes the next N creates
     /// fail (the OOM path).
     #[derive(Default)]
@@ -1416,6 +2019,7 @@ mod tests {
         frees: AtomicU64,
         fail_creates: AtomicI64,
         fail_maps: AtomicI64,
+        fail_access: AtomicI64,
         pool: std::sync::Mutex<Vec<(u64, u64)>>,
     }
 
@@ -1453,6 +2057,11 @@ mod tests {
             self.unmaps.fetch_add(1, Ordering::SeqCst);
         }
         fn set_access(&self, _va: u64, _bytes: u64) -> Result<()> {
+            if self.fail_access.load(Ordering::SeqCst) > 0
+                && self.fail_access.fetch_sub(1, Ordering::SeqCst) == 1
+            {
+                return Err(RuntimeError::Device("mock set-access failure".into()));
+            }
             Ok(())
         }
         fn alloc(&self, _bytes: u64) -> Result<u64> {
@@ -1677,6 +2286,33 @@ mod tests {
     }
 
     #[test]
+    fn ensure_rows_unwinds_map_and_access_failures() {
+        for fail_access in [false, true] {
+            let ops = Arc::new(MockVmm::default());
+            let p = uniform_pool(ops.clone());
+            if fail_access {
+                ops.fail_access.store(1, Ordering::SeqCst);
+            } else {
+                ops.fail_maps.store(1, Ordering::SeqCst);
+            }
+
+            assert!(p.ensure_rows(0, 1).is_err());
+            assert_eq!(p.mapped_rows(0), 0);
+            assert_eq!(p.stats().blocks_live, 0);
+            assert_eq!(
+                ops.maps.load(Ordering::SeqCst),
+                ops.unmaps.load(Ordering::SeqCst),
+                "every successful mapping must be unwound"
+            );
+            assert_eq!(
+                ops.creates.load(Ordering::SeqCst),
+                ops.releases.load(Ordering::SeqCst),
+                "every created block must be released"
+            );
+        }
+    }
+
+    #[test]
     fn attach_shares_blocks_without_new_creates() {
         let ops = Arc::new(MockVmm::default());
         let p = pool(ops.clone());
@@ -1896,6 +2532,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_kv_reuses_blocks_across_sequences() {
+        let ops = Arc::new(MockVmm::default());
+        let geo = uniform_pool(ops.clone()).geometry().clone();
+        let mut p = VmmKv::new_live(ops.clone(), geo, 64).unwrap();
+        p.enable_block_pool(8 * 64);
+        wait_pooled(&p, 8);
+        let created = ops.creates.load(Ordering::SeqCst);
+
+        p.ensure_rows(0, 1).unwrap();
+        p.begin_seq(0);
+        p.ensure_rows(0, 1).unwrap();
+
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst),
+            created,
+            "live sequence reset must reuse pooled blocks"
+        );
+    }
+
     /// The pool cap bounds parked VRAM: overflowing zero-ref blocks release
     /// to the driver instead of parking.
     #[test]
@@ -1967,3 +2623,7 @@ mod tests {
         assert_ne!(b[1], a[1]);
     }
 }
+
+#[cfg(test)]
+#[path = "vmm_ring_tests.rs"]
+mod ring_tests;

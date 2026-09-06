@@ -1256,6 +1256,9 @@ enum {
     PLOW_DOP_QWEN_GDN_GATE_PREP = 145,
     /* External native GDN segment: t0=core,t1=Q,t2=K,t3=V,t4=alphaF32,t5=betaF32,t6=state,t7=outstate; i0=T,i1=HK,i2=HV,i3=K,i4=V; f0=Qscale. Host launches and copies outstate to state before a Nop dependency epilogue. */
     PLOW_DOP_QWEN_GDN_PREFILL = 146,
+    PLOW_DOP_ZERO_F32 = 147,
+    PLOW_DOP_GEMM_SPLITK = 148,
+    PLOW_DOP_CAST_F32_BF16 = 149,
 
     /* ===== GPT-OSS MXFP4 MoE — FLAT fused-expert tensors, no host pointer table. =====
      * GPT-OSS ships every expert's weights as ONE checkpoint tensor per projection:
@@ -1284,7 +1287,7 @@ enum {
      * slot s in [0, B*k) reads x row s/k and writes fu row s:
      *   fu[s][n] = A(g)*B(u),  g = dot(W_e[gate_n], x) + b_e[gate_n],  u = likewise for up_n
      * with (A, B) the act's pair form (act=3 is documented on GLU, op 5). */
-    PLOW_DOP_MOE_GLU_MX = 147,
+    PLOW_DOP_MOE_GLU_MX = 150,
 
     /* DECODE grouped down + gate scale.
      *   t0=part(f32 [B*k][H]) t1=fu(bf16 [B*k][I]) t2=table
@@ -1292,7 +1295,7 @@ enum {
      *   i0=k i1=H i2=I i3=n_exp i6=n_batch(0 = 1)
      *   part[s][h] = table[s].gate * (dot(W_e[h], fu[s]) + b_e[h])      (f32, no bf16 round)
      * The row sum is MOE_COMBINE (43) / MOE_COMBINE_PF (87, i2=T=B) in fixed slot order. */
-    PLOW_DOP_MOE_DOWN_MX = 148,
+    PLOW_DOP_MOE_DOWN_MX = 151,
 
     /* PREFILL twins, token-sorted via MOE_ROUTER_TOPK_PF (83) + MOE_ALIGN_PF (84) exactly as
      * ops 85/86: gathered rows [MPF_MAX_ROWS(T,k,n_exp)] in expert-contiguous segments
@@ -1306,8 +1309,8 @@ enum {
      *       part[row_partidx[r]][h] = row_gate[r] * (dot(W_e[h], fu_g[r]) + b_e[h]); pad rows dropped.
      * Slot map follows 85/86 (t4=meta, t6/t7 = row_partidx/row_gate on DOWN); the bias takes the
      * slot the enc=2 fu_scale held there, which these flat-fp4 ops do not need. */
-    PLOW_DOP_MOE_GLU_MX_PF = 149,
-    PLOW_DOP_MOE_DOWN_MX_PF = 150,
+    PLOW_DOP_MOE_GLU_MX_PF = 152,
+    PLOW_DOP_MOE_DOWN_MX_PF = 153,
 
     PLOW_DOP__COUNT
 };

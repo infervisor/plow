@@ -1726,6 +1726,12 @@ static __device__ void d_gemm_w8a8_m1_sm90(__nv_bfloat16* C, const uint8_t* A,
 #if !PLOW_NV_FP8_M1_XCACHE || !PLOW_NV_TMA_GEMM || !PLOW_NV_FP8_M1_FAST_ACCUM
 #error "FP8 M1 TMA requires XCACHE, FAST_ACCUM and TMA helpers"
 #endif
+#ifndef PLOW_NV_FP8_M1_PROMOTE_K512
+#define PLOW_NV_FP8_M1_PROMOTE_K512 0
+#endif
+#if PLOW_NV_FP8_M1_PROMOTE_K512 != 0 && PLOW_NV_FP8_M1_PROMOTE_K512 != 1
+#error "PLOW_NV_FP8_M1_PROMOTE_K512 must be0 or1"
+#endif
 static __device__ void d_gemm_w8a8_m1_tma_sm90(__nv_bfloat16* C, const uint8_t* A,
     const uint8_t* W, const void* mapW, const float* ascale, const float* wscale, unsigned n, unsigned k,
     unsigned a_row0, unsigned slice, unsigned nblk, __nv_bfloat16* arena) {
@@ -1798,7 +1804,7 @@ static __device__ void d_gemm_w8a8_m1_tma_sm90(__nv_bfloat16* C, const uint8_t* 
                     const uint8_t* xp = cached_x + (kb / 128 + sub / 4) * 1024;
                     const uint64_t dx = sm90_desc(xp + (sub % 4) * 32);
 #if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
-                    const int accumulate = kb != 0 || sub != 0;
+                    const int accumulate = PLOW_NV_FP8_M1_PROMOTE_K512 ? (sub != 0) : (kb != 0 || sub != 0);
 #else
                     const int accumulate = sub != 0;
 #endif
@@ -1814,7 +1820,8 @@ static __device__ void d_gemm_w8a8_m1_tma_sm90(__nv_bfloat16* C, const uint8_t* 
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
 #if defined(PLOW_NV_FP8_M1_FAST_ACCUM) && PLOW_NV_FP8_M1_FAST_ACCUM
-                    total[i] = partial[i];
+                    if (PLOW_NV_FP8_M1_PROMOTE_K512) total[i] += partial[i];
+                    else total[i] = partial[i];
 #else
                     total[i] += partial[i];
 #endif

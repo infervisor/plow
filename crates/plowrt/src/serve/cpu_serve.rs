@@ -49,10 +49,7 @@ impl CpuServe {
         let batch = eng.batch();
         let decode_rungs = eng.decode_rungs().into_boxed_slice();
         let buckets = eng.prefill_buckets();
-        let pf_chunk = std::env::var("PLOW_CPU_PF_CHUNK")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
+        let pf_chunk = crate::config::RuntimeConfig::get().cpu.prefill_chunk;
         tracing::info!(
             max_ctx,
             batch,

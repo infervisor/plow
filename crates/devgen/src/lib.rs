@@ -62,7 +62,10 @@ mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
+mod decode_objects;
+mod gemv_decode_role;
 pub mod manifest;
+mod projection_rewrite;
 pub mod tune_demand;
 
 // # THE `PLOW_*` FLAG AUDIT (target dependence)
@@ -157,10 +160,81 @@ const FA_GF_FULL: u32 = 2;
 /// `(PLOW_NV_FORCE_MINBLK, --n-cu)` already is, and `DecodeKnobs::emit_env`
 /// renders both halves together. Unset leaves every packet byte-identical.
 pub(crate) fn fa_gf_full() -> u32 {
+    if let Some(gf) = emit_config::active().attention_decode_balance_gf {
+        assert!(
+            matches!(gf, 2 | 4 | 8 | 16),
+            "unsupported full-HD attention GF {gf}"
+        );
+        return gf;
+    }
     emit_config::active()
         .fa_gf_full
         .filter(|v| matches!(v, 1 | 2 | 4 | 8 | 16))
         .unwrap_or(FA_GF_FULL)
+}
+
+pub(crate) fn attention_decode_ns(
+    batch: u32,
+    heads: u32,
+    kv_heads: u32,
+    n_cu: u32,
+    fallback: u32,
+) -> u32 {
+    let Some(gf) = emit_config::active().attention_decode_balance_gf else {
+        return fallback;
+    };
+    balanced_attention_ns(batch, heads, kv_heads, n_cu, gf)
+}
+
+fn balanced_attention_ns(batch: u32, heads: u32, kv_heads: u32, n_cu: u32, gf: u32) -> u32 {
+    assert!(
+        matches!(gf, 2 | 4 | 8 | 16),
+        "unsupported attention decode GF {gf}"
+    );
+    assert!(batch > 0 && heads > 0 && kv_heads > 0 && n_cu > 0);
+    assert_eq!(heads % kv_heads, 0);
+    assert_eq!((heads / kv_heads) % gf, 0, "attention GF must divide GQA");
+    let groups = batch
+        .checked_mul(heads / gf)
+        .expect("attention work overflow");
+    n_cu / gcd(groups, n_cu)
+}
+
+#[cfg(test)]
+mod attention_decode_balance_tests {
+    use super::*;
+
+    #[test]
+    fn complete_waves_for_actual_head_groups_and_decode_rungs() {
+        for batch in [1, 2, 4, 8, 16] {
+            for (heads, kv_heads, gf, expected) in [
+                (
+                    16,
+                    1,
+                    16,
+                    if batch == 1 {
+                        132
+                    } else if batch == 2 {
+                        66
+                    } else {
+                        33
+                    },
+                ),
+                (32, 4, 8, 33),
+            ] {
+                let ns = balanced_attention_ns(batch, heads, kv_heads, 132, gf);
+                assert_eq!(ns, expected);
+                assert_eq!(batch * (heads / gf) * ns % 132, 0);
+                assert!((1..ns).all(|smaller| batch * (heads / gf) * smaller % 132 != 0));
+            }
+        }
+    }
+
+    #[test]
+    fn incompatible_sliding_gqa_is_rejected() {
+        assert!(std::panic::catch_unwind(|| balanced_attention_ns(1, 24, 4, 132, 6)).is_err());
+        assert!(std::panic::catch_unwind(|| balanced_attention_ns(1, 16, 0, 132, 2)).is_err());
+    }
 }
 
 /// Greatest common divisor (Euclid). Used to grid-align the full-layer flash-decode
@@ -3512,7 +3586,7 @@ fn emit_phase(
         // kernel must agree (dev_isa.h). GF=2 fuses sliding layers fully (GQA 2) and full layers
         // partially (GQA 8 -> reads each row 4x). Under tp=8 shared-kv-head replication a full layer
         // is GQA 4 locally, still a clean multiple of GF=2. The binding invariant is gqa_local % GF.
-        let gf = fa_gf_full(); // MUST track the kernel's PLOW_NV_FA_GF_FULL; see fa_gf_full()
+        let gf = if full { fa_gf_full() } else { 2 };
         assert_eq!(
             (heads / kvh) % gf,
             0,
@@ -3674,6 +3748,11 @@ fn emit_phase(
             ns
         };
         // DECODE nsplit ABSOLUTE OVERRIDE (occupancy tuning). PLOW_NS_MUL scales the CU-fill target;
+        let ns = if gemv_family && full {
+            attention_decode_ns(t, heads, kvh, n_cu, ns)
+        } else {
+            ns
+        };
         // PLOW_NS_ABS pins nsplit directly. MEASURED on Qwen3-4B (all-global, GQA 4, MI350X):
         // the default mul=2 (ns=16) OVER-SPLITS flash_decode — each split's fixed overhead (Q
         // re-staging + the flash_merge partial + its barriers) dominates the tiny per-split KV
@@ -4351,6 +4430,9 @@ fn emit_phase(
                 d.j[1] = kvm; // head-major; RING on a sliding layer
             })
         };
+        if !gemv_family && emit_config::active().emit_packed_prefill {
+            b.isolate(c_fa);
+        }
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
         // FlashMerge op and o_proj depends on the flash op directly. Coarse: n.at row r needs
         // every head of its q-tile, which is spread across the flash workgroups.
@@ -6004,6 +6086,31 @@ pub fn run(args: EmitArgs) {
     run_verified(args, None)
 }
 
+#[derive(Clone, Copy)]
+struct EmitCapabilities {
+    dense_packet_contracts: bool,
+    decode_objects: bool,
+    cublaslt_decode: bool,
+}
+
+fn emit_capabilities(model_type: &str) -> EmitCapabilities {
+    let dense = matches!(model_type, "gemma4" | "gemma4_text" | "llama" | "qwen3");
+    EmitCapabilities {
+        dense_packet_contracts: dense,
+        decode_objects: dense || model_type == "qwen3_5",
+        cublaslt_decode: model_type == "qwen3_5",
+    }
+}
+
+fn cublaslt_emit_supported(
+    capabilities: EmitCapabilities,
+    arch: &str,
+    tp: u32,
+    has_decode_objects: bool,
+) -> bool {
+    capabilities.cublaslt_decode && arch == "sm_90a" && tp == 1 && !has_decode_objects
+}
+
 /// [`run`] plus an optional pre-write verification gate (see [`VerifyHook`]).
 /// `run(args)` ≡ `run_verified(args, None)` — byte-identical emission.
 pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
@@ -6068,6 +6175,52 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             verify.as_ref(),
         );
         return;
+    }
+    let capabilities = emit_capabilities(&model_type);
+    if emit_config::active().decode_cublaslt {
+        assert!(
+            cublaslt_emit_supported(
+                capabilities,
+                &arch,
+                tp,
+                emit_config::active().decode_objects.is_some(),
+            ),
+            "cuBLASLt decode emission requires a supported single-GPU CUDA emitter without decode objects"
+        );
+    }
+    assert!(
+        !emit_config::active().gemv_decode_role || capabilities.dense_packet_contracts,
+        "GEMV decode role currently requires the dense BF16 emitter"
+    );
+    if emit_config::active().emit_packed_prefill {
+        assert!(
+            arch == "sm_90a" && tp == 1 && !emit_config::active().fp8_kv,
+            "packed request emission requires Hopper single-GPU BF16 KV"
+        );
+        assert!(
+            capabilities.dense_packet_contracts,
+            "packed requests require the compiled direct-KV emitter access contract"
+        );
+    }
+    if emit_config::active().decode_projection_tuning {
+        assert!(
+            arch == "sm_90a" && tp == 1 && emit_config::active().decode_objects.is_some(),
+            "projection tuning requires Hopper cooperative decode object bindings"
+        );
+        assert!(
+            capabilities.dense_packet_contracts,
+            "projection tuning is not wired to this emitter's opcode/access contracts"
+        );
+    }
+    if emit_config::active().decode_objects.is_some() {
+        assert!(
+            matches!(arch.as_str(), "sm_90a" | "sm_120") && tp == 1,
+            "decode objects require a supported single-GPU CUDA target"
+        );
+        assert!(
+            capabilities.decode_objects,
+            "decode object bindings are not wired to this emitter"
+        );
     }
     if model_type == "qwen3_5" {
         assert!(
@@ -7131,7 +7284,7 @@ fn emit_dense_gqa(
                 && (emit_config::active().kda_wu_lean || emit_config::active().kda_carry_keyfeed),
         );
         b.set_kda_carry_keyfeed_segments(emit_config::active().kda_carry_keyfeed);
-        if amd {
+        if amd || emit_config::active().emit_packed_prefill {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }
         // T18 (PLOW_UNISEG_MAX_T=<t>): small buckets emit ONE segment so the serve side takes
@@ -7227,8 +7380,18 @@ fn emit_dense_gqa(
         gen,
     };
 
+    let projection_bindings =
+        projection_rewrite::apply(&mut m, &ecfg, &gpu, &arch, std::path::Path::new(&out))
+            .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));
     // Emit v6 with sections when --embed-cubin/--embed-hsaco given, else v5.
     let mut sections = Vec::new();
+    if ecfg.gemv_decode_role {
+        assert!(
+            !amd && arch == "sm_90a" && !fp8 && !c.moe && rungs == [1],
+            "GEMV decode role requires plain BF16 SM90 with one M1 decode program"
+        );
+        sections.push(gemv_decode_role::apply(&mut m));
+    }
     // BLOCK MODE: embed the block.json descriptor
     // as SECT_METADATA — this also forces the to_blob_v6 path — and drop a
     // sibling block.json next to the blob for the record / the harness loader.
@@ -7317,7 +7480,95 @@ fn emit_dense_gqa(
     // site's — to downgrade "no usable verifier here" into an `Ok` carrying a
     // skip reason. Anything that reaches this `Err` is the verifier saying the
     // program is wrong, i.e. a real bug caught, and must be loud.
+    if ecfg.emit_packed_prefill {
+        assert!(
+            !emit_is_amd() && !fp8_kv,
+            "packed prefill requires dense BF16 KV NVIDIA packet"
+        );
+        let max_rows = m.prog_t[..packet::devbuild::decode_rung_lo(&m.prog_t)]
+            .iter()
+            .copied()
+            .max()
+            .expect("prefill buckets");
+        let batch = *m.prog_t.last().unwrap();
+        let mut declare = |name: String, bytes: u64| {
+            assert!(m.tensors.len() < packet::dev::TENSOR_NONE16 as usize);
+            let h = m.tensors.len() as u16;
+            m.tensors.push(packet::devbuild::TensorDecl {
+                name,
+                bytes,
+                init: None,
+            });
+            h
+        };
+        let slot = declare("pf.request.slot".into(), u64::from(max_rows) * 4);
+        let request = declare("pf.request.table".into(), (1 + 4 * u64::from(batch)) * 4);
+        let originals: Vec<_> = m
+            .gen
+            .iter()
+            .filter(|g| g.kind == packet::rope::GEN_TMAP_KV_PAIR)
+            .map(|g| g.tensor as u16)
+            .collect();
+        let mut maps = Vec::new();
+        for original in originals {
+            assert!(m.tensors.len() < packet::dev::TENSOR_NONE16 as usize);
+            let slots = m.tensors.len() as u16;
+            m.tensors.push(packet::devbuild::TensorDecl {
+                name: format!("pf.request.maps.{original}"),
+                bytes: 8 * u64::from(batch),
+                init: None,
+            });
+            maps.push(plow_asset::packed_prefill::Map { original, slots });
+        }
+        let manifest = plow_asset::program::with_model(&m, |p| {
+            let live = plow_asset::live_kv::emit(p).expect("packed LIVE geometry");
+            let request = plow_asset::packed_prefill::Manifest {
+                version: 1,
+                slot,
+                request,
+                maps,
+                programs: p.programs[..p.prefill_count]
+                    .iter()
+                    .map(plow_asset::live_kv::program_digest)
+                    .collect(),
+            };
+            request.validate(p, &live).expect("packed request contract");
+            request
+        });
+        sections.push(packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::packed_prefill::SECTION.into(),
+            data: serde_json::to_vec(&manifest).unwrap(),
+        });
+    }
+    if projection_bindings.is_some() || ecfg.emit_packed_prefill {
+        let manifest = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
+            .unwrap_or_else(|error| panic!("compiled LIVE KV geometry: {error}"));
+        sections.push(packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::live_kv::SECTION.into(),
+            data: serde_json::to_vec(&manifest).expect("serialize LIVE KV manifest"),
+        });
+    }
     let lean = apply_verify_gate(&m, verify.as_ref());
+    if let Some(bindings) = projection_bindings.as_ref() {
+        decode_objects::append_metadata(
+            &m,
+            &mut sections,
+            bindings,
+            &arch,
+            std::path::Path::new(&out),
+        )
+    } else {
+        decode_objects::append(
+            &m,
+            &mut sections,
+            ecfg.decode_objects.as_deref(),
+            &arch,
+            std::path::Path::new(&out),
+        )
+    }
+    .unwrap_or_else(|error| panic!("decode objects: {error}"));
     let blob = if sections.is_empty() {
         m.to_blob()
     } else {
@@ -7506,3 +7757,9 @@ mod pick_tile_tests;
 #[cfg(test)]
 #[path = "lib_tests/chunk_default.rs"]
 mod chunk_default_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/emit_capabilities.rs"]
+mod emit_capabilities_tests;
+
+pub mod fp8_m1_role;

@@ -25,7 +25,6 @@ mod bucket;
 // The prefetcher/slab helpers are GPU upload machinery; a cpu-only build binds directly.
 #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
 pub(crate) mod checkpoint;
-pub mod cubin;
 pub mod devblob;
 /// Megatron weight sharding. Gated with `checkpoint` — it is the rule for which
 /// slice of a checkpoint tensor a rank binds, and useless without one.

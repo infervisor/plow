@@ -19,7 +19,7 @@ these names — **never substitute a literal part name into a command.**
 | `$BUILD` | | `scripts/build_<isa>.sh` for `$ISA` |
 | `$FEATURES` | | `--features hsa` or `--features cuda` |
 | `$BW_BOUND` / `$COMPUTE_CEIL` | | carried from Stage 4, measured on `$GPU` |
-| `$RESULTS` | | `perf-data/plow-<isa>/` if it exists, else `perf-data/` |
+| `$RESULTS` | | campaign NVMe, or `/dev/shm` for disposable screens; raw output is not committed |
 
 You are executing **Stage 5** of the model-bringup playbook. Your job: take one
 transformer block of the target model, **prove it is numerically correct**, then
@@ -60,6 +60,26 @@ Two block shapes exist, and they use different runners:
 
 Confirm which you have with `plowrt amd-block --list-tensors` or
 `plowrt disasm <model.pkt>` before proceeding.
+
+## Select the existing harness before running
+
+Use the narrowest existing harness that preserves the behavior being tuned:
+
+| need | required harness |
+|---|---|
+| packet planning | `scripts/block_sim.sh` |
+| block numerics | the family C oracle or `plowrt amd-block`; `block_run check` is smoke only |
+| broad NVIDIA object/packet grid | `scripts/tune_decode_sweep.sh --block ... --block-run ...` |
+| Gemma block timing | `examples/block_run bench` |
+| MLA-family timing | `scripts/k3_block_sweep.sh` or `scripts/glm52_block_sweep_gfx942.sh` |
+| reference block and per-op floor | `scripts/block_layer_bench.py`, `block_op_bench.py`, then `block_compare.py` |
+| finalist confirmation | `examples/step_bench` |
+
+Search these paths before adding code. Extend the closest reusable harness if
+the exact semantic boundary is missing. Do not create a model- or
+experiment-named runner merely to vary flags. Run the broad context, batch,
+warp, register, and packet-rung grid here; send only 2–3 finalists to
+`step_bench`, and only a gated winner to serving.
 
 ## Procedure
 
@@ -136,6 +156,14 @@ and require rank token identity. Use `AMD_SERIALIZE_KERNEL=3` or
 
 Every timed run must be uncontended (`perf-data/tools/gpulease` rc=0). Discard
 and re-run any rc=76.
+
+Screen broadly at B=1 and the widest compiled rung over short, crossover, and
+long contexts. Confirm finalists at B=1/4/16 and T=1K/4K/8K/16K/32K, plus the
+points adjacent to packet-bucket, KV-ring, tile, and sliding-window boundaries.
+Run repeated control/candidate pairs in reversed order, evict L2 symmetrically,
+and retain SM-clock/power telemetry. Any chosen attention split, warp count, or
+register budget must be encoded by geometry/rung in compiler packet metadata;
+do not add model-name branches or runtime environment knobs.
 
 ### 5. Anchor and attribute
 

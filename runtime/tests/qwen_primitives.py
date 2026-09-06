@@ -4,6 +4,22 @@ p=argparse.ArgumentParser()
 p.add_argument("--run-gpu", action="store_true")
 p.add_argument("--library", required=True)
 p.add_argument("--gdn-library")
+p.add_argument("--gdn-step-library", help="benchmark-only recurrent candidate; exact native state/output gate before timing")
+p.add_argument("--gdn-timing-only", action="store_true", help="native recurrent step vs reachable vLLM FLA packed decode, batches1/4/16")
+p.add_argument("--attention-only", action="store_true", help="native attention vs installed serving FA3/FA4; excludes projections/cache writes")
+p.add_argument("--attention-gf", type=int, choices=(0,2,4,6,8,16), default=0, help="benchmark-only native decode grouping; 0 preserves fixed controls")
+p.add_argument("--attention-native-splits", default="baseline", help="baseline, fill, fill2, fill4, or positive integer; fill targets132 work items")
+p.add_argument("--attention-kind", choices=("all","full","sliding"), default="all")
+p.add_argument("--attention-contexts", default="1024,4096,8192,32768")
+p.add_argument("--attention-batches", default="1,4,16", help="active decode batch; distinct from serving concurrency")
+p.add_argument("--attention-model", choices=("all","gemma12","gemma31","qwen27"), default="all")
+p.add_argument("--attention-phases", choices=("both","decode","prefill"), default="both")
+p.add_argument("--attention-prefill-rows", default="1024,8192", help="trailing query chunks, capped at context; 0 means entire prompt")
+p.add_argument("--attention-page-size", type=int, default=0)
+p.add_argument("--attention-fa-splits", type=int, default=-1, help="-1 matches serving: FA3 graph decode32, otherwise0; nonnegative override recorded")
+p.add_argument("--attention-iters", type=int, default=20)
+p.add_argument("--attention-flush-mib", type=int, default=256)
+p.add_argument("--attention-reverse", action="store_true")
 p.add_argument("--fp8-prefill-only", action="store_true", help="run native FP8 TMA prefill vs installed CUTLASS")
 p.add_argument("--fp8-prefill-rows", type=int, choices=(128,1024,4096,8192), default=128, help="runtime M for the native TMA prefill comparator")
 p.add_argument("--fp8-rows", type=int, choices=(1,4,16,128), help="row count for the separate exact quantization gate")
@@ -20,13 +36,201 @@ if args.fp8_prefill_only:
 if not args.run_gpu: p.error("requires --run-gpu and an exclusive GPU slot")
 import torch
 lib=C.CDLL(args.library)
-if not args.fp8_gemm_only:
+if not args.fp8_gemm_only and not args.attention_only:
     lib.qwen_test.argtypes=[C.c_uint,C.POINTER(C.c_void_p),C.POINTER(C.c_int),C.POINTER(C.c_float),C.c_void_p]
     lib.qwen_test.restype=C.c_int
 def run(op,ts,ints,floats=(0.,0.)):
     code=lib.qwen_test(op,(C.c_void_p*8)(*[t.data_ptr() if t is not None else 0 for t in ts]),(C.c_int*8)(*ints),(C.c_float*2)(*floats),torch.cuda.current_stream().cuda_stream)
     assert code==0,code
 def rand(*shape):return torch.randn(*shape,device="cuda",dtype=torch.bfloat16)*0.2
+
+def check_attention():
+    import hashlib, importlib.metadata, inspect, statistics
+    from pathlib import Path
+    from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func as flash, get_scheduler_metadata
+    from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
+    shapes=[("gemma12","sliding",256,16,8,1024,1.,4,17),
+            ("gemma12","full",512,16,1,0,1.,4,33),
+            ("gemma31","sliding",256,32,16,1024,1.,4,17),
+            ("gemma31","full",512,32,4,0,1.,4,33),
+            ("qwen27","full",256,24,4,0,256**-.5,3,11)]
+    contexts=[int(x) for x in args.attention_contexts.split(",")]
+    batches=[int(x) for x in args.attention_batches.split(",")]
+    chunks=[int(x) for x in args.attention_prefill_rows.split(",")]
+    if (min(contexts+batches)<1 or min(chunks)<0 or (args.attention_page_size!=0 and args.attention_page_size<16) or
+        args.attention_page_size%16 or args.attention_iters<3 or args.attention_fa_splits < -1 or
+        args.attention_flush_mib<128):
+        p.error("invalid attention geometry; use >=3 iterations and >=128 MiB eviction")
+    if any(b not in (1,4,16) for b in batches):p.error("attention decode batches must be 1,4,16")
+    lib.plow_attention.argtypes=[C.POINTER(C.c_void_p),C.POINTER(C.c_int),C.c_float,C.c_void_p]
+    lib.plow_attention.restype=C.c_int
+    if args.attention_gf:
+        if args.attention_phases!="decode":p.error("--attention-gf requires --attention-phases decode")
+        lib.plow_attention_gf.argtypes=lib.plow_attention.argtypes+[C.c_uint]
+        lib.plow_attention_gf.restype=C.c_int
+    if args.attention_native_splits not in ("baseline","fill","fill2","fill4"):
+        try:valid_splits=int(args.attention_native_splits)>0
+        except ValueError:valid_splits=False
+        if not valid_splits:p.error("invalid native split policy")
+    lib.plow_attention_maps.argtypes=[C.c_void_p,C.c_void_p,C.c_void_p,C.c_int,C.c_int,C.c_int]
+    lib.plow_attention_maps.restype=C.c_int
+    source=Path(inspect.getsourcefile(flash))
+    report=dict(boundary="standalone native operation bodies vs vLLM library kernels; not interpreter-role or transformer-block timing; native decode includes merge; excludes QKV projection, norm/RoPE, cache write/packing, output projection/gate",
+        scheduling="FA3 scheduler metadata constructed untimed; both sides warmed and CUDA-graph captured symmetrically",
+        vllm=importlib.metadata.version("vllm"),torch=torch.__version__,
+        library=str(Path(args.library).resolve()),library_sha256=hashlib.sha256(Path(args.library).read_bytes()).hexdigest(),
+        reference_source=str(source),reference_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        gpu=torch.cuda.get_device_name(),sm_count=torch.cuda.get_device_properties(0).multi_processor_count,
+        arguments=vars(args),rows=[])
+    if report["sm_count"]!=132 or torch.cuda.get_device_capability()!=(9,0):
+        raise RuntimeError("frozen native wrapper requires the 132-SM H100")
+    torch.manual_seed(1729)
+    flush=torch.empty(args.attention_flush_mib*1024*1024,device="cuda",dtype=torch.uint8)
+    def save():
+        if args.output:Path(args.output).write_text(json.dumps(report,indent=2)+"\n")
+    def guarded(shape,dtype):
+        n=1
+        for dim in shape:n*=dim
+        buf=torch.full((n+256,),37.,device="cuda",dtype=dtype)
+        return buf[128:-128].reshape(shape),buf
+    def capture(fn):
+        for _ in range(3):fn()
+        torch.cuda.synchronize()
+        graph=torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):fn()
+        return graph
+    def timing(native,reference):
+        graphs={"native":capture(native),"vllm":capture(reference)}
+        results={}
+        start,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+        for cold in (False,True):
+            times={name:[] for name in graphs}
+            for rep in range(args.attention_iters):
+                order=["native","vllm"]
+                if bool(rep%2)^args.attention_reverse:order.reverse()
+                for name in order:
+                    if cold:flush.zero_()  # Same stream, before timing; no subtraction.
+                    start.record();graphs[name].replay();end.record();end.synchronize()
+                    times[name].append(start.elapsed_time(end)*1000)
+            for name,values in times.items():
+                values.sort()
+                results[("evicted_" if cold else "hot_")+name+"_us"]=statistics.median(values)
+                results[("evicted_" if cold else "hot_")+name+"_p95_us"]=values[min(len(values)-1,int(.95*len(values)))]
+        return results
+    for model,kind,hd,nh,nkv,window,scale,version,decode_splits in shapes:
+        if args.attention_model not in ("all",model):continue
+        if args.attention_kind not in ("all",kind):continue
+        gf=args.attention_gf or (4 if hd==512 else 2)
+        if (nh//nkv)%gf:p.error(f"GF{gf} does not divide {model} {kind} GQA{nh//nkv}")
+        page_size=args.attention_page_size or (784 if model=="qwen27" else 16)
+        for ctx in contexts:
+            cases=[]
+            if args.attention_phases!="prefill":cases.extend(("decode",b,1) for b in batches)
+            if args.attention_phases!="decode":cases.extend(("prefill",1,q) for q in sorted({min(ctx,x) if x else ctx for x in chunks}))
+            for phase,batch,rows in cases:
+                fa_splits=args.attention_fa_splits if args.attention_fa_splits>=0 else (32 if version==3 and phase=="decode" else 0)
+                native_splits=decode_splits
+                if args.attention_native_splits.startswith("fill"):
+                    waves=int(args.attention_native_splits[4:] or "1")
+                    groups=batch*(nh//gf)
+                    native_splits=(132*waves+groups-1)//groups
+                elif args.attention_native_splits!="baseline":native_splits=int(args.attention_native_splits)
+                row=dict(model=model,kind=kind,phase=phase,batch=batch,query_rows=rows,context=ctx,
+                    head_dim=hd,q_heads=nh,kv_heads=nkv,gqa=nh//nkv,window=window,scale=scale,
+                    causal=True,query_position=ctx-rows,dtype="bfloat16",fa_version=version,
+                    reference="vllm.vllm_flash_attn.flash_attn_interface.flash_attn_varlen_func",
+                    reference_layout="paged [pages,KVH,page,2HD] transposed/split views",
+                    native_layout="separate contiguous [B,KVH,context,HD]",page_size=page_size,
+                    native_grid=132,native_threads=256,native_gf=gf,
+                    native_decode_registers={(256,2):72,(256,6):113,(512,4):82,(512,8):138,(512,16):234}.get((hd,gf)),
+                    native_decode_smem_bytes=4*(gf*256+2*max(8,gf)+gf*hd//2+2048),
+                    native_prefill_smem_bytes=201728 if hd==512 else 103424,
+                    native_prefill_registers=194 if hd==512 else 124,
+                    native_policy=args.attention_native_splits,
+                    native_work_items=batch*(nh//gf)*native_splits if phase=="decode" else None,
+                    native_splits=native_splits if phase=="decode" else 1,
+                    native_prefill_tile=[64,32],native_prefill_tma=phase=="prefill",
+                    fa_num_splits=fa_splits,scheduler_metadata="FA3 AOT" if version==3 else None,
+                    precision_gate="relative L2 <= 0.003; finite outputs; output/partial canaries",
+                    input="seed1729 random BF16; Gemma Q/K unit RMS, not checkpoint capture")
+                report["rows"].append(row)
+                try:
+                    q=rand(batch*rows,nh,hd)
+                    k=rand(batch,nkv,ctx,hd);v=rand(batch,nkv,ctx,hd)
+                    if model.startswith("gemma"):
+                        q=(q.float()*torch.rsqrt(q.float().square().mean(-1,keepdim=True)+1e-6)).bfloat16()
+                        k=(k.float()*torch.rsqrt(k.float().square().mean(-1,keepdim=True)+1e-6)).bfloat16()
+                    pages=(ctx+page_size-1)//page_size
+                    cache=torch.zeros(batch*pages,nkv,page_size,2*hd,device="cuda",dtype=torch.bfloat16)
+                    kc,vc=cache.transpose(1,2).split(hd,dim=-1)
+                    for b in range(batch):
+                        # Each request owns disjoint pages. Copy/layout work is untimed.
+                        packed=torch.zeros(pages*page_size,nkv,2*hd,device="cuda",dtype=torch.bfloat16)
+                        packed[:ctx,:,:hd]=k[b].transpose(0,1);packed[:ctx,:,hd:]=v[b].transpose(0,1)
+                        cache[b*pages:(b+1)*pages].copy_(packed.reshape(pages,page_size,nkv,2*hd).transpose(1,2))
+                    kc=canonicalize_singleton_dim_strides(kc)
+                    vc=canonicalize_singleton_dim_strides(vc)
+                    table=torch.arange(batch*pages,device="cuda",dtype=torch.int32).reshape(batch,pages)
+                    lengths=torch.full((batch,),ctx,device="cuda",dtype=torch.int32)
+                    cuq=torch.arange(batch+1,device="cuda",dtype=torch.int32)*rows
+                    scheduler=None
+                    if version==3:
+                        scheduler=get_scheduler_metadata(batch_size=batch,max_seqlen_q=rows,
+                            max_seqlen_k=ctx,num_heads_q=nh,num_heads_kv=nkv,headdim=hd,
+                            cache_seqlens=lengths,qkv_dtype=torch.bfloat16,cu_seqlens_q=cuq,
+                            page_size=page_size,causal=True,window_size=(-1,-1),num_splits=fa_splits)
+                    out,ob=guarded(q.shape,torch.bfloat16);ref,rb=guarded(q.shape,torch.bfloat16)
+                    ns=row["native_splits"]
+                    op,pb=guarded((batch,nh,ns,hd) if phase=="decode" else (1,),torch.float32)
+                    ml,mb=guarded((batch,nh,ns,2) if phase=="decode" else (1,),torch.float32)
+                    maps=torch.empty(256,device="cuda",dtype=torch.uint8)
+                    if phase=="prefill":
+                        rc=lib.plow_attention_maps(maps.data_ptr(),k.data_ptr(),v.data_ptr(),hd,ctx,nkv)
+                        if rc:raise RuntimeError(f"tensor map encoding failed: {rc}")
+                    tensors=(C.c_void_p*8)(*[t.data_ptr() for t in (q,k,v,out,op,ml,lengths,maps)])
+                    ints=(C.c_int*12)(phase=="prefill",hd,batch,rows,ctx,nh,nkv,window,ns,ctx-rows,-1,ctx)
+                    def native():
+                        if args.attention_gf:
+                            rc=lib.plow_attention_gf(tensors,ints,scale,torch.cuda.current_stream().cuda_stream,gf)
+                        else:
+                            rc=lib.plow_attention(tensors,ints,scale,torch.cuda.current_stream().cuda_stream)
+                        if rc:raise RuntimeError(f"native attention launch failed: {rc}")
+                    def reference():
+                        return flash(q,kc,vc,rows,cuq,ctx,seqused_k=lengths,out=ref,
+                            softmax_scale=scale,causal=True,window_size=(window-1,0) if window else (-1,-1),
+                            block_table=table,fa_version=version,num_splits=fa_splits,scheduler_metadata=scheduler)
+                    native();reference();torch.cuda.synchronize()
+                    grouping_pass=True
+                    if args.attention_gf:
+                        control,cb=guarded(q.shape,torch.bfloat16)
+                        control_tensors=(C.c_void_p*8)(*tensors)
+                        control_tensors[3]=control.data_ptr()
+                        rc=lib.plow_attention(control_tensors,ints,scale,torch.cuda.current_stream().cuda_stream)
+                        if rc:raise RuntimeError(f"native grouping control failed: {rc}")
+                        torch.cuda.synchronize()
+                        relative=((out.float()-control.float()).norm()/control.float().norm().clamp_min(1e-30)).item()
+                        grouping_pass=bool(torch.isfinite(control).all() and (cb[:128]==37).all() and (cb[-128:]==37).all()) and relative<=.003
+                        row.update(native_grouping_control_gf=4 if hd==512 else 2,
+                            native_grouping_control_exact=torch.equal(out,control),native_grouping_control_relative_l2=relative,
+                            native_grouping_control_passed=grouping_pass)
+                    delta=out.float()-ref.float()
+                    row.update(relative_l2=(delta.norm()/ref.float().norm().clamp_min(1e-30)).item(),
+                        max_abs=delta.abs().max().item(),exact=torch.equal(out,ref))
+                    finite=bool(torch.isfinite(out).all() and torch.isfinite(ref).all())
+                    canaries=all(bool((buf[:128]==37).all() and (buf[-128:]==37).all()) for buf in (ob,rb,pb,mb))
+                    row.update(finite=finite,canaries=canaries,passed=finite and canaries and grouping_pass and row["relative_l2"]<=.003)
+                    if not row["passed"]:raise AssertionError("attention numerical/canary gate failed")
+                    row.update(timing(native,reference))
+                    print(json.dumps(row),flush=True);save()
+                except Exception as exc:
+                    row.update(passed=False,error=f"{type(exc).__name__}: {exc}");save();raise
+    if not report["rows"]:raise RuntimeError("no attention operator cells selected")
+    save()
+    print("PASS",len(report["rows"]),"matched attention operator cells")
+    return True
+if args.attention_only:
+    raise SystemExit(0 if check_attention() else 1)
+
 def check_gemma_nrn():
     from pathlib import Path
     import statistics
@@ -280,6 +484,93 @@ if args.fp8_only:
     raise SystemExit(0 if check_fp8() else 1)
 
 from vllm.third_party.flash_linear_attention.ops.fused_recurrent import fused_recurrent_gated_delta_rule_packed_decode as oracle
+if args.gdn_timing_only:
+    import hashlib, inspect, statistics
+    from pathlib import Path
+    candidate_lib=C.CDLL(args.gdn_step_library) if args.gdn_step_library else None
+    if candidate_lib:
+        candidate_lib.qwen_test.argtypes=lib.qwen_test.argtypes
+        candidate_lib.qwen_test.restype=C.c_int
+    torch.manual_seed(1729)
+    source=Path(inspect.getsourcefile(oracle))
+    report=dict(boundary="recurrent step only; excludes causal conv, projections, gated output norm",
+        reference=str(source),reference_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        library_sha256=hashlib.sha256(Path(args.library).read_bytes()).hexdigest(),
+        initial_state="random FP32, reset only the measured arm before each replay; not a captured context checkpoint",
+        cache_regimes=["hot: own logical state reset immediately before replay", "evicted: own state reset then 256 MiB flush before replay"],
+        reference_state_indices="1..B; FLA index0 is reserved NULL_BLOCK_ID",
+        context="fixed recurrent state dimensions; 1K/4K/8K/32K histories require separately captured states",
+        candidate_library=args.gdn_step_library,
+        candidate_sha256=hashlib.sha256(Path(args.gdn_step_library).read_bytes()).hexdigest() if candidate_lib else None,
+        rows=[])
+    for B in (1,4,16):
+        active=torch.ones(B,device="cuda",dtype=torch.int32)
+        mixed=rand(B,10240);a=rand(B,48);b=rand(B,48);alog=rand(48);bias=rand(48)
+        alog32=alog.float()
+        initial=torch.randn(B,48,128,128,device="cuda")*.01
+        state=initial.clone()
+        reference_initial=torch.cat([torch.zeros_like(initial[:1]),initial])
+        reference=reference_initial.clone()
+        indices=torch.arange(1,B+1,device="cuda",dtype=torch.int32)
+        out=torch.empty(B,1,48,128,device="cuda",dtype=torch.bfloat16);ref=torch.empty_like(out)
+        def native():run(137,[out,mixed,a,b,alog,bias,state,active],[16,48,128,128,B,0],[128**-.5,1e-6])
+        def reference_step():oracle(mixed,a,b,alog32,bias,128**-.5,reference,ref,indices,True)
+        native();reference_step();torch.cuda.synchronize()
+        torch.testing.assert_close(out,ref,rtol=.01,atol=1e-5)
+        torch.testing.assert_close(state,reference[1:],rtol=1e-4,atol=1e-6)
+        torch.testing.assert_close(reference[0],reference_initial[0],rtol=0,atol=0)
+        arms=[("native",native),("vllm_fla",reference_step)]
+        states={"native":state,"vllm_fla":reference[1:]}
+        if candidate_lib:
+            candidate_state=initial.clone();candidate_out=torch.empty_like(out)
+            def candidate_step():
+                ts=[candidate_out,mixed,a,b,alog,bias,candidate_state,active]
+                code=candidate_lib.qwen_test(137,(C.c_void_p*8)(*[t.data_ptr() for t in ts]),
+                    (C.c_int*8)(16,48,128,128,B,0),(C.c_float*2)(128**-.5,1e-6),torch.cuda.current_stream().cuda_stream)
+                assert code==0,code
+            for pattern in ("all","alternating","last"):
+                active.fill_(1)
+                if pattern=="alternating":active[::2]=0
+                if pattern=="last":active.zero_();active[-1]=1
+                state.copy_(initial);candidate_state.copy_(initial)
+                out.fill_(7);candidate_out.fill_(7)
+                for _ in range(3):
+                    native();candidate_step();torch.cuda.synchronize()
+                    torch.testing.assert_close(candidate_out,out,rtol=0,atol=0)
+                    torch.testing.assert_close(candidate_state,state,rtol=0,atol=0)
+                inactive=active==0
+                torch.testing.assert_close(state[inactive],initial[inactive],rtol=0,atol=0)
+                torch.testing.assert_close(out[inactive],torch.full_like(out[inactive],7),rtol=0,atol=0)
+            active.fill_(1)
+            arms.append(("candidate",candidate_step));states["candidate"]=candidate_state
+        graphs={}
+        for name,fn in arms:
+            for _ in range(3):fn()
+            torch.cuda.synchronize()
+            g=torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):fn()
+            graphs[name]=g
+        start,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+        flush=torch.empty(256*1024*1024,device="cuda",dtype=torch.uint8)
+        for cache in ("hot","evicted"):
+            times={name:[] for name in graphs}
+            for rep in range(max(3,args.attention_iters)):
+                order=list(graphs)
+                if rep%2:order.reverse()
+                for name in order:
+                    states[name].copy_(initial)
+                    if cache=="evicted":flush.zero_()
+                    start.record();graphs[name].replay();end.record();end.synchronize()
+                    times[name].append(start.elapsed_time(end)*1000)
+            row=dict(batch=B,HK=16,HV=48,DK=128,DV=128,passed=True,cache=cache,
+                pairs=max(3,args.attention_iters),flush_mib=256 if cache=="evicted" else 0,
+                native_us=statistics.median(times["native"]),vllm_fla_us=statistics.median(times["vllm_fla"]))
+            if candidate_lib:
+                row.update(candidate_us=statistics.median(times["candidate"]),candidate_exact=True,
+                    candidate_gate="3 continuation steps each: all active, alternating inactive, last physical slot only")
+            report["rows"].append(row);print(json.dumps(row),flush=True)
+            if args.output:Path(args.output).write_text(json.dumps(report,indent=2)+"\n")
+    raise SystemExit(0)
 results=[]
 def check(name,out,ref,rtol=.01,atol=1e-5):
     torch.cuda.synchronize()

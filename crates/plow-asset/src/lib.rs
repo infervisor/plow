@@ -665,3 +665,20 @@ pub struct BlockDescriptor {
     pub weights: BlockWeights,
     pub programs: BlockPrograms,
 }
+
+pub mod decode_context;
+pub mod decode_objects;
+
+pub mod cubin;
+pub mod decode_coverage;
+
+pub mod program;
+pub mod splitk;
+
+pub mod live_kv;
+
+pub mod fp8_m1_role;
+
+pub mod segment_roles;
+
+pub mod packed_prefill;

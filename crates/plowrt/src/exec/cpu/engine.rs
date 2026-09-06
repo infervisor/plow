@@ -202,8 +202,10 @@ impl CpuModel {
         // PLOW_FP8_DIR (the `--fp8-dir` runtime flag) names the fp8 weight-twin directory.
         // PLOW_MXFP4_DIR names the mxfp4 twin (`mxfp4/<name>` e2m1 + `_scale` E8M0 rows,
         // perf-data/tools/quantize_mxfp4.py); the two axes are exclusive at emit time.
-        let twin = std::env::var_os("PLOW_FP8_DIR")
-            .or_else(|| std::env::var_os("PLOW_MXFP4_DIR"))
+        let cpucfg = &crate::config::RuntimeConfig::get().cpu;
+        let twin = [cpucfg.fp8_dir.as_str(), cpucfg.mxfp4_dir.as_str()]
+            .into_iter()
+            .find(|d| !d.is_empty())
             .map(std::path::PathBuf::from);
         let ckpt = Checkpoint::open_with_twin(checkpoint, twin.as_deref())?;
 
@@ -629,7 +631,7 @@ fn loaded(p: &DevProg, n_cu: u32) -> LoadedProgram {
     // `[segment][l2 domain]`; workers claim from their domain's window and steal from the others,
     // so a slow slice no longer stalls its whole static stream. Static streams stay the default
     // until it measures faster.
-    let gq_on = std::env::var_os("PLOW_CPU_GQ").is_some_and(|v| v != "0");
+    let gq_on = crate::config::RuntimeConfig::get().cpu.gq_opt_in;
     let gq = if gq_on && !p.gq_stream.is_empty() {
         let domains = p.l2_domains.max(1);
         if p.gq_seg_ofs.len() as u32 == n_seg * domains + 1 && p.gq_stream.len() == p.stream.len() {

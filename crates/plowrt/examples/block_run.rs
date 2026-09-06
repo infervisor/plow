@@ -4,6 +4,7 @@
 //! through two verbs on ONE loaded engine:
 //!
 //!   block_run <asset-dir> check [--in x.npy] [--out y.npy] [--ctx T]
+//!                              [--dump-tensors name,name --dump-dir dir]
 //!   block_run <asset-dir> bench --batch 1,2,4,8 --ctx 128,512,1024,4096
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
 //!                              [--pf-chunk N]
@@ -112,14 +113,15 @@ mod cuda {
             let pad = (64 - total % 64) % 64;
             hdr.push_str(&" ".repeat(pad));
             hdr.push('\n');
-            let mut f = std::fs::File::create(path)?;
+            let mut f =
+                std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(path)?);
             f.write_all(b"\x93NUMPY\x01\x00")?;
             f.write_all(&(hdr.len() as u16).to_le_bytes())?;
             f.write_all(hdr.as_bytes())?;
             for &v in data {
                 f.write_all(&v.to_le_bytes())?;
             }
-            Ok(())
+            f.flush()
         }
     }
 
@@ -213,6 +215,23 @@ mod cuda {
         out_name: &str,
         flag: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let dumps = match (flag("--dump-tensors"), flag("--dump-dir")) {
+            (None, None) => None,
+            (Some(names), Some(dir)) => {
+                let mut tensors = Vec::new();
+                for name in names.split(',').map(str::trim) {
+                    if name.is_empty() || tensors.iter().any(|(prior, _)| prior == name) {
+                        return Err("--dump-tensors requires distinct nonempty names".into());
+                    }
+                    let bytes = e
+                        .tensor_bytes(name)
+                        .ok_or_else(|| format!("unknown dump tensor {name:?}"))?;
+                    tensors.push((name.to_string(), usize::try_from(bytes)?));
+                }
+                Some((PathBuf::from(dir), tensors))
+            }
+            _ => return Err("--dump-tensors and --dump-dir must be provided together".into()),
+        };
         // Input: an .npy [T, hidden] or a seeded synthetic (default T=128).
         let (t, xin) = if let Some(p) = flag("--in") {
             let (shape, data) = npy::read_f32(Path::new(&p))?;
@@ -305,6 +324,26 @@ mod cuda {
         if let Some(p) = flag("--out") {
             npy::write_f32(Path::new(&p), &[t, hidden], out)?;
             println!("  wrote {p}");
+        }
+        if let Some((dir, tensors)) = dumps {
+            std::fs::create_dir_all(&dir)?;
+            let mut rows = Vec::new();
+            for (index, (name, bytes)) in tensors.into_iter().enumerate() {
+                let mut raw = vec![0u8; bytes];
+                e.read_tensor(&name, &mut raw)?;
+                let file = format!("tensor-{index:03}.bin");
+                std::fs::write(dir.join(&file), raw)?;
+                rows.push(serde_json::json!({"name": name, "bytes": bytes, "file": file}));
+            }
+            std::fs::write(
+                dir.join("manifest.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "scope": "raw complete allocations after block execution; may contain reused scratch or padding",
+                    "input_rows": t,
+                    "tensors": rows,
+                }))?,
+            )?;
+            println!("  wrote raw tensor dumps to {}", dir.display());
         }
         if let Some(profile) = e.trace_summary()? {
             println!("{profile}");

@@ -50,6 +50,10 @@
 #define PLOW_NV_FP8_PF_SCALE_WFIRST 0
 #endif
 
+#ifndef PGM90_FP8_TMA_ISSUE_CURSOR
+#define PGM90_FP8_TMA_ISSUE_CURSOR 0
+#endif
+
 #ifndef PLOW_NV_SEG_M64N64
 #define PLOW_NV_SEG_M64N64 0
 #endif
@@ -628,29 +632,54 @@ static __device__ void d_gemm_w8a8_sm90_tma(__nv_bfloat16* __restrict__ C, const
     const int ksteps = ((int)k + PGM90_BK8 - 1) / PGM90_BK8;
 
     int ist = 0;
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+    int issue_tile = (int)slice, issue_ks = 0, issue_tm = 0, issue_tn = 0;
+    auto issue = [&]() {
+#else
     auto issue = [&](int tile, int ks) {
+#endif
         const int s = ist % NS;
         if (ist >= NS) sm90_mbar_wait(bempty + s, ((ist / NS) + 1) & 1);
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+        if (issue_ks == 0)
+            sm90_tile_remap(issue_tile, tiles_m, tiles_n, &issue_tm, &issue_tn);
+        const int ks = issue_ks;
+        const int tm = issue_tm * PGM90_BM;
+        const int tn = issue_tn * PGM90_BN;
+#else
         int tmi, tni;
         sm90_tile_remap(tile, tiles_m, tiles_n, &tmi, &tni);
         const int tm = tmi * PGM90_BM;
         const int tn = tni * PGM90_BN;
+#endif
         sm90_mbar_expect(bfull + s, PGM90_TMA_TXB);
         const uint32_t bar = sm90_su32(bfull + s);
         sm90_tma2d(sm90_su32(As + s * PGM90_A8BUF), mapA, ks * PGM90_BK8, (int)a_row0 + tm, bar);
         sm90_tma2d(sm90_su32(Bs + s * PGM90_B8BUF), mapB, ks * PGM90_BK8, tn, bar);
         ist++;
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+        if (++issue_ks == ksteps) {
+            issue_ks = 0;
+            issue_tile += (int)nblk;
+        }
+#endif
     };
+#if !PGM90_FP8_TMA_ISSUE_CURSOR
     auto stage_at = [&](int i, int& tile, int& ks) {
         tile = (int)slice + (i / ksteps) * (int)nblk;
         ks = i % ksteps;
     };
+#endif
     const int total = ((ntiles - (int)slice) + (int)nblk - 1) / (int)nblk * ksteps;
     if (tid == 0) {
         for (int i = 0; i < NS - 1 && i < total; i++) {
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+            issue();
+#else
             int tl, ks;
             stage_at(i, tl, ks);
             issue(tl, ks);
+#endif
         }
     }
 
@@ -693,9 +722,13 @@ static __device__ void d_gemm_w8a8_sm90_tma(__nv_bfloat16* __restrict__ C, const
             if (prev >= 0 && (tid & 127) == 0) sm90_mbar_arrive(bempty + prev);
             prev = s;
             if (tid == 0 && st + NS - 1 < total) {
+#if PGM90_FP8_TMA_ISSUE_CURSOR
+                issue();
+#else
                 int tl, kk;
                 stage_at(st + NS - 1, tl, kk);
                 issue(tl, kk);
+#endif
             }
         }
         sm90_wg_wait<0>();
@@ -1087,6 +1120,9 @@ static __device__ void d_quant_fp8_ws384(uint8_t* __restrict__ xq, __nv_bfloat16
 #ifndef PGM90_WS384_SMEPI
 #define PGM90_WS384_SMEPI 0
 #endif
+#ifndef PGM90_WS384_ISSUE_CURSOR
+#define PGM90_WS384_ISSUE_CURSOR 0
+#endif
 __device__ __forceinline__ void ws384_wg_bar(int cwg) {
     asm volatile("bar.sync %0, %1;" ::"r"(cwg + 1), "r"(128) : "memory");
 }
@@ -1137,6 +1173,16 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
     if (PROD) {
         if (tid == 0) {
             int ist = 0;
+#if PGM90_WS384_ISSUE_CURSOR
+            for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
+                int tmi, tni;
+                sm90_tile_remap(tile, tiles_m, tiles_n, &tmi, &tni);
+                const int tm = tmi * PGM90_BM;
+                const int tn = tni * PGM90_U256_BN;
+                for (int ks = 0; ks < ksteps; ks++) {
+                const int st = ist % NS;
+                if (ist >= NS) sm90_mbar_wait(bempty + st, ((ist / NS) + 1) & 1);
+#else
             const int total = ((ntiles - (int)slice) + (int)nblk - 1) / (int)nblk * ksteps;
             for (int i = 0; i < total; i++) {
                 const int tile = (int)slice + (i / ksteps) * (int)nblk;
@@ -1147,6 +1193,7 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
                 sm90_tile_remap(tile, tiles_m, tiles_n, &tmi, &tni);
                 const int tm = tmi * PGM90_BM;
                 const int tn = tni * PGM90_U256_BN;
+#endif
                 sm90_mbar_expect(bfull + st, PGM90_U256_TXB);
                 const uint32_t bar = sm90_su32(bfull + st);
                 sm90_tma2d(sm90_su32(As + st * PGM90_A8BUF), mapA, ks * kelem, (int)a_row0 + tm,
@@ -1156,6 +1203,9 @@ static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,
                 sm90_tma2d(sm90_su32(bs + 128 * BKB), mapB, ks * kelem, tn + 128, bar);
                 ist++;
             }
+#if PGM90_WS384_ISSUE_CURSOR
+            }
+#endif
         }
     } else {
         const int cwg = (tid >> 7) - 1; /* consumer warpgroup 0/1 -> m64 slab */
@@ -2248,6 +2298,18 @@ __device__ __forceinline__ void d_gemv_sm90_kpanel(__nv_bfloat16* C,
 #ifndef PLOW_NV_GEMV_M16_PIPE
 #define PLOW_NV_GEMV_M16_PIPE 0
 #endif
+#ifndef PLOW_NV_GEMV_M16_BK128
+#define PLOW_NV_GEMV_M16_BK128 0
+#endif
+#if PLOW_NV_GEMV_M16_BK128 && PLOW_NV_GEMV_M16_PIPE
+#error "M16 BK128 and warp-local PIPE are separate experiments"
+#endif
+#ifndef PLOW_NV_GEMV_M16_ARENA_BYTES
+#define PLOW_NV_GEMV_M16_ARENA_BYTES \
+    (PLOW_NV_GEMV_M16_BK128 ? 21776u : (PLOW_NV_GEMV_M16_PIPE ? 12304u : 11536u))
+#endif
+static_assert(PLOW_NV_GEMV_M16_ARENA_BYTES >=
+    (PLOW_NV_GEMV_M16_BK128 ? 21776u : (PLOW_NV_GEMV_M16_PIPE ? 12304u : 11536u)));
 #if PLOW_NV_GEMV_M16_PIPE
 static __device__ void d_gemv_sm90_m16_pipeline(__nv_bfloat16* C, const __nv_bfloat16* x,
     const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
@@ -2309,13 +2371,22 @@ static __device__ void d_gemv_sm90_m16_pipeline(__nv_bfloat16* C, const __nv_bfl
 }
 #endif
 
-static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
+#if PLOW_NV_GEMV_M16_BK128
+template <unsigned BK>
+static __device__ void d_gemv_sm90_m16_stage(__nv_bfloat16* C,
+#else
+static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C,
+#endif
+    const __nv_bfloat16* x,
     const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
     unsigned nblk, __nv_bfloat16* arena) {
 #if PLOW_NV_GEMV_M16_PIPE
     d_gemv_sm90_m16_pipeline(C, x, W, N, K, slice, nblk, arena);
 #else
-    constexpr unsigned stride = 72;
+#if !PLOW_NV_GEMV_M16_BK128
+    constexpr unsigned BK = 64;
+#endif
+    constexpr unsigned stride = BK + 8;
     auto* a = (__nv_bfloat16*)(((uintptr_t)arena + 15u) & ~(uintptr_t)15u);
     auto* b = a + 16 * stride;
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
@@ -2323,13 +2394,13 @@ static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
     const unsigned first = slice * per, end = min(first + per, N);
     for (unsigned col = first; col < end; col += 64) {
         float acc[4] = {};
-        for (unsigned kb = 0; kb < K; kb += 64) {
-            for (unsigned v = tid; v < 16 * 8; v += 256) {
-                const unsigned row = v / 8, k = v % 8 * 8;
+        for (unsigned kb = 0; kb < K; kb += BK) {
+            for (unsigned v = tid; v < 16 * (BK / 8); v += 256) {
+                const unsigned row = v / (BK / 8), k = v % (BK / 8) * 8;
                 sm90_cp16(a + row * stride + k, x + (size_t)row * K + kb + k, 16);
             }
-            for (unsigned v = tid; v < 64 * 8; v += 256) {
-                const unsigned row = v / 8, k = v % 8 * 8;
+            for (unsigned v = tid; v < 64 * (BK / 8); v += 256) {
+                const unsigned row = v / (BK / 8), k = v % (BK / 8) * 8;
                 const bool valid = col + row < end;
                 const auto* source = valid ? W + (size_t)(col + row) * K + kb + k : W;
                 sm90_cp16(b + row * stride + k, source, valid ? 16 : 0);
@@ -2338,7 +2409,7 @@ static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
             sm90_cp_wait<0>();
             __syncthreads();
 #pragma unroll
-            for (unsigned kk = 0; kk < 64; kk += 16) {
+            for (unsigned kk = 0; kk < BK; kk += 16) {
                 unsigned af[4], bf[2];
                 const unsigned ap = (unsigned)__cvta_generic_to_shared(
                     a + (lane % 16) * stride + kk + (lane / 16) * 8);
@@ -2367,6 +2438,17 @@ static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
     }
 #endif
 }
+#if PLOW_NV_GEMV_M16_BK128
+static __device__ void d_gemv_sm90_m16(__nv_bfloat16* C, const __nv_bfloat16* x,
+    const __nv_bfloat16* W, unsigned N, unsigned K, unsigned slice,
+    unsigned nblk, __nv_bfloat16* arena) {
+    if (!(K % 128u))
+        d_gemv_sm90_m16_stage<128>(C, x, W, N, K, slice, nblk, arena);
+    else
+        d_gemv_sm90_m16_stage<64>(C, x, W, N, K, slice, nblk, arena);
+}
+#endif
+
 #endif
 
 #endif /* PLOW_OP_GEMM_SM90_CUH */

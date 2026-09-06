@@ -145,7 +145,7 @@ impl ServeEngine {
     pub fn decode_rungs(&self) -> Box<[u32]> {
         match self {
             #[cfg(feature = "cuda")]
-            ServeEngine::Cuda(e) => vec![e.batch() as u32].into_boxed_slice(),
+            ServeEngine::Cuda(e) => e.effective_decode_rungs(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.decode_rungs().into(),
             #[cfg(feature = "cpu")]

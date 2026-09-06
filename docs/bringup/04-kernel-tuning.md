@@ -51,6 +51,29 @@ measurement without a passing correctness oracle can be stored (`provisional`)
 but never selected. This single rule decides most of what is tunable today —
 see the coverage table below.
 
+## Campaign-derived experiment funnel
+
+Use the repository's existing harnesses and spend most GPU time at block scope:
+
+1. A standalone production-header probe proves correctness and rejects grossly
+   slow arms. It does not rank close candidates.
+2. A single-block or family-specific truncated-model sweep ranks the broad
+   shape, context, batch, warp, register, and packet-rung grid through the real
+   interpreter.
+3. Only the 2–3 block winners run through whole-model `step_bench`.
+4. Only a numerically gated whole-model winner enters the serving grid.
+
+Before adding a runner, search `runtime/bench/`, `runtime/tests/`, `scripts/`,
+and `perf-data/tools/`. Extend the closest harness when it lacks a required
+field or semantic boundary. Record which harness tier produced each number.
+
+Rank work by measured block impact, not the isolated speedup. Trace a
+representative short- and long-context block, multiply each op's share by the
+candidate's measured improvement, and attack the largest recoverable term.
+When a kernel remains multiple times slower than its library peer, change the
+algorithm, data reuse, tiling, or occupancy before spending runs on small
+instruction-level variants.
+
 ## Step 0 — establish the ceiling before measuring anything
 
 The roofline % is meaningless until the denominator is right.

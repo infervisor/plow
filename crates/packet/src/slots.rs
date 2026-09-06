@@ -118,6 +118,9 @@ fn slot(raw: &'static str) -> Option<Slot> {
 /// comments and checked against them by `table_matches_doc_comments`.
 #[rustfmt::skip]
 const DOC: &[S] = &[
+    S { op: DevOp::ZeroF32, t: &["P"], i: &["M", "N"], f: &[], j: &[] },
+    S { op: DevOp::GemmSplitK, t: &["P", "A", "W"], i: &["M", "N", "K", "S"], f: &[], j: &[] },
+    S { op: DevOp::CastF32Bf16, t: &["C", "P"], i: &["M", "N"], f: &[], j: &[] },
     S { op: DevOp::QwenGdnConv, t: &["out", "x", "weight", "history", "active?"], i: &["C", "W", "B"], f: &[], j: &[] },
     S { op: DevOp::QwenGdnStep, t: &["out", "qkv", "a", "b", "A_log", "dt_bias", "state", "active?"], i: &["HK", "HV", "K", "V", "B", "alog_f32"], f: &["q_scale", "l2_eps"], j: &[] },
     S { op: DevOp::QwenGatedNorm, t: &["out", "core", "z", "gamma", "active?"], i: &["HV", "V", "B"], f: &["eps"], j: &[] },
@@ -223,7 +226,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeCombinePf, t: &["out", "residual?", "shared?", "part"], i: &["H", "k", "T", "t_row0", "det"], f: &[], j: &[] },
     S { op: DevOp::KdaConv, t: &["out", "x", "w", "conv_state"], i: &["T", "conv_dim", "W", "act"], f: &[], j: &[] },
     S { op: DevOp::KdaGate, t: &["g", "beta", "g_raw", "beta_raw", "A_log", "dt_bias"], i: &["T", "H", "D", "gate_mode"], f: &["lower_bound"], j: &[] },
-    S { op: DevOp::GemvMxfp4, t: &["C", "x", "W", "S"], i: &["M", "N", "K"], f: &[], j: &[] },
+    S { op: DevOp::GemvMxfp4, t: &["C", "x", "W", "S", "", "", "", "bias"], i: &["M", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::GemvGluMxfp4, t: &["C", "x", "Wg", "Sg", "Su", "Wu"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::GemmMxfp4, t: &["C", "A", "W", "wscale"], i: &["M", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::KdaStateStep, t: &[], i: &["T", "H", "D", "BV", "flags"], f: &["scale"], j: &[] },

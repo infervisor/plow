@@ -46,6 +46,15 @@ defect, and a row that cannot be filled is a blocker, not a default.
 - **Measurements follow the campaign conventions**: GPU leasing, same-session
   A/B, one lever at a time, honest write-ups (see
   [`docs/bringup/07-perf-campaign.md`](../07-perf-campaign.md)).
+- **Harness selection comes before execution.** Search the existing
+  `runtime/bench/`, `runtime/tests/`, `scripts/`, and `perf-data/tools/`
+  harnesses and name the selected harness in the report. Extend an existing
+  harness when its semantic boundary is incomplete; do not create a
+  campaign-specific runner for a case an existing harness can express.
+- **Spend the sweep budget on blocks.** Use standalone probes to reject broken
+  arms, single-block or truncated-model sweeps to rank the broad grid, and a
+  whole-model step only for the 2–3 finalists. Serving is the promotion gate,
+  not the tuning loop.
 - **Proof obligations are never vacuous.** Stage 2/3 prompts require real
   `rfl`-backed theorems for new rewrite rules; `sorry` fails the gate.
 

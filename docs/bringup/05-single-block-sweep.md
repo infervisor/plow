@@ -71,6 +71,13 @@ PLOW_STEP_TIME=1 ./target/release/examples/step_bench <assets> [slots] [ctx] [st
 covers tier 1 → 3 (both are written against `$VENDOR = nvidia` — read their
 headers and re-point them at `$ISA`/`$GPU` before quoting a number).
 
+For NVIDIA object and packet grids, prefer
+`scripts/tune_decode_sweep.sh --block <layer> --block-run <block_run>` so the
+same driver can promote finalists to whole-model confirmation. Use one block of
+each architecture class in the model: for Gemma this means sliding and full
+attention; for mixed MLA/recurrent models use the smallest span containing each
+mixer. A result from one class does not select the other class.
+
 **Why tier 1 cannot score.** A standalone probe re-runs one kernel on hot inputs;
 its operands and outputs become cache-resident in ways a real forward pass never
 sees, and the ops that would co-schedule against it are absent. Recorded in both
@@ -273,6 +280,19 @@ plowc --emit devblob --block 0 --arch $ISA --gpu "$GPU" --n-cu $NCU \
 writes `sweep.json`. Both phases are timed with the same warmup / median / p95
 treatment; the decode step is held at a fixed context so shapes stay static and
 the step is graph-capturable on `$VENDOR = nvidia`.
+
+Start a broad screen at B=1 and the widest compiled batch, with short, crossover,
+and long contexts. For finalists, cover B=1/4/16 and T=1K/4K/8K/16K/32K, plus
+the points immediately below, at, and above any packet-bucket, KV-ring, tile,
+or sliding-window boundary the candidate changes. Attention split count, warp
+count, and register budget are context- and rung-sensitive; select them in
+compiler-emitted packet metadata keyed by geometry and bucket. Do not turn a
+measured choice into a model-name branch or a runtime environment knob.
+
+Use repeated same-session control/candidate pairs with reversed order. Evict L2
+symmetrically when the production pass would see different layer weights, and
+log SM clock and power beside every timing. A hot repeated single-block weight
+set can otherwise overstate a streaming GEMV gain.
 
 ### MLA family (GLM / Kimi / DeepSeek): truncated-model sweep
 

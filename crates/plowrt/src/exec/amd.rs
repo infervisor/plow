@@ -7597,19 +7597,15 @@ impl AmdEngine {
         // granule itself instead of the 64 MiB-class block the CUDA feasibility
         // review settled on: the finest quantum the hardware can map costs
         // nothing extra here, and finer means less HBM held per slot.
-        // Env first (tests flip PLOW_VMM_BLOCK_MIB mid-process, after the
-        // config snapshot), then `--amd-vmm-block-mib`. 0 = query the device
-        // granularity (2 MiB measured on gfx950 — also the config default).
-        let cfg_mib = crate::config::RuntimeConfig::get().amd.vmm_block_mib as u64;
-        let block_hint =
-            crate::config::RuntimeConfig::env_parse_or::<u64>("PLOW_VMM_BLOCK_MIB", cfg_mib) << 20;
+        // 0 = query the device granularity (2 MiB measured on gfx950).
+        let block_hint = (crate::config::RuntimeConfig::get().amd_vmm_block_mib() as u64) << 20;
         let block_hint = match block_hint {
             0 => VmmOps::granularity(&**be).ok()?,
             b => b,
         };
         match VmmKv::new(Arc::clone(be) as Arc<dyn VmmOps>, geo, block_hint, 0) {
             Ok(mut kv) => {
-                kv.enable_block_pool(crate::memory::vmm::kv_pool_cap_from_env());
+                kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
                 Some(kv)
             }
             Err(e) => {
@@ -11003,7 +10999,7 @@ impl AmdEngine {
             if !program.packed_mla_segmented {
                 return Err(RuntimeError::Device(
                     "packed-prefill MLA consumer is in a mixed segment; re-emit with \
-                     PLOW_SEG_PACKED_PREFILL=1"
+                     PLOW_EMIT_PACKED_PREFILL=1"
                         .into(),
                 ));
             }
@@ -11029,7 +11025,7 @@ impl AmdEngine {
             if !program.packed_kda_segmented || self.k_packed_kda.is_none() {
                 return Err(RuntimeError::Device(
                     "packed-prefill KDA requires pure family segments and \
-                     interp_packed_kda; re-emit with PLOW_SEG_PACKED_PREFILL=1 and build the \
+                     interp_packed_kda; re-emit with PLOW_EMIT_PACKED_PREFILL=1 and build the \
                      optional family objects"
                         .into(),
                 ));

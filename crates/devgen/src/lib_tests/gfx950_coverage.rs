@@ -531,11 +531,17 @@ fn precision_knob_table_matches_the_emitters() {
 /// The instance this whole section exists for, pinned as behaviour rather than as a table row:
 /// `PLOW_MXFP4=1` on a dense model must not hand back a bf16 packet.
 ///
+/// This used to assert a REFUSAL, which was correct while gfx950 had no arm for
+/// `GEMV_MXFP4`/`GEMV_GLU_MXFP4` — emitting then would have produced a packet byte-identical to
+/// the bf16 one and benchmarked it as mxfp4. Both opcodes are in `GFX950_DISPATCHED` now, so the
+/// emit legitimately succeeds and the invariant is checked directly instead: the decode program
+/// has to carry the MXFP4 opcodes.
+///
 /// Emission reads process-global env, so the variable is restored on the way out whether or
 /// not the assert fires — leaving it set would change every blob a later test in this binary
 /// emits. (`tests/golden_blob.rs` runs in a separate process and takes its own `EMIT_LOCK`.)
 #[test]
-fn dense_mxfp4_is_refused_not_silently_bf16() {
+fn dense_mxfp4_is_not_silently_bf16() {
     let dir = std::env::temp_dir().join("devgen_dense_mxfp4_refusal");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -563,20 +569,22 @@ fn dense_mxfp4_is_refused_not_silently_bf16() {
         emit_cfg: None,
         whole_graph_fusions: WholeGraphFusionDecisions::default(),
     };
-    std::env::set_var("PLOW_MXFP4", "1");
+    // The emit now runs to completion instead of refusing immediately, so PLOW_MXFP4 is live for
+    // far longer; without the shared lock a concurrent emitter test in this binary sees it and
+    // emits MXFP4 opcodes its own contract asserts reject.
+    let _env = crate::test_env::env_guard();
+    let _scope = crate::test_env::EnvScope::set(&[("PLOW_MXFP4", "1")]);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(args())));
-    std::env::remove_var("PLOW_MXFP4");
-    let e = r.expect_err(
-        "PLOW_MXFP4=1 emitted a dense packet instead of refusing. That packet is byte-identical \
-             to the bf16 one and will be benchmarked as mxfp4.",
-    );
-    let msg = e
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_default();
+    r.expect("PLOW_MXFP4=1 must emit on a target whose interpreter dispatches the MXFP4 opcodes");
+    // The emitted file is the artifact under test; scan its raw bytes for the MXFP4 opcodes
+    // rather than pulling in plowrt's blob parser (devgen cannot depend on it).
+    let raw = std::fs::read(&out).expect("emitted packet");
+    let mxfp4 = [DevOp::GemvMxfp4 as u16, DevOp::GemvGluMxfp4 as u16]
+        .iter()
+        .any(|op| raw.windows(2).any(|w| u16::from_le_bytes([w[0], w[1]]) == *op));
     assert!(
-        msg.contains("dense_mxfp4_weights"),
-        "the refusal must name the missing capability so the message is actionable; got: {msg}"
+        mxfp4,
+        "PLOW_MXFP4=1 emitted a packet with no MXFP4 opcode. It is byte-identical to the bf16 one \
+         and would be benchmarked as mxfp4."
     );
 }

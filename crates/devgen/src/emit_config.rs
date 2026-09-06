@@ -101,6 +101,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_UNISEG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub uniseg: bool,
 
+    /// Emit the packet ABI for packed cross-request prefill.
+    #[arg(long = "emit-packed-prefill", env = "PLOW_EMIT_PACKED_PREFILL", default_value_t = false, action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+    pub emit_packed_prefill: bool,
+
     /// Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs in their own gfx950 segment.
     /// Default on; `=0` is the rollback to the interpreter-resident pair.
     #[arg(long = "emit-decode-mla-segments", env = "PLOW_SEG_DECODE_MLA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -133,6 +137,13 @@ pub struct EmitConfig {
     /// per-slot stride must not move with `B`.
     #[arg(long = "emit-decode-batch-ladder", env = "PLOW_DECODE_BATCH_LADDER")]
     pub decode_ladder: Option<String>,
+
+    /// Bind prebuilt CUDA objects in the output directory to complete decode programs.
+    #[arg(long = "emit-decode-objects")]
+    pub decode_objects: Option<std::path::PathBuf>,
+
+    #[arg(long = "emit-decode-projection-tuning", default_value_t = false)]
+    pub decode_projection_tuning: bool,
 
     /// Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket
     /// ladder and the runtime PLOW_PF_INTERLEAVE ceiling.
@@ -184,6 +195,10 @@ pub struct EmitConfig {
     /// AMD flash-decode GQA fusion factor on full-attention layers.
     #[arg(long, env = "PLOW_FA_GF_FULL")]
     pub fa_gf_full: Option<u32>,
+
+    /// Experimental full-attention decode GF with batch-aware balanced split counts.
+    #[arg(long, env = "PLOW_ATTENTION_DECODE_BALANCE_GF")]
+    pub attention_decode_balance_gf: Option<u32>,
 
     /// Widen the flash-merge dispatch by this factor (diagnostic; measured no effect).
     #[arg(long, env = "PLOW_FLASH_MERGE_DSPLIT", hide = true)]
@@ -651,14 +666,27 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_QWEN_FP8_PF_ISOLATE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fp8_pf_isolate: bool,
 
+    /// Select the packet-declared native HD256 prefill attention role.
+    #[arg(long, env = "PLOW_ATTENTION_PF_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub attention_pf_role: bool,
+
+    /// Isolate prefill attention while retaining the broad interpreter role.
+    #[arg(long, env = "PLOW_ATTENTION_PF_ISOLATE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub attention_pf_isolate: bool,
+
+    /// Select the isolated BF16 M1 GEMV decode role with 512 threads.
+    #[arg(long, env = "PLOW_GEMV_DECODE_ROLE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub gemv_decode_role: bool,
+
     #[arg(long, env = "PLOW_QWEN_FP8_M1_TMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_fp8_m1_tma: bool,
 
     #[arg(long, env = "PLOW_QWEN_W8A8_PREFILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_w8a8_prefill: bool,
 
-    #[arg(long, env = "PLOW_QWEN_DECODE_LT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub qwen_decode_lt: bool,
+    /// Emit packet segments eligible for the optional runtime cuBLASLt decode route.
+    #[arg(long = "emit-decode-cublaslt", env = "PLOW_EMIT_DECODE_CUBLASLT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_cublaslt: bool,
 
     #[arg(long, env = "PLOW_QWEN_FUSE_AB", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub qwen_fuse_ab: bool,
@@ -762,6 +790,7 @@ impl EmitConfig {
             fp8_kv_full: env_bool("PLOW_FP8_KV_FULL"),
             fp8_head: env_bool("PLOW_FP8_HEAD"),
             uniseg: env_bool("PLOW_UNISEG"),
+            emit_packed_prefill: env_bool("PLOW_EMIT_PACKED_PREFILL"),
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
             // value; direct legacy callers must name the feature explicitly.
             decode_mla_segments: env_bool("PLOW_SEG_DECODE_MLA"),
@@ -779,6 +808,7 @@ impl EmitConfig {
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             hn_split: env_bool("PLOW_HN_SPLIT"),
             fa_gf_full: env_u32("PLOW_FA_GF_FULL"),
+            attention_decode_balance_gf: env_u32("PLOW_ATTENTION_DECODE_BALANCE_GF"),
             flash_merge_dsplit: env_u32("PLOW_FLASH_MERGE_DSPLIT"),
             ns_mul: env_u32("PLOW_NS_MUL"),
             ns_abs: env_u32("PLOW_NS_ABS"),
@@ -895,9 +925,14 @@ impl EmitConfig {
             tma_gemm: env_bool("PLOW_TMA_GEMM"),
             fp8_pf_gemm_role: env_bool("PLOW_FP8_PF_GEMM_ROLE"),
             fp8_pf_isolate: env_bool("PLOW_QWEN_FP8_PF_ISOLATE"),
+            attention_pf_role: env_bool("PLOW_ATTENTION_PF_ROLE"),
+            attention_pf_isolate: env_bool("PLOW_ATTENTION_PF_ISOLATE"),
+            gemv_decode_role: env_bool("PLOW_GEMV_DECODE_ROLE"),
+            decode_objects: None,
+            decode_projection_tuning: false,
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
-            qwen_decode_lt: env_bool("PLOW_QWEN_DECODE_LT"),
+            decode_cublaslt: env_bool("PLOW_EMIT_DECODE_CUBLASLT"),
             qwen_fuse_ab: env_bool("PLOW_QWEN_FUSE_AB"),
             qwen_fuse_mlp: env_bool("PLOW_QWEN_FUSE_MLP"),
             qwen_projection_dag: env_bool("PLOW_QWEN_PROJECTION_DAG"),

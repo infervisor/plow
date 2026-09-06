@@ -1755,6 +1755,12 @@ pub enum DevOp {
     ///
     /// `t0=core t1=Q t2=K t3=V t4=alpha t5=beta t6=state t7=outstate` · `i0=T i1=HK i2=HV i3=K i4=V` · `f0=q_scale`.
     QwenGdnPrefill = 146,
+    /// `t0=P` · `i0=M i1=N`
+    ZeroF32 = 147,
+    /// `t0=P t1=A t2=W` · `i0=M i1=N i2=K i3=S`
+    GemmSplitK = 148,
+    /// `t0=C t1=P` · `i0=M i1=N`
+    CastF32Bf16 = 149,
     /// GPT-OSS MXFP4 MoE, DECODE grouped gate/up + swiglu_oai over FLAT fused-expert tensors (no
     /// host pointer table — the CPU engine rejects those). Expert `e` of `[E][N][K/2]` fp4 rows
     /// (low nibble = even k, the [`DevOp::GemvMxfp4`] layout) is at `W + e*N*K/2`, its E8M0 row
@@ -1769,7 +1775,7 @@ pub enum DevOp {
     /// t4=S_gu(e8m0[E][2I][K/32]) t5=bias_gu?` ·
     /// `i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch` · `f0=alpha f1=limit`.
     /// `bias_gu` is bf16 `[E][2I]`.
-    MoeGluMx = 147,
+    MoeGluMx = 150,
     /// GPT-OSS MXFP4 MoE, DECODE grouped down + gate scale, flat tensors as [`DevOp::MoeGluMx`]:
     /// `part[s][h] = table[s].gate * (dot(W_e[h], fu[s]) + b_e[h])` in f32 (the bias is inside
     /// the gate multiply, so it cannot be folded); a sentinel slot zeroes `part[s]`. The row sum
@@ -1778,7 +1784,7 @@ pub enum DevOp {
     /// `t0=part(f32[B*k][H]) t1=fu(bf16[B*k][I]) t2=table t3=W_d(fp4[E][H][I/2])
     /// t4=S_d(e8m0[E][H][I/32]) t5=bias_d?` · `i0=k i1=H i2=I i3=n_exp i6=n_batch`.
     /// `bias_d` is bf16 `[E][H]`.
-    MoeDownMx = 148,
+    MoeDownMx = 151,
     /// PREFILL twin of [`DevOp::MoeGluMx`]: token-sorted gathered rows from
     /// [`DevOp::MoeRouterTopkPf`] + [`DevOp::MoeAlignPf`] exactly as [`DevOp::MoeGroupGluPf`]
     /// (`meta`: `[0,n_exp)` rowoff, `[n_exp,2n_exp)` cnt, `[2n_exp,3n_exp+1)` tile prefix; pad
@@ -1787,7 +1793,7 @@ pub enum DevOp {
     ///
     /// `t0=fu_g(bf16[rows][I]) t1=xn2(bf16[T][K]) t2=W_gu t3=S_gu t4=meta(i32) t5=row_token(u32)
     /// t6=bias_gu?` · `i0=I i1=K i2=n_exp i3=layout i5=act` · `f0=alpha f1=limit`.
-    MoeGluMxPf = 149,
+    MoeGluMxPf = 152,
     /// PREFILL twin of [`DevOp::MoeDownMx`], slot map after [`DevOp::MoeGroupDownPf`] (the bias
     /// takes the `fu_scale` slot these flat-fp4 ops do not need):
     /// `part[row_partidx[r]][h] = row_gate[r] * (dot(W_e[h], fu_g[r]) + b_e[h])`; pad rows
@@ -1795,7 +1801,7 @@ pub enum DevOp {
     ///
     /// `t0=part(f32[T*k][H]) t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx(u32)
     /// t7=row_gate(f32)` · `i0=H i1=I i2=n_exp`.
-    MoeDownMxPf = 150,
+    MoeDownMxPf = 153,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -1958,6 +1964,9 @@ impl DevOp {
         DevOp::QwenGdnQkvPrep,
         DevOp::QwenGdnGatePrep,
         DevOp::QwenGdnPrefill,
+        DevOp::ZeroF32,
+        DevOp::GemmSplitK,
+        DevOp::CastF32Bf16,
         DevOp::MoeGluMx,
         DevOp::MoeDownMx,
         DevOp::MoeGluMxPf,
@@ -2129,6 +2138,9 @@ impl DevOp {
             DevOp::QwenGdnQkvPrep => "PLOW_DOP_QWEN_GDN_QKV_PREP",
             DevOp::QwenGdnGatePrep => "PLOW_DOP_QWEN_GDN_GATE_PREP",
             DevOp::QwenGdnPrefill => "PLOW_DOP_QWEN_GDN_PREFILL",
+            DevOp::ZeroF32 => "PLOW_DOP_ZERO_F32",
+            DevOp::GemmSplitK => "PLOW_DOP_GEMM_SPLITK",
+            DevOp::CastF32Bf16 => "PLOW_DOP_CAST_F32_BF16",
             DevOp::MoeGluMx => "PLOW_DOP_MOE_GLU_MX",
             DevOp::MoeDownMx => "PLOW_DOP_MOE_DOWN_MX",
             DevOp::MoeGluMxPf => "PLOW_DOP_MOE_GLU_MX_PF",
@@ -2169,8 +2181,10 @@ impl DevOp {
     /// as 121-128 in parallel with the KdaChunk/Mla pair above, which claimed the same
     /// range independently — the collision surfaced only at merge, same as 111 -> 113
     /// above; renumbering the later-merged pair (this one) was the resolution.
-    /// 147 -> 151 for `MoeGluMx = 147` .. `MoeDownMxPf = 150` (GPT-OSS flat MXFP4 MoE).
-    pub const COUNT: u16 = 151;
+    /// 147 -> 150 for `MoeGluMx` .. `MoeDownMxPf` (GPT-OSS flat MXFP4 MoE): main took
+    /// 147-149 for `ZeroF32`/`GemmSplitK`/`CastF32Bf16` while this branch was out, the same
+    /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
+    pub const COUNT: u16 = 154;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
