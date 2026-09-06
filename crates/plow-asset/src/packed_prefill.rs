@@ -91,7 +91,46 @@ impl Manifest {
             originals == live.maps.iter().map(|m| m.handle as u16).collect(),
             "descriptor table coverage",
         )?;
+        need(
+            !p.programs.iter().flat_map(|g| g.insts).any(|d| {
+                matches!(
+                    DevOp::from_u16(d.op),
+                    Some(DevOp::HeadNormRopeFp8 | DevOp::FlashPrefillFp8 | DevOp::FlashDecodeFp8)
+                )
+            }),
+            "FP8 KV is unsupported",
+        )?;
+        need(
+            !p.programs.iter().flat_map(|g| g.insts).any(|d| {
+                matches!(
+                    DevOp::from_u16(d.op),
+                    Some(
+                        DevOp::KdaConv
+                            | DevOp::KdaGate
+                            | DevOp::KdaStateStep
+                            | DevOp::KdaGatedNorm
+                            | DevOp::KdaConv3
+                            | DevOp::KdaStateStepG
+                            | DevOp::KdaConvStateStepG
+                            | DevOp::KdaChunkPrepare
+                            | DevOp::KdaChunkIntra
+                            | DevOp::KdaChunkWu
+                            | DevOp::KdaChunkCarry
+                            | DevOp::KdaDecodeFused
+                            | DevOp::QwenGdnConv
+                            | DevOp::QwenGdnStep
+                            | DevOp::QwenGdnConvPrefill
+                            | DevOp::QwenGdnQkvPrep
+                            | DevOp::QwenGdnGatePrep
+                            | DevOp::QwenGdnPrefill
+                    )
+                )
+            }),
+            "recurrent state is unsupported",
+        )?;
         for (pi, g) in p.programs.iter().enumerate() {
+            let mut flash_sites = 0usize;
+            let mut slot_writers = 0usize;
             if pi < p.prefill_count {
                 need(
                     self.programs[pi] == live_kv::program_digest(g),
@@ -115,6 +154,7 @@ impl Manifest {
                 }
                 let op = DevOp::from_u16(d.op).ok_or("packed opcode")?;
                 if op == DevOp::FlashPrefill {
+                    flash_sites += 1;
                     need(
                         matches!(d.i[6], 256 | 512) && d.i[7] > 0 && d.t[6] == TENSOR_NONE16,
                         "BF16 attention contract",
@@ -196,6 +236,7 @@ impl Manifest {
                 }
                 if op == DevOp::HeadNormRope {
                     need(d.t[6] == TENSOR_NONE16, "existing slot map")?;
+                    slot_writers += usize::from(d.fj[1] != 0);
                 }
                 if op == DevOp::FlashMerge {
                     need(
@@ -203,6 +244,12 @@ impl Manifest {
                         "merge optional operands",
                     )?;
                 }
+            }
+            if pi < p.prefill_count {
+                need(
+                    flash_sites > 0 && slot_writers > 0,
+                    "request-aware attention and KV writer required",
+                )?;
             }
         }
         Ok(())

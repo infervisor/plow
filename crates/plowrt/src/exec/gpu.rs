@@ -2422,6 +2422,12 @@ impl GpuEngine {
             })?;
             blob.with_packet_view(|p| pack.validate(p, live))
                 .map_err(RuntimeError::Rejected)?;
+            let config = RuntimeConfig::get();
+            if config.nv_vmm_prefix() || config.nv.prefix_cache {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill does not support prefix reuse".into(),
+                ));
+            }
         }
         let decode_objects = decode_object::parse(&blob, &raw)?;
         let prepared_contexts = decode_context::prepare(&blob, &raw, assets_dir)?;
@@ -3220,11 +3226,9 @@ impl GpuEngine {
             tm.log_stage("moe_tables", sys_moe, std::time::SystemTime::now(), ms);
         }
 
-        // ---- PX-1 batched-prefill buffers (`--pf-batch` / PLOW_PF_BATCH=1) ----
-        // Allocated BEFORE the tensor table so their pointers ride in it past
-        // the blob's handles (h_slot = len, h_req = len+1). Tiny (≤32 KiB), so
-        // allocation is unconditional on the flag only; the mode itself is
-        // finalized after the prefill object loads (see below).
+        // ---- Cross-request prefill buffers ----
+        // A validated packet manifest owns packet-declared tables. Legacy
+        // packets retain the explicit runtime opt-in and appended tables.
         let t_decode = std::time::Instant::now();
         let decode_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
         let sys_decode = std::time::SystemTime::now();
@@ -3236,13 +3240,13 @@ impl GpuEngine {
             .max()
             .unwrap_or(0);
         let dbatch_blob = blob.decode_prog().map(|g| g.t as usize).unwrap_or(1);
-        let pf_bufs = if pf_batch_env && packed_prefill.is_some() {
-            let p = packed_prefill.as_ref().unwrap();
+        let pf_batch_requested = packed_prefill.is_some() || pf_batch_env;
+        let pf_bufs = if let Some(p) = &packed_prefill {
             Some((
                 DeviceMem::view(devp[p.slot as usize].base, devp[p.slot as usize].len),
                 DeviceMem::view(devp[p.request as usize].base, devp[p.request as usize].len),
             ))
-        } else if pf_batch_env && pf_max_t_blob > 0 {
+        } else if pf_batch_requested && pf_max_t_blob > 0 {
             Some((
                 be.alloc(0, (pf_max_t_blob * 4) as u64)?,
                 be.alloc(0, ((1 + 4 * dbatch_blob) * 4) as u64)?,
@@ -3619,7 +3623,7 @@ impl GpuEngine {
                 grid,
                 profile.tag,
                 segment_roles.as_ref(),
-                pf_batch_env && packed_prefill.is_some(),
+                packed_prefill.is_some(),
             ) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf)) => {
                     tracing::info!(
@@ -3730,8 +3734,7 @@ impl GpuEngine {
                 ));
             }
             let module = DecodeModule::load(&be, &image)?;
-            if pf_batch_env
-                && packed_prefill.is_some()
+            if packed_prefill.is_some()
                 && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)? != Some(1)
             {
                 return Err(RuntimeError::Rejected(
@@ -3809,17 +3812,17 @@ impl GpuEngine {
             None
         };
 
-        // ---- PX-1 batched-prefill mode (finalized once the prefill object is up) ----
-        // Requirements: env flag, prefill loaded, no VMM prefix sharing (its
-        // per-slot attach/publish assumes the serialized per-slot chain), and
-        // at least one FUSED (ns==1, t5=at) bucket to harvest the per-layer
-        // `n.at` handles from. Anything missing → warn + serialized prefill.
+        // ---- Cross-request prefill mode (finalized once the prefill object is up) ----
+        // A validated manifest selects its packet-defined chain without a
+        // runtime knob. The legacy prototype retains its old opt-in/fallback.
         let pf_batch: Option<PfBatch> = match (pf_bufs, pf_handles) {
             (Some((d_slot, d_req)), Some((h_slot, h_req)))
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
                 if packed_prefill.is_some() {
                     if vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
+                        || recurrent.is_some()
+                        || prefill.iter().any(|b| b.fp8_kv)
                         || prefill.iter().any(|b| {
                             b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
                         })
@@ -3884,6 +3887,11 @@ impl GpuEngine {
                         }
                     }
                 }
+            }
+            (Some(_), _) if packed_prefill.is_some() => {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill manifest requires a loaded prefill object and buckets".into(),
+                ));
             }
             (Some(_), _) => {
                 tracing::warn!("PLOW_PF_BATCH=1 ignored: prefill object not loaded");
@@ -5550,10 +5558,9 @@ impl GpuEngine {
         self.sampler.is_some()
     }
 
-    /// Whether PX-1 cross-request batched prefill is active (`PLOW_PF_BATCH=1`
-    /// and every load-time requirement held). The mux then routes ALL prefill
-    /// through [`Self::prefill_batched`] and takes each request's first token
-    /// from a batched decode step of its last prompt token.
+    /// Whether packet-selected or legacy opt-in cross-request prefill is active.
+    /// The mux routes all prefill through [`Self::prefill_batched`] and takes
+    /// each request's first token from a decode step of its last prompt token.
     pub fn pf_batch_enabled(&self) -> bool {
         self.pf_batch.is_some()
     }
@@ -7529,6 +7536,9 @@ mod prefill_patch_tests {
     #[ignore = "GPU Gemma direct-KV block qualification; root-owned launch only"]
     fn packed_segmented_block_matches_serialized() -> Result<()> {
         assert_eq!(std::env::var("TEST_PACKED_PREFILL_GPU").as_deref(), Ok("1"));
+        assert_ne!(std::env::var("PLOW_PF_BATCH").as_deref(), Ok("1"));
+        assert_ne!(std::env::var("PLOW_VMM_PREFIX").as_deref(), Ok("1"));
+        let live_requested = std::env::var("PLOW_VMM_LIVE").as_deref() == Ok("1");
         let assets = std::path::PathBuf::from(std::env::var("TEST_PACKED_PREFILL_ASSETS").unwrap());
         let bytes = std::fs::read(assets.join("model.pkt")).unwrap();
         let blob = DevBlob::parse(&bytes).unwrap();
@@ -7544,6 +7554,10 @@ mod prefill_patch_tests {
         let be = Arc::new(CudaBackend::new(0)?);
         let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint"))?;
         assert!(e.packed_prefill.is_some() && e.pf_batch.is_some() && e.batch >= 16);
+        assert_eq!(
+            e.vmm.as_ref().is_some_and(|v| !v.kv.prefix_reuse()),
+            live_requested
+        );
         assert!(e.prefill.iter().all(|b| b.seg_class.len() > 1));
         let tensor_rows = e.tensor_bytes("act.x").unwrap() as usize / 2 / hidden;
         let input = |slot: usize, row: usize, col: usize| {
@@ -7594,81 +7608,87 @@ mod prefill_patch_tests {
             all
         };
         let lens = [31usize, 63];
-        let slots = [3usize, 15];
         let prompts: Vec<Vec<u32>> = lens.iter().map(|&len| vec![100; len]).collect();
-        let mut reference: Option<Vec<u8>> = None;
-        for arm in 0..3 {
-            e.begin_slot(0, 256).unwrap();
-            stage(&mut e, &[(0, 0, 17)]);
-            e.prefill_slot(0, &vec![100; 17]).unwrap();
-            let idle = kv(&e, &[(0, 17)]);
-            for &slot in &slots {
-                e.begin_slot(slot, 256).unwrap();
-            }
-            let mut got = Vec::new();
-            if arm == 0 {
-                for i in 0..2 {
-                    stage(&mut e, &[(slots[i], 0, lens[i])]);
-                    e.prefill_slot(slots[i], &prompts[i]).unwrap();
-                    got.extend(output(&e, lens[i]));
+        for (slots, idle_slot) in [([0usize, 3], 15usize), ([3, 15], 0)] {
+            let mut reference: Option<Vec<u8>> = None;
+            for arm in 0..3 {
+                e.begin_slot(idle_slot, 256).unwrap();
+                stage(&mut e, &[(idle_slot, 0, 17)]);
+                e.prefill_slot(idle_slot, &vec![100; 17]).unwrap();
+                let idle = kv(&e, &[(idle_slot, 17)]);
+                for &slot in &slots {
+                    e.begin_slot(slot, 256).unwrap();
                 }
-            } else {
-                stage(&mut e, &[(slots[0], 0, lens[0]), (slots[1], 0, lens[1])]);
-                let requests: Vec<_> = (0..2)
-                    .map(|i| PfBatchReq {
-                        slot: slots[i],
-                        prompt: &prompts[i],
-                        c0: 0,
-                        len: lens[i],
-                    })
-                    .collect();
-                e.prefill_batched(&requests).unwrap();
-                got = output(&e, lens.iter().sum());
-                let before = kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]);
-                let duplicate = [
-                    PfBatchReq {
-                        slot: 3,
-                        prompt: &prompts[0],
-                        c0: 31,
-                        len: 1,
-                    },
-                    PfBatchReq {
-                        slot: 3,
-                        prompt: &prompts[0],
-                        c0: 31,
-                        len: 1,
-                    },
-                ];
-                assert!(e.prefill_batched(&duplicate).is_err());
-                assert_eq!(before, kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
-            }
-            assert_eq!(idle, kv(&e, &[(0, 17)]), "request isolation: slot0 idle KV");
-            got.extend(kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
-            for i in 0..2 {
-                let continuation = vec![100; lens[i] + 1];
-                stage(&mut e, &[(slots[i], lens[i], 1)]);
-                e.prefill_slot(slots[i], &continuation).unwrap();
-                got.extend(output(&e, 1));
-            }
-            got.extend(kv(&e, &[(slots[0], lens[0] + 1), (slots[1], lens[1] + 1)]));
-            stage(&mut e, &[(0, 17, 1)]);
-            e.prefill_slot(0, &vec![100; 18]).unwrap();
-            got.extend(output(&e, 1));
-            got.extend(kv(&e, &[(0, 18)]));
-            assert_eq!(e.pos[3], 32);
-            assert_eq!(e.pos[15], 64);
-            if let Some(expected) = &reference {
-                assert_eq!(got.len(), expected.len());
-                assert!(
-                    got.iter().zip(expected).all(|(a, b)| a == b),
-                    "arm {arm}: first differing byte {:?}",
-                    got.iter().zip(expected).position(|(a, b)| a != b)
+                let mut got = Vec::new();
+                if arm == 0 {
+                    for i in 0..2 {
+                        stage(&mut e, &[(slots[i], 0, lens[i])]);
+                        e.prefill_slot(slots[i], &prompts[i]).unwrap();
+                        got.extend(output(&e, lens[i]));
+                    }
+                } else {
+                    stage(&mut e, &[(slots[0], 0, lens[0]), (slots[1], 0, lens[1])]);
+                    let requests: Vec<_> = (0..2)
+                        .map(|i| PfBatchReq {
+                            slot: slots[i],
+                            prompt: &prompts[i],
+                            c0: 0,
+                            len: lens[i],
+                        })
+                        .collect();
+                    e.prefill_batched(&requests).unwrap();
+                    got = output(&e, lens.iter().sum());
+                    let before = kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]);
+                    let duplicate_prompt = vec![100; lens[0] + 1];
+                    let duplicate = [
+                        PfBatchReq {
+                            slot: slots[0],
+                            prompt: &duplicate_prompt,
+                            c0: lens[0],
+                            len: 1,
+                        },
+                        PfBatchReq {
+                            slot: slots[0],
+                            prompt: &duplicate_prompt,
+                            c0: lens[0],
+                            len: 1,
+                        },
+                    ];
+                    assert!(e.prefill_batched(&duplicate).is_err());
+                    assert_eq!(before, kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
+                }
+                assert_eq!(
+                    idle,
+                    kv(&e, &[(idle_slot, 17)]),
+                    "request isolation: slot{idle_slot} idle KV"
                 );
-            } else {
-                reference = Some(got);
+                got.extend(kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
+                for i in 0..2 {
+                    let continuation = vec![100; lens[i] + 1];
+                    stage(&mut e, &[(slots[i], lens[i], 1)]);
+                    e.prefill_slot(slots[i], &continuation).unwrap();
+                    got.extend(output(&e, 1));
+                }
+                got.extend(kv(&e, &[(slots[0], lens[0] + 1), (slots[1], lens[1] + 1)]));
+                stage(&mut e, &[(idle_slot, 17, 1)]);
+                e.prefill_slot(idle_slot, &vec![100; 18]).unwrap();
+                got.extend(output(&e, 1));
+                got.extend(kv(&e, &[(idle_slot, 18)]));
+                assert_eq!(e.pos[slots[0]], 32);
+                assert_eq!(e.pos[slots[1]], 64);
+                if let Some(expected) = &reference {
+                    assert_eq!(got.len(), expected.len());
+                    assert!(
+                        got.iter().zip(expected).all(|(a, b)| a == b),
+                        "slots {slots:?} arm {arm}: first differing byte {:?}",
+                        got.iter().zip(expected).position(|(a, b)| a != b)
+                    );
+                } else {
+                    reference = Some(got);
+                }
             }
         }
-        eprintln!("packed segmented block PASS: physical slots3/15,94 real+34 pad rows,2 repeats,KV and continuation exact");
+        eprintln!("packed segmented block PASS: physical slots0/3 and3/15,94 real+34 pad rows,2 repeats,full activations/KV and continuation exact");
         Ok(())
     }
 
