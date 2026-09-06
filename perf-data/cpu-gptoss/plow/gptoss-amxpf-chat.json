@@ -1,0 +1,2514 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8096",
+  "model": "6cee5e81ee83917806bbde320786a8fb61efebee",
+  "server_models": [
+   "6cee5e81ee83917806bbde320786a8fb61efebee"
+  ],
+  "timestamp": "2026-09-06T08:11:28+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8096",
+   "--model",
+   "6cee5e81ee83917806bbde320786a8fb61efebee",
+   "--workload",
+   "chat_short,chat_long",
+   "--concurrency",
+   "1,2,4,8",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee",
+   "--out",
+   "perf-data/cpu-gptoss/plow/gptoss-amxpf-chat.json",
+   "--md",
+   "perf-data/cpu-gptoss/plow/gptoss-amxpf-chat.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "chat_short",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 27.143031436004094,
+    "ttft_s": {
+     "mean": 0.576244143000622,
+     "p50": 0.5745767440021154,
+     "p90": 0.6206308940018062,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.044700956265871124,
+     "p50": 0.04476071522217281,
+     "p90": 0.04504666912694192,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 3.392501688750599,
+     "p50": 3.3954542460051016,
+     "p90": 3.432921414998418,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 32.25,
+     "p50": 33,
+     "p90": 38,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 18.863036769019597,
+    "req_per_s": 0.2947349495159312,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 27.143031436004094,
+     "ttft_s": {
+      "mean": 0.576244143000622,
+      "p50": 0.5745767440021154,
+      "p90": 0.6206308940018062,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.044700956265871124,
+      "p50": 0.04476071522217281,
+      "p90": 0.04504666912694192,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 3.392501688750599,
+      "p50": 3.3954542460051016,
+      "p90": 3.432921414998418,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 32.25,
+      "p50": 33,
+      "p90": 38,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 18.863036769019597,
+     "req_per_s": 0.2947349495159312,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.5485126100029447,
+     "tpot_s": 0.04487120215864187,
+     "latency_s": 3.375494940999488,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 34,
+      "completion_tokens": 64,
+      "total_tokens": 98,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "At the end of summer, the queen\u2019s egg\u2011laying rate drops and the colony\u2019s need fo",
+     "text_chars": 292,
+     "index": 0,
+     "kind": "chat_short",
+     "t_start": 1788682291.5095325,
+     "prompt_tokens_client": 25,
+     "prompt_tokens_server": 34,
+     "prompt_chars": 94,
+     "prompt_tokens": 25
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.5216657080018194,
+     "tpot_s": 0.045614080730177066,
+     "latency_s": 3.3954542460051016,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 31,
+      "completion_tokens": 64,
+      "total_tokens": 95,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Below is a concise comparison of the two most common coffee processing methods\u2014*",
+     "text_chars": 282,
+     "index": 1,
+     "kind": "chat_short",
+     "t_start": 1788682294.8853538,
+     "prompt_tokens_client": 22,
+     "prompt_tokens_server": 31,
+     "prompt_chars": 106,
+     "prompt_tokens": 22
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.594883605997893,
+     "tpot_s": 0.04504666912694192,
+     "latency_s": 3.432921414998418,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 46,
+      "completion_tokens": 64,
+      "total_tokens": 110,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Why grinding coffee makes it go stale faster**\n\nCoffee beans are a solid, but ",
+     "text_chars": 286,
+     "index": 2,
+     "kind": "chat_short",
+     "t_start": 1788682298.2811213,
+     "prompt_tokens_client": 37,
+     "prompt_tokens_server": 46,
+     "prompt_chars": 184,
+     "prompt_tokens": 37
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.543624441997963,
+     "tpot_s": 0.044397758841302086,
+     "latency_s": 3.3407839959982084,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 34,
+      "completion_tokens": 64,
+      "total_tokens": 98,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "They gave each lighthouse a unique light\u2011signature.  \nThe flash pattern (period,",
+     "text_chars": 300,
+     "index": 3,
+     "kind": "chat_short",
+     "t_start": 1788682301.7143855,
+     "prompt_tokens_client": 25,
+     "prompt_tokens_server": 34,
+     "prompt_chars": 121,
+     "prompt_tokens": 25
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.5724749689979944,
+     "tpot_s": 0.04415753131754519,
+     "latency_s": 3.354497070002253,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 35,
+      "completion_tokens": 64,
+      "total_tokens": 99,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\n|  | **Washed (wet\u2011processed)** | **Natural (dry\u2011processed)** ",
+     "text_chars": 216,
+     "index": 4,
+     "kind": "chat_short",
+     "t_start": 1788682305.0555305,
+     "prompt_tokens_client": 26,
+     "prompt_tokens_server": 35,
+     "prompt_chars": 139,
+     "prompt_tokens": 26
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6206308940018062,
+     "tpot_s": 0.04476071522217281,
+     "latency_s": 3.440653833000397,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 47,
+      "completion_tokens": 64,
+      "total_tokens": 111,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A sinking fund is a savings account set aside specifically for a future large ex",
+     "text_chars": 275,
+     "index": 5,
+     "kind": "chat_short",
+     "t_start": 1788682308.4103782,
+     "prompt_tokens_client": 38,
+     "prompt_tokens_server": 47,
+     "prompt_chars": 165,
+     "prompt_tokens": 38
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6335841710024397,
+     "tpot_s": 0.04403070852380812,
+     "latency_s": 3.4076002660003724,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 61,
+      "completion_tokens": 64,
+      "total_tokens": 125,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A strong acetone or nail\u2011polish\u2011remover smell means the starter has produced a l",
+     "text_chars": 269,
+     "index": 6,
+     "kind": "chat_short",
+     "t_start": 1788682311.8514237,
+     "prompt_tokens_client": 52,
+     "prompt_tokens_server": 61,
+     "prompt_chars": 240,
+     "prompt_tokens": 52
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.5745767440021154,
+     "tpot_s": 0.04472898420637995,
+     "latency_s": 3.3926077430005535,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 42,
+      "completion_tokens": 64,
+      "total_tokens": 106,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The four main variables that control coffee extraction are:\n\n1. **Grind size** \u2013",
+     "text_chars": 302,
+     "index": 7,
+     "kind": "chat_short",
+     "t_start": 1788682315.2594173,
+     "prompt_tokens_client": 33,
+     "prompt_tokens_server": 42,
+     "prompt_chars": 159,
+     "prompt_tokens": 33
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 21.57309169600194,
+    "ttft_s": {
+     "mean": 0.8202809486256228,
+     "p50": 0.697604801003763,
+     "p90": 1.2685782909975387,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.07270161163256675,
+     "p50": 0.07487383385714133,
+     "p90": 0.07693971430160759,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 5.345362486500562,
+     "p50": 5.451557754000532,
+     "p90": 5.511319036995701,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 42.375,
+     "p50": 46,
+     "p90": 51,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 63.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 504,
+    "output_tok_per_s": 23.362437201961388,
+    "req_per_s": 0.37083233653906966,
+    "finish_reasons": {
+     "length": 7,
+     "stop": 1
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 21.57309169600194,
+     "ttft_s": {
+      "mean": 0.8202809486256228,
+      "p50": 0.697604801003763,
+      "p90": 1.2685782909975387,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.07270161163256675,
+      "p50": 0.07487383385714133,
+      "p90": 0.07693971430160759,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 5.345362486500562,
+      "p50": 5.451557754000532,
+      "p90": 5.511319036995701,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 42.375,
+      "p50": 46,
+      "p90": 51,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 63.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 504,
+     "output_tok_per_s": 23.362437201961388,
+     "req_per_s": 0.37083233653906966,
+     "finish_reasons": {
+      "length": 7,
+      "stop": 1
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.65640683699894,
+     "tpot_s": 0.07611177101595483,
+     "latency_s": 5.451557754000532,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 55,
+      "completion_tokens": 64,
+      "total_tokens": 119,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**The 50\u202f% rule for fixed costs**\n\n> *\u201cIn a household budget, no more than about",
+     "text_chars": 243,
+     "index": 8,
+     "kind": "chat_short",
+     "t_start": 1788682322.0525944,
+     "prompt_tokens_client": 46,
+     "prompt_tokens_server": 55,
+     "prompt_chars": 200,
+     "prompt_tokens": 46
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.3071701989974827,
+     "tpot_s": 0.06673092595236893,
+     "latency_s": 5.511319036995701,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 55,
+      "completion_tokens": 64,
+      "total_tokens": 119,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**One\u2011sentence answer:**  \nThe printing press made books thinner, lighter, and m",
+     "text_chars": 311,
+     "index": 9,
+     "kind": "chat_short",
+     "t_start": 1788682322.0527408,
+     "prompt_tokens_client": 46,
+     "prompt_tokens_server": 55,
+     "prompt_chars": 215,
+     "prompt_tokens": 46
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.698452062002616,
+     "tpot_s": 0.0835846918412172,
+     "latency_s": 5.964361034995818,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 60,
+      "completion_tokens": 64,
+      "total_tokens": 124,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer:**  \nPay the **credit\u2011card debt first**.  \nIt has the highest int",
+     "text_chars": 269,
+     "index": 10,
+     "kind": "chat_short",
+     "t_start": 1788682327.5045388,
+     "prompt_tokens_client": 51,
+     "prompt_tokens_server": 60,
+     "prompt_chars": 206,
+     "prompt_tokens": 51
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.2685782909975387,
+     "tpot_s": 0.06320093472723701,
+     "latency_s": 4.8086523649981245,
+     "output_tokens": 56,
+     "content_chunks": 55,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 45,
+      "completion_tokens": 56,
+      "total_tokens": 101,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The Moon is slowly moving away from Earth because tidal forces between the two b",
+     "text_chars": 259,
+     "index": 11,
+     "kind": "chat_short",
+     "t_start": 1788682327.5644193,
+     "prompt_tokens_client": 36,
+     "prompt_tokens_server": 45,
+     "prompt_chars": 156,
+     "prompt_tokens": 36
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.697604801003763,
+     "tpot_s": 0.07487383385714133,
+     "latency_s": 5.414719839005556,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 63,
+      "completion_tokens": 64,
+      "total_tokens": 127,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\nA sourdough starter that smells like nail\u2011polish remover (acet",
+     "text_chars": 267,
+     "index": 12,
+     "kind": "chat_short",
+     "t_start": 1788682332.3734035,
+     "prompt_tokens_client": 54,
+     "prompt_tokens_server": 63,
+     "prompt_chars": 249,
+     "prompt_tokens": 54
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6537288749968866,
+     "tpot_s": 0.07468252566664772,
+     "latency_s": 5.3588397089988575,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 44,
+      "completion_tokens": 64,
+      "total_tokens": 108,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Fresnel\u2019s lens allowed a lighthouse to focus the light into a narrow, powerful b",
+     "text_chars": 305,
+     "index": 13,
+     "kind": "chat_short",
+     "t_start": 1788682333.4692588,
+     "prompt_tokens_client": 35,
+     "prompt_tokens_server": 44,
+     "prompt_chars": 160,
+     "prompt_tokens": 35
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6095298100044602,
+     "tpot_s": 0.07693971430160759,
+     "latency_s": 5.45680452700617,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 41,
+      "completion_tokens": 64,
+      "total_tokens": 105,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Because the first steam engines were built to solve a very specific problem: pum",
+     "text_chars": 326,
+     "index": 14,
+     "kind": "chat_short",
+     "t_start": 1788682337.788502,
+     "prompt_tokens_client": 32,
+     "prompt_tokens_server": 41,
+     "prompt_chars": 144,
+     "prompt_tokens": 32
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6707767140032956,
+     "tpot_s": 0.06548849569835943,
+     "latency_s": 4.796645626003738,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 48,
+      "completion_tokens": 64,
+      "total_tokens": 112,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**The \u201cwindowpane test\u201d** is a simple visual test that bakers use to determine w",
+     "text_chars": 294,
+     "index": 15,
+     "kind": "chat_short",
+     "t_start": 1788682338.8284967,
+     "prompt_tokens_client": 39,
+     "prompt_tokens_server": 48,
+     "prompt_chars": 170,
+     "prompt_tokens": 39
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 17.89703699700476,
+    "ttft_s": {
+     "mean": 1.357610920501429,
+     "p50": 1.2717803790001199,
+     "p90": 1.8859664179981337,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.11934751831351663,
+     "p50": 0.12110789225398404,
+     "p90": 0.1288763425396783,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 8.876599517751856,
+     "p50": 8.914632375999645,
+     "p90": 9.515829910997127,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 38.5,
+     "p50": 41,
+     "p90": 47,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 28.608087477591294,
+    "req_per_s": 0.44700136683736397,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 17.89703699700476,
+     "ttft_s": {
+      "mean": 1.357610920501429,
+      "p50": 1.2717803790001199,
+      "p90": 1.8859664179981337,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.11934751831351663,
+      "p50": 0.12110789225398404,
+      "p90": 0.1288763425396783,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 8.876599517751856,
+      "p50": 8.914632375999645,
+      "p90": 9.515829910997127,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 38.5,
+      "p50": 41,
+      "p90": 47,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 28.608087477591294,
+     "req_per_s": 0.44700136683736397,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.5734284900026978,
+     "tpot_s": 0.1288763425396783,
+     "latency_s": 8.692745113003184,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 41,
+      "completion_tokens": 64,
+      "total_tokens": 105,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Propolis** is a resin\u2011like substance that bees collect from tree buds, sap, an",
+     "text_chars": 266,
+     "index": 16,
+     "kind": "chat_short",
+     "t_start": 1788682347.2905707,
+     "prompt_tokens_client": 32,
+     "prompt_tokens_server": 41,
+     "prompt_chars": 133,
+     "prompt_tokens": 32
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.2373145620003925,
+     "tpot_s": 0.11988916980956833,
+     "latency_s": 8.790447336003126,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 50,
+      "completion_tokens": 64,
+      "total_tokens": 114,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Trevithick\u2019s 1804 locomotive was the first heavy steam engine to run on ordinary",
+     "text_chars": 298,
+     "index": 17,
+     "kind": "chat_short",
+     "t_start": 1788682347.2907162,
+     "prompt_tokens_client": 41,
+     "prompt_tokens_server": 50,
+     "prompt_chars": 181,
+     "prompt_tokens": 41
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.6041359180017025,
+     "tpot_s": 0.11984121512703871,
+     "latency_s": 10.154200337005022,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 51,
+      "completion_tokens": 64,
+      "total_tokens": 115,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The Moon is slowly moving away from the Earth because the tidal forces that the ",
+     "text_chars": 302,
+     "index": 18,
+     "kind": "chat_short",
+     "t_start": 1788682347.291964,
+     "prompt_tokens_client": 42,
+     "prompt_tokens_server": 51,
+     "prompt_chars": 210,
+     "prompt_tokens": 42
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8859664179981337,
+     "tpot_s": 0.12110789225398404,
+     "latency_s": 9.515829910997127,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 47,
+      "completion_tokens": 64,
+      "total_tokens": 111,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Propolis** is a sticky, resin\u2011like substance that bees collect from trees, shr",
+     "text_chars": 255,
+     "index": 19,
+     "kind": "chat_short",
+     "t_start": 1788682347.2921078,
+     "prompt_tokens_client": 38,
+     "prompt_tokens_server": 47,
+     "prompt_chars": 173,
+     "prompt_tokens": 38
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7302974240010371,
+     "tpot_s": 0.12998533714285476,
+     "latency_s": 8.91947393999726,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 56,
+      "completion_tokens": 64,
+      "total_tokens": 120,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**The 50% rule for fixed costs**  \nIn a household budget, the \u201c50% rule\u201d says th",
+     "text_chars": 243,
+     "index": 20,
+     "kind": "chat_short",
+     "t_start": 1788682355.983704,
+     "prompt_tokens_client": 47,
+     "prompt_tokens_server": 56,
+     "prompt_chars": 199,
+     "prompt_tokens": 47
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.2684942670020973,
+     "tpot_s": 0.12136544317463487,
+     "latency_s": 8.914632375999645,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 37,
+      "completion_tokens": 64,
+      "total_tokens": 101,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**The four main variables that control coffee extraction are:**\n\n| Variable | Wh",
+     "text_chars": 304,
+     "index": 21,
+     "kind": "chat_short",
+     "t_start": 1788682356.0815008,
+     "prompt_tokens_client": 28,
+     "prompt_tokens_server": 37,
+     "prompt_chars": 146,
+     "prompt_tokens": 28
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.2717803790001199,
+     "tpot_s": 0.1113180831270588,
+     "latency_s": 8.284884917004092,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 58,
+      "completion_tokens": 64,
+      "total_tokens": 122,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\n- **Baking soda** is pure sodium bicarbonate.  \n- **Baking pow",
+     "text_chars": 263,
+     "index": 22,
+     "kind": "chat_short",
+     "t_start": 1788682356.8082638,
+     "prompt_tokens_client": 49,
+     "prompt_tokens_server": 58,
+     "prompt_chars": 250,
+     "prompt_tokens": 49
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.2894699060052517,
+     "tpot_s": 0.1023966633333152,
+     "latency_s": 7.740582212005393,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 40,
+      "completion_tokens": 64,
+      "total_tokens": 104,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Answer**\n\nThe little plastic valve on a coffee bag is a *one\u2011way vent* that le",
+     "text_chars": 268,
+     "index": 23,
+     "kind": "chat_short",
+     "t_start": 1788682357.4465404,
+     "prompt_tokens_client": 31,
+     "prompt_tokens_server": 40,
+     "prompt_chars": 152,
+     "prompt_tokens": 31
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 16.105163350999646,
+    "ttft_s": {
+     "mean": 2.8804431736243714,
+     "p50": 3.127572095996584,
+     "p90": 4.6613265209962265,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.20043425009719482,
+     "p50": 0.20538127233331102,
+     "p90": 0.2213160463332546,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 15.507912276748357,
+     "p50": 15.578622666995216,
+     "p90": 15.944651245998102,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 34.25,
+     "p50": 34,
+     "p90": 38,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 31.791046687410358,
+    "req_per_s": 0.49673510449078684,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 16.105163350999646,
+     "ttft_s": {
+      "mean": 2.8804431736243714,
+      "p50": 3.127572095996584,
+      "p90": 4.6613265209962265,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.20043425009719482,
+      "p50": 0.20538127233331102,
+      "p90": 0.2213160463332546,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 15.507912276748357,
+      "p50": 15.578622666995216,
+      "p90": 15.944651245998102,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 34.25,
+      "p50": 34,
+      "p90": 38,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 31.791046687410358,
+     "req_per_s": 0.49673510449078684,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.5573152419965481,
+     "tpot_s": 0.22820726198413122,
+     "latency_s": 14.934485999998287,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 42,
+      "completion_tokens": 64,
+      "total_tokens": 106,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\nBecause the railway timetable had to be the same everywhere.  ",
+     "text_chars": 253,
+     "index": 24,
+     "kind": "chat_short",
+     "t_start": 1788682368.6666772,
+     "prompt_tokens_client": 33,
+     "prompt_tokens_server": 42,
+     "prompt_chars": 169,
+     "prompt_tokens": 33
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.1503351310020662,
+     "tpot_s": 0.2213160463332546,
+     "latency_s": 15.09336345599877,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 35,
+      "completion_tokens": 64,
+      "total_tokens": 99,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "At the end of summer the queen\u2019s egg\u2011laying rate drops and the colony\u2019s food sto",
+     "text_chars": 290,
+     "index": 25,
+     "kind": "chat_short",
+     "t_start": 1788682368.6668127,
+     "prompt_tokens_client": 26,
+     "prompt_tokens_server": 35,
+     "prompt_chars": 115,
+     "prompt_tokens": 26
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.7802116489983746,
+     "tpot_s": 0.21383426936506386,
+     "latency_s": 15.251893022999866,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 43,
+      "completion_tokens": 64,
+      "total_tokens": 107,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Propolis is a resinous mixture bees collect from tree buds and other plant sou",
+     "text_chars": 306,
+     "index": 26,
+     "kind": "chat_short",
+     "t_start": 1788682368.667243,
+     "prompt_tokens_client": 34,
+     "prompt_tokens_server": 43,
+     "prompt_chars": 146,
+     "prompt_tokens": 34
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.417486035003094,
+     "tpot_s": 0.16962149773012025,
+     "latency_s": 16.10375201200077,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 47,
+      "completion_tokens": 64,
+      "total_tokens": 111,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Fog signals in lighthouses are usually large, high\u2011pressure steam or diesel\u2011burn",
+     "text_chars": 299,
+     "index": 27,
+     "kind": "chat_short",
+     "t_start": 1788682368.667567,
+     "prompt_tokens_client": 38,
+     "prompt_tokens_server": 47,
+     "prompt_chars": 173,
+     "prompt_tokens": 38
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.127572095996584,
+     "tpot_s": 0.19763415836507828,
+     "latency_s": 15.578622666995216,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 43,
+      "completion_tokens": 64,
+      "total_tokens": 107,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\nThe first practical steam engines were built for mines because",
+     "text_chars": 316,
+     "index": 28,
+     "kind": "chat_short",
+     "t_start": 1788682368.6676457,
+     "prompt_tokens_client": 34,
+     "prompt_tokens_server": 43,
+     "prompt_chars": 184,
+     "prompt_tokens": 34
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.6613265209962265,
+     "tpot_s": 0.17909866738092017,
+     "latency_s": 15.944651245998102,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 53,
+      "completion_tokens": 64,
+      "total_tokens": 117,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "## 1.  What is a \u201csinking fund\u201d?\n\n| **Term** | **What it means** | **Why it matt",
+     "text_chars": 243,
+     "index": 29,
+     "kind": "chat_short",
+     "t_start": 1788682368.6676984,
+     "prompt_tokens_client": 44,
+     "prompt_tokens_server": 53,
+     "prompt_chars": 199,
+     "prompt_tokens": 44
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.876290487998631,
+     "tpot_s": 0.1883808272856792,
+     "latency_s": 15.744394743996963,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 41,
+      "completion_tokens": 64,
+      "total_tokens": 105,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Propolis is a resinous mixture bees collect from tree buds and other plant sou",
+     "text_chars": 311,
+     "index": 30,
+     "kind": "chat_short",
+     "t_start": 1788682368.6677501,
+     "prompt_tokens_client": 32,
+     "prompt_tokens_server": 41,
+     "prompt_chars": 153,
+     "prompt_tokens": 32
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.4730082270034472,
+     "tpot_s": 0.20538127233331102,
+     "latency_s": 15.412135065998882,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 42,
+      "completion_tokens": 64,
+      "total_tokens": 106,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\nBecause grinding increases the surface area of the coffee that",
+     "text_chars": 328,
+     "index": 31,
+     "kind": "chat_short",
+     "t_start": 1788682368.6680124,
+     "prompt_tokens_client": 33,
+     "prompt_tokens_server": 42,
+     "prompt_chars": 151,
+     "prompt_tokens": 33
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 37.38097337799991,
+    "ttft_s": {
+     "mean": 2.035298721372783,
+     "p50": 2.2760481189980055,
+     "p90": 2.611903249999159,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.04542446986899591,
+     "p50": 0.04562128149203971,
+     "p90": 0.045887195047624924,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 4.671381959748942,
+     "p50": 4.741675101002329,
+     "p90": 5.502819625995471,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 391.875,
+     "p50": 464,
+     "p90": 506,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 58.625,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 469,
+    "output_tok_per_s": 12.546489767867413,
+    "req_per_s": 0.21401261864166163,
+    "finish_reasons": {
+     "length": 6,
+     "stop": 2
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 37.38097337799991,
+     "ttft_s": {
+      "mean": 2.035298721372783,
+      "p50": 2.2760481189980055,
+      "p90": 2.611903249999159,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.04542446986899591,
+      "p50": 0.04562128149203971,
+      "p90": 0.045887195047624924,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 4.671381959748942,
+      "p50": 4.741675101002329,
+      "p90": 5.502819625995471,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 391.875,
+      "p50": 464,
+      "p90": 506,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 58.625,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 469,
+     "output_tok_per_s": 12.546489767867413,
+     "req_per_s": 0.21401261864166163,
+     "finish_reasons": {
+      "length": 6,
+      "stop": 2
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.611903249999159,
+     "tpot_s": 0.04588604868250615,
+     "latency_s": 5.502819625995471,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 515,
+      "completion_tokens": 64,
+      "total_tokens": 579,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Where to keep it:**  \nA separate savings account that takes a day to transfer ",
+     "text_chars": 308,
+     "index": 0,
+     "kind": "chat_long",
+     "t_start": 1788682389.2662106,
+     "prompt_tokens_client": 506,
+     "prompt_tokens_server": 515,
+     "prompt_chars": 2651,
+     "prompt_tokens": 506
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8984265789986239,
+     "tpot_s": 0.04512952888889852,
+     "latency_s": 4.741675101002329,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 392,
+      "completion_tokens": 64,
+      "total_tokens": 456,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Answer**  \nAn escapement is a mechanical device that controls the release of e",
+     "text_chars": 327,
+     "index": 1,
+     "kind": "chat_long",
+     "t_start": 1788682394.7705812,
+     "prompt_tokens_client": 383,
+     "prompt_tokens_server": 392,
+     "prompt_chars": 1824,
+     "prompt_tokens": 383
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.3466365470012533,
+     "tpot_s": 0.04544335744440249,
+     "latency_s": 4.20965473799879,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 236,
+      "completion_tokens": 64,
+      "total_tokens": 300,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Below is a practical, step\u2011by\u2011step plan for the next two months (March\u2011May) that",
+     "text_chars": 263,
+     "index": 2,
+     "kind": "chat_long",
+     "t_start": 1788682399.513368,
+     "prompt_tokens_client": 227,
+     "prompt_tokens_server": 236,
+     "prompt_chars": 1035,
+     "prompt_tokens": 227
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.2760481189980055,
+     "tpot_s": 0.04540566280711414,
+     "latency_s": 4.90611065000121,
+     "output_tokens": 58,
+     "content_chunks": 57,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 473,
+      "completion_tokens": 58,
+      "total_tokens": 531,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage does not explain the detailed mechanism by which a swarm decides whe",
+     "text_chars": 299,
+     "index": 3,
+     "kind": "chat_long",
+     "t_start": 1788682403.7238946,
+     "prompt_tokens_client": 464,
+     "prompt_tokens_server": 473,
+     "prompt_chars": 2273,
+     "prompt_tokens": 464
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.4391938439948717,
+     "tpot_s": 0.043740631192542005,
+     "latency_s": 3.619524729998375,
+     "output_tokens": 27,
+     "content_chunks": 26,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 491,
+      "completion_tokens": 27,
+      "total_tokens": 518,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage does not mention a tide at all, so the tide had no effect on the tra",
+     "text_chars": 116,
+     "index": 4,
+     "kind": "chat_long",
+     "t_start": 1788682408.631478,
+     "prompt_tokens_client": 482,
+     "prompt_tokens_server": 491,
+     "prompt_chars": 2148,
+     "prompt_tokens": 482
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.3647707289928803,
+     "tpot_s": 0.04628205339683937,
+     "latency_s": 4.280637411997304,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 244,
+      "completion_tokens": 64,
+      "total_tokens": 308,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\n* The flat taste is almost certainly the result of the coffee ",
+     "text_chars": 285,
+     "index": 5,
+     "kind": "chat_long",
+     "t_start": 1788682412.2523413,
+     "prompt_tokens_client": 235,
+     "prompt_tokens_server": 244,
+     "prompt_chars": 1105,
+     "prompt_tokens": 235
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.9713315699991654,
+     "tpot_s": 0.045887195047624924,
+     "latency_s": 5.862317350001831,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 611,
+      "completion_tokens": 64,
+      "total_tokens": 675,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Spring tides** are the high\u2011and\u2011low tides that occur when the Sun, Moon and Ea",
+     "text_chars": 266,
+     "index": 6,
+     "kind": "chat_long",
+     "t_start": 1788682416.5337718,
+     "prompt_tokens_client": 602,
+     "prompt_tokens_server": 611,
+     "prompt_chars": 2855,
+     "prompt_tokens": 602
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.374079132998304,
+     "tpot_s": 0.04562128149203971,
+     "latency_s": 4.248316070996225,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 245,
+      "completion_tokens": 64,
+      "total_tokens": 309,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Why \u201cfreshness\u201d is the secret ingredient**\n\nThink of coffee the way you think ",
+     "text_chars": 290,
+     "index": 7,
+     "kind": "chat_long",
+     "t_start": 1788682422.3977833,
+     "prompt_tokens_client": 236,
+     "prompt_tokens_server": 245,
+     "prompt_chars": 1085,
+     "prompt_tokens": 236
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 33.86233028400602,
+    "ttft_s": {
+     "mean": 2.954473794625301,
+     "p50": 3.2929815530005726,
+     "p90": 4.41465262100246,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.08859128478046696,
+     "p50": 0.10098656526991233,
+     "p90": 0.11749404306349803,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 8.344720539625996,
+     "p50": 8.712020020000637,
+     "p90": 8.91917576999549,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 439.25,
+     "p50": 473,
+     "p90": 596,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 60.875,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 487,
+    "output_tok_per_s": 14.381762740942303,
+    "req_per_s": 0.23625072264381608,
+    "finish_reasons": {
+     "length": 6,
+     "stop": 2
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 33.86233028400602,
+     "ttft_s": {
+      "mean": 2.954473794625301,
+      "p50": 3.2929815530005726,
+      "p90": 4.41465262100246,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.08859128478046696,
+      "p50": 0.10098656526991233,
+      "p90": 0.11749404306349803,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 8.344720539625996,
+      "p50": 8.712020020000637,
+      "p90": 8.91917576999549,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 439.25,
+      "p50": 473,
+      "p90": 596,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 60.875,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 487,
+     "output_tok_per_s": 14.381762740942303,
+     "req_per_s": 0.23625072264381608,
+     "finish_reasons": {
+      "length": 6,
+      "stop": 2
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.349757566997141,
+     "tpot_s": 0.10098656526991233,
+     "latency_s": 8.712020020000637,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 510,
+      "completion_tokens": 64,
+      "total_tokens": 574,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Answer**\n\nSpring tides are the high\u2011and\u2011low tides that occur when the Sun, Moo",
+     "text_chars": 289,
+     "index": 8,
+     "kind": "chat_long",
+     "t_start": 1788682431.023246,
+     "prompt_tokens_client": 501,
+     "prompt_tokens_server": 510,
+     "prompt_chars": 2383,
+     "prompt_tokens": 501
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.648704049999651,
+     "tpot_s": 0.06546569833338413,
+     "latency_s": 8.773128751003242,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 482,
+      "completion_tokens": 64,
+      "total_tokens": 546,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A halo is a bright ring that appears around the sun or moon, usually about 22\u00b0 i",
+     "text_chars": 278,
+     "index": 9,
+     "kind": "chat_long",
+     "t_start": 1788682431.0234213,
+     "prompt_tokens_client": 473,
+     "prompt_tokens_server": 482,
+     "prompt_chars": 2229,
+     "prompt_tokens": 473
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4341788759993506,
+     "tpot_s": 0.11273006090466099,
+     "latency_s": 8.536276770995755,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 245,
+      "completion_tokens": 64,
+      "total_tokens": 309,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Why \u201cfreshness\u201d is the secret ingredient**\n\nThink of coffee the way you think ",
+     "text_chars": 290,
+     "index": 10,
+     "kind": "chat_long",
+     "t_start": 1788682439.7367992,
+     "prompt_tokens_client": 236,
+     "prompt_tokens_server": 245,
+     "prompt_chars": 1085,
+     "prompt_tokens": 236
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.41465262100246,
+     "tpot_s": 0.06552894773019019,
+     "latency_s": 8.543068459999631,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 605,
+      "completion_tokens": 64,
+      "total_tokens": 669,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Till** and an **esker** are both things that glaciers leave behind, but they\u2019r",
+     "text_chars": 261,
+     "index": 11,
+     "kind": "chat_long",
+     "t_start": 1788682439.797963,
+     "prompt_tokens_client": 596,
+     "prompt_tokens_server": 605,
+     "prompt_chars": 2868,
+     "prompt_tokens": 596
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.0101227150007617,
+     "tpot_s": 0.12091813639690083,
+     "latency_s": 9.628071708000789,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 387,
+      "completion_tokens": 64,
+      "total_tokens": 451,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Why we can\u2019t just \u201csolve\u201d the tide from physics**\n\nIf the Earth were a perfect",
+     "text_chars": 298,
+     "index": 12,
+     "kind": "chat_long",
+     "t_start": 1788682448.273859,
+     "prompt_tokens_client": 378,
+     "prompt_tokens_server": 387,
+     "prompt_chars": 1783,
+     "prompt_tokens": 378
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.968408567001461,
+     "tpot_s": 0.0658728942500602,
+     "latency_s": 6.665399134006293,
+     "output_tokens": 41,
+     "content_chunks": 40,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 404,
+      "completion_tokens": 41,
+      "total_tokens": 445,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage does not explain why there are two high tides a day; it only describ",
+     "text_chars": 190,
+     "index": 13,
+     "kind": "chat_long",
+     "t_start": 1788682448.3427064,
+     "prompt_tokens_client": 395,
+     "prompt_tokens_server": 404,
+     "prompt_chars": 1868,
+     "prompt_tokens": 395
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.516984408001008,
+     "tpot_s": 0.11749404306349803,
+     "latency_s": 8.91917576999549,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 272,
+      "completion_tokens": 64,
+      "total_tokens": 336,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Below is a \u201cshopping list\u201d of the kinds of records, photographs, and oral\u2011histor",
+     "text_chars": 294,
+     "index": 14,
+     "kind": "chat_long",
+     "t_start": 1788682455.0092702,
+     "prompt_tokens_client": 263,
+     "prompt_tokens_server": 272,
+     "prompt_chars": 1157,
+     "prompt_tokens": 263
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.2929815530005726,
+     "tpot_s": 0.05973393229512902,
+     "latency_s": 6.980623703006131,
+     "output_tokens": 62,
+     "content_chunks": 61,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 681,
+      "completion_tokens": 62,
+      "total_tokens": 743,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Answer**\n\nA halo around the sun or moon indicates that a warm front is approac",
+     "text_chars": 261,
+     "index": 15,
+     "kind": "chat_long",
+     "t_start": 1788682457.9031706,
+     "prompt_tokens_client": 672,
+     "prompt_tokens_server": 681,
+     "prompt_chars": 3159,
+     "prompt_tokens": 672
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 27.794402658000763,
+    "ttft_s": {
+     "mean": 4.001161431124274,
+     "p50": 3.9799217770050745,
+     "p90": 5.247659863998706,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.15591816189283683,
+     "p50": 0.16229902693642848,
+     "p90": 0.1755554748094818,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 13.824109746248723,
+     "p50": 14.552676048995636,
+     "p90": 15.372766982996836,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 344.125,
+     "p50": 357,
+     "p90": 467,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 18.420975125817936,
+    "req_per_s": 0.28782773634090525,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 27.794402658000763,
+     "ttft_s": {
+      "mean": 4.001161431124274,
+      "p50": 3.9799217770050745,
+      "p90": 5.247659863998706,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.15591816189283683,
+      "p50": 0.16229902693642848,
+      "p90": 0.1755554748094818,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 13.824109746248723,
+      "p50": 14.552676048995636,
+      "p90": 15.372766982996836,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 344.125,
+      "p50": 357,
+      "p90": 467,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 18.420975125817936,
+     "req_per_s": 0.28782773634090525,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.718877341001644,
+     "tpot_s": 0.16229902693642848,
+     "latency_s": 16.943781697002123,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 245,
+      "completion_tokens": 64,
+      "total_tokens": 309,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\nThe coffee is getting stale because the beans are sitting in t",
+     "text_chars": 282,
+     "index": 16,
+     "kind": "chat_long",
+     "t_start": 1788682469.3421245,
+     "prompt_tokens_client": 236,
+     "prompt_tokens_server": 245,
+     "prompt_chars": 1085,
+     "prompt_tokens": 236
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8827702249982394,
+     "tpot_s": 0.1755554748094818,
+     "latency_s": 12.9428779689988,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 366,
+      "completion_tokens": 64,
+      "total_tokens": 430,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Winter bees vs. summer bees \u2013 the big difference is what they\u2019re built for.**\n",
+     "text_chars": 292,
+     "index": 17,
+     "kind": "chat_long",
+     "t_start": 1788682469.3422928,
+     "prompt_tokens_client": 357,
+     "prompt_tokens_server": 366,
+     "prompt_chars": 1737,
+     "prompt_tokens": 357
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.247659863998706,
+     "tpot_s": 0.16071495036504485,
+     "latency_s": 15.372766982996836,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 244,
+      "completion_tokens": 64,
+      "total_tokens": 308,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\n* The quiet hive is almost certainly **dead**.  \n* A living co",
+     "text_chars": 253,
+     "index": 18,
+     "kind": "chat_long",
+     "t_start": 1788682469.342377,
+     "prompt_tokens_client": 235,
+     "prompt_tokens_server": 244,
+     "prompt_chars": 1075,
+     "prompt_tokens": 235
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.8006008329975884,
+     "tpot_s": 0.14674596947623372,
+     "latency_s": 13.045721723996394,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 374,
+      "completion_tokens": 64,
+      "total_tokens": 438,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Gutenberg\u2019s contribution was a system that made printing practical and efficient",
+     "text_chars": 339,
+     "index": 19,
+     "kind": "chat_long",
+     "t_start": 1788682469.3424628,
+     "prompt_tokens_client": 365,
+     "prompt_tokens_server": 374,
+     "prompt_chars": 1822,
+     "prompt_tokens": 365
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.3335897939978167,
+     "tpot_s": 0.19410907896824592,
+     "latency_s": 14.562629590996949,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 476,
+      "completion_tokens": 64,
+      "total_tokens": 540,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**The three categories of costs**\n\n1. **Fixed costs** \u2013 These are the bills that",
+     "text_chars": 286,
+     "index": 20,
+     "kind": "chat_long",
+     "t_start": 1788682482.2863872,
+     "prompt_tokens_client": 467,
+     "prompt_tokens_server": 476,
+     "prompt_chars": 2376,
+     "prompt_tokens": 467
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.8025487499980954,
+     "tpot_s": 0.17063523515874598,
+     "latency_s": 14.552676048995636,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 272,
+      "completion_tokens": 64,
+      "total_tokens": 336,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Below is a \u201cshopping list\u201d of the kinds of records, photographs, and oral\u2011histor",
+     "text_chars": 294,
+     "index": 21,
+     "kind": "chat_long",
+     "t_start": 1788682482.3894432,
+     "prompt_tokens_client": 263,
+     "prompt_tokens_server": 272,
+     "prompt_chars": 1157,
+     "prompt_tokens": 263
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.9799217770050745,
+     "tpot_s": 0.13244460304757388,
+     "latency_s": 12.324031331001606,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 505,
+      "completion_tokens": 64,
+      "total_tokens": 569,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Answer**\n\nStriations are long, narrow scratches or grooves cut into bedrock by",
+     "text_chars": 311,
+     "index": 22,
+     "kind": "chat_long",
+     "t_start": 1788682484.7160745,
+     "prompt_tokens_client": 496,
+     "prompt_tokens_server": 505,
+     "prompt_chars": 2360,
+     "prompt_tokens": 496
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.243322864997026,
+     "tpot_s": 0.10484095638094004,
+     "latency_s": 10.848392626001441,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 343,
+      "completion_tokens": 64,
+      "total_tokens": 407,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Answer**  \nA sinking fund is a savings account into which a household sets asi",
+     "text_chars": 322,
+     "index": 23,
+     "kind": "chat_long",
+     "t_start": 1788682486.2866893,
+     "prompt_tokens_client": 334,
+     "prompt_tokens_server": 343,
+     "prompt_chars": 1724,
+     "prompt_tokens": 334
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 29.79302657399967,
+    "ttft_s": {
+     "mean": 9.319710214874249,
+     "p50": 9.647229244998016,
+     "p90": 15.577608881001652,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.32595561064151574,
+     "p50": 0.3497785403226097,
+     "p90": 0.4079849318571625,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 28.476285644999734,
+     "p50": 29.087272190998192,
+     "p90": 29.625736380003218,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 422.625,
+     "p50": 506,
+     "p90": 586,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 60.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 480,
+    "output_tok_per_s": 16.111152682248647,
+    "req_per_s": 0.2685192113708108,
+    "finish_reasons": {
+     "length": 7,
+     "stop": 1
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 29.79302657399967,
+     "ttft_s": {
+      "mean": 9.319710214874249,
+      "p50": 9.647229244998016,
+      "p90": 15.577608881001652,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.32595561064151574,
+      "p50": 0.3497785403226097,
+      "p90": 0.4079849318571625,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 28.476285644999734,
+      "p50": 29.087272190998192,
+      "p90": 29.625736380003218,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 422.625,
+      "p50": 506,
+      "p90": 586,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 60.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 480,
+     "output_tok_per_s": 16.111152682248647,
+     "req_per_s": 0.2685192113708108,
+     "finish_reasons": {
+      "length": 7,
+      "stop": 1
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6032734089967562,
+     "tpot_s": 0.42821389655554887,
+     "latency_s": 28.58085576799931,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 271,
+      "completion_tokens": 64,
+      "total_tokens": 335,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Outline \u2013 \u201cFrom Oil Lamps to Automation: The Life of a Lighthouse Keeper\u201d**  \n",
+     "text_chars": 265,
+     "index": 24,
+     "kind": "chat_long",
+     "t_start": 1788682502.2813005,
+     "prompt_tokens_client": 262,
+     "prompt_tokens_server": 271,
+     "prompt_chars": 1154,
+     "prompt_tokens": 262
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.807480912000756,
+     "tpot_s": 0.3497785403226097,
+     "latency_s": 23.813687226000184,
+     "output_tokens": 32,
+     "content_chunks": 31,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 590,
+      "completion_tokens": 32,
+      "total_tokens": 622,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage does not mention Fresnel\u2019s lens or how it changed lighthouse illumin",
+     "text_chars": 156,
+     "index": 25,
+     "kind": "chat_long",
+     "t_start": 1788682502.2815433,
+     "prompt_tokens_client": 581,
+     "prompt_tokens_server": 590,
+     "prompt_chars": 2935,
+     "prompt_tokens": 581
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.026390095001261,
+     "tpot_s": 0.37906389868259704,
+     "latency_s": 28.907530712000153,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 391,
+      "completion_tokens": 64,
+      "total_tokens": 455,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer:**  \nBecause the ancient \u201chours\u201d were *not* fixed\u2011length periods ",
+     "text_chars": 292,
+     "index": 26,
+     "kind": "chat_long",
+     "t_start": 1788682502.2816427,
+     "prompt_tokens_client": 382,
+     "prompt_tokens_server": 391,
+     "prompt_chars": 1841,
+     "prompt_tokens": 382
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.0412940899987007,
+     "tpot_s": 0.4079849318571625,
+     "latency_s": 28.744464465999044,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 236,
+      "completion_tokens": 64,
+      "total_tokens": 300,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Below is a practical, step\u2011by\u2011step plan for the next two months, plus a quick \u201cd",
+     "text_chars": 267,
+     "index": 27,
+     "kind": "chat_long",
+     "t_start": 1788682502.2817311,
+     "prompt_tokens_client": 227,
+     "prompt_tokens_server": 236,
+     "prompt_chars": 1035,
+     "prompt_tokens": 227
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 9.647229244998016,
+     "tpot_s": 0.3113348860158964,
+     "latency_s": 29.2614487940009,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 244,
+      "completion_tokens": 64,
+      "total_tokens": 308,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short answer**\n\n* The quiet hive is almost certainly **dead**.  \n* A living co",
+     "text_chars": 220,
+     "index": 28,
+     "kind": "chat_long",
+     "t_start": 1788682502.2818038,
+     "prompt_tokens_client": 235,
+     "prompt_tokens_server": 244,
+     "prompt_chars": 1075,
+     "prompt_tokens": 235
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 8.145217149001837,
+     "tpot_s": 0.3324117074284697,
+     "latency_s": 29.087272190998192,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 595,
+      "completion_tokens": 64,
+      "total_tokens": 659,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Striations** are the long, straight scratches or grooves that you can see on a",
+     "text_chars": 270,
+     "index": 29,
+     "kind": "chat_long",
+     "t_start": 1788682502.2819011,
+     "prompt_tokens_client": 586,
+     "prompt_tokens_server": 595,
+     "prompt_chars": 2800,
+     "prompt_tokens": 586
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 15.577608881001652,
+     "tpot_s": 0.22298427523803963,
+     "latency_s": 29.625736380003218,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 515,
+      "completion_tokens": 64,
+      "total_tokens": 579,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "An escapement is a mechanical device that controls the release of energy from a ",
+     "text_chars": 311,
+     "index": 30,
+     "kind": "chat_long",
+     "t_start": 1788682502.2824197,
+     "prompt_tokens_client": 506,
+     "prompt_tokens_server": 515,
+     "prompt_chars": 2399,
+     "prompt_tokens": 506
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 18.70918793799501,
+     "tpot_s": 0.17587274903180225,
+     "latency_s": 29.789289622996876,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 611,
+      "completion_tokens": 64,
+      "total_tokens": 675,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Short paragraph**\n\nIn the washed process the coffee cherries are first pulped ",
+     "text_chars": 309,
+     "index": 31,
+     "kind": "chat_long",
+     "t_start": 1788682502.2828422,
+     "prompt_tokens_client": 602,
+     "prompt_tokens_server": 611,
+     "prompt_chars": 2993,
+     "prompt_tokens": 602
+    }
+   ]
+  }
+ ]
+}
