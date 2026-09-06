@@ -1021,6 +1021,16 @@ struct DecodeRung {
     _tables: Vec<DeviceMem>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeSelection {
+    Base(Option<usize>),
+    Context(usize),
+}
+
+fn decode_selection(base: Option<usize>, context: Option<usize>) -> DecodeSelection {
+    context.map_or(DecodeSelection::Base(base), DecodeSelection::Context)
+}
+
 fn decode_rung_index(
     mut widths: impl Iterator<Item = usize>,
     highest_slot: usize,
@@ -1886,6 +1896,7 @@ pub struct GpuEngine {
     /// Host copy of the decode instructions for the per-step kv-row patch.
     h_inst: Vec<DevInst64>,
     decode_rungs: Vec<DecodeRung>,
+    decode_contexts: Option<decode_context::MaterializedContexts>,
     kvrow: Vec<u32>,
     /// Contiguous instruction range covering every kv-row patch site.
     kvrow_lo: usize,
@@ -2797,6 +2808,7 @@ impl GpuEngine {
         );
         let live_kv_manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
         let decode_objects = decode_object::parse(&blob, &raw)?;
+        let prepared_contexts = decode_context::prepare(&blob, &raw, assets_dir)?;
         if blob
             .with_packet_view(plow_asset::splitk::validate)
             .map_err(RuntimeError::Rejected)?
@@ -2817,7 +2829,7 @@ impl GpuEngine {
             .filter(|p| p.roles.contains(&3))
             .map(|p| p.roles.clone())
             .unwrap_or_default();
-        if decode_objects.is_some() {
+        if decode_objects.is_some() || prepared_contexts.is_some() {
             let nv = &RuntimeConfig::get().nv;
             let multistep = RuntimeConfig::env_str_or("PLOW_MULTISTEP", None)
                 .map(|v| v.parse::<usize>())
@@ -3017,7 +3029,14 @@ impl GpuEngine {
         {
             select_decode_rungs = false;
         }
-        if decode_objects.is_some() && !select_decode_rungs {
+        if prepared_contexts.is_some()
+            && be.module_global_u32(&module, "plow_dyn_kvrow")? != Some(1)
+        {
+            return Err(RuntimeError::Rejected(
+                "context base requires dynamic KV ABI1".into(),
+            ));
+        }
+        if (decode_objects.is_some() || prepared_contexts.is_some()) && !select_decode_rungs {
             return Err(RuntimeError::Rejected(
                 "decode objects require qualified narrow dispatch".into(),
             ));
@@ -3878,6 +3897,9 @@ impl GpuEngine {
         } else {
             Vec::new()
         };
+        let decode_contexts = prepared_contexts
+            .map(|contexts| contexts.materialize(&be, kernarg, assets_dir))
+            .transpose()?;
         if !decode_rungs.is_empty() {
             tracing::info!(
                 rungs = decode_rungs.len() + 1,
@@ -4290,6 +4312,7 @@ impl GpuEngine {
             multistep,
             h_inst: insts,
             decode_rungs,
+            decode_contexts,
             kvrow,
             kvrow_lo: lo,
             kvrow_hi: hi,
@@ -5200,8 +5223,8 @@ impl GpuEngine {
             }
         }
 
-        let rung = self.decode_rung(feeds.iter().map(|&(slot, _)| slot).max().expect("nonempty"));
-        let launch_rows = rung.map_or(bsz, |ix| self.decode_rungs[ix].rows);
+        let rung = self.select_decode(feeds.iter().map(|&(slot, _)| slot))?;
+        let launch_rows = self.selected_decode(rung).map_or(bsz, |r| r.rows);
 
         // VMM backstop: every row this launch writes (fed rows at pos, idle
         // rows' garbage write at their own pos) must be mapped. The
@@ -5503,6 +5526,7 @@ impl GpuEngine {
     /// without waiting on the interpreter.
     fn enqueue_prompt_token(&mut self, slot: usize, token: u32) -> Result<()> {
         let bsz = self.batch;
+        let rung = self.select_decode(std::iter::once(slot))?;
         if bsz == 1 && !self.kvrow.is_empty() {
             let pos = self.pos[slot];
             for &ix in &self.kvrow {
@@ -5554,7 +5578,6 @@ impl GpuEngine {
         }
         self.upload_active_slots(std::iter::once(slot))?;
         self.be.event_record(&self.h2d_ev, &self.stream)?;
-        let rung = self.decode_rung(slot);
         self.reset_selected_decode_counters(rung)?;
         self.launch_selected_decode(rung)?;
         Ok(())
@@ -5564,9 +5587,34 @@ impl GpuEngine {
         decode_rung_index(self.decode_rungs.iter().map(|r| r.rows), highest_slot)
     }
 
-    fn reset_selected_decode_counters(&self, rung: Option<usize>) -> Result<()> {
-        if let Some(ix) = rung {
-            let r = &self.decode_rungs[ix];
+    fn select_decode(&self, slots: impl Iterator<Item = usize> + Clone) -> Result<DecodeSelection> {
+        let highest = slots
+            .clone()
+            .max()
+            .ok_or_else(|| RuntimeError::Rejected("empty decode selection".into()))?;
+        let band = self
+            .decode_contexts
+            .as_ref()
+            .map(|contexts| contexts.select(&self.pos, slots))
+            .transpose()?
+            .flatten();
+        Ok(decode_selection(self.decode_rung(highest), band))
+    }
+
+    fn selected_decode(&self, selection: DecodeSelection) -> Option<&DecodeRung> {
+        match selection {
+            DecodeSelection::Base(index) => index.map(|i| &self.decode_rungs[i]),
+            DecodeSelection::Context(index) => Some(
+                self.decode_contexts
+                    .as_ref()
+                    .expect("selected loaded context")
+                    .rung(index),
+            ),
+        }
+    }
+
+    fn reset_selected_decode_counters(&self, selection: DecodeSelection) -> Result<()> {
+        if let Some(r) = self.selected_decode(selection) {
             self.be
                 .memset_d8_async(r.counters.base, 0, r.counter_bytes, &self.stream)
         } else {
@@ -5574,11 +5622,11 @@ impl GpuEngine {
         }
     }
 
-    fn launch_selected_decode(&mut self, rung: Option<usize>) -> Result<()> {
-        if let Some(ix) = rung {
-            let mut arg = self.decode_rungs[ix].kernarg;
+    fn launch_selected_decode(&mut self, selection: DecodeSelection) -> Result<()> {
+        if let Some(r) = self.selected_decode(selection) {
+            let mut arg = r.kernarg;
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-            let object = self.decode_rungs[ix].object.as_deref();
+            let object = r.object.as_deref();
             self.be.launch_cooperative(
                 object.map_or(self.f, |o| o.function),
                 object.map_or(self.grid, |o| o.grid),
@@ -7603,6 +7651,7 @@ impl Drop for GpuEngine {
         if let Err(e) = self.be.synchronize() {
             report(&e, "synchronize at engine unload");
         }
+        drop(self.decode_contexts.take());
         drop(self.qwen_prefill.take());
         if let Some(m) = self.module_pf.take() {
             if let Err(e) = self.be.module_unload(&m) {

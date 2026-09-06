@@ -1,15 +1,10 @@
 use super::*;
 use crate::asset::devblob::DevBlob;
-#[cfg(test)]
 use crate::asset::devblob::DevProg;
-#[cfg(test)]
 use plow_asset::decode_context::ContextBand;
 use plow_asset::decode_context::{ContextTable, SECTION};
-#[cfg(test)]
 use plow_asset::decode_coverage::DenseBf16;
-#[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
 use std::io::Read;
 
 fn reject(message: impl std::fmt::Display) -> RuntimeError {
@@ -63,7 +58,6 @@ pub(super) fn metadata(blob: &DevBlob, raw: &[u8]) -> Result<Option<ContextTable
     .map_err(reject)
 }
 
-#[cfg(test)]
 fn ordered(dependencies: &[BTreeSet<usize>], consumer: usize, producer: usize) -> bool {
     let mut pending = vec![consumer];
     let mut seen = BTreeSet::new();
@@ -78,7 +72,6 @@ fn ordered(dependencies: &[BTreeSet<usize>], consumer: usize, producer: usize) -
     false
 }
 
-#[cfg(test)]
 fn attention_lifetimes(blob: &DevBlob, g: &DevProg, deps: &[BTreeSet<usize>]) -> Result<()> {
     let mut previous_merge = BTreeMap::new();
     let mut partials = BTreeSet::new();
@@ -189,7 +182,6 @@ fn attention_lifetimes(blob: &DevBlob, g: &DevProg, deps: &[BTreeSet<usize>]) ->
     Ok(())
 }
 
-#[cfg(test)]
 fn auxiliary_program(
     base: &DevBlob,
     aux: &DevBlob,
@@ -206,9 +198,7 @@ fn auxiliary_program(
         "auxiliary target/flags/TP mismatch",
     )?;
     require(
-        base.tensors.len() == aux.tensors.len()
-            && base.gen == aux.gen
-            && base.kvrow == aux.kvrow,
+        base.tensors.len() == aux.tensors.len() && base.gen == aux.gen && base.kvrow == aux.kvrow,
         "auxiliary tensor/generated/KV patch contract differs",
     )?;
     for (a, b) in base.tensors.iter().zip(&aux.tensors) {
@@ -318,7 +308,6 @@ fn auxiliary_program(
     )
 }
 
-#[cfg(test)]
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     let file = std::fs::File::open(path).map_err(|source| RuntimeError::Io {
         path: path.into(),
@@ -350,18 +339,15 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(test)]
 struct PreparedVariant {
     blob: Arc<DevBlob>,
     image: Arc<[u8]>,
 }
-#[cfg(test)]
 pub(super) struct PreparedContexts {
     table: ContextTable,
     variants: Vec<PreparedVariant>,
 }
 
-#[cfg(test)]
 pub(super) fn prepare(
     base: &DevBlob,
     raw: &[u8],
@@ -402,6 +388,11 @@ pub(super) fn prepare(
             image
         };
         table.check_object_image(index, &image).map_err(reject)?;
+        require(
+            plow_asset::cubin::global_u32(&image, "plow_packet_hash_lo").is_none()
+                && plow_asset::cubin::global_u32(&image, "plow_packet_hash_hi").is_none(),
+            "stamped context objects require auxiliary pairing manifests",
+        )?;
         let coverage = DenseBf16::from_image(&image).map_err(reject)?;
         auxiliary_program(
             base,
@@ -410,18 +401,41 @@ pub(super) fn prepare(
             coverage,
             plow_asset::cubin::global_u32(&image, "plow_gemm_splitk_abi"),
         )?;
+        require_dynamic_kv(
+            &blob.progs[band.program.index],
+            &blob,
+            plow_asset::cubin::global_u32(&image, "plow_dyn_kvrow"),
+        )?;
         variants.push(PreparedVariant { blob, image });
     }
     Ok(Some(PreparedContexts { table, variants }))
 }
 
-#[cfg(test)]
+fn require_dynamic_kv(g: &DevProg, _blob: &DevBlob, capability: Option<u32>) -> Result<()> {
+    require(
+        capability == Some(1),
+        "context object requires dynamic KV ABI1",
+    )?;
+    for d in &g.insts {
+        if d.op == DevOp::HeadNormRope as u16
+            && g.insts
+                .iter()
+                .any(|a| a.op == DevOp::FlashDecode as u16 && a.t[3..5].contains(&d.t[0]))
+        {
+            require(
+                d.i[6] == g.t && d.i[3] == 0,
+                "context KV writer requires immutable per-slot position addressing",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) struct MaterializedContexts {
     table: ContextTable,
     rungs: Vec<Arc<DecodeRung>>,
     be: Arc<CudaBackend>,
 }
-#[cfg(test)]
 impl PreparedContexts {
     pub(super) fn materialize(
         self,
@@ -463,8 +477,13 @@ impl PreparedContexts {
             let rung = if let Some(rung) = programs.get(&key) {
                 Arc::clone(rung)
             } else {
-                let mut rung =
-                    DecodeRung::upload(be, &variant.blob.progs[band.program.index], base)?;
+                let program = &variant.blob.progs[band.program.index];
+                require_dynamic_kv(
+                    program,
+                    &variant.blob,
+                    plow_asset::cubin::global_u32(&variant.image, "plow_dyn_kvrow"),
+                )?;
+                let mut rung = DecodeRung::upload(be, program, base)?;
                 rung.object = Some(object);
                 let rung = Arc::new(rung);
                 programs.insert(key, Arc::clone(&rung));
@@ -480,18 +499,19 @@ impl PreparedContexts {
         })
     }
 }
-#[cfg(test)]
 impl MaterializedContexts {
     pub(super) fn select(
         &self,
         positions: &[u32],
         slots: impl IntoIterator<Item = usize>,
-    ) -> Result<Option<&DecodeRung>> {
-        let selection = self.table.select(positions, slots).map_err(reject)?;
-        Ok(selection.band.map(|index| self.rungs[index].as_ref()))
+    ) -> Result<Option<usize>> {
+        Ok(self.table.select(positions, slots).map_err(reject)?.band)
+    }
+
+    pub(super) fn rung(&self, index: usize) -> &DecodeRung {
+        self.rungs[index].as_ref()
     }
 }
-#[cfg(test)]
 impl Drop for MaterializedContexts {
     fn drop(&mut self) {
         if let Err(error) = self.be.synchronize() {
@@ -824,6 +844,92 @@ mod tests {
         assert!(prepare(&base, &raw, &dir).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn dispatch_context_routes_and_fallbacks_use_live_physical_slots() {
+        let mut base = blob(2);
+        let mut first = band(&[], &[]);
+        first.kv_min = 10;
+        first.kv_max = 20;
+        let raw = attach(&mut base, first);
+        let table = metadata(&base, &raw).unwrap().unwrap();
+        let route = |positions: &[u32], slots: &[usize]| {
+            let selection = table.select(positions, slots.iter().copied()).unwrap();
+            let narrow = decode_rung_index(std::iter::once(1), *slots.iter().max().unwrap());
+            decode_selection(narrow, selection.band)
+        };
+        assert_eq!(
+            route(&[9, 100, 100, 100], &[0]),
+            DecodeSelection::Context(0)
+        );
+        assert_eq!(route(&[19, 0, 0, 0], &[0]), DecodeSelection::Context(0));
+        for pos in [0, 8, 20, 100] {
+            assert_eq!(route(&[pos, 0, 0, 0], &[0]), DecodeSelection::Base(Some(0)));
+        }
+        assert_eq!(route(&[9, 9, 9, 9], &[1]), DecodeSelection::Base(None));
+        assert_eq!(route(&[9, 9, 9, 9], &[0, 2]), DecodeSelection::Base(None));
+        assert_eq!(
+            route(&[9, 9, 9, 9], &[0, 1, 2, 3]),
+            DecodeSelection::Base(None)
+        );
+        for slots in [vec![], vec![0, 0], vec![4]] {
+            assert!(table.select(&[9; 4], slots).is_err());
+        }
+        assert!(table.select(&[u32::MAX, 0, 0, 0], [0]).is_err());
+    }
+
+    #[test]
+    fn full_prefix_context_selection_rechecks_mixed_lengths_and_reset() {
+        let mut base = blob(2);
+        let mut b = band(&[], &[]);
+        b.base_program = 1;
+        b.program.index = 1;
+        b.rows = 4;
+        b.kv_min = 10;
+        b.kv_max = 20;
+        let raw = attach(&mut base, b);
+        let table = metadata(&base, &raw).unwrap().unwrap();
+        let route = |pos: &[u32], slots: &[usize]| {
+            let selected = table.select(pos, slots.iter().copied()).unwrap();
+            decode_selection(None, selected.band)
+        };
+        assert_eq!(
+            route(&[9, 12, 15, 19], &[0, 1, 2, 3]),
+            DecodeSelection::Context(0)
+        );
+        assert_eq!(
+            route(&[9, 12, 15, 20], &[0, 1, 2, 3]),
+            DecodeSelection::Base(None)
+        );
+        assert_eq!(
+            route(&[9, 12, 0, 19], &[0, 1, 2, 3]),
+            DecodeSelection::Base(None)
+        );
+        assert_eq!(
+            route(&[9, 12, 15, 19], &[0, 2, 3]),
+            DecodeSelection::Base(None)
+        );
+        assert_eq!(
+            route(&[9, 12, 15, 19], &[3, 2, 1, 0]),
+            DecodeSelection::Context(0)
+        );
+    }
+
+    #[test]
+    fn dynamic_b1_does_not_patch_immutable_auxiliary_instructions() {
+        let base = blob(2);
+        let before = pod_bytes(&base.progs[0].insts).to_vec();
+        require_dynamic_kv(&base.progs[0], &base, Some(1)).unwrap();
+        assert_eq!(before, pod_bytes(&base.progs[0].insts));
+        for cap in [None, Some(0), Some(2)] {
+            assert!(require_dynamic_kv(&base.progs[0], &base, cap).is_err());
+        }
+        for (field, value) in [(6, 0), (6, 4), (3, 7)] {
+            let mut changed = blob(2);
+            changed.progs[0].insts[0].i[field] = value;
+            assert!(require_dynamic_kv(&changed.progs[0], &changed, Some(1)).is_err());
+        }
+    }
+
     #[test]
     #[ignore = "CPU actual packet proof; set TEST_CONTEXT_BASE and TEST_CONTEXT_AUX"]
     fn actual_frozen_auxiliary_packets() {

@@ -39,9 +39,7 @@ fn reject(message: &str) -> RuntimeError {
     RuntimeError::Rejected(format!("decode objects: {message}"))
 }
 pub(super) fn parse(blob: &DevBlob, raw: &[u8]) -> Result<Option<DecodeObjects>> {
-    if decode_context::metadata(blob, raw)?.is_some() {
-        return Err(reject("context alternatives require validated auxiliary-program loading; this engine supports the base ladder only"));
-    }
+    decode_context::metadata(blob, raw)?;
     let count = blob
         .sections
         .iter()
@@ -159,7 +157,6 @@ pub(super) fn capacity(spec: &DecodeObject, sms: u32, occupancy: u32) -> Result<
     }
     Ok(())
 }
-#[cfg(test)]
 pub(super) fn bind_module(
     spec: &DecodeObject,
     be: &Arc<CudaBackend>,
