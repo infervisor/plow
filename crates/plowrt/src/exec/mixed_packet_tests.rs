@@ -1,6 +1,6 @@
 use super::*;
 use packet::dev::DevOp;
-use packet::devbuild::{Builder, Model, SECT_CUBIN, SECT_HSACO, SECT_PROGRAMS};
+use packet::devbuild::{Builder, Model, SectionData, SECT_CUBIN, SECT_HSACO, SECT_PROGRAMS};
 use plow_asset::mixed_step::{
     payload_sha256, Capability, Manifest, PayloadBinding, ProgramBinding, Variant,
     OBJECT_CAPABILITY, PROGRAM_CAPABILITY, VERSION,
@@ -89,7 +89,7 @@ fn shared_payloads_are_bound_once_across_variants() {
         mixed_step::PayloadKind::Cubin,
         |_, _| {
             capability_reads += 1;
-            Some(VERSION)
+            Ok(Some(VERSION))
         },
     )
     .unwrap()
@@ -171,8 +171,10 @@ fn binds_exact_variant_and_selects_without_revalidation() {
         0,
         mixed_step::PayloadKind::Cubin,
         |object, symbol| {
-            (object.name == "mixed_cuda" && object.bytes == cubin && symbol == OBJECT_CAPABILITY)
-                .then_some(VERSION)
+            Ok((object.name == "mixed_cuda"
+                && object.bytes == cubin
+                && symbol == OBJECT_CAPABILITY)
+                .then_some(VERSION))
         },
     )
     .unwrap()
@@ -188,18 +190,21 @@ fn binds_exact_variant_and_selects_without_revalidation() {
     assert_eq!(selected.object().name, "mixed_cuda");
     assert!(loaded.select(ROWS, DECODE_ROWS + 1).is_none());
 
-    let loaded = load(
-        &sections,
-        N_CU,
-        0,
-        mixed_step::PayloadKind::Hsaco,
-        |object, symbol| {
-            (object.name == "mixed_amd" && object.bytes == hsaco && symbol == OBJECT_CAPABILITY)
-                .then_some(VERSION)
-        },
-    )
-    .unwrap()
-    .unwrap();
+    let loaded =
+        load(
+            &sections,
+            N_CU,
+            0,
+            mixed_step::PayloadKind::Hsaco,
+            |object, symbol| {
+                Ok((object.name == "mixed_amd"
+                    && object.bytes == hsaco
+                    && symbol == OBJECT_CAPABILITY)
+                    .then_some(VERSION))
+            },
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.backend(), mixed_step::PayloadKind::Hsaco);
     assert_eq!(
         loaded.select(ROWS, DECODE_ROWS).unwrap().object().name,
@@ -234,7 +239,7 @@ fn metadata_and_exact_payload_sections_are_unique_and_typed() {
         section(SECT_PROGRAMS, "mixed_programs", &programs),
         section(SECT_CUBIN, "mixed_cuda", cubin),
     ];
-    let capability = |_: ObjectSection<'_>, _: &str| Some(VERSION);
+    let capability = |_: ObjectSection<'_>, _: &str| Ok(Some(VERSION));
 
     let duplicate_metadata = [good[0], good[0], good[1], good[2]];
     assert!(load(
@@ -328,7 +333,7 @@ fn selected_backend_requires_one_declared_object() {
         N_CU,
         0,
         mixed_step::PayloadKind::Cubin,
-        |_, _| Some(VERSION)
+        |_, _| Ok(Some(VERSION))
     )
     .is_err());
 
@@ -345,14 +350,12 @@ fn selected_backend_requires_one_declared_object() {
         section(SECT_CUBIN, "mixed_cuda_a", cubin_a),
         section(SECT_CUBIN, "mixed_cuda_b", cubin_b),
     ];
-    assert!(load(
-        &extra,
-        N_CU,
-        0,
-        mixed_step::PayloadKind::Cubin,
-        |_, _| Some(VERSION)
-    )
-    .is_err());
+    assert!(
+        load(&extra, N_CU, 0, mixed_step::PayloadKind::Cubin, |_, _| Ok(
+            Some(VERSION)
+        ))
+        .is_err()
+    );
 }
 
 #[test]
@@ -374,7 +377,7 @@ fn digest_capability_and_grid_are_bound_to_actual_payloads() {
         N_CU,
         0,
         mixed_step::PayloadKind::Cubin,
-        |_, _| Some(VERSION)
+        |_, _| panic!("capability reader must not run for a mismatched payload")
     )
     .is_err());
 
@@ -388,7 +391,7 @@ fn digest_capability_and_grid_are_bound_to_actual_payloads() {
         N_CU,
         0,
         mixed_step::PayloadKind::Cubin,
-        |_, _| None
+        |_, _| Ok(None)
     )
     .is_err());
     assert!(load(
@@ -396,7 +399,7 @@ fn digest_capability_and_grid_are_bound_to_actual_payloads() {
         N_CU + 1,
         0,
         mixed_step::PayloadKind::Cubin,
-        |_, _| Some(VERSION)
+        |_, _| Ok(Some(VERSION))
     )
     .is_err());
 }
@@ -422,7 +425,157 @@ fn auxiliary_parser_enforces_packet_tensor_count() {
         N_CU,
         0,
         mixed_step::PayloadKind::Cubin,
-        |_, _| Some(VERSION)
+        |_, _| Ok(Some(VERSION))
     )
     .is_err());
+}
+
+fn device_model() -> Model {
+    let mut builder = Builder::new(N_CU);
+    builder.force_uniseg();
+    builder.emit(DevOp::Nop, builder.all(), &[], |_| {});
+    Model {
+        n_cu: N_CU,
+        target: 0,
+        tensors: vec![],
+        progs: vec![builder.finish()],
+        kv_row_insts: vec![],
+        prog_t: vec![1],
+        gen: vec![],
+    }
+}
+
+fn mixed_device_image() -> Vec<u8> {
+    let programs = program_payload();
+    let cubin = b"mixed object";
+    let metadata = manifest(
+        &programs,
+        vec![binding("mixed_cuda", mixed_step::PayloadKind::Cubin, cubin)],
+    );
+    device_model().to_blob_v6(&[
+        SectionData {
+            kind: SECT_PROGRAMS,
+            name: "mixed_programs".into(),
+            data: programs,
+        },
+        SectionData {
+            kind: SECT_METADATA,
+            name: mixed_step::SECTION.into(),
+            data: metadata,
+        },
+        SectionData {
+            kind: SECT_CUBIN,
+            name: "mixed_cuda".into(),
+            data: cubin.to_vec(),
+        },
+    ])
+}
+
+#[test]
+fn devblob_adapter_ignores_stock_packets_and_selects_exact_variant() {
+    let stock = device_model().to_blob_v6(&[SectionData {
+        kind: SECT_CUBIN,
+        name: "ordinary".into(),
+        data: b"ordinary object".to_vec(),
+    }]);
+    let stock_blob = DevBlob::parse(&stock).unwrap();
+    assert!(load_from_devblob(
+        &stock_blob,
+        &stock,
+        mixed_step::PayloadKind::Cubin,
+        |_, _| panic!("capability reader must not run"),
+    )
+    .unwrap()
+    .is_none());
+
+    let raw = mixed_device_image();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let loaded = load_from_devblob(
+        &blob,
+        &raw,
+        mixed_step::PayloadKind::Cubin,
+        |object, capability| {
+            assert_eq!(object.kind, mixed_step::PayloadKind::Cubin);
+            assert_eq!(object.name, "mixed_cuda");
+            assert_eq!(object.bytes, b"mixed object");
+            assert_eq!(capability, OBJECT_CAPABILITY);
+            Ok(Some(VERSION))
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let selected = loaded.select(ROWS, DECODE_ROWS).unwrap();
+    assert_eq!(selected.rows(), ROWS);
+    assert_eq!(selected.decode_rows(), DECODE_ROWS);
+    assert_eq!(selected.object().name, "mixed_cuda");
+    assert!(loaded.select(ROWS + 1, DECODE_ROWS).is_none());
+}
+
+#[test]
+fn devblob_adapter_rejects_bad_ranges_and_duplicate_metadata() {
+    let raw = mixed_device_image();
+
+    let mut overflow = DevBlob::parse(&raw).unwrap();
+    let metadata = overflow
+        .sections
+        .iter_mut()
+        .find(|section| section.name == mixed_step::SECTION)
+        .unwrap();
+    metadata.offset = usize::MAX;
+    metadata.size = 1;
+    assert!(
+        load_from_devblob(&overflow, &raw, mixed_step::PayloadKind::Cubin, |_, _| Ok(
+            Some(VERSION)
+        ),)
+        .is_err()
+    );
+
+    let mut outside = DevBlob::parse(&raw).unwrap();
+    let metadata = outside
+        .sections
+        .iter_mut()
+        .find(|section| section.name == mixed_step::SECTION)
+        .unwrap();
+    metadata.offset = raw.len();
+    metadata.size = 1;
+    assert!(
+        load_from_devblob(&outside, &raw, mixed_step::PayloadKind::Cubin, |_, _| Ok(
+            Some(VERSION)
+        ),)
+        .is_err()
+    );
+
+    let mut duplicate = DevBlob::parse(&raw).unwrap();
+    let metadata = duplicate
+        .sections
+        .iter()
+        .find(|section| section.name == mixed_step::SECTION)
+        .unwrap();
+    duplicate.sections.push(crate::asset::devblob::DevSection {
+        kind: metadata.kind,
+        name: metadata.name.clone(),
+        offset: metadata.offset,
+        size: metadata.size,
+    });
+    assert!(
+        load_from_devblob(&duplicate, &raw, mixed_step::PayloadKind::Cubin, |_, _| Ok(
+            Some(VERSION)
+        ),)
+        .is_err()
+    );
+}
+
+#[test]
+fn devblob_adapter_propagates_capability_reader_errors() {
+    let raw = mixed_device_image();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let error = load_from_devblob(&blob, &raw, mixed_step::PayloadKind::Cubin, |_, _| {
+        Err(RuntimeError::Device("module symbol lookup failed".into()))
+    })
+    .err()
+    .expect("capability failure");
+    assert!(matches!(
+        error,
+        RuntimeError::Device(message) if message == "module symbol lookup failed"
+    ));
 }

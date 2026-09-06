@@ -1,6 +1,7 @@
 use packet::devbuild::SECT_METADATA;
 use plow_asset::{aux_program, mixed_step};
 
+use crate::asset::devblob::DevBlob;
 use crate::{Result, RuntimeError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,11 +111,11 @@ impl LoadedMixedPacket<'_> {
 /// object sections. The callback must read the requested capability from the
 /// actual object bytes (for example, through an ELF symbol reader).
 pub fn load<'a>(
-    sections: &'a [PacketSection<'a>],
+    sections: &[PacketSection<'a>],
     expected_n_cu: u32,
     tensor_count: usize,
     backend: mixed_step::PayloadKind,
-    mut read_capability: impl FnMut(ObjectSection<'a>, &str) -> Option<u32>,
+    mut read_capability: impl FnMut(ObjectSection<'a>, &str) -> Result<Option<u32>>,
 ) -> Result<Option<LoadedMixedPacket<'a>>> {
     let mut metadata_sections = sections
         .iter()
@@ -201,20 +202,36 @@ pub fn load<'a>(
                 bytes: object_section.bytes,
             };
             let object_payload = payload(object_section, expected_n_cu, backend);
-            match backend {
+            let mut capability_error = None;
+            let binding = match backend {
                 mixed_step::PayloadKind::Cubin => {
                     variant.bind_cubin_with(expected_n_cu, &object_payload, |name| {
-                        read_capability(object, name)
+                        match read_capability(object, name) {
+                            Ok(capability) => capability,
+                            Err(error) => {
+                                capability_error = Some(error);
+                                None
+                            }
+                        }
                     })
                 }
                 mixed_step::PayloadKind::Hsaco => {
                     variant.bind_hsaco_with(expected_n_cu, &object_payload, |name| {
-                        read_capability(object, name)
+                        match read_capability(object, name) {
+                            Ok(capability) => capability,
+                            Err(error) => {
+                                capability_error = Some(error);
+                                None
+                            }
+                        }
                     })
                 }
                 mixed_step::PayloadKind::Programs => unreachable!(),
+            };
+            if let Some(error) = capability_error {
+                return Err(error);
             }
-            .map_err(reject)?;
+            binding.map_err(reject)?;
             object_catalog.push(object);
             object_catalog.len() - 1
         };
@@ -239,8 +256,40 @@ pub fn load<'a>(
     }))
 }
 
+/// Bind mixed-step sections from a parsed device blob. Every directory range
+/// is checked against the same raw packet image before any section is used.
+pub fn load_from_devblob<'a>(
+    blob: &'a DevBlob,
+    raw_packet_bytes: &'a [u8],
+    backend: mixed_step::PayloadKind,
+    read_capability: impl FnMut(ObjectSection<'a>, &str) -> Result<Option<u32>>,
+) -> Result<Option<LoadedMixedPacket<'a>>> {
+    let mut sections = Vec::with_capacity(blob.sections.len());
+    for section in &blob.sections {
+        let end = section
+            .offset
+            .checked_add(section.size)
+            .ok_or_else(|| reject(format!("section {} range overflow", section.name)))?;
+        let bytes = raw_packet_bytes
+            .get(section.offset..end)
+            .ok_or_else(|| reject(format!("section {} range outside packet", section.name)))?;
+        sections.push(PacketSection {
+            kind: section.kind,
+            name: &section.name,
+            bytes,
+        });
+    }
+    load(
+        &sections,
+        blob.n_cu,
+        blob.tensors.len(),
+        backend,
+        read_capability,
+    )
+}
+
 fn exact_section<'a>(
-    sections: &'a [PacketSection<'a>],
+    sections: &[PacketSection<'a>],
     kind: u32,
     name: &str,
 ) -> Result<PacketSection<'a>> {
