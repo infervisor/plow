@@ -1,0 +1,730 @@
+{
+  "schema": 1,
+  "scope": "Five saved Qwen27 layer0 M1 input rows; packet prefix through FP8 pc3 and BF16 pc2, suffix NOP with identical scheduler skeleton. No new reference/oracle/full-network/serving/timing run.",
+  "head_review": "8f16c954356780dfb7d003ffc691abd2e1b4e961",
+  "gpu_root_queue": {
+    "qwen-pc3-fp8-r1": {
+      "returncode": 0,
+      "passed": true,
+      "output": "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/manifest.json"
+    },
+    "qwen-pc3-fp8-r2": {
+      "returncode": 0,
+      "passed": true,
+      "output": "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/manifest.json"
+    },
+    "qwen-pc3-fp8-validate": {
+      "returncode": 0,
+      "passed": true,
+      "output": "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-qualification.json"
+    },
+    "qwen-pc3-bf16-r1": {
+      "returncode": 0,
+      "passed": true,
+      "output": "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/manifest.json"
+    },
+    "qwen-pc3-bf16-r2": {
+      "returncode": 0,
+      "passed": true,
+      "output": "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/manifest.json"
+    },
+    "qwen-pc3-bf16-validate": {
+      "returncode": 0,
+      "passed": true,
+      "output": "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-qualification.json"
+    }
+  },
+  "last_status": {
+    "utc": "2026-09-06T09:37:48Z",
+    "status": "complete",
+    "jobs": 6,
+    "passed": true
+  },
+  "prefix_qualifications": {
+    "fp8": {
+      "accepted": true,
+      "arm": "fp8",
+      "raw_QKV_rows_match_fullblock_exact": 10,
+      "repeat_tensor_rows": 20,
+      "scope": "Exact prefix/raw-history and repeat gates; no independent FP8 numerical-quality threshold"
+    },
+    "bf16": {
+      "accepted": true,
+      "arm": "bf16",
+      "raw_QKV_rows_match_fullblock_exact": 10,
+      "repeat_tensor_rows": 10,
+      "scope": "Exact prefix/raw-history and repeat gates; no independent FP8 numerical-quality threshold"
+    }
+  },
+  "observed_boundaries": {
+    "weight_recipe_bytes_exact": true,
+    "weight_elements": 52428800,
+    "scale_replicas_exact": true,
+    "scale_bits": 981392238,
+    "weight_quantization_error": {
+      "mismatches": 52088959,
+      "rel_l2": 0.026505394440110984,
+      "max_abs": 0.015066951513290405
+    },
+    "projection_variants": {
+      "bf16_weights_unquantized_activation": [
+        {
+          "step": 0,
+          "vs_native_fp8": {
+            "mismatches": 8824,
+            "rel_l2": 0.010874625830556227,
+            "max_abs": 1.0
+          },
+          "vs_native_bf16": {
+            "mismatches": 1,
+            "rel_l2": 6.412450610778484e-08,
+            "max_abs": 3.0517578125e-05
+          }
+        },
+        {
+          "step": 1,
+          "vs_native_fp8": {
+            "mismatches": 9388,
+            "rel_l2": 0.016423669177229504,
+            "max_abs": 0.375
+          },
+          "vs_native_bf16": {
+            "mismatches": 1,
+            "rel_l2": 3.6594795565435158e-09,
+            "max_abs": 9.5367431640625e-07
+          }
+        },
+        {
+          "step": 2,
+          "vs_native_fp8": {
+            "mismatches": 9170,
+            "rel_l2": 0.011528981709376919,
+            "max_abs": 0.75
+          },
+          "vs_native_bf16": {
+            "mismatches": 2,
+            "rel_l2": 6.258385928779943e-07,
+            "max_abs": 0.000244140625
+          }
+        },
+        {
+          "step": 3,
+          "vs_native_fp8": {
+            "mismatches": 9263,
+            "rel_l2": 0.01460207903338176,
+            "max_abs": 0.25
+          },
+          "vs_native_bf16": {
+            "mismatches": 2,
+            "rel_l2": 1.7112916741013681e-06,
+            "max_abs": 0.00048828125
+          }
+        },
+        {
+          "step": 4,
+          "vs_native_fp8": {
+            "mismatches": 9408,
+            "rel_l2": 0.017538301678884677,
+            "max_abs": 1.25
+          },
+          "vs_native_bf16": {
+            "mismatches": 3,
+            "rel_l2": 4.392098900117951e-05,
+            "max_abs": 0.015625
+          }
+        }
+      ],
+      "fp8_weights_unquantized_activation": [
+        {
+          "step": 0,
+          "vs_native_fp8": {
+            "mismatches": 8026,
+            "rel_l2": 0.007107507486131371,
+            "max_abs": 0.5
+          },
+          "vs_native_bf16": {
+            "mismatches": 8440,
+            "rel_l2": 0.008101232168824817,
+            "max_abs": 0.75
+          }
+        },
+        {
+          "step": 1,
+          "vs_native_fp8": {
+            "mismatches": 9056,
+            "rel_l2": 0.011444589764253747,
+            "max_abs": 0.25
+          },
+          "vs_native_bf16": {
+            "mismatches": 9043,
+            "rel_l2": 0.01151036332928578,
+            "max_abs": 0.25
+          }
+        },
+        {
+          "step": 2,
+          "vs_native_fp8": {
+            "mismatches": 8599,
+            "rel_l2": 0.00740407979975912,
+            "max_abs": 0.5
+          },
+          "vs_native_bf16": {
+            "mismatches": 8900,
+            "rel_l2": 0.009133447272480317,
+            "max_abs": 0.5
+          }
+        },
+        {
+          "step": 3,
+          "vs_native_fp8": {
+            "mismatches": 8880,
+            "rel_l2": 0.010338591072275699,
+            "max_abs": 0.25
+          },
+          "vs_native_bf16": {
+            "mismatches": 8966,
+            "rel_l2": 0.010706960521841056,
+            "max_abs": 0.25
+          }
+        },
+        {
+          "step": 4,
+          "vs_native_fp8": {
+            "mismatches": 9311,
+            "rel_l2": 0.014365068278250178,
+            "max_abs": 1.0
+          },
+          "vs_native_bf16": {
+            "mismatches": 8944,
+            "rel_l2": 0.009161815044528057,
+            "max_abs": 0.75
+          }
+        }
+      ],
+      "bf16_weights_quantized_activation": [
+        {
+          "step": 0,
+          "vs_native_fp8": {
+            "mismatches": 8750,
+            "rel_l2": 0.011218009578071243,
+            "max_abs": 1.0
+          },
+          "vs_native_bf16": {
+            "mismatches": 7938,
+            "rel_l2": 0.006474131137516436,
+            "max_abs": 0.25
+          }
+        },
+        {
+          "step": 1,
+          "vs_native_fp8": {
+            "mismatches": 8974,
+            "rel_l2": 0.011766915781393399,
+            "max_abs": 0.25
+          },
+          "vs_native_bf16": {
+            "mismatches": 8959,
+            "rel_l2": 0.010985593493928268,
+            "max_abs": 0.1875
+          }
+        },
+        {
+          "step": 2,
+          "vs_native_fp8": {
+            "mismatches": 9010,
+            "rel_l2": 0.011480905408217265,
+            "max_abs": 1.0
+          },
+          "vs_native_bf16": {
+            "mismatches": 8766,
+            "rel_l2": 0.007755731873824077,
+            "max_abs": 0.375
+          }
+        },
+        {
+          "step": 3,
+          "vs_native_fp8": {
+            "mismatches": 9011,
+            "rel_l2": 0.011111880716367213,
+            "max_abs": 0.375
+          },
+          "vs_native_bf16": {
+            "mismatches": 8942,
+            "rel_l2": 0.010463333116853568,
+            "max_abs": 0.375
+          }
+        },
+        {
+          "step": 4,
+          "vs_native_fp8": {
+            "mismatches": 9044,
+            "rel_l2": 0.011062827449974572,
+            "max_abs": 0.75
+          },
+          "vs_native_bf16": {
+            "mismatches": 9183,
+            "rel_l2": 0.010291285033997725,
+            "max_abs": 0.5
+          }
+        }
+      ],
+      "fp8_weights_quantized_activation": [
+        {
+          "step": 0,
+          "vs_native_fp8": {
+            "mismatches": 3910,
+            "rel_l2": 0.006878904729967736,
+            "max_abs": 0.75
+          },
+          "vs_native_bf16": {
+            "mismatches": 8685,
+            "rel_l2": 0.009641956644394501,
+            "max_abs": 0.75
+          }
+        },
+        {
+          "step": 1,
+          "vs_native_fp8": {
+            "mismatches": 2865,
+            "rel_l2": 0.0030574244866413917,
+            "max_abs": 0.125
+          },
+          "vs_native_bf16": {
+            "mismatches": 9354,
+            "rel_l2": 0.01590450052028419,
+            "max_abs": 0.375
+          }
+        },
+        {
+          "step": 2,
+          "vs_native_fp8": {
+            "mismatches": 3706,
+            "rel_l2": 0.006382127120550006,
+            "max_abs": 0.5
+          },
+          "vs_native_bf16": {
+            "mismatches": 9176,
+            "rel_l2": 0.011365336840133522,
+            "max_abs": 0.625
+          }
+        },
+        {
+          "step": 3,
+          "vs_native_fp8": {
+            "mismatches": 2759,
+            "rel_l2": 0.002775986383200435,
+            "max_abs": 0.125
+          },
+          "vs_native_bf16": {
+            "mismatches": 9246,
+            "rel_l2": 0.014459587097845244,
+            "max_abs": 0.25
+          }
+        },
+        {
+          "step": 4,
+          "vs_native_fp8": {
+            "mismatches": 3237,
+            "rel_l2": 0.005829191676115114,
+            "max_abs": 0.5
+          },
+          "vs_native_bf16": {
+            "mismatches": 9372,
+            "rel_l2": 0.014033308706494914,
+            "max_abs": 0.75
+          }
+        }
+      ]
+    },
+    "scope": "Observed prefix inputs, weight/quantizer CPU recipe validation and FP32 dot-product decomposition; CPU accumulation is not the deployed FAST_ACCUM numerical contract. Raw QKV/history and repeated capture gates remain mandatory.",
+    "quantizer_scale_f32": [
+      0.0747767835855484,
+      0.00798688642680645,
+      0.0775669664144516,
+      0.00830078125,
+      0.08984375
+    ],
+    "observed_boundary": {
+      "norm_fp8_vs_bf16_bitexact": true,
+      "predicted_norm_mismatches_per_row": [
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "activation_e4m3_mismatches_per_row": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "scale_expected_bits": [
+        1033446546,
+        1006820206,
+        1033821038,
+        1007157248,
+        1035468800
+      ],
+      "scale_observed_bits": [
+        1033446546,
+        1006820206,
+        1033821038,
+        1007157248,
+        1035468800
+      ],
+      "scale_bits_exact": true
+    }
+  },
+  "exact_quantized_dot": {
+    "accepted_cpu_exactness_proof": true,
+    "scope": "Exact unscaled dot of observed quantized operands; nested FP32 scale epilogue then BF16. Does not assert WGMMA internal accumulation is specified as full FP32.",
+    "exactness_proof": {
+      "finite_E4M3_unit": "2^-9",
+      "integer_operand_max": 229376,
+      "K": 5120,
+      "integer_sum_abs_bound": 269380348805120,
+      "bound_less_than_2pow49": true,
+      "binary64_integer_exact_limit": 9007199254740992
+    },
+    "rows": [
+      {
+        "step": 0,
+        "actual_vs_exact_nested_f32": {
+          "mismatches": 3911,
+          "rel_l2": 0.006842932798713982,
+          "max_abs": 0.75
+        },
+        "cpu_f32_vs_exact": {
+          "mismatches": 1,
+          "rel_l2": 2.0484195751194665e-06,
+          "max_abs": 0.0009765625
+        },
+        "unrounded_epilogue_vs_nested": {
+          "mismatches": 0,
+          "rel_l2": 0.0,
+          "max_abs": 0.0
+        },
+        "least_squares_actual_gain": 0.9947609047776658,
+        "magnitude_shrunk": 2978,
+        "magnitude_grew": 933,
+        "by_component": {
+          "q": {
+            "mismatches": 646,
+            "rel_l2": 0.004025655016875546,
+            "max_abs": 0.125
+          },
+          "k": {
+            "mismatches": 713,
+            "rel_l2": 0.004585024721064274,
+            "max_abs": 0.25
+          },
+          "v": {
+            "mismatches": 2552,
+            "rel_l2": 0.007427993470543251,
+            "max_abs": 0.75
+          }
+        }
+      },
+      {
+        "step": 1,
+        "actual_vs_exact_nested_f32": {
+          "mismatches": 2865,
+          "rel_l2": 0.0030530639158869426,
+          "max_abs": 0.125
+        },
+        "cpu_f32_vs_exact": {
+          "mismatches": 0,
+          "rel_l2": 0.0,
+          "max_abs": 0.0
+        },
+        "unrounded_epilogue_vs_nested": {
+          "mismatches": 0,
+          "rel_l2": 0.0,
+          "max_abs": 0.0
+        },
+        "least_squares_actual_gain": 0.9985701329237441,
+        "magnitude_shrunk": 1749,
+        "magnitude_grew": 1116,
+        "by_component": {
+          "q": {
+            "mismatches": 540,
+            "rel_l2": 0.0029963136313963805,
+            "max_abs": 0.0625
+          },
+          "k": {
+            "mismatches": 552,
+            "rel_l2": 0.002641884422582326,
+            "max_abs": 0.0625
+          },
+          "v": {
+            "mismatches": 1773,
+            "rel_l2": 0.0031239237925830498,
+            "max_abs": 0.125
+          }
+        }
+      },
+      {
+        "step": 2,
+        "actual_vs_exact_nested_f32": {
+          "mismatches": 3706,
+          "rel_l2": 0.0063521364331882236,
+          "max_abs": 0.5
+        },
+        "cpu_f32_vs_exact": {
+          "mismatches": 0,
+          "rel_l2": 0.0,
+          "max_abs": 0.0
+        },
+        "unrounded_epilogue_vs_nested": {
+          "mismatches": 0,
+          "rel_l2": 0.0,
+          "max_abs": 0.0
+        },
+        "least_squares_actual_gain": 0.9952916982986104,
+        "magnitude_shrunk": 2386,
+        "magnitude_grew": 1320,
+        "by_component": {
+          "q": {
+            "mismatches": 691,
+            "rel_l2": 0.004855848481708402,
+            "max_abs": 0.25
+          },
+          "k": {
+            "mismatches": 705,
+            "rel_l2": 0.003970916979144153,
+            "max_abs": 0.125
+          },
+          "v": {
+            "mismatches": 2310,
+            "rel_l2": 0.0070056603198577596,
+            "max_abs": 0.5
+          }
+        }
+      },
+      {
+        "step": 3,
+        "actual_vs_exact_nested_f32": {
+          "mismatches": 2759,
+          "rel_l2": 0.00277297619134107,
+          "max_abs": 0.125
+        },
+        "cpu_f32_vs_exact": {
+          "mismatches": 0,
+          "rel_l2": 0.0,
+          "max_abs": 0.0
+        },
+        "unrounded_epilogue_vs_nested": {
+          "mismatches": 0,
+          "rel_l2": 0.0,
+          "max_abs": 0.0
+        },
+        "least_squares_actual_gain": 0.998912374848153,
+        "magnitude_shrunk": 1652,
+        "magnitude_grew": 1107,
+        "by_component": {
+          "q": {
+            "mismatches": 558,
+            "rel_l2": 0.0029773592225239343,
+            "max_abs": 0.0625
+          },
+          "k": {
+            "mismatches": 579,
+            "rel_l2": 0.002914506323709082,
+            "max_abs": 0.0625
+          },
+          "v": {
+            "mismatches": 1622,
+            "rel_l2": 0.002720429401003215,
+            "max_abs": 0.125
+          }
+        }
+      },
+      {
+        "step": 4,
+        "actual_vs_exact_nested_f32": {
+          "mismatches": 3237,
+          "rel_l2": 0.00580464217049634,
+          "max_abs": 0.5
+        },
+        "cpu_f32_vs_exact": {
+          "mismatches": 2,
+          "rel_l2": 1.9820556754962944e-05,
+          "max_abs": 0.0078125
+        },
+        "unrounded_epilogue_vs_nested": {
+          "mismatches": 0,
+          "rel_l2": 0.0,
+          "max_abs": 0.0
+        },
+        "least_squares_actual_gain": 0.9957805445924713,
+        "magnitude_shrunk": 2050,
+        "magnitude_grew": 1187,
+        "by_component": {
+          "q": {
+            "mismatches": 689,
+            "rel_l2": 0.0042036281566424265,
+            "max_abs": 0.25
+          },
+          "k": {
+            "mismatches": 656,
+            "rel_l2": 0.003189305742784242,
+            "max_abs": 0.125
+          },
+          "v": {
+            "mismatches": 1892,
+            "rel_l2": 0.006484964296421538,
+            "max_abs": 0.5
+          }
+        }
+      }
+    ]
+  },
+  "raw_fp8_vs_bf16_qkv": [
+    {
+      "step": 0,
+      "mismatches": 8824,
+      "rel_l2": 0.010836584474256089,
+      "max_abs": 1.0
+    },
+    {
+      "step": 1,
+      "mismatches": 9388,
+      "rel_l2": 0.016348339034197842,
+      "max_abs": 0.375
+    },
+    {
+      "step": 2,
+      "mismatches": 9170,
+      "rel_l2": 0.0115125663045958,
+      "max_abs": 0.75
+    },
+    {
+      "step": 3,
+      "mismatches": 9263,
+      "rel_l2": 0.01459861480403278,
+      "max_abs": 0.25
+    },
+    {
+      "step": 4,
+      "mismatches": 9408,
+      "rel_l2": 0.01730502623904263,
+      "max_abs": 1.25
+    }
+  ],
+  "findings": [
+    "Every captured raw QKV row exactly reconstructs its previously saved full-block convolution history, including both repeats. All30 captured tensor rows repeat bitexact.",
+    "Input normalization is bitexact between the BF16 and FP8 paths for all25600 values. One CPU-predicted BF16 norm value differs in step4, but it is shared by both observed native paths and cannot explain their difference.",
+    "All25600 observed FP8 activation bytes and five scales exactly match true-division per-token E4M3 quantization. All52428800 QKV weight bytes and10240 scale replicas exactly match the declared packed-tensor weight recipe. No weight export or activation quantizer defect found.",
+    "The earliest additional arithmetic discrepancy is pc3 GemmFp8: exact same quantized operands versus an exact binary64 dot with nested FP32 scale epilogue differs by0.2773\u20130.6843% relL2. The CPU FP32 dot differs from that exact reference by at most0.001982% relL2 in these five rows, so CPU dot rounding does not explain the native residual.",
+    "The BF16-rounded output of a fully binary64 epilogue equals the nested FP32 epilogue in all five rows. Epilogue reassociation does not explain this measured discrepancy.",
+    "The observed FP8-vs-BF16 raw QKV discrepancy remains1.0837\u20131.7305%. Intended weight and activation quantization contribute; the additional native-vs-exact-quantized-dot discrepancy appears at GEMM, before recurrence. No conclusion about all subsequent recurrent/MLP errors or model output quality follows.",
+    "Deployed object ab3ab392 has FAST_ACCUM=1 and accumulates across the whole K=5120 with the same WGMMA register chain. Systematic magnitude shrink is compatible with accumulation precision loss, but no controlled accumulation-policy experiment has run. A load/layout defect is not excluded solely by this source audit."
+  ],
+  "next_one_factor_experiment": {
+    "status": "proposal only; production code untouched",
+    "body": "runtime/nvidia/op_gemm.cuh::d_gemm_w8a8_m1_tma_sm90",
+    "sites": [
+      "1801 accumulate flag",
+      "1817 total accumulation",
+      "1834 nested scale epilogue retained"
+    ],
+    "change": "Artifact-only generic compile option: reset WGMMA partial at each existing512-K tile and add completed partials into a separate FP32 total. Preserve TMA double-buffer schedule, descriptors, activation bytes, weights/scales,132 slices,256 threads, WGMMA instruction shape/order within tile and nested scale epilogue. Keep all-K control object and current optimized CUTLASS reference unchanged.",
+    "prerequisites": [
+      "Matched broad control/candidate ptxas/SASS/resource proof; extra FP32 totals may raise registers/spills.",
+      "Five saved real inputs through identical packet prefix: norm/bytes/scales remain bitexact, compare all51200 QKV values against exact-dot reference and preserve original control raw-history equality.",
+      "Existing primitive numerical/canary/tail/memcheck gates plus measured residual improvement for every saved input; no new loosened tolerance or claim of CUTLASS fast-accum bit identity.",
+      "Only after numerical qualification: existing native full-block five-input/reset checks and native performance tests; no full-model/serving promotion from this prefix."
+    ]
+  },
+  "production_fix_proven": false,
+  "independent_model_quality_accepted": null,
+  "sha256": {
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/observed_math.py": "b89cabb0b748e197a4bcee30634f67220cde03c1006a70d088164ff9ae5326c8",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/observed-math.json": "2b0a26e5581e959d64c288314ea240352fe55113cc08ce00bc339b5c937db0f1",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/observed-math.log": "2b0a26e5581e959d64c288314ea240352fe55113cc08ce00bc339b5c937db0f1",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/exact_dot.py": "cf88751729573feff5f2d76a7506982cbc4f62cfc4ec0061e3ff1576ca905219",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/exact-dot.json": "070bf83c1fba65c5f275714de12a6889712d9a90b4aa7f0d91273ddd77bc2105",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/exact-dot.log": "f7bd5e7292ae11b87fb1a320613d69388c018ae1c654fc39421e0b256fee784c",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/exact-dot-qkv.bf16": "a95d734fd72768258da7ff1530d0fc21bcc604e8a8da5bce7e943febcbace371",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/queue-results.json": "d9bedd62cf476455973b4b2b520c7c4fa952a140023f483a81d1af4c276fd7a8",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/queue-status.json": "9dbcfb064cff456487557ea5bfc11f2a7f6fdf78d77892881f3771bf9a35711d",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/queue-events.jsonl": "13072523facd57b7055532ec62726b9c8d5bb0239474ea748021bbacaa422d60",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/queue-clocks-power.log": "8579ee7df3e4ad0a4a9f949517b132f4db8d34303c956ca62f0446802772b8c3",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-qualification.json": "aa94a4a72aaaac61f3c6d21e3ef0a940be39bc3eff202c016ae577a6e3355b43",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-qualification.json": "6dbb86c46f9f206393e4e25f42e5c22ed2b0acca268639e20bb07ea931ff4af8",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/cpu-proof.json": "385e5bb4e0bd80fad4a266697d93b7c78167e11d8551064d434c6ce25557dd93",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/cpu-localization.json": "a1158c34b44311f4cc71d772d45631d7d66af478363b3b807c258200cc94f872",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/FREEZE.json": "3f85b3b550c39481467d1cacaf018cd743466d5bd9d0d79989574b4ef43fd21a",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/head-8f16c95-launch-receipt.json": "3090b7b514aa9b9ddc9b21253812b8176e0fe63485d90564f54b0a930c59ff3b",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/manifest.json": "672468f6e3cdebb4695697f6e3e7e1f0197870f681643532a943a3cbc0663750",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0000-tensor000.raw": "70c8f2fae7a5553fecabfc5581a285e628b84cc31e5ec6527bacfa00bf0828c6",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0000-tensor001.raw": "055f694cdea89d8b43ce5d629db0e25781a5a0ff0d01e59a473796cd1b805ab1",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0000-tensor002.raw": "8e649a2f5bee42dd91535188e2a4097cb0a53c083d5fc1877ea4217c0396e2cd",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0000-tensor003.raw": "49e985c1736c65d22d7a3c64df030386e5594c9f51f67abc523d900e7655988b",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0001-tensor000.raw": "d7b800641d5aa847ec17f86224a177f752aded0f3ec444d3971ff9dc8a53e960",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0001-tensor001.raw": "7a03f5840ffa54cd0167fffb10e51f0ee718897786efb4778fba89822de0fc8a",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0001-tensor002.raw": "1352c24375d86aa84948b3f261f004ed6022f22b5d925e8fd0be115e19ac86c1",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0001-tensor003.raw": "2af6e3845a89e4ade2bea08471d01de9952ef5756d20c819e815fb8fe86faa6e",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0002-tensor000.raw": "34dc94f1044d97c2f9912f2f7c8a2e8a63be5552eaa44608cbb66bdfa8add0fd",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0002-tensor001.raw": "0dd68fd952dbc4447600491df615aafdf3df7396feb11124d2a156427c13d645",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0002-tensor002.raw": "f3954576b68051cbdc78c420d4c6ee8c5cc01d7b2d633df42979ec688c751eb7",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0002-tensor003.raw": "835154c783d58491b28bf8b07114f096ddf636239805765df81ded56999c6b40",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0003-tensor000.raw": "7705b6b47fd0b5e91f4b67b059358b4878151377e82118c1aa068b461b462c91",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0003-tensor001.raw": "e64fbaeb68476704be9a8c7836dc9dec84f8184eb373f109539c9a455a330185",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0003-tensor002.raw": "6cb58b1f2d7c7e64d5fe03e261ea4f847da908f99d3336e3c70a70ede6140c3b",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0003-tensor003.raw": "dbf214aefa8bdb9b9017bd95054bf0c5ecc08cb7f5f7d76fab6f1d7a0b42be79",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0004-tensor000.raw": "40cf1e4ee4d0f9945801eb9b6bfb7401ab301812a2cc52ec8bd338668f741100",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0004-tensor001.raw": "407728753037ba72c242150c3669c99d76cae869dc91a9c3c7466b5b27d1b022",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0004-tensor002.raw": "a203c9e9f8122c8482a03ebb34e13e11b4fea3162729229988937d9dad6d2c83",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r1/step0004-tensor003.raw": "a8dedfc732dc8b42fa1b36f3120d3b13ac08598ad965040b241a8cf7d76521f8",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/qwen-pc3-fp8-r1.log": "f8378caf3799785a60cf78ea913b49b463c14f46959fbb3ad9eb145eaf59138d",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/manifest.json": "672468f6e3cdebb4695697f6e3e7e1f0197870f681643532a943a3cbc0663750",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0000-tensor000.raw": "70c8f2fae7a5553fecabfc5581a285e628b84cc31e5ec6527bacfa00bf0828c6",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0000-tensor001.raw": "055f694cdea89d8b43ce5d629db0e25781a5a0ff0d01e59a473796cd1b805ab1",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0000-tensor002.raw": "8e649a2f5bee42dd91535188e2a4097cb0a53c083d5fc1877ea4217c0396e2cd",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0000-tensor003.raw": "49e985c1736c65d22d7a3c64df030386e5594c9f51f67abc523d900e7655988b",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0001-tensor000.raw": "d7b800641d5aa847ec17f86224a177f752aded0f3ec444d3971ff9dc8a53e960",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0001-tensor001.raw": "7a03f5840ffa54cd0167fffb10e51f0ee718897786efb4778fba89822de0fc8a",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0001-tensor002.raw": "1352c24375d86aa84948b3f261f004ed6022f22b5d925e8fd0be115e19ac86c1",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0001-tensor003.raw": "2af6e3845a89e4ade2bea08471d01de9952ef5756d20c819e815fb8fe86faa6e",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0002-tensor000.raw": "34dc94f1044d97c2f9912f2f7c8a2e8a63be5552eaa44608cbb66bdfa8add0fd",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0002-tensor001.raw": "0dd68fd952dbc4447600491df615aafdf3df7396feb11124d2a156427c13d645",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0002-tensor002.raw": "f3954576b68051cbdc78c420d4c6ee8c5cc01d7b2d633df42979ec688c751eb7",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0002-tensor003.raw": "835154c783d58491b28bf8b07114f096ddf636239805765df81ded56999c6b40",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0003-tensor000.raw": "7705b6b47fd0b5e91f4b67b059358b4878151377e82118c1aa068b461b462c91",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0003-tensor001.raw": "e64fbaeb68476704be9a8c7836dc9dec84f8184eb373f109539c9a455a330185",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0003-tensor002.raw": "6cb58b1f2d7c7e64d5fe03e261ea4f847da908f99d3336e3c70a70ede6140c3b",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0003-tensor003.raw": "dbf214aefa8bdb9b9017bd95054bf0c5ecc08cb7f5f7d76fab6f1d7a0b42be79",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0004-tensor000.raw": "40cf1e4ee4d0f9945801eb9b6bfb7401ab301812a2cc52ec8bd338668f741100",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0004-tensor001.raw": "407728753037ba72c242150c3669c99d76cae869dc91a9c3c7466b5b27d1b022",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0004-tensor002.raw": "a203c9e9f8122c8482a03ebb34e13e11b4fea3162729229988937d9dad6d2c83",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/fp8-r2/step0004-tensor003.raw": "a8dedfc732dc8b42fa1b36f3120d3b13ac08598ad965040b241a8cf7d76521f8",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/qwen-pc3-fp8-r2.log": "ff2fe08258acaa3ee6a88f3c4211963a97ad8b8920f4b33c578ddd68db4d33b3",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/manifest.json": "16b38b52b835017fbd7adff1b3344fa81489c5ab46537b2c0a7e6c39ff66ba42",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0000-tensor000.raw": "70c8f2fae7a5553fecabfc5581a285e628b84cc31e5ec6527bacfa00bf0828c6",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0000-tensor001.raw": "c4504dea69120444636bdf1ebe7c5036e7b6c2cae267061fecd86621d0ff8ca9",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0001-tensor000.raw": "d7b800641d5aa847ec17f86224a177f752aded0f3ec444d3971ff9dc8a53e960",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0001-tensor001.raw": "6266f3999c7227f2a6bc5228f0f241fa8de6e64cc860899754bec256fff884b8",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0002-tensor000.raw": "34dc94f1044d97c2f9912f2f7c8a2e8a63be5552eaa44608cbb66bdfa8add0fd",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0002-tensor001.raw": "c0153c721eb7dba11f80a2743b09df471d82cdbba8daa44924a22c20c81c3f59",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0003-tensor000.raw": "7705b6b47fd0b5e91f4b67b059358b4878151377e82118c1aa068b461b462c91",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0003-tensor001.raw": "bbce10ee2b22acaa8355a55b7b70702341f5615c7b3ec857ab833e1ce9fbcee4",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0004-tensor000.raw": "40cf1e4ee4d0f9945801eb9b6bfb7401ab301812a2cc52ec8bd338668f741100",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r1/step0004-tensor001.raw": "93f46dc494df55e5d58f48d0d22b3a19d3923ab1db5a3949cb101ac12f2da349",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/qwen-pc3-bf16-r1.log": "3ea703f42c2e664ddb719f1dee14c7c26f9b0666587bee9267a27f83334e3b0a",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/manifest.json": "16b38b52b835017fbd7adff1b3344fa81489c5ab46537b2c0a7e6c39ff66ba42",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0000-tensor000.raw": "70c8f2fae7a5553fecabfc5581a285e628b84cc31e5ec6527bacfa00bf0828c6",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0000-tensor001.raw": "c4504dea69120444636bdf1ebe7c5036e7b6c2cae267061fecd86621d0ff8ca9",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0001-tensor000.raw": "d7b800641d5aa847ec17f86224a177f752aded0f3ec444d3971ff9dc8a53e960",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0001-tensor001.raw": "6266f3999c7227f2a6bc5228f0f241fa8de6e64cc860899754bec256fff884b8",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0002-tensor000.raw": "34dc94f1044d97c2f9912f2f7c8a2e8a63be5552eaa44608cbb66bdfa8add0fd",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0002-tensor001.raw": "c0153c721eb7dba11f80a2743b09df471d82cdbba8daa44924a22c20c81c3f59",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0003-tensor000.raw": "7705b6b47fd0b5e91f4b67b059358b4878151377e82118c1aa068b461b462c91",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0003-tensor001.raw": "bbce10ee2b22acaa8355a55b7b70702341f5615c7b3ec857ab833e1ce9fbcee4",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0004-tensor000.raw": "40cf1e4ee4d0f9945801eb9b6bfb7401ab301812a2cc52ec8bd338668f741100",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/results/bf16-r2/step0004-tensor001.raw": "93f46dc494df55e5d58f48d0d22b3a19d3923ab1db5a3949cb101ac12f2da349",
+    "/tmp/plow-model-support-checks/qwen-five-input-pc3-localization-20260906/qwen-pc3-bf16-r2.log": "b9a8b4bee265e025284ef4d6c310986bfe461298b6ef46fe6b8caa9a544f9b52"
+  }
+}
