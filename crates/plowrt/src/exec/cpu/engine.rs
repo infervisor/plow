@@ -753,16 +753,43 @@ impl CpuEngine {
         // node placement the pool will use (same rule: round-robin over nodes).
         let nodes = topo.select_nodes(&opts.numa);
         let threads = if opts.threads == 0 {
-            // Every online logical cpu (SMT siblings add bandwidth here) — mirrors
-            // WorkerPool::spawn's placement list.
-            nodes
+            // Mirrors WorkerPool::spawn's placement list, which orders physical cores first and
+            // their SMT siblings after, so `k` threads pin to `k` distinct logical cpus.
+            let logical: usize = nodes
                 .iter()
                 .map(|&n| topo.cores_on_node(n).map(|c| c.siblings.len().max(1)).sum::<usize>())
-                .sum::<usize>()
-                .max(1)
+                .sum();
+            let physical: usize = nodes.iter().map(|&n| topo.cores_on_node(n).count()).sum();
+            // ONE WORKER PER PHYSICAL CORE, not per logical cpu. The wide execution resources are
+            // per core — both SMT siblings issue into the same TMUL and the same pair of 512-bit
+            // FMA ports — so a second thread on a core buys contention, not throughput, for
+            // anything compute-bound. Measured on this 8-core / 16-thread Sapphire Rapids, 8
+            // threads vs 16:
+            //
+            //   GPT-OSS MXFP4   prefill 512 tok  445 vs 399 tok/s   decode 24.5 vs 25.5 ms
+            //   same, AVX-512   prefill 512 tok  442 vs 394 tok/s   decode 24.3 vs 25.3 ms
+            //   Gemma-12B bf16  prefill 512 tok  259 vs 185 tok/s   decode 235 vs 230 ms
+            //   Gemma-26B MXFP4 prefill 512 tok  208 vs 207 tok/s   decode 37.3 vs 38.4 ms
+            //
+            // Prefill wants it badly (up to +40%) and every quantized decode prefers it; the one
+            // case that favours the siblings is pure bf16 decode, which is weight-bandwidth-bound
+            // and gains 2.4% from the extra outstanding loads. That is a poor trade against 40%,
+            // so the rule is unconditional and `--cpu-threads` remains for hosts that disagree.
+            let _ = isa;
+            if physical > 0 {
+                physical
+            } else {
+                logical.max(1)
+            }
         } else {
             opts.threads
         };
+        tracing::info!(
+            threads,
+            ?isa,
+            physical_cores = topo.physical_cores(),
+            "cpu: worker count"
+        );
         let exec = Arc::new(KernelExec::new(&model, threads, |w| {
             // Mirrors WorkerPool::spawn's placement; only informational for kernels.
             nodes[w % nodes.len()]
