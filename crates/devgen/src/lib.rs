@@ -55,6 +55,7 @@ pub mod emit_config;
 pub mod k3;
 pub mod kda;
 use config::*;
+mod gptoss;
 mod ladder;
 mod mla;
 mod qwen35;
@@ -1644,6 +1645,13 @@ struct LW {
     g_pre2: u32,
     ewt: u32,
     est: u32,
+    // MXFP4 experts (PLOW_MXFP4 on a MoE model): flat `mxfp4/…experts.gate_up_proj` [E*2I][H/2] +
+    // `_scale` [E*2I][H/32] and the down twins, consumed by the GPT-OSS flat-expert ops 147–150
+    // (layout 1 = gate block then up block). ewt/est stay NONE and no bf16 expert is bound.
+    egu8: u32,
+    egus: u32,
+    edn8: u32,
+    edns: u32,
     // FP8 DECODE weights (PLOW_FP8) + their per-output-channel f32 dequant scales. The bf16 wq..wd
     // above stay bound (from the bf16 checkpoint) and feed PREFILL's GEMM; these fp8 twins feed the
     // decode GEMV. TENSOR_NONE in bf16 mode. The fp8 weight/scale tensors are declared under an
@@ -2113,6 +2121,11 @@ fn declare(
         // never-read weight (fp8 pkt was 32.3 GiB = 22.2 bf16 + 10.1 fp8). Elide the bf16 projection
         // in fp8 mode (norms, embedding/lm_head, RoPE stay bf16). Verified: every w.wq..wd reference
         // (fused GemvQkv, bf16 GemmGlu/GemvGlu, bf16 proj arm) is under a `!fp8` guard.
+        // MXFP4 dense twins (PLOW_MXFP4=1): `mxfp4/<name>` packed e2m1 (numel/2 bytes) +
+        // `mxfp4/<name>_scale` E8M0 (numel/32 bytes) — quantize_mxfp4.py's layout, the GPT-OSS
+        // expert byte order. Decode reads them through ops 91/92; prefill keeps the bf16 weight, so
+        // `wproj` is NOT elided here (unlike fp8, where GEMM_FP8 consumes the twin).
+        let mx4 = emit_config::active().mxfp4;
         let wproj = |b: &mut Builder, s: &str, sz: u64| {
             if fp8 || !in_block {
                 TENSOR_NONE
@@ -2134,10 +2147,20 @@ fn declare(
         // MoE fused expert weights: declared so the loader binds them by name and the harness
         // derives per-expert ewt bases from their device addresses. Not referenced as op operands
         // (the SM indexes them through the ewt pointer table), so the handles are discarded here.
+        let mut ex4 = [TENSOR_NONE; 4];
         if c.moe && in_block {
             let gu_n = (c.n_exp * 2 * c.moe_inter) as u64;
             let dn_n = (c.n_exp * c.hidden) as u64;
-            if fp8 {
+            if mx4 {
+                let gu = gu_n * c.hidden as u64;
+                let dn = dn_n * c.moe_inter as u64;
+                ex4 = [
+                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj"), gu / 2),
+                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj_scale"), gu / 32),
+                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.down_proj"), dn / 2),
+                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.down_proj_scale"), dn / 32),
+                ];
+            } else if fp8 {
                 b.tensor(
                     &format!("fp8/{prefix}layers.{l}.experts.gate_up_proj"),
                     gu_n * c.hidden as u64,
@@ -2165,13 +2188,18 @@ fn declare(
         let w8 = |b: &mut Builder, s: &str, numel: u64| -> u32 {
             if fp8 && in_block {
                 b.tensor(&format!("fp8/{prefix}layers.{l}.{s}"), numel)
+            } else if mx4 && in_block {
+                b.tensor(&format!("mxfp4/{prefix}layers.{l}.{s}"), numel / 2)
             } else {
                 TENSOR_NONE
             }
         };
-        let sc = |b: &mut Builder, s: &str, out: u64| -> u32 {
+        // Scale twin: fp8 = f32 per output channel; mxfp4 = one E8M0 byte per 32 K per row.
+        let sc = |b: &mut Builder, s: &str, out: u64, numel: u64| -> u32 {
             if fp8 && in_block {
                 b.tensor(&format!("fp8/{prefix}layers.{l}.{s}_scale"), out * F32)
+            } else if mx4 && in_block {
+                b.tensor(&format!("mxfp4/{prefix}layers.{l}.{s}_scale"), numel / 32)
             } else {
                 TENSOR_NONE
             }
@@ -2213,17 +2241,17 @@ fn declare(
             wg8: w8(b, "mlp.gate_proj.weight", (inter_sh * c.hidden) as u64),
             wu8: w8(b, "mlp.up_proj.weight", (inter_sh * c.hidden) as u64),
             wd8: w8(b, "mlp.down_proj.weight", (c.hidden * inter_sh) as u64),
-            sq: sc(b, "self_attn.q_proj.weight", qd as u64),
-            sk: sc(b, "self_attn.k_proj.weight", kd as u64),
+            sq: sc(b, "self_attn.q_proj.weight", qd as u64, (qd * c.hidden) as u64),
+            sk: sc(b, "self_attn.k_proj.weight", kd as u64, (kd * c.hidden) as u64),
             sv: if keqv {
                 TENSOR_NONE
             } else {
-                sc(b, "self_attn.v_proj.weight", kd as u64)
+                sc(b, "self_attn.v_proj.weight", kd as u64, (kd * c.hidden) as u64)
             },
-            so: sc(b, "self_attn.o_proj.weight", c.hidden as u64),
-            sg: sc(b, "mlp.gate_proj.weight", inter_sh as u64),
-            su: sc(b, "mlp.up_proj.weight", inter_sh as u64),
-            sd: sc(b, "mlp.down_proj.weight", c.hidden as u64),
+            so: sc(b, "self_attn.o_proj.weight", c.hidden as u64, (c.hidden * qd) as u64),
+            sg: sc(b, "mlp.gate_proj.weight", inter_sh as u64, (inter_sh * c.hidden) as u64),
+            su: sc(b, "mlp.up_proj.weight", inter_sh as u64, (inter_sh * c.hidden) as u64),
+            sd: sc(b, "mlp.down_proj.weight", c.hidden as u64, (c.hidden * inter_sh) as u64),
             g_in: w(b, "input_layernorm.weight", c.hidden as u64 * BF16),
             g_pa: w(b, "post_attention_layernorm.weight", c.hidden as u64 * BF16),
             // Gemma's sandwich has two extra norms; Llama/Qwen do not.
@@ -2280,7 +2308,7 @@ fn declare(
                 "pre_feedforward_layernorm_2.weight",
                 c.hidden as u64 * BF16,
             ),
-            ewt: if c.moe && in_block {
+            ewt: if c.moe && in_block && !mx4 {
                 b.tensor(&format!("moe.ewt.{l}"), (c.n_exp * 2) as u64 * 8)
             } else {
                 TENSOR_NONE
@@ -2290,6 +2318,10 @@ fn declare(
             } else {
                 TENSOR_NONE
             },
+            egu8: ex4[0],
+            egus: ex4[1],
+            edn8: ex4[2],
+            edns: ex4[3],
         });
     }
     t
@@ -3123,6 +3155,9 @@ fn emit_phase(
     // the `hn_dep` closure below already binds a `gemv: u32` parameter that would shadow it.)
     let decode = mode.decode_shape();
     let gemv_family = mode.gemv();
+    // MXFP4 dense decode (PLOW_MXFP4=1): q/k/v/o/down through GemvMxfp4 (91), gate|up through
+    // GemvGluMxfp4 (92); prefill stays on the bf16 weight. Exclusive with the fp8 axis.
+    let mx4 = emit_config::active().mxfp4;
     // A decode LADDER makes every rung — the one-row rung included — address the KV cache per
     // sequence out of `pos[]`. See the two `i[6] = n_batch_kv` sites below for why.
     let seq_rows = emit_config::active().decode_ladder_on();
@@ -3274,6 +3309,20 @@ fn emit_phase(
                 d.i[1] = nn;
                 d.i[2] = k;
                 d.i[4] = 0;
+            });
+        }
+        if gemv_family && mx4 {
+            // Op 91 has no norm-fold slot; every caller passes TENSOR_NONE (the norm is a shared
+            // packet), so a gamma here would be a silently dropped norm — refuse instead.
+            assert_eq!(gamma, TENSOR_NONE, "mxfp4 GEMV cannot fold a norm (gamma) — emit it as a packet");
+            return b.emit(DevOp::GemvMxfp4, gemv_wg_cap(cus), deps, |d| {
+                d.t[0] = out;
+                d.t[1] = a;
+                d.t[2] = w8;
+                d.t[3] = scale;
+                d.i[0] = m;
+                d.i[1] = nn;
+                d.i[2] = k;
             });
         }
         // PREFILL fp8 tiled GEMM. Two builds share the GEMM_FP8 opcodes; the interp cubin picks the
@@ -3490,6 +3539,7 @@ fn emit_phase(
         let fuse_qkv = gemv_family
             && !keqv
             && !fp8
+            && !mx4
             // `gemv_staged_rows`, not `t`: with `PLOW_GEMV_WALK` the staging moves inside the
             // row loop and the bound stops depending on M. See §6g-WALK's companion change.
             && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves()
@@ -4641,6 +4691,20 @@ fn emit_phase(
                         d.j[1] = 1;
                     }
                 })
+            } else if mx4 {
+                // w.wg8/wu8 and w.sg/su carry the mxfp4 twins (e2m1 rows + E8M0 scale rows).
+                b.emit(DevOp::GemvGluMxfp4, gemv_wg_cap(all.clone()), &[c_pf], |d| {
+                    d.t[0] = n.fu;
+                    d.t[1] = mlp_src;
+                    d.t[2] = w.wg8;
+                    d.t[5] = w.wu8;
+                    d.t[3] = w.sg;
+                    d.t[4] = w.su;
+                    d.i[0] = t;
+                    d.i[1] = inter_l;
+                    d.i[2] = c.hidden;
+                    d.i[5] = c.mlp_act;
+                })
             } else {
                 b.emit(DevOp::GemvGlu, all.clone(), &[c_pf], |d| {
                     d.t[0] = n.fu;
@@ -4872,6 +4936,44 @@ fn emit_phase(
                 } else {
                     DevOp::MoeExpertGluNormGemma
                 };
+                let c_dn = if mx4 {
+                    // MXFP4 experts: separate norm, then the GPT-OSS flat-expert ops (147/148)
+                    // over Gemma's route table; layout 1 = gate rows [0,I) then up rows [I,2I).
+                    let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
+                        d.t[0] = n.moe_xn2;
+                        d.t[1] = n.x;
+                        d.t[2] = w.g_pre2;
+                        d.i[0] = t;
+                        d.i[1] = c.hidden;
+                        d.f[0] = c.eps;
+                    });
+                    let c_glu = b.emit(DevOp::MoeGluMx, glu_cus, &[c_rt, c_xn2_local], |d| {
+                        d.t[0] = n.moe_mfu;
+                        d.t[1] = n.moe_xn2;
+                        d.t[2] = n.moe_tab;
+                        d.t[3] = w.egu8;
+                        d.t[4] = w.egus;
+                        d.i[0] = c.top_k;
+                        d.i[1] = c.moe_inter;
+                        d.i[2] = c.hidden;
+                        d.i[3] = c.n_exp;
+                        d.i[4] = 1;
+                        d.i[5] = c.mlp_act;
+                        d.i[6] = nb;
+                    });
+                    vec![b.emit(DevOp::MoeDownMx, down_cus, &[c_glu], |d| {
+                        d.t[0] = n.moe_part;
+                        d.t[1] = n.moe_mfu;
+                        d.t[2] = n.moe_tab;
+                        d.t[3] = w.edn8;
+                        d.t[4] = w.edns;
+                        d.i[0] = c.top_k;
+                        d.i[1] = c.hidden;
+                        d.i[2] = c.moe_inter;
+                        d.i[3] = c.n_exp;
+                        d.i[6] = nb;
+                    })]
+                } else {
                 let c_glu = if fp8 {
                     // fp8 path: separate norm + expert GLU (no fused fp8 norm variant)
                     let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
@@ -4920,7 +5022,7 @@ fn emit_phase(
                 } else {
                     DevOp::MoeExpertDownGemma
                 };
-                let c_dn = vec![b.emit(down_op, down_cus, &[c_glu], |d| {
+                vec![b.emit(down_op, down_cus, &[c_glu], |d| {
                     d.t[0] = n.moe_part;
                     d.t[1] = n.moe_mfu;
                     d.t[2] = n.moe_tab;
@@ -4931,7 +5033,8 @@ fn emit_phase(
                     d.i[2] = c.moe_inter;
                     d.i[3] = c.n_exp;
                     d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                })];
+                })]
+                };
                 // fused combine + rmsnorm + residual: saves 2 counter gates per layer.
                 let mut comb_deps: Vec<u32> = c_dn;
                 comb_deps.push(c_h1);
@@ -5084,6 +5187,34 @@ fn emit_phase(
                             d.i[2] = c.n_exp;
                         },
                     )
+                } else if mx4 {
+                    // MXFP4 experts: GPT-OSS grouped flat-expert prefill (149/150) over Gemma's
+                    // align tables; no bias, layout 1, GeGLU.
+                    let c_glu = b.emit(DevOp::MoeGluMxPf, all.clone(), &[c_align, c_xn2], |d| {
+                        d.t[0] = n.moe_fug;
+                        d.t[1] = n.moe_xn2;
+                        d.t[2] = w.egu8;
+                        d.t[3] = w.egus;
+                        d.t[4] = n.moe_meta;
+                        d.t[5] = n.moe_rowtok;
+                        d.i[0] = c.moe_inter;
+                        d.i[1] = c.hidden;
+                        d.i[2] = c.n_exp;
+                        d.i[3] = 1;
+                        d.i[5] = c.mlp_act;
+                    });
+                    b.emit(DevOp::MoeDownMxPf, all.clone(), &[c_glu, c_align], |d| {
+                        d.t[0] = n.moe_part;
+                        d.t[1] = n.moe_fug;
+                        d.t[2] = w.edn8;
+                        d.t[3] = w.edns;
+                        d.t[4] = n.moe_meta;
+                        d.t[6] = n.moe_rowpart;
+                        d.t[7] = n.moe_rowgate;
+                        d.i[0] = c.hidden;
+                        d.i[1] = c.moe_inter;
+                        d.i[2] = c.n_exp;
+                    })
                 } else {
                     let c_glu = b.emit(
                         DevOp::MoeGroupGluGemmaPf,
@@ -6024,6 +6155,27 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                     .map(str::to_string)
             })
             .unwrap_or_default();
+    // GPT-OSS: its own emitter (gptoss.rs) over the CPU-tier contracts; `cfg_from` would panic
+    // on its config and the dense path has no MoE-with-bias/sinks arm.
+    if model_type == "gpt_oss" {
+        assert!(
+            embed_cubin.is_none() && embed_hsaco.is_none(),
+            "gpt_oss has no GPU interpreter object to embed (CPU-tier ops only)"
+        );
+        gptoss::run(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            block_spec.as_deref(),
+            rope_gen,
+            &arch,
+            &gpu,
+            verify.as_ref(),
+        );
+        return;
+    }
     let capabilities = emit_capabilities(&model_type);
     if emit_config::active().decode_cublaslt {
         assert!(
@@ -6909,43 +7061,14 @@ fn emit_dense_gqa(
         !w8a8 || fp8,
         "PLOW_W8A8=1 requires PLOW_FP8=1 (the fp8 weight twins + scales)"
     );
-    // WEIGHT AXIS, 4-bit (`PLOW_MXFP4=1`) — REFUSED here, not ignored.
-    //
-    // The flag is real and it works, on the OTHER family: `mla::mla_moe_enc_env` reads it and
-    // returns `MoeEnc::Mxfp4`, and `scripts/build_gfx950.sh` builds and ships
-    // `interp_{decode,prefill}_mxfp4[_gq].elf` when it is set. This emitter never read it. So
-    // `PLOW_MXFP4=1` on Gemma/Qwen/Llama emitted a packet BYTE-IDENTICAL to the bf16 one, with
-    // `build.json` reporting `mxfp4_weights: false` and not one `Gemv*Mxfp4` opcode in the stream —
-    // next to a build directory full of objects named `mxfp4`. §4's recurring shape exactly: the
-    // arm exists (`DevOp::GemvMxfp4`/`GemvGluMxfp4`/`GemmMxfp4`, 91/92/93, all three dispatched by
-    // the gfx950 interpreter and all three in `GFX950_DISPATCHED`), it is correct, it is
-    // register-gated — and on this path nothing routes to it.
-    //
-    // REFUSED rather than warned, by `warn_uniseg_on_amd`'s own test: "what does the caller get if
-    // I drop this?" Dropping `PLOW_UNISEG` yields the CORRECT packet, so it is ignored with a
-    // warning. Dropping `PLOW_MXFP4` yields a bf16 packet that the caller asked to be mxfp4, will
-    // benchmark, and will report as mxfp4 — the precision substitution the apples-to-apples rule
-    // exists to prevent, and the one failure mode this file's gates are all pointed at. That puts
-    // it with w8a16-on-gfx950 (`check_fp8_a_scale_bound`), not with UNISEG. It also removes a
-    // loudness asymmetry that was itself the defect: `PLOW_FP8=1` without `PLOW_W8A8` on gfx950
-    // panics with a four-line explanation, while the 4-bit axis said nothing at all.
-    //
-    // Missing capability: `dense_mxfp4_weights`. NOT implemented rather than not wanted, and the
-    // reason is measurement: mxfp4 projects only ~1.2x over w8a8 once the fixed per-packet overhead
-    // is held constant, not the 2x its 4-bit weight implies, because that overhead does not shrink
-    // with the weights. Building it would mean declaring e2m1 weight twins + one E8M0 scale per 32
-    // K-elements per projection (bias 127 — byte 0 is 2^-127, not neutral), pointing decode at ops
-    // 91/92 and prefill at 93, and adding the `mxfp4` object row to the manifest's `requires`.
+    // WEIGHT AXIS, 4-bit (`PLOW_MXFP4=1`) on the dense family: decode q/k/v/o/down go through
+    // GemvMxfp4 (91) and gate|up through GemvGluMxfp4 (92) on `mxfp4/<name>` e2m1 twins with one
+    // E8M0 scale per 32 K (`quantize_mxfp4.py`); prefill keeps the bf16 weight (no GemmMxfp4 arm
+    // yet — prefill is compute-bound, the win is decode bytes). The manifest derives
+    // `mxfp4_weights` from the emitted stream. Exclusive with the fp8 axis.
     assert!(
-        !ecfg.mxfp4,
-        "PLOW_MXFP4=1 is not implementable on the dense-GQA family (Gemma / Qwen / Llama): this \
-         emitter has no mxfp4 arm, so it would emit a packet byte-identical to bf16 while the \
-         objects, the filename and the manifest all said mxfp4. Missing capability: \
-         `dense_mxfp4_weights`. It IS implemented for the MLA/MoE family (GLM / Kimi / DeepSeek), \
-         which is what `scripts/build_gfx950.sh`'s mxfp4 objects are for. NOT silently downgraded \
-         to bf16: a bf16 asset labelled mxfp4 is the precision substitution that makes a \
-         measurement unfalsifiable. Use PLOW_FP8=1 PLOW_W8A8=1 for the narrowest weight profile \
-         this family has on gfx950, or unset PLOW_MXFP4 for bf16."
+        !(ecfg.mxfp4 && fp8),
+        "PLOW_MXFP4=1 and PLOW_FP8/W8A16/W8A8 name two weight encodings; pick one"
     );
     // FP8 KV-CACHE (PLOW_FP8_KV=1). Stores/reads K/V as e4m3 with a per-row f32 scale, halving the
     // decode KV stream (the HBM-bound part of flash-decode) and the KV footprint. Independent of the

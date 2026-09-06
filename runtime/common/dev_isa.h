@@ -65,9 +65,15 @@ enum {
     PLOW_DOP_ROWRMS = 2,
 
     /* t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos(i32)
-     * i0=ntok i1=nhead i2=hd i3=out_row0   f0=eps
+     * i0=ntok i1=nhead i2=hd i3=out_row0 i4=skip_norm i5=pair_mode i6=n_batch_kv   f0=eps
      * cos==NONE skips RoPE (that is v_norm). out_row0 lets K/V land directly at
-     * a row offset of the KV cache, so the cache write is not a separate copy. */
+     * a row offset of the KV cache, so the cache write is not a separate copy.
+     *
+     * i5 = ROTATION PAIRING. 0 = the legacy rule (half-split (i, i+hd/2) except hd==64, which is
+     * GPT-J interleaved (2i, 2i+1) for GLM/Kimi's k_rope); 1 = interleaved at hd==128 too
+     * (GLM/Kimi); 2 = FORCE half-split (NeoX `rotate_half`) at EVERY hd. GPT-OSS is hd=64
+     * half-split, the one combination the legacy rule gets wrong, and a wrong pairing is fluent
+     * text from the wrong model. Zero-init packets keep the legacy rule byte-for-byte. */
     PLOW_DOP_HEADNORM_ROPE = 3,
 
     /* t0=out t1=a t2=b                 i0=n                     f0=scale
@@ -75,8 +81,20 @@ enum {
      * the SECOND residual add; pass 1.0 for the first. */
     PLOW_DOP_RESIDUAL = 4,
 
-    /* t0=out t1=gate t2=up             i0=n i1=act(0=gelu_tanh,1=silu)
-     * Gemma is GeGLU (gelu_tanh), not SwiGLU. */
+    /* t0=out t1=gate t2=up             i0=n i1=act(0=gelu_tanh,1=silu,3=swiglu_oai)  f0=alpha f1=limit
+     * Gemma is GeGLU (gelu_tanh), not SwiGLU.
+     *
+     * ACT CODES, shared by every GLU-family op (5, 19, 20, 45, 48, 85, 147, 149):
+     *   0 gelu_tanh(g)*u   1 silu(g)*u   2 situ (Kimi-K3, op 105 documents it)
+     *   3 swiglu_oai (GPT-OSS). PAIR FORM A(g)*B(u), like situ it transforms the UP branch:
+     *        A(g) = min(g, limit) * sigmoid(alpha * min(g, limit))
+     *        B(u) = clamp(u, -limit, limit) + 1
+     *     with f0 = alpha (1.702) and f1 = limit (7.0). HF modeling_gpt_oss.py GptOssExperts:
+     *        gate = gate.clamp(max=limit); up = up.clamp(-limit, limit)
+     *        glu = gate * sigmoid(gate * alpha); out = (up + 1) * glu
+     *     g and u are the BIASED projections (W_g x + b_g, W_u x + b_u) — the bias is added before
+     *     the clamp. Both immediates are REQUIRED at act=3: a zeroed f1 clamps everything to 0
+     *     and f0=0 makes sigmoid 0.5, so an arm must refuse f1 <= 0 rather than compute. */
     PLOW_DOP_GLU = 5,
 
     /* t0=out t1=table t2=ids(i32)      i0=ntok i1=hidden        f0=scale
@@ -86,8 +104,13 @@ enum {
     /* t0=out t1=x                      i0=n                     f0=cap */
     PLOW_DOP_SOFTCAP = 7,
 
-    /* t0=C t1=A t2=B                   i0=M i1=N i2=K  i4=a_row0  [i6=A-tmap i7=B-tmap]
+    /* t0=C t1=A t2=B t7=bias?          i0=M i1=N i2=K  i4=a_row0  [i6=A-tmap i7=B-tmap]
      * C[M,N] = A[M,K] . B[N,K]^T. B is [out_features, in_features].
+     *
+     * t7 = OPTIONAL bf16 [N] BIAS (PLOW_TENSOR_NONE = none), added to the f32 accumulator before
+     * the bf16 round of C — HF's `x @ W.T + b` (GPT-OSS attention_bias, router bias). Same slot
+     * and same rule on every tile twin (14/15/94/95), on GEMM_NORM (9), and on GEMV (10). Every
+     * pre-bias packet has t7 = NONE, so the bytes are unchanged.
      *
      * i4 skips a_row0 rows of A. It exists so prefill's lm_head can be M=1 over the LAST
      * token instead of M=T over all of them: at T=4096 that is a 512 KB logit buffer and
@@ -142,8 +165,9 @@ enum {
      * before the second reduction, reproducing NORM_RESIDUAL's store + RMSNORM's reload. */
     PLOW_DOP_NORM_RESIDUAL_NORM = 23,
 
-    /* t0=C t1=x t2=W t3=rms? t4=gamma?   i0=M i1=N i2=K i3=norm i4=a_row0   f0=eps
+    /* t0=C t1=x t2=W t3=rms? t4=gamma? t7=bias?   i0=M i1=N i2=K i3=norm i4=a_row0   f0=eps
      * Decode path: M <= PLOW_GEMV_MAXM. Bandwidth-bound, no MFMA.
+     * t7 = optional bf16 [N] bias, added to the f32 wave sum before the bf16 store (see GEMM).
      *
      * i3 (norm): 0 = none; 1 = apply a PRECOMPUTED row RMS from t3; 2 = COMPUTE the row RMS
      * here, which deletes the whole RMSNORM packet and its gate. Mode 2 is nearly free: the
@@ -167,7 +191,25 @@ enum {
      * f0=scale */
     PLOW_DOP_FLASH_DECODE = 12,
 
-    /* t0=O t1=Opart t2=mlpart          i0=n_batch i1=n_head i2=nsplit i3=hd */
+    /* t0=O t1=Opart t2=mlpart t3=sinks?   i0=n_batch i1=n_head i2=nsplit i3=hd
+     *
+     * t3 = OPTIONAL ATTENTION SINKS, bf16 [n_head] (PLOW_TENSOR_NONE = none). GPT-OSS
+     * `self_attn.sinks`: one extra UNSCALED logit per head that joins the softmax denominator
+     * and contributes no value row (HF: `softmax(cat([qk*scale, sinks]))[..., :-1]`). It is folded
+     * at EXACTLY ONE point, here, on the per-head (m, l) the splits already carry:
+     *     gm  = max_s m_s                       (as today)
+     *     gm' = max(gm, sink_h)
+     *     gl' = sum_s l_s * e^(m_s - gm') + e^(sink_h - gm')
+     *     O   = sum_s O_s * e^(m_s - gm') / gl'
+     * m_s/l_s are in the natural-exp domain the flash ops write (m_s = running max of the SCALED
+     * logits, l_s = sum e^(logit - m_s)); a split with m_s == -inf (empty) is skipped as today.
+     * With t3 == NONE the arithmetic is byte-for-byte the old merge.
+     *
+     * THE FOLD POINT IS THE MERGE AND ONLY THE MERGE. FLASH_PREFILL / FLASH_DECODE never see the
+     * sinks, so with sinks present the emitter MUST emit a FLASH_MERGE at every nsplit (including
+     * 1) and MUST leave FLASH_PREFILL.t5 (O_final direct write, which normalises inside the flash)
+     * at NONE. A flash arm that normalises internally would otherwise drop the sink or count it
+     * twice — fluent, wrong. */
     PLOW_DOP_FLASH_MERGE = 13,
 
     /* t0=part(u64[blocks]) t1=x(bf16)  i0=n
@@ -188,23 +230,38 @@ enum {
     /* GEMV over gate|up in ONE pass, with act(gate)*up applied in the EPILOGUE -- the fusion
      * every BLAS ships. Output-stationary, so the GLU runs exactly once per element and nothing
      * is replicated. Deletes the GLU packet AND merges two GEMVs into one.
-     * t[0]=fu t[1]=x t[2]=W_gate t[5]=W_up; i[0]=M i[1]=N i[2]=K i[5]=act. See op_gemm.h. */
+     * t[0]=fu t[1]=x t[2]=W_gate t[5]=W_up t[6]=bias_gate? t[7]=bias_up?;
+     * i[0]=M i[1]=N i[2]=K i[5]=act; f0/f1 = the act's immediates (situ betas, swiglu_oai
+     * alpha/limit). bias_gate/bias_up are optional bf16 [N], added to g and u in f32 BEFORE the
+     * activation (HF: gate_up = x @ W + b, then the GLU). Two tensors, not one [2N]: they mirror the
+     * two weight tensors so the loader binds checkpoint names verbatim. See op_gemm.h. */
     PLOW_DOP_GEMV_GLU = 19,
 
     /* GEMM over gate|up in ONE pass, act(gate)*up in the EPILOGUE -- the prefill twin of
      * PLOW_DOP_GEMV_GLU. Same tile, same registers, same MFMA count: the SN axis selects
      * gate vs up instead of a column block, so both land in the same lane.
-     * t[0]=fu t[1]=x t[2]=W_gate t[5]=W_up; i[0]=M i[1]=N i[2]=K i[5]=act. */
+     * t[0]=fu t[1]=x t[2]=W_gate t[5]=W_up t[6]=bias_gate? t[7]=bias_up?;
+     * i[0]=M i[1]=N i[2]=K i[5]=act; f0/f1 as op 19. */
     PLOW_DOP_GEMM_GLU = 20,
 
     PLOW_DOP_ARGMAX = 17,
     PLOW_DOP_ARGMAX_FIN = 18,
 
-    /* t0=q_out t1=x t2=W_q t3=k_out t4=W_k t5=v_out t6=W_v   i0=M i1=Nq i2=K i3=Nk i4=Nv
+    /* t0=q_out t1=x t2=W_q t3=k_out t4=W_k t5=v_out t6=W_v [t7=gamma]
+     * i0=M i1=Nq i2=K i3=Nk i4=Nv i5=bias_q i6=bias_k i7=bias_v
      * FUSED Q|K|V GEMV: q/k/v share x and K, so their outputs concatenate into one N=Nq+Nk+Nv
      * sweep (col<Nq -> q_out, <Nq+Nk -> k_out, else v_out). Decode-only. Replaces three GEMVs on
      * disjoint CU sets with one uniform-fill op: two fewer gates/layer, no cross-op imbalance.
-     * Single weight stream, so the plain GEMV register budget. See op_gemm.h. */
+     * Single weight stream, so the plain GEMV register budget. See op_gemm.h.
+     *
+     * i5/i6/i7 = OPTIONAL bf16 BIAS TENSOR HANDLES ([Nq], [Nk], [Nv]; 0 = absent), one per output
+     * stream, added to the f32 wave sum before the bf16 store. They are the op-114/115 demotion
+     * rule verbatim (a read-only weight-like operand may live in an integer slot; an output never
+     * does), because t7 is NOT free here: it is the AMD q-norm fold's gamma (PLOW_GLM_FUSE_QNORM,
+     * crates/packet/src/dev.rs). Three handles rather than one concatenated [Nq+Nk+Nv] because the
+     * checkpoint ships three bias tensors and the loader binds by name — no derived tensor needed.
+     * 0 means absent on the GEMM i6/i7 precedent: pre-bias packets zero-fill i[5..7], and handle 0
+     * is `in.ids` (the first declaration of every emitter), which can never be a bias. */
     PLOW_DOP_GEMV_QKV = 22,
 
     /* ===== CROSS-GPU (tensor-parallel) tile-graph ops. ==================     * New opcodes assigned AFTER main's last (23), no collision. Names mirror the
@@ -681,7 +738,9 @@ enum {
      *
      * Layout: W packed 2 fp4/byte, row stride K/2 bytes, low nibble = even k. S one E8M0 byte per
      * 32-K block, row stride K/32 bytes. A lane's 16-byte load is exactly one 32-element block.
-     * t0=C(bf16) t1=x(bf16) t2=W(fp4) t3=S(e8m0)   i0=M i1=N i2=K. See op_gemm.h d_gemv_mxfp4. */
+     * t0=C(bf16) t1=x(bf16) t2=W(fp4) t3=S(e8m0) t7=OPTIONAL bf16 [N] bias (CPU tiers; the GPU
+     * arms ignore it, so the emitter sets it only on CPU-targeted MXFP4 dense arms)   i0=M i1=N i2=K.
+     * See op_gemm.h d_gemv_mxfp4. */
     PLOW_DOP_GEMV_MXFP4 = 91,
 
     /* MXFP4 DECODE fused gate|up GEMV+GLU (w4a16) — the mxfp4 twin of PLOW_DOP_GEMV_GLU_FP8. Gate
@@ -1197,12 +1256,62 @@ enum {
     PLOW_DOP_QWEN_GDN_GATE_PREP = 145,
     /* External native GDN segment: t0=core,t1=Q,t2=K,t3=V,t4=alphaF32,t5=betaF32,t6=state,t7=outstate; i0=T,i1=HK,i2=HV,i3=K,i4=V; f0=Qscale. Host launches and copies outstate to state before a Nop dependency epilogue. */
     PLOW_DOP_QWEN_GDN_PREFILL = 146,
-
-
-
     PLOW_DOP_ZERO_F32 = 147,
     PLOW_DOP_GEMM_SPLITK = 148,
     PLOW_DOP_CAST_F32_BF16 = 149,
+
+    /* ===== GPT-OSS MXFP4 MoE — FLAT fused-expert tensors, no host pointer table. =====
+     * GPT-OSS ships every expert's weights as ONE checkpoint tensor per projection:
+     *   mlp.experts.gate_up_proj_blocks  u8   [E][2I][K/32][16]  == fp4 rows [E][2I][K/2]
+     *   mlp.experts.gate_up_proj_scales  u8   [E][2I][K/32]      E8M0, 2^(b-127)
+     *   mlp.experts.gate_up_proj_bias    bf16 [E][2I]
+     *   mlp.experts.down_proj_{blocks,scales,bias}                [E][H][I/2] / [E][H][I/32] / [E][H]
+     * Byte-identical to the GEMV_MXFP4 (91) row layout: row = K/2 bytes, LOW nibble = even k,
+     * e2m1 LUT {0,.5,1,1.5,2,3,4,6} with sign in bit 3; one E8M0 byte per 32-K block. So the
+     * loader binds the checkpoint tensors VERBATIM and the op indexes expert e at
+     *   W + e*N*(K/2)    S + e*N*(K/32)    bias + e*N       (N = 2I for gate_up, H for down)
+     * — every stride is derivable from i[], which is what lets these ops skip the wtab/stab
+     * device-pointer tables of ops 45-49/85/86 (the CPU engine rejects host-filled tables).
+     * The GATE/UP ROWS ARE INTERLEAVED in the checkpoint: row 2n = gate_n, row 2n+1 = up_n
+     * (HF: gate = gate_up[..., ::2], up = gate_up[..., 1::2]); i4 = layout (0 interleaved,
+     * 1 = gate block [0,I) then up block [I,2I)) so a load-time repack stays optional.
+     * The bias is PER EXPERT and added BEFORE the swiglu clamp (GLU) / BEFORE the gate multiply
+     * (DOWN: part = gate * (W_e fu + b_e)), so it cannot be a constant fold anywhere.
+     * Sentinel: table[slot].eid >= n_exp => GLU writes nothing, DOWN zeroes part[slot]; both
+     * still signal (ops 45/46 rule). Numerics: f32 accumulate, one bf16 round at fu, f32 part. */
+
+    /* DECODE grouped gate/up + swiglu_oai. ONE packet loops every slot of every row.
+     *   t0=fu(bf16 [B*k][I]) t1=x(bf16 [B][K]) t2=table([B*k] {u32 eid, f32 gate})
+     *   t3=W_gu(fp4 [E][2I][K/2]) t4=S_gu(e8m0 [E][2I][K/32]) t5=bias_gu?(bf16 [E][2I])
+     *   i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch(0 = 1)   f0=alpha f1=limit
+     * slot s in [0, B*k) reads x row s/k and writes fu row s:
+     *   fu[s][n] = A(g)*B(u),  g = dot(W_e[gate_n], x) + b_e[gate_n],  u = likewise for up_n
+     * with (A, B) the act's pair form (act=3 is documented on GLU, op 5). */
+    PLOW_DOP_MOE_GLU_MX = 150,
+
+    /* DECODE grouped down + gate scale.
+     *   t0=part(f32 [B*k][H]) t1=fu(bf16 [B*k][I]) t2=table
+     *   t3=W_d(fp4 [E][H][I/2]) t4=S_d(e8m0 [E][H][I/32]) t5=bias_d?(bf16 [E][H])
+     *   i0=k i1=H i2=I i3=n_exp i6=n_batch(0 = 1)
+     *   part[s][h] = table[s].gate * (dot(W_e[h], fu[s]) + b_e[h])      (f32, no bf16 round)
+     * The row sum is MOE_COMBINE (43) / MOE_COMBINE_PF (87, i2=T=B) in fixed slot order. */
+    PLOW_DOP_MOE_DOWN_MX = 151,
+
+    /* PREFILL twins, token-sorted via MOE_ROUTER_TOPK_PF (83) + MOE_ALIGN_PF (84) exactly as
+     * ops 85/86: gathered rows [MPF_MAX_ROWS(T,k,n_exp)] in expert-contiguous segments
+     * (meta: [0,n_exp) rowoff, [n_exp,2n_exp) cnt, [2n_exp,3n_exp+1) tile prefix), pad rows
+     * have row_token == row_partidx == PLOW_EXPERT_UNUSED and are skipped.
+     * GLU:  t0=fu_g(bf16 [rows][I]) t1=xn2(bf16 [T][K]) t2=W_gu t3=S_gu t4=meta(i32)
+     *       t5=row_token(u32) t6=bias_gu?   i0=I i1=K i2=n_exp i3=layout i5=act  f0=alpha f1=limit
+     *       fu_g[r] = swiglu_oai(W_e xn2[row_token[r]] + b_e) for r in expert e's segment.
+     * DOWN: t0=part(f32 [T*k][H]) t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d?
+     *       t6=row_partidx(u32) t7=row_gate(f32)   i0=H i1=I i2=n_exp
+     *       part[row_partidx[r]][h] = row_gate[r] * (dot(W_e[h], fu_g[r]) + b_e[h]); pad rows dropped.
+     * Slot map follows 85/86 (t4=meta, t6/t7 = row_partidx/row_gate on DOWN); the bias takes the
+     * slot the enc=2 fu_scale held there, which these flat-fp4 ops do not need. */
+    PLOW_DOP_MOE_GLU_MX_PF = 152,
+    PLOW_DOP_MOE_DOWN_MX_PF = 153,
+
     PLOW_DOP__COUNT
 };
 

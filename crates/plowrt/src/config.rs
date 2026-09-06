@@ -132,6 +132,88 @@ pub struct RuntimeConfig {
     // ──────────────────────────────────────────────────────────────────────────
     #[command(flatten)]
     pub amd: AmdRuntimeConfig,
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // CPU engine (feature = "cpu")
+    // ──────────────────────────────────────────────────────────────────────────
+    #[command(flatten)]
+    pub cpu: CpuRuntimeConfig,
+}
+
+/// Kernel-tier ceiling for the CPU engine (`--cpu-isa`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "lowercase")]
+pub enum CpuIsa {
+    /// Highest tier cpuid reports.
+    Auto,
+    Amx,
+    Avx512,
+    Scalar,
+}
+
+/// CPU engine knobs. See `plans/cpu-backend.md` §2.1.
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "CPU runtime")]
+pub struct CpuRuntimeConfig {
+    /// Persistent workers. 0 = model-selected physical-core or logical-CPU width.
+    #[arg(
+        long = "cpu-threads",
+        env = "PLOW_CPU_THREADS",
+        default_value_t = 0,
+        global = true
+    )]
+    pub threads: u32,
+
+    /// NUMA placement: `auto` (all nodes), `off`, or a node list (`0,1`).
+    #[arg(
+        long = "cpu-numa",
+        env = "PLOW_CPU_NUMA",
+        default_value = "auto",
+        global = true
+    )]
+    pub numa: crate::exec::cpu::topology::NumaMode,
+
+    /// Kernel tier ceiling (for A/B and hosts without AMX).
+    #[arg(
+        long = "cpu-isa",
+        env = "PLOW_CPU_ISA",
+        default_value = "auto",
+        value_enum,
+        global = true
+    )]
+    pub isa: CpuIsa,
+
+    /// Spin budget (µs) before a blocked worker yields/parks. Decode packets are
+    /// 100-500 µs apart; parking on every gap measured +17% TPOT at 50 µs vs 1000.
+    #[arg(
+        long = "cpu-spin-us",
+        env = "PLOW_CPU_SPIN_US",
+        default_value_t = 2000,
+        global = true
+    )]
+    pub spin_us: u32,
+
+    /// Largest prefill chunk (rows) one tick may run while other slots decode. 0 = whole prompt.
+    /// Measured NEGATIVE at concurrency >= 4 (chunks prefill slower than whole prompts and the
+    /// threads are throughput-bound, not stall-bound), so it stays off by default.
+    #[arg(
+        long = "cpu-prefill-chunk",
+        env = "PLOW_CPU_PF_CHUNK",
+        default_value_t = 0,
+        global = true
+    )]
+    pub prefill_chunk: u32,
+
+    /// Directory holding the MXFP4 weight twin (`mxfp4/<name>` + `_scale`, quantize_mxfp4.py).
+    #[arg(long = "cpu-mxfp4-dir", env = "PLOW_MXFP4_DIR", global = true)]
+    pub mxfp4_dir: Option<String>,
+
+    /// Opt in to the global work queue instead of static per-CU streams. Measured 2x slower on
+    /// this box; kept for A/B on hosts where the static partition is a poor fit. Named `gq_opt_in`
+    /// rather than `global_queue` because `AmdRuntimeConfig` already claims that clap id globally
+    /// with a different type.
+    #[arg(long = "cpu-global-queue", env = "PLOW_CPU_GQ", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub gq_opt_in: bool,
 }
 
 /// NVIDIA / sm_120 runtime knobs.

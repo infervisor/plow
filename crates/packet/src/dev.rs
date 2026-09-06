@@ -90,8 +90,14 @@ pub enum DevOp {
     /// prologue and the normalized activation never round-trips through HBM.
     RowRms = 2,
     /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos(i32)` ·
-    /// `i0=ntok i1=nhead i2=hd i3=out_row0 i4=flags i6=n_batch_kv` · `f0=eps` ·
+    /// `i0=ntok i1=nhead i2=hd i3=out_row0 i4=flags i5=pair_mode i6=n_batch_kv` · `f0=eps` ·
     /// `j0=out_stride j1=kv_mask`.
+    ///
+    /// `pair_mode` selects the rotation pairing: 0 = the legacy rule (half-split `(i, i+hd/2)`
+    /// except `hd == 64`, which is GPT-J interleaved for GLM/Kimi's `k_rope`); 1 = interleaved at
+    /// `hd == 128` too; 2 = FORCE half-split (NeoX `rotate_half`) at every `hd` — GPT-OSS is
+    /// `hd = 64` half-split, the one case the legacy rule gets wrong. Zero keeps every existing
+    /// packet byte-identical.
     ///
     /// `n_batch_kv != 0` makes row `t` sequence `t`: it writes its OWN batch-major ring at its
     /// OWN position, `((t*nhead + hh)*out_stride + pos[t]) * hd`. That is the only addressing a
@@ -106,22 +112,33 @@ pub enum DevOp {
     /// `scale` absorbs Gemma's per-layer `layer_scalar` on the SECOND residual
     /// add; pass 1.0 for the first.
     Residual = 4,
-    /// `t0=out t1=gate t2=up` · `i0=n i1=act` (0 = gelu_tanh, 1 = silu).
-    /// Gemma is GeGLU (gelu_tanh), not SwiGLU.
+    /// `t0=out t1=gate t2=up` · `i0=n i1=act` · `f0=alpha f1=limit` (act 0 = gelu_tanh,
+    /// 1 = silu, 3 = swiglu_oai). Gemma is GeGLU (gelu_tanh), not SwiGLU.
+    ///
+    /// `act = 3` is GPT-OSS's `swiglu_oai`, a PAIR form `A(g) * B(u)` like `situ`:
+    /// `A(g) = min(g, limit) * sigmoid(alpha * min(g, limit))`, `B(u) = clamp(u, -limit, limit) + 1`,
+    /// with `f0 = alpha` (1.702) and `f1 = limit` (7.0), both REQUIRED (a zeroed `limit` clamps
+    /// everything to 0). The same code and immediates apply on every GLU-family op
+    /// ([`DevOp::GemvGlu`], [`DevOp::GemmGlu`], [`DevOp::MoeGluMx`], ...). See `dev_isa.h` op 5.
     Glu = 5,
     /// `t0=out t1=table t2=ids(i32)` · `i0=ntok i1=hidden` · `f0=scale`.
     /// `scale` must be the BF16-ROUNDED `sqrt(hidden)`: 73.5 (31B), 62.0 (12B).
     Embed = 6,
     /// `t0=out t1=x` · `i0=n` · `f0=cap`, computing `cap * tanh(x / cap)`.
     SoftCap = 7,
-    /// `t0=C t1=A t2=B` · `i0=M i1=N i2=K`, computing `C[M,N] = A[M,K] . B[N,K]^T`.
+    /// `t0=C t1=A t2=B t7=bias?` · `i0=M i1=N i2=K`, computing `C[M,N] = A[M,K] . B[N,K]^T`.
     /// `B` is `[out_features, in_features]`, as HF stores a Linear weight.
+    ///
+    /// `bias` is an optional bf16 `[N]` added to the f32 accumulator before the bf16 round of `C`
+    /// (HF `x @ W.T + b`; GPT-OSS attention/router biases). Same slot on every tile twin and on
+    /// [`DevOp::GemmNorm`] / [`DevOp::Gemv`]; `TENSOR_NONE` keeps pre-bias packets byte-identical.
     Gemm = 8,
     /// As [`DevOp::Gemm`], with RMSNorm folded into the A-operand load.
     /// `t3=rms(f32) t4=gamma`.
     GemmNorm = 9,
-    /// `t0=C t1=x t2=W t3=rms? t4=gamma?` · `i0=M i1=N i2=K i3=norm` · `f0=eps`.
-    /// Decode path (`M <= 16`): bandwidth-bound, uses no MFMA.
+    /// `t0=C t1=x t2=W t3=rms? t4=gamma? t7=bias?` · `i0=M i1=N i2=K i3=norm` · `f0=eps`.
+    /// Decode path (`M <= 16`): bandwidth-bound, uses no MFMA. `bias` is the optional bf16 `[N]`
+    /// of [`DevOp::Gemm`], added to the f32 wave sum before the bf16 store.
     ///
     /// `norm`: 0 = none. 1 = scale the A-operand by a PRECOMPUTED per-row RMS in `t3`, which a
     /// separate [`DevOp::RowRms`] packet produced. 2 = compute that scalar IN THE GEMV, from the
@@ -156,7 +173,14 @@ pub enum DevOp {
     /// `i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window i5=nsplit i6=hd` ·
     /// `f0=scale`.
     FlashDecode = 12,
-    /// `t0=O t1=Opart t2=mlpart` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
+    /// `t0=O t1=Opart t2=mlpart t3=sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
+    ///
+    /// `sinks` (optional bf16 `[n_head]`, GPT-OSS `self_attn.sinks`) is one extra UNSCALED logit
+    /// per head that joins the softmax denominator with no value row, folded HERE and only here:
+    /// `gm' = max(gm, sink_h)`, `gl' = sum_s l_s e^(m_s - gm') + e^(sink_h - gm')`,
+    /// `O = sum_s O_s e^(m_s - gm') / gl'`. With sinks present the emitter must emit the merge at
+    /// every `nsplit` (including 1) and leave [`DevOp::FlashPrefill`]'s `t5` (`O_final`, which
+    /// normalises inside the flash) at `TENSOR_NONE`. See `dev_isa.h` op 13.
     FlashMerge = 13,
     /// As [`DevOp::Gemm`], 64x128 tile.
     GemmSmall = 14,
@@ -183,13 +207,15 @@ pub enum DevOp {
     /// straight into the tensor the NEXT step's [`DevOp::Embed`] reads — so a sampled token
     /// never leaves the GPU.
     ArgmaxFin = 18,
-    /// `t0=fu t1=x t2=W_gate t5=W_up` · `i0=M i1=N i2=K i5=act` · `f0=situ_beta
-    /// f1=situ_linear_beta`, computing
+    /// `t0=fu t1=x t2=W_gate t5=W_up t6=bias_gate? t7=bias_up?` · `i0=M i1=N i2=K i5=act` ·
+    /// `f0=situ_beta f1=situ_linear_beta`, computing
     /// `fu = act(W_gate @ x) * (W_up @ x)` — gate and up in ONE GEMV, with the GLU applied in
     /// the **epilogue**, as every BLAS does it (cuBLASLt/CK/hipBLASLt).
     ///
-    /// The two `f` slots carry Kimi-K3's `situ` betas and are read only at `act = 2`; every other
-    /// activation ignores them.
+    /// The two `f` slots carry the act's immediates — Kimi-K3's `situ` betas at `act = 2`,
+    /// swiglu_oai's `alpha`/`limit` at `act = 3` ([`DevOp::Glu`]); every other activation ignores
+    /// them. `bias_gate`/`bias_up` are optional bf16 `[N]` added to `g`/`u` in f32 BEFORE the
+    /// activation — two tensors, mirroring the two weights, so the loader binds names verbatim.
     ///
     /// Output-stationary: the workgroup that owns column `n` computes both halves of it and
     /// applies the GLU exactly once. Nothing is replicated. This deletes the [`DevOp::Glu`]
@@ -201,8 +227,10 @@ pub enum DevOp {
     ///
     /// Legal only when `M*K` fits LDS (`GM_LDS_HALVES`); plowc falls back to the unfused triple.
     GemvGlu = 19,
-    /// `t0=fu t1=x t2=W_gate t5=W_up` · `i0=M i1=N i2=K i5=act`, computing
-    /// `fu = act(W_gate @ x) * (W_up @ x)` — the prefill twin of [`DevOp::GemvGlu`].
+    /// `t0=fu t1=x t2=W_gate t5=W_up t6=bias_gate? t7=bias_up?` · `i0=M i1=N i2=K i5=act` ·
+    /// `f0=alpha f1=limit`, computing
+    /// `fu = act(W_gate @ x) * (W_up @ x)` — the prefill twin of [`DevOp::GemvGlu`], with the
+    /// same optional biases and the same act immediates (`f0`/`f1` read only at `act = 2/3`).
     ///
     /// Same tile, same registers, same MFMA count as a plain [`DevOp::Gemm`]: the accumulator's
     /// `SN` axis selects **gate vs up** instead of a column block, so both halves of an output
@@ -213,8 +241,14 @@ pub enum DevOp {
     /// `gt`/`ut` never reach HBM, and the [`DevOp::Glu`] packet and its gate disappear.
     GemmGlu = 20,
     /// `t0=q_out t1=x t2=W_q t3=k_out t4=W_k t5=v_out t6=W_v t7=gamma?` ·
-    /// `i0=M i1=Nq i2=K i3=Nk i4=Nv` · `f0=eps`,
+    /// `i0=M i1=Nq i2=K i3=Nk i4=Nv i5=bias_q i6=bias_k i7=bias_v` · `f0=eps`,
     /// computing all three attention projections `q=W_q@x`, `k=W_k@x`, `v=W_v@x` in ONE GEMV.
+    ///
+    /// `i5/i6/i7` are optional bf16 BIAS TENSOR HANDLES (`[Nq]`, `[Nk]`, `[Nv]`; 0 = absent),
+    /// one per output stream, added to the f32 wave sum before the bf16 store. They take the
+    /// integer slots because `t7` is the q-norm fold's gamma (below) — the [`DevOp::GemvQkvMxfp4`]
+    /// demotion rule: a read-only weight-like operand may live in `i[]`, an output never does.
+    /// 0 means absent on [`DevOp::Gemm`]'s `i6/i7` precedent (handle 0 is `in.ids`, never a bias).
     ///
     /// The three share the same `x` and `K`, so their output columns concatenate into one
     /// `N=Nq+Nk+Nv` sweep: column `n<Nq` writes `q_out`, `n<Nq+Nk` writes `k_out`, else `v_out`.
@@ -880,7 +914,7 @@ pub enum DevOp {
     /// Layout: `W` packed 2 fp4/byte, row stride `K/2` bytes, low nibble = even k; `S` one E8M0
     /// byte per 32-K block, row stride `K/32` bytes. One lane's 16-byte load is exactly one block.
     ///
-    /// `t0=C(bf16) t1=x(bf16) t2=W(fp4) t3=S(e8m0)   i0=M i1=N i2=K`
+    /// `t0=C(bf16) t1=x(bf16) t2=W(fp4) t3=S(e8m0) t7=bias?(bf16 [N], CPU tiers only)   i0=M i1=N i2=K`
     GemvMxfp4 = 91,
 
     /// MXFP4 decode fused gate|up GEMV+GLU (w4a16) — the mxfp4 twin of [`DevOp::GemvGluFp8`].
@@ -1727,7 +1761,54 @@ pub enum DevOp {
     GemmSplitK = 148,
     /// `t0=C t1=P` · `i0=M i1=N`
     CastF32Bf16 = 149,
+    /// GPT-OSS MXFP4 MoE, DECODE grouped gate/up + swiglu_oai over FLAT fused-expert tensors (no
+    /// host pointer table — the CPU engine rejects those). Expert `e` of `[E][N][K/2]` fp4 rows
+    /// (low nibble = even k, the [`DevOp::GemvMxfp4`] layout) is at `W + e*N*K/2`, its E8M0 row
+    /// scales at `S + e*N*K/32`, its bias at `bias + e*N`; `N = 2I` with gate/up rows INTERLEAVED
+    /// (`row 2n = gate_n, 2n+1 = up_n`) at `layout = 0`, gate block then up block at 1. Slot
+    /// `s in [0, n_batch*k)` reads `x` row `s/k` and writes `fu` row `s`:
+    /// `fu[s][n] = A(g)*B(u)`, `g = dot(W_e[gate_n], x) + b_e[gate_n]` (bias BEFORE the clamp),
+    /// `(A, B)` the pair form of `act` ([`DevOp::Glu`], 3 = swiglu_oai with `f0`/`f1`).
+    /// `table[s].eid >= n_exp` skips the slot. f32 accumulate, one bf16 round at `fu`.
+    ///
+    /// `t0=fu(bf16[B*k][I]) t1=x(bf16[B][K]) t2=table t3=W_gu(fp4[E][2I][K/2])
+    /// t4=S_gu(e8m0[E][2I][K/32]) t5=bias_gu?` ·
+    /// `i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch` · `f0=alpha f1=limit`.
+    /// `bias_gu` is bf16 `[E][2I]`.
+    MoeGluMx = 150,
+    /// GPT-OSS MXFP4 MoE, DECODE grouped down + gate scale, flat tensors as [`DevOp::MoeGluMx`]:
+    /// `part[s][h] = table[s].gate * (dot(W_e[h], fu[s]) + b_e[h])` in f32 (the bias is inside
+    /// the gate multiply, so it cannot be folded); a sentinel slot zeroes `part[s]`. The row sum
+    /// is [`DevOp::MoeCombine`] / [`DevOp::MoeCombinePf`] (`i2 = T = n_batch`) in fixed slot order.
+    ///
+    /// `t0=part(f32[B*k][H]) t1=fu(bf16[B*k][I]) t2=table t3=W_d(fp4[E][H][I/2])
+    /// t4=S_d(e8m0[E][H][I/32]) t5=bias_d?` · `i0=k i1=H i2=I i3=n_exp i6=n_batch`.
+    /// `bias_d` is bf16 `[E][H]`.
+    MoeDownMx = 151,
+    /// PREFILL twin of [`DevOp::MoeGluMx`]: token-sorted gathered rows from
+    /// [`DevOp::MoeRouterTopkPf`] + [`DevOp::MoeAlignPf`] exactly as [`DevOp::MoeGroupGluPf`]
+    /// (`meta`: `[0,n_exp)` rowoff, `[n_exp,2n_exp)` cnt, `[2n_exp,3n_exp+1)` tile prefix; pad
+    /// rows have `row_token == EXPERT_UNUSED` and are skipped). For row `r` in expert `e`'s
+    /// segment: `fu_g[r] = swiglu_oai(W_e xn2[row_token[r]] + b_e)`.
+    ///
+    /// `t0=fu_g(bf16[rows][I]) t1=xn2(bf16[T][K]) t2=W_gu t3=S_gu t4=meta(i32) t5=row_token(u32)
+    /// t6=bias_gu?` · `i0=I i1=K i2=n_exp i3=layout i5=act` · `f0=alpha f1=limit`.
+    MoeGluMxPf = 152,
+    /// PREFILL twin of [`DevOp::MoeDownMx`], slot map after [`DevOp::MoeGroupDownPf`] (the bias
+    /// takes the `fu_scale` slot these flat-fp4 ops do not need):
+    /// `part[row_partidx[r]][h] = row_gate[r] * (dot(W_e[h], fu_g[r]) + b_e[h])`; pad rows
+    /// (`row_partidx == EXPERT_UNUSED`) are dropped.
+    ///
+    /// `t0=part(f32[T*k][H]) t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx(u32)
+    /// t7=row_gate(f32)` · `i0=H i1=I i2=n_exp`.
+    MoeDownMxPf = 153,
 }
+
+/// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
+/// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
+pub const ACT_SWIGLU_OAI: u32 = 3;
+/// [`DevOp::HeadNormRope`] `i5 = pair_mode`: force half-split (NeoX) pairing at every `hd`.
+pub const ROPE_PAIR_HALF: u32 = 2;
 
 impl DevOp {
     /// Every opcode, in numeric order.
@@ -1886,6 +1967,10 @@ impl DevOp {
         DevOp::ZeroF32,
         DevOp::GemmSplitK,
         DevOp::CastF32Bf16,
+        DevOp::MoeGluMx,
+        DevOp::MoeDownMx,
+        DevOp::MoeGluMxPf,
+        DevOp::MoeDownMxPf,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2056,6 +2141,10 @@ impl DevOp {
             DevOp::ZeroF32 => "PLOW_DOP_ZERO_F32",
             DevOp::GemmSplitK => "PLOW_DOP_GEMM_SPLITK",
             DevOp::CastF32Bf16 => "PLOW_DOP_CAST_F32_BF16",
+            DevOp::MoeGluMx => "PLOW_DOP_MOE_GLU_MX",
+            DevOp::MoeDownMx => "PLOW_DOP_MOE_DOWN_MX",
+            DevOp::MoeGluMxPf => "PLOW_DOP_MOE_GLU_MX_PF",
+            DevOp::MoeDownMxPf => "PLOW_DOP_MOE_DOWN_MX_PF",
         }
     }
 
@@ -2092,7 +2181,10 @@ impl DevOp {
     /// as 121-128 in parallel with the KdaChunk/Mla pair above, which claimed the same
     /// range independently — the collision surfaced only at merge, same as 111 -> 113
     /// above; renumbering the later-merged pair (this one) was the resolution.
-    pub const COUNT: u16 = 150;
+    /// 147 -> 150 for `MoeGluMx` .. `MoeDownMxPf` (GPT-OSS flat MXFP4 MoE): main took
+    /// 147-149 for `ZeroF32`/`GemmSplitK`/`CastF32Bf16` while this branch was out, the same
+    /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
+    pub const COUNT: u16 = 154;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

@@ -84,6 +84,54 @@ add_executable(memmap_test tests/memmap_test.c)
 target_link_libraries(memmap_test PRIVATE plow_runtime)
 add_test(NAME memmap_test COMMAND memmap_test)
 
+# --- CPU device-ISA kernel library (runtime/cpu/dev): golden tier + cpuid dispatch ----------
+# plowrt's build.rs compiles the same sources through `cc`; this target exists so the kernels
+# have a Rust-free build and their own ctest.
+file(GLOB PLOW_CPU_DEV_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/*.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/golden/*.c)
+# Tier sources carry their own -m flags (runtime cpuid picks the tier, so the base
+# library must stay runnable on a non-AVX-512 host). Mirrors plowrt/build.rs.
+file(GLOB PLOW_CPU_DEV_AVX512_SRC ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/avx512/*.c)
+file(GLOB PLOW_CPU_DEV_AMX_SRC ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev/amx/*.c)
+set_source_files_properties(${PLOW_CPU_DEV_AVX512_SRC} PROPERTIES COMPILE_OPTIONS
+    "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mavx512vnni;-mavx512fp16")
+set_source_files_properties(${PLOW_CPU_DEV_AMX_SRC} PROPERTIES COMPILE_OPTIONS
+    "-mavx512f;-mavx512bw;-mavx512vl;-mavx512bf16;-mavx512vnni;-mavx512fp16;-mamx-tile;-mamx-bf16;-mamx-int8")
+add_library(plow_cpu_dev STATIC ${PLOW_CPU_DEV_SRC} ${PLOW_CPU_DEV_AVX512_SRC} ${PLOW_CPU_DEV_AMX_SRC})
+target_include_directories(plow_cpu_dev PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu/dev)
+target_compile_options(plow_cpu_dev PRIVATE -Wall -Wextra -Werror -O2)
+set_target_properties(plow_cpu_dev PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT WIN32)
+    target_link_libraries(plow_cpu_dev PUBLIC m)
+endif()
+
+add_executable(cpu_dev_golden_test tests/cpu_dev_golden_test.c)
+target_compile_options(cpu_dev_golden_test PRIVATE -Wall -Wextra -Werror -O2)
+target_link_libraries(cpu_dev_golden_test PRIVATE plow_cpu_dev)
+add_test(NAME cpu_dev_golden COMMAND cpu_dev_golden_test)
+
+# Tier tests: each compares its tier's kernels against the golden tier on random inputs.
+# Guarded so the tree configures before a tier's test exists.
+foreach(tier avx512 avx512_attn amx fp8 gptoss route moe_gemma)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_dev_${tier}_test.c)
+        add_executable(cpu_dev_${tier}_test tests/cpu_dev_${tier}_test.c)
+        target_compile_options(cpu_dev_${tier}_test PRIVATE -Wall -Wextra -Werror -O2)
+        target_link_libraries(cpu_dev_${tier}_test PRIVATE plow_cpu_dev)
+        add_test(NAME cpu_dev_${tier} COMMAND cpu_dev_${tier}_test)
+    endif()
+endforeach()
+
+# Same MoE test at AMX-shaped geometry (K % 32 == 0, > 32 rows per expert, partial weight tiles).
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_dev_moe_gemma_test.c)
+    add_executable(cpu_dev_moe_gemma_big_test tests/cpu_dev_moe_gemma_test.c)
+    target_compile_options(cpu_dev_moe_gemma_big_test PRIVATE -Wall -Wextra -Werror -O2 -DMOE_BIG=1)
+    target_link_libraries(cpu_dev_moe_gemma_big_test PRIVATE plow_cpu_dev)
+    add_test(NAME cpu_dev_moe_gemma_big COMMAND cpu_dev_moe_gemma_big_test)
+endif()
+
 # --- GPU backends (build-gated; unrunnable without a toolchain) ---------------
 #
 # These are SHARED plugins, not static libs: nothing in the host links them, and

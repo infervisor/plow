@@ -19,7 +19,9 @@ use std::sync::Arc;
 #[cfg(feature = "hsa")]
 use std::path::Path;
 
-use super::bench::{DecodeSelection, EngineDiagnostics, PrefillSelection, RankAgreement};
+use super::bench::EngineDiagnostics;
+#[cfg(feature = "hsa")]
+use super::bench::{DecodeSelection, PrefillSelection, RankAgreement};
 
 /// The device engine serving one slug.
 pub enum ServeEngine {
@@ -29,14 +31,66 @@ pub enum ServeEngine {
     /// The gfx950 engine (single sequence, optionally tensor-parallel).
     #[cfg(feature = "hsa")]
     Amd(AmdServe),
+    /// The CPU engine (single sequence, persistent pinned workers).
+    #[cfg(feature = "cpu")]
+    Cpu(CpuServe),
+}
+
+#[cfg(feature = "cpu")]
+pub use super::cpu_serve::CpuServe;
+
+/// What the mux's single-sequence tick needs from an engine: slot bookkeeping,
+/// whole-or-chunked prefill, one decode step per live slot, plus the AMD-only
+/// packed-prefill / deferred multistep extensions, which other engines decline
+/// by returning `None`/`Err` (the tick already handles both).
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+pub trait SeqEngine {
+    fn stop_ids(&self) -> &Arc<Vec<u32>>;
+    fn batch(&self) -> usize;
+    fn release(&mut self, slot: usize);
+    fn prefill_turn(&self) -> usize;
+    fn advance_prefill_turn(&mut self, slot: usize);
+    fn prefill_prog_t(&self, prog: usize) -> Option<u32>;
+    fn packable_prefill_span(&self, slot: usize, max_rows: u32) -> Option<packet::dev::PrefillSpan>;
+    fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()>;
+    fn prefill_frontier(&self, slot: usize) -> Option<usize>;
+    fn prefill_chunked_at_most(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        tick_max_bucket: u32,
+    ) -> crate::Result<Option<u32>>;
+    fn multistep_quantum(&self, feeds: &[(usize, u32)], requested: usize) -> Option<usize>;
+    fn multi_step(
+        &mut self,
+        feeds: &[(usize, u32)],
+        quantum: usize,
+        out: &mut Vec<u32>,
+    ) -> crate::Result<usize>;
+    fn step_batch(&mut self, feeds: &[(usize, u32)]) -> crate::Result<Vec<(usize, u32)>>;
 }
 
 impl ServeEngine {
+    /// The single-sequence tick surface, for the gfx950 and CPU engines.
+    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    pub fn seq_engine_mut(&mut self) -> Option<&mut dyn SeqEngine> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => None,
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => Some(e),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(e) => Some(e),
+        }
+    }
+
     #[cfg(feature = "hsa")]
     pub fn amd_overlap_capability(&self) -> Option<crate::exec::amd::AmdOverlapCapability> {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(_) => None,
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => None,
             ServeEngine::Amd(e) => Some(e.overlap_capability()),
         }
     }
@@ -46,6 +100,8 @@ impl ServeEngine {
         match self {
             #[cfg(feature = "cuda")]
             ServeEngine::Cuda(_) => None,
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => None,
             ServeEngine::Amd(e) => Some(e.overlap_evidence()),
         }
     }
@@ -56,6 +112,8 @@ impl ServeEngine {
             ServeEngine::Cuda(_) => {}
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.begin_diagnostics(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => {}
         }
     }
 
@@ -65,6 +123,8 @@ impl ServeEngine {
             ServeEngine::Cuda(_) => EngineDiagnostics::unsupported(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.finish_diagnostics(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => EngineDiagnostics::unsupported(),
         }
     }
 
@@ -76,6 +136,8 @@ impl ServeEngine {
             ServeEngine::Cuda(e) => e.batch(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.batch(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(e) => e.batch(),
         }
     }
 
@@ -86,6 +148,8 @@ impl ServeEngine {
             ServeEngine::Cuda(e) => e.effective_decode_rungs(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.decode_rungs().into(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(e) => e.decode_rungs().into(),
         }
     }
 
@@ -96,6 +160,8 @@ impl ServeEngine {
             ServeEngine::Cuda(e) => e.stop_ids(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.stop_ids(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(e) => SeqEngine::stop_ids(e),
         }
     }
 
@@ -113,6 +179,10 @@ impl ServeEngine {
             ServeEngine::Cuda(_) => Err(crate::RuntimeError::Device(
                 "raw AMD packet traces require an AMD serving engine".into(),
             )),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => Err(crate::RuntimeError::Device(
+                "raw AMD packet traces require an AMD serving engine".into(),
+            )),
         }
     }
 
@@ -124,6 +194,8 @@ impl ServeEngine {
             ServeEngine::Cuda(e) => e.vmm_stats_handle(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(_) => None,
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => None,
         }
     }
 }
@@ -1881,5 +1953,58 @@ mod amd_serve {
             assert_eq!(cached, [vec![1, 2, 3]]);
             assert_eq!(snap_at, [2]);
         }
+    }
+}
+
+#[cfg(feature = "hsa")]
+impl SeqEngine for AmdServe {
+    fn stop_ids(&self) -> &Arc<Vec<u32>> {
+        AmdServe::stop_ids(self)
+    }
+    fn batch(&self) -> usize {
+        AmdServe::batch(self)
+    }
+    fn release(&mut self, slot: usize) {
+        AmdServe::release(self, slot)
+    }
+    fn prefill_turn(&self) -> usize {
+        AmdServe::prefill_turn(self)
+    }
+    fn advance_prefill_turn(&mut self, slot: usize) {
+        AmdServe::advance_prefill_turn(self, slot)
+    }
+    fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
+        AmdServe::prefill_prog_t(self, prog)
+    }
+    fn packable_prefill_span(&self, slot: usize, max_rows: u32) -> Option<packet::dev::PrefillSpan> {
+        AmdServe::packable_prefill_span(self, slot, max_rows)
+    }
+    fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()> {
+        AmdServe::advance_packed_prefill(self, members)
+    }
+    fn prefill_frontier(&self, slot: usize) -> Option<usize> {
+        AmdServe::prefill_frontier(self, slot)
+    }
+    fn prefill_chunked_at_most(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        tick_max_bucket: u32,
+    ) -> crate::Result<Option<u32>> {
+        AmdServe::prefill_chunked_at_most(self, slot, prompt, tick_max_bucket)
+    }
+    fn multistep_quantum(&self, feeds: &[(usize, u32)], requested: usize) -> Option<usize> {
+        AmdServe::multistep_quantum(self, feeds, requested)
+    }
+    fn multi_step(
+        &mut self,
+        feeds: &[(usize, u32)],
+        quantum: usize,
+        out: &mut Vec<u32>,
+    ) -> crate::Result<usize> {
+        AmdServe::multi_step(self, feeds, quantum, out)
+    }
+    fn step_batch(&mut self, feeds: &[(usize, u32)]) -> crate::Result<Vec<(usize, u32)>> {
+        AmdServe::step_batch(self, feeds)
     }
 }

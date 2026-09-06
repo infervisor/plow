@@ -21,7 +21,9 @@ mod bucket;
 // by the same names. Note this pulls no new dependency — the reader mmaps the
 // shards and parses the safetensors header itself, so it needs only `memmap2`,
 // which is unconditional.
-#[cfg(any(feature = "cuda", feature = "hsa"))]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+// The prefetcher/slab helpers are GPU upload machinery; a cpu-only build binds directly.
+#[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
 pub(crate) mod checkpoint;
 pub mod devblob;
 /// Megatron weight sharding. Gated with `checkpoint` — it is the rule for which

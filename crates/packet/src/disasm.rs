@@ -241,7 +241,7 @@ pub fn int_slot_label(slot: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dev::DevInst;
+    use crate::dev::{DevInst, TENSOR_NONE};
 
     fn inst(op: DevOp) -> DevInst {
         DevInst {
@@ -253,7 +253,8 @@ mod tests {
     #[test]
     fn names_operands_from_the_slot_table() {
         let mut d = inst(DevOp::Gemm);
-        d.t = [3, 4, 5, 0, 0, 0, 0, 0];
+        // Unused slots carry the builder's TENSOR_NONE, not 0: t7 is Gemm's optional bias.
+        d.t = [3, 4, 5, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE];
         d.i = [1, 6144, 2048, 0, 0, 0, 0, 0];
         let names = ["w0", "w1", "w2", "act.hn", "act.x", "blk.q.w"];
         let out = disasm(7, &d.pack(), &names);
@@ -269,6 +270,7 @@ mod tests {
                 (Some("C"), Some("act.hn")),
                 (Some("A"), Some("act.x")),
                 (Some("B"), Some("blk.q.w")),
+                (Some("bias"), None),
             ]
         );
         let i: Vec<_> = out.ints.iter().map(|o| (o.name, o.value)).collect();

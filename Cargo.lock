@@ -2566,6 +2566,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytemuck",
+ "cc",
  "clap",
  "costmodel",
  "crossbeam-utils",
@@ -2575,6 +2576,7 @@ dependencies = [
  "hwspec",
  "hyper",
  "hyper-util",
+ "libc",
  "libloading",
  "memmap2",
  "packet",

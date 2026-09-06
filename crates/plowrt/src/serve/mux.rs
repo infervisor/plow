@@ -240,7 +240,7 @@ fn advance_health(health: EngineHealth, fault: Option<crate::DeviceErrorInfo>) -
 
 /// Record the first device fault a tick sees (per-slot errors keep flowing to
 /// their waiters; this is only the dispatcher's health signal).
-#[cfg(any(feature = "cuda", feature = "hsa"))]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 fn note_fault(tick_fault: &mut Option<crate::DeviceErrorInfo>, err: &crate::RuntimeError) {
     if tick_fault.is_none() {
         *tick_fault = err.device_fault().cloned();
@@ -250,7 +250,7 @@ fn note_fault(tick_fault: &mut Option<crate::DeviceErrorInfo>, err: &crate::Runt
 /// Per-slot copy of a batch error for fan-out to every affected waiter: a
 /// typed device fault stays typed (its fatality drives the 503 mapping);
 /// anything else degrades to the stringified `Msg` as before.
-#[cfg(any(feature = "cuda", feature = "hsa"))]
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
     match err.device_fault() {
         Some(info) => crate::RuntimeError::DeviceFault { info: info.clone() },
@@ -383,16 +383,16 @@ pub fn spawn(
         .unwrap_or(1);
     // GPU-engine bundles are bucketless: take both capacity and the optional
     // decode ladder from the loaded engine once, before the hot loop starts.
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     let gpu_shape = state.gpu_engine(bundle.network()).map(|e| {
         let e = e.lock();
         (e.batch(), e.decode_rungs())
     });
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     let capacity = gpu_shape.as_ref().map(|x| x.0).unwrap_or(capacity);
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     let rung_widths = gpu_shape.map(|x| x.1);
-    #[cfg(not(any(feature = "cuda", feature = "hsa")))]
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let rung_widths: Option<Box<[u32]>> = None;
     let mut rung_controller =
         rung_widths
@@ -483,9 +483,9 @@ pub fn spawn(
         let mut oob_events: Vec<OobMsg> = Vec::new();
         // GPU-engine models never run the CPU bucket walk — skip the ladder
         // scan + bufs machinery on the dispatcher critical path entirely.
-        #[cfg(any(feature = "cuda", feature = "hsa"))]
+        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
         let has_gpu = state.gpu_engine(bundle.network()).is_some();
-        #[cfg(not(any(feature = "cuda", feature = "hsa")))]
+        #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
         let has_gpu = false;
         // Dedicated engine/submission thread for GPU models: every tick runs
         // on ONE persistent OS thread (CUDA context bound once, no
@@ -1233,7 +1233,7 @@ fn run_one_tick(
     // table is sized to it at spawn, so mux slot i IS engine slot i). Per
     // tick: prefill each new arrival into its own KV slot (sequential), then
     // ONE batched decode launch advances every already-running slot.
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if let Some(eng) = state.gpu_engine(bundle.network()) {
         let mut guard = eng.lock();
         // Per-backend tick bodies, because the two engines differ in kind: the
@@ -1668,9 +1668,11 @@ fn run_one_tick(
         //
         // Irrefutable in an hsa-only build (the enum then has one variant) and
         // refutable alongside `cuda` — the same arm has to compile as both.
-        #[cfg(feature = "hsa")]
-        #[allow(irrefutable_let_patterns)]
-        if let crate::serve::engine::ServeEngine::Amd(e) = &mut *guard {
+        // Single-sequence engines (gfx950, CPU) share one tick body through
+        // `SeqEngine`; the packed/multistep branches are AMD-only and the CPU
+        // engine declines them (`None`), falling to whole-prompt prefill + step.
+        #[cfg(any(feature = "hsa", feature = "cpu"))]
+        if let Some(e) = guard.seq_engine_mut() {
             let stop = Arc::clone(e.stop_ids());
             let b = e.batch();
 
@@ -2350,7 +2352,7 @@ fn gpu_prefill_should_yield(has_feeds: bool, defer_decode: bool, slot: Option<&S
     has_feeds || (!defer_decode && slot.is_some_and(|s| s.step > 0 && !s.respond.is_closed()))
 }
 
-#[cfg(feature = "hsa")]
+#[cfg(any(feature = "hsa", feature = "cpu"))]
 fn amd_prefill_tick_cap(
     has_decode: bool,
     no_interleave: bool,
@@ -2364,19 +2366,19 @@ fn amd_prefill_tick_cap(
     }
 }
 
-#[cfg(feature = "hsa")]
+#[cfg(any(feature = "hsa", feature = "cpu"))]
 fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
     enabled && prefill_remains
 }
 
-#[cfg(feature = "hsa")]
+#[cfg(any(feature = "hsa", feature = "cpu"))]
 fn amd_multistep_requested(remaining: usize, scheduler_steps: usize, configured: u32) -> usize {
     remaining
         .min(scheduler_steps)
         .min(configured.max(1) as usize)
 }
 
-#[cfg(feature = "hsa")]
+#[cfg(any(feature = "hsa", feature = "cpu"))]
 fn amd_prefill_pick(
     candidates: impl IntoIterator<Item = (usize, Instant)>,
     fair: bool,
@@ -2402,7 +2404,7 @@ fn amd_prefill_pick(
 /// All members use the first selected span's compiled program. Rows are packed
 /// densely under `row_budget`; KV and recurrent coordinates remain request-local.
 /// Invalid descriptors are excluded so the caller can retain the isolated path.
-#[cfg(feature = "hsa")]
+#[cfg(any(feature = "hsa", feature = "cpu"))]
 fn amd_prefill_pack(
     candidates: impl IntoIterator<Item = packet::dev::PrefillSpan>,
     row_budget: u32,
@@ -2447,7 +2449,7 @@ fn amd_prefill_pack(
     out
 }
 
-#[cfg(feature = "hsa")]
+#[cfg(any(feature = "hsa", feature = "cpu"))]
 fn amd_packed_frontier_updates(
     members: impl IntoIterator<Item = usize>,
     mut frontier: impl FnMut(usize) -> Option<usize>,
@@ -2458,7 +2460,7 @@ fn amd_packed_frontier_updates(
         .collect()
 }
 
-#[cfg(feature = "hsa")]
+#[cfg(any(feature = "hsa", feature = "cpu"))]
 fn amd_prefill_isolated_fallback(isolated: Option<usize>, packed: bool) -> Option<usize> {
     (!packed).then_some(isolated).flatten()
 }
@@ -2968,7 +2970,7 @@ mod tests {
 
     /// A batch failure fans out to every fed slot — the typed fault must
     /// survive the copy (a fatal fault maps to 503; a Msg would read as 500).
-    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     #[test]
     fn fanout_preserves_the_typed_fault() {
         let f = crate::RuntimeError::DeviceFault { info: fault(true) };
