@@ -86,6 +86,23 @@ At 1K, mean TPOT across two repeats was:
 5. Evaluate cross-request prefill batching and mixed prefill/decode scheduling after
    kernel parity, including straggler and p99 ITL measurements.
 
+## Method changes adopted
+
+- Existing harness selection is mandatory before launching or writing a new
+  runner. Missing functionality should extend the closest reusable harness.
+- Broad tuning runs at single-block or minimal mixed-block scope. Standalone
+  probes prune; only 2–3 block finalists reach whole-model steps; serving is
+  reserved for promotion.
+- Experiment priority uses measured block op share times candidate improvement.
+  Small local gains in a kernel still several times behind its library peer do
+  not outrank algorithmic attention and batched-GEMM work.
+- Block finalist grids cover B=1/4/16, T=1K/4K/8K/16K/32K, and boundary-adjacent
+  points. Context/rung choices belong in compiler-emitted packet metadata.
+- Paired runs reverse order, evict L2 symmetrically, log SM clock/power, and bind
+  packet/object digests plus register/spill evidence to every result.
+- Raw JSON/JSONL and logs stay on campaign storage. The repository retains this
+  summary and only decision-critical CSV measurements.
+
 ## Retained raw CSV files
 
 | File | Purpose |

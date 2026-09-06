@@ -22,6 +22,12 @@ change numerics was re-verified against a correctness gate. The output is a
 **serving recipe** — a `plowrt serve` command line + `PLOW_*` knobs + measured
 TTFT/TPOT/throughput/memory numbers.
 
+Kernel, warp, register, attention-split, and packet-rung experiments do not run
+at whole-model scope here. Return them to Stage 5 and rank them with the existing
+single-block or minimal mixed-block harness. Use whole-model serving only for
+effects a block cannot represent: admission, cross-request prefill batching,
+decode/prefill overlap, KV capacity, queueing, and tail latency.
+
 ---
 
 ## The runtime, in one picture

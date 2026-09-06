@@ -20,7 +20,7 @@ part name into a command.**
 | `$BUILD` | | `scripts/build_<isa>.sh` for `$ISA` |
 | `$FEATURES` | | `--features hsa` (amd) or `--features cuda` (nvidia) |
 | `$BW_BOUND` | | carried from Stage 4 — decode is bandwidth-bound against it |
-| `$RESULTS` | | `perf-data/plow-<isa>/` if it exists, else `perf-data/` |
+| `$RESULTS` | | campaign NVMe, or `/dev/shm` for disposable screens; raw output is not committed |
 
 You are executing **Stage 6** of the model-bringup playbook. Your job: take a
 model whose single block is correct and tuned (Stage 5) and make it **serve the
@@ -32,6 +32,12 @@ commands, and pitfalls. This prompt is the executable checklist.
 Nothing here recompiles the model. Every lever is a `plowrt` flag or a `PLOW_*`
 env var read at serve time — except the decode batch width `B`, which is
 compiled into the blob and may send you back to Stage 5.
+
+Choose an existing harness before every run. Kernel, warp, register,
+attention-split, and packet-rung ideas return to the Stage-5 single-block or
+minimal mixed-block sweep. Whole-model runs here are reserved for admission,
+cross-request prefill batching, decode/prefill overlap, KV capacity, queueing,
+and p99 behavior that a block cannot represent.
 
 ## Preconditions (from Stage 5)
 

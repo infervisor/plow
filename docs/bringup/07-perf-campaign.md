@@ -2,9 +2,9 @@
 
 > Turn a serving recipe into a **defensible, reproducible number**. Measure
 > latency and throughput versus concurrency and context on the whole served
-> model, behind a correctness battery, and write it up in the established
-> `perf-data/` format so a reader can rebuild every cell. This is the final
-> stage: its output is a committed campaign write-up, not another tuning round.
+> model, behind a correctness battery, and consolidate the decision into
+> `perf-data/SUMMARY.md`. This is the final stage: its output is a reviewed
+> campaign result, not another tuning round.
 
 **Precondition:** Stage 6 complete — the model serves at its target concurrency
 with a recorded recipe (`plowrt serve` command line + `PLOW_*` knobs + measured
@@ -18,9 +18,9 @@ filled in and is part of the campaign header: a campaign is a statement about
 **Gate out (bringup complete):** the correctness battery passes (token-identity
 gate + at least one accuracy number), the performance targets are met and
 measured — same-session, uncontended, concurrency- and context-swept — and the
-whole campaign is written up in `perf-data/` with every cell traceable to a
-source file and a reproduction command. When this gate passes, the model is
-brought up.
+campaign is consolidated in `perf-data/SUMMARY.md`. Raw files, logs, and
+commands remain in `$RESULTS` on campaign storage. When this gate passes, the
+model is brought up.
 
 This stage carries one non-negotiable convention from every historical campaign:
 **the tone is neutral and research-grade.** Report what the box did. There is no
@@ -339,13 +339,12 @@ been recorded wrongly before:
 
 ## Where results live and how they're written
 
-Committed under `$RESULTS` — `perf-data/plow-<isa>/` if such a directory exists
-for `$ISA` (today only `perf-data/plow-gfx942/` does, linked from the README's
-perf section), else the `perf-data/` root. A campaign targeting one GPU family
-lands in the per-ISA home; cross-arch capacity reports live at the `perf-data/`
-root (e.g. `b2-concurrency-family.md`, `serving-capacity-report.md`). If `$ISA`
-has no home yet, create one on the same pattern rather than filing an
-ISA-specific result under another ISA's directory.
+Write raw JSON/JSONL, logs, command manifests, binaries, and intermediate
+reducers to `$RESULTS` on campaign NVMe. Disposable screens may use `/dev/shm`.
+Do not make the repository an append-only raw-results store. After review,
+update `perf-data/SUMMARY.md` and retain only compact CSV inputs that directly
+support its decisions. Every retained row names the external campaign location
+or the last Git commit containing its complete artifact set.
 
 Structure a campaign write-up to the established format:
 
@@ -368,8 +367,8 @@ Structure a campaign write-up to the established format:
   roofline arithmetic.
 * **"What's still open"** — staged, one lease each; every driver parameterized so
   dropping a missing JSON in lights up the row with no code change.
-* **Data / reproduction pointers** — the `*.json`, the driver script + its env
-  vars, the reducers.
+* **Data / reproduction pointers** — the external `$RESULTS` location, the
+  driver script + its arguments, packet/object digests, and reducers.
 
 Neutral voice throughout. A comparator ratio is a fact with a caveat
 (`1.096× at 8k — inside the range a fresh baseline could move`), never a verdict.
@@ -391,10 +390,9 @@ The model completes bringup when **all** hold:
    same-session number.
 4. **Swept, not single-point.** A concurrency ladder and a context ladder, not
    one cell.
-5. **Documented in `$RESULTS`.** A committed write-up in the established format
-   — header, honesty banner, tables with `valid` flags, per-model limiter,
-   open-work list, reproduction pointers — every cell traceable to a source JSON
-   and a command. Neutral tone; no win/loss framing.
+5. **Consolidated.** `perf-data/SUMMARY.md` contains the header, honesty banner,
+   decision tables, per-model limiter, open-work list, and pointers to external
+   raw evidence. Any retained CSV directly supports one of those entries.
 6. **The target is on the record.** The write-up names `$GPU`, `$ISA`, `$NCU`,
    `$NGPU`/`$PARALLEL`, `$MAXCTX` and the provenance of every denominator, and
    its `Scope:` line says how far the finding generalizes. An unscoped number
@@ -463,13 +461,11 @@ The model completes bringup when **all** hold:
 | `perf-data/tools/bringup_bench.sh` | one client pass (`vllm bench serve`), appends `cells.tsv` |
 | `perf-data/tools/bringup_showdown.sh` | sequential-exclusive multi-arm showdown template |
 | `perf-data/tools/bringup_ceiling.py` | vendor-BLAS/torch GEMM ceiling at your exact shapes (cuBLASLt-written) |
-| `perf-data/tools/README.md` | what each harness script is and how to drive it |
 | `perf-data/bench_ib.sh` / `bench_b2_ib.sh` | `inference-benchmarker` capacity driver (parameterized; may be absent — see note) |
 | `perf-data/consolidate_b2_ib.py`, `b2-ib/{slo_capacity,summarize}.py` | raw report JSON → `b2-concurrency-*.json`, max-users-under-SLO |
 | `scripts/bench_gsm8k.sh` | whole-stack accuracy battery (GSM8K 8-shot greedy) |
-| `$RESULTS` (`perf-data/plow-gfx942/` is the one per-ISA home in the tree today) | the per-ISA results home (README = index, LESSONS = method) |
-| `perf-data/b2-concurrency-family.md`, `serving-capacity-report.md` | the model campaign template (tables, honesty banner, per-model limiter, open-work) |
-| `perf-data/archive/k3/k3-gsm8k.md`, `perf-data/gemma12b-gh200-prefill-campaign.md` | accuracy-number method; roofline / prefill campaign |
+| `$RESULTS` | external raw JSON/JSONL, logs, command manifests, and binary evidence |
+| `perf-data/SUMMARY.md` | consolidated decisions, current gaps, retained CSV inventory, and method changes |
 
 Architecture reading: `docs/arch/06-runtime.md` (execution model),
 `docs/arch/11-tuning-coverage.md` and `docs/arch/12-using-the-tuner.md` (what the

@@ -20,7 +20,7 @@ literal part name into a command.**
 | `$FEATURES` | | `--features hsa` or `--features cuda` |
 | `$BW_BOUND` | | `MemorySpec::bandwidth_for_bound()` — **state whether it is measured or a datasheet fallback** |
 | `$COMPUTE_CEIL` | | measured sustained matrix-core ceiling **on `$GPU`** (Step 1 below) |
-| `$RESULTS` | | `perf-data/plow-<isa>/` if it exists, else `perf-data/` |
+| `$RESULTS` | | campaign NVMe, or `/dev/shm` for disposable screens; raw output is not committed |
 
 You are executing **Stage 4** of the model-bringup playbook. Your job: identify
 the target model's hot kernels, **measure each family against its roofline
@@ -49,6 +49,20 @@ Do not spend campaign time on whole-model sweeps while a hot individual kernel
 still loses its exact AITER/ROCm or library peer. Keep all harness controls
 operator- and shape-derived; model names belong only in workload manifests and
 result records.
+
+Before launching a run, select an existing harness from the repository. Use a
+production-header probe for correctness and gross pruning, then
+`scripts/tune_decode_sweep.sh --block ...` or the family-specific truncated
+model sweep for broad ranking. Only the 2–3 block winners may run through
+whole-model `step_bench`; only a gated whole-model winner may enter serving.
+If an existing harness lacks one field or shape, extend it instead of writing a
+parallel campaign script.
+
+Trace one representative short- and long-context block before prioritizing
+work. Rank a candidate by `block op share × measured improvement`. If a kernel
+is still multiple times behind its library peer, switch algorithm, reuse,
+tiling, or occupancy rather than spending the campaign on single-digit
+instruction variants.
 
 ## Preconditions (from Stages 1–3)
 
@@ -180,9 +194,11 @@ exist on your target.
   `PLOW_TOOLCHAIN_LABEL` exported by the repository flake before building and
   binds that same label through both identity probes and ingest.
   `--gpu` is required — it decides the cell.
-* **Decode knobs (`$VENDOR = nvidia`, object grid):** `scripts/tune_decode_sweep.sh`
-  (sweeps `PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, MoE knobs jointly,
-  scored by end-to-end step TPOT), then `tunedb-decode ingest`.
+* **Decode knobs (`$VENDOR = nvidia`, object grid):** use
+  `scripts/tune_decode_sweep.sh --block <layer> --block-run <block_run>` for the
+  broad grid (`PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, and MoE knobs).
+  Re-run only the 2–3 winners without `--block` for whole-model confirmation,
+  then use `tunedb-decode ingest` on qualified whole-model results.
 * **Decode-attention split count (packet grid):** when the model exposes a
   split knob (K3: `PLOW_MLA_NS`), emit matched packets across a geometric grid
   such as 16/32/64/128 while reusing the exact weights and interpreter object.
