@@ -148,7 +148,12 @@ fn sparse_decode_and_ragged_prefill_preserve_absolute_identity() {
                 PROGRAM_CAPABILITY,
             ),
         },
-        objects: vec![],
+        objects: vec![binding(
+            "mixed_cuda",
+            PayloadKind::Cubin,
+            b"cubin",
+            OBJECT_CAPABILITY,
+        )],
     };
     let manifest = Manifest {
         version: VERSION,
@@ -427,4 +432,55 @@ fn manifest_rejects_unknown_fields_and_duplicate_geometry() {
         variants: vec![a, b],
     };
     assert!(conflicting.validate().is_err());
+}
+
+#[test]
+fn manifest_requires_exactly_one_object_per_declared_backend() {
+    let mut variant = Variant {
+        rows: 8,
+        decode_rows: 1,
+        program: ProgramBinding {
+            index: 0,
+            payload: binding(
+                "programs",
+                PayloadKind::Programs,
+                b"program",
+                PROGRAM_CAPABILITY,
+            ),
+        },
+        objects: vec![],
+    };
+    let manifest = |variant| Manifest {
+        version: VERSION,
+        n_cu: 1,
+        max_active_requests: 1,
+        physical_slot_capacity: 1,
+        variants: vec![variant],
+    };
+
+    assert!(manifest(variant.clone()).validate().is_err());
+    variant.objects.push(binding(
+        "cuda_a",
+        PayloadKind::Cubin,
+        b"cuda a",
+        OBJECT_CAPABILITY,
+    ));
+    manifest(variant.clone()).validate().unwrap();
+
+    variant.objects.push(binding(
+        "cuda_b",
+        PayloadKind::Cubin,
+        b"cuda b",
+        OBJECT_CAPABILITY,
+    ));
+    assert!(manifest(variant.clone()).validate().is_err());
+
+    variant.objects.pop();
+    variant.objects.push(binding(
+        "amd",
+        PayloadKind::Hsaco,
+        b"amd",
+        OBJECT_CAPABILITY,
+    ));
+    manifest(variant).validate().unwrap();
 }
