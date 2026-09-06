@@ -166,6 +166,24 @@ impl Checkpoint {
         Ok(Checkpoint { shards, index })
     }
 
+    /// [`Self::open`] plus an optional weight TWIN directory (e.g. the fp8 e4m3 twins
+    /// `perf-data/tools/quantize_fp8.py` writes as `fp8/<name>` + `fp8/<name>_scale`).
+    /// The twin's tensors are merged into one index; on an exact name clash the twin wins.
+    pub fn open_with_twin(dir: &Path, twin: Option<&Path>) -> Result<Checkpoint> {
+        let mut ck = Self::open(dir)?;
+        if let Some(t) = twin {
+            let tw = Self::open(t)?;
+            let base = ck.shards.len();
+            ck.shards.extend(tw.shards);
+            for (name, mut e) in tw.index {
+                e.shard += base;
+                ck.index.insert(name, e);
+            }
+            tracing::info!(twin = %t.display(), tensors = ck.index.len(), "checkpoint twin merged");
+        }
+        Ok(ck)
+    }
+
     /// Tensor bytes alone. The CUDA engine binds full tensors and wants only
     /// these; the AMD engine binds shards and needs [`Checkpoint::tensor_ex`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]

@@ -896,6 +896,15 @@ impl Builder {
         f: impl FnOnce(&mut DevInst),
     ) -> u32 {
         assert!(!cus.is_empty(), "an op must run at least one CU");
+        // Emitters place fixed-block ops (e.g. the 64-block argmax) on cu ids `0..blocks`
+        // regardless of the target's executor count. Repeated ids are legal (gemv_split
+        // relies on it) and a CU simply runs both slices in order, so wrapping keeps a
+        // small-`n_cu` target (CPU cores) valid; GPU blobs (n_cu >= 64) are unchanged.
+        let cus: Vec<u32> = if cus.iter().any(|&c| c >= self.n_cu) {
+            cus.into_iter().map(|c| c % self.n_cu).collect()
+        } else {
+            cus
+        };
         for d in &deps {
             if let Dep::Fine { map, .. } = d {
                 assert_eq!(

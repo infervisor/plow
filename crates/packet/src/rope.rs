@@ -20,7 +20,8 @@
 //! If you are tempted to move this into a kernel, don't.
 
 /// RoPE frequency scaling. Gemma/Qwen use plain `theta^(-2i/hd)`; Llama-3.1 rescales the low
-/// frequencies (long wavelengths) by `factor` with a smooth transition band.
+/// frequencies (long wavelengths) by `factor` with a smooth transition band; YaRN (GPT-OSS)
+/// interpolates by dimension index and additionally scales cos/sin by `mscale`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RopeScale {
     None,
@@ -30,12 +31,45 @@ pub enum RopeScale {
         high: f64,
         orig: f64,
     },
+    /// HF `_compute_yarn_parameters` (`rope_type: "yarn"`). `orig` is
+    /// `original_max_position_embeddings`; `truncate` floors/ceils the correction range
+    /// (HF default true; GPT-OSS ships `truncate: false`). The attention factor is derived
+    /// from `factor` ([`RopeScale::mscale`]) — an explicit `attention_factor`/`mscale` in the
+    /// config is not representable and the config parser must refuse it.
+    Yarn {
+        factor: f64,
+        beta_fast: f64,
+        beta_slow: f64,
+        orig: f64,
+        truncate: bool,
+    },
 }
 
-/// Llama-3.1 inv_freq rescaling: low frequencies (long wavelengths) are divided by `factor`, high
-/// frequencies pass through, with a smooth interpolation between. Mirrors HF
-/// `_compute_llama3_parameters`. [`RopeScale::None`] returns inv unchanged (Gemma/Qwen).
-fn scale_inv_freq(inv: f64, scale: RopeScale) -> f64 {
+impl RopeScale {
+    /// The factor HF multiplies into BOTH cos and sin (`attention_scaling`): YaRN's
+    /// `get_mscale(factor) = 0.1*ln(factor) + 1` for `factor > 1`, else 1. Every other scheme is 1.
+    pub fn mscale(self) -> f64 {
+        match self {
+            RopeScale::Yarn { factor, .. } if factor > 1.0 => 0.1 * factor.ln() + 1.0,
+            _ => 1.0,
+        }
+    }
+}
+
+/// `inv_freq[j]` for rotary pair `j` of a `hd`-wide head: the plain `theta^(-2j/hd)`, rescaled
+/// per scheme.
+///
+/// Llama-3.1 (HF `_compute_llama3_parameters`): low frequencies (long wavelengths) are divided
+/// by `factor`, high frequencies pass through, with a smooth interpolation between.
+///
+/// YaRN (HF `_compute_yarn_parameters`): with `cdim(r) = hd*ln(orig/(2*pi*r)) / (2*ln(theta))`,
+/// `lo = cdim(beta_fast)`, `hi = cdim(beta_slow)` (floored/ceiled iff `truncate`, then clamped to
+/// `[0, hd-1]`, `hi += 0.001` if equal), `ramp_j = clamp((j-lo)/(hi-lo), 0, 1)`:
+/// `inv_j = (ext_j/factor)*ramp_j + ext_j*(1-ramp_j)` — pairs below `lo` keep the original
+/// (extrapolated) frequency, pairs above `hi` are interpolated by `factor`. Assumes a full rotary
+/// (`dim == hd`), which is what every YaRN checkpoint here ships.
+fn inv_freq(j: usize, hd: u32, theta: f64, scale: RopeScale) -> f64 {
+    let inv = 1.0 / theta.powf(2.0 * j as f64 / hd as f64);
     match scale {
         RopeScale::None => inv,
         RopeScale::Llama3 {
@@ -56,6 +90,29 @@ fn scale_inv_freq(inv: f64, scale: RopeScale) -> f64 {
                 (1.0 - smooth) * inv / factor + smooth * inv
             }
         }
+        RopeScale::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            orig,
+            truncate,
+        } => {
+            let dim = hd as f64;
+            let cdim =
+                |r: f64| dim * (orig / (r * 2.0 * std::f64::consts::PI)).ln() / (2.0 * theta.ln());
+            let (mut lo, mut hi) = (cdim(beta_fast), cdim(beta_slow));
+            if truncate {
+                lo = lo.floor();
+                hi = hi.ceil();
+            }
+            let lo = lo.max(0.0);
+            let mut hi = hi.min(dim - 1.0);
+            if lo == hi {
+                hi += 0.001;
+            }
+            let ramp = ((j as f64 - lo) / (hi - lo)).clamp(0.0, 1.0);
+            (inv / factor) * ramp + inv * (1.0 - ramp)
+        }
     }
 }
 
@@ -75,12 +132,14 @@ pub fn rope_tables(t: u32, hd: u32, theta: f64, frac: f64, scale: RopeScale) -> 
     let rope_angles = (frac * (hd as f64) / 2.0) as usize;
     let mut cos = Vec::with_capacity(t as usize * h2 * 4);
     let mut sin = Vec::with_capacity(t as usize * h2 * 4);
+    // YaRN's attention factor lands on both tables (HF: `cos = emb.cos() * attention_scaling`);
+    // 1.0 for every other scheme. The NoPE tail stays exact identity regardless.
+    let ms = scale.mscale();
     for p in 0..t as usize {
         for j in 0..h2 {
             let (c, s) = if j < rope_angles {
-                let inv = scale_inv_freq(1.0 / theta.powf(2.0 * j as f64 / hd as f64), scale);
-                let a = p as f64 * inv;
-                (a.cos(), a.sin())
+                let a = p as f64 * inv_freq(j, hd, theta, scale);
+                (a.cos() * ms, a.sin() * ms)
             } else {
                 (1.0, 0.0) // NoPE: identity
             };
@@ -153,6 +212,9 @@ pub const GEN_TMAP_KV_PAIR: u32 = 6;
 pub const ROPE_SCALE_NONE: u32 = 0;
 /// [`GenTensor::scale`]: Llama-3.1 smooth low-frequency rescaling.
 pub const ROPE_SCALE_LLAMA3: u32 = 1;
+/// [`GenTensor::scale`]: YaRN ([`RopeScale::Yarn`]). Field reuse: `factor`, `orig`,
+/// `low = beta_fast`, `high = beta_slow`, `aux` bit 0 = truncate. Mirrors `PLOW_ROPE_SCALE_YARN`.
+pub const ROPE_SCALE_YARN: u32 = 2;
 
 /// A recipe for one tensor the runtime materialises at bind time instead of
 /// reading from the blob's init section. Mirrors `PlowGenTensor` in
@@ -172,14 +234,15 @@ pub struct GenTensor {
     pub ctx: u32,
     /// Head dim for the `ROPE` kinds; `index_dim` for the `ROPE_IDX` kinds.
     pub hd: u32,
-    /// `rope_hd` for the `ROPE_IDX` kinds; 0 otherwise.
+    /// `rope_hd` for the `ROPE_IDX` kinds; YaRN `truncate` flag (bit 0) for the `ROPE` kinds
+    /// under [`ROPE_SCALE_YARN`]; 0 otherwise.
     pub aux: u32,
     /// One of the `ROPE_SCALE_*` constants.
     pub scale: u32,
     pub theta: f64,
     /// Partial-rotary fraction. 1.0 = fully rotated.
     pub frac: f64,
-    /// [`RopeScale::Llama3`] parameters; all 0 when `scale == ROPE_SCALE_NONE`.
+    /// [`RopeScale::Llama3`] / [`RopeScale::Yarn`] parameters; all 0 when `scale == ROPE_SCALE_NONE`.
     pub factor: f64,
     pub low: f64,
     pub high: f64,
@@ -222,7 +285,16 @@ impl GenTensor {
                 high: self.high,
                 orig: self.orig,
             },
-            _ => RopeScale::None,
+            ROPE_SCALE_YARN => RopeScale::Yarn {
+                factor: self.factor,
+                beta_fast: self.low,
+                beta_slow: self.high,
+                orig: self.orig,
+                truncate: self.aux & 1 == 1,
+            },
+            ROPE_SCALE_NONE => RopeScale::None,
+            // A scale kind from a newer compiler: refuse, never serve an unscaled table.
+            _ => return None,
         };
         let (cos, sin) = match self.kind {
             GEN_ROPE_COS | GEN_ROPE_SIN => {
@@ -242,21 +314,28 @@ impl GenTensor {
     /// The `(cos, sin)` recipe pair for a [`rope_tables`] table. `tensor` is left
     /// 0 — [`crate::devbuild::Builder::tensor_gen`] fills in the real handle.
     pub fn rope_pair(ctx: u32, hd: u32, theta: f64, frac: f64, scale: RopeScale) -> [GenTensor; 2] {
-        let (skind, factor, low, high, orig) = match scale {
-            RopeScale::None => (ROPE_SCALE_NONE, 0.0, 0.0, 0.0, 0.0),
+        let (skind, factor, low, high, orig, aux) = match scale {
+            RopeScale::None => (ROPE_SCALE_NONE, 0.0, 0.0, 0.0, 0.0, 0),
             RopeScale::Llama3 {
                 factor,
                 low,
                 high,
                 orig,
-            } => (ROPE_SCALE_LLAMA3, factor, low, high, orig),
+            } => (ROPE_SCALE_LLAMA3, factor, low, high, orig, 0),
+            RopeScale::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                orig,
+                truncate,
+            } => (ROPE_SCALE_YARN, factor, beta_fast, beta_slow, orig, truncate as u32),
         };
         let base = GenTensor {
             tensor: 0,
             kind: GEN_ROPE_COS,
             ctx,
             hd,
-            aux: 0,
+            aux,
             scale: skind,
             theta,
             frac,
@@ -380,6 +459,49 @@ mod tests {
         let [gc, gs] = GenTensor::rope_pair(256, 128, 500_000.0, 1.0, scale);
         assert_eq!(gc.generate().unwrap(), cos);
         assert_eq!(gs.generate().unwrap(), sin);
+    }
+
+    /// GPT-OSS-20B YaRN (theta 150000, hd 64, factor 32, orig 4096, beta 32/1, truncate false)
+    /// against a transcription of HF `_compute_yarn_parameters` (transformers 4.55): `inv_freq`
+    /// at the extrapolated head (pairs < lo = 8.09 keep the unscaled frequency), inside the ramp,
+    /// and the interpolated tail (pairs > hi = 17.40 are `ext/32`), plus the attention factor.
+    #[test]
+    fn yarn_matches_hf_gpt_oss() {
+        let scale = RopeScale::Yarn {
+            factor: 32.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            orig: 4096.0,
+            truncate: false,
+        };
+        let hf = [
+            (0usize, 1.0f64),
+            (7, 0.07374456821026082),
+            (8, 0.050813274815461475),
+            (12, 0.006794959489732219),
+            (20, 1.818833668168956e-05),
+            (26, 1.9465962110014815e-06),
+            (27, 1.3412910350540445e-06),
+            (31, 3.0235114281192144e-07),
+        ];
+        for (j, want) in hf {
+            let got = inv_freq(j, 64, 150_000.0, scale);
+            assert!(
+                ((got - want) / want).abs() < 1e-12,
+                "inv_freq[{j}] = {got}, HF {want}"
+            );
+        }
+        assert!((scale.mscale() - 1.3465735902799727).abs() < 1e-15);
+        // The recipe round-trips through the wire fields (low/high carry the betas, aux the flag).
+        let (cos, sin) = rope_tables(64, 64, 150_000.0, 1.0, scale);
+        let [gc, gs] = GenTensor::rope_pair(64, 64, 150_000.0, 1.0, scale);
+        assert_eq!((gc.scale, gc.aux, gc.low, gc.high), (ROPE_SCALE_YARN, 0, 32.0, 1.0));
+        assert_eq!(gc.generate().unwrap(), cos);
+        assert_eq!(gs.generate().unwrap(), sin);
+        // Position 0 is cos = mscale, sin = 0 on every pair: the factor is on the table, not on q.
+        let c0 = f32::from_le_bytes(cos[0..4].try_into().unwrap());
+        assert_eq!(c0, 1.3465735902799727f64 as f32);
+        assert_eq!(&sin[0..4], &0f32.to_le_bytes());
     }
 
     #[test]

@@ -17,6 +17,9 @@ mod amd_packed;
 #[cfg(feature = "hsa")]
 pub mod amd_tp;
 pub mod counters;
+/// CPU engine: device-ISA interpreter on persistent pinned worker threads,
+/// C kernels via `cpu::ffi`. See `plans/cpu-backend.md`.
+pub mod cpu;
 /// The device surface the interpreter engine drives, as a trait — the step
 /// that lets `gpu` stop being CUDA-only. Not gated on a vendor feature: it is
 /// the definition both backends implement.
@@ -27,6 +30,10 @@ pub mod gpu;
 pub mod health;
 pub mod host;
 pub mod indirection;
+/// KV write-row sites + prefill-chunk rebasing, shared by the AMD and CPU engines.
+// Prefill-chunk helpers are only exercised by an engine with a prefill path (AMD today).
+#[cfg_attr(not(feature = "hsa"), allow(dead_code))]
+pub mod kvrow;
 pub mod mixed_packet;
 pub mod mixed_step_staging;
 pub mod oob;

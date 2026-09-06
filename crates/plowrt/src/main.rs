@@ -2521,6 +2521,56 @@ async fn bringup_runtime(
         }
     }
 
+    // No GPU driver: bundles that ship a device blob are served by the CPU
+    // engine (persistent pinned workers + C kernels), not the reference
+    // interpreter. Same tokenizer refusal as the GPU paths.
+    #[cfg(feature = "cpu")]
+    if vendor.is_none() {
+        let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+        for slug in slugs {
+            let bundle = state.registry.get(&slug)?;
+            let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
+                continue;
+            };
+            if bundle.tokenizer().is_byte_fallback() {
+                return Err(format!(
+                    "{slug}: the CPU engine requires a real tokenizer.json in {}",
+                    bundle.dir.display()
+                )
+                .into());
+            }
+            let ckpt = RuntimeConfig::get()
+                .checkpoint
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| bundle.dir.join("checkpoint"));
+            let cpu = &RuntimeConfig::get().cpu;
+            let opts = plowrt::exec::cpu::engine::CpuEngineOpts {
+                threads: cpu.threads as usize,
+                numa: cpu.numa.clone(),
+                isa: match cpu.isa {
+                    plowrt::config::CpuIsa::Scalar => plowrt::exec::cpu::ffi::Isa::Scalar,
+                    plowrt::config::CpuIsa::Avx512 => plowrt::exec::cpu::ffi::Isa::Avx512,
+                    plowrt::config::CpuIsa::Amx | plowrt::config::CpuIsa::Auto => {
+                        plowrt::exec::cpu::ffi::Isa::Amx
+                    }
+                },
+                spin_us: cpu.spin_us,
+            };
+            tracing::info!(
+                %slug, blob = %blob.display(), checkpoint = %ckpt.display(), ?opts,
+                "loading CPU engine"
+            );
+            let t0 = std::time::Instant::now();
+            let eng = plowrt::serve::engine::CpuServe::load(&blob, &ckpt, &opts)?;
+            tracing::info!(
+                %slug, secs = t0.elapsed().as_secs_f64(), max_ctx = eng.max_ctx(),
+                "CPU engine loaded"
+            );
+            state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Cpu(eng));
+        }
+    }
+
     // Spawn a per-model dispatcher: bucket-mux + arrival-rate batch formation.
     // Each dispatcher owns a Sender clone via AppState::mux(slug). Managed
     // (GPU) models are skipped — their dispatcher lifecycle belongs to the

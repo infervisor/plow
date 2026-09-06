@@ -134,26 +134,26 @@ const DOC: &[S] = &[
     S { op: DevOp::QwenGdnPrefill, t: &["core", "Q", "K", "V", "alpha", "beta", "state", "outstate"], i: &["T", "HK", "HV", "K", "V"], f: &["q_scale"], j: &[] },
     S { op: DevOp::RmsNorm, t: &["out", "x", "gamma?", "xq?", "ascale?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::RowRms, t: &["rms", "x"], i: &["rows", "feat"], f: &["eps"], j: &[] },
-    S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },
+    S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "pair_mode", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },
     S { op: DevOp::Residual, t: &["out", "a", "b", "pre?"], i: &["n"], f: &["scale"], j: &[] },
-    S { op: DevOp::Glu, t: &["out", "gate", "up"], i: &["n", "act"], f: &[], j: &[] },
+    S { op: DevOp::Glu, t: &["out", "gate", "up"], i: &["n", "act"], f: &["alpha", "limit"], j: &[] },
     S { op: DevOp::Embed, t: &["out", "table", "ids"], i: &["ntok", "hidden"], f: &["scale"], j: &[] },
     S { op: DevOp::SoftCap, t: &["out", "x"], i: &["n"], f: &["cap"], j: &[] },
-    S { op: DevOp::Gemm, t: &["C", "A", "B"], i: &["M", "N", "K"], f: &[], j: &[] },
-    S { op: DevOp::Gemv, t: &["C", "x", "W", "rms?", "gamma?"], i: &["M", "N", "K", "norm"], f: &["eps"], j: &[] },
+    S { op: DevOp::Gemm, t: &["C", "A", "B", "", "", "", "", "bias?"], i: &["M", "N", "K"], f: &[], j: &[] },
+    S { op: DevOp::Gemv, t: &["C", "x", "W", "rms?", "gamma?", "", "", "bias?"], i: &["M", "N", "K", "norm"], f: &["eps"], j: &[] },
     S { op: DevOp::FlashPrefill, t: &["Opart", "mlpart", "Q", "K", "V", "O_final"], i: &["n_q", "n_kv", "n_head", "n_kv_head", "q_pos0", "window", "hd", "nsplit"], f: &["scale"], j: &["kv_stride", "kv_mask"] },
     S { op: DevOp::FlashDecode, t: &["Opart", "mlpart", "Q", "K", "V", "kv_len", "decode_slot?"], i: &["n_batch", "n_head", "n_kv_head", "kv_stride", "window", "nsplit", "hd"], f: &["scale"], j: &[] },
-    S { op: DevOp::FlashMerge, t: &["O", "Opart", "mlpart"], i: &["n_batch", "n_head", "nsplit", "hd"], f: &[], j: &[] },
+    S { op: DevOp::FlashMerge, t: &["O", "Opart", "mlpart", "sinks?"], i: &["n_batch", "n_head", "nsplit", "hd"], f: &[], j: &[] },
     S { op: DevOp::NormResidual, t: &["out", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::AddNorm, t: &["out", "resid", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::Argmax, t: &["part", "x"], i: &["n", "n_batch"], f: &[], j: &[] },
     S { op: DevOp::ArgmaxFin, t: &["ids", "part"], i: &["blocks", "n_batch"], f: &[], j: &[] },
-    S { op: DevOp::GemvGlu, t: &["fu", "x", "W_gate", "", "", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &["situ_beta", "situ_linear_beta"], j: &[] },
-    S { op: DevOp::GemmGlu, t: &["fu", "x", "W_gate", "", "", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
+    S { op: DevOp::GemvGlu, t: &["fu", "x", "W_gate", "", "", "W_up", "bias_gate?", "bias_up?"], i: &["M", "N", "K", "", "", "act"], f: &["situ_beta", "situ_linear_beta"], j: &[] },
+    S { op: DevOp::GemmGlu, t: &["fu", "x", "W_gate", "", "", "W_up", "bias_gate?", "bias_up?"], i: &["M", "N", "K", "", "", "act"], f: &["alpha", "limit"], j: &[] },
     // t7 != NONE is the Q-NORM FOLD (AMD decode, PLOW_GLM_FUSE_QNORM): t1 becomes the RAW
     // pre-norm activation and this packet computes the producing RmsNorm into its own LDS
     // staging, with f0 = eps. See gemv_norm_lds in op_gemm.h.
-    S { op: DevOp::GemvQkv, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v", "gamma?"], i: &["M", "Nq", "K", "Nk", "Nv"], f: &["eps"], j: &[] },
+    S { op: DevOp::GemvQkv, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v", "gamma?"], i: &["M", "Nq", "K", "Nk", "Nv", "bias_q", "bias_k", "bias_v"], f: &["eps"], j: &[] },
     // `i5=Ng` and `i6=W_g` are both REQUIRED, and `i6` is a TENSOR HANDLE, not a
     // number: nine pointers (four outputs, four weights, `x`) do not fit the
     // eight `t` slots of a fixed 64-byte instruction, so a WEIGHT was demoted —
@@ -226,7 +226,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeCombinePf, t: &["out", "residual?", "shared?", "part"], i: &["H", "k", "T", "t_row0", "det"], f: &[], j: &[] },
     S { op: DevOp::KdaConv, t: &["out", "x", "w", "conv_state"], i: &["T", "conv_dim", "W", "act"], f: &[], j: &[] },
     S { op: DevOp::KdaGate, t: &["g", "beta", "g_raw", "beta_raw", "A_log", "dt_bias"], i: &["T", "H", "D", "gate_mode"], f: &["lower_bound"], j: &[] },
-    S { op: DevOp::GemvMxfp4, t: &["C", "x", "W", "S"], i: &["M", "N", "K"], f: &[], j: &[] },
+    S { op: DevOp::GemvMxfp4, t: &["C", "x", "W", "S", "", "", "", "bias"], i: &["M", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::GemvGluMxfp4, t: &["C", "x", "Wg", "Sg", "Su", "Wu"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::GemmMxfp4, t: &["C", "A", "W", "wscale"], i: &["M", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::KdaStateStep, t: &[], i: &["T", "H", "D", "BV", "flags"], f: &["scale"], j: &[] },
@@ -266,6 +266,11 @@ const DOC: &[S] = &[
     S { op: DevOp::DsaQQuant, t: &["q_fp8", "q_scale", "q_raw"], i: &["n_rows", "head_dim"], f: &[], j: &[] },
     S { op: DevOp::IndexScoreKpool, t: &["Score", "Qfp8", "Qscale", "Kfp8", "Kscale", "W", "kv_len"], i: &["n_batch", "index_heads", "pool_stride", "index_head_dim", "pool_size", "prefill"], f: &["scale"], j: &[] },
     S { op: DevOp::GemvF32, t: &["C", "x", "W"], i: &["M", "N", "K"], f: &[], j: &[] },
+    // GPT-OSS flat MXFP4 MoE. No pointer tables: expert strides derive from i[].
+    S { op: DevOp::MoeGluMx, t: &["fu", "x", "table", "W_gu", "S_gu", "bias_gu?"], i: &["k", "I", "K", "n_exp", "layout", "act", "n_batch"], f: &["alpha", "limit"], j: &[] },
+    S { op: DevOp::MoeDownMx, t: &["part", "fu", "table", "W_d", "S_d", "bias_d?"], i: &["k", "H", "I", "n_exp", "", "", "n_batch"], f: &[], j: &[] },
+    S { op: DevOp::MoeGluMxPf, t: &["fu_g", "xn2", "W_gu", "S_gu", "meta", "row_token", "bias_gu?"], i: &["I", "K", "n_exp", "layout", "", "act"], f: &["alpha", "limit"], j: &[] },
+    S { op: DevOp::MoeDownMxPf, t: &["part", "fu_g", "W_d", "S_d", "meta", "bias_d?", "row_partidx", "row_gate"], i: &["H", "I", "n_exp"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

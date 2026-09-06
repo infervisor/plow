@@ -13,6 +13,152 @@ pub(crate) enum Arch {
     Gemma4,
     Llama,
     Qwen3,
+    /// GPT-OSS (`model_type: "gpt_oss"`): alternating sliding(128)/full GQA attention with
+    /// biases, sinks and YaRN RoPE over a top-4-of-32 MXFP4 MoE. Its own [`GptOssCfg`] and
+    /// emitter (`gptoss.rs`); never reaches the dense-GQA `Cfg` path.
+    #[allow(dead_code)]
+    GptOss,
+}
+
+/// GPT-OSS geometry, parsed from `config.json` with every field verified present. Weight names
+/// are the checkpoint's verbatim (`self_attn.{q,k,v,o}_proj.{weight,bias}`, `self_attn.sinks`,
+/// `mlp.router.{weight,bias}`, `mlp.experts.{gate_up,down}_proj_{blocks,scales,bias}`).
+pub(crate) struct GptOssCfg {
+    pub(crate) hidden: u32,
+    /// Per-expert intermediate width (`intermediate_size` IS the expert width; no dense MLP).
+    pub(crate) inter: u32,
+    pub(crate) layers: u32,
+    pub(crate) heads: u32,
+    pub(crate) kvh: u32,
+    pub(crate) hd: u32,
+    pub(crate) window: u32,
+    pub(crate) eps: f32,
+    pub(crate) vocab: u32,
+    /// `layer_types[l] == "full_attention"`.
+    pub(crate) is_full: Vec<bool>,
+    pub(crate) theta: f64,
+    pub(crate) rope_scale: RopeScale,
+    pub(crate) attn_scale: f32,
+    pub(crate) n_exp: u32,
+    pub(crate) top_k: u32,
+    /// swiglu_oai immediates: `alpha` is the reference's hard-coded 1.702, `limit` is
+    /// `swiglu_limit` (7.0).
+    pub(crate) swiglu_alpha: f32,
+    pub(crate) swiglu_limit: f32,
+    pub(crate) prefix: String,
+    /// `tie_word_embeddings`; false ships a separate `lm_head.weight`.
+    pub(crate) tied: bool,
+}
+
+/// GPT-OSS `config.json` -> [`GptOssCfg`]. Refuses (panics with the field named) anything the
+/// emitter does not implement rather than defaulting it: a dequantized (bf16) checkpoint, an
+/// explicit YaRN `attention_factor`, a non-yarn rope, a non-silu activation.
+pub(crate) fn cfg_gpt_oss(v: &Value) -> GptOssCfg {
+    let g = |k: &str| -> u32 {
+        v[k].as_u64()
+            .unwrap_or_else(|| panic!("gpt_oss config.json missing {k:?}")) as u32
+    };
+    let layers = g("num_hidden_layers");
+    let is_full: Vec<bool> = v["layer_types"]
+        .as_array()
+        .expect("gpt_oss: layer_types")
+        .iter()
+        .map(|x| match x.as_str() {
+            Some("full_attention") => true,
+            Some("sliding_attention") => false,
+            other => panic!("gpt_oss: unsupported layer type {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        is_full.len(),
+        layers as usize,
+        "gpt_oss: layer_types vs num_hidden_layers"
+    );
+    // The emitter binds the MXFP4 expert tensors (`*_blocks`/`*_scales`) by name. A checkpoint
+    // that ships dequantized bf16 experts (`experts.gate_up_proj` [E,2I,H]) has different names
+    // and needs a different op, so it is refused here rather than at the coverage gate.
+    let qm = v["quantization_config"]["quant_method"].as_str();
+    assert_eq!(
+        qm,
+        Some("mxfp4"),
+        "gpt_oss: quantization_config.quant_method must be \"mxfp4\" (got {qm:?}); the emitter \
+         binds the checkpoint's MXFP4 expert blocks/scales verbatim and has no bf16-expert arm"
+    );
+    assert_eq!(
+        v["attention_bias"], true,
+        "gpt_oss: attention_bias=false is not implemented"
+    );
+    assert_eq!(v["hidden_act"], "silu", "gpt_oss: swiglu_oai is built on silu");
+    let rs = &v["rope_scaling"];
+    assert_eq!(
+        rs["rope_type"].as_str(),
+        Some("yarn"),
+        "gpt_oss: rope_scaling.rope_type must be \"yarn\" (got {:?})",
+        rs["rope_type"]
+    );
+    // `RopeScale::Yarn` derives the attention factor from `factor`; an explicit override in the
+    // config would be silently ignored, so refuse it.
+    for k in ["attention_factor", "mscale", "mscale_all_dim"] {
+        assert!(
+            rs.get(k).is_none(),
+            "gpt_oss: rope_scaling.{k} is not representable in the RoPE table recipe (GenTensor \
+             is ABI-locked); remove it or add a field"
+        );
+    }
+    let f = |k: &str| {
+        rs[k].as_f64()
+            .unwrap_or_else(|| panic!("gpt_oss: rope_scaling.{k}"))
+    };
+    let rope_scale = RopeScale::Yarn {
+        factor: f("factor"),
+        beta_fast: rs["beta_fast"].as_f64().unwrap_or(32.0),
+        beta_slow: rs["beta_slow"].as_f64().unwrap_or(1.0),
+        orig: f("original_max_position_embeddings"),
+        // HF's default is true; GPT-OSS ships `truncate: false`.
+        truncate: rs["truncate"].as_bool().unwrap_or(true),
+    };
+    let hd = g("head_dim");
+    let top_k = v["num_experts_per_tok"]
+        .as_u64()
+        .or_else(|| v["experts_per_token"].as_u64())
+        .expect("gpt_oss: num_experts_per_tok") as u32;
+    let c = GptOssCfg {
+        hidden: g("hidden_size"),
+        inter: g("intermediate_size"),
+        layers,
+        heads: g("num_attention_heads"),
+        kvh: g("num_key_value_heads"),
+        hd,
+        window: g("sliding_window"),
+        eps: v["rms_norm_eps"].as_f64().expect("gpt_oss: rms_norm_eps") as f32,
+        vocab: g("vocab_size"),
+        is_full,
+        theta: v["rope_theta"].as_f64().expect("gpt_oss: rope_theta"),
+        rope_scale,
+        attn_scale: 1.0 / (hd as f32).sqrt(),
+        n_exp: g("num_local_experts"),
+        top_k,
+        swiglu_alpha: 1.702,
+        swiglu_limit: v["swiglu_limit"].as_f64().unwrap_or(7.0) as f32,
+        prefix: "model.".to_string(),
+        tied: v["tie_word_embeddings"].as_bool().unwrap_or(false),
+    };
+    assert!(
+        c.heads % c.kvh == 0,
+        "gpt_oss: heads {} not a multiple of kv heads {}",
+        c.heads,
+        c.kvh
+    );
+    assert!(
+        c.hidden % 32 == 0 && c.inter % 32 == 0,
+        "gpt_oss: MXFP4 needs K % 32 == 0"
+    );
+    assert!(
+        c.window > 0 && !c.is_full.iter().all(|&x| x),
+        "gpt_oss: expected sliding layers"
+    );
+    crate::require_moe_topk(c.top_k, "gpt_oss");
+    c
 }
 
 pub(crate) struct Cfg {
