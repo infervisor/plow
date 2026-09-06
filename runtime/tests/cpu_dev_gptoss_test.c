@@ -45,14 +45,15 @@ static void* xmalloc(size_t n) {
 
 static int fails = 0;
 static float g_floor = 1e-2f; /* relative-error denominator floor */
-/* Accuracy mode: report the deviation of a deliberately lower-precision path (PLOW_MOE_INT8) as
- * numbers instead of counting it against the shared tolerance. */
+/* Accuracy mode: report the deviation of a deliberately lower-precision path (PLOW_MOE_INT8
+ * prefill, PLOW_MXFP4_INT16 decode) as numbers instead of counting it against the shared
+ * tolerance. Read the l2 column for those runs. */
 static int g_soft = 0;
 /* l2 = ||a-b|| / ||a||: the per-element relative error saturates on near-zero references (the
  * g_floor denominator), so this is the number to read for a lower-precision path. */
 static void report(const char* what, double mean, double maxrel, double d2, double a2, size_t bad,
                    size_t n, size_t where) {
-    printf("  %-62s mean|a| %.3g max rel %.4f l2 %.5f  bad %zu/%zu (%.1f%%)%s\n", what,
+    printf("  %-62s mean|a| %.3g max rel %.4f l2 %.2e  bad %zu/%zu (%.1f%%)%s\n", what,
            mean / (double)(n ? n : 1), maxrel, a2 > 0 ? sqrt(d2 / a2) : 0.0, bad, n,
            100.0 * (double)bad / (double)(n ? n : 1), bad ? (g_soft ? "  [accuracy]" : "  <-- FAIL") : "");
     if (bad && !g_soft) fails++;
@@ -112,7 +113,7 @@ static PlowDevInst inst(uint16_t op) {
 }
 static const uint32_t NBLKS[] = {1, 3, 16};
 #define NNB (sizeof(NBLKS) / sizeof(*NBLKS))
-static int have_v = 0, have_x = 0, g_i8 = 0;
+static int have_v = 0, have_x = 0, g_i8 = 0, g_i16 = 0;
 #define ALPHA 1.702f
 #define LIMIT 7.0f
 
@@ -173,7 +174,7 @@ static void test_gemv_glu_mxfp4(uint32_t M, uint32_t N, uint32_t K, uint32_t act
             run_all(plow_cpu_kernel(PLOW_DOP_GEMV_GLU_MXFP4), &in, nblk, T, &ctx);
             T[0] = Cg;
             snprintf(what, sizeof what, "GEMV_GLU_MXFP4 avx512 vs golden M=%u act=%u nblk=%u", M, act, nblk);
-            cmp(what, Cg, Cv, (size_t)M * N, 1e-2f);
+            g_soft = g_i16; cmp(what, Cg, Cv, (size_t)M * N, 1e-2f); g_soft = 0;
         }
     }
     free(x); free(Wg); free(Wu); free(Sg); free(Su); free(Cref); free(Cg); free(Cv); free(ctx.scratch);
@@ -209,7 +210,7 @@ static void test_gemv_mxfp4(uint32_t M, uint32_t N, uint32_t K) {
                 run_all(plow_cpu_kernel(PLOW_DOP_GEMV_MXFP4), &in, nblk, T, &ctx);
                 T[0] = Cg;
                 snprintf(what, sizeof what, "GEMV_MXFP4 avx512 vs golden M=%u nblk=%u bias=%d", M, nblk, bb);
-                cmp(what, Cg, Cv, (size_t)M * N, 1e-2f);
+                g_soft = g_i16; cmp(what, Cg, Cv, (size_t)M * N, 1e-2f); g_soft = 0;
             }
         }
     }
@@ -628,7 +629,7 @@ static void test_moe_decode(uint32_t B, uint32_t k, uint32_t E, uint32_t I, uint
             TG[0] = fu_g;
             for (uint32_t n = 0; n < I; n++) fu_v[(size_t)(k - 1) * I + n] = 0;
             snprintf(what, sizeof what, "MOE_GLU_MX avx512 vs golden lay=%u nblk=%u", layout, nblk);
-            cmp(what, fu_g, fu_v, (size_t)S * I, 1e-2f);
+            g_soft = g_i16; cmp(what, fu_g, fu_v, (size_t)S * I, 1e-2f); g_soft = 0;
         }
         g_floor = 1e-2f;
         /* DOWN from golden's fu (the same input for every tier and the reference). */
@@ -648,7 +649,7 @@ static void test_moe_decode(uint32_t B, uint32_t k, uint32_t E, uint32_t I, uint
             run_all(plow_cpu_kernel(PLOW_DOP_MOE_DOWN_MX), &di, nblk, TD, &ctx);
             TD[0] = part_g;
             snprintf(what, sizeof what, "MOE_DOWN_MX avx512 vs golden nblk=%u", nblk);
-            cmp_f32(what, part_g, part_v, (size_t)S * H, 1e-2f);
+            g_soft = g_i16; cmp_f32(what, part_g, part_v, (size_t)S * H, 1e-2f); g_soft = 0;
         }
     }
     free(x); free(tab); free(fu_ref); free(fu_g); free(fu_v); free(part_ref); free(part_g); free(part_v); free(ctx.scratch);
@@ -882,6 +883,7 @@ int main(int argc, char** argv) {
     printf("isa tier: %d\n", tier);
     if (tier < 0) return 2;
     { const char* e = getenv("PLOW_MOE_INT8"); g_i8 = (e && *e && *e != '0') ? 1 : 0; }
+    { const char* e = getenv("PLOW_MXFP4_INT16"); g_i16 = (e && *e && *e != '0') ? 1 : 0; }
     if (argc > 1 && !strcmp(argv[1], "--bench")) { bench(argc > 2 && !strcmp(argv[2], "pf")); return 0; }
     have_v = tier >= PLOW_CPU_ISA_AVX512;
     have_x = tier >= PLOW_CPU_ISA_AMX;

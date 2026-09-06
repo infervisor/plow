@@ -4,11 +4,16 @@
  * lookups (one per nibble position, as bf16) -> four vdpbf16ps against the nibble-staged x -> one
  * fmadd with the four block scales. RB weight rows x M activation rows of accumulators, x staged
  * once per call in scratch. Slicing is golden's GV_BLOCKED column ownership. */
+#include <stdlib.h>
 #include "avx512.h"
 #include "../mxfp4_common.h"
 #include "../golden/gptoss.h"
 
 plow_mx_vlut plow_v_mx_lut;
+/* PLOW_MXFP4_INT16=1: run the DECODE dots (91/92/150/151) on the int16 VNNI path of
+ * mxfp4_common.h. Weights stay exact; x is quantized per staged row at amax/32767. Off by
+ * default, and never used by the prefill ops (152/153), whose error lands in the KV cache. */
+int plow_mx_i16_on;
 
 /* t0=C t1=x t2=W(fp4) t3=S(e8m0) t7=bias?  i0=M i1=N i2=K */
 V_K(v_gemv_mxfp4) {
@@ -26,21 +31,24 @@ V_K(v_gemv_mxfp4) {
     const plow_bf16* bias = PLOW_CPU_TEN(in, T, 7);
     const size_t ldw = K / 2u, lds = K / PLOW_MX_BLK;
     plow_bf16* XP = ctx->scratch;
-    for (uint32_t m = 0; m < M; m++) plow_mx_stage_x(&plow_v_mx_lut, XP + m * ldx, x + (size_t)m * K, K);
+    float xs[8];
+    const float* xsp = plow_mx_i16_on ? xs : NULL;
+    for (uint32_t m = 0; m < M; m++)
+        xs[m] = plow_mx_stage(&plow_v_mx_lut, XP + m * ldx, x + (size_t)m * K, K, plow_mx_i16_on);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
     const uint32_t RB = plow_mx_rb_for(M);
     float out[4 * 8];
     uint32_t n = n0;
     for (; n + RB <= n1; n += RB) {
-        plow_mx_gemv_rows(&plow_v_mx_lut, W + (size_t)n * ldw, ldw, S + (size_t)n * lds, lds, XP, ldx, K, RB, M, out);
+        plow_mx_gemv_rows(&plow_v_mx_lut, W + (size_t)n * ldw, ldw, S + (size_t)n * lds, lds, XP, ldx, K, RB, M, xsp, out);
         for (uint32_t r = 0; r < RB; r++) {
             const float b = bias ? plow_bf2f(bias[n + r]) : 0.0f;
             for (uint32_t m = 0; m < M; m++) C[(size_t)m * N + n + r] = plow_f2bf(out[r * M + m] + b);
         }
     }
     for (; n < n1; n++) {
-        plow_mx_gemv_rows(&plow_v_mx_lut, W + (size_t)n * ldw, ldw, S + (size_t)n * lds, lds, XP, ldx, K, 1, M, out);
+        plow_mx_gemv_rows(&plow_v_mx_lut, W + (size_t)n * ldw, ldw, S + (size_t)n * lds, lds, XP, ldx, K, 1, M, xsp, out);
         const float b = bias ? plow_bf2f(bias[n]) : 0.0f;
         for (uint32_t m = 0; m < M; m++) C[(size_t)m * N + n] = plow_f2bf(out[m] + b);
     }
@@ -64,15 +72,18 @@ V_K(v_gemv_glu_mxfp4) {
     const uint8_t* Su = PLOW_CPU_TEN(in, T, 4);
     const size_t ldw = K / 2u, lds = K / PLOW_MX_BLK;
     plow_bf16* XP = ctx->scratch;
-    for (uint32_t m = 0; m < M; m++) plow_mx_stage_x(&plow_v_mx_lut, XP + m * ldx, x + (size_t)m * K, K);
+    float xs[8];
+    const float* xsp = plow_mx_i16_on ? xs : NULL;
+    for (uint32_t m = 0; m < M; m++)
+        xs[m] = plow_mx_stage(&plow_v_mx_lut, XP + m * ldx, x + (size_t)m * K, K, plow_mx_i16_on);
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
     const uint32_t RB = plow_mx_rb_for(M);
     float g[4 * 8], u[4 * 8];
     for (uint32_t n = n0; n < n1;) {
         const uint32_t rb = n + RB <= n1 ? RB : 1u;
-        plow_mx_gemv_rows(&plow_v_mx_lut, Wg + (size_t)n * ldw, ldw, Sg + (size_t)n * lds, lds, XP, ldx, K, rb, M, g);
-        plow_mx_gemv_rows(&plow_v_mx_lut, Wu + (size_t)n * ldw, ldw, Su + (size_t)n * lds, lds, XP, ldx, K, rb, M, u);
+        plow_mx_gemv_rows(&plow_v_mx_lut, Wg + (size_t)n * ldw, ldw, Sg + (size_t)n * lds, lds, XP, ldx, K, rb, M, xsp, g);
+        plow_mx_gemv_rows(&plow_v_mx_lut, Wu + (size_t)n * ldw, ldw, Su + (size_t)n * lds, lds, XP, ldx, K, rb, M, xsp, u);
         for (uint32_t r = 0; r < rb; r++)
             for (uint32_t m = 0; m < M; m++)
                 C[(size_t)m * N + n + r] = plow_f2bf(g_act_gate_only(g[r * M + m], act) * u[r * M + m]);
@@ -82,6 +93,7 @@ V_K(v_gemv_glu_mxfp4) {
 
 void v_register_gptoss(plow_cpu_kernel_fn* tab) {
     plow_mx_vlut_init(&plow_v_mx_lut);
+    { const char* e = getenv("PLOW_MXFP4_INT16"); plow_mx_i16_on = (e && *e && *e != '0') ? 1 : 0; }
     tab[PLOW_DOP_GEMV_MXFP4] = v_gemv_mxfp4;
     tab[PLOW_DOP_GEMV_GLU_MXFP4] = v_gemv_glu_mxfp4;
     tab[PLOW_DOP_MOE_GLU_MX] = v_moe_glu_mx_b;

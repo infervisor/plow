@@ -12,6 +12,7 @@
 #include "../golden/gptoss.h"
 
 extern plow_mx_vlut plow_v_mx_lut; /* avx512/gptoss.c, initialised by v_register_gptoss */
+extern int plow_mx_i16_on;         /* PLOW_MXFP4_INT16: int16 dot for the DECODE ops only */
 
 static inline uint32_t row_g(uint32_t n, uint32_t layout) { return layout ? n : 2u * n; }
 static inline uint32_t row_u(uint32_t n, uint32_t I, uint32_t layout) { return layout ? I + n : 2u * n + 1u; }
@@ -24,7 +25,7 @@ static inline int mx_usable(const PlowCpuCtx* ctx, uint32_t K, uint32_t M) {
 /* g[m][j], u[m][j] for outputs n+j (j < cnt <= 16) of expert rows We/Se against M staged rows. */
 static void glu_dots(const uint8_t* We, const uint8_t* Se, size_t ldw, size_t lds, uint32_t I,
                      uint32_t K, uint32_t layout, const plow_bf16* XP, size_t ldx, uint32_t M,
-                     uint32_t n, uint32_t cnt, float g[8][16], float u[8][16]) {
+                     const float* xs, uint32_t n, uint32_t cnt, float g[8][16], float u[8][16]) {
     const plow_mx_vlut* v = &plow_v_mx_lut;
     const uint32_t RB = plow_mx_rb_for(M);
     float o[4 * 8];
@@ -34,7 +35,7 @@ static void glu_dots(const uint8_t* We, const uint8_t* Se, size_t ldw, size_t ld
         for (uint32_t j = 0; j < cnt; j += per) {
             const uint32_t np = cnt - j < per ? cnt - j : per;
             plow_mx_gemv_rows(v, We + (size_t)(2u * (n + j)) * ldw, ldw, Se + (size_t)(2u * (n + j)) * lds,
-                              lds, XP, ldx, K, 2u * np, M, o);
+                              lds, XP, ldx, K, 2u * np, M, xs, o);
             for (uint32_t p = 0; p < np; p++)
                 for (uint32_t m = 0; m < M; m++) {
                     g[m][j + p] = o[(2u * p) * M + m];
@@ -48,10 +49,10 @@ static void glu_dots(const uint8_t* We, const uint8_t* Se, size_t ldw, size_t ld
         /* layout 1: gate rows n+j.. and up rows I+n+j.. are each contiguous; layout 0 with RB==1
          * takes rows 2n and 2n+1 one at a time. */
         const uint32_t rg = row_g(n + j, layout), ru = row_u(n + j, I, layout);
-        plow_mx_gemv_rows(v, We + (size_t)rg * ldw, ldw, Se + (size_t)rg * lds, lds, XP, ldx, K, rb, M, o);
+        plow_mx_gemv_rows(v, We + (size_t)rg * ldw, ldw, Se + (size_t)rg * lds, lds, XP, ldx, K, rb, M, xs, o);
         for (uint32_t r = 0; r < rb; r++)
             for (uint32_t m = 0; m < M; m++) g[m][j + r] = o[r * M + m];
-        plow_mx_gemv_rows(v, We + (size_t)ru * ldw, ldw, Se + (size_t)ru * lds, lds, XP, ldx, K, rb, M, o);
+        plow_mx_gemv_rows(v, We + (size_t)ru * ldw, ldw, Se + (size_t)ru * lds, lds, XP, ldx, K, rb, M, xs, o);
         for (uint32_t r = 0; r < rb; r++)
             for (uint32_t m = 0; m < M; m++) u[m][j + r] = o[r * M + m];
     }
@@ -91,7 +92,8 @@ V_K(v_moe_glu_mx) {
     const size_t N2 = 2u * I, ldw = K / 2u, lds = K / PLOW_MX_BLK, ldx = plow_mx_staged_len(K);
     plow_bf16* XP = ctx->scratch;
     uint32_t staged = UINT32_MAX;
-    float g[8][16], u[8][16];
+    float g[8][16], u[8][16], xs[1];
+    const float* xsp = plow_mx_i16_on ? xs : NULL;
     uint32_t lo, hi;
     g_range(B * k * I, slice, nblk, &lo, &hi);
     for (uint32_t idx = lo; idx < hi;) {
@@ -102,7 +104,7 @@ V_K(v_moe_glu_mx) {
         if (eid >= E) continue;
         if (staged != s / k) {
             staged = s / k;
-            plow_mx_stage_x(&plow_v_mx_lut, XP, x + (size_t)staged * K, K);
+            xs[0] = plow_mx_stage(&plow_v_mx_lut, XP, x + (size_t)staged * K, K, plow_mx_i16_on);
         }
         const uint8_t* We = W + (size_t)eid * N2 * ldw;
         const uint8_t* Se = S + (size_t)eid * N2 * lds;
@@ -110,7 +112,7 @@ V_K(v_moe_glu_mx) {
         plow_bf16* out = fu + (size_t)s * I;
         for (uint32_t n = n0; n < n1;) {
             const uint32_t cnt = n1 - n < 16u ? n1 - n : 16u;
-            glu_dots(We, Se, ldw, lds, I, K, layout, XP, ldx, 1u, n, cnt, g, u);
+            glu_dots(We, Se, ldw, lds, I, K, layout, XP, ldx, 1u, xsp, n, cnt, g, u);
             glu_epilogue(out, g[0], u[0], be, I, layout, n, cnt, act, f0, f1);
             n += cnt;
         }
@@ -120,12 +122,12 @@ V_K(v_moe_glu_mx) {
 /* part[h .. h+cnt) = gate * (W rows h.. . XP + bias) for one slot / gathered row. */
 static void down_rows(const uint8_t* We, const uint8_t* Se, size_t ldw, size_t lds, uint32_t I,
                       const plow_bf16* XP, size_t ldx, uint32_t h0, uint32_t h1, const plow_bf16* be,
-                      float gate, float* pr) {
+                      const float* xs, float gate, float* pr) {
     float o[4];
     for (uint32_t h = h0; h < h1;) {
         const uint32_t rb = h1 - h < 4u ? h1 - h : 4u;
         plow_mx_gemv_rows(&plow_v_mx_lut, We + (size_t)h * ldw, ldw, Se + (size_t)h * lds, lds, XP, ldx, I,
-                          rb, 1u, o);
+                          rb, 1u, xs, o);
         for (uint32_t r = 0; r < rb; r++) pr[h + r] = gate * (o[r] + (be ? plow_bf2f(be[h + r]) : 0.0f));
         h += rb;
     }
@@ -145,6 +147,8 @@ V_K(v_moe_down_mx) {
     const size_t ldw = I / 2u, lds = I / PLOW_MX_BLK, ldx = plow_mx_staged_len(I);
     plow_bf16* XP = ctx->scratch;
     uint32_t staged = UINT32_MAX;
+    float xs[1];
+    const float* xsp = plow_mx_i16_on ? xs : NULL;
     uint32_t lo, hi;
     g_range(B * k * H, slice, nblk, &lo, &hi);
     for (uint32_t idx = lo; idx < hi;) {
@@ -159,10 +163,10 @@ V_K(v_moe_down_mx) {
         }
         if (staged != s) {
             staged = s;
-            plow_mx_stage_x(&plow_v_mx_lut, XP, fu + (size_t)s * I, I);
+            xs[0] = plow_mx_stage(&plow_v_mx_lut, XP, fu + (size_t)s * I, I, plow_mx_i16_on);
         }
         down_rows(W + (size_t)eid * H * ldw, S + (size_t)eid * H * lds, ldw, lds, I, XP, ldx, h0, h1,
-                  bias ? bias + (size_t)eid * H : NULL, tab[s].gate, pr);
+                  bias ? bias + (size_t)eid * H : NULL, xsp, tab[s].gate, pr);
     }
 }
 
@@ -214,7 +218,7 @@ V_K(v_moe_glu_mx_pf) {
             if (!M) continue;
             for (uint32_t n = n0; n < n1;) {
                 const uint32_t cnt = n1 - n < 16u ? n1 - n : 16u;
-                glu_dots(We, Se, ldw, lds, I, K, layout, XP, ldx, M, n, cnt, g, u);
+                glu_dots(We, Se, ldw, lds, I, K, layout, XP, ldx, M, NULL, n, cnt, g, u);
                 for (uint32_t m = 0; m < M; m++)
                     glu_epilogue(fu + (size_t)rows[m] * I, g[m], u[m], be, I, layout, n, cnt, act, f0, f1);
                 n += cnt;
@@ -257,7 +261,7 @@ V_K(v_moe_down_mx_pf) {
             for (uint32_t h = h0; h < h1;) {
                 const uint32_t rb = h1 - h < RB ? h1 - h : RB;
                 plow_mx_gemv_rows(&plow_v_mx_lut, We + (size_t)h * ldw, ldw, Se + (size_t)h * lds, lds, XP,
-                                  ldx, I, rb, M, o);
+                                  ldx, I, rb, M, NULL, o);
                 for (uint32_t m = 0; m < M; m++) {
                     float* pr = part + (size_t)row_partidx[rows[m]] * H;
                     const float gate = row_gate[rows[m]];
@@ -333,11 +337,13 @@ static int mxb_cols(const uint32_t* P, uint32_t d, uint32_t N, uint32_t lo, uint
 
 /* Stage up to 8 slots of one expert group: XP row m <- src row (slot / src_div). */
 static uint32_t mxb_stage(plow_bf16* XP, size_t ldx, uint32_t K, const plow_bf16* src, uint32_t src_div,
-                          const mxb_groups* g, uint32_t* i, uint32_t iend, uint32_t slots[8]) {
+                          const mxb_groups* g, uint32_t* i, uint32_t iend, uint32_t slots[8],
+                          float xs[8]) {
     uint32_t M = 0;
     while (*i < iend && M < 8u) {
         const uint32_t s = g->slot[(*i)++];
-        plow_mx_stage_x(&plow_v_mx_lut, XP + (size_t)M * ldx, src + (size_t)(s / src_div) * K, K);
+        xs[M] = plow_mx_stage(&plow_v_mx_lut, XP + (size_t)M * ldx, src + (size_t)(s / src_div) * K, K,
+                              plow_mx_i16_on);
         slots[M++] = s;
     }
     return M;
@@ -361,7 +367,8 @@ V_K(v_moe_glu_mx_b) {
     const float f0 = in->fj[0].f, f1 = in->fj[1].f;
     const size_t N2 = 2u * I, ldw = K / 2u, lds = K / PLOW_MX_BLK, ldx = plow_mx_staged_len(K);
     plow_bf16* XP = ctx->scratch;
-    float gg[8][16], uu[8][16];
+    float gg[8][16], uu[8][16], xs[8];
+    const float* xsp = plow_mx_i16_on ? xs : NULL;
     uint32_t slots[8];
     uint32_t P[MXB_MAX_SLOTS + 1], lo, hi;
     mxb_prefix(&g, I, P);
@@ -374,10 +381,10 @@ V_K(v_moe_glu_mx_b) {
         const uint8_t* Se = S + (size_t)e * N2 * lds;
         const plow_bf16* be = bias ? bias + (size_t)e * N2 : NULL;
         for (uint32_t i = g.off[d]; i < g.off[d + 1];) {
-            const uint32_t M = mxb_stage(XP, ldx, K, x, k, &g, &i, g.off[d + 1], slots);
+            const uint32_t M = mxb_stage(XP, ldx, K, x, k, &g, &i, g.off[d + 1], slots, xs);
             for (uint32_t n = n0; n < n1;) {
                 const uint32_t cnt = n1 - n < 16u ? n1 - n : 16u;
-                glu_dots(We, Se, ldw, lds, I, K, layout, XP, ldx, M, n, cnt, gg, uu);
+                glu_dots(We, Se, ldw, lds, I, K, layout, XP, ldx, M, xsp, n, cnt, gg, uu);
                 for (uint32_t m = 0; m < M; m++)
                     glu_epilogue(fu + (size_t)slots[m] * I, gg[m], uu[m], be, I, layout, n, cnt, act, f0, f1);
                 n += cnt;
@@ -407,7 +414,8 @@ V_K(v_moe_down_mx_b) {
         for (uint32_t s = 0; s < B * k; s++)
             if (tab[s].eid >= E) memset(part + (size_t)s * H, 0, (size_t)H * sizeof(float));
     uint32_t slots[8];
-    float o[4 * 8];
+    float o[4 * 8], xs[8];
+    const float* xsp = plow_mx_i16_on ? xs : NULL;
     uint32_t P[MXB_MAX_SLOTS + 1], lo, hi;
     mxb_prefix(&g, H, P);
     g_range(P[g.nd], slice, nblk, &lo, &hi);
@@ -419,12 +427,12 @@ V_K(v_moe_down_mx_b) {
         const uint8_t* Se = S + (size_t)e * H * lds;
         const plow_bf16* be = bias ? bias + (size_t)e * H : NULL;
         for (uint32_t i = g.off[d]; i < g.off[d + 1];) {
-            const uint32_t M = mxb_stage(XP, ldx, I, fu, 1u, &g, &i, g.off[d + 1], slots);
+            const uint32_t M = mxb_stage(XP, ldx, I, fu, 1u, &g, &i, g.off[d + 1], slots, xs);
             const uint32_t RB = plow_mx_rb_for(M);
             for (uint32_t h = h0; h < h1;) {
                 const uint32_t rb = h1 - h < RB ? h1 - h : RB;
                 plow_mx_gemv_rows(&plow_v_mx_lut, We + (size_t)h * ldw, ldw, Se + (size_t)h * lds, lds, XP, ldx, I,
-                                  rb, M, o);
+                                  rb, M, xsp, o);
                 for (uint32_t m = 0; m < M; m++) {
                     float* pr = part + (size_t)slots[m] * H;
                     const float gate = tab[slots[m]].gate;
