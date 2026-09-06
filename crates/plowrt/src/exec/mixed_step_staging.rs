@@ -8,6 +8,8 @@ pub enum StageError {
     NoPendingPlan,
     #[error("mixed step already has a pending device submission")]
     PendingPlan,
+    #[error("mixed step decode output has {actual} rows, expected {expected}")]
+    OutputRows { expected: usize, actual: usize },
     #[error("mixed step frontier slot {slot} is outside capacity {capacity}")]
     FrontierCapacity { slot: u32, capacity: usize },
     #[error(
@@ -114,6 +116,33 @@ impl MixedStepStaging {
             frontiers[span.slot as usize] = span.kv_len;
         }
         self.pending = false;
+        Ok(())
+    }
+
+    /// Validate and publish a completed submission, then scatter the compact
+    /// decode prefix into caller-owned logical-request order.
+    pub fn finish_after_device_success(
+        &mut self,
+        frontiers: &mut [u32],
+        device_tokens: &[u32],
+        output: &mut [u32],
+    ) -> Result<(), StageError> {
+        if !self.pending {
+            return Err(StageError::NoPendingPlan);
+        }
+        let expected = self.plan.decode_rows as usize;
+        if device_tokens.len() != expected || output.len() != expected {
+            return Err(StageError::OutputRows {
+                expected,
+                actual: if device_tokens.len() != expected {
+                    device_tokens.len()
+                } else {
+                    output.len()
+                },
+            });
+        }
+        self.commit_after_device_success(frontiers)?;
+        output.copy_from_slice(device_tokens);
         Ok(())
     }
 

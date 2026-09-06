@@ -154,3 +154,42 @@ fn stale_frontier_rejects_the_whole_commit() {
     assert_eq!(frontiers, [0, 5, 8, 12]);
     assert!(staging.pending_plan().is_some());
 }
+
+#[test]
+fn completion_scatter_is_failure_atomic_and_reuses_storage() {
+    let mut staging = MixedStepStaging::with_capacity(8, 2, 4);
+    let mut frontiers = [0, 4, 8, 12];
+    let d = [decode(2, 0, 7), decode(3, 1, 8)];
+    let p = [prefill(1, 3, 4, &[10, 11])];
+    let before = storage(&staging);
+    staging.stage(&d, &p, &frontiers, 8, 64, 5).unwrap();
+    let mut output = [u32::MAX; 2];
+
+    assert_eq!(
+        staging.finish_after_device_success(&mut frontiers, &[42], &mut output),
+        Err(StageError::OutputRows {
+            expected: 2,
+            actual: 1,
+        })
+    );
+    assert_eq!(frontiers, [0, 4, 8, 12]);
+    assert_eq!(output, [u32::MAX; 2]);
+    assert!(staging.pending_plan().is_some());
+
+    frontiers[1] = 5;
+    assert!(matches!(
+        staging.finish_after_device_success(&mut frontiers, &[42, 43], &mut output),
+        Err(StageError::FrontierChanged { slot: 1, .. })
+    ));
+    assert_eq!(frontiers, [0, 5, 8, 12]);
+    assert_eq!(output, [u32::MAX; 2]);
+    assert!(staging.pending_plan().is_some());
+
+    frontiers[1] = 4;
+    staging
+        .finish_after_device_success(&mut frontiers, &[42, 43], &mut output)
+        .unwrap();
+    assert_eq!(frontiers, [0, 6, 9, 13]);
+    assert_eq!(output, [42, 43]);
+    assert_eq!(storage(&staging), before);
+}

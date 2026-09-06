@@ -155,6 +155,13 @@ fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
 }
 
 #[test]
+fn decode_ladder_accepts_runtime_input_capacity_beyond_widest_rung() {
+    let mut blob = fixture();
+    blob.tensors[1].bytes = 128 * 4;
+    assert!(validate_decode_ladder(&blob).unwrap());
+}
+
+#[test]
 fn unsupported_families_and_single_rung_keep_widest_execution() {
     let mut blob = fixture();
     for g in &mut blob.progs {

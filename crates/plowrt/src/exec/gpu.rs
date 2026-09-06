@@ -52,6 +52,8 @@ mod decode_object;
 use decode_object::{BoundDecodeObject, DecodeModule};
 #[path = "gpu_decode_rung.rs"]
 mod gpu_decode_rung;
+#[path = "gpu_mixed_step.rs"]
+mod gpu_mixed_step;
 use gpu_cublaslt::CublasLtDecodeRoute;
 use gpu_decode_rung::{
     decode_rung_index, decode_selection, effective_decode_widths, validate_decode_ladder,
@@ -1531,6 +1533,7 @@ pub struct GpuEngine {
     /// per-slot serialized prefill, byte-identical behavior to before.
     pf_batch: Option<PfBatch>,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
+    mixed_step: Option<gpu_mixed_step::MixedCudaStep>,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -2399,6 +2402,20 @@ impl GpuEngine {
                     .map_err(|e| RuntimeError::Rejected(format!("packed prefill metadata: {e}")))
             })
             .transpose()?;
+        let mixed_packet = if blob
+            .sections
+            .iter()
+            .any(|section| section.name == plow_asset::mixed_step::SECTION)
+        {
+            crate::exec::mixed_packet::load_from_devblob(
+                &blob,
+                &raw,
+                plow_asset::mixed_step::PayloadKind::Cubin,
+                |object, name| Ok(cubin::global_u32(object.bytes, name)),
+            )?
+        } else {
+            None
+        };
         if let Some(pack) = &packed_prefill {
             let live = live_kv_manifest.as_ref().ok_or_else(|| {
                 RuntimeError::Rejected("packed prefill requires compiled LIVE contract".into())
@@ -3296,11 +3313,14 @@ impl GpuEngine {
         // Decode batch: the compiler emits the decode program with t == B
         // (PLOW_DECODE_BATCH). Cross-check against the [B]-sized in.kvlen.
         let batch = g.t as usize;
-        if blob.tensors[t_kvlen].bytes != (batch * 4) as u64 {
+        let kvlen_bytes = blob.tensors[t_kvlen].bytes;
+        if (mixed_packet.is_none() && kvlen_bytes != (batch * 4) as u64)
+            || kvlen_bytes < (batch * 4) as u64
+        {
             return Err(RuntimeError::Device(format!(
                 "in.kvlen is {} B but the decode program's batch is {batch} \
                  (want {} B) — blob/tensor mismatch",
-                blob.tensors[t_kvlen].bytes,
+                kvlen_bytes,
                 batch * 4
             )));
         }
@@ -3917,6 +3937,23 @@ impl GpuEngine {
             true => Some(StepTiming::new(&be)?),
             false => None,
         };
+        let mixed_step = mixed_packet
+            .map(|packet| {
+                if recurrent.is_some() {
+                    return Err(RuntimeError::Rejected(
+                        "mixed dense step does not support recurrent state".into(),
+                    ));
+                }
+                gpu_mixed_step::MixedCudaStep::load(
+                    &be,
+                    packet,
+                    &blob,
+                    &devp,
+                    d_tens.base,
+                    batch,
+                )
+            })
+            .transpose()?;
 
         // ---- device stochastic sampler (PLOW_DEV_SAMPLE=1; plan stage 4) ----
         // Loads a `plow_sample` cubin and allocates its per-slot param + [B][V]
@@ -4021,6 +4058,7 @@ impl GpuEngine {
             vmm,
             pf_batch,
             packed_prefill,
+            mixed_step,
         };
         if engine.cublaslt_decode_capture {
             engine.capture_decode_graph()?;
@@ -4744,6 +4782,7 @@ impl GpuEngine {
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
             self.seq_tokens[b].clear();
+            self.seq_tokens[b].reserve(total);
             v.kv.begin_seq(b);
             v.kv.ensure_rows(b, 1)?;
         }
@@ -7087,6 +7126,23 @@ impl GpuEngine {
             RuntimeError::Rejected(format!("no tensor named {name:?} in the blob"))
         })?;
         self.be.download(&self.devp[i], 0, dst)
+    }
+
+    /// Read a byte range from a named tensor for block-harness diagnostics.
+    pub fn read_tensor_range(&self, name: &str, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let i = self.handle_of(name).ok_or_else(|| {
+            RuntimeError::Rejected(format!("no tensor named {name:?} in the blob"))
+        })?;
+        let end = offset
+            .checked_add(dst.len() as u64)
+            .ok_or_else(|| RuntimeError::Rejected("tensor read range overflow".into()))?;
+        if end > self.devp[i].len {
+            return Err(RuntimeError::Rejected(format!(
+                "read_tensor_range {name}: range {offset}..{end} exceeds {} bytes",
+                self.devp[i].len
+            )));
+        }
+        self.be.download(&self.devp[i], offset, dst)
     }
 
     /// Byte size of a named tensor's device allocation.
