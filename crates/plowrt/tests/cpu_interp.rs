@@ -339,6 +339,30 @@ fn cancel_returns_pool_to_idle_and_next_run_completes() {
 }
 
 #[test]
+fn drop_cancels_an_inflight_run() {
+    let ops = vec![Op {
+        blocks: 1,
+        deps: vec![0],
+        seg: 0,
+    }];
+    let (prog, ctrs) = build(&ops, 1, 1, 0);
+    let prog = Arc::new(prog);
+    let ctr = Arc::new(CounterPool::from_counters(&ctrs));
+    let rec = Arc::new(Recorder::new(&ops, Duration::ZERO));
+    rec.base.store(prog.insts.as_ptr() as usize, Ordering::Release);
+    let p = pool(1, 1, rec);
+    p.run(&prog, 0, &ctr);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(p);
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("dropping a pool must cancel its in-flight run");
+}
+
+#[test]
 fn reset_slot_zeroes_through_workers() {
     let ops = fan_ops();
     let rec = Arc::new(Recorder::new(&ops, Duration::ZERO));

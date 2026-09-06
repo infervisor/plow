@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::time::Instant;
 
-use packet::dev::DevInst64;
+use packet::dev::{DevInst64, DevOp, StreamEnt, TENSOR_NONE16};
 
 use crate::asset::checkpoint::Checkpoint;
 use crate::asset::devblob::{DevBlob, DevProg};
@@ -187,6 +187,156 @@ pub struct CpuModel {
 unsafe impl Send for CpuModel {}
 unsafe impl Sync for CpuModel {}
 
+fn validate_stream_entry(
+    p: &DevProg,
+    pi: usize,
+    label: &str,
+    ei: usize,
+    e: &StreamEnt,
+    n_tensors: usize,
+) -> Result<()> {
+    let inst = p.insts.get(e.inst as usize).ok_or_else(|| {
+        RuntimeError::Device(format!(
+            "program {pi} {label} entry {ei} references instruction {} of {}",
+            e.inst,
+            p.insts.len()
+        ))
+    })?;
+    if inst.blocks == 0 || e.slice >= inst.blocks as u32 {
+        return Err(RuntimeError::Device(format!(
+            "program {pi} {label} entry {ei} has slice {} for {} blocks",
+            e.slice, inst.blocks
+        )));
+    }
+    let check_range = |what: &str, ofs: u32, len: u16, total: usize| -> Result<()> {
+        let start = ofs as usize;
+        let end = start.checked_add(len as usize).filter(|&end| end <= total);
+        if end.is_none() {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} {label} entry {ei} {what} range {start}+{len} exceeds {total}"
+            )));
+        }
+        Ok(())
+    };
+    check_range("wait", e.wait_ofs, e.wait_len, p.waits.len())?;
+    check_range("successor", e.succ_ofs, e.succ_len, p.succs.len())?;
+    for wait in &p.waits[e.wait_ofs as usize..e.wait_ofs as usize + e.wait_len as usize] {
+        if wait.id >= p.n_counter {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} {label} entry {ei} waits on counter {} of {}",
+                wait.id, p.n_counter
+            )));
+        }
+    }
+    for &counter in &p.succs[e.succ_ofs as usize..e.succ_ofs as usize + e.succ_len as usize] {
+        if counter >= p.n_counter {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} {label} entry {ei} increments counter {counter} of {}",
+                p.n_counter
+            )));
+        }
+    }
+    for (slot, &handle) in inst.t.iter().enumerate() {
+        if handle != TENSOR_NONE16 && handle as usize >= n_tensors {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} instruction {} tensor slot {slot} has handle {handle} of {n_tensors}",
+                e.inst
+            )));
+        }
+    }
+    if inst.op == DevOp::GemvQkv as u16 {
+        for slot in 5..8 {
+            let handle = inst.i[slot] as usize;
+            if handle != 0 && handle >= n_tensors {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi} instruction {} bias slot i{slot} has handle {handle} of {n_tensors}",
+                    e.inst
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
+    if blob.n_cu == 0 {
+        return Err(RuntimeError::Device("CPU blob declares no compute units".into()));
+    }
+    if blob.progs.is_empty() {
+        return Err(RuntimeError::Device("CPU blob declares no programs".into()));
+    }
+    if blob.tensors.len() > TENSOR_NONE16 as usize {
+        return Err(RuntimeError::Device(format!(
+            "CPU blob declares {} tensors; the u16 instruction format supports at most {}",
+            blob.tensors.len(),
+            TENSOR_NONE16
+        )));
+    }
+
+    for (pi, p) in blob.progs.iter().enumerate() {
+        if p.t == 0 {
+            return Err(RuntimeError::Device(format!("program {pi} has T=0")));
+        }
+        if p.stream_ofs.len() != blob.n_cu as usize || p.stream_len.len() != blob.n_cu as usize {
+            return Err(RuntimeError::Device(format!(
+                "program {pi} has {}/{} stream offsets/lengths for {} compute units",
+                p.stream_ofs.len(),
+                p.stream_len.len(),
+                blob.n_cu
+            )));
+        }
+        for cu in 0..blob.n_cu as usize {
+            let start = p.stream_ofs[cu] as usize;
+            let len = p.stream_len[cu] as usize;
+            if start.checked_add(len).is_none_or(|end| end > p.stream.len()) {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi} compute-unit {cu} stream {start}+{len} exceeds {} entries",
+                    p.stream.len()
+                )));
+            }
+        }
+        for (ei, e) in p.stream.iter().enumerate() {
+            validate_stream_entry(p, pi, "static", ei, e, blob.tensors.len())?;
+        }
+        if !p.gq_stream.is_empty() || !p.gq_seg_ofs.is_empty() {
+            if p.gq_stream.len() != p.stream.len() {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi} global queue has {} entries for a {}-entry static stream",
+                    p.gq_stream.len(),
+                    p.stream.len()
+                )));
+            }
+            if p.gq_seg_ofs.first().copied() != Some(0)
+                || p.gq_seg_ofs.last().copied() != Some(p.gq_stream.len() as u32)
+                || p.gq_seg_ofs.windows(2).any(|w| w[0] > w[1])
+            {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi} has invalid global-queue window offsets"
+                )));
+            }
+            for (ei, e) in p.gq_stream.iter().enumerate() {
+                validate_stream_entry(p, pi, "global-queue", ei, e, blob.tensors.len())?;
+            }
+        }
+    }
+
+    let dec_ix = blob.decode_rung_lo();
+    if dec_ix >= blob.progs.len() {
+        return Err(RuntimeError::Device("CPU blob has no decode program".into()));
+    }
+    for (pi, p) in blob.progs.iter().enumerate().skip(dec_ix) {
+        for &site in &blob.kvrow {
+            if site as usize >= p.insts.len() {
+                return Err(RuntimeError::Device(format!(
+                    "KV-row site {site} exceeds decode program {pi}'s {} instructions",
+                    p.insts.len()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl CpuModel {
     /// Parse `blob_path`, allocate every tensor in host memory, bind checkpoint
     /// weights / blob init data / generated tables, and resolve kernels for
@@ -199,6 +349,7 @@ impl CpuModel {
         // domain window itself (`exec::cpu::interp`), so the mis-dispatch the
         // flag guards against cannot happen here.
         let blob = DevBlob::parse_l2(&raw, true)?;
+        validate_cpu_blob(&blob)?;
         // PLOW_FP8_DIR (the `--fp8-dir` runtime flag) names the fp8 weight-twin directory.
         // PLOW_MXFP4_DIR names the mxfp4 twin (`mxfp4/<name>` e2m1 + `_scale` E8M0 rows,
         // perf-data/tools/quantize_mxfp4.py); the two axes are exclusive at emit time.
@@ -530,8 +681,6 @@ impl CpuModel {
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
-use packet::dev::DevOp;
 
 use crate::exec::counters::CounterPool;
 use crate::exec::cpu::control::unpack_fault;

@@ -25,6 +25,8 @@ use crate::exec::cpu::topology::{NumaMode, Topology};
 /// `cancel_gen` load, and the parkers' `sleepers`).
 struct Shared {
     ring: ControlRing,
+    /// Serializes the host side of the single-producer control ring.
+    producer: Mutex<()>,
     fb: Feedback,
     parkers: Vec<Parker>,
     /// Workers per node, in placement order — the input `cu_map` needs to re-derive ownership for a
@@ -150,6 +152,7 @@ impl WorkerPool {
 
         let shared = Arc::new(Shared {
             ring: ControlRing::new(threads),
+            producer: Mutex::new(()),
             fb: Feedback::default(),
             parkers: (0..nodes.len()).map(|_| Parker::default()).collect(),
             per_node: per_node.clone(),
@@ -158,7 +161,7 @@ impl WorkerPool {
             n_workers: threads as u32,
         });
 
-        let mut handles = Vec::with_capacity(threads);
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(threads);
         let mut worker_node = Vec::with_capacity(threads);
         for (w, &(cpu, node)) in placement.iter().enumerate() {
             worker_node.push(node);
@@ -171,10 +174,22 @@ impl WorkerPool {
             };
             let sh = shared.clone();
             let ex = exec.clone();
-            let h = std::thread::Builder::new()
+            let h = match std::thread::Builder::new()
                 .name(format!("plow-cpu-{node}-{w}"))
                 .spawn(move || worker_main(init, sh, ex))
-                .expect("spawn cpu worker");
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    shared.ring.push(Cmd::stop());
+                    for p in &shared.parkers {
+                        p.unpark_all();
+                    }
+                    for h in handles.drain(..) {
+                        let _ = h.join();
+                    }
+                    panic!("spawn cpu worker: {e}");
+                }
+            };
             handles.push(h);
         }
         WorkerPool {
@@ -245,19 +260,23 @@ impl WorkerPool {
         let fb = &self.shared.fb;
         fb.done.store(0, Ordering::Release);
         fb.fault.store(0, Ordering::Release);
-        self.shared.ring.push(Cmd::run(
-            gen,
-            Arc::as_ptr(prog) as u64,
-            Arc::as_ptr(counters) as u64,
-            seg,
-        ));
-        self.wake_all();
+        fb.cancel_gen.store(0, Ordering::Release);
         host.inflight = Some(Inflight {
             gen,
             _prog: prog.clone(),
             _pool: counters.clone(),
             _cursors: cursors,
         });
+        {
+            let _producer = self.shared.producer.lock();
+            self.shared.ring.push(Cmd::run(
+                gen,
+                Arc::as_ptr(prog) as u64,
+                Arc::as_ptr(counters) as u64,
+                seg,
+            ));
+            self.wake_all();
+        }
         gen
     }
 
@@ -293,6 +312,7 @@ impl WorkerPool {
     /// the counters before the next run.
     pub fn cancel(&self, gen: u32) {
         self.shared.fb.cancel_gen.store(gen, Ordering::Release);
+        let _producer = self.shared.producer.lock();
         self.shared.ring.push(Cmd::cancel(gen));
         self.wake_all();
     }
@@ -307,8 +327,16 @@ impl WorkerPool {
         };
         let fb = &self.shared.fb;
         fb.barrier_ack.store(0, Ordering::Release);
-        self.shared.ring.push(Cmd::barrier(seq));
-        self.wake_all();
+        {
+            let _producer = self.shared.producer.lock();
+            self.shared.ring.push(Cmd::barrier(seq));
+            self.wake_all();
+        }
+        self.wait_barrier();
+    }
+
+    fn wait_barrier(&self) {
+        let fb = &self.shared.fb;
         let n = self.shared.n_workers;
         wait_until(
             &HOST_PARKER,
@@ -325,15 +353,26 @@ impl WorkerPool {
     /// # Safety
     /// Each `(ptr, len)` must be valid writable memory for the duration of the call.
     pub unsafe fn reset_slot(&self, slot: u32, ranges: &[(*mut u8, usize)]) {
-        for &(p, len) in ranges {
-            if len == 0 {
-                continue;
+        let seq = {
+            let mut host = self.host.lock();
+            host.barrier_seq = host.barrier_seq.wrapping_add(1);
+            host.barrier_seq
+        };
+        self.shared.fb.barrier_ack.store(0, Ordering::Release);
+        {
+            let _producer = self.shared.producer.lock();
+            for &(p, len) in ranges {
+                if len == 0 {
+                    continue;
+                }
+                self.shared
+                    .ring
+                    .push(Cmd::reset_slot(slot, p as u64, len as u64));
             }
-            self.shared
-                .ring
-                .push(Cmd::reset_slot(slot, p as u64, len as u64));
+            self.shared.ring.push(Cmd::barrier(seq));
+            self.wake_all();
         }
-        self.barrier();
+        self.wait_barrier();
     }
 
     fn wake_all(&self) {
@@ -347,8 +386,18 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        self.shared.ring.push(Cmd::stop());
-        self.wake_all();
+        let gen = self.host.get_mut().inflight.as_ref().map(|run| run.gen);
+        if let Some(gen) = gen {
+            self.shared.fb.cancel_gen.store(gen, Ordering::Release);
+        }
+        {
+            let _producer = self.shared.producer.lock();
+            if let Some(gen) = gen {
+                self.shared.ring.push(Cmd::cancel(gen));
+            }
+            self.shared.ring.push(Cmd::stop());
+            self.wake_all();
+        }
         for h in self.threads.drain(..) {
             let _ = h.join();
         }
