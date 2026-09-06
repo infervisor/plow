@@ -311,6 +311,26 @@ static int mxb_group(const plow_moe_route* tab, uint32_t nslot, uint32_t E, mxb_
     return 1;
 }
 
+/* Slice ownership over WEIGHTED columns: expert d costs MXB_W_DEQ + MXB_W_DOT * M_d units per column
+ * (the fused dequant is ~7 uops per 64 weights, each staged row adds ~4), so a slice owning a
+ * 4-row expert is not handed the same column count as one owning single-row experts. Column
+ * boundaries are floor((unit - P[d]) / w_d), identical for both neighbours of a cut. */
+#define MXB_W_DEQ 7u
+#define MXB_W_DOT 4u
+static void mxb_prefix(const mxb_groups* g, uint32_t N, uint32_t* P) {
+    P[0] = 0;
+    for (uint32_t d = 0; d < g->nd; d++)
+        P[d + 1] = P[d] + (MXB_W_DEQ + MXB_W_DOT * (g->off[d + 1] - g->off[d])) * N;
+}
+static int mxb_cols(const uint32_t* P, uint32_t d, uint32_t N, uint32_t lo, uint32_t hi, uint32_t* n0,
+                    uint32_t* n1) {
+    if (P[d + 1] <= lo || P[d] >= hi) return 0;
+    const uint32_t w = (P[d + 1] - P[d]) / N;
+    *n0 = ((lo > P[d] ? lo : P[d]) - P[d]) / w;
+    *n1 = ((hi < P[d + 1] ? hi : P[d + 1]) - P[d]) / w;
+    return *n0 < *n1;
+}
+
 /* Stage up to 8 slots of one expert group: XP row m <- src row (slot / src_div). */
 static uint32_t mxb_stage(plow_bf16* XP, size_t ldx, uint32_t K, const plow_bf16* src, uint32_t src_div,
                           const mxb_groups* g, uint32_t* i, uint32_t iend, uint32_t slots[8]) {
@@ -343,12 +363,12 @@ V_K(v_moe_glu_mx_b) {
     plow_bf16* XP = ctx->scratch;
     float gg[8][16], uu[8][16];
     uint32_t slots[8];
-    uint32_t lo, hi;
-    g_range(g.nd * I, slice, nblk, &lo, &hi);
-    for (uint32_t idx = lo; idx < hi;) {
-        const uint32_t d = idx / I, n0 = idx - d * I;
-        const uint32_t n1 = n0 + (hi - idx) < I ? n0 + (hi - idx) : I;
-        idx += n1 - n0;
+    uint32_t P[MXB_MAX_SLOTS + 1], lo, hi;
+    mxb_prefix(&g, I, P);
+    g_range(P[g.nd], slice, nblk, &lo, &hi);
+    for (uint32_t d = 0; d < g.nd; d++) {
+        uint32_t n0, n1;
+        if (!mxb_cols(P, d, I, lo, hi, &n0, &n1)) continue;
         const uint32_t e = g.eid[d];
         const uint8_t* We = W + (size_t)e * N2 * ldw;
         const uint8_t* Se = S + (size_t)e * N2 * lds;
@@ -388,12 +408,12 @@ V_K(v_moe_down_mx_b) {
             if (tab[s].eid >= E) memset(part + (size_t)s * H, 0, (size_t)H * sizeof(float));
     uint32_t slots[8];
     float o[4 * 8];
-    uint32_t lo, hi;
-    g_range(g.nd * H, slice, nblk, &lo, &hi);
-    for (uint32_t idx = lo; idx < hi;) {
-        const uint32_t d = idx / H, h0 = idx - d * H;
-        const uint32_t h1 = h0 + (hi - idx) < H ? h0 + (hi - idx) : H;
-        idx += h1 - h0;
+    uint32_t P[MXB_MAX_SLOTS + 1], lo, hi;
+    mxb_prefix(&g, H, P);
+    g_range(P[g.nd], slice, nblk, &lo, &hi);
+    for (uint32_t d = 0; d < g.nd; d++) {
+        uint32_t h0, h1;
+        if (!mxb_cols(P, d, H, lo, hi, &h0, &h1)) continue;
         const uint32_t e = g.eid[d];
         const uint8_t* We = W + (size_t)e * H * ldw;
         const uint8_t* Se = S + (size_t)e * H * lds;
