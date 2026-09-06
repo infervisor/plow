@@ -234,6 +234,28 @@ fn validates_flat_mxfp4_moe_decode_ladder_rows() {
 }
 
 #[test]
+fn fine_gated_prefill_selects_segment_pair_from_packet_topology() {
+    let mut blob = fixture();
+    let mut prefill = blob.progs.remove(0);
+    prefill.t = 256;
+    prefill.stream[0].flags |= packet::dev::SE_FINE;
+    blob.progs.insert(0, prefill);
+    assert!(prefill_needs_segment_pair(&blob, None));
+    blob.progs[0].stream[0].flags &= !packet::dev::SE_FINE;
+    assert!(!prefill_needs_segment_pair(&blob, None));
+}
+
+#[test]
+#[ignore = "CPU-only actual packet check; set TEST_SEGMENTED_PREFILL_PACKET"]
+fn actual_seven_program_packet_selects_segment_pair() {
+    let path = std::env::var("TEST_SEGMENTED_PREFILL_PACKET").unwrap();
+    let blob = DevBlob::parse(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(blob.progs.len(), 7);
+    assert_eq!(blob.prefill_progs().len(), 3);
+    assert!(prefill_needs_segment_pair(&blob, None));
+}
+
+#[test]
 fn decode_ladder_accepts_runtime_input_capacity_beyond_widest_rung() {
     let mut blob = fixture();
     blob.tensors[1].bytes = 128 * 4;

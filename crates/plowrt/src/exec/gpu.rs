@@ -16,7 +16,7 @@
 //! blob's op-major `GQ01` tables in the kernarg, so the same code drives a
 //! `PLOW_NV_SCHED=0` or `=1` cubin — each build reads only its own tables.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use packet::dev::{DevInst64, DevOp, DevProgram, CTR_STRIDE, TENSOR_NONE16};
@@ -499,6 +499,13 @@ fn segment_role_metadata(blob: &DevBlob, raw: &[u8]) -> Result<Option<SegmentRol
         return Ok(None);
     };
     SegmentRoles::parse(bytes, blob).map(Some)
+}
+
+fn prefill_needs_segment_pair(blob: &DevBlob, roles: Option<&SegmentRoles>) -> bool {
+    blob.prefill_progs().iter().enumerate().any(|(index, g)| {
+        g.check_coarse_single_segment().is_err()
+            && roles.and_then(|roles| roles.program(index)).is_none()
+    })
 }
 
 trait SegmentRoleValidation: Sized {
@@ -3619,6 +3626,7 @@ impl GpuEngine {
                 &be,
                 pf,
                 &blob,
+                assets_dir,
                 d_tens.base,
                 grid,
                 profile.tag,
@@ -3952,14 +3960,7 @@ impl GpuEngine {
                         "mixed dense step does not support recurrent state".into(),
                     ));
                 }
-                gpu_mixed_step::MixedCudaStep::load(
-                    &be,
-                    packet,
-                    &blob,
-                    &devp,
-                    d_tens.base,
-                    batch,
-                )
+                gpu_mixed_step::MixedCudaStep::load(&be, packet, &blob, &devp, d_tens.base, batch)
             })
             .transpose()?;
 
@@ -5596,6 +5597,7 @@ impl GpuEngine {
         be: &Arc<CudaBackend>,
         pf: InterpImage,
         blob: &DevBlob,
+        assets_dir: &Path,
         d_tens: u64,
         grid: u32,
         interp_tag: &str,
@@ -5627,27 +5629,28 @@ impl GpuEngine {
         };
         be.set_max_dynamic_smem(f_pf, smem_pf)?;
 
-        // Segmented-prefill pair (T9c). `--pf-seg-dir` / PLOW_PF_SEG_DIR names a directory
-        // holding interp_<tag>_pfseg.cubin + interp_<tag>_pfgemm.cubin;
-        // packets must be emitted WITHOUT
-        // PLOW_UNISEG. Next step: promote to the asset manifest once the A/B settles.
+        // Fine-gated packets select the segmented pair from their own asset directory.
+        // `--pf-seg-dir` remains an explicit object-directory override.
         let small_gemm_path = crate::config::RuntimeConfig::get()
             .nv
             .pf_seg_gemm_small
             .as_deref();
-        if small_gemm_path.is_some()
-            && crate::config::RuntimeConfig::get()
-                .nv
-                .pf_seg_dir
-                .as_deref()
-                .is_none_or(str::is_empty)
-        {
+        let configured_seg_dir = crate::config::RuntimeConfig::get()
+            .nv
+            .pf_seg_dir
+            .as_deref()
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from);
+        let segment_dir = configured_seg_dir.or_else(|| {
+            prefill_needs_segment_pair(blob, segment_roles).then(|| assets_dir.to_path_buf())
+        });
+        if small_gemm_path.is_some() && segment_dir.is_none() {
             return Err(RuntimeError::Rejected(
                 "PLOW_PF_SEG_GEMM_SMALL requires PLOW_PF_SEG_DIR".into(),
             ));
         }
-        let seg_pf = match crate::config::RuntimeConfig::get().nv.pf_seg_dir.clone() {
-            Some(dir) if !dir.is_empty() => {
+        let seg_pf = match segment_dir {
+            Some(dir) => {
                 // Segmented objects currently have only bf16-KV variants. Loading one for an
                 // fp8-KV packet would resolve valid symbols and then reinterpret the cache with
                 // the wrong element width, so reject the requested pairing before loading it.
@@ -5656,32 +5659,33 @@ impl GpuEngine {
                         || inst.op == DevOp::FlashPrefillFp8 as u16
                 }) {
                     return Err(RuntimeError::Device(
-                        "PLOW_PF_SEG_DIR cannot be used with fp8-KV packets: segmented NVIDIA \
-                         prefill objects currently have no fp8-KV variants"
+                        "segmented NVIDIA prefill objects cannot be used with fp8-KV packets: \
+                         no fp8-KV variant is available"
                             .into(),
                     ));
                 }
-                let load =
-                    |file: &str, sym: &str, arena: &str| -> Result<(Module, KernelFn, u32, u32)> {
-                        let img =
-                            std::fs::read(std::path::Path::new(&dir).join(file)).map_err(|e| {
-                                RuntimeError::Device(format!("PLOW_PF_SEG_DIR: read {file}: {e}"))
-                            })?;
-                        let m = be.module_load(&img)?;
-                        if packed_requests
-                            && be.module_global_u32(&m, plow_asset::packed_prefill::CAPABILITY)?
-                                != Some(1)
-                        {
-                            return Err(RuntimeError::Rejected(format!(
-                                "{file} lacks packed request ABI1"
-                            )));
-                        }
-                        let f = be.get_function(&m, sym)?;
-                        let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
-                        be.set_max_dynamic_smem(f, sm)?;
-                        let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
-                        Ok((m, f, sm, occ * be.sm_count()))
-                    };
+                let load = |file: &str,
+                            sym: &str,
+                            arena: &str|
+                 -> Result<(Module, KernelFn, u32, u32)> {
+                    let img = std::fs::read(dir.join(file)).map_err(|e| {
+                        RuntimeError::Device(format!("segmented prefill object: read {file}: {e}"))
+                    })?;
+                    let m = be.module_load(&img)?;
+                    if packed_requests
+                        && be.module_global_u32(&m, plow_asset::packed_prefill::CAPABILITY)?
+                            != Some(1)
+                    {
+                        return Err(RuntimeError::Rejected(format!(
+                            "{file} lacks packed request ABI1"
+                        )));
+                    }
+                    let f = be.get_function(&m, sym)?;
+                    let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
+                    be.set_max_dynamic_smem(f, sm)?;
+                    let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
+                    Ok((m, f, sm, occ * be.sm_count()))
+                };
                 let seg_file = format!("interp_{interp_tag}_pfseg.cubin");
                 let gemm_file = format!("interp_{interp_tag}_pfgemm.cubin");
                 let seg_sym_name = format!("interp_{interp_tag}_pfseg");
@@ -5758,7 +5762,7 @@ impl GpuEngine {
                 // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
                 // segments are emitted at all.
                 let fa_file = format!("interp_{interp_tag}_pffa.cubin");
-                let fa = if std::path::Path::new(&dir).join(&fa_file).exists() {
+                let fa = if dir.join(&fa_file).exists() {
                     let fa_sym_name = format!("interp_{interp_tag}_pffa");
                     let fa_sym = format!("_Z{}{}11PlowProgram", fa_sym_name.len(), fa_sym_name);
                     let (m3, f3, s3, g3) = load(&fa_file, &fa_sym, "plow_arena_bytes_pffa")?;
