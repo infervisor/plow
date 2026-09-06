@@ -312,6 +312,27 @@ fn accepts_exact_hd512_wg32_contract_and_rejects_drift() {
 }
 
 #[test]
+fn accepts_hd512_fused_output_and_rejects_unsafe_contracts() {
+    let (mut program, mut tensors) = hd512_fixture();
+    program.insts[2].t[5] = 5;
+    assert_eq!(
+        packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).unwrap(),
+        [0, 0, 6, 0, 0]
+    );
+
+    program.insts[2].t[5] = 2;
+    assert!(packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).is_err());
+
+    program.insts[2].t[5] = 5;
+    program.insts[2].i[7] = 2;
+    assert!(packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).is_err());
+
+    program.insts[2].i[7] = 1;
+    tensors[5].bytes -= 1;
+    assert!(packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).is_err());
+}
+
+#[test]
 #[ignore = "requires TEST_ATTENTION_ROLE_PACKET pointing to an attention-role packet"]
 fn actual_packet_attention_roles() {
     let path = std::env::var("TEST_ATTENTION_ROLE_PACKET").expect("packet path");
