@@ -323,6 +323,8 @@ struct Shapes {
     rope_half_hd64: bool,
     /// FlashMerge carrying an attention-sink vector in `t3`.
     attention_sinks: bool,
+    /// A GEMV instruction in a prefill program (currently the M=1 lm_head).
+    prefill_gemv: bool,
     /// Opcode names present, for the encoding-aware corrections below. Kept as names because that
     /// is what `features` keys on, and the two must not disagree.
     ops_present: BTreeSet<String>,
@@ -475,6 +477,9 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
                     if inst.t[7] != packet::TENSOR_NONE {
                         s.linear_bias = true;
+                    }
+                    if op == DevOp::Gemv && !decode {
+                        s.prefill_gemv = true;
                     }
                 }
                 DevOp::HeadNormRope => {
@@ -833,7 +838,7 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("prefill") {
         req.push("PLOW_NV_PREFILL=1".into());
-        if on("qwen_gdn") {
+        if s.prefill_gemv {
             req.push("PLOW_NV_PF_GEMV_HEAD=1".into());
         }
     }
@@ -2336,6 +2341,7 @@ mod tests {
             .collect();
         assert!(req.contains(&"PLOW_FP8_KV=1"));
         assert!(req.contains(&"PLOW_NV_PREFILL=1"));
+        assert!(!req.contains(&"PLOW_NV_PF_GEMV_HEAD=1"));
         assert!(!req.contains(&"PLOW_NV_W8A8=1"));
         let rec: Vec<&str> = man["backends"]["nvcc"]["recommends"]
             .as_array()
@@ -2345,6 +2351,15 @@ mod tests {
             .collect();
         assert!(rec.contains(&"GV_MM_MAX=8"));
         assert!(rec.contains(&"PLOW_NV_FA_GF_FULL=8"));
+    }
+
+    #[test]
+    fn nvcc_prefill_gemv_requirement_follows_program_phase() {
+        let mut m = model();
+        m.progs[0].insts.push(inst(DevOp::Gemv, [0; 8]));
+        let man = build(&m, "sm_120a");
+        let req = man["backends"]["nvcc"]["requires"].as_array().unwrap();
+        assert!(req.iter().any(|v| v == "PLOW_NV_PF_GEMV_HEAD=1"));
     }
 
     /// The pairing hash must move when the compiled arm set moves, and must NOT

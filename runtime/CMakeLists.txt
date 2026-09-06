@@ -553,6 +553,11 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # __maxnreg__(128) for occ-2 (2 blocks/SM).
     set(_ax_seg_fat -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1)
     set(_ax_seg_gemm -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1)
+    if(PLOW_NV_PF_GEMV_HEAD)
+        list(APPEND _ax_prefill -DPLOW_NV_PF_GEMV_HEAD=1)
+        list(APPEND _ax_seg_fat -DPLOW_NV_PF_GEMV_HEAD=1)
+        list(APPEND _ax_seg_gemm -DPLOW_NV_PF_GEMV_HEAD=1)
+    endif()
     # AXIS 2 — bf16 KV vs fp8 (e4m3) KV. On the PREFILL side fp8-KV also fixes the
     # staging arm, and it comes from the OPTION, never a literal: FLASH_PREFILL_FP8
     # dequants at the smem stage (cp.async cannot convert fp8 inline), so PIPE=0 is

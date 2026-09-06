@@ -1472,16 +1472,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
 #if !PLOW_NV_GEMM_ONLY && (!PLOW_NV_FA_ONLY || PLOW_NV_FA_ROPE)
     /* i2 selects the head-dim template; i5==1 selects the INTERLEAVED (GPT-J) rotate.
-     * Only hd=128 non-interleaved is instantiated in this build (Qwen3). Anything else
-     * traps rather than falling through to a wrong head dim.
+     * HD64 is selected by packet inventory independently of model-family build flags.
+     * Anything else traps rather than falling through to a wrong head dim.
      * T16 (PLOW_NV_FA_ROPE): also in the FA object — rope packets classed 2 merge the
      * [rope, flash, flash, merge] chain into ONE FA-class launch. */
     case PLOW_DOP_HEADNORM_ROPE:
-#if PLOW_NV_GEMMA
-        /* Gemma: head_dim is 256 (sliding) or 512 (full), both non-interleaved.
-         * PREFILL object only: t6 (NONE on legacy bf16 packets; host-patched in PX-1 batched
-         * mode on KV-write sites) is the per-row seq-slot map — see d_headnorm_rope. The decode
-         * object never passes it, keeping its SASS byte-identical. */
 #if PLOW_MIXED_STEP
 #define PLOW_HNR_SLOT , (const int*)TEN(6), mixed
 #elif PLOW_NV_PREFILL
@@ -1489,12 +1484,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #else
 #define PLOW_HNR_SLOT
 #endif
-        /* GLM/Kimi MLA decoupled RoPE: hd=64 partial-rope slice is ALWAYS interleaved
-         * (GPT-J), i[5] ignored — GLM is the only hd=64 user, matching runtime/amd/
-         * interp.hip. GLM DSA indexer q_idx/k_idx: hd=128 interleaved (i[5]==1). Qwen
-         * GQA: hd=128 non-interleaved (i[5]==0) — required in the PREFILL object, which
-         * is a Gemma build and would otherwise trap Qwen buckets. Gemma full/sliding
-         * attention: hd=256/512 non-interleaved (i[5]==0). */
+#if PLOW_HAS_HEADNORM_HD64
+        /* The packet flag selects explicit half-split pairing; other HD64 packets use the
+         * pre-existing interleaved pairing. Packet inventory keeps this template out of
+         * objects that do not carry an HD64 instruction. */
         if (in->i[2] == 64 && in->i[5] == 2 && PLOW_PACKET_ROPE_HALF_HD64)
             d_headnorm_rope<64, /*INTERLEAVE=*/false>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
@@ -1507,7 +1500,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                 in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
-        else if (in->i[2] == 128 && in->i[5] == 1)
+        else
+#endif
+#if PLOW_NV_GEMMA
+        /* GLM DSA indexer q_idx/k_idx: hd=128 interleaved (i[5]==1). Qwen GQA:
+         * hd=128 non-interleaved. Gemma full/sliding attention: hd=256/512
+         * non-interleaved. */
+        if (in->i[2] == 128 && in->i[5] == 1)
             d_headnorm_rope<128, /*INTERLEAVE=*/true>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
@@ -1531,27 +1530,17 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                 in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
-        else
-            __trap();
-#undef PLOW_HNR_SLOT
 #else
-#if PLOW_MIXED_STEP
-#define PLOW_HNR_SLOT , (const int*)TEN(6), mixed
-#elif PLOW_NV_PREFILL
-#define PLOW_HNR_SLOT , (const int*)TEN(6)
-#else
-#define PLOW_HNR_SLOT
-#endif
         if (in->i[2] == PLOW_NV_FA_HD && in->i[5] == 0)
             d_headnorm_rope<PLOW_NV_FA_HD>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                 in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+#endif
         else
             __trap();
 #undef PLOW_HNR_SLOT
-#endif
         break;
 
 #if PLOW_FP8_KV
@@ -2096,12 +2085,16 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_FLASH_MERGE:
 #if PLOW_NV_LEAN_DECODE
         __trap();
-#elif PLOW_NV_GEMMA
+#else
+#if PLOW_HAS_FLASH_HD64
         if (in->i[3] == 64 && PLOW_HAS_FLASH_HD64 && PLOW_PACKET_ATTENTION_SINKS)
             d_flash_merge<64, true>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                     (const float*)TEN(2), in->i[0], in->i[1], in->i[2],
                                     slice, nblk, nullptr, (const __nv_bfloat16*)TEN(3));
-        else if (in->i[3] == 128)
+        else
+#endif
+#if PLOW_NV_GEMMA
+        if (in->i[3] == 128)
             d_flash_merge<128>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
         else if (in->i[3] == 256)
@@ -2110,14 +2103,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         else if (in->i[3] == 512)
             d_flash_merge<512>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
+#else
+        if (in->i[3] == PLOW_NV_FA_HD)
+            d_flash_merge<PLOW_NV_FA_HD>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
+                                         (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice,
+                                         nblk PLOW_PF_REQ_ARG);
+#endif
         else
             __trap();
-#else
-        if (in->i[3] != PLOW_NV_FA_HD) { __trap(); break; }
-        d_flash_merge<PLOW_NV_FA_HD>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
-                                     (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice,
-                                     nblk PLOW_PF_REQ_ARG);
-#endif
+#endif /* PLOW_NV_LEAN_DECODE */
         break;
 
 #if PLOW_NV_GEMMA && !PLOW_NV_PREFILL && PLOW_HAS_MOE_GEMMA

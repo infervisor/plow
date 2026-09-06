@@ -10,7 +10,7 @@
 //! ("egglog fusion analysis … fusions_found=662") was read as a compiler pass
 //! reporting its work, and quoted as such.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -1471,6 +1471,9 @@ fn build_cubin_from_manifest(
         args.push("-DPLOW_FP8_KV=ON".into());
         args.push("-DPLOW_SM120_CUBIN_FP8KV=ON".into());
     }
+    if req.iter().any(|d| d.starts_with("PLOW_NV_PF_GEMV_HEAD")) {
+        args.push("-DPLOW_NV_PF_GEMV_HEAD=ON".into());
+    }
     if segmented {
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
@@ -1487,6 +1490,15 @@ fn build_cubin_from_manifest(
     args.push(format!("-DPLOW_CUBIN_ARCH={arch}"));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
+    let config = pkt.with_file_name("plow_config.h");
+    if !config.is_file() {
+        return Err(format!(
+            "--emit devblob+cubin: packet config {} was not emitted",
+            config.display()
+        )
+        .into());
+    }
+    args.push(cubin_config_option(&config));
     let build_dir = out_dir.join(".cubin-build");
     let runtime_dir = repo_runtime_dir()?;
     args.push(format!("-DPLOW_CUBIN_DIR={}", out_dir.display()));
@@ -1522,6 +1534,10 @@ fn effective_uniseg(arch: &str, configured: bool, segmented: bool, env_present: 
     } else {
         configured
     }
+}
+
+fn cubin_config_option(config: &Path) -> String {
+    format!("-DPLOW_CUBIN_CONFIG={}", config.display())
 }
 
 fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
@@ -2211,6 +2227,15 @@ mod cli_tests {
         assert!(cubin_arch_option("gfx950")
             .unwrap_err()
             .contains("hipcc/.hsaco"));
+    }
+
+    #[test]
+    fn cubin_build_config_is_the_packet_sibling() {
+        let pkt = Path::new("/tmp/model-assets/model.pkt");
+        assert_eq!(
+            cubin_config_option(&pkt.with_file_name("plow_config.h")),
+            "-DPLOW_CUBIN_CONFIG=/tmp/model-assets/plow_config.h"
+        );
     }
 
     #[test]
