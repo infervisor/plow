@@ -27,6 +27,9 @@ struct Shared {
     ring: ControlRing,
     fb: Feedback,
     parkers: Vec<Parker>,
+    /// Workers per node, in placement order — the input `cu_map` needs to re-derive ownership for a
+    /// program that runs on fewer workers than the pool has.
+    pub per_node: Vec<Vec<u32>>,
     /// GQ cursors sized for the largest program run so far. Host-resized under
     /// the run lock before a run; workers only see it through `RunShared`.
     cursors: Mutex<Arc<Vec<CachePadded<AtomicU32>>>>,
@@ -34,12 +37,37 @@ struct Shared {
     n_workers: u32,
 }
 
+/// cu -> worker ownership: node = `cu % nodes`, then round-robin within the node, restricted to the
+/// first `active` workers. Used both at spawn (for the pool's own bookkeeping) and per program, so
+/// prefill and decode can run on different widths without respawning threads.
+pub fn cu_map(n_cu: u32, per_node: &[Vec<u32>], nodes: usize, active: usize) -> Vec<Vec<u32>> {
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); per_node.iter().map(Vec::len).sum::<usize>().max(active)];
+    let live: Vec<Vec<u32>> = per_node
+        .iter()
+        .map(|ws| ws.iter().copied().filter(|&w| (w as usize) < active).collect())
+        .collect();
+    for cu in 0..n_cu {
+        let np = (cu as usize) % nodes.max(1);
+        let ws = if live.get(np).is_some_and(|v| !v.is_empty()) {
+            &live[np]
+        } else {
+            match live.iter().find(|v| !v.is_empty()) {
+                Some(v) => v,
+                None => return out, // no active worker at all; caller rejects
+            }
+        };
+        let w = ws[(cu as usize / nodes.max(1)) % ws.len()];
+        out[w as usize].push(cu);
+    }
+    out
+}
+
 struct WorkerInit {
+    cus: Vec<u32>,
     idx: u32,
     node: u32,
     node_pos: u32,
     cpu: u32,
-    cus: Vec<u32>,
 }
 
 /// Keeps the program and counters of the in-flight run alive for the workers,
@@ -118,22 +146,13 @@ impl WorkerPool {
         for (w, &(_, n)) in placement.iter().enumerate() {
             per_node[node_pos(n) as usize].push(w as u32);
         }
-        let mut cus_of: Vec<Vec<u32>> = vec![Vec::new(); threads];
-        for cu in 0..n_cu {
-            let np = (cu as usize) % nodes.len();
-            let ws = if per_node[np].is_empty() {
-                per_node.iter().find(|v| !v.is_empty()).expect("some worker")
-            } else {
-                &per_node[np]
-            };
-            let w = ws[(cu as usize / nodes.len()) % ws.len()];
-            cus_of[w as usize].push(cu);
-        }
+        let mut cus_of = cu_map(n_cu, &per_node, nodes.len(), threads);
 
         let shared = Arc::new(Shared {
             ring: ControlRing::new(threads),
             fb: Feedback::default(),
             parkers: (0..nodes.len()).map(|_| Parker::default()).collect(),
+            per_node: per_node.clone(),
             cursors: Mutex::new(Arc::new(Vec::new())),
             spin_us,
             n_workers: threads as u32,
@@ -144,11 +163,11 @@ impl WorkerPool {
         for (w, &(cpu, node)) in placement.iter().enumerate() {
             worker_node.push(node);
             let init = WorkerInit {
+                cus: std::mem::take(&mut cus_of[w]),
                 idx: w as u32,
                 node,
                 node_pos: node_pos(node),
                 cpu,
-                cus: std::mem::take(&mut cus_of[w]),
             };
             let sh = shared.clone();
             let ex = exec.clone();
@@ -244,6 +263,11 @@ impl WorkerPool {
 
     /// Block until every worker has drained (or abandoned) run `gen`.
     /// Returns the first fault recorded, if any.
+    /// Workers per node in placement order, so a program can be loaded for a narrower set.
+    pub fn per_node(&self) -> &[Vec<u32>] {
+        &self.shared.per_node
+    }
+
     pub fn wait_done(&self, gen: u32) -> Option<u64> {
         let n = self.shared.n_workers;
         let fb = &self.shared.fb;
@@ -358,7 +382,7 @@ fn worker_main(init: WorkerInit, sh: Arc<Shared>, exec: Arc<dyn Exec>) {
         cpu: init.cpu,
         domain: init.node_pos,
     };
-    let mut st = StaticState::new(init.cus);
+    let mut st = StaticState::new(init.idx as usize, init.cus);
     let mut gq = GqState::new();
     let mut seen = 0u64;
     let exec: &dyn Exec = &*exec;

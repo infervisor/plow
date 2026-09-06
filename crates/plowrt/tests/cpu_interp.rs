@@ -111,6 +111,9 @@ fn build(ops: &[Op], n_cu: u32, n_seg: u32, gq_domains: u32) -> (LoadedProgram, 
             n_seg,
             seg_ofs: None,
             gq,
+            // None = keep the pool's spawn-time ownership; this harness runs pools whose thread
+            // count differs from the cu count and every stream must still be covered.
+            cus_of: None,
         },
         counters,
     )

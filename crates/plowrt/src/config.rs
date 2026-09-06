@@ -204,11 +204,6 @@ pub struct CpuRuntimeConfig {
     )]
     pub prefill_chunk: u32,
 
-    /// Directory holding the fp8 weight twin (`fp8/<name>` + `_scale`, quantize_fp8.py). Empty =
-    /// bf16 weights only. Mutually exclusive with `mxfp4_dir` at emit time.
-    #[arg(long = "cpu-fp8-dir", env = "PLOW_FP8_DIR", global = true)]
-    pub fp8_dir: Option<String>,
-
     /// Directory holding the MXFP4 weight twin (`mxfp4/<name>` + `_scale`, quantize_mxfp4.py).
     #[arg(long = "cpu-mxfp4-dir", env = "PLOW_MXFP4_DIR", global = true)]
     pub mxfp4_dir: Option<String>,

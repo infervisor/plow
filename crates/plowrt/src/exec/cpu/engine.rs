@@ -202,8 +202,11 @@ impl CpuModel {
         // PLOW_FP8_DIR (the `--fp8-dir` runtime flag) names the fp8 weight-twin directory.
         // PLOW_MXFP4_DIR names the mxfp4 twin (`mxfp4/<name>` e2m1 + `_scale` E8M0 rows,
         // perf-data/tools/quantize_mxfp4.py); the two axes are exclusive at emit time.
-        let cpucfg = &crate::config::RuntimeConfig::get().cpu;
-        let twin = [cpucfg.fp8_dir.as_deref(), cpucfg.mxfp4_dir.as_deref()]
+        // `--fp8-dir` already exists runtime-wide (AmdRuntimeConfig owns that clap id and its
+        // PLOW_FP8_DIR env); only the mxfp4 twin is CPU-specific. Declaring a second `fp8_dir`
+        // field here shadowed the first, and the twin then silently never loaded.
+        let rt = crate::config::RuntimeConfig::get();
+        let twin = [rt.amd.fp8_dir.as_deref(), rt.cpu.mxfp4_dir.as_deref()]
             .into_iter()
             .flatten()
             .find(|d| !d.is_empty())
@@ -621,7 +624,31 @@ impl Exec for KernelExec {
 
 /// Copy a blob program into the interpreter's form. Static per-cu streams; the
 /// global-queue windows are wired in P6.
-fn loaded(p: &DevProg, n_cu: u32) -> LoadedProgram {
+/// Is this a dense (non-MoE) single-row decode program? Those are pure weight streaming, the one
+/// shape that wants the SMT siblings rather than one worker per core.
+fn dense_row_decode(p: &DevProg) -> bool {
+    use packet::dev::DevOp;
+    if p.t != 1 {
+        return false;
+    }
+    !p.insts.iter().any(|d| {
+        matches!(
+            DevOp::from_u16(d.op),
+            Some(
+                DevOp::MoeGluMx
+                    | DevOp::MoeDownMx
+                    | DevOp::MoeGluMxPf
+                    | DevOp::MoeDownMxPf
+                    | DevOp::MoeExpertGluNormGemma
+                    | DevOp::MoeExpertDownGemma
+                    | DevOp::MoeGroupGluGemmaPf
+                    | DevOp::MoeGroupDownGemmaPf
+            )
+        )
+    })
+}
+
+fn loaded(p: &DevProg, n_cu: u32, per_node: &[Vec<u32>], nodes: usize, physical: usize, logical: usize) -> LoadedProgram {
     let n_seg = p.stream.iter().map(|e| e.seg as u32).max().map_or(1, |m| m + 1);
     let seg_ofs = if n_seg > 1 {
         packet::devbuild::static_seg_ofs(&p.stream, &p.stream_ofs, &p.stream_len, n_seg).ok()
@@ -653,7 +680,12 @@ fn loaded(p: &DevProg, n_cu: u32) -> LoadedProgram {
     } else {
         None
     };
+    // Width per program: see `dense_row_decode`. A worker outside the active set owns no cu here
+    // and idles through the run; nothing is respawned.
+    let active = if dense_row_decode(p) { logical } else { physical };
+    let cus_of = Some(crate::exec::cpu::workers::cu_map(n_cu, per_node, nodes, active.max(1)));
     LoadedProgram {
+        cus_of,
         insts: p.insts.clone(),
         stream: p.stream.clone(),
         stream_ofs: p.stream_ofs.clone(),
@@ -752,6 +784,7 @@ impl CpuEngine {
         // The pool needs the Exec before it exists; build the exec against the
         // node placement the pool will use (same rule: round-robin over nodes).
         let nodes = topo.select_nodes(&opts.numa);
+        let (physical_w, logical_w);
         let threads = if opts.threads == 0 {
             // Mirrors WorkerPool::spawn's placement list, which orders physical cores first and
             // their SMT siblings after, so `k` threads pin to `k` distinct logical cpus.
@@ -784,6 +817,26 @@ impl CpuEngine {
         } else {
             opts.threads
         };
+        // An explicit --cpu-threads pins both widths; otherwise physical for compute-bound programs
+        // and logical for a dense single-row decode.
+        if opts.threads == 0 {
+            physical_w = nodes.iter().map(|&n| topo.cores_on_node(n).count()).sum::<usize>().max(1);
+            logical_w = nodes
+                .iter()
+                .map(|&n| topo.cores_on_node(n).map(|c| c.siblings.len().max(1)).sum::<usize>())
+                .sum::<usize>()
+                .max(1);
+        } else {
+            physical_w = threads;
+            logical_w = threads;
+        }
+        // Spawn the MAX any program wants, not always the logical count. A worker with no cus for
+        // the running program still polls (200 us re-park) on the SMT sibling of a busy core, and
+        // eight such idlers cost GPT-OSS 455 -> 402 tok/s of prefill even though every one of its
+        // programs uses the physical width. A model with no dense single-row decode never spawns
+        // them, so MoE models keep the full physical-core win.
+        let wants_logical = model.blob.progs.iter().any(dense_row_decode);
+        let threads = threads.max(if wants_logical { logical_w } else { physical_w });
         tracing::info!(
             threads,
             ?isa,
@@ -796,7 +849,10 @@ impl CpuEngine {
         })?);
         let pool = WorkerPool::spawn(&topo, threads, &opts.numa, opts.spin_us, n_cu, exec);
         let progs: Vec<Arc<LoadedProgram>> =
-            model.blob.progs.iter().map(|p| Arc::new(loaded(p, n_cu))).collect();
+            model.blob.progs
+                .iter()
+                .map(|p| Arc::new(loaded(p, n_cu, pool.per_node(), nodes.len(), physical_w, logical_w)))
+                .collect();
         let counters = model
             .blob
             .progs

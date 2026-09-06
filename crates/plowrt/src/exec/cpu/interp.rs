@@ -118,6 +118,12 @@ pub struct LoadedProgram {
     /// `stream_ofs[cu]`; `None` ⇒ filter on `StreamEnt::seg`.
     pub seg_ofs: Option<Vec<u32>>,
     pub gq: Option<GlobalQueue>,
+    /// Cu ids each worker owns FOR THIS PROGRAM, indexed by worker, or `None` to keep the pool's
+    /// spawn-time ownership. Prefill and decode want different widths (prefill is compute-bound and
+    /// wants one worker per physical core; a dense single-row decode streams weights and wants the
+    /// SMT siblings), so the narrowing is per program and the tail workers simply own nothing.
+    /// `None` matters: a pool with fewer threads than cus must still cover every stream.
+    pub cus_of: Option<Vec<Vec<u32>>>,
 }
 
 impl LoadedProgram {
@@ -336,19 +342,33 @@ impl<'a> RunShared<'a> {
 
 /// Per-worker static-mode state, preallocated at spawn (no per-run allocation).
 pub struct StaticState {
-    /// Owned virtual executors (cu ids).
+    /// Cu ids owned at spawn — the fallback when a program does not narrow participation.
+    spawn_cus: Vec<u32>,
+    /// Cu ids owned for the program being run.
     pub cus: Vec<u32>,
     /// `[head, end)` per owned cu for the current segment.
     heads: Vec<(u32, u32)>,
+    /// This worker's index, the key into `LoadedProgram::cus_of`.
+    idx: usize,
 }
 
 impl StaticState {
-    pub fn new(cus: Vec<u32>) -> StaticState {
+    pub fn new(idx: usize, cus: Vec<u32>) -> StaticState {
         let heads = vec![(0, 0); cus.len()];
-        StaticState { cus, heads }
+        StaticState { spawn_cus: cus.clone(), cus, heads, idx }
     }
 
     fn reset(&mut self, prog: &LoadedProgram, seg: u32) {
+        let mine: &[u32] = match &prog.cus_of {
+            Some(m) => m.get(self.idx).map(Vec::as_slice).unwrap_or(&[]),
+            None => &self.spawn_cus,
+        };
+        if self.cus != mine {
+            self.cus.clear();
+            self.cus.extend_from_slice(mine);
+            self.heads.clear();
+            self.heads.resize(self.cus.len(), (0, 0));
+        }
         for (k, &cu) in self.cus.iter().enumerate() {
             self.heads[k] = prog.cu_range(cu, seg);
         }
