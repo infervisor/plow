@@ -1,0 +1,90 @@
+{
+  "scope": "Native block inventory for layer-weighted estimates, not measured model latency",
+  "formula": "estimated_step_us = sum(group.layers * measured_block_us[group]) + unmeasured_head_and_runtime_us",
+  "models": [
+    {
+      "model": "gemma12",
+      "source": "/opt/dlami/nvme/tmp/plow-h100-campaign/gemma12b-bf16/checkpoint/config.json",
+      "source_sha256": "478c46e8d2c52d5c2d85bf67e3b3e8c90e7c9d91086cee27e3c267907e936bd9",
+      "layers": 48,
+      "groups": [
+        {
+          "type": "sliding_attention",
+          "layers": 40,
+          "representative_layer": 0,
+          "hidden": 3840,
+          "intermediate": 15360
+        },
+        {
+          "type": "full_attention",
+          "layers": 8,
+          "representative_layer": 5,
+          "hidden": 3840,
+          "intermediate": 15360
+        }
+      ]
+    },
+    {
+      "model": "gemma31",
+      "source": "/opt/dlami/nvme/tmp/plow-h100-campaign/gemma31b-bf16/checkpoint/config.json",
+      "source_sha256": "e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1",
+      "layers": 60,
+      "groups": [
+        {
+          "type": "sliding_attention",
+          "layers": 50,
+          "representative_layer": 0,
+          "hidden": 5376,
+          "intermediate": 21504
+        },
+        {
+          "type": "full_attention",
+          "layers": 10,
+          "representative_layer": 5,
+          "hidden": 5376,
+          "intermediate": 21504
+        }
+      ]
+    },
+    {
+      "model": "qwen27",
+      "source": "/opt/dlami/nvme/hf-cache/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/config.json",
+      "source_sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+      "layers": 64,
+      "groups": [
+        {
+          "type": "linear_attention",
+          "layers": 48,
+          "representative_layer": 0,
+          "hidden": 5120,
+          "intermediate": 17408
+        },
+        {
+          "type": "full_attention",
+          "layers": 16,
+          "representative_layer": 3,
+          "hidden": 5120,
+          "intermediate": 17408
+        }
+      ]
+    }
+  ],
+  "required_decode_batches": [
+    1,
+    4,
+    8,
+    16,
+    32
+  ],
+  "screen_contexts": [
+    1024,
+    4096,
+    8192,
+    32768
+  ],
+  "caveats": [
+    "Measure each block type separately at matched batch, history, precision and object resources.",
+    "GDN recurrent history is not a dense-attention KV context.",
+    "Layer weighting estimates serial block work; serving TTFT/TPOT/p99 remain separate verification."
+  ]
+}

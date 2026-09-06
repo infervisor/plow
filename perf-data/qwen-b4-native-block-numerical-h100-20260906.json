@@ -1,0 +1,2925 @@
+{
+  "scope": "Artifact-only BF16 Qwen layer0 GDN, B4 native execution vs independent Plow B1 histories. No FP8, prefill, full-model, timing or serving qualification.",
+  "host_sha256": "893a395c1980919ca2ab9f70781d9506e6e16d8a66571ae8d402493719adbb67",
+  "queue_sha256": "7f6205da6cf51ba7263f916b9f50850cd19ef1d7414d9770379b626928a965c9",
+  "active_tensor_comparisons": 255,
+  "exact_inactive_reset_checks": 60,
+  "captures": [
+    {
+      "job": "qwen-b4-block-seed0-runtime-retry",
+      "source": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/runtime-admission-retry/results/seed0/block-batch.json",
+      "sha256": "55f4bf61db9444a059a1f3a256948c423a78f2417c8d8bc82a643a6b5601dd9e",
+      "report": {
+        "assets": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/block-b4",
+        "complete": true,
+        "exact_inactive_reset_checks": 20,
+        "passed": true,
+        "reference_assets": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/block-b1",
+        "relative_l2_limit": 0.003,
+        "reset": {
+          "slot": 2,
+          "tick": 3
+        },
+        "rows": [
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          }
+        ],
+        "schedule": [
+          [
+            0,
+            1,
+            2,
+            3
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            0,
+            1,
+            2,
+            3
+          ],
+          [
+            2
+          ],
+          [
+            0,
+            1,
+            2,
+            3
+          ]
+        ],
+        "scope": "BF16 layer0 B4 vs B1 numerical fixture, no serving or FP8 claim",
+        "token_ids": [
+          2,
+          42,
+          43,
+          44,
+          45,
+          46
+        ]
+      }
+    },
+    {
+      "job": "qwen-b4-block-seed1-runtime-retry",
+      "source": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/runtime-admission-retry/results/seed1/block-batch.json",
+      "sha256": "55f4bf61db9444a059a1f3a256948c423a78f2417c8d8bc82a643a6b5601dd9e",
+      "report": {
+        "assets": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/block-b4",
+        "complete": true,
+        "exact_inactive_reset_checks": 20,
+        "passed": true,
+        "reference_assets": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/block-b1",
+        "relative_l2_limit": 0.003,
+        "reset": {
+          "slot": 2,
+          "tick": 3
+        },
+        "rows": [
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          }
+        ],
+        "schedule": [
+          [
+            0,
+            1,
+            2,
+            3
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            0,
+            1,
+            2,
+            3
+          ],
+          [
+            2
+          ],
+          [
+            0,
+            1,
+            2,
+            3
+          ]
+        ],
+        "scope": "BF16 layer0 B4 vs B1 numerical fixture, no serving or FP8 claim",
+        "token_ids": [
+          2,
+          42,
+          43,
+          44,
+          45,
+          46
+        ]
+      }
+    },
+    {
+      "job": "qwen-b4-block-seed0-repeat-runtime-retry",
+      "source": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/runtime-admission-retry/results/seed0-repeat/block-batch.json",
+      "sha256": "55f4bf61db9444a059a1f3a256948c423a78f2417c8d8bc82a643a6b5601dd9e",
+      "report": {
+        "assets": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/block-b4",
+        "complete": true,
+        "exact_inactive_reset_checks": 20,
+        "passed": true,
+        "reference_assets": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/block-b1",
+        "relative_l2_limit": 0.003,
+        "reset": {
+          "slot": 2,
+          "tick": 3
+        },
+        "rows": [
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 0,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 1,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 1
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 4
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 2,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 0
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 2
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 3
+          },
+          {
+            "bitexact": true,
+            "elements": 5120,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.x",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 10240,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 6144,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "act.gdn.core",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 30720,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.conv",
+            "tick": 5
+          },
+          {
+            "bitexact": true,
+            "elements": 786432,
+            "max_abs": 0.0,
+            "passed": true,
+            "relative_l2": 0.0,
+            "slot": 3,
+            "tensor": "state.qwen.0.gdn",
+            "tick": 5
+          }
+        ],
+        "schedule": [
+          [
+            0,
+            1,
+            2,
+            3
+          ],
+          [
+            0,
+            2
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            0,
+            1,
+            2,
+            3
+          ],
+          [
+            2
+          ],
+          [
+            0,
+            1,
+            2,
+            3
+          ]
+        ],
+        "scope": "BF16 layer0 B4 vs B1 numerical fixture, no serving or FP8 claim",
+        "token_ids": [
+          2,
+          42,
+          43,
+          44,
+          45,
+          46
+        ]
+      }
+    }
+  ],
+  "repeat": {
+    "complete": true,
+    "passed": true,
+    "rows": [
+      {
+        "file": "b4-step0-act.gdn.conv.bin",
+        "bytes": 81920,
+        "exact": true,
+        "sha256": "4e04d1b8cd6c8e46fd2b5c852b7eb36cf02fe1c388296ae635f29dcbca4dc304"
+      },
+      {
+        "file": "b4-step0-act.gdn.core.bin",
+        "bytes": 49152,
+        "exact": true,
+        "sha256": "8844ff983ebafe836c4fcf123ccc02e3af7b27066ec9c55ae0d85b438ca5f98f"
+      },
+      {
+        "file": "b4-step0-act.x.bin",
+        "bytes": 40960,
+        "exact": true,
+        "sha256": "0ba71f330d6c83b3d2f96388f7cab9ede25d16e985637c829c17db585614e743"
+      },
+      {
+        "file": "b4-step0-state.qwen.0.conv.bin",
+        "bytes": 245760,
+        "exact": true,
+        "sha256": "b86d727c39c0251d72a813521f10569473f331dfa97dc76295a5fbaf915c545f"
+      },
+      {
+        "file": "b4-step0-state.qwen.0.gdn.bin",
+        "bytes": 12582912,
+        "exact": true,
+        "sha256": "105aed5f93d296dbaddf074f61537319a14fb478be804f7a863cc883670eae85"
+      },
+      {
+        "file": "b4-step1-act.gdn.conv.bin",
+        "bytes": 81920,
+        "exact": true,
+        "sha256": "a30dc7bdcada57ffb2acd041496abb1ed8e02d74f853824d6e53ae71e84ebe37"
+      },
+      {
+        "file": "b4-step1-act.gdn.core.bin",
+        "bytes": 49152,
+        "exact": true,
+        "sha256": "6abdbbb6d5aca5a5b975c899623bff967e4b923f2eef5bc8ae403a4e038ab473"
+      },
+      {
+        "file": "b4-step1-act.x.bin",
+        "bytes": 40960,
+        "exact": true,
+        "sha256": "553c059ad8c1230604971f57d364e9a3040b02ba4dcf000c90f133c7a817b025"
+      },
+      {
+        "file": "b4-step1-state.qwen.0.conv.bin",
+        "bytes": 245760,
+        "exact": true,
+        "sha256": "7ba01d7948dd1af5cdb14b8fbab47dd063cf8a209ac057c3de41dd65fbe55454"
+      },
+      {
+        "file": "b4-step1-state.qwen.0.gdn.bin",
+        "bytes": 12582912,
+        "exact": true,
+        "sha256": "6d646730a50e0925b7afdaf6f3ef047babc758c69ab3f9fa0d527fbe36a8fb61"
+      },
+      {
+        "file": "b4-step2-act.gdn.conv.bin",
+        "bytes": 81920,
+        "exact": true,
+        "sha256": "9c9945b81e1e7008910326a05f34c213c1d168de1b6dac65b0aaf4868df9b52c"
+      },
+      {
+        "file": "b4-step2-act.gdn.core.bin",
+        "bytes": 49152,
+        "exact": true,
+        "sha256": "55bf33b5d6a689837662560eec48474f7854689fe457b3170052c83e1c11632d"
+      },
+      {
+        "file": "b4-step2-act.x.bin",
+        "bytes": 40960,
+        "exact": true,
+        "sha256": "ca4b2c53742127dde514a8bb87507e0cd5dca871811bd961ca9e9b9ce0658035"
+      },
+      {
+        "file": "b4-step2-state.qwen.0.conv.bin",
+        "bytes": 245760,
+        "exact": true,
+        "sha256": "7d519640c9b2eda1bfb3799b2206ef6a2d84f574d70d4565e540a1b5e9b96d0b"
+      },
+      {
+        "file": "b4-step2-state.qwen.0.gdn.bin",
+        "bytes": 12582912,
+        "exact": true,
+        "sha256": "5ed086a809308091620f54acec8fcf00addf3484fc3494d2d1d947263c0cff25"
+      },
+      {
+        "file": "b4-step3-act.gdn.conv.bin",
+        "bytes": 81920,
+        "exact": true,
+        "sha256": "23c112640f122d68cbb5426b3e70634b14b757c91b258faaf925ff254bbc2870"
+      },
+      {
+        "file": "b4-step3-act.gdn.core.bin",
+        "bytes": 49152,
+        "exact": true,
+        "sha256": "b3e3c59a570f0233abeb7bc230ea5828cc22b8f54b8d37a5a49ab9a5edbd2fe5"
+      },
+      {
+        "file": "b4-step3-act.x.bin",
+        "bytes": 40960,
+        "exact": true,
+        "sha256": "585453a35625e3d6eb092e54554cf35e2ba7d5809070f169f104801d02f9b851"
+      },
+      {
+        "file": "b4-step3-state.qwen.0.conv.bin",
+        "bytes": 245760,
+        "exact": true,
+        "sha256": "ee51b65e2c3d7ece9178820e5c2d952c46bc8212a65cacc22a910535d8139261"
+      },
+      {
+        "file": "b4-step3-state.qwen.0.gdn.bin",
+        "bytes": 12582912,
+        "exact": true,
+        "sha256": "1b86febe99878d83a89a68788766ca6c71ef1a78563f3f0aa0338070008fd267"
+      },
+      {
+        "file": "b4-step4-act.gdn.conv.bin",
+        "bytes": 81920,
+        "exact": true,
+        "sha256": "33cb811adb24367575f0f61ae8843fcaea9a055f5d31792f17f74a71da3dcbf7"
+      },
+      {
+        "file": "b4-step4-act.gdn.core.bin",
+        "bytes": 49152,
+        "exact": true,
+        "sha256": "e2fdc4718865400f725841974ac77acba33328b3e4669b00040db9d84540a1a8"
+      },
+      {
+        "file": "b4-step4-act.x.bin",
+        "bytes": 40960,
+        "exact": true,
+        "sha256": "df805de81bfebf2585338f896a130c32cbe15bd9f3f53c22d0291bb8b9a31e67"
+      },
+      {
+        "file": "b4-step4-state.qwen.0.conv.bin",
+        "bytes": 245760,
+        "exact": true,
+        "sha256": "524d552218948d97dc2047b47f3c5b438f5649255723a3dc24a5f820c1503cdb"
+      },
+      {
+        "file": "b4-step4-state.qwen.0.gdn.bin",
+        "bytes": 12582912,
+        "exact": true,
+        "sha256": "63c9607c845077e4084b4e54fe9cffc38a02e1bdace5f31e7d2644aa8c4bc9c7"
+      },
+      {
+        "file": "b4-step5-act.gdn.conv.bin",
+        "bytes": 81920,
+        "exact": true,
+        "sha256": "91b239acf3aa74afaf8cf72363723eaf825b6450435bfdf3b16b64ea55088880"
+      },
+      {
+        "file": "b4-step5-act.gdn.core.bin",
+        "bytes": 49152,
+        "exact": true,
+        "sha256": "c684db652243a79753558c0e10e9a118fd6ce72c348fd6a9ca7f1f9171d2cc11"
+      },
+      {
+        "file": "b4-step5-act.x.bin",
+        "bytes": 40960,
+        "exact": true,
+        "sha256": "0dcf0f475cc189c86914ac9f46d619cbd19582b81b6722bca769cf3b409aa8e9"
+      },
+      {
+        "file": "b4-step5-state.qwen.0.conv.bin",
+        "bytes": 245760,
+        "exact": true,
+        "sha256": "7999d5ffcb370edc08a778c942c19f0d229a9c23659b3cea3cc157e09ab670f4"
+      },
+      {
+        "file": "b4-step5-state.qwen.0.gdn.bin",
+        "bytes": 12582912,
+        "exact": true,
+        "sha256": "de7d9c563141dbe1a29d58b0455ed5e04d2046b740e4cbc2773924fc5f2b062b"
+      }
+    ]
+  },
+  "repeat_source": "/tmp/plow-model-support-checks/qwen-b4-block-fixture-20260906/runtime-admission-retry/results/repeat.json",
+  "repeat_sha256": "b89ca0788d213fbeecdd73b909a892d034f9ba5cdd076480fce9253d6a1274d8",
+  "memory_status": "Raw memcheck exit99; separate exact optional-symbol API classification required. This report proves numerical/state behavior only."
+}
