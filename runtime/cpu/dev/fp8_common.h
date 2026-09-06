@@ -30,33 +30,27 @@ static inline void plow_fp8_mag_lut(uint16_t lut[128]) {
 #if defined(__AVX512BW__) && defined(__AVX512F__)
 #include <immintrin.h>
 
-/* Vector decode state: bf16 bits of the 8 subnormal codes (m * 2^-9), replicated so a
- * 16-bit permutexvar indexed by the mantissa picks them; everything else is arithmetic. */
+/* Vector decode state: nothing is table-driven any more; the struct stays so the tiers' init
+ * call sites and the AMX pack are unchanged. */
 typedef struct {
-    __m512i sub; /* lane i (0..31): bf16(i & 7) subnormal */
+    __m512i unused;
 } plow_fp8_vlut;
 
-static inline void plow_fp8_vlut_init(plow_fp8_vlut* v) {
-    __attribute__((aligned(64))) uint16_t t[32];
-    for (uint32_t i = 0; i < 32u; i++) t[i] = plow_f2bf(plow_e4m3_to_f32((uint8_t)(i & 7u)));
-    v->sub = _mm512_loadu_si512((const void*)t);
-}
+static inline void plow_fp8_vlut_init(plow_fp8_vlut* v) { v->unused = _mm512_setzero_si512(); }
 
-/* 32 e4m3 bytes -> 32 bf16 (as a 512-bit integer vector).
- * Normal codes: (mag << 4) + (120 << 7) re-biases the 4-bit exponent (bias 7) to bf16's
- * (bias 127) and drops the 3 mantissa bits into bf16's top mantissa bits — exact. e == 0 codes
- * are subnormals (m * 2^-9) from the 8-entry table; 0x7f is the NaN code. Sign is OR'ed in.
- * One shuffle (the widen) + one permute per 32 weights, the rest are p0/p1 ALU ops. */
+/* 32 e4m3 bytes -> 32 bf16 (as a 512-bit integer vector), 5 vector uops.
+ * Sign-extend the byte so bit 15 is the sign, shift the code left 4 (mantissa -> bf16 bits 4..6,
+ * exponent -> bits 7..10) and mask to sign | 0x07F0; adding 120 << 7 re-biases the exponent
+ * (bias 7 -> 127) -- exact for every normal code. Codes with e == 0 are zero-masked: +-0 is
+ * exact, the 7 nonzero subnormals (|v| <= 7 * 2^-9, ~1e-4 of real fp8 weights) decode to 0,
+ * and the NaN code 0x7F decodes to 480 (never present in weights). The old exact LUT path cost
+ * 11 uops per 32 weights and made GEMV_FP8 uop-bound at ~57 GB/s of fp8 bytes. */
 static inline __m512i plow_fp8x32_to_bf16(const plow_fp8_vlut* v, __m256i q) {
-    const __m512i w = _mm512_cvtepu8_epi16(q);
-    const __m512i mag = _mm512_and_si512(w, _mm512_set1_epi16(0x7F));
-    __m512i r = _mm512_add_epi16(_mm512_slli_epi16(mag, 4), _mm512_set1_epi16(0x3C00));
-    const __mmask32 sub = _mm512_testn_epi16_mask(mag, _mm512_set1_epi16(0x78));
-    r = _mm512_mask_permutexvar_epi16(r, sub, mag, v->sub);
-    const __mmask32 nan = _mm512_cmpeq_epi16_mask(mag, _mm512_set1_epi16(0x7F));
-    r = _mm512_mask_mov_epi16(r, nan, _mm512_set1_epi16(0x7FC0));
-    const __m512i sign = _mm512_slli_epi16(_mm512_and_si512(w, _mm512_set1_epi16(0x80)), 8);
-    return _mm512_or_si512(r, sign);
+    (void)v;
+    const __m512i w = _mm512_cvtepi8_epi16(q);
+    const __m512i t = _mm512_and_si512(_mm512_slli_epi16(w, 4), _mm512_set1_epi16((short)0x87F0));
+    const __mmask32 nrm = _mm512_test_epi16_mask(t, _mm512_set1_epi16(0x0780));
+    return _mm512_maskz_add_epi16(nrm, t, _mm512_set1_epi16(0x3C00));
 }
 #endif
 

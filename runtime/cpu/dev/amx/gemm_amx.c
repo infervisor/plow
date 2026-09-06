@@ -301,7 +301,10 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
         size_t ldas[MBLK];
         for (uint32_t mb = 0; mb < mb_n; mb++) {
             const uint32_t m = m0 + mb * 32u, rows = m1 - m < 32u ? m1 - m : 32u;
-            if (g->rms || (rows != 32u && rows != 16u)) {
+            /* Always stage when the A row stride crosses a page: TILELOADD of 16 rows at a
+             * multi-KiB stride touches 16 pages per tile (act buffers < 2 MiB are not THP-backed),
+             * and the tile loop re-reads A per strip; staged rows are 1 KiB apart. */
+            if (g->rms || (rows != 32u && rows != 16u) || (size_t)g->K * 2u > 4096u) {
                 plow_bf16* a = ap + (size_t)mb * (ABLK_BYTES / 2u);
                 stage_a(a, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL,
                         g->gamma);

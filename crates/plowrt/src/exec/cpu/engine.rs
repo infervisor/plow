@@ -40,7 +40,11 @@ unsafe impl Sync for HostTensor {}
 
 impl HostTensor {
     fn alloc(bytes: usize, zeroed: bool) -> Result<HostTensor> {
-        let align = if bytes >= HUGE { HUGE } else { ALIGN };
+        // Tensors from 256 KiB up are rounded to whole huge pages: the prefill A operands
+        // (e.g. 128 x 3840 bf16 = 960 KiB) sit below 2 MiB yet are tile-loaded at a multi-KiB
+        // row stride, where 4 KiB pages cost a TLB miss per tile row. Slack <= 2 MiB each.
+        let huge = bytes >= HUGE / 8;
+        let align = if huge { HUGE } else { ALIGN };
         let size = bytes.max(1).next_multiple_of(align);
         let layout = Layout::from_size_align(size, align)
             .map_err(|e| RuntimeError::Oom(format!("tensor layout {bytes} B: {e}")))?;
@@ -56,7 +60,7 @@ impl HostTensor {
             return Err(RuntimeError::Oom(format!("host tensor {bytes} B")));
         }
         #[cfg(target_os = "linux")]
-        if bytes >= HUGE {
+        if huge {
             // Best effort; a refusal costs TLB misses, not correctness.
             // SAFETY: ptr/size describe our own mapping.
             unsafe { libc::madvise(ptr as *mut c_void, size, libc::MADV_HUGEPAGE) };
@@ -196,7 +200,11 @@ impl CpuModel {
         // flag guards against cannot happen here.
         let blob = DevBlob::parse_l2(&raw, true)?;
         // PLOW_FP8_DIR (the `--fp8-dir` runtime flag) names the fp8 weight-twin directory.
-        let twin = std::env::var_os("PLOW_FP8_DIR").map(std::path::PathBuf::from);
+        // PLOW_MXFP4_DIR names the mxfp4 twin (`mxfp4/<name>` e2m1 + `_scale` E8M0 rows,
+        // perf-data/tools/quantize_mxfp4.py); the two axes are exclusive at emit time.
+        let twin = std::env::var_os("PLOW_FP8_DIR")
+            .or_else(|| std::env::var_os("PLOW_MXFP4_DIR"))
+            .map(std::path::PathBuf::from);
         let ckpt = Checkpoint::open_with_twin(checkpoint, twin.as_deref())?;
 
         // Kernels first: a missing op is a cheap, loud failure — before 20 GiB of copies.
@@ -620,18 +628,31 @@ pub fn plan_chunks(buckets: &[(usize, u32)], n_prompt: u32) -> Vec<Chunk> {
     let mut out = Vec::new();
     let mut c0 = 0u32;
     while c0 < n_prompt {
-        let rem = n_prompt - c0;
-        let &(prog, t) = buckets
-            .iter()
-            .filter(|(_, t)| *t >= rem)
-            .min_by_key(|(_, t)| *t)
-            .or_else(|| buckets.iter().max_by_key(|(_, t)| *t))
-            .expect("at least one prefill bucket");
-        let clen = rem.min(t);
-        out.push(Chunk { prog, c0, clen });
-        c0 += clen;
+        let ch = next_chunk(buckets, n_prompt, c0, u32::MAX);
+        c0 += ch.clen;
+        out.push(ch);
     }
     out
+}
+
+/// The next chunk of an `n_prompt`-token prefill whose rows `[0, c0)` are done, with at most
+/// `cap` rows this call: among the buckets not wider than `cap` (all of them if `cap` is
+/// below the narrowest — a chunk must fit SOME compiled program), the smallest that holds the
+/// remainder, else the widest. `cap == u32::MAX` reproduces [`plan_chunks`]'s steps.
+pub fn next_chunk(buckets: &[(usize, u32)], n_prompt: u32, c0: u32, cap: u32) -> Chunk {
+    let rem = n_prompt - c0;
+    let pick = |allowed: &dyn Fn(u32) -> bool| {
+        buckets
+            .iter()
+            .filter(|(_, t)| allowed(*t) && *t >= rem)
+            .min_by_key(|(_, t)| *t)
+            .or_else(|| buckets.iter().filter(|(_, t)| allowed(*t)).max_by_key(|(_, t)| *t))
+            .copied()
+    };
+    let (prog, t) = pick(&|t| t <= cap)
+        .or_else(|| pick(&|_| true))
+        .expect("at least one prefill bucket");
+    Chunk { prog, c0, clen: rem.min(t) }
 }
 
 /// A loaded model + its persistent worker pool: single sequence, greedy
@@ -750,20 +771,44 @@ impl CpuEngine {
                 self.max_ctx
             )));
         }
-        let buckets: Vec<(usize, u32)> = (0..self.model.dec_ix)
-            .map(|i| (i, self.model.blob.progs[i].t))
-            .collect();
+        let buckets = self.prefill_buckets();
         if buckets.is_empty() {
             return Err(RuntimeError::Device("blob has no prefill program".into()));
+        }
+        let plan = plan_chunks(&buckets, prompt.len() as u32);
+        tracing::info!(tokens = prompt.len(), chunks = ?plan, "prefill plan");
+        for ch in plan {
+            self.prefill_chunk(prompt, ch)?;
+        }
+        self.last_token()
+    }
+
+    /// The compiled prefill buckets as `(program, rows)`.
+    pub fn prefill_buckets(&self) -> Vec<(usize, u32)> {
+        (0..self.model.dec_ix)
+            .map(|i| (i, self.model.blob.progs[i].t))
+            .collect()
+    }
+
+    /// The argmax the last prefill chunk (or decode step) left in `in.ids[0]`.
+    pub fn last_token(&self) -> Result<u32> {
+        let t_ids = self.need(self.model.wk.ids, "in.ids")?;
+        Ok(self.model.read_u32(t_ids))
+    }
+
+    /// Run ONE prefill chunk: rows `[ch.c0, ch.c0 + ch.clen)` of `prompt` on program `ch.prog`
+    /// (KV rows written at their absolute positions, flash window `[0, c0 + clen)`). After the
+    /// chunk that covers the last token, [`Self::last_token`] is the first generated token.
+    pub fn prefill_chunk(&mut self, prompt: &[u32], ch: Chunk) -> Result<()> {
+        if ch.prog >= self.model.dec_ix || (ch.c0 + ch.clen) as usize > prompt.len() || ch.clen == 0 {
+            return Err(RuntimeError::Device(format!("bad prefill chunk {ch:?}")));
         }
         let (t_ids, t_pos, t_kvlen) = (
             self.need(self.model.wk.ids, "in.ids")?,
             self.need(self.model.wk.pos, "in.pos")?,
             self.need(self.model.wk.kvlen, "in.kvlen")?,
         );
-        let plan = plan_chunks(&buckets, prompt.len() as u32);
-        tracing::info!(tokens = prompt.len(), chunks = ?plan, "prefill plan");
-        for ch in plan {
+        {
             let t = self.model.blob.progs[ch.prog].t;
             // Inputs: ids (padded), positions, kv length after this chunk.
             {
@@ -793,7 +838,7 @@ impl CpuEngine {
             }
             self.run_prog(ch.prog)?;
         }
-        Ok(self.model.read_u32(t_ids))
+        Ok(())
     }
 
     /// Decode sequence slots.
@@ -811,6 +856,14 @@ impl CpuEngine {
     pub fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
         self.model.kv_rebase(slot)?;
         let r = self.prefill(prompt);
+        self.model.kv_rebase(0)?;
+        r
+    }
+
+    /// One chunk of a slot prefill (same rebase/restore discipline as [`Self::prefill_slot`]).
+    pub fn prefill_slot_chunk(&mut self, slot: usize, prompt: &[u32], ch: Chunk) -> Result<()> {
+        self.model.kv_rebase(slot)?;
+        let r = self.prefill_chunk(prompt, ch);
         self.model.kv_rebase(0)?;
         r
     }

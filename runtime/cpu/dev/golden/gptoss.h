@@ -7,6 +7,9 @@
 
 /* gptoss.c: t0=C t1=x t2=W(fp4 [N][K/2]) t3=S(e8m0 [N][K/32])  i0=M i1=N i2=K */
 G_K(g_gemv_mxfp4);
+/* gptoss.c: fused gate|up GEMV+GLU (op 92): t0=C t1=x t2=Wg t5=Wu t3=Sg t4=Su i0=M i1=N i2=K
+ * i5=act (0 GeGLU tanh, 1 SwiGLU). C = act(g) * u; the mxfp4 twin of GEMV_GLU_FP8. */
+G_K(g_gemv_glu_mxfp4);
 
 /* moe.c — routing table entry (dev_isa.h: {u32 eid, f32 gate}, PLOW_EXPERT_UNUSED = skip). */
 typedef struct {

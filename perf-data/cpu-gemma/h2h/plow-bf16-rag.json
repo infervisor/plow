@@ -1,0 +1,444 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8096",
+  "model": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+  "server_models": [
+   "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+  ],
+  "timestamp": "2026-09-06T00:48:14+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 4,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8096",
+   "--model",
+   "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+   "--workload",
+   "rag_4k",
+   "--concurrency",
+   "1,2",
+   "--requests",
+   "4",
+   "--max-tokens",
+   "64",
+   "--tokenizer",
+   "/home/lava/.claude/jobs/c77c21db/tmp/g12b-mi350-16",
+   "--out",
+   "/home/lava/plow/.claude/worktrees/cpu-backend/perf-data/cpu-gemma/h2h/plow-bf16-rag.json",
+   "--md",
+   "/home/lava/plow/.claude/worktrees/cpu-backend/perf-data/cpu-gemma/h2h/plow-bf16-rag.md"
+  ]
+ },
+ "runs": [
+  {
+   "workload": "rag_4k",
+   "concurrency": 1,
+   "agg": {
+    "n": 4,
+    "ok": 4,
+    "errors": 0,
+    "wall_s": 156.84404363200156,
+    "ttft_s": {
+     "mean": 24.69708446225013,
+     "p50": 25.945566811999015,
+     "p90": 26.76198160200147,
+     "n": 4
+    },
+    "tpot_s": {
+     "mean": 0.2551200775992777,
+     "p50": 0.2507416442221492,
+     "p90": 0.26902590284127714,
+     "n": 4
+    },
+    "latency_s": {
+     "mean": 39.205041769750096,
+     "p50": 39.712484335002955,
+     "p90": 43.71071635500266,
+     "n": 4
+    },
+    "prompt_tokens": {
+     "mean": 3094.0,
+     "p50": 3195,
+     "p90": 3306,
+     "n": 4
+    },
+    "output_tokens": {
+     "mean": 57.0,
+     "p50": 55,
+     "p90": 64,
+     "n": 4
+    },
+    "output_tokens_total": 228,
+    "output_tok_per_s": 1.4536733096154388,
+    "req_per_s": 0.025503040519569104,
+    "finish_reasons": {
+     "length": 1,
+     "stop": 3
+    }
+   },
+   "by_kind": {
+    "rag_4k": {
+     "n": 4,
+     "ok": 4,
+     "errors": 0,
+     "wall_s": 156.84404363200156,
+     "ttft_s": {
+      "mean": 24.69708446225013,
+      "p50": 25.945566811999015,
+      "p90": 26.76198160200147,
+      "n": 4
+     },
+     "tpot_s": {
+      "mean": 0.2551200775992777,
+      "p50": 0.2507416442221492,
+      "p90": 0.26902590284127714,
+      "n": 4
+     },
+     "latency_s": {
+      "mean": 39.205041769750096,
+      "p50": 39.712484335002955,
+      "p90": 43.71071635500266,
+      "n": 4
+     },
+     "prompt_tokens": {
+      "mean": 3094.0,
+      "p50": 3195,
+      "p90": 3306,
+      "n": 4
+     },
+     "output_tokens": {
+      "mean": 57.0,
+      "p50": 55,
+      "p90": 64,
+      "n": 4
+     },
+     "output_tokens_total": 228,
+     "output_tok_per_s": 1.4536733096154388,
+     "req_per_s": 0.025503040519569104,
+     "finish_reasons": {
+      "length": 1,
+      "stop": 3
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 26.76198160200147,
+     "tpot_s": 0.26902590284127714,
+     "latency_s": 43.71071635500266,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 3323,
+      "completion_tokens": 64,
+      "total_tokens": 3387,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The tides affect the length of the day and the distance to the Moon through fric",
+     "text_chars": 315,
+     "index": 0,
+     "kind": "rag_4k",
+     "t_start": 1788655728.2853317,
+     "prompt_tokens_client": 3306,
+     "prompt_tokens_server": 3323,
+     "prompt_chars": 16217,
+     "prompt_tokens": 3306
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 25.945566811999015,
+     "tpot_s": 0.25003514531487814,
+     "latency_s": 39.712484335002955,
+     "output_tokens": 55,
+     "content_chunks": 54,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 3212,
+      "completion_tokens": 55,
+      "total_tokens": 3267,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "During the roasting process, the first crack occurs when the internal pressure o",
+     "text_chars": 284,
+     "index": 1,
+     "kind": "rag_4k",
+     "t_start": 1788655772.0024784,
+     "prompt_tokens_client": 3195,
+     "prompt_tokens_server": 3212,
+     "prompt_chars": 15413,
+     "prompt_tokens": 3195
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 21.966051597999467,
+     "tpot_s": 0.25067761801880617,
+     "latency_s": 35.49803881799744,
+     "output_tokens": 54,
+     "content_chunks": 53,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 2822,
+      "completion_tokens": 54,
+      "total_tokens": 2876,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Coffee is harvested largely by hand because the cherries on a single branch ripe",
+     "text_chars": 271,
+     "index": 2,
+     "kind": "rag_4k",
+     "t_start": 1788655811.720968,
+     "prompt_tokens_client": 2805,
+     "prompt_tokens_server": 2822,
+     "prompt_chars": 13528,
+     "prompt_tokens": 2805
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 24.114737837000575,
+     "tpot_s": 0.2507416442221492,
+     "latency_s": 37.89892757099733,
+     "output_tokens": 55,
+     "content_chunks": 54,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 3087,
+      "completion_tokens": 55,
+      "total_tokens": 3142,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Fixed costs deserve the most scrutiny because they are the hardest to change. Th",
+     "text_chars": 237,
+     "index": 3,
+     "kind": "rag_4k",
+     "t_start": 1788655847.2242467,
+     "prompt_tokens_client": 3070,
+     "prompt_tokens_server": 3087,
+     "prompt_chars": 15079,
+     "prompt_tokens": 3070
+    }
+   ]
+  },
+  {
+   "workload": "rag_4k",
+   "concurrency": 2,
+   "agg": {
+    "n": 4,
+    "ok": 4,
+    "errors": 0,
+    "wall_s": 132.84931310899992,
+    "ttft_s": {
+     "mean": 31.53534668249995,
+     "p50": 26.05972623299749,
+     "p90": 52.743037872998684,
+     "n": 4
+    },
+    "tpot_s": {
+     "mean": 0.6049363661392011,
+     "p50": 0.7475468342075506,
+     "p90": 0.7577602837408011,
+     "n": 4
+    },
+    "latency_s": {
+     "mean": 65.64512403674962,
+     "p50": 67.23991059500258,
+     "p90": 92.59313001099508,
+     "n": 4
+    },
+    "prompt_tokens": {
+     "mean": 3094.0,
+     "p50": 3195,
+     "p90": 3306,
+     "n": 4
+    },
+    "output_tokens": {
+     "mean": 57.0,
+     "p50": 55,
+     "p90": 64,
+     "n": 4
+    },
+    "output_tokens_total": 228,
+    "output_tok_per_s": 1.7162301758604581,
+    "req_per_s": 0.03010930133088523,
+    "finish_reasons": {
+     "length": 1,
+     "stop": 3
+    }
+   },
+   "by_kind": {
+    "rag_4k": {
+     "n": 4,
+     "ok": 4,
+     "errors": 0,
+     "wall_s": 132.84931310899992,
+     "ttft_s": {
+      "mean": 31.53534668249995,
+      "p50": 26.05972623299749,
+      "p90": 52.743037872998684,
+      "n": 4
+     },
+     "tpot_s": {
+      "mean": 0.6049363661392011,
+      "p50": 0.7475468342075506,
+      "p90": 0.7577602837408011,
+      "n": 4
+     },
+     "latency_s": {
+      "mean": 65.64512403674962,
+      "p50": 67.23991059500258,
+      "p90": 92.59313001099508,
+      "n": 4
+     },
+     "prompt_tokens": {
+      "mean": 3094.0,
+      "p50": 3195,
+      "p90": 3306,
+      "n": 4
+     },
+     "output_tokens": {
+      "mean": 57.0,
+      "p50": 55,
+      "p90": 64,
+      "n": 4
+     },
+     "output_tokens_total": 228,
+     "output_tok_per_s": 1.7162301758604581,
+     "req_per_s": 0.03010930133088523,
+     "finish_reasons": {
+      "length": 1,
+      "stop": 3
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 52.743037872998684,
+     "tpot_s": 0.6325403240159161,
+     "latency_s": 92.59313001099508,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 3323,
+      "completion_tokens": 64,
+      "total_tokens": 3387,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The tides affect the length of the day and the distance to the Moon through fric",
+     "text_chars": 315,
+     "index": 0,
+     "kind": "rag_4k",
+     "t_start": 1788655918.932944,
+     "prompt_tokens_client": 3306,
+     "prompt_tokens_server": 3323,
+     "prompt_chars": 16217,
+     "prompt_tokens": 3306
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 26.05972623299749,
+     "tpot_s": 0.7577602837408011,
+     "latency_s": 67.23991059500258,
+     "output_tokens": 55,
+     "content_chunks": 54,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 3212,
+      "completion_tokens": 55,
+      "total_tokens": 3267,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "During the roasting process, the first crack occurs when the internal pressure o",
+     "text_chars": 281,
+     "index": 1,
+     "kind": "rag_4k",
+     "t_start": 1788655918.9332676,
+     "prompt_tokens_client": 3195,
+     "prompt_tokens_server": 3212,
+     "prompt_chars": 15413,
+     "prompt_tokens": 3195
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 22.603447815003165,
+     "tpot_s": 0.7475468342075506,
+     "latency_s": 62.510507454004255,
+     "output_tokens": 54,
+     "content_chunks": 53,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 2822,
+      "completion_tokens": 54,
+      "total_tokens": 2876,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Coffee is harvested largely by hand because the cherries on a single branch ripe",
+     "text_chars": 271,
+     "index": 2,
+     "kind": "rag_4k",
+     "t_start": 1788655986.1815243,
+     "prompt_tokens_client": 2805,
+     "prompt_tokens_server": 2822,
+     "prompt_chars": 13528,
+     "prompt_tokens": 2805
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 24.735174809000455,
+     "tpot_s": 0.2818980225925366,
+     "latency_s": 40.23694808699656,
+     "output_tokens": 55,
+     "content_chunks": 54,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 3087,
+      "completion_tokens": 55,
+      "total_tokens": 3142,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Fixed costs deserve the most scrutiny because they are the hardest to change. Th",
+     "text_chars": 237,
+     "index": 3,
+     "kind": "rag_4k",
+     "t_start": 1788656011.539097,
+     "prompt_tokens_client": 3070,
+     "prompt_tokens_server": 3087,
+     "prompt_chars": 15079,
+     "prompt_tokens": 3070
+    }
+   ]
+  }
+ ]
+}

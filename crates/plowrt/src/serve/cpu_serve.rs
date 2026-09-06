@@ -1,7 +1,8 @@
-//! The CPU engine behind a served slug: `batch` sequence slots, whole-prompt
-//! prefill into a slot, one batched greedy decode step per tick — the same
-//! shape as the single-GPU AMD engine, so it rides the mux's [`SeqEngine`] tick
-//! unchanged. Slot `i` of the mux IS engine slot `i`.
+//! The CPU engine behind a served slug: `batch` sequence slots, chunked prefill
+//! into a slot (one compiled bucket per tick, capped by the mux's interleave
+//! budget and `PLOW_CPU_PF_CHUNK`), one batched greedy decode step per tick —
+//! the same shape as the single-GPU AMD engine, so it rides the mux's
+//! [`SeqEngine`] tick unchanged. Slot `i` of the mux IS engine slot `i`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use packet::dev::PrefillSpan;
 
 use super::engine::SeqEngine;
-use crate::exec::cpu::engine::{CpuEngine, CpuEngineOpts};
+use crate::exec::cpu::engine::{next_chunk, CpuEngine, CpuEngineOpts};
 use crate::{Result, RuntimeError};
 
 pub struct CpuServe {
@@ -27,6 +28,13 @@ pub struct CpuServe {
     kvlen_stage: Vec<u32>,
     last_rung: u32,
     max_ctx: usize,
+    /// Prompt rows already prefilled per slot (0 = no chunked prefill in flight).
+    pf_pos: Vec<u32>,
+    /// Compiled prefill buckets `(program, rows)`.
+    buckets: Vec<(usize, u32)>,
+    /// Largest chunk one tick may prefill while other slots decode (`PLOW_CPU_PF_CHUNK`,
+    /// default 256): bounds the decode stall of the live slots to one chunk's prefill.
+    pf_chunk: u32,
 }
 
 impl CpuServe {
@@ -37,10 +45,18 @@ impl CpuServe {
         let max_ctx = eng.max_ctx();
         let batch = eng.batch();
         let decode_rungs = eng.decode_rungs().into_boxed_slice();
+        let buckets = eng.prefill_buckets();
+        let pf_chunk = std::env::var("PLOW_CPU_PF_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(256);
         tracing::info!(
             max_ctx,
             batch,
             rungs = ?decode_rungs,
+            prefill_buckets = ?buckets,
+            pf_chunk,
             threads = eng.threads,
             isa = ?eng.isa,
             stop_ids = ?ids,
@@ -58,6 +74,9 @@ impl CpuServe {
             kvlen_stage: vec![1; batch],
             last_rung: 0,
             max_ctx,
+            pf_pos: vec![0; batch],
+            buckets,
+            pf_chunk,
         })
     }
 
@@ -88,8 +107,7 @@ impl CpuServe {
         Ok(())
     }
 
-    /// Whole-prompt prefill into `slot`; returns the first generated token.
-    pub fn prefill(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+    fn check_prompt(&self, slot: usize, prompt: &[u32]) -> Result<()> {
         self.check_slot(slot)?;
         if prompt.is_empty() {
             return Err(RuntimeError::Rejected("empty prompt".into()));
@@ -101,11 +119,44 @@ impl CpuServe {
                 self.max_ctx
             )));
         }
-        let tok = self.eng.prefill_slot(slot, prompt)?;
+        Ok(())
+    }
+
+    fn admit_prefilled(&mut self, slot: usize, prompt: &[u32], tok: u32) {
+        self.pf_pos[slot] = 0;
         self.pos[slot] = prompt.len() as u32;
         self.live[slot] = true;
         self.next_id[slot] = tok;
+    }
+
+    /// Whole-prompt prefill into `slot`; returns the first generated token.
+    pub fn prefill(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+        self.check_prompt(slot, prompt)?;
+        let tok = self.eng.prefill_slot(slot, prompt)?;
+        self.admit_prefilled(slot, prompt, tok);
         Ok(tok)
+    }
+
+    /// One prefill chunk of at most `cap` rows into `slot`; `Ok(Some(tok))` once the prompt is
+    /// covered. Between chunks the slot is NOT live: the batched step parks it on its frontier
+    /// row (see `dispatch`), so a decode tick in between cannot touch a finished KV row.
+    pub fn prefill_chunk(&mut self, slot: usize, prompt: &[u32], cap: u32) -> Result<Option<u32>> {
+        if self.pf_pos[slot] == 0 {
+            self.check_prompt(slot, prompt)?;
+        }
+        let n = prompt.len() as u32;
+        let ch = next_chunk(&self.buckets, n, self.pf_pos[slot], cap.max(1));
+        if let Err(e) = self.eng.prefill_slot_chunk(slot, prompt, ch) {
+            self.pf_pos[slot] = 0;
+            return Err(e);
+        }
+        self.pf_pos[slot] += ch.clen;
+        if self.pf_pos[slot] < n {
+            return Ok(None);
+        }
+        let tok = self.eng.last_token()?;
+        self.admit_prefilled(slot, prompt, tok);
+        Ok(Some(tok))
     }
 
     /// Embed `id` at the slot's position and return the greedy next token
@@ -136,8 +187,13 @@ impl CpuServe {
             self.next_id[s] = id;
         }
         for s in 0..self.batch {
+            // A slot mid-prefill is parked on its frontier row: the batched step's KV write
+            // for a non-fed slot lands on `pos`, and the frontier row is exactly the one the
+            // next chunk rewrites — rows `[0, pf_pos)` stay intact. Idle slots park on row 0.
             let (p, k) = if self.live[s] {
                 (self.pos[s], self.pos[s] + 1)
+            } else if self.pf_pos[s] > 0 {
+                (self.pf_pos[s], self.pf_pos[s] + 1)
             } else {
                 (0, 1)
             };
@@ -171,6 +227,7 @@ impl CpuServe {
         if slot < self.batch {
             self.live[slot] = false;
             self.pos[slot] = 0;
+            self.pf_pos[slot] = 0;
         }
     }
 }
@@ -208,17 +265,26 @@ impl SeqEngine for CpuServe {
         ))
     }
 
-    fn prefill_frontier(&self, _slot: usize) -> Option<usize> {
-        None
+    fn prefill_frontier(&self, slot: usize) -> Option<usize> {
+        (slot < self.batch).then(|| self.pf_pos[slot] as usize)
     }
 
+    /// `tick_max_bucket` is the mux's interleave budget (u32::MAX when no slot decodes, so a
+    /// lone prompt still prefills in one tick); `pf_chunk` caps it further on the CPU, where a
+    /// 1105-token whole-prompt prefill stalled every live decode ~7 s (measured: c=8
+    /// summarize TPOT 933 ms vs 250 at c=1).
     fn prefill_chunked_at_most(
         &mut self,
         slot: usize,
         prompt: &[u32],
-        _tick_max_bucket: u32,
+        tick_max_bucket: u32,
     ) -> Result<Option<u32>> {
-        self.prefill(slot, prompt).map(Some)
+        let cap = if tick_max_bucket == u32::MAX {
+            u32::MAX
+        } else {
+            tick_max_bucket.min(self.pf_chunk)
+        };
+        self.prefill_chunk(slot, prompt, cap)
     }
 
     fn multistep_quantum(&self, _feeds: &[(usize, u32)], _requested: usize) -> Option<usize> {

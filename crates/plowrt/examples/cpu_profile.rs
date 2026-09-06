@@ -26,8 +26,10 @@ fn main() {
     let mut opts = CpuEngineOpts::default();
     let mut n_prompt = 64usize;
     let mut do_prefill = false;
+    let mut batch = 1usize;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--batch" => batch = args.next().unwrap().parse().unwrap(),
             "--threads" => opts.threads = args.next().unwrap().parse().unwrap(),
             "--spin-us" => opts.spin_us = args.next().unwrap().parse().unwrap(),
             "--prompt-tokens" => n_prompt = args.next().unwrap().parse().unwrap(),
@@ -105,6 +107,34 @@ fn main() {
     }
     let first = eng.prefill(&ids).expect("prefill");
     let mut pos = ids.len() as u32;
+    if batch > 1 {
+        // Timing-only: every slot is stepped at the same position with the same token (only
+        // slot 0 holds a real KV block; the rest attend over whatever their block contains).
+        let b = eng.batch();
+        let bb = batch.min(b);
+        let mut pos_v = vec![0u32; b];
+        let mut kv_v = vec![1u32; b];
+        let id_v = vec![first; b];
+        for s in 0..bb {
+            pos_v[s] = pos;
+            kv_v[s] = pos + 1;
+        }
+        let dp = eng.model().decode_prog_for(bb);
+        let _ = eng.decode_step_batched_at(&pos_v, &kv_v, &id_v, dp).expect("warm decode");
+        for s in 0..bb {
+            pos_v[s] += 1;
+            kv_v[s] += 1;
+        }
+        trace_begin();
+        let t = Instant::now();
+        let out = eng.decode_step_batched_at(&pos_v, &kv_v, &id_v, dp).expect("decode");
+        let wall = t.elapsed().as_secs_f64() * 1e3;
+        let evs = trace_take();
+        let insts = eng.model().blob.progs[dp].insts.clone();
+        report(&format!("decode step B={bb} (rung program {dp})"), &evs, &insts, wall, eng.threads);
+        println!("tokens: first {first} next {:?}", &out[..bb]);
+        return;
+    }
     let _ = eng.decode_step(pos, pos + 1).expect("warm decode");
     pos += 1;
     trace_begin();

@@ -126,6 +126,44 @@ static double ref_swiglu(double g, double u) {
     return g / (1.0 + exp(-ALPHA * g)) * (u + 1.0);
 }
 
+/* ---- GEMV_GLU_MXFP4 (92): C = act(g) * u, gate/up fp4 with their own E8M0 rows ---- */
+static void test_gemv_glu_mxfp4(uint32_t M, uint32_t N, uint32_t K, uint32_t act) {
+    plow_bf16* x = xmalloc((size_t)M * K * 2);
+    uint8_t *Wg = xmalloc((size_t)N * K / 2), *Wu = xmalloc((size_t)N * K / 2);
+    uint8_t *Sg = xmalloc((size_t)N * K / 32), *Su = xmalloc((size_t)N * K / 32);
+    plow_bf16 *Cref = xmalloc((size_t)M * N * 2), *Cg = xmalloc((size_t)M * N * 2), *Cv = xmalloc((size_t)M * N * 2);
+    fill_bf16(x, (size_t)M * K, 1.0f);
+    fill_fp4(Wg, (size_t)N * K / 2); fill_fp4(Wu, (size_t)N * K / 2);
+    fill_e8m0(Sg, (size_t)N * K / 32); fill_e8m0(Su, (size_t)N * K / 32);
+    for (uint32_t m = 0; m < M; m++)
+        for (uint32_t n = 0; n < N; n++) {
+            const double g = ref_mx_dot(Wg, Sg, n, K, x + (size_t)m * K), u = ref_mx_dot(Wu, Su, n, K, x + (size_t)m * K);
+            const double a = act == 1u ? g / (1.0 + exp(-g)) : 0.5 * g * (1.0 + tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)));
+            Cref[(size_t)m * N + n] = plow_f2bf((float)(a * u));
+        }
+    void* T[8] = {Cg, x, Wg, Sg, Su, Wu, NULL, NULL};
+    PlowDevInst in = inst(PLOW_DOP_GEMV_GLU_MXFP4);
+    in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[3] = 3; in.t[4] = 4; in.t[5] = 5;
+    in.i[0] = M; in.i[1] = N; in.i[2] = K; in.i[5] = act;
+    PlowCpuCtx ctx = mkctx();
+    char what[160];
+    for (size_t bi = 0; bi < NNB; bi++) {
+        const uint32_t nblk = NBLKS[bi];
+        memset(Cg, 0, (size_t)M * N * 2);
+        run_all(g_gemv_glu_mxfp4, &in, nblk, T, &ctx);
+        snprintf(what, sizeof what, "GEMV_GLU_MXFP4 golden M=%u N=%u K=%u act=%u nblk=%u", M, N, K, act, nblk);
+        cmp(what, Cref, Cg, (size_t)M * N, 2e-2f);
+        if (have_v) {
+            T[0] = Cv; memset(Cv, 0, (size_t)M * N * 2);
+            run_all(plow_cpu_kernel(PLOW_DOP_GEMV_GLU_MXFP4), &in, nblk, T, &ctx);
+            T[0] = Cg;
+            snprintf(what, sizeof what, "GEMV_GLU_MXFP4 avx512 vs golden M=%u act=%u nblk=%u", M, act, nblk);
+            cmp(what, Cg, Cv, (size_t)M * N, 1e-2f);
+        }
+    }
+    free(x); free(Wg); free(Wu); free(Sg); free(Su); free(Cref); free(Cg); free(Cv); free(ctx.scratch);
+}
+
 /* ---- GEMV_MXFP4 (91) ---- */
 static void test_gemv_mxfp4(uint32_t M, uint32_t N, uint32_t K) {
     plow_bf16* x = xmalloc((size_t)M * K * 2);
@@ -746,7 +784,7 @@ int main(int argc, char** argv) {
            plow_cpu_tier_of(PLOW_DOP_MOE_DOWN_MX_PF), plow_cpu_tier_of(PLOW_DOP_GEMV),
            plow_cpu_tier_of(PLOW_DOP_GEMM), plow_cpu_tier_of(PLOW_DOP_GEMM_GLU),
            plow_cpu_tier_of(PLOW_DOP_FLASH_MERGE), plow_cpu_tier_of(PLOW_DOP_HEADNORM_ROPE));
-    const uint16_t need[] = {PLOW_DOP_GEMV_MXFP4, PLOW_DOP_MOE_GLU_MX, PLOW_DOP_MOE_DOWN_MX,
+    const uint16_t need[] = {PLOW_DOP_GEMV_MXFP4, PLOW_DOP_GEMV_GLU_MXFP4, PLOW_DOP_MOE_GLU_MX, PLOW_DOP_MOE_DOWN_MX,
                              PLOW_DOP_MOE_GLU_MX_PF, PLOW_DOP_MOE_DOWN_MX_PF};
     for (size_t i = 0; i < sizeof(need) / sizeof(*need); i++)
         if (!plow_cpu_has(need[i])) { printf("missing op %u\n", need[i]); fails++; }
@@ -757,6 +795,9 @@ int main(int argc, char** argv) {
     test_gemv_mxfp4(8, 100, 2880);   /* N tail vs RB, M > 4 */
     test_gemv_mxfp4(1, 64, 2912);    /* K % 64 == 32 tail block */
     test_gemv_mxfp4(3, 32, 2880);    /* router shape */
+    test_gemv_glu_mxfp4(1, 256, 3840, 0);  /* Gemma GeGLU decode */
+    test_gemv_glu_mxfp4(4, 100, 3840, 1);  /* SwiGLU, N tail vs RB */
+    test_gemv_glu_mxfp4(8, 64, 2912, 0);   /* M > 4, K % 64 == 32 */
     test_gemv_bias(1, 4096, 2880);   /* q_proj */
     test_gemv_bias(4, 512, 2880);    /* k/v_proj, batch */
     test_gemv_bias(1, 32, 2880);     /* router */

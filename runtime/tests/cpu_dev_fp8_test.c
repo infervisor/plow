@@ -22,12 +22,15 @@ static float frand(void) {
 static void fill_bf16(plow_bf16* p, size_t n, float scale) {
     for (size_t i = 0; i < n; i++) p[i] = plow_f2bf(frand() * scale);
 }
-/* Random finite e4m3 codes (never 0x7f / 0xff). */
+/* Random finite e4m3 codes: never NaN (0x7f / 0xff) and never a NONZERO subnormal (e == 0,
+ * m != 0): the vector tiers decode those 7 codes as 0 (fp8_common.h — 1e-4 of real fp8 weights,
+ * |v| <= 7 * 2^-9), while golden keeps them exact. +-0 stays in the mix (exact everywhere). */
 static void fill_fp8(uint8_t* p, size_t n) {
     for (size_t i = 0; i < n; i++) {
         rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
         uint8_t b = (uint8_t)(rng >> 56);
         if ((b & 0x7f) == 0x7f) b &= 0xfe;
+        if ((b & 0x78) == 0 && (b & 0x07) != 0) b |= 0x08; /* subnormal -> smallest normal */
         p[i] = b;
     }
 }

@@ -36,6 +36,7 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_FLASH_MERGE] = g_flash_merge;
     tab[PLOW_DOP_ATTN_RES] = g_attn_res;
     tab[PLOW_DOP_GEMV_MXFP4] = g_gemv_mxfp4;
+    tab[PLOW_DOP_GEMV_GLU_MXFP4] = g_gemv_glu_mxfp4;
     tab[PLOW_DOP_MOE_GLU_MX] = g_moe_glu_mx;
     tab[PLOW_DOP_MOE_DOWN_MX] = g_moe_down_mx;
     tab[PLOW_DOP_MOE_GLU_MX_PF] = g_moe_glu_mx_pf;
