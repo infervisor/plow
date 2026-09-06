@@ -258,6 +258,10 @@ fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
     }
 }
 
+fn decode_feed_extent(feeds: &[(usize, u32)]) -> Option<usize> {
+    feeds.iter().map(|&(slot, _)| slot + 1).max()
+}
+
 impl ModelMux {
     /// Submit a job. Returns immediately; the caller awaits the stream.
     pub fn submit(&self, job: Job) -> std::result::Result<(), SubmitError> {
@@ -701,21 +705,16 @@ pub fn spawn(
             if live == 0 {
                 continue;
             }
-            let (service_capacity, tick_rung) = if let Some(controller) = rung_controller.as_ref() {
+            let service_capacity = if let Some(controller) = rung_controller.as_ref() {
                 let occupied_extent = slots
                     .iter()
                     .rposition(Option::is_some)
                     .map(|i| i + 1)
                     .unwrap_or(1);
                 let service_rung = controller.covering(occupied_extent);
-                let width = controller.width(service_rung);
-                let tick_rung = slots
-                    .iter()
-                    .rposition(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
-                    .map(|i| controller.covering(i + 1));
-                (width, tick_rung)
+                controller.width(service_rung)
             } else {
-                (capacity, None)
+                capacity
             };
 
             // Pick the covering bucket for (Decode, live, max seq requirement)
@@ -896,15 +895,17 @@ pub fn spawn(
                     tokens_produced,
                     did_prefill,
                     tick_fault,
+                    fed_extent,
                 )) => {
                     // Decode-service EWMA: prefill ticks are excluded — see
                     // `service_sample`. Updating on them poisons the admission
                     // predictor and sheds live decode streams.
                     if let Some(sample) = service_sample(ms, did_prefill) {
                         load.service_ms.update(sample);
-                        if let (Some(controller), Some(rung)) =
-                            (rung_controller.as_mut(), tick_rung)
+                        if let (Some(controller), Some(extent)) =
+                            (rung_controller.as_mut(), fed_extent)
                         {
+                            let rung = controller.covering(extent);
                             metrics
                                 .decode_rung_actual
                                 .store(controller.width(rung) as u64, Ordering::Relaxed);
@@ -1216,6 +1217,9 @@ fn run_one_tick(
     // First device fault seen this tick — the dispatcher's EngineHealth
     // signal. Always `None` on the CPU reference path.
     Option<crate::DeviceErrorInfo>,
+    // Highest physical slot fed to decode, plus one. Empty decode ticks do
+    // not produce a rung sample.
+    Option<usize>,
 ) {
     let bucket = key.and_then(|k| bundle.bucket(k));
     let mut tokens_this_tick = 0usize;
@@ -1447,6 +1451,7 @@ fn run_one_tick(
 
             let pack_prefill_ns = pack_t.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
             let pack_had_feeds = !feeds.is_empty();
+            let fed_extent = decode_feed_extent(&feeds);
             let dec_t = packlog::on().then(Instant::now);
 
             // One batched decode launch for every slot already past prefill. The
@@ -1521,7 +1526,15 @@ fn run_one_tick(
                             feeds.len(),
                         );
                     }
-                    return (slots, bufs, obs, tokens_this_tick, did_prefill, tick_fault);
+                    return (
+                        slots,
+                        bufs,
+                        obs,
+                        tokens_this_tick,
+                        did_prefill,
+                        tick_fault,
+                        fed_extent,
+                    );
                 }
                 // Device sampling (plan stage 4): when the engine has a sampler,
                 // build a batch-wide spec array so eligible temperature>0 rows are
@@ -1633,7 +1646,15 @@ fn run_one_tick(
                     feeds.len(),
                 );
             }
-            return (slots, bufs, obs, tokens_this_tick, did_prefill, tick_fault);
+            return (
+                slots,
+                bufs,
+                obs,
+                tokens_this_tick,
+                did_prefill,
+                tick_fault,
+                fed_extent,
+            );
         }
 
         // gfx950: B independent sequence slots, one decode dispatch for all of
@@ -1851,7 +1872,7 @@ fn run_one_tick(
                 }
             }
             if did_prefill && no_interleave {
-                return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+                return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
             }
             if did_prefill {
                 let prefill_remains = slots[..b.min(slots.len())]
@@ -1859,7 +1880,7 @@ fn run_one_tick(
                     .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
                 if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
                     tracing::debug!("amd: decode deferred while prefill remains");
-                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                 }
             }
             let pending = amd_prefill_isolated_fallback(isolated, did_prefill);
@@ -1935,14 +1956,14 @@ fn run_one_tick(
                 }
                 did_prefill = true;
                 if no_interleave {
-                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                 }
                 let prefill_remains = slots[..b.min(slots.len())]
                     .iter()
                     .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
                 if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
                     tracing::debug!("amd: decode deferred while prefill remains");
-                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                 }
             }
 
@@ -1953,8 +1974,17 @@ fn run_one_tick(
                     Some((i, *s.out_ids.last()?))
                 })
                 .collect();
+            let fed_extent = decode_feed_extent(&feeds);
             if feeds.is_empty() {
-                return (slots, bufs, obs, tokens_this_tick, did_prefill, tick_fault);
+                return (
+                    slots,
+                    bufs,
+                    obs,
+                    tokens_this_tick,
+                    did_prefill,
+                    tick_fault,
+                    None,
+                );
             }
             let pk_t = packlog::on().then(Instant::now);
             let pk_rows = feeds.len();
@@ -2056,7 +2086,15 @@ fn run_one_tick(
             if let Some(t) = pk_t {
                 packlog::record(0, t.elapsed().as_nanos() as u64, false, true, pk_rows);
             }
-            return (slots, bufs, obs, tokens_this_tick, did_prefill, tick_fault);
+            return (
+                slots,
+                bufs,
+                obs,
+                tokens_this_tick,
+                did_prefill,
+                tick_fault,
+                fed_extent,
+            );
         }
 
         #[allow(unreachable_code)]
@@ -2153,7 +2191,7 @@ fn run_one_tick(
                     }
                 }
             }
-            return (slots, bufs, obs, tokens_this_tick, false, tick_fault);
+            return (slots, bufs, obs, tokens_this_tick, false, tick_fault, None);
         }
     }
 
@@ -2237,7 +2275,7 @@ fn run_one_tick(
         }
     }
 
-    (slots, bufs, obs, tokens_this_tick, false, tick_fault)
+    (slots, bufs, obs, tokens_this_tick, false, tick_fault, None)
 }
 
 #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
@@ -2987,6 +3025,17 @@ mod tests {
             poisoned.update(420.0);
         }
         assert!(poisoned.get() > 250.0, "control: unfiltered EWMA sheds");
+    }
+
+    #[test]
+    fn decode_rung_attribution_uses_only_fed_slots() {
+        let controller = RungController::new(DecodeRungs::new(&[1, 4], 4).unwrap());
+        let live_slots = [0usize, 3];
+        let feeds = [(live_slots[0], 7u32)];
+        let extent = decode_feed_extent(&feeds).unwrap();
+
+        assert_eq!(controller.width(controller.covering(extent)), 1);
+        assert_eq!(decode_feed_extent(&[]), None);
     }
 
     #[cfg(feature = "cuda")]
