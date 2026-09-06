@@ -9,6 +9,8 @@
 /// (segmented dispatch, three kernels, per-phase scheduler, static LDS).
 #[cfg(feature = "hsa")]
 pub mod amd;
+#[cfg(feature = "hsa")]
+mod amd_packed;
 /// N [`amd::AmdEngine`] ranks stepped as one: the host half of the inline
 /// collective. Decode is launch-all-then-drain-all; prefill is per-segment,
 /// all-ranks, with a host barrier — see the module note for why the two differ.
