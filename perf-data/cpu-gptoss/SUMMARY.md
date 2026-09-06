@@ -239,3 +239,57 @@ off by default. Fresh-prompt results; TTFT / TPOT mean ms:
 
 The opt-in path improves default MXFP4 decode from 24-25 ms to 22-23 ms at c=1 and
 from 142-288 ms to 110-246 ms at c=8. Sampled outputs remained coherent in this campaign.
+
+## After the MoE prefill epilogue and the flash-decode GQA fold (0d07dfa + 55f9e7f, 22:2x)
+
+Two kernel changes since the physical-core table above, both bit-identical:
+
+* `0d07dfa` transposes the 32x32 accumulator in both MXFP4 MoE prefill kernels so each token's 32
+  outputs leave as one vector store instead of up to 1024 scattered 2-byte stores, and gates
+  `dot_block`'s weight prefetch at the call site. The prefetch was walking 16 weight rows ahead into a
+  dequantized strip already resident in L2, which was pure overhead on the MXFP4 path; that gating was
+  worth more than the transpose. Prefill at 512 tokens 455 -> 470 tok/s.
+* `55f9e7f` folds the GQA head groups onto one K/V pass in flash decode. With `gqa=8` the four head
+  groups behind each kv head were separate work items re-reading the same K and V rows, so the kernel
+  was loading 868 MB to consume 241 MB. It was never bandwidth-starved -- it ran at ~73 GB/s into the
+  cores, essentially at this box's roofline -- it was moving 4x the bytes it needed. FLASH_DECODE went
+  16.61 -> 7.91 ms/thread and the batch-8, 1100-context decode step 118.0 -> 105.3 ms.
+
+Fresh prompts, one server at a time, 8 slots. TTFT / TPOT mean ms; bold = best of the three.
+
+| workload | conc | plow TTFT | llama TTFT | vLLM TTFT | plow TPOT | llama TPOT | vLLM TPOT |
+|---|---|---|---|---|---|---|---|
+| chat_short | 1 | **325** | 748 | 637 | **23** | 41 | 71 |
+| chat_short | 2 | **388** | 1625 | 1220 | **46** | 65 | 95 |
+| chat_short | 4 | **727** | 3059 | 1657 | **76** | 104 | 103 |
+| chat_short | 8 | **1782** | 5260 | 2120 | **130** | 177 | 136 |
+| chat_long | 1 | **858** | 4823 | 1346 | **25** | 51 | 71 |
+| chat_long | 2 | **1294** | 9520 | 1962 | **53** | 81 | 80 |
+| chat_long | 4 | **1580** | 14432 | 2550 | **92** | 133 | 102 |
+| chat_long | 8 | **3692** | 35666 | 4591 | 182 | 215 | **137** |
+| code | 1 | **723** | 4212 | 1253 | **25** | 50 | 76 |
+| code | 2 | **1369** | 8780 | 2151 | **51** | 73 | 81 |
+| code | 4 | **1668** | 18762 | 2944 | **94** | 123 | 115 |
+| code | 8 | **3773** | 35120 | 4156 | 163 | 207 | **152** |
+| summarize | 1 | 2469 | 10693 | **1829** | **26** | 59 | 71 |
+| summarize | 2 | **2427** | 23777 | 3593 | **78** | 113 | 85 |
+| summarize | 4 | **3073** | 57888 | 6735 | 163 | 195 | **116** |
+| summarize | 8 | 10037 | 73138 | **7219** | 279 | 430 | **153** |
+
+plow wins **all 32 cells against llama.cpp** and **26 of 32 against vLLM**, up from 24: 14 of 16 TTFT
+and 12 of 16 TPOT. The two newly won cells are chat_short TPOT at c=8 (130 vs 136) and summarize TPOT
+at c=2 (78 vs 85). Every TTFT cell improved, several by a third (chat_long c=4 2468 -> 1580, summarize
+c=4 4838 -> 3073).
+
+The six remaining losses are the same structural item, not kernel speed. Decode is now at the memory
+wall: at batch 8 the MoE ops move 4.31 GB and 2.15 GB per step at 100 and 98 GB/s against a measured
+84-115 GB/s roofline, so there is no headroom left in them. `GEMV_MXFP4` is compute-bound rather than
+bandwidth-bound -- its busy time scales with batch while its weight bytes do not, fitting to ~3.4 ms
+fixed plus ~2.8 ms per batch row -- so the 25 GB/s figure it appears to run at is an artifact of
+dividing mostly-MAC time by constant bytes. What is left is that vLLM runs prefill chunks and decode
+rows in one forward, so a decoding request never queues behind another prompt.
+
+Two notes for later. Reducing decode further needs fewer bytes, not faster kernels, since MXFP4 is
+already 4-bit. And the `FA_GF=2` head pairing computes `hkv = h0 / gqa` for both heads of a pair,
+which is wrong for MHA (`gqa == 1`); no local checkpoint is MHA (Gemma-4 is gqa 2 and 4, GPT-OSS is 8)
+so it is latent, and the GQA fold guards itself to `ng=1` there.

@@ -13,9 +13,9 @@ Read the per-model files for the full 16-cell tables: `cpu-gptoss/SUMMARY.md`,
 
 | model / data type | plow | llama.cpp | vLLM | verdict |
 |---|---|---|---|---|
-| GPT-OSS-20B MXFP4, decode c=1 | 24-25 | 41-59 | 71-76 | win both, 1.7-3.0x |
+| GPT-OSS-20B MXFP4, decode c=1 | 23-26 | 41-59 | 71-76 | win both, 1.6-3.1x |
 | GPT-OSS-20B MXFP4, TTFT | wins 14/16 vs both | | | win |
-| GPT-OSS-20B MXFP4, decode c>=4 long | 142-195 | 177-430 | 137-153 | beats llama, loses vLLM |
+| GPT-OSS-20B MXFP4, decode c>=4 long | 92-279 | 123-430 | 102-153 | beats llama 16/16, vLLM 12/16 |
 | Gemma-4-26B-A4B MXFP4, decode c=1 | 35-38 | 50-63 | cannot load | win vs llama |
 | Gemma-4-26B-A4B MXFP4, TTFT | wins all 16 vs llama | | cannot load | win |
 | Gemma-4-12B MXFP4, decode c=1 | 88 | 121 | 460 | win both, 1.38x / 5.2x |
@@ -58,6 +58,8 @@ kernels.
 | AMX pack-free prefill GEMM (weights as the A operand) | GEMM +21-33%, no weight pack at all |
 | Kernel asm pass (spills, MXFP4 dequant, attention, Gemma MoE) | decode 1.2-2.2x per op |
 | Gemma AVX-512 router scoring | TTFT -29-54%, TPOT -7-38% across 12 serve cells |
+| MoE prefill: transposed epilogue + call-site-gated prefetch | prefill 455 -> 470 tok/s (GPT-OSS), +10% (26B) |
+| Flash decode: fold GQA head groups onto one K/V pass | 4x fewer KV bytes read; batch-8 step 118 -> 105 ms |
 | Experimental int16 VNNI MXFP4 decode (opt-in) | GPT-OSS c=1 decode 24-25 -> 22-23 ms |
 
 ## Methodology notes that cost real time
