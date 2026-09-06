@@ -78,12 +78,6 @@ impl HostTensor {
     pub unsafe fn as_slice(&self) -> &[u8] {
         std::slice::from_raw_parts(self.ptr, self.bytes)
     }
-
-    /// # Safety
-    /// No concurrent reader or writer to this tensor (quiescent point).
-    pub unsafe fn as_mut_slice(&self) -> &mut [u8] {
-        std::slice::from_raw_parts_mut(self.ptr, self.bytes)
-    }
 }
 
 impl Drop for HostTensor {
@@ -123,6 +117,10 @@ impl TensorTable {
 
     pub fn len(&self) -> usize {
         self.cells.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
     }
 
     #[inline]
@@ -193,7 +191,6 @@ fn validate_stream_entry(
     label: &str,
     ei: usize,
     e: &StreamEnt,
-    n_tensors: usize,
 ) -> Result<()> {
     let inst = p.insts.get(e.inst as usize).ok_or_else(|| {
         RuntimeError::Device(format!(
@@ -236,31 +233,14 @@ fn validate_stream_entry(
             )));
         }
     }
-    for (slot, &handle) in inst.t.iter().enumerate() {
-        if handle != TENSOR_NONE16 && handle as usize >= n_tensors {
-            return Err(RuntimeError::Device(format!(
-                "program {pi} instruction {} tensor slot {slot} has handle {handle} of {n_tensors}",
-                e.inst
-            )));
-        }
-    }
-    if inst.op == DevOp::GemvQkv as u16 {
-        for slot in 5..8 {
-            let handle = inst.i[slot] as usize;
-            if handle != 0 && handle >= n_tensors {
-                return Err(RuntimeError::Device(format!(
-                    "program {pi} instruction {} bias slot i{slot} has handle {handle} of {n_tensors}",
-                    e.inst
-                )));
-            }
-        }
-    }
     Ok(())
 }
 
 fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
     if blob.n_cu == 0 {
-        return Err(RuntimeError::Device("CPU blob declares no compute units".into()));
+        return Err(RuntimeError::Device(
+            "CPU blob declares no compute units".into(),
+        ));
     }
     if blob.progs.is_empty() {
         return Err(RuntimeError::Device("CPU blob declares no programs".into()));
@@ -277,6 +257,33 @@ fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
         if p.t == 0 {
             return Err(RuntimeError::Device(format!("program {pi} has T=0")));
         }
+        for (ii, inst) in p.insts.iter().enumerate() {
+            if inst.op as usize >= ffi::DOP_TABLE {
+                return Err(RuntimeError::Device(format!(
+                    "program {pi} instruction {ii} has opcode {} beyond the CPU dispatch table",
+                    inst.op
+                )));
+            }
+            for (slot, &handle) in inst.t.iter().enumerate() {
+                if handle != TENSOR_NONE16 && handle as usize >= blob.tensors.len() {
+                    return Err(RuntimeError::Device(format!(
+                        "program {pi} instruction {ii} tensor slot {slot} has handle {handle} of {}",
+                        blob.tensors.len()
+                    )));
+                }
+            }
+            if inst.op == DevOp::GemvQkv as u16 {
+                for slot in 5..8 {
+                    let handle = inst.i[slot] as usize;
+                    if handle != 0 && handle >= blob.tensors.len() {
+                        return Err(RuntimeError::Device(format!(
+                            "program {pi} instruction {ii} bias slot i{slot} has handle {handle} of {}",
+                            blob.tensors.len()
+                        )));
+                    }
+                }
+            }
+        }
         if p.stream_ofs.len() != blob.n_cu as usize || p.stream_len.len() != blob.n_cu as usize {
             return Err(RuntimeError::Device(format!(
                 "program {pi} has {}/{} stream offsets/lengths for {} compute units",
@@ -288,7 +295,10 @@ fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
         for cu in 0..blob.n_cu as usize {
             let start = p.stream_ofs[cu] as usize;
             let len = p.stream_len[cu] as usize;
-            if start.checked_add(len).is_none_or(|end| end > p.stream.len()) {
+            if start
+                .checked_add(len)
+                .is_none_or(|end| end > p.stream.len())
+            {
                 return Err(RuntimeError::Device(format!(
                     "program {pi} compute-unit {cu} stream {start}+{len} exceeds {} entries",
                     p.stream.len()
@@ -296,7 +306,7 @@ fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
             }
         }
         for (ei, e) in p.stream.iter().enumerate() {
-            validate_stream_entry(p, pi, "static", ei, e, blob.tensors.len())?;
+            validate_stream_entry(p, pi, "static", ei, e)?;
         }
         if !p.gq_stream.is_empty() || !p.gq_seg_ofs.is_empty() {
             if p.gq_stream.len() != p.stream.len() {
@@ -315,16 +325,48 @@ fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
                 )));
             }
             for (ei, e) in p.gq_stream.iter().enumerate() {
-                validate_stream_entry(p, pi, "global-queue", ei, e, blob.tensors.len())?;
+                validate_stream_entry(p, pi, "global-queue", ei, e)?;
             }
         }
     }
 
     let dec_ix = blob.decode_rung_lo();
     if dec_ix >= blob.progs.len() {
-        return Err(RuntimeError::Device("CPU blob has no decode program".into()));
+        return Err(RuntimeError::Device(
+            "CPU blob has no decode program".into(),
+        ));
+    }
+    let word_len = |name: &str| -> Result<Option<usize>> {
+        let Some(tensor) = blob.tensors.iter().find(|tensor| tensor.name == name) else {
+            return Ok(None);
+        };
+        if tensor.bytes < 4 || !tensor.bytes.is_multiple_of(4) {
+            return Err(RuntimeError::Device(format!(
+                "tensor `{name}` has {} bytes; expected a non-empty u32 array",
+                tensor.bytes
+            )));
+        }
+        Ok(Some(tensor.bytes as usize / 4))
+    };
+    let batch = word_len("in.kvlen")?.unwrap_or(1);
+    let max_rows = blob.progs.iter().map(|p| p.t as usize).max().unwrap_or(1);
+    for name in ["in.ids", "in.pos"] {
+        if let Some(words) = word_len(name)? {
+            if words < max_rows.max(batch) {
+                return Err(RuntimeError::Device(format!(
+                    "tensor `{name}` has {words} rows; programs require {}",
+                    max_rows.max(batch)
+                )));
+            }
+        }
     }
     for (pi, p) in blob.progs.iter().enumerate().skip(dec_ix) {
+        if p.t as usize > batch {
+            return Err(RuntimeError::Device(format!(
+                "decode program {pi} has T={}, larger than batch {batch}",
+                p.t
+            )));
+        }
         for &site in &blob.kvrow {
             if site as usize >= p.insts.len() {
                 return Err(RuntimeError::Device(format!(
@@ -426,7 +468,7 @@ impl CpuModel {
                 }
                 let t = HostTensor::alloc(bytes, false)?;
                 // SAFETY: fresh allocation of `bytes`, no other reference yet.
-                unsafe { t.as_mut_slice().copy_from_slice(src) };
+                unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
                 weight_bytes += td.bytes;
                 t
             } else if let Some(r) = &td.init {
@@ -440,11 +482,14 @@ impl CpuModel {
                     )));
                 }
                 let t = HostTensor::alloc(bytes, false)?;
-                unsafe { t.as_mut_slice().copy_from_slice(src) };
+                unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
                 t
             } else if let Some(g) = gen_of.get(&(h as u32)) {
                 let data = g.generate().ok_or_else(|| {
-                    RuntimeError::Device(format!("unknown gen-tensor kind {} for {}", g.kind, td.name))
+                    RuntimeError::Device(format!(
+                        "unknown gen-tensor kind {} for {}",
+                        g.kind, td.name
+                    ))
                 })?;
                 if data.len() != bytes {
                     return Err(RuntimeError::Device(format!(
@@ -455,7 +500,9 @@ impl CpuModel {
                     )));
                 }
                 let t = HostTensor::alloc(bytes, false)?;
-                unsafe { t.as_mut_slice().copy_from_slice(&data) };
+                unsafe {
+                    std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(&data)
+                };
                 t
             } else {
                 // Runtime tensor (activations, KV, inputs): zeroed.
@@ -481,18 +528,28 @@ impl CpuModel {
             };
             let e = tensors[h].bytes / 16;
             if e == 0 || tensors[h].bytes % 16 != 0 {
-                return Err(RuntimeError::Device(format!("moe.ewt.{layer}: bad size {}", tensors[h].bytes)));
+                return Err(RuntimeError::Device(format!(
+                    "moe.ewt.{layer}: bad size {}",
+                    tensors[h].bytes
+                )));
             }
-            let fill = |dst: &HostTensor, a: &HostTensor, b: &HostTensor| {
+            let fill = |dst: &HostTensor, a: &HostTensor, b: &HostTensor| -> Result<()> {
+                if !a.bytes.is_multiple_of(e) || !b.bytes.is_multiple_of(e) {
+                    return Err(RuntimeError::Device(format!(
+                        "moe.ewt.{layer}: expert tensors do not divide into {e} experts"
+                    )));
+                }
                 let (sa, sb) = (a.bytes / e, b.bytes / e);
                 // SAFETY: dst is a fresh runtime tensor of e*16 bytes; a/b are live allocations.
-                let out = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut u64, e * 2) };
+                let out =
+                    unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut u64, e * 2) };
                 for i in 0..e {
                     out[2 * i] = a.as_ptr() as u64 + (i * sa) as u64;
                     out[2 * i + 1] = b.as_ptr() as u64 + (i * sb) as u64;
                 }
+                Ok(())
             };
-            fill(&tensors[h], &tensors[gu], &tensors[dn]);
+            fill(&tensors[h], &tensors[gu], &tensors[dn])?;
             if names[gu].starts_with("fp8/") {
                 let est = names.iter().position(|n| *n == format!("moe.est.{layer}"));
                 let gs = find(&format!("layers.{layer}.experts.gate_up_proj_scale"));
@@ -502,7 +559,7 @@ impl CpuModel {
                         "MoE fp8: layer {layer} missing expert scale tensor/table"
                     )));
                 };
-                fill(&tensors[est], &tensors[gs], &tensors[ds]);
+                fill(&tensors[est], &tensors[gs], &tensors[ds])?;
             }
             tracing::debug!(layer, experts = e, "moe: fused expert pointer table filled");
         }
@@ -511,10 +568,7 @@ impl CpuModel {
         ));
         // Mirrors `exec::amd`: the batch is the `in.kvlen` width, and every `kv.*`
         // tensor (except block-residual scratch) is `[batch]` slot blocks.
-        let batch = wk
-            .kvlen
-            .map(|h| (tensors[h].bytes / 4).max(1))
-            .unwrap_or(1);
+        let batch = wk.kvlen.map(|h| (tensors[h].bytes / 4).max(1)).unwrap_or(1);
         let mut kv_slot_stride = Vec::new();
         if batch > 1 {
             if let Some(t) = names
@@ -526,12 +580,19 @@ impl CpuModel {
                      is not supported by the CPU engine yet"
                 )));
             }
-            kv_slot_stride = names
+            for (h, name) in names
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| n.starts_with("kv.") && !n.contains("blkres"))
-                .map(|(h, _)| (h, tensors[h].bytes as u64 / batch as u64))
-                .collect();
+            {
+                if !tensors[h].bytes.is_multiple_of(batch) {
+                    return Err(RuntimeError::Device(format!(
+                        "KV tensor `{name}` has {} bytes, not divisible by batch {batch}",
+                        tensors[h].bytes
+                    )));
+                }
+                kv_slot_stride.push((h, tensors[h].bytes as u64 / batch as u64));
+            }
         }
 
         let dec_ix = {
@@ -588,14 +649,14 @@ impl CpuModel {
     ///
     /// Must be called between runs: the table is read by kernels during a run.
     pub fn kv_rebase(&mut self, slot: usize) -> Result<()> {
-        if self.kv_slot == slot || self.kv_slot_stride.is_empty() {
-            return Ok(());
-        }
         if slot >= self.batch {
             return Err(RuntimeError::Device(format!(
                 "kv_rebase to slot {slot} past batch {}",
                 self.batch
             )));
+        }
+        if self.kv_slot == slot || self.kv_slot_stride.is_empty() {
+            return Ok(());
         }
         for &(h, stride) in &self.kv_slot_stride {
             let base = self.tensors[h].as_ptr() as usize + (stride as usize) * slot;
@@ -627,7 +688,10 @@ impl CpuModel {
     }
 
     pub fn tensor_by_name(&self, name: &str) -> Option<&HostTensor> {
-        self.names.iter().position(|n| n == name).map(|h| &self.tensors[h])
+        self.names
+            .iter()
+            .position(|n| n == name)
+            .map(|h| &self.tensors[h])
     }
 
     pub fn decode_prog(&self) -> &DevProg {
@@ -644,12 +708,15 @@ impl CpuModel {
     pub fn patch_kvrow(&mut self, dp: usize, row: u32) -> Result<()> {
         let n = self.blob.progs[dp].insts.len();
         for &i in &self.kvrow {
-            let inst: &mut DevInst64 = self.blob.progs[dp]
-                .insts
-                .get_mut(i as usize)
-                .ok_or_else(|| {
-                    RuntimeError::Device(format!("kvrow site {i} past program {dp}'s {n} instructions"))
-                })?;
+            let inst: &mut DevInst64 =
+                self.blob.progs[dp]
+                    .insts
+                    .get_mut(i as usize)
+                    .ok_or_else(|| {
+                        RuntimeError::Device(format!(
+                            "kvrow site {i} past program {dp}'s {n} instructions"
+                        ))
+                    })?;
             inst.i[3] = row;
         }
         Ok(())
@@ -660,8 +727,9 @@ impl CpuModel {
         // SAFETY: called between steps (no worker runs), tensor is ≥ 4 B by
         // construction of the blob.
         unsafe {
-            let s = self.tensors[h].as_mut_slice();
-            s[..4].copy_from_slice(&v.to_le_bytes());
+            let tensor = &self.tensors[h];
+            let dst = std::slice::from_raw_parts_mut(tensor.as_ptr(), tensor.bytes);
+            dst[..4].copy_from_slice(&v.to_le_bytes());
         }
     }
 
@@ -797,8 +865,20 @@ fn dense_row_decode(p: &DevProg) -> bool {
     })
 }
 
-fn loaded(p: &DevProg, n_cu: u32, per_node: &[Vec<u32>], nodes: usize, physical: usize, logical: usize) -> LoadedProgram {
-    let n_seg = p.stream.iter().map(|e| e.seg as u32).max().map_or(1, |m| m + 1);
+fn loaded(
+    p: &DevProg,
+    n_cu: u32,
+    per_node: &[Vec<u32>],
+    nodes: usize,
+    physical: usize,
+    logical: usize,
+) -> LoadedProgram {
+    let n_seg = p
+        .stream
+        .iter()
+        .map(|e| e.seg as u32)
+        .max()
+        .map_or(1, |m| m + 1);
     let seg_ofs = if n_seg > 1 {
         packet::devbuild::static_seg_ofs(&p.stream, &p.stream_ofs, &p.stream_len, n_seg).ok()
     } else {
@@ -851,7 +931,8 @@ fn loaded(p: &DevProg, n_cu: u32, per_node: &[Vec<u32>], nodes: usize, physical:
 /// Worker-pool knobs (`CpuRuntimeConfig` resolved).
 #[derive(Clone, Debug)]
 pub struct CpuEngineOpts {
-    /// 0 = one per online logical cpu.
+    /// 0 = model-selected topology width (physical cores for MoE, logical CPUs
+    /// for dense single-row decode).
     pub threads: usize,
     pub numa: NumaMode,
     pub isa: Isa,
@@ -901,20 +982,30 @@ pub fn next_chunk(buckets: &[(usize, u32)], n_prompt: u32, c0: u32, cap: u32) ->
             .iter()
             .filter(|(_, t)| allowed(*t) && *t >= rem)
             .min_by_key(|(_, t)| *t)
-            .or_else(|| buckets.iter().filter(|(_, t)| allowed(*t)).max_by_key(|(_, t)| *t))
+            .or_else(|| {
+                buckets
+                    .iter()
+                    .filter(|(_, t)| allowed(*t))
+                    .max_by_key(|(_, t)| *t)
+            })
             .copied()
     };
     let (prog, t) = pick(&|t| t <= cap)
         .or_else(|| pick(&|_| true))
         .expect("at least one prefill bucket");
-    Chunk { prog, c0, clen: rem.min(t) }
+    Chunk {
+        prog,
+        c0,
+        clen: rem.min(t),
+    }
 }
 
 /// A loaded model + its persistent worker pool: single sequence, greedy
 /// on-device sampling, the `exec::amd` step protocol on host memory.
 pub struct CpuEngine {
-    model: CpuModel,
+    // Field order is the drop order: workers must stop before model allocations.
     pool: WorkerPool,
+    model: CpuModel,
     progs: Vec<Arc<LoadedProgram>>,
     counters: Vec<Arc<CounterPool>>,
     max_ctx: usize,
@@ -939,7 +1030,11 @@ impl CpuEngine {
             // their SMT siblings after, so `k` threads pin to `k` distinct logical cpus.
             let logical: usize = nodes
                 .iter()
-                .map(|&n| topo.cores_on_node(n).map(|c| c.siblings.len().max(1)).sum::<usize>())
+                .map(|&n| {
+                    topo.cores_on_node(n)
+                        .map(|c| c.siblings.len().max(1))
+                        .sum::<usize>()
+                })
                 .sum();
             let physical: usize = nodes.iter().map(|&n| topo.cores_on_node(n).count()).sum();
             // ONE WORKER PER PHYSICAL CORE, not per logical cpu. The wide execution resources are
@@ -969,10 +1064,18 @@ impl CpuEngine {
         // An explicit --cpu-threads pins both widths; otherwise physical for compute-bound programs
         // and logical for a dense single-row decode.
         if opts.threads == 0 {
-            physical_w = nodes.iter().map(|&n| topo.cores_on_node(n).count()).sum::<usize>().max(1);
+            physical_w = nodes
+                .iter()
+                .map(|&n| topo.cores_on_node(n).count())
+                .sum::<usize>()
+                .max(1);
             logical_w = nodes
                 .iter()
-                .map(|&n| topo.cores_on_node(n).map(|c| c.siblings.len().max(1)).sum::<usize>())
+                .map(|&n| {
+                    topo.cores_on_node(n)
+                        .map(|c| c.siblings.len().max(1))
+                        .sum::<usize>()
+                })
                 .sum::<usize>()
                 .max(1);
         } else {
@@ -1009,22 +1112,28 @@ impl CpuEngine {
             nodes[w % nodes.len()]
         })?);
         let pool = WorkerPool::spawn(&topo, threads, &opts.numa, opts.spin_us, n_cu, exec);
-        let progs: Vec<Arc<LoadedProgram>> =
-            model.blob.progs
-                .iter()
-                .map(|p| Arc::new(loaded(p, n_cu, pool.per_node(), nodes.len(), physical_w, logical_w)))
-                .collect();
+        let progs: Vec<Arc<LoadedProgram>> = model
+            .blob
+            .progs
+            .iter()
+            .map(|p| {
+                Arc::new(loaded(
+                    p,
+                    n_cu,
+                    pool.per_node(),
+                    nodes.len(),
+                    physical_w,
+                    logical_w,
+                ))
+            })
+            .collect();
         let counters = model
             .blob
             .progs
             .iter()
             .map(|p| Arc::new(CounterPool::with_len(p.n_counter as usize)))
             .collect();
-        let max_ctx = model
-            .wk
-            .pos
-            .map(|h| model.tensor(h).bytes / 4)
-            .unwrap_or(0);
+        let max_ctx = model.wk.pos.map(|h| model.tensor(h).bytes / 4).unwrap_or(0);
         tracing::info!(
             threads = pool.threads(),
             n_cu,
@@ -1033,8 +1142,8 @@ impl CpuEngine {
             "CPU engine ready"
         );
         Ok(CpuEngine {
-            model,
             pool,
+            model,
             progs,
             counters,
             max_ctx,
@@ -1118,7 +1227,11 @@ impl CpuEngine {
     /// (KV rows written at their absolute positions, flash window `[0, c0 + clen)`). After the
     /// chunk that covers the last token, [`Self::last_token`] is the first generated token.
     pub fn prefill_chunk(&mut self, prompt: &[u32], ch: Chunk) -> Result<()> {
-        if ch.prog >= self.model.dec_ix || (ch.c0 + ch.clen) as usize > prompt.len() || ch.clen == 0 {
+        let end = ch.c0.checked_add(ch.clen);
+        if ch.prog >= self.model.dec_ix
+            || end.is_none_or(|end| end as usize > prompt.len())
+            || ch.clen == 0
+        {
             return Err(RuntimeError::Device(format!("bad prefill chunk {ch:?}")));
         }
         let (t_ids, t_pos, t_kvlen) = (
@@ -1131,8 +1244,14 @@ impl CpuEngine {
             // Inputs: ids (padded), positions, kv length after this chunk.
             {
                 // SAFETY: no run in flight.
-                let ids = unsafe { self.model.tensor(t_ids).as_mut_slice() };
-                let pos = unsafe { self.model.tensor(t_pos).as_mut_slice() };
+                let ids_tensor = self.model.tensor(t_ids);
+                let pos_tensor = self.model.tensor(t_pos);
+                let ids = unsafe {
+                    std::slice::from_raw_parts_mut(ids_tensor.as_ptr(), ids_tensor.bytes)
+                };
+                let pos = unsafe {
+                    std::slice::from_raw_parts_mut(pos_tensor.as_ptr(), pos_tensor.bytes)
+                };
                 for i in 0..t as usize {
                     let id = if (i as u32) < ch.clen {
                         prompt[(ch.c0 + i as u32) as usize]
@@ -1147,12 +1266,16 @@ impl CpuEngine {
             // Rebase the program from its pristine copy: KV write rows at c0,
             // flash window [c0, c0+clen), row counts for a partial chunk.
             let lp = Arc::make_mut(&mut self.progs[ch.prog]);
-            lp.insts.copy_from_slice(&self.model.blob.progs[ch.prog].insts);
+            lp.insts
+                .copy_from_slice(&self.model.blob.progs[ch.prog].insts);
             rebase_chunk_rows(&mut lp.insts, &self.model.names, ch.c0, ch.clen, t, Some(t));
             if place_lm_head_row(&mut lp.insts, self.model.wk.logits, ch.clen - 1).is_none()
                 && self.model.wk.logits.is_some()
             {
-                tracing::warn!(prog = ch.prog, "act.logits declared but no matmul writes it");
+                tracing::warn!(
+                    prog = ch.prog,
+                    "act.logits declared but no matmul writes it"
+                );
             }
             self.run_prog(ch.prog)?;
         }
@@ -1190,7 +1313,12 @@ impl CpuEngine {
     /// covering the highest slot the caller marks live. `pos`/`kvlen`/`ids` are
     /// per slot and may be ragged; idle slots carry `(0, 1, any id)` like the AMD
     /// path. Returns every slot's sampled token (slots past the rung's rows read 0).
-    pub fn decode_step_batched(&mut self, pos: &[u32], kvlen: &[u32], ids: &[u32]) -> Result<Vec<u32>> {
+    pub fn decode_step_batched(
+        &mut self,
+        pos: &[u32],
+        kvlen: &[u32],
+        ids: &[u32],
+    ) -> Result<Vec<u32>> {
         let rows = pos.len();
         let dp = self.model.decode_prog_for(rows);
         self.decode_step_batched_at(pos, kvlen, ids, dp)
@@ -1219,6 +1347,12 @@ impl CpuEngine {
                 self.max_ctx
             )));
         }
+        if let Some(&k) = kvlen.iter().find(|&&k| k == 0 || k as usize > self.max_ctx) {
+            return Err(RuntimeError::Device(format!(
+                "KV length {k} outside 1..={}",
+                self.max_ctx
+            )));
+        }
         if self.model.kv_slot != 0 {
             return Err(RuntimeError::Device(format!(
                 "decode with the KV table rebased onto slot {} — prefill_slot must restore it",
@@ -1226,7 +1360,9 @@ impl CpuEngine {
             )));
         }
         if dp < self.model.dec_ix || dp >= self.model.blob.progs.len() {
-            return Err(RuntimeError::Device(format!("program {dp} is not a decode rung")));
+            return Err(RuntimeError::Device(format!(
+                "program {dp} is not a decode rung"
+            )));
         }
         let (t_ids, t_pos, t_kvlen) = (
             self.need(self.model.wk.ids, "in.ids")?,
@@ -1243,9 +1379,12 @@ impl CpuEngine {
         }
         // SAFETY: no run in flight (host-only window between steps).
         unsafe {
-            let s_ids = self.model.tensor(t_ids).as_mut_slice();
-            let s_pos = self.model.tensor(t_pos).as_mut_slice();
-            let s_kv = self.model.tensor(t_kvlen).as_mut_slice();
+            let ids_tensor = self.model.tensor(t_ids);
+            let pos_tensor = self.model.tensor(t_pos);
+            let kv_tensor = self.model.tensor(t_kvlen);
+            let s_ids = std::slice::from_raw_parts_mut(ids_tensor.as_ptr(), ids_tensor.bytes);
+            let s_pos = std::slice::from_raw_parts_mut(pos_tensor.as_ptr(), pos_tensor.bytes);
+            let s_kv = std::slice::from_raw_parts_mut(kv_tensor.as_ptr(), kv_tensor.bytes);
             for i in 0..b {
                 s_ids[i * 4..i * 4 + 4].copy_from_slice(&ids[i].to_le_bytes());
                 s_pos[i * 4..i * 4 + 4].copy_from_slice(&pos[i].to_le_bytes());

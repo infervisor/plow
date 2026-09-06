@@ -89,7 +89,8 @@ fn main() {
         let m = eng.model();
         let h = m.names.iter().position(|n| n == name).expect("seed tensor name");
         // SAFETY: quiescent (no run in flight).
-        let bytes = unsafe { m.tensor(h).as_mut_slice() };
+        let tn = m.tensor(h);
+        let bytes = unsafe { std::slice::from_raw_parts_mut(tn.as_ptr(), tn.bytes) };
         let mut st: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; (st >> 11) as f64 / 9007199254740992.0 };
         for c in bytes.chunks_exact_mut(2) {
@@ -106,7 +107,8 @@ fn main() {
         let m = eng.model();
         let h = m.names.iter().position(|n| n == name).expect("seed tensor name");
         // SAFETY: quiescent (no run in flight).
-        let bytes = unsafe { m.tensor(h).as_mut_slice() };
+        let tn = m.tensor(h);
+        let bytes = unsafe { std::slice::from_raw_parts_mut(tn.as_ptr(), tn.bytes) };
         assert!(data.len() <= bytes.len(), "seed file {} B > tensor {} B", data.len(), bytes.len());
         bytes[..data.len()].copy_from_slice(&data);
         println!("seeded {name} with {} bytes from {path}", data.len());
@@ -153,7 +155,8 @@ fn main() {
             let m = eng.model();
             let h = m.names.iter().position(|n| n == name).expect("seed tensor name");
             // SAFETY: quiescent (no run in flight).
-            let bytes = unsafe { m.tensor(h).as_mut_slice() };
+            let tn = m.tensor(h);
+            let bytes = unsafe { std::slice::from_raw_parts_mut(tn.as_ptr(), tn.bytes) };
             bytes[..data.len()].copy_from_slice(&data);
             println!("seeded {name} (decode) with {} bytes from {path}", data.len());
         }

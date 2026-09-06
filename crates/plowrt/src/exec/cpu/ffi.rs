@@ -17,6 +17,8 @@ pub use packet::dev::DevInst64;
 
 use crate::{Result, RuntimeError};
 
+static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Kernel tier (`PLOW_CPU_ISA_*`), ordered. `init(cap)` never activates above `cap`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(i32)]
@@ -103,16 +105,24 @@ extern "C" {
 /// Process-wide init (cpuid, AMX permission, dispatch table). Idempotent.
 /// Returns the tier actually activated, which is `<= cap`.
 pub fn init(cap: Isa) -> Result<Isa> {
-    // SAFETY: plain FFI, no pointers.
+    let _guard = INIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: serialized plain FFI, no pointers.
     let rc = unsafe { plow_cpu_init(cap as i32) };
     if rc < 0 {
         return Err(RuntimeError::Device(format!(
             "plow_cpu_init(cap={cap:?}) failed: {rc}"
         )));
     }
-    Isa::from_i32(rc).ok_or_else(|| {
-        RuntimeError::Device(format!("plow_cpu_init returned unknown tier {rc}"))
-    })
+    let tier = Isa::from_i32(rc)
+        .ok_or_else(|| RuntimeError::Device(format!("plow_cpu_init returned unknown tier {rc}")))?;
+    if tier > cap {
+        return Err(RuntimeError::Device(format!(
+            "CPU kernels were already initialized at {tier:?}, above requested cap {cap:?}"
+        )));
+    }
+    Ok(tier)
 }
 
 /// Active tier, `None` before [`init`].

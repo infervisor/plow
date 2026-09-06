@@ -49,6 +49,11 @@ impl CpuServe {
         let batch = eng.batch();
         let decode_rungs = eng.decode_rungs().into_boxed_slice();
         let buckets = eng.prefill_buckets();
+        if buckets.is_empty() {
+            return Err(RuntimeError::Device(
+                "CPU serve blob has no prefill program".into(),
+            ));
+        }
         let pf_chunk = crate::config::RuntimeConfig::get().cpu.prefill_chunk;
         tracing::info!(
             max_ctx,
@@ -140,10 +145,14 @@ impl CpuServe {
     /// covered. Between chunks the slot is NOT live: the batched step parks it on its frontier
     /// row (see `dispatch`), so a decode tick in between cannot touch a finished KV row.
     pub fn prefill_chunk(&mut self, slot: usize, prompt: &[u32], cap: u32) -> Result<Option<u32>> {
-        if self.pf_pos[slot] == 0 {
-            self.check_prompt(slot, prompt)?;
-        }
+        self.check_prompt(slot, prompt)?;
         let n = prompt.len() as u32;
+        if self.pf_pos[slot] >= n && self.pf_pos[slot] != 0 {
+            return Err(RuntimeError::Rejected(format!(
+                "prefill frontier {} is past the {n}-token prompt",
+                self.pf_pos[slot]
+            )));
+        }
         let ch = next_chunk(&self.buckets, n, self.pf_pos[slot], cap.max(1));
         if let Err(e) = self.eng.prefill_slot_chunk(slot, prompt, ch) {
             self.pf_pos[slot] = 0;
@@ -210,9 +219,12 @@ impl CpuServe {
             tracing::info!(rung, occupied = rows, "cpu: decode ladder rung");
             self.last_rung = rung;
         }
-        let out = self
-            .eng
-            .decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, &self.next_id, dp)?;
+        let out = self.eng.decode_step_batched_at(
+            &self.pos_stage,
+            &self.kvlen_stage,
+            &self.next_id,
+            dp,
+        )?;
         for &(s, _) in feeds {
             self.pos[s] += 1;
             self.next_id[s] = out[s];
