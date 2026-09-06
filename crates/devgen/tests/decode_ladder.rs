@@ -61,8 +61,9 @@ fn gemma31_nvidia_ladder_keeps_fused_projection_shape_through_b16() {
         l2_layout: None,
         gpu: "H100 SXM5".into(),
         arch: "sm_90a".into(),
-        emit_cfg: Some(emit),
+        emit_cfg: Some(emit.clone()),
         whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        mixed_step: None,
     });
 
     let manifest: serde_json::Value =
@@ -83,4 +84,39 @@ fn gemma31_nvidia_ladder_keeps_fused_projection_shape_through_b16() {
         assert!(arms.iter().any(|arm| arm == "GemvGlu"), "B{batch}");
         assert!(!arms.iter().any(|arm| arm == "Glu"), "B{batch}");
     }
+
+    let object = root.join("mixed.cubin");
+    let mut object_bytes = plow_asset::cubin::synthetic_elf(
+        "plow_exec",
+        &[(
+            plow_asset::mixed_step::OBJECT_CAPABILITY,
+            plow_asset::mixed_step::VERSION,
+        )],
+        90,
+    );
+    object_bytes[0x12..0x14].copy_from_slice(&190u16.to_le_bytes());
+    std::fs::write(&object, object_bytes).unwrap();
+    devgen::run(devgen::EmitArgs {
+        dir: root.clone(),
+        ctx: 2048,
+        out: root.join("mixed.pkt").to_string_lossy().into_owned(),
+        n_cu: 132,
+        tp: 1,
+        block_spec: Some("0..2".into()),
+        embed_cubin: None,
+        embed_hsaco: None,
+        rope_gen: true,
+        l2_layout: None,
+        gpu: "H100 SXM5".into(),
+        arch: "sm_90a".into(),
+        emit_cfg: Some(emit),
+        whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        mixed_step: Some(devgen::MixedStepCompile {
+            rows: vec![devgen::MixedRows {
+                total_rows: 128,
+                decode_rows: 16,
+            }],
+            object,
+        }),
+    });
 }
