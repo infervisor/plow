@@ -1,0 +1,1277 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8096",
+  "model": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+  "server_models": [
+   "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+  ],
+  "timestamp": "2026-09-06T02:42:34+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8096",
+   "--model",
+   "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+   "--workload",
+   "chat_long,summarize",
+   "--concurrency",
+   "4,8",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--tokenizer",
+   "/home/lava/.claude/jobs/c77c21db/tmp/g12b-mi350-16",
+   "--out",
+   "perf-data/cpu-gemma/h2h/plow-bf16-chunked.json",
+   "--md",
+   "perf-data/cpu-gemma/h2h/plow-bf16-chunked.md"
+  ],
+  "fresh_prompts": false
+ },
+ "runs": [
+  {
+   "workload": "chat_long",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 63.28097271700244,
+    "ttft_s": {
+     "mean": 8.067145540748243,
+     "p50": 8.322015811994788,
+     "p90": 13.374241808996885,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.3702957361012841,
+     "p50": 0.376350150619045,
+     "p90": 0.44367747133960705,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 30.115774450249774,
+     "p50": 28.882279582998308,
+     "p90": 37.997280335999676,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 398.25,
+     "p50": 470,
+     "p90": 512,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 60.75,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 486,
+    "output_tok_per_s": 7.680033652033618,
+    "req_per_s": 0.12642030702935997,
+    "finish_reasons": {
+     "stop": 3,
+     "length": 5
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 63.28097271700244,
+     "ttft_s": {
+      "mean": 8.067145540748243,
+      "p50": 8.322015811994788,
+      "p90": 13.374241808996885,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.3702957361012841,
+      "p50": 0.376350150619045,
+      "p90": 0.44367747133960705,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 30.115774450249774,
+      "p50": 28.882279582998308,
+      "p90": 37.997280335999676,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 398.25,
+      "p50": 470,
+      "p90": 512,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 60.75,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 486,
+     "output_tok_per_s": 7.680033652033618,
+     "req_per_s": 0.12642030702935997,
+     "finish_reasons": {
+      "stop": 3,
+      "length": 5
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.6472627650000504,
+     "tpot_s": 0.45154509791501235,
+     "latency_s": 25.128925986005925,
+     "output_tokens": 48,
+     "content_chunks": 47,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 525,
+      "completion_tokens": 48,
+      "total_tokens": 573,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage recommends keeping an emergency fund in \"a separate savings account ",
+     "text_chars": 241,
+     "index": 0,
+     "kind": "chat_long",
+     "t_start": 1788662570.3710728,
+     "prompt_tokens_client": 512,
+     "prompt_tokens_server": 525,
+     "prompt_chars": 2651,
+     "prompt_tokens": 512
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 8.344864711994887,
+     "tpot_s": 0.41176245280953555,
+     "latency_s": 34.28595336199942,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 394,
+      "completion_tokens": 64,
+      "total_tokens": 458,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "An escapement is a mechanical device that serves as the \"heart\" of a mechanical ",
+     "text_chars": 299,
+     "index": 1,
+     "kind": "chat_long",
+     "t_start": 1788662570.371253,
+     "prompt_tokens_client": 381,
+     "prompt_tokens_server": 394,
+     "prompt_chars": 1824,
+     "prompt_tokens": 381
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 15.911304230998212,
+     "tpot_s": 0.3738586854127038,
+     "latency_s": 39.46445756499452,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 243,
+      "completion_tokens": 64,
+      "total_tokens": 307,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This is a classic \"winter check\" scenario that every beekeeper faces. Because yo",
+     "text_chars": 288,
+     "index": 2,
+     "kind": "chat_long",
+     "t_start": 1788662570.3717124,
+     "prompt_tokens_client": 230,
+     "prompt_tokens_server": 243,
+     "prompt_chars": 1035,
+     "prompt_tokens": 230
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 13.374241808996885,
+     "tpot_s": 0.376350150619045,
+     "latency_s": 37.997280335999676,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 483,
+      "completion_tokens": 64,
+      "total_tokens": 547,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A swarm decides where to move through the following process: scout bees search f",
+     "text_chars": 320,
+     "index": 3,
+     "kind": "chat_long",
+     "t_start": 1788662570.3718042,
+     "prompt_tokens_client": 470,
+     "prompt_tokens_server": 483,
+     "prompt_chars": 2273,
+     "prompt_tokens": 470
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.11829112200212,
+     "tpot_s": 0.44367747133960705,
+     "latency_s": 28.882279582998308,
+     "output_tokens": 54,
+     "content_chunks": 53,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 491,
+      "completion_tokens": 54,
+      "total_tokens": 545,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The tide did not affect the journey; the passage does not mention tides. Instead",
+     "text_chars": 238,
+     "index": 4,
+     "kind": "chat_long",
+     "t_start": 1788662595.501745,
+     "prompt_tokens_client": 478,
+     "prompt_tokens_server": 491,
+     "prompt_chars": 2148,
+     "prompt_tokens": 478
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.4627534140017815,
+     "tpot_s": 0.37028496288881535,
+     "latency_s": 26.79079100400122,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 263,
+      "completion_tokens": 64,
+      "total_tokens": 327,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The issue you are facing is a classic case of **oxidation and degassing.** By sw",
+     "text_chars": 315,
+     "index": 5,
+     "kind": "chat_long",
+     "t_start": 1788662604.6582448,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 263,
+     "prompt_chars": 1105,
+     "prompt_tokens": 250
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.356430460997217,
+     "tpot_s": 0.2889831628254753,
+     "latency_s": 24.562459369000862,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 628,
+      "completion_tokens": 64,
+      "total_tokens": 692,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The difference between spring and neap tides lies in the range of the water's ri",
+     "text_chars": 290,
+     "index": 6,
+     "kind": "chat_long",
+     "t_start": 1788662608.3705733,
+     "prompt_tokens_client": 615,
+     "prompt_tokens_server": 628,
+     "prompt_chars": 2855,
+     "prompt_tokens": 615
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 8.322015811994788,
+     "tpot_s": 0.24590390500007844,
+     "latency_s": 23.81404839699826,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 263,
+      "completion_tokens": 64,
+      "total_tokens": 327,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is an explanation for your customers, followed by a breakdown of the techni",
+     "text_chars": 277,
+     "index": 7,
+     "kind": "chat_long",
+     "t_start": 1788662609.8368917,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 263,
+     "prompt_chars": 1085,
+     "prompt_tokens": 250
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 61.82079769700067,
+    "ttft_s": {
+     "mean": 16.88438387875067,
+     "p50": 16.726568615005817,
+     "p90": 29.305129209998995,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.6298043598188955,
+     "p50": 0.6845056587301929,
+     "p90": 0.7463518403651145,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 54.901642125374565,
+     "p50": 54.7748073440016,
+     "p90": 56.351022065005964,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 398.25,
+     "p50": 470,
+     "p90": 512,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 60.75,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 486,
+    "output_tok_per_s": 7.8614320439863725,
+    "req_per_s": 0.12940628878989913,
+    "finish_reasons": {
+     "stop": 3,
+     "length": 5
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 61.82079769700067,
+     "ttft_s": {
+      "mean": 16.88438387875067,
+      "p50": 16.726568615005817,
+      "p90": 29.305129209998995,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.6298043598188955,
+      "p50": 0.6845056587301929,
+      "p90": 0.7463518403651145,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 54.901642125374565,
+      "p50": 54.7748073440016,
+      "p90": 56.351022065005964,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 398.25,
+      "p50": 470,
+      "p90": 512,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 60.75,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 486,
+     "output_tok_per_s": 7.8614320439863725,
+     "req_per_s": 0.12940628878989913,
+     "finish_reasons": {
+      "stop": 3,
+      "length": 5
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 23.608704411999497,
+     "tpot_s": 0.5950105995318463,
+     "latency_s": 51.979385152997565,
+     "output_tokens": 48,
+     "content_chunks": 47,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 525,
+      "completion_tokens": 48,
+      "total_tokens": 573,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage recommends keeping an emergency fund in \"a separate savings account ",
+     "text_chars": 241,
+     "index": 0,
+     "kind": "chat_long",
+     "t_start": 1788662649.612055,
+     "prompt_tokens_client": 512,
+     "prompt_tokens_server": 525,
+     "prompt_chars": 2651,
+     "prompt_tokens": 512
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.37953381499392,
+     "tpot_s": 0.7808459191587717,
+     "latency_s": 51.572918067999126,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 394,
+      "completion_tokens": 64,
+      "total_tokens": 458,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "An escapement is a mechanical device that serves as the \"heart\" of a mechanical ",
+     "text_chars": 299,
+     "index": 1,
+     "kind": "chat_long",
+     "t_start": 1788662649.6122074,
+     "prompt_tokens_client": 381,
+     "prompt_tokens_server": 394,
+     "prompt_chars": 1824,
+     "prompt_tokens": 381
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 11.650865506999253,
+     "tpot_s": 0.6845056587301929,
+     "latency_s": 54.7748073440016,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 243,
+      "completion_tokens": 64,
+      "total_tokens": 307,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This is a classic \"winter check\" scenario that every beekeeper faces. Because yo",
+     "text_chars": 288,
+     "index": 2,
+     "kind": "chat_long",
+     "t_start": 1788662649.6122785,
+     "prompt_tokens_client": 230,
+     "prompt_tokens_server": 243,
+     "prompt_chars": 1035,
+     "prompt_tokens": 230
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 16.726568615005817,
+     "tpot_s": 0.6227716344125968,
+     "latency_s": 56.351022065005964,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 483,
+      "completion_tokens": 64,
+      "total_tokens": 547,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A swarm decides where to move through the following process: scout bees search f",
+     "text_chars": 320,
+     "index": 3,
+     "kind": "chat_long",
+     "t_start": 1788662649.6128073,
+     "prompt_tokens_client": 470,
+     "prompt_tokens_server": 483,
+     "prompt_chars": 2273,
+     "prompt_tokens": 470
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 29.305129209998995,
+     "tpot_s": 0.49547146262262204,
+     "latency_s": 55.96118839799601,
+     "output_tokens": 54,
+     "content_chunks": 53,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 491,
+      "completion_tokens": 54,
+      "total_tokens": 545,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The tide did not affect the journey; the passage does not mention tides. Instead",
+     "text_chars": 238,
+     "index": 4,
+     "kind": "chat_long",
+     "t_start": 1788662649.612909,
+     "prompt_tokens_client": 478,
+     "prompt_tokens_server": 491,
+     "prompt_chars": 2148,
+     "prompt_tokens": 478
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 9.125044972002797,
+     "tpot_s": 0.7120502657459823,
+     "latency_s": 53.984317859998555,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 263,
+      "completion_tokens": 64,
+      "total_tokens": 327,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The issue you are facing is a classic case of **oxidation and degassing.** By sw",
+     "text_chars": 315,
+     "index": 5,
+     "kind": "chat_long",
+     "t_start": 1788662649.6129854,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 263,
+     "prompt_chars": 1105,
+     "prompt_tokens": 250
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 36.5276551890056,
+     "tpot_s": 0.40142749798403765,
+     "latency_s": 61.81766896699992,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 628,
+      "completion_tokens": 64,
+      "total_tokens": 692,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The difference between spring and neap tides lies in the range of the water's ri",
+     "text_chars": 290,
+     "index": 6,
+     "kind": "chat_long",
+     "t_start": 1788662649.6133766,
+     "prompt_tokens_client": 615,
+     "prompt_tokens_server": 628,
+     "prompt_chars": 2855,
+     "prompt_tokens": 615
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.751569309999468,
+     "tpot_s": 0.7463518403651145,
+     "latency_s": 52.77182914799778,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 263,
+      "completion_tokens": 64,
+      "total_tokens": 327,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is an explanation for your customers, followed by a breakdown of the techni",
+     "text_chars": 277,
+     "index": 7,
+     "kind": "chat_long",
+     "t_start": 1788662649.6134467,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 263,
+     "prompt_chars": 1085,
+     "prompt_tokens": 250
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 122.28768441700231,
+    "ttft_s": {
+     "mean": 18.62202379950122,
+     "p50": 15.03862899599335,
+     "p90": 27.683306554004957,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.643656181341251,
+     "p50": 0.7525876355396736,
+     "p90": 0.7650790977936667,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 59.17244849637518,
+     "p50": 60.15366857900517,
+     "p90": 75.09638965500199,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1105.125,
+     "p50": 1243,
+     "p90": 1411,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 4.186848434009712,
+    "req_per_s": 0.06541950678140175,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 122.28768441700231,
+     "ttft_s": {
+      "mean": 18.62202379950122,
+      "p50": 15.03862899599335,
+      "p90": 27.683306554004957,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.643656181341251,
+      "p50": 0.7525876355396736,
+      "p90": 0.7650790977936667,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 59.17244849637518,
+      "p50": 60.15366857900517,
+      "p90": 75.09638965500199,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1105.125,
+      "p50": 1243,
+      "p90": 1411,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 4.186848434009712,
+     "req_per_s": 0.06541950678140175,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.107661134999944,
+     "tpot_s": 0.7650790977936667,
+     "latency_s": 53.307726029997866,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 825,
+      "completion_tokens": 64,
+      "total_tokens": 889,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a summary of the article:\n\n*   **Early Timekeeping:** Ancient civilizati",
+     "text_chars": 296,
+     "index": 0,
+     "kind": "summarize",
+     "t_start": 1788662735.0993366,
+     "prompt_tokens_client": 812,
+     "prompt_tokens_server": 825,
+     "prompt_chars": 3908,
+     "prompt_tokens": 812
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 44.417959009006154,
+     "tpot_s": 0.7388029639999057,
+     "latency_s": 90.96260292000079,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1424,
+      "completion_tokens": 64,
+      "total_tokens": 1488,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text explores the geological processes of glacial erosion and deposition, a",
+     "text_chars": 356,
+     "index": 1,
+     "kind": "summarize",
+     "t_start": 1788662735.0995703,
+     "prompt_tokens_client": 1411,
+     "prompt_tokens_server": 1424,
+     "prompt_chars": 7075,
+     "prompt_tokens": 1411
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 27.683306554004957,
+     "tpot_s": 0.7525876355396736,
+     "latency_s": 75.09638965500199,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1340,
+      "completion_tokens": 64,
+      "total_tokens": 1404,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The article details the annual cycle of a honeybee colony and the science of clo",
+     "text_chars": 269,
+     "index": 2,
+     "kind": "summarize",
+     "t_start": 1788662735.0997345,
+     "prompt_tokens_client": 1327,
+     "prompt_tokens_server": 1340,
+     "prompt_chars": 6348,
+     "prompt_tokens": 1327
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.705884505005088,
+     "tpot_s": 0.7531377047459485,
+     "latency_s": 60.15366857900517,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 706,
+      "completion_tokens": 64,
+      "total_tokens": 770,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text outlines the complex journey of coffee from its labor-intensive harves",
+     "text_chars": 359,
+     "index": 3,
+     "kind": "summarize",
+     "t_start": 1788662735.1002848,
+     "prompt_tokens_client": 693,
+     "prompt_tokens_server": 706,
+     "prompt_chars": 3460,
+     "prompt_tokens": 693
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.41973728800076,
+     "tpot_s": 0.7781599405554718,
+     "latency_s": 61.4439094019981,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1147,
+      "completion_tokens": 64,
+      "total_tokens": 1211,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\n\nThe provided text consists of two distinct narratives: a technical ",
+     "text_chars": 335,
+     "index": 4,
+     "kind": "summarize",
+     "t_start": 1788662788.4092238,
+     "prompt_tokens_client": 1134,
+     "prompt_tokens_server": 1147,
+     "prompt_chars": 5429,
+     "prompt_tokens": 1134
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 14.664112184997066,
+     "tpot_s": 0.6624012837460863,
+     "latency_s": 56.39547894000134,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 790,
+      "completion_tokens": 64,
+      "total_tokens": 854,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Executive Summary: The Annual Lifecycle of a Honeybee Colony**\n\n*   **Colony S",
+     "text_chars": 328,
+     "index": 5,
+     "kind": "summarize",
+     "t_start": 1788662795.255887,
+     "prompt_tokens_client": 777,
+     "prompt_tokens_server": 790,
+     "prompt_chars": 3759,
+     "prompt_tokens": 777
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 16.93890072400245,
+     "tpot_s": 0.4407308473174843,
+     "latency_s": 44.70504343500215,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1457,
+      "completion_tokens": 64,
+      "total_tokens": 1521,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The article explores the life cycles of honeybee colonies and the geological imp",
+     "text_chars": 301,
+     "index": 6,
+     "kind": "summarize",
+     "t_start": 1788662810.1991274,
+     "prompt_tokens_client": 1444,
+     "prompt_tokens_server": 1457,
+     "prompt_chars": 7044,
+     "prompt_tokens": 1444
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 15.03862899599335,
+     "tpot_s": 0.2583499770317714,
+     "latency_s": 31.314769009994052,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1256,
+      "completion_tokens": 64,
+      "total_tokens": 1320,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This article explores the evolution of precision timekeeping and maritime safety",
+     "text_chars": 416,
+     "index": 7,
+     "kind": "summarize",
+     "t_start": 1788662826.0693517,
+     "prompt_tokens_client": 1243,
+     "prompt_tokens_server": 1256,
+     "prompt_chars": 6126,
+     "prompt_tokens": 1243
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 136.27490781300003,
+    "ttft_s": {
+     "mean": 48.71750020274794,
+     "p50": 48.22340203400381,
+     "p90": 87.49496413199813,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 1.1020145115079585,
+     "p50": 1.2684747463016908,
+     "p90": 1.4650949179206416,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 118.14453671412502,
+     "p50": 119.85891354400519,
+     "p90": 131.1969851469985,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1105.125,
+     "p50": 1243,
+     "p90": 1411,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 3.757111328980532,
+    "req_per_s": 0.05870486451532081,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 136.27490781300003,
+     "ttft_s": {
+      "mean": 48.71750020274794,
+      "p50": 48.22340203400381,
+      "p90": 87.49496413199813,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 1.1020145115079585,
+      "p50": 1.2684747463016908,
+      "p90": 1.4650949179206416,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 118.14453671412502,
+      "p50": 119.85891354400519,
+      "p90": 131.1969851469985,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1105.125,
+      "p50": 1243,
+      "p90": 1411,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 3.757111328980532,
+     "req_per_s": 0.05870486451532081,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.1772958309957176,
+     "tpot_s": 1.4650949179206416,
+     "latency_s": 97.47839547500189,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 825,
+      "completion_tokens": 64,
+      "total_tokens": 889,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a summary of the article:\n\n*   **Early Timekeeping:** Ancient civilizati",
+     "text_chars": 296,
+     "index": 0,
+     "kind": "summarize",
+     "t_start": 1788662881.2307696,
+     "prompt_tokens_client": 812,
+     "prompt_tokens_server": 825,
+     "prompt_chars": 3908,
+     "prompt_tokens": 812
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 87.49496413199813,
+     "tpot_s": 0.6936816304603579,
+     "latency_s": 131.1969851469985,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1424,
+      "completion_tokens": 64,
+      "total_tokens": 1488,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text explores the geological processes of glacial erosion and deposition, a",
+     "text_chars": 356,
+     "index": 1,
+     "kind": "summarize",
+     "t_start": 1788662881.23105,
+     "prompt_tokens_client": 1411,
+     "prompt_tokens_server": 1424,
+     "prompt_chars": 7075,
+     "prompt_tokens": 1411
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 106.10574208699836,
+     "tpot_s": 0.4788090232064456,
+     "latency_s": 136.27081524600362,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1340,
+      "completion_tokens": 64,
+      "total_tokens": 1404,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The article details the annual cycle of a honeybee colony and the science of clo",
+     "text_chars": 269,
+     "index": 2,
+     "kind": "summarize",
+     "t_start": 1788662881.2312543,
+     "prompt_tokens_client": 1327,
+     "prompt_tokens_server": 1340,
+     "prompt_chars": 6348,
+     "prompt_tokens": 1327
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.855263795994688,
+     "tpot_s": 1.4961488095714086,
+     "latency_s": 107.1127405629959,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 706,
+      "completion_tokens": 64,
+      "total_tokens": 770,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text outlines the complex journey of coffee from its labor-intensive harves",
+     "text_chars": 359,
+     "index": 3,
+     "kind": "summarize",
+     "t_start": 1788662881.231403,
+     "prompt_tokens_client": 693,
+     "prompt_tokens_server": 706,
+     "prompt_chars": 3460,
+     "prompt_tokens": 693
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 48.22340203400381,
+     "tpot_s": 1.1370704374602942,
+     "latency_s": 119.85891354400519,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1147,
+      "completion_tokens": 64,
+      "total_tokens": 1211,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\n\nThe provided text consists of two distinct narratives: a technical ",
+     "text_chars": 335,
+     "index": 4,
+     "kind": "summarize",
+     "t_start": 1788662881.2320082,
+     "prompt_tokens_client": 1134,
+     "prompt_tokens_server": 1147,
+     "prompt_chars": 5429,
+     "prompt_tokens": 1134
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 35.62287998199463,
+     "tpot_s": 1.2684747463016908,
+     "latency_s": 115.53689562499494,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 790,
+      "completion_tokens": 64,
+      "total_tokens": 854,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Executive Summary: The Annual Lifecycle of a Honeybee Colony**\n\n*   **Colony S",
+     "text_chars": 328,
+     "index": 5,
+     "kind": "summarize",
+     "t_start": 1788662881.2322383,
+     "prompt_tokens_client": 777,
+     "prompt_tokens_server": 790,
+     "prompt_chars": 3759,
+     "prompt_tokens": 777
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 67.63826610799879,
+     "tpot_s": 0.9198254356507234,
+     "latency_s": 125.5873709410007,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1457,
+      "completion_tokens": 64,
+      "total_tokens": 1521,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The article explores the life cycles of honeybee colonies and the geological imp",
+     "text_chars": 301,
+     "index": 6,
+     "kind": "summarize",
+     "t_start": 1788662881.2327511,
+     "prompt_tokens_client": 1444,
+     "prompt_tokens_server": 1457,
+     "prompt_chars": 7044,
+     "prompt_tokens": 1444
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 26.62218765199941,
+     "tpot_s": 1.3570110914921056,
+     "latency_s": 112.11417717199947,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1256,
+      "completion_tokens": 64,
+      "total_tokens": 1320,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This article explores the evolution of precision timekeeping and maritime safety",
+     "text_chars": 416,
+     "index": 7,
+     "kind": "summarize",
+     "t_start": 1788662881.2329357,
+     "prompt_tokens_client": 1243,
+     "prompt_tokens_server": 1256,
+     "prompt_chars": 6126,
+     "prompt_tokens": 1243
+    }
+   ]
+  }
+ ]
+}
