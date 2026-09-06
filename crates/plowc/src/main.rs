@@ -1379,7 +1379,7 @@ fn build_cubin_from_manifest(
         return Err(format!(
             "--emit devblob+cubin needs a CUDA toolkit: {} not found. The packet and \
              {} were written successfully — build the object separately (see \
-             runtime/CMakeLists.txt, -DPLOW_SM120_CUBIN=ON) or use --emit devblob, \
+             runtime/CMakeLists.txt) or use --emit devblob, \
              which needs no toolkit.",
             nvcc.display(),
             mpath.display()
@@ -1396,19 +1396,13 @@ fn build_cubin_from_manifest(
     }
 
     // The manifest is arch-agnostic on purpose; picking the backend is this
-    // function's job. Only nvcc/sm_1xx is wired — hipcc → .hsaco (runtime/amd/)
-    // is the same shape and is deliberately left for a follow-up.
+    // function's job. hipcc → .hsaco (runtime/amd/) is the same shape and is
+    // deliberately left for a follow-up.
     let flags = man
         .get("backends")
         .and_then(|b| b.get("nvcc"))
         .ok_or_else(|| format!("{}: no nvcc backend section", mpath.display()))?;
-    if !arch.starts_with("sm_") {
-        return Err(format!(
-            "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
-             need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
-        )
-        .into());
-    }
+    let arch_option = cubin_arch_option(arch)?;
     let list = |k: &str| -> Vec<String> {
         flags
             .get(k)
@@ -1427,7 +1421,7 @@ fn build_cubin_from_manifest(
     // table appends verbatim. PLOW_NV_FA_GF_FULL has its own cache variable (it
     // must reach every decode-family object from one place — that was bug #2),
     // so route it there rather than into the raw-append bucket.
-    let mut args: Vec<String> = vec!["-DPLOW_SM120_CUBIN=ON".into()];
+    let mut args: Vec<String> = vec![arch_option.into()];
     if !req.iter().any(|d| d.starts_with("PLOW_NV_GEMMA")) {
         args.push("-DPLOW_CUBIN_GEMMA=OFF".into());
     }
@@ -1479,6 +1473,21 @@ fn build_cubin_from_manifest(
     }
     info!(out = %out_dir.display(), "interpreter object built");
     Ok(())
+}
+
+fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
+    match arch {
+        "sm_90a" => Ok("-DPLOW_SM90A_CUBIN=ON"),
+        "sm_120a" => Ok("-DPLOW_SM120_CUBIN=ON"),
+        _ if !arch.starts_with("sm_") => Err(format!(
+            "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
+             need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
+        )),
+        _ => Err(format!(
+            "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
+             supported CUDA architectures are sm_90a and sm_120a."
+        )),
+    }
 }
 
 fn which_cmake() -> Option<PathBuf> {
@@ -2121,6 +2130,24 @@ mod cli_tests {
         )
         .unwrap_err();
         assert!(err.contains("FP8 lowering"));
+    }
+
+    #[test]
+    fn cubin_build_selects_the_interpreter_for_the_target_arch() {
+        assert_eq!(
+            cubin_arch_option("sm_90a").unwrap(),
+            "-DPLOW_SM90A_CUBIN=ON"
+        );
+        assert_eq!(
+            cubin_arch_option("sm_120a").unwrap(),
+            "-DPLOW_SM120_CUBIN=ON"
+        );
+        assert!(cubin_arch_option("sm_100a")
+            .unwrap_err()
+            .contains("no served interpreter"));
+        assert!(cubin_arch_option("gfx950")
+            .unwrap_err()
+            .contains("hipcc/.hsaco"));
     }
 
     /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be
