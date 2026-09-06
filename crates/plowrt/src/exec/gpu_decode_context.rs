@@ -596,42 +596,7 @@ mod tests {
             ("plow_decode_staging_bytes", 16384),
             ("plow_gemv_mm_cap", 16),
         ];
-        let mut names = vec!["_Z12interp_sm90a11PlowProgram"];
-        names.extend(globals.iter().map(|v| v.0));
-        let mut strings = vec![0u8];
-        let mut symbols = vec![];
-        for (i, name) in names.iter().enumerate() {
-            let mut sym = [0u8; 24];
-            sym[..4].copy_from_slice(&(strings.len() as u32).to_le_bytes());
-            sym[4] = if i == 0 { 0x12 } else { 0x11 };
-            sym[6..8].copy_from_slice(&3u16.to_le_bytes());
-            sym[8..16].copy_from_slice(&((i.saturating_sub(1) * 4) as u64).to_le_bytes());
-            sym[16..24].copy_from_slice(&4u64.to_le_bytes());
-            symbols.extend_from_slice(&sym);
-            strings.extend_from_slice(name.as_bytes());
-            strings.push(0);
-        }
-        let mut image = vec![0u8; 320];
-        image[..6].copy_from_slice(b"\x7fELF\x02\x01");
-        image[40..48].copy_from_slice(&64u64.to_le_bytes());
-        image[48..52].copy_from_slice(&(90u32 << 8).to_le_bytes());
-        image[58..60].copy_from_slice(&64u16.to_le_bytes());
-        image[60..62].copy_from_slice(&4u16.to_le_bytes());
-        let values = globals
-            .into_iter()
-            .flat_map(|v| v.1.to_le_bytes())
-            .collect();
-        for (i, kind, data) in [(1, 2u32, symbols), (2, 3, strings), (3, 1, values)] {
-            let h = 64 + i * 64;
-            image[h + 4..h + 8].copy_from_slice(&kind.to_le_bytes());
-            let offset = image.len() as u64;
-            image[h + 24..h + 32].copy_from_slice(&offset.to_le_bytes());
-            image[h + 32..h + 40].copy_from_slice(&(data.len() as u64).to_le_bytes());
-            image.extend_from_slice(&data);
-        }
-        image[168..172].copy_from_slice(&2u32.to_le_bytes());
-        image[184..192].copy_from_slice(&24u64.to_le_bytes());
-        image
+        plow_asset::cubin::synthetic_elf("_Z12interp_sm90a11PlowProgram", &globals, 90)
     }
     fn band(packet: &[u8], object: &[u8]) -> ContextBand {
         ContextBand {
