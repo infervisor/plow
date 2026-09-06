@@ -1732,50 +1732,47 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #else
     case PLOW_DOP_FLASH_DECODE: {
         const unsigned gqa = in->i[1] / in->i[2];
+#define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
+    do {                                                                                       \
+        if (TEN(6))                                                                            \
+            d_flash_decode_slots<DD, GG>(                                                       \
+                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
+                (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
+                (const int*)TEN(6));                                                            \
+        else                                                                                   \
+            d_flash_decode<DD, GG>(                                                            \
+                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
+                (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u);              \
+    } while (0)
 #if PLOW_NV_GEMMA
         if (in->i[6] == 128) {
             if ((gqa % PLOW_NV_FA_GF) != 0) { __trap(); break; }
-            d_flash_decode<128, PLOW_NV_FA_GF>(
-                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                slice, nblk, arena, in->fj[1].u);
+            PLOW_NV_FLASH_DECODE(128, PLOW_NV_FA_GF);
         } else if (in->i[6] == 256) {
 #if PLOW_NV_FA_GF_HD256 != 2
             if (gqa % PLOW_NV_FA_GF_HD256 == 0) {
-                d_flash_decode<256, PLOW_NV_FA_GF_HD256>(
-                    (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-                    (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-                    in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                    slice, nblk, arena, in->fj[1].u);
+                PLOW_NV_FLASH_DECODE(256, PLOW_NV_FA_GF_HD256);
                 break;
             }
 #endif
             if ((gqa % 2u) != 0) { __trap(); break; }
-            d_flash_decode<256, 2>(
-                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                slice, nblk, arena, in->fj[1].u);
+            PLOW_NV_FLASH_DECODE(256, 2);
         } else if (in->i[6] == 512) {
             if ((gqa % PLOW_NV_FA_GF_FULL) != 0) { __trap(); break; }
-            d_flash_decode<512, PLOW_NV_FA_GF_FULL>(
-                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                slice, nblk, arena, in->fj[1].u);
+            PLOW_NV_FLASH_DECODE(512, PLOW_NV_FA_GF_FULL);
         } else {
             __trap();
         }
 #else
         if ((gqa % PLOW_NV_FA_GF) != 0) { __trap(); break; }
         if (in->i[6] != PLOW_NV_FA_HD) { __trap(); break; }
-        d_flash_decode<PLOW_NV_FA_HD, PLOW_NV_FA_GF>(
-            (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-            (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-            in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-            slice, nblk, arena, in->fj[1].u);
+        PLOW_NV_FLASH_DECODE(PLOW_NV_FA_HD, PLOW_NV_FA_GF);
 #endif
+#undef PLOW_NV_FLASH_DECODE
         break;
     }
 #endif /* PLOW_NV_LEAN_DECODE (FLASH_DECODE) */

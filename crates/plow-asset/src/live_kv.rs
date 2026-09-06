@@ -320,6 +320,19 @@ impl Manifest {
                     } else {
                         op == DevOp::FlashDecode
                             && d.t[5] == self.kv_length
+                            && d.t[7] == TENSOR_NONE16
+                            && crate::mixed_step::validate_decode_slot_tensor(
+                                d.t[6],
+                                p.rows,
+                                tensor(d.t[6]).ok().map(|slot_map| {
+                                    crate::mixed_step::TensorContract {
+                                        name: slot_map.name,
+                                        bytes: slot_map.bytes,
+                                        initialized: slot_map.initialized,
+                                    }
+                                }),
+                            )
+                            .is_ok()
                             && d.i[0] == p.rows
                             && (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7])
                                 == (c.heads, c.hd, c.stride, c.window, c.mask)
@@ -410,3 +423,7 @@ fn direct_operands(op: DevOp) -> Result<()> {
         "opcode has no audited direct-operand access contract",
     )
 }
+
+#[cfg(test)]
+#[path = "live_kv_tests.rs"]
+mod tests;

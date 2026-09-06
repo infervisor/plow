@@ -163,6 +163,8 @@ enum {
     PLOW_DOP_FLASH_PREFILL = 11,
 
     /* t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32)
+     * t6=decode_slot(i32[n_batch])|NONE for ordinary bf16; maps compact row b to a physical KV
+     * slot. Packed extension forms retain their extension-specific operands.
      * i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window i5=nsplit i6=hd
      * f0=scale */
     PLOW_DOP_FLASH_DECODE = 12,

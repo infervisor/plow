@@ -30,6 +30,7 @@ struct VariantEntry {
     program_index: u32,
     program_section: usize,
     object_section: usize,
+    decode_slot: Option<u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -39,6 +40,8 @@ pub struct SelectedVariant<'a> {
     program_index: u32,
     program: &'a aux_program::Program,
     object: ObjectSection<'a>,
+    decode_slot: Option<u16>,
+    physical_slot_capacity: u32,
 }
 
 impl SelectedVariant<'_> {
@@ -60,6 +63,21 @@ impl SelectedVariant<'_> {
 
     pub fn object(&self) -> ObjectSection<'_> {
         self.object
+    }
+
+    pub fn decode_slot(&self) -> Option<u16> {
+        self.decode_slot
+    }
+
+    /// Validate the physical-slot image before uploading it for this program.
+    pub fn validate_decode_slots(&self, slots: &[i32]) -> Result<()> {
+        mixed_step::validate_decode_slot_binding(
+            slots,
+            self.decode_rows,
+            self.physical_slot_capacity,
+            self.decode_slot,
+        )
+        .map_err(reject)
     }
 }
 
@@ -103,6 +121,8 @@ impl LoadedMixedPacket<'_> {
                 program: &self.programs[variant.program_section].parsed.programs
                     [variant.program_index as usize],
                 object: self.objects[variant.object_section],
+                decode_slot: variant.decode_slot,
+                physical_slot_capacity: self.physical_slot_capacity,
             })
     }
 }
@@ -113,7 +133,7 @@ impl LoadedMixedPacket<'_> {
 pub fn load<'a>(
     sections: &[PacketSection<'a>],
     expected_n_cu: u32,
-    tensor_count: usize,
+    tensors: &[mixed_step::TensorContract<'_>],
     backend: mixed_step::PayloadKind,
     mut read_capability: impl FnMut(ObjectSection<'a>, &str) -> Result<Option<u32>>,
 ) -> Result<Option<LoadedMixedPacket<'a>>> {
@@ -169,7 +189,7 @@ pub fn load<'a>(
             index
         } else {
             let parsed = variant
-                .bind_program(expected_n_cu, tensor_count, &program_payload)
+                .bind_program(expected_n_cu, tensors.len(), &program_payload)
                 .map_err(reject)?;
             program_catalog.push(ProgramSection {
                 name: program_section.name,
@@ -177,6 +197,13 @@ pub fn load<'a>(
             });
             program_catalog.len() - 1
         };
+
+        let decode_slot = mixed_step::flash_decode_slot_operand(
+            &program_catalog[program_section].parsed.programs[variant.program.index as usize],
+            variant.decode_rows,
+            tensors,
+        )
+        .map_err(reject)?;
 
         let mut object_choices = variant
             .objects
@@ -242,6 +269,7 @@ pub fn load<'a>(
             program_index: variant.program.index,
             program_section,
             object_section,
+            decode_slot,
         });
     }
 
@@ -279,13 +307,16 @@ pub fn load_from_devblob<'a>(
             bytes,
         });
     }
-    load(
-        &sections,
-        blob.n_cu,
-        blob.tensors.len(),
-        backend,
-        read_capability,
-    )
+    let tensors: Vec<_> = blob
+        .tensors
+        .iter()
+        .map(|tensor| mixed_step::TensorContract {
+            name: &tensor.name,
+            bytes: tensor.bytes,
+            initialized: tensor.init.is_some(),
+        })
+        .collect();
+    load(&sections, blob.n_cu, &tensors, backend, read_capability)
 }
 
 fn exact_section<'a>(

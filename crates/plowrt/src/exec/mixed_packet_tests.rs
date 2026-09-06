@@ -85,7 +85,7 @@ fn shared_payloads_are_bound_once_across_variants() {
     let loaded = load(
         &sections,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         |_, _| {
             capability_reads += 1;
@@ -168,7 +168,7 @@ fn binds_exact_variant_and_selects_without_revalidation() {
     let loaded = load(
         &sections,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         |object, symbol| {
             Ok((object.name == "mixed_cuda"
@@ -188,13 +188,15 @@ fn binds_exact_variant_and_selects_without_revalidation() {
     assert_eq!(selected.program_index(), 0);
     assert_eq!(selected.program().rows, ROWS);
     assert_eq!(selected.object().name, "mixed_cuda");
+    assert!(selected.validate_decode_slots(&[0]).is_ok());
+    assert!(selected.validate_decode_slots(&[1]).is_err());
     assert!(loaded.select(ROWS, DECODE_ROWS + 1).is_none());
 
     let loaded =
         load(
             &sections,
             N_CU,
-            0,
+            &[],
             mixed_step::PayloadKind::Hsaco,
             |object, symbol| {
                 Ok((object.name == "mixed_amd"
@@ -248,7 +250,7 @@ fn payload_identity_includes_kind_when_section_names_match() {
         (mixed_step::PayloadKind::Cubin, cubin.as_slice()),
         (mixed_step::PayloadKind::Hsaco, hsaco.as_slice()),
     ] {
-        let loaded = load(&sections, N_CU, 0, backend, |_, _| Ok(Some(VERSION)))
+        let loaded = load(&sections, N_CU, &[], backend, |_, _| Ok(Some(VERSION)))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -264,7 +266,7 @@ fn stock_packet_without_metadata_is_ignored() {
     let loaded = load(
         &sections,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         |_, _| panic!("capability reader must not run"),
     )
@@ -291,7 +293,7 @@ fn metadata_and_exact_payload_sections_are_unique_and_typed() {
     assert!(load(
         &duplicate_metadata,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         capability
     )
@@ -300,7 +302,7 @@ fn metadata_and_exact_payload_sections_are_unique_and_typed() {
     assert!(load(
         &wrong_metadata_kind,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         capability
     )
@@ -309,7 +311,7 @@ fn metadata_and_exact_payload_sections_are_unique_and_typed() {
     assert!(load(
         &duplicate_program,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         capability
     )
@@ -318,7 +320,7 @@ fn metadata_and_exact_payload_sections_are_unique_and_typed() {
     assert!(load(
         &missing_program,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         capability
     )
@@ -331,7 +333,7 @@ fn metadata_and_exact_payload_sections_are_unique_and_typed() {
     assert!(load(
         &wrong_program_kind,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         capability
     )
@@ -340,7 +342,7 @@ fn metadata_and_exact_payload_sections_are_unique_and_typed() {
     assert!(load(
         &duplicate_object,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         capability
     )
@@ -349,7 +351,7 @@ fn metadata_and_exact_payload_sections_are_unique_and_typed() {
     assert!(load(
         &missing_object,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         capability
     )
@@ -377,7 +379,7 @@ fn selected_backend_requires_one_declared_object() {
     assert!(load(
         &undeclared,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         |_, _| Ok(Some(VERSION))
     )
@@ -396,12 +398,14 @@ fn selected_backend_requires_one_declared_object() {
         section(SECT_CUBIN, "mixed_cuda_a", cubin_a),
         section(SECT_CUBIN, "mixed_cuda_b", cubin_b),
     ];
-    assert!(
-        load(&extra, N_CU, 0, mixed_step::PayloadKind::Cubin, |_, _| Ok(
-            Some(VERSION)
-        ))
-        .is_err()
-    );
+    assert!(load(
+        &extra,
+        N_CU,
+        &[],
+        mixed_step::PayloadKind::Cubin,
+        |_, _| Ok(Some(VERSION))
+    )
+    .is_err());
 }
 
 #[test]
@@ -421,7 +425,7 @@ fn digest_capability_and_grid_are_bound_to_actual_payloads() {
     assert!(load(
         &sections,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         |_, _| panic!("capability reader must not run for a mismatched payload")
     )
@@ -435,7 +439,7 @@ fn digest_capability_and_grid_are_bound_to_actual_payloads() {
     assert!(load(
         &sections,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         |_, _| Ok(None)
     )
@@ -443,7 +447,7 @@ fn digest_capability_and_grid_are_bound_to_actual_payloads() {
     assert!(load(
         &sections,
         N_CU + 1,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         |_, _| Ok(Some(VERSION))
     )
@@ -469,7 +473,7 @@ fn auxiliary_parser_enforces_packet_tensor_count() {
     assert!(load(
         &sections,
         N_CU,
-        0,
+        &[],
         mixed_step::PayloadKind::Cubin,
         |_, _| Ok(Some(VERSION))
     )

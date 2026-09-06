@@ -21,19 +21,21 @@ fn prefill<'a>(slot: u32, state_slot: u32, start: u32, tokens: &'a [u32]) -> Pre
 fn storage(
     staging: &MixedStepStaging,
 ) -> (
-    (*const (), *const (), *const (), *const ()),
-    (usize, usize, usize, usize),
+    (*const (), *const (), *const (), *const (), *const ()),
+    (usize, usize, usize, usize, usize),
 ) {
     let plan = &staging.plan;
     (
         (
             plan.rows.as_ptr().cast(),
+            plan.decode_slots.as_ptr().cast(),
             plan.prefill_spans.as_ptr().cast(),
             plan.parked.as_ptr().cast(),
             plan.mapped_ends.as_ptr().cast(),
         ),
         (
             plan.rows.capacity(),
+            plan.decode_slots.capacity(),
             plan.prefill_spans.capacity(),
             plan.parked.capacity(),
             plan.mapped_ends.capacity(),
@@ -53,6 +55,7 @@ fn reuses_all_storage_across_successful_steps() {
         let p = [prefill(1, 3, frontiers[1], &p_tokens)];
         let plan = staging.stage(&d, &p, &frontiers, 8, 64, 5).unwrap();
         assert_eq!(plan.decode_rows, 1);
+        assert_eq!(plan.decode_slots, [2]);
         assert_eq!(plan.real_rows, 3);
         assert_eq!(storage(&staging), before);
         staging.commit_after_device_success(&mut frontiers).unwrap();
