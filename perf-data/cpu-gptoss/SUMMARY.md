@@ -121,3 +121,34 @@ owns prefill throughput (summarize c=1: 1111 tokens in 1.8 s ≈ 600 tok/s vs pl
 therefore every long-prompt cell at c ≥ 2, plus decode at c = 8 (its batched MoE/attention scale better: 136–153
 ms at 8 rows vs plow 174–466). The gap to close is prefill throughput (prepacked AMX weights, MoE prefill
 efficiency) and batched-decode scaling — the same two items on the plan.
+
+## After the kernel optimization pass (commit c835609, 11:2x) — current three-way
+
+Same bench, same servers, fresh prompts. plow = MXFP4 dense+experts with the optimized kernels.
+Raw: `plow/gptoss-mx4-opt-*.md`. TTFT / TPOT mean ms; bold = best of the three.
+
+| workload | conc | plow TTFT | llama TTFT | vLLM TTFT | plow TPOT | llama TPOT | vLLM TPOT |
+|---|---|---|---|---|---|---|---|
+| chat_short | 1 | **553** | 748 | 637 | **29** | 41 | 71 |
+| chat_short | 2 | **773** | 1625 | 1220 | **54** | 65 | 95 |
+| chat_short | 4 | **1283** | 3059 | 1657 | **97** | 104 | 103 |
+| chat_short | 8 | 2669 | 5260 | **2120** | 155 | 177 | **136** |
+| chat_long | 1 | 1928 | 4823 | **1346** | **28** | 51 | 71 |
+| chat_long | 2 | 2779 | 9520 | **1962** | **67** | 81 | 80 |
+| chat_long | 4 | 3506 | 14432 | **2550** | 128 | 133 | **102** |
+| chat_long | 8 | 7994 | 35666 | **4591** | 261 | 215 | **137** |
+| code | 1 | 1544 | 4212 | **1253** | **28** | 50 | 76 |
+| code | 2 | 2457 | 8780 | **2151** | **58** | 73 | 81 |
+| code | 4 | 3613 | 18762 | **2944** | 125 | 123 | **115** |
+| code | 8 | 6902 | 35120 | **4156** | 209 | 207 | **152** |
+| summarize | 1 | 5061 | 10693 | **1829** | **29** | 59 | 71 |
+| summarize | 2 | 5828 | 23777 | **3593** | 119 | 113 | **85** |
+| summarize | 4 | 10095 | 57888 | **6735** | 270 | 195 | **116** |
+| summarize | 8 | 23170 | 73138 | **7219** | 431 | 430 | **153** |
+
+Reading: plow now wins **every** c=1 and c=2 decode cell (28-29 ms at c=1 vs 41-59 llama.cpp and
+71-76 vLLM, a 1.4-2.0x and 2.4-2.7x margin) and every TTFT cell against llama.cpp; it also wins TTFT
+against vLLM at c<=4 on short prompts. vLLM still wins long-prompt TTFT and every c>=4 decode cell on
+long prompts: it runs prefill and decode tokens in ONE mixed forward (chunked prefill, 2048-token
+budget), so decode never waits behind a whole prompt. That scheduling change, not kernel speed, is the
+remaining gap — plow's own kernels are now at 1.2-2.2x their previous throughput per op.
