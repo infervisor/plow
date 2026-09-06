@@ -7257,6 +7257,8 @@ impl GpuEngine {
             bytes.extend_from_slice(&h.to_le_bytes());
         }
         self.be.upload(&self.devp[i], 0, &bytes)?;
+        // Pageable H2D can return before DMA completes; kernels use a nonblocking stream.
+        self.be.synchronize()?;
         Ok(())
     }
 
