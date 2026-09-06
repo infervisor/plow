@@ -863,6 +863,30 @@ mod tests {
     }
 
     #[test]
+    fn sliding_cache_uses_position_capacity_instead_of_batch_or_ring_rows() {
+        let mut base = blob(2);
+        base.tensors[0].bytes = 32_768 * 4;
+        for program in &mut base.progs {
+            for writer in &mut program.insts[..2] {
+                writer.fj[2] = 1023;
+            }
+            let attention = &mut program.insts[2];
+            attention.i[4] = 1024;
+            attention.i[7] = 1023;
+        }
+        let manifest = base.with_packet_view(plow_asset::live_kv::emit).unwrap();
+        assert_eq!(manifest.max_ctx, 32_768);
+        assert!(manifest.caches.iter().all(|cache| cache.window == 1024));
+        let mut context = band(&[], &[]);
+        context.kv_min = 32_000;
+        context.kv_max = 32_768;
+        let raw = attach(&mut base, context);
+        let table = metadata(&base, &raw).unwrap().unwrap();
+        assert_eq!(table.select(&[31_999, 0, 0, 0], [0]).unwrap().band, Some(0));
+        assert!(table.select(&[32_768, 0, 0, 0], [0]).is_err());
+    }
+
+    #[test]
     fn full_prefix_context_selection_rechecks_mixed_lengths_and_reset() {
         let mut base = blob(2);
         let mut b = band(&[], &[]);
