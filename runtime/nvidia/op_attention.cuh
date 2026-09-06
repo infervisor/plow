@@ -109,13 +109,13 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #ifndef PLOW_NV_FA_TC_GQA8_HD512
 #define PLOW_NV_FA_TC_GQA8_HD512 0
 #endif
-/* Opt-in HD512/GQA8 decode candidate: 16 padded Q rows and a 64-row K/V staging tile. */
+/* Opt-in HD512/GQA8 decode candidate: 16 padded Q rows and a two-stage 64-row K/V ring. */
 #define FA_DEC_TC_GQA8(HD, GF) (PLOW_NV_FA_TC_GQA8_HD512 && (HD) == 512 && (GF) == 8)
 #define FA_DEC_BASE_SMEM_FLOATS(D, GF)                                                         \
     ((GF) * FA_DEC_TILE + 2 * FA_DEC_REDUCTION_HEADS(GF) + (GF) * ((D) / 2) + FA_DEC_NG(D) * (D))
 #define FA_DEC_SMEM_FLOATS(D, GF)                                                              \
     (FA_DEC_BASE_SMEM_FLOATS(D, GF) +                                                         \
-     (FA_DEC_TC_GQA8(D, GF) ? (16 + 64) * ((D) + 8) / 2 : 0))
+     (FA_DEC_TC_GQA8(D, GF) ? (16 + 2 * 64) * ((D) + 8) / 2 : 0))
 
 /* V rows in flight per thread. A fused row feeds GF accumulators, so arithmetic per load
  * grows with GF and the unroll can shrink before the 255-register cliff. */
@@ -434,19 +434,40 @@ __device__ __forceinline__ void fa_decode_qk_tc_gqa8(
     for (unsigned r = live_rows + tid; r < FA_DEC_TILE; r += PLOW_NV_THREADS)
 #pragma unroll
         for (int g = 0; g < GF; ++g) scores[g * FA_DEC_TILE + r] = FA_NEG_INF;
-    for (unsigned first = 0; first < live_rows; first += 64) {
-        const unsigned nr = live_rows - first < 64 ? live_rows - first : 64;
+    constexpr unsigned TILE_ELEMS = 64 * STRIDE;
+    {
+        const unsigned nr = live_rows < 64 ? live_rows : 64;
         for (unsigned v = tid; v < 64u * (D / 8); v += PLOW_NV_THREADS) {
             const unsigned r = v / (D / 8), c = (v % (D / 8)) * 8;
             const bool live = r < nr;
             const __nv_bfloat16* in = live
-                ? kbase + (size_t)((kv0 + first + r) & kv_mask) * D + c
+                ? kbase + (size_t)((kv0 + r) & kv_mask) * D + c
                 : kbase;
             fa_cp_async_cg16(ktile + r * STRIDE + c, in, live ? 16 : 0);
         }
         fa_cp_commit();
-        fa_cp_wait<0>();
+    }
+    for (unsigned first = 0; first < live_rows; first += 64) {
+        const unsigned nr = live_rows - first < 64 ? live_rows - first : 64;
+        const unsigned next = first + 64;
+        if (next < live_rows) {
+            const unsigned next_nr = live_rows - next < 64 ? live_rows - next : 64;
+            __nv_bfloat16* next_tile = ktile + (((first / 64) + 1) & 1) * TILE_ELEMS;
+            for (unsigned v = tid; v < 64u * (D / 8); v += PLOW_NV_THREADS) {
+                const unsigned r = v / (D / 8), c = (v % (D / 8)) * 8;
+                const bool live = r < next_nr;
+                const __nv_bfloat16* in = live
+                    ? kbase + (size_t)((kv0 + next + r) & kv_mask) * D + c
+                    : kbase;
+                fa_cp_async_cg16(next_tile + r * STRIDE + c, in, live ? 16 : 0);
+            }
+            fa_cp_commit();
+            fa_cp_wait<1>();
+        } else {
+            fa_cp_wait<0>();
+        }
         __syncthreads();
+        const __nv_bfloat16* current_tile = ktile + ((first / 64) & 1) * TILE_ELEMS;
         float acc[4] = {};
 #pragma unroll
         for (unsigned k0 = 0; k0 < D; k0 += 64) {
@@ -455,8 +476,8 @@ __device__ __forceinline__ void fa_decode_qk_tc_gqa8(
             for (unsigned k = k0; k < k0 + 64; k += 16) {
                 unsigned a[4], b[2];
                 fa_ldmatrix_x4(a, qtile + (lane % 16) * STRIDE + k + (lane / 16) * 8);
-                fa_ldmatrix_x2(b, ktile + (warp * 8 + (lane & 7)) * STRIDE + k +
-                                           ((lane >> 3) & 1) * 8);
+                fa_ldmatrix_x2(b, current_tile + (warp * 8 + (lane & 7)) * STRIDE + k +
+                                                   ((lane >> 3) & 1) * 8);
                 fa_mma(partial, a, b, partial);
             }
 #pragma unroll
@@ -487,19 +508,40 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
     for (unsigned j = 0; j < NJ; ++j)
 #pragma unroll
         for (unsigned e = 0; e < 4; ++e) acc[j][e] *= resc[e / 2];
-    for (unsigned first = 0; first < live_rows; first += 64) {
-        const unsigned nr = live_rows - first < 64 ? live_rows - first : 64;
+    constexpr unsigned TILE_ELEMS = 64 * STRIDE;
+    {
+        const unsigned nr = live_rows < 64 ? live_rows : 64;
         for (unsigned i = tid; i < 64u * (D / 8); i += PLOW_NV_THREADS) {
             const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8;
             const bool live = r < nr;
             const __nv_bfloat16* in = live
-                ? vbase + (size_t)((kv0 + first + r) & kv_mask) * D + c
+                ? vbase + (size_t)((kv0 + r) & kv_mask) * D + c
                 : vbase;
             fa_cp_async_cg16(vtile + r * STRIDE + c, in, live ? 16 : 0);
         }
         fa_cp_commit();
-        fa_cp_wait<0>();
+    }
+    for (unsigned first = 0; first < live_rows; first += 64) {
+        const unsigned nr = live_rows - first < 64 ? live_rows - first : 64;
+        const unsigned next = first + 64;
+        if (next < live_rows) {
+            const unsigned next_nr = live_rows - next < 64 ? live_rows - next : 64;
+            __nv_bfloat16* next_tile = vtile + (((first / 64) + 1) & 1) * TILE_ELEMS;
+            for (unsigned i = tid; i < 64u * (D / 8); i += PLOW_NV_THREADS) {
+                const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8;
+                const bool live = r < next_nr;
+                const __nv_bfloat16* in = live
+                    ? vbase + (size_t)((kv0 + next + r) & kv_mask) * D + c
+                    : vbase;
+                fa_cp_async_cg16(next_tile + r * STRIDE + c, in, live ? 16 : 0);
+            }
+            fa_cp_commit();
+            fa_cp_wait<1>();
+        } else {
+            fa_cp_wait<0>();
+        }
         __syncthreads();
+        const __nv_bfloat16* current_tile = vtile + ((first / 64) & 1) * TILE_ELEMS;
 #pragma unroll
         for (unsigned k = 0; k < 64; k += 8) {
             unsigned hi[4], lo[4];
@@ -518,9 +560,9 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
             for (unsigned j = 0; j < NJ; ++j) {
                 const unsigned col = (warp * NJ + j) * 8 + lane / 4;
                 unsigned b[2] = {
-                    __float_as_uint(__bfloat162float(vtile[(k + lane % 4) * STRIDE + col])),
+                    __float_as_uint(__bfloat162float(current_tile[(k + lane % 4) * STRIDE + col])),
                     __float_as_uint(__bfloat162float(
-                        vtile[(k + lane % 4 + 4) * STRIDE + col]))};
+                        current_tile[(k + lane % 4 + 4) * STRIDE + col]))};
                 fa_mma_tf32(acc[j], lo, b, acc[j]);
                 fa_mma_tf32(acc[j], hi, b, acc[j]);
             }
