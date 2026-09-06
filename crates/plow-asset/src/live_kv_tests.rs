@@ -13,6 +13,13 @@ fn inst(op: DevOp) -> DevInst64 {
 }
 
 fn validate(slot_map: Option<Tensor<'_>>, mutate: impl FnOnce(&mut DevInst64)) -> Result<()> {
+    validate_all(slot_map, |insts, _| mutate(&mut insts[0]))
+}
+
+fn validate_all(
+    slot_map: Option<Tensor<'_>>,
+    mutate: impl FnOnce(&mut [DevInst64; 3], &mut Vec<Tensor<'_>>),
+) -> Result<()> {
     let mut tensors = vec![
         Tensor {
             name: "in.pos",
@@ -58,7 +65,6 @@ fn validate(slot_map: Option<Tensor<'_>>, mutate: impl FnOnce(&mut DevInst64)) -
     decode.t[..6].copy_from_slice(&[5, 6, 4, 2, 3, 1]);
     decode.t[6] = slot_handle.unwrap_or(TENSOR_NONE16);
     decode.i = [2, 1, 1, 4, 0, 1, 256, u32::MAX];
-    mutate(&mut decode);
     let writer = |cache| {
         let mut d = inst(DevOp::HeadNormRope);
         d.t[0] = cache;
@@ -68,7 +74,8 @@ fn validate(slot_map: Option<Tensor<'_>>, mutate: impl FnOnce(&mut DevInst64)) -
         d.fj[2] = u32::MAX;
         d
     };
-    let insts = [decode, writer(2), writer(3)];
+    let mut insts = [decode, writer(2), writer(3)];
+    mutate(&mut insts, &mut tensors);
     let program = Program {
         rows: 2,
         packed_prefill_only: false,
@@ -93,6 +100,27 @@ fn validate(slot_map: Option<Tensor<'_>>, mutate: impl FnOnce(&mut DevInst64)) -
         kv_row_insts: &[],
     })
     .map(|_| ())
+}
+
+#[test]
+fn hd64_half_split_cache_geometry_is_valid() {
+    let hd64 = |insts: &mut [DevInst64; 3], tensors: &mut Vec<Tensor<'_>>| {
+        insts[0].i[6] = 64;
+        for d in &mut insts[1..] {
+            d.i[2] = 64;
+            d.i[5] = packet::dev::ROPE_PAIR_HALF;
+        }
+        tensors[2].bytes /= 4;
+        tensors[3].bytes /= 4;
+        tensors[4].bytes /= 4;
+        tensors[5].bytes /= 4;
+    };
+    validate_all(None, hd64).unwrap();
+    assert!(validate_all(None, |insts, tensors| {
+        hd64(insts, tensors);
+        insts[1].i[5] = 0;
+    })
+    .is_err());
 }
 
 #[test]
