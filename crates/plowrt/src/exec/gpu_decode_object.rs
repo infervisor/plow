@@ -56,7 +56,7 @@ pub(super) fn parse(blob: &DevBlob, raw: &[u8]) -> Result<Option<DecodeObjects>>
     metadata
         .validate(&programs, blob.n_cu, std::mem::size_of::<DevProgram>())
         .map_err(|e| reject(&e))?;
-    if !validate_decode_ladder(blob)? || blob.tp.is_some() {
+    if (programs.len() > 1 && !validate_decode_ladder(blob)?) || blob.tp.is_some() {
         return Err(reject("unqualified decode ladder"));
     }
     for g in blob.decode_progs() {
@@ -371,6 +371,15 @@ mod tests {
         changed.progs[1].stream[0].flags |= packet::dev::SE_XCTR;
         let (blob, raw) = attach(changed, &metadata, false);
         assert!(parse(&blob, &raw).is_err());
+    }
+    #[test]
+    fn one_decode_program_can_bind_one_object() {
+        let mut blob = model();
+        blob.progs.truncate(1);
+        let mut metadata = metadata();
+        metadata.programs.truncate(1);
+        let (blob, raw) = attach(blob, &metadata, false);
+        assert_eq!(parse(&blob, &raw).unwrap().unwrap().programs.len(), 1);
     }
     #[test]
     fn context_metadata_cannot_be_silently_ignored_before_materialization() {

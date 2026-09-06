@@ -95,7 +95,7 @@ impl DecodeObjects {
     ) -> Result<(), String> {
         if self.version != 1
             || self.kernarg_bytes != kernarg_bytes
-            || programs.len() < 2
+            || programs.is_empty()
             || self.programs.len() != programs.len()
             || self.objects.is_empty()
             || grid == 0
@@ -201,6 +201,13 @@ mod tests {
         let mut bad = raw;
         bad["objects"]["0"]["unknown"] = serde_json::json!(1);
         assert!(serde_json::from_value::<DecodeObjects>(bad).is_err());
+    }
+    #[test]
+    fn accepts_one_complete_decode_program() {
+        let mut metadata = fixture();
+        metadata.programs.truncate(1);
+        assert!(metadata.validate(&[(3, 1)], 132, 192).is_ok());
+        assert!(metadata.validate(&[], 132, 192).is_err());
     }
     #[test]
     fn rejects_object_identity_resource_and_path_mutations() {

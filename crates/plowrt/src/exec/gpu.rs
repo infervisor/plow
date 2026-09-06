@@ -2403,7 +2403,8 @@ impl GpuEngine {
                 nv_config.cubin.is_some() || nv_config.kernel.is_some() || nv_config.smem.is_some(),
             )?;
         }
-        let mut select_decode_rungs = validate_decode_ladder(&blob)?;
+        let single_bound_decode = decode_objects.is_some() && blob.decode_progs().len() == 1;
+        let mut select_decode_rungs = single_bound_decode || validate_decode_ladder(&blob)?;
         if recurrent.is_some() {
             let config = RuntimeConfig::get();
             if config.nv_vmm_prefix() || config.nv.prefix_cache {
