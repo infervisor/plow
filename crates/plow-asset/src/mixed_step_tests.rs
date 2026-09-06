@@ -76,12 +76,14 @@ fn sparse_decode_and_ragged_prefill_preserve_absolute_identity() {
     assert_eq!(reusable, plan);
     let pointers = (
         reusable.rows.as_ptr(),
+        reusable.decode_slots.as_ptr(),
         reusable.prefill_spans.as_ptr(),
         reusable.parked.as_ptr(),
         reusable.mapped_ends.as_ptr(),
     );
     let capacities = (
         reusable.rows.capacity(),
+        reusable.decode_slots.capacity(),
         reusable.prefill_spans.capacity(),
         reusable.parked.capacity(),
         reusable.mapped_ends.capacity(),
@@ -92,6 +94,7 @@ fn sparse_decode_and_ragged_prefill_preserve_absolute_identity() {
         pointers,
         (
             reusable.rows.as_ptr(),
+            reusable.decode_slots.as_ptr(),
             reusable.prefill_spans.as_ptr(),
             reusable.parked.as_ptr(),
             reusable.mapped_ends.as_ptr(),
@@ -101,6 +104,7 @@ fn sparse_decode_and_ragged_prefill_preserve_absolute_identity() {
         capacities,
         (
             reusable.rows.capacity(),
+            reusable.decode_slots.capacity(),
             reusable.prefill_spans.capacity(),
             reusable.parked.capacity(),
             reusable.mapped_ends.capacity(),
@@ -108,6 +112,7 @@ fn sparse_decode_and_ragged_prefill_preserve_absolute_identity() {
     );
 
     assert_eq!(plan.decode_rows, 2);
+    assert_eq!(plan.decode_slots, [12, 0]);
     assert_eq!(plan.real_rows, 7);
     assert_eq!(
         plan.rows.iter().map(|r| r.token).collect::<Vec<_>>(),
@@ -177,11 +182,75 @@ fn sparse_decode_and_ragged_prefill_preserve_absolute_identity() {
     assert!(validated.validate_plan(&malformed).is_err());
 }
 
+#[test]
+fn decode_slot_map_has_exact_compact_extent_and_physical_bounds() {
+    assert!(validate_decode_slots(&[15, 0], 2, 16).is_ok());
+    assert!(validate_decode_slots(&[0], 2, 16).is_err());
+    assert!(validate_decode_slots(&[0, -1], 2, 16).is_err());
+    assert!(validate_decode_slots(&[0, 16], 2, 16).is_err());
+
+    assert!(validate_decode_slot_binding(&[0, 1], 2, 16, None).is_ok());
+    assert!(validate_decode_slot_binding(&[1, 0], 2, 16, None).is_err());
+    assert!(validate_decode_slot_binding(&[1, 0], 2, 16, Some(4)).is_ok());
+}
+
+#[test]
+fn flash_decode_slot_operand_is_optional_consistent_and_runtime_filled() {
+    let mut decode = packet::dev::DevInst64 {
+        op: DevOp::FlashDecode as u16,
+        blocks: 1,
+        fj: [0; 3],
+        t: [packet::dev::TENSOR_NONE16; 8],
+        i: [0; 8],
+    };
+    decode.i[0] = 2;
+    let program = |insts| crate::aux_program::Program {
+        rows: 8,
+        n_counter: 1,
+        insts,
+        stream: vec![],
+        stream_ofs: vec![],
+        stream_len: vec![],
+        waits: vec![],
+        succs: vec![],
+        gq_stream: vec![],
+        gq_seg_ofs: vec![],
+    };
+    assert_eq!(
+        flash_decode_slot_operand(&program(vec![decode]), 2, &[]).unwrap(),
+        None
+    );
+
+    decode.t[6] = 0;
+    let tensors = [TensorContract {
+        name: DECODE_SLOT_TENSOR,
+        bytes: 8,
+        initialized: false,
+    }];
+    assert_eq!(
+        flash_decode_slot_operand(&program(vec![decode, decode]), 2, &tensors).unwrap(),
+        Some(0)
+    );
+    let mut absent = decode;
+    absent.t[6] = packet::dev::TENSOR_NONE16;
+    assert!(flash_decode_slot_operand(&program(vec![decode, absent]), 2, &tensors).is_err());
+    assert!(flash_decode_slot_operand(
+        &program(vec![decode]),
+        2,
+        &[TensorContract {
+            bytes: 4,
+            ..tensors[0]
+        }]
+    )
+    .is_err());
+}
+
 fn buffers(rows: usize, spans: usize, parked: usize, mapped: usize) -> Plan {
     Plan {
         decode_rows: 0,
         real_rows: 0,
         rows: Vec::with_capacity(rows),
+        decode_slots: Vec::with_capacity(rows),
         prefill_spans: Vec::with_capacity(spans),
         parked: Vec::with_capacity(parked),
         mapped_ends: Vec::with_capacity(mapped),

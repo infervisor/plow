@@ -20,7 +20,8 @@
  * OPERAND CONTRACT (read off the EMITTER crates/plowc/src/bin/gemma4.rs:1070-1080 and the
  * consumer runtime/amd/interp.hip, NOT crates/packet/src/dev.rs which is stale):
  *   FLASH_DECODE  t0=Opart(f32)  t1=mlpart(f32)  t2=Q(bf16)  t3=K  t4=V  t5=kv_len(i32)
- *                 t6=k_scale     t7=v_scale                (fp8 only; TENSOR_NONE in bf16)
+ *                 t6=decode_slot (bf16 only; TENSOR_NONE means compact b == physical slot)
+ *                 t6=k_scale     t7=v_scale                (fp8 only)
  *                 i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window
  *                 i5=nsplit  i6=head_dim i7=kv_mask        <-- i7 IS kv_mask (dev.rs omits it)
  *                 f0=scale
@@ -540,7 +541,7 @@ __device__ __forceinline__ void fa_decode_pv_tc_gqa8(
 #ifndef PLOW_NV_KVBOUNDS
 #define PLOW_NV_KVBOUNDS 0
 #endif
-template <int D, int GF, bool FP8KV = false, bool SZKV = false>
+template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const __nv_bfloat16* __restrict__ Q,
                                const __nv_bfloat16* __restrict__ K,
@@ -550,7 +551,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                float scale, unsigned nsplit, unsigned kv_mask, unsigned slice,
                                unsigned nblk, float* lds, unsigned kv_cap = 0,
                                const float* __restrict__ k_scale = nullptr,
-                               const float* __restrict__ v_scale = nullptr) {
+                               const float* __restrict__ v_scale = nullptr,
+                               const int* __restrict__ decode_slot = nullptr) {
     /* A work item carries GF CONSECUTIVE query heads sharing one KV head (needs GF | gqa).
      * Indexing by head-GROUP, not by kv_head, is what makes GF < gqa correct. */
     static_assert(GF <= (int)PLOW_NV_WARPS || (PLOW_NV_FA_GF16_BENCH && GF == 16), "unsupported decode GQA grouping");
@@ -575,6 +577,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         const unsigned sp = w % nsplit;
         const unsigned hg = (w / nsplit) % n_grp;
         const unsigned b = w / (nsplit * n_grp);
+        unsigned slot = b;
+        if constexpr (SLOTMAP) {
+            const int physical = decode_slot[b];
+            if (physical < 0) __trap();
+            slot = (unsigned)physical;
+        }
         const unsigned h0 = hg * GF;
         const unsigned hkv = h0 / gqa;
 
@@ -593,27 +601,32 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
          * (b*n_kv_head+hkv)*kv_stride + (kv_stride-1) exceeds the declared capacity — i.e. when
          * declare() under-sized the KV tensor for the batch this packet was emitted at. */
 #if PLOW_NV_KVBOUNDS
-        if (kv_cap && (((size_t)b * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap) {
-            __trap();
+        if constexpr (SLOTMAP) {
+            if (kv_cap && (((size_t)slot * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap)
+                __trap();
+        } else {
+            if (kv_cap && (((size_t)b * n_kv_head + hkv) * kv_stride + (kv_stride - 1)) >= kv_cap)
+                __trap();
         }
 #endif
-        const __nv_bfloat16* kbase = K + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride * D;
-        const __nv_bfloat16* vbase = V + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride * D;
+        const size_t kv_batch = slot;
+        const __nv_bfloat16* kbase = K + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
+        const __nv_bfloat16* vbase = V + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * D;
         /* FP8 KV: the cache is uint8 e4m3 (1 byte/elem, HALF the bytes) + a PER-ROW f32 scale, in
          * the SAME head-major RING layout. These byte bases and the per-(kv_head) scale slice are
          * unused on the bf16 instantiation (FP8KV=false compiles them out). */
         /* SZKV: rows are FA_SZ_ROWB(D)-byte blobs, not D elems — same head-major ring indexing. */
         constexpr size_t RB = SZKV ? (size_t)FA_SZ_ROWB(D) : (size_t)D;
-        const unsigned char* kb8 = (const unsigned char*)K + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride * RB;
-        const unsigned char* vb8 = (const unsigned char*)V + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride * RB;
+        const unsigned char* kb8 = (const unsigned char*)K + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * RB;
+        const unsigned char* vb8 = (const unsigned char*)V + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride * RB;
         /* Offset the scale slice only on the FP8KV arm — k_scale/v_scale are null on the bf16
          * instantiation, so forming null+offset (even unused) is UB. if constexpr keeps ksc/vsc
          * in scope for the FP8KV code below with zero runtime cost. */
         const float* ksc = nullptr;
         const float* vsc = nullptr;
         if constexpr (FP8KV) {
-            ksc = k_scale + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride;
-            vsc = v_scale + ((size_t)b * n_kv_head + hkv) * (size_t)kv_stride;
+            ksc = k_scale + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride;
+            vsc = v_scale + (kv_batch * n_kv_head + hkv) * (size_t)kv_stride;
         }
 
         __syncthreads(); /* previous item's osm reads must finish before qsm is rewritten */
@@ -1115,6 +1128,18 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         }
         }
     }
+}
+
+template <int D, int GF>
+__device__ __noinline__ void d_flash_decode_slots(
+    float* Opart, float* mlpart, const __nv_bfloat16* Q, const __nv_bfloat16* K,
+    const __nv_bfloat16* V, const int* kv_len, unsigned n_batch, unsigned n_head,
+    unsigned n_kv_head, unsigned kv_stride, unsigned window, float scale, unsigned nsplit,
+    unsigned kv_mask, unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
+    const int* decode_slot) {
+    d_flash_decode<D, GF, false, false, true>(
+        Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
+        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot);
 }
 
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).

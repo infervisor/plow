@@ -1079,21 +1079,24 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
         return;
     }
     const unsigned hd = in->i[6];
-    if (hd == 128)
-        d_flash_decode<128, PLOW_FA_GF(128)>((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
-                            (const bf16*)TEN(3), (const bf16*)TEN(4), (const int*)TEN(5),
-                            in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
-                            in->i[5], in->i[7], slice, nblk, lds);
-    else if (hd == 256)
-        d_flash_decode<256, PLOW_FA_GF(256)>((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
-                            (const bf16*)TEN(3), (const bf16*)TEN(4), (const int*)TEN(5),
-                            in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
-                            in->i[5], in->i[7], slice, nblk, lds);
-    else if (hd == 512)
-        d_flash_decode<512, PLOW_FA_GF(512)>((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
-                            (const bf16*)TEN(3), (const bf16*)TEN(4), (const int*)TEN(5),
-                            in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
-                            in->i[5], in->i[7], slice, nblk, lds);
+#define PLOW_AMD_FLASH_DECODE(DD)                                                               \
+    do {                                                                                        \
+        if (TEN(6))                                                                             \
+            d_flash_decode_slots<DD, PLOW_FA_GF(DD)>(                                           \
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
+                (const bf16*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1], in->i[2],         \
+                in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds,         \
+                (const int*)TEN(6));                                                            \
+        else                                                                                    \
+            d_flash_decode<DD, PLOW_FA_GF(DD)>(                                                 \
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),       \
+                (const bf16*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1], in->i[2],         \
+                in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds);         \
+    } while (0)
+    if (hd == 128) PLOW_AMD_FLASH_DECODE(128);
+    else if (hd == 256) PLOW_AMD_FLASH_DECODE(256);
+    else if (hd == 512) PLOW_AMD_FLASH_DECODE(512);
+#undef PLOW_AMD_FLASH_DECODE
 #undef TEN
 }
 
