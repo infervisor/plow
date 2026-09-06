@@ -1,0 +1,26 @@
+{
+  "e6-logits-w0-t0-ctx1024": {
+    "passed": true,
+    "returncode": 0,
+    "finite_full_logits_rows": 5
+  },
+  "e6-logits-w16384-t0-ctx1024": {
+    "passed": true,
+    "returncode": 0,
+    "bit_exact_full_logits": true
+  },
+  "e6-memcheck-w16384-ctx1024": {
+    "passed": false,
+    "returncode": 99
+  },
+  "e6-logits-w0-t0-ctx32768": {
+    "passed": true,
+    "returncode": 0,
+    "finite_full_logits_rows": 5
+  },
+  "e6-logits-w16384-t0-ctx32768": {
+    "passed": true,
+    "returncode": 0,
+    "bit_exact_full_logits": true
+  }
+}

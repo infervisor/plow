@@ -1,0 +1,115 @@
+{
+  "passed": true,
+  "packet_buckets": [
+    {
+      "M": 128,
+      "NS": 9,
+      "blocks": 132,
+      "opart_required": 37748736,
+      "mlpart_required": 147456,
+      "cases": [
+        {
+          "BQ": 32,
+          "nwork": 576,
+          "unique_row_head_split": 18432,
+          "exact_coverage": true
+        },
+        {
+          "BQ": 64,
+          "nwork": 288,
+          "unique_row_head_split": 18432,
+          "exact_coverage": true
+        }
+      ]
+    },
+    {
+      "M": 512,
+      "NS": 5,
+      "blocks": 132,
+      "opart_required": 83886080,
+      "mlpart_required": 327680,
+      "cases": [
+        {
+          "BQ": 32,
+          "nwork": 1280,
+          "unique_row_head_split": 40960,
+          "exact_coverage": true
+        },
+        {
+          "BQ": 64,
+          "nwork": 640,
+          "unique_row_head_split": 40960,
+          "exact_coverage": true
+        }
+      ]
+    },
+    {
+      "M": 1024,
+      "NS": 3,
+      "blocks": 132,
+      "opart_required": 100663296,
+      "mlpart_required": 393216,
+      "cases": [
+        {
+          "BQ": 32,
+          "nwork": 1536,
+          "unique_row_head_split": 49152,
+          "exact_coverage": true
+        },
+        {
+          "BQ": 64,
+          "nwork": 768,
+          "unique_row_head_split": 49152,
+          "exact_coverage": true
+        }
+      ]
+    }
+  ],
+  "WG64_output_fragment_exact_once": true,
+  "WG64_ml_fragment_exact_once": true,
+  "scope": "CPU arithmetic/index ownership check, not GPU memory ordering proof or execution trace",
+  "ns9_span": {
+    "per": 15,
+    "ranges": [
+      [
+        0,
+        15
+      ],
+      [
+        15,
+        30
+      ],
+      [
+        30,
+        45
+      ],
+      [
+        45,
+        60
+      ],
+      [
+        60,
+        75
+      ],
+      [
+        75,
+        90
+      ],
+      [
+        90,
+        105
+      ],
+      [
+        105,
+        120
+      ],
+      [
+        120,
+        128
+      ]
+    ],
+    "all_staging_cp_async": true,
+    "reason": "each split length<=15<BKV64; no full TMA64 tile possible"
+  },
+  "arena_note": "loader log smem_flash is pfseg s1; dedicated pffa separately loads its exported205824 and uses s3 on class2"
+}
