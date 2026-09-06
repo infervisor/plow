@@ -1,0 +1,2749 @@
+{
+  "primitive_vector_qualified": true,
+  "vector_rule": "Each of five inputs strictly improves relL2; max absolute error does not grow. Per-element non-worsening diagnostic failed and is retained.",
+  "vector_result": {
+    "passed": true,
+    "values": 51200,
+    "rows": [
+      {
+        "step": 0,
+        "values": 10240,
+        "improved": 3346,
+        "unchanged": 6573,
+        "worsened": 321,
+        "control_rel_l2": 0.006842932798713982,
+        "candidate_rel_l2": 0.001079828060289861,
+        "control_max_abs": 0.75,
+        "candidate_max_abs": 0.125
+      },
+      {
+        "step": 1,
+        "values": 10240,
+        "improved": 2306,
+        "unchanged": 7611,
+        "worsened": 323,
+        "control_rel_l2": 0.0030530639158869426,
+        "candidate_rel_l2": 0.0007990511454979181,
+        "control_max_abs": 0.125,
+        "candidate_max_abs": 0.125
+      },
+      {
+        "step": 2,
+        "values": 10240,
+        "improved": 3049,
+        "unchanged": 6736,
+        "worsened": 455,
+        "control_rel_l2": 0.0063521364331882236,
+        "candidate_rel_l2": 0.0012328460922721343,
+        "control_max_abs": 0.5,
+        "candidate_max_abs": 0.25
+      },
+      {
+        "step": 3,
+        "values": 10240,
+        "improved": 2243,
+        "unchanged": 7613,
+        "worsened": 384,
+        "control_rel_l2": 0.00277297619134107,
+        "candidate_rel_l2": 0.0008989410576715701,
+        "control_max_abs": 0.125,
+        "candidate_max_abs": 0.125
+      },
+      {
+        "step": 4,
+        "values": 10240,
+        "improved": 2677,
+        "unchanged": 7164,
+        "worsened": 399,
+        "control_rel_l2": 0.00580464217049634,
+        "candidate_rel_l2": 0.0018150818064452364,
+        "control_max_abs": 0.5,
+        "candidate_max_abs": 0.25
+      }
+    ],
+    "prior_per_element_gate_passed": false,
+    "vector_gate_passed": true,
+    "gate_revision": "Root explicitly directed vector-level relL2 improvement for each of five inputs and non-regressing maxabs; prior per-element failure retained, never overwritten.",
+    "memory_qualified": true,
+    "timing_qualified": false,
+    "prior_receipt_rule_text": "Every output absolute residual must not worsen; each input row must strictly improve relL2; max_abs cannot grow. No new relaxed tolerance.",
+    "effective_rule": "Each of five inputs strictly improves relL2; max absolute error does not grow. Per-element non-worsening diagnostic failed and is retained."
+  },
+  "per_element_nonworsening_passed": false,
+  "worsened_outputs": 1882,
+  "total_outputs": 51200,
+  "memory": {
+    "device_memory_qualified": true,
+    "tool_exit_zero": false,
+    "raw_returncodes": [
+      99,
+      99,
+      99,
+      99
+    ],
+    "classification": {
+      "candidate-observed-memcheck-classification": {
+        "device_memory_qualified": true,
+        "raw_returncode": 99,
+        "tool_exit_zero": false,
+        "expected_handled_runtime_context_probes": 7,
+        "scope": "No device-memory reports; only exact bound libcudart handled201 probes. Raw99 retained, not clean tool exit.",
+        "application_rows": 5,
+        "all_numerical_cases_match_uninstrumented": true,
+        "sha256": {
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/results/candidate-observed-memcheck.xml": "40dfff01f4ae7a8a222d3a742ed4695b01119a7bcf0b156ee16fd386103c2b85",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/candidate-observed-memcheck.log": "800bd3f196de01dd4bb3e9e98163309b7256a34482fbb4c1755a7f847e791dbd",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/results/candidate-observed-memcheck.json": "9070a86ccdbbb5f0521063b0033d52e16e7b6e9de4e17b4efbb5b2b779493d24",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/api-audit/proof.json": "e058f78cd3500fb8efbfc426e4407938522b69e9ee2dc2490a44368a72e4d4d1"
+        },
+        "actual_api_records": [
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::ExchangeDevice",
+                "pc": "0x4c901",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::ExchangeDevice",
+                "pc": "0x4c901",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          }
+        ],
+        "raw_log_summary": [
+          "========= ERROR SUMMARY: 7 errors"
+        ],
+        "raw_xml_sha256": "40dfff01f4ae7a8a222d3a742ed4695b01119a7bcf0b156ee16fd386103c2b85",
+        "raw_log_sha256": "800bd3f196de01dd4bb3e9e98163309b7256a34482fbb4c1755a7f847e791dbd"
+      },
+      "control-synthetic-memcheck-classification": {
+        "device_memory_qualified": true,
+        "raw_returncode": 99,
+        "tool_exit_zero": false,
+        "expected_handled_runtime_context_probes": 7,
+        "scope": "No device-memory reports; only exact bound libcudart handled201 probes. Raw99 retained, not clean tool exit.",
+        "application_rows": 15,
+        "all_numerical_cases_match_uninstrumented": true,
+        "sha256": {
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/results/control-synthetic-memcheck.xml": "10a87cf8ebb67a941d1ec62c58a36dab3b336a959bd5fb6b8ea399650f0229d7",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/control-synthetic-memcheck.log": "41cb56f5553fd20041b78094225c1a738f43b70c8c9ff3924e3bf38978b27720",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/results/control-synthetic-memcheck.json": "7ff5fbfe77bc7013e1b3443d0fd7f49430516058bad3b4cda269541ee9f327d3",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/api-audit/proof.json": "e058f78cd3500fb8efbfc426e4407938522b69e9ee2dc2490a44368a72e4d4d1"
+        },
+        "actual_api_records": [
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          }
+        ],
+        "raw_log_summary": [
+          "========= ERROR SUMMARY: 7 errors"
+        ],
+        "raw_xml_sha256": "10a87cf8ebb67a941d1ec62c58a36dab3b336a959bd5fb6b8ea399650f0229d7",
+        "raw_log_sha256": "41cb56f5553fd20041b78094225c1a738f43b70c8c9ff3924e3bf38978b27720"
+      },
+      "candidate-synthetic-memcheck-classification": {
+        "device_memory_qualified": true,
+        "raw_returncode": 99,
+        "tool_exit_zero": false,
+        "expected_handled_runtime_context_probes": 7,
+        "scope": "No device-memory reports; only exact bound libcudart handled201 probes. Raw99 retained, not clean tool exit.",
+        "application_rows": 15,
+        "all_numerical_cases_match_uninstrumented": true,
+        "sha256": {
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/results/candidate-synthetic-memcheck.xml": "10a87cf8ebb67a941d1ec62c58a36dab3b336a959bd5fb6b8ea399650f0229d7",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/candidate-synthetic-memcheck.log": "52b9c651cd7d3e4f98b10f0ee998cd077a31f6b2a1717ea61b5dcbc8fb478055",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/results/candidate-synthetic-memcheck.json": "a64afb36f786b0fc8e9f39e81a18b24e6b8854380a02d18b389f44674ed0abc3",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/api-audit/proof.json": "e058f78cd3500fb8efbfc426e4407938522b69e9ee2dc2490a44368a72e4d4d1"
+        },
+        "actual_api_records": [
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          }
+        ],
+        "raw_log_summary": [
+          "========= ERROR SUMMARY: 7 errors"
+        ],
+        "raw_xml_sha256": "10a87cf8ebb67a941d1ec62c58a36dab3b336a959bd5fb6b8ea399650f0229d7",
+        "raw_log_sha256": "52b9c651cd7d3e4f98b10f0ee998cd077a31f6b2a1717ea61b5dcbc8fb478055"
+      },
+      "control-observed-memcheck-classification": {
+        "device_memory_qualified": true,
+        "raw_returncode": 99,
+        "tool_exit_zero": false,
+        "expected_handled_runtime_context_probes": 7,
+        "scope": "No device-memory reports; only exact bound libcudart handled201 probes. Raw99 retained, not clean tool exit.",
+        "application_rows": 5,
+        "all_numerical_cases_match_uninstrumented": true,
+        "sha256": {
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/results/control-observed-memcheck.xml": "40dfff01f4ae7a8a222d3a742ed4695b01119a7bcf0b156ee16fd386103c2b85",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/control-observed-memcheck.log": "d1be8a7476c0bb7e7c48ee23a22c0d708f0e173f1e1a7bbe9ef98bf718b3f1bb",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/results/control-observed-memcheck.json": "1d7728869c9fdada577cf22312519123794aa5b9f9f80e64539bab88ee7a46f4",
+          "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/api-audit/proof.json": "e058f78cd3500fb8efbfc426e4407938522b69e9ee2dc2490a44368a72e4d4d1"
+        },
+        "actual_api_records": [
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::ExchangeDevice",
+                "pc": "0x4c901",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::ExchangeDevice",
+                "pc": "0x4c901",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          },
+          {
+            "kind": "Api",
+            "api": "cuCtxGetDevice_v2",
+            "error": "CUDA_ERROR_INVALID_CONTEXT",
+            "result": "201",
+            "first_three_frames": [
+              {
+                "pc": "0x109d7",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "cudaGetDevice",
+                "pc": "0x48e52",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13"
+              },
+              {
+                "func": "c10::cuda::GetDevice",
+                "pc": "0x4ce84",
+                "module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so"
+              }
+            ]
+          }
+        ],
+        "raw_log_summary": [
+          "========= ERROR SUMMARY: 7 errors"
+        ],
+        "raw_xml_sha256": "40dfff01f4ae7a8a222d3a742ed4695b01119a7bcf0b156ee16fd386103c2b85",
+        "raw_log_sha256": "d1be8a7476c0bb7e7c48ee23a22c0d708f0e173f1e1a7bbe9ef98bf718b3f1bb"
+      }
+    }
+  },
+  "performance_qualified": false,
+  "full_block_qualified": true,
+  "resource_scope": {
+    "primitive": "160 registers; zero stack and spills in both arms",
+    "broad": "255 registers both; stack232\u2192240 B, spill stores248\u2192356 B, spill loads584\u2192624 B; rejected for performance"
+  },
+  "scope": "Primitive only; independent model quality and full-block reset remain required",
+  "artifact": "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906",
+  "date": "2026-09-06",
+  "experiment": "FP8 M1 WGMMA accumulator promotion every512K vs all-K FAST_ACCUM, five captured QKV inputs",
+  "resources_and_control_parity": {
+    "control_sass_exact_qualified_primitive": true,
+    "resources": {
+      "control": "\nFatbin elf code:\n================\narch = sm_90a\ncode version = [1,8]\nhost = linux\ncompile_size = 64bit\n\nResource usage:\n Common:\n  GLOBAL:0\n\nFatbin elf code:\n================\narch = sm_90a\ncode version = [1,8]\nhost = linux\ncompile_size = 64bit\n\nResource usage:\n Common:\n  GLOBAL:0\n Function _Z3runj4Args:\n  REG:160 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[2]:96 CONSTANT[0]:640 TEXTURE:0 SURFACE:0 SAMPLER:0\n",
+      "candidate": "\nFatbin elf code:\n================\narch = sm_90a\ncode version = [1,8]\nhost = linux\ncompile_size = 64bit\n\nResource usage:\n Common:\n  GLOBAL:0\n\nFatbin elf code:\n================\narch = sm_90a\ncode version = [1,8]\nhost = linux\ncompile_size = 64bit\n\nResource usage:\n Common:\n  GLOBAL:0\n Function _Z3runj4Args:\n  REG:160 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[2]:96 CONSTANT[0]:640 TEXTURE:0 SURFACE:0 SAMPLER:0\n"
+    },
+    "instruction_counts": {
+      "control": {
+        "HGMMA": 2,
+        "FADD": 280,
+        "UTMALDG": 12,
+        "MBARRIER": 0,
+        "WARPGROUP": 18,
+        "LDL": 0,
+        "STL": 0
+      },
+      "candidate": {
+        "HGMMA": 2,
+        "FADD": 282,
+        "UTMALDG": 12,
+        "MBARRIER": 0,
+        "WARPGROUP": 18,
+        "LDL": 0,
+        "STL": 0
+      }
+    },
+    "control_cubin_files": [
+      {
+        "path": "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/control-elf/control.1.sm_90a.cubin",
+        "sha256": "1274733c614841b9fd786b6d9727bb2e557ec82452fc58bae54b3c07c57f1a52"
+      },
+      {
+        "path": "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/control-elf/control.2.sm_90a.cubin",
+        "sha256": "a6d1da9ea90e5e25a357aa4f786764c783a5a62e94266eec6bd9193a83337530"
+      }
+    ],
+    "candidate_cubin_files": [
+      {
+        "path": "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/candidate-elf/candidate.1.sm_90a.cubin",
+        "sha256": "1274733c614841b9fd786b6d9727bb2e557ec82452fc58bae54b3c07c57f1a52"
+      },
+      {
+        "path": "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/candidate-elf/candidate.2.sm_90a.cubin",
+        "sha256": "50a04dffc65d2da71fb8fe50dd6488888dce91774c890cfdf7528691215533bf"
+      }
+    ],
+    "source_scope": "Only two arithmetic sites plus default-off artifact macro in TMA M1 body; qwen_test launch wrapper unchanged. Primitive160regs0stack0spills static1024+dynamic205840,256threads,132blocks both arms. No broad object/resource or GPU qualification yet.",
+    "sha256": {
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-tma/source/runtime/nvidia/op_gemm.cuh": "861cce8de5c88575e4105282fd4a8098eff6ce91bf8ac4536847135e6870cdfc",
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/nvidia/op_gemm.cuh": "0e8a5c0654aa1b157dcab7b34d3fb415d5739b9a0e706ee1cb8220ba3f6b769e",
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/control.so": "448e3813ce0cdbf2977e6a29126fbd725b0b75ef69441fed6338d6ba352d16c8",
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/candidate.so": "b3e946de0c4ce432310ed25724f8aaa89a116d21bfc961bcdd3524b25a4f80b4",
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/build-commands.json": "04fe60f7a519a201d7e7a5f50a8154f4c2305db3a40b545bbb8e575c2e61d0be",
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/kernel.patch": "873ab99784aeb2ace7c9e24f5e1d5afba5712bd80fbd440d2840cb538062637f"
+    }
+  },
+  "broad_resources_and_control_parity": {
+    "control_sass_exact": true,
+    "resources": {
+      "control": "\nResource usage:\n Common:\n  GLOBAL:32 CONSTANT[4]:64\n Function _Z12interp_sm90a11PlowProgram:\n  REG:255 STACK:232 SHARED:2448 LOCAL:0 CONSTANT[0]:696 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj:\n  REG:40 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:588 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj:\n  REG:46 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:584 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj:\n  REG:48 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:592 TEXTURE:0 SURFACE:0 SAMPLER:0\n",
+      "candidate": "\nResource usage:\n Common:\n  GLOBAL:32 CONSTANT[4]:64\n Function _Z12interp_sm90a11PlowProgram:\n  REG:255 STACK:240 SHARED:2448 LOCAL:0 CONSTANT[0]:696 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj:\n  REG:40 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:588 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj:\n  REG:46 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:584 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj:\n  REG:48 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:592 TEXTURE:0 SURFACE:0 SAMPLER:0\n"
+    },
+    "sha256": {
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/full-block/control.cubin": "27a2e4859bb3edad1dc059ac64ccd94e5f4c83cc6ccf4064291a4611056d681d",
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/full-block/candidate.cubin": "ea777f7fb736297e965ebf225ab819b429716061f9761b766a819f749d901d83",
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/full-block/control.sass": "c13b265eceea166e013482231e41aaa6eb2aaedb7a29ef9be0a2c8b480b05a45",
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/full-block/candidate.sass": "0a08c5ec7d92584bc7046fa54e5e1ef5cfa0efe5bd86ec14d8ca1f597713b352",
+      "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/full-block/build-commands.json": "5114f9e0456c8c4166661fa8d06280b3cf92ce789163416c485de1aadd79a9d1"
+    }
+  },
+  "negative_classifier_tests": {
+    "negative-tests.json": {
+      "passed": true,
+      "positive": 1,
+      "negative": 8
+    },
+    "observed-negative-tests.json": {
+      "passed": true,
+      "positive": 1,
+      "negative": 3,
+      "scope": "exact ExchangeDevice callsite and two allowed record positions"
+    }
+  },
+  "api_callsite_proofs": {
+    "proof.json": {
+      "libcudart": "/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib/libcudart.so.13",
+      "libcudart_sha256": "96c42e418cec19054186b9429c321603cc190bf26a18104e19408117a2a817b0",
+      "record_count": 7,
+      "api": "cuCtxGetDevice_v2",
+      "error": "CUDA_ERROR_INVALID_CONTEXT",
+      "result": "201",
+      "driver_call": "0x109d6",
+      "reported_driver_call_last_byte": "0x109d7",
+      "caller_call": "0x48e4e",
+      "reported_caller_call_last_byte": "0x48e52",
+      "fallback": "109e0 cmp eax,201;109e5 branch10a28;10a67 stores cached/default device;10a6b clears ebx;10a71 eax=ebx;10a79 returns0",
+      "raw_control_stack_records": [
+        "<record>\n    <kind>Api</kind>\n    <what>\n      <text>Program hit CUDA_ERROR_INVALID_CONTEXT (error 201) due to \"invalid device context\" on CUDA API call to cuCtxGetDevice_v2.</text>\n      <api>cuCtxGetDevice_v2</api>\n      <error>CUDA_ERROR_INVALID_CONTEXT</error>\n      <message>invalid device context</message>\n      <result>201</result>\n    </what>\n    <hostStack>\n      <saveLocation>error</saveLocation>\n      <frame>\n        <pc>0x109d7</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>cudaGetDevice</func>\n        <pc>0x48e52</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::GetDevice</func>\n        <pc>0x4ce84</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::current_device</func>\n        <pc>0x4cef2</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::cuda::assertNotCapturing</func>\n        <pc>0xcd19d8</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::CUDAGeneratorImpl::CUDAGeneratorImpl</func>\n        <pc>0xcce707</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::Generator at::make_generator&lt;at::CUDAGeneratorImpl, signed char&amp;&gt;</func>\n        <pc>0xcd2a43</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::cuda::detail::getDefaultCUDAGenerator</func>\n        <pc>0xccfb6e</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>THCPModule_initExtension</func>\n        <pc>0xe81488</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x170e83</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyObject_Vectorcall</func>\n        <pc>0x170202</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x402e5</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x169ef8</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyObject_CallMethod</func>\n        <pc>0x256f8f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>torch::utils::device_lazy_init</func>\n        <pc>0xdc73aa</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <func>torch::autograd::THPVariable_randn</func>\n        <pc>0x5af47b</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x191fe2</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x25b582</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x3fe08</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyEval_EvalCode</func>\n        <pc>0x24d829</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x289ad1</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x286c8d</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x28380a</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2830d3</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x282ec4</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_RunMain</func>\n        <pc>0x28191f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_BytesMain</func>\n        <pc>0x23c9bc</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2a1c9</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>__libc_start_main</func>\n        <pc>0x2a28a</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>_start</func>\n        <pc>0x23be54</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>_lazy_init</func>\n        <path>/opt/pytorch/lib/python3.13/site-packages/torch/cuda/__init__.py</path>\n        <line>529</line>\n      </frame>\n      <frame>\n        <func>rand</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>26</line>\n      </frame>\n      <frame>\n        <func>check_fp8_gemm</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>122</line>\n      </frame>\n      <frame>\n        <func>&lt;module&gt;</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>252</line>\n      </frame>\n    </hostStack>\n  </record>\n  ",
+        "<record>\n    <kind>Api</kind>\n    <what>\n      <text>Program hit CUDA_ERROR_INVALID_CONTEXT (error 201) due to \"invalid device context\" on CUDA API call to cuCtxGetDevice_v2.</text>\n      <api>cuCtxGetDevice_v2</api>\n      <error>CUDA_ERROR_INVALID_CONTEXT</error>\n      <message>invalid device context</message>\n      <result>201</result>\n    </what>\n    <hostStack>\n      <saveLocation>error</saveLocation>\n      <frame>\n        <pc>0x109d7</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>cudaGetDevice</func>\n        <pc>0x48e52</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::GetDevice</func>\n        <pc>0x4ce84</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::current_device</func>\n        <pc>0x4cef2</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::cuda::assertNotCapturing</func>\n        <pc>0xcd19d8</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::CUDAGeneratorImpl::seed</func>\n        <pc>0xccd840</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::cuda::detail::getDefaultCUDAGenerator</func>\n        <pc>0xccfba8</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>THCPModule_initExtension</func>\n        <pc>0xe81488</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x170e83</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyObject_Vectorcall</func>\n        <pc>0x170202</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x402e5</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x169ef8</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyObject_CallMethod</func>\n        <pc>0x256f8f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>torch::utils::device_lazy_init</func>\n        <pc>0xdc73aa</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <func>torch::autograd::THPVariable_randn</func>\n        <pc>0x5af47b</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x191fe2</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x25b582</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x3fe08</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyEval_EvalCode</func>\n        <pc>0x24d829</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x289ad1</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x286c8d</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x28380a</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2830d3</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x282ec4</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_RunMain</func>\n        <pc>0x28191f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_BytesMain</func>\n        <pc>0x23c9bc</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2a1c9</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>__libc_start_main</func>\n        <pc>0x2a28a</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>_start</func>\n        <pc>0x23be54</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>_lazy_init</func>\n        <path>/opt/pytorch/lib/python3.13/site-packages/torch/cuda/__init__.py</path>\n        <line>529</line>\n      </frame>\n      <frame>\n        <func>rand</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>26</line>\n      </frame>\n      <frame>\n        <func>check_fp8_gemm</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>122</line>\n      </frame>\n      <frame>\n        <func>&lt;module&gt;</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>252</line>\n      </frame>\n    </hostStack>\n  </record>\n  ",
+        "<record>\n    <kind>Api</kind>\n    <what>\n      <text>Program hit CUDA_ERROR_INVALID_CONTEXT (error 201) due to \"invalid device context\" on CUDA API call to cuCtxGetDevice_v2.</text>\n      <api>cuCtxGetDevice_v2</api>\n      <error>CUDA_ERROR_INVALID_CONTEXT</error>\n      <message>invalid device context</message>\n      <result>201</result>\n    </what>\n    <hostStack>\n      <saveLocation>error</saveLocation>\n      <frame>\n        <pc>0x109d7</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>cudaGetDevice</func>\n        <pc>0x48e52</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::GetDevice</func>\n        <pc>0x4ce84</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::current_device</func>\n        <pc>0x4cef2</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::CUDAGeneratorImpl::set_current_seed</func>\n        <pc>0xccce70</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::CUDAGeneratorImpl::seed</func>\n        <pc>0xccd870</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::cuda::detail::getDefaultCUDAGenerator</func>\n        <pc>0xccfba8</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>THCPModule_initExtension</func>\n        <pc>0xe81488</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x170e83</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyObject_Vectorcall</func>\n        <pc>0x170202</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x402e5</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x169ef8</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyObject_CallMethod</func>\n        <pc>0x256f8f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>torch::utils::device_lazy_init</func>\n        <pc>0xdc73aa</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <func>torch::autograd::THPVariable_randn</func>\n        <pc>0x5af47b</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x191fe2</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x25b582</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x3fe08</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyEval_EvalCode</func>\n        <pc>0x24d829</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x289ad1</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x286c8d</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x28380a</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2830d3</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x282ec4</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_RunMain</func>\n        <pc>0x28191f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_BytesMain</func>\n        <pc>0x23c9bc</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2a1c9</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>__libc_start_main</func>\n        <pc>0x2a28a</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>_start</func>\n        <pc>0x23be54</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>_lazy_init</func>\n        <path>/opt/pytorch/lib/python3.13/site-packages/torch/cuda/__init__.py</path>\n        <line>529</line>\n      </frame>\n      <frame>\n        <func>rand</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>26</line>\n      </frame>\n      <frame>\n        <func>check_fp8_gemm</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>122</line>\n      </frame>\n      <frame>\n        <func>&lt;module&gt;</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>252</line>\n      </frame>\n    </hostStack>\n  </record>\n  ",
+        "<record>\n    <kind>Api</kind>\n    <what>\n      <text>Program hit CUDA_ERROR_INVALID_CONTEXT (error 201) due to \"invalid device context\" on CUDA API call to cuCtxGetDevice_v2.</text>\n      <api>cuCtxGetDevice_v2</api>\n      <error>CUDA_ERROR_INVALID_CONTEXT</error>\n      <message>invalid device context</message>\n      <result>201</result>\n    </what>\n    <hostStack>\n      <saveLocation>error</saveLocation>\n      <frame>\n        <pc>0x109d7</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>cudaGetDevice</func>\n        <pc>0x48e52</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::GetDevice</func>\n        <pc>0x4ce84</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::current_device</func>\n        <pc>0x4cef2</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::CUDAGeneratorImpl::set_current_seed</func>\n        <pc>0xccce70</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>THPGenerator_manualSeed</func>\n        <pc>0x72d970</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x1a7b14</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyObject_Vectorcall</func>\n        <pc>0x170202</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x402e5</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x169ef8</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyObject_CallMethod</func>\n        <pc>0x256f8f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>torch::utils::device_lazy_init</func>\n        <pc>0xdc73aa</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <func>torch::autograd::THPVariable_randn</func>\n        <pc>0x5af47b</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x191fe2</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x25b582</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x3fe08</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyEval_EvalCode</func>\n        <pc>0x24d829</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x289ad1</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x286c8d</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x28380a</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2830d3</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x282ec4</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_RunMain</func>\n        <pc>0x28191f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_BytesMain</func>\n        <pc>0x23c9bc</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2a1c9</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>__libc_start_main</func>\n        <pc>0x2a28a</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>_start</func>\n        <pc>0x23be54</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>cb</func>\n        <path>/opt/pytorch/lib/python3.13/site-packages/torch/cuda/random.py</path>\n        <line>126</line>\n      </frame>\n      <frame>\n        <func>_lazy_init</func>\n        <path>/opt/pytorch/lib/python3.13/site-packages/torch/cuda/__init__.py</path>\n        <line>540</line>\n      </frame>\n      <frame>\n        <func>rand</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>26</line>\n      </frame>\n      <frame>\n        <func>check_fp8_gemm</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>122</line>\n      </frame>\n      <frame>\n        <func>&lt;module&gt;</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>252</line>\n      </frame>\n    </hostStack>\n  </record>\n  ",
+        "<record>\n    <kind>Api</kind>\n    <what>\n      <text>Program hit CUDA_ERROR_INVALID_CONTEXT (error 201) due to \"invalid device context\" on CUDA API call to cuCtxGetDevice_v2.</text>\n      <api>cuCtxGetDevice_v2</api>\n      <error>CUDA_ERROR_INVALID_CONTEXT</error>\n      <message>invalid device context</message>\n      <result>201</result>\n    </what>\n    <hostStack>\n      <saveLocation>error</saveLocation>\n      <frame>\n        <pc>0x109d7</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>cudaGetDevice</func>\n        <pc>0x48e52</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::GetDevice</func>\n        <pc>0x4ce84</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::impl::CUDAGuardImpl::getDevice const</func>\n        <pc>0x1dd12</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::InlineDeviceGuard&lt;c10::impl::VirtualGuardImpl&gt;::InlineDeviceGuard</func>\n        <pc>0xcd145a</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::</func>\n        <pc>0x372305b</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x37231bb</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::empty_memory_format::redispatch</func>\n        <pc>0x28da409</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x2d18828</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::empty_memory_format::call</func>\n        <pc>0x299fcef</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::empty [clone .constprop.0]</func>\n        <pc>0x207b590</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::native::randn</func>\n        <pc>0x208c92a</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::native::randn</func>\n        <pc>0x208ca4e</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x2fb2a09</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::randn::redispatch</func>\n        <pc>0x255b974</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x2d172be</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::randn::call</func>\n        <pc>0x261e9ee</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>torch::autograd::THPVariable_randn</func>\n        <pc>0x5af5d4</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x191fe2</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x25b582</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x3fe08</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyEval_EvalCode</func>\n        <pc>0x24d829</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x289ad1</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x286c8d</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x28380a</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2830d3</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x282ec4</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_RunMain</func>\n        <pc>0x28191f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_BytesMain</func>\n        <pc>0x23c9bc</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2a1c9</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>__libc_start_main</func>\n        <pc>0x2a28a</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>_start</func>\n        <pc>0x23be54</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>rand</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>26</line>\n      </frame>\n      <frame>\n        <func>check_fp8_gemm</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>122</line>\n      </frame>\n      <frame>\n        <func>&lt;module&gt;</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>252</line>\n      </frame>\n    </hostStack>\n  </record>\n  ",
+        "<record>\n    <kind>Api</kind>\n    <what>\n      <text>Program hit CUDA_ERROR_INVALID_CONTEXT (error 201) due to \"invalid device context\" on CUDA API call to cuCtxGetDevice_v2.</text>\n      <api>cuCtxGetDevice_v2</api>\n      <error>CUDA_ERROR_INVALID_CONTEXT</error>\n      <message>invalid device context</message>\n      <result>201</result>\n    </what>\n    <hostStack>\n      <saveLocation>error</saveLocation>\n      <frame>\n        <pc>0x109d7</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>cudaGetDevice</func>\n        <pc>0x48e52</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::GetDevice</func>\n        <pc>0x4ce84</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::impl::CUDAGuardImpl::getDevice const</func>\n        <pc>0x1dd12</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::InlineDeviceGuard&lt;c10::impl::VirtualGuardImpl&gt;::InlineDeviceGuard</func>\n        <pc>0xcd145a</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::detail::empty_cuda</func>\n        <pc>0xcf4069</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::detail::empty_cuda</func>\n        <pc>0xcf429d</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::native::empty_cuda</func>\n        <pc>0x104c762</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::</func>\n        <pc>0x37230a1</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x37231bb</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::empty_memory_format::redispatch</func>\n        <pc>0x28da409</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x2d18828</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::empty_memory_format::call</func>\n        <pc>0x299fcef</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::empty [clone .constprop.0]</func>\n        <pc>0x207b590</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::native::randn</func>\n        <pc>0x208c92a</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::native::randn</func>\n        <pc>0x208ca4e</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x2fb2a09</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::randn::redispatch</func>\n        <pc>0x255b974</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x2d172be</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::randn::call</func>\n        <pc>0x261e9ee</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>torch::autograd::THPVariable_randn</func>\n        <pc>0x5af5d4</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x191fe2</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x25b582</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x3fe08</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyEval_EvalCode</func>\n        <pc>0x24d829</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x289ad1</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x286c8d</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x28380a</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2830d3</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x282ec4</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_RunMain</func>\n        <pc>0x28191f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_BytesMain</func>\n        <pc>0x23c9bc</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2a1c9</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>__libc_start_main</func>\n        <pc>0x2a28a</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>_start</func>\n        <pc>0x23be54</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>rand</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>26</line>\n      </frame>\n      <frame>\n        <func>check_fp8_gemm</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>122</line>\n      </frame>\n      <frame>\n        <func>&lt;module&gt;</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>252</line>\n      </frame>\n    </hostStack>\n  </record>\n  ",
+        "<record>\n    <kind>Api</kind>\n    <what>\n      <text>Program hit CUDA_ERROR_INVALID_CONTEXT (error 201) due to \"invalid device context\" on CUDA API call to cuCtxGetDevice_v2.</text>\n      <api>cuCtxGetDevice_v2</api>\n      <error>CUDA_ERROR_INVALID_CONTEXT</error>\n      <message>invalid device context</message>\n      <result>201</result>\n    </what>\n    <hostStack>\n      <saveLocation>error</saveLocation>\n      <frame>\n        <pc>0x109d7</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>cudaGetDevice</func>\n        <pc>0x48e52</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/../../nvidia/cu13/lib/libcudart.so.13</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::GetDevice</func>\n        <pc>0x4ce84</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::cuda::CUDACachingAllocator::Native::NativeCachingAllocator::allocate</func>\n        <pc>0x47a58</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::detail::empty_generic</func>\n        <pc>0x183caf2</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::detail::empty_cuda</func>\n        <pc>0xcf408e</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::detail::empty_cuda</func>\n        <pc>0xcf429d</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::native::empty_cuda</func>\n        <pc>0x104c762</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::</func>\n        <pc>0x37230a1</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x37231bb</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::empty_memory_format::redispatch</func>\n        <pc>0x28da409</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x2d18828</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::empty_memory_format::call</func>\n        <pc>0x299fcef</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::empty [clone .constprop.0]</func>\n        <pc>0x207b590</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::native::randn</func>\n        <pc>0x208c92a</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::native::randn</func>\n        <pc>0x208ca4e</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x2fb2a09</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::randn::redispatch</func>\n        <pc>0x255b974</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>c10::impl::wrap_kernel_functor_unboxed_&lt;c10::impl::detail::WrapFunctionIntoFunctor_&lt;c10::CompileTimeFunctionPointer&lt;at::Tensor </func>\n        <pc>0x2d172be</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>at::_ops::randn::call</func>\n        <pc>0x261e9ee</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_cpu.so</module>\n      </frame>\n      <frame>\n        <func>torch::autograd::THPVariable_randn</func>\n        <pc>0x5af5d4</pc>\n        <module>/opt/pytorch/lib/python3.13/site-packages/torch/lib/libtorch_python.so</module>\n      </frame>\n      <frame>\n        <pc>0x191fe2</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x25b582</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x3fe08</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>PyEval_EvalCode</func>\n        <pc>0x24d829</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x289ad1</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x286c8d</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x28380a</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2830d3</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x282ec4</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_RunMain</func>\n        <pc>0x28191f</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>Py_BytesMain</func>\n        <pc>0x23c9bc</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <pc>0x2a1c9</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>__libc_start_main</func>\n        <pc>0x2a28a</pc>\n        <module>/lib/x86_64-linux-gnu/libc.so.6</module>\n      </frame>\n      <frame>\n        <func>_start</func>\n        <pc>0x23be54</pc>\n        <module>/opt/pytorch/bin/python</module>\n      </frame>\n      <frame>\n        <func>rand</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>26</line>\n      </frame>\n      <frame>\n        <func>check_fp8_gemm</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>122</line>\n      </frame>\n      <frame>\n        <func>&lt;module&gt;</func>\n        <path>/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/source/runtime/tests/qwen_primitives.py</path>\n        <line>252</line>\n      </frame>\n    </hostStack>\n  </record>\n"
+      ],
+      "commands": [
+        [
+          "objdump",
+          "-d",
+          "--start-address=0x109b0",
+          "--stop-address=0x10ab0",
+          "/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib/libcudart.so.13"
+        ],
+        [
+          "objdump",
+          "-d",
+          "--start-address=0x48e44",
+          "--stop-address=0x48e63",
+          "/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib/libcudart.so.13"
+        ]
+      ],
+      "hashes": {
+        "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/api-audit/libcudart-0.asm": "49e70875165320038147520a69b81b68deb748e7d7587e1ccc0b12e55424e4ab",
+        "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/api-audit/libcudart-1.asm": "08002a2b85eecfe13cd7d0bd851aa99c085d2939dd3e337bd85ae11bb07a77ba"
+      }
+    },
+    "observed-callchain-proof.json": {
+      "c10_module": "/opt/pytorch/lib/python3.13/site-packages/torch/lib/libc10_cuda.so",
+      "sha256": "54da13d79545600a1822a72b179a58295c1915f8ea0194a89066437c3ac48c1a",
+      "call": "0x4c8fd cudaGetDevice@plt",
+      "reported_last_byte": "0x4c901",
+      "records": "observed records4,5 use ExchangeDevice; other5 use GetDevice; all7 retain exact libcudart callsite and201 fallback",
+      "source_control_xml_sha256": "40dfff01f4ae7a8a222d3a742ed4695b01119a7bcf0b156ee16fd386103c2b85",
+      "same_handled_libcudart_fallback": true
+    }
+  },
+  "full_block_structural_result": {
+    "qualification": {
+      "accepted": true,
+      "scope": "Native layer0 fullblock ten teacher-forced steps perarm; five saved inputs then reset and repeat. Structural/reset/QKV primitive gates only; independent errors reported without new acceptance threshold.",
+      "control_baseline_exact_rows": 30,
+      "reset_exact_rows": 30,
+      "QKV_matches_primitive_rows": 20,
+      "rows": [
+        {
+          "step": 0,
+          "input_token": 760,
+          "boundaries": {
+            "act.x": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4957,
+                  "relative_l2": 0.011771332327337116,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4825,
+                  "relative_l2": 0.0068471804388918625,
+                  "max_abs": 0.015625,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3456
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4936,
+                  "relative_l2": 0.011969833262202242,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4834,
+                  "relative_l2": 0.007066656564898615,
+                  "max_abs": 0.015625,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3456
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4971,
+                  "relative_l2": 0.012592986860700326,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4849,
+                  "relative_l2": 0.0075317817725707665,
+                  "max_abs": 0.0234375,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3456
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            },
+            "state.qwen.0.conv": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 8824,
+                  "relative_l2": 0.010836584474256089,
+                  "max_abs": 1.0,
+                  "max_abs_index": [
+                    0,
+                    7781,
+                    2
+                  ],
+                  "first_mismatch_index": 2
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 8697,
+                  "relative_l2": 0.009673902831140217,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    3692,
+                    2
+                  ],
+                  "first_mismatch_index": 2
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 8824,
+                  "relative_l2": 0.010836556661228961,
+                  "max_abs": 1.0,
+                  "max_abs_index": [
+                    0,
+                    7781,
+                    2
+                  ],
+                  "first_mismatch_index": 2
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 8697,
+                  "relative_l2": 0.009673871638208514,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    3692,
+                    2
+                  ],
+                  "first_mismatch_index": 2
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 8824,
+                  "relative_l2": 0.010836556661228961,
+                  "max_abs": 1.0,
+                  "max_abs_index": [
+                    0,
+                    7781,
+                    2
+                  ],
+                  "first_mismatch_index": 2
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 8697,
+                  "relative_l2": 0.009673871638208514,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    3692,
+                    2
+                  ],
+                  "first_mismatch_index": 2
+                }
+              }
+            },
+            "state.qwen.0.gdn": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786430,
+                  "relative_l2": 0.01545251308094579,
+                  "max_abs": 0.13283300399780273,
+                  "max_abs_index": [
+                    0,
+                    6,
+                    10,
+                    59
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.014718107634667675,
+                  "max_abs": 0.12157201766967773,
+                  "max_abs_index": [
+                    0,
+                    20,
+                    66,
+                    44
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.015683818034927938,
+                  "max_abs": 0.16023683547973633,
+                  "max_abs_index": [
+                    0,
+                    6,
+                    10,
+                    59
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786430,
+                  "relative_l2": 0.014745175910871839,
+                  "max_abs": 0.1199793815612793,
+                  "max_abs_index": [
+                    0,
+                    20,
+                    66,
+                    44
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.015354465383227007,
+                  "max_abs": 0.13620615005493164,
+                  "max_abs_index": [
+                    0,
+                    6,
+                    10,
+                    59
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.014565644574998947,
+                  "max_abs": 0.12242794036865234,
+                  "max_abs_index": [
+                    0,
+                    20,
+                    66,
+                    44
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "step": 1,
+          "input_token": 6511,
+          "boundaries": {
+            "act.x": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4944,
+                  "relative_l2": 0.01393907866159028,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4815,
+                  "relative_l2": 0.010654543797099765,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4931,
+                  "relative_l2": 0.01393897703186326,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4831,
+                  "relative_l2": 0.010623221268377952,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4934,
+                  "relative_l2": 0.014008601319039266,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4795,
+                  "relative_l2": 0.010664364236922326,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            },
+            "state.qwen.0.conv": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 18212,
+                  "relative_l2": 0.012328676991565224,
+                  "max_abs": 1.0,
+                  "max_abs_index": [
+                    0,
+                    7781,
+                    1
+                  ],
+                  "first_mismatch_index": 1
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 18054,
+                  "relative_l2": 0.01142801291295688,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    3692,
+                    1
+                  ],
+                  "first_mismatch_index": 1
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 18212,
+                  "relative_l2": 0.012328658216390419,
+                  "max_abs": 1.0,
+                  "max_abs_index": [
+                    0,
+                    7781,
+                    1
+                  ],
+                  "first_mismatch_index": 1
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 18054,
+                  "relative_l2": 0.011427992636393545,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    3692,
+                    1
+                  ],
+                  "first_mismatch_index": 1
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 18212,
+                  "relative_l2": 0.012328658216390419,
+                  "max_abs": 1.0,
+                  "max_abs_index": [
+                    0,
+                    7781,
+                    1
+                  ],
+                  "first_mismatch_index": 1
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 18054,
+                  "relative_l2": 0.011427992636393545,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    3692,
+                    1
+                  ],
+                  "first_mismatch_index": 1
+                }
+              }
+            },
+            "state.qwen.0.gdn": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.017663123713841124,
+                  "max_abs": 0.20493459701538086,
+                  "max_abs_index": [
+                    0,
+                    38,
+                    66,
+                    125
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.0172698290902052,
+                  "max_abs": 0.2005624771118164,
+                  "max_abs_index": [
+                    0,
+                    38,
+                    66,
+                    125
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.01775964396345401,
+                  "max_abs": 0.2175731658935547,
+                  "max_abs_index": [
+                    0,
+                    38,
+                    66,
+                    125
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786430,
+                  "relative_l2": 0.01749589638489562,
+                  "max_abs": 0.21320104598999023,
+                  "max_abs_index": [
+                    0,
+                    38,
+                    66,
+                    125
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786431,
+                  "relative_l2": 0.017628390626640716,
+                  "max_abs": 0.2063279151916504,
+                  "max_abs_index": [
+                    0,
+                    38,
+                    66,
+                    125
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.017215302547106476,
+                  "max_abs": 0.20195579528808594,
+                  "max_abs_index": [
+                    0,
+                    38,
+                    66,
+                    125
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "step": 2,
+          "input_token": 314,
+          "boundaries": {
+            "act.x": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4895,
+                  "relative_l2": 0.021834357576687106,
+                  "max_abs": 0.25,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4900,
+                  "relative_l2": 0.011526548795755839,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4907,
+                  "relative_l2": 0.021827078641279123,
+                  "max_abs": 0.25,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4904,
+                  "relative_l2": 0.011519548971796776,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4902,
+                  "relative_l2": 0.021818374769627398,
+                  "max_abs": 0.25,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4886,
+                  "relative_l2": 0.011505376191098652,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            },
+            "state.qwen.0.conv": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27382,
+                  "relative_l2": 0.012045686118094647,
+                  "max_abs": 1.0,
+                  "max_abs_index": [
+                    0,
+                    7781,
+                    0
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27223,
+                  "relative_l2": 0.011383803901980771,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    3692,
+                    0
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27382,
+                  "relative_l2": 0.012045673709003283,
+                  "max_abs": 1.0,
+                  "max_abs_index": [
+                    0,
+                    7781,
+                    0
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27223,
+                  "relative_l2": 0.011383790761226021,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    3692,
+                    0
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27382,
+                  "relative_l2": 0.012045673709003283,
+                  "max_abs": 1.0,
+                  "max_abs_index": [
+                    0,
+                    7781,
+                    0
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27223,
+                  "relative_l2": 0.011383790761226021,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    3692,
+                    0
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            },
+            "state.qwen.0.gdn": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.019309464199891442,
+                  "max_abs": 0.18869638442993164,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.018735242607416342,
+                  "max_abs": 0.1813165545463562,
+                  "max_abs_index": [
+                    0,
+                    42,
+                    31,
+                    35
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786431,
+                  "relative_l2": 0.019554253744344306,
+                  "max_abs": 0.20054149627685547,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.019014034753597944,
+                  "max_abs": 0.20070838928222656,
+                  "max_abs_index": [
+                    0,
+                    21,
+                    59,
+                    64
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786431,
+                  "relative_l2": 0.01935149613786942,
+                  "max_abs": 0.17639464139938354,
+                  "max_abs_index": [
+                    0,
+                    42,
+                    31,
+                    35
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.018761074977249315,
+                  "max_abs": 0.18932855129241943,
+                  "max_abs_index": [
+                    0,
+                    42,
+                    31,
+                    35
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "step": 3,
+          "input_token": 9338,
+          "boundaries": {
+            "act.x": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4882,
+                  "relative_l2": 0.00789353149271793,
+                  "max_abs": 0.015625,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    257
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4881,
+                  "relative_l2": 0.007175636236761456,
+                  "max_abs": 0.015625,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    257
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4895,
+                  "relative_l2": 0.007868248210094162,
+                  "max_abs": 0.015625,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    257
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4867,
+                  "relative_l2": 0.007171430813140496,
+                  "max_abs": 0.015625,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    257
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4925,
+                  "relative_l2": 0.0111014010685657,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4890,
+                  "relative_l2": 0.010485924471091158,
+                  "max_abs": 0.125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            },
+            "state.qwen.0.conv": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27821,
+                  "relative_l2": 0.013529662752719744,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    6982,
+                    1
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27752,
+                  "relative_l2": 0.013290134641956025,
+                  "max_abs": 0.625,
+                  "max_abs_index": [
+                    0,
+                    4045,
+                    1
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27821,
+                  "relative_l2": 0.01352966277490446,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    6982,
+                    1
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27752,
+                  "relative_l2": 0.013290134664676115,
+                  "max_abs": 0.625,
+                  "max_abs_index": [
+                    0,
+                    4045,
+                    1
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27821,
+                  "relative_l2": 0.01352966277490446,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    6982,
+                    1
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27752,
+                  "relative_l2": 0.013290134664676115,
+                  "max_abs": 0.625,
+                  "max_abs_index": [
+                    0,
+                    4045,
+                    1
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            },
+            "state.qwen.0.gdn": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.01760027056849708,
+                  "max_abs": 0.24112540483474731,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.01700720791031486,
+                  "max_abs": 0.2331380844116211,
+                  "max_abs_index": [
+                    0,
+                    25,
+                    66,
+                    48
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.017910639692154586,
+                  "max_abs": 0.24711650609970093,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.01740817231195459,
+                  "max_abs": 0.23284149169921875,
+                  "max_abs_index": [
+                    0,
+                    25,
+                    66,
+                    48
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786430,
+                  "relative_l2": 0.01770223430323351,
+                  "max_abs": 0.2249419093132019,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.01710490959619387,
+                  "max_abs": 0.22264480590820312,
+                  "max_abs_index": [
+                    0,
+                    25,
+                    66,
+                    48
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "step": 4,
+          "input_token": 369,
+          "boundaries": {
+            "act.x": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4990,
+                  "relative_l2": 0.02695085330243248,
+                  "max_abs": 0.3125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4941,
+                  "relative_l2": 0.016571316439116444,
+                  "max_abs": 0.1875,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4962,
+                  "relative_l2": 0.026922715010112237,
+                  "max_abs": 0.3125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4934,
+                  "relative_l2": 0.016533950014364442,
+                  "max_abs": 0.1875,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4978,
+                  "relative_l2": 0.026965627462353824,
+                  "max_abs": 0.3125,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    1,
+                    5120
+                  ],
+                  "exact": false,
+                  "mismatched_values": 4961,
+                  "relative_l2": 0.01658898293037604,
+                  "max_abs": 0.1875,
+                  "max_abs_index": [
+                    0,
+                    0,
+                    3994
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            },
+            "state.qwen.0.conv": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27841,
+                  "relative_l2": 0.014652556895053783,
+                  "max_abs": 1.25,
+                  "max_abs_index": [
+                    0,
+                    9503,
+                    2
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27767,
+                  "relative_l2": 0.013228921153665819,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    4209,
+                    2
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27841,
+                  "relative_l2": 0.014652553692520278,
+                  "max_abs": 1.25,
+                  "max_abs_index": [
+                    0,
+                    9503,
+                    2
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27767,
+                  "relative_l2": 0.013228917651578631,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    4209,
+                    2
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27841,
+                  "relative_l2": 0.014652553692520278,
+                  "max_abs": 1.25,
+                  "max_abs_index": [
+                    0,
+                    9503,
+                    2
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    10240,
+                    3
+                  ],
+                  "exact": false,
+                  "mismatched_values": 27767,
+                  "relative_l2": 0.013228917651578631,
+                  "max_abs": 0.75,
+                  "max_abs_index": [
+                    0,
+                    4209,
+                    2
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            },
+            "state.qwen.0.gdn": {
+              "native_bf16": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.018838376066635357,
+                  "max_abs": 0.384765625,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786431,
+                  "relative_l2": 0.017725188795308242,
+                  "max_abs": 0.3907151222229004,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "original_bf16_normalization": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.01904319821863753,
+                  "max_abs": 0.39951610565185547,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786431,
+                  "relative_l2": 0.017952970535123645,
+                  "max_abs": 0.40546560287475586,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                }
+              },
+              "fp32_normalization_control": {
+                "control": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786432,
+                  "relative_l2": 0.018912721503831963,
+                  "max_abs": 0.37537384033203125,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                },
+                "candidate": {
+                  "shape": [
+                    1,
+                    48,
+                    128,
+                    128
+                  ],
+                  "exact": false,
+                  "mismatched_values": 786430,
+                  "relative_l2": 0.017804707489276442,
+                  "max_abs": 0.38132333755493164,
+                  "max_abs_index": [
+                    0,
+                    2,
+                    113,
+                    100
+                  ],
+                  "first_mismatch_index": 0
+                }
+              }
+            }
+          }
+        }
+      ],
+      "independent_model_quality_accepted": null,
+      "performance_qualified": false,
+      "broad_spill_regression": "Rejected for performance: control232Bstack248/584spill -> candidate240Bstack356/624spill"
+    },
+    "all45_relative_l2_improve": true,
+    "max_abs_regressions": [
+      {
+        "step": 2,
+        "tensor": "state.qwen.0.gdn",
+        "reference": "original_bf16_normalization",
+        "control_max_abs": 0.20054149627685547,
+        "candidate_max_abs": 0.20070838928222656
+      },
+      {
+        "step": 2,
+        "tensor": "state.qwen.0.gdn",
+        "reference": "fp32_normalization_control",
+        "control_max_abs": 0.17639464139938354,
+        "candidate_max_abs": 0.18932855129241943
+      },
+      {
+        "step": 4,
+        "tensor": "state.qwen.0.gdn",
+        "reference": "native_bf16",
+        "control_max_abs": 0.384765625,
+        "candidate_max_abs": 0.3907151222229004
+      },
+      {
+        "step": 4,
+        "tensor": "state.qwen.0.gdn",
+        "reference": "original_bf16_normalization",
+        "control_max_abs": 0.39951610565185547,
+        "candidate_max_abs": 0.40546560287475586
+      },
+      {
+        "step": 4,
+        "tensor": "state.qwen.0.gdn",
+        "reference": "fp32_normalization_control",
+        "control_max_abs": 0.37537384033203125,
+        "candidate_max_abs": 0.38132333755493164
+      }
+    ],
+    "queue_results": {
+      "control-five-reset": {
+        "returncode": 0,
+        "passed": true,
+        "output": "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/full-block/results/control"
+      },
+      "candidate-five-reset": {
+        "returncode": 0,
+        "passed": true,
+        "output": "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/full-block/results/candidate"
+      },
+      "full-block-qualify": {
+        "returncode": 0,
+        "passed": true,
+        "output": "/tmp/plow-model-support-checks/qwen-fp8-m1-promotion-20260906/full-block/results/qualification.json"
+      }
+    },
+    "scope": "All mapped M1 projections promoted in broad diagnostic; not QKV-only and not full-model acceptance",
+    "performance_rejected": true
+  },
+  "full_block_note": "Structural/reset/rawQKV qualification only; independent quality acceptance remains unset. Small recurrent-state maxabs regressions preserved."
+}
