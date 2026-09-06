@@ -2768,6 +2768,85 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
     });
 }
 
+/* OCP MXFP4 weight-only GEMV. Hopper has no FP4 tensor-core operand, so decode expands one
+ * 32-element microscale block in registers and keeps the activation in bf16. The reduction and
+ * scaling order mirrors the packet's CPU reference: f32 dot within each 32-element block, then
+ * multiply its exact power-of-two E8M0 scale and accumulate across blocks. */
+__device__ __forceinline__ float plow_mxfp4_e2m1(unsigned v) {
+    const unsigned mag = v & 7u;
+    float x;
+    switch (mag) {
+    case 0: x = 0.0f; break;
+    case 1: x = 0.5f; break;
+    case 2: x = 1.0f; break;
+    case 3: x = 1.5f; break;
+    case 4: x = 2.0f; break;
+    case 5: x = 3.0f; break;
+    case 6: x = 4.0f; break;
+    default: x = 6.0f; break;
+    }
+    return (v & 8u) ? -x : x;
+}
+
+__device__ __forceinline__ float plow_mxfp4_scale(unsigned v) {
+    return __uint_as_float(v << 23);
+}
+
+template <int MM>
+__device__ __forceinline__ void gemv_rows_mxfp4(
+    __nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+    const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
+    const __nv_bfloat16* __restrict__ bias, unsigned M, unsigned N, unsigned K,
+    unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    const unsigned nscale = (K + 31u) >> 5;
+    const unsigned wstride = (K + 1u) >> 1;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned n0 = slice * per;
+    const unsigned n1 = min(n0 + per, N);
+
+    for (unsigned n = n0 + warp; n < n1; n += PLOW_NV_WARPS) {
+        const uint8_t* wrow = W + (size_t)n * wstride;
+        const uint8_t* srow = S + (size_t)n * nscale;
+        float acc[MM];
+#pragma unroll
+        for (int m = 0; m < MM; m++) acc[m] = 0.0f;
+        for (unsigned b = 0; b < nscale; b++) {
+            const unsigned k = (b << 5) + lane;
+            const uint8_t packed = k < K ? wrow[k >> 1] : 0u;
+            const unsigned q = (k & 1u) ? packed >> 4 : packed & 15u;
+            const float w = plow_mxfp4_e2m1(q);
+            const float scale = plow_mxfp4_scale(srow[b]);
+#pragma unroll
+            for (int m = 0; m < MM; m++) {
+                const float part = ((unsigned)m < M && k < K)
+                                       ? w * __bfloat162float(x[(size_t)m * K + k])
+                                       : 0.0f;
+                acc[m] += warp_sum32(part) * scale;
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < MM; m++) {
+            if (lane == 0 && (unsigned)m < M) {
+                const float v = acc[m] + (bias ? __bfloat162float(bias[n]) : 0.0f);
+                C[(size_t)m * N + n] = __float2bfloat16(v);
+            }
+        }
+    }
+}
+
+static __device__ void d_gemv_mxfp4(
+    __nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
+    const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
+    const __nv_bfloat16* __restrict__ bias, unsigned M, unsigned N, unsigned K,
+    unsigned slice, unsigned nblk) {
+    gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
+        gemv_rows_mxfp4<decltype(mm)::v>(C + (size_t)m0 * N, x + (size_t)m0 * K,
+                                         W, S, bias, rows, N, K, slice, nblk);
+    });
+}
+
 /* Arena-aware overload: persistent interpreter stages x into smem. */
 static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,
                                const uint8_t* __restrict__ Wg, const uint8_t* __restrict__ Wu,
