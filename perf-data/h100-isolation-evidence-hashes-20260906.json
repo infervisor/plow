@@ -1,0 +1,34 @@
+{
+  "attention-e1-scalar-gf16-broad-20260906/analysis.json": {
+    "copy": "e1-scalar-gf16-full-logits-h100-20260906.json",
+    "sha256": "00dc643427e405eba1342d5a9ad7af82fdb4f44145ff4eb1522519a74194189a"
+  },
+  "e6-current-packet-prefetch/sanitizer-api-audit/qualification.json": {
+    "copy": "e6-prefetch-memory-qualification-h100-20260906.json",
+    "sha256": "b9fb80caf8e30e402df3e6553112a1f63f7c0bd91135d405dbe2181831396d38"
+  },
+  "e3-zg0-grid132/performance-analysis.json": {
+    "copy": "e3-grid132-performance-h100-20260906.json",
+    "sha256": "bc2e25d6f6e5037c5b4950ad22eb2c3cc3c43426a0d715d87ca4cffae5c44f21"
+  },
+  "e3-grid132-window-20260906/results.json": {
+    "copy": "e3-grid132-validation-h100-20260906.json",
+    "sha256": "3d86afbdb638ca642ff527eff81e990d34234eddcadbdb92964572d4c9bad837"
+  },
+  "attention-e4-hd512-role-20260906/diagnosis/candidate-role/comparison.json": {
+    "copy": "e4-role-layer5-comparison-h100-20260906.json",
+    "sha256": "49a916f1ddd10f29847ead8abb05c47e446e98433aa854bc9d5b69392fcee8bd"
+  },
+  "e3-zg0-grid132/e3-g132-real-gemma-m4.csv": {
+    "copy": "e3-grid132-m4-h100-20260906.csv",
+    "sha256": "bf4bc39ee8d870b3247f8a7ffeaa9cd87df1fef11bd3da379a51c858a45d23f0"
+  },
+  "e3-zg0-grid132/e3-g132-real-gemma-m8.csv": {
+    "copy": "e3-grid132-m8-h100-20260906.csv",
+    "sha256": "3453adb8042c5f72e25a7e2c4b7e2dce9226a1e00e1afac921120ed313a4d48a"
+  },
+  "e3-zg0-grid132/e3-g132-real-gemma-m16.csv": {
+    "copy": "e3-grid132-m16-h100-20260906.csv",
+    "sha256": "77d4a22fb677c7d81a15347d7eac72768bd174ee257c5d5e0cb63f5495e96820"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "scope": "Gemma12 BF16 4096 input / 512 output, C16, 32 measured / 16 warmup, seed42, APCoff. One order: vLLM then Plow. Plow original startup failed from root Nix checkout ownership; retry changed only exact checkout git safe.directory. No repeated serving qualification or Plow win.",
+  "input_tokens": 4096,
+  "output_tokens": 512,
+  "concurrency": 16,
+  "plow": {
+    "mean_ttft_ms": 1966.9787225648179,
+    "p99_ttft_ms": 6371.543576391996,
+    "mean_tpot_ms": 65.53533470896281,
+    "p99_tpot_ms": 69.73651285805313,
+    "mean_itl_ms": 65.40733642956553,
+    "p99_itl_ms": 240.17532341415063,
+    "mean_e2el_ms": 35455.534758844806,
+    "p99_e2el_ms": 40348.43465143058,
+    "output_throughput": 228.36170425972824,
+    "request_throughput": 0.4460189536322817,
+    "completed": 32,
+    "failed": 0,
+    "source": "/tmp/plow-model-support-checks/gemma12-realworld-lazy2048-20260905/gemma12-lazy2048-in4096-c16-r1-bosretry1-nixretry1/in4096_c16.json",
+    "sha256": "e83282ae0a1cf7380e3e66ca193318295d74f4846df5ae63841311176100cc89"
+  },
+  "vllm": {
+    "mean_ttft_ms": 1289.756421752827,
+    "p99_ttft_ms": 2514.689287340152,
+    "mean_tpot_ms": 15.02087176590184,
+    "p99_tpot_ms": 17.13862858367186,
+    "mean_itl_ms": 15.020872166531586,
+    "p99_itl_ms": 16.267373612499796,
+    "mean_e2el_ms": 8965.421894128667,
+    "p99_e2el_ms": 10358.01927487133,
+    "output_throughput": 911.5572730530705,
+    "request_throughput": 1.7803852989317783,
+    "completed": 32,
+    "failed": 0,
+    "source": "/tmp/plow-model-support-checks/gemma12-realworld-fresh-vllm-20260905/vllm028-gemma12-fresh-in4096-c16-r1-pathretry1/in4096_c16.json",
+    "sha256": "627abae8cf3ae50e16f2902e65c971d1664d3bf3752acff7b75ec03b118559c0"
+  },
+  "plow_tpot_over_vllm": 4.362951480468093,
+  "plow_output_throughput_over_vllm": 0.25051821866867285
+}
