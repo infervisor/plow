@@ -19,9 +19,16 @@ struct Ledger {
     handles: BTreeMap<u64, u64>,
     mapped: BTreeMap<u64, (u64, u64, bool)>,
 }
-#[derive(Default)]
-struct Mock(Mutex<Ledger>);
+struct Mock(Mutex<Ledger>, u64);
+impl Default for Mock {
+    fn default() -> Self {
+        Self(Mutex::new(Ledger::default()), 64)
+    }
+}
 impl Mock {
+    fn with_granularity(granularity: u64) -> Self {
+        Self(Mutex::new(Ledger::default()), granularity)
+    }
     fn call(&self, call: Call) -> Result<()> {
         let mut s = self.0.lock().unwrap();
         s.calls.push(call);
@@ -49,7 +56,7 @@ impl Mock {
 }
 impl VmmOps for Mock {
     fn granularity(&self) -> Result<u64> {
-        Ok(64)
+        Ok(self.1)
     }
     fn reserve(&self, bytes: u64) -> Result<u64> {
         self.call(Call::Reserve)?;
@@ -114,6 +121,32 @@ impl VmmOps for Mock {
     fn copy_dtod(&self, _: u64, _: u64, _: u64) -> Result<()> {
         panic!("rings cannot copy prefixes")
     }
+}
+
+#[test]
+fn sub_granularity_slots_share_aligned_backing() {
+    let granularity = 2 << 20;
+    let ops = Arc::new(Mock::with_granularity(granularity));
+    let tensors = [LiveRingTensor {
+        tensor: 3,
+        slot_bytes: 1 << 20,
+    }];
+    let mut rings = VmmRings::new(ops.clone(), &tensors, 3).unwrap();
+    assert_eq!(rings.stats().reserved_bytes, 2 * granularity);
+
+    rings.ensure_slot(0).unwrap();
+    rings.ensure_slot(1).unwrap();
+    rings.ensure_slot(2).unwrap();
+
+    let s = ops.0.lock().unwrap();
+    assert_eq!(s.mapped.len(), 2);
+    assert!(s
+        .mapped
+        .iter()
+        .all(|(&va, &(bytes, _, _))| va % granularity == 0 && bytes == granularity));
+    drop(s);
+    drop(rings);
+    ops.empty();
 }
 
 fn tensors() -> [LiveRingTensor; 2] {
@@ -204,13 +237,6 @@ fn constructor_failure_and_invalid_geometry_leak_no_reservations() {
             vec![LiveRingTensor {
                 tensor: 0,
                 slot_bytes: 0,
-            }],
-            16,
-        ),
-        (
-            vec![LiveRingTensor {
-                tensor: 0,
-                slot_bytes: 65,
             }],
             16,
         ),

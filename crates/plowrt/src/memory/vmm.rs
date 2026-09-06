@@ -227,6 +227,7 @@ struct RingWindow {
     va: u64,
     bytes: u64,
     slot_bytes: u64,
+    map_bytes: u64,
     handles: Vec<Option<u64>>,
 }
 
@@ -236,37 +237,45 @@ pub struct VmmRings {
     windows: Vec<RingWindow>,
     mapped: Vec<bool>,
     prefix: usize,
-    slot_bytes: u64,
     stats: LiveRingStats,
 }
 
 impl VmmRings {
     pub fn new(ops: Arc<dyn VmmOps>, tensors: &[LiveRingTensor], batch: usize) -> Result<Self> {
-        let reject = || RuntimeError::Rejected("invalid live ring allocation geometry".into());
+        let reject = |slot_bytes: u64, granularity: u64| {
+            RuntimeError::Rejected(format!(
+                "invalid live ring allocation geometry: slot_bytes={slot_bytes}, granularity={granularity}"
+            ))
+        };
         if batch == 0 {
-            return Err(reject());
+            return Err(reject(0, 0));
         }
         let granularity = ops.granularity()?;
         if granularity == 0 {
-            return Err(reject());
+            return Err(reject(0, granularity));
         }
-        let mut slot_bytes = 0u64;
+        let mut reserved_bytes = 0u64;
         for (i, t) in tensors.iter().enumerate() {
-            if t.slot_bytes == 0
-                || t.slot_bytes % granularity != 0
-                || tensors[..i].iter().any(|p| p.tensor == t.tensor)
-            {
-                return Err(reject());
+            if t.slot_bytes == 0 || tensors[..i].iter().any(|p| p.tensor == t.tensor) {
+                return Err(reject(t.slot_bytes, granularity));
             }
-            slot_bytes = slot_bytes.checked_add(t.slot_bytes).ok_or_else(reject)?;
+            let logical_bytes = t
+                .slot_bytes
+                .checked_mul(batch as u64)
+                .ok_or_else(|| reject(t.slot_bytes, granularity))?;
+            let bytes = logical_bytes
+                .checked_add(granularity - 1)
+                .map(|n| n / granularity * granularity)
+                .ok_or_else(|| reject(t.slot_bytes, granularity))?;
+            reserved_bytes = reserved_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| reject(t.slot_bytes, granularity))?;
         }
-        let reserved_bytes = slot_bytes.checked_mul(batch as u64).ok_or_else(reject)?;
         let mut rings = Self {
             ops,
             windows: Vec::with_capacity(tensors.len()),
             mapped: vec![false; batch],
             prefix: 0,
-            slot_bytes,
             stats: LiveRingStats {
                 reserved_bytes,
                 resident_bytes: 0,
@@ -275,18 +284,25 @@ impl VmmRings {
             },
         };
         for t in tensors {
-            let bytes = t.slot_bytes * batch as u64;
+            let logical_bytes = t.slot_bytes * batch as u64;
+            let bytes = (logical_bytes + granularity - 1) / granularity * granularity;
+            let map_bytes = if t.slot_bytes % granularity == 0 {
+                t.slot_bytes
+            } else {
+                granularity
+            };
             let va = rings.ops.reserve(bytes)?;
             if va == 0 || va % granularity != 0 || va.checked_add(bytes).is_none() {
                 rings.ops.address_free(va, bytes);
-                return Err(reject());
+                return Err(reject(t.slot_bytes, granularity));
             }
             rings.windows.push(RingWindow {
                 tensor: t.tensor,
                 va,
                 bytes,
                 slot_bytes: t.slot_bytes,
-                handles: vec![None; batch],
+                map_bytes,
+                handles: vec![None; (bytes / map_bytes) as usize],
             });
         }
         Ok(rings)
@@ -312,33 +328,47 @@ impl VmmRings {
         if self.mapped[slot] {
             return Ok(());
         }
+        let mut added = Vec::new();
         for i in 0..self.windows.len() {
-            let w = &self.windows[i];
-            let va = w.va + slot as u64 * w.slot_bytes;
-            let result = (|| {
-                let handle = self.ops.create(w.slot_bytes)?;
-                if let Err(e) = self.ops.map(va, w.slot_bytes, handle) {
-                    self.ops.release(handle);
-                    return Err(e);
+            let va_base = self.windows[i].va;
+            let slot_bytes = self.windows[i].slot_bytes;
+            let map_bytes = self.windows[i].map_bytes;
+            let first = slot as u64 * slot_bytes / map_bytes;
+            let end = (slot as u64 + 1) * slot_bytes;
+            let last = (end + map_bytes - 1) / map_bytes;
+            for unit in first..last {
+                if self.windows[i].handles[unit as usize].is_some() {
+                    continue;
                 }
-                if let Err(e) = self.ops.set_access(va, w.slot_bytes) {
-                    self.ops.unmap(va, w.slot_bytes);
-                    self.ops.release(handle);
-                    return Err(e);
-                }
-                Ok(handle)
-            })();
-            match result {
-                Ok(handle) => self.windows[i].handles[slot] = Some(handle),
-                Err(e) => {
-                    for w in &mut self.windows[..i] {
-                        if let Some(handle) = w.handles[slot].take() {
+                let va = va_base + unit * map_bytes;
+                let result = (|| {
+                    let handle = self.ops.create(map_bytes)?;
+                    if let Err(e) = self.ops.map(va, map_bytes, handle) {
+                        self.ops.release(handle);
+                        return Err(e);
+                    }
+                    if let Err(e) = self.ops.set_access(va, map_bytes) {
+                        self.ops.unmap(va, map_bytes);
+                        self.ops.release(handle);
+                        return Err(e);
+                    }
+                    Ok(handle)
+                })();
+                match result {
+                    Ok(handle) => {
+                        self.windows[i].handles[unit as usize] = Some(handle);
+                        added.push((i, unit as usize));
+                    }
+                    Err(e) => {
+                        for &(window, unit) in added.iter().rev() {
+                            let w = &mut self.windows[window];
+                            let handle = w.handles[unit].take().unwrap();
                             self.ops
-                                .unmap(w.va + slot as u64 * w.slot_bytes, w.slot_bytes);
+                                .unmap(w.va + unit as u64 * w.map_bytes, w.map_bytes);
                             self.ops.release(handle);
                         }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
             }
         }
@@ -348,7 +378,10 @@ impl VmmRings {
         }
         self.stats.mapped_slots += 1;
         self.stats.mapped_prefix = self.prefix;
-        self.stats.resident_bytes += self.slot_bytes;
+        self.stats.resident_bytes += added
+            .iter()
+            .map(|&(window, _)| self.windows[window].map_bytes)
+            .sum::<u64>();
         Ok(())
     }
 
@@ -371,7 +404,7 @@ impl Drop for VmmRings {
             for (slot, handle) in w.handles.iter_mut().enumerate() {
                 if let Some(handle) = handle.take() {
                     self.ops
-                        .unmap(w.va + slot as u64 * w.slot_bytes, w.slot_bytes);
+                        .unmap(w.va + slot as u64 * w.map_bytes, w.map_bytes);
                     self.ops.release(handle);
                 }
             }
