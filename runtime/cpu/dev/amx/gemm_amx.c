@@ -91,27 +91,42 @@ static inline void tr16x16_epi32(__m512i* r) {
 
 /* Pack columns [n0, n0+32) x K range [k0, k0+kp) of row-major W[N][K] into `dst`
  * (kp multiple of 32; columns >= N and K beyond `K` read as zero). */
-/* The pack is the DRAM-facing side of the GEMM: 32 weight rows advance 64 B per K step, sixteen
- * independent streams per thread that the L2 streamer does not cover with 16 threads active.
- * Measured: the same kernel does 813 GFLOPS single-thread from L3 but ~17 GFLOPS/thread in-model.
- * Prefetch each row PACK_PF_B ahead (into L2) so ~128 lines are in flight per thread. */
-#define PACK_PF_B 512u
+/* The pack is the DRAM-facing side of the GEMM. Transposing straight from W reads 32 rows in
+ * 64 B steps — a 32-stream gather per thread that DRAM served at ~3 GB/s/thread (51 GB/s
+ * aggregate, half of what GEMV streams get; PLOW_AMX_DEBUG attribution: 380 of 774 ms/thr at
+ * T=128). Two passes instead: copy each row's [k0, k0+kp) piece as ONE contiguous burst into a
+ * thread-local slab (row stride KP*2 B), then transpose from L1. */
+#define SLAB_ROW_B (KP * 2u)
+static __thread uint8_t g_slab[32u * SLAB_ROW_B] __attribute__((aligned(64)));
+
+/* Row j of the slab <- W[n][k0 .. k0+kp) (zero beyond N or K); kp % 32 == 0, kp <= KP. */
+static inline void slab_fill_bf16(const plow_bf16* W, uint32_t N, uint32_t K, uint32_t n0, uint32_t k0,
+                                  uint32_t kp) {
+    for (uint32_t j = 0; j < 32u; j++) {
+        uint8_t* d = g_slab + (size_t)j * SLAB_ROW_B;
+        const uint32_t n = n0 + j;
+        if (n >= N) {
+            for (uint32_t c = 0; c < kp * 2u; c += 64u) _mm512_store_si512((void*)(d + c), _mm512_setzero_si512());
+            continue;
+        }
+        const plow_bf16* src = W + (size_t)n * K + k0;
+        const uint32_t kv = k0 + kp <= K ? kp : (K > k0 ? (K - k0) & ~31u : 0u); /* whole 32-blocks */
+        for (uint32_t c = 0; c < kv * 2u; c += 64u)
+            _mm512_store_si512((void*)(d + c), _mm512_loadu_si512((const void*)((const char*)src + c)));
+        for (uint32_t c = kv * 2u; c < kp * 2u; c += 64u) _mm512_store_si512((void*)(d + c), _mm512_setzero_si512());
+    }
+}
 
 void plow_cpu_amx_pack_b_strip(void* dst, const plow_bf16* W, uint32_t N, uint32_t K, uint32_t n0,
                                 uint32_t k0, uint32_t kp) {
     uint8_t* out = dst;
     const uint32_t nkb = kp / 32u;
+    slab_fill_bf16(W, N, K, n0, k0, kp);
     for (uint32_t kb = 0; kb < nkb; kb++) {
-        const uint32_t k = k0 + kb * 32u;
         for (uint32_t t = 0; t < 2; t++) {
             __m512i r[16];
-            for (uint32_t j = 0; j < 16; j++) {
-                const uint32_t n = n0 + t * 16u + j;
-                if (n < N) _mm_prefetch((const char*)(W + (size_t)n * K + k) + PACK_PF_B, _MM_HINT_T1);
-                r[j] = (n < N && k + 32u <= K)
-                           ? _mm512_loadu_si512((const void*)(W + (size_t)n * K + k))
-                           : _mm512_setzero_si512();
-            }
+            for (uint32_t j = 0; j < 16; j++)
+                r[j] = _mm512_load_si512((const void*)(g_slab + (size_t)(t * 16u + j) * SLAB_ROW_B + (size_t)kb * 64u));
             tr16x16_epi32(r);
             uint8_t* tile = out + ((size_t)kb * 2u + t) * 1024u;
             for (uint32_t rr = 0; rr < 16; rr++) _mm512_storeu_si512((void*)(tile + rr * 64u), r[rr]);
@@ -126,18 +141,21 @@ static void pack_b_strip_fp8(void* dst, const uint8_t* W, uint32_t N, uint32_t K
                              uint32_t k0, uint32_t kp) {
     uint8_t* out = dst;
     const uint32_t nkb = kp / 32u;
+    /* Slab of e4m3 bytes: row j = W[n0+j][k0 .. k0+kp) (kp bytes, contiguous burst), zero padded. */
+    for (uint32_t j = 0; j < 32u; j++) {
+        uint8_t* d = g_slab + (size_t)j * SLAB_ROW_B;
+        const uint32_t n = n0 + j;
+        const uint32_t kv = n < N ? (k0 + kp <= K ? kp : (K > k0 ? (K - k0) & ~31u : 0u)) : 0u;
+        const uint8_t* src = W + (size_t)n * K + k0;
+        for (uint32_t c = 0; c < kv; c += 64u) _mm512_store_si512((void*)(d + c), _mm512_loadu_si512((const void*)(src + c)));
+        for (uint32_t c = kv; c < kp; c += 64u) _mm512_store_si512((void*)(d + c), _mm512_setzero_si512());
+    }
     for (uint32_t kb = 0; kb < nkb; kb++) {
-        const uint32_t k = k0 + kb * 32u;
         for (uint32_t t = 0; t < 2; t++) {
             __m512i r[16];
-            for (uint32_t j = 0; j < 16; j++) {
-                const uint32_t n = n0 + t * 16u + j;
-                if (n < N) _mm_prefetch((const char*)(W + (size_t)n * K + k) + PACK_PF_B / 2u, _MM_HINT_T1);
-                r[j] = (n < N && k + 32u <= K)
-                           ? plow_fp8x32_to_bf16(&plow_amx_fp8_lut,
-                                                 _mm256_loadu_si256((const __m256i*)(W + (size_t)n * K + k)))
-                           : _mm512_setzero_si512();
-            }
+            for (uint32_t j = 0; j < 16; j++)
+                r[j] = plow_fp8x32_to_bf16(&plow_amx_fp8_lut,
+                                           _mm256_load_si256((const __m256i*)(g_slab + (size_t)(t * 16u + j) * SLAB_ROW_B + (size_t)kb * 32u)));
             tr16x16_epi32(r);
             uint8_t* tile = out + ((size_t)kb * 2u + t) * 1024u;
             for (uint32_t rr = 0; rr < 16; rr++) _mm512_storeu_si512((void*)(tile + rr * 64u), r[rr]);
@@ -259,15 +277,33 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
         _tile_zero(3);
     }
     const uint32_t per = pend ? (pend->rows + nkb - 1u) / nkb : 0u;
+    /* Tile loads do not pipeline their 16 line fills: measured ~360 cycles per K step against 64 of
+     * TDP when A comes from L2 (the old T1 hint kept it there by design) and, with two SMT threads
+     * per core, the 32 KiB B strips spill L1 too. Prefetch both operands BLOCK_PF steps ahead so the
+     * tile loads hit L1: 64 prefetches per step, about one per TDP cycle. */
+    enum { BLOCK_PF = 2 };
     for (uint32_t kb = 0; kb < nkb; kb++) {
         const uint8_t* b = bp + (size_t)kb * 2048u;
-        _tile_stream_loadd(4, A0 + kb * 32u, lda); /* A streams (T1 hint), B stays in L1 */
+        if (kb + BLOCK_PF < nkb) {
+            const char* pa0 = (const char*)(A0 + (kb + BLOCK_PF) * 32u);
+            const char* pb = (const char*)(bp + (size_t)(kb + BLOCK_PF) * 2048u);
+            for (uint32_t r = 0; r < 16u; r++) {
+                _mm_prefetch(pa0 + r * lda, _MM_HINT_T0);
+                _mm_prefetch(pb + r * 64u, _MM_HINT_T0);
+                _mm_prefetch(pb + 1024u + r * 64u, _MM_HINT_T0);
+            }
+            if (A1) {
+                const char* pa1 = (const char*)(A1 + (kb + BLOCK_PF) * 32u);
+                for (uint32_t r = 0; r < 16u; r++) _mm_prefetch(pa1 + r * lda, _MM_HINT_T0);
+            }
+        }
+        _tile_loadd(4, A0 + kb * 32u, lda);
         _tile_loadd(6, b, 64);
         _tile_dpbf16ps(0, 4, 6);
         _tile_loadd(7, b + 1024, 64);
         _tile_dpbf16ps(1, 4, 7);
         if (A1) {
-            _tile_stream_loadd(5, A1 + kb * 32u, lda);
+            _tile_loadd(5, A1 + kb * 32u, lda);
             _tile_dpbf16ps(2, 5, 6);
             _tile_dpbf16ps(3, 5, 7);
         }
@@ -496,8 +532,11 @@ double plow_cpu_amx_debug_tdp(uint32_t iters, PlowCpuCtx* ctx) {
     return (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
 }
 
+void plow_cpu_register_amx_gemv(plow_cpu_kernel_fn* tab); /* gemv_amx.c: batched decode M >= 4 */
+
 void plow_cpu_register_amx(plow_cpu_kernel_fn* tab) {
     plow_fp8_vlut_init(&plow_amx_fp8_lut);
+    plow_cpu_register_amx_gemv(tab);
     tab[PLOW_DOP_GEMM] = x_gemm;
     tab[PLOW_DOP_GEMM_SMALL] = x_gemm_small;
     tab[PLOW_DOP_GEMM_MED] = x_gemm_med;

@@ -147,55 +147,10 @@ static void prenorm_rows(plow_bf16* xn, const plow_bf16* x, const plow_bf16* gam
     }
 }
 
-/* M >= 5: K-blocked. With 8 activation rows (8 x 7.5 KiB) the x loads of `dot_rm` miss L1 and
- * every weight row pair drags 4x its own bytes of x out of L2 (measured: rung 8 = 457 ms vs 250 at
- * rung 4). Here the M x KBLK x 2 B = 16 KiB x chunk stays in L1 while EVERY row of the slice streams
- * through once per chunk; the f32 partials acc[(n1-n0)][M] live in scratch (30 KiB for a GLU slice,
- * 512 KiB for the lm_head). Weights are still read exactly once. */
-#define KBLK 1024u
-#define GEMV_KBLK_MIN_M 5u
-
-static inline size_t kblk_acc_bytes(uint32_t rows, uint32_t M) { return (size_t)rows * M * sizeof(float); }
-
-static void gemv_span_kblk(float* acc, const plow_bf16* W, size_t ldw, const plow_bf16* X,
-                           size_t ldx, uint32_t M, uint32_t K, uint32_t n0, uint32_t n1) {
-    const uint32_t rows = n1 - n0;
-    float out[16];
-    for (uint32_t k0 = 0; k0 < K; k0 += KBLK) {
-        const uint32_t kb = K - k0 < KBLK ? K - k0 : KBLK;
-        uint32_t n = 0;
-        for (; n < rows;) {
-            const uint32_t rb = n + 2u <= rows ? 2u : 1u;
-            const plow_bf16* w = W + (size_t)(n0 + n) * ldw + k0;
-            /* Warm the next row pair's chunk start: 2 KiB pieces are too short for the streamer. */
-            if (n + rb < rows)
-                for (uint32_t r = 0; r < 2u; r++)
-                    _mm_prefetch((const char*)(w + (size_t)(rb + r) * ldw), _MM_HINT_T0);
-            gemv_rows(w, ldw, X + k0, ldx, kb, rb, M, out);
-            float* a = acc + (size_t)n * M;
-            if (k0 == 0)
-                for (uint32_t i = 0; i < rb * M; i++) a[i] = out[i];
-            else
-                for (uint32_t i = 0; i < rb * M; i++) a[i] += out[i];
-            n += rb;
-        }
-    }
-}
-
-/* C[m][n0..n1) = X[m] . W[n]^T (+ bias[n]), plain bf16 store. `acc` (scratch, kblk_acc_bytes) enables
- * the K-blocked path for M >= GEMV_KBLK_MIN_M; NULL = direct. */
+/* C[m][n0..n1) = X[m] . W[n]^T (+ bias[n]), plain bf16 store. */
 static void gemv_span(plow_bf16* C, size_t ldc, const plow_bf16* W, const plow_bf16* X,
                       size_t ldx, uint32_t M, uint32_t K, uint32_t n0, uint32_t n1,
-                      const plow_bf16* bias, float* acc) {
-    if (acc && M >= GEMV_KBLK_MIN_M && K > KBLK) {
-        gemv_span_kblk(acc, W, K, X, ldx, M, K, n0, n1);
-        for (uint32_t n = n0; n < n1; n++) {
-            const float b = bias ? plow_bf2f(bias[n]) : 0.0f;
-            const float* a = acc + (size_t)(n - n0) * M;
-            for (uint32_t m = 0; m < M; m++) C[m * ldc + n] = plow_f2bf(a[m] + b);
-        }
-        return;
-    }
+                      const plow_bf16* bias) {
     float out[32];
     const uint32_t RB = rb_for(M);
     uint32_t n = n0;
@@ -254,23 +209,19 @@ V_K(v_gemv) {
         return;
     }
     const plow_bf16* X = x;
-    size_t used = 0;
     if (norm == 2u) {
         const size_t need = (size_t)M * K * sizeof(plow_bf16);
         if (!ctx || !ctx->scratch || ctx->scratch_bytes < need) { g_gemv(in, slice, nblk, T, ctx); return; }
         prenorm_rows(ctx->scratch, x, gamma, M, K, eps);
         X = ctx->scratch;
-        used = (need + 63u) & ~(size_t)63u;
     }
-    float* acc = NULL;
-    if (ctx && ctx->scratch && ctx->scratch_bytes >= used + kblk_acc_bytes(n1 - n0, M))
-        acc = (float*)((uint8_t*)ctx->scratch + used);
-    gemv_span(C, N, W, X, K, M, K, n0, n1, bias, acc);
+    gemv_span(C, N, W, X, K, M, K, n0, n1, bias);
 }
 
 /* t0=fu t1=x t2=W_gate t5=W_up t6=bias_gate? t7=bias_up?  i0=M i1=N i2=K i5=act  f0/f1 = act
  * immediates (situ beta/lbeta, swiglu_oai alpha/limit). */
 V_K(v_gemv_glu) {
+    (void)ctx;
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2], act = in->i[5];
     plow_bf16* C = PLOW_CPU_TEN(in, T, 0);
     const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
@@ -282,24 +233,6 @@ V_K(v_gemv_glu) {
     if (M == 0u || M > 8u) { g_gemv_glu(in, slice, nblk, T, ctx); return; }
     uint32_t n0, n1;
     g_range(N, slice, nblk, &n0, &n1);
-    const size_t accb = kblk_acc_bytes(n1 - n0, M);
-    if (M >= GEMV_KBLK_MIN_M && K > KBLK && ctx && ctx->scratch && ctx->scratch_bytes >= 2u * accb) {
-        float* ga = ctx->scratch;
-        float* ua = (float*)((uint8_t*)ctx->scratch + accb);
-        gemv_span_kblk(ga, Wg, K, x, K, M, K, n0, n1);
-        gemv_span_kblk(ua, Wu, K, x, K, M, K, n0, n1);
-        const __mmask16 mk = v_tail16(M);
-        for (uint32_t n = n0; n < n1; n++) {
-            __m512 gv = _mm512_maskz_loadu_ps(mk, ga + (size_t)(n - n0) * M);
-            __m512 uv = _mm512_maskz_loadu_ps(mk, ua + (size_t)(n - n0) * M);
-            if (bg) gv = _mm512_add_ps(gv, _mm512_set1_ps(plow_bf2f(bg[n])));
-            if (bu) uv = _mm512_add_ps(uv, _mm512_set1_ps(plow_bf2f(bu[n])));
-            float of[16];
-            _mm512_mask_storeu_ps(of, mk, v_glu_pair(gv, uv, act, f0, f1));
-            for (uint32_t m = 0; m < M; m++) C[(size_t)m * N + n] = plow_f2bf(of[m]);
-        }
-        return;
-    }
     const uint32_t RB = rb_for(M);
     float g[32], u[32];
     for (uint32_t n = n0; n < n1;) {
@@ -338,24 +271,19 @@ V_K(v_gemv_qkv) {
     const uint32_t Ns[3] = {Nq, Nk, Nv};
     if (M == 0u || M > 8u) { g_gemv_qkv(in, slice, nblk, T, ctx); return; }
     const plow_bf16* X = x;
-    size_t used = 0;
     if (gnorm) {
         const size_t need = (size_t)M * K * sizeof(plow_bf16);
         if (!ctx || !ctx->scratch || ctx->scratch_bytes < need) { g_gemv_qkv(in, slice, nblk, T, ctx); return; }
         prenorm_rows(ctx->scratch, x, gnorm, M, K, eps);
         X = ctx->scratch;
-        used = (need + 63u) & ~(size_t)63u;
     }
     uint32_t n0, n1;
     g_range(Nq + Nk + Nv, slice, nblk, &n0, &n1);
-    float* acc = NULL;
-    if (ctx && ctx->scratch && ctx->scratch_bytes >= used + kblk_acc_bytes(n1 - n0, M))
-        acc = (float*)((uint8_t*)ctx->scratch + used);
     uint32_t S0 = 0;
     for (uint32_t s = 0; s < 3; s++) {
         const uint32_t S1 = S0 + Ns[s];
         const uint32_t a = n0 > S0 ? n0 : S0, b = n1 < S1 ? n1 : S1;
-        if (a < b) gemv_span(Cs[s], Ns[s], Ws[s], X, K, M, K, a - S0, b - S0, Bs[s], acc);
+        if (a < b) gemv_span(Cs[s], Ns[s], Ws[s], X, K, M, K, a - S0, b - S0, Bs[s]);
         S0 = S1;
     }
 }

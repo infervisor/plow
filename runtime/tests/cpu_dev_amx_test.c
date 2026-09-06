@@ -200,6 +200,75 @@ static void bench(PlowCpuCtx* ctx) {
     free(A); free(W); free(C);
 }
 
+/* ---- Batched decode GEMV on AMX (gemv_amx.c): GEMV / GEMV_GLU / GEMV_QKV vs golden, M >= 4 ---- */
+static void test_gemv_amx(uint32_t M, uint32_t N, uint32_t K, int bias, PlowCpuCtx* ctx) {
+    plow_bf16* x = malloc((size_t)(M + 2) * K * 2);
+    plow_bf16* W = malloc((size_t)N * K * 2);
+    plow_bf16* b = malloc((size_t)N * 2);
+    plow_bf16 *C = calloc((size_t)M * N, 2), *R = calloc((size_t)M * N, 2);
+    fill_bf16(x, (size_t)(M + 2) * K, 1.0f); fill_bf16(W, (size_t)N * K, 0.05f); fill_bf16(b, N, 0.5f);
+    void* T[8] = {C, x, W, NULL, NULL, NULL, NULL, bias ? b : NULL};
+    PlowDevInst in = inst(PLOW_DOP_GEMV);
+    in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; if (bias) in.t[7] = 7;
+    in.i[0] = M; in.i[1] = N; in.i[2] = K; in.i[4] = 2; /* a_row0 */
+    kfn f = plow_cpu_kernel(PLOW_DOP_GEMV);
+    CHECK(plow_cpu_tier_of(PLOW_DOP_GEMV) == PLOW_CPU_ISA_AMX, "GEMV on the AMX tier");
+    T[0] = R; run_all(g_gemv, &in, 1, T, ctx);
+    for (int k = 0; k < 3; k++) {
+        T[0] = C; memset(C, 0, (size_t)M * N * 2);
+        run_all(f, &in, NBLKS[k], T, ctx);
+        char what[96];
+        snprintf(what, sizeof what, "amx gemv M=%u N=%u K=%u bias=%d nblk=%u", M, N, K, bias, NBLKS[k]);
+        compare(what, C, R, (size_t)M * N);
+    }
+    free(x); free(W); free(b); free(C); free(R);
+}
+
+static void test_gemv_glu_amx(uint32_t M, uint32_t N, uint32_t K, uint32_t act, PlowCpuCtx* ctx) {
+    plow_bf16* x = malloc((size_t)M * K * 2);
+    plow_bf16* Wg = malloc((size_t)N * K * 2);
+    plow_bf16* Wu = malloc((size_t)N * K * 2);
+    plow_bf16 *C = calloc((size_t)M * N, 2), *R = calloc((size_t)M * N, 2);
+    fill_bf16(x, (size_t)M * K, 1.0f); fill_bf16(Wg, (size_t)N * K, 0.05f); fill_bf16(Wu, (size_t)N * K, 0.05f);
+    void* T[8] = {C, x, Wg, NULL, NULL, Wu, NULL, NULL};
+    PlowDevInst in = inst(PLOW_DOP_GEMV_GLU);
+    in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[5] = 5;
+    in.i[0] = M; in.i[1] = N; in.i[2] = K; in.i[5] = act;
+    kfn f = plow_cpu_kernel(PLOW_DOP_GEMV_GLU);
+    T[0] = R; run_all(g_gemv_glu, &in, 1, T, ctx);
+    for (int k = 0; k < 3; k++) {
+        T[0] = C; memset(C, 0, (size_t)M * N * 2);
+        run_all(f, &in, NBLKS[k], T, ctx);
+        char what[96];
+        snprintf(what, sizeof what, "amx gemv_glu M=%u N=%u K=%u act=%u nblk=%u", M, N, K, act, NBLKS[k]);
+        compare(what, C, R, (size_t)M * N);
+    }
+    free(x); free(Wg); free(Wu); free(C); free(R);
+}
+
+static void test_gemv_qkv_amx(uint32_t M, uint32_t Nq, uint32_t Nk, uint32_t Nv, uint32_t K, PlowCpuCtx* ctx) {
+    plow_bf16* x = malloc((size_t)M * K * 2);
+    plow_bf16 *Wq = malloc((size_t)Nq * K * 2), *Wk = malloc((size_t)Nk * K * 2), *Wv = malloc((size_t)Nv * K * 2);
+    plow_bf16 *q = calloc((size_t)M * Nq, 2), *kk = calloc((size_t)M * Nk, 2), *v = calloc((size_t)M * Nv, 2);
+    plow_bf16 *rq = calloc((size_t)M * Nq, 2), *rk = calloc((size_t)M * Nk, 2), *rv = calloc((size_t)M * Nv, 2);
+    fill_bf16(x, (size_t)M * K, 1.0f); fill_bf16(Wq, (size_t)Nq * K, 0.05f); fill_bf16(Wk, (size_t)Nk * K, 0.05f); fill_bf16(Wv, (size_t)Nv * K, 0.05f);
+    void* T[8] = {q, x, Wq, kk, Wk, v, Wv, NULL};
+    PlowDevInst in = inst(PLOW_DOP_GEMV_QKV);
+    for (int i = 0; i < 7; i++) in.t[i] = (uint16_t)i;
+    in.i[0] = M; in.i[1] = Nq; in.i[2] = K; in.i[3] = Nk; in.i[4] = Nv;
+    kfn f = plow_cpu_kernel(PLOW_DOP_GEMV_QKV);
+    T[0] = rq; T[3] = rk; T[5] = rv; run_all(g_gemv_qkv, &in, 1, T, ctx);
+    for (int k = 0; k < 3; k++) {
+        T[0] = q; T[3] = kk; T[5] = v;
+        memset(q, 0, (size_t)M * Nq * 2); memset(kk, 0, (size_t)M * Nk * 2); memset(v, 0, (size_t)M * Nv * 2);
+        run_all(f, &in, NBLKS[k], T, ctx);
+        char what[96];
+        snprintf(what, sizeof what, "amx gemv_qkv M=%u nblk=%u", M, NBLKS[k]);
+        compare(what, q, rq, (size_t)M * Nq); compare(what, kk, rk, (size_t)M * Nk); compare(what, v, rv, (size_t)M * Nv);
+    }
+    free(x); free(Wq); free(Wk); free(Wv); free(q); free(kk); free(v); free(rq); free(rk); free(rv);
+}
+
 int main(int argc, char** argv) {
     const int tier = plow_cpu_init(PLOW_CPU_ISA_AMX);
     if (tier < PLOW_CPU_ISA_AMX) {
@@ -255,6 +324,14 @@ int main(int argc, char** argv) {
     test_shape(PLOW_DOP_GEMM_SMALL, 21, 100, 128, &ctx);
     test_shape(PLOW_DOP_GEMM_GLU, 21, 100, 128, &ctx);
     test_shape(PLOW_DOP_GEMM_NORM, 33, 64, 2048 + 32, &ctx);
+    test_gemv_amx(4, 512, 3840, 0, &ctx);
+    test_gemv_amx(8, 1000, 3840, 1, &ctx);   /* ragged slices: 16- and tail-row groups */
+    test_gemv_amx(5, 37, 1024, 1, &ctx);     /* all-tail slices */
+    test_gemv_amx(16, 256, 2048, 0, &ctx);
+    test_gemv_glu_amx(8, 500, 3840, 0, &ctx);
+    test_gemv_glu_amx(6, 100, 1024, 1, &ctx);
+    test_gemv_qkv_amx(8, 512, 128, 128, 3840, &ctx);
+    test_gemv_qkv_amx(4, 100, 60, 60, 1024, &ctx);
 
     free(ctx.scratch);
     printf(fails ? "cpu_dev_amx_test: %d FAILURES\n" : "cpu_dev_amx_test: all passed\n", fails);
