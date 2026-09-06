@@ -56,3 +56,35 @@ work of its neighbours). Run-to-run TPOT spread at c >= 4 is ~±15 % (prefill of
 with decode), so chat_long c=4 is within noise. The remaining c >= 2 gap is prefill interleaving +
 per-row dequant; the c=1 gap (45 vs 41 ms) is the bf16 dense weights (lm_head 1.16 GB + QKV/o ≈ 21 of
 44 ms) — next lever: MXFP4 dense + head twin for GPT-OSS (~0.9 GB).
+
+## MXFP4 dense projections + lm_head (commit 4df9a9b, 09:2x) — current plow numbers
+
+`plowc --mxfp4` on GPT-OSS now reads q/k/v/o and lm_head from an MXFP4 twin
+(`quantize_mxfp4.py <hf> /home/lava/models/gpt-oss-20b-mxfp4-dense model. --extra lm_head.weight`, 0.65 GB,
+served with `PLOW_MXFP4_DIR=/home/lava/models/gpt-oss-20b-mxfp4-dense`); the bf16 dense weights were ~21 of
+the 44 ms per decode token (lm_head alone 1.16 GB). Grouped batched MoE decode included. Raw: `plow/gptoss-mx4-*.md`.
+llama.cpp = fresh-prompt re-run (`llamacpp/results-gptoss-fresh-*.md`). Bold = plow wins.
+
+| workload | conc | plow TTFT | llama.cpp TTFT | plow TPOT | llama.cpp TPOT |
+|---|---|---|---|---|---|
+| chat_short | 1 | **602** | 748 | **33** | 41 |
+| chat_short | 2 | **829** | 1625 | **61** | 65 |
+| chat_short | 4 | **1369** | 3059 | 109 | 104 |
+| chat_short | 8 | **2876** | 5260 | **174** | 177 |
+| chat_long | 1 | **2070** | 4823 | **32** | 51 |
+| chat_long | 2 | **2969** | 9520 | **75** | 81 |
+| chat_long | 4 | **3837** | 14432 | 146 | 133 |
+| chat_long | 8 | **10469** | 35666 | 285 | 215 |
+| code | 1 | **1697** | 4212 | **33** | 50 |
+| code | 2 | **2705** | 8780 | **68** | 73 |
+| code | 4 | **3971** | 18762 | 148 | 123 |
+| code | 8 | **7692** | 35120 | 243 | 207 |
+| summarize | 1 | **5437** | 10693 | **33** | 59 |
+| summarize | 2 | **6200** | 23777 | 128 | 113 |
+| summarize | 4 | **11179** | 57888 | 283 | 195 |
+| summarize | 8 | **24319** | 73138 | 466 | 430 |
+
+Reading: plow wins TTFT everywhere (1.2–5×) and decode at c=1 (33 vs 41–59, 1.25–1.8×) and c=2; at c≥4 it is
+at parity on short prompts and 10–45 % behind on long prompts, where other slots' whole-prompt prefills stall
+the decode steps (TPOT p90 ≫ p50). Next: chunked prefill (PLOW_CPU_PF_CHUNK) by default at c≥2, then the
+dense MXFP4 GEMV at batch ≥ 5 (AMX x_gemv_mxfp4 path) and per-row dequant cost in the grouped MoE decode.

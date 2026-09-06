@@ -1,0 +1,1274 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8096",
+  "model": "6cee5e81ee83917806bbde320786a8fb61efebee",
+  "server_models": [
+   "6cee5e81ee83917806bbde320786a8fb61efebee"
+  ],
+  "timestamp": "2026-09-06T09:31:46+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8096",
+   "--model",
+   "6cee5e81ee83917806bbde320786a8fb61efebee",
+   "--workload",
+   "summarize",
+   "--concurrency",
+   "1,2,4,8",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee",
+   "--out",
+   "perf-data/cpu-gptoss/plow/gptoss-mx4-summ.json",
+   "--md",
+   "perf-data/cpu-gptoss/plow/gptoss-mx4-summ.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "summarize",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 60.2073905080033,
+    "ttft_s": {
+     "mean": 5.436809513746994,
+     "p50": 6.135215515998425,
+     "p90": 7.01868264299992,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.03311496487699587,
+     "p50": 0.033213631825342343,
+     "p90": 0.03363441766677646,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 7.523144241620685,
+     "p50": 8.217981084992061,
+     "p90": 9.11970293399645,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1111.25,
+     "p50": 1243,
+     "p90": 1434,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 8.503939394814669,
+    "req_per_s": 0.1328740530439792,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 60.2073905080033,
+     "ttft_s": {
+      "mean": 5.436809513746994,
+      "p50": 6.135215515998425,
+      "p90": 7.01868264299992,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.03311496487699587,
+      "p50": 0.033213631825342343,
+      "p90": 0.03363441766677646,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 7.523144241620685,
+      "p50": 8.217981084992061,
+      "p90": 9.11970293399645,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1111.25,
+      "p50": 1243,
+      "p90": 1434,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 8.503939394814669,
+     "req_per_s": 0.1328740530439792,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.7014853169966955,
+     "tpot_s": 0.032492109761935555,
+     "latency_s": 5.748594289994799,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 822,
+      "completion_tokens": 64,
+      "total_tokens": 886,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- **Early time\u2011keeping**:  \n  * Sundials and water clocks were the first devices",
+     "text_chars": 260,
+     "index": 0,
+     "kind": "summarize",
+     "t_start": 1788687115.0775065,
+     "prompt_tokens_client": 813,
+     "prompt_tokens_server": 822,
+     "prompt_chars": 3908,
+     "prompt_tokens": 813
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 7.01868264299992,
+     "tpot_s": 0.033348028063459975,
+     "latency_s": 9.11970293399645,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1443,
+      "completion_tokens": 64,
+      "total_tokens": 1507,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nGlaciers erode valleys by sliding, plucking, and melt\u2011water action",
+     "text_chars": 270,
+     "index": 1,
+     "kind": "summarize",
+     "t_start": 1788687120.828313,
+     "prompt_tokens_client": 1434,
+     "prompt_tokens_server": 1443,
+     "prompt_chars": 7075,
+     "prompt_tokens": 1434
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.616594827995868,
+     "tpot_s": 0.03363441766677646,
+     "latency_s": 8.735655277996557,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1337,
+      "completion_tokens": 64,
+      "total_tokens": 1401,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Honeybee colony cycle** \u2013 In late winter the queen resumes laying, raising bro",
+     "text_chars": 245,
+     "index": 2,
+     "kind": "summarize",
+     "t_start": 1788687129.9513955,
+     "prompt_tokens_client": 1328,
+     "prompt_tokens_server": 1337,
+     "prompt_chars": 6348,
+     "prompt_tokens": 1328
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.293856236996362,
+     "tpot_s": 0.033841463730260285,
+     "latency_s": 5.425958492007339,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 706,
+      "completion_tokens": 64,
+      "total_tokens": 770,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Two\u2011sentence summary**  \nCoffee is harvested by hand, processed either by wash",
+     "text_chars": 315,
+     "index": 3,
+     "kind": "summarize",
+     "t_start": 1788687138.6901464,
+     "prompt_tokens_client": 697,
+     "prompt_tokens_server": 706,
+     "prompt_chars": 3460,
+     "prompt_tokens": 697
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.893804680003086,
+     "tpot_s": 0.03276126303165848,
+     "latency_s": 7.957857301997137,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1153,
+      "completion_tokens": 64,
+      "total_tokens": 1217,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe article explains the coffee production process from harvest to ",
+     "text_chars": 332,
+     "index": 4,
+     "kind": "summarize",
+     "t_start": 1788687144.1181927,
+     "prompt_tokens_client": 1144,
+     "prompt_tokens_server": 1153,
+     "prompt_chars": 5429,
+     "prompt_tokens": 1144
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.7210735299886437,
+     "tpot_s": 0.0325704483176297,
+     "latency_s": 5.7731037639896385,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 783,
+      "completion_tokens": 64,
+      "total_tokens": 847,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Headline:**  \n*How a Honeybee Colony Survives the Year \u2013 From Winter Huddles t",
+     "text_chars": 270,
+     "index": 5,
+     "kind": "summarize",
+     "t_start": 1788687152.0789201,
+     "prompt_tokens_client": 774,
+     "prompt_tokens_server": 783,
+     "prompt_chars": 3759,
+     "prompt_tokens": 774
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 7.113763358996948,
+     "tpot_s": 0.033213631825342343,
+     "latency_s": 9.206300787991495,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1466,
+      "completion_tokens": 64,
+      "total_tokens": 1530,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Honeybee colony cycle** \u2013 In late winter the queen resumes laying, raising a b",
+     "text_chars": 249,
+     "index": 6,
+     "kind": "summarize",
+     "t_start": 1788687157.8541183,
+     "prompt_tokens_client": 1457,
+     "prompt_tokens_server": 1466,
+     "prompt_chars": 7044,
+     "prompt_tokens": 1457
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.135215515998425,
+     "tpot_s": 0.03305835661890414,
+     "latency_s": 8.217981084992061,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1252,
+      "completion_tokens": 64,
+      "total_tokens": 1316,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The article traces the evolution of time\u2011keeping from ancient water clocks to mo",
+     "text_chars": 350,
+     "index": 7,
+     "kind": "summarize",
+     "t_start": 1788687167.0640361,
+     "prompt_tokens_client": 1243,
+     "prompt_tokens_server": 1252,
+     "prompt_chars": 6126,
+     "prompt_tokens": 1243
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 57.10237651599164,
+    "ttft_s": {
+     "mean": 6.20041321012468,
+     "p50": 6.016044018993853,
+     "p90": 6.838897276000353,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.12781503998808652,
+     "p50": 0.14530010226978143,
+     "p90": 0.1527832239999765,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 14.252844046372047,
+     "p50": 14.187937893002527,
+     "p90": 16.460967250008252,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1123.875,
+     "p50": 1190,
+     "p90": 1228,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 8.966351862021249,
+    "req_per_s": 0.140099247844082,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 57.10237651599164,
+     "ttft_s": {
+      "mean": 6.20041321012468,
+      "p50": 6.016044018993853,
+      "p90": 6.838897276000353,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.12781503998808652,
+      "p50": 0.14530010226978143,
+      "p90": 0.1527832239999765,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 14.252844046372047,
+      "p50": 14.187937893002527,
+      "p90": 16.460967250008252,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1123.875,
+      "p50": 1190,
+      "p90": 1228,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 8.966351862021249,
+     "req_per_s": 0.140099247844082,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.016044018993853,
+     "tpot_s": 0.1486041825079906,
+     "latency_s": 15.378197351994459,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1224,
+      "completion_tokens": 64,
+      "total_tokens": 1288,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Household budgeting**: A household budget plans money before it arrives. Start",
+     "text_chars": 282,
+     "index": 8,
+     "kind": "summarize",
+     "t_start": 1788687184.0779574,
+     "prompt_tokens_client": 1215,
+     "prompt_tokens_server": 1224,
+     "prompt_chars": 6181,
+     "prompt_tokens": 1215
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.071358752000378,
+     "tpot_s": 0.11945377057141048,
+     "latency_s": 19.597016257990617,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1199,
+      "completion_tokens": 64,
+      "total_tokens": 1263,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- **Keeper duties and conditions** \u2013 A lighthouse keeper\u2019s routine involved main",
+     "text_chars": 315,
+     "index": 9,
+     "kind": "summarize",
+     "t_start": 1788687184.0782297,
+     "prompt_tokens_client": 1190,
+     "prompt_tokens_server": 1199,
+     "prompt_chars": 5793,
+     "prompt_tokens": 1190
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.161338190999231,
+     "tpot_s": 0.14530010226978143,
+     "latency_s": 13.315341997993528,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 959,
+      "completion_tokens": 64,
+      "total_tokens": 1023,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe article traces the evolution of time\u2011keeping from ancient water",
+     "text_chars": 347,
+     "index": 10,
+     "kind": "summarize",
+     "t_start": 1788687199.4627264,
+     "prompt_tokens_client": 950,
+     "prompt_tokens_server": 959,
+     "prompt_chars": 4566,
+     "prompt_tokens": 950
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.815574203996221,
+     "tpot_s": 0.12409519447620758,
+     "latency_s": 13.633642364991829,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1178,
+      "completion_tokens": 64,
+      "total_tokens": 1242,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Headline:**  \n**From Sun\u2011Dials to Atomic Clocks: How Timekeeping Evolved from ",
+     "text_chars": 283,
+     "index": 11,
+     "kind": "summarize",
+     "t_start": 1788687203.678409,
+     "prompt_tokens_client": 1169,
+     "prompt_tokens_server": 1178,
+     "prompt_chars": 5720,
+     "prompt_tokens": 1169
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.425342467002338,
+     "tpot_s": 0.1527832239999765,
+     "latency_s": 14.050778792996425,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1018,
+      "completion_tokens": 64,
+      "total_tokens": 1082,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nBread\u2019s rise and flavor come from yeast fermentation that produces",
+     "text_chars": 328,
+     "index": 12,
+     "kind": "summarize",
+     "t_start": 1788687212.7806523,
+     "prompt_tokens_client": 1009,
+     "prompt_tokens_server": 1018,
+     "prompt_chars": 4942,
+     "prompt_tokens": 1009
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.320906388005824,
+     "tpot_s": 0.16095226553974615,
+     "latency_s": 16.460967250008252,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1237,
+      "completion_tokens": 64,
+      "total_tokens": 1301,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- Glaciers erode valleys by sliding, plucking, and melt\u2011water action, producing ",
+     "text_chars": 264,
+     "index": 13,
+     "kind": "summarize",
+     "t_start": 1788687217.3150897,
+     "prompt_tokens_client": 1228,
+     "prompt_tokens_server": 1237,
+     "prompt_chars": 5923,
+     "prompt_tokens": 1228
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.838897276000353,
+     "tpot_s": 0.11665002596823291,
+     "latency_s": 14.187937893002527,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1369,
+      "completion_tokens": 64,
+      "total_tokens": 1433,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nTides are caused by the differential gravitational pull of the Moo",
+     "text_chars": 315,
+     "index": 14,
+     "kind": "summarize",
+     "t_start": 1788687226.8341074,
+     "prompt_tokens_client": 1360,
+     "prompt_tokens_server": 1369,
+     "prompt_chars": 6617,
+     "prompt_tokens": 1360
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.9538443839992397,
+     "tpot_s": 0.054681554571346616,
+     "latency_s": 7.39887046199874,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 879,
+      "completion_tokens": 64,
+      "total_tokens": 943,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nBread dough relies on gluten to trap gas, and fermentation\u2014whether",
+     "text_chars": 321,
+     "index": 15,
+     "kind": "summarize",
+     "t_start": 1788687233.7791436,
+     "prompt_tokens_client": 870,
+     "prompt_tokens_server": 879,
+     "prompt_chars": 4337,
+     "prompt_tokens": 870
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 58.28661988899694,
+    "ttft_s": {
+     "mean": 11.179409450374806,
+     "p50": 7.2094780759944115,
+     "p90": 20.278580803991645,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.2827661430713753,
+     "p50": 0.3241433961585345,
+     "p90": 0.3607385619998529,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 28.99376069662503,
+     "p50": 31.13641782400373,
+     "p90": 39.7248862109991,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1187.75,
+     "p50": 1203,
+     "p90": 1421,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 8.784177242994543,
+    "req_per_s": 0.13725276942178974,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 58.28661988899694,
+     "ttft_s": {
+      "mean": 11.179409450374806,
+      "p50": 7.2094780759944115,
+      "p90": 20.278580803991645,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.2827661430713753,
+      "p50": 0.3241433961585345,
+      "p90": 0.3607385619998529,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 28.99376069662503,
+      "p50": 31.13641782400373,
+      "p90": 39.7248862109991,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1187.75,
+      "p50": 1203,
+      "p90": 1421,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 8.784177242994543,
+     "req_per_s": 0.13725276942178974,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 13.039713848993415,
+     "tpot_s": 0.34883251865089515,
+     "latency_s": 35.01623309600109,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1212,
+      "completion_tokens": 64,
+      "total_tokens": 1276,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe text contrasts the lives of lighthouse keepers with the working",
+     "text_chars": 284,
+     "index": 16,
+     "kind": "summarize",
+     "t_start": 1788687250.0291,
+     "prompt_tokens_client": 1203,
+     "prompt_tokens_server": 1212,
+     "prompt_chars": 5985,
+     "prompt_tokens": 1203
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 25.64165638900886,
+     "tpot_s": 0.3241433961585345,
+     "latency_s": 46.062746543000685,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1103,
+      "completion_tokens": 64,
+      "total_tokens": 1167,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nThe printing press revolutionized Europe by making books cheaper, ",
+     "text_chars": 323,
+     "index": 17,
+     "kind": "summarize",
+     "t_start": 1788687250.029372,
+     "prompt_tokens_client": 1094,
+     "prompt_tokens_server": 1103,
+     "prompt_chars": 5472,
+     "prompt_tokens": 1094
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.829069265004364,
+     "tpot_s": 0.38582925755546305,
+     "latency_s": 31.13641782400373,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1430,
+      "completion_tokens": 64,
+      "total_tokens": 1494,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Headline:**  \n*Glaciers Sculpt Landscapes & the Printing Press Revolutionized ",
+     "text_chars": 267,
+     "index": 18,
+     "kind": "summarize",
+     "t_start": 1788687250.0297217,
+     "prompt_tokens_client": 1421,
+     "prompt_tokens_server": 1430,
+     "prompt_chars": 7053,
+     "prompt_tokens": 1421
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 20.278580803991645,
+     "tpot_s": 0.3086697566031944,
+     "latency_s": 39.7248862109991,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1498,
+      "completion_tokens": 64,
+      "total_tokens": 1562,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- Glaciers form when snowfall exceeds melt, compressing into ice that flows down",
+     "text_chars": 270,
+     "index": 19,
+     "kind": "summarize",
+     "t_start": 1788687250.0304346,
+     "prompt_tokens_client": 1489,
+     "prompt_tokens_server": 1498,
+     "prompt_chars": 7150,
+     "prompt_tokens": 1489
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.7800029210047796,
+     "tpot_s": 0.3607385619998529,
+     "latency_s": 26.50659712399647,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 821,
+      "completion_tokens": 64,
+      "total_tokens": 885,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe article traces the journey of coffee from its origins in East A",
+     "text_chars": 355,
+     "index": 20,
+     "kind": "summarize",
+     "t_start": 1788687281.172547,
+     "prompt_tokens_client": 812,
+     "prompt_tokens_server": 821,
+     "prompt_chars": 4018,
+     "prompt_tokens": 812
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.495501337994938,
+     "tpot_s": 0.26050628855545443,
+     "latency_s": 22.90748786799668,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1274,
+      "completion_tokens": 64,
+      "total_tokens": 1338,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Glaciers form where snowfall exceeds melt, compressing into ice that flows downh",
+     "text_chars": 313,
+     "index": 21,
+     "kind": "summarize",
+     "t_start": 1788687285.048479,
+     "prompt_tokens_client": 1265,
+     "prompt_tokens_server": 1274,
+     "prompt_chars": 6176,
+     "prompt_tokens": 1265
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 7.2094780759944115,
+     "tpot_s": 0.1772673171905649,
+     "latency_s": 18.377401935998932,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1117,
+      "completion_tokens": 64,
+      "total_tokens": 1181,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nTides are caused by the gravitational pull of the Moon and Sun, cr",
+     "text_chars": 317,
+     "index": 22,
+     "kind": "summarize",
+     "t_start": 1788687289.7615137,
+     "prompt_tokens_client": 1108,
+     "prompt_tokens_server": 1117,
+     "prompt_chars": 5420,
+     "prompt_tokens": 1108
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.161272961006034,
+     "tpot_s": 0.09614204785704339,
+     "latency_s": 12.218314971003565,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1119,
+      "completion_tokens": 64,
+      "total_tokens": 1183,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The printing press, invented around 1450 by Johannes\u202fGutenberg, revolutionised t",
+     "text_chars": 313,
+     "index": 23,
+     "kind": "summarize",
+     "t_start": 1788687296.0947123,
+     "prompt_tokens_client": 1110,
+     "prompt_tokens_server": 1119,
+     "prompt_chars": 5489,
+     "prompt_tokens": 1110
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 54.64602541999193,
+    "ttft_s": {
+     "mean": 24.318768100753005,
+     "p50": 27.157759736001026,
+     "p90": 37.870009099002345,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.46649261945238985,
+     "p50": 0.5038270958570398,
+     "p90": 0.695680404063462,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 53.707904558003065,
+     "p50": 53.90092583501246,
+     "p90": 54.32218502700562,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1136.25,
+     "p50": 1127,
+     "p90": 1363,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 9.369391388759407,
+    "req_per_s": 0.14639674044936574,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 54.64602541999193,
+     "ttft_s": {
+      "mean": 24.318768100753005,
+      "p50": 27.157759736001026,
+      "p90": 37.870009099002345,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.46649261945238985,
+      "p50": 0.5038270958570398,
+      "p90": 0.695680404063462,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 53.707904558003065,
+      "p50": 53.90092583501246,
+      "p90": 54.32218502700562,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1136.25,
+      "p50": 1127,
+      "p90": 1363,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 9.369391388759407,
+     "req_per_s": 0.14639674044936574,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.337541724002222,
+     "tpot_s": 0.7534611604602856,
+     "latency_s": 52.805710378001095,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1126,
+      "completion_tokens": 64,
+      "total_tokens": 1190,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Lighthouses were identified by unique light patterns\u2014fixed, flashing at 5, 10, o",
+     "text_chars": 289,
+     "index": 24,
+     "kind": "summarize",
+     "t_start": 1788687317.1754518,
+     "prompt_tokens_client": 1117,
+     "prompt_tokens_server": 1126,
+     "prompt_chars": 5567,
+     "prompt_tokens": 1117
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 34.01626228399982,
+     "tpot_s": 0.3201586680317257,
+     "latency_s": 54.18636061200232,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1372,
+      "completion_tokens": 64,
+      "total_tokens": 1436,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- **Ancient & early time\u2011keeping** \u2013 Sundials and water clocks were the first to",
+     "text_chars": 278,
+     "index": 25,
+     "kind": "summarize",
+     "t_start": 1788687317.1757596,
+     "prompt_tokens_client": 1363,
+     "prompt_tokens_server": 1372,
+     "prompt_chars": 6563,
+     "prompt_tokens": 1363
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 21.854110346001107,
+     "tpot_s": 0.5038270958570398,
+     "latency_s": 53.59528314699128,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1510,
+      "completion_tokens": 64,
+      "total_tokens": 1574,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Steam Engines and the Early Railways**  \nEarly steam engines were first used a",
+     "text_chars": 283,
+     "index": 26,
+     "kind": "summarize",
+     "t_start": 1788687317.1759977,
+     "prompt_tokens_client": 1501,
+     "prompt_tokens_server": 1510,
+     "prompt_chars": 7308,
+     "prompt_tokens": 1501
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 14.529712100003962,
+     "tpot_s": 0.6147011465239173,
+     "latency_s": 53.25599913200131,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1136,
+      "completion_tokens": 64,
+      "total_tokens": 1200,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe article traces the evolution of timekeeping from ancient water ",
+     "text_chars": 354,
+     "index": 27,
+     "kind": "summarize",
+     "t_start": 1788687317.1761901,
+     "prompt_tokens_client": 1127,
+     "prompt_tokens_server": 1136,
+     "prompt_chars": 5371,
+     "prompt_tokens": 1127
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 9.12820235300751,
+     "tpot_s": 0.695680404063462,
+     "latency_s": 52.95617861600476,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 801,
+      "completion_tokens": 64,
+      "total_tokens": 865,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Glaciers form when more snow falls than melts, compressing into ice that slowly ",
+     "text_chars": 294,
+     "index": 28,
+     "kind": "summarize",
+     "t_start": 1788687317.1769712,
+     "prompt_tokens_client": 792,
+     "prompt_tokens_server": 801,
+     "prompt_chars": 3835,
+     "prompt_tokens": 792
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 27.157759736001026,
+     "tpot_s": 0.42449282569855096,
+     "latency_s": 53.90092583501246,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1057,
+      "completion_tokens": 64,
+      "total_tokens": 1121,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe article explains the journey of coffee from its origins in East",
+     "text_chars": 301,
+     "index": 29,
+     "kind": "summarize",
+     "t_start": 1788687317.1772556,
+     "prompt_tokens_client": 1048,
+     "prompt_tokens_server": 1057,
+     "prompt_chars": 5151,
+     "prompt_tokens": 1048
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 44.65654716400604,
+     "tpot_s": 0.15847545657131362,
+     "latency_s": 54.640593717005686,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1339,
+      "completion_tokens": 64,
+      "total_tokens": 1403,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- **Lighthouses**: 18th\u2011century Fresnel lenses made lights visible up to ~20\u202fmi;",
+     "text_chars": 267,
+     "index": 30,
+     "kind": "summarize",
+     "t_start": 1788687317.177469,
+     "prompt_tokens_client": 1330,
+     "prompt_tokens_server": 1339,
+     "prompt_chars": 6535,
+     "prompt_tokens": 1330
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 37.870009099002345,
+     "tpot_s": 0.26114419841282405,
+     "latency_s": 54.32218502700562,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 821,
+      "completion_tokens": 64,
+      "total_tokens": 885,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe article traces the journey of coffee from its origins in East A",
+     "text_chars": 355,
+     "index": 31,
+     "kind": "summarize",
+     "t_start": 1788687317.17802,
+     "prompt_tokens_client": 812,
+     "prompt_tokens_server": 821,
+     "prompt_chars": 4018,
+     "prompt_tokens": 812
+    }
+   ]
+  }
+ ]
+}
