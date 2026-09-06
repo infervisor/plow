@@ -676,6 +676,7 @@ pub mod program;
 pub mod splitk;
 
 pub mod live_kv;
+pub mod mixed_step;
 
 pub mod fp8_m1_role;
 
