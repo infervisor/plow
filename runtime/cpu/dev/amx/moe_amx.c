@@ -50,9 +50,11 @@ static inline void stage_rows(uint8_t* t, const char* w, size_t ldw_b, uint32_t 
         _mm512_store_si512((void*)(t + r * 64u), _mm512_loadu_si512((const void*)(w + r * ldw_b)));
 }
 
-/* out[r][c] (f32, row stride 32) = W[r] . x[c] for r < rows (<= 32), c < 16*nxt. */
+/* out[r][c] (f32, row stride 32) = W[r] . x[c] for r < rows (<= 32), c < 16*nxt. `pf_rows` walks the
+ * weight rows ahead of the tile loads: worth its 16 uops per K step only when W is an expert
+ * matrix being streamed from memory, not when it is a dequantized strip already sitting in L2. */
 static void dot_block(const plow_bf16* W, size_t ldw, uint32_t rows, const uint8_t* xp, uint32_t nkb,
-                      uint32_t nxt, float* out) {
+                      uint32_t nxt, int pf_rows, float* out) {
     const size_t ldw_b = ldw * 2u;
     const uint32_t r0 = rows < 16u ? rows : 16u, r1 = rows - r0;
     const char* w0 = (const char*)W;
@@ -64,10 +66,12 @@ static void dot_block(const plow_bf16* W, size_t ldw, uint32_t rows, const uint8
         if (nxt > 1u) _tile_zero(3);
     }
     for (uint32_t kb = 0; kb < nkb; kb++) {
-        const int odd = (kb & 1u) && r1;
-        const char* pf = (odd ? w1 : w0) + (size_t)kb * 64u + XM_PF;
-        const uint32_t pr = odd ? r1 : r0;
-        for (uint32_t r = 0; r < pr; r++) _mm_prefetch(pf + r * ldw_b, _MM_HINT_T0);
+        if (pf_rows) {
+            const int odd = (kb & 1u) && r1;
+            const char* pf = (odd ? w1 : w0) + (size_t)kb * 64u + XM_PF;
+            const uint32_t pr = odd ? r1 : r0;
+            for (uint32_t r = 0; r < pr; r++) _mm_prefetch(pf + r * ldw_b, _MM_HINT_T0);
+        }
         _tile_loadd(6, xp + (size_t)kb * 2048u, 64);
         if (nxt > 1u) _tile_loadd(7, xp + (size_t)kb * 2048u + 1024u, 64);
         if (r0 == 16u) {
@@ -95,6 +99,54 @@ static void dot_block(const plow_bf16* W, size_t ldw, uint32_t rows, const uint8
         _tile_stored(2, out + 16 * 32, 128);
         if (nxt > 1u) _tile_stored(3, out + 16 * 32 + 16, 128);
     }
+}
+
+/* dot_block leaves C as [weight row][token]; every consumer wants [token][weight row] so its 32
+ * outputs for one token can leave as one vector store instead of 32 scattered 2-byte ones. Only
+ * the 16x16 quadrants covering `nr` rows and `nc` columns are produced; `a` and `t` both have a
+ * row stride of 32 floats and must be 64-byte aligned. */
+static void acc_tr32(const float* a, float* t, uint32_t nr, uint32_t nc) {
+    for (uint32_t R = 0; R * 16u < nr; R++)
+        for (uint32_t C = 0; C * 16u < nc; C++) {
+            __m512i v[16];
+#pragma GCC unroll 16
+            for (uint32_t i = 0; i < 16u; i++)
+                v[i] = _mm512_load_si512((const void*)(a + (R * 16u + i) * 32u + C * 16u));
+            plow_amx_tr16x16(v);
+#pragma GCC unroll 16
+            for (uint32_t j = 0; j < 16u; j++)
+                _mm512_store_si512((void*)(t + (C * 16u + j) * 32u + R * 16u), v[j]);
+        }
+}
+
+/* Vector plow_f2bf. VCVTNEPS2BF16 is not used: its denormal and NaN results are not the same
+ * bits, and the AMX tier must round exactly like the golden tier it replaces. */
+static inline __m256i v_f2bf16(__m512 f) {
+    const __m512i u = _mm512_castps_si512(f);
+    const __m512i em = _mm512_set1_epi32(0x7F800000);
+    const __m512i hi = _mm512_srli_epi32(u, 16);
+    const __mmask16 sp = _mm512_cmpeq_epi32_mask(_mm512_and_si512(u, em), em);
+    const __m512i rn = _mm512_srli_epi32(
+        _mm512_add_epi32(u, _mm512_add_epi32(_mm512_and_si512(hi, _mm512_set1_epi32(1)),
+                                             _mm512_set1_epi32(0x7FFF))),
+        16);
+    const __mmask16 pay = _mm512_test_epi32_mask(u, _mm512_set1_epi32(0xFFFF));
+    return _mm512_cvtepi32_epi16(_mm512_mask_blend_epi32(
+        sp, rn, _mm512_mask_or_epi32(hi, pay, hi, _mm512_set1_epi32(0x40))));
+}
+
+/* plow_bf2f over 16 lanes; masked-off lanes (and any past the end of the row) read as +0.0f. */
+static inline __m512 v_wide_bf16(const plow_bf16* p, __mmask16 m) {
+    return _mm512_castsi512_ps(
+        _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_maskz_loadu_epi16(m, p)), 16));
+}
+
+/* Lanes of a 32-wide accumulator row that hold real weight columns. */
+static inline __mmask16 acc_m0(uint32_t rw) {
+    return (__mmask16)(rw >= 16u ? 0xFFFFu : (1u << rw) - 1u);
+}
+static inline __mmask16 acc_m1(uint32_t rw) {
+    return (__mmask16)(rw <= 16u ? 0u : (1u << (rw - 16u)) - 1u);
 }
 
 /* Next <= 32 live rows of segment [*r, rend): key[row] == UNUSED rows are padding. */
@@ -146,8 +198,8 @@ X_K(x_moe_group_glu_gemma_pf) {
             const uint32_t nxt = M > 16u ? 2u : 1u;
             for (uint32_t n = n0; n < n1;) {
                 const uint32_t rw = n1 - n < 32u ? n1 - n : 32u;
-                dot_block(gu + (size_t)n * H, H, rw, xp, nkb, nxt, g);
-                dot_block(gu + (size_t)(I + n) * H, H, rw, xp, nkb, nxt, u);
+                dot_block(gu + (size_t)n * H, H, rw, xp, nkb, nxt, 1, g);
+                dot_block(gu + (size_t)(I + n) * H, H, rw, xp, nkb, nxt, 1, u);
                 for (uint32_t rr = 0; rr < rw; rr++) {
                     for (uint32_t c = 0; c < nxt; c++)
                         _mm512_store_ps(of + c * 16u, v_glu_pair(_mm512_load_ps(g + rr * 32u + c * 16u),
@@ -195,7 +247,7 @@ X_K(x_moe_group_down_gemma_pf) {
             const uint32_t nxt = M > 16u ? 2u : 1u;
             for (uint32_t h = h0; h < h1;) {
                 const uint32_t rw = h1 - h < 32u ? h1 - h : 32u;
-                dot_block(dn + (size_t)h * I, I, rw, xp, nkb, nxt, o);
+                dot_block(dn + (size_t)h * I, I, rw, xp, nkb, nxt, 1, o);
                 for (uint32_t m = 0; m < M; m++) {
                     float* pr = part + (size_t)row_partidx[rows[m]] * H + h;
                     const float gate = row_gate[rows[m]];
@@ -642,7 +694,6 @@ X_K(x_moe_glu_mx_pf) {
     uint32_t rows[MXPF_ROW_MAX];
     float g[32 * 32] __attribute__((aligned(64)));
     float u[32 * 32] __attribute__((aligned(64)));
-    float of[32] __attribute__((aligned(64)));
     uint32_t lo, hi;
     if (E > MXPF_MAX_E) {
         g_moe_glu_mx_pf(in, slice, nblk, T, ctx);
@@ -670,6 +721,7 @@ X_K(x_moe_glu_mx_pf) {
             }
             for (uint32_t n = n0; n < n1;) {
                 const uint32_t rw = n1 - n < 32u ? n1 - n : 32u;
+                const __mmask16 m0 = acc_m0(rw), m1 = acc_m1(rw);
                 const uint32_t rg = layout ? n : 2u * n, ru = layout ? I + n : 2u * n + 1u;
                 dequant_strip(wg, K, We + (size_t)rg * ldw, rs, Se + (size_t)rg * lds, ss, rw, nkb);
                 dequant_strip(wu, K, We + (size_t)ru * ldw, rs, Se + (size_t)ru * lds, ss, rw, nkb);
@@ -677,16 +729,23 @@ X_K(x_moe_glu_mx_pf) {
                     const uint32_t mb = M - b * 32u < 32u ? M - b * 32u : 32u;
                     const uint32_t nxt = mb > 16u ? 2u : 1u;
                     const uint32_t* rw_ = rows + b * 32u;
-                    dot_block(wg, K, rw, xp + (size_t)b * xblk, nkb, nxt, g);
-                    dot_block(wu, K, rw, xp + (size_t)b * xblk, nkb, nxt, u);
+                    dot_block(wg, K, rw, xp + (size_t)b * xblk, nkb, nxt, 0, g);
+                    dot_block(wu, K, rw, xp + (size_t)b * xblk, nkb, nxt, 0, u);
+                    /* GLU in place over g, then transpose into the dead u so each token's rw
+                     * outputs are one contiguous masked store instead of rw scattered ones. */
                     for (uint32_t rr = 0; rr < rw; rr++) {
                         const __m512 bg = _mm512_set1_ps(be ? plow_bf2f(be[rg + rr * (layout ? 1u : 2u)]) : 0.0f);
                         const __m512 bu = _mm512_set1_ps(be ? plow_bf2f(be[ru + rr * (layout ? 1u : 2u)]) : 0.0f);
                         for (uint32_t c = 0; c < nxt; c++)
-                            _mm512_store_ps(of + c * 16u,
+                            _mm512_store_ps(g + rr * 32u + c * 16u,
                                             v_glu_pair(_mm512_add_ps(_mm512_load_ps(g + rr * 32u + c * 16u), bg),
                                                        _mm512_add_ps(_mm512_load_ps(u + rr * 32u + c * 16u), bu), act, f0, f1));
-                        for (uint32_t m = 0; m < mb; m++) fu[(size_t)rw_[m] * I + n + rr] = plow_f2bf(of[m]);
+                    }
+                    acc_tr32(g, u, rw, mb);
+                    for (uint32_t m = 0; m < mb; m++) {
+                        plow_bf16* d = fu + (size_t)rw_[m] * I + n;
+                        _mm256_mask_storeu_epi16(d, m0, v_f2bf16(_mm512_load_ps(u + m * 32u)));
+                        if (m1) _mm256_mask_storeu_epi16(d + 16, m1, v_f2bf16(_mm512_load_ps(u + m * 32u + 16u)));
                     }
                 }
                 n += rw;
@@ -723,6 +782,7 @@ X_K(x_moe_down_mx_pf) {
     const plow_bf16* rowp[MXPF_ROW_MAX];
     uint32_t rows[MXPF_ROW_MAX];
     float o[32 * 32] __attribute__((aligned(64)));
+    float ot[32 * 32] __attribute__((aligned(64)));
     uint32_t lo, hi;
     if (E > MXPF_MAX_E) {
         g_moe_down_mx_pf(in, slice, nblk, T, ctx);
@@ -750,17 +810,26 @@ X_K(x_moe_down_mx_pf) {
             }
             for (uint32_t h = h0; h < h1;) {
                 const uint32_t rw = h1 - h < 32u ? h1 - h : 32u;
+                const __mmask16 m0 = acc_m0(rw), m1 = acc_m1(rw);
+                const __m512 bv0 = be ? v_wide_bf16(be + h, m0) : _mm512_setzero_ps();
+                const __m512 bv1 = be ? v_wide_bf16(be + h + 16u, m1) : _mm512_setzero_ps();
                 dequant_strip(wd, I, We + (size_t)h * ldw, ldw, Se + (size_t)h * lds, lds, rw, nkb);
                 for (uint32_t b = 0; b < nb; b++) {
                     const uint32_t mb = M - b * 32u < 32u ? M - b * 32u : 32u;
                     const uint32_t nxt = mb > 16u ? 2u : 1u;
                     const uint32_t* rw_ = rows + b * 32u;
-                    dot_block(wd, I, rw, xp + (size_t)b * xblk, nkb, nxt, o);
+                    dot_block(wd, I, rw, xp + (size_t)b * xblk, nkb, nxt, 0, o);
+                    acc_tr32(o, ot, rw, mb);
                     for (uint32_t m = 0; m < mb; m++) {
                         float* pr = part + (size_t)row_partidx[rw_[m]] * H + h;
-                        const float gate = row_gate[rw_[m]];
-                        for (uint32_t rr = 0; rr < rw; rr++)
-                            pr[rr] = gate * (o[rr * 32u + m] + (be ? plow_bf2f(be[h + rr]) : 0.0f));
+                        const __m512 gv = _mm512_set1_ps(row_gate[rw_[m]]);
+                        _mm512_mask_storeu_ps(
+                            pr, m0,
+                            _mm512_mul_ps(gv, _mm512_add_ps(_mm512_maskz_load_ps(m0, ot + m * 32u), bv0)));
+                        if (m1)
+                            _mm512_mask_storeu_ps(
+                                pr + 16, m1,
+                                _mm512_mul_ps(gv, _mm512_add_ps(_mm512_maskz_load_ps(m1, ot + m * 32u + 16u), bv1)));
                     }
                 }
                 h += rw;
