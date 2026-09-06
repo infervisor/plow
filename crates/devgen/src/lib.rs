@@ -187,7 +187,7 @@ pub(crate) fn attention_decode_ns(
 
 fn balanced_attention_ns(batch: u32, heads: u32, kv_heads: u32, n_cu: u32, gf: u32) -> u32 {
     assert!(
-        matches!(gf, 2 | 4 | 6 | 8 | 16),
+        matches!(gf, 2 | 4 | 8 | 16),
         "unsupported attention decode GF {gf}"
     );
     assert!(batch > 0 && heads > 0 && kv_heads > 0 && n_cu > 0);
@@ -220,7 +220,6 @@ mod attention_decode_balance_tests {
                     },
                 ),
                 (32, 4, 8, 33),
-                (24, 4, 6, 33),
             ] {
                 let ns = balanced_attention_ns(batch, heads, kv_heads, 132, gf);
                 assert_eq!(ns, expected);
@@ -232,7 +231,7 @@ mod attention_decode_balance_tests {
 
     #[test]
     fn incompatible_sliding_gqa_is_rejected() {
-        assert!(std::panic::catch_unwind(|| balanced_attention_ns(1, 16, 8, 132, 6)).is_err());
+        assert!(std::panic::catch_unwind(|| balanced_attention_ns(1, 24, 4, 132, 6)).is_err());
         assert!(std::panic::catch_unwind(|| balanced_attention_ns(1, 16, 0, 132, 2)).is_err());
     }
 }
