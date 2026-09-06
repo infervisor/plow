@@ -1,0 +1,1440 @@
+{
+  "scope": "Native attention+merge operator, Gemma12 B1 saved8K/32K QKV, scalarGF4/BF16PV-GF16/TF32PV-GF16, NS33, 256MiB per-invocation eviction. No broad interpreter/block/full-model/serving win.",
+  "decision": "Advance one fixed-schedule broad build:1.493\u20131.503x scalar speedup8K,1.706\u20131.720x32K. Candidate slower than diagnosticBF16PV and less precise than scalar; fixed numerical gates passed.",
+  "raw": {
+    "e1-k64-tf32-pv-20260906/long-context/timing-analysis/RESULTS.md": {
+      "sha256": "e31fef79b0077a5fd56cc310cd04d6a7e3e2c440540ad7f0e2c30ce752d4b1fa",
+      "content": "Advance for root review: repeatable native operator gain, with no production promotion.\n\n| Context | Scalar GF4 | Original BF16 PV | K64+TF32 PV | Scalar speedup range |\n|---|---:|---:|---:|---:|\n| 8192 | 71.80us | 42.72us | 47.82us | 1.493\u20131.503x |\n| 32768 | 235.40us | 116.92us | 137.58us | 1.706\u20131.720x |\n\nNumbers are medians across all three histories and both initial process orders. Every individual history/order beats scalar; candidate medians shift less than0.51% across process orders.192 measured event samples perarm/context,384 perarm overall;1152 total. Candidate is12\u201318% slower than original BF16PV, the cost of improved arithmetic accuracy.\n\nMemory: fresh32K raw0,9 numerical cells and27 tensor files exact. Timed runs each preserve27 numerical tensor files and post-graph canaries/output identity.8K/32K precision gates passed: BF16PV RNE515\u21928 and408\u219242; scalar has2 each. Candidate is less precise than scalar, with worst native relL2 .000338372 below unchanged .003 limit.\n\nEach event contains one operation+merge graph.256MiB eviction precedes every start event, including8K inputs that fitL2. Three untimed warmups perarm/history; allocation/upload/capture excluded. Observed dmon clocks1830MHz SM/2619MHz memory in all samples; one-second sampling does not prove every timed instruction clock.\n\nScope: native standalone CABI bodies, B1/HD512/GQA16/NS33, actual saved synthetic native block histories. GF4 has132 useful tasks, GF16 has33 despite both launching132CTAs. Candidate124registers/zero spills belongs to the standalone operator; broad interpreter resource/occupancy and fixed block numerical behavior remain unqualified. No vLLM, serving, or fullmodel performance claim.\n\nNext only after root approval: transplant this unchanged arithmetic into a matched private interpreter candidate, inspect registers/spills/arena and instruction preservation, then fixed native block gates8K/32K before any integrated timing. Existingfullmodel.01 gate remains unchanged.\n"
+    },
+    "e1-k64-tf32-pv-20260906/long-context/timing-analysis/results.json": {
+      "sha256": "6f688db247722f7ddb82d57f2d2740ad8784e119441ce43f42b5330ea1b0c8eb",
+      "content": {
+        "passed": true,
+        "decision": "Advance to root review for an artifact-only actual-interpreter resource and fixed native-block numerical gate; no automatic broad build or production promotion",
+        "summary": [
+          {
+            "context": 8192,
+            "median_of_history_process_medians_us": {
+              "scalar": 71.8000028282404,
+              "control": 42.7200011909008,
+              "candidate": 47.81599901616573
+            },
+            "scalar_over_candidate_range": [
+              1.4926813259604148,
+              1.502689961108515
+            ],
+            "candidate_latency_reduction_range": [
+              0.3300646409865252,
+              0.33452673147406076
+            ],
+            "candidate_slowdown_vs_bf16_pv": 0.1192883352810008,
+            "max_candidate_between_process_delta": 0.005018361216536649,
+            "samples_per_arm": 192
+          },
+          {
+            "context": 32768,
+            "median_of_history_process_medians_us": {
+              "scalar": 235.4000024497509,
+              "control": 116.9199999421835,
+              "candidate": 137.58399710059166
+            },
+            "scalar_over_candidate_range": [
+              1.7055073181440106,
+              1.720378518727059
+            ],
+            "candidate_latency_reduction_range": [
+              0.4136641987040941,
+              0.4187325701207202
+            ],
+            "candidate_slowdown_vs_bf16_pv": 0.17673620568445458,
+            "max_candidate_between_process_delta": 0.0022151622292390094,
+            "samples_per_arm": 192
+          }
+        ],
+        "records": [
+          {
+            "context": 8192,
+            "process_order": "forward",
+            "step": 0,
+            "length": 8193,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 71.79200276732445,
+              "control": 42.89599880576134,
+              "candidate": 48.09600114822388
+            },
+            "p95_us": {
+              "scalar": 74.14399832487106,
+              "control": 43.87199878692627,
+              "candidate": 49.056001007556915
+            },
+            "scalar_over_candidate": 1.4926813259604148,
+            "old_bf16_pv_over_candidate": 0.8918828547421854,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.4895755061405258,
+              "minimum": 1.4586614070976682,
+              "maximum": 1.542609789644803
+            }
+          },
+          {
+            "context": 8192,
+            "process_order": "forward",
+            "step": 1,
+            "length": 8194,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 71.50400057435036,
+              "control": 42.78399981558323,
+              "candidate": 47.58400097489357
+            },
+            "p95_us": {
+              "scalar": 73.27999919652939,
+              "control": 43.90399903059006,
+              "candidate": 49.0880012512207
+            },
+            "scalar_over_candidate": 1.502689961108515,
+            "old_bf16_pv_over_candidate": 0.8991257342600734,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.5031964531911002,
+              "minimum": 1.4556714143474672,
+              "maximum": 1.5567640624720536
+            }
+          },
+          {
+            "context": 8192,
+            "process_order": "forward",
+            "step": 2,
+            "length": 8195,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 71.80800288915634,
+              "control": 42.75200143456459,
+              "candidate": 47.807998955249786
+            },
+            "p95_us": {
+              "scalar": 73.34399968385696,
+              "control": 44.064000248909,
+              "candidate": 48.895999789237976
+            },
+            "scalar_over_candidate": 1.5020081253844473,
+            "old_bf16_pv_over_candidate": 0.8942436907803271,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.5021870947357383,
+              "minimum": 1.4542462123444535,
+              "maximum": 1.542395662769417
+            }
+          },
+          {
+            "context": 8192,
+            "process_order": "reverse",
+            "step": 0,
+            "length": 8193,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 71.87199965119362,
+              "control": 42.688000947237015,
+              "candidate": 47.98400029540062
+            },
+            "p95_us": {
+              "scalar": 73.27999919652939,
+              "control": 43.71200129389763,
+              "candidate": 48.70399832725525
+            },
+            "scalar_over_candidate": 1.497832594380063,
+            "old_bf16_pv_over_candidate": 0.8896298908894589,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.495820930453625,
+              "minimum": 1.4595659599162392,
+              "maximum": 1.5396610017526227
+            }
+          },
+          {
+            "context": 8192,
+            "process_order": "reverse",
+            "step": 1,
+            "length": 8194,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 71.84000313282013,
+              "control": 42.62400045990944,
+              "candidate": 47.82399907708168
+            },
+            "p95_us": {
+              "scalar": 73.18399846553802,
+              "control": 43.20000112056732,
+              "candidate": 49.056001007556915
+            },
+            "scalar_over_candidate": 1.502174734844528,
+            "old_bf16_pv_over_candidate": 0.8912680094194758,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.5003297614019537,
+              "minimum": 1.431180624481238,
+              "maximum": 1.5397688502993956
+            }
+          },
+          {
+            "context": 8192,
+            "process_order": "reverse",
+            "step": 2,
+            "length": 8195,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 71.71200215816498,
+              "control": 42.62400045990944,
+              "candidate": 47.759998589754105
+            },
+            "p95_us": {
+              "scalar": 73.72800260782242,
+              "control": 43.776001781225204,
+              "candidate": 49.15200173854828
+            },
+            "scalar_over_candidate": 1.5015076272123105,
+            "old_bf16_pv_over_candidate": 0.892462347539799,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.49714364082783,
+              "minimum": 1.445466533270919,
+              "maximum": 1.563419712629561
+            }
+          },
+          {
+            "context": 32768,
+            "process_order": "forward",
+            "step": 0,
+            "length": 32769,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 234.92799699306488,
+              "control": 116.89599975943565,
+              "candidate": 137.4719962477684
+            },
+            "p95_us": {
+              "scalar": 237.44000494480133,
+              "control": 120.7680031657219,
+              "candidate": 141.12000167369843
+            },
+            "scalar_over_candidate": 1.7089152947895634,
+            "old_bf16_pv_over_candidate": 0.8503259060030798,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.7096626678790794,
+              "minimum": 1.6626561300003753,
+              "maximum": 1.7799389805848604
+            }
+          },
+          {
+            "context": 32768,
+            "process_order": "forward",
+            "step": 1,
+            "length": 32770,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 235.56800186634064,
+              "control": 116.92800000309944,
+              "candidate": 136.9280070066452
+            },
+            "p95_us": {
+              "scalar": 244.3840056657791,
+              "control": 120.99199742078781,
+              "candidate": 140.9599930047989
+            },
+            "scalar_over_candidate": 1.720378518727059,
+            "old_bf16_pv_over_candidate": 0.85393779226937,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.7214507482524537,
+              "minimum": 1.6592759620382815,
+              "maximum": 1.7890295611966383
+            }
+          },
+          {
+            "context": 32768,
+            "process_order": "forward",
+            "step": 2,
+            "length": 32771,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 235.36000400781631,
+              "control": 116.91199988126755,
+              "candidate": 137.9999965429306
+            },
+            "p95_us": {
+              "scalar": 245.44000625610352,
+              "control": 121.18399888277054,
+              "candidate": 141.79199934005737
+            },
+            "scalar_over_candidate": 1.7055073181440106,
+            "old_bf16_pv_over_candidate": 0.8471884261598314,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.708414765638481,
+              "minimum": 1.6579481084282068,
+              "maximum": 1.7966736797646672
+            }
+          },
+          {
+            "context": 32768,
+            "process_order": "reverse",
+            "step": 0,
+            "length": 32769,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 235.4400008916855,
+              "control": 117.15199798345566,
+              "candidate": 137.77600228786469
+            },
+            "p95_us": {
+              "scalar": 244.47999894618988,
+              "control": 121.50400131940842,
+              "candidate": 141.76000654697418
+            },
+            "scalar_over_candidate": 1.7088607375888643,
+            "old_bf16_pv_over_candidate": 0.8503077171500599,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.7110433821907554,
+              "minimum": 1.6572652193062825,
+              "maximum": 1.7901415255781905
+            }
+          },
+          {
+            "context": 32768,
+            "process_order": "reverse",
+            "step": 1,
+            "length": 32770,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 236.01599782705307,
+              "control": 116.86400324106216,
+              "candidate": 137.2319981455803
+            },
+            "p95_us": {
+              "scalar": 244.9599951505661,
+              "control": 120.41600048542023,
+              "candidate": 140.6400054693222
+            },
+            "scalar_over_candidate": 1.7198321165350912,
+            "old_bf16_pv_over_candidate": 0.8515798415839498,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.719529507904165,
+              "minimum": 1.6903298524049788,
+              "maximum": 1.7973702109951823
+            }
+          },
+          {
+            "context": 32768,
+            "process_order": "reverse",
+            "step": 2,
+            "length": 32771,
+            "samples_per_arm": 32,
+            "median_us": {
+              "scalar": 235.36000400781631,
+              "control": 117.10399761795998,
+              "candidate": 137.69599795341492
+            },
+            "p95_us": {
+              "scalar": 244.57600712776184,
+              "control": 120.80000340938568,
+              "candidate": 141.79199934005737
+            },
+            "scalar_over_candidate": 1.7092726550225732,
+            "old_bf16_pv_over_candidate": 0.8504531675465137,
+            "paired_raw_scalar_over_candidate": {
+              "median": 1.7085370802253834,
+              "minimum": 1.6610246440018916,
+              "maximum": 1.7803401985020957
+            }
+          }
+        ],
+        "clocks": [
+          {
+            "job": "e1-tf32-native-timing-ctx8192-forward",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "06:59:20",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "06:59:21",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "06:59:22",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "note": "One-second observed dmon samples; not a continuous per-event clock measurement"
+          },
+          {
+            "job": "e1-tf32-native-timing-ctx8192-reverse",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "06:59:24",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "06:59:25",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "06:59:26",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "note": "One-second observed dmon samples; not a continuous per-event clock measurement"
+          },
+          {
+            "job": "e1-tf32-native-timing-ctx32768-forward",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "06:59:27",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "06:59:28",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "06:59:29",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "note": "One-second observed dmon samples; not a continuous per-event clock measurement"
+          },
+          {
+            "job": "e1-tf32-native-timing-ctx32768-reverse",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "06:59:31",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "06:59:32",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "06:59:33",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "note": "One-second observed dmon samples; not a continuous per-event clock measurement"
+          }
+        ],
+        "total_event_samples": 1152,
+        "event_samples_per_arm": 384,
+        "memory": {
+          "passed": true,
+          "context": 32768,
+          "raw_errors": 0,
+          "exact_tensor_files": 27,
+          "numerical_cells": 9,
+          "scope": "Native operator long-loop memory; no broad-interpreter/block memory claim"
+        },
+        "scope": "Standalone native operation-body plus merge only, B1 Gemma12 HD512/GQA16, NS33, actual8K/32K saved synthetic native histories; not deployed interpreter, fullmodel, serving or vLLM timing",
+        "geometry": {
+          "scalar_gf": 4,
+          "scalar_useful_work_items": 132,
+          "tensor_gf": 16,
+          "tensor_useful_work_items": 33,
+          "launch_ctas": 132,
+          "threads": 256
+        },
+        "timed_boundary": "Exactly one decode+merge graph per event interval;256MiB same-stream eviction outside each interval; QKVupload/setup/capture/3warmups excluded",
+        "diagnostic_control": "Original BF16PV remains accuracy-inferior diagnostic despite its lower latency; primary performance reference is qualified scalarGF4",
+        "quality": {
+          "passed": true,
+          "rows": [
+            {
+              "context": 8192,
+              "arms": {
+                "scalar": {
+                  "rne": 2,
+                  "worst_partial_rel_l2": 8.55057416451608e-08,
+                  "worst_native_rel_l2": 0.0
+                },
+                "control": {
+                  "rne": 515,
+                  "worst_partial_rel_l2": 0.00013102465413497187,
+                  "worst_native_rel_l2": 0.0006653740655004682
+                },
+                "candidate": {
+                  "rne": 8,
+                  "worst_partial_rel_l2": 1.2240431775783574e-06,
+                  "worst_native_rel_l2": 9.472811559703111e-05
+                }
+              }
+            },
+            {
+              "context": 32768,
+              "arms": {
+                "scalar": {
+                  "rne": 2,
+                  "worst_partial_rel_l2": 1.3742305239791821e-07,
+                  "worst_native_rel_l2": 0.0
+                },
+                "control": {
+                  "rne": 408,
+                  "worst_partial_rel_l2": 8.16660045848366e-05,
+                  "worst_native_rel_l2": 0.00042413010735812634
+                },
+                "candidate": {
+                  "rne": 42,
+                  "worst_partial_rel_l2": 6.959567183381208e-06,
+                  "worst_native_rel_l2": 0.00033837202134036966
+                }
+              }
+            }
+          ],
+          "scope": "18 cells, six native histories; candidate improves original BF16 PV accuracy but remains less precise than scalar at long loops; fixed gates"
+        }
+      }
+    },
+    "e1-k64-tf32-pv-20260906/long-context/timing-analysis/FREEZE.json": {
+      "sha256": "4cc50c296ff023a763430d8a78e2bcbc0be68edd24ddc9b8b1bfb7ec1ab11f70",
+      "content": {
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx8192-forward-before.txt": "02715709da98a2d1d9f62629f07734607e5effce057da369ce804baf1f2e6ebc",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx8192-forward-after.txt": "1a06d3c11f1c1c1518dfb56dc891ce27b23234f5be33eedff901c54f9c20c1ce",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx8192-forward-dmon.log": "7e00b62bf231ad22858403cfddac0921732fb26763d814080d4a99ce655d37a6",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx8192-forward.json": "e382c13d85df5da95f7ec4cb19579d4b4e99d77ca802dbc86884a6ba5acdcc6b",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx8192-forward.validated.json": "90cc09b047a55e4eb21e8b7cbcbf13ca457420b6a3afd8d6cfa43531e19b4542",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx8192-forward.log": "11b3e5365a7de6e7eba4c15fd5d97e7d40a6f49540bbb96d3c960d14c93e3cbd",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx8192-reverse-before.txt": "95ce0d43e030bdb323a771c33ac06735b24e3d47886eeef1d7f37f4542743c2b",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx8192-reverse-after.txt": "2ecf7084cef5acf666f799f9fa563c1102165d074ae3116bea69e257fe0a5d21",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx8192-reverse-dmon.log": "665722fab0158b669d45df4e23e3437575dd9c591f2bfa39548588578f270cb2",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx8192-reverse.json": "876b5b2b79287b13246fb168dc41a1e91f944501546ca579c99e4e11d2294617",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx8192-reverse.validated.json": "90cc09b047a55e4eb21e8b7cbcbf13ca457420b6a3afd8d6cfa43531e19b4542",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx8192-reverse.log": "11b3e5365a7de6e7eba4c15fd5d97e7d40a6f49540bbb96d3c960d14c93e3cbd",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx32768-forward-before.txt": "eee0933fb9e7012a951032ad6f9e2250ff90a6fd8204516fb2443876262f753b",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx32768-forward-after.txt": "335647f3a0dd0e54a38df6ff528cd98ecebe4b5cd6f7dd9d1a717b289ec044e9",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx32768-forward-dmon.log": "d7d69d0ed5f353ca06c1b027ff061193a2a57b5cc59067e32d1aa3003750f9c5",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx32768-forward.json": "e40ee1fd9e23eb95c011ba5a30fae575d7c5cb234e364afb51fe5608c07892bc",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx32768-forward.validated.json": "b8f9ee67ee399ea0bacd38ed38829575b70b4a6f3aae20de74f19405d48c1cd0",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx32768-forward.log": "11b3e5365a7de6e7eba4c15fd5d97e7d40a6f49540bbb96d3c960d14c93e3cbd",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx32768-reverse-before.txt": "27047d0c22bd4a8cb9786bc844a3a976f4de31ff2deaef4e7e2f56069db45fc3",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx32768-reverse-after.txt": "bdc5f853546e8207a4e59fb39b9a6ea5dd721666433e630f621a75c4535b82d5",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-native-timing-ctx32768-reverse-dmon.log": "b2ddfa41a9349406c5fb28c4a018fb20ee4cf337cd1dd0e495a3c729c8114e76",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx32768-reverse.json": "ade223419796a2094104fb680b118fad44845d209e93ec3a6bd292fac6954661",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx32768-reverse.validated.json": "b8f9ee67ee399ea0bacd38ed38829575b70b4a6f3aae20de74f19405d48c1cd0",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/results/e1-tf32-native-timing-ctx32768-reverse.log": "11b3e5365a7de6e7eba4c15fd5d97e7d40a6f49540bbb96d3c960d14c93e3cbd",
+        "/tmp/plow-model-support-checks/e1-tf32-long-timing-window-20260906/queue.json": "87d4fcd09d496cbb74ae74b2a09825cc16ad5f282eff0af17b1f4c49d90e8140",
+        "/tmp/plow-model-support-checks/e1-tf32-long-timing-window-20260906/results.json": "8a54194414a64abc8bdb4363156f780a74f0794b4851dc6389bafb22df3d24e0",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/ADVANCE-FREEZE.json": "42c7d62b436c970e473e82cb72d0e084d3d854956f828afa4bd92edd6de0e6cd",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/NUMERICAL-RESULTS.json": "bbe546b8bbd6da6de8a7e97b7b3a517e8c80d1f425e9ffb53a5407adcfa0778f",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/sass-resources.json": "09cf663fe4c3a96e3566bcd879ea5aa36b54d2fe23ecc155f968a5aa349b86a6",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/memory-validation.json": "29e31b9c4707d2c0e7ba911c7edfe456b016411df465f8daa3177a2722d33ec8",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/memcheck.raw.log": "a9d061cee538182f762e132abeea7bac7bddb844338f25751bbbb043f242c425",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing-analysis/analyze.py": "690025402c04da484d3bd2dd9564c535e28d1d2709a85b0d44da6adff678be17",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing-analysis/results.json": "6f688db247722f7ddb82d57f2d2740ad8784e119441ce43f42b5330ea1b0c8eb",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing-analysis/RESULTS.md": "e31fef79b0077a5fd56cc310cd04d6a7e3e2c440540ad7f0e2c30ce752d4b1fa",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck.stdout.log": "af13ee9cd583e2cf09d33337927373fc1f7747859f63019d7ddf859eab234fec",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck.json": "fa2efa162fe8c70d978c8eba53d06064320d3538943080c06efd6d658e26d31b",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck.stdout.log.validation": "3f7ba584c8428fa573dac598322904197574bf2a591d3de1f3817a9b4950de67",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/candidate-step1-opart.raw": "9190962754da41045499c0f209b839e798735fcfdf027fd4c4508a63f6c25607",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/candidate-step2-out.raw": "0b58624ba1ca8df8a2f66295e18791f09bbc40d78bc3f4a8cc97ad409e42108c",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/scalar-step1-opart.raw": "a7c45127e4c141b67444420137331c6522153e9b76862bd9d47a8c4376877e40",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/control-step0-mlpart.raw": "450496177b7581d714701db81d4a4db16a9ea32d6cd77f34319ffa9b750cb4d9",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/candidate-step2-mlpart.raw": "0260463e7492869959372aa5a309a4ad913eac20f2f00f71d8955972b5b743b1",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/candidate-step1-out.raw": "1b6ef09f1eb6280f181da670e7ccc682601192364dc194d190cf7cb534b2811c",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/control-step0-opart.raw": "0538ed78bc34dfe0a289b978289fdc9f5efacb7f471fa585a02c2e6d662d9d0a",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/candidate-step1-mlpart.raw": "b25846806e70a16480b041ee79984bfe5f9f3a9d1b80bf1df88670df20e060eb",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/control-step1-mlpart.raw": "3acbf0e932908a6824164b7d806f093d8becc7bc5a00984c57e63fb77aa95618",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/candidate-step2-opart.raw": "f437c0ca666a5020896df8f8c2b6985fa4afe71b0e9dc278a9bb451c405f5c1d",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/scalar-step1-mlpart.raw": "766be1b2a332aae516f965f8510c4ef3558f9f162a965192b751bdf053e61dcc",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/scalar-step0-out.raw": "59ebe3f57dd5116f5f4f5cbb1fd8b7b08dd1d97034054c35e97cd9059b002e42",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/control-step1-out.raw": "5e779074e7826c477417ac81ea6f87ec315781ea897ea3ea286a6416842a2456",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/scalar-step1-out.raw": "c82e4d192dbab7ebe7a9c5761b4820cabdacbab2a552b8fd8c691d5bca53c802",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/control-step0-out.raw": "f858447d256c5fb3eea8156f88b696d1278286f9a4ea1974087c82728f37b4c2",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/control-step1-opart.raw": "acf55f0a12d3799e5fff95657ed7e5c7bb3c3a75b0cd718563aa62b2381c34fa",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/control-step2-opart.raw": "14120a454ceef00359f389ca099489a1e10b40280561378e084a6f9fbad3fb02",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/scalar-step2-mlpart.raw": "fbf58c5a50ed93937fcbcc6baf0f991119dbdadceea510fb7dba153b6b8e82f7",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/candidate-step0-mlpart.raw": "af1ac94b19dd9138b40f096c2fcda035d4a4266e067b4c0f3869e34c846bb8c3",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/scalar-step2-opart.raw": "d3d70c9a75909befc83f3452a929a95b8bd0d6d81cc8da90415a7d39549f601e",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/control-step2-mlpart.raw": "312c5cf35af5ca2100abb09c0ae904e57d4c2bfa2ee525ec1b7ad923f5faf499",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/scalar-step2-out.raw": "ba90d231b119c308334635d53b7228c1b6307486500a4c8c48e716c377723e44",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/control-step2-out.raw": "753f0ffc96b3ab909686e1adf677877bba421a5dc66f133cd9104b6c030aa9ec",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/candidate-step0-out.raw": "aead5691ffedc63dd8733e6e669d3c18c18f9cdc64542e5df7810166b7946fab",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/scalar-step0-mlpart.raw": "8f3f815e5896923cbc0527c3414d7b092c5cccdde3ba496d8a5f31d7ccaf2f05",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/candidate-step0-opart.raw": "6ed521ca8e6fd3cd9fc2b032de3c7e1eaee07d2e67b926f320e8a0e0e2d5f049",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/results/operator-ctx32768-memcheck-tensors/scalar-step0-opart.raw": "2b5ff966639e9bda91f13218fe02b6d919ccb3f47bc4ef8e920e46cc977f1a65"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/long-context/NUMERICAL-FREEZE.json": {
+      "sha256": "a8c20656280ccd8de9011169e3a949416748c6f7ff292a6adbf54bae32e7cf18",
+      "content": {
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/numerical-queue.json": "adc6e32e21dd33bbac108cddb092efd1f92370d4353330fdaf86e609d6f64668",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/qwen_primitives.py": "7a4147eb55edf0779b1a2d110e34d43fe74030a2dda298f81d6aada7f4d321c0",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/primary_context.py": "16f9b7d5a50eb2beb1cc49842327c1b2d9cd7d0c87a250b50d62ff1e8f22cbf2",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/validate-replay.py": "5338953531c7fbab67c7a59814ea35a9c2f09c828cbc47a23d166e41dd220b05",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/prepare-replay.py": "0bdbb5a87d0039a07e548b7eeb28b274ed0c946e9d5b698639de34728f43cf1c",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/numerical-cpu-checks.json": "08d8b0b59473dfb16ec54393a70005183a4e929bef72bac9bce4e7774019b929",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/NUMERICAL-README.md": "f24f535cb0e16ff2ca270b72546988f52af8b664d1425792e8eda4c0d8642300",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/REPLAY-INPUTS.json": "4dee1492ec5ced8a34bd8095711d0086571bbc8c13c5303c01005b2532340655",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/CAPTURE-FREEZE.json": "630c83866971ec8307fa59ce345f3af8aa79562c8135a168429db8fd8d5049fd",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/k64-tf32-pv.so": "2f462128debb16c1f07d329250d5eb2a9ad80d8732609990af0156071556d870",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/bf16-pv-control.so": "0f1dec1ec726f4b360118a749a02f74d0d9fe8f19f283777d8fdb9fa92e64d8b",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/memory-gates/RESULTS-FREEZE.json": "ac67ec4ca3bf403923180d66bbc79a15238a047a067c53a0aa2a458d95b23010",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/sass-resources.json": "09cf663fe4c3a96e3566bcd879ea5aa36b54d2fe23ecc155f968a5aa349b86a6"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/long-context/numerical-ctx8192-validation.json": {
+      "sha256": "7197e1c7d24b43af5f0d718a7c11324e70f9432e3f0609bbc5bef4a253635270",
+      "content": {
+        "passed": true,
+        "failure": null,
+        "context": 8192,
+        "rows": [
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 8.55057416451608e-08,
+              "max_abs": 1.4162467887324226e-06,
+              "max_ref": 5.131668112680043,
+              "exact": false
+            },
+            "gf": 4,
+            "useful_tasks": 132,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 0,
+            "arm": "scalar",
+            "length": 8193,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 4.09375,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 0.0016410339612498888,
+              "max_abs": 0.00781212570720502,
+              "max_ref": 4.088857096934752,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 4194,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step0-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 0.00013052142526801,
+              "max_abs": 0.002007295642029394,
+              "max_ref": 5.131668112680043,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 0,
+            "arm": "control",
+            "length": 8193,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0006653740655004682,
+              "max_abs": 0.015625,
+              "max_ref": 4.09375,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0016428675660204533,
+              "max_abs": 0.007964451199619305,
+              "max_ref": 4.088857096934752,
+              "exact": false
+            },
+            "reference_rne_mismatches": 176,
+            "reference_trunc_mismatches": 4190,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step0-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 1.2240431775783574e-06,
+              "max_abs": 1.5089261655720776e-05,
+              "max_ref": 5.131668112680043,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 0,
+            "arm": "candidate",
+            "length": 8193,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 4.09375,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 0.0016410339612498888,
+              "max_abs": 0.00781212570720502,
+              "max_ref": 4.088857096934752,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 4194,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step0-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 8.35808027118551e-08,
+              "max_abs": 9.53674318626696e-07,
+              "max_ref": 5.174602701600355,
+              "exact": false
+            },
+            "gf": 4,
+            "useful_tasks": 132,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 1,
+            "arm": "scalar",
+            "length": 8194,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 2.796875,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 0.0016583663467490883,
+              "max_abs": 0.0073463698301448055,
+              "max_ref": 2.794202452280433,
+              "exact": false
+            },
+            "reference_rne_mismatches": 1,
+            "reference_trunc_mismatches": 4085,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step1-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 0.00011828381436928389,
+              "max_abs": 0.0014737790843941667,
+              "max_ref": 5.174602701600355,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 1,
+            "arm": "control",
+            "length": 8194,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.00042036588157889286,
+              "max_abs": 0.0078125,
+              "max_ref": 2.796875,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0016590156729690217,
+              "max_abs": 0.0073463698301448055,
+              "max_ref": 2.794202452280433,
+              "exact": false
+            },
+            "reference_rne_mismatches": 181,
+            "reference_trunc_mismatches": 4087,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step1-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 1.2105966231635644e-06,
+              "max_abs": 9.346291101497428e-06,
+              "max_ref": 5.174602701600355,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 1,
+            "arm": "candidate",
+            "length": 8194,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 9.472811559703111e-05,
+              "max_abs": 0.00390625,
+              "max_ref": 2.796875,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.001658367021635814,
+              "max_abs": 0.0073463698301448055,
+              "max_ref": 2.794202452280433,
+              "exact": false
+            },
+            "reference_rne_mismatches": 4,
+            "reference_trunc_mismatches": 4084,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step1-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 8.419877062029682e-08,
+              "max_abs": 1.3080140206511714e-06,
+              "max_ref": 5.152569581336017,
+              "exact": false
+            },
+            "gf": 4,
+            "useful_tasks": 132,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 2,
+            "arm": "scalar",
+            "length": 8195,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 3.0,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 0.00165542256740636,
+              "max_abs": 0.007354234081376809,
+              "max_ref": 2.9928805845846367,
+              "exact": false
+            },
+            "reference_rne_mismatches": 1,
+            "reference_trunc_mismatches": 4111,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step2-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 0.00013102465413497187,
+              "max_abs": 0.0017988154569217318,
+              "max_ref": 5.152569581336017,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 2,
+            "arm": "control",
+            "length": 8195,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.00042093879933897797,
+              "max_abs": 0.0078125,
+              "max_ref": 3.0,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0016558778992136426,
+              "max_abs": 0.007354234081376809,
+              "max_ref": 2.9928805845846367,
+              "exact": false
+            },
+            "reference_rne_mismatches": 158,
+            "reference_trunc_mismatches": 4124,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step2-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 1.2090357482192884e-06,
+              "max_abs": 1.5160354239984741e-05,
+              "max_ref": 5.152569581336017,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 2,
+            "arm": "candidate",
+            "length": 8195,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 2.027753821522312e-05,
+              "max_abs": 0.0009765625,
+              "max_ref": 3.0,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0016554226227610037,
+              "max_abs": 0.007354234081376809,
+              "max_ref": 2.9928805845846367,
+              "exact": false
+            },
+            "reference_rne_mismatches": 4,
+            "reference_trunc_mismatches": 4108,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step2-mlpart.raw"
+          }
+        ],
+        "scope": "Native saved-input operator only, three histories, originalBF16PV diagnostic if nativegate fails; no timing/broad"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/long-context/numerical-ctx32768-validation.json": {
+      "sha256": "5b1bd8a81398b451a1884de02d0b0f3a3b6a2606141653d1e18874e0b2f27e51",
+      "content": {
+        "passed": true,
+        "failure": null,
+        "context": 32768,
+        "rows": [
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 1.3742305239791821e-07,
+              "max_abs": 1.580132220624364e-06,
+              "max_ref": 5.197596100276894,
+              "exact": false
+            },
+            "gf": 4,
+            "useful_tasks": 132,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 0,
+            "arm": "scalar",
+            "length": 32769,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 3.984375,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 0.0016665482251120016,
+              "max_abs": 0.007791443032274081,
+              "max_ref": 3.9781385490708137,
+              "exact": false
+            },
+            "reference_rne_mismatches": 1,
+            "reference_trunc_mismatches": 4049,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step0-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 8.16660045848366e-05,
+              "max_abs": 0.0022990231946153905,
+              "max_ref": 5.197596100276894,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 0,
+            "arm": "control",
+            "length": 32769,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.00042413010735812634,
+              "max_abs": 0.0078125,
+              "max_ref": 3.984375,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0016670774790797445,
+              "max_abs": 0.007791443032274081,
+              "max_ref": 3.9781385490708137,
+              "exact": false
+            },
+            "reference_rne_mismatches": 158,
+            "reference_trunc_mismatches": 4074,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step0-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 6.959567183381208e-06,
+              "max_abs": 5.580401136473512e-05,
+              "max_ref": 5.197596100276894,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 0,
+            "arm": "candidate",
+            "length": 32769,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.00033837202134036966,
+              "max_abs": 0.015625,
+              "max_ref": 3.984375,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.001666617133020347,
+              "max_abs": 0.007833556967725919,
+              "max_ref": 3.9781385490708137,
+              "exact": false
+            },
+            "reference_rne_mismatches": 9,
+            "reference_trunc_mismatches": 4039,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step0-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 1.3510378569507614e-07,
+              "max_abs": 1.841711833261428e-06,
+              "max_ref": 5.24346742203675,
+              "exact": false
+            },
+            "gf": 4,
+            "useful_tasks": 132,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 1,
+            "arm": "scalar",
+            "length": 32770,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 2.859375,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 0.0016531224346611664,
+              "max_abs": 0.00716928399598471,
+              "max_ref": 2.8569680243262425,
+              "exact": false
+            },
+            "reference_rne_mismatches": 1,
+            "reference_trunc_mismatches": 4147,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step1-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 7.729595345138413e-05,
+              "max_abs": 0.0009213489628141502,
+              "max_ref": 5.24346742203675,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 1,
+            "arm": "control",
+            "length": 32770,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.00035698960545782135,
+              "max_abs": 0.0078125,
+              "max_ref": 2.859375,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.001653324945317614,
+              "max_abs": 0.00716928399598471,
+              "max_ref": 2.8569680243262425,
+              "exact": false
+            },
+            "reference_rne_mismatches": 128,
+            "reference_trunc_mismatches": 4154,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step1-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 6.822362360894834e-06,
+              "max_abs": 5.921575068157381e-05,
+              "max_ref": 5.24346742203675,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 1,
+            "arm": "candidate",
+            "length": 32770,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0001658000275739842,
+              "max_abs": 0.00390625,
+              "max_ref": 2.859375,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.001653136753865156,
+              "max_abs": 0.00716928399598471,
+              "max_ref": 2.8569680243262425,
+              "exact": false
+            },
+            "reference_rne_mismatches": 16,
+            "reference_trunc_mismatches": 4134,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step1-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 1.33395848835606e-07,
+              "max_abs": 1.661810268949182e-06,
+              "max_ref": 5.365653597481667,
+              "exact": false
+            },
+            "gf": 4,
+            "useful_tasks": 132,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 2,
+            "arm": "scalar",
+            "length": 32771,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 2.65625,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 0.001675759513333294,
+              "max_abs": 0.007744517295139364,
+              "max_ref": 2.652222336382207,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 4120,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step2-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 7.945469153085428e-05,
+              "max_abs": 0.001218271966044071,
+              "max_ref": 5.365653597481667,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 2,
+            "arm": "control",
+            "length": 32771,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.00030701829596301277,
+              "max_abs": 0.0078125,
+              "max_ref": 2.65625,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0016761095338018814,
+              "max_abs": 0.007744517295139364,
+              "max_ref": 2.652222336382207,
+              "exact": false
+            },
+            "reference_rne_mismatches": 122,
+            "reference_trunc_mismatches": 4114,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step2-mlpart.raw"
+          },
+          {
+            "native_tolerance_pass": true,
+            "normalized_partial": {
+              "relative_l2": 6.784447193678231e-06,
+              "max_abs": 5.7688977721070955e-05,
+              "max_ref": 5.365653597481667,
+              "exact": false
+            },
+            "gf": 16,
+            "useful_tasks": 33,
+            "launch_ctas": 132,
+            "threads": 256,
+            "step": 2,
+            "arm": "candidate",
+            "length": 32771,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0002370671095792599,
+              "max_abs": 0.0078125,
+              "max_ref": 2.65625,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.001675778289445351,
+              "max_abs": 0.007744517295139364,
+              "max_ref": 2.652222336382207,
+              "exact": false
+            },
+            "reference_rne_mismatches": 17,
+            "reference_trunc_mismatches": 4111,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step2-mlpart.raw"
+          }
+        ],
+        "scope": "Native saved-input operator only, three histories, originalBF16PV diagnostic if nativegate fails; no timing/broad"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/long-context/memory/results/memory-validation.json": {
+      "sha256": "29e31b9c4707d2c0e7ba911c7edfe456b016411df465f8daa3177a2722d33ec8",
+      "content": {
+        "passed": true,
+        "context": 32768,
+        "raw_errors": 0,
+        "exact_tensor_files": 27,
+        "numerical_cells": 9,
+        "scope": "Native operator long-loop memory; no broad-interpreter/block memory claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/long-context/memory/results/memcheck.raw.log": {
+      "sha256": "a9d061cee538182f762e132abeea7bac7bddb844338f25751bbbb043f242c425",
+      "content": "========= COMPUTE-SANITIZER\n========= ERROR SUMMARY: 0 errors\n"
+    },
+    "e1-k64-tf32-pv-20260906/long-context/ADVANCE-FREEZE.json": {
+      "sha256": "42c7d62b436c970e473e82cb72d0e084d3d854956f828afa4bd92edd6de0e6cd",
+      "content": {
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/advance-queue.json": "fe7e32a2c101e4d6b5583e2147e0a4e4c6c7de2d451b183807b738eac95cd87a",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/ADVANCE-README.md": "f4fd6c6c48bc99c39d9955ceceb1064f076a303e45255f35a26aa9e437843dea",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/NUMERICAL-RESULTS.json": "bbe546b8bbd6da6de8a7e97b7b3a517e8c80d1f425e9ffb53a5407adcfa0778f",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/NUMERICAL-FREEZE.json": "a8c20656280ccd8de9011169e3a949416748c6f7ff292a6adbf54bae32e7cf18",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/REPLAY-INPUTS.json": "4dee1492ec5ced8a34bd8095711d0086571bbc8c13c5303c01005b2532340655",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/gpu-queue.json": "4c98a21cb33a0a9dbd80f3ebdad680c96f65336c7bae3b61eb63cd219e7d6318",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/memory/validate-memory.py": "cc53e4d7d44bed40432d827c235ef2513902fa30cd0c1c6e08463204481a825c",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/qwen_primitives.py": "7a1a01bd5d2b742a9668e066dd53f04d5423c8c13fbd5469fbe2fe1c9887eebf",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/primary_context.py": "078ed0580498495d51bcf26c0d4840582573235318a427bde7adb02750fbd793",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/validate-timing.py": "2c5ad0795e97d63d2d11f4b35c7959aeb1e9d9d51b98045186614af85222e3ef",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/cpu-checks.json": "1c06175f7a14a8320b8ba0f2bf5e76b74823d5b17ea2563f970f20eea1ec56f0",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/timing/README.md": "339f4c368c0354a9d1d647563f3fbed3980f4d389972f2f802a25ad00bb75810",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh": "61c2b9dc32fcf05adb4debae6e5055c12a2720a086bb8fc82078045f7170b282",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/numerical-ctx8192-validation.json": "7197e1c7d24b43af5f0d718a7c11324e70f9432e3f0609bbc5bef4a253635270",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192.json": "021700863b8fa033b3cc39135a2750d5b67bfc2bbfeefa9580d2341cacc62735",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step0-out.raw": "498e33f54f18b0f61ee233e36a4396e00cf74104619f9161a26111f1d0bce468",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step0-opart.raw": "705fc1a129a392e2f5b67233338530092889cfd3328ef1cd6577382a65854a55",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step0-mlpart.raw": "393ead03be1cfdb6c1b5853a1189dcf8e9abe6d5036bd417791edf2fcc40e7e4",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step0-out.raw": "37a7dbb4cde5d3543dd1698c92a9af247fe4b57325acb86e911a91f4df856bd4",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step0-opart.raw": "6998c69f85cb2f6952358c25931c150319eb408af68cffebf4ab9e6e45e0a2aa",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step0-mlpart.raw": "f8a894bd0f3c56d6d76f4eb66ed610ebe8812afceb18d3c5d8adf19aea1eec97",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step0-out.raw": "498e33f54f18b0f61ee233e36a4396e00cf74104619f9161a26111f1d0bce468",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step0-opart.raw": "3a0ddbb556391e0e6948f0beed8e6058d53c437d7a1323de068004470a076eb2",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step0-mlpart.raw": "ceec1ad10216c9bd4c9377e7081f572663b7e8cb4f2a401e7f974ae406c8ac55",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step1-out.raw": "d628982c9ab5e1592fdc89cd09f2a099524c9c5241368303a03502700765bf0e",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step1-opart.raw": "4eed7798eb0677119a235e48c3923c74f45d6ed67f599781ba211e6caa5f345d",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step1-mlpart.raw": "d4b2f721bdf32b276acd3ac672a6f881921450938042b79c782078dbbc0ec399",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step1-out.raw": "1f9bb3471b2be1ba0a3800509032deff5b1b2561e8d1823bfcb9a51e8f85da72",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step1-opart.raw": "69b6a9a5a7fa01080067769a5ecf20b277616f4d8ab4022a46aebe1001b58ac5",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step1-mlpart.raw": "f6987920ba6d5bb59e7234f6dcf6631e3671e5c791d87a0127837d5ef425f225",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step1-out.raw": "cc4ca6e0768ccf108823a9e9e887b612a994972bad63b4f47b20cf24212ceac9",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step1-opart.raw": "03d2f08841afec78e18d54f4d1354fef6409798be8a8e63237b4e5dadd0a6be6",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step1-mlpart.raw": "4314fca6d23df4f42217159ce3dbbfb3a6ce6984876be2d48b15b71b33656e96",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step2-out.raw": "b0d1136f07b5ce92b2670f84d833cb8d7432f2b4a32051f97deaf6e39c49bce5",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step2-opart.raw": "ae2fcb7fc745b2f1ba4afb1a35214b44b4d085e6f7da4096ed24989c3927d08e",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/scalar-step2-mlpart.raw": "1e0cd84eb124be7e7f3d1d816f87cbf2f55306ac78bc8bd74e7e1cd038337f1a",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step2-out.raw": "583bed05261f0d7f80b56cbd8845a3a73326c91762dbf39d7c30fe99bc072b47",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step2-opart.raw": "e67ee1c7c9ed04a6721e5d0907bfae0c9a87143febef1feef205d04852bcb704",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/control-step2-mlpart.raw": "3e7665f98b695f27475c245aa76433af84f0dbcb4171ca149e6e20f4e06d6d8a",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step2-out.raw": "af61016b5f28f300d1f2395d9080d5f0ce58d086aca61c291b3193f7ec7249d9",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step2-opart.raw": "4563a0c670ea953975df57aedd989850f65810a0545e3fd5dea1fb706f46f41c",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx8192-tensors/candidate-step2-mlpart.raw": "f95e54a76882fff06380625c7d929904ddc77c86d27e995fd8afecef7640fbbc",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/numerical-ctx32768-validation.json": "5b1bd8a81398b451a1884de02d0b0f3a3b6a2606141653d1e18874e0b2f27e51",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768.json": "d671b68e89e6c533f62d0776c09121b6cee04fa15cc98ffce880646672c91f47",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step0-out.raw": "59ebe3f57dd5116f5f4f5cbb1fd8b7b08dd1d97034054c35e97cd9059b002e42",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step0-opart.raw": "2b5ff966639e9bda91f13218fe02b6d919ccb3f47bc4ef8e920e46cc977f1a65",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step0-mlpart.raw": "8f3f815e5896923cbc0527c3414d7b092c5cccdde3ba496d8a5f31d7ccaf2f05",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step0-out.raw": "f858447d256c5fb3eea8156f88b696d1278286f9a4ea1974087c82728f37b4c2",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step0-opart.raw": "0538ed78bc34dfe0a289b978289fdc9f5efacb7f471fa585a02c2e6d662d9d0a",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step0-mlpart.raw": "450496177b7581d714701db81d4a4db16a9ea32d6cd77f34319ffa9b750cb4d9",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step0-out.raw": "aead5691ffedc63dd8733e6e669d3c18c18f9cdc64542e5df7810166b7946fab",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step0-opart.raw": "6ed521ca8e6fd3cd9fc2b032de3c7e1eaee07d2e67b926f320e8a0e0e2d5f049",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step0-mlpart.raw": "af1ac94b19dd9138b40f096c2fcda035d4a4266e067b4c0f3869e34c846bb8c3",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step1-out.raw": "c82e4d192dbab7ebe7a9c5761b4820cabdacbab2a552b8fd8c691d5bca53c802",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step1-opart.raw": "a7c45127e4c141b67444420137331c6522153e9b76862bd9d47a8c4376877e40",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step1-mlpart.raw": "766be1b2a332aae516f965f8510c4ef3558f9f162a965192b751bdf053e61dcc",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step1-out.raw": "5e779074e7826c477417ac81ea6f87ec315781ea897ea3ea286a6416842a2456",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step1-opart.raw": "acf55f0a12d3799e5fff95657ed7e5c7bb3c3a75b0cd718563aa62b2381c34fa",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step1-mlpart.raw": "3acbf0e932908a6824164b7d806f093d8becc7bc5a00984c57e63fb77aa95618",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step1-out.raw": "1b6ef09f1eb6280f181da670e7ccc682601192364dc194d190cf7cb534b2811c",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step1-opart.raw": "9190962754da41045499c0f209b839e798735fcfdf027fd4c4508a63f6c25607",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step1-mlpart.raw": "b25846806e70a16480b041ee79984bfe5f9f3a9d1b80bf1df88670df20e060eb",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step2-out.raw": "ba90d231b119c308334635d53b7228c1b6307486500a4c8c48e716c377723e44",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step2-opart.raw": "d3d70c9a75909befc83f3452a929a95b8bd0d6d81cc8da90415a7d39549f601e",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/scalar-step2-mlpart.raw": "fbf58c5a50ed93937fcbcc6baf0f991119dbdadceea510fb7dba153b6b8e82f7",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step2-out.raw": "753f0ffc96b3ab909686e1adf677877bba421a5dc66f133cd9104b6c030aa9ec",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step2-opart.raw": "14120a454ceef00359f389ca099489a1e10b40280561378e084a6f9fbad3fb02",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/control-step2-mlpart.raw": "312c5cf35af5ca2100abb09c0ae904e57d4c2bfa2ee525ec1b7ad923f5faf499",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step2-out.raw": "0b58624ba1ca8df8a2f66295e18791f09bbc40d78bc3f4a8cc97ad409e42108c",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step2-opart.raw": "f437c0ca666a5020896df8f8c2b6985fa4afe71b0e9dc278a9bb451c405f5c1d",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/long-context/results/operator-ctx32768-tensors/candidate-step2-mlpart.raw": "0260463e7492869959372aa5a309a4ad913eac20f2f00f71d8955972b5b743b1"
+      }
+    }
+  },
+  "e1-tf32-long-numerical-window-20260906": {
+    "events.jsonl": "{\"status\": \"waiting_for_existing_supervisors\", \"pids\": [], \"utc\": \"2026-09-06T06:54:29Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-three-arm-ctx8192\", \"utc\": \"2026-09-06T06:54:29Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-three-arm-ctx8192\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T06:54:32Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-three-arm-ctx32768\", \"utc\": \"2026-09-06T06:54:32Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-three-arm-ctx32768\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T06:54:35Z\"}\n{\"status\": \"complete\", \"passed\": 2, \"jobs\": 2, \"utc\": \"2026-09-06T06:54:35Z\"}\n{\"status\": \"finished\", \"gpu_pids\": \"\", \"jobs\": 2, \"utc\": \"2026-09-06T06:54:36Z\"}\n",
+    "clocks-power.log": "#Date        Time         gpu    pwr  gtemp  mtemp   mclk   pclk \n#YYYYMMDD    HH:MM:SS     Idx      W      C      C    MHz    MHz \n 20260906    06:54:29       0    123     35     39   2619   1830 \n 20260906    06:54:30       0    120     34     39   2619   1830 \n 20260906    06:54:31       0    119     34     39   2619   1830 \n 20260906    06:54:32       0    122     35     39   2619   1830 \n 20260906    06:54:33       0    121     34     39   2619   1830 \n 20260906    06:54:34       0    119     34     39   2619   1830 \n 20260906    06:54:35       0    121     34     39   2619   1830 \n"
+  },
+  "e1-tf32-long-timing-window-20260906": {
+    "events.jsonl": "{\"status\": \"waiting_for_existing_supervisors\", \"pids\": [], \"utc\": \"2026-09-06T06:59:17Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-three-arm-ctx32768-memcheck\", \"utc\": \"2026-09-06T06:59:17Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-three-arm-ctx32768-memcheck\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T06:59:20Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-native-timing-ctx8192-forward\", \"utc\": \"2026-09-06T06:59:20Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-native-timing-ctx8192-forward\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T06:59:24Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-native-timing-ctx8192-reverse\", \"utc\": \"2026-09-06T06:59:24Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-native-timing-ctx8192-reverse\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T06:59:27Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-native-timing-ctx32768-forward\", \"utc\": \"2026-09-06T06:59:27Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-native-timing-ctx32768-forward\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T06:59:30Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-native-timing-ctx32768-reverse\", \"utc\": \"2026-09-06T06:59:30Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-native-timing-ctx32768-reverse\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T06:59:34Z\"}\n{\"status\": \"complete\", \"passed\": 5, \"jobs\": 5, \"utc\": \"2026-09-06T06:59:34Z\"}\n{\"status\": \"finished\", \"gpu_pids\": \"\", \"jobs\": 5, \"utc\": \"2026-09-06T06:59:34Z\"}\n",
+    "clocks-power.log": "#Date        Time         gpu    pwr  gtemp  mtemp   mclk   pclk \n#YYYYMMDD    HH:MM:SS     Idx      W      C      C    MHz    MHz \n 20260906    06:59:17       0    123     34     39   2619   1830 \n 20260906    06:59:18       0    120     34     39   2619   1830 \n 20260906    06:59:19       0    119     34     39   2619   1830 \n 20260906    06:59:20       0    127     34     39   2619   1830 \n 20260906    06:59:21       0    122     34     39   2619   1830 \n 20260906    06:59:22       0    119     34     40   2619   1830 \n 20260906    06:59:23       0    129     35     39   2619   1830 \n 20260906    06:59:24       0    123     35     39   2619   1830 \n 20260906    06:59:25       0    119     34     39   2619   1830 \n 20260906    06:59:26       0    127     35     41   2619   1830 \n 20260906    06:59:27       0    123     34     39   2619   1830 \n 20260906    06:59:28       0    121     34     39   2619   1830 \n 20260906    06:59:29       0    119     34     39   2619   1830 \n 20260906    06:59:30       0    133     35     39   2619   1830 \n 20260906    06:59:31       0    122     34     39   2619   1830 \n 20260906    06:59:32       0    119     34     39   2619   1830 \n 20260906    06:59:33       0    134     35     41   2619   1830 \n"
+  }
+}
