@@ -1,0 +1,210 @@
+{
+  "scope": "CPU fixture only, Gemma31block5 ordinarydownN5376K21504; no kernel qualification",
+  "original_failure": "Error: Rejected(\"live KV: KV tensormap geometry conflicts with attention packets\")\n",
+  "aligned_emission": {
+    "command": [
+      "/tmp/plow-model-support-checks/attention-gqa-interpreter/bin/plowc",
+      "--emit",
+      "devblob",
+      "--hf-dir",
+      "/opt/dlami/nvme/tmp/plow-h100-campaign/gemma31b-bf16/checkpoint",
+      "--gpu",
+      "H100 NVL",
+      "--arch",
+      "sm_90a",
+      "--n-cu",
+      "132",
+      "--max-ctx",
+      "33280",
+      "--batch",
+      "1",
+      "--out",
+      "/tmp/plow-model-support-checks/gemma31-e3-native-block-20260906/aligned-control",
+      "--block",
+      "5"
+    ],
+    "env": {
+      "PLOW_UNISEG": "0",
+      "PLOW_TMA_GEMM": "1",
+      "PLOW_NO_GLU_FUSE": "1",
+      "PLOW_SEG_PURE_GEMM": "1",
+      "PLOW_SEG_FA512": "all",
+      "PLOW_MAX_CHUNK": "1024",
+      "PLOW_DECODE_BATCH": "32",
+      "PLOW_DECODE_BATCH_LADDER": "1,4,8,16,32",
+      "PLOW_PF_GFUSE": "0",
+      "PLOW_FA_GF_FULL": "4",
+      "PLOW_NS_FULL_ABS": "33",
+      "PLOW_VERIFY_BIN": "/tmp/plow-model-support-review/lean-plow/.lake/build/bin/plow_verify"
+    },
+    "single_change": "context33000\u219233280, natural32Kprompt+512output and multiple32",
+    "compiler_sha256": "9a08fedd9842f9b4ffea91d8b729dc9770c50a8001b533b31db56331a0d8bca4"
+  },
+  "aligned_proof": {
+    "B1_B2_and_prefill_unchanged": true,
+    "canonical_instructions_dependencies_equal_to_original": true,
+    "live_kv_layout_identical": true,
+    "partial_allocations": {
+      "22": 344064
+    },
+    "records": {
+      "records": [
+        {
+          "K": 21504,
+          "M": 4,
+          "N": 5376,
+          "S": 16,
+          "repeat1_speedup_scalar": 3.1919902850258985,
+          "source": "/tmp/plow-model-support-checks/e3-zg0-grid132/performance-analysis.json"
+        },
+        {
+          "K": 21504,
+          "M": 8,
+          "N": 5376,
+          "S": 8,
+          "repeat1_speedup_scalar": 3.9217378819711,
+          "source": "/tmp/plow-model-support-checks/e3-zg0-grid132/performance-analysis.json"
+        },
+        {
+          "K": 21504,
+          "M": 16,
+          "N": 5376,
+          "S": 8,
+          "repeat1_speedup_scalar": 7.400081401368593,
+          "source": "/tmp/plow-model-support-checks/e3-zg0-grid132/performance-analysis.json"
+        }
+      ],
+      "scope": "Existing fixed132-grid standalone repeat0-selected split, native Gemma31 block qualification pending"
+    },
+    "rungs": [
+      {
+        "rewritten": 0,
+        "rows": 128,
+        "unchanged": true
+      },
+      {
+        "rewritten": 0,
+        "rows": 512,
+        "unchanged": true
+      },
+      {
+        "rewritten": 0,
+        "rows": 1024,
+        "unchanged": true
+      },
+      {
+        "rewritten": 0,
+        "rows": 1,
+        "unchanged": true
+      },
+      {
+        "mapped_dependency_sets_equal": true,
+        "new_instructions": 15,
+        "old_instructions": 13,
+        "old_to_new": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          13,
+          14
+        ],
+        "rewritten": 1,
+        "rows": 4,
+        "unmodified_instruction_bytes_equal": true
+      },
+      {
+        "mapped_dependency_sets_equal": true,
+        "new_instructions": 15,
+        "old_instructions": 13,
+        "old_to_new": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          13,
+          14
+        ],
+        "rewritten": 1,
+        "rows": 8,
+        "unmodified_instruction_bytes_equal": true
+      },
+      {
+        "mapped_dependency_sets_equal": true,
+        "new_instructions": 17,
+        "old_instructions": 15,
+        "old_to_new": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          15,
+          16
+        ],
+        "rewritten": 1,
+        "rows": 16,
+        "unmodified_instruction_bytes_equal": true
+      },
+      {
+        "rewritten": 0,
+        "rows": 32,
+        "unchanged": true
+      }
+    ],
+    "source": "/tmp/plow-model-support-checks/gemma31-e3-native-block-20260906/aligned-control/model.pkt"
+  },
+  "shape_records": {
+    "scope": "Existing fixed132-grid standalone repeat0-selected split, native Gemma31 block qualification pending",
+    "records": [
+      {
+        "M": 4,
+        "N": 5376,
+        "K": 21504,
+        "S": 16,
+        "source": "/tmp/plow-model-support-checks/e3-zg0-grid132/performance-analysis.json",
+        "repeat1_speedup_scalar": 3.1919902850258985
+      },
+      {
+        "M": 8,
+        "N": 5376,
+        "K": 21504,
+        "S": 8,
+        "source": "/tmp/plow-model-support-checks/e3-zg0-grid132/performance-analysis.json",
+        "repeat1_speedup_scalar": 3.9217378819711
+      },
+      {
+        "M": 16,
+        "N": 5376,
+        "K": 21504,
+        "S": 8,
+        "source": "/tmp/plow-model-support-checks/e3-zg0-grid132/performance-analysis.json",
+        "repeat1_speedup_scalar": 7.400081401368593
+      }
+    ]
+  },
+  "candidate_gpu_status": "unstaged pending compatible object/resource proof",
+  "archive": "/opt/dlami/nvme/tmp/plow-h100-campaign/raw-checks-20260905/gemma31-e3-native-block-20260906"
+}

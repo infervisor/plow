@@ -1,0 +1,4873 @@
+{
+  "scope": "Native Gemma12 block5M1/M2 resource guards andM4/M8 S8. Packet-entry256MiB eviction,40samples5warmups, AB/BA. Harness persists aggregate median/p95, not individual samples; no serving/fullmodel claim.",
+  "analysis": {
+    "qualified_block_timing": true,
+    "window": "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906",
+    "job_count": 40,
+    "timing_processes": 32,
+    "cell_validators": 8,
+    "measured_samples_per_process": 40,
+    "warmups_per_process": 5,
+    "cache_regime": "256MiB checked write eviction before decode packet entry, outside timer; not per-op cold",
+    "full_process_clock_samples": 257,
+    "partial_terminal_dmon_rows": 14,
+    "SM_MHz": [
+      1830
+    ],
+    "memory_MHz": [
+      2619
+    ],
+    "full_process_power_W_range": [
+      127,
+      375
+    ],
+    "cells": [
+      {
+        "M": 1,
+        "context": 1024,
+        "kind": "unchanged-rung resource guard",
+        "pairs": [
+          {
+            "repeat": 0,
+            "control_us": 299.45,
+            "candidate_us": 301.65,
+            "saved_us": -2.1999999999999886,
+            "reduction_percent": -0.7346802471197122,
+            "speedup": 0.9927067793800762,
+            "control_p95_us": 309.7,
+            "candidate_p95_us": 311.87
+          },
+          {
+            "repeat": 1,
+            "control_us": 299.45,
+            "candidate_us": 304.17,
+            "saved_us": -4.720000000000027,
+            "reduction_percent": -1.576223075638672,
+            "speedup": 0.9844823618371304,
+            "control_p95_us": 306.94,
+            "candidate_p95_us": 309.88
+          }
+        ],
+        "mean_saved_us": -3.460000000000008,
+        "both_orders_faster": false,
+        "validated_timing": {
+          "schema_pass": true,
+          "M": 1,
+          "context": 1024,
+          "rows": [
+            {
+              "arm": "control",
+              "repeat": 0,
+              "batch": 1,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 299.45,
+              "latency_us_p95": 309.7,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 9.109,
+              "prefill_ms_p95": 9.109,
+              "prefill_tok_s": 112411.5,
+              "tok_s": 3339.5
+            },
+            {
+              "arm": "s8",
+              "repeat": 0,
+              "batch": 1,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 301.65,
+              "latency_us_p95": 311.87,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 8.718,
+              "prefill_ms_p95": 8.718,
+              "prefill_tok_s": 117462.8,
+              "tok_s": 3315.1
+            },
+            {
+              "arm": "s8",
+              "repeat": 1,
+              "batch": 1,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 304.17,
+              "latency_us_p95": 309.88,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 8.757,
+              "prefill_ms_p95": 8.757,
+              "prefill_tok_s": 116939.4,
+              "tok_s": 3287.7
+            },
+            {
+              "arm": "control",
+              "repeat": 1,
+              "batch": 1,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 299.45,
+              "latency_us_p95": 306.94,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 8.872,
+              "prefill_ms_p95": 8.872,
+              "prefill_tok_s": 115415.0,
+              "tok_s": 3339.5
+            }
+          ],
+          "pairs": [
+            {
+              "repeat": 0,
+              "control_us": 299.45,
+              "candidate_us": 301.65,
+              "speedup": 0.9927067793800762,
+              "saved_us": -2.1999999999999886
+            },
+            {
+              "repeat": 1,
+              "control_us": 299.45,
+              "candidate_us": 304.17,
+              "speedup": 0.9844823618371304,
+              "saved_us": -4.720000000000027
+            }
+          ],
+          "scope": "native block5, packet-entry eviction; M1/M2 are widened-object guards; no serving/full-model claim",
+          "memory_qualification": "must be separately attached; this validator does not suppress API reports"
+        }
+      },
+      {
+        "M": 2,
+        "context": 1024,
+        "kind": "unchanged-rung resource guard",
+        "pairs": [
+          {
+            "repeat": 0,
+            "control_us": 347.11,
+            "candidate_us": 359.4,
+            "saved_us": -12.289999999999964,
+            "reduction_percent": -3.5406643427155604,
+            "speedup": 0.9658041179744019,
+            "control_p95_us": 353.25,
+            "candidate_p95_us": 364.13
+          },
+          {
+            "repeat": 1,
+            "control_us": 344.67,
+            "candidate_us": 360.12,
+            "saved_us": -15.449999999999989,
+            "reduction_percent": -4.482548524675778,
+            "speedup": 0.9570976341219594,
+            "control_p95_us": 351.2,
+            "candidate_p95_us": 364.76
+          }
+        ],
+        "mean_saved_us": -13.869999999999976,
+        "both_orders_faster": false,
+        "validated_timing": {
+          "schema_pass": true,
+          "M": 2,
+          "context": 1024,
+          "rows": [
+            {
+              "arm": "control",
+              "repeat": 0,
+              "batch": 2,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 347.11,
+              "latency_us_p95": 353.25,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 17.781,
+              "prefill_ms_p95": 17.781,
+              "prefill_tok_s": 115179.5,
+              "tok_s": 5761.9
+            },
+            {
+              "arm": "s8",
+              "repeat": 0,
+              "batch": 2,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 359.4,
+              "latency_us_p95": 364.13,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 17.761,
+              "prefill_ms_p95": 17.761,
+              "prefill_tok_s": 115312.0,
+              "tok_s": 5564.9
+            },
+            {
+              "arm": "s8",
+              "repeat": 1,
+              "batch": 2,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 360.12,
+              "latency_us_p95": 364.76,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 17.757,
+              "prefill_ms_p95": 17.757,
+              "prefill_tok_s": 115333.0,
+              "tok_s": 5553.7
+            },
+            {
+              "arm": "control",
+              "repeat": 1,
+              "batch": 2,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 344.67,
+              "latency_us_p95": 351.2,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 18.013,
+              "prefill_ms_p95": 18.013,
+              "prefill_tok_s": 113698.4,
+              "tok_s": 5802.7
+            }
+          ],
+          "pairs": [
+            {
+              "repeat": 0,
+              "control_us": 347.11,
+              "candidate_us": 359.4,
+              "speedup": 0.9658041179744019,
+              "saved_us": -12.289999999999964
+            },
+            {
+              "repeat": 1,
+              "control_us": 344.67,
+              "candidate_us": 360.12,
+              "speedup": 0.9570976341219594,
+              "saved_us": -15.449999999999989
+            }
+          ],
+          "scope": "native block5, packet-entry eviction; M1/M2 are widened-object guards; no serving/full-model claim",
+          "memory_qualification": "must be separately attached; this validator does not suppress API reports"
+        }
+      },
+      {
+        "M": 4,
+        "context": 1024,
+        "kind": "one ordinary down rewrite",
+        "pairs": [
+          {
+            "repeat": 0,
+            "control_us": 445.31,
+            "candidate_us": 375.76,
+            "saved_us": 69.55000000000001,
+            "reduction_percent": 15.618333295906229,
+            "speedup": 1.1850915477964659,
+            "control_p95_us": 456.07,
+            "candidate_p95_us": 382.26
+          },
+          {
+            "repeat": 1,
+            "control_us": 433.85,
+            "candidate_us": 374.32,
+            "saved_us": 59.53000000000003,
+            "reduction_percent": 13.721332257692753,
+            "speedup": 1.1590350502244071,
+            "control_p95_us": 441.19,
+            "candidate_p95_us": 380.6
+          }
+        ],
+        "mean_saved_us": 64.54000000000002,
+        "both_orders_faster": true,
+        "validated_timing": {
+          "schema_pass": true,
+          "M": 4,
+          "context": 1024,
+          "rows": [
+            {
+              "arm": "control",
+              "repeat": 0,
+              "batch": 4,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 445.31,
+              "latency_us_p95": 456.07,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 35.216,
+              "prefill_ms_p95": 35.216,
+              "prefill_tok_s": 116311.9,
+              "tok_s": 8982.5
+            },
+            {
+              "arm": "s8",
+              "repeat": 0,
+              "batch": 4,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 375.76,
+              "latency_us_p95": 382.26,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 35.694,
+              "prefill_ms_p95": 35.694,
+              "prefill_tok_s": 114751.6,
+              "tok_s": 10645.1
+            },
+            {
+              "arm": "s8",
+              "repeat": 1,
+              "batch": 4,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 374.32,
+              "latency_us_p95": 380.6,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 35.954,
+              "prefill_ms_p95": 35.954,
+              "prefill_tok_s": 113924.1,
+              "tok_s": 10686.1
+            },
+            {
+              "arm": "control",
+              "repeat": 1,
+              "batch": 4,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 433.85,
+              "latency_us_p95": 441.19,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 35.495,
+              "prefill_ms_p95": 35.495,
+              "prefill_tok_s": 115395.4,
+              "tok_s": 9219.8
+            }
+          ],
+          "pairs": [
+            {
+              "repeat": 0,
+              "control_us": 445.31,
+              "candidate_us": 375.76,
+              "speedup": 1.1850915477964659,
+              "saved_us": 69.55000000000001
+            },
+            {
+              "repeat": 1,
+              "control_us": 433.85,
+              "candidate_us": 374.32,
+              "speedup": 1.1590350502244071,
+              "saved_us": 59.53000000000003
+            }
+          ],
+          "scope": "native block5, packet-entry eviction; M1/M2 are widened-object guards; no serving/full-model claim",
+          "memory_qualification": "must be separately attached; this validator does not suppress API reports"
+        }
+      },
+      {
+        "M": 8,
+        "context": 1024,
+        "kind": "one ordinary down rewrite",
+        "pairs": [
+          {
+            "repeat": 0,
+            "control_us": 641.18,
+            "candidate_us": 520.5,
+            "saved_us": 120.67999999999995,
+            "reduction_percent": 18.821547771296665,
+            "speedup": 1.2318539865513929,
+            "control_p95_us": 649.04,
+            "candidate_p95_us": 530.93
+          },
+          {
+            "repeat": 1,
+            "control_us": 641.12,
+            "candidate_us": 519.63,
+            "saved_us": 121.49000000000001,
+            "reduction_percent": 18.949650611430002,
+            "speedup": 1.2338009737697977,
+            "control_p95_us": 652.79,
+            "candidate_p95_us": 529.25
+          }
+        ],
+        "mean_saved_us": 121.08499999999998,
+        "both_orders_faster": true,
+        "validated_timing": {
+          "schema_pass": true,
+          "M": 8,
+          "context": 1024,
+          "rows": [
+            {
+              "arm": "control",
+              "repeat": 0,
+              "batch": 8,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 641.18,
+              "latency_us_p95": 649.04,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 71.192,
+              "prefill_ms_p95": 71.192,
+              "prefill_tok_s": 115069.8,
+              "tok_s": 12476.9
+            },
+            {
+              "arm": "s8",
+              "repeat": 0,
+              "batch": 8,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 520.5,
+              "latency_us_p95": 530.93,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 71.526,
+              "prefill_ms_p95": 71.526,
+              "prefill_tok_s": 114531.0,
+              "tok_s": 15369.8
+            },
+            {
+              "arm": "s8",
+              "repeat": 1,
+              "batch": 8,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 519.63,
+              "latency_us_p95": 529.25,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 71.279,
+              "prefill_ms_p95": 71.279,
+              "prefill_tok_s": 114928.1,
+              "tok_s": 15395.5
+            },
+            {
+              "arm": "control",
+              "repeat": 1,
+              "batch": 8,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 641.12,
+              "latency_us_p95": 652.79,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 71.474,
+              "prefill_ms_p95": 71.474,
+              "prefill_tok_s": 114615.2,
+              "tok_s": 12478.1
+            }
+          ],
+          "pairs": [
+            {
+              "repeat": 0,
+              "control_us": 641.18,
+              "candidate_us": 520.5,
+              "speedup": 1.2318539865513929,
+              "saved_us": 120.67999999999995
+            },
+            {
+              "repeat": 1,
+              "control_us": 641.12,
+              "candidate_us": 519.63,
+              "speedup": 1.2338009737697977,
+              "saved_us": 121.49000000000001
+            }
+          ],
+          "scope": "native block5, packet-entry eviction; M1/M2 are widened-object guards; no serving/full-model claim",
+          "memory_qualification": "must be separately attached; this validator does not suppress API reports"
+        }
+      },
+      {
+        "M": 1,
+        "context": 32768,
+        "kind": "unchanged-rung resource guard",
+        "pairs": [
+          {
+            "repeat": 0,
+            "control_us": 435.54,
+            "candidate_us": 439.7,
+            "saved_us": -4.159999999999968,
+            "reduction_percent": -0.9551361528217672,
+            "speedup": 0.9905390038662726,
+            "control_p95_us": 443.14,
+            "candidate_p95_us": 445.77
+          },
+          {
+            "repeat": 1,
+            "control_us": 436.56,
+            "candidate_us": 439.55,
+            "saved_us": -2.990000000000009,
+            "reduction_percent": -0.6849001282756007,
+            "speedup": 0.9931975884427255,
+            "control_p95_us": 440.6,
+            "candidate_p95_us": 444.48
+          }
+        ],
+        "mean_saved_us": -3.5749999999999886,
+        "both_orders_faster": false,
+        "validated_timing": {
+          "schema_pass": true,
+          "M": 1,
+          "context": 32768,
+          "rows": [
+            {
+              "arm": "control",
+              "repeat": 0,
+              "batch": 1,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 435.54,
+              "latency_us_p95": 443.14,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 706.405,
+              "prefill_ms_p95": 706.405,
+              "prefill_tok_s": 46387.0,
+              "tok_s": 2296.0
+            },
+            {
+              "arm": "s8",
+              "repeat": 0,
+              "batch": 1,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 439.7,
+              "latency_us_p95": 445.77,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 705.064,
+              "prefill_ms_p95": 705.064,
+              "prefill_tok_s": 46475.2,
+              "tok_s": 2274.3
+            },
+            {
+              "arm": "s8",
+              "repeat": 1,
+              "batch": 1,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 439.55,
+              "latency_us_p95": 444.48,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 703.922,
+              "prefill_ms_p95": 703.922,
+              "prefill_tok_s": 46550.6,
+              "tok_s": 2275.1
+            },
+            {
+              "arm": "control",
+              "repeat": 1,
+              "batch": 1,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 436.56,
+              "latency_us_p95": 440.6,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 704.455,
+              "prefill_ms_p95": 704.455,
+              "prefill_tok_s": 46515.4,
+              "tok_s": 2290.6
+            }
+          ],
+          "pairs": [
+            {
+              "repeat": 0,
+              "control_us": 435.54,
+              "candidate_us": 439.7,
+              "speedup": 0.9905390038662726,
+              "saved_us": -4.159999999999968
+            },
+            {
+              "repeat": 1,
+              "control_us": 436.56,
+              "candidate_us": 439.55,
+              "speedup": 0.9931975884427255,
+              "saved_us": -2.990000000000009
+            }
+          ],
+          "scope": "native block5, packet-entry eviction; M1/M2 are widened-object guards; no serving/full-model claim",
+          "memory_qualification": "must be separately attached; this validator does not suppress API reports"
+        }
+      },
+      {
+        "M": 2,
+        "context": 32768,
+        "kind": "unchanged-rung resource guard",
+        "pairs": [
+          {
+            "repeat": 0,
+            "control_us": 618.53,
+            "candidate_us": 630.54,
+            "saved_us": -12.009999999999991,
+            "reduction_percent": -1.9417004834042073,
+            "speedup": 0.9809528340787261,
+            "control_p95_us": 625.94,
+            "candidate_p95_us": 635.82
+          },
+          {
+            "repeat": 1,
+            "control_us": 619.35,
+            "candidate_us": 630.8,
+            "saved_us": -11.449999999999932,
+            "reduction_percent": -1.8487123597319632,
+            "speedup": 0.981848446417248,
+            "control_p95_us": 624.21,
+            "candidate_p95_us": 636.85
+          }
+        ],
+        "mean_saved_us": -11.729999999999961,
+        "both_orders_faster": false,
+        "validated_timing": {
+          "schema_pass": true,
+          "M": 2,
+          "context": 32768,
+          "rows": [
+            {
+              "arm": "control",
+              "repeat": 0,
+              "batch": 2,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 618.53,
+              "latency_us_p95": 625.94,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 1414.026,
+              "prefill_ms_p95": 1414.026,
+              "prefill_tok_s": 46347.1,
+              "tok_s": 3233.5
+            },
+            {
+              "arm": "s8",
+              "repeat": 0,
+              "batch": 2,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 630.54,
+              "latency_us_p95": 635.82,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 1411.343,
+              "prefill_ms_p95": 1411.343,
+              "prefill_tok_s": 46435.2,
+              "tok_s": 3171.9
+            },
+            {
+              "arm": "s8",
+              "repeat": 1,
+              "batch": 2,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 630.8,
+              "latency_us_p95": 636.85,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 1414.162,
+              "prefill_ms_p95": 1414.162,
+              "prefill_tok_s": 46342.6,
+              "tok_s": 3170.6
+            },
+            {
+              "arm": "control",
+              "repeat": 1,
+              "batch": 2,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 619.35,
+              "latency_us_p95": 624.21,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 1412.571,
+              "prefill_ms_p95": 1412.571,
+              "prefill_tok_s": 46394.8,
+              "tok_s": 3229.2
+            }
+          ],
+          "pairs": [
+            {
+              "repeat": 0,
+              "control_us": 618.53,
+              "candidate_us": 630.54,
+              "speedup": 0.9809528340787261,
+              "saved_us": -12.009999999999991
+            },
+            {
+              "repeat": 1,
+              "control_us": 619.35,
+              "candidate_us": 630.8,
+              "speedup": 0.981848446417248,
+              "saved_us": -11.449999999999932
+            }
+          ],
+          "scope": "native block5, packet-entry eviction; M1/M2 are widened-object guards; no serving/full-model claim",
+          "memory_qualification": "must be separately attached; this validator does not suppress API reports"
+        }
+      },
+      {
+        "M": 4,
+        "context": 32768,
+        "kind": "one ordinary down rewrite",
+        "pairs": [
+          {
+            "repeat": 0,
+            "control_us": 1078.12,
+            "candidate_us": 918.71,
+            "saved_us": 159.40999999999985,
+            "reduction_percent": 14.785923644863264,
+            "speedup": 1.1735150373893828,
+            "control_p95_us": 1120.24,
+            "candidate_p95_us": 925.65
+          },
+          {
+            "repeat": 1,
+            "control_us": 978.4,
+            "candidate_us": 921.09,
+            "saved_us": 57.309999999999945,
+            "reduction_percent": 5.857522485690914,
+            "speedup": 1.0622197613696815,
+            "control_p95_us": 984.24,
+            "candidate_p95_us": 927.18
+          }
+        ],
+        "mean_saved_us": 108.3599999999999,
+        "both_orders_faster": true,
+        "validated_timing": {
+          "schema_pass": true,
+          "M": 4,
+          "context": 32768,
+          "rows": [
+            {
+              "arm": "control",
+              "repeat": 0,
+              "batch": 4,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1078.12,
+              "latency_us_p95": 1120.24,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 2850.241,
+              "prefill_ms_p95": 2850.241,
+              "prefill_tok_s": 45986.3,
+              "tok_s": 3710.1
+            },
+            {
+              "arm": "s8",
+              "repeat": 0,
+              "batch": 4,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 918.71,
+              "latency_us_p95": 925.65,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 2831.935,
+              "prefill_ms_p95": 2831.935,
+              "prefill_tok_s": 46283.5,
+              "tok_s": 4353.9
+            },
+            {
+              "arm": "s8",
+              "repeat": 1,
+              "batch": 4,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 921.09,
+              "latency_us_p95": 927.18,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 2831.012,
+              "prefill_ms_p95": 2831.012,
+              "prefill_tok_s": 46298.6,
+              "tok_s": 4342.7
+            },
+            {
+              "arm": "control",
+              "repeat": 1,
+              "batch": 4,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 978.4,
+              "latency_us_p95": 984.24,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 2824.499,
+              "prefill_ms_p95": 2824.499,
+              "prefill_tok_s": 46405.4,
+              "tok_s": 4088.3
+            }
+          ],
+          "pairs": [
+            {
+              "repeat": 0,
+              "control_us": 1078.12,
+              "candidate_us": 918.71,
+              "speedup": 1.1735150373893828,
+              "saved_us": 159.40999999999985
+            },
+            {
+              "repeat": 1,
+              "control_us": 978.4,
+              "candidate_us": 921.09,
+              "speedup": 1.0622197613696815,
+              "saved_us": 57.309999999999945
+            }
+          ],
+          "scope": "native block5, packet-entry eviction; M1/M2 are widened-object guards; no serving/full-model claim",
+          "memory_qualification": "must be separately attached; this validator does not suppress API reports"
+        }
+      },
+      {
+        "M": 8,
+        "context": 32768,
+        "kind": "one ordinary down rewrite",
+        "pairs": [
+          {
+            "repeat": 0,
+            "control_us": 1734.95,
+            "candidate_us": 1613.12,
+            "saved_us": 121.83000000000015,
+            "reduction_percent": 7.022104383411632,
+            "speedup": 1.0755244495139855,
+            "control_p95_us": 1746.69,
+            "candidate_p95_us": 1619.9
+          },
+          {
+            "repeat": 1,
+            "control_us": 1732.19,
+            "candidate_us": 1610.08,
+            "saved_us": 122.11000000000013,
+            "reduction_percent": 7.049457623009026,
+            "speedup": 1.075840952002385,
+            "control_p95_us": 1740.25,
+            "candidate_p95_us": 1621.79
+          }
+        ],
+        "mean_saved_us": 121.97000000000014,
+        "both_orders_faster": true,
+        "validated_timing": {
+          "schema_pass": true,
+          "M": 8,
+          "context": 32768,
+          "rows": [
+            {
+              "arm": "control",
+              "repeat": 0,
+              "batch": 8,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1734.95,
+              "latency_us_p95": 1746.69,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 5644.771,
+              "prefill_ms_p95": 5644.771,
+              "prefill_tok_s": 46440.1,
+              "tok_s": 4611.1
+            },
+            {
+              "arm": "s8",
+              "repeat": 0,
+              "batch": 8,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1613.12,
+              "latency_us_p95": 1619.9,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 5654.273,
+              "prefill_ms_p95": 5654.273,
+              "prefill_tok_s": 46362.1,
+              "tok_s": 4959.3
+            },
+            {
+              "arm": "s8",
+              "repeat": 1,
+              "batch": 8,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1610.08,
+              "latency_us_p95": 1621.79,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 5644.593,
+              "prefill_ms_p95": 5644.593,
+              "prefill_tok_s": 46441.6,
+              "tok_s": 4968.7
+            },
+            {
+              "arm": "control",
+              "repeat": 1,
+              "batch": 8,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1732.19,
+              "latency_us_p95": 1740.25,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 5660.173,
+              "prefill_ms_p95": 5660.173,
+              "prefill_tok_s": 46313.8,
+              "tok_s": 4618.4
+            }
+          ],
+          "pairs": [
+            {
+              "repeat": 0,
+              "control_us": 1734.95,
+              "candidate_us": 1613.12,
+              "speedup": 1.0755244495139855,
+              "saved_us": 121.83000000000015
+            },
+            {
+              "repeat": 1,
+              "control_us": 1732.19,
+              "candidate_us": 1610.08,
+              "speedup": 1.075840952002385,
+              "saved_us": 122.11000000000013
+            }
+          ],
+          "scope": "native block5, packet-entry eviction; M1/M2 are widened-object guards; no serving/full-model claim",
+          "memory_qualification": "must be separately attached; this validator does not suppress API reports"
+        }
+      }
+    ],
+    "raw_processes": [
+      {
+        "name": "e3-phaseB-entry-evicted-control-m1-ctx1024-r0-ordered",
+        "M": 1,
+        "context": 1024,
+        "arm": "control",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 1,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 299.45,
+              "latency_us_p95": 309.7,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 9.109,
+              "prefill_ms_p95": 9.109,
+              "prefill_tok_s": 112411.5,
+              "tok_s": 3339.5
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:20:30",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:31",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:32",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:33",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m1-ctx1024-r0-ordered",
+        "M": 1,
+        "context": 1024,
+        "arm": "s8",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 1,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 301.65,
+              "latency_us_p95": 311.87,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 8.718,
+              "prefill_ms_p95": 8.718,
+              "prefill_tok_s": 117462.8,
+              "tok_s": 3315.1
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:20:34",
+            "gpu": 0,
+            "power_W": 133,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:35",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:36",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:37",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:20:38       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m1-ctx1024-r1-ordered",
+        "M": 1,
+        "context": 1024,
+        "arm": "s8",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 1,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 304.17,
+              "latency_us_p95": 309.88,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 8.757,
+              "prefill_ms_p95": 8.757,
+              "prefill_tok_s": 116939.4,
+              "tok_s": 3287.7
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:20:39",
+            "gpu": 0,
+            "power_W": 132,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:40",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:41",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:42",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m1-ctx1024-r1-ordered",
+        "M": 1,
+        "context": 1024,
+        "arm": "control",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 1,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 299.45,
+              "latency_us_p95": 306.94,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 8.872,
+              "prefill_ms_p95": 8.872,
+              "prefill_tok_s": 115415.0,
+              "tok_s": 3339.5
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:20:43",
+            "gpu": 0,
+            "power_W": 144,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:44",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:45",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:46",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m2-ctx1024-r0-ordered",
+        "M": 2,
+        "context": 1024,
+        "arm": "control",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 2,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 347.11,
+              "latency_us_p95": 353.25,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 17.781,
+              "prefill_ms_p95": 17.781,
+              "prefill_tok_s": 115179.5,
+              "tok_s": 5761.9
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:20:47",
+            "gpu": 0,
+            "power_W": 145,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:48",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:49",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:50",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:20:51       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m2-ctx1024-r0-ordered",
+        "M": 2,
+        "context": 1024,
+        "arm": "s8",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 2,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 359.4,
+              "latency_us_p95": 364.13,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 17.761,
+              "prefill_ms_p95": 17.761,
+              "prefill_tok_s": 115312.0,
+              "tok_s": 5564.9
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:20:52",
+            "gpu": 0,
+            "power_W": 132,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:53",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:54",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:55",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:20:56       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m2-ctx1024-r1-ordered",
+        "M": 2,
+        "context": 1024,
+        "arm": "s8",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 2,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 360.12,
+              "latency_us_p95": 364.76,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 17.757,
+              "prefill_ms_p95": 17.757,
+              "prefill_tok_s": 115333.0,
+              "tok_s": 5553.7
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:20:56",
+            "gpu": 0,
+            "power_W": 153,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:57",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:58",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:20:59",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:21:00       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m2-ctx1024-r1-ordered",
+        "M": 2,
+        "context": 1024,
+        "arm": "control",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 2,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 344.67,
+              "latency_us_p95": 351.2,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 18.013,
+              "prefill_ms_p95": 18.013,
+              "prefill_tok_s": 113698.4,
+              "tok_s": 5802.7
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:01",
+            "gpu": 0,
+            "power_W": 154,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:02",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:03",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:04",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:21:05       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m4-ctx1024-r0-ordered",
+        "M": 4,
+        "context": 1024,
+        "arm": "control",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 4,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 445.31,
+              "latency_us_p95": 456.07,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 35.216,
+              "prefill_ms_p95": 35.216,
+              "prefill_tok_s": 116311.9,
+              "tok_s": 8982.5
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:05",
+            "gpu": 0,
+            "power_W": 152,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:06",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:07",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:08",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:21:09       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m4-ctx1024-r0-ordered",
+        "M": 4,
+        "context": 1024,
+        "arm": "s8",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 4,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 375.76,
+              "latency_us_p95": 382.26,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 35.694,
+              "prefill_ms_p95": 35.694,
+              "prefill_tok_s": 114751.6,
+              "tok_s": 10645.1
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:09",
+            "gpu": 0,
+            "power_W": 170,
+            "temperature_C": 35,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:10",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:11",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:12",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m4-ctx1024-r1-ordered",
+        "M": 4,
+        "context": 1024,
+        "arm": "s8",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 4,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 374.32,
+              "latency_us_p95": 380.6,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 35.954,
+              "prefill_ms_p95": 35.954,
+              "prefill_tok_s": 113924.1,
+              "tok_s": 10686.1
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:14",
+            "gpu": 0,
+            "power_W": 153,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:15",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:16",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:17",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:21:18       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m4-ctx1024-r1-ordered",
+        "M": 4,
+        "context": 1024,
+        "arm": "control",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 4,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 433.85,
+              "latency_us_p95": 441.19,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 35.495,
+              "prefill_ms_p95": 35.495,
+              "prefill_tok_s": 115395.4,
+              "tok_s": 9219.8
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:18",
+            "gpu": 0,
+            "power_W": 144,
+            "temperature_C": 35,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:19",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:20",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:21",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:21:22       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m8-ctx1024-r0-ordered",
+        "M": 8,
+        "context": 1024,
+        "arm": "control",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 8,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 641.18,
+              "latency_us_p95": 649.04,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 71.192,
+              "prefill_ms_p95": 71.192,
+              "prefill_tok_s": 115069.8,
+              "tok_s": 12476.9
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:23",
+            "gpu": 0,
+            "power_W": 150,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:24",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:25",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:26",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:21:27       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m8-ctx1024-r0-ordered",
+        "M": 8,
+        "context": 1024,
+        "arm": "s8",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 8,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 520.5,
+              "latency_us_p95": 530.93,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 71.526,
+              "prefill_ms_p95": 71.526,
+              "prefill_tok_s": 114531.0,
+              "tok_s": 15369.8
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:27",
+            "gpu": 0,
+            "power_W": 173,
+            "temperature_C": 35,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:28",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:29",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:30",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m8-ctx1024-r1-ordered",
+        "M": 8,
+        "context": 1024,
+        "arm": "s8",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 8,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 519.63,
+              "latency_us_p95": 529.25,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 71.279,
+              "prefill_ms_p95": 71.279,
+              "prefill_tok_s": 114928.1,
+              "tok_s": 15395.5
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:31",
+            "gpu": 0,
+            "power_W": 203,
+            "temperature_C": 36,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:32",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:33",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:34",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m8-ctx1024-r1-ordered",
+        "M": 8,
+        "context": 1024,
+        "arm": "control",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 8,
+              "ctx": 1024,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 641.12,
+              "latency_us_p95": 652.79,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 71.474,
+              "prefill_ms_p95": 71.474,
+              "prefill_tok_s": 114615.2,
+              "tok_s": 12478.1
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:36",
+            "gpu": 0,
+            "power_W": 205,
+            "temperature_C": 36,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:37",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:38",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:39",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m1-ctx32768-r0-ordered",
+        "M": 1,
+        "context": 32768,
+        "arm": "control",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 1,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 435.54,
+              "latency_us_p95": 443.14,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 706.405,
+              "prefill_ms_p95": 706.405,
+              "prefill_tok_s": 46387.0,
+              "tok_s": 2296.0
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:40",
+            "gpu": 0,
+            "power_W": 207,
+            "temperature_C": 36,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:41",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 35,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:42",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 40,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:43",
+            "gpu": 0,
+            "power_W": 127,
+            "temperature_C": 35,
+            "memory_temperature_C": 39,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:44",
+            "gpu": 0,
+            "power_W": 309,
+            "temperature_C": 42,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:45",
+            "gpu": 0,
+            "power_W": 359,
+            "temperature_C": 43,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m1-ctx32768-r0-ordered",
+        "M": 1,
+        "context": 32768,
+        "arm": "s8",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 1,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 439.7,
+              "latency_us_p95": 445.77,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 705.064,
+              "prefill_ms_p95": 705.064,
+              "prefill_tok_s": 46475.2,
+              "tok_s": 2274.3
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:47",
+            "gpu": 0,
+            "power_W": 135,
+            "temperature_C": 37,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:48",
+            "gpu": 0,
+            "power_W": 129,
+            "temperature_C": 36,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:49",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 36,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:50",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 36,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:51",
+            "gpu": 0,
+            "power_W": 274,
+            "temperature_C": 42,
+            "memory_temperature_C": 42,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:52",
+            "gpu": 0,
+            "power_W": 367,
+            "temperature_C": 44,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:21:53       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m1-ctx32768-r1-ordered",
+        "M": 1,
+        "context": 32768,
+        "arm": "s8",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 1,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 439.55,
+              "latency_us_p95": 444.48,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 703.922,
+              "prefill_ms_p95": 703.922,
+              "prefill_tok_s": 46550.6,
+              "tok_s": 2275.1
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:21:53",
+            "gpu": 0,
+            "power_W": 187,
+            "temperature_C": 37,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:54",
+            "gpu": 0,
+            "power_W": 130,
+            "temperature_C": 36,
+            "memory_temperature_C": 42,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:55",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 36,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:56",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 36,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:57",
+            "gpu": 0,
+            "power_W": 279,
+            "temperature_C": 42,
+            "memory_temperature_C": 42,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:21:58",
+            "gpu": 0,
+            "power_W": 361,
+            "temperature_C": 44,
+            "memory_temperature_C": 44,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:21:59       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m1-ctx32768-r1-ordered",
+        "M": 1,
+        "context": 32768,
+        "arm": "control",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 1,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 436.56,
+              "latency_us_p95": 440.6,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 704.455,
+              "prefill_ms_p95": 704.455,
+              "prefill_tok_s": 46515.4,
+              "tok_s": 2290.6
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:22:00",
+            "gpu": 0,
+            "power_W": 135,
+            "temperature_C": 37,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:01",
+            "gpu": 0,
+            "power_W": 129,
+            "temperature_C": 37,
+            "memory_temperature_C": 42,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:02",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 36,
+            "memory_temperature_C": 42,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:03",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 36,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:04",
+            "gpu": 0,
+            "power_W": 299,
+            "temperature_C": 41,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:05",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 44,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m2-ctx32768-r0-ordered",
+        "M": 2,
+        "context": 32768,
+        "arm": "control",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 2,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 618.53,
+              "latency_us_p95": 625.94,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 1414.026,
+              "prefill_ms_p95": 1414.026,
+              "prefill_tok_s": 46347.1,
+              "tok_s": 3233.5
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:22:06",
+            "gpu": 0,
+            "power_W": 148,
+            "temperature_C": 38,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:07",
+            "gpu": 0,
+            "power_W": 130,
+            "temperature_C": 37,
+            "memory_temperature_C": 42,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:08",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 37,
+            "memory_temperature_C": 42,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:09",
+            "gpu": 0,
+            "power_W": 128,
+            "temperature_C": 36,
+            "memory_temperature_C": 42,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:10",
+            "gpu": 0,
+            "power_W": 284,
+            "temperature_C": 42,
+            "memory_temperature_C": 44,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:11",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 44,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:12",
+            "gpu": 0,
+            "power_W": 357,
+            "temperature_C": 44,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:13",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 45,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m2-ctx32768-r0-ordered",
+        "M": 2,
+        "context": 32768,
+        "arm": "s8",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 2,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 630.54,
+              "latency_us_p95": 635.82,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 1411.343,
+              "prefill_ms_p95": 1411.343,
+              "prefill_tok_s": 46435.2,
+              "tok_s": 3171.9
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:22:14",
+            "gpu": 0,
+            "power_W": 187,
+            "temperature_C": 39,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:15",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 38,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:16",
+            "gpu": 0,
+            "power_W": 129,
+            "temperature_C": 37,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:17",
+            "gpu": 0,
+            "power_W": 129,
+            "temperature_C": 37,
+            "memory_temperature_C": 41,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:18",
+            "gpu": 0,
+            "power_W": 288,
+            "temperature_C": 43,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:19",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 45,
+            "memory_temperature_C": 44,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:20",
+            "gpu": 0,
+            "power_W": 354,
+            "temperature_C": 45,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:21",
+            "gpu": 0,
+            "power_W": 367,
+            "temperature_C": 45,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m2-ctx32768-r1-ordered",
+        "M": 2,
+        "context": 32768,
+        "arm": "s8",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 2,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 630.8,
+              "latency_us_p95": 636.85,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 1414.162,
+              "prefill_ms_p95": 1414.162,
+              "prefill_tok_s": 46342.6,
+              "tok_s": 3170.6
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:22:23",
+            "gpu": 0,
+            "power_W": 208,
+            "temperature_C": 39,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:24",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 38,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:25",
+            "gpu": 0,
+            "power_W": 129,
+            "temperature_C": 38,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:26",
+            "gpu": 0,
+            "power_W": 129,
+            "temperature_C": 37,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:27",
+            "gpu": 0,
+            "power_W": 303,
+            "temperature_C": 43,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:28",
+            "gpu": 0,
+            "power_W": 362,
+            "temperature_C": 45,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:29",
+            "gpu": 0,
+            "power_W": 362,
+            "temperature_C": 45,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:30",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 46,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:22:31       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m2-ctx32768-r1-ordered",
+        "M": 2,
+        "context": 32768,
+        "arm": "control",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 2,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 619.35,
+              "latency_us_p95": 624.21,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 1412.571,
+              "prefill_ms_p95": 1412.571,
+              "prefill_tok_s": 46394.8,
+              "tok_s": 3229.2
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:22:31",
+            "gpu": 0,
+            "power_W": 167,
+            "temperature_C": 39,
+            "memory_temperature_C": 44,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:32",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 38,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:33",
+            "gpu": 0,
+            "power_W": 130,
+            "temperature_C": 38,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:34",
+            "gpu": 0,
+            "power_W": 129,
+            "temperature_C": 38,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:35",
+            "gpu": 0,
+            "power_W": 301,
+            "temperature_C": 44,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:36",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 45,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:37",
+            "gpu": 0,
+            "power_W": 362,
+            "temperature_C": 46,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:38",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 46,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m4-ctx32768-r0-ordered",
+        "M": 4,
+        "context": 32768,
+        "arm": "control",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 4,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1078.12,
+              "latency_us_p95": 1120.24,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 2850.241,
+              "prefill_ms_p95": 2850.241,
+              "prefill_tok_s": 45986.3,
+              "tok_s": 3710.1
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:22:40",
+            "gpu": 0,
+            "power_W": 173,
+            "temperature_C": 40,
+            "memory_temperature_C": 44,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:41",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 39,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:42",
+            "gpu": 0,
+            "power_W": 130,
+            "temperature_C": 38,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:43",
+            "gpu": 0,
+            "power_W": 129,
+            "temperature_C": 38,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:44",
+            "gpu": 0,
+            "power_W": 283,
+            "temperature_C": 44,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:45",
+            "gpu": 0,
+            "power_W": 366,
+            "temperature_C": 46,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:46",
+            "gpu": 0,
+            "power_W": 361,
+            "temperature_C": 46,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:47",
+            "gpu": 0,
+            "power_W": 362,
+            "temperature_C": 46,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:48",
+            "gpu": 0,
+            "power_W": 366,
+            "temperature_C": 47,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:49",
+            "gpu": 0,
+            "power_W": 359,
+            "temperature_C": 46,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:50",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:51",
+            "gpu": 0,
+            "power_W": 355,
+            "temperature_C": 47,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:52",
+            "gpu": 0,
+            "power_W": 334,
+            "temperature_C": 45,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:53",
+            "gpu": 0,
+            "power_W": 137,
+            "temperature_C": 40,
+            "memory_temperature_C": 44,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m4-ctx32768-r0-ordered",
+        "M": 4,
+        "context": 32768,
+        "arm": "s8",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 4,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 918.71,
+              "latency_us_p95": 925.65,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 2831.935,
+              "prefill_ms_p95": 2831.935,
+              "prefill_tok_s": 46283.5,
+              "tok_s": 4353.9
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:22:53",
+            "gpu": 0,
+            "power_W": 136,
+            "temperature_C": 40,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:54",
+            "gpu": 0,
+            "power_W": 132,
+            "temperature_C": 39,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:55",
+            "gpu": 0,
+            "power_W": 130,
+            "temperature_C": 39,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:56",
+            "gpu": 0,
+            "power_W": 130,
+            "temperature_C": 39,
+            "memory_temperature_C": 44,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:57",
+            "gpu": 0,
+            "power_W": 130,
+            "temperature_C": 38,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:58",
+            "gpu": 0,
+            "power_W": 266,
+            "temperature_C": 44,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:22:59",
+            "gpu": 0,
+            "power_W": 360,
+            "temperature_C": 46,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:00",
+            "gpu": 0,
+            "power_W": 361,
+            "temperature_C": 46,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:01",
+            "gpu": 0,
+            "power_W": 357,
+            "temperature_C": 46,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:02",
+            "gpu": 0,
+            "power_W": 372,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:03",
+            "gpu": 0,
+            "power_W": 362,
+            "temperature_C": 47,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:04",
+            "gpu": 0,
+            "power_W": 369,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:05",
+            "gpu": 0,
+            "power_W": 362,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:06",
+            "gpu": 0,
+            "power_W": 358,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:07",
+            "gpu": 0,
+            "power_W": 153,
+            "temperature_C": 41,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m4-ctx32768-r1-ordered",
+        "M": 4,
+        "context": 32768,
+        "arm": "s8",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 4,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 921.09,
+              "latency_us_p95": 927.18,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 2831.012,
+              "prefill_ms_p95": 2831.012,
+              "prefill_tok_s": 46298.6,
+              "tok_s": 4342.7
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:23:08",
+            "gpu": 0,
+            "power_W": 136,
+            "temperature_C": 40,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:09",
+            "gpu": 0,
+            "power_W": 132,
+            "temperature_C": 39,
+            "memory_temperature_C": 44,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:10",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 39,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:11",
+            "gpu": 0,
+            "power_W": 130,
+            "temperature_C": 39,
+            "memory_temperature_C": 43,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:12",
+            "gpu": 0,
+            "power_W": 287,
+            "temperature_C": 45,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:13",
+            "gpu": 0,
+            "power_W": 367,
+            "temperature_C": 46,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:14",
+            "gpu": 0,
+            "power_W": 360,
+            "temperature_C": 47,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:15",
+            "gpu": 0,
+            "power_W": 372,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:16",
+            "gpu": 0,
+            "power_W": 363,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:17",
+            "gpu": 0,
+            "power_W": 363,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:18",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:19",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:23:20       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m4-ctx32768-r1-ordered",
+        "M": 4,
+        "context": 32768,
+        "arm": "control",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 4,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 978.4,
+              "latency_us_p95": 984.24,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 2824.499,
+              "prefill_ms_p95": 2824.499,
+              "prefill_tok_s": 46405.4,
+              "tok_s": 4088.3
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:23:20",
+            "gpu": 0,
+            "power_W": 281,
+            "temperature_C": 42,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:21",
+            "gpu": 0,
+            "power_W": 133,
+            "temperature_C": 40,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:22",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 40,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:23",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 39,
+            "memory_temperature_C": 44,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:24",
+            "gpu": 0,
+            "power_W": 279,
+            "temperature_C": 45,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:25",
+            "gpu": 0,
+            "power_W": 363,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:26",
+            "gpu": 0,
+            "power_W": 361,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:27",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 48,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:28",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 48,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:29",
+            "gpu": 0,
+            "power_W": 360,
+            "temperature_C": 47,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:30",
+            "gpu": 0,
+            "power_W": 371,
+            "temperature_C": 48,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:31",
+            "gpu": 0,
+            "power_W": 363,
+            "temperature_C": 48,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": [
+          " 20260906    05:23:32       0 "
+        ]
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m8-ctx32768-r0-ordered",
+        "M": 8,
+        "context": 32768,
+        "arm": "control",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 8,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1734.95,
+              "latency_us_p95": 1746.69,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 5644.771,
+              "prefill_ms_p95": 5644.771,
+              "prefill_tok_s": 46440.1,
+              "tok_s": 4611.1
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:23:33",
+            "gpu": 0,
+            "power_W": 241,
+            "temperature_C": 42,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:34",
+            "gpu": 0,
+            "power_W": 133,
+            "temperature_C": 41,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:35",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 40,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:36",
+            "gpu": 0,
+            "power_W": 131,
+            "temperature_C": 40,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:37",
+            "gpu": 0,
+            "power_W": 248,
+            "temperature_C": 45,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:38",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:39",
+            "gpu": 0,
+            "power_W": 366,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:40",
+            "gpu": 0,
+            "power_W": 363,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:41",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 48,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:42",
+            "gpu": 0,
+            "power_W": 363,
+            "temperature_C": 48,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:43",
+            "gpu": 0,
+            "power_W": 361,
+            "temperature_C": 48,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:44",
+            "gpu": 0,
+            "power_W": 367,
+            "temperature_C": 48,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:45",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 48,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:46",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 49,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:47",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 48,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:48",
+            "gpu": 0,
+            "power_W": 366,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:49",
+            "gpu": 0,
+            "power_W": 366,
+            "temperature_C": 48,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:50",
+            "gpu": 0,
+            "power_W": 363,
+            "temperature_C": 48,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:51",
+            "gpu": 0,
+            "power_W": 371,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:52",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 48,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:53",
+            "gpu": 0,
+            "power_W": 370,
+            "temperature_C": 49,
+            "memory_temperature_C": 50,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m8-ctx32768-r0-ordered",
+        "M": 8,
+        "context": 32768,
+        "arm": "s8",
+        "repeat": 0,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 8,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1613.12,
+              "latency_us_p95": 1619.9,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 5654.273,
+              "prefill_ms_p95": 5654.273,
+              "prefill_tok_s": 46362.1,
+              "tok_s": 4959.3
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:23:54",
+            "gpu": 0,
+            "power_W": 192,
+            "temperature_C": 42,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:55",
+            "gpu": 0,
+            "power_W": 134,
+            "temperature_C": 41,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:56",
+            "gpu": 0,
+            "power_W": 132,
+            "temperature_C": 41,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:57",
+            "gpu": 0,
+            "power_W": 132,
+            "temperature_C": 40,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:58",
+            "gpu": 0,
+            "power_W": 306,
+            "temperature_C": 47,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:23:59",
+            "gpu": 0,
+            "power_W": 373,
+            "temperature_C": 48,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:00",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 48,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:01",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 48,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:02",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 48,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:03",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 48,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:04",
+            "gpu": 0,
+            "power_W": 373,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:05",
+            "gpu": 0,
+            "power_W": 360,
+            "temperature_C": 48,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:06",
+            "gpu": 0,
+            "power_W": 375,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:07",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:08",
+            "gpu": 0,
+            "power_W": 375,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:09",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:10",
+            "gpu": 0,
+            "power_W": 369,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:11",
+            "gpu": 0,
+            "power_W": 371,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:12",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:13",
+            "gpu": 0,
+            "power_W": 369,
+            "temperature_C": 49,
+            "memory_temperature_C": 50,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:14",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-s8-m8-ctx32768-r1-ordered",
+        "M": 8,
+        "context": 32768,
+        "arm": "s8",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 8,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1610.08,
+              "latency_us_p95": 1621.79,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 5644.593,
+              "prefill_ms_p95": 5644.593,
+              "prefill_tok_s": 46441.6,
+              "tok_s": 4968.7
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:24:16",
+            "gpu": 0,
+            "power_W": 139,
+            "temperature_C": 42,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:17",
+            "gpu": 0,
+            "power_W": 134,
+            "temperature_C": 41,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:18",
+            "gpu": 0,
+            "power_W": 132,
+            "temperature_C": 41,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:19",
+            "gpu": 0,
+            "power_W": 132,
+            "temperature_C": 41,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:20",
+            "gpu": 0,
+            "power_W": 299,
+            "temperature_C": 47,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:21",
+            "gpu": 0,
+            "power_W": 370,
+            "temperature_C": 48,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:22",
+            "gpu": 0,
+            "power_W": 363,
+            "temperature_C": 48,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:23",
+            "gpu": 0,
+            "power_W": 367,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:24",
+            "gpu": 0,
+            "power_W": 366,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:25",
+            "gpu": 0,
+            "power_W": 369,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:26",
+            "gpu": 0,
+            "power_W": 370,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:27",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:28",
+            "gpu": 0,
+            "power_W": 369,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:29",
+            "gpu": 0,
+            "power_W": 366,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:30",
+            "gpu": 0,
+            "power_W": 371,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:31",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:32",
+            "gpu": 0,
+            "power_W": 363,
+            "temperature_C": 49,
+            "memory_temperature_C": 50,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:33",
+            "gpu": 0,
+            "power_W": 372,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:34",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:35",
+            "gpu": 0,
+            "power_W": 369,
+            "temperature_C": 50,
+            "memory_temperature_C": 50,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:36",
+            "gpu": 0,
+            "power_W": 369,
+            "temperature_C": 50,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      },
+      {
+        "name": "e3-phaseB-entry-evicted-control-m8-ctx32768-r1-ordered",
+        "M": 8,
+        "context": 32768,
+        "arm": "control",
+        "repeat": 1,
+        "sweep": {
+          "sweep": [
+            {
+              "batch": 8,
+              "ctx": 32768,
+              "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+              "decode_evict_bytes": 268435456,
+              "decode_eviction_before_timer": true,
+              "decode_iterations": 40,
+              "decode_warmup": 5,
+              "latency_us_median": 1732.19,
+              "latency_us_p95": 1740.25,
+              "prefill_explicit_eviction": false,
+              "prefill_ms_median": 5660.173,
+              "prefill_ms_p95": 5660.173,
+              "prefill_tok_s": 46313.8,
+              "tok_s": 4618.4
+            }
+          ]
+        },
+        "clock_samples": [
+          {
+            "date": "20260906",
+            "time": "05:24:37",
+            "gpu": 0,
+            "power_W": 140,
+            "temperature_C": 43,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:38",
+            "gpu": 0,
+            "power_W": 134,
+            "temperature_C": 42,
+            "memory_temperature_C": 46,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:39",
+            "gpu": 0,
+            "power_W": 133,
+            "temperature_C": 41,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:40",
+            "gpu": 0,
+            "power_W": 132,
+            "temperature_C": 41,
+            "memory_temperature_C": 45,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:41",
+            "gpu": 0,
+            "power_W": 296,
+            "temperature_C": 47,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:42",
+            "gpu": 0,
+            "power_W": 374,
+            "temperature_C": 48,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:43",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:44",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:45",
+            "gpu": 0,
+            "power_W": 367,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:46",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 49,
+            "memory_temperature_C": 47,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:47",
+            "gpu": 0,
+            "power_W": 371,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:48",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 49,
+            "memory_temperature_C": 48,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:49",
+            "gpu": 0,
+            "power_W": 367,
+            "temperature_C": 50,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:50",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 49,
+            "memory_temperature_C": 50,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:51",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:52",
+            "gpu": 0,
+            "power_W": 368,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:53",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:54",
+            "gpu": 0,
+            "power_W": 374,
+            "temperature_C": 50,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:55",
+            "gpu": 0,
+            "power_W": 364,
+            "temperature_C": 49,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:56",
+            "gpu": 0,
+            "power_W": 365,
+            "temperature_C": 50,
+            "memory_temperature_C": 50,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          },
+          {
+            "date": "20260906",
+            "time": "05:24:57",
+            "gpu": 0,
+            "power_W": 370,
+            "temperature_C": 50,
+            "memory_temperature_C": 49,
+            "memory_MHz": 2619,
+            "SM_MHz": 1830
+          }
+        ],
+        "partial_terminal_dmon_rows": []
+      }
+    ],
+    "sha256": {
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/queue.json": "24780b56061acdf7e8e97112998aaf02829afe9eaabd131ac2c7a2b2154b5a4a",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/results.json": "0197f4fe069e3f301631af4bd737196fcd4f19b8c3a6326e14cac68d34b9692b",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m1-ctx1024-r0-ordered/sweep.json": "b9094061f2e0a1099739760edaad23885a76fb45b0638503629444dc31e3fb0c",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m1-ctx1024-r0-ordered-dmon.log": "7565cac3253123f9eb349db1688f3c4f9112c2970db1639d5fd389b39347b3f6",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m1-ctx1024-r0-ordered.log": "341b4dc2f44f464d7972de55e7081a02dc67b803f5c226460ab386e258f1f8f6",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m1-ctx1024-r0-ordered/sweep.json": "84c44df36744179a370c7c90fd7262759fe3de6f4566cf47f72e6d74bccf90ab",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m1-ctx1024-r0-ordered-dmon.log": "840b789cf160be95ea78307f1226cdbca8d7141ef7cfc82bf010a1bb8f3bbb55",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m1-ctx1024-r0-ordered.log": "cf55309f3e68d5d7fbd96251411efe0f69bb22fe5ff15893cbd0b972185b31b9",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m1-ctx1024-r1-ordered/sweep.json": "f601a20bfac1eab9c85208ca6d38aaf05b8e1d6d6e8ac2b7e00df155f7e99ada",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m1-ctx1024-r1-ordered-dmon.log": "e4773338c21114bf523e472befede5b9d39e33e56648a9e238b34fb8badef084",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m1-ctx1024-r1-ordered.log": "1a2bb9412005ffd976965e67968a093e2f86347d98b7e15f498e619c197848ff",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m1-ctx1024-r1-ordered/sweep.json": "67e8d519a0d85657506df0720fb46d0e5ce8e0c997c884927223bf57e275c32c",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m1-ctx1024-r1-ordered-dmon.log": "d2edf8a8fb6677488ade62e6c58fb3e17caea9308978774fe8d26e77664f68ef",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m1-ctx1024-r1-ordered.log": "46aa2a7626da2a5bc24b3110bd5f2ac22e964472cfd3e016fdf6bf6db9d1dba1",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m2-ctx1024-r0-ordered/sweep.json": "d1d8e23de7d4839ae59b8e3064445a80501bf7d26931f26766660b680ba41176",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m2-ctx1024-r0-ordered-dmon.log": "c53850518a04ae62f0f183b26868b116e0765a27c284313696a06c440a4e412b",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m2-ctx1024-r0-ordered.log": "2295970a602274d2693a08e3f1774fa4de65793c85a870ccb9e63b68e46bb734",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m2-ctx1024-r0-ordered/sweep.json": "e24ed3eb5d030e9164e144ba21c1d6279a487e6dff3bd3c14fb5fda1c07051d4",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m2-ctx1024-r0-ordered-dmon.log": "eaec93052ba13cee1bc8e8f158b9ec66ee7baa53cb6bb8fc3ab1604c6527e850",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m2-ctx1024-r0-ordered.log": "265eb0ada71109bebce74a55984e7460ae8795598da6b388561e1d416592cab8",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m2-ctx1024-r1-ordered/sweep.json": "31134a9943027a0cb2605e228050a276be599ad3c5fa33d122040a2a0a0fd2ca",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m2-ctx1024-r1-ordered-dmon.log": "4dfd9bb8fdc9394999e7d0b2578bc2dabd4778a4b5e8810387700959c422de1c",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m2-ctx1024-r1-ordered.log": "80b8a2e4a875bf9f3c16fee0e99641d0885fdf40dfe8bdec277c15f49c38461a",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m2-ctx1024-r1-ordered/sweep.json": "a66796e8f8aa0c73e17d98cdc735a0cddbf3db13a9335286a264e7f8bf52e3ae",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m2-ctx1024-r1-ordered-dmon.log": "1497bf11cc69db02d89333bd1fc3139ca2410d2787ad9548ae26753e463e138c",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m2-ctx1024-r1-ordered.log": "53b741fdce97e09ae92c28e3ec29d5dfb1225c46e2e4858e309cabbef87404c2",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m4-ctx1024-r0-ordered/sweep.json": "47fc8d5fe4341768ef13f14813171e6dda711a4d950413b8217d4e6983df015e",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m4-ctx1024-r0-ordered-dmon.log": "561a209b4c166d234813247030b808c168c0747b42bbe3f9dc1d6ff704992504",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m4-ctx1024-r0-ordered.log": "7401d4542fcaad3bb9afb610ffed2fb08272c5436cb6d8b3f29442798c6767c4",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m4-ctx1024-r0-ordered/sweep.json": "25cc73cfc68d2e3cc31e94dc81ee872ca9d60a5bbf1c5ecad8f47b6d583a13da",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m4-ctx1024-r0-ordered-dmon.log": "b486c466c7e12e1f584cc982537fbb1a24f32e95da67cfb741cd17fb62b7d2f0",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m4-ctx1024-r0-ordered.log": "41dd1bce402b23a70041f3f2db8bee3df5ca87eb668cdc1f9dbbdbf923052a15",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m4-ctx1024-r1-ordered/sweep.json": "45da4c9eb74ffa050fc4c2ce0f7726811a2e19b4f2dcc0cd20a04ab3eff1c1f3",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m4-ctx1024-r1-ordered-dmon.log": "dd7b5339f7920169944a7aa983c36b524cb521f55760f5c923f5711f9ca1ce29",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m4-ctx1024-r1-ordered.log": "b694ef18cacbae96423c2a61f8a1c89eaea6a3902549655d8ce11683fe0b849d",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m4-ctx1024-r1-ordered/sweep.json": "429673b3de5f2baf8aec233d1efb51fc36fb9462a47c96141f4aa3fa3b7f345d",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m4-ctx1024-r1-ordered-dmon.log": "fbf5e9d41736d4b92259ecbdfbc7dce4aa2dba03828d50e481120317caff30a2",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m4-ctx1024-r1-ordered.log": "44a41a77d0abe98e8002f52bb62659da64780cd98e1fb811de7011a7c9c4781b",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m8-ctx1024-r0-ordered/sweep.json": "0d2d544fdd662f84699149ba8505e301f491b46dd10773949a2b9259a823f071",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m8-ctx1024-r0-ordered-dmon.log": "fe0e5a13f2c3b2e31bf77aaea056d5e289ffd4ff160ae6c1b98ab9c8bef65a3b",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m8-ctx1024-r0-ordered.log": "f1366e0e77e86c751ab5bd8e5c6f1162d404121534a1a91c702952f58c4ea7e3",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m8-ctx1024-r0-ordered/sweep.json": "27de3f8882a2ff1cb0e4cbddc06ffddcf32c9d5c370a707ed8b33d32a71cbb06",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m8-ctx1024-r0-ordered-dmon.log": "fa347c704bff83ef43fb28790be62c8093e487526c310d0506813e3616aaf322",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m8-ctx1024-r0-ordered.log": "31cbcd7549e125ae7664ced4ebd2f410f33af9553ce5f02f879736c1b992523d",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m8-ctx1024-r1-ordered/sweep.json": "147027629a11cc35643d679597deeb43214d5cc7148d0711cb0658b4e0044576",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m8-ctx1024-r1-ordered-dmon.log": "b6af59308bfbc494e7b3c1dd99296d194b9ed400dcaadf7cffe19221b6eb56b7",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m8-ctx1024-r1-ordered.log": "85ccd0b1d13f62f029760d47307752185c5bbee1a4637c3bd733aa813198ebb3",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m8-ctx1024-r1-ordered/sweep.json": "e4b5a127f59e10d98356699d6cbdd7cea8ccfec44b8b6b6067f7af6657898d0e",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m8-ctx1024-r1-ordered-dmon.log": "86064cdbcd14b37d630d797dc4f6e031dbbe0fa5280a024b7f35be7d01b9ab3d",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m8-ctx1024-r1-ordered.log": "84f7f75f0b6d85a378d05d42c6d9e526dce8ffd13a354ae66260d9e2deb310ac",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m1-ctx32768-r0-ordered/sweep.json": "bdd28b6da71fded400bfe3fb8afb987f3f33e1f2203a10aa3a58b22701dcb2d3",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m1-ctx32768-r0-ordered-dmon.log": "6d2a250d0c3c0c83ce2b14d729bd8e33410cb4fbde96a189defdeccc9b85345d",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m1-ctx32768-r0-ordered.log": "474b8b37d9afa384bab7771933865e3d5cc30068efb77a44836e6678370a0624",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m1-ctx32768-r0-ordered/sweep.json": "2ec30e76f5e54aea4ba11befb1f0162d073d25fa73f9e55f829ef67d75c8786c",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m1-ctx32768-r0-ordered-dmon.log": "99aa5e6ccbbd9991e72333d0334cde16605c8029f5f19856da50cd196e8bc34e",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m1-ctx32768-r0-ordered.log": "97976eaccc4c5bbfb81d7c0b8b550935a98fc4278350b2203d37f8db8a77f10e",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m1-ctx32768-r1-ordered/sweep.json": "debe9ef30e471527e7b950ddf7be420c700183fc6d4f291f4c97c8dea0687345",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m1-ctx32768-r1-ordered-dmon.log": "9350d8c6151b79df58328a5bb9b10be2cf7cffdfd54d3f7f6eea81e2ed3be7ef",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m1-ctx32768-r1-ordered.log": "69b214866ff4f155151bbfc31ef02c25183e3efe29ca238c5a924da503d5f337",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m1-ctx32768-r1-ordered/sweep.json": "f3e4ce230f4ee4a04e7099dfbc05cb550f739c8257a020af64c5bd9117213794",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m1-ctx32768-r1-ordered-dmon.log": "fa51d766794c9371c7e2381327f165a00ff0a59dee9ce612f645edb25c8ac3b4",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m1-ctx32768-r1-ordered.log": "02221b28161c66c3260efdac42b6d4190ebad5b41c0ad86dd2763aafb7fa7248",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m2-ctx32768-r0-ordered/sweep.json": "b61cbe60669b2f3f4579bd83d5bd0fe67951453e4bd21c61e81d3eed74f7b915",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m2-ctx32768-r0-ordered-dmon.log": "7de3d4b9156b26e4ef8c3f3e4a3bbcc5e2f7b0b2536caa80f593c5cab52842fc",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m2-ctx32768-r0-ordered.log": "91aec29dad692ff49f2789b1665209b00a5b0c9ab84acd41b2590bf84518b949",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m2-ctx32768-r0-ordered/sweep.json": "68ed579b312449123d4006fa619c7919a51e79ec314577cd919a25fcdf179922",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m2-ctx32768-r0-ordered-dmon.log": "1ed2926dcbcdea312ad4b66bd4fa9077223cf5a11f04ac11430cbe647cbf0eb2",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m2-ctx32768-r0-ordered.log": "f27ff26044a73f8f24d860b2cc57aa74a2fa4b92c975475d0aabe0301e4d67c1",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m2-ctx32768-r1-ordered/sweep.json": "6254afd52d16d7cdfd4c4df4f2e5d3aec3992aa15cfd275a158386afdc854aa1",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m2-ctx32768-r1-ordered-dmon.log": "5d1d19e2f4078c0fd78a64eb8a9c1716e90ffb56956f40ef37fdb6c6b35ef84f",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m2-ctx32768-r1-ordered.log": "43637c365e37bf83041ef79413a1096d618edd70f6d2884a33252c720eb768f0",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m2-ctx32768-r1-ordered/sweep.json": "347cbdc833a0da24faddb8fe096fc24414af9bea1ba18cb508907b1bba273403",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m2-ctx32768-r1-ordered-dmon.log": "9ee82f1f38e05c36e24ae2e8588ec53cc218c3b379666075de57190ef0ad2339",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m2-ctx32768-r1-ordered.log": "8b57af01237203f79b0a967641a67a4d3afee7ea0a93da8e0b6e1046098750a9",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m4-ctx32768-r0-ordered/sweep.json": "cc0e7f7416dd602874daf070c35eb786b79421f6d8a4fcaf428c768bc5d6206d",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m4-ctx32768-r0-ordered-dmon.log": "fc6daf771a6bbc460b5afcebcb58478953c9d5292dfc94f82f4dd4b16c886ef3",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m4-ctx32768-r0-ordered.log": "60626b07a22f00cb3b397b7ce1580349c71289df2151063be7f2939bde267fc7",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m4-ctx32768-r0-ordered/sweep.json": "9f1d6ca0f2660f88b69e474b060cfd02d017dded91f51b4d7a67422326fe5c08",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m4-ctx32768-r0-ordered-dmon.log": "5d5187fde57b5cd44e19fb9a4c25338ad56d7f90d7b033b921529a59a05b1412",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m4-ctx32768-r0-ordered.log": "cbc16c47918b0d23ce8032d1ed16edfbed0124885174317edf60c56514c24210",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m4-ctx32768-r1-ordered/sweep.json": "99f35e135448dfe19639d451e31363e8c2093551db16df1781330f8e4a9a6177",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m4-ctx32768-r1-ordered-dmon.log": "33f7c76c5af806f6a1ae1504b40747cfebb0313d98b7e5d48f49b021c4442245",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m4-ctx32768-r1-ordered.log": "2ba3161a654a1782bddb7bfc2864eb9a70ddce05d662856285549a3ae40bc556",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m4-ctx32768-r1-ordered/sweep.json": "60861cd75f26ceb691e2edd6a79d112609a5e0d37c0b19b816209b4f43b6814a",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m4-ctx32768-r1-ordered-dmon.log": "ced0dc9ff4d27079b626cada5f7fd14e6adacc10b0645f50326668ed4c6375e1",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m4-ctx32768-r1-ordered.log": "23e483df9fba5cb5af0be3fd4375b3d464ca175fcc48b5f2b053934d66dcdc4c",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m8-ctx32768-r0-ordered/sweep.json": "63aa766ec5359816c11a606a1095a38fa0a80bdd4b03945ffad67ff7b902c79b",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m8-ctx32768-r0-ordered-dmon.log": "6e15f930424fff6c1551011f5548dcc3fcbe2aec5c474ad47a4248c6fa210c67",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m8-ctx32768-r0-ordered.log": "ce2820381e351e9269fa3dcc3a3311fc6d8a0a7d5606a61e7e1301de8ea5495b",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m8-ctx32768-r0-ordered/sweep.json": "240dc33bd1861be05e01866e341308d8ce68d53aee3b7fda64bd0edca5aaecea",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m8-ctx32768-r0-ordered-dmon.log": "f9f61240d32df38ec9d44c67fa7757115a1620d0ebf247ad1cf6c1ffbbf12039",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m8-ctx32768-r0-ordered.log": "34de62dd62fe06ba6a6323a37b533d20a110a8ded2f4d9b35bf0544b84d2df77",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-s8-m8-ctx32768-r1-ordered/sweep.json": "fdc1edda43d8d116b2cc0b79fa707cbc7878ef31195479d065f70f61b5bf5033",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-s8-m8-ctx32768-r1-ordered-dmon.log": "1ae006e856d9ee3d4b4a17f08e0a68ea270ec86704683353bc5aec3185675cac",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-s8-m8-ctx32768-r1-ordered.log": "711c3954d0448f302960ff370cafa9f8b586c6419b60e192fcc0988e52a33db5",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/results/e3-phaseB-entry-evicted-control-m8-ctx32768-r1-ordered/sweep.json": "b1dcc2265d7f0ac234a8a0b363ad0ba51da6f6ecb55ef6ab49aaf944f0c1ffc3",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e3-phaseB-entry-evicted-control-m8-ctx32768-r1-ordered-dmon.log": "f9282b52f5ff8687015dfbf7e5a06241cfcb1af1a4a82120d85847423b286651",
+      "/tmp/plow-model-support-checks/e3-rung-timing-window-20260906/e3-phaseB-entry-evicted-control-m8-ctx32768-r1-ordered.log": "3c1accfc4e4f52e9373b3b9c08e22154937045ddc965cbd75c7e7ea39c38bc95",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/timing-m1-ctx1024.json": "e70bf811c5bc52986d75afed204d029efbdc8ed3da055117f6128efcba206711",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/timing-m2-ctx1024.json": "851fd7f935d307a1bdeed9a707d6a0f462ac468579b6d75c54ebb3bde2715534",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/timing-m4-ctx1024.json": "6a9313a0fda95fdbe074069bcba48e8b7cc2b6d983e3d5309405f75eb630cde1",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/timing-m8-ctx1024.json": "e466e3c87e3475494200b694b1dad709e6f4b9f2bf06044268813c27f143da10",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/timing-m1-ctx32768.json": "dd40c573ae9bda2e4b6b10669aa9946d81b56b7bb3c11a756c1eb121d5400331",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/timing-m2-ctx32768.json": "b25f225308294117394137e0991aca1862cd325d8aaf5097e3e9a8216f00c93f",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/timing-m4-ctx32768.json": "934aa5b7f9aa7fdd9b8fa07164857df328c6b72dbad994f552633c203dba79e4",
+      "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/timing-m8-ctx32768.json": "21b81950c08a6e2f5f0796e58298ba60443a2bf8498aea15b1e4645117bd4cb1"
+    },
+    "limitations": [
+      "Native Gemma12 block5 only; no full-model/serving promotion.",
+      "Per-process median and p95 saved by existing harness; individual40 latency samples are not persisted.",
+      "One-second power samples include load/prefill and may miss brief decode region; not an isolated kernel power measurement.",
+      "M1/M2 unchanged packet bytes still use widened216-register/82944-byte candidate object versus200-register/16448-byte control.",
+      "Prefill timings have no explicit eviction and are excluded."
+    ]
+  },
+  "execution": {
+    "e3-phaseB-entry-evicted-control-m1-ctx1024-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m1-ctx1024-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m1-ctx1024-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m1-ctx1024-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m2-ctx1024-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m2-ctx1024-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m2-ctx1024-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m2-ctx1024-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m4-ctx1024-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m4-ctx1024-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m4-ctx1024-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m4-ctx1024-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m8-ctx1024-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m8-ctx1024-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m8-ctx1024-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m8-ctx1024-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m1-ctx32768-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m1-ctx32768-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m1-ctx32768-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m1-ctx32768-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m2-ctx32768-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m2-ctx32768-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m2-ctx32768-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m2-ctx32768-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m4-ctx32768-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m4-ctx32768-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m4-ctx32768-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m4-ctx32768-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m8-ctx32768-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m8-ctx32768-r0-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-s8-m8-ctx32768-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "e3-phaseB-entry-evicted-control-m8-ctx32768-r1-ordered": {
+      "passed": true,
+      "returncode": 0
+    },
+    "validate-m1-ctx1024": {
+      "passed": true,
+      "returncode": 0
+    },
+    "validate-m1-ctx32768": {
+      "passed": true,
+      "returncode": 0
+    },
+    "validate-m2-ctx1024": {
+      "passed": true,
+      "returncode": 0
+    },
+    "validate-m2-ctx32768": {
+      "passed": true,
+      "returncode": 0
+    },
+    "validate-m4-ctx1024": {
+      "passed": true,
+      "returncode": 0
+    },
+    "validate-m4-ctx32768": {
+      "passed": true,
+      "returncode": 0
+    },
+    "validate-m8-ctx1024": {
+      "passed": true,
+      "returncode": 0
+    },
+    "validate-m8-ctx32768": {
+      "passed": true,
+      "returncode": 0
+    }
+  },
+  "archive": "/opt/dlami/nvme/tmp/plow-h100-campaign/raw-checks-20260905/e3-splitk-interpreter-upload-order/eviction-host"
+}
