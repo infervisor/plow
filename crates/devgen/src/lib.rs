@@ -2403,7 +2403,7 @@ fn gemv_row_bucket(t: u32) -> u32 {
     p.min(GEMV_MAXM)
 }
 
-/// Rows a fused decode GEMV stages in LDS at once — the quantity the fusion gate must bound.
+/// Rows a fused AMD decode GEMV stages in LDS at once — the quantity the fusion gate must bound.
 ///
 /// # This is the §6g-WALK companion change, and without it the walk buys nothing
 ///
@@ -2436,6 +2436,23 @@ fn gemv_staged_rows(t: u32) -> u32 {
     } else {
         t
     }
+}
+
+/// Whether the fused QKV/GLU input representation fits the backend body.
+///
+/// AMD's fused bodies stage every active row in LDS and therefore need the arena bound above.
+/// NVIDIA's batched bodies use `gemv_walk` over global activation rows; only their separate M=1
+/// overload stages one row in shared memory. Applying the AMD bound to CUDA made Gemma-4-31B's
+/// B16 rung drop both fusions and invalidated the otherwise uniform decode-object ladder.
+fn gemv_fused_input_fits(amd: bool, t: u32, hidden: u32) -> bool {
+    let staged_rows = if amd {
+        gemv_staged_rows(t)
+    } else if t <= 1 {
+        t
+    } else {
+        return true;
+    };
+    staged_rows as u64 * hidden as u64 <= gm_lds_halves()
 }
 
 /// Largest prefill chunk. Mirrors `PLOW_MAX_CHUNK` in `dev_isa.h`.
@@ -3474,11 +3491,9 @@ fn emit_phase(
         // (q/k/v as three separate bf16 Gemv packets = +2 packets/layer, uneven CU fill). Tokens
         // are bit-identical (each output column is the same per-column dot). Off by default =>
         // byte-identical stream. Measures the marginal TPOT cost of a 2-gate/layer reduction.
-        // THE SAME LDS PRECONDITION `glu_fused` CHECKS. `gemv_qkv_rows` reads x
-        // only through `ld_lds8` — it has no global-read arm — and `op_gemm.h`
-        // says so: *"x is ALWAYS staged in LDS here: plowc emits this op only
-        // when M*K fits GM_LDS_HALVES."* That precondition was stated and never
-        // enforced for THIS op, only for `GemvGlu`.
+        // AMD has the same LDS precondition as `glu_fused`: its `gemv_qkv_rows` reads x only
+        // through LDS. CUDA's batched overload reads x from global memory through `gemv_walk`,
+        // so applying that constraint there changes ladder composition without protecting memory.
         //
         // MEASURED, Gemma-4-31B (hidden 5376), PLOW_DECODE_BATCH=16: the arena
         // holds 73728 halves, `M*K` is 16*5376 = 86016, and row `m` lives at
@@ -3490,9 +3505,7 @@ fn emit_phase(
         let fuse_qkv = gemv_family
             && !keqv
             && !fp8
-            // `gemv_staged_rows`, not `t`: with `PLOW_GEMV_WALK` the staging moves inside the
-            // row loop and the bound stops depending on M. See §6g-WALK's companion change.
-            && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves()
+            && gemv_fused_input_fits(amd, t, c.hidden)
             && !emit_config::active().no_fuse_qkv;
         // FUSED Q|K|V, per-channel fp8 (DevOp::GemvQkvFp8, op 115) — the arm the comment above
         // called "opcode 26 deferred", landed but OFF BY DEFAULT, because it MEASURES SLOWER.
@@ -4573,10 +4586,8 @@ fn emit_phase(
         // gate-vs-up), so only when pick_tile would have chosen Gemm anyway.
         // gate/up are COLUMN-parallel (inter_l lanes on this rank); the GLU is elementwise on the
         // rank's own lanes, so no communication. `c_gl` is the dependency feeding down_proj.
-        // Same bound, same reason as `fuse_qkv` above: `gemv_glu_rows` also reads x only
-        // through LDS, and with the walk on it stages `min(MM, M)` rows, not M.
-        let glu_fused =
-            gemv_family && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves();
+        // Same backend-specific bound as `fuse_qkv` above.
+        let glu_fused = gemv_family && gemv_fused_input_fits(amd, t, c.hidden);
         let gemm_glu = !gemv_family && glu_fusion_wins(t, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
