@@ -90,6 +90,12 @@ static inline void tr16x16_epi32(__m512i* r) {
 
 /* Pack columns [n0, n0+32) x K range [k0, k0+kp) of row-major W[N][K] into `dst`
  * (kp multiple of 32; columns >= N and K beyond `K` read as zero). */
+/* The pack is the DRAM-facing side of the GEMM: 32 weight rows advance 64 B per K step, sixteen
+ * independent streams per thread that the L2 streamer does not cover with 16 threads active.
+ * Measured: the same kernel does 813 GFLOPS single-thread from L3 but ~17 GFLOPS/thread in-model.
+ * Prefetch each row PACK_PF_B ahead (into L2) so ~128 lines are in flight per thread. */
+#define PACK_PF_B 512u
+
 void plow_cpu_amx_pack_b_strip(void* dst, const plow_bf16* W, uint32_t N, uint32_t K, uint32_t n0,
                                 uint32_t k0, uint32_t kp) {
     uint8_t* out = dst;
@@ -100,6 +106,7 @@ void plow_cpu_amx_pack_b_strip(void* dst, const plow_bf16* W, uint32_t N, uint32
             __m512i r[16];
             for (uint32_t j = 0; j < 16; j++) {
                 const uint32_t n = n0 + t * 16u + j;
+                if (n < N) _mm_prefetch((const char*)(W + (size_t)n * K + k) + PACK_PF_B, _MM_HINT_T1);
                 r[j] = (n < N && k + 32u <= K)
                            ? _mm512_loadu_si512((const void*)(W + (size_t)n * K + k))
                            : _mm512_setzero_si512();
@@ -124,6 +131,7 @@ static void pack_b_strip_fp8(void* dst, const uint8_t* W, uint32_t N, uint32_t K
             __m512i r[16];
             for (uint32_t j = 0; j < 16; j++) {
                 const uint32_t n = n0 + t * 16u + j;
+                if (n < N) _mm_prefetch((const char*)(W + (size_t)n * K + k) + PACK_PF_B / 2u, _MM_HINT_T1);
                 r[j] = (n < N && k + 32u <= K)
                            ? plow_fp8x32_to_bf16(&plow_amx_fp8_lut,
                                                  _mm256_loadu_si256((const __m256i*)(W + (size_t)n * K + k)))
