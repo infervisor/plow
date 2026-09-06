@@ -358,6 +358,7 @@ X_K(x_gemv_mxfp4) {
     const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
     const uint8_t* W = PLOW_CPU_TEN(in, T, 2);
     const uint8_t* S = PLOW_CPU_TEN(in, T, 3);
+    const plow_bf16* bias = PLOW_CPU_TEN(in, T, 7);
     uint8_t* xp = ctx->scratch;
     pack_x_tiles(xp, x, K, M, K);
     uint32_t n0, n1;
@@ -366,8 +367,7 @@ X_K(x_gemv_mxfp4) {
     for (uint32_t n = n0; n < n1;) {
         const uint32_t rows = n1 - n < 32u ? n1 - n : 32u;
         dot_rows_q(1, W, K / 2u, S, K / 32u, x, xp, M, K, n, rows, out);
-        for (uint32_t r = 0; r < rows; r++)
-            for (uint32_t m = 0; m < M; m++) C[(size_t)m * N + n + r] = plow_f2bf(out[r * 16u + m]);
+        store_span(C, N, n, rows, M, out, bias);
         n += rows;
     }
 }

@@ -914,7 +914,7 @@ pub enum DevOp {
     /// Layout: `W` packed 2 fp4/byte, row stride `K/2` bytes, low nibble = even k; `S` one E8M0
     /// byte per 32-K block, row stride `K/32` bytes. One lane's 16-byte load is exactly one block.
     ///
-    /// `t0=C(bf16) t1=x(bf16) t2=W(fp4) t3=S(e8m0)   i0=M i1=N i2=K`
+    /// `t0=C(bf16) t1=x(bf16) t2=W(fp4) t3=S(e8m0) t7=bias?(bf16 [N], CPU tiers only)   i0=M i1=N i2=K`
     GemvMxfp4 = 91,
 
     /// MXFP4 decode fused gate|up GEMV+GLU (w4a16) — the mxfp4 twin of [`DevOp::GemvGluFp8`].

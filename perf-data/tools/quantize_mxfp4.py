@@ -12,7 +12,9 @@ METHOD: per (row, 32-block) power-of-two scale chosen so |w/scale| <= 6 with no 
   (3, 6]; codes = round-to-nearest onto the e2m1 grid (ties down). All-zero block -> scale 2^-3,
   codes 0. Same helpers / projection set as quantize_fp8.py; norms, embeddings, lm_head stay bf16.
 
-Usage: quantize_mxfp4.py <src-model-dir> <out-dir> [prefix]   (prefix default "model.language_model.")
+Usage: quantize_mxfp4.py <src-model-dir> <out-dir> [prefix] [--extra lm_head.weight]
+  prefix default "model.language_model."; GPT-OSS: prefix "model." --extra lm_head.weight (attention
+  projections + untied head; its experts are MXFP4 in the checkpoint already).
 """
 import os
 import struct
@@ -65,15 +67,28 @@ def build_plan(weight_map, shards, prefix, layers):
     return plan
 
 
+def add_top_level(plan, weight_map, shards, names):
+    """Extra 2-D tensors outside the layer stack (e.g. an untied lm_head.weight [vocab, hidden])."""
+    for name in names:
+        if name not in weight_map:
+            raise ValueError(f"{name}: not in checkpoint")
+        hdr, _, _, _ = shards[weight_map[name]]
+        N, K = hdr[name]["shape"]
+        plan.append((f"mxfp4/{name}", f"mxfp4/{name}_scale", name, N, K))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("src_dir")
     parser.add_argument("out_dir")
     parser.add_argument("prefix", nargs="?", default="model.language_model.")
+    parser.add_argument("--extra", action="append", default=[],
+                        help="extra 2-D tensor to quantize (repeatable), e.g. lm_head.weight")
     args = parser.parse_args()
     weight_map, shards = open_sources(args.src_dir)
     layers = 1 + max(int(k.split("layers.")[1].split(".")[0]) for k in weight_map if "layers." in k)
     plan = build_plan(weight_map, shards, args.prefix, layers)
+    add_top_level(plan, weight_map, shards, args.extra)
     if not plan:
         raise ValueError("no supported projection weights found")
     print(f"src {args.src_dir}: {len(weight_map)} tensors, {layers} layers, {len(plan)} projections")

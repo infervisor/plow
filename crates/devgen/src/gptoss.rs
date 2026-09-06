@@ -87,6 +87,21 @@ impl Emitter<'_> {
             d.i[2] = k;
         })
     }
+    /// Decode-only MXFP4 twin of `proj`: `out[t, n] = src[t] . dequant(W4[n]) + bias[n]` (op 91, t7 bias).
+    fn proj_mx4(&mut self, out: u32, src: u32, w4: u32, s4: u32, bias: u32, n: u32, k: u32, dep: u32) -> u32 {
+        debug_assert!(!self.prefill && w4 != TENSOR_NONE);
+        let t = self.t;
+        self.b.emit(DevOp::GemvMxfp4, self.b.all(), &[dep], |d| {
+            d.t[0] = out;
+            d.t[1] = src;
+            d.t[2] = w4;
+            d.t[3] = s4;
+            d.t[7] = bias;
+            d.i[0] = t;
+            d.i[1] = n;
+            d.i[2] = k;
+        })
+    }
     /// `hn = RMSNorm(x + b, gamma)`, `x += b` in place (the Llama pre-norm tail).
     fn add_norm(&mut self, b_in: u32, gamma: u32, dep: u32) -> u32 {
         let (x, hn, t, h, eps) = (self.x, self.hn, self.t, self.c.hidden, self.c.eps);
@@ -142,6 +157,24 @@ impl Emitter<'_> {
         let bv = self.w(&format!("{p}.self_attn.v_proj.bias"), kd as u64 * BF16);
         let wo = self.w(&format!("{p}.self_attn.o_proj.weight"), h as u64 * qd as u64 * BF16);
         let bo = self.w(&format!("{p}.self_attn.o_proj.bias"), h as u64 * BF16);
+        // PLOW_MXFP4: decode reads the dense projections from `mxfp4/<name>` twins (e2m1 + E8M0,
+        // quantize_mxfp4.py) through biased GEMV_MXFP4 (t7 = bias, CPU tiers); prefill keeps the bf16
+        // GEMMs, so the bf16 weights above stay bound.
+        let mx4 = emit_config::active().mxfp4 && !self.prefill;
+        let w4 = |em: &mut Self, s: &str, out: u64, k: u64| -> (u32, u32) {
+            if mx4 {
+                (
+                    em.w(&format!("mxfp4/{p}.self_attn.{s}.weight"), out * k / 2),
+                    em.w(&format!("mxfp4/{p}.self_attn.{s}.weight_scale"), out * k / 32),
+                )
+            } else {
+                (TENSOR_NONE, TENSOR_NONE)
+            }
+        };
+        let (wq4, sq4) = w4(self, "q_proj", qd as u64, h as u64);
+        let (wk4, sk4) = w4(self, "k_proj", kd as u64, h as u64);
+        let (wv4, sv4) = w4(self, "v_proj", kd as u64, h as u64);
+        let (wo4, so4) = w4(self, "o_proj", h as u64, qd as u64);
         let sinks = self.w(&format!("{p}.self_attn.sinks"), heads as u64 * BF16);
         let g_post = self.w(&format!("{p}.post_attention_layernorm.weight"), h as u64 * BF16);
         let full = c.is_full[l];
@@ -159,6 +192,12 @@ impl Emitter<'_> {
                 self.proj(qg, hn, wq, bq, qd, h, dep),
                 self.proj(kg, hn, wk, bk, kd, h, dep),
                 self.proj(vg, hn, wv, bv, kd, h, dep),
+            )
+        } else if mx4 {
+            (
+                self.proj_mx4(qg, hn, wq4, sq4, bq, qd, h, dep),
+                self.proj_mx4(kg, hn, wk4, sk4, bk, kd, h, dep),
+                self.proj_mx4(vg, hn, wv4, sv4, bv, kd, h, dep),
             )
         } else {
             let f = self.b.emit(DevOp::GemvQkv, self.b.all(), &[dep], |d| {
@@ -246,7 +285,11 @@ impl Emitter<'_> {
             d.i[3] = hd;
         });
         let og = self.og;
-        let c_o = self.proj(og, at, wo, bo, h, qd, c_mg);
+        let c_o = if mx4 {
+            self.proj_mx4(og, at, wo4, so4, bo, h, qd, c_mg)
+        } else {
+            self.proj(og, at, wo, bo, h, qd, c_mg)
+        };
         let c_n1 = self.add_norm(og, g_post, c_o);
 
         // MoE. Router logits carry the linear bias in the GEMV (MoeRouterTopk's t3 is DeepSeek's
@@ -511,15 +554,31 @@ fn phase(
     };
     let lm = em.w(&head, c.vocab as u64 * h as u64 * BF16);
     let (vocab, all) = (c.vocab, em.b.all());
-    dep = em.b.emit(DevOp::Gemv, all, &[dep], |d| {
-        d.t[0] = logits;
-        d.t[1] = hn;
-        d.t[2] = lm;
-        d.i[0] = if prefill { 1 } else { t };
-        d.i[1] = vocab;
-        d.i[2] = h;
-        d.i[4] = if prefill { t - 1 } else { 0 };
-    });
+    let head_mx4 = emit_config::active().mxfp4 && !prefill;
+    dep = if head_mx4 {
+        // PLOW_MXFP4 decode head: the 1.16 GB bf16 lm_head is ~1/4 of a GPT-OSS decode step's bytes.
+        let lm4 = em.w(&format!("mxfp4/{head}"), c.vocab as u64 * h as u64 / 2);
+        let ls4 = em.w(&format!("mxfp4/{head}_scale"), c.vocab as u64 * h as u64 / 32);
+        em.b.emit(DevOp::GemvMxfp4, all, &[dep], |d| {
+            d.t[0] = logits;
+            d.t[1] = hn;
+            d.t[2] = lm4;
+            d.t[3] = ls4;
+            d.i[0] = t;
+            d.i[1] = vocab;
+            d.i[2] = h;
+        })
+    } else {
+        em.b.emit(DevOp::Gemv, all, &[dep], |d| {
+            d.t[0] = logits;
+            d.t[1] = hn;
+            d.t[2] = lm;
+            d.i[0] = if prefill { 1 } else { t };
+            d.i[1] = vocab;
+            d.i[2] = h;
+            d.i[4] = if prefill { t - 1 } else { 0 };
+        })
+    };
     let nb = if !prefill && t > 1 { t } else { 0 };
     dep = em.b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[dep], |d| {
         d.t[0] = amax;

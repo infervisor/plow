@@ -170,30 +170,35 @@ static void test_gemv_mxfp4(uint32_t M, uint32_t N, uint32_t K) {
     uint8_t* W = xmalloc((size_t)N * K / 2);
     uint8_t* S = xmalloc((size_t)N * K / 32);
     plow_bf16 *Cref = xmalloc((size_t)M * N * 2), *Cg = xmalloc((size_t)M * N * 2), *Cv = xmalloc((size_t)M * N * 2);
+    plow_bf16* bias = xmalloc((size_t)N * 2);
     fill_bf16(x, (size_t)M * K, 1.0f); fill_fp4(W, (size_t)N * K / 2); fill_e8m0(S, (size_t)N * K / 32);
-    for (uint32_t m = 0; m < M; m++)
-        for (uint32_t n = 0; n < N; n++) Cref[(size_t)m * N + n] = plow_f2bf((float)ref_mx_dot(W, S, n, K, x + (size_t)m * K));
-    void* T[8] = {Cg, x, W, S, NULL, NULL, NULL, NULL};
-    PlowDevInst in = inst(PLOW_DOP_GEMV_MXFP4);
-    in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[3] = 3;
-    in.i[0] = M; in.i[1] = N; in.i[2] = K;
+    fill_bf16(bias, N, 1.0f);
     PlowCpuCtx ctx = mkctx();
     char what[160];
-    for (size_t bi = 0; bi < NNB; bi++) {
-        const uint32_t nblk = NBLKS[bi];
-        memset(Cg, 0, (size_t)M * N * 2);
-        run_all(g_gemv_mxfp4, &in, nblk, T, &ctx);
-        snprintf(what, sizeof what, "GEMV_MXFP4 golden M=%u N=%u K=%u nblk=%u", M, N, K, nblk);
-        cmp(what, Cref, Cg, (size_t)M * N, 1e-2f);
-        if (have_v) {
-            T[0] = Cv; memset(Cv, 0, (size_t)M * N * 2);
-            run_all(plow_cpu_kernel(PLOW_DOP_GEMV_MXFP4), &in, nblk, T, &ctx);
-            T[0] = Cg;
-            snprintf(what, sizeof what, "GEMV_MXFP4 avx512 vs golden M=%u nblk=%u", M, nblk);
-            cmp(what, Cg, Cv, (size_t)M * N, 1e-2f);
+    for (int bb = 0; bb < 2; bb++) { /* bb = 1: optional t7 bias (GPT-OSS dense twins) */
+        for (uint32_t m = 0; m < M; m++)
+            for (uint32_t n = 0; n < N; n++)
+                Cref[(size_t)m * N + n] = plow_f2bf((float)ref_mx_dot(W, S, n, K, x + (size_t)m * K) + (bb ? plow_bf2f(bias[n]) : 0.0f));
+        void* T[8] = {Cg, x, W, S, NULL, NULL, NULL, bb ? bias : NULL};
+        PlowDevInst in = inst(PLOW_DOP_GEMV_MXFP4);
+        in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[3] = 3; if (bb) in.t[7] = 7;
+        in.i[0] = M; in.i[1] = N; in.i[2] = K;
+        for (size_t bi = 0; bi < NNB; bi++) {
+            const uint32_t nblk = NBLKS[bi];
+            memset(Cg, 0, (size_t)M * N * 2);
+            run_all(g_gemv_mxfp4, &in, nblk, T, &ctx);
+            snprintf(what, sizeof what, "GEMV_MXFP4 golden M=%u N=%u K=%u nblk=%u bias=%d", M, N, K, nblk, bb);
+            cmp(what, Cref, Cg, (size_t)M * N, 1e-2f);
+            if (have_v) {
+                T[0] = Cv; memset(Cv, 0, (size_t)M * N * 2);
+                run_all(plow_cpu_kernel(PLOW_DOP_GEMV_MXFP4), &in, nblk, T, &ctx);
+                T[0] = Cg;
+                snprintf(what, sizeof what, "GEMV_MXFP4 avx512 vs golden M=%u nblk=%u bias=%d", M, nblk, bb);
+                cmp(what, Cg, Cv, (size_t)M * N, 1e-2f);
+            }
         }
     }
-    free(x); free(W); free(S); free(Cref); free(Cg); free(Cv); free(ctx.scratch);
+    free(x); free(W); free(S); free(bias); free(Cref); free(Cg); free(Cv); free(ctx.scratch);
 }
 
 /* ---- swiglu_oai helper vs the HF formula in f64 ---- */

@@ -10,7 +10,7 @@
 
 plow_mx_vlut plow_v_mx_lut;
 
-/* t0=C t1=x t2=W(fp4) t3=S(e8m0)  i0=M i1=N i2=K */
+/* t0=C t1=x t2=W(fp4) t3=S(e8m0) t7=bias?  i0=M i1=N i2=K */
 V_K(v_gemv_mxfp4) {
     const uint32_t M = in->i[0], N = in->i[1], K = in->i[2];
     const size_t ldx = plow_mx_staged_len(K);
@@ -23,6 +23,7 @@ V_K(v_gemv_mxfp4) {
     const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
     const uint8_t* W = PLOW_CPU_TEN(in, T, 2);
     const uint8_t* S = PLOW_CPU_TEN(in, T, 3);
+    const plow_bf16* bias = PLOW_CPU_TEN(in, T, 7);
     const size_t ldw = K / 2u, lds = K / PLOW_MX_BLK;
     plow_bf16* XP = ctx->scratch;
     for (uint32_t m = 0; m < M; m++) plow_mx_stage_x(&plow_v_mx_lut, XP + m * ldx, x + (size_t)m * K, K);
@@ -33,12 +34,15 @@ V_K(v_gemv_mxfp4) {
     uint32_t n = n0;
     for (; n + RB <= n1; n += RB) {
         plow_mx_gemv_rows(&plow_v_mx_lut, W + (size_t)n * ldw, ldw, S + (size_t)n * lds, lds, XP, ldx, K, RB, M, out);
-        for (uint32_t r = 0; r < RB; r++)
-            for (uint32_t m = 0; m < M; m++) C[(size_t)m * N + n + r] = plow_f2bf(out[r * M + m]);
+        for (uint32_t r = 0; r < RB; r++) {
+            const float b = bias ? plow_bf2f(bias[n + r]) : 0.0f;
+            for (uint32_t m = 0; m < M; m++) C[(size_t)m * N + n + r] = plow_f2bf(out[r * M + m] + b);
+        }
     }
     for (; n < n1; n++) {
         plow_mx_gemv_rows(&plow_v_mx_lut, W + (size_t)n * ldw, ldw, S + (size_t)n * lds, lds, XP, ldx, K, 1, M, out);
-        for (uint32_t m = 0; m < M; m++) C[(size_t)m * N + n] = plow_f2bf(out[m]);
+        const float b = bias ? plow_bf2f(bias[n]) : 0.0f;
+        for (uint32_t m = 0; m < M; m++) C[(size_t)m * N + n] = plow_f2bf(out[m] + b);
     }
 }
 
