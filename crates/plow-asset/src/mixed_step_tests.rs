@@ -245,6 +245,75 @@ fn flash_decode_slot_operand_is_optional_consistent_and_runtime_filled() {
     .is_err());
 }
 
+#[test]
+fn dense_mixed_consumers_share_decode_slots_and_canonical_prefill_spans() {
+    let inst = |op| packet::dev::DevInst64 {
+        op: op as u16,
+        blocks: 1,
+        fj: [0; 3],
+        t: [packet::dev::TENSOR_NONE16; 8],
+        i: [0; 8],
+    };
+    let mut decode = inst(DevOp::FlashDecode);
+    decode.i[0] = 2;
+    decode.t[6] = 0;
+    let mut writer = inst(DevOp::HeadNormRope);
+    writer.i[0] = 8;
+    writer.fj[1] = 16;
+    writer.t[6] = 0;
+    let mut prefill = inst(DevOp::FlashPrefill);
+    prefill.i[0] = 8;
+    prefill.i[1] = 8;
+    prefill.i[7] = 1;
+    prefill.t[5] = 1;
+    let program = |insts| crate::aux_program::Program {
+        rows: 8,
+        n_counter: 1,
+        insts,
+        stream: vec![],
+        stream_ofs: vec![],
+        stream_len: vec![],
+        waits: vec![],
+        succs: vec![],
+        gq_stream: vec![],
+        gq_seg_ofs: vec![],
+    };
+    let tensors = [
+        TensorContract {
+            name: DECODE_SLOT_TENSOR,
+            bytes: 8,
+            initialized: false,
+        },
+        TensorContract {
+            name: "act.attn",
+            bytes: 128,
+            initialized: false,
+        },
+    ];
+
+    assert_eq!(
+        dense_consumer_contract(&program(vec![decode, writer, prefill]), 2, &tensors).unwrap(),
+        0
+    );
+    let mut legacy_table = prefill;
+    legacy_table.t[6] = 0;
+    assert!(
+        dense_consumer_contract(&program(vec![decode, writer, legacy_table]), 2, &tensors).is_err()
+    );
+    let mut wrong_writer = writer;
+    wrong_writer.t[6] = packet::dev::TENSOR_NONE16;
+    assert!(
+        dense_consumer_contract(&program(vec![decode, wrong_writer, prefill]), 2, &tensors)
+            .is_err()
+    );
+    let mut split_prefill = prefill;
+    split_prefill.i[7] = 2;
+    assert!(
+        dense_consumer_contract(&program(vec![decode, writer, split_prefill]), 2, &tensors)
+            .is_err()
+    );
+}
+
 fn buffers(rows: usize, spans: usize, parked: usize, mapped: usize) -> Plan {
     Plan {
         decode_rows: 0,
@@ -388,13 +457,13 @@ fn variant_binds_exact_program_and_either_backend_object() {
         "mixed_sm90a",
         PayloadKind::Cubin,
         cubin_bytes,
-        "plow.mixed.interpreter",
+        "plow_mixed_interpreter",
     );
     let hsaco = binding(
         "mixed_gfx950",
         PayloadKind::Hsaco,
         hsaco_bytes,
-        "plow.mixed.interpreter",
+        "plow_mixed_interpreter",
     );
     let manifest = Manifest {
         version: VERSION,

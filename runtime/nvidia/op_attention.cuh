@@ -1,6 +1,7 @@
 #ifndef PLOW_NV_PACKED_REQUEST
 #define PLOW_NV_PACKED_REQUEST 0
 #endif
+#include "mixed_step.h"
 /* sm_120 (RTX 5090 / GB202) flash DECODE + MERGE.
  *
  * Port of runtime/amd/op_attention.h d_flash_decode / d_flash_merge to a 32-lane warp.
@@ -3659,3 +3660,32 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
         }
     }
 }
+
+#if PLOW_MIXED_STEP
+template <int HD, int BQ, int BKV>
+__device__ void d_flash_prefill_mixed(const PlowProgram* prog, float* __restrict__ Opart,
+                                     float* __restrict__ mlpart,
+                                     const __nv_bfloat16* __restrict__ Q,
+                                     const __nv_bfloat16* __restrict__ K,
+                                     const __nv_bfloat16* __restrict__ V,
+                                     __nv_bfloat16* __restrict__ O, unsigned seq_q,
+                                     unsigned n_head, unsigned n_kv_head, unsigned window,
+                                     unsigned nsplit, unsigned kv_stride, unsigned kv_mask,
+                                     float scale, unsigned slice, unsigned nblk, float* lds,
+                                     const void* __restrict__ mapkv = nullptr) {
+    if (!plow_mixed_step_enabled(prog) || seq_q != prog->n_prefill_rows || nsplit != 1u || !O)
+        __trap();
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_mixed_prefill_span(prog, si);
+        const size_t qoff = (size_t)span->row0 * n_head * HD;
+        const size_t kvoff = (size_t)span->slot * n_kv_head * kv_stride * HD;
+        const void* descriptor = mapkv ? (const void*)((const uint64_t*)mapkv)[span->slot] : nullptr;
+        d_flash_prefill<HD, BQ, BKV>(
+            Opart + qoff, mlpart + (size_t)span->row0 * n_head * 2u, Q + qoff, K + kvoff,
+            V + kvoff, O + qoff, span->n_rows, span->kv_len, n_head, n_kv_head,
+            span->kv_row0, window, 1u, kv_stride, kv_mask, scale, slice, nblk, lds, nullptr,
+            descriptor);
+        __syncthreads();
+    }
+}
+#endif
