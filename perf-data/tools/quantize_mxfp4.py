@@ -21,7 +21,7 @@ import argparse
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from quantize_fp8 import open_sources, source_chunks, raw_bytes, PROJS, GDN_PROJS  # noqa: E402
+from quantize_fp8 import open_sources, source_chunks, raw_bytes, PROJS, GDN_PROJS, EXPERT_PROJS  # noqa: E402
 import torch  # noqa: E402
 
 MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
@@ -50,14 +50,16 @@ def quant_rows(w):
 def build_plan(weight_map, shards, prefix, layers):
     plan = []
     for l in range(layers):
-        for proj in PROJS + GDN_PROJS:
+        for proj in PROJS + GDN_PROJS + EXPERT_PROJS:
             name = f"{prefix}layers.{l}.{proj}"
             if name not in weight_map:
                 continue
             hdr, _, _, _ = shards[weight_map[name]]
             shape = list(hdr[name]["shape"])
+            if len(shape) == 3:  # fused experts [E][N][K] -> flat rows [E*N][K] (ops 147-150 index e*N)
+                shape = [shape[0] * shape[1], shape[2]]
             if len(shape) != 2:
-                raise ValueError(f"{name}: expected a 2-D weight, got {shape}")
+                raise ValueError(f"{name}: expected a 2-D or 3-D weight, got {shape}")
             N, K = shape
             plan.append((f"mxfp4/{name}", f"mxfp4/{name}_scale", name, N, K))
     return plan

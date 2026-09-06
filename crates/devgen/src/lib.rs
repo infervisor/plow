@@ -1571,6 +1571,13 @@ struct LW {
     g_pre2: u32,
     ewt: u32,
     est: u32,
+    // MXFP4 experts (PLOW_MXFP4 on a MoE model): flat `mxfp4/…experts.gate_up_proj` [E*2I][H/2] +
+    // `_scale` [E*2I][H/32] and the down twins, consumed by the GPT-OSS flat-expert ops 147–150
+    // (layout 1 = gate block then up block). ewt/est stay NONE and no bf16 expert is bound.
+    egu8: u32,
+    egus: u32,
+    edn8: u32,
+    edns: u32,
     // FP8 DECODE weights (PLOW_FP8) + their per-output-channel f32 dequant scales. The bf16 wq..wd
     // above stay bound (from the bf16 checkpoint) and feed PREFILL's GEMM; these fp8 twins feed the
     // decode GEMV. TENSOR_NONE in bf16 mode. The fp8 weight/scale tensors are declared under an
@@ -2066,10 +2073,20 @@ fn declare(
         // MoE fused expert weights: declared so the loader binds them by name and the harness
         // derives per-expert ewt bases from their device addresses. Not referenced as op operands
         // (the SM indexes them through the ewt pointer table), so the handles are discarded here.
+        let mut ex4 = [TENSOR_NONE; 4];
         if c.moe && in_block {
             let gu_n = (c.n_exp * 2 * c.moe_inter) as u64;
             let dn_n = (c.n_exp * c.hidden) as u64;
-            if fp8 {
+            if mx4 {
+                let gu = gu_n * c.hidden as u64;
+                let dn = dn_n * c.moe_inter as u64;
+                ex4 = [
+                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj"), gu / 2),
+                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj_scale"), gu / 32),
+                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.down_proj"), dn / 2),
+                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.down_proj_scale"), dn / 32),
+                ];
+            } else if fp8 {
                 b.tensor(
                     &format!("fp8/{prefix}layers.{l}.experts.gate_up_proj"),
                     gu_n * c.hidden as u64,
@@ -2217,7 +2234,7 @@ fn declare(
                 "pre_feedforward_layernorm_2.weight",
                 c.hidden as u64 * BF16,
             ),
-            ewt: if c.moe && in_block {
+            ewt: if c.moe && in_block && !mx4 {
                 b.tensor(&format!("moe.ewt.{l}"), (c.n_exp * 2) as u64 * 8)
             } else {
                 TENSOR_NONE
@@ -2227,6 +2244,10 @@ fn declare(
             } else {
                 TENSOR_NONE
             },
+            egu8: ex4[0],
+            egus: ex4[1],
+            edn8: ex4[2],
+            edns: ex4[3],
         });
     }
     t
@@ -4833,6 +4854,44 @@ fn emit_phase(
                 } else {
                     DevOp::MoeExpertGluNormGemma
                 };
+                let c_dn = if mx4 {
+                    // MXFP4 experts: separate norm, then the GPT-OSS flat-expert ops (147/148)
+                    // over Gemma's route table; layout 1 = gate rows [0,I) then up rows [I,2I).
+                    let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
+                        d.t[0] = n.moe_xn2;
+                        d.t[1] = n.x;
+                        d.t[2] = w.g_pre2;
+                        d.i[0] = t;
+                        d.i[1] = c.hidden;
+                        d.f[0] = c.eps;
+                    });
+                    let c_glu = b.emit(DevOp::MoeGluMx, glu_cus, &[c_rt, c_xn2_local], |d| {
+                        d.t[0] = n.moe_mfu;
+                        d.t[1] = n.moe_xn2;
+                        d.t[2] = n.moe_tab;
+                        d.t[3] = w.egu8;
+                        d.t[4] = w.egus;
+                        d.i[0] = c.top_k;
+                        d.i[1] = c.moe_inter;
+                        d.i[2] = c.hidden;
+                        d.i[3] = c.n_exp;
+                        d.i[4] = 1;
+                        d.i[5] = c.mlp_act;
+                        d.i[6] = nb;
+                    });
+                    vec![b.emit(DevOp::MoeDownMx, down_cus, &[c_glu], |d| {
+                        d.t[0] = n.moe_part;
+                        d.t[1] = n.moe_mfu;
+                        d.t[2] = n.moe_tab;
+                        d.t[3] = w.edn8;
+                        d.t[4] = w.edns;
+                        d.i[0] = c.top_k;
+                        d.i[1] = c.hidden;
+                        d.i[2] = c.moe_inter;
+                        d.i[3] = c.n_exp;
+                        d.i[6] = nb;
+                    })]
+                } else {
                 let c_glu = if fp8 {
                     // fp8 path: separate norm + expert GLU (no fused fp8 norm variant)
                     let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
@@ -4881,7 +4940,7 @@ fn emit_phase(
                 } else {
                     DevOp::MoeExpertDownGemma
                 };
-                let c_dn = vec![b.emit(down_op, down_cus, &[c_glu], |d| {
+                vec![b.emit(down_op, down_cus, &[c_glu], |d| {
                     d.t[0] = n.moe_part;
                     d.t[1] = n.moe_mfu;
                     d.t[2] = n.moe_tab;
@@ -4892,7 +4951,8 @@ fn emit_phase(
                     d.i[2] = c.moe_inter;
                     d.i[3] = c.n_exp;
                     d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                })];
+                })]
+                };
                 // fused combine + rmsnorm + residual: saves 2 counter gates per layer.
                 let mut comb_deps: Vec<u32> = c_dn;
                 comb_deps.push(c_h1);
@@ -5045,6 +5105,34 @@ fn emit_phase(
                             d.i[2] = c.n_exp;
                         },
                     )
+                } else if mx4 {
+                    // MXFP4 experts: GPT-OSS grouped flat-expert prefill (149/150) over Gemma's
+                    // align tables; no bias, layout 1, GeGLU.
+                    let c_glu = b.emit(DevOp::MoeGluMxPf, all.clone(), &[c_align, c_xn2], |d| {
+                        d.t[0] = n.moe_fug;
+                        d.t[1] = n.moe_xn2;
+                        d.t[2] = w.egu8;
+                        d.t[3] = w.egus;
+                        d.t[4] = n.moe_meta;
+                        d.t[5] = n.moe_rowtok;
+                        d.i[0] = c.moe_inter;
+                        d.i[1] = c.hidden;
+                        d.i[2] = c.n_exp;
+                        d.i[3] = 1;
+                        d.i[5] = c.mlp_act;
+                    });
+                    b.emit(DevOp::MoeDownMxPf, all.clone(), &[c_glu, c_align], |d| {
+                        d.t[0] = n.moe_part;
+                        d.t[1] = n.moe_fug;
+                        d.t[2] = w.edn8;
+                        d.t[3] = w.edns;
+                        d.t[4] = n.moe_meta;
+                        d.t[6] = n.moe_rowpart;
+                        d.t[7] = n.moe_rowgate;
+                        d.i[0] = c.hidden;
+                        d.i[1] = c.moe_inter;
+                        d.i[2] = c.n_exp;
+                    })
                 } else {
                     let c_glu = b.emit(
                         DevOp::MoeGroupGluGemmaPf,

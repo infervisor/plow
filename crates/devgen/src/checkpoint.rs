@@ -366,7 +366,11 @@ pub(crate) fn validate_coverage(
     // bug happened — a freshly quantized checkpoint could not load at all.
     let want: HashSet<&str> = declared
         .iter()
-        .map(|s| s.strip_prefix("fp8/").unwrap_or(s.as_str()))
+        .map(|s| {
+            s.strip_prefix("fp8/")
+                .or_else(|| s.strip_prefix("mxfp4/"))
+                .unwrap_or(s.as_str())
+        })
         .filter(|n| n.starts_with(prefix))
         .collect();
 
