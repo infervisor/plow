@@ -22,6 +22,7 @@
 
 #include "amd_common.h"
 #include "packed_prefill.h"
+#include "mixed_step.h"
 
 /* RN_REG / RN_VEC moved to amd_common.h: op_gemm.h's fused-norm GEMV (`norm == 2`,
  * `gemv_norm_lds`) must reduce with the SAME per-thread element map as `d_rmsnorm` below to
@@ -348,7 +349,10 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
                                 float eps, unsigned out_row0, unsigned out_stride, unsigned kv_mask,
                                 unsigned skip_norm, unsigned slice,
                                 unsigned nblk, unsigned n_batch_kv = 0
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_MIXED_STEP
+                                , const PlowProgram* mixed = nullptr,
+                                const int* decode_slots = nullptr
+#elif PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
                                 ,
                                 const PlowProgram* packed = nullptr,
                                 unsigned packed_slot_stride = 0
@@ -373,7 +377,16 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
 
     for (unsigned w = slice * PLOW_WAVES + wave_in_blk; w < total; w += nblk * PLOW_WAVES) {
         const unsigned t = w / nhead, hh = w % nhead;
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_MIXED_STEP
+        PlowMixedRow mrow = {nullptr, 0u, 0u, 0u, 0u};
+        if (out_stride && mixed) {
+            mrow = plow_mixed_row(mixed, decode_slots, pos, t);
+            if (!mrow.active) continue;
+        }
+        const unsigned position = out_stride && mixed
+                                      ? mrow.position
+                                      : (pg ? (unsigned)pg[t] : out_row0 + t);
+#elif PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
         const PlowPackedRow prow = plow_packed_prefill_row(packed, t);
         if (!prow.active) continue;
         const unsigned position =
@@ -397,7 +410,12 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
          * legacy formula gets right. n_batch_kv == 0 keeps the legacy path byte-identical, so
          * every prefill packet and B=1 decode are unchanged. */
         const size_t obase =
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_MIXED_STEP
+            out_stride && mixed
+                ? (((size_t)mrow.slot * nhead + hh) * out_stride +
+                   (position & kv_mask)) * hd
+                :
+#elif PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
             packed_slot_stride && prow.span
                 ? (((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
                    (position & kv_mask)) * hd

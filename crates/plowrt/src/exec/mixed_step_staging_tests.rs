@@ -57,6 +57,11 @@ fn reuses_all_storage_across_successful_steps() {
         assert_eq!(plan.decode_rows, 1);
         assert_eq!(plan.decode_slots, [2]);
         assert_eq!(plan.real_rows, 3);
+        let metadata = staging.pending_device_metadata().unwrap();
+        assert_eq!(metadata.decode_slots, [2]);
+        assert_eq!(metadata.prefill_spans[0].row0, 1);
+        assert_eq!(metadata.parked, [0, 0, 0, 1, 1, 1, 1, 1]);
+        assert_eq!((metadata.rows, metadata.decode_rows), (8, 1));
         assert_eq!(storage(&staging), before);
         staging.commit_after_device_success(&mut frontiers).unwrap();
         assert_eq!(storage(&staging), before);
