@@ -294,6 +294,28 @@ fn rejects_unsafe_programs_duplicate_sections_and_capability_bytes() {
     assert!(append(&model, &mut sections, &inputs(&programs, &[], &variant)).is_err());
     assert!(sections.is_empty());
 
+    let reserved_object = [object(
+        mixed_step::PayloadKind::Cubin,
+        mixed_step::SECTION,
+        EM_CUDA,
+    )];
+    let bound_variant = [Variant {
+        object_indices: &[0],
+        ..variant[0]
+    }];
+    assert!(append(
+        &model,
+        &mut sections,
+        &inputs(&programs, &reserved_object, &bound_variant)
+    )
+    .is_err());
+    assert!(sections.is_empty());
+
+    let mut reserved_program = inputs(&programs, &reserved_object, &bound_variant);
+    reserved_program.programs.section = mixed_step::SECTION;
+    assert!(append(&model, &mut sections, &reserved_program).is_err());
+    assert!(sections.is_empty());
+
     let two_cuda = [
         object(mixed_step::PayloadKind::Cubin, "cuda_a", EM_CUDA),
         object(mixed_step::PayloadKind::Cubin, "cuda_b", EM_CUDA),
