@@ -389,6 +389,90 @@ pub struct LiveKvLayout {
 }
 
 impl LiveKvLayout {
+    pub fn manifest(
+        blob: &crate::asset::devblob::DevBlob,
+        raw: &[u8],
+    ) -> Result<Option<plow_asset::live_kv::Manifest>> {
+        let count = blob
+            .sections
+            .iter()
+            .filter(|s| {
+                s.kind == packet::devbuild::SECT_METADATA && s.name == plow_asset::live_kv::SECTION
+            })
+            .count();
+        if count == 0 {
+            return Ok(None);
+        }
+        if count != 1 {
+            return Err(RuntimeError::Rejected("duplicate LIVE KV manifest".into()));
+        }
+        let bytes = blob
+            .section_data_named(
+                raw,
+                packet::devbuild::SECT_METADATA,
+                plow_asset::live_kv::SECTION,
+            )
+            .ok_or_else(|| RuntimeError::Rejected("missing LIVE KV manifest bytes".into()))?;
+        let m: plow_asset::live_kv::Manifest = serde_json::from_slice(bytes)
+            .map_err(|e| RuntimeError::Rejected(format!("invalid LIVE KV manifest: {e}")))?;
+        blob.with_packet_view(|packet| m.validate(packet))
+            .map_err(RuntimeError::Rejected)?;
+        Ok(Some(m))
+    }
+    pub fn from_manifest(
+        blob: &crate::asset::devblob::DevBlob,
+        m: &plow_asset::live_kv::Manifest,
+    ) -> Result<Self> {
+        blob.with_packet_view(|packet| m.validate(packet))
+            .map_err(RuntimeError::Rejected)?;
+        let mut full_tensors = Vec::new();
+        let mut ring_tensors = Vec::new();
+        let mut cache_tensors = Vec::new();
+        let mut full_shape = None;
+        for c in &m.caches {
+            cache_tensors.extend(c.pair.map(usize::from));
+            if c.window == 0 {
+                if full_shape.is_some_and(|shape| shape != (c.heads, c.hd)) {
+                    return Err(RuntimeError::Rejected(
+                        "LIVE allocator requires uniform full-cache head geometry".into(),
+                    ));
+                }
+                full_shape = Some((c.heads, c.hd));
+                full_tensors.push(c.pair.map(usize::from));
+            } else {
+                for tensor in c.pair.map(usize::from) {
+                    ring_tensors.push(LiveRingTensor {
+                        tensor,
+                        slot_bytes: blob.tensors[tensor].bytes / u64::from(m.batch),
+                    });
+                }
+            }
+        }
+        let full_shape = full_shape.ok_or_else(|| {
+            RuntimeError::Rejected(
+                "LIVE allocator does not support sliding-only packets; declared geometry is valid"
+                    .into(),
+            )
+        })?;
+        Ok(Self {
+            geometry: VmmGeometry {
+                full_layers: (0..full_tensors.len() as u32).collect(),
+                kvh_full: full_shape.0,
+                hd_full: full_shape.1,
+                slide_layers: Vec::new(),
+                kvh_slide: 0,
+                hd_slide: 0,
+                window: 0,
+                elem: 2,
+                elem_slide: 2,
+                max_ctx: m.max_ctx,
+                batch: m.batch,
+            },
+            full_tensors,
+            ring_tensors,
+            cache_tensors,
+        })
+    }
     pub fn from_blob(blob: &crate::asset::devblob::DevBlob) -> Result<Self> {
         use packet::dev::{DevOp, TENSOR_NONE16};
         use std::collections::BTreeMap;
@@ -1958,6 +2042,63 @@ mod tests {
             gen: Vec::new(),
             tp: None,
         }
+    }
+
+    #[test]
+    fn declared_geometry_matches_legacy_and_rejects_stale_accesses() {
+        let mut blob = live_blob();
+        let m = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+        let legacy = LiveKvLayout::from_blob(&blob).unwrap();
+        let declared = LiveKvLayout::from_manifest(&blob, &m).unwrap();
+        assert_eq!(legacy.full_tensors, declared.full_tensors);
+        assert_eq!(legacy.cache_tensors, declared.cache_tensors);
+        assert_eq!(legacy.geometry.batch, declared.geometry.batch);
+        assert_eq!(legacy.geometry.max_ctx, declared.geometry.max_ctx);
+        assert_eq!(legacy.geometry.kvh_full, declared.geometry.kvh_full);
+        blob.progs[1].insts[0].fj[1] += 32;
+        assert!(blob.with_packet_view(|p| m.validate(p)).is_err());
+        let mut bad = m.clone();
+        bad.programs[1] =
+            blob.with_packet_view(|p| plow_asset::live_kv::program_digest(&p.programs[1]));
+        assert!(blob.with_packet_view(|p| bad.validate(p)).is_err());
+    }
+    #[test]
+    fn sliding_only_manifest_is_valid_but_allocator_limitation_is_explicit() {
+        let mut blob = live_blob();
+        for p in &mut blob.progs {
+            for d in &mut p.insts {
+                if d.op == packet::dev::DevOp::HeadNormRope as u16 {
+                    d.fj[2] = 1023;
+                }
+                if d.op == packet::dev::DevOp::FlashPrefill as u16 {
+                    d.i[5] = 512;
+                    d.fj[2] = 1023;
+                }
+                if d.op == packet::dev::DevOp::FlashDecode as u16 {
+                    d.i[4] = 512;
+                    d.i[7] = 1023;
+                }
+            }
+        }
+        let manifest = blob.with_packet_view(plow_asset::live_kv::emit).unwrap();
+        assert!(blob.with_packet_view(|p| manifest.validate(p)).is_ok());
+        let error = LiveKvLayout::from_manifest(&blob, &manifest)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("allocator does not support sliding-only"));
+    }
+    #[test]
+    fn malformed_present_manifest_cannot_fall_back() {
+        let mut blob = live_blob();
+        assert!(LiveKvLayout::manifest(&blob, &[]).unwrap().is_none());
+        blob.sections.push(crate::asset::devblob::DevSection {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::live_kv::SECTION.into(),
+            offset: 0,
+            size: 2,
+        });
+        assert!(LiveKvLayout::manifest(&blob, b"{}").is_err());
     }
 
     #[test]

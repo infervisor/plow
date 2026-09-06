@@ -2,7 +2,7 @@ use super::*;
 use crate::asset::devblob::{DevProg, DevTensor};
 use packet::dev::StreamEnt;
 
-fn fixture() -> DevBlob {
+pub(super) fn fixture() -> DevBlob {
     let progs = [1, 2, 4, 8, 16]
         .into_iter()
         .map(|rows| {
@@ -338,4 +338,147 @@ fn gpu_decode_rungs_match_widest_full_logits() {
         }
         eprintln!("candidate={candidate}: {checked} full-logit snapshots");
     }
+}
+
+pub(super) fn splitk_fixture() -> DevBlob {
+    use packet::devbuild::{Builder, Model, TensorDecl};
+    let old = fixture();
+    let mut tensors: Vec<_> = old
+        .tensors
+        .iter()
+        .map(|t| TensorDecl {
+            name: t.name.clone(),
+            bytes: t.bytes,
+            init: None,
+        })
+        .collect();
+    tensors.extend([
+        TensorDecl {
+            name: "act.a".into(),
+            bytes: 16 * 64 * 2,
+            init: None,
+        },
+        TensorDecl {
+            name: "model.layers.0.mlp.down_proj.weight".into(),
+            bytes: 128 * 64 * 2,
+            init: None,
+        },
+        TensorDecl {
+            name: "act.c".into(),
+            bytes: 16 * 128 * 2,
+            init: None,
+        },
+        TensorDecl {
+            name: "act.partial".into(),
+            bytes: 16 * 128 * 4,
+            init: None,
+        },
+    ]);
+    let mut programs = Vec::new();
+    for p in old.progs {
+        let mut b = Builder::new(1);
+        b.force_uniseg();
+        b.adopt_tensors(tensors.clone());
+        let mut prior = None;
+        for d in p.insts {
+            prior = Some(b.emit(
+                DevOp::from_u16(d.op).unwrap(),
+                vec![0],
+                &prior.into_iter().collect::<Vec<_>>(),
+                |i| {
+                    i.t = d.t.map(|h| {
+                        if h == TENSOR_NONE16 {
+                            packet::dev::TENSOR_NONE
+                        } else {
+                            u32::from(h)
+                        }
+                    });
+                    i.i = d.i;
+                    i.f = [f32::from_bits(d.fj[0]), 0.];
+                    i.j = [d.fj[1], d.fj[2]];
+                },
+            ));
+        }
+        if p.t < 4 {
+            b.emit(
+                DevOp::Gemv,
+                vec![0],
+                &prior.into_iter().collect::<Vec<_>>(),
+                |i| {
+                    i.t[..3].copy_from_slice(&[10, 8, 9]);
+                    i.i[..3].copy_from_slice(&[p.t, 128, 64]);
+                    i.f[0] = 1e-6;
+                },
+            );
+        } else {
+            let z = b.emit(DevOp::ZeroF32, vec![0], &[], |i| {
+                i.t[0] = 11;
+                i.i[..2].copy_from_slice(&[p.t, 128]);
+            });
+            let g = b.emit(DevOp::GemmSplitK, vec![0], &[prior.unwrap(), z], |i| {
+                i.t[..3].copy_from_slice(&[11, 8, 9]);
+                i.i[..4].copy_from_slice(&[p.t, 128, 64, 8]);
+            });
+            b.emit(DevOp::CastF32Bf16, vec![0], &[g], |i| {
+                i.t[..2].copy_from_slice(&[10, 11]);
+                i.i[..2].copy_from_slice(&[p.t, 128]);
+            });
+        }
+        programs.push(b.finish());
+    }
+    DevBlob::parse(
+        &Model {
+            n_cu: 1,
+            target: 0,
+            tensors,
+            progs: programs,
+            prog_t: vec![1, 2, 4, 8, 16],
+            gen: vec![],
+            kv_row_insts: vec![],
+        }
+        .to_blob(),
+    )
+    .unwrap()
+}
+#[test]
+fn canonical_splitk_ladder_preserves_shapes_and_rejects_changed_dependency() {
+    assert!(validate_decode_ladder(&splitk_fixture()).unwrap());
+    let mut b = splitk_fixture();
+    let g = &mut b.progs[2];
+    for e in g
+        .stream
+        .iter_mut()
+        .chain(&mut g.gq_stream)
+        .filter(|e| e.inst == 5)
+    {
+        let zero = g.waits[e.wait_ofs as usize..e.wait_ofs as usize + e.wait_len as usize]
+            .iter()
+            .position(|w| w.id == 4)
+            .unwrap();
+        e.wait_ofs += zero as u32;
+        e.wait_len = 1;
+    }
+    assert!(validate_decode_ladder(&b).is_err());
+    let mut b = splitk_fixture();
+    b.progs[2].insts[5].i[1] = 64;
+    b.progs[2].insts[4].i[1] = 64;
+    b.progs[2].insts[6].i[1] = 64;
+    assert!(validate_decode_ladder(&b).is_err());
+}
+#[test]
+fn bound_projection_requires_capability_only_on_assigned_e3_rungs() {
+    let b = splitk_fixture();
+    let coverage = plow_asset::decode_coverage::DenseBf16([1, 2, 8, 16448, 16, 82944]);
+    b.with_packet_view(|p| {
+        assert!(coverage.program(p, 0, None).is_ok());
+        assert!(coverage.program(p, 1, None).is_ok());
+        assert!(coverage.program(p, 2, None).is_err());
+        assert!(coverage.program(p, 2, Some(0)).is_err());
+        assert!(coverage.program(p, 2, Some(1)).is_ok());
+        assert!(
+            plow_asset::decode_coverage::DenseBf16([1, 2, 8, 16448, 16, 16448])
+                .program(p, 2, Some(1))
+                .is_err()
+        );
+    });
 }

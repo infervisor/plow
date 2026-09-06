@@ -1200,6 +1200,9 @@ enum {
 
 
 
+    PLOW_DOP_ZERO_F32 = 147,
+    PLOW_DOP_GEMM_SPLITK = 148,
+    PLOW_DOP_CAST_F32_BF16 = 149,
     PLOW_DOP__COUNT
 };
 

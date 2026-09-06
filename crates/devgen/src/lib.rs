@@ -61,8 +61,10 @@ mod qwen35;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
+mod decode_objects;
 mod gemv_decode_role;
 pub mod manifest;
+mod projection_rewrite;
 pub mod tune_demand;
 
 // # THE `PLOW_*` FLAG AUDIT (target dependence)
@@ -6013,6 +6015,51 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             ),
         "GEMV decode role currently requires the dense BF16 emitter"
     );
+    if emit_config::active().decode_projection_tuning {
+        assert!(
+            arch == "sm_90a" && tp == 1 && emit_config::active().decode_objects.is_some(),
+            "projection tuning requires Hopper cooperative decode object bindings"
+        );
+        assert!(
+            !matches!(
+                model_type.as_str(),
+                "qwen3_5"
+                    | "kimi_k3"
+                    | "glm5_next"
+                    | "glm_moe_dsa"
+                    | "kimi_k2"
+                    | "kimi"
+                    | "deepseek_v3"
+                    | "deepseek_v2"
+                    | "nemotron_h"
+                    | "nemotron3"
+                    | "nemotron"
+            ),
+            "projection tuning is not wired to this emitter's opcode/access contracts"
+        );
+    }
+    if emit_config::active().decode_objects.is_some() {
+        assert!(
+            matches!(arch.as_str(), "sm_90a" | "sm_120") && tp == 1,
+            "decode objects require a supported single-GPU CUDA target"
+        );
+        assert!(
+            !matches!(
+                model_type.as_str(),
+                "kimi_k3"
+                    | "glm5_next"
+                    | "glm_moe_dsa"
+                    | "kimi_k2"
+                    | "kimi"
+                    | "deepseek_v3"
+                    | "deepseek_v2"
+                    | "nemotron_h"
+                    | "nemotron3"
+                    | "nemotron"
+            ),
+            "decode object bindings are not wired to this emitter"
+        );
+    }
     if model_type == "qwen3_5" {
         assert!(
             embed_cubin.is_none() && embed_hsaco.is_none(),
@@ -7200,6 +7247,9 @@ fn emit_dense_gqa(
         gen,
     };
 
+    let projection_bindings =
+        projection_rewrite::apply(&mut m, &ecfg, &gpu, &arch, std::path::Path::new(&out))
+            .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));
     // Emit v6 with sections when --embed-cubin/--embed-hsaco given, else v5.
     let mut sections = Vec::new();
     if ecfg.gemv_decode_role {
@@ -7297,7 +7347,34 @@ fn emit_dense_gqa(
     // site's — to downgrade "no usable verifier here" into an `Ok` carrying a
     // skip reason. Anything that reaches this `Err` is the verifier saying the
     // program is wrong, i.e. a real bug caught, and must be loud.
+    if projection_bindings.is_some() {
+        let manifest = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
+            .unwrap_or_else(|error| panic!("compiled LIVE KV geometry: {error}"));
+        sections.push(packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::live_kv::SECTION.into(),
+            data: serde_json::to_vec(&manifest).expect("serialize LIVE KV manifest"),
+        });
+    }
     let lean = apply_verify_gate(&m, verify.as_ref());
+    if let Some(bindings) = projection_bindings.as_ref() {
+        decode_objects::append_metadata(
+            &m,
+            &mut sections,
+            bindings,
+            &arch,
+            std::path::Path::new(&out),
+        )
+    } else {
+        decode_objects::append(
+            &m,
+            &mut sections,
+            ecfg.decode_objects.as_deref(),
+            &arch,
+            std::path::Path::new(&out),
+        )
+    }
+    .unwrap_or_else(|error| panic!("decode objects: {error}"));
     let blob = if sections.is_empty() {
         m.to_blob()
     } else {

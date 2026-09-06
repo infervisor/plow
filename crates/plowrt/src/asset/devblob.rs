@@ -464,6 +464,46 @@ impl DevBlob {
             .and_then(|s| buf.get(s.offset..s.offset + s.size))
     }
 
+    pub fn with_packet_view<T>(&self, f: impl FnOnce(&plow_asset::program::Packet<'_>) -> T) -> T {
+        use plow_asset::program::{Packet, Program, Tensor};
+        let tensors: Vec<_> = self
+            .tensors
+            .iter()
+            .map(|t| Tensor {
+                name: &t.name,
+                bytes: t.bytes,
+                initialized: t.init.is_some(),
+            })
+            .collect();
+        let programs: Vec<_> = self
+            .progs
+            .iter()
+            .map(|p| Program {
+                rows: p.t,
+                packed_prefill_only: p.packed_prefill_only,
+                n_counter: p.n_counter,
+                insts: &p.insts,
+                stream: &p.stream,
+                stream_ofs: &p.stream_ofs,
+                stream_len: &p.stream_len,
+                waits: &p.waits,
+                succs: &p.succs,
+                gq_stream: &p.gq_stream,
+                gq_seg_ofs: &p.gq_seg_ofs,
+                l2_domains: p.l2_domains,
+            })
+            .collect();
+        f(&Packet {
+            n_cu: self.n_cu,
+            tp: self.tp.is_some(),
+            prefill_count: self.decode_rung_lo(),
+            tensors: &tensors,
+            programs: &programs,
+            generated: &self.gen,
+            kv_row_insts: &self.kvrow,
+        })
+    }
+
     /// Index of the first decode rung. The compiler emits prefill buckets first,
     /// then a trailing ascending decode ladder whose widths are at most 128.
     pub fn decode_rung_lo(&self) -> usize {

@@ -134,6 +134,13 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-batch-ladder", env = "PLOW_DECODE_BATCH_LADDER")]
     pub decode_ladder: Option<String>,
 
+    /// Bind prebuilt CUDA objects in the output directory to complete decode programs.
+    #[arg(long = "emit-decode-objects")]
+    pub decode_objects: Option<std::path::PathBuf>,
+
+    #[arg(long = "emit-decode-projection-tuning", default_value_t = false)]
+    pub decode_projection_tuning: bool,
+
     /// Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket
     /// ladder and the runtime PLOW_PF_INTERLEAVE ceiling.
     #[arg(long = "emit-max-chunk", env = "PLOW_MAX_CHUNK")]
@@ -915,6 +922,8 @@ impl EmitConfig {
             attention_pf_role: env_bool("PLOW_ATTENTION_PF_ROLE"),
             attention_pf_isolate: env_bool("PLOW_ATTENTION_PF_ISOLATE"),
             gemv_decode_role: env_bool("PLOW_GEMV_DECODE_ROLE"),
+            decode_objects: None,
+            decode_projection_tuning: false,
             qwen_fp8_m1_tma: env_bool("PLOW_QWEN_FP8_M1_TMA"),
             qwen_w8a8_prefill: env_bool("PLOW_QWEN_W8A8_PREFILL"),
             qwen_decode_lt: env_bool("PLOW_QWEN_DECODE_LT"),

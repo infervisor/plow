@@ -45,6 +45,10 @@ use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHo
 use crate::device::{Backend, DeviceMem, Module};
 use crate::{Result, RuntimeError};
 
+#[path = "gpu_decode_object.rs"]
+mod decode_object;
+use decode_object::{BoundDecodeObject, DecodeModule};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InterpreterProfile {
     tag: &'static str,
@@ -1008,6 +1012,7 @@ impl KvTensorMap {
 
 struct DecodeRung {
     rows: usize,
+    object: Option<Arc<BoundDecodeObject>>,
     kernarg: DevProgram,
     counters: DeviceMem,
     counter_bytes: usize,
@@ -1022,6 +1027,9 @@ fn decode_rung_index(
 }
 
 fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
+    let splitk = blob
+        .with_packet_view(plow_asset::splitk::validate)
+        .map_err(RuntimeError::Rejected)?;
     let programs = blob.decode_progs();
     if programs.len() < 2 {
         return Ok(false);
@@ -1074,9 +1082,17 @@ fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
     let mut compatible = true;
     let mut same_shape = true;
     let mut normalized = Vec::new();
-    for g in programs {
+    for (index, g) in programs.iter().enumerate() {
+        let logical = splitk.as_ref().map(|proof| &proof.canonical[index]);
+        if let Some(proof) = &splitk {
+            if proof.canonical[index].dependencies != proof.canonical[0].dependencies {
+                return Err(reject(
+                    "canonical projection dependencies differ across rungs",
+                ));
+            }
+        }
         let mut insts = Vec::new();
-        for d in &g.insts {
+        for d in logical.map_or(g.insts.as_slice(), |p| p.instructions.as_slice()) {
             let mut d = *d;
             d.blocks = 0;
             match DevOp::from_u16(d.op) {
@@ -1335,6 +1351,7 @@ impl DecodeRung {
         };
         Ok(Self {
             rows: g.t as usize,
+            object: None,
             kernarg,
             counters,
             counter_bytes,
@@ -1758,7 +1775,7 @@ pub struct GpuEngine {
     /// globals through. NOT `_module` — the leading-underscore convention in
     /// this file means "held for liveness only, never read", which is true of
     /// [`Sampler::_module`] and [`MultiStep::_module`] and false of this one.
-    module: Module,
+    module: Arc<DecodeModule>,
 
     /// The prefill object's kernel + smem, and the uploaded bucket programs.
     /// `None`/empty when no `_pf` cubin is present — the mux then falls back to
@@ -2762,6 +2779,18 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
+        let live_kv_manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
+        let decode_objects = decode_object::parse(&blob, &raw)?;
+        if blob
+            .with_packet_view(plow_asset::splitk::validate)
+            .map_err(RuntimeError::Rejected)?
+            .is_some()
+            && (decode_objects.is_none() || live_kv_manifest.is_none())
+        {
+            return Err(RuntimeError::Rejected(
+                "splitK packets require compiled decode object and LIVE KV manifests".into(),
+            ));
+        }
         let segment_roles = blob
             .section_data_named(&raw, packet::devbuild::SECT_METADATA, "segment_roles.json")
             .map(|bytes| SegmentRoles::parse(bytes, &blob))
@@ -2772,6 +2801,29 @@ impl GpuEngine {
             .filter(|p| p.roles.contains(&3))
             .map(|p| p.roles.clone())
             .unwrap_or_default();
+        if decode_objects.is_some() {
+            let nv = &RuntimeConfig::get().nv;
+            let multistep = RuntimeConfig::env_str_or("PLOW_MULTISTEP", None)
+                .map(|v| v.parse::<usize>())
+                .transpose()
+                .map_err(|_| RuntimeError::Rejected("invalid multistep for decode objects".into()))?
+                .unwrap_or(nv.multistep as usize);
+            decode_object::check_options(
+                segment_roles.as_ref().is_some_and(|roles| {
+                    roles
+                        .programs
+                        .iter()
+                        .any(|program| program.index >= blob.prefill_progs().len())
+                }),
+                RuntimeConfig::env_bool_or("PLOW_QWEN_DECODE_LT", false),
+                multistep,
+                RuntimeConfig::env_str_or("PLOW_NV_CUBIN", None).is_some()
+                    || RuntimeConfig::env_str_or("PLOW_NV_KERNEL", None).is_some()
+                    || nv.cubin.is_some()
+                    || nv.kernel.is_some()
+                    || nv.smem.is_some(),
+            )?;
+        }
         let mut select_decode_rungs = validate_decode_ladder(&blob)?;
         let kv_maps = kv_tensor_maps(&blob.tensors, &blob.gen, blob.decode_prog()?.t as usize)?;
         let qwen_block = blob
@@ -2838,10 +2890,15 @@ impl GpuEngine {
         let want_sm = cc.0 * 10 + cc.1;
         let (module, f, _kname, smem, grid, _dec_source, _image_len) = {
             let run = || -> Result<_> {
-                let dec =
+                let selected = if let Some(metadata) = &decode_objects {
+                    let spec = &metadata.objects
+                        [&metadata.programs.last().expect("validated coverage").object];
+                    Some(decode_object::image(spec, assets_dir, &profile, want_sm)?)
+                } else {
                     resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Decode)?
-                        .ok_or_else(|| {
-                            RuntimeError::Device(format!(
+                };
+                let dec = selected.ok_or_else(|| {
+                    RuntimeError::Device(format!(
                         "no sm_{want_sm} decode interpreter object for {} in {} — expected a cubin \
                      carrying `{}` (embedded in the blob, or a file; {} is only the conventional \
                      name, the symbol table decides). Candidates found:\n{}",
@@ -2851,11 +2908,11 @@ impl GpuEngine {
                         profile.decode_file,
                         describe_candidates(assets_dir),
                     ))
-                        })?;
+                })?;
                 let image = dec.image;
                 let image_len = image.len();
                 let dec_source = dec.source.clone();
-                let module = be.module_load(&image)?;
+                let module = DecodeModule::load(&be, &image)?;
                 let kname = std::env::var(env_kernel_var(Role::Decode))
                     .ok()
                     .or_else(|| crate::config::RuntimeConfig::get().nv.kernel.clone())
@@ -2872,15 +2929,12 @@ impl GpuEngine {
                     be.set_max_dynamic_smem(f, smem)?;
                 }
                 let occ = be.occupancy_blocks_per_sm(f, BLOCK, smem as usize)?;
-                let grid = occ * be.sm_count();
-                if grid != blob.n_cu {
-                    return Err(RuntimeError::Device(format!(
-                        "interpreter grid {grid} ({occ}/SM × {} SMs) != packet n_cu {} — recompile \
-                 the packet with n_cu={grid}",
-                        be.sm_count(),
-                        blob.n_cu
-                    )));
-                }
+                let grid = decode_object::initial_grid(
+                    decode_objects.as_ref(),
+                    blob.n_cu,
+                    be.sm_count(),
+                    occ,
+                )?;
                 Ok((module, f, kname, smem, grid, dec_source, image_len, occ))
             };
             if let Some(tm) = load_tim.as_mut() {
@@ -2913,6 +2967,14 @@ impl GpuEngine {
                 (module, f, kname, smem, grid, dec_source, image_len)
             }
         };
+        let bound_objects = decode_objects
+            .as_ref()
+            .map(|metadata| {
+                decode_object::bind(
+                    metadata, &blob, assets_dir, &be, &module, f, &profile, want_sm,
+                )
+            })
+            .transpose()?;
         let gemv_mm_cap = be.module_global_u32(&module, "plow_gemv_mm_cap")?;
         if recurrent.is_some()
             && blob
@@ -2938,6 +3000,11 @@ impl GpuEngine {
             && be.module_global_u32(&module, "plow_dyn_kvrow")? != Some(1)
         {
             select_decode_rungs = false;
+        }
+        if decode_objects.is_some() && !select_decode_rungs {
+            return Err(RuntimeError::Rejected(
+                "decode objects require qualified narrow dispatch".into(),
+            ));
         }
         let decode_rungs = blob.decode_rungs();
         if decode_rungs.len() > 1 && !select_decode_rungs {
@@ -2981,7 +3048,7 @@ impl GpuEngine {
                             "live KV allocation requires prefix caching off".into(),
                         ));
                     }
-                    Self::vmm_live_bringup(&be, &blob, rings).map(Some)
+                    Self::vmm_live_bringup(&be, &blob, rings, live_kv_manifest.as_ref()).map(Some)
                 } else {
                     Ok(Self::vmm_bringup(&be, &blob, checkpoint_dir))
                 }
@@ -3778,7 +3845,19 @@ impl GpuEngine {
         let decode_rungs = if select_decode_rungs && !lt_enabled {
             blob.decode_progs()[..blob.decode_progs().len() - 1]
                 .iter()
-                .map(|g| DecodeRung::upload(&be, g, kernarg))
+                .enumerate()
+                .map(|(index, g)| {
+                    let mut rung = DecodeRung::upload(&be, g, kernarg)?;
+                    if let (Some(metadata), Some(objects)) = (&decode_objects, &bound_objects) {
+                        rung.object = Some(Arc::clone(&objects[&metadata.programs[index].object]));
+                        tracing::info!(
+                            rows = g.t,
+                            object = metadata.programs[index].object,
+                            "decode program object selected at load"
+                        );
+                    }
+                    Ok(rung)
+                })
                 .collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -4337,8 +4416,12 @@ impl GpuEngine {
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
         live_rings: bool,
+        manifest: Option<&plow_asset::live_kv::Manifest>,
     ) -> Result<VmmServe> {
-        let layout = crate::memory::vmm::LiveKvLayout::from_blob(blob)?;
+        let layout = match manifest {
+            Some(m) => crate::memory::vmm::LiveKvLayout::from_manifest(blob, m)?,
+            None => crate::memory::vmm::LiveKvLayout::from_blob(blob)?,
+        };
         let config = RuntimeConfig::get();
         let block_hint =
             RuntimeConfig::env_parse_or("PLOW_VMM_BLOCK_MIB", config.nv.vmm_block_mib as u64) << 20;
@@ -5466,11 +5549,12 @@ impl GpuEngine {
         if let Some(ix) = rung {
             let mut arg = self.decode_rungs[ix].kernarg;
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+            let object = self.decode_rungs[ix].object.as_deref();
             self.be.launch_cooperative(
-                self.f,
-                self.grid,
-                BLOCK,
-                self.smem,
+                object.map_or(self.f, |o| o.function),
+                object.map_or(self.grid, |o| o.grid),
+                object.map_or(BLOCK, |o| o.block),
+                object.map_or(self.smem, |o| o.smem),
                 &mut params,
                 Some(&self.stream),
             )
@@ -7542,9 +7626,6 @@ impl Drop for GpuEngine {
                     report(&e, "unload seg fa512 module");
                 }
             }
-        }
-        if let Err(e) = self.be.module_unload(&self.module) {
-            report(&e, "unload decode module");
         }
     }
 }

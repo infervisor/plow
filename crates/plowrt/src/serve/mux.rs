@@ -1270,7 +1270,8 @@ fn run_one_tick(
             // feeds so the prefill chain runs uninterrupted and no decode launch pays
             // its fixed cost at a partial batch. Every deferred row is picked up by a
             // full-batch decode tick once prefill drains.
-            if pf_defer_decode() && did_prefill {
+            let defer_decode = pf_defer_decode();
+            if defer_decode && did_prefill {
                 feeds.clear();
             }
 
@@ -1338,8 +1339,8 @@ fn run_one_tick(
                 // decoders, at most ONE capped prefill chunk runs per tick, so a
                 // mid-decode arrival stalls the running streams by one chunk (not one
                 // whole prompt); the decode launch below runs between chunks. With no
-                // decoders live, the chain runs to completion (fastest cold TTFT —
-                // the pre-interleave behavior).
+                // decoders live, stop once a request becomes ready for decode,
+                // unless the caller explicitly defers decode.
                 let cap_rows = if feeds.is_empty() {
                     usize::MAX
                 } else {
@@ -1421,8 +1422,10 @@ fn run_one_tick(
                             }
                         }
                     }
-                    if !feeds.is_empty() {
-                        break; // bounded stall: decode now, next chunk next tick
+                    if gpu_prefill_should_yield(!feeds.is_empty(), defer_decode, slot_opt.as_ref())
+                    {
+                        // New decoders join next tick; their first token was already emitted.
+                        break;
                     }
                 }
             }
@@ -2289,6 +2292,11 @@ fn pf_defer_decode() -> bool {
     crate::config::RuntimeConfig::get().nv.pf_defer_decode
 }
 
+#[cfg(feature = "cuda")]
+fn gpu_prefill_should_yield(has_feeds: bool, defer_decode: bool, slot: Option<&Slot>) -> bool {
+    has_feeds || (!defer_decode && slot.is_some_and(|s| s.step > 0 && !s.respond.is_closed()))
+}
+
 #[cfg(feature = "hsa")]
 fn amd_prefill_tick_cap(
     has_decode: bool,
@@ -2964,6 +2972,113 @@ mod tests {
             poisoned.update(420.0);
         }
         assert!(poisoned.get() > 250.0, "control: unfiltered EWMA sheds");
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prefill_test_bundle(name: &str) -> ModelBundle {
+        let dir =
+            std::env::temp_dir().join(format!("plowrt-prefill-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("weights.json"),
+            r#"{"network":"prefill-test","gpu":"cpu","num_gpus":1,"parallel":"none","weight_shared":false,"buckets":[]}"#,
+        )
+        .unwrap();
+        let bundle = ModelBundle::load(&dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        bundle
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prefill_test_slot() -> (Option<Slot>, crate::serve::stream::ChunkReceiver) {
+        let (respond, rx) = crate::serve::stream::channel();
+        (
+            Some(Slot {
+                prompt_ids: vec![1, 2, 3],
+                out_ids: Vec::new(),
+                gen: GenParams::default(),
+                respond,
+                prefix_offset: 0,
+                read_offset: 0,
+                executed: 0,
+                step: 0,
+                pf_pos: 2,
+                cached_tokens: 0,
+                kv: None,
+                arrived: Instant::now(),
+            }),
+            rx,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_cold_prefill_yields_after_first_token_without_advancing_twice() {
+        let bundle = prefill_test_bundle("ready");
+        let (mut slot, mut rx) = prefill_test_slot();
+        let feeds: Vec<(usize, u32)> = Vec::new();
+        let mut tokens = 0;
+        assert!(!gpu_prefill_should_yield(false, false, slot.as_ref()));
+        assert!(gpu_prefill_should_yield(true, false, slot.as_ref()));
+
+        slot.as_mut().unwrap().pf_pos = 3;
+        handle_produced_token(&mut slot, &None, &bundle, 65, 1, &mut tokens, Some(&[]));
+        assert!(gpu_prefill_should_yield(
+            !feeds.is_empty(),
+            false,
+            slot.as_ref()
+        ));
+        assert!(!gpu_prefill_should_yield(
+            !feeds.is_empty(),
+            true,
+            slot.as_ref()
+        ));
+        assert!(feeds.is_empty(), "new decoder waits for the next tick");
+        let ready = slot.as_ref().unwrap();
+        assert_eq!((ready.step, ready.executed, tokens), (1, 1, 1));
+        assert_eq!(ready.out_ids, [65]);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            StreamChunk::Token { id: 65, .. }
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        rx.close();
+        assert!(!gpu_prefill_should_yield(false, false, slot.as_ref()));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_cold_prefill_continues_after_first_token_finishes_or_cancels() {
+        let bundle = prefill_test_bundle("finished");
+        for (stop_ids, max_tokens, cancel) in [
+            (&[65][..], 4, false),
+            (&[][..], 1, false),
+            (&[][..], 4, true),
+        ] {
+            let (mut slot, mut rx) = prefill_test_slot();
+            slot.as_mut().unwrap().gen.max_tokens = max_tokens;
+            if cancel {
+                rx.close();
+            }
+            let mut tokens = 0;
+            handle_produced_token(
+                &mut slot,
+                &None,
+                &bundle,
+                65,
+                1,
+                &mut tokens,
+                Some(stop_ids),
+            );
+            assert!(slot.is_none());
+            assert!(!gpu_prefill_should_yield(false, false, slot.as_ref()));
+            assert!(!gpu_prefill_should_yield(false, true, slot.as_ref()));
+            assert!(gpu_prefill_should_yield(true, false, slot.as_ref()));
+        }
     }
 
     #[cfg(feature = "hsa")]

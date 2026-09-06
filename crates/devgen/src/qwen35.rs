@@ -1032,6 +1032,14 @@ pub(super) fn run(
     if let Some(section) = prefill_segment_roles(&m) {
         sections.push(section);
     }
+    crate::decode_objects::append(
+        &m,
+        &mut sections,
+        crate::emit_config::active().decode_objects.as_deref(),
+        arch,
+        out,
+    )
+    .unwrap_or_else(|error| panic!("decode objects: {error}"));
     let bytes = if let Some(layer) = c.block {
         use plow_asset::*;
         let full = c.layers[layer];

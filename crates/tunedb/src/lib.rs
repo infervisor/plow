@@ -31,6 +31,7 @@ pub mod gemm;
 pub mod gemv;
 pub mod moe_decode;
 pub mod object;
+pub mod projection;
 pub mod record;
 pub mod sample;
 pub mod store;
