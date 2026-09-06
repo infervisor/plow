@@ -1,0 +1,352 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8097",
+  "model": "/home/lava/llamacpp/gemma-4-26b-a4b-it-q8_0.gguf",
+  "server_models": [
+   "/home/lava/llamacpp/gemma-4-26b-a4b-it-q8_0.gguf"
+  ],
+  "timestamp": "2026-09-06T07:03:06+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8097",
+   "--model",
+   "/home/lava/llamacpp/gemma-4-26b-a4b-it-q8_0.gguf",
+   "--workload",
+   "chat_long",
+   "--concurrency",
+   "8",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/",
+   "--out",
+   "perf-data/cpu-gemma26b/llamacpp/results-q8_0-cl8.json",
+   "--md",
+   "perf-data/cpu-gemma26b/llamacpp/results-q8_0-cl8.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "chat_long",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 51.95963242399739,
+    "ttft_s": {
+     "mean": 28.26181322012326,
+     "p50": 43.811362026994175,
+     "p90": 43.940078826999525,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.13034997850828178,
+     "p50": 0.13075577855557813,
+     "p90": 0.1309618470357756,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 36.03995698024937,
+     "p50": 49.660312114996486,
+     "p90": 51.776856493001105,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 398.25,
+     "p50": 470,
+     "p90": 512,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 60.375,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 483,
+    "output_tok_per_s": 9.29567776882363,
+    "req_per_s": 0.15396567733041208,
+    "finish_reasons": {
+     "stop": 3,
+     "length": 5
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 51.95963242399739,
+     "ttft_s": {
+      "mean": 28.26181322012326,
+      "p50": 43.811362026994175,
+      "p90": 43.940078826999525,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.13034997850828178,
+      "p50": 0.13075577855557813,
+      "p90": 0.1309618470357756,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 36.03995698024937,
+      "p50": 49.660312114996486,
+      "p90": 51.776856493001105,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 398.25,
+      "p50": 470,
+      "p90": 512,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 60.375,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 483,
+     "output_tok_per_s": 9.29567776882363,
+     "req_per_s": 0.15396567733041208,
+     "finish_reasons": {
+      "stop": 3,
+      "length": 5
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 43.94256896299339,
+     "tpot_s": 0.1309618470357756,
+     "latency_s": 51.39192500599893,
+     "output_tokens": 57,
+     "content_chunks": 55,
+     "finish_reason": "stop",
+     "usage": {
+      "completion_tokens": 57,
+      "prompt_tokens": 528,
+      "total_tokens": 585,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The passage recommends keeping an emergency fund in a",
+     "text_chars": 281,
+     "index": 0,
+     "kind": "chat_long",
+     "t_start": 1788678193.0884056,
+     "prompt_tokens_client": 512,
+     "prompt_tokens_server": 528,
+     "prompt_chars": 2651,
+     "prompt_tokens": 512
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.649119148001773,
+     "tpot_s": 0.13074424247615896,
+     "latency_s": 20.886060272998293,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 397,
+      "total_tokens": 461,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>An escapement is the core mechanism of a mechanical c",
+     "text_chars": 327,
+     "index": 1,
+     "kind": "chat_long",
+     "t_start": 1788678193.0886264,
+     "prompt_tokens_client": 381,
+     "prompt_tokens_server": 397,
+     "prompt_chars": 1824,
+     "prompt_tokens": 381
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.645898677998048,
+     "tpot_s": 0.13076214506353218,
+     "latency_s": 20.883983653999167,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 246,
+      "total_tokens": 310,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>*Disclaimer: I am an AI, not a professional apiarist.",
+     "text_chars": 317,
+     "index": 2,
+     "kind": "chat_long",
+     "t_start": 1788678193.0899887,
+     "prompt_tokens_client": 230,
+     "prompt_tokens_server": 246,
+     "prompt_chars": 1035,
+     "prompt_tokens": 230
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 43.81447402699996,
+     "tpot_s": 0.12879481285247002,
+     "latency_s": 51.776856493001105,
+     "output_tokens": 62,
+     "content_chunks": 60,
+     "finish_reason": "stop",
+     "usage": {
+      "completion_tokens": 62,
+      "prompt_tokens": 486,
+      "total_tokens": 548,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>A swarm decides where to move once scout bees have se",
+     "text_chars": 318,
+     "index": 3,
+     "kind": "chat_long",
+     "t_start": 1788678193.0901186,
+     "prompt_tokens_client": 470,
+     "prompt_tokens_server": 486,
+     "prompt_chars": 2273,
+     "prompt_tokens": 470
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 43.811362026994175,
+     "tpot_s": 0.1328336468604691,
+     "latency_s": 49.660312114996486,
+     "output_tokens": 44,
+     "content_chunks": 42,
+     "finish_reason": "stop",
+     "usage": {
+      "completion_tokens": 44,
+      "prompt_tokens": 494,
+      "total_tokens": 538,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The provided text does not mention a tide; the river ",
+     "text_chars": 216,
+     "index": 4,
+     "kind": "chat_long",
+     "t_start": 1788678193.0908232,
+     "prompt_tokens_client": 478,
+     "prompt_tokens_server": 494,
+     "prompt_chars": 2148,
+     "prompt_tokens": 478
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.64698589299951,
+     "tpot_s": 0.13075577855557813,
+     "latency_s": 20.88465702100075,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 266,
+      "total_tokens": 330,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The \"flat\" taste you are experiencing is a classic sy",
+     "text_chars": 307,
+     "index": 5,
+     "kind": "chat_long",
+     "t_start": 1788678193.0909173,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 266,
+     "prompt_chars": 1105,
+     "prompt_tokens": 250
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 43.940078826999525,
+     "tpot_s": 0.12722043780954592,
+     "latency_s": 51.95507066199934,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 631,
+      "total_tokens": 695,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>Spring tides and neap tides differ in their tidal ran",
+     "text_chars": 324,
+     "index": 6,
+     "kind": "chat_long",
+     "t_start": 1788678193.0910058,
+     "prompt_tokens_client": 615,
+     "prompt_tokens_server": 631,
+     "prompt_chars": 2855,
+     "prompt_tokens": 615
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.644018197999685,
+     "tpot_s": 0.13072691741272427,
+     "latency_s": 20.8807906180009,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 266,
+      "total_tokens": 330,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>### The \"Customer Perspective\": Why Freshness Matters",
+     "text_chars": 257,
+     "index": 7,
+     "kind": "chat_long",
+     "t_start": 1788678193.0911956,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 266,
+     "prompt_chars": 1085,
+     "prompt_tokens": 250
+    }
+   ]
+  }
+ ]
+}

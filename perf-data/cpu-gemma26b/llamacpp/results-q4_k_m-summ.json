@@ -1,0 +1,1274 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8097",
+  "model": "/home/lava/llamacpp/gemma-4-26b-a4b-it-q4_k_m.gguf",
+  "server_models": [
+   "/home/lava/llamacpp/gemma-4-26b-a4b-it-q4_k_m.gguf"
+  ],
+  "timestamp": "2026-09-06T07:30:13+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8097",
+   "--model",
+   "/home/lava/llamacpp/gemma-4-26b-a4b-it-q4_k_m.gguf",
+   "--workload",
+   "summarize",
+   "--concurrency",
+   "1,2,4,8",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/",
+   "--out",
+   "perf-data/cpu-gemma26b/llamacpp/results-q4_k_m-summ.json",
+   "--md",
+   "perf-data/cpu-gemma26b/llamacpp/results-q4_k_m-summ.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "summarize",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 118.02239026399911,
+    "ttft_s": {
+     "mean": 11.237459719876824,
+     "p50": 12.650370372000907,
+     "p90": 14.3411676800024,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.05574179167855156,
+     "p50": 0.05612544888884129,
+     "p90": 0.05627731666662305,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 14.7497031993762,
+     "p50": 16.236617750000732,
+     "p90": 17.88456858399877,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1105.125,
+     "p50": 1243,
+     "p90": 1411,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 4.338159893683984,
+    "req_per_s": 0.06778374833881225,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 118.02239026399911,
+     "ttft_s": {
+      "mean": 11.237459719876824,
+      "p50": 12.650370372000907,
+      "p90": 14.3411676800024,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.05574179167855156,
+      "p50": 0.05612544888884129,
+      "p90": 0.05627731666662305,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 14.7497031993762,
+      "p50": 16.236617750000732,
+      "p90": 17.88456858399877,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1105.125,
+      "p50": 1243,
+      "p90": 1411,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 4.338159893683984,
+     "req_per_s": 0.06778374833881225,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 8.707058403997507,
+     "tpot_s": 0.054249215809538745,
+     "latency_s": 12.125232302001677,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 828,
+      "total_tokens": 892,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>Here is a summary of the article:\n\n* **Early Timekeep",
+     "text_chars": 342,
+     "index": 0,
+     "kind": "summarize",
+     "t_start": 1788679832.462446,
+     "prompt_tokens_client": 812,
+     "prompt_tokens_server": 828,
+     "prompt_chars": 3908,
+     "prompt_tokens": 812
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 15.169366540001647,
+     "tpot_s": 0.055946029618979314,
+     "latency_s": 18.69452404799813,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1427,
+      "total_tokens": 1491,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>**Summary**\nThe provided text explores the geological",
+     "text_chars": 390,
+     "index": 1,
+     "kind": "summarize",
+     "t_start": 1788679844.5901942,
+     "prompt_tokens_client": 1411,
+     "prompt_tokens_server": 1427,
+     "prompt_chars": 7075,
+     "prompt_tokens": 1411
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 14.3411676800024,
+     "tpot_s": 0.056235541238117824,
+     "latency_s": 17.88456858399877,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1343,
+      "total_tokens": 1407,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The article describes the seasonal lifecycle of a hon",
+     "text_chars": 294,
+     "index": 2,
+     "kind": "summarize",
+     "t_start": 1788679863.2885602,
+     "prompt_tokens_client": 1327,
+     "prompt_tokens_server": 1343,
+     "prompt_chars": 6348,
+     "prompt_tokens": 1327
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 7.527993857002002,
+     "tpot_s": 0.054120375682523154,
+     "latency_s": 10.937816967001709,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 709,
+      "total_tokens": 773,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>**Summary**\nThe production of coffee is a complex, la",
+     "text_chars": 351,
+     "index": 3,
+     "kind": "summarize",
+     "t_start": 1788679881.1764917,
+     "prompt_tokens_client": 693,
+     "prompt_tokens_server": 709,
+     "prompt_chars": 3460,
+     "prompt_tokens": 693
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 9.85741041500296,
+     "tpot_s": 0.05627731666662305,
+     "latency_s": 13.403420155998901,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1150,
+      "total_tokens": 1214,
+      "prompt_tokens_details": {
+       "cached_tokens": 192
+      }
+     },
+     "text_head": "<|channel>thought<channel|>### Summary\n\nThe provided text consists of two distin",
+     "text_chars": 321,
+     "index": 4,
+     "kind": "summarize",
+     "t_start": 1788679892.1165304,
+     "prompt_tokens_client": 1134,
+     "prompt_tokens_server": 1150,
+     "prompt_chars": 5429,
+     "prompt_tokens": 1134
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 8.272599128002184,
+     "tpot_s": 0.05612544888884129,
+     "latency_s": 11.809096123004565,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 793,
+      "total_tokens": 857,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|># The Lifecycle and Management of a Honeybee Colony\n\n",
+     "text_chars": 354,
+     "index": 5,
+     "kind": "summarize",
+     "t_start": 1788679905.523094,
+     "prompt_tokens_client": 777,
+     "prompt_tokens_server": 793,
+     "prompt_chars": 3759,
+     "prompt_tokens": 777
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.650370372000907,
+     "tpot_s": 0.05691551409524566,
+     "latency_s": 16.236617750000732,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1460,
+      "total_tokens": 1524,
+      "prompt_tokens_details": {
+       "cached_tokens": 276
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The article describes the seasonal life cycle of a ho",
+     "text_chars": 337,
+     "index": 6,
+     "kind": "summarize",
+     "t_start": 1788679917.334569,
+     "prompt_tokens_client": 1444,
+     "prompt_tokens_server": 1460,
+     "prompt_chars": 7044,
+     "prompt_tokens": 1444
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 13.373711363004986,
+     "tpot_s": 0.05606489142854347,
+     "latency_s": 16.90634966500511,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1259,
+      "total_tokens": 1323,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>This article explores the historical evolution of pre",
+     "text_chars": 384,
+     "index": 7,
+     "kind": "summarize",
+     "t_start": 1788679933.5749602,
+     "prompt_tokens_client": 1243,
+     "prompt_tokens_server": 1259,
+     "prompt_chars": 6126,
+     "prompt_tokens": 1243
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 119.48095584000112,
+    "ttft_s": {
+     "mean": 23.240658175250246,
+     "p50": 23.612774658999115,
+     "p90": 25.6305942540057,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.1051769868730382,
+     "p50": 0.11272519679371885,
+     "p90": 0.11615898625394847,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 29.86706405962468,
+     "p50": 30.411786202996154,
+     "p90": 32.948733928002184,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1119.125,
+     "p50": 1187,
+     "p90": 1223,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 4.285201741151347,
+    "req_per_s": 0.0669562772054898,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 119.48095584000112,
+     "ttft_s": {
+      "mean": 23.240658175250246,
+      "p50": 23.612774658999115,
+      "p90": 25.6305942540057,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.1051769868730382,
+      "p50": 0.11272519679371885,
+      "p90": 0.11615898625394847,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 29.86706405962468,
+      "p50": 30.411786202996154,
+      "p90": 32.948733928002184,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1119.125,
+      "p50": 1187,
+      "p90": 1223,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 4.285201741151347,
+     "req_per_s": 0.0669562772054898,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 25.63090594499954,
+     "tpot_s": 0.11621657360321103,
+     "latency_s": 32.95262722299958,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1239,
+      "total_tokens": 1303,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The article provides guidance on household budgeting,",
+     "text_chars": 383,
+     "index": 8,
+     "kind": "summarize",
+     "t_start": 1788679954.9831233,
+     "prompt_tokens_client": 1223,
+     "prompt_tokens_server": 1239,
+     "prompt_chars": 6181,
+     "prompt_tokens": 1223
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 25.6305942540057,
+     "tpot_s": 0.11615898625394847,
+     "latency_s": 32.948733928002184,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1203,
+      "total_tokens": 1267,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>Here is a summary of the article:\n\n* **The Role of th",
+     "text_chars": 342,
+     "index": 9,
+     "kind": "summarize",
+     "t_start": 1788679954.983394,
+     "prompt_tokens_client": 1187,
+     "prompt_tokens_server": 1203,
+     "prompt_chars": 5793,
+     "prompt_tokens": 1187
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 20.425593148996995,
+     "tpot_s": 0.097582736619058,
+     "latency_s": 26.573743942994042,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 961,
+      "total_tokens": 1025,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>### Summary\n\nThe article traces the evolution of time",
+     "text_chars": 366,
+     "index": 10,
+     "kind": "summarize",
+     "t_start": 1788679987.935365,
+     "prompt_tokens_client": 945,
+     "prompt_tokens_server": 961,
+     "prompt_chars": 4566,
+     "prompt_tokens": 945
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 20.31569869100349,
+     "tpot_s": 0.09794869919047443,
+     "latency_s": 26.48693829200056,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1188,
+      "total_tokens": 1252,
+      "prompt_tokens_details": {
+       "cached_tokens": 311
+      }
+     },
+     "text_head": "<|channel>thought<channel|># Evolution of Measurement and Management\n\n* **Techno",
+     "text_chars": 362,
+     "index": 11,
+     "kind": "summarize",
+     "t_start": 1788679987.938392,
+     "prompt_tokens_client": 1172,
+     "prompt_tokens_server": 1188,
+     "prompt_chars": 5720,
+     "prompt_tokens": 1172
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 23.388669977000973,
+     "tpot_s": 0.11272519679371885,
+     "latency_s": 30.49086792300659,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1010,
+      "total_tokens": 1074,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>This text explores the fundamental chemistry and proc",
+     "text_chars": 363,
+     "index": 12,
+     "kind": "summarize",
+     "t_start": 1788680014.4283595,
+     "prompt_tokens_client": 994,
+     "prompt_tokens_server": 1010,
+     "prompt_chars": 4942,
+     "prompt_tokens": 994
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 23.305232947997865,
+     "tpot_s": 0.11280002652381968,
+     "latency_s": 30.411786202996154,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1224,
+      "total_tokens": 1288,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>Here is a summary of the article:\n\n* **Glacial Erosio",
+     "text_chars": 319,
+     "index": 13,
+     "kind": "summarize",
+     "t_start": 1788680014.5117266,
+     "prompt_tokens_client": 1208,
+     "prompt_tokens_server": 1224,
+     "prompt_chars": 5923,
+     "prompt_tokens": 1208
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 23.61579577899829,
+     "tpot_s": 0.09396847134924009,
+     "latency_s": 29.535983059999126,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1379,
+      "total_tokens": 1443,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>**Summary**\nThe tides are caused by the gravitational",
+     "text_chars": 386,
+     "index": 14,
+     "kind": "summarize",
+     "t_start": 1788680044.9221609,
+     "prompt_tokens_client": 1363,
+     "prompt_tokens_server": 1379,
+     "prompt_chars": 6617,
+     "prompt_tokens": 1363
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 23.612774658999115,
+     "tpot_s": 0.09401520465083497,
+     "latency_s": 29.535831904999213,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 877,
+      "total_tokens": 941,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>This text explains the biological and chemical proces",
+     "text_chars": 346,
+     "index": 15,
+     "kind": "summarize",
+     "t_start": 1788680044.926076,
+     "prompt_tokens_client": 861,
+     "prompt_tokens_server": 877,
+     "prompt_chars": 4337,
+     "prompt_tokens": 861
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 119.3879223460026,
+    "ttft_s": {
+     "mean": 50.45322783725078,
+     "p50": 54.423747278997325,
+     "p90": 54.78202187699935,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.14587075825791487,
+     "p50": 0.14441462895231938,
+     "p90": 0.14645682782533445,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 59.64335944362574,
+     "p50": 63.64648518600006,
+     "p90": 63.75876549100212,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1178.125,
+     "p50": 1205,
+     "p90": 1397,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 4.288541000957816,
+    "req_per_s": 0.06700845313996588,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 119.3879223460026,
+     "ttft_s": {
+      "mean": 50.45322783725078,
+      "p50": 54.423747278997325,
+      "p90": 54.78202187699935,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.14587075825791487,
+      "p50": 0.14441462895231938,
+      "p90": 0.14645682782533445,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 59.64335944362574,
+      "p50": 63.64648518600006,
+      "p90": 63.75876549100212,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1178.125,
+      "p50": 1205,
+      "p90": 1397,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 4.288541000957816,
+     "req_per_s": 0.06700845313996588,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 54.42439678200026,
+     "tpot_s": 0.14645682782533445,
+     "latency_s": 63.65126099900226,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1221,
+      "total_tokens": 1285,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>### Summary\n\nThe provided text consists of two distin",
+     "text_chars": 359,
+     "index": 16,
+     "kind": "summarize",
+     "t_start": 1788680079.1870687,
+     "prompt_tokens_client": 1205,
+     "prompt_tokens_server": 1221,
+     "prompt_chars": 5985,
+     "prompt_tokens": 1205
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 54.955627740004275,
+     "tpot_s": 0.1600003563651135,
+     "latency_s": 65.0357897960057,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1099,
+      "total_tokens": 1163,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>**Summary**\nThe invention of the printing press revol",
+     "text_chars": 385,
+     "index": 17,
+     "kind": "summarize",
+     "t_start": 1788680079.1873345,
+     "prompt_tokens_client": 1083,
+     "prompt_tokens_server": 1099,
+     "prompt_chars": 5472,
+     "prompt_tokens": 1083
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 54.423747278997325,
+     "tpot_s": 0.14639053998412455,
+     "latency_s": 63.64648518600006,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1413,
+      "total_tokens": 1477,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|># The Impact of Glacial Erosion and the Printing Pres",
+     "text_chars": 321,
+     "index": 18,
+     "kind": "summarize",
+     "t_start": 1788680079.18767,
+     "prompt_tokens_client": 1397,
+     "prompt_tokens_server": 1413,
+     "prompt_chars": 7053,
+     "prompt_tokens": 1397
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 54.78202187699935,
+     "tpot_s": 0.14247853247624812,
+     "latency_s": 63.75876549100212,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1481,
+      "total_tokens": 1545,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>Here is a summary of the article:\n\n* **Glacial Format",
+     "text_chars": 335,
+     "index": 19,
+     "kind": "summarize",
+     "t_start": 1788680079.1884258,
+     "prompt_tokens_client": 1465,
+     "prompt_tokens_server": 1481,
+     "prompt_chars": 7150,
+     "prompt_tokens": 1465
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 46.51440175100288,
+     "tpot_s": 0.1442773358412235,
+     "latency_s": 55.604418980001356,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 821,
+      "total_tokens": 885,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>### Summary\n\nThe article traces the journey of coffee",
+     "text_chars": 349,
+     "index": 20,
+     "kind": "summarize",
+     "t_start": 1788680142.8377695,
+     "prompt_tokens_client": 805,
+     "prompt_tokens_server": 821,
+     "prompt_chars": 4018,
+     "prompt_tokens": 805
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 46.51151004900021,
+     "tpot_s": 0.14441462895231938,
+     "latency_s": 55.60971132099803,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1258,
+      "total_tokens": 1322,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The article covers two distinct topics. First, it exp",
+     "text_chars": 339,
+     "index": 21,
+     "kind": "summarize",
+     "t_start": 1788680142.8413556,
+     "prompt_tokens_client": 1242,
+     "prompt_tokens_server": 1258,
+     "prompt_chars": 6176,
+     "prompt_tokens": 1242
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 46.40103685500071,
+     "tpot_s": 0.14434383434912426,
+     "latency_s": 55.49521995699615,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1124,
+      "total_tokens": 1188,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>**Summary**\nThe provided text explores the scientific",
+     "text_chars": 390,
+     "index": 22,
+     "kind": "summarize",
+     "t_start": 1788680142.951187,
+     "prompt_tokens_client": 1108,
+     "prompt_tokens_server": 1124,
+     "prompt_chars": 5420,
+     "prompt_tokens": 1108
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 45.613080365001224,
+     "tpot_s": 0.13860401026983118,
+     "latency_s": 54.34522381900024,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1136,
+      "total_tokens": 1200,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The provided text consists of two distinct articles: ",
+     "text_chars": 415,
+     "index": 23,
+     "kind": "summarize",
+     "t_start": 1788680144.22677,
+     "prompt_tokens_client": 1120,
+     "prompt_tokens_server": 1136,
+     "prompt_chars": 5489,
+     "prompt_tokens": 1120
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 86.86463525799627,
+    "ttft_s": {
+     "mean": 48.026729733996945,
+     "p50": 71.6530168859972,
+     "p90": 77.71518703599577,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.1901601235357457,
+     "p50": 0.14839344725404527,
+     "p90": 0.2362064141111443,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 60.00734486499914,
+     "p50": 86.53509216399834,
+     "p90": 86.80391957199754,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1133.0,
+     "p50": 1122,
+     "p90": 1366,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 5.894228398925651,
+    "req_per_s": 0.0920973187332133,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 86.86463525799627,
+     "ttft_s": {
+      "mean": 48.026729733996945,
+      "p50": 71.6530168859972,
+      "p90": 77.71518703599577,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.1901601235357457,
+      "p50": 0.14839344725404527,
+      "p90": 0.2362064141111443,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 60.00734486499914,
+      "p50": 86.53509216399834,
+      "p90": 86.80391957199754,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1133.0,
+      "p50": 1122,
+      "p90": 1366,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 5.894228398925651,
+     "req_per_s": 0.0920973187332133,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 77.34249663399532,
+     "tpot_s": 0.14839344725404527,
+     "latency_s": 86.6913770530009,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1127,
+      "total_tokens": 1191,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The article covers two distinct subjects. First, it d",
+     "text_chars": 322,
+     "index": 24,
+     "kind": "summarize",
+     "t_start": 1788680203.9505935,
+     "prompt_tokens_client": 1111,
+     "prompt_tokens_server": 1127,
+     "prompt_chars": 5567,
+     "prompt_tokens": 1111
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 71.6530168859972,
+     "tpot_s": 0.2362064141111443,
+     "latency_s": 86.53509216399834,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1382,
+      "total_tokens": 1446,
+      "prompt_tokens_details": {
+       "cached_tokens": 671
+      }
+     },
+     "text_head": "<|channel>thought<channel|>Here is a summary of the article:\n\n* **Evolution of T",
+     "text_chars": 334,
+     "index": 25,
+     "kind": "summarize",
+     "t_start": 1788680203.9508533,
+     "prompt_tokens_client": 1366,
+     "prompt_tokens_server": 1382,
+     "prompt_chars": 6563,
+     "prompt_tokens": 1366
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 77.71518703599577,
+     "tpot_s": 0.1442640972857748,
+     "latency_s": 86.80391957199754,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1528,
+      "total_tokens": 1592,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>The article details the evolution of steam engines, f",
+     "text_chars": 268,
+     "index": 26,
+     "kind": "summarize",
+     "t_start": 1788680203.9510677,
+     "prompt_tokens_client": 1512,
+     "prompt_tokens_server": 1528,
+     "prompt_chars": 7308,
+     "prompt_tokens": 1512
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 77.85143623699696,
+     "tpot_s": 0.1429987629523985,
+     "latency_s": 86.86046809999971,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1138,
+      "total_tokens": 1202,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>### Summary\n\nThe article explores the historical evol",
+     "text_chars": 396,
+     "index": 27,
+     "kind": "summarize",
+     "t_start": 1788680203.9515867,
+     "prompt_tokens_client": 1122,
+     "prompt_tokens_server": 1138,
+     "prompt_chars": 5371,
+     "prompt_tokens": 1122
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 19.69596956299938,
+     "tpot_s": 0.1442314860159679,
+     "latency_s": 28.782616376003716,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 784,
+      "total_tokens": 848,
+      "prompt_tokens_details": {
+       "cached_tokens": 741
+      }
+     },
+     "text_head": "<|channel>thought<channel|>This article explains how glaciers form and reshape l",
+     "text_chars": 390,
+     "index": 28,
+     "kind": "summarize",
+     "t_start": 1788680203.9519286,
+     "prompt_tokens_client": 768,
+     "prompt_tokens_server": 784,
+     "prompt_chars": 3835,
+     "prompt_tokens": 768
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 20.208845966997615,
+     "tpot_s": 0.37482227119044326,
+     "latency_s": 43.8227786790012,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1059,
+      "total_tokens": 1123,
+      "prompt_tokens_details": {
+       "cached_tokens": 7
+      }
+     },
+     "text_head": "<|channel>thought<channel|>### Summary\n\nThe provided text consists of two distin",
+     "text_chars": 325,
+     "index": 29,
+     "kind": "summarize",
+     "t_start": 1788680203.95237,
+     "prompt_tokens_client": 1043,
+     "prompt_tokens_server": 1059,
+     "prompt_chars": 5151,
+     "prompt_tokens": 1043
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 20.053026268993563,
+     "tpot_s": 0.18614992363498978,
+     "latency_s": 31.782985385994834,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 1353,
+      "total_tokens": 1417,
+      "prompt_tokens_details": {
+       "cached_tokens": 704
+      }
+     },
+     "text_head": "<|channel>thought<channel|>Here is a summary of the article:\n\n* **Evolution of L",
+     "text_chars": 381,
+     "index": 30,
+     "kind": "summarize",
+     "t_start": 1788680203.9525533,
+     "prompt_tokens_client": 1337,
+     "prompt_tokens_server": 1353,
+     "prompt_chars": 6535,
+     "prompt_tokens": 1337
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 19.693859279999742,
+     "tpot_s": 0.1442145858412019,
+     "latency_s": 28.779521589996875,
+     "output_tokens": 64,
+     "content_chunks": 63,
+     "finish_reason": "length",
+     "usage": {
+      "completion_tokens": 64,
+      "prompt_tokens": 821,
+      "total_tokens": 885,
+      "prompt_tokens_details": {
+       "cached_tokens": 816
+      }
+     },
+     "text_head": "<|channel>thought<channel|>### Summary\n\nThe article traces the journey of coffee",
+     "text_chars": 349,
+     "index": 31,
+     "kind": "summarize",
+     "t_start": 1788680203.9526806,
+     "prompt_tokens_client": 805,
+     "prompt_tokens_server": 821,
+     "prompt_chars": 4018,
+     "prompt_tokens": 805
+    }
+   ]
+  }
+ ]
+}
