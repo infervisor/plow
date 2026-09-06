@@ -48,3 +48,25 @@ Same seeded bench-api workloads (64 output tokens, 8 requests per cell, rag_4k 4
 | 2 | 26060 / 748 / 1.7 | 24692 / 615 / 1.9 | 10658 / 597 / 2.7 | err 8 | 1859 / 286 / 6.4 | 1799 / 257 / 4.2 |
 | 4 | - | - | - | err 8 | 3105 / 400 / 4.9 | 2179 / 364 / 8.8 |
 | 8 | - | - | - | err 8 | 3326 / 984 / 6.2 | 3495 / 1027 / 6.1 |
+
+## Gemma-4-12B, all data types, current kernels (13:0x-13:2x)
+
+plow served through `plowrt serve --cpu-threads 16`, fresh prompts, one server at a time, with
+the optimized kernels (commit 25e0875). llama.cpp decode is its c=1 figure for the matching
+quantization; vLLM is the recorded bf16 CPU run (it has no fp8 or MXFP4 CPU path, so its one
+row is the comparison for every plow data type). Raw: `g12b-*-chat.md`.
+
+| data type | plow decode ms (c=1) | llama.cpp | vLLM bf16 | margin vs llama | margin vs vLLM |
+|---|---|---|---|---|---|
+| bf16 | 232 | 267 (bf16 GGUF) | 516 | 1.15x | 2.2x |
+| fp8 | 133 | 133 (Q8_0) | 516 | 1.00x | 3.9x |
+| mxfp4 | 88 | 121 (Q4_K_M) | 516 | 1.38x | 5.9x |
+
+All three data types beat vLLM by 2.2-5.9x, because vLLM's CPU GEMM stays in its blocked oneDNN
+form at batch 1. Against llama.cpp, bf16 and MXFP4 win by 1.15x and 1.38x, and **fp8 is a tie**
+(133 vs 133 ms). That tie is a scheduling limit, not a kernel one: profiling the fp8 decode step
+shows workers busy 111.4 of 125.5 ms, well balanced (109.8-114.9), and during that busy time the
+GEMV reads 13 GB of weights at 117 GB/s, i.e. at the measured memory roofline. The 11% idle is
+pipeline fill and drain across the 48 layer boundaries. Closing it would give ~118 ms and a 1.13x
+margin; the byte counts cap it there, since our fp8 weights are 12.0 GB against Q8_0's 12.75 GB.
+MXFP4 is the data type where the margin is real, and it is also our fastest configuration.
