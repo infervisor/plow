@@ -616,8 +616,7 @@ struct PacketRole {
     function: KernelFn,
     smem: u32,
     block: u32,
-    _module: Option<Module>,
-    _owned_module: Option<Arc<DecodeModule>>,
+    _module: Arc<DecodeModule>,
 }
 
 fn check_fp8_gemm_role(capability: Option<u32>, block: Option<u32>) -> Result<()> {
@@ -4053,7 +4052,7 @@ impl GpuEngine {
             let path = assets_dir.join(&object.file);
             let image = std::fs::read(&path)
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
-            let module = be.module_load(&image)?;
+            let module = DecodeModule::load(&be, &image)?;
             if pf_batch_env
                 && packed_prefill.is_some()
                 && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)? != Some(1)
@@ -4103,8 +4102,7 @@ impl GpuEngine {
                 function,
                 smem,
                 block,
-                _module: Some(module),
-                _owned_module: None,
+                _module: module,
             });
         }
 
@@ -7772,13 +7770,7 @@ impl Drop for GpuEngine {
             self.be.graph_destroy(g);
         }
         for role in &mut self.packet_roles {
-            if let Some(role) = role.take() {
-                if let Some(module) = role._module {
-                    if let Err(e) = self.be.module_unload(&module) {
-                        report(&e, "unload packet role module");
-                    }
-                }
-            }
+            drop(role.take());
         }
         if let Some(sp) = self.seg_pf.take() {
             if let Some(small) = sp.small_gemm {

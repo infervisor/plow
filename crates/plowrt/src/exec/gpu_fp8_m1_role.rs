@@ -68,8 +68,7 @@ pub(super) fn load_fp8_m1_role(
             function,
             smem,
             block: 256,
-            _module: None,
-            _owned_module: Some(module),
+            _module: module,
         }),
         Err(e) => Err(e),
     }
