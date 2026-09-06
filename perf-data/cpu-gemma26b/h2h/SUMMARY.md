@@ -69,3 +69,34 @@ grouped expert pass has fewer rows per expert than its block-aligned one.
 Single-stream cpu_bench (batch 1, 16 threads): decode p50 37.2-39.5 ms, prefill 107.6 / 146.2 / 177.2 tok/s at
 64 / 128 / 512 prompt tokens. Chat answer: 'Paris' (HF reference: 'Paris'). Block-0 vs HF hidden states:
 mean|d| 0.0245 on mean|x| 0.426 (5.8%), against 0.6% for bf16 — ordinary 4-bit quantization noise.
+
+
+## Final: balanced MoE prefill (commit 25e0875, 12:5x)
+
+Same two prefill fixes as GPT-OSS (dequant hoisted out of the token-block loop, slice split weighted
+by rows per expert), which matter more here because the 26B has 128 experts. Prefill at 64/128/512
+prompt tokens: 128.8 / 171.1 / 201.5 tok/s (was 107.6 / 146.2 / 177.2). Single-stream decode p50
+36.7-38.9 ms. Raw: `g26b-bal-*.md`. Bold = best of the three.
+
+| workload | conc | plow TTFT | Q8_0 TTFT | Q4_K_M TTFT | plow TPOT | Q8_0 TPOT | Q4_K_M TPOT |
+|---|---|---|---|---|---|---|---|
+| chat_short | 1 | **464** | 739 | 649 | **41** | 56 | 50 |
+| chat_short | 2 | **703** | 1351 | 1226 | **65** | 84 | 80 |
+| chat_short | 4 | **1111** | 2852 | 2508 | **102** | 115 | 107 |
+| chat_short | 8 | **2370** | 7024 | 6492 | 151 | 119 | **105** |
+| chat_long | 1 | **2222** | 4532 | 4187 | **43** | 56 | 52 |
+| chat_long | 2 | **3307** | 6252 | 7009 | **86** | 159 | 125 |
+| chat_long | 4 | **3949** | 13887 | 12936 | 152 | 126 | **119** |
+| chat_long | 8 | **9336** | 28262 | 29015 | 308 | 130 | **118** |
+| code | 1 | **1999** | 4221 | 3858 | **43** | 60 | 52 |
+| code | 2 | **3166** | 8636 | 7914 | **75** | 112 | 90 |
+| code | 4 | **4681** | 18089 | 16867 | 155 | 131 | **120** |
+| code | 8 | **8665** | 27944 | 26328 | 248 | 132 | **119** |
+| summarize | 1 | **6021** | 12084 | 11237 | **45** | 63 | 56 |
+| summarize | 2 | **7003** | 24992 | 23241 | 147 | **102** | 105 |
+| summarize | 4 | **11838** | 54272 | 50453 | 323 | 159 | **146** |
+| summarize | 8 | **27414** | 56278 | 48027 | 507 | 227 | **190** |
+
+plow wins every TTFT cell (1.4-6.1x) and every c=1 and c=2 decode cell. At c>=4 llama.cpp wins
+decode: its TPOT is nearly flat in batch (105-130 ms at c=8) while ours grows, because a decode step
+still waits behind other slots' whole-prompt prefills. Same fix as GPT-OSS.

@@ -152,3 +152,36 @@ against vLLM at c<=4 on short prompts. vLLM still wins long-prompt TTFT and ever
 long prompts: it runs prefill and decode tokens in ONE mixed forward (chunked prefill, 2048-token
 budget), so decode never waits behind a whole prompt. That scheduling change, not kernel speed, is the
 remaining gap — plow's own kernels are now at 1.2-2.2x their previous throughput per op.
+
+
+## Final: balanced MoE prefill (commit 25e0875, 12:4x)
+
+Two structural fixes to the MXFP4 MoE prefill kernels landed after the kernel pass: the weight
+dequant was hoisted out of the token-block loop (it was re-unpacking each expert matrix per 32-token
+block), and the slice split is now weighted by rows per expert (an even column split left threads
+50% idle with a 1.5x spread). GPT-OSS prefill at 512 tokens went 226 -> 403 tok/s and the prefill
+wall for one 512-token pass went 11.0 s -> 1.24 s. Raw: `plow/gptoss-bal-*.md`. Bold = best.
+
+| workload | conc | plow TTFT | llama TTFT | vLLM TTFT | plow TPOT | llama TPOT | vLLM TPOT |
+|---|---|---|---|---|---|---|---|
+| chat_short | 1 | **447** | 748 | 637 | **29** | 41 | 71 |
+| chat_short | 2 | **637** | 1625 | 1220 | **53** | 65 | 95 |
+| chat_short | 4 | **1034** | 3059 | 1657 | **92** | 104 | 103 |
+| chat_short | 8 | 2249 | 5260 | **2120** | 152 | 177 | **136** |
+| chat_long | 1 | **1126** | 4823 | 1346 | **30** | 51 | 71 |
+| chat_long | 2 | **1626** | 9520 | 1962 | **60** | 81 | 80 |
+| chat_long | 4 | **2097** | 14432 | 2550 | 112 | 133 | **102** |
+| chat_long | 8 | 5184 | 35666 | **4591** | 204 | 215 | **137** |
+| code | 1 | **993** | 4212 | 1253 | **30** | 50 | 76 |
+| code | 2 | **1577** | 8780 | 2151 | **58** | 73 | 81 |
+| code | 4 | **2309** | 18762 | 2944 | **113** | 123 | 115 |
+| code | 8 | 4432 | 35120 | **4156** | 189 | 207 | **152** |
+| summarize | 1 | 2882 | 10693 | **1829** | **31** | 59 | 71 |
+| summarize | 2 | **3332** | 23777 | 3593 | 89 | 113 | **85** |
+| summarize | 4 | **6118** | 57888 | 6735 | 186 | 195 | **116** |
+| summarize | 8 | 13053 | 73138 | **7219** | 308 | 430 | **153** |
+
+plow wins **all 32 cells against llama.cpp**. Against vLLM it wins 11 of 16 TTFT cells and 9 of 16
+TPOT cells: every c=1 and c=2 cell except summarize TTFT at c=1 and TPOT at c=2. vLLM still wins at
+c>=4 on long prompts, where it runs prefill chunks and decode rows in one mixed forward so decode
+never queues behind a prompt; that scheduling change is the remaining structural item.
