@@ -1,3 +1,4 @@
+use crate::aux_program;
 use packet::dev::{PrefillSpan, PREFILL_SPAN_RESET_STATE};
 use packet::devbuild::{SECT_CUBIN, SECT_HSACO, SECT_NAME_LEN, SECT_PROGRAMS};
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,8 @@ type Result<T> = std::result::Result<T, String>;
 
 pub const SECTION: &str = "mixed_step";
 pub const VERSION: u32 = 1;
-pub const PROGRAM_CAPABILITY: &str = "plow.dev-program";
+pub const PROGRAM_CAPABILITY: &str = aux_program::CAPABILITY;
+pub const OBJECT_CAPABILITY: &str = "plow.mixed.interpreter";
 
 fn require(ok: bool, reason: &str) -> Result<()> {
     if ok {
@@ -385,17 +387,13 @@ pub struct ValidatedManifest<'a> {
     manifest: &'a Manifest,
 }
 
+#[derive(Clone, Copy)]
 pub struct Payload<'a> {
     pub section: &'a str,
     pub kind: PayloadKind,
     pub version: u32,
     pub n_cu: u32,
     pub bytes: &'a [u8],
-    /// Capabilities proven by parsing the program payload or reading object
-    /// symbols. Callers must not synthesize this list from the manifest.
-    pub capabilities: &'a [Capability],
-    /// Parsed entry count for `Programs`; `None` for an interpreter object.
-    pub program_count: Option<u32>,
 }
 
 fn identifier(s: &str, max: usize) -> bool {
@@ -427,16 +425,30 @@ impl PayloadBinding {
         )
     }
 
-    pub fn bind(&self, expected_n_cu: u32, payload: &Payload<'_>) -> Result<()> {
+    fn bind_identity(&self, expected_n_cu: u32, payload: &Payload<'_>) -> Result<()> {
         self.validate()?;
         require(
             payload.section == self.section
                 && payload.kind == self.kind
                 && payload.version == self.version
                 && payload.n_cu == expected_n_cu
-                && payload_sha256(payload.bytes) == self.sha256
-                && payload.capabilities.contains(&self.capability),
+                && payload_sha256(payload.bytes) == self.sha256,
             "payload binding",
+        )
+    }
+
+    fn bind_object_with(
+        &self,
+        expected_kind: PayloadKind,
+        expected_n_cu: u32,
+        payload: &Payload<'_>,
+        mut read_capability: impl FnMut(&str) -> Option<u32>,
+    ) -> Result<()> {
+        require(self.kind == expected_kind, "object backend kind")?;
+        self.bind_identity(expected_n_cu, payload)?;
+        require(
+            read_capability(&self.capability.name) == Some(self.capability.version),
+            "object capability",
         )
     }
 }
@@ -463,6 +475,7 @@ impl Manifest {
                     && variant.decode_rows <= self.max_active_requests
                     && shapes.insert((variant.rows, variant.decode_rows))
                     && variant.program.payload.kind == PayloadKind::Programs
+                    && variant.program.payload.version == VERSION
                     && variant.program.payload.capability.name == PROGRAM_CAPABILITY
                     && variant.program.payload.capability.version == VERSION,
                 "variant geometry",
@@ -473,6 +486,9 @@ impl Manifest {
             for object in &variant.objects {
                 require(
                     matches!(object.kind, PayloadKind::Cubin | PayloadKind::Hsaco)
+                        && object.version == VERSION
+                        && object.capability.name == OBJECT_CAPABILITY
+                        && object.capability.version == VERSION
                         && objects.insert((object.kind.section_kind(), object.section.as_str())),
                     "object kind or duplicate",
                 )?;
@@ -641,29 +657,65 @@ impl Variant {
         )
     }
 
-    pub fn bind(
+    pub fn bind_program(
         &self,
         expected_n_cu: u32,
+        tensor_count: usize,
         program: &Payload<'_>,
-        object: Option<&Payload<'_>>,
-    ) -> Result<()> {
-        self.program.payload.bind(expected_n_cu, program)?;
+    ) -> Result<aux_program::Section> {
+        self.program.payload.bind_identity(expected_n_cu, program)?;
         require(
-            program
-                .program_count
-                .is_some_and(|count| self.program.index < count),
+            self.program.payload.kind == PayloadKind::Programs
+                && self.program.payload.capability.name == aux_program::CAPABILITY
+                && self.program.payload.capability.version == aux_program::VERSION,
+            "program capability",
+        )?;
+        let parsed = aux_program::parse(program.bytes, expected_n_cu, tensor_count)?;
+        require(
+            parsed
+                .programs
+                .get(self.program.index as usize)
+                .is_some_and(|p| p.rows == self.rows),
             "auxiliary program index",
         )?;
-        match (self.objects.is_empty(), object) {
-            (true, None) => Ok(()),
-            (false, Some(payload)) => self
-                .objects
-                .iter()
-                .find(|binding| binding.section == payload.section && binding.kind == payload.kind)
-                .ok_or_else(|| "mixed step: undeclared object".to_string())?
-                .bind(expected_n_cu, payload),
-            _ => Err("mixed step: object binding".into()),
-        }
+        Ok(parsed)
+    }
+
+    /// Bind a CUDA object after its adapter has read an actual module or ELF
+    /// capability symbol. The callback maps the backend-neutral capability
+    /// name to the object's initialized u32 value.
+    pub fn bind_cubin_with(
+        &self,
+        expected_n_cu: u32,
+        payload: &Payload<'_>,
+        read_capability: impl FnMut(&str) -> Option<u32>,
+    ) -> Result<()> {
+        self.bind_object_with(PayloadKind::Cubin, expected_n_cu, payload, read_capability)
+    }
+
+    /// HSACO twin of [`Self::bind_cubin_with`]. HSA module symbol lookup stays
+    /// in the runtime adapter; shared policy only compares the proven value.
+    pub fn bind_hsaco_with(
+        &self,
+        expected_n_cu: u32,
+        payload: &Payload<'_>,
+        read_capability: impl FnMut(&str) -> Option<u32>,
+    ) -> Result<()> {
+        self.bind_object_with(PayloadKind::Hsaco, expected_n_cu, payload, read_capability)
+    }
+
+    fn bind_object_with(
+        &self,
+        kind: PayloadKind,
+        expected_n_cu: u32,
+        payload: &Payload<'_>,
+        read_capability: impl FnMut(&str) -> Option<u32>,
+    ) -> Result<()> {
+        self.objects
+            .iter()
+            .find(|binding| binding.section == payload.section && binding.kind == kind)
+            .ok_or_else(|| "mixed step: undeclared object".to_string())?
+            .bind_object_with(kind, expected_n_cu, payload, read_capability)
     }
 }
 
