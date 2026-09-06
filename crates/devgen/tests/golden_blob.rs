@@ -76,6 +76,7 @@ fn emit_with(dir: &Path, ctx: u32, n_cu: u32, tp: u32, rope_gen: bool) -> Vec<u8
         arch: String::new(),
         emit_cfg: None,
         whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        mixed_step: None,
     });
     std::fs::read(&out).unwrap()
 }
@@ -268,6 +269,7 @@ fn the_verification_gate_does_not_change_a_single_emitted_byte() {
             arch: String::new(),
             emit_cfg: None,
             whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+            mixed_step: None,
         },
         Some(Box::new(move |m: &packet::devbuild::Model| {
             // Guards against the test passing because the hook never ran.
@@ -363,6 +365,153 @@ fn gemma_dense_blob_is_stable() {
     );
 }
 
+fn section<'a>(blob: &'a [u8], kind: u32, name: &str) -> &'a [u8] {
+    use packet::devbuild::{BlobSectionEntry, SECT_MAGIC};
+    let dir = u64::from_le_bytes(blob[40..48].try_into().unwrap()) as usize;
+    assert_eq!(&blob[dir..dir + 4], SECT_MAGIC);
+    let count = u32::from_le_bytes(blob[dir + 4..dir + 8].try_into().unwrap()) as usize;
+    let size = std::mem::size_of::<BlobSectionEntry>();
+    for index in 0..count {
+        let at = dir + 8 + index * size;
+        let entry_kind = u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
+        let end = blob[at + 24..at + 48]
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(24);
+        if entry_kind == kind && &blob[at + 24..at + 24 + end] == name.as_bytes() {
+            let off = u64::from_le_bytes(blob[at + 8..at + 16].try_into().unwrap()) as usize;
+            let len = u64::from_le_bytes(blob[at + 16..at + 24].try_into().unwrap()) as usize;
+            return &blob[off..off + len];
+        }
+    }
+    panic!("missing section {kind}:{name}")
+}
+
+#[test]
+fn dense_mixed_step_is_reachable_and_keeps_the_stock_blob_stable_when_absent() {
+    let _g = emit_guard();
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("golden_gemma_mixed");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    write_gemma_config(&root);
+
+    let stock = emit(&root, 512, 128, 1);
+    assert_eq!(fnv1a(&stock), 0xefe5_b0ec_5b7d_a84f);
+
+    let object = root.join("mixed.cubin");
+    let mut object_bytes = plow_asset::cubin::synthetic_elf(
+        "plow_exec",
+        &[(
+            plow_asset::mixed_step::OBJECT_CAPABILITY,
+            plow_asset::mixed_step::VERSION,
+        )],
+        90,
+    );
+    object_bytes[0x12..0x14].copy_from_slice(&190u16.to_le_bytes());
+    std::fs::write(&object, object_bytes).unwrap();
+    let out = root.join("mixed.pkt");
+    devgen::run(devgen::EmitArgs {
+        dir: root.clone(),
+        ctx: 512,
+        out: out.to_string_lossy().into_owned(),
+        n_cu: 128,
+        tp: 1,
+        block_spec: None,
+        embed_cubin: None,
+        embed_hsaco: None,
+        rope_gen: true,
+        l2_layout: None,
+        gpu: "H100 SXM5".into(),
+        arch: "sm_90a".into(),
+        emit_cfg: None,
+        whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        mixed_step: Some(devgen::MixedStepCompile {
+            rows: vec![devgen::MixedRows {
+                total_rows: 128,
+                decode_rows: 1,
+            }],
+            object,
+        }),
+    });
+    let blob = std::fs::read(out).unwrap();
+    let tensor_count = u32::from_le_bytes(blob[12..16].try_into().unwrap()) as usize;
+    let programs = plow_asset::aux_program::parse(
+        section(&blob, packet::devbuild::SECT_PROGRAMS, "mixed.programs"),
+        128,
+        tensor_count,
+    )
+    .unwrap();
+    assert_eq!(programs.programs.len(), 1);
+    let program = &programs.programs[0];
+    assert_eq!(program.rows, 128);
+    let ops: Vec<_> = program
+        .insts
+        .iter()
+        .filter_map(|inst| packet::dev::DevOp::from_u16(inst.op))
+        .collect();
+    assert_eq!(
+        ops.iter()
+            .filter(|&&op| op == packet::dev::DevOp::FlashDecode)
+            .count(),
+        2
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|&&op| op == packet::dev::DevOp::FlashPrefill)
+            .count(),
+        2
+    );
+    for inst in program
+        .insts
+        .iter()
+        .filter(|inst| inst.op == packet::dev::DevOp::FlashDecode as u16)
+    {
+        assert_eq!(inst.i[0], 1);
+        assert_ne!(inst.t[6], u16::MAX);
+    }
+    for inst in program
+        .insts
+        .iter()
+        .filter(|inst| inst.op == packet::dev::DevOp::FlashPrefill as u16)
+    {
+        assert_eq!((inst.i[0], inst.i[1], inst.i[7]), (128, 128, 1));
+        assert_ne!(inst.t[5], u16::MAX);
+    }
+    for (prefill_index, _) in program
+        .insts
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| inst.op == packet::dev::DevOp::FlashPrefill as u16)
+    {
+        let merge_index = prefill_index - 1;
+        assert_eq!(
+            program.insts[merge_index].op,
+            packet::dev::DevOp::FlashMerge as u16
+        );
+        let projection_index = prefill_index + 1;
+        for entry in program
+            .stream
+            .iter()
+            .filter(|entry| entry.inst as usize == projection_index)
+        {
+            let waits = &program.waits
+                [entry.wait_ofs as usize..(entry.wait_ofs + u32::from(entry.wait_len)) as usize];
+            assert!(waits.iter().any(|wait| wait.id as usize == merge_index));
+            assert!(waits.iter().any(|wait| wait.id as usize == prefill_index));
+        }
+    }
+    let manifest: plow_asset::mixed_step::Manifest = serde_json::from_slice(section(
+        &blob,
+        packet::devbuild::SECT_METADATA,
+        plow_asset::mixed_step::SECTION,
+    ))
+    .unwrap();
+    assert_eq!(
+        (manifest.variants[0].rows, manifest.variants[0].decode_rows),
+        (128, 1)
+    );
+}
+
 /// Byte-golden for the dense **Llama** path.
 #[test]
 fn llama_dense_blob_is_stable() {
@@ -454,6 +603,7 @@ fn emit_arch(dir: &Path, arch: &str, gpu: &str, l2: Option<packet::devbuild::L2L
         arch: arch.to_string(),
         emit_cfg: None,
         whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        mixed_step: None,
     });
 }
 
@@ -592,6 +742,7 @@ fn emit_block(dir: &Path, block: &str) {
         arch: "gfx950".into(),
         emit_cfg: None,
         whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        mixed_step: None,
     });
 }
 
