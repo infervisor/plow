@@ -80,8 +80,8 @@ void v_register_gptoss(plow_cpu_kernel_fn* tab) {
     plow_mx_vlut_init(&plow_v_mx_lut);
     tab[PLOW_DOP_GEMV_MXFP4] = v_gemv_mxfp4;
     tab[PLOW_DOP_GEMV_GLU_MXFP4] = v_gemv_glu_mxfp4;
-    tab[PLOW_DOP_MOE_GLU_MX] = v_moe_glu_mx;
-    tab[PLOW_DOP_MOE_DOWN_MX] = v_moe_down_mx;
+    tab[PLOW_DOP_MOE_GLU_MX] = v_moe_glu_mx_b;
+    tab[PLOW_DOP_MOE_DOWN_MX] = v_moe_down_mx_b;
     tab[PLOW_DOP_MOE_GLU_MX_PF] = v_moe_glu_mx_pf;
     tab[PLOW_DOP_MOE_DOWN_MX_PF] = v_moe_down_mx_pf;
 }

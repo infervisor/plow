@@ -269,3 +269,150 @@ V_K(v_moe_down_mx_pf) {
         }
     }
 }
+
+/* ---- Batched decode grouped by expert (147/148 at B >= 2) --------------------------------------
+ * The per-slot decode kernels stream + dequantize an expert once per SLOT, so a rung-8 step costs
+ * ~8x rung 1. Here the B*k slots are sorted by expert and each selected expert's rows are
+ * dequantized once for all its M <= 8 slots (a row never selects an expert twice, so M <= B).
+ * Per-slot outputs are unchanged (fu[slot], part[slot]); every slice builds the same grouping, so
+ * slice ownership (g_range over distinct experts x columns) stays deterministic. Sentinel slots
+ * (eid >= E) are left out: GLU writes nothing, DOWN zeroes them (slice 0). An AMX-tile variant of
+ * this (weights staged into A tiles) measured 40 % SLOWER in serving: most experts carry one row,
+ * where the tile staging costs ~2x this fused even/odd-nibble dequant-dot. */
+#define MXB_MAX_SLOTS 256u
+typedef struct {
+    uint32_t nd;
+    uint32_t eid[MXB_MAX_SLOTS];
+    uint32_t off[MXB_MAX_SLOTS + 1];
+    uint32_t slot[MXB_MAX_SLOTS];
+} mxb_groups;
+
+static int mxb_group(const plow_moe_route* tab, uint32_t nslot, uint32_t E, mxb_groups* g) {
+    if (nslot > MXB_MAX_SLOTS) return 0;
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < nslot; s++) {
+        if (tab[s].eid >= E) continue;
+        uint32_t i = n++;
+        while (i && tab[g->slot[i - 1]].eid > tab[s].eid) {
+            g->slot[i] = g->slot[i - 1];
+            i--;
+        }
+        g->slot[i] = s;
+    }
+    g->nd = 0;
+    for (uint32_t i = 0; i < n;) {
+        const uint32_t e = tab[g->slot[i]].eid;
+        g->eid[g->nd] = e;
+        g->off[g->nd] = i;
+        while (i < n && tab[g->slot[i]].eid == e) i++;
+        g->nd++;
+    }
+    g->off[g->nd] = n;
+    return 1;
+}
+
+/* Stage up to 8 slots of one expert group: XP row m <- src row (slot / src_div). */
+static uint32_t mxb_stage(plow_bf16* XP, size_t ldx, uint32_t K, const plow_bf16* src, uint32_t src_div,
+                          const mxb_groups* g, uint32_t* i, uint32_t iend, uint32_t slots[8]) {
+    uint32_t M = 0;
+    while (*i < iend && M < 8u) {
+        const uint32_t s = g->slot[(*i)++];
+        plow_mx_stage_x(&plow_v_mx_lut, XP + (size_t)M * ldx, src + (size_t)(s / src_div) * K, K);
+        slots[M++] = s;
+    }
+    return M;
+}
+
+/* 147 at B >= 2 (slot map as v_moe_glu_mx). */
+V_K(v_moe_glu_mx_b) {
+    const uint32_t k = in->i[0], I = in->i[1], K = in->i[2], E = in->i[3], layout = in->i[4];
+    const uint32_t act = in->i[5], B = in->i[6] ? in->i[6] : 1u;
+    const plow_moe_route* tab = PLOW_CPU_TEN(in, T, 2);
+    mxb_groups g;
+    if (B < 2u || k == 0u || !mx_usable(ctx, K, 8u) || !mxb_group(tab, B * k, E, &g)) {
+        v_moe_glu_mx(in, slice, nblk, T, ctx);
+        return;
+    }
+    plow_bf16* fu = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
+    const uint8_t* W = PLOW_CPU_TEN(in, T, 3);
+    const uint8_t* S = PLOW_CPU_TEN(in, T, 4);
+    const plow_bf16* bias = PLOW_CPU_TEN(in, T, 5);
+    const float f0 = in->fj[0].f, f1 = in->fj[1].f;
+    const size_t N2 = 2u * I, ldw = K / 2u, lds = K / PLOW_MX_BLK, ldx = plow_mx_staged_len(K);
+    plow_bf16* XP = ctx->scratch;
+    float gg[8][16], uu[8][16];
+    uint32_t slots[8];
+    uint32_t lo, hi;
+    g_range(g.nd * I, slice, nblk, &lo, &hi);
+    for (uint32_t idx = lo; idx < hi;) {
+        const uint32_t d = idx / I, n0 = idx - d * I;
+        const uint32_t n1 = n0 + (hi - idx) < I ? n0 + (hi - idx) : I;
+        idx += n1 - n0;
+        const uint32_t e = g.eid[d];
+        const uint8_t* We = W + (size_t)e * N2 * ldw;
+        const uint8_t* Se = S + (size_t)e * N2 * lds;
+        const plow_bf16* be = bias ? bias + (size_t)e * N2 : NULL;
+        for (uint32_t i = g.off[d]; i < g.off[d + 1];) {
+            const uint32_t M = mxb_stage(XP, ldx, K, x, k, &g, &i, g.off[d + 1], slots);
+            for (uint32_t n = n0; n < n1;) {
+                const uint32_t cnt = n1 - n < 16u ? n1 - n : 16u;
+                glu_dots(We, Se, ldw, lds, I, K, layout, XP, ldx, M, n, cnt, gg, uu);
+                for (uint32_t m = 0; m < M; m++)
+                    glu_epilogue(fu + (size_t)slots[m] * I, gg[m], uu[m], be, I, layout, n, cnt, act, f0, f1);
+                n += cnt;
+            }
+        }
+    }
+}
+
+/* 148 at B >= 2 (slot map as v_moe_down_mx). */
+V_K(v_moe_down_mx_b) {
+    const uint32_t k = in->i[0], H = in->i[1], I = in->i[2], E = in->i[3];
+    const uint32_t B = in->i[6] ? in->i[6] : 1u;
+    const plow_moe_route* tab = PLOW_CPU_TEN(in, T, 2);
+    mxb_groups g;
+    if (B < 2u || k == 0u || !mx_usable(ctx, I, 8u) || !mxb_group(tab, B * k, E, &g)) {
+        v_moe_down_mx(in, slice, nblk, T, ctx);
+        return;
+    }
+    float* part = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* fu = PLOW_CPU_TEN(in, T, 1);
+    const uint8_t* W = PLOW_CPU_TEN(in, T, 3);
+    const uint8_t* S = PLOW_CPU_TEN(in, T, 4);
+    const plow_bf16* bias = PLOW_CPU_TEN(in, T, 5);
+    const size_t ldw = I / 2u, lds = I / PLOW_MX_BLK, ldx = plow_mx_staged_len(I);
+    plow_bf16* XP = ctx->scratch;
+    if (slice == 0)
+        for (uint32_t s = 0; s < B * k; s++)
+            if (tab[s].eid >= E) memset(part + (size_t)s * H, 0, (size_t)H * sizeof(float));
+    uint32_t slots[8];
+    float o[4 * 8];
+    uint32_t lo, hi;
+    g_range(g.nd * H, slice, nblk, &lo, &hi);
+    for (uint32_t idx = lo; idx < hi;) {
+        const uint32_t d = idx / H, h0 = idx - d * H;
+        const uint32_t h1 = h0 + (hi - idx) < H ? h0 + (hi - idx) : H;
+        idx += h1 - h0;
+        const uint32_t e = g.eid[d];
+        const uint8_t* We = W + (size_t)e * H * ldw;
+        const uint8_t* Se = S + (size_t)e * H * lds;
+        const plow_bf16* be = bias ? bias + (size_t)e * H : NULL;
+        for (uint32_t i = g.off[d]; i < g.off[d + 1];) {
+            const uint32_t M = mxb_stage(XP, ldx, I, fu, 1u, &g, &i, g.off[d + 1], slots);
+            const uint32_t RB = plow_mx_rb_for(M);
+            for (uint32_t h = h0; h < h1;) {
+                const uint32_t rb = h1 - h < RB ? h1 - h : RB;
+                plow_mx_gemv_rows(&plow_v_mx_lut, We + (size_t)h * ldw, ldw, Se + (size_t)h * lds, lds, XP, ldx, I,
+                                  rb, M, o);
+                for (uint32_t m = 0; m < M; m++) {
+                    float* pr = part + (size_t)slots[m] * H;
+                    const float gate = tab[slots[m]].gate;
+                    for (uint32_t rr = 0; rr < rb; rr++)
+                        pr[h + rr] = gate * (o[rr * M + m] + (be ? plow_bf2f(be[h + rr]) : 0.0f));
+                }
+                h += rb;
+            }
+        }
+    }
+}

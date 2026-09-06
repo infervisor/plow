@@ -39,6 +39,8 @@ void v_register_attention(plow_cpu_kernel_fn* tab);
 V_K(v_gemv_mxfp4);
 V_K(v_moe_glu_mx);
 V_K(v_moe_down_mx);
+V_K(v_moe_glu_mx_b);  /* 147 at B >= 2: grouped by expert */
+V_K(v_moe_down_mx_b); /* 148 at B >= 2 */
 V_K(v_moe_glu_mx_pf);
 V_K(v_moe_down_mx_pf);
 void v_register_gptoss(plow_cpu_kernel_fn* tab);
