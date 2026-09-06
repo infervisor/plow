@@ -1,6 +1,6 @@
 use crate::program::{Packet, Program};
 use crate::splitk::ProjectionAccess;
-use packet::dev::{DevOp, TENSOR_NONE16};
+use packet::dev::{DevOp, ROPE_PAIR_HALF, TENSOR_NONE16};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -204,7 +204,7 @@ impl Manifest {
                     && !c.pair.contains(&self.position)
                     && !c.pair.contains(&self.kv_length)
                     && c.heads > 0
-                    && matches!(c.hd, 256 | 512)
+                    && matches!(c.hd, 64 | 256 | 512)
                     && c.stride > 0
                     && if c.window == 0 {
                         c.stride == self.max_ctx && c.mask == u32::MAX
@@ -363,6 +363,10 @@ impl Manifest {
                                 d.i[0] == p.rows
                                     && d.i[1] == c.heads
                                     && d.i[2] == c.hd
+                                    && matches!(
+                                        (c.hd, d.i[5]),
+                                        (64, ROPE_PAIR_HALF) | (256 | 512, 0)
+                                    )
                                     && d.i[3] == 0
                                     && d.fj[1] == c.stride
                                     && d.fj[2] == c.mask

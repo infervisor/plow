@@ -1,4 +1,5 @@
 use super::*;
+use packet::dev::ROPE_PAIR_HALF;
 
 pub(super) struct DecodeRung {
     pub(super) rows: usize,
@@ -187,7 +188,7 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
         if d.op != DevOp::FlashDecode as u16 {
             continue;
         }
-        if d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16 || !matches!(d.i[6], 256 | 512) {
+        if d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16 || !matches!(d.i[6], 64 | 256 | 512) {
             return Ok(false);
         }
         let (heads, hd, stride, window, mask) = (d.i[2], d.i[6], d.i[3], d.i[4], d.i[7]);
@@ -300,6 +301,7 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                         if d.i[6] != g.t
                             || d.i[3] != 0
                             || d.t[5] as usize != pos
+                            || !matches!((hd, d.i[5]), (64, ROPE_PAIR_HALF) | (256 | 512, 0))
                             || (d.i[1], d.i[2], d.fj[1], d.fj[2]) != (heads, hd, stride, mask)
                         {
                             return Err(reject(
