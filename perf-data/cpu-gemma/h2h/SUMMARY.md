@@ -87,3 +87,27 @@ chat_short and chat_long at c=1..4, so the plow margins below hold on like-for-l
 TTFT at c=1 is close: plow 696 (bf16) / 456 (fp8) / 686 (MXFP4) vs vLLM 657 on chat_short, and
 vLLM leads on chat_long (1959 vs our ~2430). vLLM has no fp8 or MXFP4 CPU path, so its single bf16
 row is the only available comparison for all three plow data types.
+
+### Why fp8 cannot beat Q8_0 by a margin on this box (13:5x-14:0x)
+
+Three independent measurements bound it, so this is a format/hardware limit rather than a tuning gap.
+
+1. **Bytes.** Our fp8 weights are 12.0 GB (1 byte per weight, f32 scale per output channel) against
+   Q8_0's 12.75 GB (8 bits plus an f16 scale per 32). We already read 6% fewer bytes.
+2. **Roofline.** In the decode profile workers are busy 112 ms of a 125 ms step and well balanced
+   (109.7-116.9). During that busy time the fp8 GEMV moves 13 GB at ~116 GB/s, which is the measured
+   ceiling of this memory system (16-thread bf16 read bandwidth is 110-115 GB/s). The kernel has no
+   headroom left; only the idle fraction is recoverable.
+3. **The idle is structural, not latency or granularity.** Two sweeps:
+   - gate re-check interval (`pause` count before re-testing a blocked head): 64 -> 4 -> 1 moved the
+     step from 125.2 to 123.2 to 123.0 ms, i.e. 1.8%. Detection latency is not the cost.
+   - CU streams per op, which lets a worker average several slices instead of owning exactly one:
+     16 / 32 / 48 CUs gave 125.2 / 121.5 / 124.6 ms and idle 10% / 8% / 10%. 32 is a mild win (3%)
+     and 48 regresses on packet overhead.
+   The residue is the accumulated `(max - mean)` slice time at every gate of a 48-layer chain, since
+   each op must complete across all slices before the next begins.
+
+Best realistic fp8 step is therefore ~121 ms against llama.cpp's 133, i.e. ~1.10x in the profiler and
+about 1.04x through the server. MXFP4 is where the margin lives on this data-type axis (1.38x), and
+it is the same model at better quality-per-byte. Beating an 8-bit baseline by a margin needs either
+fewer bits or a machine whose compute-to-bandwidth ratio leaves room, and this one does not.
