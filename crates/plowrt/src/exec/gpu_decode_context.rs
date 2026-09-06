@@ -19,22 +19,9 @@ fn require(ok: bool, message: &str) -> Result<()> {
 }
 
 pub(super) fn metadata(blob: &DevBlob, raw: &[u8]) -> Result<Option<ContextTable>> {
-    let sections: Vec<_> = blob.sections.iter().filter(|s| s.name == SECTION).collect();
-    if sections.is_empty() {
+    let Some(bytes) = blob.reserved_metadata(raw, SECTION)? else {
         return Ok(None);
-    }
-    require(
-        sections.len() == 1 && sections[0].kind == packet::devbuild::SECT_METADATA,
-        "reserved section requires exactly one metadata entry",
-    )?;
-    let section = sections[0];
-    let end = section
-        .offset
-        .checked_add(section.size)
-        .ok_or_else(|| reject("section range overflow"))?;
-    let bytes = raw
-        .get(section.offset..end)
-        .ok_or_else(|| reject("section range outside packet"))?;
+    };
     let positions: Vec<_> = blob.tensors.iter().filter(|t| t.name == "in.pos").collect();
     require(
         positions.len() == 1 && positions[0].bytes % 4 == 0,

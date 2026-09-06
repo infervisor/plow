@@ -203,7 +203,7 @@ impl DevBlob {
     /// `l2_dispatch_ok` says the CALLER will verify the code object actually carries the
     /// dispatch axis (AMD does, via the `plow_l2_place_dispatch_1` marker at object-load time).
     /// Backends that cannot check keep the old behaviour through [`DevBlob::parse`], which is
-    /// this with `false` -- placement is then refused unless the operator opts in by env.
+    /// this with `false` -- placement is then refused unless runtime configuration opts in.
     pub fn parse_l2(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
         Self::parse_inner(buf, l2_dispatch_ok)
     }
@@ -394,17 +394,9 @@ impl DevBlob {
 
         // PLOW_L2_PLACE guard: a placed blob requires physical-domain queue dispatch.
         //
-        // `PLOW_NV_PLACE_DISPATCH` stays accepted alongside the new spelling: the flag was
-        // renamed because an L2 domain is a GPC on NVIDIA and an XCD on AMD, and a run that
-        // opted in under the old name must not start failing to load.
-        // `--l2-place-dispatch` counts too: declaring the flag and then reading
-        // only the environment makes it parse and do nothing.
-        let dispatch_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
         if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
             && !l2_dispatch_ok
             && !crate::config::RuntimeConfig::get().nv.l2_place_dispatch
-            && !dispatch_on("PLOW_L2_PLACE_DISPATCH")
-            && !dispatch_on("PLOW_NV_PLACE_DISPATCH")
         {
             return Err(RuntimeError::Device(
                 "devblob: blob uses L2-domain packet placement (PLOW_L2_PLACE), so a standard \
@@ -447,14 +439,31 @@ impl DevBlob {
         })
     }
 
-    /// Get the raw bytes of a section by kind, sliced from the original buffer.
-    /// Returns `None` if the section is not present.
     /// Get a section by kind and architecture-specific name.
     pub fn section_data_named<'a>(&self, buf: &'a [u8], kind: u32, name: &str) -> Option<&'a [u8]> {
         self.sections
             .iter()
             .find(|s| s.kind == kind && s.name == name)
             .and_then(|s| buf.get(s.offset..s.offset + s.size))
+    }
+
+    pub fn reserved_metadata<'a>(&self, buf: &'a [u8], name: &str) -> Result<Option<&'a [u8]>> {
+        let mut matches = self.sections.iter().filter(|section| section.name == name);
+        let Some(section) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() || section.kind != packet::devbuild::SECT_METADATA {
+            return Err(RuntimeError::Rejected(format!(
+                "{name} requires exactly one metadata section"
+            )));
+        }
+        let end = section
+            .offset
+            .checked_add(section.size)
+            .ok_or_else(|| RuntimeError::Rejected(format!("{name} section range overflow")))?;
+        buf.get(section.offset..end)
+            .map(Some)
+            .ok_or_else(|| RuntimeError::Rejected(format!("{name} section range outside packet")))
     }
 
     pub fn section_data<'a>(&self, buf: &'a [u8], kind: u32) -> Option<&'a [u8]> {
@@ -1116,6 +1125,41 @@ mod tests {
         bad[0] = b'X';
         assert!(DevBlob::parse(&bad).is_err());
         assert!(DevBlob::parse(&blob[..blob.len() / 3]).is_err());
+    }
+
+    #[test]
+    fn reserved_metadata_is_name_strict_and_bounds_checked() {
+        let raw = tiny_model().to_blob();
+        let mut blob = DevBlob::parse(&raw).unwrap();
+        let name = "reserved.json";
+        assert!(blob.reserved_metadata(&raw, name).unwrap().is_none());
+
+        let good = DevSection {
+            kind: packet::devbuild::SECT_METADATA,
+            name: name.into(),
+            offset: 1,
+            size: 3,
+        };
+        blob.sections.push(good);
+        assert_eq!(
+            blob.reserved_metadata(&raw, name).unwrap(),
+            Some(&raw[1..4])
+        );
+
+        blob.sections.last_mut().unwrap().kind = packet::devbuild::SECT_METADATA + 1;
+        assert!(blob.reserved_metadata(&raw, name).is_err());
+        blob.sections.last_mut().unwrap().kind = packet::devbuild::SECT_METADATA;
+        blob.sections.push(DevSection {
+            kind: packet::devbuild::SECT_METADATA + 1,
+            name: name.into(),
+            offset: 0,
+            size: 0,
+        });
+        assert!(blob.reserved_metadata(&raw, name).is_err());
+        blob.sections.pop();
+        blob.sections.last_mut().unwrap().offset = usize::MAX;
+        blob.sections.last_mut().unwrap().size = 1;
+        assert!(blob.reserved_metadata(&raw, name).is_err());
     }
 
     #[test]

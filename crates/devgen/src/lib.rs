@@ -4381,7 +4381,7 @@ fn emit_phase(
                 d.j[1] = kvm; // head-major; RING on a sliding layer
             })
         };
-        if !gemv_family && emit_config::active().pf_batch {
+        if !gemv_family && emit_config::active().emit_packed_prefill {
             b.isolate(c_fa);
         }
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
@@ -5956,6 +5956,31 @@ pub fn run(args: EmitArgs) {
     run_verified(args, None)
 }
 
+#[derive(Clone, Copy)]
+struct EmitCapabilities {
+    dense_packet_contracts: bool,
+    decode_objects: bool,
+    cublaslt_decode: bool,
+}
+
+fn emit_capabilities(model_type: &str) -> EmitCapabilities {
+    let dense = matches!(model_type, "gemma4" | "gemma4_text" | "llama" | "qwen3");
+    EmitCapabilities {
+        dense_packet_contracts: dense,
+        decode_objects: dense || model_type == "qwen3_5",
+        cublaslt_decode: model_type == "qwen3_5",
+    }
+}
+
+fn cublaslt_emit_supported(
+    capabilities: EmitCapabilities,
+    arch: &str,
+    tp: u32,
+    has_decode_objects: bool,
+) -> bool {
+    capabilities.cublaslt_decode && arch == "sm_90a" && tp == 1 && !has_decode_objects
+}
+
 /// [`run`] plus an optional pre-write verification gate (see [`VerifyHook`]).
 /// `run(args)` ≡ `run_verified(args, None)` — byte-identical emission.
 pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
@@ -6000,44 +6025,29 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                     .map(str::to_string)
             })
             .unwrap_or_default();
-    assert!(
-        !emit_config::active().gemv_decode_role
-            || !matches!(
-                model_type.as_str(),
-                "qwen3_5"
-                    | "kimi_k3"
-                    | "glm5_next"
-                    | "glm_moe_dsa"
-                    | "kimi_k2"
-                    | "kimi"
-                    | "deepseek_v3"
-                    | "deepseek_v2"
-                    | "nemotron_h"
-                    | "nemotron3"
-                    | "nemotron"
+    let capabilities = emit_capabilities(&model_type);
+    if emit_config::active().decode_cublaslt {
+        assert!(
+            cublaslt_emit_supported(
+                capabilities,
+                &arch,
+                tp,
+                emit_config::active().decode_objects.is_some(),
             ),
+            "cuBLASLt decode emission requires a supported single-GPU CUDA emitter without decode objects"
+        );
+    }
+    assert!(
+        !emit_config::active().gemv_decode_role || capabilities.dense_packet_contracts,
         "GEMV decode role currently requires the dense BF16 emitter"
     );
-    if emit_config::active().pf_batch {
+    if emit_config::active().emit_packed_prefill {
         assert!(
             arch == "sm_90a" && tp == 1 && !emit_config::active().fp8_kv,
             "packed request emission requires Hopper single-GPU BF16 KV"
         );
         assert!(
-            !matches!(
-                model_type.as_str(),
-                "qwen3_5"
-                    | "kimi_k3"
-                    | "glm5_next"
-                    | "glm_moe_dsa"
-                    | "kimi_k2"
-                    | "kimi"
-                    | "deepseek_v3"
-                    | "deepseek_v2"
-                    | "nemotron_h"
-                    | "nemotron3"
-                    | "nemotron"
-            ),
+            capabilities.dense_packet_contracts,
             "packed requests require the compiled direct-KV emitter access contract"
         );
     }
@@ -6047,20 +6057,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             "projection tuning requires Hopper cooperative decode object bindings"
         );
         assert!(
-            !matches!(
-                model_type.as_str(),
-                "qwen3_5"
-                    | "kimi_k3"
-                    | "glm5_next"
-                    | "glm_moe_dsa"
-                    | "kimi_k2"
-                    | "kimi"
-                    | "deepseek_v3"
-                    | "deepseek_v2"
-                    | "nemotron_h"
-                    | "nemotron3"
-                    | "nemotron"
-            ),
+            capabilities.dense_packet_contracts,
             "projection tuning is not wired to this emitter's opcode/access contracts"
         );
     }
@@ -6070,19 +6067,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             "decode objects require a supported single-GPU CUDA target"
         );
         assert!(
-            !matches!(
-                model_type.as_str(),
-                "kimi_k3"
-                    | "glm5_next"
-                    | "glm_moe_dsa"
-                    | "kimi_k2"
-                    | "kimi"
-                    | "deepseek_v3"
-                    | "deepseek_v2"
-                    | "nemotron_h"
-                    | "nemotron3"
-                    | "nemotron"
-            ),
+            capabilities.decode_objects,
             "decode object bindings are not wired to this emitter"
         );
     }
@@ -7177,7 +7162,7 @@ fn emit_dense_gqa(
                 && (emit_config::active().kda_wu_lean || emit_config::active().kda_carry_keyfeed),
         );
         b.set_kda_carry_keyfeed_segments(emit_config::active().kda_carry_keyfeed);
-        if amd || emit_config::active().pf_batch {
+        if amd || emit_config::active().emit_packed_prefill {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }
         // T18 (PLOW_UNISEG_MAX_T=<t>): small buckets emit ONE segment so the serve side takes
@@ -7373,7 +7358,7 @@ fn emit_dense_gqa(
     // site's — to downgrade "no usable verifier here" into an `Ok` carrying a
     // skip reason. Anything that reaches this `Err` is the verifier saying the
     // program is wrong, i.e. a real bug caught, and must be loud.
-    if ecfg.pf_batch {
+    if ecfg.emit_packed_prefill {
         assert!(
             !emit_is_amd() && !fp8_kv,
             "packed prefill requires dense BF16 KV NVIDIA packet"
@@ -7434,7 +7419,7 @@ fn emit_dense_gqa(
             data: serde_json::to_vec(&manifest).unwrap(),
         });
     }
-    if projection_bindings.is_some() || ecfg.pf_batch {
+    if projection_bindings.is_some() || ecfg.emit_packed_prefill {
         let manifest = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
             .unwrap_or_else(|error| panic!("compiled LIVE KV geometry: {error}"));
         sections.push(packet::devbuild::SectionData {
@@ -7650,5 +7635,9 @@ mod pick_tile_tests;
 #[cfg(test)]
 #[path = "lib_tests/chunk_default.rs"]
 mod chunk_default_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/emit_capabilities.rs"]
+mod emit_capabilities_tests;
 
 pub mod fp8_m1_role;

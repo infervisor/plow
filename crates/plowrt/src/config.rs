@@ -63,9 +63,9 @@ pub struct RuntimeConfig {
     #[arg(long = "rt-weight-slab", env = "PLOW_WEIGHT_SLAB", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_slab: bool,
 
-    /// Keep freed slabs in the pool for reuse.
-    #[arg(long = "rt-slab-keep", env = "PLOW_SLAB_KEEP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub slab_keep: bool,
+    /// Override whether freed slabs remain in the process reuse pool.
+    #[arg(long = "rt-slab-keep", env = "PLOW_SLAB_KEEP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub slab_keep: Option<bool>,
 
     /// Per-decode-step timing interval (N = every Nth step). 0 = off.
     #[arg(long = "rt-dstep-every", env = "PLOW_DSTEP_EVERY", global = true)]
@@ -278,7 +278,7 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "step-time", env = "PLOW_STEP_TIME", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub step_time: bool,
 
-    /// L2-domain placement dispatch (accepts old PLOW_NV_PLACE_DISPATCH too).
+    /// L2-domain placement dispatch.
     #[arg(long = "l2-place-dispatch", env = "PLOW_L2_PLACE_DISPATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub l2_place_dispatch: bool,
 
@@ -662,7 +662,132 @@ pub struct AmdRuntimeConfig {
 /// Global runtime config, initialized once at startup from CLI parse.
 static RUNTIME_CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 
+fn select_compat<T>(parsed: T, environment: Option<T>, allow_environment: bool) -> T {
+    if allow_environment {
+        environment.unwrap_or(parsed)
+    } else {
+        parsed
+    }
+}
+
 impl RuntimeConfig {
+    fn env_bool(var: &str) -> Option<bool> {
+        let value = std::env::var(var).ok()?;
+        Some(matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "y" | "on"
+        ))
+    }
+
+    fn env_parse<T: std::str::FromStr>(var: &str) -> Option<T> {
+        std::env::var(var).ok()?.parse().ok()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_vmm_live(&self) -> bool {
+        select_compat(
+            self.nv.vmm_live,
+            Self::env_bool("PLOW_VMM_LIVE"),
+            !Self::is_initialized(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_vmm_live_rings(&self) -> bool {
+        select_compat(
+            self.nv.vmm_live_rings,
+            Self::env_bool("PLOW_VMM_LIVE_RINGS"),
+            !Self::is_initialized(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_vmm_prefix(&self) -> bool {
+        select_compat(
+            self.nv.vmm_prefix,
+            Self::env_bool("PLOW_VMM_PREFIX"),
+            !Self::is_initialized(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_vmm_block_mib(&self) -> u32 {
+        select_compat(
+            self.nv.vmm_block_mib,
+            Self::env_parse("PLOW_VMM_BLOCK_MIB"),
+            !Self::is_initialized(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_vmm_cache_mib(&self) -> u32 {
+        select_compat(
+            self.nv.vmm_cache_mib,
+            Self::env_parse("PLOW_VMM_CACHE_MIB"),
+            !Self::is_initialized(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_multistep(&self) -> u32 {
+        select_compat(
+            self.nv.multistep,
+            Self::env_parse("PLOW_MULTISTEP"),
+            !Self::is_initialized(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_dev_sample(&self) -> Option<String> {
+        select_compat(
+            self.nv.dev_sample.clone(),
+            std::env::var("PLOW_DEV_SAMPLE").ok().map(Some),
+            !Self::is_initialized(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_cubin_sample(&self) -> Option<String> {
+        select_compat(
+            self.nv.cubin_sample.clone(),
+            std::env::var("PLOW_NV_CUBIN_SAMPLE").ok().map(Some),
+            !Self::is_initialized(),
+        )
+    }
+
+    #[cfg(feature = "hsa")]
+    pub(crate) fn amd_vmm_block_mib(&self) -> u32 {
+        select_compat(
+            self.amd.vmm_block_mib,
+            Self::env_parse("PLOW_VMM_BLOCK_MIB"),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn slab_keep_override(&self) -> Option<bool> {
+        select_compat(
+            self.slab_keep,
+            Self::env_bool("PLOW_SLAB_KEEP").map(Some),
+            !Self::is_initialized(),
+        )
+    }
+
+    pub(crate) fn kv_pool_mib(&self) -> u64 {
+        select_compat(
+            self.kv_pool_mib,
+            Self::env_parse("PLOW_KV_POOL_MIB"),
+            !Self::is_initialized(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn drain_timeout_ms(&self) -> Option<u64> {
+        let environment = std::env::var("PLOW_DRAIN_TIMEOUT_MS")
+            .ok()
+            .map(|value| value.parse().ok());
+        select_compat(self.drain_timeout_ms, environment, !Self::is_initialized())
+    }
+
     /// Store the parsed config globally. Call once from `main()` after CLI parse.
     ///
     /// # Panics
@@ -687,52 +812,6 @@ impl RuntimeConfig {
     /// Whether the global config has been initialized (for tests that don't go through main).
     pub fn is_initialized() -> bool {
         RUNTIME_CONFIG.get().is_some()
-    }
-
-    /// A knob whose env var must be re-read on every call, falling back to the
-    /// parsed config — for the handful of knobs a test or bench flips
-    /// mid-process, after the config snapshot is cached.
-    ///
-    /// Exists so those sites stop hand-rolling the parse. They had drifted into
-    /// four different answers for the same input: one site read `v == "1"`, so
-    /// `PLOW_VMM_PREFIX=true` *disabled* VMM prefix while the config path —
-    /// clap's `BoolishValueParser` — reads `true` as enabled. Same variable,
-    /// opposite meaning depending on which line got there first. This uses
-    /// clap's own boolish set, so env and CLI agree by construction.
-    pub fn env_bool_or(var: &str, cfg: bool) -> bool {
-        match std::env::var(var) {
-            Ok(v) => matches!(
-                v.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            ),
-            Err(_) => cfg,
-        }
-    }
-
-    /// Tri-state form of [`Self::env_bool_or`]: `None` when the var is unset,
-    /// for knobs whose unset case is not simply "use the config" (the weight
-    /// slab also consults a process-wide default the manager sets).
-    pub fn env_bool(var: &str) -> Option<bool> {
-        let v = std::env::var(var).ok()?;
-        Some(matches!(
-            v.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "y" | "on"
-        ))
-    }
-
-    /// Env-first parse for a value knob, falling back to the parsed config.
-    /// A malformed value falls through to the config rather than silently
-    /// meaning zero — the old hand-rolled sites disagreed on this.
-    pub fn env_parse_or<T: std::str::FromStr>(var: &str, cfg: T) -> T {
-        std::env::var(var)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(cfg)
-    }
-
-    /// Env-first string knob, falling back to the parsed config.
-    pub fn env_str_or(var: &str, cfg: Option<String>) -> Option<String> {
-        std::env::var(var).ok().or(cfg)
     }
 
     /// The initialized global when present, else a cached env-only snapshot.
@@ -760,6 +839,17 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compatibility_overrides_apply_only_without_initialized_cli() {
+        assert_eq!(super::select_compat(true, Some(false), false), true);
+        assert_eq!(super::select_compat(true, Some(false), true), false);
+        assert_eq!(
+            super::select_compat(Some(7_u64), Some(None), false),
+            Some(7)
+        );
+        assert_eq!(super::select_compat(Some(7_u64), Some(None), true), None);
+    }
+
     #[test]
     fn live_kv_defaults_off_and_can_be_enabled_without_prefix_reuse() {
         use clap::{Args, FromArgMatches};
@@ -877,7 +967,7 @@ mod tests {
     /// worked, so nothing looked broken; the flag was decoration. Same duplicated-parse shape as
     /// the `PLOW_XR_CUS` defect, and `devgen::emit_config` already carries the twin of this test.
     ///
-    /// Coarse on purpose — "does any plowrt source outside this file mention `.field`". A
+    /// Coarse on purpose — "does any plowrt source mention `.field`". A
     /// reachability analysis needs the feature cross-product and a wrong one fails working
     /// builds; naming is the cheap 90%, and what it catches is "nobody named it at all".
     #[test]
@@ -913,12 +1003,13 @@ mod tests {
         );
 
         let others: String = walk(&src_dir);
-        assert!(!others.is_empty(), "no sibling sources readable");
+        assert!(!others.is_empty(), "no runtime sources readable");
+        let readers = format!("{me}\n{others}");
 
         let dead: Vec<&String> = fields
             .iter()
             // `amd`/`nvidia` are the sub-struct handles; reads go through them as `.amd.x`.
-            .filter(|f| !others.contains(&format!(".{f}")))
+            .filter(|f| !readers.contains(&format!(".{f}")))
             .collect();
         assert!(
             dead.is_empty(),
@@ -979,10 +1070,6 @@ mod tests {
     }
 
     fn walk(dir: &std::path::Path) -> String {
-        files(dir)
-            .into_iter()
-            .filter(|(p, _)| p.file_name().is_some_and(|n| n != "config.rs"))
-            .map(|(_, t)| t)
-            .collect()
+        files(dir).into_iter().map(|(_, t)| t).collect()
     }
 }

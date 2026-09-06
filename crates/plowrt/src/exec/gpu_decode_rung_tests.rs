@@ -226,7 +226,7 @@ fn gpu_decode_rungs_match_widest_full_logits() {
         let mut e = GpuEngine::load(Arc::clone(&be), assets, &assets.join("checkpoint")).unwrap();
         assert_eq!(e.batch(), batch);
         assert!(
-            e.lt_decode.is_empty() && e.multistep.is_none(),
+            e.cublaslt_decode.is_empty() && e.multistep.is_none(),
             "disable Lt and multistep for this gate"
         );
         if candidate {

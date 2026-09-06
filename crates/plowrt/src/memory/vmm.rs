@@ -393,26 +393,9 @@ impl LiveKvLayout {
         blob: &crate::asset::devblob::DevBlob,
         raw: &[u8],
     ) -> Result<Option<plow_asset::live_kv::Manifest>> {
-        let count = blob
-            .sections
-            .iter()
-            .filter(|s| {
-                s.kind == packet::devbuild::SECT_METADATA && s.name == plow_asset::live_kv::SECTION
-            })
-            .count();
-        if count == 0 {
+        let Some(bytes) = blob.reserved_metadata(raw, plow_asset::live_kv::SECTION)? else {
             return Ok(None);
-        }
-        if count != 1 {
-            return Err(RuntimeError::Rejected("duplicate LIVE KV manifest".into()));
-        }
-        let bytes = blob
-            .section_data_named(
-                raw,
-                packet::devbuild::SECT_METADATA,
-                plow_asset::live_kv::SECTION,
-            )
-            .ok_or_else(|| RuntimeError::Rejected("missing LIVE KV manifest bytes".into()))?;
+        };
         let m: plow_asset::live_kv::Manifest = serde_json::from_slice(bytes)
             .map_err(|e| RuntimeError::Rejected(format!("invalid LIVE KV manifest: {e}")))?;
         blob.with_packet_view(|packet| m.validate(packet))
@@ -1686,18 +1669,12 @@ fn release_window(s: &Shared, inner: &mut Inner, seq: usize) {
 /// load). The manager flips the process default on when it manages more than
 /// one model ([`set_slab_keep_default`]); everything else — single-model
 /// serves, the lifecycle tests' return-to-baseline assert — keeps the
-/// release-on-drop behavior. `PLOW_SLAB_KEEP=1`/`0` force-overrides either
-/// way. The env is read per-drop — BEFORE the cached config — because the
-/// lifecycle tests flip it mid-process; `--rt-slab-keep` lands via the config
-/// fallback (opt-in only, so the manager's default still decides when unset).
+/// release-on-drop behavior. `PLOW_SLAB_KEEP=1`/`0` or `--rt-slab-keep`
+/// force-overrides either way.
 fn slab_keep_enabled() -> bool {
-    match crate::config::RuntimeConfig::env_bool("PLOW_SLAB_KEEP") {
-        Some(v) => v,
-        None => {
-            crate::config::RuntimeConfig::get().slab_keep
-                || SLAB_KEEP_DEFAULT.load(Ordering::Relaxed)
-        }
-    }
+    crate::config::RuntimeConfig::get()
+        .slab_keep_override()
+        .unwrap_or_else(|| SLAB_KEEP_DEFAULT.load(Ordering::Relaxed))
 }
 
 static SLAB_KEEP_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1712,11 +1689,9 @@ pub fn set_slab_keep_default(on: bool) {
 /// `--kv-pool-mib` / `PLOW_KV_POOL_MIB` — cap (MiB) for the KV physical-block
 /// reuse pool the engines hand to [`VmmKv::enable_block_pool`]. Default 512;
 /// 0 disables pooling entirely (every zero-ref block released, pre-creator
-/// not spawned). Env read first so a mid-process flip in tests still lands;
-/// engine load is cold path.
-pub fn kv_pool_cap_from_env() -> u64 {
-    let cfg = crate::config::RuntimeConfig::get().kv_pool_mib;
-    crate::config::RuntimeConfig::env_parse_or::<u64>("PLOW_KV_POOL_MIB", cfg) << 20
+/// not spawned).
+pub fn kv_pool_cap() -> u64 {
+    crate::config::RuntimeConfig::get().kv_pool_mib() << 20
 }
 
 /// Physical-commit chunk for [`VmmSlab`]-backed weight slabs. The CUDA driver

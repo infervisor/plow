@@ -2326,10 +2326,10 @@ extern "C" __device__ unsigned plow_attention_sm90_hd256_abi = 1;
 #else
 extern "C" __device__ unsigned plow_attention_sm90_hd256_abi = 0;
 #endif
-#if PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
-extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 1;
+#if !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
+extern "C" __device__ unsigned plow_cublaslt_decode_abi = 1;
 #else
-extern "C" __device__ unsigned plow_qwen_decode_lt_arm = 0;
+extern "C" __device__ unsigned plow_cublaslt_decode_abi = 0;
 #endif
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_QWEN_GDN && !PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_PLACE_DISPATCH && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
 extern "C" __device__ unsigned plow_fp8_m1_arm = 1;

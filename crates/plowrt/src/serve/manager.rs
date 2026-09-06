@@ -580,16 +580,9 @@ impl ModelManager {
 
 /// `--drain-timeout-ms` / `PLOW_DRAIN_TIMEOUT_MS`: how long an eviction lets
 /// in-flight generations finish before preempting them. Unset = graceful
-/// unbounded drain (the pre-existing behavior). The env is read per-evict —
-/// BEFORE the cached config — because the preempt drill (`s1_switch_bench`
-/// phase 5) flips it mid-process; eviction is seconds-scale, so the extra
-/// env read costs nothing.
+/// unbounded drain (the pre-existing behavior).
 fn drain_timeout_ms() -> Option<u64> {
-    let cfg = crate::config::RuntimeConfig::get().drain_timeout_ms;
-    match crate::config::RuntimeConfig::env_str_or("PLOW_DRAIN_TIMEOUT_MS", None) {
-        Some(v) => v.parse().ok(),
-        None => cfg,
-    }
+    crate::config::RuntimeConfig::get().drain_timeout_ms()
 }
 
 /// Least-recently-used pick: the resident slug with the oldest (or absent)

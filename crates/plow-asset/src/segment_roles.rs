@@ -1,6 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const SECTION: &str = "segment_roles.json";
+pub const INTERPRETER: u8 = 0;
+pub const FP8_PREFILL_GEMM: u8 = 1;
+pub const PREFILL_ATTENTION: u8 = 2;
+pub const GEMV_CTA512: u8 = 3;
+pub const FP8_M1: u8 = 4;
+pub const CUBLASLT: u8 = 5;
+pub const MAX_ROLE: u8 = CUBLASLT;
+
+pub fn requires_object(role: u8) -> bool {
+    matches!(
+        role,
+        FP8_PREFILL_GEMM | PREFILL_ATTENTION | GEMV_CTA512 | FP8_M1
+    )
+}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,15 +75,15 @@ impl SegmentRoles {
     pub fn validate_schema(&self) -> Result<(), String> {
         if self.version != 1
             || self.programs.is_empty()
-            || self.objects.keys().any(|id| !(1..=4).contains(id))
+            || self.objects.keys().any(|&id| !requires_object(id))
         {
             return Err("unsupported packet segment roles".into());
         }
         for (&id, object) in &self.objects {
             let abi = match id {
-                1 => "fp8_gemm_tma128_v1",
-                2 => "attention_sm90_hd256_v1",
-                3 => "gemv_sm90_cta512_v1",
+                FP8_PREFILL_GEMM => "fp8_gemm_tma128_v1",
+                PREFILL_ATTENTION => "attention_sm90_hd256_v1",
+                GEMV_CTA512 => "gemv_sm90_cta512_v1",
                 _ => crate::fp8_m1_role::ABI,
             };
             if object.abi != abi
@@ -77,7 +91,7 @@ impl SegmentRoles {
                 || std::path::Path::new(&object.file)
                     .components()
                     .any(|c| !matches!(c, std::path::Component::Normal(_)))
-                || (id == 4
+                || (id == FP8_M1
                     && (object.promote_k512.is_none_or(|v| v > 1)
                         || object.sha256.as_ref().is_none_or(|s| {
                             s.len() != 64
@@ -85,7 +99,7 @@ impl SegmentRoles {
                                     .bytes()
                                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
                         })))
-                || (id != 4 && (object.sha256.is_some() || object.promote_k512.is_some()))
+                || (id != FP8_M1 && (object.sha256.is_some() || object.promote_k512.is_some()))
             {
                 return Err("invalid packet segment object".into());
             }
@@ -95,11 +109,17 @@ impl SegmentRoles {
         for program in &self.programs {
             if !programs.insert(program.index)
                 || program.roles.is_empty()
-                || program.roles.iter().any(|&r| r > 4)
+                || program.roles.iter().any(|&r| r > MAX_ROLE)
             {
                 return Err("invalid packet segment program".into());
             }
-            used.extend(program.roles.iter().copied().filter(|&r| r != 0));
+            used.extend(
+                program
+                    .roles
+                    .iter()
+                    .copied()
+                    .filter(|&role| requires_object(role)),
+            );
         }
         if used != self.objects.keys().copied().collect() {
             return Err("packet segment declarations do not match use".into());
@@ -135,6 +155,18 @@ mod tests {
             (r#""version":1"#, r#""version":1,"version":1"#),
         ] {
             assert!(SegmentRoles::from_bytes(raw.replace(needle, replacement).as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn cublaslt_role_is_packet_only() {
+        let raw = br#"{"version":1,"objects":{},"programs":[{"index":0,"roles":[0,5]}]}"#;
+        SegmentRoles::from_bytes(raw).unwrap();
+        for bad in [
+            br#"{"version":1,"objects":{"5":{"abi":"x","file":"x"}},"programs":[{"index":0,"roles":[5]}]}"#.as_slice(),
+            br#"{"version":1,"objects":{},"programs":[{"index":0,"roles":[6]}]}"#.as_slice(),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad).is_err());
         }
     }
 }

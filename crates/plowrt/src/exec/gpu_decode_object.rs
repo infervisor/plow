@@ -40,20 +40,9 @@ fn reject(message: &str) -> RuntimeError {
 }
 pub(super) fn parse(blob: &DevBlob, raw: &[u8]) -> Result<Option<DecodeObjects>> {
     decode_context::metadata(blob, raw)?;
-    let count = blob
-        .sections
-        .iter()
-        .filter(|s| s.kind == packet::devbuild::SECT_METADATA && s.name == SECTION)
-        .count();
-    if count == 0 {
+    let Some(bytes) = blob.reserved_metadata(raw, SECTION)? else {
         return Ok(None);
-    }
-    if count != 1 {
-        return Err(reject("duplicate metadata"));
-    }
-    let bytes = blob
-        .section_data_named(raw, packet::devbuild::SECT_METADATA, SECTION)
-        .ok_or_else(|| reject("missing metadata bytes"))?;
+    };
     let metadata: DecodeObjects =
         serde_json::from_slice(bytes).map_err(|e| reject(&e.to_string()))?;
     let start = blob.prefill_progs().len();
@@ -86,7 +75,7 @@ pub(super) fn check_options(
     override_present: bool,
 ) -> Result<()> {
     if segmented_decode || lt || multistep > 1 || override_present {
-        return Err(reject("only plain cooperative decode without object/resource overrides, Lt, decode graph or multistep is supported"));
+        return Err(reject("only plain cooperative decode without resource overrides, cuBLASLt, decode graph or multistep is supported"));
     }
     Ok(())
 }
@@ -391,7 +380,11 @@ mod tests {
                 section.name = plow_asset::decode_context::SECTION.into();
             }
             let error = parse(&blob, &raw).unwrap_err().to_string();
-            assert!(error.contains("decode context") || error.contains("unknown field"));
+            assert!(
+                error.contains(plow_asset::decode_context::SECTION)
+                    || error.contains("decode context")
+                    || error.contains("unknown field")
+            );
             blob.sections[0].kind = 0;
             assert!(parse(&blob, &raw).is_err());
         }

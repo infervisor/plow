@@ -217,7 +217,6 @@ driver_api! {
     cuStreamCreate: fn(*mut CUstream, u32) -> CUresult,
     cuStreamDestroy_v2: fn(CUstream) -> CUresult,
     cuStreamSynchronize: fn(CUstream) -> CUresult,
-    cuMemcpyDtoDAsync_v2: fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
     cuMemcpyHtoDAsync_v2: fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
     cuMemcpyDtoHAsync_v2: fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
     cuMemsetD8Async: fn(CUdeviceptr, u8, usize, CUstream) -> CUresult,
@@ -1554,22 +1553,6 @@ impl CudaBackend {
             win32_handle_meta_data: std::ptr::null_mut(),
             alloc_flags: [0; 8],
         }
-    }
-
-    /// Raw D2D copy (`cuMemcpyDtoD`) between two live device ranges.
-    // Both ranges must remain live until the stream retires; overlap is not supported.
-    pub(crate) unsafe fn memcpy_dtod_async(
-        &self,
-        dst: u64,
-        src: u64,
-        bytes: usize,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        self.bind()?;
-        self.check(
-            unsafe { (self.api.cuMemcpyDtoDAsync_v2)(dst, src, bytes, stream.raw as CUstream) },
-            "cuMemcpyDtoDAsync",
-        )
     }
 
     pub fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {

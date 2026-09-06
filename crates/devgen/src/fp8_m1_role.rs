@@ -88,8 +88,15 @@ pub fn apply(
     let mut roles = Vec::new();
     let mut segs = Vec::new();
     for pc in 0..p.insts.len() {
-        let role = if sel.pcs.contains(&pc) { 4 } else { 0 };
-        if roles.is_empty() || role != 0 || roles.last() != Some(&0) {
+        let role = if sel.pcs.contains(&pc) {
+            plow_asset::segment_roles::FP8_M1
+        } else {
+            plow_asset::segment_roles::INTERPRETER
+        };
+        if roles.is_empty()
+            || role != plow_asset::segment_roles::INTERPRETER
+            || roles.last() != Some(&plow_asset::segment_roles::INTERPRETER)
+        {
             roles.push(role);
         }
         segs.push(u16::try_from(roles.len() - 1).map_err(|_| "too many FP8 role segments")?);

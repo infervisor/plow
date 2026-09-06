@@ -166,8 +166,8 @@ fn gpu_gemv_role_graph_matches_coarse_full_logits() {
     for (is_role, assets) in [(false, baseline), (true, candidate)] {
         let mut e = GpuEngine::load(Arc::clone(&be), &assets, &assets.join("checkpoint")).unwrap();
         assert_eq!(e.batch, 1);
-        assert!(e.multistep.is_none() && e.lt_decode.is_empty() && e.decode_rungs.is_empty());
-        assert_eq!(e.lt_decode_graph.is_some(), is_role);
+        assert!(e.multistep.is_none() && e.cublaslt_decode.is_empty() && e.decode_rungs.is_empty());
+        assert_eq!(e.cublaslt_decode_graph.is_some(), is_role);
         assert_eq!(!e.decode_packet_roles.is_empty(), is_role);
         assert!(!e.prefill.is_empty(), "prefill required");
         let prefixes: Vec<usize> = std::env::var("TEST_GEMV_ROLE_PREFIXES")
@@ -214,7 +214,7 @@ fn gpu_gemv_role_graph_matches_coarse_full_logits() {
             e.step_slots(&[(0, token)], &mut decoded).unwrap();
             compare(&mut e, decoded[0]);
         }
-        assert_eq!(e.lt_decode_graph.is_some(), is_role);
+        assert_eq!(e.cublaslt_decode_graph.is_some(), is_role);
         eprintln!("role3={is_role}: {checked} full-logit snapshots; repeated graph replay, reset, padded prefill, continuation and sparse-slot rejection passed");
     }
 }

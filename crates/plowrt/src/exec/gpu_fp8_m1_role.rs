@@ -83,7 +83,7 @@ pub(super) fn validate_fp8_role_checkpoint(
     for p in &roles.programs {
         let g = &blob.progs[p.index];
         for (seg, &role) in p.roles.iter().enumerate() {
-            if role != 4 {
+            if role != plow_asset::segment_roles::FP8_M1 {
                 continue;
             }
             let d = &g.insts[g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize];
