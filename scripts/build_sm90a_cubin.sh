@@ -36,6 +36,8 @@
 #      <assets>/interp_sm90a_pf.cubin (PLOW_NV_CUBIN_PF overrides); absent, the
 #      serve path falls back to decode-only prompt consumption.
 # Both are verified to carry their kernel symbol.
+# `PLOW_BUILD_DECODE_ONLY=1` stops after the decode object; decode block sweeps
+# retain the packet-paired prefill objects and do not need to rebuild them.
 #
 # Runs with a clean environment: under `nix develop`, CPATH points nvcc's host
 # pass at nix glibc headers that conflict with the CUDA math headers.
@@ -315,6 +317,10 @@ if ! "${NVENV[@]}" \
   exit 1
 fi
 echo "built $OUT ($(stat -c%s "$OUT") B), kernel $KSYM present"
+
+if [ "${PLOW_BUILD_DECODE_ONLY:-0}" = "1" ]; then
+  exit 0
+fi
 
 "${NVENV[@]}" \
   "$NVCC" -arch=sm_90a -O3 -cubin \
