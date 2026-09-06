@@ -39,6 +39,13 @@ fn reject(message: &str) -> RuntimeError {
     RuntimeError::Rejected(format!("decode objects: {message}"))
 }
 pub(super) fn parse(blob: &DevBlob, raw: &[u8]) -> Result<Option<DecodeObjects>> {
+    if blob
+        .sections
+        .iter()
+        .any(|s| s.name == plow_asset::decode_context::SECTION)
+    {
+        return Err(reject("context alternatives require validated auxiliary-program loading; this engine supports the base ladder only"));
+    }
     let count = blob
         .sections
         .iter()
@@ -366,6 +373,21 @@ mod tests {
         let (blob, raw) = attach(changed, &metadata, false);
         assert!(parse(&blob, &raw).is_err());
     }
+    #[test]
+    fn context_metadata_cannot_be_silently_ignored_before_materialization() {
+        for duplicate in [false, true] {
+            let (mut blob, raw) = attach(model(), &metadata(), duplicate);
+            for section in &mut blob.sections {
+                section.name = plow_asset::decode_context::SECTION.into();
+            }
+            let error = parse(&blob, &raw).unwrap_err().to_string();
+            assert!(error.contains("validated auxiliary-program loading"));
+            blob.sections[0].kind = 0;
+            assert!(parse(&blob, &raw).is_err());
+        }
+        assert!(parse(&model(), &[]).unwrap().is_none());
+    }
+
     #[test]
     fn resources_and_derived_cooperative_capacity_must_match() {
         let s = spec();

@@ -666,6 +666,7 @@ pub struct BlockDescriptor {
     pub programs: BlockPrograms,
 }
 
+pub mod decode_context;
 pub mod decode_objects;
 
 pub mod cubin;
