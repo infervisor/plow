@@ -3,13 +3,12 @@
 #define PLOW_NV_HOPPER 1
 #define PLOW_NV_FA_PIPE 1
 #define PLOW_NV_FA_TMA 1
-#define PLOW_NV_FA512_WG 1
 #include "op_attention.cuh"
 
 extern "C" __device__ unsigned plow_attention_sm90_hd512_wg32_abi = 1;
 extern "C" __device__ unsigned plow_attention_head_dim = 512;
-extern "C" __device__ unsigned plow_attention_query_tile = 64;
-extern "C" __device__ unsigned plow_attention_kv_tile = 32;
+extern "C" __device__ unsigned plow_attention_query_tile = 32;
+extern "C" __device__ unsigned plow_attention_kv_tile = 16;
 extern "C" __device__ unsigned plow_attention_warps = 8;
 extern "C" __device__ unsigned plow_block_pfattn_hd512 = 256;
 extern "C" __device__ unsigned plow_arena_bytes_pfattn_hd512 =
@@ -42,7 +41,7 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
     const unsigned t4 = in->t[4], t5 = in->t[5], t7 = in->t[7];
     __nv_bfloat16* const output =
         t5 == PLOW_TENSOR_NONE ? nullptr : static_cast<__nv_bfloat16*>(tensors[t5]);
-    d_flash_prefill<512, 64, 32>(
+    d_flash_prefill<512, 32, 16>(
         static_cast<float*>(tensors[t0]), static_cast<float*>(tensors[t1]),
         static_cast<const __nv_bfloat16*>(tensors[t2]),
         static_cast<const __nv_bfloat16*>(tensors[t3]),
@@ -52,7 +51,7 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
         arena, nullptr, tensors[t7]);
 }
 
-extern "C" __global__ __maxnreg__(194)
+extern "C" __global__
 void plow_sm90a_pfattn_hd512(PlowProgram prog) {
     extern __shared__ float arena[];
     const unsigned lo = prog.gq_seg_ofs[prog.cur_seg];

@@ -114,7 +114,7 @@ fn output_object_is_explicit_inert_and_validated_before_mutation() {
     assert!(sections.is_empty());
 
     let mut stale = OBJECT_GLOBALS;
-    stale[3].1 = 16;
+    stale[3].1 = 32;
     std::fs::write(directory.join(OBJECT_FILE), object_image(&stale)).unwrap();
     assert!(apply_output_object(&mut model, &mut sections, "sm90a", &output).is_err());
     assert_eq!(model.to_blob(), before);
