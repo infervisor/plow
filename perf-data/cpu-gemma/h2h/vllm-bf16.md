@@ -1,28 +1,28 @@
 # bench-api results
 
-- server: `http://localhost:8096`  model: `707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7`
-- time: 2026-09-06T00:56:41+00:00  seed: 1234  max_tokens: 64  warmup: 1
+- server: `http://localhost:8094`  model: `gemma-4-12b-it`
+- time: 2026-09-06T01:28:41+00:00  seed: 1234  max_tokens: 64  warmup: 1
 - prompt tokens counted by: tokenizer
-- server models: 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+- server models: gemma-4-12b-it
 
 | workload | conc | n | err | in tok | out tok | TTFT mean/p50/p90 ms | TPOT mean/p50/p90 ms | latency p50/p90 s | out tok/s | req/s |
 |---|---|---|---|---|---|---|---|---|---|---|
-| chat_short | 1 | 8 | 0 | 34 | 64.0 | 563/564/596 | 161/160/166 | 10.59/11.07 | 6.0 | 0.09 |
-| chat_short | 2 | 8 | 0 | 34 | 64.0 | 987/1231/1314 | 198/201/203 | 13.40/13.79 | 9.5 | 0.15 |
-| chat_short | 4 | 8 | 0 | 34 | 64.0 | 1423/1442/1903 | 283/286/291 | 19.24/19.95 | 13.2 | 0.21 |
-| chat_short | 8 | 8 | 0 | 34 | 64.0 | 3360/3619/5546 | 464/469/482 | 32.88/33.73 | 15.0 | 0.23 |
-| chat_long | 1 | 8 | 0 | 398 | 59.4 | 2472/2530/3427 | 160/162/163 | 11.73/12.81 | 5.0 | 0.08 |
-| chat_long | 2 | 8 | 0 | 398 | 58.1 | 3064/2818/4068 | 234/238/244 | 17.84/18.46 | 6.6 | 0.11 |
-| chat_long | 4 | 8 | 0 | 398 | 59.2 | 5541/6113/7944 | 382/387/416 | 26.51/31.49 | 8.1 | 0.14 |
-| chat_long | 8 | 8 | 0 | 398 | 59.2 | 11630/11945/18187 | 650/667/718 | 51.32/52.70 | 8.9 | 0.15 |
-| code | 1 | 8 | 0 | 365 | 64.0 | 2188/2160/2447 | 163/163/166 | 12.45/12.62 | 5.1 | 0.08 |
-| code | 2 | 8 | 0 | 365 | 64.0 | 3490/3807/4888 | 223/226/252 | 18.42/18.64 | 7.3 | 0.11 |
-| code | 4 | 8 | 0 | 365 | 64.0 | 4850/4726/6471 | 330/337/352 | 26.21/27.45 | 9.9 | 0.15 |
-| code | 8 | 8 | 0 | 365 | 64.0 | 10051/11335/16036 | 553/571/634 | 45.10/45.95 | 11.0 | 0.17 |
-| summarize | 1 | 8 | 0 | 1105 | 64.0 | 6870/8030/8949 | 163/164/164 | 18.31/19.28 | 3.7 | 0.06 |
-| summarize | 2 | 8 | 0 | 1105 | 64.0 | 10679/11560/13860 | 252/267/332 | 26.24/30.17 | 4.8 | 0.08 |
-| summarize | 4 | 8 | 0 | 1105 | 64.0 | 14781/14046/18279 | 487/522/556 | 46.61/51.18 | 5.6 | 0.09 |
-| summarize | 8 | 8 | 0 | 1105 | 64.0 | 28065/29369/47928 | 913/1000/1186 | 85.86/86.74 | 5.9 | 0.09 |
+| chat_short | 1 | 8 | 0 | 34 | 64.0 | 628/649/690 | 516/520/521 | 33.37/33.53 | 1.9 | 0.03 |
+| chat_short | 2 | 8 | 0 | 34 | 64.0 | 1036/1089/1152 | 441/442/443 | 28.90/28.99 | 4.4 | 0.07 |
+| chat_short | 4 | 8 | 0 | 34 | 64.0 | 1436/1553/1765 | 445/442/451 | 29.61/29.61 | 8.7 | 0.14 |
+| chat_short | 8 | 8 | 0 | 34 | 63.8 | 1941/2139/2139 | 449/447/447 | 30.28/30.28 | 16.8 | 0.26 |
+| chat_long | 1 | 8 | 0 | 398 | 61.2 | 1719/1930/2011 | 441/441/442 | 29.11/29.61 | 2.2 | 0.04 |
+| chat_long | 2 | 8 | 0 | 398 | 61.2 | 1094/1370/1412 | 446/448/450 | 29.35/29.71 | 4.2 | 0.07 |
+| chat_long | 4 | 8 | 0 | 398 | 57.4 | 1487/1589/1751 | 457/457/467 | 29.71/30.55 | 7.6 | 0.13 |
+| chat_long | 8 | 8 | 0 | 398 | 61.2 | 2076/2306/2306 | 462/459/459 | 31.20/31.20 | 15.7 | 0.26 |
+| code | 1 | 8 | 0 | 365 | 64.0 | 1591/1626/1794 | 445/445/446 | 29.70/29.83 | 2.2 | 0.03 |
+| code | 2 | 8 | 0 | 365 | 64.0 | 1326/1385/1493 | 446/446/449 | 29.40/29.87 | 4.3 | 0.07 |
+| code | 4 | 8 | 0 | 365 | 64.0 | 1713/1959/1990 | 452/449/460 | 30.29/30.29 | 8.5 | 0.13 |
+| code | 8 | 8 | 0 | 365 | 64.0 | 2463/2703/2704 | 461/458/458 | 31.56/31.56 | 16.2 | 0.25 |
+| summarize | 1 | 8 | 0 | 1105 | 64.0 | 2732/2634/3741 | 449/449/450 | 30.94/32.10 | 2.1 | 0.03 |
+| summarize | 2 | 8 | 0 | 1105 | 64.0 | 4224/4154/6099 | 467/461/498 | 34.29/34.42 | 3.8 | 0.06 |
+| summarize | 4 | 8 | 0 | 1105 | 64.0 | 6542/7110/11574 | 509/512/549 | 39.51/41.92 | 6.6 | 0.10 |
+| summarize | 8 | 8 | 0 | 1105 | 64.0 | 16141/13637/15920 | 559/550/628 | 48.32/48.76 | 6.7 | 0.11 |
 
 ## Samples
 
@@ -68,23 +68,23 @@
 
 **code @ 1**
 
-- #0 code in=463 out=64 fin=length: `### Explanation of the Bug The issue is caused by **closures** and the way the '`
-- #1 code in=304 out=64 fin=length: `'''sql /* Approach: 1. Use a LEFT JOIN to ensure customers with zero orders are `
+- #0 code in=463 out=64 fin=length: `### Explanation of the Bug The issue is caused by **closure behavior** in JavaSc`
+- #1 code in=304 out=64 fin=length: `'''sql /* Approach: 1. Use a LEFT JOIN to ensure customers with no orders are in`
 
 **code @ 2**
 
-- #0 code in=463 out=64 fin=length: `### Explanation of the Bug The issue is caused by **closures** and the way the '`
-- #1 code in=304 out=64 fin=length: `'''sql /* Approach: 1. Use a LEFT JOIN to ensure customers with zero orders are `
+- #0 code in=463 out=64 fin=length: `### Explanation of the Bug The issue is caused by **closure behavior** in JavaSc`
+- #1 code in=304 out=64 fin=length: `'''sql /* Approach: 1. Use a LEFT JOIN to ensure customers with no orders are in`
 
 **code @ 4**
 
-- #0 code in=463 out=64 fin=length: `### Explanation of the Bug The issue is caused by **closures** and the way the '`
-- #1 code in=304 out=64 fin=length: `'''sql /* Approach: 1. Use a LEFT JOIN to ensure customers with zero orders are `
+- #0 code in=463 out=64 fin=length: `### Explanation of the Bug The issue is caused by **closure behavior** in JavaSc`
+- #1 code in=304 out=64 fin=length: `'''sql /* Approach: 1. Use a LEFT JOIN to ensure customers with no orders are in`
 
 **code @ 8**
 
-- #0 code in=463 out=64 fin=length: `### Explanation of the Bug The issue is caused by **closures** and the way the '`
-- #1 code in=304 out=64 fin=length: `'''sql /* Approach: 1. Use a LEFT JOIN to ensure customers with zero orders are `
+- #0 code in=463 out=64 fin=length: `### Explanation of the Bug The issue is caused by **closure behavior** in JavaSc`
+- #1 code in=304 out=64 fin=length: `'''sql /* Approach: 1. Use a LEFT JOIN to ensure customers with no orders are in`
 
 **summarize @ 1**
 

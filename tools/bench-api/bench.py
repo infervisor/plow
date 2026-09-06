@@ -448,7 +448,7 @@ async def amain(args):
             "seed": args.seed, "max_tokens": args.max_tokens, "requests": args.requests,
             "warmup": args.warmup, "arrival": args.arrival, "ignore_eos": args.ignore_eos,
             "prompt_token_source": "tokenizer" if tok_count else "server usage",
-            "samples": args.samples, "argv": sys.argv[1:],
+            "samples": args.samples, "argv": sys.argv[1:], "fresh_prompts": args.fresh_prompts,
         },
         "runs": [],
     }
@@ -459,8 +459,12 @@ async def amain(args):
             if args.warmup:
                 await run_closed_loop(args, url, tok_count, w, args.warmup, min(c or 4, args.warmup),
                                       index_base=WARMUP_INDEX_BASE, progress=False)
+            # --fresh-prompts: every (workload, concurrency) cell gets prompts no earlier cell
+            # used, so servers with a prefix/prompt cache (llama-server slots, vLLM APC) prefill
+            # for real instead of replaying the c=1 cell's KV.
+            base = concs.index(c) * args.requests if (args.fresh_prompts and rps is None) else 0
             if rps is None:
-                recs, wall = await run_closed_loop(args, url, tok_count, w, args.requests, c)
+                recs, wall = await run_closed_loop(args, url, tok_count, w, args.requests, c, index_base=base)
             else:
                 recs, wall = await run_open_loop(args, url, tok_count, w, args.requests, rps)
             recs.sort(key=lambda r: r["index"])
@@ -498,6 +502,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--tokenizer", help="dir containing tokenizer.json (or the file); needs `tokenizers`")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--fresh-prompts", action="store_true",
+                    help="distinct prompts per concurrency cell (defeats server prefix caches)")
     ap.add_argument("--warmup", type=int, default=1, help="untimed requests before each cell")
     ap.add_argument("--timeout", type=float, default=900.0, help="per-request timeout (s)")
     ap.add_argument("--ignore-eos", action="store_true", help="send ignore_eos=true (vLLM/plowrt extension)")
