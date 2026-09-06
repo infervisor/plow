@@ -1,5 +1,5 @@
 use crate::aux_program;
-use packet::dev::{PrefillSpan, PREFILL_SPAN_RESET_STATE};
+use packet::dev::{DevOp, PrefillSpan, PREFILL_SPAN_RESET_STATE, TENSOR_NONE16};
 use packet::devbuild::{SECT_CUBIN, SECT_HSACO, SECT_NAME_LEN, SECT_PROGRAMS};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,6 +10,14 @@ pub const SECTION: &str = "mixed_step";
 pub const VERSION: u32 = 1;
 pub const PROGRAM_CAPABILITY: &str = aux_program::CAPABILITY;
 pub const OBJECT_CAPABILITY: &str = "plow.mixed.interpreter";
+pub const DECODE_SLOT_TENSOR: &str = "in.decode_slot";
+
+#[derive(Clone, Copy)]
+pub struct TensorContract<'a> {
+    pub name: &'a str,
+    pub bytes: u64,
+    pub initialized: bool,
+}
 
 fn require(ok: bool, reason: &str) -> Result<()> {
     if ok {
@@ -66,6 +74,9 @@ pub struct Plan {
     pub decode_rows: u32,
     pub real_rows: u32,
     pub rows: Vec<Row>,
+    /// Physical KV slot for each compact decode row. This is the host image of
+    /// the optional `FlashDecode.t6` packet tensor.
+    pub decode_slots: Vec<i32>,
     pub prefill_spans: Vec<PrefillSpan>,
     pub parked: Vec<u32>,
     /// Largest mapped KV end per active physical slot, including bounded
@@ -84,6 +95,7 @@ impl Plan {
             decode_rows: 0,
             real_rows: 0,
             rows: Vec::with_capacity(row_capacity),
+            decode_slots: Vec::with_capacity(row_capacity),
             prefill_spans: Vec::with_capacity(prefill_capacity),
             parked: Vec::with_capacity(row_capacity),
             mapped_ends: Vec::with_capacity(active_capacity),
@@ -94,6 +106,7 @@ impl Plan {
         self.decode_rows = 0;
         self.real_rows = 0;
         self.rows.clear();
+        self.decode_slots.clear();
         self.prefill_spans.clear();
         self.parked.clear();
         self.mapped_ends.clear();
@@ -153,6 +166,7 @@ fn plan_into_inner(
     require(
         out.rows.capacity() >= capacity
             && out.prefill_spans.capacity() >= prefill.len()
+            && out.decode_slots.capacity() >= decode.len()
             && out.parked.capacity() >= capacity
             && out.mapped_ends.capacity() >= active,
         "output buffer capacity",
@@ -188,6 +202,8 @@ fn plan_into_inner(
             kv_len,
             phase: RowPhase::Decode,
         });
+        out.decode_slots
+            .push(i32::try_from(request.slot).map_err(|_| "mixed step: physical slot overflow")?);
         out.mapped_ends.push((request.slot, kv_len));
     }
     let decode_rows = u32::try_from(out.rows.len()).map_err(|_| "mixed step: decode rows")?;
@@ -558,6 +574,7 @@ impl Variant {
             plan.mapped_ends.len() == decode_rows + plan.prefill_spans.len(),
             "mapped slot count",
         )?;
+        validate_decode_slots(&plan.decode_slots, plan.decode_rows, physical_slot_capacity)?;
         require(
             plan.rows[..decode_rows].iter().all(|row| {
                 row.phase == RowPhase::Decode
@@ -574,6 +591,7 @@ impl Variant {
                 .unwrap_or(row.kv_len);
             require(
                 row.slot < physical_slot_capacity
+                    && plan.decode_slots[index] as u32 == row.slot
                     && row.state_slot < physical_slot_capacity
                     && !prior.iter().any(|p| p.slot == row.slot)
                     && !prior.iter().any(|p| p.state_slot == row.state_slot)
@@ -721,6 +739,87 @@ impl Variant {
             .ok_or_else(|| "mixed step: undeclared object".to_string())?
             .bind_object_with(kind, expected_n_cu, payload, read_capability)
     }
+}
+
+/// Validate the host image uploaded to `FlashDecode.t6`.
+pub fn validate_decode_slots(
+    slots: &[i32],
+    decode_rows: u32,
+    physical_slot_capacity: u32,
+) -> Result<()> {
+    require(
+        slots.len() == decode_rows as usize
+            && slots
+                .iter()
+                .all(|&slot| slot >= 0 && (slot as u32) < physical_slot_capacity),
+        "decode slot map",
+    )
+}
+
+/// Validate the physical-slot image against the selected program operand.
+pub fn validate_decode_slot_binding(
+    slots: &[i32],
+    decode_rows: u32,
+    physical_slot_capacity: u32,
+    operand: Option<u16>,
+) -> Result<()> {
+    validate_decode_slots(slots, decode_rows, physical_slot_capacity)?;
+    require(
+        operand.is_some()
+            || slots
+                .iter()
+                .enumerate()
+                .all(|(row, &slot)| slot == row as i32),
+        "unmapped FlashDecode requires compact slots",
+    )
+}
+
+pub fn validate_decode_slot_tensor(
+    handle: u16,
+    decode_rows: u32,
+    tensor: Option<TensorContract<'_>>,
+) -> Result<Option<u16>> {
+    if handle == TENSOR_NONE16 {
+        return Ok(None);
+    }
+    let tensor = tensor.ok_or("mixed step: invalid FlashDecode slot map handle")?;
+    require(
+        tensor.name == DECODE_SLOT_TENSOR
+            && !tensor.initialized
+            && tensor.bytes >= u64::from(decode_rows) * 4,
+        "FlashDecode slot map tensor",
+    )?;
+    Ok(Some(handle))
+}
+
+/// Validate and return the runtime-filled physical-slot tensor used by every
+/// ordinary BF16 FlashDecode in one mixed program.
+pub fn flash_decode_slot_operand(
+    program: &aux_program::Program,
+    decode_rows: u32,
+    tensors: &[TensorContract<'_>],
+) -> Result<Option<u16>> {
+    let mut operand: Option<Option<u16>> = None;
+    for inst in &program.insts {
+        if inst.op != DevOp::FlashDecode as u16 || inst.i[1] & (1 << 16) != 0 {
+            continue;
+        }
+        require(
+            inst.i[0] == decode_rows && inst.t[7] == TENSOR_NONE16,
+            "FlashDecode row or operand contract",
+        )?;
+        let current = validate_decode_slot_tensor(
+            inst.t[6],
+            decode_rows,
+            tensors.get(inst.t[6] as usize).copied(),
+        )?;
+        if let Some(prior) = operand {
+            require(current == prior, "inconsistent FlashDecode slot map")?;
+        } else {
+            operand = Some(current);
+        }
+    }
+    Ok(operand.flatten())
 }
 
 fn record_payload(

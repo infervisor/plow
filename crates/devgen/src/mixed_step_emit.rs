@@ -92,6 +92,15 @@ pub fn append(model: &Model, sections: &mut Vec<SectionData>, spec: &Spec<'_>) -
         spec.programs.programs,
     )?;
     let parsed = aux_program::parse(&program_bytes, model.n_cu, model.tensors.len())?;
+    let tensor_contracts: Vec<_> = model
+        .tensors
+        .iter()
+        .map(|tensor| mixed_step::TensorContract {
+            name: &tensor.name,
+            bytes: tensor.bytes,
+            initialized: tensor.init.is_some(),
+        })
+        .collect();
     let program_binding = mixed_step::PayloadBinding {
         section: spec.programs.section.into(),
         kind: mixed_step::PayloadKind::Programs,
@@ -129,13 +138,13 @@ pub fn append(model: &Model, sections: &mut Vec<SectionData>, spec: &Spec<'_>) -
     for variant in spec.variants {
         let program_index = usize::try_from(variant.program_index)
             .map_err(|_| "mixed step emitter: program index overflow")?;
-        if parsed
-            .programs
-            .get(program_index)
-            .is_none_or(|program| program.rows != variant.rows)
-        {
+        let Some(program) = parsed.programs.get(program_index) else {
+            return Err("mixed step emitter: variant program or row mismatch".into());
+        };
+        if program.rows != variant.rows {
             return Err("mixed step emitter: variant program or row mismatch".into());
         }
+        mixed_step::flash_decode_slot_operand(program, variant.decode_rows, &tensor_contracts)?;
         used_programs[program_index] = true;
         let mut objects = Vec::with_capacity(variant.object_indices.len());
         let mut selected = std::collections::BTreeSet::new();

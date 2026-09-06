@@ -1066,7 +1066,7 @@ __device__ __forceinline__ float fa_merge_ml(const float* __restrict__ ml, unsig
 #endif /* FA_MERGE_UNROLL4 */
 }
 
-template <int D, int GF, bool FP8KV = false, bool NRF = false>
+template <int D, int GF, bool FP8KV = false, bool NRF = false, bool SLOTMAP = false>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const bf16* __restrict__ Q, const bf16* __restrict__ K,
                                const bf16* __restrict__ V, const int* __restrict__ kv_len,
@@ -1082,7 +1082,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                const float* __restrict__ nrf_cos = nullptr,
                                const float* __restrict__ nrf_sin = nullptr, float nrf_eps = 0.0f,
                                unsigned nrf_skip = 0, unsigned* mrg_ctr = nullptr,
-                               bf16* o_final = nullptr) {
+                               bf16* o_final = nullptr,
+                               const int* __restrict__ decode_slot = nullptr) {
     /* A work item carries GF CONSECUTIVE query heads. They share a KV head as long as GF divides
      * GQA — which is the only thing this kernel needs, and is weaker than GF == GQA. On Gemma the
      * two coincide (hd 256 -> GQA 2 -> GF 2; hd 512 -> GQA 8 -> GF 8), but a true-MQA model has
@@ -1105,6 +1106,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         const unsigned sp = w % nsplit;
         const unsigned hg = (w / nsplit) % n_grp;
         const unsigned b = w / (nsplit * n_grp);
+        unsigned slot = b;
+        if constexpr (SLOTMAP) {
+            const int physical = decode_slot[b];
+            if (physical < 0) __builtin_trap();
+            slot = (unsigned)physical;
+        }
         const unsigned h0 = hg * GF;   /* the GF consecutive query heads this item carries */
         const unsigned hkv = h0 / gqa; /* they all share this KV head (GF divides gqa) */
 
@@ -1131,15 +1138,16 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         /* HEAD-MAJOR: this head's rows are CONTIGUOUS. See dev_isa.h -- token-major put
          * n_kv_head*D of stride between consecutive rows of one head (8 KB around 512 bytes of
          * payload at Gemma-31B), so a workgroup spanned 512 KB to read 256 KB. */
-        const auto* kbase = as_glob(K) + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
-        const auto* vbase = as_glob(V) + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
+        const size_t kv_batch = slot;
+        const auto* kbase = as_glob(K) + (kv_batch * n_kv_head + hkv) * kv_stride * D;
+        const auto* vbase = as_glob(V) + (kv_batch * n_kv_head + hkv) * kv_stride * D;
         /* FP8 KV: the cache is uint8[...] (1 byte/elem) with a PER-ROW f32 scale, head-major like
          * the bf16 cache. These bases are byte pointers (byte offset == element index) and the
          * per-(kv_head) scale slice; both unused on the bf16 instantiation. */
-        const unsigned char* kb8 = (const unsigned char*)K + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
-        const unsigned char* vb8 = (const unsigned char*)V + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
-        const float* ksc = k_scale + ((size_t)b * n_kv_head + hkv) * kv_stride;
-        const float* vsc = v_scale + ((size_t)b * n_kv_head + hkv) * kv_stride;
+        const unsigned char* kb8 = (const unsigned char*)K + (kv_batch * n_kv_head + hkv) * kv_stride * D;
+        const unsigned char* vb8 = (const unsigned char*)V + (kv_batch * n_kv_head + hkv) * kv_stride * D;
+        const float* ksc = k_scale + (kv_batch * n_kv_head + hkv) * kv_stride;
+        const float* vsc = v_scale + (kv_batch * n_kv_head + hkv) * kv_stride;
 
         /* All GF query rows into LDS, once.
          *
@@ -1203,8 +1211,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             }
             /* Phase 2 (the ONE owning item): current-token K and V rows -> the cache. */
             if (qpos >= lo && qpos < hi) {
-                const size_t slot =
-                    (((size_t)b * n_kv_head + hkv) * kv_stride + (qpos & kv_mask)) * D;
+                const size_t cache_off =
+                    ((kv_batch * n_kv_head + hkv) * kv_stride + (qpos & kv_mask)) * D;
                 if (wave == 0) { /* K: norm(gamma_k) + RoPE, exactly hnr's k arm */
                     const auto* xg = as_glob(nrf_kg) + ((size_t)b * n_kv_head + hkv) * D;
                     const auto* gg = as_glob(nrf_gk);
@@ -1233,7 +1241,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                         r[e] = (e < EH) ? (v[e] * c - v[e + EH] * s) : (v[e] * c + v[e - EH] * s);
                     }
 #pragma unroll
-                    for (unsigned e = 0; e < E; e++) st_act1(&og[slot + lane + e * 64], f2bf(r[e]));
+                    for (unsigned e = 0; e < E; e++) st_act1(&og[cache_off + lane + e * 64], f2bf(r[e]));
                 } else if (wave == 1) { /* V: weightless RMS (Gemma norms V), no RoPE, no gamma */
                     const auto* xg = as_glob(nrf_vg) + ((size_t)b * n_kv_head + hkv) * D;
                     auto* og = as_glob((bf16*)V);
@@ -1248,7 +1256,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                         inv = rsqrtf(wave_sum(ss) / (float)D + nrf_eps);
                     }
 #pragma unroll
-                    for (unsigned e = 0; e < E; e++) st_act1(&og[slot + lane + e * 64], f2bf(v[e] * inv));
+                    for (unsigned e = 0; e < E; e++) st_act1(&og[cache_off + lane + e * 64], f2bf(v[e] * inv));
                 }
                 /* Drain the stores (s_waitcnt, NO cache ops) before the barrier. An agent-scope
                  * fence here was the first attempt and it cost +0.6 ms/token: its buffer_inv is
@@ -1698,6 +1706,18 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             }
         }
     }
+}
+
+template <int D, int GF>
+__device__ __noinline__ void d_flash_decode_slots(
+    float* Opart, float* mlpart, const bf16* Q, const bf16* K, const bf16* V,
+    const int* kv_len, unsigned n_batch, unsigned n_head, unsigned n_kv_head,
+    unsigned kv_stride, unsigned window, float scale, unsigned nsplit, unsigned kv_mask,
+    unsigned slice, unsigned nblk, float* lds, const int* decode_slot) {
+    d_flash_decode<D, GF, false, false, true>(
+        Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
+        nsplit, kv_mask, slice, nblk, lds, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, 0.0f, 0, nullptr, nullptr, decode_slot);
 }
 
 /* Combine the split partials: standard online-softmax merge.
