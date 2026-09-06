@@ -42,6 +42,7 @@ V_K(v_moe_down_mx);
 V_K(v_moe_glu_mx_pf);
 V_K(v_moe_down_mx_pf);
 void v_register_gptoss(plow_cpu_kernel_fn* tab);
+void v_register_moe_gemma(plow_cpu_kernel_fn* tab); /* moe_gemma.c: Gemma-4 26B-A4B MoE ops */
 
 /* --- bf16 <-> f32 (spec §5: explicit widen, cvtneps_pbh on store) ------------------- */
 

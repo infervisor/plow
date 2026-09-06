@@ -353,4 +353,5 @@ void plow_cpu_register_avx512(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_GEMV_ARGMAX] = v_gemv_argmax;
     v_register_attention(tab);
     v_register_gptoss(tab);
+    v_register_moe_gemma(tab);
 }

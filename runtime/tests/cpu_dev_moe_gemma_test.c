@@ -88,7 +88,9 @@ static void cmp_out(const char* what, const plow_bf16* got, const double* want, 
 }
 
 int main(void) {
-    plow_cpu_init(PLOW_CPU_ISA_SCALAR);
+    const int tier = plow_cpu_init(PLOW_CPU_ISA_AMX);
+    printf("tier %d: 69/71/63/75/76 on tier %d %d %d %d %d\n", tier, plow_cpu_tier_of(69), plow_cpu_tier_of(71),
+           plow_cpu_tier_of(63), plow_cpu_tier_of(75), plow_cpu_tier_of(76));
     PlowCpuCtx ctx; memset(&ctx, 0, sizeof ctx);
     ctx.scratch_bytes = plow_cpu_scratch_bytes(); ctx.scratch = aligned_alloc(64, ctx.scratch_bytes);
     plow_cpu_thread_init(&ctx);
