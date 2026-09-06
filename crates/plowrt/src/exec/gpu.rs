@@ -1026,6 +1026,20 @@ fn decode_rung_index(
     widths.position(|rows| rows > highest_slot)
 }
 
+fn effective_decode_widths(
+    narrow: impl Iterator<Item = usize>,
+    widest: usize,
+    widest_only: bool,
+) -> Box<[u32]> {
+    if widest_only {
+        return vec![widest as u32].into_boxed_slice();
+    }
+    narrow
+        .map(|rows| rows as u32)
+        .chain(std::iter::once(widest as u32))
+        .collect()
+}
+
 fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
     let splitk = blob
         .with_packet_view(plow_asset::splitk::validate)
@@ -4969,6 +4983,19 @@ impl GpuEngine {
     /// drives (the compiled `PLOW_DECODE_BATCH`).
     pub fn batch(&self) -> usize {
         self.batch
+    }
+
+    /// Decode widths this loaded engine can execute, in ascending order.
+    ///
+    /// `decode_rungs` contains only the narrow programs; the main program is
+    /// the widest rung. Lt and multi-step execution use the main program, so
+    /// advertise only that width when either path is active.
+    pub fn effective_decode_rungs(&self) -> Box<[u32]> {
+        effective_decode_widths(
+            self.decode_rungs.iter().map(|r| r.rows),
+            self.batch,
+            self.multistep.is_some() || self.decode_rungs.is_empty(),
+        )
     }
 
     /// VMM prefix-sharing counters; `None` when `PLOW_VMM_PREFIX` is off.

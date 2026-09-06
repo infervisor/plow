@@ -111,6 +111,22 @@ fn selects_by_highest_physical_slot_and_preserves_sparse_slots() {
 }
 
 #[test]
+fn effective_widths_include_main_and_preserve_widest_only_fallbacks() {
+    assert_eq!(
+        effective_decode_widths([1, 2, 4, 8].into_iter(), 16, false).as_ref(),
+        [1, 2, 4, 8, 16]
+    );
+    assert_eq!(
+        effective_decode_widths([1, 2, 4, 8].into_iter(), 16, true).as_ref(),
+        [16]
+    );
+    assert_eq!(
+        effective_decode_widths(std::iter::empty(), 16, true).as_ref(),
+        [16]
+    );
+}
+
+#[test]
 fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
     assert!(validate_decode_ladder(&fixture()).unwrap());
     let mutations: &[fn(&mut DevBlob)] = &[

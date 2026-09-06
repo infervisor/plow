@@ -568,12 +568,22 @@ pub fn spawn(
                     .rposition(Option::is_some)
                     .map(|i| i + 1)
                     .unwrap_or(1);
-                let queued = metrics.queued_requests.load(Ordering::Relaxed) as usize;
+                // This receiver belongs to one model. The exported metric is
+                // process-wide and cannot drive a per-model rung controller.
+                let queued = rx.len();
                 let (sum, n) = slots
                     .iter()
                     .flatten()
                     .fold((0usize, 0usize), |(s, n), slot| {
-                        (s.saturating_add(slot.gen.max_tokens.max(1)), n + 1)
+                        (
+                            s.saturating_add(
+                                slot.gen
+                                    .max_tokens
+                                    .saturating_sub(slot.out_ids.len())
+                                    .max(1),
+                            ),
+                            n + 1,
+                        )
                     });
                 let mean_output_tokens = if n == 0 { 1.0 } else { sum as f64 / n as f64 };
                 let before = controller.admission_limit();
@@ -617,11 +627,10 @@ pub fn spawn(
                 .count();
             if !draining && idle > 0 {
                 let lambda = load.lambda.get();
-                let live_now = admission_limit - idle;
                 // Only hold when the slot table is empty (cold-start burst);
                 // if any slot is already live, spinning up the tick delivers
                 // TTFT faster than waiting for more arrivals.
-                let hold_ms = if live_now == 0 {
+                let hold_ms = if live == 0 {
                     formation_window_ms(lambda, cfg.max_hold_ms)
                 } else {
                     0.0
@@ -698,12 +707,13 @@ pub fn spawn(
                     .rposition(Option::is_some)
                     .map(|i| i + 1)
                     .unwrap_or(1);
-                let rung = controller.covering(occupied_extent);
-                let width = controller.width(rung);
-                metrics
-                    .decode_rung_actual
-                    .store(width as u64, Ordering::Relaxed);
-                (width, Some(rung))
+                let service_rung = controller.covering(occupied_extent);
+                let width = controller.width(service_rung);
+                let tick_rung = slots
+                    .iter()
+                    .rposition(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
+                    .map(|i| controller.covering(i + 1));
+                (width, tick_rung)
             } else {
                 (capacity, None)
             };
@@ -876,7 +886,7 @@ pub fn spawn(
                     .map_err(|e| e.to_string()),
             };
 
-            let ms = t_service_start.elapsed().as_millis() as f64;
+            let ms = t_service_start.elapsed().as_secs_f64() * 1e3;
 
             match joined {
                 Ok((
@@ -895,8 +905,13 @@ pub fn spawn(
                         if let (Some(controller), Some(rung)) =
                             (rung_controller.as_mut(), tick_rung)
                         {
+                            metrics
+                                .decode_rung_actual
+                                .store(controller.width(rung) as u64, Ordering::Relaxed);
                             controller.observe_decode(rung, sample);
                         }
+                    } else if rung_controller.is_some() {
+                        metrics.decode_rung_actual.store(0, Ordering::Relaxed);
                     }
                     slots = returned_slots;
                     if let Some(b) = returned_bufs {

@@ -229,7 +229,13 @@ impl RungController {
         (0..rung)
             .rev()
             .find(|&i| self.stats[i].samples > 0)
-            .map(|i| self.stats[i].service_ms.get())
+            // Until the wider rung has a sample, assume work scales with its
+            // width. Reusing the narrow latency unchanged overstates wider
+            // capacity and can admit a burst on evidence it does not have.
+            .map(|i| {
+                self.stats[i].service_ms.get() * self.rungs.width(rung) as f64
+                    / self.rungs.width(i) as f64
+            })
             .unwrap_or(0.0)
     }
 
@@ -333,5 +339,17 @@ mod tests {
         assert_eq!(d.reason, RungReason::Slo);
         assert_eq!(c.stats[0].samples, 1);
         assert_eq!(c.stats[1].samples, 0);
+    }
+
+    #[test]
+    fn unseen_wider_rung_uses_conservative_width_scaled_service() {
+        let mut c = controller(&[1, 4, 16]);
+        c.observe_decode(0, 2.5);
+        let b1 = c.service_ms(0);
+        assert!(b1 > 0.0);
+        assert_eq!(c.service_ms(1), b1 * 4.0);
+        assert_eq!(c.service_ms(2), b1 * 16.0);
+        c.observe_decode(1, 6.0);
+        assert_eq!(c.service_ms(2), c.service_ms(1) * 4.0);
     }
 }
