@@ -17,6 +17,7 @@
 #define _POSIX_C_SOURCE 199309L /* clock_gettime under the cc build's -std=c11 */
 #include <errno.h>
 #include <immintrin.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "cpu_dev_internal.h"
@@ -280,8 +281,24 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
 
 /* ---- Tile driver shared by every op --------------------------------------------------- */
 
+/* PLOW_AMX_DEBUG=nopack|notdp|nostage: attribution knobs (WRONG RESULTS) — skip the B strip pack,
+ * skip the tile math, or read A in place instead of staging. Read once, off by default. */
+enum { AMX_DBG_NOPACK = 1, AMX_DBG_NOTDP = 2, AMX_DBG_NOSTAGE = 4 };
+static int amx_debug_flags(void) {
+    static int f = -1;
+    if (f < 0) {
+        const char* e = getenv("PLOW_AMX_DEBUG");
+        f = 0;
+        if (e && strstr(e, "nopack")) f |= AMX_DBG_NOPACK;
+        if (e && strstr(e, "notdp")) f |= AMX_DBG_NOTDP;
+        if (e && strstr(e, "nostage")) f |= AMX_DBG_NOSTAGE;
+    }
+    return f;
+}
+
 static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, uint32_t n1,
                      uint8_t* scratch) {
+    const int dbg = amx_debug_flags();
     uint8_t* bp = scratch + BP_OFF;
     plow_bf16* ap = (plow_bf16*)(scratch + AP_OFF);
     float* cp = (float*)(scratch + CP_OFF);
@@ -294,7 +311,7 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
     for (uint32_t p = 0; p < npanel; p++) {
         const uint32_t k0 = p * KP, kp = g->K - k0 < KP ? g->K - k0 : KP, nkb = kp / 32u;
         const int first = p == 0, last = p + 1 == npanel;
-        for (uint32_t s = 0; s < nb; s++) {
+        for (uint32_t s = 0; s < nb && !(dbg & AMX_DBG_NOPACK); s++) {
             const uint32_t n = n0 + s * 32u;
             if (g->Wq) {
                 if (!glu) {
@@ -319,7 +336,8 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
             /* Always stage when the A row stride crosses a page: TILELOADD of 16 rows at a
              * multi-KiB stride touches 16 pages per tile (act buffers < 2 MiB are not THP-backed),
              * and the tile loop re-reads A per strip; staged rows are 1 KiB apart. */
-            if (g->rms || (rows != 32u && rows != 16u) || (size_t)g->K * 2u > 4096u) {
+            if (g->rms || (rows != 32u && rows != 16u) ||
+                ((size_t)g->K * 2u > 4096u && !(dbg & AMX_DBG_NOSTAGE))) {
                 plow_bf16* a = ap + (size_t)mb * (ABLK_BYTES / 2u);
                 stage_a(a, g->A + (size_t)m * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m : NULL,
                         g->gamma);
@@ -342,10 +360,14 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
                 float* part = cp + ((size_t)mb * NSTRIP + (glu ? 2u * s : s)) * 1024u;
                 const float* in_part = first ? NULL : part;
                 float* out = last ? cb + (size_t)cur * 2048u : part;
-                block(A0s[mb], A1s[mb], ldas[mb], bs, nkb, in_part, out, pend.rows ? &pend : NULL);
-                if (glu)
-                    block(A0s[mb], A1s[mb], ldas[mb], bs + STRIP_BYTES, nkb,
-                          in_part ? in_part + 1024 : NULL, out + 1024, pend.rows ? &pend : NULL);
+                if (!(dbg & AMX_DBG_NOTDP)) {
+                    block(A0s[mb], A1s[mb], ldas[mb], bs, nkb, in_part, out, pend.rows ? &pend : NULL);
+                    if (glu)
+                        block(A0s[mb], A1s[mb], ldas[mb], bs + STRIP_BYTES, nkb,
+                              in_part ? in_part + 1024 : NULL, out + 1024, pend.rows ? &pend : NULL);
+                } else if (pend.rows) {
+                    ils_drain(&pend);
+                }
                 if (last) {
                     ils_drain(&pend);
                     pend = (ils_t){.cb = out,
