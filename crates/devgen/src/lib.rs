@@ -48,6 +48,7 @@ use serde_json::Value;
 
 mod checkpoint;
 use checkpoint::{layer_scalars, validate_coverage};
+mod attention_prefill_role;
 mod block;
 use block::{parse_block, write_block_descriptor};
 mod config;
@@ -7458,6 +7459,13 @@ fn emit_dense_gqa(
         )
     }
     .unwrap_or_else(|error| panic!("decode objects: {error}"));
+    attention_prefill_role::apply_output_object(
+        &mut m,
+        &mut sections,
+        &arch,
+        std::path::Path::new(&out),
+    )
+    .unwrap_or_else(|error| panic!("prefill attention object: {error}"));
     let blob = if sections.is_empty() {
         m.to_blob()
     } else {
