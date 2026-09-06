@@ -1,0 +1,3109 @@
+{
+  "scope": "Gemma12 block5 B1, same TF32 cubin at1K/8K/32K; native synthetic blockhistory, existing40/5median+p95harness,256MiBpacket-entryeviction. No whole-model/serving or unmeasured-context claim.",
+  "decision": "Keep original at1K and8K. Candidate is5.06\u20135.16%slower1K and1.01\u20131.26%slower8K;32K6.01\u20136.62%faster. No universal defaultpromotion. Next compilerNSladder uses samecubin and explicitboundedgates.",
+  "raw": {
+    "e1-k64-tf32-pv-20260906/broad/timing/all-context-analysis/FREEZE.json": {
+      "sha256": "e686a880aef6a743430deb302831e26b34628facfd166b47fb0234cd317e90a8",
+      "content": {
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/screen-analysis/RESULTS.json": "31337934c077775ac9244a5682ba8ffdd0df911d3cb5c212aba2cafe1588d994",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/screen-analysis/FREEZE.json": "1dedadeab21eab1f039fac0490daef297307a47a2e9bcb1d9af84f1e974d3422",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/short-context-queue-ready.json": "5507a2dac4cd6f6d414328cb4c5e77fe69bc441607110db91e9074fb79b7fbb6",
+        "/tmp/plow-model-support-checks/e1-tf32-broad-short-timing-window-20260906/results.json": "30c006e7c58466a6a67176cd99c143205311e74d6dc9f39e2a44a851e33c96b5",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r0/validation.json": "50d5324ff1dcec849c5c316e1feebb532d8d8e1f2ec84a9f79c78faf06b9a994",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r0/sweep.json": "bafd1320ac2932968e42c5d23ecca231fe990d436b00aa34dc25f53c7b0392e9",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r0.log": "15979ed6449cb280c051f01f3eda744ceb7f31f805882aa69de0755918aff097",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx8192-default-r0-dmon.log": "4d8abd8a20198d8598662f7da123ecdaaed087a2f839a5d0665107614bd130ec",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r0/validation.json": "9503a0e666d6960348dac25982533396252ae95a00913227a01196400c63ed14",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r0/sweep.json": "d7dae6d9a405dfec652787fe33a2e8bee198ab5d951e0104d9e30de9482fa1e3",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r0.log": "1cbd01e5a1c26e86dc911cabf594aac837e51084a6dfb88414e6ac9b753d06b5",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx8192-control-r0-dmon.log": "6cff2aab3d4a7816522192b7972dd487dd775a638e8763381bb13ba435a7f6af",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r0/validation.json": "e642e0a13e83a3110290b508b42616023af2183c4ccc33bd9128fbe7ce862278",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r0/sweep.json": "cdb1ee76ffeec3dc468900577466af06ed9c3b677a173266ed8e1295429aa6a3",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r0.log": "be551521a2cd0227c44ce052d2724e92dcc0fbf5e2dd21c2a823c567c162f771",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx8192-candidate-r0-dmon.log": "6fa7ea23d94692487a3ec4c9a9fee7f151fe386c34181331db00d42875886368",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r1/validation.json": "9c9054778f405a9ba0fca2ba6d39de192db31a98df9494a1ad4711dbc6a8f133",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r1/sweep.json": "03053f3da7e86d0c93e889b392b778ef067090f75ce2044dfa679fe16e026df5",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r1.log": "76f37053b9f45cc0d594e334d66190903c344bf353ec814c75d0ca34ef6a2c20",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx8192-candidate-r1-dmon.log": "5e5190355c17c3d46dfd256981ddc1b544d4e29d1ac4dd077fcf6939ed6dfdf5",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r1/validation.json": "883b5be81eac76f05a3347eeaf74901a02ba93fbdc2e850dd889487bc13f5191",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r1/sweep.json": "5093315024501450c029205e0e739ff48dd27709daee0b7d1f7e0478f688d9ef",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r1.log": "c23c1320dacef4b017fb4a9f17e0226b0bec28e2b18d02eda83fc838ceaaa2ec",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx8192-control-r1-dmon.log": "7656221d57ee8b0e9a4693a600cf26bcc416ae95c34567b11ca4fb14bc1880e5",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r1/validation.json": "b5b5ab06da49b5ae03fb01e9bcb719c2261facc9604ee03de6bc322d0bb60dbd",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r1/sweep.json": "48fd5927bb1a0a86fb25ff41d3e54b17106c1c93499972d5f6e6f70a3aed059b",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r1.log": "34926b1c41b5198108a625e7536f0b5fb14265869d34697990bc601673be63fc",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx8192-default-r1-dmon.log": "b426bb49cef122549de387ec92b196164c3ba2c47a8eb9090061d399e94c5d2c",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r0/validation.json": "f9949733c875d7b7d19488c2213087b3f0d9a792f9c40b589c3971b062de8a6d",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r0/sweep.json": "cc8805d36c95cac891507fcbaa6f92d490ccd9255d8a9849429bff0a4cfb730a",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r0.log": "4823b653cd52dd4e16d9ab36bbcc86d2787c966da97f996db991a525dd58111d",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx1024-default-r0-dmon.log": "4bc51dba46e34ef882e740e253d079075e4567e3bfd1bc7ec08415f6af51f51f",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r0/validation.json": "948402efe9e03621aca62e89938bf812969e82e6c6ccc9c462d407b3cff6696c",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r0/sweep.json": "9a901a22e057f2898e12524112a95f4d23fa8690509d94d5d65f1032bc2df6b9",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r0.log": "cbd0a361198aa3d5a198591d8fdd20359f9952e0296db01a22727d52d1f83adf",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx1024-control-r0-dmon.log": "527669153332fdabfdf316c1ecabfaf3db591781d0b1f8565e0a140d98fb8a9f",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r0/validation.json": "0c453a40fc249efc31199b76c5749f956512b8f58575cda7761ee976915257b8",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r0/sweep.json": "0f5bdbf15d9179e5bda3365fc6fd66c3679ce2b4857d395013d09cddf6f6a485",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r0.log": "1ca86d3992acd26d9c13cdb11fb2a9c89555ab5ddcc65ec9b5ea795423f7aac1",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx1024-candidate-r0-dmon.log": "f449b3f691d31465d3ee67b3f0bc2917051cbf032526fdecd34006efc4a25dde",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r1/validation.json": "26b85cf3b89cbca15865d419cc60d3496444341fce6e858d2298b4f19463f0f4",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r1/sweep.json": "868cf175737a033d3b9475fd19f2840114d7685214e0d40f5168d8a8798ac466",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r1.log": "1d1f1ebf0c29c9d8b1768d9942faf7ce3e267572d8ff81c5b52f2a59dd7fcc49",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx1024-candidate-r1-dmon.log": "3aefa0b208c90d278b48499e96d51f8d0d73f961e2fbba105364aa0b3e844f55",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r1/validation.json": "92f6ab7463973a1b17d06d5b355779a51083a64902452eb1100ff180c6e1a230",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r1/sweep.json": "1cbfb1dc4627364eaa33dd0b1376401e07c6c8e221ac2ff76b9443772bcccaf1",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r1.log": "22afad4e39be75818bc35de521b253e54730ab34e12b7242e628fd5b8a312a41",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx1024-control-r1-dmon.log": "b3cc84458f925bcdb9977272529a1abb9ebadcbb12779753c7411b9f774d84d1",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r1/validation.json": "83d3f19efaf432fe4ac6455a3378f28b99b1c2c5ffbf9307226535d9a0e5c8b0",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r1/sweep.json": "fbef10261ad5dc4aa341c37f34c5230204f811e49263d83efbf7b2413a7b7f40",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r1.log": "338c9a6604e12286e00efbcae047aaa48d8aae564e0cd54c7c2da2f988188a7d",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-block-ctx1024-default-r1-dmon.log": "6a6b5bf6f9fcf9304484983009d3323f750369c750872cd254e5381dc4397028",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/all-context-analysis/RESULTS.json": "764f538cc6d35b046d1594704ffc25843993a005ee71b2022658eb6c071a069e",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/all-context-analysis/RESULTS.md": "06a445df6b12f94155314aad5dc8499ae99588b01b73092d127d887498dc684a",
+        "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/all-context-analysis/analyze.py": "3b9c3e6d627436096e3a946f531b4b9e37eef1021481a6c7585fbbf090b4720f"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/all-context-analysis/RESULTS.json": {
+      "sha256": "764f538cc6d35b046d1594704ffc25843993a005ee71b2022658eb6c071a069e",
+      "content": {
+        "schema": 1,
+        "passed": true,
+        "scope": "Native broad-interpreter block5B1 syntheticself-fedhistory,45stepsincl5warmup,256MiBpacket-entryevictionoutsidewhole-stepwalltimer; notper-opcold,PF/fullmodel/serving/vLLM timing. Existingharness storesroundedmedian/p95only; no individualdurationclaims",
+        "decision": "Retain 32K private native block win only. Reject universal use: 1K regresses 5.06\u20135.16%, 8K regresses 1.01\u20131.26% versus qualified default despite beating equal-arena. Permit bounded compiler NS experiment after fixed numerical gates; no full-model/serving/default promotion.",
+        "rows": [
+          {
+            "arm": "default",
+            "repeat": 0,
+            "context": 32768,
+            "median_us": 437.66,
+            "p95_us": 440.87,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "control",
+            "repeat": 0,
+            "context": 32768,
+            "median_us": 442.34,
+            "p95_us": 448.54,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "candidate",
+            "repeat": 0,
+            "context": 32768,
+            "median_us": 408.7,
+            "p95_us": 417.33,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "candidate",
+            "repeat": 1,
+            "context": 32768,
+            "median_us": 409.64,
+            "p95_us": 413.86,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "control",
+            "repeat": 1,
+            "context": 32768,
+            "median_us": 444.16,
+            "p95_us": 450.29,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "default",
+            "repeat": 1,
+            "context": 32768,
+            "median_us": 435.83,
+            "p95_us": 443.59,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "default",
+            "repeat": 0,
+            "context": 8192,
+            "median_us": 331.55,
+            "p95_us": 350.96,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "control",
+            "repeat": 0,
+            "context": 8192,
+            "median_us": 339.25,
+            "p95_us": 344.87,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "candidate",
+            "repeat": 0,
+            "context": 8192,
+            "median_us": 334.89,
+            "p95_us": 341.87,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "candidate",
+            "repeat": 1,
+            "context": 8192,
+            "median_us": 333.96,
+            "p95_us": 337.83,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "control",
+            "repeat": 1,
+            "context": 8192,
+            "median_us": 340.13,
+            "p95_us": 345.5,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "default",
+            "repeat": 1,
+            "context": 8192,
+            "median_us": 329.79,
+            "p95_us": 335.48,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "default",
+            "repeat": 0,
+            "context": 1024,
+            "median_us": 300.87,
+            "p95_us": 307.22,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "control",
+            "repeat": 0,
+            "context": 1024,
+            "median_us": 307.1,
+            "p95_us": 314.28,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "candidate",
+            "repeat": 0,
+            "context": 1024,
+            "median_us": 316.38,
+            "p95_us": 323.04,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "candidate",
+            "repeat": 1,
+            "context": 1024,
+            "median_us": 316.9,
+            "p95_us": 322.93,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "control",
+            "repeat": 1,
+            "context": 1024,
+            "median_us": 308.35,
+            "p95_us": 315.29,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          },
+          {
+            "arm": "default",
+            "repeat": 1,
+            "context": 1024,
+            "median_us": 301.64,
+            "p95_us": 310.0,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "actual_duration_samples_retained": false
+          }
+        ],
+        "pairs": [
+          {
+            "context": 1024,
+            "repeat": 0,
+            "reference": "default",
+            "reference_us": 300.87,
+            "candidate_us": 316.38,
+            "speedup": 0.95097667362033,
+            "saved_us": -15.509999999999991,
+            "latency_reduction_percent": -5.155050353973478,
+            "p95_reduction_percent": -5.149404335655228
+          },
+          {
+            "context": 1024,
+            "repeat": 0,
+            "reference": "control",
+            "reference_us": 307.1,
+            "candidate_us": 316.38,
+            "speedup": 0.9706681838295721,
+            "saved_us": -9.279999999999973,
+            "latency_reduction_percent": -3.0218169977205944,
+            "p95_reduction_percent": -2.7873234058801266
+          },
+          {
+            "context": 1024,
+            "repeat": 1,
+            "reference": "default",
+            "reference_us": 301.64,
+            "candidate_us": 316.9,
+            "speedup": 0.951846008204481,
+            "saved_us": -15.259999999999991,
+            "latency_reduction_percent": -5.059010741280989,
+            "p95_reduction_percent": -4.170967741935483
+          },
+          {
+            "context": 1024,
+            "repeat": 1,
+            "reference": "control",
+            "reference_us": 308.35,
+            "candidate_us": 316.9,
+            "speedup": 0.973019880088356,
+            "saved_us": -8.549999999999955,
+            "latency_reduction_percent": -2.772823090643728,
+            "p95_reduction_percent": -2.423165974182484
+          },
+          {
+            "context": 8192,
+            "repeat": 0,
+            "reference": "default",
+            "reference_us": 331.55,
+            "candidate_us": 334.89,
+            "speedup": 0.9900265758905911,
+            "saved_us": -3.339999999999975,
+            "latency_reduction_percent": -1.0073895340069194,
+            "p95_reduction_percent": 2.590038750854795
+          },
+          {
+            "context": 8192,
+            "repeat": 0,
+            "reference": "control",
+            "reference_us": 339.25,
+            "candidate_us": 334.89,
+            "speedup": 1.0130192003344383,
+            "saved_us": 4.360000000000014,
+            "latency_reduction_percent": 1.2851879145173162,
+            "p95_reduction_percent": 0.8698930031606156
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "reference": "default",
+            "reference_us": 329.79,
+            "candidate_us": 333.96,
+            "speedup": 0.987513474667625,
+            "saved_us": -4.169999999999959,
+            "latency_reduction_percent": -1.2644410079141188,
+            "p95_reduction_percent": -0.7004888517944341
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "reference": "control",
+            "reference_us": 340.13,
+            "candidate_us": 333.96,
+            "speedup": 1.018475266498982,
+            "saved_us": 6.170000000000016,
+            "latency_reduction_percent": 1.8140122894187538,
+            "p95_reduction_percent": 2.219971056439951
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "reference": "default",
+            "reference_us": 437.66,
+            "candidate_us": 408.7,
+            "speedup": 1.0708588206508443,
+            "saved_us": 28.960000000000036,
+            "latency_reduction_percent": 6.617008636841392,
+            "p95_reduction_percent": 5.3394424660330735
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "reference": "control",
+            "reference_us": 442.34,
+            "candidate_us": 408.7,
+            "speedup": 1.0823097626620992,
+            "saved_us": 33.639999999999986,
+            "latency_reduction_percent": 7.605009721029066,
+            "p95_reduction_percent": 6.958130824452679
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "reference": "default",
+            "reference_us": 435.83,
+            "candidate_us": 409.64,
+            "speedup": 1.0639341861146372,
+            "saved_us": 26.189999999999998,
+            "latency_reduction_percent": 6.009223779914185,
+            "p95_reduction_percent": 6.702134854257302
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "reference": "control",
+            "reference_us": 444.16,
+            "candidate_us": 409.64,
+            "speedup": 1.0842691143443024,
+            "saved_us": 34.52000000000004,
+            "latency_reduction_percent": 7.771974063400588,
+            "p95_reduction_percent": 8.09034177974195
+          }
+        ],
+        "clocks": [
+          {
+            "job": "e1-tf32-block-ctx32768-default-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:24:51",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:24:52",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:24:53",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:24:54",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:24:55",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:24:56",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx32768-control-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:24:58",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:24:59",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:00",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:01",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:02",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:03",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx32768-candidate-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:25:04",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:05",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:06",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:07",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:08",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:09",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": [
+              " 20260906    07:25:10       0 "
+            ]
+          },
+          {
+            "job": "e1-tf32-block-ctx32768-candidate-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:25:11",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:12",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:13",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:14",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:15",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:16",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx32768-control-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:25:17",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:18",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:19",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:20",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:21",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:22",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx32768-default-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:25:24",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:25",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:26",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:27",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:28",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:25:29",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": [
+              " 20260906    07:25:30       0 "
+            ]
+          },
+          {
+            "job": "e1-tf32-block-ctx8192-default-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:34:45",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:34:46",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:34:47",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:34:48",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx8192-control-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:34:50",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:34:51",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:34:52",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:34:53",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx8192-candidate-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:34:54",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:34:55",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:34:56",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:34:57",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": [
+              [
+                "20260906",
+                "07:34:58",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-block-ctx8192-candidate-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:34:59",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:00",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:01",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:02",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": [
+              [
+                "20260906",
+                "07:35:03",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-block-ctx8192-control-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:35:03",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:04",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:05",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:06",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": [
+              [
+                "20260906",
+                "07:35:07",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-block-ctx8192-default-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:35:08",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:09",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:10",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:11",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx1024-default-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:35:12",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:13",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:14",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:15",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx1024-control-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:35:16",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:17",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:18",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:20",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx1024-candidate-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:35:21",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:22",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:23",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:24",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx1024-candidate-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:35:25",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:26",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:27",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:28",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": []
+          },
+          {
+            "job": "e1-tf32-block-ctx1024-control-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:35:30",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:31",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:32",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:33",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": [
+              [
+                "20260906",
+                "07:35:34",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-block-ctx1024-default-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "07:35:34",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:35",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:36",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "07:35:37",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "monitor_termination_partial_final_line": [
+              [
+                "20260906",
+                "07:35:38",
+                "0"
+              ]
+            ]
+          }
+        ],
+        "resources": {
+          "default_registers": 200,
+          "equal_arena_registers": 200,
+          "candidate_registers": 251,
+          "spills": 0,
+          "default_arena": 16448,
+          "equal_arena_and_candidate_arena": 126592,
+          "threads": 256,
+          "actual_grid": 132,
+          "actual_occupancy_per_sm": 1
+        },
+        "memory": "Freshbroad32K raw99strictknown2optionalprobes,nootherrecords,66tensorfilesexact",
+        "numerical": "18candidateblockrows1K/8K/32Kpassfixedattention.003/block.01gates,upstream/resetexact,attentionequalsqualifiedoperator",
+        "short_window_jobs_passed": 13,
+        "short_window_gpu_processes": 12,
+        "original_32k_validator_resolution": "Six validators reached finalroot-ownedfilewrite thenfailedPermissionError; unchangedCPUvalidatorsrerunviasudoPASS,noGPUrerun,originalstatusesretained"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/all-context-analysis/RESULTS.md": {
+      "sha256": "06a445df6b12f94155314aad5dc8499ae99588b01b73092d127d887498dc684a",
+      "content": "# TF32 PV native block: all measured contexts\n\nB1 Gemma12 block5; same NS33 and checkpoint; default scalar GF4, equal-arena scalar GF4, candidate GF16. Two process orders.\n\n| Context | Order | Default us | Equal arena us | Candidate us | Gain vs default | Gain vs equal arena |\n|---|---:|---:|---:|---:|---:|---:|\n| 1024 | 0 | 300.87 | 307.10 | 316.38 | -5.16% | -3.02% |\n| 1024 | 1 | 301.64 | 308.35 | 316.90 | -5.06% | -2.77% |\n| 8192 | 0 | 331.55 | 339.25 | 334.89 | -1.01% | 1.29% |\n| 8192 | 1 | 329.79 | 340.13 | 333.96 | -1.26% | 1.81% |\n| 32768 | 0 | 437.66 | 442.34 | 408.70 | 6.62% | 7.61% |\n| 32768 | 1 | 435.83 | 444.16 | 409.64 | 6.01% | 7.77% |\n\nAll short-window 13 jobs passed; 12 GPU processes. Original 32K six GPU processes passed, unchanged CPU validators required sudo only to write root-owned reports; original failures preserved.\n\n40 iterations / 5 warmups; only median and p95 retained. 256 MiB eviction before each whole-step wall timer, not per-op cold. Synthetic self-fed block history, PF setup excluded; no PF throughput claim. Complete dmon samples 1830 MHz SM / 2619 MHz memory; monitor termination partial lines recorded.\n\n1K regresses 5.06\u20135.16% and 8K regresses 1.01\u20131.26% against qualified default. Equal-arena comparison alone does not justify 8K advancement. Preserve scalar short-context control; the measured win is 32K only.\n\nAll context numerical gates and fresh 32K broad memory qualified at original thresholds. Candidate 251 registers, zero spills; both scalar controls 200 registers, zero spills. No full-model, serving, or vLLM claim.\n"
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/all-context-analysis/analyze.py": {
+      "sha256": "3b9c3e6d627436096e3a946f531b4b9e37eef1021481a6c7585fbbf090b4720f",
+      "content": "import json, hashlib\nfrom pathlib import Path\np=Path(__file__).parent; d=p.parent\nold=json.loads((d/'screen-analysis/RESULTS.json').read_text())\nrows=old['rows'].copy(); clocks=old['clocks'].copy(); files=[d/'screen-analysis/RESULTS.json', d/'screen-analysis/FREEZE.json', d/'short-context-queue-ready.json',Path('/tmp/plow-model-support-checks/e1-tf32-broad-short-timing-window-20260906/results.json')]\nfor j in json.loads((d/'short-context-queue-ready.json').read_text())['jobs'][1:]:\n out=Path(j['output']);v=json.loads((out/'validation.json').read_text());assert v['passed']\n s=json.loads((out/'sweep.json').read_text())['sweep'];assert len(s)==1;s=s[0]\n assert s['decode_evict_bytes']==268435456 and s['decode_eviction_before_timer'] and s['decode_iterations']==40 and s['decode_warmup']==5\n rows.append(dict(arm=j['arm'],repeat=j['repeat'],context=j['context'],median_us=s['latency_us_median'],p95_us=s['latency_us_p95'],iterations_reported=40,warmup_reported=5,actual_duration_samples_retained=False))\n dm=Path('/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs')/(j['name']+'-dmon.log')\n lines=[x.split() for x in dm.read_text().splitlines() if x.strip() and not x.lstrip().startswith('#')]\n good=[x for x in lines if len(x)==8];partial=[x for x in lines if len(x)!=8]\n assert good\n assert all(x[0].isdigit() and len(x[0])==8 for x in good)\n # dmon pc: date,time,gpu,pwr,gtemp,mtemp,mclk,pclk\n samples=[dict(date=x[0],time=x[1],memory_mhz=int(x[-2]),sm_mhz=int(x[-1])) for x in good]\n assert {(x['memory_mhz'],x['sm_mhz']) for x in samples}=={(2619,1830)}\n assert len(partial)<=1 and (not partial or lines[-1]==partial[0])\n clocks.append(dict(job=j['name'],samples=samples,monitor_termination_partial_final_line=partial))\n files.extend([out/'validation.json',out/'sweep.json',Path(j['log']),dm])\npairs=[]\nfor ctx in [1024,8192,32768]:\n for rep in [0,1]:\n  arms={r['arm']:r for r in rows if r['context']==ctx and r['repeat']==rep};assert set(arms)=={'default','control','candidate'};c=arms['candidate']\n  for ref in ['default','control']:\n   r=arms[ref];pairs.append(dict(context=ctx,repeat=rep,reference=ref,reference_us=r['median_us'],candidate_us=c['median_us'],speedup=r['median_us']/c['median_us'],saved_us=r['median_us']-c['median_us'],latency_reduction_percent=100*(1-c['median_us']/r['median_us']),p95_reduction_percent=100*(1-c['p95_us']/r['p95_us'])))\nres=dict(schema=1,passed=True,scope=old['scope'],decision='Retain 32K private native block win only. Reject universal use: 1K regresses 5.06\u20135.16%, 8K regresses 1.01\u20131.26% versus qualified default despite beating equal-arena. Permit bounded compiler NS experiment after fixed numerical gates; no full-model/serving/default promotion.',rows=rows,pairs=pairs,clocks=clocks,resources=old['resources'],memory=old['memory'],numerical=old['numerical'],short_window_jobs_passed=13,short_window_gpu_processes=12,original_32k_validator_resolution=old['validator_resolution'])\n(p/'RESULTS.json').write_text(json.dumps(res,indent=2)+'\\n')\nmd=['# TF32 PV native block: all measured contexts','','B1 Gemma12 block5; same NS33 and checkpoint; default scalar GF4, equal-arena scalar GF4, candidate GF16. Two process orders.','','| Context | Order | Default us | Equal arena us | Candidate us | Gain vs default | Gain vs equal arena |','|---|---:|---:|---:|---:|---:|---:|']\nfor ctx in [1024,8192,32768]:\n for rep in [0,1]:\n  a={r['arm']:r for r in rows if r['context']==ctx and r['repeat']==rep};g=[r for r in pairs if r['context']==ctx and r['repeat']==rep]\n  md.append(f\"| {ctx} | {rep} | {a['default']['median_us']:.2f} | {a['control']['median_us']:.2f} | {a['candidate']['median_us']:.2f} | {g[0]['latency_reduction_percent']:.2f}% | {g[1]['latency_reduction_percent']:.2f}% |\")\nmd += ['', 'All short-window 13 jobs passed; 12 GPU processes. Original 32K six GPU processes passed, unchanged CPU validators required sudo only to write root-owned reports; original failures preserved.', '', '40 iterations / 5 warmups; only median and p95 retained. 256 MiB eviction before each whole-step wall timer, not per-op cold. Synthetic self-fed block history, PF setup excluded; no PF throughput claim. Complete dmon samples 1830 MHz SM / 2619 MHz memory; monitor termination partial lines recorded.', '', '1K regresses 5.06\u20135.16% and 8K regresses 1.01\u20131.26% against qualified default. Equal-arena comparison alone does not justify 8K advancement. Preserve scalar short-context control; the measured win is 32K only.', '', 'All context numerical gates and fresh 32K broad memory qualified at original thresholds. Candidate 251 registers, zero spills; both scalar controls 200 registers, zero spills. No full-model, serving, or vLLM claim.']\n(p/'RESULTS.md').write_text('\\n'.join(md)+'\\n');files += [p/'RESULTS.json',p/'RESULTS.md',Path(__file__)]\n(p/'FREEZE.json').write_text(json.dumps({str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in files},indent=2)+'\\n')\nprint('\\n'.join(md[:13]))\n"
+    },
+    "e1-tf32-broad-short-timing-window-20260906/results.json": {
+      "sha256": "30c006e7c58466a6a67176cd99c143205311e74d6dc9f39e2a44a851e33c96b5",
+      "content": {
+        "e1-tf32-block-timing-preflight": {
+          "passed": true,
+          "returncode": 0
+        },
+        "e1-tf32-block-ctx8192-default-r0": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx8192-control-r0": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx8192-candidate-r0": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx8192-candidate-r1": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx8192-control-r1": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx8192-default-r1": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx1024-default-r0": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx1024-control-r0": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx1024-candidate-r0": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx1024-candidate-r1": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx1024-control-r1": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        },
+        "e1-tf32-block-ctx1024-default-r1": {
+          "passed": true,
+          "returncode": 0,
+          "validated_native_block": true
+        }
+      }
+    },
+    "e1-tf32-broad-short-timing-window-20260906/queue.json": {
+      "sha256": "26ef411fb97705bbff3f714b559997b15215e48de146d490c9afe960c03ef5e8",
+      "content": {
+        "jobs": [
+          {
+            "name": "e1-tf32-block-timing-preflight",
+            "kind": "cpu_qualification",
+            "command": [
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/preflight.py"
+            ],
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/short-preflight.log",
+            "timeout": 180,
+            "required_returncode": 0,
+            "env": {}
+          },
+          {
+            "name": "e1-tf32-block-ctx8192-default-r0",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/default.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx8192-default-r0",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "8192",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r0",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/default.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 8192,
+            "repeat": 0,
+            "arm": "default",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r0.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r0",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx8192-default-r0"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx8192-control-r0",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/control.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx8192-control-r0",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "8192",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r0",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/control.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 8192,
+            "repeat": 0,
+            "arm": "control",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r0.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r0",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx8192-control-r0"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx8192-candidate-r0",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/candidate.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx8192-candidate-r0",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "8192",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r0",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/candidate.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 8192,
+            "repeat": 0,
+            "arm": "candidate",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r0.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r0",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx8192-candidate-r0"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx8192-candidate-r1",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/candidate.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx8192-candidate-r1",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "8192",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r1",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/candidate.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 8192,
+            "repeat": 1,
+            "arm": "candidate",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r1.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r1",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx8192-candidate-r1"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx8192-control-r1",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/control.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx8192-control-r1",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "8192",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r1",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/control.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 8192,
+            "repeat": 1,
+            "arm": "control",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r1.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r1",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx8192-control-r1"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx8192-default-r1",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/default.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx8192-default-r1",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "8192",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r1",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/default.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 8192,
+            "repeat": 1,
+            "arm": "default",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r1.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r1",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx8192-default-r1"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx1024-default-r0",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/default.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx1024-default-r0",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "1024",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r0",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/default.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 1024,
+            "repeat": 0,
+            "arm": "default",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r0.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r0",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx1024-default-r0"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx1024-control-r0",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/control.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx1024-control-r0",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "1024",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r0",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/control.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 1024,
+            "repeat": 0,
+            "arm": "control",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r0.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r0",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx1024-control-r0"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx1024-candidate-r0",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/candidate.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx1024-candidate-r0",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "1024",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r0",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/candidate.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 1024,
+            "repeat": 0,
+            "arm": "candidate",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r0.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r0",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx1024-candidate-r0"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx1024-candidate-r1",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/candidate.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx1024-candidate-r1",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "1024",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r1",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/candidate.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 1024,
+            "repeat": 1,
+            "arm": "candidate",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r1.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r1",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx1024-candidate-r1"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx1024-control-r1",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/control.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx1024-control-r1",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "1024",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r1",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/control.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 1024,
+            "repeat": 1,
+            "arm": "control",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r1.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r1",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx1024-control-r1"
+            ],
+            "required_returncode": 0
+          },
+          {
+            "name": "e1-tf32-block-ctx1024-default-r1",
+            "kind": "block_numerical",
+            "command": [
+              "/usr/bin/sudo",
+              "-n",
+              "/usr/bin/env",
+              "-i",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "PATH=/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_DEV_SAMPLE=0",
+              "PLOW_LIBCUDA=/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "PLOW_MULTISTEP=0",
+              "PLOW_NV_CUBIN=/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/default.cubin",
+              "PLOW_NV_CUBIN_PF=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_BATCH=0",
+              "PLOW_PF_CUBLASLT=0",
+              "PLOW_PF_SEG_DIR=/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "PLOW_PF_SEG_FA512=all",
+              "PLOW_PF_SEG_GRAPH=1",
+              "PLOW_PF_SEG_PURE=1",
+              "PLOW_PREFIX_CACHE=0",
+              "PLOW_VMM_LIVE=1",
+              "PLOW_VMM_LIVE_RINGS=0",
+              "PLOW_VMM_PREFIX=0",
+              "RUST_LOG=plowrt=info",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/run-logged.sh",
+              "e1-tf32-block-ctx1024-default-r1",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-upload-order/eviction-host/block_run_evict",
+              "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control",
+              "bench",
+              "--batch",
+              "1",
+              "--ctx",
+              "1024",
+              "--iters",
+              "40",
+              "--warmup",
+              "5",
+              "--prefill-iters",
+              "1",
+              "--pf-chunk",
+              "1024",
+              "--out-dir",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r1",
+              "--evict-mib",
+              "256"
+            ],
+            "env": {
+              "PLOW_VMM_LIVE": "1",
+              "PLOW_VMM_LIVE_RINGS": "0",
+              "PLOW_VMM_PREFIX": "0",
+              "PLOW_PREFIX_CACHE": "0",
+              "PLOW_PF_BATCH": "0",
+              "PLOW_PF_SEG_GRAPH": "1",
+              "PLOW_PF_SEG_PURE": "1",
+              "PLOW_PF_SEG_FA512": "all",
+              "PLOW_MULTISTEP": "0",
+              "PLOW_DEV_SAMPLE": "0",
+              "PLOW_PF_CUBLASLT": "0",
+              "PLOW_LIBCUDA": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+              "LD_LIBRARY_PATH": "/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only",
+              "RUST_LOG": "plowrt=info",
+              "PATH": "/usr/local/bin:/usr/local/cuda/bin:/usr/bin:/bin",
+              "PLOW_NV_CUBIN": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/default.cubin",
+              "PLOW_NV_CUBIN_PF": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control/interp_sm90a_pf.cubin",
+              "PLOW_PF_SEG_DIR": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/block-control"
+            },
+            "M": 1,
+            "context": 1024,
+            "repeat": 1,
+            "arm": "default",
+            "scope": "Native block5B1,threearms withdefault/equal-arena controls;40samples5warmup,256MiBpacket-entryeviction; noPF/rawindividualsamples/fullmodelclaim",
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r1.log",
+            "requires": [
+              "e1-tf32-block-timing-preflight"
+            ],
+            "timeout": 900,
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r1",
+            "validator_command": [
+              "sudo",
+              "-n",
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/validate-job.py",
+              "e1-tf32-block-ctx1024-default-r1"
+            ],
+            "required_returncode": 0
+          }
+        ],
+        "status": "READY afterpositive32Kscreen andfreshbroadmemory; GPUcommands unchanged, CPUvalidators run viasudo forroot-ownedreportdirs",
+        "sha256": {
+          "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/short-context-queue-ready.json": "5507a2dac4cd6f6d414328cb4c5e77fe69bc441607110db91e9074fb79b7fbb6",
+          "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/short-context-queue-held.json": "c10e15db7fa82a5c2c6f039b89cec25cfd2a7257eef050083dfdf4ff74eed6b2",
+          "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/FREEZE.json": "5ab0d4b1fbebe4e6335db2b24ec515a0f194868fa45ae1580dd2cf2c7548dc0d",
+          "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/screen-analysis/RESULTS.json": "31337934c077775ac9244a5682ba8ffdd0df911d3cb5c212aba2cafe1588d994",
+          "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/timing/screen-analysis/FREEZE.json": "1dedadeab21eab1f039fac0490daef297307a47a2e9bcb1d9af84f1e974d3422",
+          "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/broad/memory/qualification.json": "81e3243b90e97637b9623dfe936cfa0a75f7647df1424394228c9a505e8bc6ab"
+        },
+        "wait_for_pids": [
+          1471454
+        ]
+      }
+    },
+    "e1-tf32-broad-short-timing-window-20260906/events.jsonl": {
+      "sha256": "693b092fd1b54174580c6e75e81d7dd2c3670a91b66e5231b303278c1b7975ce",
+      "content": "{\"status\": \"waiting_for_existing_supervisors\", \"pids\": [1471454], \"utc\": \"2026-09-06T07:30:00Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-timing-preflight\", \"utc\": \"2026-09-06T07:34:45Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-timing-preflight\", \"passed\": true, \"returncode\": 0, \"utc\": \"2026-09-06T07:34:45Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx8192-default-r0\", \"utc\": \"2026-09-06T07:34:45Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx8192-default-r0\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:34:49Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx8192-control-r0\", \"utc\": \"2026-09-06T07:34:49Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx8192-control-r0\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:34:54Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx8192-candidate-r0\", \"utc\": \"2026-09-06T07:34:54Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx8192-candidate-r0\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:34:58Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx8192-candidate-r1\", \"utc\": \"2026-09-06T07:34:58Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx8192-candidate-r1\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:35:03Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx8192-control-r1\", \"utc\": \"2026-09-06T07:35:03Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx8192-control-r1\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:35:07Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx8192-default-r1\", \"utc\": \"2026-09-06T07:35:07Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx8192-default-r1\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:35:12Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx1024-default-r0\", \"utc\": \"2026-09-06T07:35:12Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx1024-default-r0\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:35:16Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx1024-control-r0\", \"utc\": \"2026-09-06T07:35:16Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx1024-control-r0\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:35:21Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx1024-candidate-r0\", \"utc\": \"2026-09-06T07:35:21Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx1024-candidate-r0\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:35:25Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx1024-candidate-r1\", \"utc\": \"2026-09-06T07:35:25Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx1024-candidate-r1\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:35:30Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx1024-control-r1\", \"utc\": \"2026-09-06T07:35:30Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx1024-control-r1\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:35:34Z\"}\n{\"status\": \"running\", \"job\": \"e1-tf32-block-ctx1024-default-r1\", \"utc\": \"2026-09-06T07:35:34Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-tf32-block-ctx1024-default-r1\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T07:35:39Z\"}\n{\"status\": \"complete\", \"passed\": 13, \"jobs\": 13, \"utc\": \"2026-09-06T07:35:39Z\"}\n{\"status\": \"finished\", \"gpu_pids\": \"\", \"jobs\": 13, \"utc\": \"2026-09-06T07:35:39Z\"}\n"
+    },
+    "e1-tf32-broad-short-timing-window-20260906/clocks-power.log": {
+      "sha256": "b13d5b55a3e62305876b6f963f65e8dfd7a0278a0767f2c9e3fcf2c61bf7444f",
+      "content": "#Date        Time         gpu    pwr  gtemp  mtemp   mclk   pclk \n#YYYYMMDD    HH:MM:SS     Idx      W      C      C    MHz    MHz \n 20260906    07:34:45       0    132     35     41   2619   1830 \n 20260906    07:34:46       0    129     35     41   2619   1830 \n 20260906    07:34:47       0    127     35     40   2619   1830 \n 20260906    07:34:48       0    127     35     41   2619   1830 \n 20260906    07:34:49       0    210     38     43   2619   1830 \n 20260906    07:34:50       0    132     36     41   2619   1830 \n 20260906    07:34:51       0    127     35     41   2619   1830 \n 20260906    07:34:52       0    127     35     41   2619   1830 \n 20260906    07:34:53       0    128     35     41   2619   1830 \n 20260906    07:34:54       0    214     36     41   2619   1830 \n 20260906    07:34:55       0    129     35     41   2619   1830 \n 20260906    07:34:56       0    127     35     41   2619   1830 \n 20260906    07:34:57       0    127     35     41   2619   1830 \n 20260906    07:34:58       0    213     37     41   2619   1830 \n 20260906    07:34:59       0    132     36     41   2619   1830 \n 20260906    07:35:00       0    127     35     41   2619   1830 \n 20260906    07:35:01       0    127     35     41   2619   1830 \n 20260906    07:35:02       0    168     38     43   2619   1830 \n 20260906    07:35:03       0    200     36     41   2619   1830 \n 20260906    07:35:04       0    129     36     41   2619   1830 \n 20260906    07:35:05       0    127     35     41   2619   1830 \n 20260906    07:35:06       0    127     35     41   2619   1830 \n 20260906    07:35:07       0    211     37     41   2619   1830 \n 20260906    07:35:08       0    131     36     41   2619   1830 \n 20260906    07:35:09       0    128     35     41   2619   1830 \n 20260906    07:35:10       0    127     35     41   2619   1830 \n 20260906    07:35:11       0    173     39     41   2619   1830 \n 20260906    07:35:12       0    164     36     41   2619   1830 \n 20260906    07:35:13       0    128     36     41   2619   1830 \n 20260906    07:35:14       0    127     35     41   2619   1830 \n 20260906    07:35:15       0    127     35     41   2619   1830 \n 20260906    07:35:16       0    145     36     41   2619   1830 \n 20260906    07:35:17       0    130     35     41   2619   1830 \n 20260906    07:35:18       0    127     35     41   2619   1830 \n 20260906    07:35:19       0    127     35     41   2619   1830 \n 20260906    07:35:20       0    142     36     41   2619   1830 \n 20260906    07:35:21       0    132     35     41   2619   1830 \n 20260906    07:35:22       0    127     35     41   2619   1830 \n 20260906    07:35:23       0    127     35     41   2619   1830 \n 20260906    07:35:24       0    128     35     41   2619   1830 \n 20260906    07:35:25       0    149     35     41   2619   1830 \n 20260906    07:35:26       0    129     35     41   2619   1830 \n 20260906    07:35:27       0    127     35     41   2619   1830 \n 20260906    07:35:28       0    127     35     40   2619   1830 \n#Date        Time         gpu    pwr  gtemp  mtemp   mclk   pclk \n#YYYYMMDD    HH:MM:SS     Idx      W      C      C    MHz    MHz \n 20260906    07:35:29       0    142     35     41   2619   1830 \n 20260906    07:35:30       0    131     35     41   2619   1830 \n 20260906    07:35:31       0    127     35     41   2619   1830 \n 20260906    07:35:32       0    127     35     41   2619   1830 \n 20260906    07:35:33       0    139     35     41   2619   1830 \n 20260906    07:35:34       0    139     35     41   2619   1830 \n 20260906    07:35:35       0    129     35     41   2619   1830 \n 20260906    07:35:36       0    127     35     41   2619   1830 \n 20260906    07:35:37       0    127     35     41   2619   1830 \n 20260906    07:35:38       0    144     35     41   2619   1830 \n"
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r0/sweep.json": {
+      "sha256": "0f5bdbf15d9179e5bda3365fc6fd66c3679ce2b4857d395013d09cddf6f6a485",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 1024,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 316.38,
+            "latency_us_p95": 323.04,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 8.792,
+            "prefill_ms_p95": 8.792,
+            "prefill_tok_s": 116472.0,
+            "tok_s": 3160.8
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r1/sweep.json": {
+      "sha256": "868cf175737a033d3b9475fd19f2840114d7685214e0d40f5168d8a8798ac466",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 1024,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 316.9,
+            "latency_us_p95": 322.93,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 8.753,
+            "prefill_ms_p95": 8.753,
+            "prefill_tok_s": 116983.4,
+            "tok_s": 3155.6
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r0/sweep.json": {
+      "sha256": "9a901a22e057f2898e12524112a95f4d23fa8690509d94d5d65f1032bc2df6b9",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 1024,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 307.1,
+            "latency_us_p95": 314.28,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 8.921,
+            "prefill_ms_p95": 8.921,
+            "prefill_tok_s": 114785.3,
+            "tok_s": 3256.3
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r1/sweep.json": {
+      "sha256": "1cbfb1dc4627364eaa33dd0b1376401e07c6c8e221ac2ff76b9443772bcccaf1",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 1024,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 308.35,
+            "latency_us_p95": 315.29,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 9.206,
+            "prefill_ms_p95": 9.206,
+            "prefill_tok_s": 111229.9,
+            "tok_s": 3243.1
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r0/sweep.json": {
+      "sha256": "cc8805d36c95cac891507fcbaa6f92d490ccd9255d8a9849429bff0a4cfb730a",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 1024,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 300.87,
+            "latency_us_p95": 307.22,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 8.78,
+            "prefill_ms_p95": 8.78,
+            "prefill_tok_s": 116630.0,
+            "tok_s": 3323.7
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r1/sweep.json": {
+      "sha256": "fbef10261ad5dc4aa341c37f34c5230204f811e49263d83efbf7b2413a7b7f40",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 1024,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 301.64,
+            "latency_us_p95": 310.0,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 8.787,
+            "prefill_ms_p95": 8.787,
+            "prefill_tok_s": 116538.0,
+            "tok_s": 3315.3
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-candidate-r0/sweep.json": {
+      "sha256": "cbdadbba228dadf4276c8581d3aa2b11a7ac3721c79b8d264ec6a3027bf04270",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 408.7,
+            "latency_us_p95": 417.33,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 705.712,
+            "prefill_ms_p95": 705.712,
+            "prefill_tok_s": 46432.5,
+            "tok_s": 2446.8
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-candidate-r1/sweep.json": {
+      "sha256": "5edbcb2a84ef0b163e5eb043d3123f858975372a979d5b5e29e3e98288b0e9d3",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 409.64,
+            "latency_us_p95": 413.86,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 706.278,
+            "prefill_ms_p95": 706.278,
+            "prefill_tok_s": 46395.3,
+            "tok_s": 2441.2
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-control-r0/sweep.json": {
+      "sha256": "bbdcec140c701c8f3ad86c3fc138b3a47ae85b45bfec06873d74338647f28ca2",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 442.34,
+            "latency_us_p95": 448.54,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 705.457,
+            "prefill_ms_p95": 705.457,
+            "prefill_tok_s": 46449.4,
+            "tok_s": 2260.7
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-control-r1/sweep.json": {
+      "sha256": "a50f70ec0fdfdd488ed83c0f46211e54c59f543664a75b090e1d773e5fb34696",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 444.16,
+            "latency_us_p95": 450.29,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 705.558,
+            "prefill_ms_p95": 705.558,
+            "prefill_tok_s": 46442.7,
+            "tok_s": 2251.4
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-default-r0/sweep.json": {
+      "sha256": "c0209fa8905d02fb93089f6316b0d79a46e050ceb62348da3bc24540469a57f2",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 437.66,
+            "latency_us_p95": 440.87,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 704.568,
+            "prefill_ms_p95": 704.568,
+            "prefill_tok_s": 46507.9,
+            "tok_s": 2284.9
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-default-r1/sweep.json": {
+      "sha256": "70c4ab68c469458b5d3a36e195e8f0e955ca544e1f70588a9ed0e91fb107a80f",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 435.83,
+            "latency_us_p95": 443.59,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 703.27,
+            "prefill_ms_p95": 703.27,
+            "prefill_tok_s": 46593.8,
+            "tok_s": 2294.5
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r0/sweep.json": {
+      "sha256": "cdb1ee76ffeec3dc468900577466af06ed9c3b677a173266ed8e1295429aa6a3",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 334.89,
+            "latency_us_p95": 341.87,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 95.623,
+            "prefill_ms_p95": 95.623,
+            "prefill_tok_s": 85669.7,
+            "tok_s": 2986.1
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r1/sweep.json": {
+      "sha256": "03053f3da7e86d0c93e889b392b778ef067090f75ce2044dfa679fe16e026df5",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 333.96,
+            "latency_us_p95": 337.83,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 95.228,
+            "prefill_ms_p95": 95.228,
+            "prefill_tok_s": 86024.9,
+            "tok_s": 2994.4
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r0/sweep.json": {
+      "sha256": "d7dae6d9a405dfec652787fe33a2e8bee198ab5d951e0104d9e30de9482fa1e3",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 339.25,
+            "latency_us_p95": 344.87,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 95.307,
+            "prefill_ms_p95": 95.307,
+            "prefill_tok_s": 85954.0,
+            "tok_s": 2947.7
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r1/sweep.json": {
+      "sha256": "5093315024501450c029205e0e739ff48dd27709daee0b7d1f7e0478f688d9ef",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 340.13,
+            "latency_us_p95": 345.5,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 96.175,
+            "prefill_ms_p95": 96.175,
+            "prefill_tok_s": 85177.9,
+            "tok_s": 2940.1
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r0/sweep.json": {
+      "sha256": "bafd1320ac2932968e42c5d23ecca231fe990d436b00aa34dc25f53c7b0392e9",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 331.55,
+            "latency_us_p95": 350.96,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 95.764,
+            "prefill_ms_p95": 95.764,
+            "prefill_tok_s": 85543.8,
+            "tok_s": 3016.2
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r1/sweep.json": {
+      "sha256": "48fd5927bb1a0a86fb25ff41d3e54b17106c1c93499972d5f6e6f70a3aed059b",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 329.79,
+            "latency_us_p95": 335.48,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 96.138,
+            "prefill_ms_p95": 96.138,
+            "prefill_tok_s": 85211.1,
+            "tok_s": 3032.3
+          }
+        ]
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r0/validation.json": {
+      "sha256": "0c453a40fc249efc31199b76c5749f956512b8f58575cda7761ee976915257b8",
+      "content": {
+        "passed": true,
+        "arm": "candidate",
+        "context": 1024,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 1024,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 316.38,
+          "latency_us_p95": 323.04,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 8.792,
+          "prefill_ms_p95": 8.792,
+          "prefill_tok_s": 116472.0,
+          "tok_s": 3160.8
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-candidate-r1/validation.json": {
+      "sha256": "26b85cf3b89cbca15865d419cc60d3496444341fce6e858d2298b4f19463f0f4",
+      "content": {
+        "passed": true,
+        "arm": "candidate",
+        "context": 1024,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 1024,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 316.9,
+          "latency_us_p95": 322.93,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 8.753,
+          "prefill_ms_p95": 8.753,
+          "prefill_tok_s": 116983.4,
+          "tok_s": 3155.6
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r0/validation.json": {
+      "sha256": "948402efe9e03621aca62e89938bf812969e82e6c6ccc9c462d407b3cff6696c",
+      "content": {
+        "passed": true,
+        "arm": "control",
+        "context": 1024,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 1024,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 307.1,
+          "latency_us_p95": 314.28,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 8.921,
+          "prefill_ms_p95": 8.921,
+          "prefill_tok_s": 114785.3,
+          "tok_s": 3256.3
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-control-r1/validation.json": {
+      "sha256": "92f6ab7463973a1b17d06d5b355779a51083a64902452eb1100ff180c6e1a230",
+      "content": {
+        "passed": true,
+        "arm": "control",
+        "context": 1024,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 1024,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 308.35,
+          "latency_us_p95": 315.29,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 9.206,
+          "prefill_ms_p95": 9.206,
+          "prefill_tok_s": 111229.9,
+          "tok_s": 3243.1
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r0/validation.json": {
+      "sha256": "f9949733c875d7b7d19488c2213087b3f0d9a792f9c40b589c3971b062de8a6d",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 1024,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 1024,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 300.87,
+          "latency_us_p95": 307.22,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 8.78,
+          "prefill_ms_p95": 8.78,
+          "prefill_tok_s": 116630.0,
+          "tok_s": 3323.7
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx1024-default-r1/validation.json": {
+      "sha256": "83d3f19efaf432fe4ac6455a3378f28b99b1c2c5ffbf9307226535d9a0e5c8b0",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 1024,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 1024,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 301.64,
+          "latency_us_p95": 310.0,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 8.787,
+          "prefill_ms_p95": 8.787,
+          "prefill_tok_s": 116538.0,
+          "tok_s": 3315.3
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-candidate-r0/validation.json": {
+      "sha256": "127c614562b91283389994ec2cb3b79a73614fa1854609126585686d63cd302f",
+      "content": {
+        "passed": true,
+        "arm": "candidate",
+        "context": 32768,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 408.7,
+          "latency_us_p95": 417.33,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 705.712,
+          "prefill_ms_p95": 705.712,
+          "prefill_tok_s": 46432.5,
+          "tok_s": 2446.8
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-candidate-r1/validation.json": {
+      "sha256": "31521d54068f9e9a6d280a7407296be54ead5988202479aa5acbc58c366c4f52",
+      "content": {
+        "passed": true,
+        "arm": "candidate",
+        "context": 32768,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 409.64,
+          "latency_us_p95": 413.86,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 706.278,
+          "prefill_ms_p95": 706.278,
+          "prefill_tok_s": 46395.3,
+          "tok_s": 2441.2
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-control-r0/validation.json": {
+      "sha256": "b01a417cf795fd7a5af4cda46bedf2e85820c00aca263f6b8977a81f0a7f8086",
+      "content": {
+        "passed": true,
+        "arm": "control",
+        "context": 32768,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 442.34,
+          "latency_us_p95": 448.54,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 705.457,
+          "prefill_ms_p95": 705.457,
+          "prefill_tok_s": 46449.4,
+          "tok_s": 2260.7
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-control-r1/validation.json": {
+      "sha256": "dd0bd400cf1e50365317fb33e8767fff151556e4020ecf3f3837394fb522742e",
+      "content": {
+        "passed": true,
+        "arm": "control",
+        "context": 32768,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 444.16,
+          "latency_us_p95": 450.29,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 705.558,
+          "prefill_ms_p95": 705.558,
+          "prefill_tok_s": 46442.7,
+          "tok_s": 2251.4
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-default-r0/validation.json": {
+      "sha256": "22c547e48df290e51e72acbeb6b3b6b6a5a55e548374038fa07532d8a54c0661",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 32768,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 437.66,
+          "latency_us_p95": 440.87,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 704.568,
+          "prefill_ms_p95": 704.568,
+          "prefill_tok_s": 46507.9,
+          "tok_s": 2284.9
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx32768-default-r1/validation.json": {
+      "sha256": "d957aad3f5f006c96a78504c6822117c6f5e8875f5335f0d7bde06d2822cb008",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 32768,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 435.83,
+          "latency_us_p95": 443.59,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 703.27,
+          "prefill_ms_p95": 703.27,
+          "prefill_tok_s": 46593.8,
+          "tok_s": 2294.5
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r0/validation.json": {
+      "sha256": "e642e0a13e83a3110290b508b42616023af2183c4ccc33bd9128fbe7ce862278",
+      "content": {
+        "passed": true,
+        "arm": "candidate",
+        "context": 8192,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 334.89,
+          "latency_us_p95": 341.87,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 95.623,
+          "prefill_ms_p95": 95.623,
+          "prefill_tok_s": 85669.7,
+          "tok_s": 2986.1
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-candidate-r1/validation.json": {
+      "sha256": "9c9054778f405a9ba0fca2ba6d39de192db31a98df9494a1ad4711dbc6a8f133",
+      "content": {
+        "passed": true,
+        "arm": "candidate",
+        "context": 8192,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 333.96,
+          "latency_us_p95": 337.83,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 95.228,
+          "prefill_ms_p95": 95.228,
+          "prefill_tok_s": 86024.9,
+          "tok_s": 2994.4
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r0/validation.json": {
+      "sha256": "9503a0e666d6960348dac25982533396252ae95a00913227a01196400c63ed14",
+      "content": {
+        "passed": true,
+        "arm": "control",
+        "context": 8192,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 339.25,
+          "latency_us_p95": 344.87,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 95.307,
+          "prefill_ms_p95": 95.307,
+          "prefill_tok_s": 85954.0,
+          "tok_s": 2947.7
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-control-r1/validation.json": {
+      "sha256": "883b5be81eac76f05a3347eeaf74901a02ba93fbdc2e850dd889487bc13f5191",
+      "content": {
+        "passed": true,
+        "arm": "control",
+        "context": 8192,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 340.13,
+          "latency_us_p95": 345.5,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 96.175,
+          "prefill_ms_p95": 96.175,
+          "prefill_tok_s": 85177.9,
+          "tok_s": 2940.1
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r0/validation.json": {
+      "sha256": "50d5324ff1dcec849c5c316e1feebb532d8d8e1f2ec84a9f79c78faf06b9a994",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 8192,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 331.55,
+          "latency_us_p95": 350.96,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 95.764,
+          "prefill_ms_p95": 95.764,
+          "prefill_tok_s": 85543.8,
+          "tok_s": 3016.2
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-k64-tf32-pv-20260906/broad/timing/results/e1-tf32-block-ctx8192-default-r1/validation.json": {
+      "sha256": "b5b5ab06da49b5ae03fb01e9bcb719c2261facc9604ee03de6bc322d0bb60dbd",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 8192,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 329.79,
+          "latency_us_p95": 335.48,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 96.138,
+          "prefill_ms_p95": 96.138,
+          "prefill_tok_s": 85211.1,
+          "tok_s": 3032.3
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    }
+  }
+}
