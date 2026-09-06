@@ -70,3 +70,20 @@ GEMV reads 13 GB of weights at 117 GB/s, i.e. at the measured memory roofline. T
 pipeline fill and drain across the 48 layer boundaries. Closing it would give ~118 ms and a 1.13x
 margin; the byte counts cap it there, since our fp8 weights are 12.0 GB against Q8_0's 12.75 GB.
 MXFP4 is the data type where the margin is real, and it is also our fastest configuration.
+
+### vLLM re-run with the current methodology (13:5x)
+
+The vLLM figures above came from the original run, which predated `--fresh-prompts`. Re-run with the
+same settings as every other cell in this file (`vllm serve --dtype bfloat16 --max-model-len 4096
+--max-num-seqs 8`, fresh prompts): raw in `vllm-g12b-chat.md`. Decode is 460-544 ms/token across
+chat_short and chat_long at c=1..4, so the plow margins below hold on like-for-like measurement.
+
+| data type | plow decode c=1 | vLLM bf16 (fresh) | margin |
+|---|---|---|---|
+| bf16 | 232 | 460 | 1.98x |
+| fp8 | 133 | 460 | 3.5x |
+| MXFP4 | 88 | 460 | 5.2x |
+
+TTFT at c=1 is close: plow 696 (bf16) / 456 (fp8) / 686 (MXFP4) vs vLLM 657 on chat_short, and
+vLLM leads on chat_long (1959 vs our ~2430). vLLM has no fp8 or MXFP4 CPU path, so its single bf16
+row is the only available comparison for all three plow data types.
