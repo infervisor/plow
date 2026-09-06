@@ -34,6 +34,7 @@ pub mod indirection;
 // Prefill-chunk helpers are only exercised by an engine with a prefill path (AMD today).
 #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 pub mod kvrow;
+pub mod mixed_step_staging;
 pub mod oob;
 pub mod queue;
 /// Multi-GPU (tensor-parallel) device group: peer buffers, cross-GPU counters,
