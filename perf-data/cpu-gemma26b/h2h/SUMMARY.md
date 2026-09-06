@@ -100,3 +100,19 @@ prompt tokens: 128.8 / 171.1 / 201.5 tok/s (was 107.6 / 146.2 / 177.2). Single-s
 plow wins every TTFT cell (1.4-6.1x) and every c=1 and c=2 decode cell. At c>=4 llama.cpp wins
 decode: its TPOT is nearly flat in batch (105-130 ms at c=8) while ours grows, because a decode step
 still waits behind other slots' whole-prompt prefills. Same fix as GPT-OSS.
+
+## vLLM 0.28 CPU cannot serve this model on this box (13:4x)
+
+Attempted twice with `vllm serve <hf 26B> --dtype bfloat16`, first at `--max-model-len 4096
+--max-num-seqs 8` with `VLLM_CPU_KVCACHE_SPACE=2`, then at 2048 / 2 seqs / 1 GiB. Both times the
+worker was OOM-killed during model load:
+
+    Worker proc VllmWorker-0 died unexpectedly (exit code: -9), shutting down executor
+
+Exit code -9 is SIGKILL from the kernel OOM killer. The cause is structural rather than a tuning
+miss: the Gemma-4-26B-A4B checkpoint ships bf16, and vLLM's CPU backend has no 4-bit weight path
+for it (its MXFP4 support dequantizes to bf16, and that is for GPT-OSS-shaped checkpoints), so it
+must materialise ~47 GB of weights on a 58 GB machine. plow serves the same model from a 13.0 GB
+MXFP4 twin at ~21 GB resident, answers correctly, and beats both llama.cpp builds on every TTFT
+cell and every c<=2 decode cell. For this model the vLLM comparison is therefore not a latency
+number but a capability one.
