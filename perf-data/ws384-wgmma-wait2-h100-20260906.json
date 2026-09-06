@@ -1,0 +1,1891 @@
+{
+  "scope": "Native standalone BF16 WS384 primitive. Reused supervisor validator field name does not imply block qualification.",
+  "decision": "Stop candidate before block or serving runs: mostly within1percent, mixed gains and regressions. No production flag or kernel change.",
+  "analysis": {
+    "scope": "native standalone operation bodies, not blocks",
+    "records": [
+      {
+        "shape": "g12_o_local",
+        "control_us": [
+          202.8,
+          202.5
+        ],
+        "candidate_us": [
+          203.7,
+          204.0
+        ],
+        "speedups": [
+          0.9955817378497792,
+          0.9926470588235294
+        ],
+        "median_speedup": 0.9941133186166299,
+        "control_native_over_Lt": [
+          1.253604111821487,
+          1.2457954403886882
+        ],
+        "Lt_us": [
+          161.77356,
+          162.54675
+        ]
+      },
+      {
+        "shape": "g12_o_full",
+        "control_us": [
+          373.0,
+          374.3
+        ],
+        "candidate_us": [
+          373.0,
+          373.8
+        ],
+        "speedups": [
+          1.0,
+          1.0013376136971643
+        ],
+        "median_speedup": 1.0006695232994107,
+        "control_native_over_Lt": [
+          1.1674060238150827,
+          1.1697274535033337
+        ],
+        "Lt_us": [
+          319.5118,
+          319.98907
+        ]
+      },
+      {
+        "shape": "g12_down",
+        "control_us": [
+          677.3000000000001,
+          682.0
+        ],
+        "candidate_us": [
+          673.5,
+          679.6
+        ],
+        "speedups": [
+          1.0056421677802525,
+          1.003531489111242
+        ],
+        "median_speedup": 1.0045820708003845,
+        "control_native_over_Lt": [
+          1.0551862403714256,
+          1.0396091069757771
+        ],
+        "Lt_us": [
+          641.8772100000001,
+          656.0158
+        ]
+      },
+      {
+        "shape": "g31_o_local",
+        "control_us": [
+          551.1,
+          551.5
+        ],
+        "candidate_us": [
+          558.5,
+          555.6
+        ],
+        "speedups": [
+          0.986750223813787,
+          0.9926205903527717
+        ],
+        "median_speedup": 0.9896777668072884,
+        "control_native_over_Lt": [
+          1.2078753472641623,
+          1.222344456667889
+        ],
+        "Lt_us": [
+          456.25569,
+          451.18215000000004
+        ]
+      },
+      {
+        "shape": "g31_o_full",
+        "control_us": [
+          1072.4,
+          1075.5
+        ],
+        "candidate_us": [
+          1069.0,
+          1065.8000000000002
+        ],
+        "speedups": [
+          1.0031805425631433,
+          1.0091011446800524
+        ],
+        "median_speedup": 1.0061364062207232,
+        "control_native_over_Lt": [
+          1.1268875366238449,
+          1.1646866992778941
+        ],
+        "Lt_us": [
+          951.6477600000001,
+          923.4243
+        ]
+      },
+      {
+        "shape": "g31_down",
+        "control_us": [
+          1406.5,
+          1411.6
+        ],
+        "candidate_us": [
+          1402.9,
+          1387.0
+        ],
+        "speedups": [
+          1.002566113051536,
+          1.0177361211247296
+        ],
+        "median_speedup": 1.0101078891716548,
+        "control_native_over_Lt": [
+          1.1032656663724625,
+          1.0895619960775769
+        ],
+        "Lt_us": [
+          1274.8516,
+          1295.56648
+        ]
+      },
+      {
+        "shape": "qwen_o",
+        "control_us": [
+          362.70000000000005,
+          363.20000000000005
+        ],
+        "candidate_us": [
+          363.59999999999997,
+          363.5
+        ],
+        "speedups": [
+          0.9975247524752477,
+          0.999174690508941
+        ],
+        "median_speedup": 0.9983496080319079,
+        "control_native_over_Lt": [
+          1.1362345188046814,
+          1.1161960040183057
+        ],
+        "Lt_us": [
+          319.21227000000005,
+          325.39088000000004
+        ]
+      },
+      {
+        "shape": "qwen_down",
+        "control_us": [
+          970.6,
+          973.4000000000001
+        ],
+        "candidate_us": [
+          964.1999999999999,
+          965.1999999999999
+        ],
+        "speedups": [
+          1.0066376270483304,
+          1.0084956485702448
+        ],
+        "median_speedup": 1.0075671193117033,
+        "control_native_over_Lt": [
+          0.9941346058256287,
+          0.997207818109294
+        ],
+        "Lt_us": [
+          976.32654,
+          976.12552
+        ]
+      },
+      {
+        "shape": "tail",
+        "control_us": [
+          87.6,
+          89.5
+        ],
+        "candidate_us": [
+          87.1,
+          87.1
+        ],
+        "speedups": [
+          1.0057405281285878,
+          1.0275545350172217
+        ],
+        "median_speedup": 1.0166475315729047,
+        "control_native_over_Lt": [
+          0.7202016564638098,
+          0.7556294393229561
+        ],
+        "Lt_us": [
+          121.6326,
+          118.4443
+        ]
+      },
+      {
+        "shape": "stage1",
+        "control_us": [
+          11.4,
+          11.4
+        ],
+        "candidate_us": [
+          11.2,
+          11.299999999999999
+        ],
+        "speedups": [
+          1.017857142857143,
+          1.0088495575221241
+        ],
+        "median_speedup": 1.0133333333333334,
+        "control_native_over_Lt": [
+          2.908667830133799,
+          2.9585798816568047
+        ],
+        "Lt_us": [
+          3.91932,
+          3.8532
+        ]
+      },
+      {
+        "shape": "stage2",
+        "control_us": [
+          12.1,
+          12.1
+        ],
+        "candidate_us": [
+          12.0,
+          12.1
+        ],
+        "speedups": [
+          1.0083333333333333,
+          1.0
+        ],
+        "median_speedup": 1.004149377593361,
+        "control_native_over_Lt": [
+          2.8563267637817766,
+          2.8768699654775602
+        ],
+        "Lt_us": [
+          4.23621,
+          4.20596
+        ]
+      },
+      {
+        "shape": "g12_q_local",
+        "control_us": [
+          192.20000000000002,
+          192.70000000000002
+        ],
+        "candidate_us": [
+          193.70000000000002,
+          194.3
+        ],
+        "speedups": [
+          0.9922560660815695,
+          0.9917653113741637
+        ],
+        "median_speedup": 0.9920103092783507,
+        "control_native_over_Lt": [
+          1.184413123297406,
+          1.183011948420679
+        ],
+        "Lt_us": [
+          162.27446000000003,
+          162.88931000000002
+        ]
+      },
+      {
+        "shape": "g12_q_full",
+        "control_us": [
+          380.09999999999997,
+          378.7
+        ],
+        "candidate_us": [
+          380.7,
+          381.0
+        ],
+        "speedups": [
+          0.9984239558707643,
+          0.9939632545931758
+        ],
+        "median_speedup": 0.9961927267953261,
+        "control_native_over_Lt": [
+          1.1899095668729176,
+          1.1674060238150827
+        ],
+        "Lt_us": [
+          319.43604,
+          324.39442
+        ]
+      },
+      {
+        "shape": "g12_gate",
+        "control_us": [
+          709.4,
+          708.6
+        ],
+        "candidate_us": [
+          708.0,
+          708.7
+        ],
+        "speedups": [
+          1.0019774011299434,
+          0.9998588965711867
+        ],
+        "median_speedup": 1.000917625467636,
+        "control_native_over_Lt": [
+          1.069747539580659,
+          1.0447137484329294
+        ],
+        "Lt_us": [
+          663.14712,
+          678.27192
+        ]
+      },
+      {
+        "shape": "g31_q_local",
+        "control_us": [
+          512.0,
+          512.4
+        ],
+        "candidate_us": [
+          511.0,
+          512.7
+        ],
+        "speedups": [
+          1.0019569471624266,
+          0.9994148624926856
+        ],
+        "median_speedup": 1.000683794080297,
+        "control_native_over_Lt": [
+          1.0303967027305512,
+          1.1416828405069073
+        ],
+        "Lt_us": [
+          496.896,
+          448.81116
+        ]
+      },
+      {
+        "shape": "g31_q_full",
+        "control_us": [
+          1025.4,
+          1025.1999999999998
+        ],
+        "candidate_us": [
+          1022.5,
+          1020.3
+        ],
+        "speedups": [
+          1.002836185819071,
+          1.004802509065961
+        ],
+        "median_speedup": 1.003818288623458,
+        "control_native_over_Lt": [
+          1.0040160642570282,
+          1.0177081213108081
+        ],
+        "Lt_us": [
+          1021.2984000000001,
+          1007.3615199999998
+        ]
+      },
+      {
+        "shape": "g31_gate",
+        "control_us": [
+          1355.9,
+          1352.0
+        ],
+        "candidate_us": [
+          1352.5,
+          1338.0
+        ],
+        "speedups": [
+          1.0025138632162662,
+          1.0104633781763828
+        ],
+        "median_speedup": 1.006467199405315,
+        "control_native_over_Lt": [
+          1.0212418300653596,
+          1.0123506782749545
+        ],
+        "Lt_us": [
+          1327.69728,
+          1335.5056
+        ]
+      }
+    ],
+    "clocks": {
+      "samples": 47,
+      "sm_MHz": [
+        1425,
+        1455,
+        1485,
+        1500,
+        1515,
+        1560,
+        1650,
+        1695,
+        1725,
+        1785,
+        1815,
+        1830
+      ],
+      "memory_MHz": [
+        2619
+      ],
+      "power_W_range": [
+        132,
+        624
+      ],
+      "temperature_C_range": [
+        38,
+        58
+      ]
+    },
+    "decision": "Stop wait2; no meaningful broad real-shape gain. No native block or serving GPU advancement.",
+    "aggregate": {
+      "g12": {
+        "geomean_speedup": 0.9980714810211371,
+        "sum_shape_time_speedups": [
+          1.0008686725104636,
+          0.9989769418430786
+        ],
+        "note": "unweighted six-shape operator summary, not model-layer frequency weighting"
+      },
+      "g31": {
+        "geomean_speedup": 1.0027938754511492,
+        "sum_shape_time_speedups": [
+          1.0011662497464675,
+          1.008300166683675
+        ],
+        "note": "unweighted six-shape operator summary, not model-layer frequency weighting"
+      }
+    },
+    "gate": {
+      "jobs": 9,
+      "all_pass": true,
+      "memory_raw_returncode": 0,
+      "scope_warning": "root generic validated_native_block field means primitive validator here; no block executed"
+    }
+  },
+  "execution": {
+    "e5-check-m65-control": {
+      "passed": true,
+      "returncode": 0,
+      "validated_native_block": true
+    },
+    "e5-check-m65-candidate": {
+      "passed": true,
+      "returncode": 0,
+      "validated_native_block": true
+    },
+    "e5-check-m4096-control": {
+      "passed": true,
+      "returncode": 0,
+      "validated_native_block": true
+    },
+    "e5-check-m4096-candidate": {
+      "passed": true,
+      "returncode": 0,
+      "validated_native_block": true
+    },
+    "e5-memcheck-m65-candidate": {
+      "passed": true,
+      "returncode": 0,
+      "validated_native_block": true
+    },
+    "e5-timing-m4096-ab-control": {
+      "passed": true,
+      "returncode": 0,
+      "validated_native_block": true
+    },
+    "e5-timing-m4096-ab-candidate": {
+      "passed": true,
+      "returncode": 0,
+      "validated_native_block": true
+    },
+    "e5-timing-m4096-ba-candidate": {
+      "passed": true,
+      "returncode": 0,
+      "validated_native_block": true
+    },
+    "e5-timing-m4096-ba-control": {
+      "passed": true,
+      "returncode": 0,
+      "validated_native_block": true
+    }
+  },
+  "resources": {
+    "primitive-control": {
+      "sha256": "41c98d9f82a5c0175ad6c0bfdcbf56281f8bab9da988c3cf5418f04bc8e77868",
+      "symbol": "_Z7k_ws384P13__nv_bfloat16PKvS2_jjj",
+      "instruction_count": 1152,
+      "counts": {
+        "HGMMA.64x256x16.F32.BF16": 4,
+        "WARPGROUP.DEPBAR.LE": 2,
+        "0x2 ;": 4,
+        "LDL": 0,
+        "STL": 0,
+        "UTMALDG": 15,
+        "SETMAXNREG": 0
+      },
+      "mma_opcode_order_without_register_names": [
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R, UP0",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R, gsb0"
+      ],
+      "waits": [
+        "WARPGROUP.DEPBAR.LE gsb0, 0x1",
+        "WARPGROUP.DEPBAR.LE gsb0, 0x0"
+      ],
+      "host_check_only_rebuild_kernel_instructions_identical": true
+    },
+    "primitive-candidate": {
+      "sha256": "ba9d0f05412439c2e84570484fd057282eaef2c2998ffc1cd0bddf230b02f284",
+      "symbol": "_Z7k_ws384P13__nv_bfloat16PKvS2_jjj",
+      "instruction_count": 1232,
+      "counts": {
+        "HGMMA.64x256x16.F32.BF16": 4,
+        "WARPGROUP.DEPBAR.LE": 2,
+        "0x2 ;": 13,
+        "LDL": 0,
+        "STL": 0,
+        "UTMALDG": 15,
+        "SETMAXNREG": 0
+      },
+      "mma_opcode_order_without_register_names": [
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R, UP0",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R, gsb0"
+      ],
+      "waits": [
+        "WARPGROUP.DEPBAR.LE gsb0, 0x2",
+        "WARPGROUP.DEPBAR.LE gsb0, 0x0"
+      ],
+      "host_check_only_rebuild_kernel_instructions_identical": true
+    },
+    "role-control": {
+      "sha256": "e2808e27f09f9d9d4859936011f9fe4c3e135d7c95e8007c6af9eecf4bb2a667",
+      "symbol": "_Z19interp_sm90a_pfgemm11PlowProgram",
+      "instruction_count": 4816,
+      "counts": {
+        "HGMMA.64x256x16.F32.BF16": 4,
+        "WARPGROUP.DEPBAR.LE": 4,
+        "0x2 ;": 10,
+        "LDL": 0,
+        "STL": 0,
+        "UTMALDG": 30,
+        "SETMAXNREG": 0
+      },
+      "mma_opcode_order_without_register_names": [
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R, UP0",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R, gsb0"
+      ],
+      "waits": [
+        "WARPGROUP.DEPBAR.LE gsb0, 0x1",
+        "WARPGROUP.DEPBAR.LE gsb0, 0x0",
+        "WARPGROUP.DEPBAR.LE gsb0, 0x1",
+        "WARPGROUP.DEPBAR.LE gsb0, 0x0"
+      ]
+    },
+    "role-candidate": {
+      "sha256": "06a34e9962f4aa3ee9e97eac8f359de54e5d5f78ad80820b4e007edade26c51f",
+      "symbol": "_Z19interp_sm90a_pfgemm11PlowProgram",
+      "instruction_count": 4960,
+      "counts": {
+        "HGMMA.64x256x16.F32.BF16": 4,
+        "WARPGROUP.DEPBAR.LE": 4,
+        "0x2 ;": 28,
+        "LDL": 0,
+        "STL": 0,
+        "UTMALDG": 30,
+        "SETMAXNREG": 0
+      },
+      "mma_opcode_order_without_register_names": [
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R, UP0",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R",
+        "HGMMA.64x256x16.F32.BF16 R, gdesc[UR], R, gsb0"
+      ],
+      "waits": [
+        "WARPGROUP.DEPBAR.LE gsb0, 0x2",
+        "WARPGROUP.DEPBAR.LE gsb0, 0x0",
+        "WARPGROUP.DEPBAR.LE gsb0, 0x2",
+        "WARPGROUP.DEPBAR.LE gsb0, 0x0"
+      ]
+    },
+    "unchanged_other_text": true,
+    "default_off_role_byteexact_old": true
+  },
+  "protocol": {
+    "pass": true,
+    "cases": 600,
+    "interleaving_states": 1184760,
+    "negative_ns2_depth2_rejected": true,
+    "scope": "abstract independent-producer/two-consumer protocol; completed WGMMA group retirement per PTX wait bound, not GPU execution or proof of instruction semantics",
+    "exact_release_ownership": "every global K-stage released exactly once by each consumer; final drain retires the last min(Ksteps,2), includingKtails and tile transitions"
+  },
+  "raw": {
+    "results/e5-check-m4096-candidate.log": "Hopper ws384 BF16 vs cuBLASLt SMs=132\n\nshape(cuBLASLt)      M       ms   TFLOP/s\ncorrectness g12_o_local M=4096 relL2=0 max_abs=0 max_ref=27.125\ncorrectness g12_o_full M=4096 relL2=0 max_abs=0 max_ref=40.5\ncorrectness g12_down M=4096 relL2=0 max_abs=0 max_ref=54\ncorrectness g31_o_local M=4096 relL2=0 max_abs=0 max_ref=41\ncorrectness g31_o_full M=4096 relL2=0 max_abs=0 max_ref=58.25\ncorrectness g31_down M=4096 relL2=0 max_abs=0 max_ref=69\ncorrectness qwen_o M=4096 relL2=0 max_abs=0 max_ref=37.5\ncorrectness qwen_down M=4096 relL2=0 max_abs=0 max_ref=74\ncorrectness tail M=4096 relL2=0 max_abs=0 max_ref=11.5625\ncorrectness stage1 M=4096 relL2=0 max_abs=0 max_ref=3.23438\ncorrectness stage2 M=4096 relL2=0 max_abs=0 max_ref=4.65625\ncorrectness g12_q_local M=4096 relL2=0 max_abs=0 max_ref=28.5\ncorrectness g12_q_full M=4096 relL2=0 max_abs=0 max_ref=27.25\ncorrectness g12_gate M=4096 relL2=0 max_abs=0 max_ref=29.375\ncorrectness g31_q_local M=4096 relL2=0 max_abs=0 max_ref=35\ncorrectness g31_q_full M=4096 relL2=0 max_abs=0 max_ref=35.25\ncorrectness g31_gate M=4096 relL2=0 max_abs=0 max_ref=40\nchecked_shapes=17 M=4096 check_only=1\n",
+    "results/e5-check-m4096-control.log": "Hopper ws384 BF16 vs cuBLASLt SMs=132\n\nshape(cuBLASLt)      M       ms   TFLOP/s\ncorrectness g12_o_local M=4096 relL2=0 max_abs=0 max_ref=27.125\ncorrectness g12_o_full M=4096 relL2=0 max_abs=0 max_ref=40.5\ncorrectness g12_down M=4096 relL2=0 max_abs=0 max_ref=54\ncorrectness g31_o_local M=4096 relL2=0 max_abs=0 max_ref=41\ncorrectness g31_o_full M=4096 relL2=0 max_abs=0 max_ref=58.25\ncorrectness g31_down M=4096 relL2=0 max_abs=0 max_ref=69\ncorrectness qwen_o M=4096 relL2=0 max_abs=0 max_ref=37.5\ncorrectness qwen_down M=4096 relL2=0 max_abs=0 max_ref=74\ncorrectness tail M=4096 relL2=0 max_abs=0 max_ref=11.5625\ncorrectness stage1 M=4096 relL2=0 max_abs=0 max_ref=3.23438\ncorrectness stage2 M=4096 relL2=0 max_abs=0 max_ref=4.65625\ncorrectness g12_q_local M=4096 relL2=0 max_abs=0 max_ref=28.5\ncorrectness g12_q_full M=4096 relL2=0 max_abs=0 max_ref=27.25\ncorrectness g12_gate M=4096 relL2=0 max_abs=0 max_ref=29.375\ncorrectness g31_q_local M=4096 relL2=0 max_abs=0 max_ref=35\ncorrectness g31_q_full M=4096 relL2=0 max_abs=0 max_ref=35.25\ncorrectness g31_gate M=4096 relL2=0 max_abs=0 max_ref=40\nchecked_shapes=17 M=4096 check_only=1\n",
+    "results/e5-check-m65-candidate.log": "Hopper ws384 BF16 vs cuBLASLt SMs=132\n\nshape(cuBLASLt)      M       ms   TFLOP/s\ncorrectness g12_o_local M=65 relL2=0 max_abs=0 max_ref=24.375\ncorrectness g12_o_full M=65 relL2=4.38294e-05 max_abs=0.125 max_ref=33.75\ncorrectness g12_down M=65 relL2=0.000133393 max_abs=0.25 max_ref=47.25\ncorrectness g31_o_local M=65 relL2=0 max_abs=0 max_ref=37.75\ncorrectness g31_o_full M=65 relL2=0.000137643 max_abs=0.25 max_ref=49.5\ncorrectness g31_down M=65 relL2=0.000181316 max_abs=0.25 max_ref=58.75\ncorrectness qwen_o M=65 relL2=0 max_abs=0 max_ref=31.875\ncorrectness qwen_down M=65 relL2=0.000152047 max_abs=0.25 max_ref=74\ncorrectness tail M=65 relL2=0 max_abs=0 max_ref=10.5\ncorrectness stage1 M=65 relL2=0 max_abs=0 max_ref=2.54688\ncorrectness stage2 M=65 relL2=0 max_abs=0 max_ref=4.125\ncorrectness g12_q_local M=65 relL2=0 max_abs=0 max_ref=22.5\ncorrectness g12_q_full M=65 relL2=0 max_abs=0 max_ref=26.125\ncorrectness g12_gate M=65 relL2=0 max_abs=0 max_ref=26.25\ncorrectness g31_q_local M=65 relL2=0 max_abs=0 max_ref=29.75\ncorrectness g31_q_full M=65 relL2=0 max_abs=0 max_ref=28.25\ncorrectness g31_gate M=65 relL2=0 max_abs=0 max_ref=29.75\nchecked_shapes=17 M=65 check_only=1\n",
+    "results/e5-check-m65-control.log": "Hopper ws384 BF16 vs cuBLASLt SMs=132\n\nshape(cuBLASLt)      M       ms   TFLOP/s\ncorrectness g12_o_local M=65 relL2=0 max_abs=0 max_ref=24.375\ncorrectness g12_o_full M=65 relL2=4.38294e-05 max_abs=0.125 max_ref=33.75\ncorrectness g12_down M=65 relL2=0.000133393 max_abs=0.25 max_ref=47.25\ncorrectness g31_o_local M=65 relL2=0 max_abs=0 max_ref=37.75\ncorrectness g31_o_full M=65 relL2=0.000137643 max_abs=0.25 max_ref=49.5\ncorrectness g31_down M=65 relL2=0.000181316 max_abs=0.25 max_ref=58.75\ncorrectness qwen_o M=65 relL2=0 max_abs=0 max_ref=31.875\ncorrectness qwen_down M=65 relL2=0.000152047 max_abs=0.25 max_ref=74\ncorrectness tail M=65 relL2=0 max_abs=0 max_ref=10.5\ncorrectness stage1 M=65 relL2=0 max_abs=0 max_ref=2.54688\ncorrectness stage2 M=65 relL2=0 max_abs=0 max_ref=4.125\ncorrectness g12_q_local M=65 relL2=0 max_abs=0 max_ref=22.5\ncorrectness g12_q_full M=65 relL2=0 max_abs=0 max_ref=26.125\ncorrectness g12_gate M=65 relL2=0 max_abs=0 max_ref=26.25\ncorrectness g31_q_local M=65 relL2=0 max_abs=0 max_ref=29.75\ncorrectness g31_q_full M=65 relL2=0 max_abs=0 max_ref=28.25\ncorrectness g31_gate M=65 relL2=0 max_abs=0 max_ref=29.75\nchecked_shapes=17 M=65 check_only=1\n",
+    "results/e5-memcheck-m65-candidate.log": "========= COMPUTE-SANITIZER\nHopper ws384 BF16 vs cuBLASLt SMs=132\n\nshape(cuBLASLt)      M       ms   TFLOP/s\ncorrectness g12_o_local M=65 relL2=0 max_abs=0 max_ref=24.375\ncorrectness g12_o_full M=65 relL2=4.38294e-05 max_abs=0.125 max_ref=33.75\ncorrectness g12_down M=65 relL2=0.000133393 max_abs=0.25 max_ref=47.25\ncorrectness g31_o_local M=65 relL2=0 max_abs=0 max_ref=37.75\ncorrectness g31_o_full M=65 relL2=0.000137643 max_abs=0.25 max_ref=49.5\ncorrectness g31_down M=65 relL2=0.000181316 max_abs=0.25 max_ref=58.75\ncorrectness qwen_o M=65 relL2=0 max_abs=0 max_ref=31.875\ncorrectness qwen_down M=65 relL2=0.000152047 max_abs=0.25 max_ref=74\ncorrectness tail M=65 relL2=0 max_abs=0 max_ref=10.5\ncorrectness stage1 M=65 relL2=0 max_abs=0 max_ref=2.54688\ncorrectness stage2 M=65 relL2=0 max_abs=0 max_ref=4.125\ncorrectness g12_q_local M=65 relL2=0 max_abs=0 max_ref=22.5\ncorrectness g12_q_full M=65 relL2=0 max_abs=0 max_ref=26.125\ncorrectness g12_gate M=65 relL2=0 max_abs=0 max_ref=26.25\ncorrectness g31_q_local M=65 relL2=0 max_abs=0 max_ref=29.75\ncorrectness g31_q_full M=65 relL2=0 max_abs=0 max_ref=28.25\ncorrectness g31_gate M=65 relL2=0 max_abs=0 max_ref=29.75\nchecked_shapes=17 M=65 check_only=1\n========= ERROR SUMMARY: 0 errors\n",
+    "results/e5-timing-m4096-ab-candidate.log": "Hopper ws384 BF16 vs cuBLASLt SMs=132\n\nshape(cuBLASLt)      M       ms   TFLOP/s\ncuBLASLt selected=5 candidates=8 workspace=4\ng12_o_local   4096   0.1622     794.2\ncorrectness g12_o_local M=4096 relL2=0 max_abs=0 max_ref=30.875\ng12_o_local   4096   0.2037     632.5 Plow speedup=0.7964 cold_MiB=480.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_o_full   4096   0.3182     809.8\ncorrectness g12_o_full M=4096 relL2=0 max_abs=0 max_ref=43.75\ng12_o_full   4096   0.3730     690.9 Plow speedup=0.8532 cold_MiB=960.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_down    4096   0.6192     780.3\ncorrectness g12_down M=4096 relL2=0 max_abs=0 max_ref=56\ng12_down    4096   0.6735     717.4 Plow speedup=0.9194 cold_MiB=1800.0\ncuBLASLt selected=1 candidates=8 workspace=4\ng31_o_local   4096   0.4586     786.7\ncorrectness g31_o_local M=4096 relL2=0 max_abs=0 max_ref=39\ng31_o_local   4096   0.5585     646.0 Plow speedup=0.8212 cold_MiB=1344.0\ncuBLASLt selected=1 candidates=8 workspace=4\ng31_o_full   4096   0.9290     776.7\ncorrectness g31_o_full M=4096 relL2=0 max_abs=0 max_ref=60.75\ng31_o_full   4096   1.0690     675.0 Plow speedup=0.8691 cold_MiB=2688.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_down    4096   1.2529     755.9\ncorrectness g31_down M=4096 relL2=0 max_abs=0 max_ref=68\ng31_down    4096   1.4029     675.1 Plow speedup=0.8931 cold_MiB=3528.0\ncuBLASLt selected=1 candidates=8 workspace=4\nqwen_o      4096   0.3184     809.3\ncorrectness qwen_o M=4096 relL2=0 max_abs=0 max_ref=37.75\nqwen_o      4096   0.3636     708.7 Plow speedup=0.8757 cold_MiB=960.0\ncuBLASLt selected=0 candidates=8 workspace=4\nqwen_down   4096   0.9987     731.1\ncorrectness qwen_down M=4096 relL2=0 max_abs=0 max_ref=60.75\nqwen_down   4096   0.9642     757.3 Plow speedup=1.0358 cold_MiB=2720.0\ncuBLASLt selected=0 candidates=8 workspace=0\ntail        4096   0.1167     177.6\ncorrectness tail M=4096 relL2=0 max_abs=0 max_ref=12\ntail        4096   0.0871     238.0 Plow speedup=1.3398 cold_MiB=77.2\ncuBLASLt selected=1 candidates=8 workspace=0\nstage1      4096   0.0038      35.5\ncorrectness stage1 M=4096 relL2=0 max_abs=0 max_ref=3.53125\nstage1      4096   0.0112      11.9 Plow speedup=0.3363 cold_MiB=0.5\ncuBLASLt selected=1 candidates=8 workspace=0\nstage2      4096   0.0040      66.8\ncorrectness stage2 M=4096 relL2=0 max_abs=0 max_ref=5.15625\nstage2      4096   0.0120      22.4 Plow speedup=0.3360 cold_MiB=1.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_q_local   4096   0.1625     792.9\ncorrectness g12_q_local M=4096 relL2=0 max_abs=0 max_ref=25.625\ng12_q_local   4096   0.1937     665.1 Plow speedup=0.8388 cold_MiB=480.0\ncuBLASLt selected=2 candidates=8 workspace=4\ng12_q_full   4096   0.3213     802.1\ncorrectness g12_q_full M=4096 relL2=0 max_abs=0 max_ref=31\ng12_q_full   4096   0.3807     676.9 Plow speedup=0.8438 cold_MiB=960.0\ncuBLASLt selected=2 candidates=8 workspace=4\ng12_gate    4096   0.6351     760.8\ncorrectness g12_gate M=4096 relL2=0 max_abs=0 max_ref=28.5\ng12_gate    4096   0.7080     682.4 Plow speedup=0.8970 cold_MiB=1800.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_q_local   4096   0.4751     759.3\ncorrectness g31_q_local M=4096 relL2=0 max_abs=0 max_ref=34.25\ng31_q_local   4096   0.5110     706.0 Plow speedup=0.9298 cold_MiB=1344.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_q_full   4096   1.0241     704.6\ncorrectness g31_q_full M=4096 relL2=0 max_abs=0 max_ref=35.5\ng31_q_full   4096   1.0225     705.6 Plow speedup=1.0015 cold_MiB=2688.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_gate    4096   1.2864     736.2\ncorrectness g31_gate M=4096 relL2=0 max_abs=0 max_ref=36\ng31_gate    4096   1.3525     700.2 Plow speedup=0.9511 cold_MiB=3528.0\nchecked_shapes=17 M=4096 check_only=0\n",
+    "results/e5-timing-m4096-ab-control.log": "Hopper ws384 BF16 vs cuBLASLt SMs=132\n\nshape(cuBLASLt)      M       ms   TFLOP/s\ncuBLASLt selected=5 candidates=8 workspace=4\ng12_o_local   4096   0.1617     796.6\ncorrectness g12_o_local M=4096 relL2=0 max_abs=0 max_ref=30.875\ng12_o_local   4096   0.2028     635.4 Plow speedup=0.7977 cold_MiB=480.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_o_full   4096   0.3196     806.4\ncorrectness g12_o_full M=4096 relL2=0 max_abs=0 max_ref=43.75\ng12_o_full   4096   0.3730     690.8 Plow speedup=0.8566 cold_MiB=960.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_down    4096   0.6418     752.8\ncorrectness g12_down M=4096 relL2=0 max_abs=0 max_ref=56\ng12_down    4096   0.6773     713.4 Plow speedup=0.9477 cold_MiB=1800.0\ncuBLASLt selected=1 candidates=8 workspace=4\ng31_o_local   4096   0.4562     790.8\ncorrectness g31_o_local M=4096 relL2=0 max_abs=0 max_ref=39\ng31_o_local   4096   0.5511     654.6 Plow speedup=0.8279 cold_MiB=1344.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_o_full   4096   0.9517     758.2\ncorrectness g31_o_full M=4096 relL2=0 max_abs=0 max_ref=60.75\ng31_o_full   4096   1.0724     672.8 Plow speedup=0.8874 cold_MiB=2688.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_down    4096   1.2749     742.8\ncorrectness g31_down M=4096 relL2=0 max_abs=0 max_ref=68\ng31_down    4096   1.4065     673.3 Plow speedup=0.9064 cold_MiB=3528.0\ncuBLASLt selected=1 candidates=8 workspace=4\nqwen_o      4096   0.3192     807.3\ncorrectness qwen_o M=4096 relL2=0 max_abs=0 max_ref=37.75\nqwen_o      4096   0.3627     710.5 Plow speedup=0.8801 cold_MiB=960.0\ncuBLASLt selected=1 candidates=8 workspace=4\nqwen_down   4096   0.9764     747.8\ncorrectness qwen_down M=4096 relL2=0 max_abs=0 max_ref=60.75\nqwen_down   4096   0.9706     752.2 Plow speedup=1.0059 cold_MiB=2720.0\ncuBLASLt selected=0 candidates=8 workspace=0\ntail        4096   0.1216     170.5\ncorrectness tail M=4096 relL2=0 max_abs=0 max_ref=12\ntail        4096   0.0876     236.8 Plow speedup=1.3885 cold_MiB=77.2\ncuBLASLt selected=1 candidates=8 workspace=0\nstage1      4096   0.0039      34.2\ncorrectness stage1 M=4096 relL2=0 max_abs=0 max_ref=3.53125\nstage1      4096   0.0114      11.8 Plow speedup=0.3438 cold_MiB=0.5\ncuBLASLt selected=1 candidates=8 workspace=0\nstage2      4096   0.0043      63.1\ncorrectness stage2 M=4096 relL2=0 max_abs=0 max_ref=5.15625\nstage2      4096   0.0121      22.1 Plow speedup=0.3501 cold_MiB=1.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_q_local   4096   0.1623     793.9\ncorrectness g12_q_local M=4096 relL2=0 max_abs=0 max_ref=25.625\ng12_q_local   4096   0.1922     670.3 Plow speedup=0.8443 cold_MiB=480.0\ncuBLASLt selected=6 candidates=8 workspace=4\ng12_q_full   4096   0.3194     806.8\ncorrectness g12_q_full M=4096 relL2=0 max_abs=0 max_ref=31\ng12_q_full   4096   0.3801     678.0 Plow speedup=0.8404 cold_MiB=960.0\ncuBLASLt selected=2 candidates=8 workspace=4\ng12_gate    4096   0.6631     728.7\ncorrectness g12_gate M=4096 relL2=0 max_abs=0 max_ref=28.5\ng12_gate    4096   0.7094     681.1 Plow speedup=0.9348 cold_MiB=1800.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_q_local   4096   0.4969     726.0\ncorrectness g31_q_local M=4096 relL2=0 max_abs=0 max_ref=34.25\ng31_q_local   4096   0.5120     704.7 Plow speedup=0.9705 cold_MiB=1344.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_q_full   4096   1.0213     706.5\ncorrectness g31_q_full M=4096 relL2=0 max_abs=0 max_ref=35.5\ng31_q_full   4096   1.0254     703.7 Plow speedup=0.9960 cold_MiB=2688.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_gate    4096   1.3276     713.3\ncorrectness g31_gate M=4096 relL2=0 max_abs=0 max_ref=36\ng31_gate    4096   1.3559     698.5 Plow speedup=0.9792 cold_MiB=3528.0\nchecked_shapes=17 M=4096 check_only=0\n",
+    "results/e5-timing-m4096-ba-candidate.log": "Hopper ws384 BF16 vs cuBLASLt SMs=132\n\nshape(cuBLASLt)      M       ms   TFLOP/s\ncuBLASLt selected=5 candidates=8 workspace=4\ng12_o_local   4096   0.1625     792.9\ncorrectness g12_o_local M=4096 relL2=0 max_abs=0 max_ref=30.875\ng12_o_local   4096   0.2040     631.6 Plow speedup=0.7966 cold_MiB=480.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_o_full   4096   0.3452     746.6\ncorrectness g12_o_full M=4096 relL2=0 max_abs=0 max_ref=43.75\ng12_o_full   4096   0.3738     689.5 Plow speedup=0.9235 cold_MiB=960.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_down    4096   0.6417     753.0\ncorrectness g12_down M=4096 relL2=0 max_abs=0 max_ref=56\ng12_down    4096   0.6796     711.0 Plow speedup=0.9443 cold_MiB=1800.0\ncuBLASLt selected=1 candidates=8 workspace=4\ng31_o_local   4096   0.4590     786.0\ncorrectness g31_o_local M=4096 relL2=0 max_abs=0 max_ref=39\ng31_o_local   4096   0.5556     649.3 Plow speedup=0.8261 cold_MiB=1344.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_o_full   4096   0.9943     725.7\ncorrectness g31_o_full M=4096 relL2=0 max_abs=0 max_ref=60.75\ng31_o_full   4096   1.0658     677.0 Plow speedup=0.9330 cold_MiB=2688.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_down    4096   1.2814     739.1\ncorrectness g31_down M=4096 relL2=0 max_abs=0 max_ref=68\ng31_down    4096   1.3870     682.8 Plow speedup=0.9239 cold_MiB=3528.0\ncuBLASLt selected=1 candidates=8 workspace=4\nqwen_o      4096   0.3196     806.3\ncorrectness qwen_o M=4096 relL2=0 max_abs=0 max_ref=37.75\nqwen_o      4096   0.3635     708.8 Plow speedup=0.8791 cold_MiB=960.0\ncuBLASLt selected=0 candidates=8 workspace=4\nqwen_down   4096   1.0008     729.6\ncorrectness qwen_down M=4096 relL2=0 max_abs=0 max_ref=60.75\nqwen_down   4096   0.9652     756.5 Plow speedup=1.0369 cold_MiB=2720.0\ncuBLASLt selected=0 candidates=8 workspace=0\ntail        4096   0.1171     177.0\ncorrectness tail M=4096 relL2=0 max_abs=0 max_ref=12\ntail        4096   0.0871     238.1 Plow speedup=1.3452 cold_MiB=77.2\ncuBLASLt selected=1 candidates=8 workspace=0\nstage1      4096   0.0038      35.4\ncorrectness stage1 M=4096 relL2=0 max_abs=0 max_ref=3.53125\nstage1      4096   0.0113      11.9 Plow speedup=0.3367 cold_MiB=0.5\ncuBLASLt selected=1 candidates=8 workspace=0\nstage2      4096   0.0041      65.9\ncorrectness stage2 M=4096 relL2=0 max_abs=0 max_ref=5.15625\nstage2      4096   0.0121      22.3 Plow speedup=0.3380 cold_MiB=1.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_q_local   4096   0.1625     792.9\ncorrectness g12_q_local M=4096 relL2=0 max_abs=0 max_ref=25.625\ng12_q_local   4096   0.1943     663.2 Plow speedup=0.8364 cold_MiB=480.0\ncuBLASLt selected=6 candidates=8 workspace=4\ng12_q_full   4096   0.3211     802.5\ncorrectness g12_q_full M=4096 relL2=0 max_abs=0 max_ref=31\ng12_q_full   4096   0.3810     676.4 Plow speedup=0.8428 cold_MiB=960.0\ncuBLASLt selected=2 candidates=8 workspace=4\ng12_gate    4096   0.6374     758.0\ncorrectness g12_gate M=4096 relL2=0 max_abs=0 max_ref=28.5\ng12_gate    4096   0.7087     681.8 Plow speedup=0.8994 cold_MiB=1800.0\ncuBLASLt selected=2 candidates=8 workspace=4\ng31_q_local   4096   0.4519     798.3\ncorrectness g31_q_local M=4096 relL2=0 max_abs=0 max_ref=34.25\ng31_q_local   4096   0.5127     703.7 Plow speedup=0.8816 cold_MiB=1344.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_q_full   4096   1.0311     699.8\ncorrectness g31_q_full M=4096 relL2=0 max_abs=0 max_ref=35.5\ng31_q_full   4096   1.0203     707.2 Plow speedup=1.0105 cold_MiB=2688.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_gate    4096   1.2915     733.3\ncorrectness g31_gate M=4096 relL2=0 max_abs=0 max_ref=36\ng31_gate    4096   1.3380     707.8 Plow speedup=0.9653 cold_MiB=3528.0\nchecked_shapes=17 M=4096 check_only=0\n",
+    "results/e5-timing-m4096-ba-control.log": "Hopper ws384 BF16 vs cuBLASLt SMs=132\n\nshape(cuBLASLt)      M       ms   TFLOP/s\ncuBLASLt selected=5 candidates=8 workspace=4\ng12_o_local   4096   0.1626     792.6\ncorrectness g12_o_local M=4096 relL2=0 max_abs=0 max_ref=30.875\ng12_o_local   4096   0.2025     636.2 Plow speedup=0.8027 cold_MiB=480.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_o_full   4096   0.3200     805.2\ncorrectness g12_o_full M=4096 relL2=0 max_abs=0 max_ref=43.75\ng12_o_full   4096   0.3743     688.4 Plow speedup=0.8549 cold_MiB=960.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_down    4096   0.6560     736.6\ncorrectness g12_down M=4096 relL2=0 max_abs=0 max_ref=56\ng12_down    4096   0.6820     708.5 Plow speedup=0.9619 cold_MiB=1800.0\ncuBLASLt selected=3 candidates=8 workspace=4\ng31_o_local   4096   0.4512     799.6\ncorrectness g31_o_local M=4096 relL2=0 max_abs=0 max_ref=39\ng31_o_local   4096   0.5515     654.1 Plow speedup=0.8181 cold_MiB=1344.0\ncuBLASLt selected=1 candidates=8 workspace=4\ng31_o_full   4096   0.9234     781.4\ncorrectness g31_o_full M=4096 relL2=0 max_abs=0 max_ref=60.75\ng31_o_full   4096   1.0755     670.9 Plow speedup=0.8586 cold_MiB=2688.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_down    4096   1.2955     731.0\ncorrectness g31_down M=4096 relL2=0 max_abs=0 max_ref=68\ng31_down    4096   1.4116     670.9 Plow speedup=0.9178 cold_MiB=3528.0\ncuBLASLt selected=1 candidates=8 workspace=4\nqwen_o      4096   0.3254     791.9\ncorrectness qwen_o M=4096 relL2=0 max_abs=0 max_ref=37.75\nqwen_o      4096   0.3632     709.5 Plow speedup=0.8959 cold_MiB=960.0\ncuBLASLt selected=1 candidates=8 workspace=4\nqwen_down   4096   0.9761     748.0\ncorrectness qwen_down M=4096 relL2=0 max_abs=0 max_ref=60.75\nqwen_down   4096   0.9734     750.1 Plow speedup=1.0028 cold_MiB=2720.0\ncuBLASLt selected=1 candidates=8 workspace=0\ntail        4096   0.1185     175.0\ncorrectness tail M=4096 relL2=0 max_abs=0 max_ref=12\ntail        4096   0.0895     231.6 Plow speedup=1.3234 cold_MiB=77.2\ncuBLASLt selected=1 candidates=8 workspace=0\nstage1      4096   0.0039      34.7\ncorrectness stage1 M=4096 relL2=0 max_abs=0 max_ref=3.53125\nstage1      4096   0.0114      11.7 Plow speedup=0.3380 cold_MiB=0.5\ncuBLASLt selected=1 candidates=8 workspace=0\nstage2      4096   0.0042      63.8\ncorrectness stage2 M=4096 relL2=0 max_abs=0 max_ref=5.15625\nstage2      4096   0.0121      22.2 Plow speedup=0.3476 cold_MiB=1.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng12_q_local   4096   0.1628     791.2\ncorrectness g12_q_local M=4096 relL2=0 max_abs=0 max_ref=25.625\ng12_q_local   4096   0.1927     668.8 Plow speedup=0.8453 cold_MiB=480.0\ncuBLASLt selected=2 candidates=8 workspace=4\ng12_q_full   4096   0.3244     794.3\ncorrectness g12_q_full M=4096 relL2=0 max_abs=0 max_ref=31\ng12_q_full   4096   0.3787     680.5 Plow speedup=0.8566 cold_MiB=960.0\ncuBLASLt selected=2 candidates=8 workspace=4\ng12_gate    4096   0.6782     712.4\ncorrectness g12_gate M=4096 relL2=0 max_abs=0 max_ref=28.5\ng12_gate    4096   0.7086     681.9 Plow speedup=0.9572 cold_MiB=1800.0\ncuBLASLt selected=2 candidates=8 workspace=4\ng31_q_local   4096   0.4488     803.9\ncorrectness g31_q_local M=4096 relL2=0 max_abs=0 max_ref=34.25\ng31_q_local   4096   0.5124     704.2 Plow speedup=0.8759 cold_MiB=1344.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_q_full   4096   1.0074     716.3\ncorrectness g31_q_full M=4096 relL2=0 max_abs=0 max_ref=35.5\ng31_q_full   4096   1.0252     703.8 Plow speedup=0.9826 cold_MiB=2688.0\ncuBLASLt selected=0 candidates=8 workspace=4\ng31_gate    4096   1.3356     709.1\ncorrectness g31_gate M=4096 relL2=0 max_abs=0 max_ref=36\ng31_gate    4096   1.3520     700.5 Plow speedup=0.9878 cold_MiB=3528.0\nchecked_shapes=17 M=4096 check_only=0\n",
+    "results/e5-check-m4096-candidate.json": {
+      "pass": true,
+      "rows": 4096,
+      "shape_count": 17,
+      "mode": "check",
+      "max_relL2": 0.0,
+      "timing": [],
+      "raw_process_returncode_required": 0
+    },
+    "results/e5-check-m4096-control.json": {
+      "pass": true,
+      "rows": 4096,
+      "shape_count": 17,
+      "mode": "check",
+      "max_relL2": 0.0,
+      "timing": [],
+      "raw_process_returncode_required": 0
+    },
+    "results/e5-check-m65-candidate.json": {
+      "pass": true,
+      "rows": 65,
+      "shape_count": 17,
+      "mode": "check",
+      "max_relL2": 0.000181316,
+      "timing": [],
+      "raw_process_returncode_required": 0
+    },
+    "results/e5-check-m65-control.json": {
+      "pass": true,
+      "rows": 65,
+      "shape_count": 17,
+      "mode": "check",
+      "max_relL2": 0.000181316,
+      "timing": [],
+      "raw_process_returncode_required": 0
+    },
+    "results/e5-memcheck-m65-candidate.json": {
+      "pass": true,
+      "rows": 65,
+      "shape_count": 17,
+      "mode": "memcheck",
+      "max_relL2": 0.000181316,
+      "timing": [],
+      "raw_process_returncode_required": 0
+    },
+    "results/e5-timing-m4096-ab-candidate.json": {
+      "pass": true,
+      "rows": 4096,
+      "shape_count": 17,
+      "mode": "timing",
+      "max_relL2": 0.0,
+      "timing": [
+        [
+          "g12_o_local",
+          "4096",
+          "0.2037",
+          "632.5",
+          "0.7964",
+          "480.0"
+        ],
+        [
+          "g12_o_full",
+          "4096",
+          "0.3730",
+          "690.9",
+          "0.8532",
+          "960.0"
+        ],
+        [
+          "g12_down",
+          "4096",
+          "0.6735",
+          "717.4",
+          "0.9194",
+          "1800.0"
+        ],
+        [
+          "g31_o_local",
+          "4096",
+          "0.5585",
+          "646.0",
+          "0.8212",
+          "1344.0"
+        ],
+        [
+          "g31_o_full",
+          "4096",
+          "1.0690",
+          "675.0",
+          "0.8691",
+          "2688.0"
+        ],
+        [
+          "g31_down",
+          "4096",
+          "1.4029",
+          "675.1",
+          "0.8931",
+          "3528.0"
+        ],
+        [
+          "qwen_o",
+          "4096",
+          "0.3636",
+          "708.7",
+          "0.8757",
+          "960.0"
+        ],
+        [
+          "qwen_down",
+          "4096",
+          "0.9642",
+          "757.3",
+          "1.0358",
+          "2720.0"
+        ],
+        [
+          "tail",
+          "4096",
+          "0.0871",
+          "238.0",
+          "1.3398",
+          "77.2"
+        ],
+        [
+          "stage1",
+          "4096",
+          "0.0112",
+          "11.9",
+          "0.3363",
+          "0.5"
+        ],
+        [
+          "stage2",
+          "4096",
+          "0.0120",
+          "22.4",
+          "0.3360",
+          "1.0"
+        ],
+        [
+          "g12_q_local",
+          "4096",
+          "0.1937",
+          "665.1",
+          "0.8388",
+          "480.0"
+        ],
+        [
+          "g12_q_full",
+          "4096",
+          "0.3807",
+          "676.9",
+          "0.8438",
+          "960.0"
+        ],
+        [
+          "g12_gate",
+          "4096",
+          "0.7080",
+          "682.4",
+          "0.8970",
+          "1800.0"
+        ],
+        [
+          "g31_q_local",
+          "4096",
+          "0.5110",
+          "706.0",
+          "0.9298",
+          "1344.0"
+        ],
+        [
+          "g31_q_full",
+          "4096",
+          "1.0225",
+          "705.6",
+          "1.0015",
+          "2688.0"
+        ],
+        [
+          "g31_gate",
+          "4096",
+          "1.3525",
+          "700.2",
+          "0.9511",
+          "3528.0"
+        ]
+      ],
+      "raw_process_returncode_required": 0
+    },
+    "results/e5-timing-m4096-ab-control.json": {
+      "pass": true,
+      "rows": 4096,
+      "shape_count": 17,
+      "mode": "timing",
+      "max_relL2": 0.0,
+      "timing": [
+        [
+          "g12_o_local",
+          "4096",
+          "0.2028",
+          "635.4",
+          "0.7977",
+          "480.0"
+        ],
+        [
+          "g12_o_full",
+          "4096",
+          "0.3730",
+          "690.8",
+          "0.8566",
+          "960.0"
+        ],
+        [
+          "g12_down",
+          "4096",
+          "0.6773",
+          "713.4",
+          "0.9477",
+          "1800.0"
+        ],
+        [
+          "g31_o_local",
+          "4096",
+          "0.5511",
+          "654.6",
+          "0.8279",
+          "1344.0"
+        ],
+        [
+          "g31_o_full",
+          "4096",
+          "1.0724",
+          "672.8",
+          "0.8874",
+          "2688.0"
+        ],
+        [
+          "g31_down",
+          "4096",
+          "1.4065",
+          "673.3",
+          "0.9064",
+          "3528.0"
+        ],
+        [
+          "qwen_o",
+          "4096",
+          "0.3627",
+          "710.5",
+          "0.8801",
+          "960.0"
+        ],
+        [
+          "qwen_down",
+          "4096",
+          "0.9706",
+          "752.2",
+          "1.0059",
+          "2720.0"
+        ],
+        [
+          "tail",
+          "4096",
+          "0.0876",
+          "236.8",
+          "1.3885",
+          "77.2"
+        ],
+        [
+          "stage1",
+          "4096",
+          "0.0114",
+          "11.8",
+          "0.3438",
+          "0.5"
+        ],
+        [
+          "stage2",
+          "4096",
+          "0.0121",
+          "22.1",
+          "0.3501",
+          "1.0"
+        ],
+        [
+          "g12_q_local",
+          "4096",
+          "0.1922",
+          "670.3",
+          "0.8443",
+          "480.0"
+        ],
+        [
+          "g12_q_full",
+          "4096",
+          "0.3801",
+          "678.0",
+          "0.8404",
+          "960.0"
+        ],
+        [
+          "g12_gate",
+          "4096",
+          "0.7094",
+          "681.1",
+          "0.9348",
+          "1800.0"
+        ],
+        [
+          "g31_q_local",
+          "4096",
+          "0.5120",
+          "704.7",
+          "0.9705",
+          "1344.0"
+        ],
+        [
+          "g31_q_full",
+          "4096",
+          "1.0254",
+          "703.7",
+          "0.9960",
+          "2688.0"
+        ],
+        [
+          "g31_gate",
+          "4096",
+          "1.3559",
+          "698.5",
+          "0.9792",
+          "3528.0"
+        ]
+      ],
+      "raw_process_returncode_required": 0
+    },
+    "results/e5-timing-m4096-ba-candidate.json": {
+      "pass": true,
+      "rows": 4096,
+      "shape_count": 17,
+      "mode": "timing",
+      "max_relL2": 0.0,
+      "timing": [
+        [
+          "g12_o_local",
+          "4096",
+          "0.2040",
+          "631.6",
+          "0.7966",
+          "480.0"
+        ],
+        [
+          "g12_o_full",
+          "4096",
+          "0.3738",
+          "689.5",
+          "0.9235",
+          "960.0"
+        ],
+        [
+          "g12_down",
+          "4096",
+          "0.6796",
+          "711.0",
+          "0.9443",
+          "1800.0"
+        ],
+        [
+          "g31_o_local",
+          "4096",
+          "0.5556",
+          "649.3",
+          "0.8261",
+          "1344.0"
+        ],
+        [
+          "g31_o_full",
+          "4096",
+          "1.0658",
+          "677.0",
+          "0.9330",
+          "2688.0"
+        ],
+        [
+          "g31_down",
+          "4096",
+          "1.3870",
+          "682.8",
+          "0.9239",
+          "3528.0"
+        ],
+        [
+          "qwen_o",
+          "4096",
+          "0.3635",
+          "708.8",
+          "0.8791",
+          "960.0"
+        ],
+        [
+          "qwen_down",
+          "4096",
+          "0.9652",
+          "756.5",
+          "1.0369",
+          "2720.0"
+        ],
+        [
+          "tail",
+          "4096",
+          "0.0871",
+          "238.1",
+          "1.3452",
+          "77.2"
+        ],
+        [
+          "stage1",
+          "4096",
+          "0.0113",
+          "11.9",
+          "0.3367",
+          "0.5"
+        ],
+        [
+          "stage2",
+          "4096",
+          "0.0121",
+          "22.3",
+          "0.3380",
+          "1.0"
+        ],
+        [
+          "g12_q_local",
+          "4096",
+          "0.1943",
+          "663.2",
+          "0.8364",
+          "480.0"
+        ],
+        [
+          "g12_q_full",
+          "4096",
+          "0.3810",
+          "676.4",
+          "0.8428",
+          "960.0"
+        ],
+        [
+          "g12_gate",
+          "4096",
+          "0.7087",
+          "681.8",
+          "0.8994",
+          "1800.0"
+        ],
+        [
+          "g31_q_local",
+          "4096",
+          "0.5127",
+          "703.7",
+          "0.8816",
+          "1344.0"
+        ],
+        [
+          "g31_q_full",
+          "4096",
+          "1.0203",
+          "707.2",
+          "1.0105",
+          "2688.0"
+        ],
+        [
+          "g31_gate",
+          "4096",
+          "1.3380",
+          "707.8",
+          "0.9653",
+          "3528.0"
+        ]
+      ],
+      "raw_process_returncode_required": 0
+    },
+    "results/e5-timing-m4096-ba-control.json": {
+      "pass": true,
+      "rows": 4096,
+      "shape_count": 17,
+      "mode": "timing",
+      "max_relL2": 0.0,
+      "timing": [
+        [
+          "g12_o_local",
+          "4096",
+          "0.2025",
+          "636.2",
+          "0.8027",
+          "480.0"
+        ],
+        [
+          "g12_o_full",
+          "4096",
+          "0.3743",
+          "688.4",
+          "0.8549",
+          "960.0"
+        ],
+        [
+          "g12_down",
+          "4096",
+          "0.6820",
+          "708.5",
+          "0.9619",
+          "1800.0"
+        ],
+        [
+          "g31_o_local",
+          "4096",
+          "0.5515",
+          "654.1",
+          "0.8181",
+          "1344.0"
+        ],
+        [
+          "g31_o_full",
+          "4096",
+          "1.0755",
+          "670.9",
+          "0.8586",
+          "2688.0"
+        ],
+        [
+          "g31_down",
+          "4096",
+          "1.4116",
+          "670.9",
+          "0.9178",
+          "3528.0"
+        ],
+        [
+          "qwen_o",
+          "4096",
+          "0.3632",
+          "709.5",
+          "0.8959",
+          "960.0"
+        ],
+        [
+          "qwen_down",
+          "4096",
+          "0.9734",
+          "750.1",
+          "1.0028",
+          "2720.0"
+        ],
+        [
+          "tail",
+          "4096",
+          "0.0895",
+          "231.6",
+          "1.3234",
+          "77.2"
+        ],
+        [
+          "stage1",
+          "4096",
+          "0.0114",
+          "11.7",
+          "0.3380",
+          "0.5"
+        ],
+        [
+          "stage2",
+          "4096",
+          "0.0121",
+          "22.2",
+          "0.3476",
+          "1.0"
+        ],
+        [
+          "g12_q_local",
+          "4096",
+          "0.1927",
+          "668.8",
+          "0.8453",
+          "480.0"
+        ],
+        [
+          "g12_q_full",
+          "4096",
+          "0.3787",
+          "680.5",
+          "0.8566",
+          "960.0"
+        ],
+        [
+          "g12_gate",
+          "4096",
+          "0.7086",
+          "681.9",
+          "0.9572",
+          "1800.0"
+        ],
+        [
+          "g31_q_local",
+          "4096",
+          "0.5124",
+          "704.2",
+          "0.8759",
+          "1344.0"
+        ],
+        [
+          "g31_q_full",
+          "4096",
+          "1.0252",
+          "703.8",
+          "0.9826",
+          "2688.0"
+        ],
+        [
+          "g31_gate",
+          "4096",
+          "1.3520",
+          "700.5",
+          "0.9878",
+          "3528.0"
+        ]
+      ],
+      "raw_process_returncode_required": 0
+    }
+  },
+  "root_clocks": "#Date        Time         gpu    pwr  gtemp  mtemp   mclk   pclk \n#YYYYMMDD    HH:MM:SS     Idx      W      C      C    MHz    MHz \n 20260906    05:10:41       0    135     39     43   2619   1830 \n 20260906    05:10:42       0    135     39     43   2619   1830 \n 20260906    05:10:43       0    136     39     43   2619   1830 \n 20260906    05:10:44       0    141     39     44   2619   1830 \n 20260906    05:10:45       0    135     38     43   2619   1830 \n 20260906    05:10:46       0    133     38     43   2619   1830 \n 20260906    05:10:47       0    135     38     43   2619   1830 \n 20260906    05:10:48       0    136     38     43   2619   1830 \n 20260906    05:10:49       0    132     40     43   2619   1830 \n 20260906    05:10:50       0    132     38     43   2619   1830 \n 20260906    05:10:51       0    133     38     43   2619   1830 \n 20260906    05:10:52       0    145     38     43   2619   1830 \n 20260906    05:10:53       0    442     52     49   2619   1485 \n 20260906    05:10:54       0    510     51     49   2619   1785 \n 20260906    05:10:55       0    566     53     51   2619   1725 \n 20260906    05:10:56       0    425     44     47   2619   1815 \n 20260906    05:10:57       0    439     54     52   2619   1455 \n 20260906    05:10:58       0    287     44     47   2619   1815 \n 20260906    05:10:59       0    387     42     45   2619   1830 \n 20260906    05:11:00       0    427     43     46   2619   1830 \n 20260906    05:11:01       0    166     41     45   2619   1830 \n 20260906    05:11:02       0    447     48     49   2619   1815 \n 20260906    05:11:03       0    588     54     50   2619   1500 \n 20260906    05:11:04       0    566     56     52   2619   1500 \n 20260906    05:11:05       0    364     46     49   2619   1830 \n 20260906    05:11:06       0    395     45     47   2619   1815 \n 20260906    05:11:07       0    496     55     54   2619   1425 \n 20260906    05:11:08       0    423     58     54   2619   1455 \n 20260906    05:11:09       0    221     43     48   2619   1815 \n 20260906    05:11:10       0    277     48     49   2619   1695 \n 20260906    05:11:11       0    501     57     52   2619   1500 \n 20260906    05:11:12       0    624     51     51   2619   1650 \n 20260906    05:11:13       0    487     48     49   2619   1785 \n 20260906    05:11:14       0    336     46     49   2619   1815 \n 20260906    05:11:15       0    386     55     54   2619   1560 \n 20260906    05:11:16       0    430     46     49   2619   1815 \n 20260906    05:11:17       0    445     47     49   2619   1815 \n 20260906    05:11:18       0    165     43     47   2619   1830 \n 20260906    05:11:19       0    336     56     53   2619   1815 \n 20260906    05:11:20       0    556     54     52   2619   1455 \n 20260906    05:11:21       0    549     58     55   2619   1695 \n 20260906    05:11:22       0    458     47     49   2619   1815 \n 20260906    05:11:23       0    376     57     54   2619   1515 \n 20260906    05:11:24       0    361     47     49   2619   1815 \n#Date        Time         gpu    pwr  gtemp  mtemp   mclk   pclk \n#YYYYMMDD    HH:MM:SS     Idx      W      C      C    MHz    MHz \n 20260906    05:11:25       0    413     48     50   2619   1830 \n 20260906    05:11:26       0    417     45     49   2619   1830 \n 20260906    05:11:27       0    169     43     47   2619   1830 \n",
+  "frozen_inputs": {
+    "status": "CPU ready; GPU unqualified",
+    "files": {
+      "DESIGN.md": {
+        "bytes": 4626,
+        "sha256": "761e11a418b7185fb1ec7c4ed9bf6e350fa9a6c5f507bdaae90e0782a2596caa"
+      },
+      "HANDOFF.md": {
+        "bytes": 3799,
+        "sha256": "86dc827b3194fca4e436ae58554ea79e93fffeb575bb02f1e911406fa678f1bb"
+      },
+      "build-commands.json": {
+        "bytes": 3713,
+        "sha256": "12c381bb925bc49018a86d872d456042aa0594c196825fa9dacbcf2af5b33501"
+      },
+      "build-results.json": {
+        "bytes": 269,
+        "sha256": "5953580daa7dc30d1a71e33b0a383564ad2c9f19cac5d9ee3a90b7749f3afb41"
+      },
+      "build.py": {
+        "bytes": 593,
+        "sha256": "8731cafa66aea322894845882102c2c13b17fe9150c912a6f4e9ed8fce9f52c7"
+      },
+      "comparator.patch": {
+        "bytes": 4568,
+        "sha256": "1a45df398297a638007800b567629d693fb302a4b05d9137db484cdfb369e7db"
+      },
+      "cpu-validator-fixtures/absolute.log": {
+        "bytes": 1003,
+        "sha256": "d28346ca1eeab76c756ed218b1d6fc64e47dac960350d4775aac58b049fdd902"
+      },
+      "cpu-validator-fixtures/duplicate.log": {
+        "bytes": 1005,
+        "sha256": "493e7cda9be6b0753a5de1bf7164e9bd5e90af77cc7b8e07ab8e7c623f69073e"
+      },
+      "cpu-validator-fixtures/guard.log": {
+        "bytes": 1028,
+        "sha256": "606b5b828ee3cadcc2455c758e855cebdff113c608b4c75b4a8f6d780936fc1a"
+      },
+      "cpu-validator-fixtures/memextra.log": {
+        "bytes": 1081,
+        "sha256": "02195de563473a03c3463142f771faf913ca244f2edaadddc6f4b542e6053aab"
+      },
+      "cpu-validator-fixtures/memmissing.log": {
+        "bytes": 1003,
+        "sha256": "f90f265a57a5c7cffd9754aae8c904e8e5242b64d9b159a88bda44d25a0e0de2"
+      },
+      "cpu-validator-fixtures/memvalid.log": {
+        "bytes": 1037,
+        "sha256": "d3bcb19c02939bfbb27aa85e9098b889805c8d64a35706ef016598207742bd8c"
+      },
+      "cpu-validator-fixtures/missing.log": {
+        "bytes": 953,
+        "sha256": "c2072f12a67deecef11a33e214457569fe2c96e29718538dffa7850242431b34"
+      },
+      "cpu-validator-fixtures/missing_end.log": {
+        "bytes": 968,
+        "sha256": "08af6c737206d7c6653ca55e95f2949fbd4fd8d643503d54a2c8a2d86aa0f30d"
+      },
+      "cpu-validator-fixtures/nan.log": {
+        "bytes": 1005,
+        "sha256": "69cf05dd91976aaa9b1123ee6c15e9414652c13b787b440d9c34e5524785fd34"
+      },
+      "cpu-validator-fixtures/rel.log": {
+        "bytes": 1007,
+        "sha256": "f3b2b5bbb0791fad4558f75e22a6f585be8b367deaf39cc155bcdefe1e80b7d9"
+      },
+      "cpu-validator-fixtures/unexpected_timing.log": {
+        "bytes": 1023,
+        "sha256": "cfe95effbba6025ba4e1c1a42862cc22efebafa8c44cbb3c717ef7deaafa86b8"
+      },
+      "cpu-validator-fixtures/valid.log": {
+        "bytes": 1003,
+        "sha256": "f90f265a57a5c7cffd9754aae8c904e8e5242b64d9b159a88bda44d25a0e0de2"
+      },
+      "cpu-validator-fixtures/wrong_m.log": {
+        "bytes": 1004,
+        "sha256": "73155260192c609548d7d9c8acc44ed04feef5244aab322b6ac7f09e5127a8ba"
+      },
+      "gpu-queue.json": {
+        "bytes": 11972,
+        "sha256": "ed668259192f45c505a6902551b58268c24e87e4e17f7e537b44bedc369d4f7a"
+      },
+      "kernel.patch": {
+        "bytes": 1915,
+        "sha256": "4bcebe9f191b08e737005f099d28427d8991293ccbd06859874ce4f9360a00f6"
+      },
+      "primitive-candidate": {
+        "bytes": 1222200,
+        "sha256": "ba9d0f05412439c2e84570484fd057282eaef2c2998ffc1cd0bddf230b02f284"
+      },
+      "primitive-candidate.build.log": {
+        "bytes": 1991,
+        "sha256": "e712f65092b0feaec5d33bd474ae89dc93989ea557f4eac7b29b3b68f58b5234"
+      },
+      "primitive-candidate.kernel.sass": {
+        "bytes": 147840,
+        "sha256": "a6d474193b2b1d218b1c1a316417d472e4849306ddee3ab63e869b396614a90b"
+      },
+      "primitive-candidate.resources.txt": {
+        "bytes": 924,
+        "sha256": "166d5108502745ecb60d6350c40070c7ddd603c8c50288a93e2e944cf7888bf1"
+      },
+      "primitive-candidate.sass": {
+        "bytes": 1827824,
+        "sha256": "575f3299cf8ca1f1dcf0ec683faf9f1b20d6af976a8cb04ae62c009c639bbd56"
+      },
+      "primitive-control": {
+        "bytes": 1222200,
+        "sha256": "41c98d9f82a5c0175ad6c0bfdcbf56281f8bab9da988c3cf5418f04bc8e77868"
+      },
+      "primitive-control.build.log": {
+        "bytes": 1991,
+        "sha256": "0d08d4de99ce1bc48778146f2a2902b4f60b7275d315b38339a0a233580a8aac"
+      },
+      "primitive-control.kernel.sass": {
+        "bytes": 138240,
+        "sha256": "ee26690fdfdfdebc79ecffb2c32c842f720bf335af3ce2be37d09412a6087221"
+      },
+      "primitive-control.resources.txt": {
+        "bytes": 924,
+        "sha256": "166d5108502745ecb60d6350c40070c7ddd603c8c50288a93e2e944cf7888bf1"
+      },
+      "primitive-control.sass": {
+        "bytes": 1807344,
+        "sha256": "d2d2fe87d47495a07ba7a7abb565c3321c2f138b13a29c06f7187be4748f1021"
+      },
+      "protocol-check.py": {
+        "bytes": 2551,
+        "sha256": "91861a3a7f9266418835bf85274e4e8d8209da3de0d31614db7a08dd41d6aa97"
+      },
+      "protocol-proof.json": {
+        "bytes": 455,
+        "sha256": "c2798e622f94981ba0de9ff41394f54f5b70abf76ef86434c9a4b7646f3af273"
+      },
+      "role-candidate.build.log": {
+        "bytes": 1799,
+        "sha256": "9ba9b9ab185c3bbcdef6c341ee8ebf12ee322fef81e66517df765ebdf1bcdd77"
+      },
+      "role-candidate.cubin": {
+        "bytes": 109760,
+        "sha256": "06a34e9962f4aa3ee9e97eac8f359de54e5d5f78ad80820b4e007edade26c51f"
+      },
+      "role-candidate.kernel.sass": {
+        "bytes": 580320,
+        "sha256": "4cd7ff7aec298c8e0010bfb7877765c6045f0b5a78507f03e22e1bf0d0df6dc1"
+      },
+      "role-candidate.resources.txt": {
+        "bytes": 661,
+        "sha256": "84d74292abf44ed45da8a4763b5725dbd6010f3e36a2026dd5b01e1f2a43967b"
+      },
+      "role-candidate.sass": {
+        "bytes": 1510714,
+        "sha256": "4b4423c2704f82ade763e94297f8f624761451e14bb9c9def0fe191a2cd7431f"
+      },
+      "role-control.build.log": {
+        "bytes": 1799,
+        "sha256": "ec114499c29deb3d53f337b0292e2d2c41cb53d18aeb9a32013e8e759a6aa048"
+      },
+      "role-control.cubin": {
+        "bytes": 107200,
+        "sha256": "e2808e27f09f9d9d4859936011f9fe4c3e135d7c95e8007c6af9eecf4bb2a667"
+      },
+      "role-control.kernel.sass": {
+        "bytes": 563472,
+        "sha256": "4e44502b0767bcf69f9a88795da0f159b9b5553c3fb38aa0fc1617931f00d74e"
+      },
+      "role-control.resources.txt": {
+        "bytes": 661,
+        "sha256": "84d74292abf44ed45da8a4763b5725dbd6010f3e36a2026dd5b01e1f2a43967b"
+      },
+      "role-control.sass": {
+        "bytes": 1474714,
+        "sha256": "1532621c43ce9ecf49f9f3a130eadb3d3f0adb82775c3944bf0fb1afe426e763"
+      },
+      "sass-resource-audit.json": {
+        "bytes": 3346,
+        "sha256": "dc9474e7954c96d7430326c14fccb6e286f32b0aaae84b91cd568d128024b037"
+      },
+      "source/runtime/bench/nvidia/bf16_gemm_vs_cublas_bench.cu": {
+        "bytes": 25978,
+        "sha256": "0c68de89c5833f18892979823adbee40ba4087db96111d5bb37cbc62174d7a98"
+      },
+      "source/runtime/common/control_queue_probe.h": {
+        "bytes": 4734,
+        "sha256": "433db5c952a111da21a823ce14d186f600233bd940080396063ecebaa8575d7c"
+      },
+      "source/runtime/common/decode.c": {
+        "bytes": 3773,
+        "sha256": "79c1aaac45ce2720c00e81855739e46853a0e136f5bcfc19e995031b10a2e3e9"
+      },
+      "source/runtime/common/decode.h": {
+        "bytes": 1569,
+        "sha256": "444ce685929bd60cfc6fb76272ecb3c0edcd30f2eb8703eb7baf74608e3c3534"
+      },
+      "source/runtime/common/dev_blob.h": {
+        "bytes": 10941,
+        "sha256": "8be2c3734d2dfffb933d819cb4c43eb2c10c639725e59cf0fc2ad2cf3fd1fdb2"
+      },
+      "source/runtime/common/dev_isa.h": {
+        "bytes": 109775,
+        "sha256": "c177dec4fc888e2ced03863c8a2c482a62dfa7a2de2669ec6384ec95279311ed"
+      },
+      "source/runtime/common/dispatch.c": {
+        "bytes": 542,
+        "sha256": "68f05097b5c022f39474c243617806dcb298bb755a9c9a58eb86ce76a8126c08"
+      },
+      "source/runtime/common/dispatch.h": {
+        "bytes": 1224,
+        "sha256": "19018f27b7be4d8d767d97985262f8f2dd5ed13e149f1ca907a1e6cd98d62070"
+      },
+      "source/runtime/common/interp.c": {
+        "bytes": 2173,
+        "sha256": "29a8bcb315f13c3ee0d97d557d89f7aef49baa5c6e581a4e3b07f7d52d438e70"
+      },
+      "source/runtime/common/interp.h": {
+        "bytes": 1133,
+        "sha256": "23b86369065f75b3b728843e9c7f701716712b90fc30a292f88af464a62a6a23"
+      },
+      "source/runtime/common/kernel.h": {
+        "bytes": 3787,
+        "sha256": "00c6dd6618a9e4d8549b9c8b7ce27c81bbaf480d61288a6d2eb10f0c59ee6497"
+      },
+      "source/runtime/common/memmap.c": {
+        "bytes": 1066,
+        "sha256": "e517e159b6ac7b10923939de410474e53f8d04e37b57ed162d67f5c641c7e18b"
+      },
+      "source/runtime/common/memmap.h": {
+        "bytes": 4557,
+        "sha256": "c47143732c5204108199d872d6f1d21fcb731f128a32f4bfbab46d8ef738bdd1"
+      },
+      "source/runtime/common/safetensors.h": {
+        "bytes": 4261,
+        "sha256": "8c5a61e3b97211c959b89ff740d49918fb5c7f7b18c7bde89116657a830ff3b2"
+      },
+      "source/runtime/nvidia/cuda_backend.c": {
+        "bytes": 19708,
+        "sha256": "95135e8930f3264636bd88f977da0de14c2079c66a4c22e5f73f585b691a6be6"
+      },
+      "source/runtime/nvidia/dma.cu": {
+        "bytes": 1037,
+        "sha256": "707b0a746f937d3d47dea01e977d2c5d670420479656ee51ddcefb013e02895e"
+      },
+      "source/runtime/nvidia/experiments/README.md": {
+        "bytes": 22534,
+        "sha256": "fcd5d47ab961fda116e5edaba32b37a8d15523d7983523ffbfbfc81954943a52"
+      },
+      "source/runtime/nvidia/experiments/chunk_dbuf_poc.cu": {
+        "bytes": 20610,
+        "sha256": "00bcfd420e389658fa20d22b41cf01820bc97514ceb17264bef730b82925c5e8"
+      },
+      "source/runtime/nvidia/experiments/cluster_gq_probe.cu": {
+        "bytes": 67636,
+        "sha256": "45d83ef185315c2b5a0aae0aa9a4588ead4d966693390258668cde6cf889a82a"
+      },
+      "source/runtime/nvidia/experiments/decode_fp8_occ.cu": {
+        "bytes": 19091,
+        "sha256": "9f769b196c6a91e7dcea9ef6d253e4a53e4e1ad1b6cbc49e865f44873be2c076"
+      },
+      "source/runtime/nvidia/experiments/decode_seg_cpasync.cu": {
+        "bytes": 17635,
+        "sha256": "a7d82747707e637b4efe9de30f6f667cd75ac00271d40f15479f1bfcb78fdc48"
+      },
+      "source/runtime/nvidia/experiments/decode_seg_gemv.cu": {
+        "bytes": 11092,
+        "sha256": "bb4b706e22ade7d11bdad630d9d26b12ba76efae8b046d1bfa797f85927e2c5a"
+      },
+      "source/runtime/nvidia/experiments/decode_smalln_warppair.cu": {
+        "bytes": 15834,
+        "sha256": "4a7672a23af1fa91522fecff10977bd137670775b26ba7abc445f518ffd7d0ee"
+      },
+      "source/runtime/nvidia/experiments/fa_gf_full_ab.cu": {
+        "bytes": 9241,
+        "sha256": "4380df093a4e16f904e1376495eaa91b6fcd1287c642fa2e37cdbc397521497c"
+      },
+      "source/runtime/nvidia/experiments/fa_gf_full_h100_ab.cu": {
+        "bytes": 23658,
+        "sha256": "377c54d534145cfa675b18f21fc05407abee7c00cc443b81c4df35813613f3bf"
+      },
+      "source/runtime/nvidia/experiments/fa_pv_bench.cu": {
+        "bytes": 4943,
+        "sha256": "9313d7b3a6ffec97eed87de82a4b5f1ef525125e4ff679f891bab662831bce7f"
+      },
+      "source/runtime/nvidia/experiments/fa_varlen_bench.cu": {
+        "bytes": 6734,
+        "sha256": "cebc2d989b90b5bf09fb424f18c7c25186aafd1124992244ff57267b9ef1df23"
+      },
+      "source/runtime/nvidia/experiments/fp8_gemm_w8a8_probe.cu": {
+        "bytes": 6839,
+        "sha256": "a0134d9c9c9118f502491b66253bb544ab178b86d78c04e25e3d76d97b1b021c"
+      },
+      "source/runtime/nvidia/experiments/fp8_gemv.cu": {
+        "bytes": 11949,
+        "sha256": "806d648800d2a0517fea1fa340221d3fb615a0c3f3d0fd0a73d500afbde485d2"
+      },
+      "source/runtime/nvidia/experiments/fp8_gemv_moe.cu": {
+        "bytes": 9005,
+        "sha256": "5cea08c007d39957ffe4487bf923ddafbda0f541f8af9d6903870805c3abf905"
+      },
+      "source/runtime/nvidia/experiments/fp8_mma_rate_probe.cu": {
+        "bytes": 4236,
+        "sha256": "beafbb5b68aa79f2ca72443d1371bc0643ded9e2cb8b502ce22d4112e72605b5"
+      },
+      "source/runtime/nvidia/experiments/fp8_probe.cu": {
+        "bytes": 3034,
+        "sha256": "8cc4dafb91cfc05044e70a0e97ed7bb489d9b572e9a5b2523a14f92a004e3e5e"
+      },
+      "source/runtime/nvidia/experiments/fp8_verify.cu": {
+        "bytes": 6449,
+        "sha256": "d477ee6791fb681416afeff938ac16d36b9ba3edc93a7528935b8c12dfb92746"
+      },
+      "source/runtime/nvidia/experiments/gemv_cpasync_h100.cu": {
+        "bytes": 14197,
+        "sha256": "d0478bf4ab949b6ab2400f15440f197f663c31c85150e71079f466a180c02f87"
+      },
+      "source/runtime/nvidia/experiments/gemv_dimspec.cu": {
+        "bytes": 11505,
+        "sha256": "d1bac320a33373b2aa1a35373827901d8fb72614a142fe4ac4ef62a53e932af2"
+      },
+      "source/runtime/nvidia/experiments/gemv_lab_h100.cu": {
+        "bytes": 20281,
+        "sha256": "6054db60c86f5e07204128ed0084a4e2d49292f06c9a9e4a00c604e025c077c3"
+      },
+      "source/runtime/nvidia/experiments/gemv_lds_vectorize_probe.cu": {
+        "bytes": 18921,
+        "sha256": "82b5bf04769cc4b9d4b717ff01af43c3feddf39bb26902b74eb60134df11294c"
+      },
+      "source/runtime/nvidia/experiments/gemv_transport.cu": {
+        "bytes": 22264,
+        "sha256": "40adde2fdf377024fa04eb2c42d8c59faa9b460ce28318507212c1c19a9529ff"
+      },
+      "source/runtime/nvidia/experiments/gemv_warpspec_prod_cons.cu": {
+        "bytes": 13904,
+        "sha256": "6796bbab5d36abb68427206d288d3ca4dd13955d1ecad948d2ff5bbe2a26d9b1"
+      },
+      "source/runtime/nvidia/experiments/h100_elementwise_ab.cu": {
+        "bytes": 48262,
+        "sha256": "b3050cddb6763e2d9db9974f8d63f19ccfdf1893fe044ea92377cb34632296ce"
+      },
+      "source/runtime/nvidia/experiments/hbm_ceiling_h100.cu": {
+        "bytes": 5365,
+        "sha256": "9a9a64058ddc7fb81e8450335ced0589b874e2f82d45bfe2ba4e05271150f82a"
+      },
+      "source/runtime/nvidia/experiments/hopper_cluster_multicast.cu": {
+        "bytes": 35058,
+        "sha256": "4d20a0ac6586ef2cd5dfa19ab4149fa288376f20d14e6d3d111c22a9fe5eddba"
+      },
+      "source/runtime/nvidia/experiments/hopper_warpspec_prefill.cu": {
+        "bytes": 29164,
+        "sha256": "c97672fcd21031ed80f145339cfadf0585d2b7075f4a0d75fa13288a135a93da"
+      },
+      "source/runtime/nvidia/experiments/ksplit_gemv.cu": {
+        "bytes": 6908,
+        "sha256": "22e5f1e0f702cea47b10edc20e2188f4b507afb50cd8535285e5db3d9597fa04"
+      },
+      "source/runtime/nvidia/experiments/kv_l2.cu": {
+        "bytes": 12277,
+        "sha256": "96a9ab0ef486cf2b7b59ed7af4fbe52f1dbeae547a5b758be925c10175c1d9c7"
+      },
+      "source/runtime/nvidia/experiments/mxfp8_probe.cu": {
+        "bytes": 8329,
+        "sha256": "9de685eeed40cf17dd72b10b276cb68087546dd14aa59718cddaf7cc1c11dab6"
+      },
+      "source/runtime/nvidia/experiments/op_moe_w64.cuh": {
+        "bytes": 13848,
+        "sha256": "51ab722445c17a22a54e93f9656b80385f6579567ffe9e758cdd8fb9104c8607"
+      },
+      "source/runtime/nvidia/experiments/prefill_fp8_wgmma.cu": {
+        "bytes": 10249,
+        "sha256": "feca6479648d0381fc5b7576cb6a0e6115e43e9dcc3dee76af4c60030e5d9d36"
+      },
+      "source/runtime/nvidia/experiments/px2_gemm_bench.cu": {
+        "bytes": 4785,
+        "sha256": "d060959331941020b92954dff26cce50bd22aadd888e949e2e4597abfdb099f8"
+      },
+      "source/runtime/nvidia/experiments/px4_fa_ablate.cu": {
+        "bytes": 13027,
+        "sha256": "696f87de7824d8dd73083e020d9f91ad596c855bb75fc45343c657c26d28044b"
+      },
+      "source/runtime/nvidia/experiments/px4_fp8mma_ablate.cu": {
+        "bytes": 15202,
+        "sha256": "08e4e16639e7ef08085f3b5fbaf8ba93ad7468ed2f281dd962591abb84d5d15b"
+      },
+      "source/runtime/nvidia/experiments/segws_repro.cu": {
+        "bytes": 6875,
+        "sha256": "cb6369a183baaa4edb53d78ea7409869b2565875ca1ef169c3596fb98c8c6878"
+      },
+      "source/runtime/nvidia/experiments/setmaxnreg_design.cu": {
+        "bytes": 2322,
+        "sha256": "14143add6fe7772e369f2f96eeb375898ee9bdf5fcef47fa49ad87ae1b8b7e3b"
+      },
+      "source/runtime/nvidia/experiments/setmaxnreg_occ.cu": {
+        "bytes": 1501,
+        "sha256": "901bc8a66aae2d09f1dfe87f31a562dd0b9337ed1eac58392d112b4c973ba01d"
+      },
+      "source/runtime/nvidia/experiments/setmaxnreg_probe.cu": {
+        "bytes": 3179,
+        "sha256": "50c03818931182e3335f26d315901de5aeec48244f345da6681a0b5fc32dc6fa"
+      },
+      "source/runtime/nvidia/experiments/shfl_convergence_ab.cu": {
+        "bytes": 32387,
+        "sha256": "55e3119c4e7b9da6317f096ae4b450b8dcec924465f0dd618ef9456d3bce43a1"
+      },
+      "source/runtime/nvidia/experiments/splitzip_bitexact.cu": {
+        "bytes": 5247,
+        "sha256": "1f9d243e8d86de59b6e2d2b96251ca9d48248eea77f278d9e96eac907e9d549b"
+      },
+      "source/runtime/nvidia/experiments/splitzip_codec.cu": {
+        "bytes": 9422,
+        "sha256": "55210385da0c9b3162f058fd82b454ce488cfd1218829474daea768109cdee08"
+      },
+      "source/runtime/nvidia/experiments/splitzip_gemv.cu": {
+        "bytes": 15714,
+        "sha256": "012555cf234eb31b22dc6083cb4441d1e528211f8a114172afc1a78cba2831c6"
+      },
+      "source/runtime/nvidia/experiments/splitzip_gemv12.cu": {
+        "bytes": 10475,
+        "sha256": "5706317bc21965105ed6bcc1ba438fe782d9dbc9009ddf505b00d6427409ee00"
+      },
+      "source/runtime/nvidia/experiments/splitzip_h100_ab.cu": {
+        "bytes": 31057,
+        "sha256": "3c231ddbadb4f4d3dbb3e28804e6bcc82537ea4478a8859eae0f50a1913ad1ea"
+      },
+      "source/runtime/nvidia/experiments/t3_pipe_probe.cu": {
+        "bytes": 7999,
+        "sha256": "e30a334ceda874ef41871ae324e4240d3b583763bbf6e22f354d1dcbf864d95e"
+      },
+      "source/runtime/nvidia/experiments/tma_abi_probe.cu": {
+        "bytes": 32439,
+        "sha256": "814ec93d4c5eade6b6d275205c63ebb5ce209a62d60b97af054af1360721df44"
+      },
+      "source/runtime/nvidia/experiments/tma_uni_gemm_ab.cu": {
+        "bytes": 7665,
+        "sha256": "e5a1d44e19bcdaf0a2f4b7b6db0e3bc320a1528ce501700c561f0d635971e180"
+      },
+      "source/runtime/nvidia/experiments/tma_ws_flash_prefill.cu": {
+        "bytes": 65650,
+        "sha256": "c8ef87c8cdc6e4b7085efa5f9711e243d9ce792d9fe86c92b92fcd40ead9b33e"
+      },
+      "source/runtime/nvidia/experiments/tma_ws_gemm_bf16.cu": {
+        "bytes": 53339,
+        "sha256": "5dc009bc0258d0b9be8ea532eef4bc5e0aeac0b9c446da1759620ec899207002"
+      },
+      "source/runtime/nvidia/experiments/tma_ws_gemm_fp8.cu": {
+        "bytes": 51889,
+        "sha256": "ea69910b2b998892091c296f29004bc56564fbc10fda5fa48d057d21ddd4e319"
+      },
+      "source/runtime/nvidia/experiments/tma_ws_moe_group.cu": {
+        "bytes": 43565,
+        "sha256": "41acbcd90936ae9a33082b814d37c62848df82f07b37ca9c6b4d7dd2185809ff"
+      },
+      "source/runtime/nvidia/experiments/uni256_cluster_probe.cu": {
+        "bytes": 15218,
+        "sha256": "a64ab075427b6800e0bf557695453f15077ecc8a7d3113345d299cc828a18e0e"
+      },
+      "source/runtime/nvidia/experiments/uni256_probe.cu": {
+        "bytes": 11014,
+        "sha256": "9791e01e1f529cab6d0fe9b7dad9fc3e6ba9333447b8992cdb9348dc4411e95c"
+      },
+      "source/runtime/nvidia/experiments/vmm_kv_ab.cu": {
+        "bytes": 17896,
+        "sha256": "f1076ead53970c77b677e973e38875380fbd99299c89668698da517bddce572a"
+      },
+      "source/runtime/nvidia/experiments/vmm_probe.cu": {
+        "bytes": 22737,
+        "sha256": "7ff8cd00d1e00e1c5c7a6750a607c8e0725d12cce2c786db1244dcfa11033e97"
+      },
+      "source/runtime/nvidia/experiments/warpspec_ab.cu": {
+        "bytes": 17788,
+        "sha256": "83cea2a3cc9ab97cdb220a0b5be3eac8b8a8096b892143f6169364108ff5eb43"
+      },
+      "source/runtime/nvidia/experiments/wgmma_bf16_probe.cu": {
+        "bytes": 25186,
+        "sha256": "745f517caadf2c1dd22ea1659628fc922ac4af8f8954f9b6af19d62875a67807"
+      },
+      "source/runtime/nvidia/experiments/wgmma_flash_prefill_probe.cu": {
+        "bytes": 46841,
+        "sha256": "d8ab032e4e8c3e7685013aafe4bcc28dc1760769dead8e0a022498e0bb2cd9df"
+      },
+      "source/runtime/nvidia/experiments/wgmma_fp8_probe.cu": {
+        "bytes": 24024,
+        "sha256": "0117b4650bf0cd381955bd125b72c71b2af9e6557b6a1e79b86007c7cc28e267"
+      },
+      "source/runtime/nvidia/experiments/wgmma_moe_group_probe.cu": {
+        "bytes": 33363,
+        "sha256": "07d9a161b98c07a61b0d6e93b073d58f2efe7bc82d0eed21b2a25175a0252c68"
+      },
+      "source/runtime/nvidia/experiments/ws384_probe.cu": {
+        "bytes": 7806,
+        "sha256": "acf35b3d9ba9b0d7f0d046cbde2dd2c7986c3bcb160ea5346b064f8e42627f5b"
+      },
+      "source/runtime/nvidia/flash.cu": {
+        "bytes": 3901,
+        "sha256": "ad10078c8658cf1cee9bc8b67f811adc0cf5829ddf08114dba725f0f352e1f6b"
+      },
+      "source/runtime/nvidia/gdn_prefill.cpp": {
+        "bytes": 3791,
+        "sha256": "965d161910cef387c858c689810e110e516d7a3655c3910fa3525640d4a159bc"
+      },
+      "source/runtime/nvidia/gemm.cu": {
+        "bytes": 5275,
+        "sha256": "c73565666b682b88de3dc154ce33a6ffb7dc4d5e1f2e6004776eb2e223560c9a"
+      },
+      "source/runtime/nvidia/gemma_sm120.cu": {
+        "bytes": 45810,
+        "sha256": "3905308f8cb096805d5657a263815b9d90bac1a115c18b301455baac93272beb"
+      },
+      "source/runtime/nvidia/gpu_common.h": {
+        "bytes": 783,
+        "sha256": "797ac2c3089063209d203bbeb2b2e9a6c5b4d756fbda4498bd1f2082778ff011"
+      },
+      "source/runtime/nvidia/interp_sm120.cu": {
+        "bytes": 139156,
+        "sha256": "ef686e9036d359eabb527d6f4e7a45fb1b1f9ddf5961caebeb26801399a11470"
+      },
+      "source/runtime/nvidia/interp_sm120_poc.cu": {
+        "bytes": 13607,
+        "sha256": "d0d640fd6c9c219e3d5f291bcb94c45ab0bc8e77a7b31278c277fb81debbf029"
+      },
+      "source/runtime/nvidia/interp_sm90a.cu": {
+        "bytes": 1798,
+        "sha256": "7d88bf14fcc6e42e8d7ccdcc112000fb2cb99373c0bfa1a5be8e870a86d555d1"
+      },
+      "source/runtime/nvidia/layout.cu": {
+        "bytes": 4334,
+        "sha256": "273ef8e6904403f5173f57fbb34f02fa92f9962ff8b40f46fdaaaa58642eb584"
+      },
+      "source/runtime/nvidia/op_attention.cuh": {
+        "bytes": 186677,
+        "sha256": "53b87b6b78481a985c433709b2466afce27795c15ed46319f8c3b29a36606317"
+      },
+      "source/runtime/nvidia/op_attention_sm90.cuh": {
+        "bytes": 47167,
+        "sha256": "82d13d8aad180c81c3b0fa2cf3e8ea6d008d08da47ad1ee9b3dc2e9258f96bca"
+      },
+      "source/runtime/nvidia/op_dsa.cuh": {
+        "bytes": 31052,
+        "sha256": "b6cb35ba9ecc2787c1f5accfde2de35736a34eb8aad1320c205ee62af29cc1f6"
+      },
+      "source/runtime/nvidia/op_elementwise.cuh": {
+        "bytes": 8842,
+        "sha256": "7c63310d5438280cff524293fde75ec08de7347cd48037e2da275c7d2dab5663"
+      },
+      "source/runtime/nvidia/op_gemm.cuh": {
+        "bytes": 144973,
+        "sha256": "861cce8de5c88575e4105282fd4a8098eff6ce91bf8ac4536847135e6870cdfc"
+      },
+      "source/runtime/nvidia/op_gemm_sm90.cuh": {
+        "bytes": 113268,
+        "sha256": "a1d5b4283258e93676de997b4e9c7256ea82f78d9ab27929e29f9c44ade70d35"
+      },
+      "source/runtime/nvidia/op_mamba.cuh": {
+        "bytes": 8649,
+        "sha256": "f37ff61085f71542b04f85dc63bf15a0c74a843c0b1576bfafbfeda2a87315db"
+      },
+      "source/runtime/nvidia/op_mla.cuh": {
+        "bytes": 20554,
+        "sha256": "fde05716b1cc47912f4fd38f56cfe6e0441f916cdde90b6accb21efabd446e8e"
+      },
+      "source/runtime/nvidia/op_moe.cuh": {
+        "bytes": 134755,
+        "sha256": "c8430f25cfeb28166d58b9087c5429542594233ee846d2b9b565a2417b526672"
+      },
+      "source/runtime/nvidia/op_moe_sm90.cuh": {
+        "bytes": 26171,
+        "sha256": "0620ab1515bbc5816b7be6da645abd117fc465850093b18d8d19b8dc614a0132"
+      },
+      "source/runtime/nvidia/op_norm.cuh": {
+        "bytes": 51216,
+        "sha256": "d320b65c2e730f841a07d110407c1061d13760971af43e14fa199907ae7ffc78"
+      },
+      "source/runtime/nvidia/op_qwen_gdn.cuh": {
+        "bytes": 12969,
+        "sha256": "8a80cd892178c7a00cfc5c31d98c3dffddfd3bc2cc1769a5378eea7d276585e5"
+      },
+      "source/runtime/nvidia/register_blackwell.cu": {
+        "bytes": 1866,
+        "sha256": "14e53eb38080865b1389159d28fbda6c747b2e33e3437b256a811f6535bfa8f5"
+      },
+      "source/runtime/nvidia/register_hopper.cu": {
+        "bytes": 3543,
+        "sha256": "6dbb5000eec1bbd1fb6f6935414474b8b01364dc6f52002a8f0636d707c4e961"
+      },
+      "source/runtime/nvidia/register_rtx6000.cu": {
+        "bytes": 4605,
+        "sha256": "65e6e6c62a9304f9859925f88f84bbe6f294e47f7d24ae4daaedd74ccc11ac12"
+      },
+      "source/runtime/nvidia/row.cu": {
+        "bytes": 6451,
+        "sha256": "ba2e941c29b23eb793bdfe7ab51e80425d7e730f2b0d31e7ec9c9f66289990ee"
+      },
+      "source/runtime/nvidia/sample_sm120.cu": {
+        "bytes": 11077,
+        "sha256": "572a7f30928b4432e32d75814412c24d183cce8fe77fb1173d404152bfffc8ac"
+      },
+      "source/runtime/nvidia/sm120_common.cuh": {
+        "bytes": 5922,
+        "sha256": "5cd89fa717633eeb0066840d96ba7913a413443d28f2ae2474b083211afa4e07"
+      },
+      "source/runtime/nvidia/sm90_wgmma.cuh": {
+        "bytes": 21342,
+        "sha256": "73ca9b991d981fd20800c959bf07e21d345e2763530ed7571f7891bc0435a7d9"
+      },
+      "tile-stage-matrix.json": {
+        "bytes": 4008,
+        "sha256": "4aca92b2d3e0f8abfc98ef22cdb32d8f96aa3ebb58641601941c6f06880ac186"
+      },
+      "validate.py": {
+        "bytes": 1886,
+        "sha256": "d1a972a41d8ab6f904b7fd0b718106aa54e65ffd8bf3326962e16e9ac9bea8c3"
+      },
+      "validator-cpu-tests.json": {
+        "bytes": 1155,
+        "sha256": "16d9dd401e7d14350a5449397c6d9bcdd4402c455e96649d5e437cc2625638ea"
+      }
+    }
+  },
+  "patch": "--- /tmp/plow-model-support-checks/gemma-native-gemm-next-audit/source/runtime/nvidia/op_gemm_sm90.cuh\t2026-09-05 18:53:23.248248710 +0000\n+++ /tmp/plow-model-support-checks/e5-ws384-wgmma-window-20260906/source/runtime/nvidia/op_gemm_sm90.cuh\t2026-09-06 04:55:23.898615938 +0000\n@@ -1136,6 +1136,12 @@\n  * consumer path (needs >=154). Same m128n256 tile, ring and epilogue as the uniform body;\n  * the producer never does math, the consumers never issue, so neither stalls the other.\n  * Template <PROD, E4M3>: one function, both roles, aligned __syncthreads counts. */\n+#ifndef E5_WS384_WAIT2\n+#define E5_WS384_WAIT2 0\n+#endif\n+#if E5_WS384_WAIT2 && (PGM90_UNI256_NS < 3 || PGM90_WS384_SMEPI)\n+#error \"E5 wait2 needs at least3 ring slots and the unchanged direct epilogue\"\n+#endif\n template <bool PROD, bool E4M3>\n static __device__ void d_gemm_sm90_tma_ws384_role(__nv_bfloat16* __restrict__ C,\n                                                   const void* mapA, const void* mapB,\n@@ -1236,13 +1242,24 @@\n                                          sm90_desc(Bc + sub * 32), sd);\n                 }\n                 sm90_wg_commit();\n+#if E5_WS384_WAIT2\n+                sm90_wg_wait<2>();\n+                if (ks >= 2 && lt == 0) sm90_mbar_arrive(bempty + (st - 2) % NS);\n+#else\n                 sm90_wg_wait<1>();\n                 if (prev >= 0 && lt == 0) sm90_mbar_arrive(bempty + prev);\n+#endif\n                 prev = s;\n             }\n             sm90_wg_wait<0>();\n #if !PGM90_WS384_SMEPI\n+#if E5_WS384_WAIT2\n+            if (lt == 0)\n+                for (int pending = ksteps < 2 ? ksteps : 2; pending > 0; pending--)\n+                    sm90_mbar_arrive(bempty + (st - pending) % NS);\n+#else\n             if (prev >= 0 && lt == 0) sm90_mbar_arrive(bempty + prev);\n+#endif\n \n             const int r0 = tm + cwg * PGM90_MSLAB + wiw * 16 + (lane >> 2);\n             const int c0 = tn + 2 * (lane & 3);\n",
+  "archive": "/opt/dlami/nvme/tmp/plow-h100-campaign/raw-checks-20260905/e5-ws384-wgmma-window-20260906"
+}
