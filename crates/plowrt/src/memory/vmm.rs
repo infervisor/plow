@@ -1529,8 +1529,15 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32) -> Result<()> {
                 let id = create_block(s, &mut inner)?;
                 let va = slot_va(s, &inner.tracks[t], seq, h, k);
                 let handle = inner.blocks[id as usize].handle;
-                s.ops.map(va, s.block_bytes, handle)?;
-                s.ops.set_access(va, s.block_bytes)?;
+                if let Err(error) = s.ops.map(va, s.block_bytes, handle) {
+                    deref_block(s, &mut inner, id);
+                    return Err(error);
+                }
+                if let Err(error) = s.ops.set_access(va, s.block_bytes) {
+                    s.ops.unmap(va, s.block_bytes);
+                    deref_block(s, &mut inner, id);
+                    return Err(error);
+                }
                 let slot = slot_index(s, seq, h, k);
                 debug_assert!(inner.tracks[t].slots[slot].is_none());
                 inner.tracks[t].slots[slot] = Some(id);
@@ -2224,6 +2231,7 @@ mod tests {
         frees: AtomicU64,
         fail_creates: AtomicI64,
         fail_maps: AtomicI64,
+        fail_access: AtomicI64,
         pool: std::sync::Mutex<Vec<(u64, u64)>>,
     }
 
@@ -2261,6 +2269,11 @@ mod tests {
             self.unmaps.fetch_add(1, Ordering::SeqCst);
         }
         fn set_access(&self, _va: u64, _bytes: u64) -> Result<()> {
+            if self.fail_access.load(Ordering::SeqCst) > 0
+                && self.fail_access.fetch_sub(1, Ordering::SeqCst) == 1
+            {
+                return Err(RuntimeError::Device("mock set-access failure".into()));
+            }
             Ok(())
         }
         fn alloc(&self, _bytes: u64) -> Result<u64> {
@@ -2482,6 +2495,33 @@ mod tests {
         // Idempotent below the frontier.
         p.ensure_rows(0, 10).unwrap();
         assert_eq!(ops.creates.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn ensure_rows_unwinds_map_and_access_failures() {
+        for fail_access in [false, true] {
+            let ops = Arc::new(MockVmm::default());
+            let p = uniform_pool(ops.clone());
+            if fail_access {
+                ops.fail_access.store(1, Ordering::SeqCst);
+            } else {
+                ops.fail_maps.store(1, Ordering::SeqCst);
+            }
+
+            assert!(p.ensure_rows(0, 1).is_err());
+            assert_eq!(p.mapped_rows(0), 0);
+            assert_eq!(p.stats().blocks_live, 0);
+            assert_eq!(
+                ops.maps.load(Ordering::SeqCst),
+                ops.unmaps.load(Ordering::SeqCst),
+                "every successful mapping must be unwound"
+            );
+            assert_eq!(
+                ops.creates.load(Ordering::SeqCst),
+                ops.releases.load(Ordering::SeqCst),
+                "every created block must be released"
+            );
+        }
     }
 
     #[test]
