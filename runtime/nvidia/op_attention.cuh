@@ -1,3 +1,6 @@
+#ifndef PLOW_NV_PACKED_REQUEST
+#define PLOW_NV_PACKED_REQUEST 0
+#endif
 /* sm_120 (RTX 5090 / GB202) flash DECODE + MERGE.
  *
  * Port of runtime/amd/op_attention.h d_flash_decode / d_flash_merge to a 32-lane warp.
@@ -920,7 +923,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 template <int D>
 __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __restrict__ Opart,
                               const float* __restrict__ mlpart, unsigned n_batch, unsigned n_head,
-                              unsigned nsplit, unsigned slice, unsigned nblk) {
+                              unsigned nsplit, unsigned slice, unsigned nblk, const int* req = nullptr) {
     /* BRANCHLESS: the old body computed the exp weight under an `== NEG_INF` guard per (d, s)
      * element — nsplit FSETP+guarded-EX2 chains per output, predicate pressure high enough that
      * ptxas spilled predicates (P2R). The guard is unnecessary: an empty split carries
@@ -931,6 +934,15 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
     const unsigned n_work = n_batch * n_head;
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned h = w % n_head, b = w / n_head;
+#if PLOW_NV_PACKED_REQUEST
+        if (req && b >= (unsigned)(req[1 + 4 * (req[0]-1)] + req[2 + 4 * (req[0]-1)])) {
+            for (unsigned d=threadIdx.x; d<D; d+=PLOW_NV_THREADS)
+                O[((size_t)b*n_head+h)*D+d]=__float2bfloat16(0.0f);
+            continue;
+        }
+#else
+        if (req) __trap();
+#endif
         const float2* ml2 = (const float2*)(mlpart + (size_t)(b * n_head + h) * nsplit * 2);
 
         float gm = FA_NEG_INF;
@@ -3364,7 +3376,30 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
                                     unsigned window, unsigned nsplit, unsigned kv_stride,
                                     unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
                                     float* lds, const void* __restrict__ mapkv = nullptr) {
-    if (req && O == nullptr) __trap(); /* batched mode requires the fused (t5=O) epilogue */
+#if PLOW_NV_PACKED_REQUEST
+    if (req) {
+        const unsigned count=(unsigned)req[0];
+        for (unsigned r=0; r<count; ++r) {
+            const unsigned q0=req[1+4*r], qlen=req[2+4*r], slot=req[3+4*r], kvlen=req[4+4*r];
+            const size_t qoff=(size_t)q0*n_head*HD;
+            const size_t kvoff=(size_t)slot*n_kv_head*kv_stride*HD;
+            const void* descriptor=mapkv ? (const void*)((const uint64_t*)mapkv)[slot] : nullptr;
+            d_flash_prefill<HD,BQ,BKV>(Opart+qoff*nsplit,
+                mlpart+(size_t)q0*n_head*nsplit*2, Q+qoff,K+kvoff,V+kvoff,
+                O ? O+qoff : nullptr,qlen,kvlen,n_head,n_kv_head,kvlen-qlen,
+                window,nsplit,kv_stride,kv_mask,scale,slice,nblk,lds,nullptr,descriptor);
+            __syncthreads();
+        }
+        if (O) {
+            const unsigned real=req[1+4*(count-1)]+req[2+4*(count-1)];
+            const size_t begin=(size_t)real*n_head*HD, end=(size_t)seq_q*n_head*HD;
+            for (size_t i=begin+(size_t)slice*blockDim.x+threadIdx.x;i<end;i+=(size_t)nblk*blockDim.x)
+                O[i]=__float2bfloat16(0.0f);
+        }
+        return;
+    }
+#endif
+    if (req && O == nullptr) __trap(); /* legacy fused request ABI */
     /* MERGE (px4 + PX-1 stage-2) routing. The fused varlen body handles the sliding (hd256) layers
      * in ONE block-diagonal pass — the PX-1 stage-2 win (1.30-2.57x at R=2..8). The hd512 FULL
      * layers instead run each request SERIALLY (offset bases): px4's restructured single-request

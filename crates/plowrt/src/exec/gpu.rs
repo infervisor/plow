@@ -1972,6 +1972,7 @@ pub struct GpuEngine {
     /// PX-1 cross-request batched prefill (`PLOW_PF_BATCH=1`); `None` = the
     /// per-slot serialized prefill, byte-identical behavior to before.
     pf_batch: Option<PfBatch>,
+    packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -2767,6 +2768,52 @@ pub enum PrefillStep {
     Done(u32),
 }
 
+fn packed_prefill_section<'a>(
+    sections: &[crate::asset::devblob::DevSection],
+    raw: &'a [u8],
+) -> Result<Option<&'a [u8]>> {
+    let mut named = sections
+        .iter()
+        .filter(|s| s.name == plow_asset::packed_prefill::SECTION);
+    let Some(section) = named.next() else {
+        return Ok(None);
+    };
+    if named.next().is_some() {
+        return Err(RuntimeError::Rejected(
+            "duplicate packed prefill reserved section".into(),
+        ));
+    }
+    if section.kind != packet::devbuild::SECT_METADATA {
+        return Err(RuntimeError::Rejected(
+            "packed prefill reserved section has wrong kind".into(),
+        ));
+    }
+    let bytes = section
+        .offset
+        .checked_add(section.size)
+        .and_then(|end| raw.get(section.offset..end))
+        .ok_or_else(|| {
+            RuntimeError::Rejected("packed prefill reserved section is out of bounds".into())
+        })?;
+    Ok(Some(bytes))
+}
+
+fn is_checkpoint_tensor(
+    index: usize,
+    name: &str,
+    packed: Option<&plow_asset::packed_prefill::Manifest>,
+) -> bool {
+    let declared_runtime = packed.is_some_and(|m| {
+        (index == usize::from(m.slot) && name == "pf.request.slot")
+            || (index == usize::from(m.request) && name == "pf.request.table")
+            || m.maps.iter().any(|map| {
+                index == usize::from(map.slots)
+                    && name == format!("pf.request.maps.{}", map.original)
+            })
+    });
+    !declared_runtime && packet::names::is_checkpoint_weight(name)
+}
+
 impl GpuEngine {
     /// Bring the model up on the device: blob + cubin + weights + decode
     /// tables. Slow (a 12B checkpoint is ~22 GiB of H2D) — called once at
@@ -2817,6 +2864,19 @@ impl GpuEngine {
             "parsed PLOWDEV blob"
         );
         let live_kv_manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
+        let packed_prefill = packed_prefill_section(&blob.sections, &raw)?
+            .map(|bytes| {
+                serde_json::from_slice::<plow_asset::packed_prefill::Manifest>(bytes)
+                    .map_err(|e| RuntimeError::Rejected(format!("packed prefill metadata: {e}")))
+            })
+            .transpose()?;
+        if let Some(pack) = &packed_prefill {
+            let live = live_kv_manifest.as_ref().ok_or_else(|| {
+                RuntimeError::Rejected("packed prefill requires compiled LIVE contract".into())
+            })?;
+            blob.with_packet_view(|p| pack.validate(p, live))
+                .map_err(RuntimeError::Rejected)?;
+        }
         let decode_objects = decode_object::parse(&blob, &raw)?;
         let prepared_contexts = decode_context::prepare(&blob, &raw, assets_dir)?;
         if blob
@@ -3268,7 +3328,7 @@ impl GpuEngine {
             while *cur < blob.tensors.len() && n < budget {
                 let td = &blob.tensors[*cur];
                 *cur += 1;
-                if !packet::names::is_checkpoint_weight(&td.name) {
+                if !is_checkpoint_tensor(*cur - 1, &td.name, packed_prefill.as_ref()) {
                     continue;
                 }
                 if let Some(s) = ckpt.span(&td.name, 0, td.bytes as usize) {
@@ -3336,7 +3396,7 @@ impl GpuEngine {
                         td.name
                     )));
                 }
-                if !packet_cache && packet::names::is_checkpoint_weight(&td.name) {
+                if !packet_cache && is_checkpoint_tensor(i, &td.name, packed_prefill.as_ref()) {
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {
                         RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name))
                     })?;
@@ -3633,7 +3693,13 @@ impl GpuEngine {
             .max()
             .unwrap_or(0);
         let dbatch_blob = blob.decode_prog().map(|g| g.t as usize).unwrap_or(1);
-        let pf_bufs = if pf_batch_env && pf_max_t_blob > 0 {
+        let pf_bufs = if pf_batch_env && packed_prefill.is_some() {
+            let p = packed_prefill.as_ref().unwrap();
+            Some((
+                DeviceMem::view(devp[p.slot as usize].base, devp[p.slot as usize].len),
+                DeviceMem::view(devp[p.request as usize].base, devp[p.request as usize].len),
+            ))
+        } else if pf_batch_env && pf_max_t_blob > 0 {
             Some((
                 be.alloc(0, (pf_max_t_blob * 4) as u64)?,
                 be.alloc(0, ((1 + 4 * dbatch_blob) * 4) as u64)?,
@@ -3682,6 +3748,9 @@ impl GpuEngine {
             map.encode_slot(&be, &ptrs, 0, &devp[map.tensor])?;
         }
         let pf_handles = pf_bufs.as_ref().map(|(s, r)| {
+            if let Some(p) = &packed_prefill {
+                return (u32::from(p.slot), u32::from(p.request));
+            }
             let h_slot = ptrs.len() as u32;
             // These runtime-appended handles are patched into u16 wire slots
             // (`DevInst64::t`), which the compiler's pack-time assert cannot see.
@@ -3981,6 +4050,15 @@ impl GpuEngine {
         // a shifted table. A few KiB per slot.
         let mut d_tens_slots: Vec<DeviceMem> = Vec::new();
         let mut kv_tmap_slots: Vec<DeviceMem> = Vec::new();
+        let mut packed_map_ptrs: Vec<Vec<u64>> = packed_prefill
+            .as_ref()
+            .map(|p| {
+                p.maps
+                    .iter()
+                    .map(|m| vec![ptrs[m.original as usize]])
+                    .collect()
+            })
+            .unwrap_or_default();
         if batch > 1 && (!kv_slots.is_empty() || !kv_maps.is_empty()) {
             let mut shifted = ptrs.clone();
             for b in 1..batch {
@@ -3994,10 +4072,27 @@ impl GpuEngine {
                     }
                     kv_tmap_slots.push(descriptor);
                 }
+                if let Some(pack) = &packed_prefill {
+                    for (m, table) in pack.maps.iter().zip(&mut packed_map_ptrs) {
+                        table.push(shifted[m.original as usize]);
+                    }
+                }
                 let mem = be.alloc(0, (shifted.len() * 8) as u64)?;
                 be.upload(&mem, 0, bytemuck::cast_slice(&shifted))?;
                 d_tens_slots.push(mem);
             }
+        }
+
+        if let Some(pack) = &packed_prefill {
+            for (m, table) in pack.maps.iter().zip(&packed_map_ptrs) {
+                if table.len() != batch {
+                    return Err(RuntimeError::Rejected(
+                        "packed descriptor slot coverage".into(),
+                    ));
+                }
+                be.upload(&devp[m.slots as usize], 0, bytemuck::cast_slice(table))?;
+            }
+            be.synchronize()?;
         }
 
         // Every slot's row 0 must be mapped before any batched decode: unfed
@@ -4048,6 +4143,7 @@ impl GpuEngine {
                 grid,
                 profile.tag,
                 segment_roles.as_ref(),
+                pf_batch_env && packed_prefill.is_some(),
             ) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf)) => {
                     tracing::info!(
@@ -4138,6 +4234,14 @@ impl GpuEngine {
             let image = std::fs::read(&path)
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
             let module = be.module_load(&image)?;
+            if pf_batch_env
+                && packed_prefill.is_some()
+                && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)? != Some(1)
+            {
+                return Err(RuntimeError::Rejected(
+                    "packet role lacks packed request ABI1".into(),
+                ));
+            }
             let capability = be.module_global_u32(&module, marker)?;
             let block = be.module_global_u32(&module, block)?;
             if id == 1 {
@@ -4196,7 +4300,24 @@ impl GpuEngine {
             (Some((d_slot, d_req)), Some((h_slot, h_req)))
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
-                if vmm.is_some() {
+                if packed_prefill.is_some() {
+                    if vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
+                        || prefill.iter().any(|b| {
+                            b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
+                        })
+                    {
+                        return Err(RuntimeError::Rejected("packed requests require complete direct-KV segmented chains without prefix reuse".into()));
+                    }
+                    Some(PfBatch {
+                        d_slot,
+                        d_req,
+                        h_slot,
+                        h_req,
+                        at_sites: Vec::new(),
+                        slot_buf: vec![0; pf_max_t_blob],
+                        req_buf: Vec::with_capacity(1 + 4 * dbatch_blob),
+                    })
+                } else if vmm.is_some() {
                     tracing::warn!("PLOW_PF_BATCH=1 ignored: incompatible with VMM KV allocation");
                     None
                 } else {
@@ -4409,6 +4530,7 @@ impl GpuEngine {
             timing,
             vmm,
             pf_batch,
+            packed_prefill,
         };
         if !engine.decode_packet_roles.is_empty() {
             let be = Arc::clone(&engine.be);
@@ -6042,8 +6164,16 @@ impl GpuEngine {
         grid: u32,
         interp_tag: &str,
         segment_roles: Option<&SegmentRoles>,
+        packed_requests: bool,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
         let module = be.module_load(&pf.image)?;
+        if packed_requests
+            && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)? != Some(1)
+        {
+            return Err(RuntimeError::Rejected(
+                "prefill object lacks packed request ABI1".into(),
+            ));
+        }
         let kname = std::env::var(env_kernel_var(Role::Prefill))
             .ok()
             .or_else(|| crate::config::RuntimeConfig::get().nv.kernel_pf.clone())
@@ -6101,6 +6231,14 @@ impl GpuEngine {
                                 RuntimeError::Device(format!("PLOW_PF_SEG_DIR: read {file}: {e}"))
                             })?;
                         let m = be.module_load(&img)?;
+                        if packed_requests
+                            && be.module_global_u32(&m, plow_asset::packed_prefill::CAPABILITY)?
+                                != Some(1)
+                        {
+                            return Err(RuntimeError::Rejected(format!(
+                                "{file} lacks packed request ABI1"
+                            )));
+                        }
                         let f = be.get_function(&m, sym)?;
                         let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
                         be.set_max_dynamic_smem(f, sm)?;
@@ -6131,6 +6269,14 @@ impl GpuEngine {
                         RuntimeError::Device(format!("PLOW_PF_SEG_GEMM_SMALL: read {path}: {e}"))
                     })?;
                     let module = be.module_load(&img)?;
+                    if packed_requests
+                        && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)?
+                            != Some(1)
+                    {
+                        return Err(RuntimeError::Rejected(
+                            "small GEMM object lacks packed request ABI1".into(),
+                        ));
+                    }
                     let abi = be
                         .module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")?
                         .unwrap_or(0);
@@ -6570,7 +6716,7 @@ impl GpuEngine {
         // Batched mode owns the bucket instruction streams (t5/t6/merge are
         // patched to the batched contract) — the serialized chunk path must
         // never launch against them.
-        if self.pf_batch.is_some() {
+        if self.pf_batch.is_some() && self.packed_prefill.is_none() {
             return Err(RuntimeError::Rejected(
                 "PLOW_PF_BATCH=1: serialized prefill_chunk disabled — use prefill_batched".into(),
             ));
@@ -6790,6 +6936,24 @@ impl GpuEngine {
             v.kv.ensure_rows(b, ((c0 + tc) as u32).min(self.max_ctx as u32))?;
         }
 
+        if self.packed_prefill.is_some() && self.prefill[bi].batch_patched {
+            let pack = self.packed_prefill.as_ref().unwrap();
+            let bucket = &mut self.prefill[bi];
+            for &pc in &bucket.rope_sites {
+                bucket.h_inst[pc].t[6] = TENSOR_NONE16;
+            }
+            for &pc in &bucket.flash_sites {
+                let d = &mut bucket.h_inst[pc];
+                d.t[6] = TENSOR_NONE16;
+                if let Some(m) = pack.maps.iter().find(|m| m.slots == d.t[7]) {
+                    d.t[7] = m.original;
+                }
+            }
+            for &pc in &bucket.merge_sites {
+                bucket.h_inst[pc].t[3] = TENSOR_NONE16;
+            }
+            bucket.batch_patched = false;
+        }
         // Patch this bucket's instruction stream for the chunk, then enqueue
         // the covering window as an async H2D on the engine stream.
         {
@@ -6857,6 +7021,20 @@ impl GpuEngine {
 
         // All uploads/memsets are enqueued on the engine stream — the launch
         // follows them in stream order (no context sync needed).
+        self.launch_prefill_chain(bi, arg, f_pf, b, c0, n, tc)?;
+        Ok(real)
+    }
+
+    fn launch_prefill_chain(
+        &mut self,
+        bi: usize,
+        mut arg: DevProgram,
+        f_pf: KernelFn,
+        b: usize,
+        c0: usize,
+        n: usize,
+        tc: usize,
+    ) -> Result<()> {
         // SEGMENTED MODE (SegPf): one launch per wave-class segment, in blob order,
         // alternating the fat (flash) and lean occ-2 (GEMM) objects. Sequential stream
         // launches make cross-segment gates trivially satisfied (dependencies only point
@@ -6980,7 +7158,7 @@ impl GpuEngine {
                         tracing::info!("prefill {sdump}");
                     }
                 }
-                return Ok(real);
+                return Ok(());
             }
             // PLOW_PF_SEG_TIME=1: per-CLASS wall attribution via one event pair per segment
             // (diagnostic; events cost ~us each — never on by default).
@@ -7111,7 +7289,7 @@ impl GpuEngine {
             }
         }
 
-        Ok(real)
+        Ok(())
     }
 
     /// One-time PX-1 batched-mode patch of bucket `bi`'s instruction stream:
@@ -7123,6 +7301,35 @@ impl GpuEngine {
     /// decode step of the last prompt token). One covering-window upload.
     fn ensure_batch_patch(&mut self, bi: usize) -> Result<()> {
         if self.prefill[bi].batch_patched {
+            return Ok(());
+        }
+        if let Some(pack) = &self.packed_prefill {
+            let b = &mut self.prefill[bi];
+            for &pc in &b.rope_sites {
+                b.h_inst[pc].t[6] = pack.slot;
+            }
+            for &pc in &b.flash_sites {
+                let d = &mut b.h_inst[pc];
+                d.t[6] = pack.request;
+                if let Some(m) = pack.maps.iter().find(|m| m.original == d.t[7]) {
+                    d.t[7] = m.slots;
+                }
+            }
+            for &pc in &b.merge_sites {
+                b.h_inst[pc].t[3] = pack.request;
+            }
+            for &pc in &b.lmhead_sites {
+                b.h_inst[pc].i[4] = 0;
+            }
+            if !b.inst_range.is_empty() {
+                let offset = b.inst_range.start * std::mem::size_of::<DevInst64>();
+                self.be.memcpy_htod(
+                    b.d_inst.base + offset as u64,
+                    pod_bytes(&b.h_inst[b.inst_range.clone()]),
+                )?;
+                self.be.synchronize()?;
+            }
+            b.batch_patched = true;
             return Ok(());
         }
         let (h_slot, h_req, at_sites) = {
@@ -7190,6 +7397,37 @@ impl GpuEngine {
         if reqs.is_empty() {
             return Ok(());
         }
+        let request_plan = if self.packed_prefill.is_some() {
+            let total = reqs
+                .iter()
+                .try_fold(0usize, |n, r| n.checked_add(r.len))
+                .ok_or_else(|| RuntimeError::Rejected("packed row overflow".into()))?;
+            let bucket = self
+                .prefill
+                .iter()
+                .find(|b| b.t as usize >= total)
+                .ok_or_else(|| RuntimeError::Rejected("packed bucket overflow".into()))?;
+            let requests: Vec<_> = reqs
+                .iter()
+                .map(|r| plow_asset::packed_prefill::Request {
+                    slot: r.slot,
+                    start: r.c0,
+                    len: r.len,
+                    prompt: r.prompt.len(),
+                })
+                .collect();
+            Some(
+                plow_asset::packed_prefill::plan(
+                    &requests,
+                    &self.pos,
+                    bucket.t as usize,
+                    self.max_ctx,
+                )
+                .map_err(RuntimeError::Rejected)?,
+            )
+        } else {
+            None
+        };
         let mut total = 0usize;
         for r in reqs {
             if r.slot >= self.batch {
@@ -7236,13 +7474,21 @@ impl GpuEngine {
         // its first segment and silently skip every op after it — stale KV, garbage
         // logits, launch reports success. Refuse instead: the two features are
         // mutually exclusive until the batched path learns the segment chain.
-        if !self.prefill[bi].seg_class.is_empty() {
+        if self.packed_prefill.is_none() && !self.prefill[bi].seg_class.is_empty() {
             return Err(RuntimeError::Rejected(
                 "PLOW_PF_BATCH with a wave-class-segmented prefill program \
                  (PLOW_PF_SEG_DIR): the batched path launches segment 0 only — \
                  unset one of the two"
                     .into(),
             ));
+        }
+        if let (Some(plan), Some(v)) = (&request_plan, &mut self.vmm) {
+            for &(slot, end) in &plan.mapped_ends {
+                if let Some(rings) = &mut v.rings {
+                    rings.ensure_slot(slot)?;
+                }
+                v.kv.ensure_rows(slot, end)?;
+            }
         }
         self.ensure_batch_patch(bi)?;
         let tc = self.prefill[bi].t as usize;
@@ -7291,6 +7537,11 @@ impl GpuEngine {
                 pb.slot_buf[k] = s;
                 p += 1;
             }
+            if let Some(plan) = &request_plan {
+                self.pf_pos.copy_from_slice(&plan.positions);
+                pb.slot_buf.copy_from_slice(&plan.slots);
+                pb.req_buf.clone_from(&plan.table);
+            }
             // SAFETY: pf_ids, pf_pos live on self past the stream_synchronize;
             // pb.slot_buf, pb.req_buf are put back into self.pf_batch (below)
             // before the sync; kvlen_bytes is declared above the closure so it
@@ -7325,27 +7576,37 @@ impl GpuEngine {
             Ok(())
         })();
         self.pf_batch = Some(pb);
-        staged?;
+        if let Err(error) = staged {
+            let _ = self.be.stream_synchronize(&self.stream);
+            return Err(error);
+        }
 
         let (ctr_base, ctr_bytes, mut arg) = {
             let b = &self.prefill[bi];
             (b.d_ctr.base, b.ctr_bytes, b.kernarg)
         };
         // One async fill re-arms the bucket's counters AND its tail GQ cursor.
-        self.be
-            .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
-
-        // All uploads/memsets are enqueued on the engine stream — the launch
-        // follows them in stream order (no context sync needed).
-        let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-        self.be.launch_cooperative(
-            f_pf,
-            self.grid,
-            BLOCK,
-            self.smem_pf,
-            &mut params,
-            Some(&self.stream),
-        )?;
+        let launched = (|| -> Result<()> {
+            self.be
+                .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
+            if self.packed_prefill.is_some() {
+                self.launch_prefill_chain(bi, arg, f_pf, reqs[0].slot, reqs[0].c0, total, tc)
+            } else {
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                self.be.launch_cooperative(
+                    f_pf,
+                    self.grid,
+                    BLOCK,
+                    self.smem_pf,
+                    &mut params,
+                    Some(&self.stream),
+                )
+            }
+        })();
+        if let Err(error) = launched {
+            let _ = self.be.stream_synchronize(&self.stream);
+            return Err(error);
+        }
         if let Err(e) = self.be.stream_synchronize(&self.stream) {
             tracing::warn!(
                 error = %e,
@@ -7771,6 +8032,249 @@ mod attention_role_tests;
 #[cfg(test)]
 mod prefill_patch_tests {
     use super::*;
+
+    #[test]
+    fn packed_section_accepts_absent_or_one_bounded_metadata() {
+        use crate::asset::devblob::DevSection;
+        let make = |name: &str, kind, offset, size| DevSection {
+            name: name.into(),
+            kind,
+            offset,
+            size,
+        };
+        assert!(packed_prefill_section(&[], b"xabcx").unwrap().is_none());
+        let unrelated = make("other", 0, usize::MAX, usize::MAX);
+        assert!(packed_prefill_section(&[unrelated], b"xabcx")
+            .unwrap()
+            .is_none());
+        let section = make(
+            plow_asset::packed_prefill::SECTION,
+            packet::devbuild::SECT_METADATA,
+            1,
+            3,
+        );
+        assert_eq!(
+            packed_prefill_section(&[section], b"xabcx").unwrap(),
+            Some(&b"abc"[..])
+        );
+    }
+
+    #[test]
+    fn packed_section_rejects_wrong_kind_duplicates_and_invalid_bounds() {
+        use crate::asset::devblob::DevSection;
+        let make = |kind, offset, size| DevSection {
+            name: plow_asset::packed_prefill::SECTION.into(),
+            kind,
+            offset,
+            size,
+        };
+        let good = packet::devbuild::SECT_METADATA;
+        let bad = good.wrapping_add(1);
+        for sections in [
+            vec![make(bad, 0, 2)],
+            vec![make(good, 0, 2), make(good, 0, 2)],
+            vec![make(good, 0, 2), make(bad, 0, 2)],
+            vec![make(bad, 0, 2), make(good, 0, 2)],
+            vec![make(bad, 0, 2), make(bad, 0, 2)],
+            vec![make(good, 4, 0)],
+            vec![make(good, 1, 3)],
+            vec![make(good, usize::MAX, 1)],
+        ] {
+            assert!(matches!(
+                packed_prefill_section(&sections, b"abc"),
+                Err(RuntimeError::Rejected(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {
+        let m = plow_asset::packed_prefill::Manifest {
+            version: 1,
+            slot: 4,
+            request: 5,
+            maps: vec![plow_asset::packed_prefill::Map {
+                original: 6,
+                slots: 7,
+            }],
+            programs: vec![],
+        };
+        for (index, name) in [
+            (4, "pf.request.slot"),
+            (5, "pf.request.table"),
+            (7, "pf.request.maps.6"),
+        ] {
+            assert!(!is_checkpoint_tensor(index, name, Some(&m)));
+            assert!(
+                is_checkpoint_tensor(index, name, None),
+                "undeclared runtime-looking name must not bypass weight lookup"
+            );
+            assert!(
+                is_checkpoint_tensor(index + 10, name, Some(&m)),
+                "wrong handle"
+            );
+        }
+        for (index, name) in [
+            (4, "model.layers.0.weight"),
+            (5, "pf.request.other"),
+            (7, "pf.request.maps.9"),
+            (6, "pf.request.maps.6"),
+        ] {
+            assert!(
+                is_checkpoint_tensor(index, name, Some(&m)),
+                "unbound or mismatched declaration"
+            );
+        }
+        assert!(is_checkpoint_tensor(0, "model.layers.0.weight", Some(&m)));
+        assert!(!is_checkpoint_tensor(1, "act.x", Some(&m)));
+    }
+
+    #[test]
+    #[ignore = "GPU Gemma direct-KV block qualification; root-owned launch only"]
+    fn packed_segmented_block_matches_serialized() -> Result<()> {
+        assert_eq!(std::env::var("TEST_PACKED_PREFILL_GPU").as_deref(), Ok("1"));
+        let assets = std::path::PathBuf::from(std::env::var("TEST_PACKED_PREFILL_ASSETS").unwrap());
+        let bytes = std::fs::read(assets.join("model.pkt")).unwrap();
+        let blob = DevBlob::parse(&bytes).unwrap();
+        let live = crate::memory::vmm::LiveKvLayout::manifest(&blob, &bytes)
+            .unwrap()
+            .unwrap();
+        let block: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(assets.join("block.json")).unwrap()).unwrap();
+        let hidden = block["hidden"].as_u64().unwrap() as usize;
+        assert_eq!(block["arch"], "gemma_dense");
+        assert_eq!(block["inputs"][0]["name"], "act.x");
+        assert_eq!(block["outputs"][0]["name"], "act.x");
+        let be = Arc::new(CudaBackend::new(0)?);
+        let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint"))?;
+        assert!(e.packed_prefill.is_some() && e.pf_batch.is_some() && e.batch >= 16);
+        assert!(e.prefill.iter().all(|b| b.seg_class.len() > 1));
+        let tensor_rows = e.tensor_bytes("act.x").unwrap() as usize / 2 / hidden;
+        let input = |slot: usize, row: usize, col: usize| {
+            (((slot * 101 + row * 17 + col * 13) % 251) as f32 - 125.0) / 128.0
+        };
+        let stage = |e: &mut GpuEngine, spans: &[(usize, usize, usize)]| {
+            let mut x = vec![0.0; tensor_rows * hidden];
+            let mut offset = 0;
+            for &(slot, start, len) in spans {
+                for row in start..start + len {
+                    for col in 0..hidden {
+                        x[offset * hidden + col] = input(slot, row, col);
+                    }
+                    offset += 1;
+                }
+            }
+            e.upload_activation("act.x", &x).unwrap();
+        };
+        let output = |e: &GpuEngine, rows: usize| {
+            let mut raw = vec![0; rows * hidden * 2];
+            e.read_tensor("act.x", &mut raw).unwrap();
+            for x in raw.chunks_exact(2) {
+                assert!(
+                    f32::from_bits(u32::from(u16::from_le_bytes([x[0], x[1]])) << 16).is_finite()
+                );
+            }
+            raw
+        };
+        let kv = |e: &GpuEngine, spans: &[(usize, usize)]| {
+            let mut all = Vec::new();
+            for c in &live.caches {
+                for &handle in &c.pair {
+                    for &(slot, len) in spans {
+                        for head in 0..c.heads as usize {
+                            assert!(len <= c.stride as usize);
+                            let offset = ((slot * c.heads as usize + head)
+                                * c.stride as usize
+                                * c.hd as usize
+                                * 2) as u64;
+                            let mut raw = vec![0; len * c.hd as usize * 2];
+                            e.be.download(&e.devp[handle as usize], offset, &mut raw)
+                                .unwrap();
+                            all.extend(raw);
+                        }
+                    }
+                }
+            }
+            all
+        };
+        let lens = [31usize, 63];
+        let slots = [3usize, 15];
+        let prompts: Vec<Vec<u32>> = lens.iter().map(|&len| vec![100; len]).collect();
+        let mut reference: Option<Vec<u8>> = None;
+        for arm in 0..3 {
+            e.begin_slot(0, 256).unwrap();
+            stage(&mut e, &[(0, 0, 17)]);
+            e.prefill_slot(0, &vec![100; 17]).unwrap();
+            let idle = kv(&e, &[(0, 17)]);
+            for &slot in &slots {
+                e.begin_slot(slot, 256).unwrap();
+            }
+            let mut got = Vec::new();
+            if arm == 0 {
+                for i in 0..2 {
+                    stage(&mut e, &[(slots[i], 0, lens[i])]);
+                    e.prefill_slot(slots[i], &prompts[i]).unwrap();
+                    got.extend(output(&e, lens[i]));
+                }
+            } else {
+                stage(&mut e, &[(slots[0], 0, lens[0]), (slots[1], 0, lens[1])]);
+                let requests: Vec<_> = (0..2)
+                    .map(|i| PfBatchReq {
+                        slot: slots[i],
+                        prompt: &prompts[i],
+                        c0: 0,
+                        len: lens[i],
+                    })
+                    .collect();
+                e.prefill_batched(&requests).unwrap();
+                got = output(&e, lens.iter().sum());
+                let before = kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]);
+                let duplicate = [
+                    PfBatchReq {
+                        slot: 3,
+                        prompt: &prompts[0],
+                        c0: 31,
+                        len: 1,
+                    },
+                    PfBatchReq {
+                        slot: 3,
+                        prompt: &prompts[0],
+                        c0: 31,
+                        len: 1,
+                    },
+                ];
+                assert!(e.prefill_batched(&duplicate).is_err());
+                assert_eq!(before, kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
+            }
+            assert_eq!(idle, kv(&e, &[(0, 17)]), "request isolation: slot0 idle KV");
+            got.extend(kv(&e, &[(slots[0], lens[0]), (slots[1], lens[1])]));
+            for i in 0..2 {
+                let continuation = vec![100; lens[i] + 1];
+                stage(&mut e, &[(slots[i], lens[i], 1)]);
+                e.prefill_slot(slots[i], &continuation).unwrap();
+                got.extend(output(&e, 1));
+            }
+            got.extend(kv(&e, &[(slots[0], lens[0] + 1), (slots[1], lens[1] + 1)]));
+            stage(&mut e, &[(0, 17, 1)]);
+            e.prefill_slot(0, &vec![100; 18]).unwrap();
+            got.extend(output(&e, 1));
+            got.extend(kv(&e, &[(0, 18)]));
+            assert_eq!(e.pos[3], 32);
+            assert_eq!(e.pos[15], 64);
+            if let Some(expected) = &reference {
+                assert_eq!(got.len(), expected.len());
+                assert!(
+                    got.iter().zip(expected).all(|(a, b)| a == b),
+                    "arm {arm}: first differing byte {:?}",
+                    got.iter().zip(expected).position(|(a, b)| a != b)
+                );
+            } else {
+                reference = Some(got);
+            }
+        }
+        eprintln!("packed segmented block PASS: physical slots3/15,94 real+34 pad rows,2 repeats,KV and continuation exact");
+        Ok(())
+    }
 
     #[test]
     fn no_patch_sites_produce_an_empty_upload_range() {

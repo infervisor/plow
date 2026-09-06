@@ -110,6 +110,15 @@
 #endif
 
 #include "op_attention.cuh" /* validated: d_flash_decode / d_flash_merge (harvested) */
+#if PLOW_NV_PACKED_REQUEST
+#define PLOW_PF_REQ_ARG , (const int*)TEN(3)
+#if !defined(PLOW_NV_HOPPER) || !PLOW_NV_HOPPER || !PLOW_NV_PREFILL || PLOW_FP8_KV
+#error "packed request ABI requires Hopper BF16 prefill"
+#endif
+extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 1;
+#else
+#define PLOW_PF_REQ_ARG
+#endif
 #include "op_mla.cuh"        /* MLA (DeepSeek/GLM/Kimi) latent decode + fused merge-fold (P1) */
 #include "op_dsa.cuh"        /* GLM DSA indexer: score (mma.sync) + top-k select (P3) */
 #include "op_elementwise.cuh"
@@ -1893,20 +1902,20 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #elif PLOW_NV_GEMMA
         if (in->i[3] == 128)
             d_flash_merge<128>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
-                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
+                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
         else if (in->i[3] == 256)
             d_flash_merge<256>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
-                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
+                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
         else if (in->i[3] == 512)
             d_flash_merge<512>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
-                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
+                               (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
         else
             __trap();
 #else
         if (in->i[3] != PLOW_NV_FA_HD) { __trap(); break; }
         d_flash_merge<PLOW_NV_FA_HD>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                      (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice,
-                                     nblk);
+                                     nblk PLOW_PF_REQ_ARG);
 #endif
         break;
 
