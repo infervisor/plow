@@ -18,7 +18,7 @@ fn validate(slot_map: Option<Tensor<'_>>, mutate: impl FnOnce(&mut DevInst64)) -
 
 fn validate_all(
     slot_map: Option<Tensor<'_>>,
-    mutate: impl FnOnce(&mut [DevInst64; 3], &mut Vec<Tensor<'_>>),
+    mutate: impl FnOnce(&mut Vec<DevInst64>, &mut Vec<Tensor<'_>>),
 ) -> Result<()> {
     let mut tensors = vec![
         Tensor {
@@ -74,7 +74,7 @@ fn validate_all(
         d.fj[2] = u32::MAX;
         d
     };
-    let mut insts = [decode, writer(2), writer(3)];
+    let mut insts = vec![decode, writer(2), writer(3)];
     mutate(&mut insts, &mut tensors);
     let program = Program {
         rows: 2,
@@ -104,12 +104,12 @@ fn validate_all(
 
 #[test]
 fn hd64_half_split_cache_geometry_is_valid() {
-    let hd64 = |insts: &mut [DevInst64; 3], tensors: &mut Vec<Tensor<'_>>| {
+    let hd64 = |insts: &mut Vec<DevInst64>, tensors: &mut Vec<Tensor<'_>>| {
         insts[0].i[6] = 64;
         for d in &mut insts[1..] {
             d.i[2] = 64;
-            d.i[5] = packet::dev::ROPE_PAIR_HALF;
         }
+        insts[1].i[5] = packet::dev::ROPE_PAIR_HALF;
         tensors[2].bytes /= 4;
         tensors[3].bytes /= 4;
         tensors[4].bytes /= 4;
@@ -121,6 +121,27 @@ fn hd64_half_split_cache_geometry_is_valid() {
         insts[1].i[5] = 0;
     })
     .is_err());
+}
+
+#[test]
+fn flat_mxfp4_moe_operands_are_direct_and_cannot_alias_kv() {
+    for op in [
+        DevOp::MoeRouterTopkPf,
+        DevOp::MoeAlignPf,
+        DevOp::MoeCombinePf,
+        DevOp::MoeGluMx,
+        DevOp::MoeDownMx,
+        DevOp::MoeGluMxPf,
+        DevOp::MoeDownMxPf,
+    ] {
+        validate_all(None, |insts, _| insts.push(inst(op))).unwrap();
+        assert!(validate_all(None, |insts, _| {
+            let mut d = inst(op);
+            d.t[0] = 2;
+            insts.push(d);
+        })
+        .is_err());
+    }
 }
 
 #[test]

@@ -124,6 +124,24 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                     }
                     d.i[1] = 1;
                 }
+                Some(DevOp::MoeRouterTopkPf) => {
+                    if d.i[4] != g.t {
+                        return Err(reject("MoE router rows disagree with rung width"));
+                    }
+                    d.i[4] = 1;
+                }
+                Some(DevOp::MoeGluMx | DevOp::MoeDownMx) => {
+                    if d.i[6] != g.t {
+                        return Err(reject("MoE expert rows disagree with rung width"));
+                    }
+                    d.i[6] = 1;
+                }
+                Some(DevOp::MoeCombinePf) => {
+                    if d.i[2] != g.t {
+                        return Err(reject("MoE combine rows disagree with rung width"));
+                    }
+                    d.i[2] = 1;
+                }
                 Some(
                     DevOp::RmsNorm
                     | DevOp::RowRms
@@ -208,12 +226,19 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
             .and_then(|n| n.checked_mul(u64::from(stride)))
             .and_then(|n| n.checked_mul(u64::from(hd) * 2))
             .ok_or_else(|| reject("KV extent overflow"))?;
-        for &id in &d.t[3..5] {
+        for (kind, &id) in d.t[3..5].iter().enumerate() {
+            let pair_mode = if hd == 64 && kind == 0 {
+                ROPE_PAIR_HALF
+            } else {
+                0
+            };
             if blob
                 .tensors
                 .get(id as usize)
                 .is_none_or(|t| t.bytes != bytes || t.init.is_some())
-                || caches.insert(id, (heads, hd, stride, mask)).is_some()
+                || caches
+                    .insert(id, (heads, hd, stride, mask, pair_mode))
+                    .is_some()
                 || [pos, kvlen, ids].contains(&(id as usize))
             {
                 return Err(reject("invalid or aliased BF16 KV tensor extent"));
@@ -288,7 +313,7 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                 }
             }
             for (operand, &id) in d.t.iter().enumerate() {
-                let Some(&(heads, hd, stride, mask)) = caches.get(&id) else {
+                let Some(&(heads, hd, stride, mask, pair_mode)) = caches.get(&id) else {
                     continue;
                 };
                 match DevOp::from_u16(d.op) {
@@ -301,7 +326,7 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                         if d.i[6] != g.t
                             || d.i[3] != 0
                             || d.t[5] as usize != pos
-                            || !matches!((hd, d.i[5]), (64, ROPE_PAIR_HALF) | (256 | 512, 0))
+                            || d.i[5] != pair_mode
                             || (d.i[1], d.i[2], d.fj[1], d.fj[2]) != (heads, hd, stride, mask)
                         {
                             return Err(reject(
