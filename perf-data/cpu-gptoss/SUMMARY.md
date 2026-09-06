@@ -36,3 +36,23 @@ Reading
   64 expert passes/step) where llama.cpp batches the rows through each expert once.
 * Next for decode: expert-deduplicated batched MoE decode (sort B·k slots by expert, one weight pass per expert,
   AMX x-as-B tiles as in the prefill kernels) — same fix the 26B needs.
+
+## Batched decode grouped by expert (commit af83ce4, 09:1x)
+
+Ops 147/148 at B >= 2 now sort the B·k slots by expert and dequantize each selected expert once for all
+its rows (fused AVX-512 dequant-dot, M <= 8), with the slice partition weighted by per-expert work.
+Fresh-prompt serve cells (`plow/gptoss-grpw-chat48.md`; the ungrouped build is `gptoss-amxpf-chat.md`):
+
+| workload | conc | plow ungrouped TPOT | plow grouped TPOT | llama.cpp TPOT | plow grouped TTFT | llama.cpp TTFT |
+|---|---|---|---|---|---|---|
+| chat_short | 4 | 119 | 109 | 104 | 1305 | 3059 |
+| chat_short | 8 | 200 | 178 | 177 | 3095 | 5260 |
+| chat_long | 4 | 156 | 177 | 133 | 4273 | 14432 |
+| chat_long | 8 | 326 | 294 | 215 | 9539 | 35666 |
+
+Notes: an AMX-tile variant of the grouping (weights staged into A tiles) was 40 % slower (most experts
+carry one row); an unweighted column partition was neutral (a slice owning a 4-row expert did ~2x the
+work of its neighbours). Run-to-run TPOT spread at c >= 4 is ~±15 % (prefill of other slots interleaves
+with decode), so chat_long c=4 is within noise. The remaining c >= 2 gap is prefill interleaving +
+per-row dequant; the c=1 gap (45 vs 41 ms) is the bf16 dense weights (lm_head 1.16 GB + QKV/o ≈ 21 of
+44 ms) — next lever: MXFP4 dense + head twin for GPT-OSS (~0.9 GB).
