@@ -2744,6 +2744,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_kv_reuses_blocks_across_sequences() {
+        let ops = Arc::new(MockVmm::default());
+        let geo = uniform_pool(ops.clone()).geometry().clone();
+        let mut p = VmmKv::new_live(ops.clone(), geo, 64).unwrap();
+        p.enable_block_pool(8 * 64);
+        wait_pooled(&p, 8);
+        let created = ops.creates.load(Ordering::SeqCst);
+
+        p.ensure_rows(0, 1).unwrap();
+        p.begin_seq(0);
+        p.ensure_rows(0, 1).unwrap();
+
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst),
+            created,
+            "live sequence reset must reuse pooled blocks"
+        );
+    }
+
     /// The pool cap bounds parked VRAM: overflowing zero-ref blocks release
     /// to the driver instead of parking.
     #[test]

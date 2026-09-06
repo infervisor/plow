@@ -4465,11 +4465,12 @@ impl GpuEngine {
         } else {
             None
         };
-        let kv = crate::memory::vmm::VmmKv::new_live(
+        let mut kv = crate::memory::vmm::VmmKv::new_live(
             Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
             layout.geometry,
             block_hint,
         )?;
+        kv.enable_block_pool(crate::memory::vmm::kv_pool_cap());
         let tensor_tracks = layout
             .full_tensors
             .iter()
