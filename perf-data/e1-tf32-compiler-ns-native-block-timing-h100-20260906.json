@@ -1,0 +1,2089 @@
+{
+  "scope": "Actual native Gemma12 block5, one active slot, same checkpoint, current scalar baseline vs TF32 compilerNS33/66/132,40iterations5warmup256MiB per-step entryeviction, median/p95 only. NoPF/wholemodel/serving/vLLM claim",
+  "decision": "Advance bounded32K/B1 NS132 native block result;8KNS66 is marginal. No defaultpromotion. Context/rung-specific packet selection needs newqualification.",
+  "raw": {
+    "e1-tf32-compiler-ns-audit-20260906/timing/analysis/RESULTS.json": {
+      "sha256": "cd57453aae8565d5821740375f330af30be2fbaaa3abe15bd4396d5deb0a8f3e",
+      "content": {
+        "schema": 1,
+        "terminal": true,
+        "passed": true,
+        "window": "/tmp/plow-model-support-checks/e1-tf32-ns-timing-window-v2-20260906",
+        "rows": [
+          {
+            "context": 8192,
+            "repeat": 0,
+            "arm": "default",
+            "median_us": 330.36,
+            "p95_us": 336.18,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 8192,
+            "repeat": 0,
+            "arm": "ns33",
+            "median_us": 334.77,
+            "p95_us": 343.34,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 8192,
+            "repeat": 0,
+            "arm": "ns66",
+            "median_us": 326.99,
+            "p95_us": 332.15,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 8192,
+            "repeat": 0,
+            "arm": "ns132",
+            "median_us": 332.03,
+            "p95_us": 338.11,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "arm": "ns132",
+            "median_us": 334.1,
+            "p95_us": 339.46,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "arm": "ns66",
+            "median_us": 327.2,
+            "p95_us": 334.31,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "arm": "ns33",
+            "median_us": 334.68,
+            "p95_us": 339.44,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "arm": "default",
+            "median_us": 331.18,
+            "p95_us": 335.18,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "arm": "default",
+            "median_us": 437.23,
+            "p95_us": 442.12,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "arm": "ns33",
+            "median_us": 410.28,
+            "p95_us": 419.38,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "arm": "ns66",
+            "median_us": 365.06,
+            "p95_us": 372.58,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "arm": "ns132",
+            "median_us": 357.52,
+            "p95_us": 363.77,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "arm": "ns132",
+            "median_us": 355.97,
+            "p95_us": 365.57,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "arm": "ns66",
+            "median_us": 365.11,
+            "p95_us": 375.64,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "arm": "ns33",
+            "median_us": 408.67,
+            "p95_us": 412.64,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "arm": "default",
+            "median_us": 438.89,
+            "p95_us": 444.73,
+            "iterations_reported": 40,
+            "warmup_reported": 5,
+            "individual_durations_retained": false
+          }
+        ],
+        "pairs": [
+          {
+            "context": 8192,
+            "repeat": 0,
+            "reference": "default",
+            "arm": "ns33",
+            "reference_us": 330.36,
+            "candidate_us": 334.77,
+            "speedup": 0.9868267765928848,
+            "saved_us": -4.409999999999968,
+            "latency_reduction_percent": -1.3349073737740635,
+            "p95_reduction_percent": -2.1298114105538613
+          },
+          {
+            "context": 8192,
+            "repeat": 0,
+            "reference": "default",
+            "arm": "ns66",
+            "reference_us": 330.36,
+            "candidate_us": 326.99,
+            "speedup": 1.0103061255695893,
+            "saved_us": 3.3700000000000045,
+            "latency_reduction_percent": 1.0200992856278068,
+            "p95_reduction_percent": 1.1987625676720848
+          },
+          {
+            "context": 8192,
+            "repeat": 0,
+            "reference": "ns33",
+            "arm": "ns66",
+            "reference_us": 334.77,
+            "candidate_us": 326.99,
+            "speedup": 1.0237927765375088,
+            "saved_us": 7.779999999999973,
+            "latency_reduction_percent": 2.3239836305523065,
+            "p95_reduction_percent": 3.2591600163103585
+          },
+          {
+            "context": 8192,
+            "repeat": 0,
+            "reference": "default",
+            "arm": "ns132",
+            "reference_us": 330.36,
+            "candidate_us": 332.03,
+            "speedup": 0.9949703340059635,
+            "saved_us": -1.669999999999959,
+            "latency_reduction_percent": -0.5055091415425483,
+            "p95_reduction_percent": -0.5740972098280617
+          },
+          {
+            "context": 8192,
+            "repeat": 0,
+            "reference": "ns33",
+            "arm": "ns132",
+            "reference_us": 334.77,
+            "candidate_us": 332.03,
+            "speedup": 1.0082522663614735,
+            "saved_us": 2.740000000000009,
+            "latency_reduction_percent": 0.8184723840248598,
+            "p95_reduction_percent": 1.5232713927884833
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "reference": "default",
+            "arm": "ns33",
+            "reference_us": 331.18,
+            "candidate_us": 334.68,
+            "speedup": 0.9895422493127763,
+            "saved_us": -3.5,
+            "latency_reduction_percent": -1.0568271030859444,
+            "p95_reduction_percent": -1.2709588877617861
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "reference": "default",
+            "arm": "ns66",
+            "reference_us": 331.18,
+            "candidate_us": 327.2,
+            "speedup": 1.012163814180929,
+            "saved_us": 3.980000000000018,
+            "latency_reduction_percent": 1.2017633915091586,
+            "p95_reduction_percent": 0.25956202637389403
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "reference": "ns33",
+            "arm": "ns66",
+            "reference_us": 334.68,
+            "candidate_us": 327.2,
+            "speedup": 1.0228606356968215,
+            "saved_us": 7.480000000000018,
+            "latency_reduction_percent": 2.2349707182980794,
+            "p95_reduction_percent": 1.5113127504124413
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "reference": "default",
+            "arm": "ns132",
+            "reference_us": 331.18,
+            "candidate_us": 334.1,
+            "speedup": 0.9912601017659383,
+            "saved_us": -2.920000000000016,
+            "latency_reduction_percent": -0.8816957545745518,
+            "p95_reduction_percent": -1.2769258308968245
+          },
+          {
+            "context": 8192,
+            "repeat": 1,
+            "reference": "ns33",
+            "arm": "ns132",
+            "reference_us": 334.68,
+            "candidate_us": 334.1,
+            "speedup": 1.001736007183478,
+            "saved_us": 0.5799999999999841,
+            "latency_reduction_percent": 0.17329986853112933,
+            "p95_reduction_percent": -0.005892057506473591
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "reference": "default",
+            "arm": "ns33",
+            "reference_us": 437.23,
+            "candidate_us": 410.28,
+            "speedup": 1.0656868480062398,
+            "saved_us": 26.950000000000045,
+            "latency_reduction_percent": 6.163803947579083,
+            "p95_reduction_percent": 5.143399981905372
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "reference": "default",
+            "arm": "ns66",
+            "reference_us": 437.23,
+            "candidate_us": 365.06,
+            "speedup": 1.1976935298307128,
+            "saved_us": 72.17000000000002,
+            "latency_reduction_percent": 16.50618667520527,
+            "p95_reduction_percent": 15.728761422238314
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "reference": "ns33",
+            "arm": "ns66",
+            "reference_us": 410.28,
+            "candidate_us": 365.06,
+            "speedup": 1.123870048759108,
+            "saved_us": 45.21999999999997,
+            "latency_reduction_percent": 11.021741249878126,
+            "p95_reduction_percent": 11.159330440173587
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "reference": "default",
+            "arm": "ns132",
+            "reference_us": 437.23,
+            "candidate_us": 357.52,
+            "speedup": 1.2229525620944284,
+            "saved_us": 79.71000000000004,
+            "latency_reduction_percent": 18.230679505065993,
+            "p95_reduction_percent": 17.721433095087313
+          },
+          {
+            "context": 32768,
+            "repeat": 0,
+            "reference": "ns33",
+            "arm": "ns132",
+            "reference_us": 410.28,
+            "candidate_us": 357.52,
+            "speedup": 1.1475721637950325,
+            "saved_us": 52.75999999999999,
+            "latency_reduction_percent": 12.859510578141753,
+            "p95_reduction_percent": 13.260050550813107
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "reference": "default",
+            "arm": "ns33",
+            "reference_us": 438.89,
+            "candidate_us": 408.67,
+            "speedup": 1.0739471945579562,
+            "saved_us": 30.21999999999997,
+            "latency_reduction_percent": 6.885552188475463,
+            "p95_reduction_percent": 7.215613968025547
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "reference": "default",
+            "arm": "ns66",
+            "reference_us": 438.89,
+            "candidate_us": 365.11,
+            "speedup": 1.2020760866588152,
+            "saved_us": 73.77999999999997,
+            "latency_reduction_percent": 16.810590352935805,
+            "p95_reduction_percent": 15.535268589930972
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "reference": "ns33",
+            "arm": "ns66",
+            "reference_us": 408.67,
+            "candidate_us": 365.11,
+            "speedup": 1.1193065103667388,
+            "saved_us": 43.56,
+            "latency_reduction_percent": 10.65896689260284,
+            "p95_reduction_percent": 8.966653741760378
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "reference": "default",
+            "arm": "ns132",
+            "reference_us": 438.89,
+            "candidate_us": 355.97,
+            "speedup": 1.2329409781723177,
+            "saved_us": 82.91999999999996,
+            "latency_reduction_percent": 18.893116726286763,
+            "p95_reduction_percent": 17.79956378027118
+          },
+          {
+            "context": 32768,
+            "repeat": 1,
+            "reference": "ns33",
+            "arm": "ns132",
+            "reference_us": 408.67,
+            "candidate_us": 355.97,
+            "speedup": 1.148046183667163,
+            "saved_us": 52.69999999999999,
+            "latency_reduction_percent": 12.895490248856046,
+            "p95_reduction_percent": 11.40703761147731
+          }
+        ],
+        "clocks": [
+          {
+            "job": "e1-tf32-ns-block-ctx8192-default-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:16",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:17",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:18",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:19",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": []
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx8192-ns33-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:21",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:22",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:23",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:24",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:15:25",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx8192-ns66-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:25",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:26",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:27",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:28",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:15:29",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx8192-ns132-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:30",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:31",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:32",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:33",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:15:34",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx8192-ns132-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:34",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:35",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:36",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:37",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": []
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx8192-ns66-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:39",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:40",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:41",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:42",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:15:43",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx8192-ns33-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:43",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:44",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:45",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:46",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:15:47",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx8192-default-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:48",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:49",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:50",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:51",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": []
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx32768-default-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:52",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:53",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:54",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:55",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:56",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:15:57",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:15:58",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx32768-ns33-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:15:59",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:00",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:01",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:02",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:03",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:04",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:16:05",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx32768-ns66-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:16:05",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:07",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:08",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:09",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:10",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:11",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:16:12",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx32768-ns132-r0",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:16:12",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:13",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:14",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:15",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:16",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:17",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:16:18",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx32768-ns132-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:16:19",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:20",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:21",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:22",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:23",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:24",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:16:25",
+                "0"
+              ]
+            ]
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx32768-ns66-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:16:25",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:26",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:27",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:28",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:29",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:30",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": []
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx32768-ns33-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:16:32",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:33",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:34",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:35",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:36",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:37",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": []
+          },
+          {
+            "job": "e1-tf32-ns-block-ctx32768-default-r1",
+            "samples": [
+              {
+                "date": "20260906",
+                "time": "08:16:38",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:39",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:40",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:41",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:42",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              },
+              {
+                "date": "20260906",
+                "time": "08:16:43",
+                "memory_mhz": 2619,
+                "sm_mhz": 1830
+              }
+            ],
+            "observed_clock_pairs": [
+              [
+                1830,
+                2619
+              ]
+            ],
+            "partial_final_monitor_line": [
+              [
+                "20260906",
+                "08:16:44",
+                "0"
+              ]
+            ]
+          }
+        ],
+        "pending_jobs": [],
+        "failed_jobs": [],
+        "process_orders": [
+          [
+            "default",
+            "ns33",
+            "ns66",
+            "ns132"
+          ],
+          [
+            "ns132",
+            "ns66",
+            "ns33",
+            "default"
+          ]
+        ],
+        "scope": "Actual native Gemma12 block5, one active slot, same checkpoint, current scalar baseline vs TF32 compilerNS33/66/132,40iterations5warmup256MiB per-step entryeviction, median/p95 only. NoPF/wholemodel/serving/vLLM claim",
+        "original_no_gpu_failure": "/tmp/plow-model-support-checks/e1-tf32-ns-timing-window-20260906/results.json"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/analysis/FREEZE.json": {
+      "sha256": "2c8a95b75ea207faa35486954f7368038d5599e6ed60a19a6c62db419ca418f7",
+      "content": {
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/gpu-queue-held.json": "42c0d02ed8a7a763ad10efddf18abdfa3bccb7385098b1e853e41b37e8bb5822",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/FREEZE.json": "44ca5c6742453ee4a2090dad78acfbb385404aacf5cb1a9082c338c8b9d2a442",
+        "/tmp/plow-model-support-checks/e1-tf32-ns-timing-window-v2-20260906/queue.json": "958c4185595a2f0daaef415d83953780a5cf3c3688b40c912f4e165caec12413",
+        "/tmp/plow-model-support-checks/e1-tf32-ns-timing-window-v2-20260906/results.json": "85b6b2493954e0de09f0c97cd755b3fa63bac4f584eeea36aca11b558ffe006b",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r0.log": "2b206f8ee6692cd10d604975c1733ccc9449710c63be2b65d074f9e8d4e6929b",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r0/sweep.json": "d505f0c6a64c5d270bdd35d7750a23d76345d91c927772b602361c69cd632fb8",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r0/validation.json": "627027fc1fdb220dd7cc978077054551db086eb7a1e10fadac4d0e51e3adfc39",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx8192-default-r0-dmon.log": "8c1104fb4ced2489ed5f9d901c569e7de559fd7949493209d1c8225d528aafda",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r0.log": "7750ffde73b16ad37ec142b470638c5a621629439f3a80f6fc7e697977cdaa52",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r0/sweep.json": "c9556cd9dc1e64c86332a6d779fcc67182a3232a39d77b03092180793e3e92e0",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r0/validation.json": "efa9911637f9810b5fa6c47254402ff77fa19a0793e98fcb71bd114e510972fe",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx8192-ns33-r0-dmon.log": "5b2237f63bd95f78dbf5d860991e708e8cfb2d62ec456b5359c3a989ec589e5f",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r0.log": "d5667d478b0b9d817d7eb371851fa5b1cbf894130618aef50849b4b3c6c105a2",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r0/sweep.json": "e6a32721ea8d046784c732d022879195f9737f0902e3f904236028cde18074ca",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r0/validation.json": "c8f9c0c58d07fe07a3a4d597cee7fa00c9d23fc5ea688f6e1ef3b850b9a493ea",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx8192-ns66-r0-dmon.log": "00e43c7f312f2f26480c881ca0c6e509fdcb78b55db62b494e4040ad4e82b4c9",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r0.log": "0dfba32178eb0c1c8f039c4ccfeb9eadd4f6d2cb56685cc2d01b824fc90f7bf1",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r0/sweep.json": "ac11d85e835707957267cafc2696dd840518d901fcf20f99e73bc66920ca8235",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r0/validation.json": "3dc70127c1b1d8f796499bdd81e1e02c984765237d4fe847bd42ebc0f56296d4",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx8192-ns132-r0-dmon.log": "4f7cd77aab6a460f40181cd33a4aa69eb999be6ccfebf666e9176dffffd21455",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r1.log": "4253cafc8376149f87194c6abb5eb96bfeb5391494c7110ef42e00ff392a7880",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r1/sweep.json": "2320460a95252e0cfe13d1d344ec069d3275f2f079b6d655b34161d00785f4e8",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r1/validation.json": "23c027980299e4383b586127737c6ab124f34c1abbccb9d80fe56bfead6aa5e2",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx8192-ns132-r1-dmon.log": "62dfef7dcea2669bd971427012cea997433dcd4a1ba4292a7c32eaed305d8321",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r1.log": "aaadf3c7fdf60499b064817faf491cdf3603adf4003a9b2d702d985975e1653d",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r1/sweep.json": "df0fe5343d00932f51acf096e5d2b2fac0811ea56b6fee5d927d336b1cd11ab5",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r1/validation.json": "955bcb60ac07de0d67dde8d5d54696ce8d0884eae064f4fa47501ddcc8ed3744",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx8192-ns66-r1-dmon.log": "6d609415a31f5f9d846cdfd96b643bc2aa21b12fdca942009b72890ab0545a0e",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r1.log": "8a5c5b446d47c5d9746a13f70c430837d9a02e99c4cd375f4bb128d1fe044fa3",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r1/sweep.json": "bfbae3173e5b61ad2bae3886763ac0d7c97aad55c0023ebc2ec952b9c5abb89c",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r1/validation.json": "30b22b32a5fed1f2d7937863d306c9b92452b4d1a57b3d91a08d25ef0553abe2",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx8192-ns33-r1-dmon.log": "9d2b9341795d6dd9f07d8212b3f543b1a8ac268eaf84d2e9d07d4422c08e94bb",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r1.log": "7bc8cfdfd5eee6a46a3e8619849fd2c212f0d2dba63d3dd78ef3ccd18846b131",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r1/sweep.json": "05b60f2e57594f3acbe0eaebf8dc7aad9980f54b54921c37bcfc950bb5115c6f",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r1/validation.json": "986d7d99e3ee1e82dba20143b853e14414f03ae4edea2385949ec5fcb6db5fa0",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx8192-default-r1-dmon.log": "248eaedc7e07ce7fe19dd93dced04ba7de78be17cd2bccda1d873b9a07926243",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r0.log": "0cf81cd7da3ddebb764068f0f8d0d4244677fcea8d6ad2cefee4cc28cbcc4f83",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r0/sweep.json": "51a0f4255f4c93fae7beb525bfdf86b70f47222bd2424c56606270e96a809cbf",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r0/validation.json": "3ea1107aacab3a53050666c05e47967eda1f097ee309b2d4ba7c43a10aa5d151",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx32768-default-r0-dmon.log": "e696b4dcece3f55fd6285b03e400dcbbc5b3568c434e8967fde063a1a21fc18a",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r0.log": "be28c1c745fa55341f4990dc87ff2c164a9b65387c92a39b944f8249f800b394",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r0/sweep.json": "52fb555440a64823ddb1bd89c6feb798d3ccebb6804f6f1008a0aede36fbf348",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r0/validation.json": "38d9ddb1a7b6ce105d5d91a041510c8827c3b05c1f70c55bd84a5d0ff5bae39c",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx32768-ns33-r0-dmon.log": "7db53775ccbe567bdaaba3e8b237f1e3349d92b3113840bf87740e6ad91cde04",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r0.log": "17793e98350d0d385c73309866fed6947e4215c6ab24b14807a74a4377fafedc",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r0/sweep.json": "9d0f716f32c5954f5ded944b76128269dd6b2d434d5950ae47ba99c05401f48b",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r0/validation.json": "15fbe19895eeaded287bb8015c74127bdca9cd4a7b1d2ca8b0a6f11d53d61c83",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx32768-ns66-r0-dmon.log": "6576747cb956045cd47ada3d4058cb5fdafbe0c9ea107636404837ed87304f0a",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r0.log": "1d5c0877035342139e3b71d091e312f2db2ad85f75f36fdd6b9af94b766ffd01",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r0/sweep.json": "a9f4e8c091e74aa5ec73d1e468c7d26dbbe794322650e6f87bcb07e987a8153c",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r0/validation.json": "e05851624048f54213292c6d9c798a05f2442545a051acdbc4d33682105dda92",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx32768-ns132-r0-dmon.log": "29ca63f7b052b6390379cb8d9a9f1ed22e18dcaa3e356f6c1219b7ce0b9a6f88",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r1.log": "99c72252256c13d1983e5ee0a7b84dff5c30f335849b9a845ade81505de4664c",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r1/sweep.json": "dd48ee756ddb2231c81762986c0e9ad3a59ca25a71af8261efe44cc6d7688b12",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r1/validation.json": "60f8e951882c9f3a3307423df9a23973e5c588ad85cbdb6812e8965a80d5ec83",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx32768-ns132-r1-dmon.log": "d0df851ce4c54ef8780d77ee9fece7cac4cd63560fc8a8641227a0d851d23da0",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r1.log": "8c4b83b15136b42189ec39c8e3a11f6627e82349ffee551b54e1ccb69c6521ca",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r1/sweep.json": "51996ab12e0a9a9372d459eaeabc4cbe5dbbb2908a1f6f4e0bce1e533c307ad1",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r1/validation.json": "2b84a28d226de36b4311305bcbb84cd48c5e7ec33d7b81bc829a2c6518069b04",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx32768-ns66-r1-dmon.log": "b69aad7cfffc71eb851bace2a3da8dcd61c0feb934da3bf5ce673c3635cdde4a",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r1.log": "b8e00c1dc84e3f061c82a08fe011237a1016182421924e7ea9644c6e4a542a56",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r1/sweep.json": "72ee2bc839cba578b00fe5ed01ce3c36827217b4be79192d8de99e5410847c1c",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r1/validation.json": "56db02d32049708ab35bf72e15f881470177e5f7ee96050a1d5b3ca72edbfc04",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx32768-ns33-r1-dmon.log": "8ce7af8fd2c090ed1a17c1983f67974118fc108d0af6c2ed10a3364574fa6bcf",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r1.log": "03110007c47fb1f3c59e480fbf31b4bc8e41f4618a256ad4c6c3da08a9597e82",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r1/sweep.json": "de03dfaf419334f23eab9c73eab0e8d8774db6b98ac91c133c84c36052d2da07",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r1/validation.json": "58bf6c17345e24e0e39760a0e3366d624a11dbe6a6398819018d2382252a3332",
+        "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseB/logs/e1-tf32-ns-block-ctx32768-default-r1-dmon.log": "ec7a87b35e86aa3774b4ce1ac617a004ac74d5485d825c78b1206c3021aff3b4",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/analysis/analyze.py": "26d6b62f5a4cde34208f9af917cd56916da268977e3ba7229478bdc516806a8f",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/analysis/RESULTS.json": "cd57453aae8565d5821740375f330af30be2fbaaa3abe15bd4396d5deb0a8f3e",
+        "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/analysis/RESULTS.md": "70f049042aec598daa38ce2525aa92c02db58962a1aab10d9687b138433d8d1c",
+        "/tmp/plow-model-support-checks/e1-tf32-ns-timing-window-20260906/results.json": "c50504d5f4a1cdd356e6019a5047cb9f70ef25716a4c20c09a0f433a8ce566e4"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/analysis/CONTEXT-SELECTOR.json": {
+      "sha256": "67b825c22a9244f969c74467bcfc393e13c9abb850efac82559e8c9399d28101",
+      "content": {
+        "scope": "Compiler design consequence only; no default or production TuneDB record",
+        "observations": {
+          "8192_B1": "NS66 gives only1.02\u20131.20% gain vs actual scalar; keep as marginal candidate, not a broad policy. NS132 loses.",
+          "32768_B1": "NS132 repeatably gives18.23\u201318.89% whole-block latency reduction; advance bounded intermediate-context/batch validation.",
+          "1024_B1": "Only NS33 measured and regresses5%; preserve scalar. NS66/132 unmeasured here."
+        },
+        "dimensions": [
+          "H100 SXM5 target fingerprint",
+          "BF16 Q/K/V",
+          "HD512",
+          "query heads16/KVheads1/GQA16",
+          "active batch",
+          "context bucket",
+          "compiled body identity and arena/register/warp budget",
+          "paired packet decodeNS and mergeNS/capacity"
+        ],
+        "requirements": [
+          "Select a complete compiled packet/role variant; do not switch NS without its matching merge/scratch metadata.",
+          "Existing absolute fullNS emit knob applies allrungs; observedB1 optimum is not an allbatch choice.",
+          "Numeric host uses widest16 with one active slot; record active and compiledrung separately.",
+          "Keep scalar variant for unmeasured/short contexts and otherGQA shapes until their gates.",
+          "Threshold between8K and32K is unknown; next bounded4K/16K checks locate crossover."
+        ],
+        "work_grid": {
+          "B1_NS33": 33,
+          "B1_NS66": 66,
+          "B1_NS132": 132,
+          "B4_NS33": 132,
+          "B16_NS33": 528
+        },
+        "note": "At8K+1..3 NS132 has131 nonempty tasks because ceilpartition leaves one empty. B4/B16 alreadyfill132SMs atNS33; first batched test should keepNS33 rather than transplantB1 splits."
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/analysis/DECISION.md": {
+      "sha256": "de6f0197b75065582b4fd40820f5a9a781b481e866cdbdddff63737d5799e160",
+      "content": "# Four-arm native NS sweep decision\n\n-32K/B1 NS132 wins18.23\u201318.89% vs scalar; p95 improves17.72\u201317.80%. NS66 wins16.51\u201316.81%.\n-8K/B1 NS66 gives1.02\u20131.20% median gain; p95.26\u20131.20%. Marginal, not a large gain. NS132 regresses.\n-The earlierNS33 candidate loses at1K and8K; no universal TF32/NS132 default.\n\nUse complete compiler packet/role variants keyed by shape, activebatch, context and target resource budget. ExistingNSabsolute override is not a runtimecontextselector and currently affectsallrungs. Preserve fallback outside measured scopes; context boundary remains unmeasured. B4 has132tasks withNS33 andB16has528, so testbatched arithmetic atNS33 before increasing splits.\n\nNo serving, wholemodel or vLLM claim. Raw medians/p95 and exact failedfirst-window record are retained inRESULTS.json/FREEZE.json.\n"
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/directory-repair.json": {
+      "sha256": "3a44f12932cc9191250c27d5ee3d1e8ae37ff8afcc118ec8511162593c41c802",
+      "content": {
+        "action": "Created missing results directory only",
+        "path": "/tmp/plow-model-support-checks/e1-tf32-compiler-ns-audit-20260906/timing/results",
+        "failure": "Root driver could not open preflight.log before command execution",
+        "gpu_jobs_executed": 0,
+        "original_results": "/tmp/plow-model-support-checks/e1-tf32-ns-timing-window-20260906/results.json",
+        "frozen_queue_changed": false
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r0/sweep.json": {
+      "sha256": "d505f0c6a64c5d270bdd35d7750a23d76345d91c927772b602361c69cd632fb8",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 330.36,
+            "latency_us_p95": 336.18,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 95.668,
+            "prefill_ms_p95": 95.668,
+            "prefill_tok_s": 85629.6,
+            "tok_s": 3027.0
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r0/validation.json": {
+      "sha256": "627027fc1fdb220dd7cc978077054551db086eb7a1e10fadac4d0e51e3adfc39",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 8192,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 330.36,
+          "latency_us_p95": 336.18,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 95.668,
+          "prefill_ms_p95": 95.668,
+          "prefill_tok_s": 85629.6,
+          "tok_s": 3027.0
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r0/sweep.json": {
+      "sha256": "c9556cd9dc1e64c86332a6d779fcc67182a3232a39d77b03092180793e3e92e0",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 334.77,
+            "latency_us_p95": 343.34,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 96.149,
+            "prefill_ms_p95": 96.149,
+            "prefill_tok_s": 85201.5,
+            "tok_s": 2987.1
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r0/validation.json": {
+      "sha256": "efa9911637f9810b5fa6c47254402ff77fa19a0793e98fcb71bd114e510972fe",
+      "content": {
+        "passed": true,
+        "arm": "ns33",
+        "context": 8192,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 334.77,
+          "latency_us_p95": 343.34,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 96.149,
+          "prefill_ms_p95": 96.149,
+          "prefill_tok_s": 85201.5,
+          "tok_s": 2987.1
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r0/sweep.json": {
+      "sha256": "e6a32721ea8d046784c732d022879195f9737f0902e3f904236028cde18074ca",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 326.99,
+            "latency_us_p95": 332.15,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 95.414,
+            "prefill_ms_p95": 95.414,
+            "prefill_tok_s": 85857.3,
+            "tok_s": 3058.2
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r0/validation.json": {
+      "sha256": "c8f9c0c58d07fe07a3a4d597cee7fa00c9d23fc5ea688f6e1ef3b850b9a493ea",
+      "content": {
+        "passed": true,
+        "arm": "ns66",
+        "context": 8192,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 326.99,
+          "latency_us_p95": 332.15,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 95.414,
+          "prefill_ms_p95": 95.414,
+          "prefill_tok_s": 85857.3,
+          "tok_s": 3058.2
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r0/sweep.json": {
+      "sha256": "ac11d85e835707957267cafc2696dd840518d901fcf20f99e73bc66920ca8235",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 332.03,
+            "latency_us_p95": 338.11,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 96.052,
+            "prefill_ms_p95": 96.052,
+            "prefill_tok_s": 85287.5,
+            "tok_s": 3011.8
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r0/validation.json": {
+      "sha256": "3dc70127c1b1d8f796499bdd81e1e02c984765237d4fe847bd42ebc0f56296d4",
+      "content": {
+        "passed": true,
+        "arm": "ns132",
+        "context": 8192,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 332.03,
+          "latency_us_p95": 338.11,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 96.052,
+          "prefill_ms_p95": 96.052,
+          "prefill_tok_s": 85287.5,
+          "tok_s": 3011.8
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r1/sweep.json": {
+      "sha256": "2320460a95252e0cfe13d1d344ec069d3275f2f079b6d655b34161d00785f4e8",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 334.1,
+            "latency_us_p95": 339.46,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 96.201,
+            "prefill_ms_p95": 96.201,
+            "prefill_tok_s": 85154.7,
+            "tok_s": 2993.1
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns132-r1/validation.json": {
+      "sha256": "23c027980299e4383b586127737c6ab124f34c1abbccb9d80fe56bfead6aa5e2",
+      "content": {
+        "passed": true,
+        "arm": "ns132",
+        "context": 8192,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 334.1,
+          "latency_us_p95": 339.46,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 96.201,
+          "prefill_ms_p95": 96.201,
+          "prefill_tok_s": 85154.7,
+          "tok_s": 2993.1
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r1/sweep.json": {
+      "sha256": "df0fe5343d00932f51acf096e5d2b2fac0811ea56b6fee5d927d336b1cd11ab5",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 327.2,
+            "latency_us_p95": 334.31,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 95.262,
+            "prefill_ms_p95": 95.262,
+            "prefill_tok_s": 85994.3,
+            "tok_s": 3056.3
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns66-r1/validation.json": {
+      "sha256": "955bcb60ac07de0d67dde8d5d54696ce8d0884eae064f4fa47501ddcc8ed3744",
+      "content": {
+        "passed": true,
+        "arm": "ns66",
+        "context": 8192,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 327.2,
+          "latency_us_p95": 334.31,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 95.262,
+          "prefill_ms_p95": 95.262,
+          "prefill_tok_s": 85994.3,
+          "tok_s": 3056.3
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r1/sweep.json": {
+      "sha256": "bfbae3173e5b61ad2bae3886763ac0d7c97aad55c0023ebc2ec952b9c5abb89c",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 334.68,
+            "latency_us_p95": 339.44,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 96.494,
+            "prefill_ms_p95": 96.494,
+            "prefill_tok_s": 84896.4,
+            "tok_s": 2988.0
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-ns33-r1/validation.json": {
+      "sha256": "30b22b32a5fed1f2d7937863d306c9b92452b4d1a57b3d91a08d25ef0553abe2",
+      "content": {
+        "passed": true,
+        "arm": "ns33",
+        "context": 8192,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 334.68,
+          "latency_us_p95": 339.44,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 96.494,
+          "prefill_ms_p95": 96.494,
+          "prefill_tok_s": 84896.4,
+          "tok_s": 2988.0
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r1/sweep.json": {
+      "sha256": "05b60f2e57594f3acbe0eaebf8dc7aad9980f54b54921c37bcfc950bb5115c6f",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 8192,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 331.18,
+            "latency_us_p95": 335.18,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 95.566,
+            "prefill_ms_p95": 95.566,
+            "prefill_tok_s": 85721.2,
+            "tok_s": 3019.5
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx8192-default-r1/validation.json": {
+      "sha256": "986d7d99e3ee1e82dba20143b853e14414f03ae4edea2385949ec5fcb6db5fa0",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 8192,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 8192,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 331.18,
+          "latency_us_p95": 335.18,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 95.566,
+          "prefill_ms_p95": 95.566,
+          "prefill_tok_s": 85721.2,
+          "tok_s": 3019.5
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r0/sweep.json": {
+      "sha256": "51a0f4255f4c93fae7beb525bfdf86b70f47222bd2424c56606270e96a809cbf",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 437.23,
+            "latency_us_p95": 442.12,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 704.827,
+            "prefill_ms_p95": 704.827,
+            "prefill_tok_s": 46490.9,
+            "tok_s": 2287.1
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r0/validation.json": {
+      "sha256": "3ea1107aacab3a53050666c05e47967eda1f097ee309b2d4ba7c43a10aa5d151",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 32768,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 437.23,
+          "latency_us_p95": 442.12,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 704.827,
+          "prefill_ms_p95": 704.827,
+          "prefill_tok_s": 46490.9,
+          "tok_s": 2287.1
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r0/sweep.json": {
+      "sha256": "52fb555440a64823ddb1bd89c6feb798d3ccebb6804f6f1008a0aede36fbf348",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 410.28,
+            "latency_us_p95": 419.38,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 706.111,
+            "prefill_ms_p95": 706.111,
+            "prefill_tok_s": 46406.3,
+            "tok_s": 2437.4
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r0/validation.json": {
+      "sha256": "38d9ddb1a7b6ce105d5d91a041510c8827c3b05c1f70c55bd84a5d0ff5bae39c",
+      "content": {
+        "passed": true,
+        "arm": "ns33",
+        "context": 32768,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 410.28,
+          "latency_us_p95": 419.38,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 706.111,
+          "prefill_ms_p95": 706.111,
+          "prefill_tok_s": 46406.3,
+          "tok_s": 2437.4
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r0/sweep.json": {
+      "sha256": "9d0f716f32c5954f5ded944b76128269dd6b2d434d5950ae47ba99c05401f48b",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 365.06,
+            "latency_us_p95": 372.58,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 704.256,
+            "prefill_ms_p95": 704.256,
+            "prefill_tok_s": 46528.5,
+            "tok_s": 2739.3
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r0/validation.json": {
+      "sha256": "15fbe19895eeaded287bb8015c74127bdca9cd4a7b1d2ca8b0a6f11d53d61c83",
+      "content": {
+        "passed": true,
+        "arm": "ns66",
+        "context": 32768,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 365.06,
+          "latency_us_p95": 372.58,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 704.256,
+          "prefill_ms_p95": 704.256,
+          "prefill_tok_s": 46528.5,
+          "tok_s": 2739.3
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r0/sweep.json": {
+      "sha256": "a9f4e8c091e74aa5ec73d1e468c7d26dbbe794322650e6f87bcb07e987a8153c",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 357.52,
+            "latency_us_p95": 363.77,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 704.132,
+            "prefill_ms_p95": 704.132,
+            "prefill_tok_s": 46536.7,
+            "tok_s": 2797.1
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r0/validation.json": {
+      "sha256": "e05851624048f54213292c6d9c798a05f2442545a051acdbc4d33682105dda92",
+      "content": {
+        "passed": true,
+        "arm": "ns132",
+        "context": 32768,
+        "repeat": 0,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 357.52,
+          "latency_us_p95": 363.77,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 704.132,
+          "prefill_ms_p95": 704.132,
+          "prefill_tok_s": 46536.7,
+          "tok_s": 2797.1
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r1/sweep.json": {
+      "sha256": "dd48ee756ddb2231c81762986c0e9ad3a59ca25a71af8261efe44cc6d7688b12",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 355.97,
+            "latency_us_p95": 365.57,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 705.102,
+            "prefill_ms_p95": 705.102,
+            "prefill_tok_s": 46472.7,
+            "tok_s": 2809.2
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns132-r1/validation.json": {
+      "sha256": "60f8e951882c9f3a3307423df9a23973e5c588ad85cbdb6812e8965a80d5ec83",
+      "content": {
+        "passed": true,
+        "arm": "ns132",
+        "context": 32768,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 355.97,
+          "latency_us_p95": 365.57,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 705.102,
+          "prefill_ms_p95": 705.102,
+          "prefill_tok_s": 46472.7,
+          "tok_s": 2809.2
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r1/sweep.json": {
+      "sha256": "51996ab12e0a9a9372d459eaeabc4cbe5dbbb2908a1f6f4e0bce1e533c307ad1",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 365.11,
+            "latency_us_p95": 375.64,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 705.336,
+            "prefill_ms_p95": 705.336,
+            "prefill_tok_s": 46457.3,
+            "tok_s": 2738.9
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns66-r1/validation.json": {
+      "sha256": "2b84a28d226de36b4311305bcbb84cd48c5e7ec33d7b81bc829a2c6518069b04",
+      "content": {
+        "passed": true,
+        "arm": "ns66",
+        "context": 32768,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 365.11,
+          "latency_us_p95": 375.64,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 705.336,
+          "prefill_ms_p95": 705.336,
+          "prefill_tok_s": 46457.3,
+          "tok_s": 2738.9
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r1/sweep.json": {
+      "sha256": "72ee2bc839cba578b00fe5ed01ce3c36827217b4be79192d8de99e5410847c1c",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 408.67,
+            "latency_us_p95": 412.64,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 704.691,
+            "prefill_ms_p95": 704.691,
+            "prefill_tok_s": 46499.8,
+            "tok_s": 2447.0
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-ns33-r1/validation.json": {
+      "sha256": "56db02d32049708ab35bf72e15f881470177e5f7ee96050a1d5b3ca72edbfc04",
+      "content": {
+        "passed": true,
+        "arm": "ns33",
+        "context": 32768,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 408.67,
+          "latency_us_p95": 412.64,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 704.691,
+          "prefill_ms_p95": 704.691,
+          "prefill_tok_s": 46499.8,
+          "tok_s": 2447.0
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r1/sweep.json": {
+      "sha256": "de03dfaf419334f23eab9c73eab0e8d8774db6b98ac91c133c84c36052d2da07",
+      "content": {
+        "sweep": [
+          {
+            "batch": 1,
+            "ctx": 32768,
+            "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+            "decode_evict_bytes": 268435456,
+            "decode_eviction_before_timer": true,
+            "decode_iterations": 40,
+            "decode_warmup": 5,
+            "latency_us_median": 438.89,
+            "latency_us_p95": 444.73,
+            "prefill_explicit_eviction": false,
+            "prefill_ms_median": 704.896,
+            "prefill_ms_p95": 704.896,
+            "prefill_tok_s": 46486.3,
+            "tok_s": 2278.5
+          }
+        ]
+      }
+    },
+    "e1-tf32-compiler-ns-audit-20260906/timing/results/e1-tf32-ns-block-ctx32768-default-r1/validation.json": {
+      "sha256": "58bf6c17345e24e0e39760a0e3366d624a11dbe6a6398819018d2382252a3332",
+      "content": {
+        "passed": true,
+        "arm": "default",
+        "context": 32768,
+        "repeat": 1,
+        "row": {
+          "batch": 1,
+          "ctx": 32768,
+          "decode_cache_regime": "packet-entry write eviction; not per-op cold",
+          "decode_evict_bytes": 268435456,
+          "decode_eviction_before_timer": true,
+          "decode_iterations": 40,
+          "decode_warmup": 5,
+          "latency_us_median": 438.89,
+          "latency_us_p95": 444.73,
+          "prefill_explicit_eviction": false,
+          "prefill_ms_median": 704.896,
+          "prefill_ms_p95": 704.896,
+          "prefill_tok_s": 46486.3,
+          "tok_s": 2278.5
+        },
+        "scope": "Native block5B1,40measured/5warmup,256MiBpacket-entryeviction outsidewalltimer; existingharness storesmedian/p95only, no rawindividualdurations; noPF/serving claim"
+      }
+    }
+  }
+}
