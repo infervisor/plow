@@ -771,7 +771,15 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_NV_FA_ARENA                                                                     \
     (PLOW_NV_FA_ARENA1 > PLOW_NV_DSA_ARENA ? PLOW_NV_FA_ARENA1 : PLOW_NV_DSA_ARENA)
 #else
-#define PLOW_NV_FA_ARENA FA_DEC_SMEM_FLOATS(PLOW_NV_FA_HD, PLOW_NV_FA_GF)
+#define PLOW_NV_DEFAULT_FA_ARENA FA_DEC_SMEM_FLOATS(PLOW_NV_FA_HD, PLOW_NV_FA_GF)
+#if PLOW_HAS_FLASH_HD64
+#define PLOW_NV_HD64_FA_ARENA FA_DEC_SMEM_FLOATS(64, PLOW_PACKET_GQA)
+#define PLOW_NV_FA_ARENA                                                                    \
+    (PLOW_NV_DEFAULT_FA_ARENA > PLOW_NV_HD64_FA_ARENA ? PLOW_NV_DEFAULT_FA_ARENA            \
+                                                        : PLOW_NV_HD64_FA_ARENA)
+#else
+#define PLOW_NV_FA_ARENA PLOW_NV_DEFAULT_FA_ARENA
+#endif
 #endif
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_XCACHE && !PLOW_NV_PREFILL
 #if PLOW_NV_FP8_M1_TMA
@@ -1873,11 +1881,14 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u);              \
     } while (0)
-#if PLOW_NV_GEMMA
+#if PLOW_HAS_FLASH_HD64
         if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64) {
             if (gqa != PLOW_PACKET_GQA) { __trap(); break; }
             PLOW_NV_FLASH_DECODE(64, PLOW_PACKET_GQA);
-        } else if (in->i[6] == 128) {
+        } else
+#endif
+#if PLOW_NV_GEMMA
+        if (in->i[6] == 128) {
             if ((gqa % PLOW_NV_FA_GF) != 0) { __trap(); break; }
             PLOW_NV_FLASH_DECODE(128, PLOW_NV_FA_GF);
         } else if (in->i[6] == 256) {
@@ -1896,9 +1907,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             __trap();
         }
 #else
-        if ((gqa % PLOW_NV_FA_GF) != 0) { __trap(); break; }
-        if (in->i[6] != PLOW_NV_FA_HD) { __trap(); break; }
-        PLOW_NV_FLASH_DECODE(PLOW_NV_FA_HD, PLOW_NV_FA_GF);
+        if (in->i[6] == PLOW_NV_FA_HD) {
+            if ((gqa % PLOW_NV_FA_GF) != 0) { __trap(); break; }
+            PLOW_NV_FLASH_DECODE(PLOW_NV_FA_HD, PLOW_NV_FA_GF);
+        } else {
+            __trap();
+        }
 #endif
 #undef PLOW_NV_FLASH_DECODE
         break;
