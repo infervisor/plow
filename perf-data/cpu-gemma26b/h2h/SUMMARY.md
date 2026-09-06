@@ -32,3 +32,40 @@ Reading
   to 64 expert loads per step; llama.cpp batches the 8 rows through each expert once).
 * Fixes queued: MXFP4 experts (emitter arm landed in 0890fae; the 14 GB twin needs disk space), and
   expert-deduplicated batched MoE decode (sort the B·k slots by expert, one weight pass per expert).
+
+## MXFP4 experts + dense (commit pending, 11:5x) — plow vs llama.cpp
+
+plow: `plowc --mxfp4` on the 26B, experts through the flat MXFP4 ops 147-150 and dense projections through
+the MXFP4 GEMV, twin `/home/lava/models/gemma-4-26b-a4b-it-mxfp4` (13.0 GB, `quantize_mxfp4.py`, 3-D expert
+tensors flattened to `[E*N][K]`). Optimized kernels (commit c835609). Fresh prompts, one server at a time.
+Raw: `g26b-mx4-*.md`. TTFT / TPOT mean ms; bold = best of the three.
+
+| workload | conc | plow TTFT | Q8_0 TTFT | Q4_K_M TTFT | plow TPOT | Q8_0 TPOT | Q4_K_M TPOT |
+|---|---|---|---|---|---|---|---|
+| chat_short | 1 | **536** | 739 | 649 | **41** | 56 | 50 |
+| chat_short | 2 | **812** | 1351 | 1226 | **65** | 84 | 80 |
+| chat_short | 4 | **1300** | 2852 | 2508 | **103** | 115 | 107 |
+| chat_short | 8 | **2741** | 7024 | 6492 | 154 | 119 | **105** |
+| chat_long | 1 | **2537** | 4532 | 4187 | **42** | 56 | 52 |
+| chat_long | 2 | **3778** | 6252 | 7009 | **90** | 159 | 125 |
+| chat_long | 4 | **4552** | 13887 | 12936 | 158 | 126 | **119** |
+| chat_long | 8 | **11050** | 28262 | 29015 | 306 | 130 | **118** |
+| code | 1 | **2229** | 4221 | 3858 | **43** | 60 | 52 |
+| code | 2 | **3542** | 8636 | 7914 | **76** | 112 | 90 |
+| code | 4 | **5275** | 18089 | 16867 | 160 | 131 | **120** |
+| code | 8 | **10213** | 27944 | 26328 | 256 | 132 | **119** |
+| summarize | 1 | **6960** | 12084 | 11237 | **45** | 63 | 56 |
+| summarize | 2 | **8046** | 24992 | 23241 | 161 | **102** | 105 |
+| summarize | 4 | **13594** | 54272 | 50453 | 356 | 159 | **146** |
+| summarize | 8 | **29595** | 56278 | 48027 | 593 | 227 | **190** |
+
+Reading: with MXFP4 experts the 26B wins **every TTFT cell** (1.2-5.5x) and **every c=1 and c=2 decode cell**
+(41-45 ms vs 50-56 Q4_K_M and 56-63 Q8_0). bf16 could not do this: bf16 reads ~8 GB of active weights per token
+against a ~110 GB/s memory system, a 73 ms floor, and it measured 74 ms — exactly the roofline. MXFP4 cuts the
+active bytes to ~2.2 GB and lands at 37-45 ms. At c>=4 llama.cpp still wins decode: its TPOT barely grows with
+batch (105-130 ms at c=8) while ours goes 154-593, because a rung-8 step still pays prefill interleaving and our
+grouped expert pass has fewer rows per expert than its block-aligned one.
+
+Single-stream cpu_bench (batch 1, 16 threads): decode p50 37.2-39.5 ms, prefill 107.6 / 146.2 / 177.2 tok/s at
+64 / 128 / 512 prompt tokens. Chat answer: 'Paris' (HF reference: 'Paris'). Block-0 vs HF hidden states:
+mean|d| 0.0245 on mean|x| 0.426 (5.8%), against 0.6% for bf16 — ordinary 4-bit quantization noise.
