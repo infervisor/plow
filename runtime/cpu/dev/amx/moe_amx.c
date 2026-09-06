@@ -261,6 +261,33 @@ static inline uint32_t mxpf_blocks(size_t scratch, size_t wbuf_bytes, uint32_t n
     return (uint32_t)nb;
 }
 
+/* Work-weighted column ownership for the grouped prefill ops. Cost per column of expert e is the
+ * strip dequant (paid once per column now that it is hoisted) plus one tile pass per 32 rows, and
+ * an expert with no rows costs nothing at all. Splitting E*N columns evenly instead handed a slice
+ * that owns busy experts ~1.5x its neighbours' work (measured busy min 660 / max 990 ms over a
+ * 1652 ms prefill, 50% idle), and every dependent op boundary waits for the slowest slice. */
+#define MXPF_W_DEQ 7u
+#define MXPF_W_DOT 2u
+#define MXPF_MAX_E 1024u
+static void mxpf_prefix(const int32_t* meta, uint32_t E, uint32_t N, uint32_t* P) {
+    P[0] = 0;
+    for (uint32_t e = 0; e < E; e++) {
+        const uint32_t cnt = (uint32_t)meta[E + e];
+        const uint32_t w = cnt ? MXPF_W_DEQ + MXPF_W_DOT * ((cnt + 31u) / 32u) : 0u;
+        P[e + 1] = P[e] + w * N;
+    }
+}
+/* Columns [n0, n1) of expert e owned by the unit range [lo, hi). Boundaries are computed the same
+ * way from both sides of a cut, so ownership is a partition. */
+static int mxpf_cols(const uint32_t* P, uint32_t e, uint32_t N, uint32_t lo, uint32_t hi,
+                     uint32_t* n0, uint32_t* n1) {
+    if (P[e + 1] == P[e] || P[e + 1] <= lo || P[e] >= hi) return 0;
+    const uint32_t w = (P[e + 1] - P[e]) / N;
+    *n0 = ((lo > P[e] ? lo : P[e]) - P[e]) / w;
+    *n1 = ((hi < P[e + 1] ? hi : P[e + 1]) - P[e]) / w;
+    return *n0 < *n1;
+}
+
 /* 149: t0=fu_g t1=xn2 t2=W_gu t3=S_gu t4=meta t5=row_token t6=bias_gu?  i0=I i1=K i2=E i3=layout
  * i5=act f0/f1. layout 0: gate row 2n / up row 2n+1 (stride 2 rows); 1: gate n / up I+n. */
 X_K(x_moe_glu_mx_pf) {
@@ -294,11 +321,16 @@ X_K(x_moe_glu_mx_pf) {
     float u[32 * 32] __attribute__((aligned(64)));
     float of[32] __attribute__((aligned(64)));
     uint32_t lo, hi;
-    g_range(E * I, slice, nblk, &lo, &hi);
-    for (uint32_t idx = lo; idx < hi;) {
-        const uint32_t e = idx / I, n0 = idx - e * I;
-        const uint32_t n1 = n0 + (hi - idx) < I ? n0 + (hi - idx) : I;
-        idx += n1 - n0;
+    if (E > MXPF_MAX_E) {
+        g_moe_glu_mx_pf(in, slice, nblk, T, ctx);
+        return;
+    }
+    uint32_t P[MXPF_MAX_E + 1];
+    mxpf_prefix(meta, E, I, P);
+    g_range(P[E], slice, nblk, &lo, &hi);
+    for (uint32_t e = 0; e < E; e++) {
+        uint32_t n0, n1;
+        if (!mxpf_cols(P, e, I, lo, hi, &n0, &n1)) continue;
         const uint32_t r0 = (uint32_t)meta[e], rend = r0 + (uint32_t)meta[E + e];
         if (rend == r0) continue;
         const uint8_t* We = W + (size_t)e * N2 * ldw;
@@ -368,11 +400,16 @@ X_K(x_moe_down_mx_pf) {
     uint32_t rows[MXPF_ROW_MAX];
     float o[32 * 32] __attribute__((aligned(64)));
     uint32_t lo, hi;
-    g_range(E * H, slice, nblk, &lo, &hi);
-    for (uint32_t idx = lo; idx < hi;) {
-        const uint32_t e = idx / H, h0 = idx - e * H;
-        const uint32_t h1 = h0 + (hi - idx) < H ? h0 + (hi - idx) : H;
-        idx += h1 - h0;
+    if (E > MXPF_MAX_E) {
+        g_moe_down_mx_pf(in, slice, nblk, T, ctx);
+        return;
+    }
+    uint32_t P[MXPF_MAX_E + 1];
+    mxpf_prefix(meta, E, H, P);
+    g_range(P[E], slice, nblk, &lo, &hi);
+    for (uint32_t e = 0; e < E; e++) {
+        uint32_t h0, h1;
+        if (!mxpf_cols(P, e, H, lo, hi, &h0, &h1)) continue;
         const uint32_t r0 = (uint32_t)meta[e], rend = r0 + (uint32_t)meta[E + e];
         if (rend == r0) continue;
         const uint8_t* We = W + (size_t)e * H * ldw;
