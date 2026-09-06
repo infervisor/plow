@@ -111,6 +111,7 @@ fn plan(
     want: &tunedb::Digests,
     mut resources: impl FnMut(&DecodeObject) -> Result<(Option<u32>, u32)>,
 ) -> Result<(Selection, DecodeObjects)> {
+    let baseline_packet_sha256 = plow_asset::decode_objects::image_sha256(&model.to_blob());
     let mut selected = BTreeMap::new();
     let mut bindings = metadata.clone();
     for binding in &mut bindings.programs {
@@ -140,6 +141,7 @@ fn plan(
                     &cell,
                     &digest,
                     baseline,
+                    &baseline_packet_sha256,
                     Some(1),
                     record.candidate_object.arena_bytes,
                 )
@@ -153,6 +155,7 @@ fn plan(
                     &cell,
                     &digest,
                     baseline,
+                    &baseline_packet_sha256,
                     abi,
                     arena,
                 )

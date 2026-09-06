@@ -154,9 +154,16 @@ fn fixture() -> (DecodeObjects, ProjectionMeasurement) {
     };
     (metadata, record)
 }
+fn bind_packet(record: &mut ProjectionMeasurement, model: &Model) {
+    let digest = plow_asset::decode_objects::image_sha256(&model.to_blob());
+    for guard in &mut record.native_blocks {
+        guard.packet_sha256.clone_from(&digest);
+    }
+}
 #[test]
 fn missing_stale_failed_records_preserve_binding_resources_and_packet_bytes() {
-    let (metadata, r) = fixture();
+    let (metadata, mut r) = fixture();
+    bind_packet(&mut r, &model());
     for case in 0..6 {
         let mut m = model();
         let before = m.to_blob();
@@ -189,8 +196,9 @@ fn missing_stale_failed_records_preserve_binding_resources_and_packet_bytes() {
 }
 #[test]
 fn selected_rung_rebinds_only_after_qualification_and_conflicts_reject() {
-    let (metadata, r) = fixture();
+    let (metadata, mut r) = fixture();
     let mut m = model();
+    bind_packet(&mut r, &m);
     let (selected, bindings) = plan(
         &m,
         &metadata,
@@ -226,6 +234,8 @@ fn selected_rung_rebinds_only_after_qualification_and_conflicts_reject() {
     let mut inst = m.progs[2].insts[0].clone();
     inst.i[1] = 64;
     m.progs[2].insts.push(inst);
+    bind_packet(&mut r, &m);
+    bind_packet(&mut second, &m);
     assert!(plan(
         &m,
         &metadata,
@@ -282,8 +292,10 @@ fn measured_rewrite_preserves_b1_b2_and_canonical_graph() {
     }
 }
 #[test]
-fn gemma31_routes_all_ordinary_projections_at_measured_rungs() {
-    let (metadata, record) = fixture();
+fn packet_bound_gemma31_shapes_route_all_ordinary_projections() {
+    let (metadata, mut record) = fixture();
+    let mut m = gemma31_model();
+    bind_packet(&mut record, &m);
     let mut records = Vec::new();
     for rows in [4, 8, 16] {
         for (n, k, split) in [
@@ -300,7 +312,6 @@ fn gemma31_routes_all_ordinary_projections_at_measured_rungs() {
             records.push(measured);
         }
     }
-    let mut m = gemma31_model();
     let untouched: Vec<_> = m.progs[..2].iter().map(|p| p.to_blob()).collect();
     let (selected, bindings) = plan(&m, &metadata, &records, "test", &record.digests, |_| {
         Ok((Some(1), 82944))
@@ -344,6 +355,25 @@ fn gemma31_routes_all_ordinary_projections_at_measured_rungs() {
             );
         }
     }
+}
+#[test]
+fn same_shape_record_from_another_packet_is_rejected() {
+    let (metadata, mut record) = fixture();
+    let measured = model();
+    bind_packet(&mut record, &measured);
+    let mut unrelated = model();
+    unrelated.tensors[0].bytes += 2;
+    let (selected, bindings) = plan(
+        &unrelated,
+        &metadata,
+        std::slice::from_ref(&record),
+        "test",
+        &record.digests,
+        |_| panic!("a packet-mismatched record must not load its candidate"),
+    )
+    .unwrap();
+    assert!(selected.is_empty());
+    assert_eq!(bindings, metadata);
 }
 #[test]
 fn unsupported_selection_rejected() {
