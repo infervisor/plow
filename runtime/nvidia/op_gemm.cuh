@@ -2768,6 +2768,7 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
     });
 }
 
+#if PLOW_NV_MXFP4_PROJ || PLOW_NV_MXFP4_MOE
 /* OCP MXFP4 weight-only GEMV. Hopper has no FP4 tensor-core operand, so decode expands one
  * 32-element microscale block in registers and keeps the activation in bf16. The reduction and
  * scaling order mirrors the packet's CPU reference: f32 dot within each 32-element block, then
@@ -2846,6 +2847,7 @@ static __device__ void d_gemv_mxfp4(
                                          W, S, bias, rows, N, K, slice, nblk);
     });
 }
+#endif
 
 /* Arena-aware overload: persistent interpreter stages x into smem. */
 static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ x,

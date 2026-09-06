@@ -91,6 +91,23 @@ extern "C" __device__ unsigned plow_mixed_interpreter
 #ifndef PLOW_HAS_MOE_EXPERT_GLU_GEMMA
 #define PLOW_HAS_MOE_EXPERT_GLU_GEMMA 1
 #endif
+
+/* Flat MXFP4 projections and experts are compiled only into a packet-specialized object. The
+ * general serving objects predate these opcodes; keeping the bodies out preserves their register
+ * and instruction-cache profile. `plow_config.h` derives every term from the selected object's
+ * opcode inventory and stamps the packet digest into the cubin. */
+#ifdef PLOW_CONFIG
+#define PLOW_NV_MXFP4_PROJ PLOW_HAS_GEMV_MXFP4
+#define PLOW_NV_MXFP4_MOE                                                                  \
+    (PLOW_HAS_MOE_GLU_MX || PLOW_HAS_MOE_DOWN_MX || PLOW_HAS_MOE_GLU_MX_PF ||              \
+     PLOW_HAS_MOE_DOWN_MX_PF)
+#define PLOW_NV_MOE_COMMON                                                                 \
+    (PLOW_HAS_MOE_ROUTER_TOPK_PF || PLOW_HAS_MOE_ALIGN_PF || PLOW_HAS_MOE_COMBINE_PF)
+#else
+#define PLOW_NV_MXFP4_PROJ 0
+#define PLOW_NV_MXFP4_MOE 0
+#define PLOW_NV_MOE_COMMON 0
+#endif
 /* The Gemma decode MoE family is all-or-nothing per model: a dense checkpoint emits none of
  * the router/expert/combine ops, a sparse one emits the whole family. Deriving the block gate
  * from two members rather than adding a fourteenth macro keeps the header honest — every
@@ -1706,11 +1723,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                    in->i[3], in->i[4], in->i[2], slice, nblk, (__nv_bfloat16*)arena);
         break;
 
+#if PLOW_NV_MXFP4_PROJ
     case PLOW_DOP_GEMV_MXFP4:
         d_gemv_mxfp4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                       (const uint8_t*)TEN(2), (const uint8_t*)TEN(3),
                       (const __nv_bfloat16*)TEN(7), in->i[0], in->i[1], in->i[2], slice, nblk);
         break;
+#endif
 
     case PLOW_DOP_GEMV_GLU:
         d_gemv_glu((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
@@ -1954,6 +1973,67 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif /* !PLOW_NV_PREFILL || PLOW_MIXED_STEP */
 
 #if !PLOW_NV_GEMM_ONLY
+#if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ROUTER_TOPK_PF
+    case PLOW_DOP_MOE_ROUTER_TOPK_PF:
+        if (TEN(2) || in->i[0] || in->i[6] > 1u || in->i[7]) { __trap(); break; }
+        d_moe_router_topk_pf_nv((unsigned char*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                                (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr,
+                                in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[4], slice,
+                                nblk, (float*)arena);
+        break;
+#endif
+#if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ALIGN_PF
+    case PLOW_DOP_MOE_ALIGN_PF:
+        if (in->i[3] || in->i[4]) { __trap(); break; }
+        d_moe_align_pf_nv((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
+                          (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                          slice);
+        break;
+#endif
+#if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_GLU_MX
+    case PLOW_DOP_MOE_GLU_MX:
+        d_moe_glu_mx((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                     (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
+                     (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
+                     in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6],
+                     in->fj[0].f, in->fj[1].f, slice, nblk);
+        break;
+#endif
+#if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX
+    case PLOW_DOP_MOE_DOWN_MX:
+        d_moe_down_mx((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                      (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
+                      (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
+                      in->i[1], in->i[2], in->i[3], in->i[6], slice, nblk);
+        break;
+#endif
+#if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_GLU_MX_PF
+    case PLOW_DOP_MOE_GLU_MX_PF:
+        d_moe_glu_mx_pf((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                        (const uint8_t*)TEN(2), (const uint8_t*)TEN(3), (const int*)TEN(4),
+                        (const unsigned*)TEN(5), (const __nv_bfloat16*)TEN(6), in->i[0],
+                        in->i[1], in->i[2], in->i[3], in->i[5], in->fj[0].f, in->fj[1].f,
+                        slice, nblk);
+        break;
+#endif
+#if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX_PF
+    case PLOW_DOP_MOE_DOWN_MX_PF:
+        d_moe_down_mx_pf((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                         (const uint8_t*)TEN(2), (const uint8_t*)TEN(3),
+                         (const int*)TEN(4), (const __nv_bfloat16*)TEN(5),
+                         (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0], in->i[1],
+                         in->i[2], slice, nblk);
+        break;
+#endif
+#if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_COMBINE_PF
+    case PLOW_DOP_MOE_COMBINE_PF:
+        if (in->i[3] || in->i[4] || in->i[7]) { __trap(); break; }
+        d_moe_combine_pf_nv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                            (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), in->i[0],
+                            in->i[1], in->i[2], slice, nblk);
+        break;
+#endif
+
     case PLOW_DOP_FLASH_MERGE:
 #if PLOW_NV_LEAN_DECODE
         __trap();
