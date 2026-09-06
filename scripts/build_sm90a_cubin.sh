@@ -301,6 +301,15 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
     "${NVENV[@]}" \
       cuobjdump -symbols "$OUT_PFFA" | grep -q "_pffa" || { echo "FATAL: _pffa symbol missing" >&2; exit 1; }
     echo "built $OUT_PFFA ($(stat -c%s "$OUT_PFFA") B)"
+
+    OUT_PFATTN="${OUT%.cubin}_pfattn_hd512.cubin"
+    "${NVENV[@]}" \
+      "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
+      -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+      -o "$OUT_PFATTN" "$HERE/runtime/nvidia/interp_sm90a_pfattn_hd512.cu"
+    "${NVENV[@]}" \
+      cuobjdump -symbols "$OUT_PFATTN" | grep -q "plow_sm90a_pfattn_hd512" || { echo "FATAL: pfattn hd512 symbol missing" >&2; exit 1; }
+    echo "built $OUT_PFATTN ($(stat -c%s "$OUT_PFATTN") B)"
   fi
 fi
 

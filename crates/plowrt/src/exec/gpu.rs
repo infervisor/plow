@@ -531,6 +531,15 @@ impl SegmentRoleValidation for SegmentRoles {
                     })
                     .map_err(RuntimeError::Rejected)?;
                 }
+                if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 {
+                    let g = &blob.progs[program.index];
+                    let pc = g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize;
+                    if u32::from(g.insts[pc].blocks) != blob.n_cu {
+                        return Err(RuntimeError::Rejected(
+                            "HD512 WG32 role requires one slice per packet block".into(),
+                        ));
+                    }
+                }
             }
         }
         Ok(value)
@@ -642,6 +651,36 @@ fn check_attention_role(arch: &str, capability: Option<u32>, block: Option<u32>)
     Ok(())
 }
 
+fn check_attention_hd512_role(
+    arch: &str,
+    object: &plow_asset::segment_roles::SegmentObject,
+    capability: Option<u32>,
+    block: Option<u32>,
+    geometry: [Option<u32>; 4],
+) -> Result<()> {
+    let expected = object.attention.as_ref();
+    if arch != "sm90a"
+        || capability != Some(1)
+        || block != Some(BLOCK)
+        || expected.is_none_or(|a| {
+            a.profile != arch
+                || a.dtype != "bf16"
+                || geometry
+                    != [
+                        Some(a.head_dim),
+                        Some(a.query_tile),
+                        Some(a.kv_tile),
+                        Some(a.warps),
+                    ]
+        })
+    {
+        return Err(RuntimeError::Rejected(
+            "incompatible HD512 WG32 attention role".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_gemv_decode_role_inst(
     d: &DevInst64,
     rows: u32,
@@ -704,9 +743,11 @@ fn validate_attention_role_inst(
     d: &DevInst64,
     rows: u32,
     tensors: &[crate::asset::devblob::DevTensor],
+    hd_required: u32,
+    require_tma_map: bool,
 ) -> Result<()> {
     let reject =
-        || RuntimeError::Rejected("unsupported HD256 attention role operands or geometry".into());
+        || RuntimeError::Rejected("unsupported attention role operands or geometry".into());
     let prefill = d.op == DevOp::FlashPrefill as u16;
     let (heads, splits, hd) = if prefill {
         (d.i[2], d.i[7], d.i[6])
@@ -715,15 +756,15 @@ fn validate_attention_role_inst(
     } else {
         return Err(reject());
     };
-    if rows == 0 || d.i[0] != rows || heads == 0 || splits == 0 || hd != 256 {
+    if rows == 0 || d.i[0] != rows || heads == 0 || splits == 0 || hd != hd_required {
         return Err(reject());
     }
     let work = rows.checked_mul(heads).ok_or_else(reject)?;
     let partials = u64::from(work)
         .checked_mul(u64::from(splits))
         .ok_or_else(reject)?;
-    let output_bytes = u64::from(work) * 256 * 2;
-    let partial_bytes = partials.checked_mul(256 * 4).ok_or_else(reject)?;
+    let output_bytes = u64::from(work) * u64::from(hd) * 2;
+    let partial_bytes = partials.checked_mul(u64::from(hd) * 4).ok_or_else(reject)?;
     let ml_bytes = partials.checked_mul(8).ok_or_else(reject)?;
     let extent = |slot: usize, bytes: u64| -> Result<()> {
         if d.t[slot] == TENSOR_NONE16
@@ -744,7 +785,14 @@ fn validate_attention_role_inst(
         if d.i[1] == 0
             || d.i[3] == 0
             || heads % d.i[3] != 0
-            || d.t[5..].iter().any(|&t| t != TENSOR_NONE16)
+            || d.t[5] != TENSOR_NONE16
+            || d.t[6] != TENSOR_NONE16
+            || (require_tma_map
+                && (d.t[7] == TENSOR_NONE16
+                    || tensors
+                        .get(d.t[7] as usize)
+                        .is_none_or(|tensor| tensor.bytes != 256)))
+            || (!require_tma_map && d.t[7] != TENSOR_NONE16)
             || !f32::from_bits(d.fj[0]).is_finite()
             || rows
                 .div_ceil(64)
@@ -757,7 +805,7 @@ fn validate_attention_role_inst(
         let stride = if d.fj[1] == 0 { d.i[1] } else { d.fj[1] };
         let kv_bytes = u64::from(stride)
             .checked_mul(u64::from(d.i[3]))
-            .and_then(|bytes| bytes.checked_mul(256 * 2))
+            .and_then(|bytes| bytes.checked_mul(u64::from(hd) * 2))
             .ok_or_else(reject)?;
         extent(0, partial_bytes)?;
         extent(1, ml_bytes)?;
@@ -793,7 +841,14 @@ fn packet_role_segments(
         || roles
             .iter()
             .any(|&role| role > plow_asset::segment_roles::MAX_ROLE)
-        || (g.packed_prefill_only && roles.contains(&plow_asset::segment_roles::PREFILL_ATTENTION))
+        || (g.packed_prefill_only
+            && roles.iter().any(|&role| {
+                matches!(
+                    role,
+                    plow_asset::segment_roles::PREFILL_ATTENTION
+                        | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                )
+            }))
     {
         return Err(RuntimeError::Rejected(
             "invalid packet segment role count or id".into(),
@@ -840,7 +895,14 @@ fn packet_role_segments(
                     ));
                 }
             } else if role == plow_asset::segment_roles::PREFILL_ATTENTION {
-                validate_attention_role_inst(d, g.t, tensors)?;
+                validate_attention_role_inst(d, g.t, tensors, 256, false)?;
+            } else if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 {
+                if d.op != DevOp::FlashPrefill as u16 {
+                    return Err(RuntimeError::Rejected(
+                        "HD512 WG32 role requires FlashPrefill".into(),
+                    ));
+                }
+                validate_attention_role_inst(d, g.t, tensors, 512, true)?;
             } else if role == plow_asset::segment_roles::GEMV_CTA512 {
                 validate_gemv_decode_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
             } else if role == plow_asset::segment_roles::FP8_M1
@@ -1309,7 +1371,7 @@ pub struct GpuEngine {
     /// Segmented-prefill object pair (PLOW_PF_SEG_DIR); None = single-object prefill.
     seg_pf: Option<SegPf>,
     qwen_prefill: Option<crate::device::cuda::qwen_gdn::NativeGdn>,
-    packet_roles: [Option<PacketRole>; 4],
+    packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize],
     decode_packet_roles: Vec<u8>,
     cublaslt_decode: Vec<Option<CublasLtDecodeRoute>>,
     cublaslt_decode_graph: Option<crate::device::cuda::GraphExec>,
@@ -3572,8 +3634,8 @@ impl GpuEngine {
             (None, SMEM_PF, None, Vec::new(), None)
         };
 
-        let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::FP8_M1 as usize] =
-            [None, None, None, None];
+        let mut packet_roles: [Option<PacketRole>; plow_asset::segment_roles::MAX_ROLE as usize] =
+            std::array::from_fn(|_| None);
         for (&id, object) in segment_roles.iter().flat_map(|r| &r.objects) {
             if id == plow_asset::segment_roles::FP8_M1 {
                 packet_roles[plow_asset::segment_roles::FP8_M1 as usize - 1] = Some(
@@ -3591,12 +3653,11 @@ impl GpuEngine {
             if matches!(
                 id,
                 plow_asset::segment_roles::PREFILL_ATTENTION
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
                     | plow_asset::segment_roles::GEMV_CTA512
             ) && profile.tag != "sm90a"
             {
-                return Err(RuntimeError::Rejected(
-                    "HD256 attention role requires SM90".into(),
-                ));
+                return Err(RuntimeError::Rejected("packet role requires SM90".into()));
             }
             let (marker, block, entry, arena) = match id {
                 plow_asset::segment_roles::FP8_PREFILL_GEMM => (
@@ -3610,6 +3671,12 @@ impl GpuEngine {
                     "plow_block_pffa",
                     "_Z17interp_sm90a_pffa11PlowProgram",
                     "plow_arena_bytes_pffa",
+                ),
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 => (
+                    "plow_attention_sm90_hd512_wg32_abi",
+                    "plow_block_pfattn_hd512",
+                    "plow_sm90a_pfattn_hd512",
+                    "plow_arena_bytes_pfattn_hd512",
                 ),
                 plow_asset::segment_roles::GEMV_CTA512 => (
                     "plow_gemv_sm90_cta512_abi",
@@ -3626,6 +3693,14 @@ impl GpuEngine {
             let path = assets_dir.join(&object.file);
             let image = std::fs::read(&path)
                 .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            if id == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                && object.sha256.as_deref()
+                    != Some(plow_asset::decode_objects::image_sha256(&image).as_str())
+            {
+                return Err(RuntimeError::Rejected(
+                    "HD512 attention role object hash mismatch".into(),
+                ));
+            }
             let module = DecodeModule::load(&be, &image)?;
             if pf_batch_env
                 && packed_prefill.is_some()
@@ -3643,6 +3718,20 @@ impl GpuEngine {
                 }
                 plow_asset::segment_roles::PREFILL_ATTENTION => {
                     check_attention_role(profile.tag, capability, block)?
+                }
+                plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 => {
+                    check_attention_hd512_role(
+                        profile.tag,
+                        object,
+                        capability,
+                        block,
+                        [
+                            be.module_global_u32(&module, "plow_attention_head_dim")?,
+                            be.module_global_u32(&module, "plow_attention_query_tile")?,
+                            be.module_global_u32(&module, "plow_attention_kv_tile")?,
+                            be.module_global_u32(&module, "plow_attention_warps")?,
+                        ],
+                    )?
                 }
                 plow_asset::segment_roles::GEMV_CTA512 => {
                     if capability != Some(1) || block != Some(512) {
@@ -5765,7 +5854,16 @@ impl GpuEngine {
                     program_index,
                     launches = p.roles.len(),
                     gemm_launches = selected.iter().filter(|&&x| x == 1).count(),
-                    attention_launches = selected.iter().filter(|&&x| x == 2).count(),
+                    attention_launches = selected
+                        .iter()
+                        .filter(|&&role| {
+                            matches!(
+                                role,
+                                plow_asset::segment_roles::PREFILL_ATTENTION
+                                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+                            )
+                        })
+                        .count(),
                     "packet segment roles loaded"
                 );
                 selected
