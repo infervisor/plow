@@ -818,6 +818,8 @@ int main(int argc, char** argv) {
     test_moe_decode(1, 4, 8, 2880, 2880, 2880, 0);   /* GPT-OSS layer shape, 8 experts */
     test_moe_decode(2, 4, 32, 352, 2912, 320, 0);    /* K % 64 == 32, batch 2, all 32 experts */
     test_moe_decode(1, 4, 32, 352, 2880, 320, 1);    /* blocked gate|up layout */
+    test_moe_decode(8, 4, 8, 352, 2880, 320, 1);     /* batch 8 over 8 experts: grouped decode, M ~ 4 per expert */
+    test_moe_decode(8, 4, 32, 352, 2912, 320, 0);    /* batch 8, interleaved rows, K % 64 == 32 */
     test_moe_prefill(37, 4, 32, 352, 2880, 320, 0);  /* 37 tokens: segments of 1..8+ rows, pads */
     test_moe_prefill(9, 4, 8, 2880, 2880, 2880, 0);  /* layer shape */
     test_moe_prefill(20, 4, 16, 352, 2912, 320, 1);
