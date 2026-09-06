@@ -107,6 +107,10 @@ extern "C" __device__ unsigned plow_mixed_interpreter
 #define PLOW_NV_MXFP4_PROJ 0
 #define PLOW_NV_MXFP4_MOE 0
 #define PLOW_NV_MOE_COMMON 0
+#define PLOW_PACKET_LINEAR_BIAS 0
+#define PLOW_PACKET_ROPE_HALF_HD64 0
+#define PLOW_PACKET_ATTENTION_SINKS 0
+#define PLOW_PACKET_GQA 1
 #endif
 /* The Gemma decode MoE family is all-or-nothing per model: a dense checkpoint emits none of
  * the router/expert/combine ops, a sparse one emits the whole family. Deriving the block gate
@@ -135,6 +139,9 @@ extern "C" __device__ unsigned plow_mixed_interpreter
 #endif
 
 #include "op_attention.cuh" /* validated: d_flash_decode / d_flash_merge (harvested) */
+#if PLOW_PACKET_ATTENTION_SINKS && PLOW_NV_PACKED_REQUEST
+#error "attention sinks and packed-request FlashMerge currently share t3"
+#endif
 #if PLOW_NV_PACKED_REQUEST
 #define PLOW_PF_REQ_ARG , (const int*)TEN(3)
 #if !defined(PLOW_NV_HOPPER) || !PLOW_NV_HOPPER || !PLOW_NV_PREFILL || PLOW_FP8_KV
@@ -1073,6 +1080,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_GEMM:
     case PLOW_DOP_GEMM_MED:
     case PLOW_DOP_GEMM_SMALL:
+#if defined(PLOW_NV_HOPPER) && PLOW_PACKET_LINEAR_BIAS
+        if (TEN(7)) {
+            d_gemm_bias((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                        (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(7),
+                        in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk,
+                        (__nv_bfloat16*)arena);
+            break;
+        }
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_TMA_GEMM
         if (in->i[6] && in->i[7]) {
 #if PGM90_UNI_BN256
@@ -1329,6 +1345,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #else
     case PLOW_DOP_FLASH_PREFILL:
+#if PLOW_HAS_FLASH_HD64
+        if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64)
+            d_flash_prefill_mux<64, 64, 64>(
+                (const int*)TEN(6), (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
+                in->fj[2].u, in->fj[0].f, slice, nblk, arena);
+        else
+#endif
 #if !PLOW_NV_FA_ONLY /* lean hd512-only FA object does not carry the Qwen arm */
         if (in->i[6] == 128)
             d_flash_prefill_mux<128, 64, PLOW_NV_FA128_BKV>(
@@ -1466,7 +1491,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
          * GQA: hd=128 non-interleaved (i[5]==0) — required in the PREFILL object, which
          * is a Gemma build and would otherwise trap Qwen buckets. Gemma full/sliding
          * attention: hd=256/512 non-interleaved (i[5]==0). */
-        if (in->i[2] == 64)
+        if (in->i[2] == 64 && in->i[5] == 2 && PLOW_PACKET_ROPE_HALF_HD64)
+            d_headnorm_rope<64, /*INTERLEAVE=*/false>(
+                (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
+                (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+        else if (in->i[2] == 64)
             d_headnorm_rope<64, /*INTERLEAVE=*/true>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
@@ -1680,6 +1711,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
+#if PLOW_PACKET_LINEAR_BIAS
+        if (TEN(7)) {
+            d_gemv_bias((__nv_bfloat16*)TEN(0),
+                        (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                        (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(7),
+                        in->i[0], in->i[1], in->i[2], slice, nblk);
+            break;
+        }
+#endif
         if (in->i[2] <= PLOW_NV_GEMV_STAGING_BYTES / 2u)
             d_gemv((__nv_bfloat16*)TEN(0),
                    (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
@@ -1714,6 +1754,18 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             d_gemv_sm90_xreg<5120>((__nv_bfloat16*)TEN(3),
                 (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(4),
                 17408, slice, nblk);
+            break;
+        }
+#endif
+#if PLOW_PACKET_LINEAR_BIAS
+        if (in->i[5] && in->i[6] && in->i[7]) {
+            d_gemv_qkv_bias(
+                (__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3), (__nv_bfloat16*)TEN(5),
+                (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(6),
+                (const __nv_bfloat16*)T[in->i[5]], (const __nv_bfloat16*)T[in->i[6]],
+                (const __nv_bfloat16*)T[in->i[7]], in->i[0], in->i[1], in->i[3],
+                in->i[4], in->i[2], slice, nblk);
             break;
         }
 #endif
@@ -1829,7 +1881,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u);              \
     } while (0)
 #if PLOW_NV_GEMMA
-        if (in->i[6] == 128) {
+        if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64) {
+            if (gqa != PLOW_PACKET_GQA) { __trap(); break; }
+            PLOW_NV_FLASH_DECODE(64, PLOW_PACKET_GQA);
+        } else if (in->i[6] == 128) {
             if ((gqa % PLOW_NV_FA_GF) != 0) { __trap(); break; }
             PLOW_NV_FLASH_DECODE(128, PLOW_NV_FA_GF);
         } else if (in->i[6] == 256) {
@@ -2038,7 +2093,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if PLOW_NV_LEAN_DECODE
         __trap();
 #elif PLOW_NV_GEMMA
-        if (in->i[3] == 128)
+        if (in->i[3] == 64 && PLOW_HAS_FLASH_HD64 && PLOW_PACKET_ATTENTION_SINKS)
+            d_flash_merge<64, true>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
+                                    (const float*)TEN(2), in->i[0], in->i[1], in->i[2],
+                                    slice, nblk, nullptr, (const __nv_bfloat16*)TEN(3));
+        else if (in->i[3] == 128)
             d_flash_merge<128>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
         else if (in->i[3] == 256)
