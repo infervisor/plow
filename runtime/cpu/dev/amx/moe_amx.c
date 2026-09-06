@@ -210,62 +210,66 @@ X_K(x_moe_group_down_gemma_pf) {
 
 extern plow_mx_vlut plow_v_mx_lut; /* avx512/gptoss.c */
 
-/* Row r of the tile <- 32 e2m1 values of packed row (W + r*rs, scale S[r*ss + kb]) at block kb,
- * scaled by 2^(s-127) as an exponent add on nonzero lanes (as gemv_amx.c stage_mx4). */
-static inline void stage_mx4_rows(uint8_t* t, const uint8_t* W, size_t rs, const uint8_t* S, size_t ss,
-                                  uint32_t kb, uint32_t rows) {
+/* Dequantize `rows` MXFP4 weight rows (K wide) into a bf16 buffer with row stride `ldo`, so one
+ * unpack serves every token block of that expert. The per-tile-load variant below (dot_block_mx)
+ * re-unpacks the whole expert matrix for each 32-token block, and the unpack is ~3x the tile work,
+ * so at prefill widths (64+ rows per expert) hoisting it here is the difference between MoE prefill
+ * being unpack-bound and tile-bound. Same math as stage_mx4_rows, strided output. */
+static void dequant_strip(plow_bf16* out, size_t ldo, const uint8_t* W, size_t rs, const uint8_t* S,
+                          size_t ss, uint32_t rows, uint32_t nkb) {
     const __m512i il = _mm512_set_epi16(47, 15, 46, 14, 45, 13, 44, 12, 43, 11, 42, 10, 41, 9, 40, 8,
                                         39, 7, 38, 6, 37, 5, 36, 4, 35, 3, 34, 2, 33, 1, 32, 0);
+    const __m512i mag = _mm512_set1_epi16(0x7FFF);
     for (uint32_t r = 0; r < rows; r++) {
-        const __m512i b = _mm512_cvtepu8_epi16(
-            _mm256_zextsi128_si256(_mm_loadu_si128((const __m128i*)(W + r * rs + (size_t)kb * 16u))));
-        const __m512i ev = _mm512_permutexvar_epi16(b, plow_v_mx_lut.lut);
-        const __m512i od = _mm512_permutexvar_epi16(_mm512_srli_epi16(b, 4), plow_v_mx_lut.lut);
-        __m512i v = _mm512_permutex2var_epi16(ev, il, od);
-        const int e = (int)S[r * ss + kb] - 127;
-        const __mmask32 nz = _mm512_test_epi16_mask(v, _mm512_set1_epi16(0x7FFF));
-        v = _mm512_mask_add_epi16(v, nz, v, _mm512_set1_epi16((short)(e << 7)));
-        _mm512_store_si512((void*)(t + r * 64u), v);
+        const uint8_t* w = W + (size_t)r * rs;
+        const uint8_t* sc = S + (size_t)r * ss;
+        plow_bf16* o = out + (size_t)r * ldo;
+        for (uint32_t kb = 0; kb < nkb; kb++) {
+            const __m512i b = _mm512_cvtepu8_epi16(
+                _mm256_zextsi128_si256(_mm_loadu_si128((const __m128i*)(w + (size_t)kb * 16u))));
+            const __m512i ev = _mm512_permutexvar_epi16(b, plow_v_mx_lut.lut);
+            const __m512i od = _mm512_permutexvar_epi16(_mm512_srli_epi16(b, 4), plow_v_mx_lut.lut);
+            __m512i v = _mm512_permutex2var_epi16(ev, il, od);
+            const int e = (int)sc[kb] - 127;
+            const __mmask32 nz = _mm512_test_epi16_mask(v, mag);
+            v = _mm512_mask_add_epi16(v, nz, v, _mm512_set1_epi16((short)(e << 7)));
+            _mm512_storeu_si512((void*)(o + (size_t)kb * 32u), v);
+        }
     }
 }
 
-/* out[r][c] (row stride 32) = dequant(W row r) . x[c], rows <= 32 at row strides rs/ss (bytes). */
-static void dot_block_mx(const uint8_t* W, size_t rs, const uint8_t* S, size_t ss, uint32_t rows,
-                         const uint8_t* xp, uint32_t nkb, uint32_t nxt, float* out) {
-    const uint32_t r0 = rows < 16u ? rows : 16u, r1 = rows - r0;
-    _tile_zero(0);
-    if (nxt > 1u) _tile_zero(1);
-    if (r1) {
-        _tile_zero(2);
-        if (nxt > 1u) _tile_zero(3);
+/* Take up to `cap` live rows of segment [*r, rend) (key == UNUSED is padding). */
+static uint32_t take_rows_cap(const uint32_t* key, uint32_t* r, uint32_t rend, uint32_t cap,
+                              uint32_t* rows) {
+    uint32_t M = 0;
+    while (*r < rend && M < cap) {
+        const uint32_t rr = (*r)++;
+        if (key[rr] != PLOW_EXPERT_UNUSED) rows[M++] = rr;
     }
-    for (uint32_t kb = 0; kb < nkb; kb++) {
-        _tile_loadd(6, xp + (size_t)kb * 2048u, 64);
-        if (nxt > 1u) _tile_loadd(7, xp + (size_t)kb * 2048u + 1024u, 64);
-        stage_mx4_rows(g_wtile[0], W, rs, S, ss, kb, r0);
-        _tile_loadd(4, g_wtile[0], 64);
-        _tile_dpbf16ps(0, 4, 6);
-        if (nxt > 1u) _tile_dpbf16ps(1, 4, 7);
-        if (r1) {
-            stage_mx4_rows(g_wtile[1], W + 16u * rs, rs, S + 16u * ss, ss, kb, r1);
-            _tile_loadd(5, g_wtile[1], 64);
-            _tile_dpbf16ps(2, 5, 6);
-            if (nxt > 1u) _tile_dpbf16ps(3, 5, 7);
-        }
-    }
-    _tile_stored(0, out, 128);
-    if (nxt > 1u) _tile_stored(1, out + 16, 128);
-    if (r1) {
-        _tile_stored(2, out + 16 * 32, 128);
-        if (nxt > 1u) _tile_stored(3, out + 16 * 32 + 16, 128);
-    }
+    return M;
+}
+
+/* Rows per pass: as many 32-token blocks of packed x as the scratch holds after the weight
+ * buffers, capped at MXPF_BLK_MAX. */
+#define MXPF_BLK_MAX 8u
+#define MXPF_ROW_MAX (MXPF_BLK_MAX * 32u)
+static inline uint32_t mxpf_blocks(size_t scratch, size_t wbuf_bytes, uint32_t nkb) {
+    const size_t xblk = (size_t)nkb * 2048u;
+    if (scratch <= wbuf_bytes + xblk) return 0;
+    size_t nb = (scratch - wbuf_bytes) / xblk;
+    if (nb > MXPF_BLK_MAX) nb = MXPF_BLK_MAX;
+    return (uint32_t)nb;
 }
 
 /* 149: t0=fu_g t1=xn2 t2=W_gu t3=S_gu t4=meta t5=row_token t6=bias_gu?  i0=I i1=K i2=E i3=layout
  * i5=act f0/f1. layout 0: gate row 2n / up row 2n+1 (stride 2 rows); 1: gate n / up I+n. */
 X_K(x_moe_glu_mx_pf) {
     const uint32_t I = in->i[0], K = in->i[1], E = in->i[2], layout = in->i[3], act = in->i[5];
-    if ((K & 31u) || !ctx || !ctx->scratch || ctx->scratch_bytes < (size_t)(K / 32u) * 2048u) {
+    const size_t wbuf_glu = 2u * 32u * (size_t)K * 2u;
+    const uint32_t nxb = (K & 31u) || !ctx || !ctx->scratch
+                             ? 0u
+                             : mxpf_blocks(ctx->scratch_bytes, wbuf_glu, K / 32u);
+    if (!nxb) {
         g_moe_glu_mx_pf(in, slice, nblk, T, ctx);
         return;
     }
@@ -279,10 +283,13 @@ X_K(x_moe_glu_mx_pf) {
     const float f0 = in->fj[0].f, f1 = in->fj[1].f;
     const size_t N2 = 2u * I, ldw = K / 2u, lds = K / 32u;
     const size_t rs = layout ? ldw : 2u * ldw, ss = layout ? lds : 2u * lds;
-    const uint32_t nkb = K / 32u;
+    const uint32_t nkb = K / 32u, cap = nxb * 32u;
+    const size_t xblk = (size_t)nkb * 2048u;
     uint8_t* xp = ctx->scratch;
-    const plow_bf16* rowp[XM_MAX];
-    uint32_t rows[XM_MAX];
+    plow_bf16* wg = (plow_bf16*)(ctx->scratch + (size_t)nxb * xblk);
+    plow_bf16* wu = wg + 32u * (size_t)K;
+    const plow_bf16* rowp[MXPF_ROW_MAX];
+    uint32_t rows[MXPF_ROW_MAX];
     float g[32 * 32] __attribute__((aligned(64)));
     float u[32 * 32] __attribute__((aligned(64)));
     float of[32] __attribute__((aligned(64)));
@@ -298,24 +305,34 @@ X_K(x_moe_glu_mx_pf) {
         const uint8_t* Se = S + (size_t)e * N2 * lds;
         const plow_bf16* be = bias ? bias + (size_t)e * N2 : NULL;
         for (uint32_t r = r0; r < rend;) {
-            const uint32_t M = take_rows(row_token, &r, rend, rows);
+            const uint32_t M = take_rows_cap(row_token, &r, rend, cap, rows);
             if (!M) continue;
+            const uint32_t nb = (M + 31u) / 32u;
             for (uint32_t m = 0; m < M; m++) rowp[m] = x + (size_t)row_token[rows[m]] * K;
-            pack_x2(xp, rowp, M, K);
-            const uint32_t nxt = M > 16u ? 2u : 1u;
+            for (uint32_t b = 0; b < nb; b++) {
+                const uint32_t mb = M - b * 32u < 32u ? M - b * 32u : 32u;
+                pack_x2(xp + (size_t)b * xblk, rowp + b * 32u, mb, K);
+            }
             for (uint32_t n = n0; n < n1;) {
                 const uint32_t rw = n1 - n < 32u ? n1 - n : 32u;
                 const uint32_t rg = layout ? n : 2u * n, ru = layout ? I + n : 2u * n + 1u;
-                dot_block_mx(We + (size_t)rg * ldw, rs, Se + (size_t)rg * lds, ss, rw, xp, nkb, nxt, g);
-                dot_block_mx(We + (size_t)ru * ldw, rs, Se + (size_t)ru * lds, ss, rw, xp, nkb, nxt, u);
-                for (uint32_t rr = 0; rr < rw; rr++) {
-                    const __m512 bg = _mm512_set1_ps(be ? plow_bf2f(be[rg + rr * (layout ? 1u : 2u)]) : 0.0f);
-                    const __m512 bu = _mm512_set1_ps(be ? plow_bf2f(be[ru + rr * (layout ? 1u : 2u)]) : 0.0f);
-                    for (uint32_t c = 0; c < nxt; c++)
-                        _mm512_store_ps(of + c * 16u,
-                                        v_glu_pair(_mm512_add_ps(_mm512_load_ps(g + rr * 32u + c * 16u), bg),
-                                                   _mm512_add_ps(_mm512_load_ps(u + rr * 32u + c * 16u), bu), act, f0, f1));
-                    for (uint32_t m = 0; m < M; m++) fu[(size_t)rows[m] * I + n + rr] = plow_f2bf(of[m]);
+                dequant_strip(wg, K, We + (size_t)rg * ldw, rs, Se + (size_t)rg * lds, ss, rw, nkb);
+                dequant_strip(wu, K, We + (size_t)ru * ldw, rs, Se + (size_t)ru * lds, ss, rw, nkb);
+                for (uint32_t b = 0; b < nb; b++) {
+                    const uint32_t mb = M - b * 32u < 32u ? M - b * 32u : 32u;
+                    const uint32_t nxt = mb > 16u ? 2u : 1u;
+                    const uint32_t* rw_ = rows + b * 32u;
+                    dot_block(wg, K, rw, xp + (size_t)b * xblk, nkb, nxt, g);
+                    dot_block(wu, K, rw, xp + (size_t)b * xblk, nkb, nxt, u);
+                    for (uint32_t rr = 0; rr < rw; rr++) {
+                        const __m512 bg = _mm512_set1_ps(be ? plow_bf2f(be[rg + rr * (layout ? 1u : 2u)]) : 0.0f);
+                        const __m512 bu = _mm512_set1_ps(be ? plow_bf2f(be[ru + rr * (layout ? 1u : 2u)]) : 0.0f);
+                        for (uint32_t c = 0; c < nxt; c++)
+                            _mm512_store_ps(of + c * 16u,
+                                            v_glu_pair(_mm512_add_ps(_mm512_load_ps(g + rr * 32u + c * 16u), bg),
+                                                       _mm512_add_ps(_mm512_load_ps(u + rr * 32u + c * 16u), bu), act, f0, f1));
+                        for (uint32_t m = 0; m < mb; m++) fu[(size_t)rw_[m] * I + n + rr] = plow_f2bf(of[m]);
+                    }
                 }
                 n += rw;
             }
@@ -326,7 +343,11 @@ X_K(x_moe_glu_mx_pf) {
 /* 150: t0=part t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx t7=row_gate  i0=H i1=I i2=E. */
 X_K(x_moe_down_mx_pf) {
     const uint32_t H = in->i[0], I = in->i[1], E = in->i[2];
-    if ((I & 31u) || !ctx || !ctx->scratch || ctx->scratch_bytes < (size_t)(I / 32u) * 2048u) {
+    const size_t wbuf_dn = 32u * (size_t)I * 2u;
+    const uint32_t nxb = (I & 31u) || !ctx || !ctx->scratch
+                             ? 0u
+                             : mxpf_blocks(ctx->scratch_bytes, wbuf_dn, I / 32u);
+    if (!nxb) {
         g_moe_down_mx_pf(in, slice, nblk, T, ctx);
         return;
     }
@@ -339,10 +360,12 @@ X_K(x_moe_down_mx_pf) {
     const uint32_t* row_partidx = PLOW_CPU_TEN(in, T, 6);
     const float* row_gate = PLOW_CPU_TEN(in, T, 7);
     const size_t ldw = I / 2u, lds = I / 32u;
-    const uint32_t nkb = I / 32u;
+    const uint32_t nkb = I / 32u, cap = nxb * 32u;
+    const size_t xblk = (size_t)nkb * 2048u;
     uint8_t* xp = ctx->scratch;
-    const plow_bf16* rowp[XM_MAX];
-    uint32_t rows[XM_MAX];
+    plow_bf16* wd = (plow_bf16*)(ctx->scratch + (size_t)nxb * xblk);
+    const plow_bf16* rowp[MXPF_ROW_MAX];
+    uint32_t rows[MXPF_ROW_MAX];
     float o[32 * 32] __attribute__((aligned(64)));
     uint32_t lo, hi;
     g_range(E * H, slice, nblk, &lo, &hi);
@@ -356,19 +379,28 @@ X_K(x_moe_down_mx_pf) {
         const uint8_t* Se = S + (size_t)e * H * lds;
         const plow_bf16* be = bias ? bias + (size_t)e * H : NULL;
         for (uint32_t r = r0; r < rend;) {
-            const uint32_t M = take_rows(row_partidx, &r, rend, rows);
+            const uint32_t M = take_rows_cap(row_partidx, &r, rend, cap, rows);
             if (!M) continue;
+            const uint32_t nb = (M + 31u) / 32u;
             for (uint32_t m = 0; m < M; m++) rowp[m] = fu + (size_t)rows[m] * I;
-            pack_x2(xp, rowp, M, I);
-            const uint32_t nxt = M > 16u ? 2u : 1u;
+            for (uint32_t b = 0; b < nb; b++) {
+                const uint32_t mb = M - b * 32u < 32u ? M - b * 32u : 32u;
+                pack_x2(xp + (size_t)b * xblk, rowp + b * 32u, mb, I);
+            }
             for (uint32_t h = h0; h < h1;) {
                 const uint32_t rw = h1 - h < 32u ? h1 - h : 32u;
-                dot_block_mx(We + (size_t)h * ldw, ldw, Se + (size_t)h * lds, lds, rw, xp, nkb, nxt, o);
-                for (uint32_t m = 0; m < M; m++) {
-                    float* pr = part + (size_t)row_partidx[rows[m]] * H + h;
-                    const float gate = row_gate[rows[m]];
-                    for (uint32_t rr = 0; rr < rw; rr++)
-                        pr[rr] = gate * (o[rr * 32u + m] + (be ? plow_bf2f(be[h + rr]) : 0.0f));
+                dequant_strip(wd, I, We + (size_t)h * ldw, ldw, Se + (size_t)h * lds, lds, rw, nkb);
+                for (uint32_t b = 0; b < nb; b++) {
+                    const uint32_t mb = M - b * 32u < 32u ? M - b * 32u : 32u;
+                    const uint32_t nxt = mb > 16u ? 2u : 1u;
+                    const uint32_t* rw_ = rows + b * 32u;
+                    dot_block(wd, I, rw, xp + (size_t)b * xblk, nkb, nxt, o);
+                    for (uint32_t m = 0; m < mb; m++) {
+                        float* pr = part + (size_t)row_partidx[rw_[m]] * H + h;
+                        const float gate = row_gate[rw_[m]];
+                        for (uint32_t rr = 0; rr < rw; rr++)
+                            pr[rr] = gate * (o[rr * 32u + m] + (be ? plow_bf2f(be[h + rr]) : 0.0f));
+                    }
                 }
                 h += rw;
             }
