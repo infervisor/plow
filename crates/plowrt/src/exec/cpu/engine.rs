@@ -203,8 +203,9 @@ impl CpuModel {
         // PLOW_MXFP4_DIR names the mxfp4 twin (`mxfp4/<name>` e2m1 + `_scale` E8M0 rows,
         // perf-data/tools/quantize_mxfp4.py); the two axes are exclusive at emit time.
         let cpucfg = &crate::config::RuntimeConfig::get().cpu;
-        let twin = [cpucfg.fp8_dir.as_str(), cpucfg.mxfp4_dir.as_str()]
+        let twin = [cpucfg.fp8_dir.as_deref(), cpucfg.mxfp4_dir.as_deref()]
             .into_iter()
+            .flatten()
             .find(|d| !d.is_empty())
             .map(std::path::PathBuf::from);
         let ckpt = Checkpoint::open_with_twin(checkpoint, twin.as_deref())?;

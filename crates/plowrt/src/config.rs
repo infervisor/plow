@@ -206,12 +206,12 @@ pub struct CpuRuntimeConfig {
 
     /// Directory holding the fp8 weight twin (`fp8/<name>` + `_scale`, quantize_fp8.py). Empty =
     /// bf16 weights only. Mutually exclusive with `mxfp4_dir` at emit time.
-    #[arg(long = "cpu-fp8-dir", env = "PLOW_FP8_DIR", default_value = "", global = true)]
-    pub fp8_dir: String,
+    #[arg(long = "cpu-fp8-dir", env = "PLOW_FP8_DIR", global = true)]
+    pub fp8_dir: Option<String>,
 
     /// Directory holding the MXFP4 weight twin (`mxfp4/<name>` + `_scale`, quantize_mxfp4.py).
-    #[arg(long = "cpu-mxfp4-dir", env = "PLOW_MXFP4_DIR", default_value = "", global = true)]
-    pub mxfp4_dir: String,
+    #[arg(long = "cpu-mxfp4-dir", env = "PLOW_MXFP4_DIR", global = true)]
+    pub mxfp4_dir: Option<String>,
 
     /// Opt in to the global work queue instead of static per-CU streams. Measured 2x slower on
     /// this box; kept for A/B on hosts where the static partition is a poor fit. Named `gq_opt_in`
