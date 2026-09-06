@@ -97,6 +97,14 @@ pub fn is_elf64_le(image: &[u8]) -> bool {
     image.len() >= EI_NIDENT && image[..4] == *b"\x7fELF" && image[4] == 2 && image[5] == 1
 }
 
+/// Return the ELF `e_machine` value after validating the class and byte order.
+pub fn elf_machine(image: &[u8]) -> Option<u16> {
+    if !is_elf64_le(image) {
+        return None;
+    }
+    u16_at(image, 0x12)
+}
+
 /// Parse a cubin's SM number and global entry points. `None` if `image` is not
 /// a well-formed ELF64-LE object.
 pub fn inspect(image: &[u8]) -> Option<CubinInfo> {

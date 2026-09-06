@@ -56,6 +56,7 @@ pub mod k3;
 pub mod kda;
 use config::*;
 mod ladder;
+pub mod mixed_step_emit;
 mod mla;
 mod qwen35;
 #[cfg(test)]
