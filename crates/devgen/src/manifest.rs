@@ -316,6 +316,13 @@ struct Shapes {
     /// A pre-arm object ignores both and stages `t[1]` verbatim, i.e. it runs the projection
     /// over an UNNORMED row and returns finite, fluent, wrong tokens. Refuse at load.
     glm_fuse_qnorm: bool,
+    /// Optional linear biases carried by the instruction stream. Plain GEMM/GEMV use `t7`;
+    /// fused QKV uses the three demoted handles in `i5/i6/i7`.
+    linear_bias: bool,
+    /// HD64 HeadNormRope using the explicit NeoX half-split pairing mode.
+    rope_half_hd64: bool,
+    /// FlashMerge carrying an attention-sink vector in `t3`.
+    attention_sinks: bool,
     /// Opcode names present, for the encoding-aware corrections below. Kept as names because that
     /// is what `features` keys on, and the two must not disagree.
     ops_present: BTreeSet<String>,
@@ -460,6 +467,24 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::GemvQkv => {
                     if inst.t[7] != packet::TENSOR_NONE {
                         s.glm_fuse_qnorm = true;
+                    }
+                    if inst.i[5..8].iter().any(|&h| h != 0) {
+                        s.linear_bias = true;
+                    }
+                }
+                DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
+                    if inst.t[7] != packet::TENSOR_NONE {
+                        s.linear_bias = true;
+                    }
+                }
+                DevOp::HeadNormRope => {
+                    if inst.i[2] == 64 && inst.i[5] == packet::dev::ROPE_PAIR_HALF {
+                        s.rope_half_hd64 = true;
+                    }
+                }
+                DevOp::FlashMerge => {
+                    if inst.t[3] != packet::TENSOR_NONE {
+                        s.attention_sinks = true;
                     }
                 }
                 DevOp::FlashMlaPrefill => {
@@ -1548,6 +1573,9 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         .any(|inst| inst.op == DevOp::AttnRes as u16 && inst.i[6] != 0);
     f.insert("attnres_decode_mwg".into(), json!(attnres_decode_mwg));
     encoding_features(&mut f, &s);
+    f.insert("linear_bias".into(), json!(s.linear_bias));
+    f.insert("rope_half_hd64".into(), json!(s.rope_half_hd64));
+    f.insert("attention_sinks".into(), json!(s.attention_sinks));
     let axes = precision_axes(&mut f, &s, &union);
     let t = tuning(&s);
     let attention: Vec<Value> = crate::attention_decisions()
@@ -1927,10 +1955,24 @@ pub fn config_header(manifest: &Value) -> String {
 
     // Head dims the flash family is instantiated at.
     out.push_str("\n/* --- flash head dims present --- */\n");
-    for hd in [256u32, 512] {
+    for hd in [64u32, 128, 256, 512] {
         let present = union.iter().any(|k| k.ends_with(&format!("/hd{hd}")));
         out.push_str(&format!(
             "#ifndef PLOW_HAS_FLASH_HD{hd}\n#define PLOW_HAS_FLASH_HD{hd} {}\n#endif\n",
+            if present { 1 } else { 0 }
+        ));
+    }
+    for (feature, define) in [
+        ("linear_bias", "PLOW_PACKET_LINEAR_BIAS"),
+        ("rope_half_hd64", "PLOW_PACKET_ROPE_HALF_HD64"),
+        ("attention_sinks", "PLOW_PACKET_ATTENTION_SINKS"),
+    ] {
+        let present = manifest
+            .pointer(&format!("/features/{feature}"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        out.push_str(&format!(
+            "#define {define} {}\n",
             if present { 1 } else { 0 }
         ));
     }
@@ -1962,6 +2004,9 @@ pub fn config_header(manifest: &Value) -> String {
                 "#ifndef PLOW_NV_FA_GF_FULL\n#define PLOW_NV_FA_GF_FULL {v}\n#endif\n"
             ));
         }
+    }
+    if let Some(gqa) = manifest.pointer("/shapes/gqa").and_then(Value::as_u64) {
+        out.push_str(&format!("#define PLOW_PACKET_GQA {gqa}\n"));
     }
     out
 }

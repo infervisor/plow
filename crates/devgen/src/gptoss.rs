@@ -1,4 +1,4 @@
-//! GPT-OSS-20B emitter (`model_type: "gpt_oss"`), CPU-tier target.
+//! GPT-OSS-20B emitter (`model_type: "gpt_oss"`).
 //!
 //! Per layer: `RMSNorm -> q/k/v (+bias) -> half-split YaRN RoPE -> flash (sliding 128 on even
 //! layers, full on odd) + FLASH_MERGE with sinks -> o_proj (+bias) -> AddNorm -> router GEMV
@@ -75,7 +75,11 @@ impl Emitter<'_> {
     /// `out[t, n] = src[t, k] . W[n, k]^T + bias`. Decode is the GEMV family, prefill the plain
     /// GEMM: the CPU tier has one GEMM body, so the GPU tile rungs are not selected here.
     fn proj(&mut self, out: u32, src: u32, w: u32, bias: u32, n: u32, k: u32, dep: u32) -> u32 {
-        let op = if self.prefill { DevOp::Gemm } else { DevOp::Gemv };
+        let op = if self.prefill {
+            DevOp::Gemm
+        } else {
+            DevOp::Gemv
+        };
         let t = self.t;
         self.b.emit(op, self.b.all(), &[dep], |d| {
             d.t[0] = out;
@@ -88,7 +92,17 @@ impl Emitter<'_> {
         })
     }
     /// Decode-only MXFP4 twin of `proj`: `out[t, n] = src[t] . dequant(W4[n]) + bias[n]` (op 91, t7 bias).
-    fn proj_mx4(&mut self, out: u32, src: u32, w4: u32, s4: u32, bias: u32, n: u32, k: u32, dep: u32) -> u32 {
+    fn proj_mx4(
+        &mut self,
+        out: u32,
+        src: u32,
+        w4: u32,
+        s4: u32,
+        bias: u32,
+        n: u32,
+        k: u32,
+        dep: u32,
+    ) -> u32 {
         debug_assert!(!self.prefill && w4 != TENSOR_NONE);
         let t = self.t;
         self.b.emit(DevOp::GemvMxfp4, self.b.all(), &[dep], |d| {
@@ -116,9 +130,22 @@ impl Emitter<'_> {
             d.f[0] = eps;
         })
     }
-    fn rope(&mut self, out: u32, src: u32, nhead: u32, rotate: bool, cache: Option<(u32, u32)>, dep: u32) -> u32 {
-        let (cos, sin, pos, t, hd, eps) = (self.cos, self.sin, self.pos, self.t, self.c.hd, self.c.eps);
-        let batch_kv = if !self.prefill && (t > 1 || self.ladder) { t } else { 0 };
+    fn rope(
+        &mut self,
+        out: u32,
+        src: u32,
+        nhead: u32,
+        rotate: bool,
+        cache: Option<(u32, u32)>,
+        dep: u32,
+    ) -> u32 {
+        let (cos, sin, pos, t, hd, eps) =
+            (self.cos, self.sin, self.pos, self.t, self.c.hd, self.c.eps);
+        let batch_kv = if !self.prefill && (t > 1 || self.ladder) {
+            t
+        } else {
+            0
+        };
         self.b.emit(DevOp::HeadNormRope, self.b.all(), &[dep], |d| {
             d.t[0] = out;
             d.t[1] = src;
@@ -149,13 +176,25 @@ impl Emitter<'_> {
         let (t, h, hd, heads, kvh) = (self.t, c.hidden, c.hd, c.heads, c.kvh);
         let (qd, kd) = (heads * hd, kvh * hd);
         let p = format!("{}layers.{l}", c.prefix);
-        let wq = self.w(&format!("{p}.self_attn.q_proj.weight"), qd as u64 * h as u64 * BF16);
+        let wq = self.w(
+            &format!("{p}.self_attn.q_proj.weight"),
+            qd as u64 * h as u64 * BF16,
+        );
         let bq = self.w(&format!("{p}.self_attn.q_proj.bias"), qd as u64 * BF16);
-        let wk = self.w(&format!("{p}.self_attn.k_proj.weight"), kd as u64 * h as u64 * BF16);
+        let wk = self.w(
+            &format!("{p}.self_attn.k_proj.weight"),
+            kd as u64 * h as u64 * BF16,
+        );
         let bk = self.w(&format!("{p}.self_attn.k_proj.bias"), kd as u64 * BF16);
-        let wv = self.w(&format!("{p}.self_attn.v_proj.weight"), kd as u64 * h as u64 * BF16);
+        let wv = self.w(
+            &format!("{p}.self_attn.v_proj.weight"),
+            kd as u64 * h as u64 * BF16,
+        );
         let bv = self.w(&format!("{p}.self_attn.v_proj.bias"), kd as u64 * BF16);
-        let wo = self.w(&format!("{p}.self_attn.o_proj.weight"), h as u64 * qd as u64 * BF16);
+        let wo = self.w(
+            &format!("{p}.self_attn.o_proj.weight"),
+            h as u64 * qd as u64 * BF16,
+        );
         let bo = self.w(&format!("{p}.self_attn.o_proj.bias"), h as u64 * BF16);
         // PLOW_MXFP4: decode reads the dense projections from `mxfp4/<name>` twins (e2m1 + E8M0,
         // quantize_mxfp4.py) through biased GEMV_MXFP4 (t7 = bias, CPU tiers); prefill keeps the bf16
@@ -165,7 +204,10 @@ impl Emitter<'_> {
             if mx4 {
                 (
                     em.w(&format!("mxfp4/{p}.self_attn.{s}.weight"), out * k / 2),
-                    em.w(&format!("mxfp4/{p}.self_attn.{s}.weight_scale"), out * k / 32),
+                    em.w(
+                        &format!("mxfp4/{p}.self_attn.{s}.weight_scale"),
+                        out * k / 32,
+                    ),
                 )
             } else {
                 (TENSOR_NONE, TENSOR_NONE)
@@ -176,7 +218,10 @@ impl Emitter<'_> {
         let (wv4, sv4) = w4(self, "v_proj", kd as u64, h as u64);
         let (wo4, so4) = w4(self, "o_proj", h as u64, qd as u64);
         let sinks = self.w(&format!("{p}.self_attn.sinks"), heads as u64 * BF16);
-        let g_post = self.w(&format!("{p}.post_attention_layernorm.weight"), h as u64 * BF16);
+        let g_post = self.w(
+            &format!("{p}.post_attention_layernorm.weight"),
+            h as u64 * BF16,
+        );
         let full = c.is_full[l];
         let win = if full { 0 } else { c.window };
         let (kvr, kvm) = kv_ring(full, self.ctx, c.window, self.chunk);
@@ -228,48 +273,55 @@ impl Emitter<'_> {
             self.kv_rows.push(c_vn);
         }
 
-        let (opart, mlpart, kvlen, ns, scale) = (self.opart, self.mlpart, self.kvlen, self.ns, c.attn_scale);
+        let (opart, mlpart, kvlen, ns, scale) =
+            (self.opart, self.mlpart, self.kvlen, self.ns, c.attn_scale);
         let c_fa = if self.prefill {
             // t5 (O_final) stays NONE: the sinks fold lives in FLASH_MERGE only (dev_isa.h op 13).
-            self.b.emit(DevOp::FlashPrefill, self.b.all(), &[c_qn, c_kn, c_vn], |d| {
-                d.t[0] = opart;
-                d.t[1] = mlpart;
-                d.t[2] = q;
-                d.t[3] = kc;
-                d.t[4] = vc;
-                d.i[0] = t;
-                d.i[1] = t;
-                d.i[2] = heads;
-                d.i[3] = kvh;
-                d.i[4] = 0;
-                d.i[5] = win;
-                d.i[6] = hd;
-                d.i[7] = ns;
-                d.f[0] = scale;
-                d.j[0] = kvr;
-                d.j[1] = kvm;
-            })
+            self.b.emit(
+                DevOp::FlashPrefill,
+                self.b.all(),
+                &[c_qn, c_kn, c_vn],
+                |d| {
+                    d.t[0] = opart;
+                    d.t[1] = mlpart;
+                    d.t[2] = q;
+                    d.t[3] = kc;
+                    d.t[4] = vc;
+                    d.i[0] = t;
+                    d.i[1] = t;
+                    d.i[2] = heads;
+                    d.i[3] = kvh;
+                    d.i[4] = 0;
+                    d.i[5] = win;
+                    d.i[6] = hd;
+                    d.i[7] = ns;
+                    d.f[0] = scale;
+                    d.j[0] = kvr;
+                    d.j[1] = kvm;
+                },
+            )
         } else {
-            self.b.emit(DevOp::FlashDecode, self.b.all(), &[c_qn, c_kn, c_vn], |d| {
-                d.t[0] = opart;
-                d.t[1] = mlpart;
-                d.t[2] = q;
-                d.t[3] = kc;
-                d.t[4] = vc;
-                d.t[5] = kvlen;
-                d.i[0] = t;
-                d.i[1] = heads;
-                d.i[2] = kvh;
-                d.i[3] = kvr;
-                d.i[4] = win;
-                d.i[5] = ns;
-                d.i[6] = hd;
-                d.i[7] = kvm;
-                d.f[0] = scale;
-                if t > 1 {
-                    d.j[0] = t * kvh * kvr;
-                }
-            })
+            self.b
+                .emit(DevOp::FlashDecode, self.b.all(), &[c_qn, c_kn, c_vn], |d| {
+                    d.t[0] = opart;
+                    d.t[1] = mlpart;
+                    d.t[2] = q;
+                    d.t[3] = kc;
+                    d.t[4] = vc;
+                    d.t[5] = kvlen;
+                    d.i[0] = t;
+                    d.i[1] = heads;
+                    d.i[2] = kvh;
+                    d.i[3] = kvr;
+                    d.i[4] = win;
+                    d.i[5] = ns;
+                    d.i[6] = hd;
+                    d.i[7] = kvm;
+                    d.f[0] = scale;
+                    if t > 1 {
+                        d.j[0] = t * kvh * kvr;
+                    }
+                })
         };
         // Always emitted, even at nsplit == 1: the sink enters the softmax denominator here.
         let at = self.at;
@@ -295,7 +347,10 @@ impl Emitter<'_> {
         // MoE. Router logits carry the linear bias in the GEMV (MoeRouterTopk's t3 is DeepSeek's
         // selection-only bias); flat top-k, softmax over the selected.
         let (e, k, inter) = (c.n_exp, c.top_k, c.inter);
-        let wr = self.w(&format!("{p}.mlp.router.weight"), e as u64 * h as u64 * BF16);
+        let wr = self.w(
+            &format!("{p}.mlp.router.weight"),
+            e as u64 * h as u64 * BF16,
+        );
         let br = self.w(&format!("{p}.mlp.router.bias"), e as u64 * BF16);
         let w_gu = self.w(
             &format!("{p}.mlp.experts.gate_up_proj_blocks"),
@@ -305,7 +360,10 @@ impl Emitter<'_> {
             &format!("{p}.mlp.experts.gate_up_proj_scales"),
             e as u64 * (2 * inter) as u64 * (h / 32) as u64,
         );
-        let b_gu = self.w(&format!("{p}.mlp.experts.gate_up_proj_bias"), e as u64 * (2 * inter) as u64 * BF16);
+        let b_gu = self.w(
+            &format!("{p}.mlp.experts.gate_up_proj_bias"),
+            e as u64 * (2 * inter) as u64 * BF16,
+        );
         let w_d = self.w(
             &format!("{p}.mlp.experts.down_proj_blocks"),
             e as u64 * h as u64 * (inter / 2) as u64,
@@ -314,18 +372,23 @@ impl Emitter<'_> {
             &format!("{p}.mlp.experts.down_proj_scales"),
             e as u64 * h as u64 * (inter / 32) as u64,
         );
-        let b_d = self.w(&format!("{p}.mlp.experts.down_proj_bias"), e as u64 * h as u64 * BF16);
+        let b_d = self.w(
+            &format!("{p}.mlp.experts.down_proj_bias"),
+            e as u64 * h as u64 * BF16,
+        );
         let (rlogit, tab, fu, part, moe) = (self.rlogit, self.tab, self.fu, self.part, self.moe);
         let c_r = self.proj(rlogit, hn, wr, br, e, h, c_n1);
-        let c_tk = self.b.emit(DevOp::MoeRouterTopkPf, self.rows(), &[c_r], |d| {
-            d.t[0] = tab;
-            d.t[1] = rlogit;
-            d.i[1] = e;
-            d.i[2] = k;
-            d.i[3] = ROUTER_FLAGS;
-            d.i[4] = t;
-            d.f[0] = 1.0;
-        });
+        let c_tk = self
+            .b
+            .emit(DevOp::MoeRouterTopkPf, self.rows(), &[c_r], |d| {
+                d.t[0] = tab;
+                d.t[1] = rlogit;
+                d.i[1] = e;
+                d.i[2] = k;
+                d.i[3] = ROUTER_FLAGS;
+                d.i[4] = t;
+                d.f[0] = 1.0;
+            });
         let (alpha, limit) = (c.swiglu_alpha, c.swiglu_limit);
         let c_d = if self.prefill {
             let (meta, row_token, row_partidx, row_gate) =
@@ -421,7 +484,7 @@ struct Phase {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn phase(
+fn phase_range(
     c: &GptOssCfg,
     ctx: u32,
     n_cu: u32,
@@ -430,8 +493,13 @@ fn phase(
     chunk: u32,
     prefill: bool,
     tensors: Option<Vec<TensorDecl>>,
+    layers: std::ops::Range<usize>,
 ) -> Phase {
     let mut b = Builder::new(n_cu);
+    let block_mode = layers.start != 0 || layers.end != c.layers as usize;
+    if block_mode {
+        b.force_uniseg();
+    }
     if let Some(tensors) = tensors {
         b.adopt_tensors(tensors);
     }
@@ -448,7 +516,8 @@ fn phase(
     // Flash split count. Prefill tiles the q axis; decode fills the machine per head. GF (the
     // decode GQA head fusion) is a kernel constant the CPU tier does not apply.
     let ns = if prefill {
-        n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1)).max(1)
+        n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
+            .max(1)
     } else {
         n_cu.div_ceil(heads).max(1)
     };
@@ -460,7 +529,11 @@ fn phase(
     let kg = act(&mut b, "kg", tr * kd as u64 * BF16);
     let vg = act(&mut b, "vg", tr * kd as u64 * BF16);
     let q = act(&mut b, "q", tr * qd as u64 * BF16);
-    let opart = act(&mut b, "opart", tr * heads as u64 * ns as u64 * hd as u64 * F32);
+    let opart = act(
+        &mut b,
+        "opart",
+        tr * heads as u64 * ns as u64 * hd as u64 * F32,
+    );
     let mlpart = act(&mut b, "mlpart", tr * heads as u64 * ns as u64 * 2 * F32);
     let at = act(&mut b, "at", tr * qd as u64 * BF16);
     let og = act(&mut b, "og", tr * h as u64 * BF16);
@@ -514,25 +587,40 @@ fn phase(
         row_gate,
         kv_rows: Vec::new(),
     };
-    let emb = em.w(
-        &format!("{}embed_tokens.weight", c.prefix),
-        c.vocab as u64 * h as u64 * BF16,
-    );
     let rows = em.rows();
-    let mut dep = em.b.emit(DevOp::Embed, rows.clone(), &[], |d| {
-        d.t[0] = x;
-        d.t[1] = emb;
-        d.t[2] = ids;
-        d.i[0] = t;
-        d.i[1] = h;
-        d.f[0] = 1.0;
-    });
-    let g_in: Vec<u32> = (0..c.layers as usize)
-        .map(|l| em.w(&format!("{}layers.{l}.input_layernorm.weight", c.prefix), h as u64 * BF16))
+    let mut dep = if block_mode {
+        0
+    } else {
+        let emb = em.w(
+            &format!("{}embed_tokens.weight", c.prefix),
+            c.vocab as u64 * h as u64 * BF16,
+        );
+        em.b.emit(DevOp::Embed, rows.clone(), &[], |d| {
+            d.t[0] = x;
+            d.t[1] = emb;
+            d.t[2] = ids;
+            d.i[0] = t;
+            d.i[1] = h;
+            d.f[0] = 1.0;
+        })
+    };
+    let g_in: Vec<u32> = layers
+        .clone()
+        .map(|l| {
+            em.w(
+                &format!("{}layers.{l}.input_layernorm.weight", c.prefix),
+                h as u64 * BF16,
+            )
+        })
         .collect();
-    let g_final = em.w(&format!("{}norm.weight", c.prefix), h as u64 * BF16);
+    let g_final = if block_mode {
+        TENSOR_NONE
+    } else {
+        em.w(&format!("{}norm.weight", c.prefix), h as u64 * BF16)
+    };
     let eps = c.eps;
-    dep = em.b.emit(DevOp::RmsNorm, rows.clone(), &[dep], |d| {
+    let norm_deps: Vec<u32> = if block_mode { Vec::new() } else { vec![dep] };
+    dep = em.b.emit(DevOp::RmsNorm, rows.clone(), &norm_deps, |d| {
         d.t[0] = hn;
         d.t[1] = x;
         d.t[2] = g_in[0];
@@ -540,10 +628,31 @@ fn phase(
         d.i[1] = h;
         d.f[0] = eps;
     });
-    for l in 0..c.layers as usize {
+    for (li, l) in layers.clone().enumerate() {
         // The layer tail's AddNorm already applies the NEXT norm (or the final one).
-        let gamma_next = g_in.get(l + 1).copied().unwrap_or(g_final);
+        // At an extracted block's boundary `hn` is not an output. Reusing the current gamma
+        // keeps the residual `act.x` exact without binding a weight outside the block.
+        let gamma_next =
+            g_in.get(li + 1).copied().unwrap_or_else(
+                || {
+                    if block_mode {
+                        g_in[li]
+                    } else {
+                        g_final
+                    }
+                },
+            );
         dep = em.layer(l, dep, gamma_next);
+    }
+    if block_mode {
+        let tensors = em.b.tensors();
+        let gen = em.b.gen_tensors();
+        return Phase {
+            prog: em.b.finish(),
+            tensors,
+            gen,
+            kv_rows: em.kv_rows,
+        };
     }
     // Untied head over the normed residual (`hn` after the last tail). Prefill scores the LAST
     // row only (a_row0 = t-1); decode scores every sequence row.
@@ -558,7 +667,10 @@ fn phase(
     dep = if head_mx4 {
         // PLOW_MXFP4 decode head: the 1.16 GB bf16 lm_head is ~1/4 of a GPT-OSS decode step's bytes.
         let lm4 = em.w(&format!("mxfp4/{head}"), c.vocab as u64 * h as u64 / 2);
-        let ls4 = em.w(&format!("mxfp4/{head}_scale"), c.vocab as u64 * h as u64 / 32);
+        let ls4 = em.w(
+            &format!("mxfp4/{head}_scale"),
+            c.vocab as u64 * h as u64 / 32,
+        );
         em.b.emit(DevOp::GemvMxfp4, all, &[dep], |d| {
             d.t[0] = logits;
             d.t[1] = hn;
@@ -580,12 +692,13 @@ fn phase(
         })
     };
     let nb = if !prefill && t > 1 { t } else { 0 };
-    dep = em.b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[dep], |d| {
-        d.t[0] = amax;
-        d.t[1] = logits;
-        d.i[0] = vocab;
-        d.i[1] = nb;
-    });
+    dep =
+        em.b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[dep], |d| {
+            d.t[0] = amax;
+            d.t[1] = logits;
+            d.i[0] = vocab;
+            d.i[1] = nb;
+        });
     em.b.emit(DevOp::ArgmaxFin, vec![0], &[dep], |d| {
         d.t[0] = ids;
         d.t[1] = amax;
@@ -602,6 +715,31 @@ fn phase(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn phase(
+    c: &GptOssCfg,
+    ctx: u32,
+    n_cu: u32,
+    t: u32,
+    dbatch: u32,
+    chunk: u32,
+    prefill: bool,
+    tensors: Option<Vec<TensorDecl>>,
+) -> Phase {
+    phase_range(
+        c,
+        ctx,
+        n_cu,
+        t,
+        dbatch,
+        chunk,
+        prefill,
+        tensors,
+        0..c.layers as usize,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     dir: &Path,
@@ -616,11 +754,17 @@ pub(super) fn run(
     verify: Option<&VerifyHook>,
 ) {
     assert_eq!(tp, 1, "gpt_oss: tensor parallelism is not implemented");
-    assert!(block.is_none(), "gpt_oss: --block extraction is not implemented");
     let v: Value =
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
             .expect("gpt_oss config JSON");
     let c = cfg_gpt_oss(&v);
+    let layers = block
+        .map(|spec| parse_block(spec, c.layers as usize))
+        .unwrap_or(0..c.layers as usize);
+    assert!(
+        block.is_none() || layers.len() == 1,
+        "gpt_oss: --block currently extracts one layer"
+    );
     let ecfg = emit_config::active();
     let rungs = ecfg.decode_rungs();
     let dbatch = *rungs.last().expect("decode_rungs is non-empty");
@@ -651,14 +795,34 @@ pub(super) fn run(
     let mut gen = Vec::new();
     let mut kv_rows = Vec::new();
     for &t in &buckets {
-        let ph = phase(&c, ctx, n_cu, t, dbatch, chunk, true, tensors.take());
+        let ph = phase_range(
+            &c,
+            ctx,
+            n_cu,
+            t,
+            dbatch,
+            chunk,
+            true,
+            tensors.take(),
+            layers.clone(),
+        );
         tensors = Some(ph.tensors);
         gen = ph.gen;
         progs.push(ph.prog);
         prog_t.push(t);
     }
     for &rb in &rungs {
-        let ph = phase(&c, ctx, n_cu, rb, dbatch, chunk, false, tensors.take());
+        let ph = phase_range(
+            &c,
+            ctx,
+            n_cu,
+            rb,
+            dbatch,
+            chunk,
+            false,
+            tensors.take(),
+            layers.clone(),
+        );
         tensors = Some(ph.tensors);
         gen = ph.gen;
         // The KV-append sites the host patches index the LAST (widest) program.
@@ -681,7 +845,7 @@ pub(super) fn run(
         dir,
         &c.prefix,
         &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
-        None,
+        block.map(|_| layers.clone()),
         &[],
         &[],
         &[],
@@ -692,7 +856,70 @@ pub(super) fn run(
     }
     let lean = apply_verify_gate(&m, verify);
     let outp = Path::new(out);
-    std::fs::write(outp, m.to_blob()).expect("write gpt_oss blob");
+    let mut sections = Vec::new();
+    if block.is_some() {
+        use plow_asset::*;
+        let l = layers.start;
+        let hidden = c.hidden as i64;
+        let ckpt = dir.to_string_lossy().into_owned();
+        let desc = BlockDescriptor {
+            model: ckpt.clone(),
+            arch: "gpt_oss_moe".into(),
+            layer: l as u32,
+            kind: vec![
+                if c.is_full[l] {
+                    "full_attn"
+                } else {
+                    "sliding_attn"
+                }
+                .into(),
+                "moe_ffn".into(),
+            ],
+            hidden,
+            dtype: "mxfp4_experts_bf16_activations".into(),
+            dims: BlockDims {
+                heads: Some(c.heads as i64),
+                head_dim: Some(c.hd as i64),
+                kv_heads: Some(c.kvh as i64),
+                n_exp: Some(c.n_exp as i64),
+                top_k: Some(c.top_k as i64),
+                moe_inter: Some(c.inter as i64),
+                ..Default::default()
+            },
+            dsa_role: None,
+            inputs: vec![BlockTensor {
+                name: "act.x".into(),
+                shape: vec![Dim::Symbolic("T".into()), Dim::Fixed(hidden)],
+                dtype: "bf16".into(),
+            }],
+            outputs: vec![BlockTensor {
+                name: "act.x".into(),
+                shape: vec![Dim::Symbolic("T".into()), Dim::Fixed(hidden)],
+                dtype: "bf16".into(),
+            }],
+            carried_state: vec![CarriedState {
+                role: "kv".into(),
+                tensors: vec![format!("kv.{l}.k"), format!("kv.{l}.v")],
+                layout: "head_major".into(),
+            }],
+            weights: BlockWeights {
+                mode: "symlink".into(),
+                ckpt,
+                prefix: format!("{}layers.{l}.", c.prefix),
+            },
+            programs: BlockPrograms {
+                prefill_buckets: buckets.iter().map(|&t| t as i64).collect(),
+                decode_t: dbatch as i64,
+            },
+        };
+        sections.push(write_block_descriptor(out, &desc));
+    }
+    let bytes = if sections.is_empty() {
+        m.to_blob()
+    } else {
+        m.to_blob_v6(&sections)
+    };
+    std::fs::write(outp, bytes).expect("write gpt_oss blob");
     if !arch.is_empty() {
         let man = manifest::build(&m, arch, &lean);
         manifest::write_config_header(&outp.with_file_name("plow_config.h"), &man)
@@ -703,12 +930,11 @@ pub(super) fn run(
         )
         .expect("gpt_oss build manifest");
     }
-    // Ops 147-150 (and the bias/sinks/pair_mode fields) have CPU-tier arms only. The gfx950
-    // dispatch-coverage gate is not applied: this blob is not a GPU asset.
     eprintln!(
         "gpt_oss: {} layers ({} full)  hidden={} inter={} heads={} kvh={} hd={} experts={}x top{} \
          vocab={}\n  max_ctx={} chunk={} prefill buckets {:?} + decode rungs {:?} -> {}\n  \
-         NOTE: MoE ops 147-150 + bias/sinks fields are CPU-tier only (no gfx950/sm arm).",
+         NOTE: NVIDIA block packets are functional; whole-model serving still requires HD64 \
+         decode coverage and live-KV validation.",
         c.layers,
         c.is_full.iter().filter(|x| **x).count(),
         c.hidden,
@@ -766,21 +992,49 @@ mod tests {
         assert_eq!(ph.tensors[0].name, "in.ids");
         let name = |h: u32| ph.tensors[h as usize].name.clone();
         let bytes = |n: &str| ph.tensors.iter().find(|t| t.name == n).unwrap().bytes;
-        assert_eq!(bytes("model.layers.0.mlp.experts.gate_up_proj_blocks"), 32 * 5760 * 90 * 16);
-        assert_eq!(bytes("model.layers.0.mlp.experts.gate_up_proj_scales"), 32 * 5760 * 90);
-        assert_eq!(bytes("model.layers.0.mlp.experts.down_proj_blocks"), 32 * 2880 * 90 * 16);
-        assert_eq!(bytes("model.layers.0.mlp.experts.gate_up_proj_bias"), 32 * 5760 * 2);
+        assert_eq!(
+            bytes("model.layers.0.mlp.experts.gate_up_proj_blocks"),
+            32 * 5760 * 90 * 16
+        );
+        assert_eq!(
+            bytes("model.layers.0.mlp.experts.gate_up_proj_scales"),
+            32 * 5760 * 90
+        );
+        assert_eq!(
+            bytes("model.layers.0.mlp.experts.down_proj_blocks"),
+            32 * 2880 * 90 * 16
+        );
+        assert_eq!(
+            bytes("model.layers.0.mlp.experts.gate_up_proj_bias"),
+            32 * 5760 * 2
+        );
         assert_eq!(bytes("model.layers.0.self_attn.sinks"), 64 * 2);
         assert_eq!(bytes("lm_head.weight"), 201088 * 2880 * 2);
         // Sliding layer 0 rings (128 + 1024 - 1 -> 2048 rows), full layer 1 is linear (4096).
         assert_eq!(bytes("kv.0.k"), 8 * 2048 * 64 * 2);
         assert_eq!(bytes("kv.1.k"), 8 * 4096 * 64 * 2);
         assert_eq!(ph.kv_rows.len(), 4, "k and v append sites per layer");
-        let ops: Vec<DevOp> = ph.prog.insts.iter().map(|d| DevOp::from_u16(d.op).unwrap()).collect();
+        let ops: Vec<DevOp> = ph
+            .prog
+            .insts
+            .iter()
+            .map(|d| DevOp::from_u16(d.op).unwrap())
+            .collect();
         for want in [
-            DevOp::Embed, DevOp::RmsNorm, DevOp::GemvQkv, DevOp::HeadNormRope, DevOp::FlashDecode,
-            DevOp::FlashMerge, DevOp::Gemv, DevOp::AddNorm, DevOp::MoeRouterTopkPf, DevOp::MoeGluMx,
-            DevOp::MoeDownMx, DevOp::MoeCombinePf, DevOp::Argmax, DevOp::ArgmaxFin,
+            DevOp::Embed,
+            DevOp::RmsNorm,
+            DevOp::GemvQkv,
+            DevOp::HeadNormRope,
+            DevOp::FlashDecode,
+            DevOp::FlashMerge,
+            DevOp::Gemv,
+            DevOp::AddNorm,
+            DevOp::MoeRouterTopkPf,
+            DevOp::MoeGluMx,
+            DevOp::MoeDownMx,
+            DevOp::MoeCombinePf,
+            DevOp::Argmax,
+            DevOp::ArgmaxFin,
         ] {
             assert!(ops.contains(&want), "missing {want:?}");
         }
@@ -865,9 +1119,8 @@ mod tests {
         let c = cfg_gpt_oss(&fixture());
         for rung in [1u32, 8] {
             let ph = phase(&c, 4096, 16, rung, 8, 1024, false, None);
-            let kv_write = |d: &packet::dev::DevInst| {
-                d.op == DevOp::HeadNormRope as u16 && d.j[0] != 0
-            };
+            let kv_write =
+                |d: &packet::dev::DevInst| d.op == DevOp::HeadNormRope as u16 && d.j[0] != 0;
             let writers: Vec<_> = ph.prog.insts.iter().filter(|d| kv_write(d)).collect();
             assert_eq!(writers.len(), 4);
             for d in &writers {
@@ -880,7 +1133,12 @@ mod tests {
                 .map(|&i| &ph.prog.insts[i as usize])
                 .collect();
             assert!(sites.iter().all(|d| kv_write(d)));
-            for d in ph.prog.insts.iter().filter(|d| d.op == DevOp::FlashDecode as u16) {
+            for d in ph
+                .prog
+                .insts
+                .iter()
+                .filter(|d| d.op == DevOp::FlashDecode as u16)
+            {
                 assert_eq!(d.i[0], rung);
                 assert_eq!(d.j[0], if rung > 1 { rung * 8 * d.i[3] } else { 0 });
             }
@@ -888,9 +1146,19 @@ mod tests {
                 let d = ph.prog.insts.iter().find(|d| d.op == op as u16).unwrap();
                 assert_eq!(d.i[6], rung, "{op:?} n_batch");
             }
-            let tk = ph.prog.insts.iter().find(|d| d.op == DevOp::MoeRouterTopkPf as u16).unwrap();
+            let tk = ph
+                .prog
+                .insts
+                .iter()
+                .find(|d| d.op == DevOp::MoeRouterTopkPf as u16)
+                .unwrap();
             assert_eq!(tk.i[4], rung);
-            let am = ph.prog.insts.iter().find(|d| d.op == DevOp::Argmax as u16).unwrap();
+            let am = ph
+                .prog
+                .insts
+                .iter()
+                .find(|d| d.op == DevOp::Argmax as u16)
+                .unwrap();
             assert_eq!(am.i[1], if rung > 1 { rung } else { 0 });
         }
     }
@@ -900,10 +1168,21 @@ mod tests {
         let _env = crate::test_env::env_guard();
         let c = cfg_gpt_oss(&fixture());
         let ph = phase(&c, 4096, 16, 128, 8, 1024, true, None);
-        let ops: Vec<DevOp> = ph.prog.insts.iter().map(|d| DevOp::from_u16(d.op).unwrap()).collect();
+        let ops: Vec<DevOp> = ph
+            .prog
+            .insts
+            .iter()
+            .map(|d| DevOp::from_u16(d.op).unwrap())
+            .collect();
         for want in [
-            DevOp::Gemm, DevOp::FlashPrefill, DevOp::FlashMerge, DevOp::MoeRouterTopkPf,
-            DevOp::MoeAlignPf, DevOp::MoeGluMxPf, DevOp::MoeDownMxPf, DevOp::MoeCombinePf,
+            DevOp::Gemm,
+            DevOp::FlashPrefill,
+            DevOp::FlashMerge,
+            DevOp::MoeRouterTopkPf,
+            DevOp::MoeAlignPf,
+            DevOp::MoeGluMxPf,
+            DevOp::MoeDownMxPf,
+            DevOp::MoeCombinePf,
         ] {
             assert!(ops.contains(&want), "missing {want:?}");
         }
@@ -918,7 +1197,10 @@ mod tests {
                     }
                 }
                 DevOp::MoeGluMxPf => {
-                    assert_eq!((d.i[0], d.i[1], d.i[2], d.i[3], d.i[5]), (2880, 2880, 32, 0, ACT_SWIGLU_OAI));
+                    assert_eq!(
+                        (d.i[0], d.i[1], d.i[2], d.i[3], d.i[5]),
+                        (2880, 2880, 32, 0, ACT_SWIGLU_OAI)
+                    );
                 }
                 DevOp::MoeCombinePf => assert_eq!(d.i[2], 128),
                 _ => {}
@@ -929,5 +1211,76 @@ mod tests {
         assert_eq!(bytes("in.kvlen"), 8 * 4);
         assert_eq!(bytes("kv.1.v"), 8 * 8 * 4096 * 64 * 2);
         assert_eq!(bytes("act.fu"), (128 * 4 + 32 * 128) * 2880 * 2);
+    }
+
+    #[test]
+    fn sliding_and_full_single_blocks_are_self_contained() {
+        let _env = crate::test_env::env_guard();
+        let c = cfg_gpt_oss(&fixture());
+        for (layer, window) in [(0usize, 128u32), (1, 0)] {
+            let ph = phase_range(&c, 4096, 16, 128, 1, 1024, true, None, layer..layer + 1);
+            assert!(ph.prog.stream.iter().all(|entry| entry.seg == 0));
+            let names: Vec<_> = ph.tensors.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"act.x"));
+            assert!(names
+                .iter()
+                .any(|n| n.starts_with(&format!("model.layers.{layer}."))));
+            assert!(!names.iter().any(|n| {
+                n.starts_with("model.layers.") && !n.starts_with(&format!("model.layers.{layer}."))
+            }));
+            assert!(!ph.prog.insts.iter().any(|d| {
+                matches!(
+                    DevOp::from_u16(d.op).unwrap(),
+                    DevOp::Embed | DevOp::Argmax | DevOp::ArgmaxFin
+                )
+            }));
+            let flash = ph
+                .prog
+                .insts
+                .iter()
+                .find(|d| d.op == DevOp::FlashPrefill as u16)
+                .unwrap();
+            assert_eq!(flash.i[5], window);
+            assert_eq!(flash.i[6], 64);
+            let merge = ph
+                .prog
+                .insts
+                .iter()
+                .find(|d| d.op == DevOp::FlashMerge as u16)
+                .unwrap();
+            assert_ne!(merge.t[3], TENSOR_NONE);
+
+            let man = manifest::build(
+                &Model {
+                    n_cu: 16,
+                    target: 0,
+                    tensors: ph.tensors,
+                    progs: vec![ph.prog],
+                    kv_row_insts: vec![],
+                    prog_t: vec![128],
+                    gen: ph.gen,
+                },
+                "sm_90a",
+                &LeanReport::default(),
+            );
+            assert_eq!(man["features"]["linear_bias"], true);
+            assert_eq!(man["features"]["rope_half_hd64"], true);
+            assert_eq!(man["features"]["attention_sinks"], true);
+            let header = manifest::config_header(&man);
+            for required in [
+                "#define PLOW_HAS_FLASH_HD64 1",
+                "#define PLOW_PACKET_LINEAR_BIAS 1",
+                "#define PLOW_PACKET_ROPE_HALF_HD64 1",
+                "#define PLOW_PACKET_ATTENTION_SINKS 1",
+            ] {
+                assert!(header.contains(required), "missing {required}");
+            }
+        }
+
+        let full = phase(&c, 4096, 16, 128, 1, 1024, true, None);
+        assert!(
+            full.prog.stream.iter().any(|entry| entry.seg != 0),
+            "full-model program retains its family segments"
+        );
     }
 }

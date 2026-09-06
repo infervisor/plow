@@ -169,11 +169,13 @@ __device__ __forceinline__ void pgm90_stage_fp8(uint8_t* dst, const uint8_t* __r
 
 /* ================================ bf16 plain GEMM =========================================== */
 /* C[m,n] = A[m,k] . B[n,k]^T. Drop-in for d_gemm. */
-static __device__ void d_gemm_sm90(__nv_bfloat16* __restrict__ C,
+template <bool BIAS = false>
+static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
                                    const __nv_bfloat16* __restrict__ A,
                                    const __nv_bfloat16* __restrict__ B, unsigned m, unsigned n,
                                    unsigned k, unsigned a_row0, unsigned slice, unsigned nblk,
-                                   __nv_bfloat16* arena) {
+                                   __nv_bfloat16* arena,
+                                   const __nv_bfloat16* __restrict__ bias = nullptr) {
     if (sm90_bad_k(k, 8u)) return; /* swizzle staging needs K%8==0, k>0 (bf16 chunk = 8 elems) */
     __nv_bfloat16* base = (__nv_bfloat16*)sm90_align1024(arena);
     __nv_bfloat16* As = base;                                /* [STAGES][128][64] swizzled */
@@ -246,13 +248,35 @@ static __device__ void d_gemm_sm90(__nv_bfloat16* __restrict__ C,
 #pragma unroll
                 for (int lo = 0; lo < 2; lo++) {
                     const int cc = c0 + 8 * g + lo;
-                    if (cc < (int)n)
-                        C[(size_t)rr * n + cc] = __float2bfloat16(acc[4 * g + 2 * hi + lo]);
+                    if (cc < (int)n) {
+                        float v = acc[4 * g + 2 * hi + lo];
+                        if constexpr (BIAS) v += __bfloat162float(bias[cc]);
+                        C[(size_t)rr * n + cc] = __float2bfloat16(v);
+                    }
                 }
             }
         __syncthreads();
     }
 }
+
+static __device__ void d_gemm_sm90(__nv_bfloat16* __restrict__ C,
+                                   const __nv_bfloat16* __restrict__ A,
+                                   const __nv_bfloat16* __restrict__ B, unsigned m, unsigned n,
+                                   unsigned k, unsigned a_row0, unsigned slice, unsigned nblk,
+                                   __nv_bfloat16* arena) {
+    d_gemm_sm90_impl<false>(C, A, B, m, n, k, a_row0, slice, nblk, arena);
+}
+
+#if PLOW_PACKET_LINEAR_BIAS
+static __device__ void d_gemm_sm90_bias(__nv_bfloat16* __restrict__ C,
+                                        const __nv_bfloat16* __restrict__ A,
+                                        const __nv_bfloat16* __restrict__ B,
+                                        const __nv_bfloat16* __restrict__ bias, unsigned m,
+                                        unsigned n, unsigned k, unsigned a_row0, unsigned slice,
+                                        unsigned nblk, __nv_bfloat16* arena) {
+    d_gemm_sm90_impl<true>(C, A, B, m, n, k, a_row0, slice, nblk, arena, bias);
+}
+#endif
 
 /* ================================ TMA + warp-specialized bf16 GEMM ==========================
  * PLOW_NV_TMA_GEMM=1 opt-in. Port of the winning tma_ws_gemm_bf16.cu configuration

@@ -133,11 +133,12 @@ template <class F> __device__ __forceinline__ void gemv_walk(unsigned M, F f) {
 }
 
 /* C[m][n] = dot(x[m][:], W[n][:]). W is [N, K] — HF nn.Linear layout, row n is output n. */
-template <int MM, int UN = gv_un<MM>::v>
+template <int MM, int UN = gv_un<MM>::v, bool BIAS = false>
 __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
                                           const __nv_bfloat16* __restrict__ x,
                                           const __nv_bfloat16* __restrict__ W, unsigned M,
-                                          unsigned N, unsigned K, unsigned slice, unsigned nblk) {
+                                          unsigned N, unsigned K, unsigned slice, unsigned nblk,
+                                          const __nv_bfloat16* __restrict__ bias = nullptr) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned nchunk = (K + GV_STEP - 1) / GV_STEP;
@@ -179,7 +180,8 @@ __device__ __forceinline__ void gemv_rows(__nv_bfloat16* __restrict__ C,
         }
 #pragma unroll
         for (int m = 0; m < MM; m++) {
-            const float t = warp_sum32(acc[m]);
+            float t = warp_sum32(acc[m]);
+            if constexpr (BIAS) t += __bfloat162float(bias[n]);
             if (lane == 0 && (unsigned)m < M) C[(size_t)m * N + n] = __float2bfloat16(t);
         }
     }
@@ -205,6 +207,19 @@ static __device__ void d_gemv(__nv_bfloat16* __restrict__ C, const __nv_bfloat16
                                    slice, nblk);
     });
 }
+
+#if PLOW_PACKET_LINEAR_BIAS
+static __device__ void d_gemv_bias(__nv_bfloat16* __restrict__ C,
+                                   const __nv_bfloat16* __restrict__ x,
+                                   const __nv_bfloat16* __restrict__ W,
+                                   const __nv_bfloat16* __restrict__ bias, unsigned M,
+                                   unsigned N, unsigned K, unsigned slice, unsigned nblk) {
+    gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
+        gemv_rows<decltype(mm)::v, gv_un<decltype(mm)::v>::v, true>(
+            C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows, N, K, slice, nblk, bias);
+    });
+}
+#endif
 
 /* ---- ROW-BLOCKED M=1 DECODE GEMV CORE (PLOW_NV_GEMV_RB, H100 campaign E2) ----------------
  * One warp owning ONE output row keeps only UN weight loads in flight. On H100 at the
@@ -522,11 +537,14 @@ static __device__ void d_gemv_argmax(__nv_bfloat16* __restrict__ C, const __nv_b
  * that 169 blocks stall behind) into one. */
 /* BATCH>1: one weight row feeds all MM x-rows (Cq/Ck/Cv are each [M][Nx]). MM==1 is
  * byte-identical to the old scalar-accumulator body (the B=1 serving path). */
-template <int MM, int UN = gv_un<MM>::v>
+template <int MM, int UN = gv_un<MM>::v, bool BIAS = false>
 __device__ __forceinline__ void gemv_qkv_rows(__nv_bfloat16* Cq, __nv_bfloat16* Ck,
                            __nv_bfloat16* Cv, const __nv_bfloat16* x, const __nv_bfloat16* Wq,
                            const __nv_bfloat16* Wk, const __nv_bfloat16* Wv, unsigned M, unsigned Nq,
-                           unsigned Nk, unsigned Nv, unsigned K, unsigned slice, unsigned nblk) {
+                           unsigned Nk, unsigned Nv, unsigned K, unsigned slice, unsigned nblk,
+                           const __nv_bfloat16* bq = nullptr,
+                           const __nv_bfloat16* bk = nullptr,
+                           const __nv_bfloat16* bv = nullptr) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned nchunk = (K + GV_STEP - 1) / GV_STEP;
@@ -539,14 +557,15 @@ __device__ __forceinline__ void gemv_qkv_rows(__nv_bfloat16* Cq, __nv_bfloat16* 
     for (unsigned g = g0 + warp; g < g1; g += PLOW_NV_WARPS) {
         /* Route the concatenated column to its matrix. */
         const __nv_bfloat16* W;
+        const __nv_bfloat16* bias;
         __nv_bfloat16* C;
         unsigned Nx, n;
         if (g < Nq) {
-            W = Wq; C = Cq; Nx = Nq; n = g;
+            W = Wq; C = Cq; Nx = Nq; n = g; bias = bq;
         } else if (g < Nq + Nk) {
-            W = Wk; C = Ck; Nx = Nk; n = g - Nq;
+            W = Wk; C = Ck; Nx = Nk; n = g - Nq; bias = bk;
         } else {
-            W = Wv; C = Cv; Nx = Nv; n = g - Nq - Nk;
+            W = Wv; C = Cv; Nx = Nv; n = g - Nq - Nk; bias = bv;
         }
         const __nv_bfloat16* wrow = W + (size_t)n * K;
         float acc[MM];
@@ -573,11 +592,30 @@ __device__ __forceinline__ void gemv_qkv_rows(__nv_bfloat16* Cq, __nv_bfloat16* 
         }
 #pragma unroll
         for (int m = 0; m < MM; m++) {
-            const float t = warp_sum32(acc[m]);
+            float t = warp_sum32(acc[m]);
+            if constexpr (BIAS) t += __bfloat162float(bias[n]);
             if (lane == 0 && (unsigned)m < M) C[(size_t)m * Nx + n] = __float2bfloat16(t);
         }
     }
 }
+
+#if PLOW_PACKET_LINEAR_BIAS
+static __device__ void d_gemv_qkv_bias(
+    __nv_bfloat16* __restrict__ Cq, __nv_bfloat16* __restrict__ Ck,
+    __nv_bfloat16* __restrict__ Cv, const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ Wq, const __nv_bfloat16* __restrict__ Wk,
+    const __nv_bfloat16* __restrict__ Wv, const __nv_bfloat16* __restrict__ bq,
+    const __nv_bfloat16* __restrict__ bk, const __nv_bfloat16* __restrict__ bv,
+    unsigned M, unsigned Nq, unsigned Nk, unsigned Nv, unsigned K, unsigned slice,
+    unsigned nblk) {
+    gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
+        gemv_qkv_rows<decltype(mm)::v, gv_un<decltype(mm)::v>::v, true>(
+            Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk, Cv + (size_t)m0 * Nv,
+            x + (size_t)m0 * K, Wq, Wk, Wv, rows, Nq, Nk, Nv, K, slice, nblk, bq,
+            bk, bv);
+    });
+}
+#endif
 static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16* __restrict__ Ck,
                            __nv_bfloat16* __restrict__ Cv, const __nv_bfloat16* __restrict__ x,
                            const __nv_bfloat16* __restrict__ Wq,
@@ -987,6 +1025,17 @@ static __device__ void d_gemm(__nv_bfloat16* __restrict__ C, const __nv_bfloat16
     }
 #endif /* PLOW_NV_HOPPER */
 }
+
+#if defined(PLOW_NV_HOPPER) && PLOW_PACKET_LINEAR_BIAS
+static __device__ void d_gemm_bias(__nv_bfloat16* __restrict__ C,
+                                   const __nv_bfloat16* __restrict__ A,
+                                   const __nv_bfloat16* __restrict__ B,
+                                   const __nv_bfloat16* __restrict__ bias, unsigned m,
+                                   unsigned n, unsigned k, unsigned a_row0, unsigned slice,
+                                   unsigned nblk, __nv_bfloat16* arena) {
+    d_gemm_sm90_bias(C, A, B, bias, m, n, k, a_row0, slice, nblk, arena);
+}
+#endif
 
 /* GEMM over gate|up in ONE pass, act(gate)*up in the epilogue — the prefill twin of d_gemv_glu.
  * fu = act(A.Wg^T) * (A.Wu^T). Stages TWO B tiles (Wg, Wu) per K-step, keeps two accumulators,
