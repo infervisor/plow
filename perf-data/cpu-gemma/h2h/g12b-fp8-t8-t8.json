@@ -1,0 +1,350 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8096",
+  "model": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+  "server_models": [
+   "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
+  ],
+  "timestamp": "2026-09-06T17:29:47+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8096",
+   "--model",
+   "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+   "--workload",
+   "chat_short",
+   "--concurrency",
+   "1",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+   "--out",
+   "perf-data/cpu-gemma/h2h/g12b-fp8-t8-t8.json",
+   "--md",
+   "perf-data/cpu-gemma/h2h/g12b-fp8-t8-t8.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "chat_short",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 77.48816360499768,
+    "ttft_s": {
+     "mean": 0.40875936812517466,
+     "p50": 0.40424828400136903,
+     "p90": 0.42085411300649866,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.14724986142460866,
+     "p50": 0.14739484626994773,
+     "p90": 0.14749064719043894,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 9.685600830373005,
+     "p50": 9.690227928003878,
+     "p90": 9.697335431992542,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 33.875,
+     "p50": 37,
+     "p90": 42,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 6.60746075503818,
+    "req_per_s": 0.10324157429747156,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 77.48816360499768,
+     "ttft_s": {
+      "mean": 0.40875936812517466,
+      "p50": 0.40424828400136903,
+      "p90": 0.42085411300649866,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.14724986142460866,
+      "p50": 0.14739484626994773,
+      "p90": 0.14749064719043894,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 9.685600830373005,
+      "p50": 9.690227928003878,
+      "p90": 9.697335431992542,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 33.875,
+      "p50": 37,
+      "p90": 42,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 6.60746075503818,
+     "req_per_s": 0.10324157429747156,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.38611404100083746,
+     "tpot_s": 0.14741386768259368,
+     "latency_s": 9.673293350992026,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 40,
+      "completion_tokens": 64,
+      "total_tokens": 104,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Bees kick out drones at the end of summer primarily because they are **non-produ",
+     "text_chars": 301,
+     "index": 0,
+     "kind": "chat_short",
+     "t_start": 1788715797.3728285,
+     "prompt_tokens_client": 27,
+     "prompt_tokens_server": 40,
+     "prompt_chars": 94,
+     "prompt_tokens": 27
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.40462718400522135,
+     "tpot_s": 0.14749064719043894,
+     "latency_s": 9.696634067004197,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 34,
+      "completion_tokens": 64,
+      "total_tokens": 98,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "When coffee is harvested, the fruit (cherry) must be removed to get to the seed ",
+     "text_chars": 276,
+     "index": 1,
+     "kind": "chat_short",
+     "t_start": 1788715807.0464942,
+     "prompt_tokens_client": 21,
+     "prompt_tokens_server": 34,
+     "prompt_chars": 106,
+     "prompt_tokens": 21
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.40424828400136903,
+     "tpot_s": 0.14739484626994773,
+     "latency_s": 9.690227928003878,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 52,
+      "completion_tokens": 64,
+      "total_tokens": 116,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a clear, concise explanation you can use for your newsletter.\n\n### The S",
+     "text_chars": 317,
+     "index": 2,
+     "kind": "chat_short",
+     "t_start": 1788715816.7434828,
+     "prompt_tokens_client": 39,
+     "prompt_tokens_server": 52,
+     "prompt_chars": 184,
+     "prompt_tokens": 39
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.3805918029975146,
+     "tpot_s": 0.14688205690467768,
+     "latency_s": 9.634258530990337,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 39,
+      "completion_tokens": 64,
+      "total_tokens": 103,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Lighthouse keepers used a system called **\"light characteristics\"** to distingui",
+     "text_chars": 303,
+     "index": 3,
+     "kind": "chat_short",
+     "t_start": 1788715826.4341354,
+     "prompt_tokens_client": 26,
+     "prompt_tokens_server": 39,
+     "prompt_chars": 121,
+     "prompt_tokens": 26
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.4029199030046584,
+     "tpot_s": 0.14730424260316852,
+     "latency_s": 9.683192255004542,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 40,
+      "completion_tokens": 64,
+      "total_tokens": 104,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To understand the difference between **Washed** and **Natural** processed coffee",
+     "text_chars": 292,
+     "index": 4,
+     "kind": "chat_short",
+     "t_start": 1788715836.0687592,
+     "prompt_tokens_client": 27,
+     "prompt_tokens_server": 40,
+     "prompt_chars": 139,
+     "prompt_tokens": 27
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.4028408479935024,
+     "tpot_s": 0.14753009355557706,
+     "latency_s": 9.697335431992542,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 55,
+      "completion_tokens": 64,
+      "total_tokens": 119,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A sinking fund is a savings strategy where you set aside a specific amount of mo",
+     "text_chars": 303,
+     "index": 5,
+     "kind": "chat_short",
+     "t_start": 1788715845.7523425,
+     "prompt_tokens_client": 42,
+     "prompt_tokens_server": 55,
+     "prompt_chars": 165,
+     "prompt_tokens": 42
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.46787876899179537,
+     "tpot_s": 0.147032380666739,
+     "latency_s": 9.731006033995072,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 65,
+      "completion_tokens": 64,
+      "total_tokens": 129,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Your starter is likely not dead, but it is experiencing a chemical imbalance or ",
+     "text_chars": 296,
+     "index": 6,
+     "kind": "chat_short",
+     "t_start": 1788715855.4500866,
+     "prompt_tokens_client": 52,
+     "prompt_tokens_server": 65,
+     "prompt_chars": 240,
+     "prompt_tokens": 52
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.42085411300649866,
+     "tpot_s": 0.14695075652372677,
+     "latency_s": 9.678859045001445,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 50,
+      "completion_tokens": 64,
+      "total_tokens": 114,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To achieve the perfect cup, you must balance these four primary variables:\n\n1. *",
+     "text_chars": 278,
+     "index": 7,
+     "kind": "chat_short",
+     "t_start": 1788715865.1815462,
+     "prompt_tokens_client": 37,
+     "prompt_tokens_server": 50,
+     "prompt_chars": 159,
+     "prompt_tokens": 37
+    }
+   ]
+  }
+ ]
+}
