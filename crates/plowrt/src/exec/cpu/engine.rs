@@ -579,6 +579,31 @@ fn loaded(p: &DevProg, n_cu: u32) -> LoadedProgram {
     } else {
         None
     };
+    // Global-queue mode (opt-in, `PLOW_CPU_GQ=1`): the blob's op-major `GQ01` stream windowed by
+    // `[segment][l2 domain]`; workers claim from their domain's window and steal from the others,
+    // so a slow slice no longer stalls its whole static stream. Static streams stay the default
+    // until it measures faster.
+    let gq_on = std::env::var_os("PLOW_CPU_GQ").is_some_and(|v| v != "0");
+    let gq = if gq_on && !p.gq_stream.is_empty() {
+        let domains = p.l2_domains.max(1);
+        if p.gq_seg_ofs.len() as u32 == n_seg * domains + 1 && p.gq_stream.len() == p.stream.len() {
+            Some(crate::exec::cpu::interp::GlobalQueue {
+                stream: p.gq_stream.clone(),
+                seg_ofs: p.gq_seg_ofs.clone(),
+                domains,
+            })
+        } else {
+            tracing::warn!(
+                windows = p.gq_seg_ofs.len(),
+                n_seg,
+                domains,
+                "PLOW_CPU_GQ: blob GQ appendix does not match the program; using static streams"
+            );
+            None
+        }
+    } else {
+        None
+    };
     LoadedProgram {
         insts: p.insts.clone(),
         stream: p.stream.clone(),
@@ -589,7 +614,7 @@ fn loaded(p: &DevProg, n_cu: u32) -> LoadedProgram {
         n_cu,
         n_seg,
         seg_ofs,
-        gq: None,
+        gq,
     }
 }
 
