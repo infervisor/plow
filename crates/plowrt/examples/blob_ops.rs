@@ -52,6 +52,11 @@ fn main() {
             }
         }
     }
+    if std::env::args().any(|a| a == "--tensors") {
+        for (i, t) in blob.tensors.iter().enumerate() {
+            println!("  tensor {:>3} {:<40} {} B", i, t.name, t.bytes);
+        }
+    }
     println!("union: {} distinct ops", union.len());
     for op in union.keys() {
         println!("  {:>4} {}", op, name(*op));

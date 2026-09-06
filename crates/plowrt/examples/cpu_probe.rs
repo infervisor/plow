@@ -27,6 +27,8 @@ fn main() {
     let mut dump_dir: Option<PathBuf> = None;
     let mut seeds: Vec<String> = Vec::new();
     let mut seed_files: Vec<String> = Vec::new();
+    let mut decode_only = false;
+    let mut seed_files_dec: Vec<String> = Vec::new();
     let mut opts = CpuEngineOpts::default();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -44,6 +46,13 @@ fn main() {
             // `--seed-file act.x:/path/h0.bin`: raw bytes (e.g. an HF hidden_states dump) copied into
             // the tensor's head before the run — the single-block validation path.
             "--seed-file" => seed_files.push(args.next().unwrap()),
+            // Skip the prefill: decode steps start at pos 0 with the seeds re-applied before each
+            // step, so one token through the decode program can be diffed against the prefill
+            // program's row (block blobs have no EMBED, so act.x is whatever was seeded).
+            "--decode-only" => decode_only = true,
+            // `--seed-file-decode act.x:/path`: raw bytes copied before EACH decode step (row 0 of a
+            // block blob's act.x = the new token's residual), independent of the prefill seeds.
+            "--seed-file-decode" => seed_files_dec.push(args.next().unwrap()),
             "--threads" => opts.threads = args.next().unwrap().parse().unwrap(),
             "--isa" => {
                 opts.isa = match args.next().unwrap().as_str() {
@@ -73,6 +82,7 @@ fn main() {
     println!("prompt ids ({}): {:?}", ids.len(), &ids[..ids.len().min(16)]);
     let mut eng = CpuEngine::load(&blob, &ckpt, &opts).expect("load");
     println!("isa={:?} threads={}", eng.isa, eng.threads);
+    let apply_seeds = |eng: &CpuEngine| {
     for sd in &seeds {
         let (name, std) = sd.split_once(':').unwrap_or((sd.as_str(), "1.0"));
         let std: f32 = std.parse().unwrap();
@@ -101,17 +111,8 @@ fn main() {
         bytes[..data.len()].copy_from_slice(&data);
         println!("seeded {name} with {} bytes from {path}", data.len());
     }
-    let first = eng.prefill(&ids).expect("prefill");
-    println!("prefill -> token {first} {:?}", tok.decode(&[first]));
-    if let Some(p) = &dump_logits {
-        let h = eng.model().wk.logits.expect("act.logits");
-        // SAFETY: quiescent.
-        let bytes = unsafe { eng.model().tensor(h).as_slice() };
-        std::fs::write(p, bytes).expect("write logits");
-        println!("dumped {} bytes of act.logits to {}", bytes.len(), p.display());
-    }
-    dump(eng.model(), &filter);
-    if let Some(dir) = &dump_dir {
+    };
+    let write_dump = |eng: &CpuEngine, dir: &std::path::Path| {
         std::fs::create_dir_all(dir).expect("dump dir");
         let m = eng.model();
         for (h, name) in m.names.iter().enumerate() {
@@ -123,15 +124,63 @@ fn main() {
             std::fs::write(dir.join(name.replace('/', "_")), bytes).expect("write tensor");
         }
         println!("dumped tensors matching {filter:?} to {}", dir.display());
+    };
+    let mut pos = 0u32;
+    if !decode_only {
+    apply_seeds(&eng);
+    let first = eng.prefill(&ids).expect("prefill");
+    println!("prefill -> token {first} {:?}", tok.decode(&[first]));
+    if let Some(p) = &dump_logits {
+        let h = eng.model().wk.logits.expect("act.logits");
+        // SAFETY: quiescent.
+        let bytes = unsafe { eng.model().tensor(h).as_slice() };
+        std::fs::write(p, bytes).expect("write logits");
+        println!("dumped {} bytes of act.logits to {}", bytes.len(), p.display());
     }
-    let mut pos = ids.len() as u32;
+    dump(eng.model(), &filter);
+    if let Some(dir) = &dump_dir {
+        write_dump(&eng, dir);
+    }
+    pos = ids.len() as u32;
+    }
     for s in 0..decode_steps {
+        if decode_only {
+            apply_seeds(&eng);
+        }
+        for sf in &seed_files_dec {
+            let (name, path) = sf.split_once(':').expect("--seed-file-decode name:path");
+            let data = std::fs::read(path).expect("seed file");
+            let m = eng.model();
+            let h = m.names.iter().position(|n| n == name).expect("seed tensor name");
+            // SAFETY: quiescent (no run in flight).
+            let bytes = unsafe { m.tensor(h).as_mut_slice() };
+            bytes[..data.len()].copy_from_slice(&data);
+            println!("seeded {name} (decode) with {} bytes from {path}", data.len());
+        }
+        let peek = |eng: &CpuEngine, what: &str| {
+            for nm in ["act.x", "act.hn", "act.og"] {
+                let m = eng.model();
+                if let Some(h) = m.names.iter().position(|n| n == nm) {
+                    // SAFETY: quiescent.
+                    let b = unsafe { m.tensor(h).as_slice() };
+                    let v: Vec<f32> = (0..4).map(|i| f32::from_bits((u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as u32) << 16)).collect();
+                    println!("  [{what}] {nm} row0[:4] = {v:?}");
+                }
+            }
+        };
+        if std::env::var_os("PLOW_PROBE_PEEK").is_some() { peek(&eng, "pre-decode"); }
         let t = eng.decode_step(pos, pos + 1).expect("decode");
+        if std::env::var_os("PLOW_PROBE_PEEK").is_some() { peek(&eng, "post-decode"); }
         println!("decode step {s} -> token {t} {:?}", tok.decode(&[t]));
         pos += 1;
     }
     if decode_steps > 0 {
         dump(eng.model(), &filter);
+        if decode_only {
+            if let Some(dir) = &dump_dir {
+                write_dump(&eng, dir);
+            }
+        }
     }
 }
 

@@ -69,6 +69,12 @@ static inline void dotf_r4(const plow_bf16* W0, const plow_bf16* W1, const plow_
     out[2] = _mm512_reduce_add_ps(a2); out[3] = _mm512_reduce_add_ps(a3);
 }
 
+#include <stdlib.h>
+static int v_xn_bf16(void) {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PLOW_MOE_XN_BF16"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
 static inline float row_invrms(const plow_bf16* r, uint32_t H, float eps) {
     return g_rsqrt(v_row_ss(r, H) / (float)H + eps);
 }
@@ -145,8 +151,12 @@ V_K(v_moe_expert_glu_norm_gemma) {
         if (row != cur) {
             const plow_bf16* rr = resid + (size_t)row * H;
             const __m512 inv = _mm512_set1_ps(row_invrms(rr, H, eps));
-            for (uint32_t h = 0; h < H; h += 16u)
-                _mm512_storeu_ps(xn + h, _mm512_mul_ps(_mm512_mul_ps(v_load_bf16(rr + h), inv), v_load_bf16(gamma + h)));
+            const int rnd = v_xn_bf16();
+            for (uint32_t h = 0; h < H; h += 16u) {
+                __m512 v = _mm512_mul_ps(_mm512_mul_ps(v_load_bf16(rr + h), inv), v_load_bf16(gamma + h));
+                if (rnd) v = v_round_bf16(v);
+                _mm512_storeu_ps(xn + h, v);
+            }
             cur = row;
         }
         plow_bf16* frow = fu + (size_t)slot * I;

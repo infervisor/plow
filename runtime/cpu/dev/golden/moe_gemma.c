@@ -12,6 +12,16 @@
 
 #define GM_NB(v) ((v) ? (v) : 1u)
 
+#include <stdlib.h>
+/* PLOW_MOE_XN_BF16=1: round the fused-norm expert input xn through bf16 (HF's numerics: the
+ * pre-FFN norm output is a bf16 tensor). Default keeps xn in f32 (the AMD reference). */
+static int gm_xn_bf16(void) {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PLOW_MOE_XN_BF16"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v;
+}
+static inline float gm_round_xn(float x) { return gm_xn_bf16() ? plow_bf2f(plow_f2bf(x)) : x; }
+
 static inline const plow_bf16* ewt_base(const uint64_t* ewt, uint32_t eid, uint32_t which) {
     return (const plow_bf16*)(uintptr_t)ewt[(size_t)eid * 2u + which];
 }
@@ -139,7 +149,7 @@ G_K(g_moe_expert_glu_norm_gemma) {
         if (row != cur_row) {
             const plow_bf16* rr = resid + (size_t)row * H;
             const float inv = gm_invrms(rr, H, eps);
-            for (uint32_t h = 0; h < H; h++) xn[h] = plow_bf2f(rr[h]) * inv * plow_bf2f(gamma[h]);
+            for (uint32_t h = 0; h < H; h++) xn[h] = gm_round_xn(plow_bf2f(rr[h]) * inv * plow_bf2f(gamma[h]));
             cur_row = row;
         }
         for (uint32_t n = n0; n < n1; n++) {
