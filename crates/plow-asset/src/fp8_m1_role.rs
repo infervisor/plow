@@ -69,6 +69,18 @@ fn writes(op: u16) -> Result<&'static [usize]> {
     })
 }
 
+fn dependency_ancestors(dependencies: &[BTreeSet<usize>], pc: usize) -> Vec<bool> {
+    let mut ancestors = vec![false; dependencies.len()];
+    let mut pending: Vec<_> = dependencies[pc].iter().copied().collect();
+    while let Some(parent) = pending.pop() {
+        if !ancestors[parent] {
+            ancestors[parent] = true;
+            pending.extend(dependencies[parent].iter().copied());
+        }
+    }
+    ancestors
+}
+
 pub fn validate(packet: &Packet<'_>, program: usize, pc: usize) -> Result<()> {
     require(
         !packet.tp
@@ -174,20 +186,18 @@ pub fn validate(packet: &Packet<'_>, program: usize, pc: usize) -> Result<()> {
         g.gq_stream.windows(2).all(|w| w[0].inst <= w[1].inst),
         "reordered instruction windows",
     )?;
-    let mut ancestors = Vec::<BTreeSet<usize>>::new();
-    for ds in &deps {
-        let mut set = ds.clone();
-        for &p in ds {
-            set.extend(ancestors[p].iter().copied());
-        }
-        ancestors.push(set);
+    let pc_ancestors = dependency_ancestors(&deps, pc);
+    let mut pc_descendants = vec![false; deps.len()];
+    pc_descendants[pc] = true;
+    for j in pc + 1..deps.len() {
+        pc_descendants[j] = deps[j].iter().any(|&parent| pc_descendants[parent]);
     }
     let mut quant = None;
     for (j, inst) in g.insts.iter().enumerate() {
         if inst.op == DevOp::QuantFp8 as u16
             && inst.t[0] == d.t[1]
             && inst.t[2] == d.t[3]
-            && ancestors[pc].contains(&j)
+            && pc_ancestors[j]
         {
             quant = Some(j);
         }
@@ -208,9 +218,9 @@ pub fn validate(packet: &Packet<'_>, program: usize, pc: usize) -> Result<()> {
                     require(
                         j == pc
                             || if j < pc {
-                                ancestors[pc].contains(&j)
+                                pc_ancestors[j]
                             } else {
-                                ancestors[j].contains(&pc)
+                                pc_descendants[j]
                             },
                         "unordered activation/output lifetime",
                     )?;
@@ -253,8 +263,9 @@ pub fn validate(packet: &Packet<'_>, program: usize, pc: usize) -> Result<()> {
         }
     }
     let nw = norm_writer.ok_or("missing BF16 quantizer-input producer")?;
+    let quant_ancestors = dependency_ancestors(&deps, q);
     require(
-        ancestors[q].contains(&nw)
+        quant_ancestors[nw]
             && matches!(
                 DevOp::from_u16(g.insts[nw].op),
                 Some(
