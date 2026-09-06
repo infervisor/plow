@@ -1,4 +1,6 @@
 use super::*;
+use packet::dev::DevOp;
+use packet::devbuild::{Builder, Model};
 
 fn binding(section: &str, kind: PayloadKind, bytes: &[u8], capability: &str) -> PayloadBinding {
     PayloadBinding {
@@ -11,6 +13,25 @@ fn binding(section: &str, kind: PayloadKind, bytes: &[u8], capability: &str) -> 
             version: 1,
         },
     }
+}
+
+fn program_payload(n_cu: u32, rows: u32, count: usize) -> Vec<u8> {
+    let mut builder = Builder::new(n_cu);
+    builder.force_uniseg();
+    builder.emit(DevOp::Nop, builder.all(), &[], |_| {});
+    let model = Model {
+        n_cu,
+        target: 0,
+        tensors: vec![],
+        progs: vec![builder.finish()],
+        kv_row_insts: vec![],
+        prog_t: vec![rows],
+        gen: vec![],
+    };
+    crate::program::with_model(&model, |packet| {
+        let programs = vec![packet.programs[0]; count];
+        crate::aux_program::encode(n_cu, 0, &programs).unwrap()
+    })
 }
 
 #[test]
@@ -280,13 +301,13 @@ fn invalid_alias_frontier_bucket_and_padding_are_rejected() {
 
 #[test]
 fn variant_binds_exact_program_and_either_backend_object() {
-    let program_bytes = b"shared dev program";
+    let program_bytes = program_payload(132, 128, 3);
     let cubin_bytes = b"cuda object";
     let hsaco_bytes = b"amd object";
     let program = binding(
         "mixed_programs",
         PayloadKind::Programs,
-        program_bytes,
+        &program_bytes,
         PROGRAM_CAPABILITY,
     );
     let cubin = binding(
@@ -317,48 +338,49 @@ fn variant_binds_exact_program_and_either_backend_object() {
         }],
     };
     manifest.validate().unwrap();
-    let caps = [Capability {
-        name: PROGRAM_CAPABILITY.into(),
-        version: 1,
-    }];
-    let program_payload = Payload {
+    let program_section = Payload {
         section: "mixed_programs",
         kind: PayloadKind::Programs,
         version: 1,
         n_cu: 132,
-        bytes: program_bytes,
-        capabilities: &caps,
-        program_count: Some(3),
+        bytes: &program_bytes,
     };
-    let object_caps = [Capability {
-        name: "plow.mixed.interpreter".into(),
-        version: 1,
-    }];
     let amd = Payload {
         section: "mixed_gfx950",
         kind: PayloadKind::Hsaco,
         version: 1,
         n_cu: 132,
         bytes: hsaco_bytes,
-        capabilities: &object_caps,
-        program_count: None,
     };
-    manifest.variants[0]
-        .bind(132, &program_payload, Some(&amd))
+    let variant = &manifest.variants[0];
+    variant.bind_program(132, 0, &program_section).unwrap();
+    variant
+        .bind_hsaco_with(132, &amd, |name| (name == OBJECT_CAPABILITY).then_some(1))
+        .unwrap();
+    let cuda = Payload {
+        section: "mixed_sm90a",
+        kind: PayloadKind::Cubin,
+        version: 1,
+        n_cu: 132,
+        bytes: cubin_bytes,
+    };
+    variant
+        .bind_cubin_with(132, &cuda, |name| (name == OBJECT_CAPABILITY).then_some(1))
         .unwrap();
 
     let wrong = Payload {
         bytes: b"other",
         ..amd
     };
-    assert!(manifest.variants[0]
-        .bind(132, &program_payload, Some(&wrong))
-        .is_err());
+    assert!(variant.bind_hsaco_with(132, &wrong, |_| Some(1)).is_err());
+    assert!(variant.bind_hsaco_with(132, &amd, |_| None).is_err());
+
+    let short_bytes = program_payload(132, 128, 2);
     let short = Payload {
-        program_count: Some(2),
-        ..program_payload
+        bytes: &short_bytes,
+        ..program_section
     };
-    assert!(manifest.variants[0].bind(132, &short, None).is_err());
+    assert!(variant.bind_program(132, 0, &short).is_err());
 }
 
 #[test]
