@@ -417,6 +417,7 @@ impl PayloadBinding {
     fn validate(&self) -> Result<()> {
         require(
             identifier(&self.section, SECT_NAME_LEN - 1)
+                && self.section != SECTION
                 && self.version > 0
                 && digest(&self.sha256)
                 && identifier(&self.capability.name, 63)

@@ -467,6 +467,10 @@ fn manifest_requires_exactly_one_object_per_declared_backend() {
     ));
     manifest(variant.clone()).validate().unwrap();
 
+    let mut reserved = variant.clone();
+    reserved.objects[0].section = SECTION.into();
+    assert!(manifest(reserved).validate().is_err());
+
     variant.objects.push(binding(
         "cuda_b",
         PayloadKind::Cubin,
