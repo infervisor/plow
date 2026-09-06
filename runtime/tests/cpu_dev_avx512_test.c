@@ -3,8 +3,11 @@
  * Every registered op runs over ALL slices for nblk in {1, 3, 16} at Gemma-like shapes, both
  * through the live table (AVX-512 after plow_cpu_init(AVX512)) and through the golden entry
  * points called directly. bf16 outputs: 1e-2 relative (+1e-2 abs); integer outputs exact.
- * `--bench`: single-thread GEMV bandwidth, N=15360 K=3840 M=1, vs a plain AVX-512 read. */
+ * `--bench`: single-thread GEMV bandwidth, N=15360 K=3840 M=1, vs a plain AVX-512 read, then
+ * DRAM-streaming GEMV (weights rotated over ~1 GB) at decode shapes, M=1/8, 1 and 16 threads. */
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -426,6 +429,7 @@ __attribute__((target("avx512f"))) static uint64_t stream_read(const void* p, si
     return (uint64_t)_mm512_reduce_add_epi64(a);
 }
 
+static void bench_stream(void);
 static void bench(void) {
     const uint32_t N = 15360, K = 3840, M = 1;
     plow_bf16* x = rand_bf16(K, 1.0f);
@@ -464,6 +468,93 @@ static void bench(void) {
     g_gemv(&in, 0, 1, T, &g_ctx);
     printf("golden gemv: %.1f ms\n", (now_s() - t0) * 1e3);
     free(x); free(W); free(out);
+    bench_stream();
+}
+
+/* --- multi-thread streaming bench ---------------------------------------------------------
+ * One start barrier, then every thread runs its own slice over all rotations free-running (a
+ * per-rotation barrier turned into a scheduler artifact: 16 spinning threads on 16 logical
+ * CPUs stalled a whole timeslice whenever one was preempted). Aggregate bandwidth = all the
+ * weight bytes read divided by the wall time from the first start to the last finish. */
+
+typedef struct {
+    plow_cpu_kernel_fn f;
+    PlowDevInst in;
+    void*** Ts; /* per-rotation tensor tables (distinct weight buffers) */
+    uint32_t nrot, nthr;
+    atomic_uint arrive;
+    double t0[64], t1[64];
+} MtBench;
+typedef struct { MtBench* b; uint32_t slice; PlowCpuCtx ctx; } MtThr;
+
+static void* mt_run(void* p) {
+    MtThr* t = p;
+    MtBench* b = t->b;
+    atomic_fetch_add(&b->arrive, 1);
+    while (atomic_load(&b->arrive) < b->nthr) _mm_pause();
+    b->t0[t->slice] = now_s();
+    for (uint32_t r = 0; r < b->nrot; r++) b->f(&b->in, t->slice, b->nthr, b->Ts[r], &t->ctx);
+    b->t1[t->slice] = now_s();
+    return NULL;
+}
+/* Wall seconds for one rotation of the whole weight matrix across all threads. */
+static double mt_bench(MtBench* b) {
+    MtThr* th = calloc(b->nthr, sizeof *th);
+    pthread_t* tid = calloc(b->nthr, sizeof *tid);
+    atomic_store(&b->arrive, 0);
+    for (uint32_t i = 0; i < b->nthr; i++) {
+        th[i].b = b;
+        th[i].slice = i;
+        th[i].ctx.scratch_bytes = plow_cpu_scratch_bytes();
+        th[i].ctx.scratch = aligned_alloc(64, th[i].ctx.scratch_bytes);
+        plow_cpu_thread_init(&th[i].ctx);
+        if (i) pthread_create(&tid[i], NULL, mt_run, &th[i]);
+    }
+    mt_run(&th[0]);
+    for (uint32_t i = 1; i < b->nthr; i++) pthread_join(tid[i], NULL);
+    double lo = b->t0[0], hi = b->t1[0];
+    for (uint32_t i = 1; i < b->nthr; i++) {
+        if (b->t0[i] < lo) lo = b->t0[i];
+        if (b->t1[i] > hi) hi = b->t1[i];
+    }
+    for (uint32_t i = 0; i < b->nthr; i++) free(th[i].ctx.scratch);
+    free(th); free(tid);
+    return (hi - lo) / (double)b->nrot;
+}
+
+static void bench_stream(void) {
+    const uint32_t shapes[3][2] = {{3840, 3840}, {5760, 2880}, {5760, 3840}};
+    const size_t wmax = (size_t)5760 * 3840;
+    const uint32_t R = 24; /* 24 x 44 MB > 1 GB: past L3 even on a 260 MB part */
+    plow_bf16* W = aligned_alloc(64, wmax * 2 * R);
+    plow_bf16* w0 = rand_bf16(wmax, 0.05f);
+    for (uint32_t r = 0; r < R; r++) memcpy(W + r * wmax, w0, wmax * 2);
+    free(w0);
+    plow_bf16* x = rand_bf16((size_t)8 * 3840, 1.0f);
+    plow_bf16* C = zeros_bf16((size_t)8 * 5760);
+    void*** Ts = malloc(R * sizeof *Ts);
+    void** Tbuf = malloc(R * 3 * sizeof *Tbuf);
+    printf("--- DRAM-streaming GEMV bf16 (weights rotated over %u buffers) ---\n", R);
+    for (int si = 0; si < 3; si++)
+        for (uint32_t M = 1; M <= 8; M += 7)
+            for (uint32_t thr = 1; thr <= 16; thr *= 16) {
+                const uint32_t N = shapes[si][0], K = shapes[si][1];
+                for (uint32_t r = 0; r < R; r++) {
+                    Ts[r] = Tbuf + r * 3;
+                    Ts[r][0] = C; Ts[r][1] = x; Ts[r][2] = W + r * wmax;
+                }
+                MtBench b = {0};
+                b.f = plow_cpu_kernel(PLOW_DOP_GEMV);
+                b.in = inst(PLOW_DOP_GEMV);
+                b.in.t[0] = 0; b.in.t[1] = 1; b.in.t[2] = 2;
+                b.in.i[0] = M; b.in.i[1] = N; b.in.i[2] = K;
+                b.in.blocks = (uint16_t)thr;
+                b.Ts = Ts; b.nrot = R; b.nthr = thr;
+                const double best = mt_bench(&b), bytes = (double)N * K * 2.0;
+                printf("gemv bf16 N=%5u K=%4u M=%u thr=%2u: %7.3f ms  %6.1f GB/s\n", N, K, M, thr,
+                       best * 1e3, bytes / best / 1e9);
+            }
+    free(W); free(x); free(C); free(Ts); free(Tbuf);
 }
 
 /* Static-archive pitfall: dispatch.o's weak no-op registrar satisfies the symbol, so the

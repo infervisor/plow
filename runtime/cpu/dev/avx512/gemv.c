@@ -9,6 +9,9 @@
  * contiguous column ownership (g_range), so the fine gemv->headnorm dependency map holds. */
 #include "avx512.h"
 
+/* -O2 leaves the constant-trip RB/M loops rolled (acc[][] then lives on the stack). */
+#define UNROLL _Pragma("GCC unroll 8")
+
 #define PF_DIST 256u /* bf16 elements = 512 B */
 
 static inline __m512bh ldbh(const plow_bf16* p) { return (__m512bh)_mm512_loadu_si512(p); }
@@ -23,29 +26,39 @@ static inline __attribute__((always_inline)) void dot_rm(const plow_bf16* W, siz
                                                          uint32_t K, const uint32_t RB,
                                                          const uint32_t M, float* out) {
     __m512 acc[4][8];
+    UNROLL
     for (uint32_t r = 0; r < RB; r++)
+        UNROLL
         for (uint32_t m = 0; m < M; m++) acc[r][m] = _mm512_setzero_ps();
     uint32_t k = 0;
     for (; k + 32 <= K; k += 32) {
         __m512bh xv[8];
+        UNROLL
         for (uint32_t m = 0; m < M; m++) xv[m] = ldbh(X + m * ldx + k);
+        UNROLL
         for (uint32_t r = 0; r < RB; r++) {
             const plow_bf16* w = W + r * ldw + k;
             _mm_prefetch((const char*)(w + PF_DIST), _MM_HINT_T0);
             const __m512bh wv = ldbh(w);
+            UNROLL
             for (uint32_t m = 0; m < M; m++) acc[r][m] = _mm512_dpbf16_ps(acc[r][m], wv, xv[m]);
         }
     }
     if (k < K) {
         const __mmask32 mk = (__mmask32)((1u << (K - k)) - 1u);
         __m512bh xv[8];
+        UNROLL
         for (uint32_t m = 0; m < M; m++) xv[m] = ldbh_mask(X + m * ldx + k, mk);
+        UNROLL
         for (uint32_t r = 0; r < RB; r++) {
             const __m512bh wv = ldbh_mask(W + r * ldw + k, mk);
+            UNROLL
             for (uint32_t m = 0; m < M; m++) acc[r][m] = _mm512_dpbf16_ps(acc[r][m], wv, xv[m]);
         }
     }
+    UNROLL
     for (uint32_t r = 0; r < RB; r++)
+        UNROLL
         for (uint32_t m = 0; m < M; m++) out[r * M + m] = _mm512_reduce_add_ps(acc[r][m]);
 }
 
@@ -54,10 +67,12 @@ static inline __attribute__((always_inline)) void dot_m1_r4(const plow_bf16* W, 
                                                             const plow_bf16* x, uint32_t K,
                                                             float* out) {
     __m512 acc[4][2];
+    UNROLL
     for (uint32_t r = 0; r < 4; r++) acc[r][0] = acc[r][1] = _mm512_setzero_ps();
     uint32_t k = 0;
     for (; k + 64 <= K; k += 64) {
         const __m512bh x0 = ldbh(x + k), x1 = ldbh(x + k + 32);
+        UNROLL
         for (uint32_t r = 0; r < 4; r++) {
             const plow_bf16* w = W + r * ldw + k;
             _mm_prefetch((const char*)(w + PF_DIST), _MM_HINT_T0);
@@ -68,14 +83,17 @@ static inline __attribute__((always_inline)) void dot_m1_r4(const plow_bf16* W, 
     }
     for (; k + 32 <= K; k += 32) {
         const __m512bh x0 = ldbh(x + k);
+        UNROLL
         for (uint32_t r = 0; r < 4; r++) acc[r][0] = _mm512_dpbf16_ps(acc[r][0], ldbh(W + r * ldw + k), x0);
     }
     if (k < K) {
         const __mmask32 mk = (__mmask32)((1u << (K - k)) - 1u);
         const __m512bh x0 = ldbh_mask(x + k, mk);
+        UNROLL
         for (uint32_t r = 0; r < 4; r++)
             acc[r][1] = _mm512_dpbf16_ps(acc[r][1], ldbh_mask(W + r * ldw + k, mk), x0);
     }
+    UNROLL
     for (uint32_t r = 0; r < 4; r++) out[r] = _mm512_reduce_add_ps(_mm512_add_ps(acc[r][0], acc[r][1]));
 }
 
@@ -107,20 +125,27 @@ static inline __attribute__((always_inline)) void dotf_rm(const plow_bf16* W, si
                                                           const uint32_t RB, const uint32_t M,
                                                           float* out) {
     __m512 acc[2][8];
+    UNROLL
     for (uint32_t r = 0; r < RB; r++)
+        UNROLL
         for (uint32_t m = 0; m < M; m++) acc[r][m] = _mm512_setzero_ps();
     for (uint32_t k = 0; k < K; k += 16) {
         const __mmask16 mk = k + 16 <= K ? 0xFFFF : v_tail16(K - k);
         __m512 xv[8];
+        UNROLL
         for (uint32_t m = 0; m < M; m++) xv[m] = _mm512_maskz_loadu_ps(mk, XG + m * ldx + k);
+        UNROLL
         for (uint32_t r = 0; r < RB; r++) {
             const plow_bf16* w = W + r * ldw + k;
             _mm_prefetch((const char*)(w + PF_DIST), _MM_HINT_T0);
             const __m512 wv = v_load_bf16_mask(w, mk);
+            UNROLL
             for (uint32_t m = 0; m < M; m++) acc[r][m] = _mm512_fmadd_ps(wv, xv[m], acc[r][m]);
         }
     }
+    UNROLL
     for (uint32_t r = 0; r < RB; r++)
+        UNROLL
         for (uint32_t m = 0; m < M; m++) out[r * M + m] = _mm512_reduce_add_ps(acc[r][m]);
 }
 

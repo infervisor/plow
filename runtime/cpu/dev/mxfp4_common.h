@@ -42,151 +42,146 @@ static inline float plow_mxfp4_row_dot(const uint8_t* w, const uint8_t* s, const
 #if defined(__AVX512BW__) && defined(__AVX512F__) && defined(__AVX512BF16__)
 #include <immintrin.h>
 
-/* Vector decode state. The unit of work is 64 weights = 32 packed bytes = 2 blocks: the bytes are
- * widened to 32 u16 lanes, low/high nibbles become two vpermw LUT lookups giving the 32 EVEN and
- * the 32 ODD elements as bf16, and x is staged once per row-set in the same even|odd order per
- * 64-chunk (plow_mx_stage_x) so the pair `vdpbf16ps` reduces is (2j, 2j+1) either way. f32 lane
- * l of the dot then covers elements 4l..4l+3: lanes 0..7 = block b, 8..15 = block b+1.
- * K must be <= 64 * PLOW_MX_MAX_BLOCKS / 2 (callers fall back to golden otherwise). */
+/* Vector decode state. The unit of work is 128 weights = 64 packed bytes = 4 blocks, loaded as one
+ * zmm of 32 words: word j holds weights 4j..4j+3 in its four nibbles, so nibble q of every word is
+ * `word >> 4q` and one vpermw LUT lookup per q gives 32 bf16 lanes (lane j = weight 4j+q) -- no
+ * byte widening, and 4 lookups per 64 loaded bytes instead of the 2 per 32 bytes a 64-weight step
+ * needs. vdpbf16ps reduces lane pairs (2l, 2l+1) = weights (8l+q, 8l+4+q), so x is staged once per
+ * row-set with xq[2l+h] = x[8l+4h+q] (plow_mx_stage_x) and f32 lane l of the four dots covers
+ * weights 8l..8l+7: lanes 4b..4b+3 are block b of the chunk, so the four block scales apply as ONE
+ * fmadd against a 4-lane-spread scale vector (vs two broadcast fmadds per 64 weights before).
+ * K must be <= 32 * PLOW_MX_MAX_BLOCKS (callers fall back to golden otherwise). */
 typedef struct {
-    __m512i lut;   /* lane i: bf16(plow_e2m1_lut[i & 15]) */
-    __m512i ev;    /* vpermi2w indices: even elements of a 64-chunk */
-    __m512i od;    /* odd elements */
+    __m512i lut;   /* lane i: bf16(plow_e2m1_lut[i & 15]) (amx/ stages its bf16 tiles from this) */
+    __m512i xi[4]; /* vpermi2w indices staging nibble position q of a 64-element half */
+    __m512i sidx;  /* vpermps: lane l <- l / 4 */
 } plow_mx_vlut;
 
-#define PLOW_MX_PF_DIST 1024u /* bytes ahead of the current weight byte (measured; see gptoss test --bench) */
+#define PLOW_MX_CHUNK 128u
 /* The RB / M loops below must fully unroll (constant trip counts after inlining) or acc[][]
  * lands on the stack behind store-forwarding chains; -O2 alone does not do it (measured: 3x). */
 #define PLOW_MX_UNROLL _Pragma("GCC unroll 8")
 
 static inline void plow_mx_vlut_init(plow_mx_vlut* v) {
-    __attribute__((aligned(64))) uint16_t t[32], e[32], o[32];
-    for (uint32_t i = 0; i < 32u; i++) {
-        t[i] = plow_f2bf(plow_e2m1_lut[i & 15u]);
-        e[i] = (uint16_t)(2u * i);
-        o[i] = (uint16_t)(2u * i + 1u);
-    }
+    __attribute__((aligned(64))) uint16_t t[32], xi[4][32];
+    __attribute__((aligned(64))) uint32_t si[16];
+    for (uint32_t i = 0; i < 32u; i++) t[i] = plow_f2bf(plow_e2m1_lut[i & 15u]);
+    for (uint32_t q = 0; q < 4u; q++)
+        for (uint32_t l = 0; l < 16u; l++)
+            for (uint32_t h = 0; h < 2u; h++) xi[q][2u * l + h] = (uint16_t)(8u * (l & 7u) + 4u * h + q);
+    for (uint32_t l = 0; l < 16u; l++) si[l] = l / 4u;
     v->lut = _mm512_load_si512((const void*)t);
-    v->ev = _mm512_load_si512((const void*)e);
-    v->od = _mm512_load_si512((const void*)o);
+    for (uint32_t q = 0; q < 4u; q++) v->xi[q] = _mm512_load_si512((const void*)xi[q]);
+    v->sidx = _mm512_load_si512((const void*)si);
 }
 
-/* Bytes needed for a staged x row of K elements (rounded up to whole 64-chunks). */
-static inline uint32_t plow_mx_staged_len(uint32_t K) { return (K + 63u) & ~63u; }
+/* Elements needed for a staged x row of K elements (rounded up to whole chunks). */
+static inline uint32_t plow_mx_staged_len(uint32_t K) {
+    return (K + PLOW_MX_CHUNK - 1u) & ~(PLOW_MX_CHUNK - 1u);
+}
 
-/* xp[64c .. 64c+64) = even elements of x[64c ..) then the odd ones; tail zero-padded. */
+static inline __mmask32 plow_mx_tail32(uint32_t n) {
+    return n >= 32u ? 0xFFFFFFFFu : (__mmask32)((1u << n) - 1u);
+}
+
+/* xp[128c + 32q + 2l + h] = x[128c + 8l + 4h + q]; tail zero-padded. */
 static inline void plow_mx_stage_x(const plow_mx_vlut* v, plow_bf16* xp, const plow_bf16* x,
                                    uint32_t K) {
-    uint32_t k = 0;
-    for (; k + 64u <= K; k += 64u) {
-        const __m512i a = _mm512_loadu_si512((const void*)(x + k));
-        const __m512i b = _mm512_loadu_si512((const void*)(x + k + 32u));
-        _mm512_storeu_si512((void*)(xp + k), _mm512_permutex2var_epi16(a, v->ev, b));
-        _mm512_storeu_si512((void*)(xp + k + 32u), _mm512_permutex2var_epi16(a, v->od, b));
+    for (uint32_t k = 0; k < K; k += PLOW_MX_CHUNK) {
+        __m512i a[4];
+        if (k + PLOW_MX_CHUNK <= K) {
+            for (uint32_t i = 0; i < 4u; i++) a[i] = _mm512_loadu_si512((const void*)(x + k + 32u * i));
+        } else {
+            for (uint32_t i = 0; i < 4u; i++) {
+                const uint32_t n = K - k > 32u * i ? K - k - 32u * i : 0u;
+                a[i] = _mm512_maskz_loadu_epi16(plow_mx_tail32(n), x + k + 32u * i);
+            }
+        }
+        for (uint32_t q = 0; q < 4u; q++) {
+            const __m512i lo = _mm512_permutex2var_epi16(a[0], v->xi[q], a[1]);
+            const __m512i hi = _mm512_permutex2var_epi16(a[2], v->xi[q], a[3]);
+            _mm512_storeu_si512((void*)(xp + k + 32u * q), _mm512_mask_blend_epi16(0xFFFF0000u, lo, hi));
+        }
     }
-    if (k < K) {
-        const uint32_t n = K - k;
-        const __mmask32 ma = n >= 32u ? 0xFFFFFFFFu : (__mmask32)((1u << n) - 1u);
-        const __mmask32 mb = n >= 64u ? 0xFFFFFFFFu : n > 32u ? (__mmask32)((1u << (n - 32u)) - 1u) : 0u;
-        const __m512i a = _mm512_maskz_loadu_epi16(ma, x + k);
-        const __m512i b = _mm512_maskz_loadu_epi16(mb, x + k + 32u);
-        _mm512_storeu_si512((void*)(xp + k), _mm512_permutex2var_epi16(a, v->ev, b));
-        _mm512_storeu_si512((void*)(xp + k + 32u), _mm512_permutex2var_epi16(a, v->od, b));
-    }
 }
 
-/* 32 packed bytes -> even / odd elements as bf16 (lane j = element 2j / 2j+1 of the 64).
- * vpermw reads 5 index bits and the LUT is replicated over 32 lanes, so the low nibble needs no
- * mask (bit 4 of the byte is harmless) and the high nibble is just the byte >> 4. */
-static inline void plow_mx_dequant64(const plow_mx_vlut* v, const uint8_t* w, __m512i* ev,
-                                     __m512i* od) {
-    const __m512i b = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*)w));
-    *ev = _mm512_permutexvar_epi16(b, v->lut);
-    *od = _mm512_permutexvar_epi16(_mm512_srli_epi16(b, 4), v->lut);
-}
-
-/* Last 16 bytes of a row whose K % 64 == 32: the upper block decodes to +0. */
-static inline void plow_mx_dequant32(const plow_mx_vlut* v, const uint8_t* w, __m512i* ev,
-                                     __m512i* od) {
-    const __m512i b = _mm512_cvtepu8_epi16(
-        _mm256_zextsi128_si256(_mm_loadu_si128((const __m128i*)w)));
-    *ev = _mm512_permutexvar_epi16(b, v->lut);
-    *od = _mm512_permutexvar_epi16(_mm512_srli_epi16(b, 4), v->lut);
-}
-
-/* Per-row f32 block scales for one row block (K/32 <= PLOW_MX_MAX_BLOCKS). Precomputed so the
- * inner loop applies them as embedded-broadcast FMA operands (pure loads, no shuffle-port work). */
+/* Per-row f32 block scales for one row block (K/32 <= PLOW_MX_MAX_BLOCKS). The 4 zero pads after
+ * the last block let a partial final chunk multiply its empty lanes by 0 instead of garbage. */
 #define PLOW_MX_MAX_BLOCKS 512u /* K <= 16384 */
+#define PLOW_MX_SF_STRIDE (PLOW_MX_MAX_BLOCKS + 4u)
 static inline void plow_mx_scale_row(float* sf, const uint8_t* s, uint32_t nblk) {
     uint32_t b = 0;
     for (; b + 16u <= nblk; b += 16u)
         _mm512_storeu_ps(sf + b, _mm512_castsi512_ps(_mm512_slli_epi32(
                                      _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(s + b))), 23)));
     for (; b < nblk; b++) sf[b] = plow_e8m0_to_f32(s[b]);
+    for (; b < nblk + 4u; b++) sf[b] = 0.0f;
+}
+
+/* One chunk (64 packed bytes, masked by wm for a partial last chunk) of RB weight rows x M staged
+ * rows into acc[][]. Nibble-major: b[r] is shifted in place by 4 per step, so besides the RB*M dot
+ * and RB*M accumulator registers only the LUT, RB packed words, RB decoded words and one x vector
+ * are live (2*RB*M + 2*RB + 3 <= 32). */
+static inline __attribute__((always_inline)) void plow_mx_chunk(
+    const plow_mx_vlut* v, const uint8_t* W, size_t ldw, size_t lead, const float* sf,
+    const plow_bf16* XP, size_t ldx, uint32_t c, __mmask64 wm, const uint32_t RB, const uint32_t M,
+    __m512 acc[4][8]) {
+    __m512i b[4];
+    __m512 t[4][8];
+    PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++) {
+        const uint8_t* w = W + r * ldw + (size_t)c * 64u;
+        _mm_prefetch((const char*)(w + lead), _MM_HINT_T0);
+        b[r] = _mm512_maskz_loadu_epi8(wm, w);
+        PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++) t[r][m] = _mm512_setzero_ps();
+    }
+    PLOW_MX_UNROLL for (uint32_t q = 0; q < 4u; q++) {
+        __m512i wq[4];
+        PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++)
+            wq[r] = _mm512_permutexvar_epi16(q ? _mm512_srli_epi16(b[r], 4 * q) : b[r], v->lut);
+        PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++) {
+            const __m512bh xq = (__m512bh)_mm512_loadu_si512(
+                (const void*)(XP + m * ldx + (size_t)c * PLOW_MX_CHUNK + 32u * q));
+            PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++)
+                t[r][m] = _mm512_dpbf16_ps(t[r][m], (__m512bh)wq[r], xq);
+        }
+    }
+    PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++) {
+        const __m512 sv = _mm512_permutexvar_ps(
+            v->sidx, _mm512_castps128_ps512(_mm_loadu_ps(sf + r * PLOW_MX_SF_STRIDE + 4u * c)));
+        PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++) acc[r][m] = _mm512_fmadd_ps(t[r][m], sv, acc[r][m]);
+    }
 }
 
 /* out[r*M + m] = W[r] . X[m] over K (K % 32 == 0), RB packed weight rows (stride ldw bytes, scale
  * rows stride lds bytes) x M staged activation rows (stride ldx elements). RB/M are compile-time
- * constants at every call site so acc[][] lives in registers.
- * Per 64-chunk: t = dp(ev, xe) + dp(od, xo) holds block b in lanes 0..7 and block b+1 in lanes
- * 8..15; lo += t * s_b and hi += t * s_{b+1} as two broadcast FMAs, and the reduction takes the
- * low half of lo and the high half of hi -- cheaper than building a two-half scale vector on the
- * shuffle port every chunk. 2*RB*M <= 16 accumulators. */
+ * constants at every call site so acc[][] lives in registers. */
 static inline __attribute__((always_inline)) void plow_mx_dot_rm(
     const plow_mx_vlut* v, const uint8_t* W, size_t ldw, const uint8_t* S, size_t lds,
     const plow_bf16* XP, size_t ldx, uint32_t K, const uint32_t RB, const uint32_t M, float* out) {
-    __m512 lo[4][8], hi[4][8];
+    __m512 acc[4][8];
     PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++)
-        PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++) lo[r][m] = hi[r][m] = _mm512_setzero_ps();
-    float sf[4][PLOW_MX_MAX_BLOCKS];
-    const uint32_t nb = K / PLOW_MX_BLK, nc = K / 64u;
-    for (uint32_t r = 0; r < RB; r++) plow_mx_scale_row(sf[r], S + r * lds, nb);
-    const __m512 zero = _mm512_setzero_ps();
+        PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++) acc[r][m] = _mm512_setzero_ps();
+    float sf[4u * PLOW_MX_SF_STRIDE];
+    const uint32_t nb = K / PLOW_MX_BLK, nc = K / PLOW_MX_CHUNK;
+    for (uint32_t r = 0; r < RB; r++) plow_mx_scale_row(sf + r * PLOW_MX_SF_STRIDE, S + r * lds, nb);
     /* Packed rows are short (K/2 bytes: 1.9 KiB at K=3840), so a fixed 1 KiB lead never covers the
      * jump to the next row block and every block restarts cold (measured: cache-warm 13 GB/s vs
      * DRAM-streaming 6 per thread). A slice's rows are contiguous, so prefetching the same chunk of
      * row r+RB (one row block ahead, at least 4 KiB) keeps one continuous stream per row. */
     const size_t lead = (size_t)RB * ldw > 4096u ? (size_t)RB * ldw : 4096u;
-    for (uint32_t c = 0; c < nc; c++) {
-        __m512i ev[4], od[4];
-        PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++) {
-            const uint8_t* w = W + r * ldw + (size_t)c * 32u;
-            _mm_prefetch((const char*)(w + lead), _MM_HINT_T0);
-            plow_mx_dequant64(v, w, &ev[r], &od[r]);
-        }
-        PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++) {
-            const __m512bh xe = (__m512bh)_mm512_loadu_si512((const void*)(XP + m * ldx + c * 64u));
-            const __m512bh xo = (__m512bh)_mm512_loadu_si512((const void*)(XP + m * ldx + c * 64u + 32u));
-            PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++) {
-                __m512 t = _mm512_dpbf16_ps(zero, (__m512bh)ev[r], xe);
-                t = _mm512_dpbf16_ps(t, (__m512bh)od[r], xo);
-                lo[r][m] = _mm512_fmadd_ps(t, _mm512_set1_ps(sf[r][2u * c]), lo[r][m]);
-                hi[r][m] = _mm512_fmadd_ps(t, _mm512_set1_ps(sf[r][2u * c + 1u]), hi[r][m]);
-            }
-        }
-    }
-    if (K & 32u) {
-        __m512i ev[4], od[4];
-        PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++) plow_mx_dequant32(v, W + r * ldw + (size_t)nc * 32u, &ev[r], &od[r]);
-        PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++) {
-            const __m512bh xe = (__m512bh)_mm512_loadu_si512((const void*)(XP + m * ldx + nc * 64u));
-            const __m512bh xo = (__m512bh)_mm512_loadu_si512((const void*)(XP + m * ldx + nc * 64u + 32u));
-            PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++) {
-                __m512 t = _mm512_dpbf16_ps(zero, (__m512bh)ev[r], xe);
-                t = _mm512_dpbf16_ps(t, (__m512bh)od[r], xo);
-                lo[r][m] = _mm512_fmadd_ps(t, _mm512_set1_ps(sf[r][2u * nc]), lo[r][m]);
-            }
-        }
-    }
+    for (uint32_t c = 0; c < nc; c++)
+        plow_mx_chunk(v, W, ldw, lead, sf, XP, ldx, c, ~(__mmask64)0, RB, M, acc);
+    if (nb & 3u)
+        plow_mx_chunk(v, W, ldw, lead, sf, XP, ldx, nc, (__mmask64)((1ull << (16u * (nb & 3u))) - 1ull),
+                      RB, M, acc);
     PLOW_MX_UNROLL for (uint32_t r = 0; r < RB; r++)
-        PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++)
-            out[r * M + m] = _mm512_reduce_add_ps(_mm512_mask_blend_ps(0xFF00, lo[r][m], hi[r][m]));
+        PLOW_MX_UNROLL for (uint32_t m = 0; m < M; m++) out[r * M + m] = _mm512_reduce_add_ps(acc[r][m]);
 }
 
 #define PLOW_MX_DOT_CASE(RB_, M_) \
     case (RB_) * 16 + (M_): plow_mx_dot_rm(v, W, ldw, S, lds, XP, ldx, K, RB_, M_, out); break;
 
-/* Row block width for M activation rows (register budget: 2*RB*M + 2*RB + 4 <= 32). */
+/* Row block width for M activation rows (register budget: 2*RB*M + 2*RB + 3 <= 32). */
 static inline uint32_t plow_mx_rb_for(uint32_t M) { return M <= 2u ? 4u : M <= 4u ? 2u : 1u; }
 
 /* Runtime (RB, M) -> the unrolled instance. RB in {1, 2, 4}, M in 1..8. */

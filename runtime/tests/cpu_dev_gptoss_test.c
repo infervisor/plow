@@ -4,7 +4,7 @@
  * slices at GPT-OSS shapes.
  *
  *   ./cpu_dev_gptoss_test            run the comparisons (exit 1 on mismatch)
- *   ./cpu_dev_gptoss_test --bench    GEMV_MXFP4 N=5760 K=2880 M=1, 1 thread: GB/s of packed bytes */
+ *   ./cpu_dev_gptoss_test --bench    GEMV_MXFP4 N=5760 K=2880 M=1/4 + MoE decode B=1..8, 1 thread */
 #define _POSIX_C_SOURCE 199309L
 #include <math.h>
 #include <stdio.h>
@@ -730,22 +730,29 @@ static void test_moe_prefill(uint32_t Tn, uint32_t k, uint32_t E, uint32_t I, ui
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 static void bench(void) {
-    const uint32_t M = 1, N = 5760, K = 2880; /* one expert's gate_up: 8.3 MB packed */
-    plow_bf16* x = xmalloc((size_t)K * 2);
+    const uint32_t N = 5760, K = 2880; /* one expert's gate_up: 8.3 MB packed */
+    plow_bf16* x = xmalloc((size_t)8 * K * 2);
     uint8_t* W = xmalloc((size_t)N * K / 2); uint8_t* S = xmalloc((size_t)N * K / 32);
-    plow_bf16* C = xmalloc((size_t)N * 2);
-    fill_bf16(x, K, 1.0f); fill_fp4(W, (size_t)N * K / 2); fill_e8m0(S, (size_t)N * K / 32);
+    plow_bf16* C = xmalloc((size_t)8 * N * 2);
+    fill_bf16(x, (size_t)8 * K, 1.0f); fill_fp4(W, (size_t)N * K / 2); fill_e8m0(S, (size_t)N * K / 32);
     void* T[8] = {C, x, W, S, NULL, NULL, NULL, NULL};
     PlowDevInst in = inst(PLOW_DOP_GEMV_MXFP4);
-    in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[3] = 3; in.i[0] = M; in.i[1] = N; in.i[2] = K;
+    in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[3] = 3; in.i[0] = 1; in.i[1] = N; in.i[2] = K;
     PlowCpuCtx ctx = mkctx();
     kfn f = plow_cpu_kernel(PLOW_DOP_GEMV_MXFP4);
     const double bytes = (double)N * K / 2 + (double)N * K / 32;
-    f(&in, 0, 1, T, &ctx);
     double best = 1e9;
-    for (int r = 0; r < 20; r++) { double t0 = now(); f(&in, 0, 1, T, &ctx); double dt = now() - t0; if (dt < best) best = dt; }
-    printf("bench GEMV_MXFP4 tier %d M=1 N=%u K=%u (cache-warm): %.3f ms, %.1f GB/s packed (%.1f MB)\n",
-           plow_cpu_tier_of(PLOW_DOP_GEMV_MXFP4), N, K, best * 1e3, bytes / best / 1e9, bytes / 1e6);
+    for (uint32_t M = 1; M <= 4; M *= 4) { /* M >= 5 is the AMX tier's */
+        in.i[0] = M;
+        f(&in, 0, 1, T, &ctx);
+        double b = 1e9;
+        for (int r = 0; r < 20; r++) { double t0 = now(); f(&in, 0, 1, T, &ctx); double dt = now() - t0; if (dt < b) b = dt; }
+        if (M == 1) best = b;
+        printf("bench GEMV_MXFP4 tier %d M=%u N=%u K=%u (cache-warm): %.3f ms, %.1f GB/s packed (%.1f MB), %.2f ns/64w/row\n",
+               plow_cpu_tier_of(PLOW_DOP_GEMV_MXFP4), M, N, K, b * 1e3, bytes / b / 1e9, bytes / 1e6,
+               b * 1e9 / ((double)N * K * M / 64));
+    }
+    in.i[0] = 1;
     /* DRAM-streaming: cycle through 32 experts' worth of weights (265 MB > L3). */
     const uint32_t E = 32;
     uint8_t* We = xmalloc((size_t)E * N * K / 2); uint8_t* Se = xmalloc((size_t)E * N * K / 32);
@@ -758,21 +765,41 @@ static void bench(void) {
     printf("bench GEMV_MXFP4 DRAM-streaming over %u experts: %.3f ms/expert, %.1f GB/s packed\n", E, tot / E * 1e3, bytes * E / tot / 1e9);
     double t0 = now(); g_gemv_mxfp4(&in, 0, 1, T, &ctx); double tg = now() - t0;
     printf("      golden: %.2f ms (%.1fx)\n", tg * 1e3, tg / best);
-    /* MOE_GLU_MX at the GPT-OSS layer shape, k=4 slots of one token, 1 thread (all slices). */
-    {
-        const uint32_t k = 4, I = 2880, KK = 2880;
-        plow_moe_route tab[4] = {{0, 0.3f}, {5, 0.3f}, {9, 0.2f}, {17, 0.2f}};
-        plow_bf16* fu = xmalloc((size_t)k * I * 2);
+    /* MOE_GLU_MX / MOE_DOWN_MX at the GPT-OSS layer shape, k=4, B tokens all routed to the same 4
+     * experts (B >= 2 takes the grouped path: each expert dequantized once for M = B rows), 1 thread. */
+    for (uint32_t B = 1; B <= 8; B *= 2) {
+        const uint32_t k = 4, I = 2880, KK = 2880, H = 2880;
+        plow_moe_route tab[32];
+        for (uint32_t b = 0; b < B; b++) {
+            tab[b * 4 + 0] = (plow_moe_route){0, 0.3f}; tab[b * 4 + 1] = (plow_moe_route){5, 0.3f};
+            tab[b * 4 + 2] = (plow_moe_route){9, 0.2f}; tab[b * 4 + 3] = (plow_moe_route){17, 0.2f};
+        }
+        plow_bf16* fu = xmalloc((size_t)B * k * I * 2);
+        float* part = xmalloc((size_t)B * k * H * 4);
         void* TG[8] = {fu, x, tab, We, Se, NULL, NULL, NULL};
         PlowDevInst gi = inst(PLOW_DOP_MOE_GLU_MX);
         gi.t[0] = 0; gi.t[1] = 1; gi.t[2] = 2; gi.t[3] = 3; gi.t[4] = 4;
-        gi.i[0] = k; gi.i[1] = I; gi.i[2] = KK; gi.i[3] = E; gi.i[5] = 3; gi.fj[0].f = ALPHA; gi.fj[1].f = LIMIT;
+        gi.i[0] = k; gi.i[1] = I; gi.i[2] = KK; gi.i[3] = E; gi.i[5] = 3; gi.i[6] = B;
+        gi.fj[0].f = ALPHA; gi.fj[1].f = LIMIT;
         kfn fm = plow_cpu_kernel(PLOW_DOP_MOE_GLU_MX);
         double bm = 1e9;
         for (int r = 0; r < 5; r++) { double t1 = now(); fm(&gi, 0, 1, TG, &ctx); double dt = now() - t1; if (dt < bm) bm = dt; }
-        printf("bench MOE_GLU_MX tier %d k=4 I=K=2880 (4 experts, %.1f MB): %.3f ms, %.1f GB/s packed\n",
-               plow_cpu_tier_of(PLOW_DOP_MOE_GLU_MX), 4 * bytes / 1e6, bm * 1e3, 4 * bytes / bm / 1e9);
-        free(fu);
+        printf("bench MOE_GLU_MX tier %d B=%u k=4 I=K=2880 (4 experts, %.1f MB): %.3f ms, %.1f GB/s packed, %.2f ns/64w/row\n",
+               plow_cpu_tier_of(PLOW_DOP_MOE_GLU_MX), B, 4 * bytes / 1e6, bm * 1e3, 4 * bytes / bm / 1e9,
+               bm * 1e9 / (4.0 * N * KK * B / 64));
+        /* down: W_d [E][H][I/2] reuses the gate_up bytes (expert stride H*I/2 < N*K/2). */
+        void* TD[8] = {part, fu, tab, We, Se, NULL, NULL, NULL};
+        PlowDevInst di = inst(PLOW_DOP_MOE_DOWN_MX);
+        di.t[0] = 0; di.t[1] = 1; di.t[2] = 2; di.t[3] = 3; di.t[4] = 4;
+        di.i[0] = k; di.i[1] = H; di.i[2] = I; di.i[3] = E; di.i[6] = B;
+        kfn fd = plow_cpu_kernel(PLOW_DOP_MOE_DOWN_MX);
+        const double dbytes = 4.0 * ((double)H * I / 2 + (double)H * I / 32);
+        double bd = 1e9;
+        for (int r = 0; r < 5; r++) { double t1 = now(); fd(&di, 0, 1, TD, &ctx); double dt = now() - t1; if (dt < bd) bd = dt; }
+        printf("bench MOE_DOWN_MX tier %d B=%u k=4 H=I=2880 (4 experts, %.1f MB): %.3f ms, %.1f GB/s packed, %.2f ns/64w/row\n",
+               plow_cpu_tier_of(PLOW_DOP_MOE_DOWN_MX), B, dbytes / 1e6, bd * 1e3, dbytes / bd / 1e9,
+               bd * 1e9 / (4.0 * H * I * B / 64));
+        free(fu); free(part);
     }
 }
 
@@ -798,7 +825,8 @@ int main(int argc, char** argv) {
     test_gemv_mxfp4(1, 512, 2880);
     test_gemv_mxfp4(4, 256, 2880);
     test_gemv_mxfp4(8, 100, 2880);   /* N tail vs RB, M > 4 */
-    test_gemv_mxfp4(1, 64, 2912);    /* K % 64 == 32 tail block */
+    test_gemv_mxfp4(1, 64, 2912);    /* 3-block tail chunk */
+    test_gemv_mxfp4(2, 64, 2848);    /* 1-block tail chunk */
     test_gemv_mxfp4(3, 32, 2880);    /* router shape */
     test_gemv_glu_mxfp4(1, 256, 3840, 0);  /* Gemma GeGLU decode */
     test_gemv_glu_mxfp4(4, 100, 3840, 1);  /* SwiGLU, N tail vs RB */

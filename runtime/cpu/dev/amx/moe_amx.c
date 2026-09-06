@@ -12,6 +12,7 @@
 #include "golden/gptoss.h"
 #include "../avx512/avx512.h"
 #include "../mxfp4_common.h"
+#include "amx_common.h"
 
 #define XM_MAX 32u
 #define XM_PF 1024u /* bytes ahead of the current weight byte per streamed row */
@@ -23,14 +24,20 @@ static inline const plow_bf16* ewt_base(const uint64_t* ewt, uint32_t eid, uint3
 /* xp: per K block two B tiles ([16 k-pairs][16 columns] u32); column m of tile m/16 = row m. */
 static void pack_x2(uint8_t* xp, const plow_bf16* const* rowp, uint32_t M, uint32_t K) {
     const uint32_t nkb = K / 32u;
-    const __m512i idx = _mm512_mullo_epi32(
-        _mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), _mm512_set1_epi32(16));
-    for (uint32_t kb = 0; kb < nkb; kb++) {
-        uint32_t* tile = (uint32_t*)(xp + (size_t)kb * 2048u);
-        memset(tile, 0, 2048u);
-        for (uint32_t m = 0; m < M; m++) {
-            const __m512i v = _mm512_loadu_si512((const void*)(rowp[m] + (size_t)kb * 32u));
-            _mm512_i32scatter_epi32((void*)(tile + (m >> 4) * 256u + (m & 15u)), idx, v, 4);
+    /* One in-register transpose per 16 rows; the second tile is skipped (never loaded) at M <= 16. */
+    for (uint32_t t = 0; t < 2u && t * 16u < M; t++) {
+        const plow_bf16* const* rp = rowp + t * 16u;
+        const uint32_t mv = M - t * 16u;
+        for (uint32_t kb = 0; kb < nkb; kb++) {
+            __m512i r[16];
+#pragma GCC unroll 16
+            for (uint32_t m = 0; m < 16; m++)
+                r[m] = m < mv ? _mm512_loadu_si512((const void*)(rp[m] + (size_t)kb * 32u))
+                              : _mm512_setzero_si512();
+            plow_amx_tr16x16(r);
+            uint8_t* tile = xp + (size_t)kb * 2048u + t * 1024u;
+#pragma GCC unroll 16
+            for (uint32_t p = 0; p < 16; p++) _mm512_storeu_si512((void*)(tile + p * 64u), r[p]);
         }
     }
 }
@@ -38,7 +45,8 @@ static void pack_x2(uint8_t* xp, const plow_bf16* const* rowp, uint32_t M, uint3
 /* A tile for a partial 16-row group: only `rows` rows are copied; the rest are never read back. */
 static __thread uint8_t g_wtile[2][1024] __attribute__((aligned(64)));
 static inline void stage_rows(uint8_t* t, const char* w, size_t ldw_b, uint32_t rows) {
-    for (uint32_t r = 0; r < rows; r++) memcpy(t + r * 64u, w + r * ldw_b, 64u);
+    for (uint32_t r = 0; r < rows; r++)
+        _mm512_store_si512((void*)(t + r * 64u), _mm512_loadu_si512((const void*)(w + r * ldw_b)));
 }
 
 /* out[r][c] (f32, row stride 32) = W[r] . x[c] for r < rows (<= 32), c < 16*nxt. */

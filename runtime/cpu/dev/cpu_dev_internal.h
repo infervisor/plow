@@ -4,7 +4,9 @@
 
 #include "cpu_dev.h"
 
-#define PLOW_CPU_SCRATCH_BYTES (1u << 20)
+/* 8 MiB: the pack-free AMX GEMM keeps an x panel for every token plus fp32 partials per (strip,
+ * token block) here (amx/gemm_amx.c wm_run); allocated once per worker thread. */
+#define PLOW_CPU_SCRATCH_BYTES (8u << 20)
 
 /* The live table (dispatch.c). Registrars write it during plow_cpu_init only. */
 plow_cpu_kernel_fn* plow_cpu_table(void);

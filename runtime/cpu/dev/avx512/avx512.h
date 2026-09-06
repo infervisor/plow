@@ -45,6 +45,9 @@ V_K(v_moe_glu_mx_pf);
 V_K(v_moe_down_mx_pf);
 void v_register_gptoss(plow_cpu_kernel_fn* tab);
 void v_register_moe_gemma(plow_cpu_kernel_fn* tab); /* moe_gemma.c: Gemma-4 26B-A4B MoE ops */
+/* route.c */
+V_K(v_moe_combine_pf);
+void v_register_route(plow_cpu_kernel_fn* tab);
 
 /* --- bf16 <-> f32 (spec §5: explicit widen, cvtneps_pbh on store) ------------------- */
 
@@ -158,16 +161,30 @@ static inline float v_row_ss(const plow_bf16* x, uint32_t n) {
     return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
 }
 
-/* o = bf16(x * inv * gamma?) */
+/* o = bf16(x * inv * gamma?). Full chunks unmasked then one masked tail: a mask recomputed per
+ * chunk costs ~12 scalar uops per 16 lanes, more than the vector work itself. HAS_G is a template
+ * flag because gcc keeps a `gamma != NULL` test inside the loop otherwise. */
+static inline __attribute__((always_inline)) void v_scale_row_g(plow_bf16* o, const plow_bf16* x,
+                                                                const plow_bf16* gamma, __m512 vinv,
+                                                                uint32_t n, const int HAS_G) {
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 v = _mm512_mul_ps(v_load_bf16(x + i), vinv);
+        if (HAS_G) v = _mm512_mul_ps(v, v_load_bf16(gamma + i));
+        v_store_bf16(o + i, v);
+    }
+    if (i < n) {
+        const __mmask16 m = v_tail16(n - i);
+        __m512 v = _mm512_mul_ps(v_load_bf16_mask(x + i, m), vinv);
+        if (HAS_G) v = _mm512_mul_ps(v, v_load_bf16_mask(gamma + i, m));
+        v_store_bf16_mask(o + i, m, v);
+    }
+}
 static inline void v_scale_row(plow_bf16* o, const plow_bf16* x, const plow_bf16* gamma, float inv,
                                uint32_t n) {
     const __m512 vinv = _mm512_set1_ps(inv);
-    for (uint32_t i = 0; i < n; i += 16) {
-        const __mmask16 m = i + 16 <= n ? 0xFFFF : v_tail16(n - i);
-        __m512 v = _mm512_mul_ps(v_load_bf16_mask(x + i, m), vinv);
-        if (gamma) v = _mm512_mul_ps(v, v_load_bf16_mask(gamma + i, m));
-        v_store_bf16_mask(o + i, m, v);
-    }
+    if (gamma) v_scale_row_g(o, x, gamma, vinv, n, 1);
+    else v_scale_row_g(o, x, NULL, vinv, n, 0);
 }
 
 /* --- argmax key (golden g_amax_pack, 16 lanes) ----------------------------------------- */

@@ -87,19 +87,25 @@ static void test_route(uint32_t E, uint32_t k, uint32_t T, uint32_t flags, int w
     PlowDevInst ic; memset(&ic, 0, sizeof ic);
     ic.op = PLOW_DOP_MOE_COMBINE_PF; ic.t[0] = 0; ic.t[1] = 1; ic.t[2] = PLOW_TENSOR_NONE; ic.t[3] = 3; for (int i = 4; i < 8; i++) ic.t[i] = PLOW_TENSOR_NONE;
     ic.i[0] = H; ic.i[1] = k; ic.i[2] = T;
-    run_op(plow_cpu_kernel(PLOW_DOP_MOE_COMBINE_PF), &ic, Tc, nblk, ctx);
-    for (uint32_t t = 0; t < T; t++)
-        for (uint32_t h = 0; h < H; h++) {
-            double r = plow_bf2f(resid[(size_t)t * H + h]);
-            for (uint32_t j = 0; j < k; j++) r += part[((size_t)t * k + j) * H + h];
-            double got = plow_bf2f(out[(size_t)t * H + h]);
-            CHECK(fabs(got - r) <= 1e-2 * fmax(1.0, fabs(r)), "combine tok %u h %u: %g want %g", t, h, got, r);
-        }
+    for (int live = 0; live < 2; live++) {
+        memset(out, 0, (size_t)T * H * 2);
+        run_op(live ? plow_cpu_kernel(PLOW_DOP_MOE_COMBINE_PF) : g_moe_combine_pf, &ic, Tc, nblk, ctx);
+        for (uint32_t t = 0; t < T; t++)
+            for (uint32_t h = 0; h < H; h++) {
+                double r = plow_bf2f(resid[(size_t)t * H + h]);
+                for (uint32_t j = 0; j < k; j++) r += part[((size_t)t * k + j) * H + h];
+                double got = plow_bf2f(out[(size_t)t * H + h]);
+                CHECK(fabs(got - r) <= 1e-2 * fmax(1.0, fabs(r)), "combine%s tok %u h %u: %g want %g",
+                      live ? "" : " (golden)", t, h, got, r);
+            }
+    }
     free(logit); free(bias); free(tab); free(sc); free(meta); free(row_token); free(row_partidx); free(row_gate); free(part); free(resid); free(out);
 }
 
 int main(void) {
-    plow_cpu_init(PLOW_CPU_ISA_SCALAR);
+    /* The live table: top-k and align have no fast arm and resolve to golden, combine does.
+     * The golden combine is checked against the same reference inside test_route. */
+    plow_cpu_init(PLOW_CPU_ISA_AMX);
     PlowCpuCtx ctx; memset(&ctx, 0, sizeof ctx);
     ctx.scratch_bytes = plow_cpu_scratch_bytes(); ctx.scratch = aligned_alloc(64, ctx.scratch_bytes);
     plow_cpu_thread_init(&ctx);

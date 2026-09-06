@@ -9,12 +9,73 @@ static inline float hsum(__m512 v) { return _mm512_reduce_add_ps(v); }
 /* Sum of squares of (a + b) over n. */
 static float row_ss_sum(const plow_bf16* a, const plow_bf16* b, uint32_t n) {
     __m512 acc = _mm512_setzero_ps();
-    for (uint32_t i = 0; i < n; i += 16) {
-        const __mmask16 m = i + 16 <= n ? 0xFFFF : v_tail16(n - i);
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 f = _mm512_add_ps(v_load_bf16(a + i), v_load_bf16(b + i));
+        acc = _mm512_fmadd_ps(f, f, acc);
+    }
+    if (i < n) {
+        const __mmask16 m = v_tail16(n - i);
         const __m512 f = _mm512_add_ps(v_load_bf16_mask(a + i, m), v_load_bf16_mask(b + i, m));
         acc = _mm512_fmadd_ps(f, f, acc);
     }
     return hsum(acc);
+}
+
+/* resid = a + b (bf16) and out = bf16(resid * inv * gamma?), one pass. See v_scale_row_g on the
+ * unmasked-bulk / template-gamma shape. */
+static inline __attribute__((always_inline)) void add_norm_row(plow_bf16* out, plow_bf16* resid,
+                                                               const plow_bf16* a, const plow_bf16* b,
+                                                               const plow_bf16* gamma, __m512 vinv,
+                                                               uint32_t n, const int HAS_G) {
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 f = _mm512_add_ps(v_load_bf16(a + i), v_load_bf16(b + i));
+        v_store_bf16(resid + i, f);
+        __m512 v = _mm512_mul_ps(f, vinv);
+        if (HAS_G) v = _mm512_mul_ps(v, v_load_bf16(gamma + i));
+        v_store_bf16(out + i, v);
+    }
+    if (i < n) {
+        const __mmask16 m = v_tail16(n - i);
+        const __m512 f = _mm512_add_ps(v_load_bf16_mask(a + i, m), v_load_bf16_mask(b + i, m));
+        v_store_bf16_mask(resid + i, m, f);
+        __m512 v = _mm512_mul_ps(f, vinv);
+        if (HAS_G) v = _mm512_mul_ps(v, v_load_bf16_mask(gamma + i, m));
+        v_store_bf16_mask(out + i, m, v);
+    }
+}
+
+/* out = bf16((a + RMSNorm(b, gamma)) * scale); rb? also takes the bf16-rounded value and its
+ * sum of squares (the NORM_RESIDUAL_NORM first pass). */
+static inline __attribute__((always_inline)) __m512 norm_resid_row(plow_bf16* out, const plow_bf16* a,
+                                                                   const plow_bf16* b, const plow_bf16* gamma,
+                                                                   __m512 vinv, __m512 scale, uint32_t n,
+                                                                   const int HAS_G, const int ROUND) {
+    __m512 ssr = _mm512_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 nb = _mm512_mul_ps(v_load_bf16(b + i), vinv);
+        if (HAS_G) nb = _mm512_mul_ps(nb, v_load_bf16(gamma + i));
+        __m512 v = _mm512_mul_ps(_mm512_add_ps(v_load_bf16(a + i), nb), scale);
+        if (ROUND) {
+            v = v_round_bf16(v);
+            ssr = _mm512_fmadd_ps(v, v, ssr);
+        }
+        v_store_bf16(out + i, v);
+    }
+    if (i < n) {
+        const __mmask16 m = v_tail16(n - i);
+        __m512 nb = _mm512_mul_ps(v_load_bf16_mask(b + i, m), vinv);
+        if (HAS_G) nb = _mm512_mul_ps(nb, v_load_bf16_mask(gamma + i, m));
+        __m512 v = _mm512_mul_ps(_mm512_add_ps(v_load_bf16_mask(a + i, m), nb), scale);
+        if (ROUND) {
+            v = _mm512_maskz_mov_ps(m, v_round_bf16(v));
+            ssr = _mm512_fmadd_ps(v, v, ssr);
+        }
+        v_store_bf16_mask(out + i, m, v);
+    }
+    return ssr;
 }
 
 /* t0=out t1=x t2=gamma?  i0=rows i1=feat i2=out_row0  f0=eps (t3 quant fold -> qNaN row). */
@@ -89,13 +150,10 @@ V_K(v_norm_residual) {
     for (uint32_t row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;
         const __m512 vinv = _mm512_set1_ps(g_rsqrt(row_ss(b + base, feat) / (float)feat + eps));
-        for (uint32_t i = 0; i < feat; i += 16) {
-            const __mmask16 m = i + 16 <= feat ? 0xFFFF : v_tail16(feat - i);
-            __m512 nb = _mm512_mul_ps(v_load_bf16_mask(b + base + i, m), vinv);
-            if (gamma) nb = _mm512_mul_ps(nb, v_load_bf16_mask(gamma + i, m));
-            const __m512 v = _mm512_add_ps(v_load_bf16_mask(a + base + i, m), nb);
-            v_store_bf16_mask(out + base + i, m, _mm512_mul_ps(v, scale));
-        }
+        if (gamma)
+            norm_resid_row(out + base, a + base, b + base, gamma, vinv, scale, feat, 1, 0);
+        else
+            norm_resid_row(out + base, a + base, b + base, NULL, vinv, scale, feat, 0, 0);
     }
 }
 
@@ -113,15 +171,10 @@ V_K(v_add_norm) {
         const size_t base = (size_t)row * feat;
         const __m512 vinv =
             _mm512_set1_ps(g_rsqrt(row_ss_sum(a + base, b + base, feat) / (float)feat + eps));
-        for (uint32_t i = 0; i < feat; i += 16) {
-            const __mmask16 m = i + 16 <= feat ? 0xFFFF : v_tail16(feat - i);
-            const __m512 f =
-                _mm512_add_ps(v_load_bf16_mask(a + base + i, m), v_load_bf16_mask(b + base + i, m));
-            v_store_bf16_mask(resid + base + i, m, f);
-            __m512 v = _mm512_mul_ps(f, vinv);
-            if (gamma) v = _mm512_mul_ps(v, v_load_bf16_mask(gamma + i, m));
-            v_store_bf16_mask(out + base + i, m, v);
-        }
+        if (gamma)
+            add_norm_row(out + base, resid + base, a + base, b + base, gamma, vinv, feat, 1);
+        else
+            add_norm_row(out + base, resid + base, a + base, b + base, NULL, vinv, feat, 0);
     }
 }
 
@@ -140,16 +193,8 @@ V_K(v_norm_residual_norm) {
     for (uint32_t row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;
         const __m512 vinvb = _mm512_set1_ps(g_rsqrt(row_ss(b + base, feat) / (float)feat + eps));
-        __m512 ssr = _mm512_setzero_ps();
-        for (uint32_t i = 0; i < feat; i += 16) {
-            const __mmask16 m = i + 16 <= feat ? 0xFFFF : v_tail16(feat - i);
-            __m512 nb = _mm512_mul_ps(v_load_bf16_mask(b + base + i, m), vinvb);
-            if (gb) nb = _mm512_mul_ps(nb, v_load_bf16_mask(gb + i, m));
-            const __m512 rb = v_round_bf16(
-                _mm512_mul_ps(_mm512_add_ps(v_load_bf16_mask(a + base + i, m), nb), scale));
-            v_store_bf16_mask(resid + base + i, m, rb);
-            ssr = _mm512_fmadd_ps(rb, rb, ssr);
-        }
+        const __m512 ssr = gb ? norm_resid_row(resid + base, a + base, b + base, gb, vinvb, scale, feat, 1, 1)
+                              : norm_resid_row(resid + base, a + base, b + base, NULL, vinvb, scale, feat, 0, 1);
         scale_row(out + base, resid + base, gn, g_rsqrt(hsum(ssr) / (float)feat + eps), feat);
     }
 }

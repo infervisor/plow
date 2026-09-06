@@ -15,6 +15,7 @@
 #include "../avx512/avx512.h"
 #include "../fp8_common.h"
 #include "../mxfp4_common.h"
+#include "amx_common.h"
 
 /* M = 4 measured 276 ms on this path vs 250 on the AVX-512 RB=4 dots (Gemma-4-12B bf16); the
  * crossover is between 4 and 5. */
@@ -26,15 +27,16 @@
  * u32 = (x[m][kb*32+2p], x[m][kb*32+2p+1]). Columns m >= M are zero. */
 static void pack_x_tiles(uint8_t* xp, const plow_bf16* X, size_t ldx, uint32_t M, uint32_t K) {
     const uint32_t nkb = K / 32u;
-    const __m512i idx = _mm512_mullo_epi32(
-        _mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), _mm512_set1_epi32(16));
     for (uint32_t kb = 0; kb < nkb; kb++) {
-        uint32_t* tile = (uint32_t*)(xp + (size_t)kb * 1024u);
-        memset(tile, 0, 1024u);
-        for (uint32_t m = 0; m < M; m++) {
-            const __m512i v = _mm512_loadu_si512((const void*)(X + m * ldx + (size_t)kb * 32u));
-            _mm512_i32scatter_epi32((void*)(tile + m), idx, v, 4);
-        }
+        __m512i r[16];
+#pragma GCC unroll 16
+        for (uint32_t m = 0; m < 16; m++)
+            r[m] = m < M ? _mm512_loadu_si512((const void*)(X + m * ldx + (size_t)kb * 32u))
+                         : _mm512_setzero_si512();
+        plow_amx_tr16x16(r);
+        uint8_t* tile = xp + (size_t)kb * 1024u;
+#pragma GCC unroll 16
+        for (uint32_t p = 0; p < 16; p++) _mm512_storeu_si512((void*)(tile + p * 64u), r[p]);
     }
 }
 

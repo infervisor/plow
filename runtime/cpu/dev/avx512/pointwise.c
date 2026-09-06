@@ -63,8 +63,11 @@ V_K(v_embed) {
     for (uint32_t t = slice; t < ntok; t += nblk) {
         const plow_bf16* src = table + (size_t)ids[t] * hidden;
         plow_bf16* dst = out + (size_t)t * hidden;
-        for (uint32_t i = 0; i < hidden; i += 16) {
-            const __mmask16 m = i + 16 <= hidden ? 0xFFFF : v_tail16(hidden - i);
+        uint32_t i = 0;
+        for (; i + 16 <= hidden; i += 16)
+            v_store_bf16(dst + i, _mm512_mul_ps(v_load_bf16(src + i), scale));
+        if (i < hidden) {
+            const __mmask16 m = v_tail16(hidden - i);
             v_store_bf16_mask(dst + i, m, _mm512_mul_ps(v_load_bf16_mask(src + i, m), scale));
         }
     }

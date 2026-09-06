@@ -1,8 +1,8 @@
 /* avx512/gptoss.c — GPT-OSS family, dense part: MXFP4 (w4a16) GEMV, AVX-512 BF16.
  *
- * Inner loop = mxfp4_common.h plow_mx_dot_rm: 32 packed bytes (2 blocks) -> two vpermw LUT
- * lookups (even / odd elements as bf16) -> two vdpbf16ps against the even|odd-staged x -> one
- * fmadd with the two block scales. RB weight rows x M activation rows of accumulators, x staged
+ * Inner loop = mxfp4_common.h plow_mx_dot_rm: 64 packed bytes (4 blocks) -> four vpermw LUT
+ * lookups (one per nibble position, as bf16) -> four vdpbf16ps against the nibble-staged x -> one
+ * fmadd with the four block scales. RB weight rows x M activation rows of accumulators, x staged
  * once per call in scratch. Slicing is golden's GV_BLOCKED column ownership. */
 #include "avx512.h"
 #include "../mxfp4_common.h"

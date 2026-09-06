@@ -247,23 +247,27 @@ static double now_s(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-static void bench_decode(void) {
-    const uint32_t n_head = 16, n_kv_head = 1, hd = 512, kvlen = 1024, stride = 2048, mask = 2047;
-    plow_bf16* Q = rand_bf16((size_t)n_head * hd, 1.0f);
-    plow_bf16* K = rand_bf16((size_t)n_kv_head * stride * hd, 1.0f);
-    plow_bf16* V = rand_bf16((size_t)n_kv_head * stride * hd, 1.0f);
-    int32_t len = (int32_t)kvlen;
-    float *op = zeros_f32((size_t)n_head * hd), *ml = zeros_f32((size_t)n_head * 2);
-    void* T[6] = {op, ml, Q, K, V, &len};
+/* Single thread, nsplit 1, all work items in sequence; `with_golden` also times the golden tier.
+ * KV bytes = n_batch x kv_heads x kvlen x hd x 2 (K, V) x 2 B, read once per head pair (GF 2). */
+static void bench_decode(uint32_t n_batch, uint32_t n_head, uint32_t n_kv_head, uint32_t hd, uint32_t kvlen,
+                         uint32_t stride, int with_golden) {
+    const uint32_t mask = stride - 1;
+    plow_bf16* Q = rand_bf16((size_t)n_batch * n_head * hd, 1.0f);
+    plow_bf16* K = rand_bf16((size_t)n_batch * n_kv_head * stride * hd, 1.0f);
+    plow_bf16* V = rand_bf16((size_t)n_batch * n_kv_head * stride * hd, 1.0f);
+    int32_t* len = malloc(n_batch * 4);
+    for (uint32_t b = 0; b < n_batch; b++) len[b] = (int32_t)kvlen;
+    float *op = zeros_f32((size_t)n_batch * n_head * hd), *ml = zeros_f32((size_t)n_batch * n_head * 2);
+    void* T[6] = {op, ml, Q, K, V, len};
     PlowDevInst in = inst(PLOW_DOP_FLASH_DECODE);
     for (int k = 0; k < 6; k++) in.t[k] = (uint16_t)k;
-    in.i[0] = 1; in.i[1] = n_head; in.i[2] = n_kv_head; in.i[3] = stride; in.i[4] = 0;
+    in.i[0] = n_batch; in.i[1] = n_head; in.i[2] = n_kv_head; in.i[3] = stride; in.i[4] = 0;
     in.i[5] = 1; in.i[6] = hd; in.i[7] = mask;
-    in.fj[0].f = 1.0f;
+    in.fj[0].f = 1.0f / sqrtf((float)hd);
     plow_cpu_kernel_fn f = plow_cpu_kernel(PLOW_DOP_FLASH_DECODE);
-    /* Bytes the op must read: K and V rows for every head group (8 items x kvlen x hd x 2 x 2). */
-    const double bytes = 8.0 * kvlen * hd * 2.0 * 2.0;
-    for (int which = 0; which < 2; which++) {
+    const uint32_t gf = 2, reads = (n_head + gf - 1) / gf * n_kv_head / (n_head / n_kv_head < gf ? 1 : n_head / n_kv_head / gf) / n_kv_head;
+    const double bytes = (double)n_batch * n_kv_head * kvlen * hd * 4.0 * (n_head / n_kv_head < gf ? 1.0 : (double)(n_head / n_kv_head) / gf) * reads;
+    for (int which = with_golden ? 0 : 1; which < 2; which++) {
         plow_cpu_kernel_fn fn = which ? f : g_flash_decode;
         double best = 1e9;
         for (int rep = 0; rep < 5; rep++) {
@@ -272,10 +276,62 @@ static void bench_decode(void) {
             const double dt = now_s() - t0;
             if (dt < best) best = dt;
         }
-        printf("flash_decode kvlen=%u hd=%u heads=%u/%u %s: %.1f us/call, %.1f GB/s KV read\n", kvlen, hd,
-               n_head, n_kv_head, which ? "avx512" : "golden", best * 1e6, bytes / best / 1e9);
+        printf("flash_decode B=%u kvlen=%u hd=%u heads=%u/%u %s: %.1f us/call, %.1f GB/s KV read\n", n_batch, kvlen,
+               hd, n_head, n_kv_head, which ? "avx512" : "golden", best * 1e6, bytes / best / 1e9);
     }
-    free(Q); free(K); free(V); free(op); free(ml);
+    free(Q); free(K); free(V); free(op); free(ml); free(len);
+}
+
+/* Causal prefill from position 0 over T tokens, fused output, nsplit 1, single thread. */
+static void bench_prefill(uint32_t n_q, uint32_t n_head, uint32_t n_kv_head, uint32_t hd, uint32_t window,
+                          int with_golden) {
+    const uint32_t stride = 4096, mask = stride - 1;
+    plow_bf16* Q = rand_bf16((size_t)n_q * n_head * hd, 1.0f);
+    plow_bf16* K = rand_bf16((size_t)n_kv_head * stride * hd, 1.0f);
+    plow_bf16* V = rand_bf16((size_t)n_kv_head * stride * hd, 1.0f);
+    float *op = zeros_f32((size_t)n_q * n_head * hd), *ml = zeros_f32((size_t)n_q * n_head * 2);
+    plow_bf16* O = zeros_bf16((size_t)n_q * n_head * hd);
+    void* T[6] = {op, ml, Q, K, V, O};
+    PlowDevInst in = inst(PLOW_DOP_FLASH_PREFILL);
+    for (int k = 0; k < 6; k++) in.t[k] = (uint16_t)k;
+    in.i[0] = n_q; in.i[1] = n_q; in.i[2] = n_head; in.i[3] = n_kv_head; in.i[4] = 0;
+    in.i[5] = window; in.i[6] = hd; in.i[7] = 1;
+    in.fj[0].f = 1.0f / sqrtf((float)hd);
+    in.fj[1].u = stride; in.fj[2].u = mask;
+    plow_cpu_kernel_fn f = plow_cpu_kernel(PLOW_DOP_FLASH_PREFILL);
+    /* (q, k) pairs visited: causal triangle, clipped by the window. */
+    double pairs = 0;
+    for (uint32_t i = 0; i < n_q; i++) pairs += window && i + 1 > window ? window : i + 1;
+    pairs *= n_head;
+    for (int which = with_golden ? 0 : 1; which < 2; which++) {
+        plow_cpu_kernel_fn fn = which ? f : g_flash_prefill;
+        double best = 1e9;
+        for (int rep = 0; rep < 3; rep++) {
+            const double t0 = now_s();
+            run_all(fn, &in, 1, T);
+            const double dt = now_s() - t0;
+            if (dt < best) best = dt;
+        }
+        printf("flash_prefill T=%u hd=%u heads=%u/%u window=%u %s: %.2f ms/call, %.2f ns per (q,k,head)\n", n_q, hd,
+               n_head, n_kv_head, window, which ? "avx512" : "golden", best * 1e3, best * 1e9 / pairs);
+    }
+    free(Q); free(K); free(V); free(op); free(ml); free(O);
+}
+
+static void bench(void) {
+    bench_decode(1, 16, 1, 512, 1024, 2048, 1); /* the historical case, with golden */
+    bench_decode(1, 16, 8, 64, 512, 4096, 0);
+    bench_decode(1, 16, 8, 64, 4096, 4096, 0);
+    bench_decode(1, 16, 8, 256, 512, 4096, 0);
+    bench_decode(1, 16, 8, 256, 4096, 4096, 0);
+    bench_decode(8, 16, 8, 64, 512, 4096, 0);
+    bench_decode(8, 16, 8, 64, 4096, 4096, 0);
+    bench_decode(8, 16, 8, 256, 512, 4096, 0);
+    bench_decode(8, 16, 8, 256, 4096, 4096, 0);
+    bench_prefill(512, 16, 8, 256, 0, 1);
+    bench_prefill(1024, 16, 8, 256, 0, 0);
+    bench_prefill(1024, 16, 8, 256, 1024, 0);
+    bench_prefill(1024, 16, 8, 64, 128, 0);
 }
 
 int main(int argc, char** argv) {
@@ -286,9 +342,11 @@ int main(int argc, char** argv) {
         return 0;
     }
     memset(&g_ctx, 0, sizeof g_ctx);
+    g_ctx.scratch_bytes = plow_cpu_scratch_bytes();
+    g_ctx.scratch = aligned_alloc(64, g_ctx.scratch_bytes);
     plow_cpu_thread_init(&g_ctx);
     if (argc > 1 && strcmp(argv[1], "--bench") == 0) {
-        bench_decode();
+        bench();
         return 0;
     }
 

@@ -1,8 +1,8 @@
 /* avx512/moe.c — GPT-OSS flat-tensor MXFP4 MoE, AVX-512 BF16 (dev_isa.h ops 147-150).
  *
  * Same slice partition (golden/gptoss.h) and numerics as golden/moe.c. Inner loop is
- * mxfp4_common.h plow_mx_dot_rm: RB packed weight rows x M staged activation rows, 64 weights per
- * step (two vpermw LUT lookups -> two vdpbf16ps -> two broadcast FMAs with the block scales).
+ * mxfp4_common.h plow_mx_dot_rm: RB packed weight rows x M staged activation rows, 128 weights per
+ * step (four vpermw LUT lookups -> four vdpbf16ps -> one FMA with the four block scales).
  * Decode stages one x row per slot (k slots share a row); prefill stages up to 8 gathered token
  * rows per pass over the expert's weight range, so the dequant is amortised over M rows.
  * Epilogues run 16 outputs at a time: bias in f32, v_glu_pair (act 3 = swiglu_oai), one bf16 round
@@ -312,11 +312,11 @@ static int mxb_group(const plow_moe_route* tab, uint32_t nslot, uint32_t E, mxb_
 }
 
 /* Slice ownership over WEIGHTED columns: expert d costs MXB_W_DEQ + MXB_W_DOT * M_d units per column
- * (the fused dequant is ~7 uops per 64 weights, each staged row adds ~4), so a slice owning a
+ * (the fused dequant is ~5 uops per 64 weights, each staged row adds ~3), so a slice owning a
  * 4-row expert is not handed the same column count as one owning single-row experts. Column
  * boundaries are floor((unit - P[d]) / w_d), identical for both neighbours of a cut. */
-#define MXB_W_DEQ 7u
-#define MXB_W_DOT 4u
+#define MXB_W_DEQ 5u
+#define MXB_W_DOT 3u
 static void mxb_prefix(const mxb_groups* g, uint32_t N, uint32_t* P) {
     P[0] = 0;
     for (uint32_t d = 0; d < g->nd; d++)

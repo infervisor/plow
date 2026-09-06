@@ -1,7 +1,13 @@
 /* gemm_amx.c — AMX-BF16 GEMM family (tier X): GEMM/_SMALL/_MED/_WIDE/_C5, GEMM_NORM, GEMM_GLU.
  *
- * Same slice partition and output as golden/gemm.c (nominal tile per op, SWZ=0 linear order);
- * only the math inside a tile changes. Inner loop per plans/cpu-kernel-innerloops.md §1.2/§6.3:
+ * TWO drivers. `wm_run` (default for bf16 weights, see its header) never packs a weight: the
+ * WEIGHTS are the tile A operand and the activations are the packed B operand, so W streams from
+ * DRAM once per call instead of once per M tile. The strip driver below it keeps the opposite
+ * assignment and is what fp8 weights (dequantized while packing) and slices too large for the
+ * scratch still use; PLOW_AMX_DEBUG=pack forces it for A/B measurement.
+ *
+ * Strip driver: same slice partition and output as golden/gemm.c (nominal tile per op, SWZ=0
+ * linear order); only the math inside a tile changes. Inner loop per §1.2/§6.3:
  * 2x2 fp32 accumulators (tmm0-3), A row-major via TILELOADD (tmm4/5), B packed on the fly into a
  * per-thread 32-column VNNI strip (tmm6/7), K outermost of the tile loops, TILESTORED into a
  * ping-pong fp32 C buffer whose epilogue is interleaved into the next block's K loop.
@@ -64,31 +70,6 @@ int plow_cpu_thread_init_amx(PlowCpuCtx* ctx) {
 
 /* ---- B strip pack: W[N][K] row-major -> [kb][t][r][c] = W[n0+16t+c/2][k0+32kb+2r+(c&1)] ----- */
 
-/* 16x16 transpose of 32-bit lanes: tile row r (a k-pair) gathers pair r of 16 weight rows. */
-static inline void tr16x16_epi32(__m512i* r) {
-    __m512i t[16];
-    for (int i = 0; i < 8; i++) {
-        t[2 * i] = _mm512_unpacklo_epi32(r[2 * i], r[2 * i + 1]);
-        t[2 * i + 1] = _mm512_unpackhi_epi32(r[2 * i], r[2 * i + 1]);
-    }
-    for (int i = 0; i < 4; i++) {
-        r[4 * i] = _mm512_unpacklo_epi64(t[4 * i], t[4 * i + 2]);
-        r[4 * i + 1] = _mm512_unpackhi_epi64(t[4 * i], t[4 * i + 2]);
-        r[4 * i + 2] = _mm512_unpacklo_epi64(t[4 * i + 1], t[4 * i + 3]);
-        r[4 * i + 3] = _mm512_unpackhi_epi64(t[4 * i + 1], t[4 * i + 3]);
-    }
-    for (int i = 0; i < 4; i++) {
-        t[i] = _mm512_shuffle_i32x4(r[i], r[i + 4], 0x88);
-        t[i + 4] = _mm512_shuffle_i32x4(r[i], r[i + 4], 0xdd);
-        t[i + 8] = _mm512_shuffle_i32x4(r[i + 8], r[i + 12], 0x88);
-        t[i + 12] = _mm512_shuffle_i32x4(r[i + 8], r[i + 12], 0xdd);
-    }
-    for (int i = 0; i < 8; i++) {
-        r[i] = _mm512_shuffle_i32x4(t[i], t[i + 8], 0x88);
-        r[i + 8] = _mm512_shuffle_i32x4(t[i], t[i + 8], 0xdd);
-    }
-}
-
 /* Pack columns [n0, n0+32) x K range [k0, k0+kp) of row-major W[N][K] into `dst`
  * (kp multiple of 32; columns >= N and K beyond `K` read as zero). */
 /* The pack is the DRAM-facing side of the GEMM: 32 weight rows advance 64 B per K step, sixteen
@@ -97,24 +78,43 @@ static inline void tr16x16_epi32(__m512i* r) {
  * Prefetch each row PACK_PF_B ahead (into L2) so ~128 lines are in flight per thread. */
 #define PACK_PF_B 512u
 
+/* One 16-column VNNI tile of the strip: 16 weight rows x 32 k at (n, k) -> tile[16 k-pairs][16].
+ * Rows >= nvalid (columns past N) are zero; the nvalid >= 16 path has no per-row branches. */
+static inline __attribute__((always_inline)) void pack_tile_bf16(uint8_t* tile, const plow_bf16* W,
+                                                                 size_t K, uint32_t n, uint32_t k,
+                                                                 uint32_t nvalid) {
+    __m512i r[16];
+    const plow_bf16* w = W + (size_t)n * K + k;
+    if (nvalid >= 16u) {
+#pragma GCC unroll 16
+        for (uint32_t j = 0; j < 16; j++) {
+            _mm_prefetch((const char*)(w + (size_t)j * K) + PACK_PF_B, _MM_HINT_T1);
+            r[j] = _mm512_loadu_si512((const void*)(w + (size_t)j * K));
+        }
+    } else {
+#pragma GCC unroll 16
+        for (uint32_t j = 0; j < 16; j++) {
+            if (j < nvalid) _mm_prefetch((const char*)(w + (size_t)j * K) + PACK_PF_B, _MM_HINT_T1);
+            r[j] = j < nvalid ? _mm512_loadu_si512((const void*)(w + (size_t)j * K)) : _mm512_setzero_si512();
+        }
+    }
+    plow_amx_tr16x16(r);
+#pragma GCC unroll 16
+    for (uint32_t rr = 0; rr < 16; rr++) _mm512_storeu_si512((void*)(tile + rr * 64u), r[rr]);
+}
+
 void plow_cpu_amx_pack_b_strip(void* dst, const plow_bf16* W, uint32_t N, uint32_t K, uint32_t n0,
                                 uint32_t k0, uint32_t kp) {
     uint8_t* out = dst;
     const uint32_t nkb = kp / 32u;
-    for (uint32_t kb = 0; kb < nkb; kb++) {
-        const uint32_t k = k0 + kb * 32u;
-        for (uint32_t t = 0; t < 2; t++) {
-            __m512i r[16];
-            for (uint32_t j = 0; j < 16; j++) {
-                const uint32_t n = n0 + t * 16u + j;
-                if (n < N) _mm_prefetch((const char*)(W + (size_t)n * K + k) + PACK_PF_B, _MM_HINT_T1);
-                r[j] = (n < N && k + 32u <= K)
-                           ? _mm512_loadu_si512((const void*)(W + (size_t)n * K + k))
-                           : _mm512_setzero_si512();
-            }
-            tr16x16_epi32(r);
+    for (uint32_t t = 0; t < 2; t++) {
+        const uint32_t n = n0 + t * 16u;
+        const uint32_t nvalid = n >= N ? 0u : N - n;
+        for (uint32_t kb = 0; kb < nkb; kb++) {
             uint8_t* tile = out + ((size_t)kb * 2u + t) * 1024u;
-            for (uint32_t rr = 0; rr < 16; rr++) _mm512_storeu_si512((void*)(tile + rr * 64u), r[rr]);
+            const uint32_t k = k0 + kb * 32u;
+            if (k + 32u <= K) pack_tile_bf16(tile, W, K, n, k, nvalid);
+            else memset(tile, 0, 1024u);
         }
     }
 }
@@ -122,25 +122,38 @@ void plow_cpu_amx_pack_b_strip(void* dst, const plow_bf16* W, uint32_t N, uint32
 /* Same strip from an e4m3 weight: dequant 32 bytes -> 32 bf16 (exact) ahead of the transpose. */
 plow_fp8_vlut plow_amx_fp8_lut;
 
+static inline __attribute__((always_inline)) void pack_tile_fp8(uint8_t* tile, const uint8_t* W,
+                                                                size_t K, uint32_t n, uint32_t k,
+                                                                uint32_t nvalid) {
+    __m512i r[16];
+    const uint8_t* w = W + (size_t)n * K + k;
+#pragma GCC unroll 16
+    for (uint32_t j = 0; j < 16; j++) {
+        if (j < nvalid) {
+            _mm_prefetch((const char*)(w + (size_t)j * K) + PACK_PF_B / 2u, _MM_HINT_T1);
+            r[j] = plow_fp8x32_to_bf16(&plow_amx_fp8_lut,
+                                       _mm256_loadu_si256((const __m256i*)(w + (size_t)j * K)));
+        } else {
+            r[j] = _mm512_setzero_si512();
+        }
+    }
+    plow_amx_tr16x16(r);
+#pragma GCC unroll 16
+    for (uint32_t rr = 0; rr < 16; rr++) _mm512_storeu_si512((void*)(tile + rr * 64u), r[rr]);
+}
+
 static void pack_b_strip_fp8(void* dst, const uint8_t* W, uint32_t N, uint32_t K, uint32_t n0,
                              uint32_t k0, uint32_t kp) {
     uint8_t* out = dst;
     const uint32_t nkb = kp / 32u;
-    for (uint32_t kb = 0; kb < nkb; kb++) {
-        const uint32_t k = k0 + kb * 32u;
-        for (uint32_t t = 0; t < 2; t++) {
-            __m512i r[16];
-            for (uint32_t j = 0; j < 16; j++) {
-                const uint32_t n = n0 + t * 16u + j;
-                if (n < N) _mm_prefetch((const char*)(W + (size_t)n * K + k) + PACK_PF_B / 2u, _MM_HINT_T1);
-                r[j] = (n < N && k + 32u <= K)
-                           ? plow_fp8x32_to_bf16(&plow_amx_fp8_lut,
-                                                 _mm256_loadu_si256((const __m256i*)(W + (size_t)n * K + k)))
-                           : _mm512_setzero_si512();
-            }
-            tr16x16_epi32(r);
+    for (uint32_t t = 0; t < 2; t++) {
+        const uint32_t n = n0 + t * 16u;
+        const uint32_t nvalid = n >= N ? 0u : N - n;
+        for (uint32_t kb = 0; kb < nkb; kb++) {
             uint8_t* tile = out + ((size_t)kb * 2u + t) * 1024u;
-            for (uint32_t rr = 0; rr < 16; rr++) _mm512_storeu_si512((void*)(tile + rr * 64u), r[rr]);
+            const uint32_t k = k0 + kb * 32u;
+            if (k + 32u <= K) pack_tile_fp8(tile, W, K, n, k, nvalid);
+            else memset(tile, 0, 1024u);
         }
     }
 }
@@ -183,14 +196,36 @@ static void stage_a(plow_bf16* ap, const plow_bf16* A, uint32_t rows, uint32_t K
 typedef struct {
     const float* cb;    /* [32][32] fp32, gate (or plain) */
     const float* cb_up; /* GLU only */
+    const float* cbT;    /* pack-free path: C^T [32 n][32 m] as TILESTORED; the first four ILS steps
+                            transpose its 16x16 quadrants into cb (NULL: cb is already [m][n]) */
+    const float* cbT_up;
     plow_bf16* dst;     /* C + m*N + n */
     const float* sc;    /* fp8: per-column w_scale for these 32 columns, else NULL */
     const float* sc_up; /* fp8 GLU: up scale */
     const plow_bf16* bias; /* per-column bias for these 32 columns, else NULL (GLU: gate bias) */
     const plow_bf16* bias_up;
     uint32_t ldc, rows, cols, done, act;
+    uint32_t tq; /* quadrants of cbT transposed so far (0..4) */
     float f0, f1;
 } ils_t;
+
+/* Quadrant q of C^T (n rows 16(q>>1).., m columns 16(q&1)..) -> cb[m][n]. */
+static inline void ils_transpose(const float* cbT, float* cb, uint32_t q) {
+    const uint32_t i = q >> 1, j = q & 1u;
+    __m512i r[16];
+#pragma GCC unroll 16
+    for (uint32_t c = 0; c < 16; c++)
+        r[c] = _mm512_loadu_si512((const void*)(cbT + (size_t)(16u * i + c) * 32u + 16u * j));
+    plow_amx_tr16x16(r);
+#pragma GCC unroll 16
+    for (uint32_t c = 0; c < 16; c++)
+        _mm512_storeu_si512((void*)(cb + (size_t)(16u * j + c) * 32u + 16u * i), r[c]);
+}
+
+/* ILS work units left: pending quadrant transposes + rows. */
+static inline uint32_t ils_left(const ils_t* e) {
+    return (e->cbT ? 4u - e->tq : 0u) + e->rows - e->done;
+}
 
 static inline void ils_row(const ils_t* e, uint32_t r) {
     const float* c = e->cb + (size_t)r * 32u;
@@ -234,11 +269,21 @@ static inline void ils_row(const ils_t* e, uint32_t r) {
 }
 
 static inline void ils_step(ils_t* e, uint32_t n) {
-    while (n-- && e->done < e->rows) ils_row(e, e->done++);
+    while (n--) {
+        if (e->cbT && e->tq < 4u) {
+            ils_transpose(e->cbT, (float*)e->cb, e->tq);
+            if (e->cbT_up) ils_transpose(e->cbT_up, (float*)e->cb_up, e->tq);
+            e->tq++;
+        } else if (e->done < e->rows) {
+            ils_row(e, e->done++);
+        } else {
+            break;
+        }
+    }
 }
 
 static inline void ils_drain(ils_t* e) {
-    while (e->done < e->rows) ils_row(e, e->done++);
+    ils_step(e, ils_left(e));
 }
 
 /* ---- One 32x32 block over one K panel ------------------------------------------------- */
@@ -258,7 +303,7 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
         _tile_zero(2);
         _tile_zero(3);
     }
-    const uint32_t per = pend ? (pend->rows + nkb - 1u) / nkb : 0u;
+    const uint32_t per = pend ? (ils_left(pend) + nkb - 1u) / nkb : 0u;
     for (uint32_t kb = 0; kb < nkb; kb++) {
         const uint8_t* b = bp + (size_t)kb * 2048u;
         _tile_stream_loadd(4, A0 + kb * 32u, lda); /* A streams (T1 hint), B stays in L1 */
@@ -281,9 +326,11 @@ static void block(const plow_bf16* A0, const plow_bf16* A1, size_t lda, const ui
 
 /* ---- Tile driver shared by every op --------------------------------------------------- */
 
-/* PLOW_AMX_DEBUG=nopack|notdp|nostage: attribution knobs (WRONG RESULTS) — skip the B strip pack,
- * skip the tile math, or read A in place instead of staging. Read once, off by default. */
-enum { AMX_DBG_NOPACK = 1, AMX_DBG_NOTDP = 2, AMX_DBG_NOSTAGE = 4 };
+/* PLOW_AMX_DEBUG=nopack|notdp|nostage|noxpack: attribution knobs (WRONG RESULTS) — skip the B
+ * strip pack, skip the tile math, read A in place instead of staging, skip the x pack of the
+ * pack-free path. `pack`: force the old B-strip-pack driver (correct results, A/B timing).
+ * Read once, off by default. */
+enum { AMX_DBG_NOPACK = 1, AMX_DBG_NOTDP = 2, AMX_DBG_NOSTAGE = 4, AMX_DBG_PACK = 8, AMX_DBG_NOXPACK = 16 };
 static int amx_debug_flags(void) {
     static int f = -1;
     if (f < 0) {
@@ -292,6 +339,9 @@ static int amx_debug_flags(void) {
         if (e && strstr(e, "nopack")) f |= AMX_DBG_NOPACK;
         if (e && strstr(e, "notdp")) f |= AMX_DBG_NOTDP;
         if (e && strstr(e, "nostage")) f |= AMX_DBG_NOSTAGE;
+        if (e && strstr(e, "noxpack")) f |= AMX_DBG_NOXPACK;
+        for (const char* p = e ? strstr(e, "pack") : NULL; p; p = strstr(p + 1, "pack"))
+            if (p == e || p[-1] == ',' || p[-1] == ' ') f |= AMX_DBG_PACK;
     }
     return f;
 }
@@ -392,11 +442,241 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
     ils_drain(&pend);
 }
 
+/* ---- Pack-free formulation: WEIGHTS are the A operand, ACTIVATIONS the packed B operand ------
+ *
+ * TILELOADD reads 16 row-major weight rows x 32 K straight from W (stride K*2 B): no weight pack,
+ * no A staging, W streams from DRAM exactly once per call. The x rows are the B operand, packed
+ * once per K panel for every token of the call (one 16x16 dword transpose per tile, redundant per
+ * thread: M x K bf16 per GEMM). C tiles come out transposed (16 weight rows x 16 tokens); the
+ * epilogue transposes the 32x32 fp32 block back (four ILS steps) and then runs the existing bf16 /
+ * bias / GLU rows.
+ *
+ * Blocking mirrors the strip driver above with the roles swapped: K is paneled (WM_KP) so the x
+ * panel of ALL tokens (M x 1 KiB, 512 KiB at M=512) stays L2-resident and a strip's W panel (32
+ * rows x 1 KiB) stays L1-resident across the token blocks; fp32 partials per (strip, token block)
+ * live in scratch between panels. Measured single-thread here: x tiles from L3 (the strip-outer,
+ * full-K order) would cap the K loop at ~40% of the TMUL, both operands from L2 run at ~94%.
+ * The next strip's W panel is software-prefetched (T1) at ~2 lines per K step so its first token
+ * block does not stall on DRAM. Slices own contiguous 32-row weight strips. */
+#define WM_KP 1024u
+#define WM_TB_BYTES (WM_KP * 64u) /* one token block's x tiles over a panel: 16 kb x 2 tiles */
+#define WM_CB_OFF 0u              /* ping-pong x {gate, up} C^T landing, 4 KiB each */
+#define WM_CT_OFF (WM_CB_OFF + 4u * 4096u) /* same, transposed [m][n] */
+#define WM_WT_OFF (WM_CT_OFF + 4u * 4096u) /* staged tiles of a partial weight strip */
+#define WM_XP_OFF (WM_WT_OFF + 2048u)
+
+/* x[0..rows) x [k0, k0+kp) -> xp[tb][kb][t][16 k-pairs][16 tokens] (tokens >= rows zero; a 16-token
+ * tile with no live token is skipped, its block runs with nxt = 1). Norm fold as stage_a. */
+static void pack_x_panel(uint8_t* xp, const plow_bf16* A, uint32_t rows, size_t K, uint32_t k0,
+                         uint32_t kp, const float* rms, const plow_bf16* gamma) {
+    const uint32_t nkb = kp / 32u;
+    for (uint32_t m0 = 0; m0 < rows; m0 += 16u) {
+        const uint32_t mv = rows - m0 < 16u ? rows - m0 : 16u;
+        const plow_bf16* a = A + (size_t)m0 * K + k0;
+        uint8_t* xt = xp + (size_t)(m0 / 32u) * nkb * 2048u + (m0 & 16u) * 64u;
+        for (uint32_t kb = 0; kb < nkb; kb++) {
+            __m512i r[16];
+            if (!rms) {
+#pragma GCC unroll 16
+                for (uint32_t m = 0; m < 16; m++)
+                    r[m] = m < mv ? _mm512_loadu_si512((const void*)(a + (size_t)m * K + kb * 32u))
+                                  : _mm512_setzero_si512();
+            } else {
+                const uint32_t k = k0 + kb * 32u;
+                const __m512 g0 = bf16x16_to_f32(gamma + k), g1 = bf16x16_to_f32(gamma + k + 16);
+#pragma GCC unroll 16
+                for (uint32_t m = 0; m < 16; m++) {
+                    if (m < mv) {
+                        const plow_bf16* s = a + (size_t)m * K + kb * 32u;
+                        const __m512 sc = _mm512_set1_ps(rms[m0 + m]);
+                        const __m512 lo = _mm512_mul_ps(_mm512_mul_ps(bf16x16_to_f32(s), sc), g0);
+                        const __m512 hi = _mm512_mul_ps(_mm512_mul_ps(bf16x16_to_f32(s + 16), sc), g1);
+                        r[m] = (__m512i)_mm512_cvtne2ps_pbh(hi, lo);
+                    } else {
+                        r[m] = _mm512_setzero_si512();
+                    }
+                }
+            }
+            plow_amx_tr16x16(r);
+#pragma GCC unroll 16
+            for (uint32_t p = 0; p < 16; p++)
+                _mm512_storeu_si512((void*)(xt + (size_t)kb * 2048u + p * 64u), r[p]);
+        }
+    }
+}
+
+/* Prefetch stream for the next (strip, panel): `nl` lines per K step out of 32 x nkb per matrix.
+ * Row/line advance incrementally — a divide here sits in the K loop. */
+typedef struct {
+    const uint8_t* p[2]; /* cursor into gate (or plain) / up; p[0] NULL = nothing to prefetch */
+    size_t ldw;
+    uint32_t nkb, nl, row, line;
+} wm_pf_t;
+
+static inline void wm_prefetch(wm_pf_t* pf) {
+    for (uint32_t i = 0; i < pf->nl && pf->row < 32u; i++) {
+        _mm_prefetch((const char*)pf->p[0] + pf->line * 64u, _MM_HINT_T1);
+        if (pf->p[1]) _mm_prefetch((const char*)pf->p[1] + pf->line * 64u, _MM_HINT_T1);
+        if (++pf->line == pf->nkb) {
+            pf->line = 0;
+            pf->row++;
+            pf->p[0] += pf->ldw;
+            if (pf->p[1]) pf->p[1] += pf->ldw;
+        }
+    }
+}
+
+/* One (strip, token block) over one panel: acc tmm0..3 = W rows [n, n+r0) x tokens [0,16) /
+ * [16,32) and W rows [n+16, n+16+r1) likewise. W tiles load in place (rows staged into `wt` when a
+ * strip has fewer than 16 rows); x tiles stream (T1) from the L2-resident panel. */
+static void wm_block(const uint8_t* W0, const uint8_t* W1, size_t ldw, uint32_t r0, uint32_t r1,
+                     const uint8_t* xtb, uint32_t nkb, uint32_t nxt, const float* part, float* out,
+                     uint8_t* wt, wm_pf_t* pf, ils_t* pend) {
+    if (part) {
+        _tile_loadd(0, part, 128);
+        if (nxt > 1u) _tile_loadd(1, part + 16, 128);
+        if (r1) {
+            _tile_loadd(2, part + 16 * 32, 128);
+            if (nxt > 1u) _tile_loadd(3, part + 16 * 32 + 16, 128);
+        }
+    } else {
+        _tile_zero(0);
+        _tile_zero(1);
+        _tile_zero(2);
+        _tile_zero(3);
+    }
+    const uint32_t per = pend ? (ils_left(pend) + nkb - 1u) / nkb : 0u;
+    for (uint32_t kb = 0; kb < nkb; kb++) {
+        const uint8_t* x = xtb + (size_t)kb * 2048u;
+        _tile_stream_loadd(6, x, 64);
+        if (nxt > 1u) _tile_stream_loadd(7, x + 1024, 64);
+        if (r0 == 16u) {
+            _tile_loadd(4, W0 + kb * 64u, ldw);
+        } else {
+            for (uint32_t r = 0; r < r0; r++)
+                _mm512_store_si512((void*)(wt + r * 64u), _mm512_loadu_si512((const void*)(W0 + r * ldw + kb * 64u)));
+            _tile_loadd(4, wt, 64);
+        }
+        _tile_dpbf16ps(0, 4, 6);
+        if (nxt > 1u) _tile_dpbf16ps(1, 4, 7);
+        if (r1) {
+            if (r1 == 16u) {
+                _tile_loadd(5, W1 + kb * 64u, ldw);
+            } else {
+                for (uint32_t r = 0; r < r1; r++)
+                    _mm512_store_si512((void*)(wt + 1024u + r * 64u),
+                                       _mm512_loadu_si512((const void*)(W1 + r * ldw + kb * 64u)));
+                _tile_loadd(5, wt + 1024u, 64);
+            }
+            _tile_dpbf16ps(2, 5, 6);
+            if (nxt > 1u) _tile_dpbf16ps(3, 5, 7);
+        }
+        if (pf) wm_prefetch(pf);
+        if (pend) ils_step(pend, per);
+    }
+    _tile_stored(0, out, 128);
+    if (nxt > 1u) _tile_stored(1, out + 16, 128);
+    if (r1) {
+        _tile_stored(2, out + 16 * 32, 128);
+        if (nxt > 1u) _tile_stored(3, out + 16 * 32 + 16, 128);
+    }
+}
+
+/* Returns 0 when this slice's partials do not fit even one token block (caller falls back). */
+static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
+    const int dbg = amx_debug_flags();
+    const int glu = g->Wu != NULL;
+    const uint32_t S = (g->N + 31u) / 32u;
+    const uint32_t s0 = (uint32_t)((uint64_t)S * slice / nblk), s1 = (uint32_t)((uint64_t)S * (slice + 1u) / nblk);
+    if (s0 >= s1) return 1;
+    const uint32_t nstrip = s1 - s0, nacc = glu ? 2u : 1u;
+    const size_t ldw = (size_t)g->K * 2u;
+    uint8_t* sc = ctx->scratch;
+    float* cbT = (float*)(sc + WM_CB_OFF);
+    float* cb = (float*)(sc + WM_CT_OFF);
+    uint8_t* wt = sc + WM_WT_OFF;
+    uint8_t* xp = sc + WM_XP_OFF;
+    /* Token chunk: x panel (ntb x 32 KiB) + partials (nstrip x ntb x nacc x 4 KiB) must fit. */
+    const size_t per_tb = (size_t)WM_TB_BYTES + (size_t)nstrip * nacc * 4096u;
+    const uint32_t ntb_max = (uint32_t)((ctx->scratch_bytes - WM_XP_OFF) / per_tb);
+    if (!ntb_max) return 0;
+    memset(wt, 0, 2048u);
+    const uint32_t npanel = (g->K + WM_KP - 1u) / WM_KP;
+    for (uint32_t m0 = 0; m0 < g->M; m0 += ntb_max * 32u) {
+        const uint32_t rows = g->M - m0 < ntb_max * 32u ? g->M - m0 : ntb_max * 32u;
+        const uint32_t ntb = (rows + 31u) / 32u;
+        float* cp = (float*)(xp + (size_t)ntb * WM_TB_BYTES);
+        ils_t pend = {0};
+        uint32_t cur = 0;
+        for (uint32_t p = 0; p < npanel; p++) {
+            const uint32_t k0 = p * WM_KP, kp = g->K - k0 < WM_KP ? g->K - k0 : WM_KP, nkb = kp / 32u;
+            const int first = p == 0, last = p + 1u == npanel;
+            if (!(dbg & AMX_DBG_NOXPACK))
+                pack_x_panel(xp, g->A + (size_t)m0 * g->K, rows, g->K, k0, kp, g->rms ? g->rms + m0 : NULL, g->gamma);
+            for (uint32_t s = 0; s < nstrip; s++) {
+                const uint32_t n = (s0 + s) * 32u, cols = g->N - n < 32u ? g->N - n : 32u;
+                const uint32_t r0 = cols < 16u ? cols : 16u, r1 = cols - r0;
+                const uint8_t* W0 = (const uint8_t*)g->W + (size_t)n * ldw + (size_t)k0 * 2u;
+                const uint8_t* U0 = glu ? (const uint8_t*)g->Wu + (size_t)n * ldw + (size_t)k0 * 2u : NULL;
+                /* Prefetch the next strip of this panel, or the first strip of the next panel. */
+                wm_pf_t pf = {.ldw = ldw, .nkb = nkb, .nl = (32u + ntb - 1u) / ntb};
+                if (s + 1u < nstrip) {
+                    pf.p[0] = W0 + 32u * ldw;
+                    pf.p[1] = glu ? U0 + 32u * ldw : NULL;
+                } else if (!last) {
+                    pf.p[0] = (const uint8_t*)g->W + (size_t)s0 * 32u * ldw + (size_t)(k0 + kp) * 2u;
+                    pf.p[1] = glu ? (const uint8_t*)g->Wu + (size_t)s0 * 32u * ldw + (size_t)(k0 + kp) * 2u : NULL;
+                }
+                for (uint32_t tb = 0; tb < ntb; tb++) {
+                    const uint32_t trows = rows - tb * 32u < 32u ? rows - tb * 32u : 32u;
+                    const uint32_t nxt = trows > 16u ? 2u : 1u;
+                    float* part = cp + ((size_t)s * ntb + tb) * nacc * 1024u;
+                    const float* in_part = first ? NULL : part;
+                    float* out = last ? cbT + (size_t)cur * 2048u : part;
+                    const uint8_t* xtb = xp + (size_t)tb * nkb * 2048u;
+                    if (!(dbg & AMX_DBG_NOTDP)) {
+                        wm_block(W0, W0 + 16u * ldw, ldw, r0, r1, xtb, nkb, nxt, in_part, out, wt,
+                                 pf.p[0] ? &pf : NULL, pend.rows ? &pend : NULL);
+                        if (glu)
+                            wm_block(U0, U0 + 16u * ldw, ldw, r0, r1, xtb, nkb, nxt,
+                                     in_part ? in_part + 1024 : NULL, out + 1024, wt, pf.p[0] ? &pf : NULL,
+                                     pend.rows ? &pend : NULL);
+                    } else if (pend.rows) {
+                        ils_drain(&pend);
+                    }
+                    if (last) {
+                        ils_drain(&pend);
+                        pend = (ils_t){.cbT = out,
+                                       .cbT_up = glu ? out + 1024 : NULL,
+                                       .cb = cb + (size_t)cur * 2048u,
+                                       .cb_up = glu ? cb + (size_t)cur * 2048u + 1024 : NULL,
+                                       .dst = g->C + (size_t)(m0 + tb * 32u) * g->N + n,
+                                       .bias = g->bias ? g->bias + n : NULL,
+                                       .bias_up = g->bias_up ? g->bias_up + n : NULL,
+                                       .f0 = g->f0,
+                                       .f1 = g->f1,
+                                       .ldc = g->N,
+                                       .rows = trows,
+                                       .cols = cols,
+                                       .act = g->act};
+                        cur ^= 1u;
+                    }
+                }
+            }
+        }
+        ils_drain(&pend);
+    }
+    return 1;
+}
+
 int plow_amx_usable(const PlowCpuCtx* ctx, uint32_t K) {
     return ctx && ctx->scratch && ctx->scratch_bytes >= SCRATCH_NEED && (K % 32u) == 0u && K > 0;
 }
 
 void plow_amx_run_tiles(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
+    /* bf16 weights take the pack-free driver unless PLOW_AMX_DEBUG=pack; fp8 (dequant in the
+     * strip pack) and slices whose partials cannot fit the scratch keep the strip driver. */
+    if (!g->Wq && !(amx_debug_flags() & AMX_DBG_PACK) && wm_run(g, slice, nblk, ctx)) return;
     const uint32_t tm = (g->M + g->BM - 1u) / g->BM, tn = (g->N + g->BN - 1u) / g->BN;
     for (uint32_t lin = slice; lin < tm * tn; lin += nblk) {
         const uint32_t m0 = (lin / tn) * g->BM, n0 = (lin % tn) * g->BN;

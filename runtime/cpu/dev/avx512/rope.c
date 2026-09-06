@@ -23,63 +23,83 @@ V_K(v_headnorm_rope) {
         g_headnorm_rope(in, slice, nblk, T, ctx);
         return;
     }
-    float v[512] __attribute__((aligned(64)));
+    /* WV heads staged at once: the 1/sqrt is ~35 cycles of pure latency between the two passes,
+     * and one head's second pass cannot start under it. Four lanes of vsqrtps/vdivps pay it once
+     * for WV heads and are bit-identical to WV scalar 1/sqrtf. */
+#define WV 4u
+    float v[WV][512] __attribute__((aligned(64)));
+    float ss[WV] __attribute__((aligned(16))), inv[WV] __attribute__((aligned(16)));
     const __m512i dup2 = _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0);
     const __m512 sgn = _mm512_set_ps(1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1);
 
     for (uint32_t w0 = slice * G_WAVES; w0 < total; w0 += nblk * G_WAVES) {
-        for (uint32_t wi = 0; wi < G_WAVES && w0 + wi < total; wi++) {
-            const uint32_t w = w0 + wi, t = w / nhead, hh = w % nhead;
-            const uint32_t position = pos ? (uint32_t)pos[t] : out_row0 + t;
-            const plow_bf16* xr = x + ((size_t)t * nhead + hh) * hd;
-            const size_t obase =
-                out_stride
-                    ? (n_batch_kv != 0
-                           ? ((size_t)(t * nhead + hh) * out_stride + (position & kv_mask)) * hd
-                           : ((size_t)hh * out_stride + ((out_row0 + t) & kv_mask)) * hd)
-                    : ((size_t)(out_row0 + t) * nhead + hh) * hd;
-
-            __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
-            for (uint32_t i = 0; i < hd; i += 32) {
-                const __m512 a = v_load_bf16(xr + i), b = v_load_bf16(xr + i + 16);
-                _mm512_store_ps(v + i, a);
-                _mm512_store_ps(v + i + 16, b);
-                acc0 = _mm512_fmadd_ps(a, a, acc0);
-                acc1 = _mm512_fmadd_ps(b, b, acc1);
+        const uint32_t wend = w0 + G_WAVES < total ? w0 + G_WAVES : total;
+        for (uint32_t wb = w0; wb < wend; wb += WV) {
+            const uint32_t nw = wend - wb < WV ? wend - wb : WV;
+            for (uint32_t k = 0; k < nw; k++) {
+                const uint32_t w = wb + k, t = w / nhead, hh = w % nhead;
+                const plow_bf16* xr = x + ((size_t)t * nhead + hh) * hd;
+                __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+                for (uint32_t i = 0; i < hd; i += 32) {
+                    const __m512 a = v_load_bf16(xr + i), b = v_load_bf16(xr + i + 16);
+                    _mm512_store_ps(v[k] + i, a);
+                    _mm512_store_ps(v[k] + i + 16, b);
+                    acc0 = _mm512_fmadd_ps(a, a, acc0);
+                    acc1 = _mm512_fmadd_ps(b, b, acc1);
+                }
+                ss[k] = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
             }
-            const float ss = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
-            const float inv = skip_norm ? 1.0f : g_rsqrt(ss / (float)hd + eps);
-            const __m512 vinv = _mm512_set1_ps(inv);
-            for (uint32_t i = 0; i < hd; i += 16) {
-                __m512 a = _mm512_mul_ps(_mm512_load_ps(v + i), vinv);
-                if (gamma) a = _mm512_mul_ps(a, v_load_bf16(gamma + i));
-                _mm512_store_ps(v + i, a);
+            if (skip_norm) {
+                for (uint32_t k = 0; k < nw; k++) inv[k] = 1.0f;
+            } else {
+                const __m128 q = _mm_add_ps(_mm_div_ps(_mm_load_ps(ss), _mm_set1_ps((float)hd)),
+                                            _mm_set1_ps(eps));
+                _mm_store_ps(inv, _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(q)));
             }
 
-            if (cosb) {
-                const size_t p = (size_t)position * H2;
-                if (!interleave) {
-                    for (uint32_t i = 0; i < H2; i += 16) {
-                        const __m512 c = _mm512_loadu_ps(cosb + p + i), s = _mm512_loadu_ps(sinb + p + i);
-                        const __m512 lo = _mm512_load_ps(v + i), hi = _mm512_load_ps(v + i + H2);
-                        _mm512_store_ps(v + i, _mm512_fmsub_ps(lo, c, _mm512_mul_ps(hi, s)));
-                        _mm512_store_ps(v + i + H2, _mm512_fmadd_ps(hi, c, _mm512_mul_ps(lo, s)));
-                    }
-                } else {
-                    /* GPT-J pairs: lanes (2k, 2k+1) share cos/sin[k]; partner = lane ^ 1. */
-                    for (uint32_t i = 0; i < hd; i += 16) {
-                        const __m512 c = _mm512_permutexvar_ps(
-                            dup2, _mm512_castps256_ps512(_mm256_loadu_ps(cosb + p + (i >> 1))));
-                        const __m512 s = _mm512_permutexvar_ps(
-                            dup2, _mm512_castps256_ps512(_mm256_loadu_ps(sinb + p + (i >> 1))));
-                        const __m512 a = _mm512_load_ps(v + i);
-                        const __m512 partner = _mm512_permute_ps(a, 0xB1);
-                        _mm512_store_ps(v + i, _mm512_fmadd_ps(_mm512_mul_ps(partner, sgn), s,
-                                                               _mm512_mul_ps(a, c)));
+            for (uint32_t k = 0; k < nw; k++) {
+                const uint32_t w = wb + k, t = w / nhead, hh = w % nhead;
+                const uint32_t position = pos ? (uint32_t)pos[t] : out_row0 + t;
+                const size_t obase =
+                    out_stride
+                        ? (n_batch_kv != 0
+                               ? ((size_t)(t * nhead + hh) * out_stride + (position & kv_mask)) * hd
+                               : ((size_t)hh * out_stride + ((out_row0 + t) & kv_mask)) * hd)
+                        : ((size_t)(out_row0 + t) * nhead + hh) * hd;
+                const __m512 vinv = _mm512_set1_ps(inv[k]);
+                float* vk = v[k];
+                for (uint32_t i = 0; i < hd; i += 16) {
+                    __m512 a = _mm512_mul_ps(_mm512_load_ps(vk + i), vinv);
+                    if (gamma) a = _mm512_mul_ps(a, v_load_bf16(gamma + i));
+                    _mm512_store_ps(vk + i, a);
+                }
+
+                if (cosb) {
+                    const size_t p = (size_t)position * H2;
+                    if (!interleave) {
+                        for (uint32_t i = 0; i < H2; i += 16) {
+                            const __m512 c = _mm512_loadu_ps(cosb + p + i), s = _mm512_loadu_ps(sinb + p + i);
+                            const __m512 lo = _mm512_load_ps(vk + i), hi = _mm512_load_ps(vk + i + H2);
+                            _mm512_store_ps(vk + i, _mm512_fmsub_ps(lo, c, _mm512_mul_ps(hi, s)));
+                            _mm512_store_ps(vk + i + H2, _mm512_fmadd_ps(hi, c, _mm512_mul_ps(lo, s)));
+                        }
+                    } else {
+                        /* GPT-J pairs: lanes (2k, 2k+1) share cos/sin[k]; partner = lane ^ 1. */
+                        for (uint32_t i = 0; i < hd; i += 16) {
+                            const __m512 c = _mm512_permutexvar_ps(
+                                dup2, _mm512_castps256_ps512(_mm256_loadu_ps(cosb + p + (i >> 1))));
+                            const __m512 s = _mm512_permutexvar_ps(
+                                dup2, _mm512_castps256_ps512(_mm256_loadu_ps(sinb + p + (i >> 1))));
+                            const __m512 a = _mm512_load_ps(vk + i);
+                            const __m512 partner = _mm512_permute_ps(a, 0xB1);
+                            _mm512_store_ps(vk + i, _mm512_fmadd_ps(_mm512_mul_ps(partner, sgn), s,
+                                                                    _mm512_mul_ps(a, c)));
+                        }
                     }
                 }
+                for (uint32_t i = 0; i < hd; i += 16) v_store_bf16(out + obase + i, _mm512_load_ps(vk + i));
             }
-            for (uint32_t i = 0; i < hd; i += 16) v_store_bf16(out + obase + i, _mm512_load_ps(v + i));
         }
     }
+#undef WV
 }

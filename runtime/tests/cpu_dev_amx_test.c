@@ -150,40 +150,167 @@ static void test_shape(uint16_t op, uint32_t M, uint32_t N, uint32_t K, PlowCpuC
     free(A); free(W); free(Wu); free(C); free(Cg); free(rms); free(gamma);
 }
 
-static void bench(PlowCpuCtx* ctx) {
-    const uint32_t M = 512, N = 3840, K = 3840;
+/* Best of `reps` single-thread all-slice runs of one GEMM-family op (no golden check). */
+static void bench_gemm(uint16_t op, uint32_t M, uint32_t N, uint32_t K, PlowCpuCtx* ctx) {
+    const int glu = op == PLOW_DOP_GEMM_GLU, norm = op == PLOW_DOP_GEMM_NORM;
     plow_bf16* A = malloc((size_t)M * K * 2);
     plow_bf16* W = malloc((size_t)N * K * 2);
+    plow_bf16* Wu = glu ? malloc((size_t)N * K * 2) : NULL;
     plow_bf16* C = malloc((size_t)M * N * 2);
+    float* rms = norm ? malloc(M * sizeof(float)) : NULL;
+    plow_bf16* gamma = norm ? malloc((size_t)K * 2) : NULL;
     fill_bf16(A, (size_t)M * K, 1.0f);
     fill_bf16(W, (size_t)N * K, 0.05f);
-    void* T[3] = {C, A, W};
-    PlowDevInst in = inst(PLOW_DOP_GEMM);
+    if (glu) fill_bf16(Wu, (size_t)N * K, 0.05f);
+    if (norm) { fill_f32(rms, M, 0.5f, 1.5f); fill_bf16(gamma, K, 1.0f); }
+    void* T[8] = {C, A, W, rms, gamma, Wu, NULL, NULL};
+    PlowDevInst in = inst(op);
     in.t[0] = 0; in.t[1] = 1; in.t[2] = 2;
+    if (glu) { in.t[5] = 5; in.i[5] = 1; }
+    if (norm) { in.t[3] = 3; in.t[4] = 4; }
     in.i[0] = M; in.i[1] = N; in.i[2] = K;
-    in.blocks = 1;
-    kfn f = plow_cpu_kernel(PLOW_DOP_GEMM);
-    f(&in, 0, 1, T, ctx); /* warm */
+    kfn f = plow_cpu_kernel(op);
+    /* The 16 in-model slices run back to back on one thread: per-slice work equals the runtime's. */
+    run_all(f, &in, 16, T, ctx);
     double best = 1e9;
-    for (int r = 0; r < 5; r++) {
+    for (int r = 0; r < 4; r++) {
         const double t0 = now();
-        f(&in, 0, 1, T, ctx);
+        run_all(f, &in, 16, T, ctx);
         const double dt = now() - t0;
         if (dt < best) best = dt;
     }
+    const double flops = 2.0 * M * N * K * (glu ? 2 : 1);
+    printf("bench %-9s M=%u N=%-5u K=%u: %7.2f ms  %6.1f GFLOPS (1 thread, 16 slices)\n",
+           name_of(op), M, N, K, best * 1e3, flops / best / 1e9);
+    free(A); free(W); free(Wu); free(C); free(rms); free(gamma);
+}
+
+/* Same GEMM with the weights out of L3: `nw` distinct weight matrices in rotation, one pass each. */
+static void bench_gemm_cold(uint32_t M, uint32_t N, uint32_t K, PlowCpuCtx* ctx) {
+    const uint32_t nw = 12;
+    plow_bf16* A = malloc((size_t)M * K * 2);
+    plow_bf16* C = malloc((size_t)M * N * 2);
+    plow_bf16* W[12];
+    fill_bf16(A, (size_t)M * K, 1.0f);
+    for (uint32_t i = 0; i < nw; i++) {
+        W[i] = malloc((size_t)N * K * 2);
+        memset(W[i], 0x3c, (size_t)N * K * 2);
+    }
+    PlowDevInst in = inst(PLOW_DOP_GEMM);
+    in.t[0] = 0; in.t[1] = 1; in.t[2] = 2;
+    in.i[0] = M; in.i[1] = N; in.i[2] = K;
+    kfn f = plow_cpu_kernel(PLOW_DOP_GEMM);
+    const double t0 = now();
+    for (uint32_t i = 0; i < nw; i++) {
+        void* T[3] = {C, A, W[i]};
+        run_all(f, &in, 16, T, ctx);
+    }
+    const double dt = (now() - t0) / nw;
+    printf("bench GEMM cold  M=%u N=%-5u K=%u: %7.2f ms  %6.1f GFLOPS (1 thread, 16 slices, "
+           "%u x %.0f MB weights > L3, %.1f GB/s of W)\n",
+           M, N, K, dt * 1e3, 2.0 * M * N * K / dt / 1e9, nw, (double)N * K * 2 / 1e6,
+           (double)N * K * 2 / dt / 1e9);
+    for (uint32_t i = 0; i < nw; i++) free(W[i]);
+    free(A); free(C);
+}
+
+/* Gemma grouped MoE prefill (75 GLU + 76 down), E experts x `rpe` live rows each, 1 thread. */
+static void bench_moe(uint32_t E, uint32_t H, uint32_t I, uint32_t rpe, PlowCpuCtx* ctx) {
+    const uint32_t rows = E * rpe;
+    plow_bf16* x = malloc((size_t)rows * H * 2);
+    plow_bf16* fu = malloc((size_t)rows * I * 2);
+    float* part = malloc((size_t)rows * H * 4);
+    uint64_t* ewt = malloc((size_t)E * 2 * 8);
+    int32_t* meta = malloc((size_t)(2 * E) * 4);
+    uint32_t* row_token = malloc((size_t)rows * 4);
+    float* row_gate = malloc((size_t)rows * 4);
+    fill_bf16(x, (size_t)rows * H, 1.0f);
+    for (uint32_t e = 0; e < E; e++) {
+        plow_bf16* gu = malloc((size_t)2 * I * H * 2);
+        plow_bf16* dn = malloc((size_t)H * I * 2);
+        fill_bf16(gu, (size_t)2 * I * H, 0.05f);
+        fill_bf16(dn, (size_t)H * I, 0.05f);
+        ewt[2 * e] = (uint64_t)(uintptr_t)gu;
+        ewt[2 * e + 1] = (uint64_t)(uintptr_t)dn;
+        meta[e] = (int32_t)(e * rpe);
+        meta[E + e] = (int32_t)rpe;
+    }
+    for (uint32_t r = 0; r < rows; r++) { row_token[r] = r; row_gate[r] = 0.5f; }
+    void* T1[8] = {fu, x, ewt, meta, row_token, NULL, NULL, NULL};
+    PlowDevInst in = inst(PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF);
+    for (int i = 0; i < 5; i++) in.t[i] = (uint16_t)i;
+    in.i[0] = I; in.i[1] = H; in.i[2] = E; in.i[5] = 0;
+    in.blocks = 1;
+    kfn f = plow_cpu_kernel(PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF);
+    f(&in, 0, 1, T1, ctx);
+    double best = 1e9;
+    for (int r = 0; r < 4; r++) {
+        const double t0 = now();
+        f(&in, 0, 1, T1, ctx);
+        const double dt = now() - t0;
+        if (dt < best) best = dt;
+    }
+    printf("bench MOE_GLU_PF  E=%u H=%u I=%u rows/expert=%-2u: %7.2f ms  %6.1f GFLOPS\n", E, H, I, rpe,
+           best * 1e3, 2.0 * rows * 2 * I * H / best / 1e9);
+    void* T2[8] = {part, fu, ewt, meta, row_token, row_gate, NULL, NULL};
+    in = inst(PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF);
+    for (int i = 0; i < 6; i++) in.t[i] = (uint16_t)i;
+    in.i[0] = H; in.i[1] = I; in.i[2] = E;
+    in.blocks = 1;
+    f = plow_cpu_kernel(PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF);
+    f(&in, 0, 1, T2, ctx);
+    best = 1e9;
+    for (int r = 0; r < 4; r++) {
+        const double t0 = now();
+        f(&in, 0, 1, T2, ctx);
+        const double dt = now() - t0;
+        if (dt < best) best = dt;
+    }
+    printf("bench MOE_DOWN_PF E=%u H=%u I=%u rows/expert=%-2u: %7.2f ms  %6.1f GFLOPS\n", E, H, I, rpe,
+           best * 1e3, 2.0 * rows * I * H / best / 1e9);
+    for (uint32_t e = 0; e < E; e++) { free((void*)(uintptr_t)ewt[2 * e]); free((void*)(uintptr_t)ewt[2 * e + 1]); }
+    free(x); free(fu); free(part); free(ewt); free(meta); free(row_token); free(row_gate);
+}
+
+static void bench(PlowCpuCtx* ctx) {
+    const uint32_t M = 512, N = 3840, K = 3840;
+    plow_bf16* W = malloc((size_t)N * K * 2);
+    fill_bf16(W, (size_t)N * K, 0.05f);
     /* Where the time goes: strip packing vs the raw 2x2 K loop on scratch-resident data. */
     {
         extern void plow_cpu_amx_pack_b_strip(void*, const plow_bf16*, uint32_t, uint32_t,
                                               uint32_t, uint32_t, uint32_t);
         extern double plow_cpu_amx_debug_kloop(uint32_t iters, PlowCpuCtx* ctx);
-        const double t0 = now();
-        for (uint32_t s = 0; s < N / 32; s++)
-            for (uint32_t k0 = 0; k0 < K; k0 += 1024)
-                plow_cpu_amx_pack_b_strip(ctx->scratch, W, N, K, s * 32, k0,
-                                          K - k0 < 1024 ? K - k0 : 1024);
-        const double tp = now() - t0;
-        printf("pack all of W (%u x %u bf16 = %.1f MB): %.2f ms = %.1f GB/s\n", N, K,
-               (double)N * K * 2 / 1e6, tp * 1e3, (double)N * K * 2 / tp / 1e9);
+        double tp = 1e9;
+        for (int r = 0; r < 3; r++) {
+            const double t0 = now();
+            for (uint32_t s = 0; s < N / 32; s++)
+                for (uint32_t k0 = 0; k0 < K; k0 += 512)
+                    plow_cpu_amx_pack_b_strip(ctx->scratch, W, N, K, s * 32, k0, 512);
+            const double dt = now() - t0;
+            if (dt < tp) tp = dt;
+        }
+        printf("pack all of W from L3 (%u x %u bf16 = %.1f MB): %.2f ms = %.1f GB/s = %.0f cycles/KiB tile @2.3GHz\n",
+               N, K, (double)N * K * 2 / 1e6, tp * 1e3, (double)N * K * 2 / tp / 1e9,
+               tp * 2.3e9 / ((double)N * K * 2 / 1024));
+        /* DRAM-streaming pack: rotate over 6 x 78 MB weights (> 260 MB L3). */
+        {
+            const uint32_t Nd = 10240, nw = 6;
+            plow_bf16* Ws[6];
+            for (uint32_t i = 0; i < nw; i++) {
+                Ws[i] = malloc((size_t)Nd * K * 2);
+                memset(Ws[i], 0x3c, (size_t)Nd * K * 2);
+            }
+            const double t0 = now();
+            for (uint32_t i = 0; i < nw; i++)
+                for (uint32_t s = 0; s < Nd / 32; s++)
+                    for (uint32_t k0 = 0; k0 < K; k0 += 512)
+                        plow_cpu_amx_pack_b_strip(ctx->scratch, Ws[i], Nd, K, s * 32, k0, 512);
+            const double dt = now() - t0;
+            printf("pack DRAM-streaming (%u x %.0f MB): %.1f GB/s on 1 thread\n", nw,
+                   (double)Nd * K * 2 / 1e6, (double)nw * Nd * K * 2 / dt / 1e9);
+            for (uint32_t i = 0; i < nw; i++) free(Ws[i]);
+        }
         const uint32_t iters = 2000;
         const double tk = plow_cpu_amx_debug_kloop(iters, ctx);
         printf("raw 2x2 K loop (one panel, data in scratch): %.1f GFLOPS\n",
@@ -193,11 +320,15 @@ static void bench(PlowCpuCtx* ctx) {
         printf("pure TDPBF16PS (no loads): %.1f GFLOPS = TMUL ceiling on this core\n",
                2.0 * 16 * 16 * 32 * 4 * 200000 / tt / 1e9);
     }
-    const double flops = 2.0 * M * N * K;
-    printf("bench GEMM M=%u N=%u K=%u: %.2f ms, %.1f GFLOPS on 1 thread "
-           "(peak 1024 FLOP/cycle x 3.4 GHz assumed = 3482 GFLOPS -> %.0f%%)\n",
-           M, N, K, best * 1e3, flops / best / 1e9, flops / best / 1e9 / 3482.0 * 100.0);
-    free(A); free(W); free(C);
+    free(W);
+    bench_gemm(PLOW_DOP_GEMM, M, N, K, ctx);
+    bench_gemm(PLOW_DOP_GEMM, M, 10240, K, ctx);
+    bench_gemm(PLOW_DOP_GEMM_GLU, M, 10240, K, ctx);
+    bench_gemm(PLOW_DOP_GEMM, 128, N, K, ctx);
+    bench_gemm(PLOW_DOP_GEMM_NORM, M, N, K, ctx);
+    bench_gemm_cold(M, N, K, ctx);
+    bench_moe(8, 3840, 1536, 8, ctx);
+    bench_moe(8, 3840, 1536, 32, ctx);
 }
 
 /* ---- Batched decode GEMV on AMX (gemv_amx.c): GEMV / GEMV_GLU / GEMV_QKV vs golden, M >= 4 ---- */
