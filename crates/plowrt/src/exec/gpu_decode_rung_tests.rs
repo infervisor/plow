@@ -155,6 +155,27 @@ fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
 }
 
 #[test]
+fn validates_hd64_half_split_attention_ladder() {
+    let mut blob = fixture();
+    for g in &mut blob.progs {
+        for d in &mut g.insts[..2] {
+            d.i[2] = 64;
+            d.i[5] = packet::dev::ROPE_PAIR_HALF;
+        }
+        g.insts[2].i[6] = 64;
+        g.insts[3].i[3] = 64;
+    }
+    for t in &mut blob.tensors[3..5] {
+        t.bytes /= 4;
+    }
+    blob.tensors[5].bytes /= 4;
+    blob.tensors[7].bytes /= 4;
+    assert!(validate_decode_ladder(&blob).unwrap());
+    blob.progs[0].insts[0].i[5] = 0;
+    assert!(validate_decode_ladder(&blob).is_err());
+}
+
+#[test]
 fn decode_ladder_accepts_runtime_input_capacity_beyond_widest_rung() {
     let mut blob = fixture();
     blob.tensors[1].bytes = 128 * 4;
