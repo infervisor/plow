@@ -1,0 +1,2177 @@
+{
+  "scope": "E1 Gemma12 block5 HD512/GQA16, B1, prefix1024 and three following synthetic inputs repeated after reset. K64 FP32 accumulation groups, QK-only tensor cores. Local accuracy experiment; no full-model repair, long-context or timing qualification.",
+  "decision": "Advance native 8K/32K block numerical and fresh memory gates before timing. All six act.x rows bit-exact native control; operator BF16 outputs match float64-RNE on 24576 words.",
+  "resources": "Operator239\u2192254registers no spills; broad255registers retains stack/spills. Do not claim resource or performance win.",
+  "artifact_root": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906",
+  "raw": {
+    "HANDOFF.md": {
+      "sha256": "cc29f9f22b8751f43c9ef0c1e067a5527609fb58fe3bfacf1f0cdc68cc99905f",
+      "content": "# K64 QK partial promotion \u2014 artifact only\n\nOne accuracyexperiment, notabugfix. CurrentQK-onlyloop originallychains32 m16n8k16updates acrossD512. Candidate resetsMMApartials aftereachfourupdates (K64), thenaccumulatesfouroutputs intoFP32CUDAtotals with __fadd_rn. D512gets8partialgroups,D256gets4. SamefullK/orderwithinchunks, originalBF16Q/K, post-dotscale, GQAownership/masks, NS, softmax/scalarPV/merge. Artifactmacro E1_QK_PROMOTE_K64 default0; no productionedit.\n\n## CPU resources and gate\n\nBuild94547: operatorandbroadcandidatePASS. Preprocesseddefault-offQKhelpertokensidentical. FullK/tail/layoutcontractsunchanged. D512GF16SASS retains32HMMA; zero-accresetcount1\u21928; exactly32additionalFP32FADD. Operatorregisters239\u2192254, both0stack/0spills; dynamicarena124288B unchanged,256threads/132physicalCTAs. Roundedregisterallocation andsharedsize allowoneCTA/SM. Broadregisters255/stack152B unchanged; spills172stores/316loads\u2192168stores/276loads, staticshared2448B andmatchedarena126592B unchanged. Broadstillspills: this isnot aresourcewinorperformanceclaim. ExistingQK-onlycontrol.so/cubin are immutablecopies, notregeneratedbaselines.\n\n## Root-only queue\n\n`gpu-operator-queue.json`: oneexistingqwen_primitives.py invocation withartifact-only --attention-native-replay. Sixcells=3actualcapturednativeQKVhistories\u00d7control/candidate, eachtwobitexactrepeats. NoFAimport/execution, noCUDAevent/timing, nofullmodel. ExactB1NH16NKV1D512, scale1/window0/NS33, actualmask0xffffffff/stride65536; K/Vtailsallocatedzero butvalidrangeslimitedto1025/1026/1027. Fixed .003nativeattentiongate, finitepartial/outputandcanaries. QK-onlyDSOcontrolmustreproducetheexistingQK-onlybroadBF16output. Reportindependentfloat64/RNE/truncationmetrics, saveOpart/MLpart/outputforCPUanalysis.\n\nExplicitpostvalidator `validate-operator.py` requiresall6cells/tworepeats/completeoutputs. Existingblockcapturedinputs/helpersandfloat64references arepinnedin saved-input-provenance.json. Rootmustbindthoseexternalfiles aswellasFREEZE.json. Accuracyimprovement isnotassumedfromnumericPASS; inspectreferenceRNmismatchesandpartialerrorsbeforeanytiming.\n\n`gpu-block-held.json`: oneK64broadcapture usingtheEXISTINGorderedprefixhost/packet/checkpoint/input/PF. HELDuntiloperatorqualityimproves. Existingnativecontrol/GF16/QK/PVcapturesremainreusedwiththeirhashes; newK64outputdirectoryseparate. No blocktimingqueueyet andno fullmodelqueued. Thispreventswastingtimingonaworsenumericalcandidate.\n\nPythonCPUsyntax, default-offpreprocessoridentity, KcoverageandactualSASSgatespassed. NoGPUexecutedbyagent. PV TF32hi/lo alternative documentedseparately; noPVkernelbuild.\n"
+    },
+    "kernel.patch": {
+      "sha256": "36e862cc71be77fc8f73b30a0c4e7932ca25bf545955457f96068487829c12be",
+      "content": "--- qualified-QK-only/op_attention.cuh\n+++ artifact-K64/op_attention.cuh\n@@ -410,6 +410,9 @@\n     asm volatile(\"cp.async.wait_group %0;\\n\" ::\"n\"(N));\n }\n \n+#ifndef E1_QK_PROMOTE_K64\n+#define E1_QK_PROMOTE_K64 0\n+#endif\n #if PLOW_NV_FA_QK_TC\n template <int D, int GF>\n __device__ __forceinline__ void fa_decode_qk_tc(float* scores, const __nv_bfloat16* qtile,\n@@ -432,6 +435,22 @@\n         fa_cp_wait<0>();\n         __syncthreads();\n         float acc[4] = {};\n+#if E1_QK_PROMOTE_K64\n+        static_assert(D % 64 == 0, \"QK promotion covers full K\");\n+#pragma unroll\n+        for (unsigned k0 = 0; k0 < D; k0 += 64) {\n+            float partial[4] = {};\n+#pragma unroll\n+            for (unsigned k = k0; k < k0 + 64; k += 16) {\n+                unsigned a[4], b[2];\n+                fa_ldmatrix_x4(a, qtile + (lane % 16) * STRIDE + k + (lane / 16) * 8);\n+                fa_ldmatrix_x2(b, ktile + (warp * 8 + (lane & 7)) * STRIDE + k + ((lane >> 3) & 1) * 8);\n+                fa_mma(partial, a, b, partial);\n+            }\n+#pragma unroll\n+            for (unsigned e = 0; e < 4; ++e) acc[e] = __fadd_rn(acc[e], partial[e]);\n+        }\n+#else\n #pragma unroll\n         for (unsigned k = 0; k < D; k += 16) {\n             unsigned a[4], b[2];\n@@ -439,6 +458,7 @@\n             fa_ldmatrix_x2(b, ktile + (warp * 8 + (lane & 7)) * STRIDE + k + ((lane >> 3) & 1) * 8);\n             fa_mma(acc, a, b, acc);\n         }\n+#endif\n #pragma unroll\n         for (unsigned e = 0; e < 4; ++e) {\n             const unsigned g = lane / 4 + (e / 2) * 8;\n"
+    },
+    "cpu-proof.json": {
+      "sha256": "3a3f1db98751abc3000de3231789bd3b5fd06a3b0fa7c0421f34fe20355e7cd7",
+      "content": {
+        "default_off_preprocessed_helper_identical": true,
+        "helper_sha256": "8569aef7e196ce18c66501f467b491762ed887960dc17da361dcc703d49fac01",
+        "fullK_promotions": {
+          "256": {
+            "MMA_calls": 16,
+            "reset_groups": 4,
+            "FP32_adds_per_lane": 16,
+            "K_indices_exact": true
+          },
+          "512": {
+            "MMA_calls": 32,
+            "reset_groups": 8,
+            "FP32_adds_per_lane": 32,
+            "K_indices_exact": true
+          }
+        },
+        "scope": "CPU/preprocessor/SASS proof; noGPUaccuracy/performanceclaim"
+      }
+    },
+    "sass-audit.json": {
+      "sha256": "1412f00aee98ff4c22ae8bb2acc8ba5c4aa68a51377cf039d723909c73d56e99",
+      "content": {
+        "qk-control.so": {
+          "sha256": "3e3b5e112d55aad05c5dd7420088e7d472cb77d138a308681ecbdeed3d268a22",
+          "symbol": "_Z16attention_decodeILi512ELi16EEv13AttentionArgs",
+          "instructions": 9704,
+          "HMMA": 32,
+          "FADD": 2309,
+          "LDL": 0,
+          "STL": 0,
+          "HMMA_reset_zero_acc": 1,
+          "resources": "REG:239 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0",
+          "dynamic_smem_bytes": 124288
+        },
+        "k64.so": {
+          "sha256": "74a230b0c3ad6ec91746802c6449c1e6ce06698fcf605808e96647b9260b7875",
+          "symbol": "_Z16attention_decodeILi512ELi16EEv13AttentionArgs",
+          "instructions": 9704,
+          "HMMA": 32,
+          "FADD": 2341,
+          "LDL": 0,
+          "STL": 0,
+          "HMMA_reset_zero_acc": 8,
+          "resources": "REG:254 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0",
+          "dynamic_smem_bytes": 124288
+        },
+        "qk-control.cubin": {
+          "sha256": "ff4dd4b56ffc5d2105af56508f60f93737cd61160a387a7371a968d2a8224c15",
+          "symbol": "_Z12interp_sm90a11PlowProgram",
+          "instructions": 85320,
+          "HMMA": 32,
+          "FADD": 4401,
+          "LDL": 75,
+          "STL": 38,
+          "HMMA_reset_zero_acc": 1,
+          "resources": "REG:255 STACK:152 SHARED:2448 LOCAL:0 CONSTANT[0]:696 TEXTURE:0 SURFACE:0 SAMPLER:0",
+          "dynamic_smem_bytes": 126592
+        },
+        "k64.cubin": {
+          "sha256": "0c7dc896c6e6d0fa9f8a0bb6bbf276a44ab7885a72682817ed3f5f02a2752a07",
+          "symbol": "_Z12interp_sm90a11PlowProgram",
+          "instructions": 85272,
+          "HMMA": 32,
+          "FADD": 4433,
+          "LDL": 64,
+          "STL": 36,
+          "HMMA_reset_zero_acc": 8,
+          "resources": "REG:255 STACK:152 SHARED:2448 LOCAL:0 CONSTANT[0]:696 TEXTURE:0 SURFACE:0 SAMPLER:0",
+          "dynamic_smem_bytes": 126592
+        }
+      }
+    },
+    "build-commands.json": {
+      "sha256": "a2df5c932f5db376093652b61bc16161ea1ca9393ddd873cb989faeef52c329a",
+      "content": {
+        "k64-operator": [
+          "/usr/local/cuda/bin/nvcc",
+          "-DE1_QK_PROMOTE_K64=1",
+          "-DPLOW_NV_FA_PV_TC=0",
+          "-DPLOW_NV_FA_QK_TC=1",
+          "-DPLOW_NV_FA_GF16_BENCH=1",
+          "-std=c++17",
+          "-gencode",
+          "arch=compute_90a,code=sm_90a",
+          "-O3",
+          "--shared",
+          "-Xcompiler=-fPIC",
+          "-Xptxas=-v",
+          "-DPLOW_FA_LIBRARY=1",
+          "-DPLOW_NV_HOPPER=1",
+          "-DPLOW_NV_FA_PIPE=1",
+          "-DPLOW_NV_FA512_WG=1",
+          "-DPLOW_NV_FA_WPR=1",
+          "-DPLOW_NV_FA_QREG=0",
+          "-I",
+          "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/source/runtime/common",
+          "-I",
+          "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/source/runtime/nvidia",
+          "-include",
+          "cstdint",
+          "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/source/runtime/nvidia/experiments/fa_gf_full_h100_ab.cu",
+          "-o",
+          "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/k64.so",
+          "-lcuda"
+        ],
+        "k64-broad": [
+          "env",
+          "-i",
+          "PATH=/usr/local/cuda/bin:/usr/bin:/bin",
+          "/usr/local/cuda/bin/nvcc",
+          "-DE1_QK_PROMOTE_K64=1",
+          "-arch=sm_90a",
+          "-DPLOW_NV_ARENA_MIN_BYTES=126592",
+          "-DPLOW_NV_GEMV_STAGING_BYTES=16448",
+          "-DPLOW_NV_FA_GF16_BENCH=1",
+          "-DPLOW_NV_FA_QK_TC=1",
+          "-DPLOW_NV_FA_PV_TC=0",
+          "-DPLOW_NV_FA_QREG=0",
+          "-O3",
+          "-cubin",
+          "-Xptxas=-v",
+          "-lineinfo",
+          "-I",
+          "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/broad-source/runtime/common",
+          "-I",
+          "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/broad-source/runtime/nvidia",
+          "-DPLOW_NV_GEMMA=1",
+          "-DPLOW_NV_FA_GF=2",
+          "-DPLOW_NV_EMBED_SMEM=1",
+          "-DPLOW_NV_MLA=0",
+          "-DPLOW_NV_MAMBA=0",
+          "-DPLOW_NV_DSA=0",
+          "-DPLOW_NV_GEMV_RB=1",
+          "-DPLOW_MOE_DOWN_LANESPLIT=1",
+          "-DPLOW_NV_FA_WPR=1",
+          "-DPLOW_NV_FP8_RB=4",
+          "-DPLOW_NV_FA_GF_FULL=16",
+          "-DPLOW_NV_TRACE=0",
+          "-o",
+          "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/k64.cubin",
+          "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/broad-source/runtime/nvidia/interp_sm90a.cu"
+        ]
+      }
+    },
+    "build-results.json": {
+      "sha256": "d3f54c0c43e356bd3506805c4d2fbf0a9e06cc9228ef8c7c8b3476c85f89424f",
+      "content": {
+        "k64-operator": {
+          "returncode": 0
+        },
+        "k64-broad": {
+          "returncode": 0
+        }
+      }
+    },
+    "accuracy-analysis.json": {
+      "sha256": "8d8ed7530f4d98eb2c02db8dd2b69ddcff5ae84c0f2239de2cf773ae3f8606ef",
+      "content": {
+        "decision": "ADVANCE bounded native block numerical gate only",
+        "scope": "Three captured native synthetic-prefix histories; not full-model or representative quality qualification",
+        "rows": [
+          {
+            "step": 0,
+            "length": 1025,
+            "arms": {
+              "scalar": {
+                "output_vs_fp64": {
+                  "relative_l2": 3.316955908151579e-08,
+                  "max_abs": 1.7366272510171976e-06,
+                  "max_ref": 4.156250000000002,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 5.863175709456535e-08,
+                  "max_abs": 8.419266848136431e-07,
+                  "max_ref": 4.156250000000003,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 4.9530917599634904e-08,
+                  "max_abs": 1.3197660528874167e-06,
+                  "max_ref": 12.82690774548053,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 2.1460406923103495e-07,
+                  "max_abs": 1.7028661762452657e-05,
+                  "max_ref": 23.74621352944241,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": []
+              },
+              "control": {
+                "output_vs_fp64": {
+                  "relative_l2": 3.316955908151579e-08,
+                  "max_abs": 1.7366272510171976e-06,
+                  "max_ref": 4.156250000000002,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 5.6665008977617324e-08,
+                  "max_abs": 9.435232053434106e-07,
+                  "max_ref": 4.156250000000003,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 4.5534940159950245e-07,
+                  "max_abs": 7.263302794768833e-06,
+                  "max_ref": 12.82690774548053,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 4.2862584809546153e-07,
+                  "max_abs": 3.18353104304947e-05,
+                  "max_ref": 23.74621352944241,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": []
+              },
+              "candidate": {
+                "output_vs_fp64": {
+                  "relative_l2": 3.316955908151579e-08,
+                  "max_abs": 1.7366272510171976e-06,
+                  "max_ref": 4.156250000000002,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 5.81088674291453e-08,
+                  "max_abs": 8.09372976640077e-07,
+                  "max_ref": 4.156250000000003,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 8.57620400091659e-08,
+                  "max_abs": 1.9401958617493165e-06,
+                  "max_ref": 12.82690774548053,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 1.980200407918909e-07,
+                  "max_abs": 1.1433345658673488e-05,
+                  "max_ref": 23.74621352944241,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": []
+              }
+            }
+          },
+          {
+            "step": 1,
+            "length": 1026,
+            "arms": {
+              "scalar": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.0015245345993152525,
+                  "max_abs": 0.012615309855275036,
+                  "max_ref": 4.155750832400932,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 5.929543379834801e-08,
+                  "max_abs": 8.525717483109929e-07,
+                  "max_ref": 5.153704232261815,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 7.510927516246062e-08,
+                  "max_abs": 5.407664973589021e-07,
+                  "max_ref": 10.419732081775374,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 1.008156239206848e-07,
+                  "max_abs": 6.813458988119692e-06,
+                  "max_ref": 26.952500172568627,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": [
+                  {
+                    "head": 13,
+                    "dimension": 104,
+                    "reference": 0.09008779116918043,
+                    "rne": 0.08984375,
+                    "old_qk": 0.09033203125,
+                    "actual": 0.08984375
+                  }
+                ]
+              },
+              "control": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.0015245346034745706,
+                  "max_abs": 0.012615309855275036,
+                  "max_ref": 4.155750832400932,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 6.084947008951021e-08,
+                  "max_abs": 1.75936696811263e-06,
+                  "max_ref": 5.153704232261815,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 6.03553151451435e-07,
+                  "max_abs": 4.756335920674815e-06,
+                  "max_ref": 10.419732081775374,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 3.3367753374160356e-07,
+                  "max_abs": 1.2983005754918509e-05,
+                  "max_ref": 26.952500172568627,
+                  "exact": false
+                },
+                "rne_mismatches": 1,
+                "native": {
+                  "relative_l2": 5.5787397028497975e-06,
+                  "max_abs": 0.00048828125,
+                  "max_ref": 4.15625,
+                  "exact": false
+                },
+                "changed_words": []
+              },
+              "candidate": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.0015245345993152525,
+                  "max_abs": 0.012615309855275036,
+                  "max_ref": 4.155750832400932,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 6.05003606565005e-08,
+                  "max_abs": 8.672482234572954e-07,
+                  "max_ref": 5.153704232261815,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 1.0606831025634259e-07,
+                  "max_abs": 8.745073314386786e-07,
+                  "max_ref": 10.419732081775374,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 8.3775139827938e-08,
+                  "max_abs": 4.903589340798931e-06,
+                  "max_ref": 26.952500172568627,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": [
+                  {
+                    "head": 13,
+                    "dimension": 104,
+                    "reference": 0.09008779116918043,
+                    "rne": 0.08984375,
+                    "old_qk": 0.09033203125,
+                    "actual": 0.08984375
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "step": 2,
+            "length": 1027,
+            "arms": {
+              "scalar": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.00157371990195374,
+                  "max_abs": 0.01525225024501875,
+                  "max_ref": 4.153745435643849,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 6.036785709165448e-08,
+                  "max_abs": 7.499718481795981e-07,
+                  "max_ref": 4.391592063902198,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 5.915659107357409e-08,
+                  "max_abs": 7.352746216326977e-07,
+                  "max_ref": 8.470760446495747,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 1.2115431086991826e-07,
+                  "max_abs": 9.204701822085326e-06,
+                  "max_ref": 25.465208626965726,
+                  "exact": false
+                },
+                "rne_mismatches": 1,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": [
+                  {
+                    "head": 12,
+                    "dimension": 243,
+                    "reference": -0.0002179442247662866,
+                    "rne": -0.00021839141845703125,
+                    "old_qk": -0.00021839141845703125,
+                    "actual": -0.000217437744140625
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 445,
+                    "reference": 0.2626952250937581,
+                    "rne": 0.26171875,
+                    "old_qk": 0.263671875,
+                    "actual": 0.26171875
+                  }
+                ]
+              },
+              "control": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.0015737199161621107,
+                  "max_abs": 0.01525225024501875,
+                  "max_ref": 4.153745435643849,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 6.427345011745445e-08,
+                  "max_abs": 1.3197221510607982e-06,
+                  "max_ref": 4.391592063902198,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 5.71370155629966e-07,
+                  "max_abs": 6.7767569777998915e-06,
+                  "max_ref": 8.470760446495747,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 4.080705186258318e-07,
+                  "max_abs": 2.2073217863294303e-05,
+                  "max_ref": 25.465208626965726,
+                  "exact": false
+                },
+                "rne_mismatches": 1,
+                "native": {
+                  "relative_l2": 2.2352062607362856e-05,
+                  "max_abs": 0.001953125,
+                  "max_ref": 4.15625,
+                  "exact": false
+                },
+                "changed_words": []
+              },
+              "candidate": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.0015737199019513865,
+                  "max_abs": 0.01525225024501875,
+                  "max_ref": 4.153745435643849,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 6.045282838941025e-08,
+                  "max_abs": 8.790747869913407e-07,
+                  "max_ref": 4.391592063902198,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 8.298593302646304e-08,
+                  "max_abs": 9.381600865054907e-07,
+                  "max_ref": 8.470760446495747,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 1.2035735156043781e-07,
+                  "max_abs": 7.687003957812522e-06,
+                  "max_ref": 25.465208626965726,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 1.0914091768940346e-08,
+                  "max_abs": 9.5367431640625e-07,
+                  "max_ref": 4.15625,
+                  "exact": false
+                },
+                "changed_words": [
+                  {
+                    "head": 12,
+                    "dimension": 445,
+                    "reference": 0.2626952250937581,
+                    "rne": 0.26171875,
+                    "old_qk": 0.263671875,
+                    "actual": 0.26171875
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "words": 24576,
+        "old_qk_rne_mismatches": 2,
+        "k64_rne_mismatches": 0,
+        "notes": [
+          "Unchanged BF16 QKV, scale1, NS33, original FP32 softmax/PV/merge",
+          "Reference rounds FP64 to FP32 then BF16 RNE, matching documented store semantics",
+          "The one surviving changed native-scalar word is closer to FP64",
+          "V has only 2/3/4 distinct rows; evidence is limited to this fixture",
+          "Fixed full-model gate unchanged; no timing or speed claim"
+        ]
+      }
+    },
+    "results/operator-numerical.json": {
+      "sha256": "113f5e6e5086cff91291605037dcfb86c698991566cf94835f3fcaef27bdbb83",
+      "content": {
+        "scope": "existing native attention C ABI bodies andmerge, savedblockQKV; noFA/timing/fullmodel",
+        "rows": [
+          {
+            "step": 0,
+            "arm": "control",
+            "length": 1025,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 4.15625,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 3.316955908151579e-08,
+              "max_abs": 1.7366272510171976e-06,
+              "max_ref": 4.156250000000002,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 16,
+            "out_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/control-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/control-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/control-step0-mlpart.raw"
+          },
+          {
+            "step": 0,
+            "arm": "candidate",
+            "length": 1025,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 4.15625,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 3.316955908151579e-08,
+              "max_abs": 1.7366272510171976e-06,
+              "max_ref": 4.156250000000002,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 16,
+            "out_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/candidate-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/candidate-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/candidate-step0-mlpart.raw"
+          },
+          {
+            "step": 1,
+            "arm": "control",
+            "length": 1026,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 5.5787397028497975e-06,
+              "max_abs": 0.00048828125,
+              "max_ref": 4.15625,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0015245346034745706,
+              "max_abs": 0.012615309855275036,
+              "max_ref": 4.155750832400932,
+              "exact": false
+            },
+            "reference_rne_mismatches": 1,
+            "reference_trunc_mismatches": 4519,
+            "out_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/control-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/control-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/control-step1-mlpart.raw"
+          },
+          {
+            "step": 1,
+            "arm": "candidate",
+            "length": 1026,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 4.15625,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 0.0015245345993152525,
+              "max_abs": 0.012615309855275036,
+              "max_ref": 4.155750832400932,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 4518,
+            "out_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/candidate-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/candidate-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/candidate-step1-mlpart.raw"
+          },
+          {
+            "step": 2,
+            "arm": "control",
+            "length": 1027,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 2.2352062607362856e-05,
+              "max_abs": 0.001953125,
+              "max_ref": 4.15625,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0015737199161621107,
+              "max_abs": 0.01525225024501875,
+              "max_ref": 4.153745435643849,
+              "exact": false
+            },
+            "reference_rne_mismatches": 1,
+            "reference_trunc_mismatches": 4465,
+            "out_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/control-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/control-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/control-step2-mlpart.raw"
+          },
+          {
+            "step": 2,
+            "arm": "candidate",
+            "length": 1027,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 1.0914091768940346e-08,
+              "max_abs": 9.5367431640625e-07,
+              "max_ref": 4.15625,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0015737199019513865,
+              "max_abs": 0.01525225024501875,
+              "max_ref": 4.153745435643849,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 4464,
+            "out_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/candidate-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/candidate-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/results/operator-numerical-tensors/candidate-step2-mlpart.raw"
+          }
+        ],
+        "libraries": {
+          "control": {
+            "path": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/qk-control.so",
+            "sha256": "3e3b5e112d55aad05c5dd7420088e7d472cb77d138a308681ecbdeed3d268a22"
+          },
+          "candidate": {
+            "path": "/tmp/plow-model-support-checks/e1-qk-k64-promote-20260906/k64.so",
+            "sha256": "74a230b0c3ad6ec91746802c6449c1e6ce06698fcf605808e96647b9260b7875"
+          }
+        },
+        "passed": true
+      }
+    },
+    "results/block-numerical.json": {
+      "sha256": "a34977ec64db5e644946d4c9876fcb056e54bd23c2e37bcd6c57837c10849c12",
+      "content": {
+        "passed": true,
+        "data_valid": true,
+        "numerical_pass": true,
+        "rows": 6,
+        "records": [
+          {
+            "step": 0,
+            "upstream_exact": true,
+            "repeats_exact": true,
+            "saved_operator_output_exact": true,
+            "metrics": {
+              "act.opart": {
+                "relative_l2": 2.947941173830049e-07,
+                "max_abs": 9.918212890625e-05,
+                "max_ref": 98.6951904296875,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 2.7505212133265973e-07,
+                "max_abs": 2.47955322265625e-05,
+                "max_ref": 23.7462100982666,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 4.15625,
+                "exact": true
+              },
+              "act.x": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 17.5,
+                "exact": true
+              }
+            },
+            "previous_qk_metrics": {
+              "act.opart": {
+                "relative_l2": 5.191779342294295e-07,
+                "max_abs": 0.000152587890625,
+                "max_ref": 98.6951904296875,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 5.122334042486449e-07,
+                "max_abs": 3.62396240234375e-05,
+                "max_ref": 23.7462100982666,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 4.15625,
+                "exact": true
+              },
+              "act.x": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 17.5,
+                "exact": true
+              }
+            }
+          },
+          {
+            "step": 1,
+            "upstream_exact": true,
+            "repeats_exact": true,
+            "saved_operator_output_exact": true,
+            "metrics": {
+              "act.opart": {
+                "relative_l2": 1.2660197154799142e-07,
+                "max_abs": 2.6702880859375e-05,
+                "max_ref": 112.02132415771484,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 1.2428818562421563e-07,
+                "max_abs": 7.62939453125e-06,
+                "max_ref": 26.952499389648438,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 4.15625,
+                "exact": true
+              },
+              "act.x": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 25.5,
+                "exact": true
+              }
+            },
+            "previous_qk_metrics": {
+              "act.opart": {
+                "relative_l2": 3.8410756647190194e-07,
+                "max_abs": 6.103515625e-05,
+                "max_ref": 112.02132415771484,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 3.852333764228671e-07,
+                "max_abs": 1.52587890625e-05,
+                "max_ref": 26.952499389648438,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 5.5787397028497975e-06,
+                "max_abs": 0.00048828125,
+                "max_ref": 4.15625,
+                "exact": false
+              },
+              "act.x": {
+                "relative_l2": 0.0010392412992500895,
+                "max_abs": 0.015625,
+                "max_ref": 25.5,
+                "exact": false
+              }
+            }
+          },
+          {
+            "step": 2,
+            "upstream_exact": true,
+            "repeats_exact": true,
+            "saved_operator_output_exact": true,
+            "metrics": {
+              "act.opart": {
+                "relative_l2": 1.6330746301201572e-07,
+                "max_abs": 4.57763671875e-05,
+                "max_ref": 105.83976745605469,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 1.6394409725694753e-07,
+                "max_abs": 1.1444091796875e-05,
+                "max_ref": 25.465206146240234,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 1.0914091768940346e-08,
+                "max_abs": 9.5367431640625e-07,
+                "max_ref": 4.15625,
+                "exact": false
+              },
+              "act.x": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 22.625,
+                "exact": true
+              }
+            },
+            "previous_qk_metrics": {
+              "act.opart": {
+                "relative_l2": 4.5540260699876433e-07,
+                "max_abs": 9.918212890625e-05,
+                "max_ref": 105.83976745605469,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 4.611708253485449e-07,
+                "max_abs": 2.288818359375e-05,
+                "max_ref": 25.465206146240234,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 2.2352062607362856e-05,
+                "max_abs": 0.001953125,
+                "max_ref": 4.15625,
+                "exact": false
+              },
+              "act.x": {
+                "relative_l2": 0.0017481681898312235,
+                "max_abs": 0.03125,
+                "max_ref": 22.625,
+                "exact": false
+              }
+            }
+          },
+          {
+            "step": 3,
+            "upstream_exact": true,
+            "repeats_exact": true,
+            "saved_operator_output_exact": true,
+            "metrics": {
+              "act.opart": {
+                "relative_l2": 2.947941173830049e-07,
+                "max_abs": 9.918212890625e-05,
+                "max_ref": 98.6951904296875,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 2.7505212133265973e-07,
+                "max_abs": 2.47955322265625e-05,
+                "max_ref": 23.7462100982666,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 4.15625,
+                "exact": true
+              },
+              "act.x": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 17.5,
+                "exact": true
+              }
+            },
+            "previous_qk_metrics": {
+              "act.opart": {
+                "relative_l2": 5.191779342294295e-07,
+                "max_abs": 0.000152587890625,
+                "max_ref": 98.6951904296875,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 5.122334042486449e-07,
+                "max_abs": 3.62396240234375e-05,
+                "max_ref": 23.7462100982666,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 4.15625,
+                "exact": true
+              },
+              "act.x": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 17.5,
+                "exact": true
+              }
+            }
+          },
+          {
+            "step": 4,
+            "upstream_exact": true,
+            "repeats_exact": true,
+            "saved_operator_output_exact": true,
+            "metrics": {
+              "act.opart": {
+                "relative_l2": 1.2660197154799142e-07,
+                "max_abs": 2.6702880859375e-05,
+                "max_ref": 112.02132415771484,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 1.2428818562421563e-07,
+                "max_abs": 7.62939453125e-06,
+                "max_ref": 26.952499389648438,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 4.15625,
+                "exact": true
+              },
+              "act.x": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 25.5,
+                "exact": true
+              }
+            },
+            "previous_qk_metrics": {
+              "act.opart": {
+                "relative_l2": 3.8410756647190194e-07,
+                "max_abs": 6.103515625e-05,
+                "max_ref": 112.02132415771484,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 3.852333764228671e-07,
+                "max_abs": 1.52587890625e-05,
+                "max_ref": 26.952499389648438,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 5.5787397028497975e-06,
+                "max_abs": 0.00048828125,
+                "max_ref": 4.15625,
+                "exact": false
+              },
+              "act.x": {
+                "relative_l2": 0.0010392412992500895,
+                "max_abs": 0.015625,
+                "max_ref": 25.5,
+                "exact": false
+              }
+            }
+          },
+          {
+            "step": 5,
+            "upstream_exact": true,
+            "repeats_exact": true,
+            "saved_operator_output_exact": true,
+            "metrics": {
+              "act.opart": {
+                "relative_l2": 1.6330746301201572e-07,
+                "max_abs": 4.57763671875e-05,
+                "max_ref": 105.83976745605469,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 1.6394409725694753e-07,
+                "max_abs": 1.1444091796875e-05,
+                "max_ref": 25.465206146240234,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 1.0914091768940346e-08,
+                "max_abs": 9.5367431640625e-07,
+                "max_ref": 4.15625,
+                "exact": false
+              },
+              "act.x": {
+                "relative_l2": 0.0,
+                "max_abs": 0.0,
+                "max_ref": 22.625,
+                "exact": true
+              }
+            },
+            "previous_qk_metrics": {
+              "act.opart": {
+                "relative_l2": 4.5540260699876433e-07,
+                "max_abs": 9.918212890625e-05,
+                "max_ref": 105.83976745605469,
+                "exact": false
+              },
+              "act.mlpart": {
+                "relative_l2": 4.611708253485449e-07,
+                "max_abs": 2.288818359375e-05,
+                "max_ref": 25.465206146240234,
+                "exact": false
+              },
+              "act.at": {
+                "relative_l2": 2.2352062607362856e-05,
+                "max_abs": 0.001953125,
+                "max_ref": 4.15625,
+                "exact": false
+              },
+              "act.x": {
+                "relative_l2": 0.0017481681898312235,
+                "max_abs": 0.03125,
+                "max_ref": 22.625,
+                "exact": false
+              }
+            }
+          }
+        ],
+        "scope": "Native single-block numerical gate; unchanged .003 attention/.01 block plus original maxabs gate. No full-model or timing qualification."
+      }
+    },
+    "ACCURACY-RESULTS.md": {
+      "sha256": "ce85c685e87908fe892b7a78c63089ac632e8c0dad415ca3bb5269b5061af0dd",
+      "content": "# K64 QK precision: advance one native block numerical gate\n\nRoot operator window44495: four jobs passed. Six operator cells = three unique saved native QKV histories \u00d7 original QK-only/K64. Both repeats exact, all outputs finite, canaries intact. No timing was performed.\n\n| History | Scalar RNE mismatches | QK-only | K64 | QK-only max-stat error | K64 max-stat error |\n|---|---:|---:|---:|---:|---:|\n| 0 | 0 | 0 | 0 | 7.263e-06 | 1.94e-06 |\n| 1 | 0 | 1 | 0 | 4.756e-06 | 8.745e-07 |\n| 2 | 1 | 1 | 0 | 6.777e-06 | 9.382e-07 |\n\nK64 matches all 24,576 independently rounded reference BF16 words. It corrects the two original QK-only words where scalar was closer to FP64 and retains the one changed scalar word where QK was closer. Split maxima absolute errors shrink 3.7\u20137.2\u00d7; normalized partial relative errors remain roughly 6e-8 and are mixed rather than uniformly improved. Old QK DSO output AND raw Opart/MLpart match the previously captured broad interpreter exactly.\n\nThe native-scalar attention relative L2 becomes 0 / 0 / 1.0914e-8, versus 0 / 5.5787e-6 / 2.2352e-5. Aggregate FP64 output relative L2 is dominated by BF16 quantization and changes negligibly.\n\nRelease gpu-block-ready.json only for the existing block5 numerical capture. Explicit validate-block.py reuses the existing capture loader, fixed .003 attention and .01 block thresholds plus original absolute bound; checks six rows, exact inputs and resets, and exact agreement with the already qualified same-input K64 DSO output. Original gpu-block-held.json remains unchanged.\n\nLimits: one synthetic-prefix block, only 2/3/4 distinct V rows in the three histories; not a full-network attention capture. Original E1 full-model numerical failure remains open. K64 operator resources rise 239\u2192254 registers; no speed benefit is claimed. Broad remains 255 registers with spills. No further precision alternatives built.\n"
+    },
+    "BLOCK-RESULTS.md": {
+      "sha256": "da1669b1dbdf360b667901a8500b8bed1e19d6b8bb0ef9311aeae15d3a65d628",
+      "content": "# K64 native block numerical result\n\nRoot capture window78102 completed; explicit validator passed all six rows. K64 block act.x is byte-exact to native scalar on all three unique histories and their reset repeats. Original QK-only block relative L2 was 0 / .00103924 / .00174817.\n\nQ/K/V and lengths are exact. Broad attention output matches the independently replayed K64 operation body byte-for-byte. Attention relative L2 against scalar is 0 / 0 / 1.0914e-8: its one retained changed BF16 word matches the independently rounded float64 result. It produces no changed block output words on this fixture.\n\nThis qualifies bounded native block accuracy, not speed or full-network quality. The original full-network gate remains unresolved. No performance timing has been performed for K64; its higher operation-body register count may cost performance.\n\nThe child rerun reached the final report write after every assertion passed but could not overwrite the already root-owned PASS report. The existing root report is preserved unchanged.\n"
+    },
+    "validate-block.py": {
+      "sha256": "a50132a3d6049ad4793ec93190d8cf81e084fa6818d3285714f84105e4a1eded",
+      "content": "import argparse,hashlib,importlib.util,json\nfrom pathlib import Path\nimport numpy as np\nR=Path(__file__).parent; A=R.parent/\"e1-qk-numerical-audit-20260906\"\nspec=importlib.util.spec_from_file_location(\"base\",A/\"compare-block.py\");C=importlib.util.module_from_spec(spec);spec.loader.exec_module(C)\ndef check(cr,cv,raw,vals):\n for k in [\"in.kvlen\",\"act.q\",\"kv.5.k\",\"kv.5.v\"]:assert raw[k]==cr[k],(k,\"upstream differs\")\n m={k:C.metrics(cv[k],vals[k]) for k in [\"act.opart\",\"act.mlpart\",\"act.at\",\"act.x\"]}\n assert m[\"act.at\"][\"relative_l2\"]<=.003,(\"attention\",m[\"act.at\"])\n assert m[\"act.x\"][\"relative_l2\"]<=.01 and m[\"act.x\"][\"max_abs\"]<=.05+.02*m[\"act.x\"][\"max_ref\"],(\"block\",m[\"act.x\"])\n return m\ndef self_test():\n C.self_test(); raw={k:b\"x\" for k in [\"in.kvlen\",\"act.q\",\"kv.5.k\",\"kv.5.v\"]}; vals={k:np.array([1.]) for k in [\"act.opart\",\"act.mlpart\",\"act.at\",\"act.x\"]}\n check(raw,vals,raw,vals)\n bad=[]\n r=dict(raw);r[\"act.q\"]=b\"y\";bad.append((r,vals))\n for key,value in [(\"act.at\",1.004),(\"act.x\",1.011),(\"act.x\",float(\"nan\"))]:\n  v=dict(vals);v[key]=np.array([value]);bad.append((raw,v))\n for r,v in bad:\n  try:check(raw,vals,r,v)\n  except AssertionError:pass\n  else:raise AssertionError(\"negative fixture accepted\")\n print(\"PASS unchanged gates, upstream mutation, attention/block excess, nonfinite rejection\")\ndef run():\n for name in [\"input-provenance.json\",\"saved-input-provenance.json\"]:\n  obj=json.loads((R/name).read_text());files=obj.get(\"files\",obj)\n  for p,d in files.items():assert hashlib.sha256(Path(p).read_bytes()).hexdigest()==d[\"sha256\"],p\n for p,d in json.loads((R/\"FREEZE.json\").read_text())[\"files\"].items():assert hashlib.sha256((R/p).read_bytes()).hexdigest()==d[\"sha256\"],p\n native=C.load(\"control\"); qk=C.load(\"qk-only\"); C.R=R; candidate=C.load(\"k64\")\n assert len(native)==len(qk)==len(candidate)==6\n records=[]\n for step,((cr,cv),(raw,vals)) in enumerate(zip(native,candidate)):\n  metric=check(cr,cv,raw,vals)\n  replay=R/\"results/operator-numerical-tensors\"/f\"candidate-step{step%3}-out.raw\"\n  assert raw[\"act.at\"]==replay.read_bytes(),(step,\"broad output differs from same-input DSO\")\n  records.append(dict(step=step,upstream_exact=True,repeats_exact=True,saved_operator_output_exact=True,metrics=metric,previous_qk_metrics={k:C.metrics(cv[k],qk[step][1][k]) for k in metric}))\n out=dict(passed=True,data_valid=True,numerical_pass=True,rows=6,records=records,scope=\"Native single-block numerical gate; unchanged .003 attention/.01 block plus original maxabs gate. No full-model or timing qualification.\")\n (R/\"results/block-numerical.json\").write_text(json.dumps(out,indent=2)+\"\\n\");print(json.dumps(dict(passed=True,rows=6,max_block_rel_l2=max(r[\"metrics\"][\"act.x\"][\"relative_l2\"] for r in records))))\nif __name__==\"__main__\":\n p=argparse.ArgumentParser();p.add_argument(\"--self-test\",action=\"store_true\");a=p.parse_args()\n if a.self_test:self_test()\n else:run()\n"
+    },
+    "validate-operator.py": {
+      "sha256": "67d86095208329283db25720a8627ccdf4fe15de99d8b6d39639d48da92bfe68",
+      "content": "import json,sys,math\nfrom pathlib import Path\nx=json.loads(Path(sys.argv[1]).read_text());assert x.get(\"passed\") is True and len(x[\"rows\"])==6\nassert [(r[\"step\"],r[\"arm\"]) for r in x[\"rows\"]]==[(s,a) for s in range(3) for a in [\"control\",\"candidate\"]]\nfor r in x[\"rows\"]:\n assert r[\"length\"]==1025+r[\"step\"] and r[\"splits\"]==33 and r[\"scale\"]==1 and r[\"kv_stride\"]==65536\n assert r[\"finite\"] and r[\"canaries\"] and r[\"repeats_exact\"] and r[\"native\"][\"relative_l2\"]<=.003\n assert all(math.isfinite(r[\"float64\"][k]) for k in [\"relative_l2\",\"max_abs\",\"max_ref\"])\n for n,b in [(\"out\",8192*2),(\"opart\",16*33*512*4),(\"mlpart\",16*33*2*4)]:assert Path(r[n+\"_file\"]).stat().st_size==b\nprint(\"PASS sixnative savedinput numericalcells; accuracyimprovement/timingrequiresseparateanalysis\")\n"
+    },
+    "FREEZE.json": {
+      "sha256": "8c77540b4bb085b51462301caa4cb5368cb3e537802d430c701b041ec4105035",
+      "content": {
+        "status": "CPUready; GPUunqualified; blockHELD",
+        "files": {
+          "HANDOFF.md": {
+            "bytes": 2637,
+            "sha256": "cc29f9f22b8751f43c9ef0c1e067a5527609fb58fe3bfacf1f0cdc68cc99905f"
+          },
+          "PV-TF32-FEASIBILITY.md": {
+            "bytes": 2018,
+            "sha256": "729cb5c4b96b972cbf656ca3125201c15d874940d8aac7c8751093155d23b348"
+          },
+          "broad-source/runtime/common/control_queue_probe.h": {
+            "bytes": 4734,
+            "sha256": "433db5c952a111da21a823ce14d186f600233bd940080396063ecebaa8575d7c"
+          },
+          "broad-source/runtime/common/decode.c": {
+            "bytes": 3773,
+            "sha256": "79c1aaac45ce2720c00e81855739e46853a0e136f5bcfc19e995031b10a2e3e9"
+          },
+          "broad-source/runtime/common/decode.h": {
+            "bytes": 1569,
+            "sha256": "444ce685929bd60cfc6fb76272ecb3c0edcd30f2eb8703eb7baf74608e3c3534"
+          },
+          "broad-source/runtime/common/dev_blob.h": {
+            "bytes": 10941,
+            "sha256": "8be2c3734d2dfffb933d819cb4c43eb2c10c639725e59cf0fc2ad2cf3fd1fdb2"
+          },
+          "broad-source/runtime/common/dev_isa.h": {
+            "bytes": 109775,
+            "sha256": "c177dec4fc888e2ced03863c8a2c482a62dfa7a2de2669ec6384ec95279311ed"
+          },
+          "broad-source/runtime/common/dispatch.c": {
+            "bytes": 542,
+            "sha256": "68f05097b5c022f39474c243617806dcb298bb755a9c9a58eb86ce76a8126c08"
+          },
+          "broad-source/runtime/common/dispatch.h": {
+            "bytes": 1224,
+            "sha256": "19018f27b7be4d8d767d97985262f8f2dd5ed13e149f1ca907a1e6cd98d62070"
+          },
+          "broad-source/runtime/common/interp.c": {
+            "bytes": 2173,
+            "sha256": "29a8bcb315f13c3ee0d97d557d89f7aef49baa5c6e581a4e3b07f7d52d438e70"
+          },
+          "broad-source/runtime/common/interp.h": {
+            "bytes": 1133,
+            "sha256": "23b86369065f75b3b728843e9c7f701716712b90fc30a292f88af464a62a6a23"
+          },
+          "broad-source/runtime/common/kernel.h": {
+            "bytes": 3787,
+            "sha256": "00c6dd6618a9e4d8549b9c8b7ce27c81bbaf480d61288a6d2eb10f0c59ee6497"
+          },
+          "broad-source/runtime/common/memmap.c": {
+            "bytes": 1066,
+            "sha256": "e517e159b6ac7b10923939de410474e53f8d04e37b57ed162d67f5c641c7e18b"
+          },
+          "broad-source/runtime/common/memmap.h": {
+            "bytes": 4557,
+            "sha256": "c47143732c5204108199d872d6f1d21fcb731f128a32f4bfbab46d8ef738bdd1"
+          },
+          "broad-source/runtime/common/safetensors.h": {
+            "bytes": 4261,
+            "sha256": "8c5a61e3b97211c959b89ff740d49918fb5c7f7b18c7bde89116657a830ff3b2"
+          },
+          "broad-source/runtime/nvidia/cuda_backend.c": {
+            "bytes": 19708,
+            "sha256": "95135e8930f3264636bd88f977da0de14c2079c66a4c22e5f73f585b691a6be6"
+          },
+          "broad-source/runtime/nvidia/dma.cu": {
+            "bytes": 1037,
+            "sha256": "707b0a746f937d3d47dea01e977d2c5d670420479656ee51ddcefb013e02895e"
+          },
+          "broad-source/runtime/nvidia/experiments/README.md": {
+            "bytes": 22534,
+            "sha256": "fcd5d47ab961fda116e5edaba32b37a8d15523d7983523ffbfbfc81954943a52"
+          },
+          "broad-source/runtime/nvidia/experiments/chunk_dbuf_poc.cu": {
+            "bytes": 20610,
+            "sha256": "00bcfd420e389658fa20d22b41cf01820bc97514ceb17264bef730b82925c5e8"
+          },
+          "broad-source/runtime/nvidia/experiments/cluster_gq_probe.cu": {
+            "bytes": 67636,
+            "sha256": "45d83ef185315c2b5a0aae0aa9a4588ead4d966693390258668cde6cf889a82a"
+          },
+          "broad-source/runtime/nvidia/experiments/decode_fp8_occ.cu": {
+            "bytes": 19091,
+            "sha256": "9f769b196c6a91e7dcea9ef6d253e4a53e4e1ad1b6cbc49e865f44873be2c076"
+          },
+          "broad-source/runtime/nvidia/experiments/decode_seg_cpasync.cu": {
+            "bytes": 17635,
+            "sha256": "a7d82747707e637b4efe9de30f6f667cd75ac00271d40f15479f1bfcb78fdc48"
+          },
+          "broad-source/runtime/nvidia/experiments/decode_seg_gemv.cu": {
+            "bytes": 11092,
+            "sha256": "bb4b706e22ade7d11bdad630d9d26b12ba76efae8b046d1bfa797f85927e2c5a"
+          },
+          "broad-source/runtime/nvidia/experiments/decode_smalln_warppair.cu": {
+            "bytes": 15834,
+            "sha256": "4a7672a23af1fa91522fecff10977bd137670775b26ba7abc445f518ffd7d0ee"
+          },
+          "broad-source/runtime/nvidia/experiments/fa_gf_full_ab.cu": {
+            "bytes": 9241,
+            "sha256": "4380df093a4e16f904e1376495eaa91b6fcd1287c642fa2e37cdbc397521497c"
+          },
+          "broad-source/runtime/nvidia/experiments/fa_gf_full_h100_ab.cu": {
+            "bytes": 28300,
+            "sha256": "e1f8f66fdd96532153f4c0f6bdf3e54b43f9cc4aa39c4d9537fa84333dbaf5b7"
+          },
+          "broad-source/runtime/nvidia/experiments/fa_pv_bench.cu": {
+            "bytes": 4943,
+            "sha256": "9313d7b3a6ffec97eed87de82a4b5f1ef525125e4ff679f891bab662831bce7f"
+          },
+          "broad-source/runtime/nvidia/experiments/fa_varlen_bench.cu": {
+            "bytes": 6734,
+            "sha256": "cebc2d989b90b5bf09fb424f18c7c25186aafd1124992244ff57267b9ef1df23"
+          },
+          "broad-source/runtime/nvidia/experiments/fp8_gemm_w8a8_probe.cu": {
+            "bytes": 6839,
+            "sha256": "a0134d9c9c9118f502491b66253bb544ab178b86d78c04e25e3d76d97b1b021c"
+          },
+          "broad-source/runtime/nvidia/experiments/fp8_gemv.cu": {
+            "bytes": 11949,
+            "sha256": "806d648800d2a0517fea1fa340221d3fb615a0c3f3d0fd0a73d500afbde485d2"
+          },
+          "broad-source/runtime/nvidia/experiments/fp8_gemv_moe.cu": {
+            "bytes": 9005,
+            "sha256": "5cea08c007d39957ffe4487bf923ddafbda0f541f8af9d6903870805c3abf905"
+          },
+          "broad-source/runtime/nvidia/experiments/fp8_mma_rate_probe.cu": {
+            "bytes": 4236,
+            "sha256": "beafbb5b68aa79f2ca72443d1371bc0643ded9e2cb8b502ce22d4112e72605b5"
+          },
+          "broad-source/runtime/nvidia/experiments/fp8_probe.cu": {
+            "bytes": 3034,
+            "sha256": "8cc4dafb91cfc05044e70a0e97ed7bb489d9b572e9a5b2523a14f92a004e3e5e"
+          },
+          "broad-source/runtime/nvidia/experiments/fp8_verify.cu": {
+            "bytes": 6449,
+            "sha256": "d477ee6791fb681416afeff938ac16d36b9ba3edc93a7528935b8c12dfb92746"
+          },
+          "broad-source/runtime/nvidia/experiments/gemv_cpasync_h100.cu": {
+            "bytes": 14197,
+            "sha256": "d0478bf4ab949b6ab2400f15440f197f663c31c85150e71079f466a180c02f87"
+          },
+          "broad-source/runtime/nvidia/experiments/gemv_dimspec.cu": {
+            "bytes": 11505,
+            "sha256": "d1bac320a33373b2aa1a35373827901d8fb72614a142fe4ac4ef62a53e932af2"
+          },
+          "broad-source/runtime/nvidia/experiments/gemv_lab_h100.cu": {
+            "bytes": 20281,
+            "sha256": "6054db60c86f5e07204128ed0084a4e2d49292f06c9a9e4a00c604e025c077c3"
+          },
+          "broad-source/runtime/nvidia/experiments/gemv_lds_vectorize_probe.cu": {
+            "bytes": 18921,
+            "sha256": "82b5bf04769cc4b9d4b717ff01af43c3feddf39bb26902b74eb60134df11294c"
+          },
+          "broad-source/runtime/nvidia/experiments/gemv_transport.cu": {
+            "bytes": 22264,
+            "sha256": "40adde2fdf377024fa04eb2c42d8c59faa9b460ce28318507212c1c19a9529ff"
+          },
+          "broad-source/runtime/nvidia/experiments/gemv_warpspec_prod_cons.cu": {
+            "bytes": 13904,
+            "sha256": "6796bbab5d36abb68427206d288d3ca4dd13955d1ecad948d2ff5bbe2a26d9b1"
+          },
+          "broad-source/runtime/nvidia/experiments/h100_elementwise_ab.cu": {
+            "bytes": 48262,
+            "sha256": "b3050cddb6763e2d9db9974f8d63f19ccfdf1893fe044ea92377cb34632296ce"
+          },
+          "broad-source/runtime/nvidia/experiments/hbm_ceiling_h100.cu": {
+            "bytes": 5365,
+            "sha256": "9a9a64058ddc7fb81e8450335ced0589b874e2f82d45bfe2ba4e05271150f82a"
+          },
+          "broad-source/runtime/nvidia/experiments/hopper_cluster_multicast.cu": {
+            "bytes": 35058,
+            "sha256": "4d20a0ac6586ef2cd5dfa19ab4149fa288376f20d14e6d3d111c22a9fe5eddba"
+          },
+          "broad-source/runtime/nvidia/experiments/hopper_warpspec_prefill.cu": {
+            "bytes": 29164,
+            "sha256": "c97672fcd21031ed80f145339cfadf0585d2b7075f4a0d75fa13288a135a93da"
+          },
+          "broad-source/runtime/nvidia/experiments/ksplit_gemv.cu": {
+            "bytes": 6908,
+            "sha256": "22e5f1e0f702cea47b10edc20e2188f4b507afb50cd8535285e5db3d9597fa04"
+          },
+          "broad-source/runtime/nvidia/experiments/kv_l2.cu": {
+            "bytes": 12277,
+            "sha256": "96a9ab0ef486cf2b7b59ed7af4fbe52f1dbeae547a5b758be925c10175c1d9c7"
+          },
+          "broad-source/runtime/nvidia/experiments/mxfp8_probe.cu": {
+            "bytes": 8329,
+            "sha256": "9de685eeed40cf17dd72b10b276cb68087546dd14aa59718cddaf7cc1c11dab6"
+          },
+          "broad-source/runtime/nvidia/experiments/op_moe_w64.cuh": {
+            "bytes": 13848,
+            "sha256": "51ab722445c17a22a54e93f9656b80385f6579567ffe9e758cdd8fb9104c8607"
+          },
+          "broad-source/runtime/nvidia/experiments/prefill_fp8_wgmma.cu": {
+            "bytes": 10249,
+            "sha256": "feca6479648d0381fc5b7576cb6a0e6115e43e9dcc3dee76af4c60030e5d9d36"
+          },
+          "broad-source/runtime/nvidia/experiments/px2_gemm_bench.cu": {
+            "bytes": 4785,
+            "sha256": "d060959331941020b92954dff26cce50bd22aadd888e949e2e4597abfdb099f8"
+          },
+          "broad-source/runtime/nvidia/experiments/px4_fa_ablate.cu": {
+            "bytes": 13027,
+            "sha256": "696f87de7824d8dd73083e020d9f91ad596c855bb75fc45343c657c26d28044b"
+          },
+          "broad-source/runtime/nvidia/experiments/px4_fp8mma_ablate.cu": {
+            "bytes": 15202,
+            "sha256": "08e4e16639e7ef08085f3b5fbaf8ba93ad7468ed2f281dd962591abb84d5d15b"
+          },
+          "broad-source/runtime/nvidia/experiments/segws_repro.cu": {
+            "bytes": 6875,
+            "sha256": "cb6369a183baaa4edb53d78ea7409869b2565875ca1ef169c3596fb98c8c6878"
+          },
+          "broad-source/runtime/nvidia/experiments/setmaxnreg_design.cu": {
+            "bytes": 2322,
+            "sha256": "14143add6fe7772e369f2f96eeb375898ee9bdf5fcef47fa49ad87ae1b8b7e3b"
+          },
+          "broad-source/runtime/nvidia/experiments/setmaxnreg_occ.cu": {
+            "bytes": 1501,
+            "sha256": "901bc8a66aae2d09f1dfe87f31a562dd0b9337ed1eac58392d112b4c973ba01d"
+          },
+          "broad-source/runtime/nvidia/experiments/setmaxnreg_probe.cu": {
+            "bytes": 3179,
+            "sha256": "50c03818931182e3335f26d315901de5aeec48244f345da6681a0b5fc32dc6fa"
+          },
+          "broad-source/runtime/nvidia/experiments/shfl_convergence_ab.cu": {
+            "bytes": 32387,
+            "sha256": "55e3119c4e7b9da6317f096ae4b450b8dcec924465f0dd618ef9456d3bce43a1"
+          },
+          "broad-source/runtime/nvidia/experiments/splitzip_bitexact.cu": {
+            "bytes": 5247,
+            "sha256": "1f9d243e8d86de59b6e2d2b96251ca9d48248eea77f278d9e96eac907e9d549b"
+          },
+          "broad-source/runtime/nvidia/experiments/splitzip_codec.cu": {
+            "bytes": 9422,
+            "sha256": "55210385da0c9b3162f058fd82b454ce488cfd1218829474daea768109cdee08"
+          },
+          "broad-source/runtime/nvidia/experiments/splitzip_gemv.cu": {
+            "bytes": 15714,
+            "sha256": "012555cf234eb31b22dc6083cb4441d1e528211f8a114172afc1a78cba2831c6"
+          },
+          "broad-source/runtime/nvidia/experiments/splitzip_gemv12.cu": {
+            "bytes": 10475,
+            "sha256": "5706317bc21965105ed6bcc1ba438fe782d9dbc9009ddf505b00d6427409ee00"
+          },
+          "broad-source/runtime/nvidia/experiments/splitzip_h100_ab.cu": {
+            "bytes": 31057,
+            "sha256": "3c231ddbadb4f4d3dbb3e28804e6bcc82537ea4478a8859eae0f50a1913ad1ea"
+          },
+          "broad-source/runtime/nvidia/experiments/t3_pipe_probe.cu": {
+            "bytes": 7999,
+            "sha256": "e30a334ceda874ef41871ae324e4240d3b583763bbf6e22f354d1dcbf864d95e"
+          },
+          "broad-source/runtime/nvidia/experiments/tma_abi_probe.cu": {
+            "bytes": 32439,
+            "sha256": "814ec93d4c5eade6b6d275205c63ebb5ce209a62d60b97af054af1360721df44"
+          },
+          "broad-source/runtime/nvidia/experiments/tma_uni_gemm_ab.cu": {
+            "bytes": 7665,
+            "sha256": "e5a1d44e19bcdaf0a2f4b7b6db0e3bc320a1528ce501700c561f0d635971e180"
+          },
+          "broad-source/runtime/nvidia/experiments/tma_ws_flash_prefill.cu": {
+            "bytes": 65650,
+            "sha256": "c8ef87c8cdc6e4b7085efa5f9711e243d9ce792d9fe86c92b92fcd40ead9b33e"
+          },
+          "broad-source/runtime/nvidia/experiments/tma_ws_gemm_bf16.cu": {
+            "bytes": 53339,
+            "sha256": "5dc009bc0258d0b9be8ea532eef4bc5e0aeac0b9c446da1759620ec899207002"
+          },
+          "broad-source/runtime/nvidia/experiments/tma_ws_gemm_fp8.cu": {
+            "bytes": 51889,
+            "sha256": "ea69910b2b998892091c296f29004bc56564fbc10fda5fa48d057d21ddd4e319"
+          },
+          "broad-source/runtime/nvidia/experiments/tma_ws_moe_group.cu": {
+            "bytes": 43565,
+            "sha256": "41acbcd90936ae9a33082b814d37c62848df82f07b37ca9c6b4d7dd2185809ff"
+          },
+          "broad-source/runtime/nvidia/experiments/uni256_cluster_probe.cu": {
+            "bytes": 15218,
+            "sha256": "a64ab075427b6800e0bf557695453f15077ecc8a7d3113345d299cc828a18e0e"
+          },
+          "broad-source/runtime/nvidia/experiments/uni256_probe.cu": {
+            "bytes": 11014,
+            "sha256": "9791e01e1f529cab6d0fe9b7dad9fc3e6ba9333447b8992cdb9348dc4411e95c"
+          },
+          "broad-source/runtime/nvidia/experiments/vmm_kv_ab.cu": {
+            "bytes": 17896,
+            "sha256": "f1076ead53970c77b677e973e38875380fbd99299c89668698da517bddce572a"
+          },
+          "broad-source/runtime/nvidia/experiments/vmm_probe.cu": {
+            "bytes": 22737,
+            "sha256": "7ff8cd00d1e00e1c5c7a6750a607c8e0725d12cce2c786db1244dcfa11033e97"
+          },
+          "broad-source/runtime/nvidia/experiments/warpspec_ab.cu": {
+            "bytes": 17788,
+            "sha256": "83cea2a3cc9ab97cdb220a0b5be3eac8b8a8096b892143f6169364108ff5eb43"
+          },
+          "broad-source/runtime/nvidia/experiments/wgmma_bf16_probe.cu": {
+            "bytes": 25186,
+            "sha256": "745f517caadf2c1dd22ea1659628fc922ac4af8f8954f9b6af19d62875a67807"
+          },
+          "broad-source/runtime/nvidia/experiments/wgmma_flash_prefill_probe.cu": {
+            "bytes": 46841,
+            "sha256": "d8ab032e4e8c3e7685013aafe4bcc28dc1760769dead8e0a022498e0bb2cd9df"
+          },
+          "broad-source/runtime/nvidia/experiments/wgmma_fp8_probe.cu": {
+            "bytes": 24024,
+            "sha256": "0117b4650bf0cd381955bd125b72c71b2af9e6557b6a1e79b86007c7cc28e267"
+          },
+          "broad-source/runtime/nvidia/experiments/wgmma_moe_group_probe.cu": {
+            "bytes": 33363,
+            "sha256": "07d9a161b98c07a61b0d6e93b073d58f2efe7bc82d0eed21b2a25175a0252c68"
+          },
+          "broad-source/runtime/nvidia/experiments/ws384_probe.cu": {
+            "bytes": 7806,
+            "sha256": "acf35b3d9ba9b0d7f0d046cbde2dd2c7986c3bcb160ea5346b064f8e42627f5b"
+          },
+          "broad-source/runtime/nvidia/flash.cu": {
+            "bytes": 3901,
+            "sha256": "ad10078c8658cf1cee9bc8b67f811adc0cf5829ddf08114dba725f0f352e1f6b"
+          },
+          "broad-source/runtime/nvidia/gdn_prefill.cpp": {
+            "bytes": 3791,
+            "sha256": "965d161910cef387c858c689810e110e516d7a3655c3910fa3525640d4a159bc"
+          },
+          "broad-source/runtime/nvidia/gemm.cu": {
+            "bytes": 5275,
+            "sha256": "c73565666b682b88de3dc154ce33a6ffb7dc4d5e1f2e6004776eb2e223560c9a"
+          },
+          "broad-source/runtime/nvidia/gemma_sm120.cu": {
+            "bytes": 45810,
+            "sha256": "3905308f8cb096805d5657a263815b9d90bac1a115c18b301455baac93272beb"
+          },
+          "broad-source/runtime/nvidia/gpu_common.h": {
+            "bytes": 783,
+            "sha256": "797ac2c3089063209d203bbeb2b2e9a6c5b4d756fbda4498bd1f2082778ff011"
+          },
+          "broad-source/runtime/nvidia/interp_sm120.cu": {
+            "bytes": 143193,
+            "sha256": "44f4f5eeeafe6337e12471b2da30ef8eb70128e9b1e34f5f2492888de3a12890"
+          },
+          "broad-source/runtime/nvidia/interp_sm120_poc.cu": {
+            "bytes": 13607,
+            "sha256": "d0d640fd6c9c219e3d5f291bcb94c45ab0bc8e77a7b31278c277fb81debbf029"
+          },
+          "broad-source/runtime/nvidia/interp_sm90a.cu": {
+            "bytes": 1798,
+            "sha256": "7d88bf14fcc6e42e8d7ccdcc112000fb2cb99373c0bfa1a5be8e870a86d555d1"
+          },
+          "broad-source/runtime/nvidia/interp_sm90a_gemv512.cu": {
+            "bytes": 838,
+            "sha256": "fd1a745d84c3e4acc3f5655465899749c627d95aba31d3b7cd5e55c4555e745a"
+          },
+          "broad-source/runtime/nvidia/layout.cu": {
+            "bytes": 4334,
+            "sha256": "273ef8e6904403f5173f57fbb34f02fa92f9962ff8b40f46fdaaaa58642eb584"
+          },
+          "broad-source/runtime/nvidia/op_attention.cuh": {
+            "bytes": 195855,
+            "sha256": "d7e283241876abd3e5f80d42fd12cb929bdbffa5361bda08370cc4e6a70efa52"
+          },
+          "broad-source/runtime/nvidia/op_attention_sm90.cuh": {
+            "bytes": 47167,
+            "sha256": "82d13d8aad180c81c3b0fa2cf3e8ea6d008d08da47ad1ee9b3dc2e9258f96bca"
+          },
+          "broad-source/runtime/nvidia/op_dsa.cuh": {
+            "bytes": 31052,
+            "sha256": "b6cb35ba9ecc2787c1f5accfde2de35736a34eb8aad1320c205ee62af29cc1f6"
+          },
+          "broad-source/runtime/nvidia/op_elementwise.cuh": {
+            "bytes": 8842,
+            "sha256": "7c63310d5438280cff524293fde75ec08de7347cd48037e2da275c7d2dab5663"
+          },
+          "broad-source/runtime/nvidia/op_gemm.cuh": {
+            "bytes": 144973,
+            "sha256": "861cce8de5c88575e4105282fd4a8098eff6ce91bf8ac4536847135e6870cdfc"
+          },
+          "broad-source/runtime/nvidia/op_gemm_sm90.cuh": {
+            "bytes": 113836,
+            "sha256": "1b5de2a57ec3a6dae38c246a4e7ce5d23d747961aedf11d5771037c3e8fa0dfa"
+          },
+          "broad-source/runtime/nvidia/op_mamba.cuh": {
+            "bytes": 8649,
+            "sha256": "f37ff61085f71542b04f85dc63bf15a0c74a843c0b1576bfafbfeda2a87315db"
+          },
+          "broad-source/runtime/nvidia/op_mla.cuh": {
+            "bytes": 20554,
+            "sha256": "fde05716b1cc47912f4fd38f56cfe6e0441f916cdde90b6accb21efabd446e8e"
+          },
+          "broad-source/runtime/nvidia/op_moe.cuh": {
+            "bytes": 134755,
+            "sha256": "c8430f25cfeb28166d58b9087c5429542594233ee846d2b9b565a2417b526672"
+          },
+          "broad-source/runtime/nvidia/op_moe_sm90.cuh": {
+            "bytes": 26171,
+            "sha256": "0620ab1515bbc5816b7be6da645abd117fc465850093b18d8d19b8dc614a0132"
+          },
+          "broad-source/runtime/nvidia/op_norm.cuh": {
+            "bytes": 51216,
+            "sha256": "d320b65c2e730f841a07d110407c1061d13760971af43e14fa199907ae7ffc78"
+          },
+          "broad-source/runtime/nvidia/op_qwen_gdn.cuh": {
+            "bytes": 13942,
+            "sha256": "ea17af9975f1da3050d0fdc3efa56e82f22291ddb562f0ae934b323c7a66a0be"
+          },
+          "broad-source/runtime/nvidia/register_blackwell.cu": {
+            "bytes": 1866,
+            "sha256": "14e53eb38080865b1389159d28fbda6c747b2e33e3437b256a811f6535bfa8f5"
+          },
+          "broad-source/runtime/nvidia/register_hopper.cu": {
+            "bytes": 3543,
+            "sha256": "6dbb5000eec1bbd1fb6f6935414474b8b01364dc6f52002a8f0636d707c4e961"
+          },
+          "broad-source/runtime/nvidia/register_rtx6000.cu": {
+            "bytes": 4605,
+            "sha256": "65e6e6c62a9304f9859925f88f84bbe6f294e47f7d24ae4daaedd74ccc11ac12"
+          },
+          "broad-source/runtime/nvidia/row.cu": {
+            "bytes": 6451,
+            "sha256": "ba2e941c29b23eb793bdfe7ab51e80425d7e730f2b0d31e7ec9c9f66289990ee"
+          },
+          "broad-source/runtime/nvidia/sample_sm120.cu": {
+            "bytes": 11077,
+            "sha256": "572a7f30928b4432e32d75814412c24d183cce8fe77fb1173d404152bfffc8ac"
+          },
+          "broad-source/runtime/nvidia/sm120_common.cuh": {
+            "bytes": 5922,
+            "sha256": "5cd89fa717633eeb0066840d96ba7913a413443d28f2ae2474b083211afa4e07"
+          },
+          "broad-source/runtime/nvidia/sm90_wgmma.cuh": {
+            "bytes": 21342,
+            "sha256": "73ca9b991d981fd20800c959bf07e21d345e2763530ed7571f7891bc0435a7d9"
+          },
+          "build-commands.json": {
+            "bytes": 2067,
+            "sha256": "a2df5c932f5db376093652b61bc16161ea1ca9393ddd873cb989faeef52c329a"
+          },
+          "build-results.json": {
+            "bytes": 90,
+            "sha256": "d3f54c0c43e356bd3506805c4d2fbf0a9e06cc9228ef8c7c8b3476c85f89424f"
+          },
+          "build.py": {
+            "bytes": 488,
+            "sha256": "6fe7ff5cd7e5dbc149b463c56a94baa1123347e9200bb1e6fc3e8ed5e41b9cfe"
+          },
+          "comparator.patch": {
+            "bytes": 7011,
+            "sha256": "8ea0ee751a70ca09c0758de7f13f26209262ce42cfa274fadfe4e8d923b41759"
+          },
+          "cpu-proof.json": {
+            "bytes": 505,
+            "sha256": "3a3f1db98751abc3000de3231789bd3b5fd06a3b0fa7c0421f34fe20355e7cd7"
+          },
+          "gpu-block-held.json": {
+            "bytes": 3514,
+            "sha256": "a51a5a7e48b02e98375e07521ca2b202f908740bb9439534655defeabd940718"
+          },
+          "gpu-operator-queue.json": {
+            "bytes": 1718,
+            "sha256": "68cdde27160f225dca817f52f82f733c80c302f9df1fe9033055d869a0f81b00"
+          },
+          "k64-broad.log": {
+            "bytes": 3197,
+            "sha256": "8c73764e44a435ce989117a85e259461b3f8a9375cb1359e86cc85cb70c28fe0"
+          },
+          "k64-operator.log": {
+            "bytes": 5076,
+            "sha256": "cb13a71693689ecbd332176ff6ce8c249976e87661d61059204202364c985fda"
+          },
+          "k64.cubin": {
+            "bytes": 5846224,
+            "sha256": "0c7dc896c6e6d0fa9f8a0bb6bbf276a44ab7885a72682817ed3f5f02a2752a07"
+          },
+          "k64.cubin.resources.txt": {
+            "bytes": 656,
+            "sha256": "a0a7e5ef50afe96374fb66586f1b281e468a4b391e4a38abcf7f5822321e1474"
+          },
+          "k64.cubin.sass": {
+            "bytes": 21761411,
+            "sha256": "02219d1254ae5ffb72d4b82150f6fc49709a22b0f131e963ba754c016e86ee70"
+          },
+          "k64.so": {
+            "bytes": 1827064,
+            "sha256": "74a230b0c3ad6ec91746802c6449c1e6ce06698fcf605808e96647b9260b7875"
+          },
+          "k64.so.resources.txt": {
+            "bytes": 2290,
+            "sha256": "fd9f40790d36f8af817c1117020e54c4c4e9301b421e33e519838eab9b04ede8"
+          },
+          "k64.so.sass": {
+            "bytes": 10299106,
+            "sha256": "d141ece65b6ae85755d48b406ff7aeeb545e9b8cc8bd2f3b34f08c8c2e05681c"
+          },
+          "kernel.patch": {
+            "bytes": 1536,
+            "sha256": "36e862cc71be77fc8f73b30a0c4e7932ca25bf545955457f96068487829c12be"
+          },
+          "pv-tf32-cpu-feasibility.json": {
+            "bytes": 714,
+            "sha256": "0cd48f88f3ed263319908672dbdba69b66ca3629309fb7e0158d58769c65e001"
+          },
+          "qk-control.cubin": {
+            "bytes": 5846864,
+            "sha256": "ff4dd4b56ffc5d2105af56508f60f93737cd61160a387a7371a968d2a8224c15"
+          },
+          "qk-control.cubin.resources.txt": {
+            "bytes": 656,
+            "sha256": "a0a7e5ef50afe96374fb66586f1b281e468a4b391e4a38abcf7f5822321e1474"
+          },
+          "qk-control.cubin.sass": {
+            "bytes": 21773507,
+            "sha256": "23fd7fc59a60a7f30ade47fbe5d20147c2013d30b2df10bb473f76154c0b9474"
+          },
+          "qk-control.so": {
+            "bytes": 1821240,
+            "sha256": "3e3b5e112d55aad05c5dd7420088e7d472cb77d138a308681ecbdeed3d268a22"
+          },
+          "qk-control.so.resources.txt": {
+            "bytes": 2290,
+            "sha256": "7c29c782b4f17af708113674b5f9801152639aa1d2ccc600e513273c2f10045a"
+          },
+          "qk-control.so.sass": {
+            "bytes": 10297138,
+            "sha256": "d703e4bce859e2b4c1c2221b9ae9e65f90c298cc2fb54bcc269ba4fa1d0676cb"
+          },
+          "qwen_primitives.py": {
+            "bytes": 52274,
+            "sha256": "d3d6c3bdffbac6cb5719758c2cd3dd9ba18dbb8ec770bace3c06b36f9de5905a"
+          },
+          "sass-audit.json": {
+            "bytes": 1677,
+            "sha256": "1412f00aee98ff4c22ae8bb2acc8ba5c4aa68a51377cf039d723909c73d56e99"
+          },
+          "saved-input-provenance.json": {
+            "bytes": 23499,
+            "sha256": "3410e1a2d0465cc012d40e856ea6b65b54e22b08e2fe3564a6f5ea8fd0aa3955"
+          },
+          "source/runtime/common/control_queue_probe.h": {
+            "bytes": 4734,
+            "sha256": "433db5c952a111da21a823ce14d186f600233bd940080396063ecebaa8575d7c"
+          },
+          "source/runtime/common/decode.h": {
+            "bytes": 1569,
+            "sha256": "444ce685929bd60cfc6fb76272ecb3c0edcd30f2eb8703eb7baf74608e3c3534"
+          },
+          "source/runtime/common/dev_blob.h": {
+            "bytes": 10941,
+            "sha256": "8be2c3734d2dfffb933d819cb4c43eb2c10c639725e59cf0fc2ad2cf3fd1fdb2"
+          },
+          "source/runtime/common/dev_isa.h": {
+            "bytes": 109775,
+            "sha256": "c177dec4fc888e2ced03863c8a2c482a62dfa7a2de2669ec6384ec95279311ed"
+          },
+          "source/runtime/common/dispatch.h": {
+            "bytes": 1224,
+            "sha256": "19018f27b7be4d8d767d97985262f8f2dd5ed13e149f1ca907a1e6cd98d62070"
+          },
+          "source/runtime/common/interp.h": {
+            "bytes": 1133,
+            "sha256": "23b86369065f75b3b728843e9c7f701716712b90fc30a292f88af464a62a6a23"
+          },
+          "source/runtime/common/kernel.h": {
+            "bytes": 3787,
+            "sha256": "00c6dd6618a9e4d8549b9c8b7ce27c81bbaf480d61288a6d2eb10f0c59ee6497"
+          },
+          "source/runtime/common/memmap.h": {
+            "bytes": 4557,
+            "sha256": "c47143732c5204108199d872d6f1d21fcb731f128a32f4bfbab46d8ef738bdd1"
+          },
+          "source/runtime/common/safetensors.h": {
+            "bytes": 4261,
+            "sha256": "8c5a61e3b97211c959b89ff740d49918fb5c7f7b18c7bde89116657a830ff3b2"
+          },
+          "source/runtime/nvidia/dma.cu": {
+            "bytes": 1037,
+            "sha256": "707b0a746f937d3d47dea01e977d2c5d670420479656ee51ddcefb013e02895e"
+          },
+          "source/runtime/nvidia/experiments/fa_gf_full_h100_ab.cu": {
+            "bytes": 28625,
+            "sha256": "15b2d3ae7361291b61ad33927acb714fa6d3926d0de065cf78f98be4f80b5425"
+          },
+          "source/runtime/nvidia/flash.cu": {
+            "bytes": 3901,
+            "sha256": "ad10078c8658cf1cee9bc8b67f811adc0cf5829ddf08114dba725f0f352e1f6b"
+          },
+          "source/runtime/nvidia/gemm.cu": {
+            "bytes": 5275,
+            "sha256": "c73565666b682b88de3dc154ce33a6ffb7dc4d5e1f2e6004776eb2e223560c9a"
+          },
+          "source/runtime/nvidia/gemma_sm120.cu": {
+            "bytes": 45810,
+            "sha256": "3905308f8cb096805d5657a263815b9d90bac1a115c18b301455baac93272beb"
+          },
+          "source/runtime/nvidia/gpu_common.h": {
+            "bytes": 783,
+            "sha256": "797ac2c3089063209d203bbeb2b2e9a6c5b4d756fbda4498bd1f2082778ff011"
+          },
+          "source/runtime/nvidia/interp_sm120.cu": {
+            "bytes": 143193,
+            "sha256": "44f4f5eeeafe6337e12471b2da30ef8eb70128e9b1e34f5f2492888de3a12890"
+          },
+          "source/runtime/nvidia/interp_sm120_poc.cu": {
+            "bytes": 13607,
+            "sha256": "d0d640fd6c9c219e3d5f291bcb94c45ab0bc8e77a7b31278c277fb81debbf029"
+          },
+          "source/runtime/nvidia/interp_sm90a.cu": {
+            "bytes": 1798,
+            "sha256": "7d88bf14fcc6e42e8d7ccdcc112000fb2cb99373c0bfa1a5be8e870a86d555d1"
+          },
+          "source/runtime/nvidia/interp_sm90a_gemv512.cu": {
+            "bytes": 838,
+            "sha256": "fd1a745d84c3e4acc3f5655465899749c627d95aba31d3b7cd5e55c4555e745a"
+          },
+          "source/runtime/nvidia/layout.cu": {
+            "bytes": 4334,
+            "sha256": "273ef8e6904403f5173f57fbb34f02fa92f9962ff8b40f46fdaaaa58642eb584"
+          },
+          "source/runtime/nvidia/op_attention.cuh": {
+            "bytes": 195855,
+            "sha256": "d7e283241876abd3e5f80d42fd12cb929bdbffa5361bda08370cc4e6a70efa52"
+          },
+          "source/runtime/nvidia/op_attention_sm90.cuh": {
+            "bytes": 47167,
+            "sha256": "82d13d8aad180c81c3b0fa2cf3e8ea6d008d08da47ad1ee9b3dc2e9258f96bca"
+          },
+          "source/runtime/nvidia/op_dsa.cuh": {
+            "bytes": 31052,
+            "sha256": "b6cb35ba9ecc2787c1f5accfde2de35736a34eb8aad1320c205ee62af29cc1f6"
+          },
+          "source/runtime/nvidia/op_elementwise.cuh": {
+            "bytes": 8842,
+            "sha256": "7c63310d5438280cff524293fde75ec08de7347cd48037e2da275c7d2dab5663"
+          },
+          "source/runtime/nvidia/op_gemm.cuh": {
+            "bytes": 144973,
+            "sha256": "861cce8de5c88575e4105282fd4a8098eff6ce91bf8ac4536847135e6870cdfc"
+          },
+          "source/runtime/nvidia/op_gemm_sm90.cuh": {
+            "bytes": 113836,
+            "sha256": "1b5de2a57ec3a6dae38c246a4e7ce5d23d747961aedf11d5771037c3e8fa0dfa"
+          },
+          "source/runtime/nvidia/op_mamba.cuh": {
+            "bytes": 8649,
+            "sha256": "f37ff61085f71542b04f85dc63bf15a0c74a843c0b1576bfafbfeda2a87315db"
+          },
+          "source/runtime/nvidia/op_mla.cuh": {
+            "bytes": 20554,
+            "sha256": "fde05716b1cc47912f4fd38f56cfe6e0441f916cdde90b6accb21efabd446e8e"
+          },
+          "source/runtime/nvidia/op_moe.cuh": {
+            "bytes": 134755,
+            "sha256": "c8430f25cfeb28166d58b9087c5429542594233ee846d2b9b565a2417b526672"
+          },
+          "source/runtime/nvidia/op_moe_sm90.cuh": {
+            "bytes": 26171,
+            "sha256": "0620ab1515bbc5816b7be6da645abd117fc465850093b18d8d19b8dc614a0132"
+          },
+          "source/runtime/nvidia/op_norm.cuh": {
+            "bytes": 51216,
+            "sha256": "d320b65c2e730f841a07d110407c1061d13760971af43e14fa199907ae7ffc78"
+          },
+          "source/runtime/nvidia/op_qwen_gdn.cuh": {
+            "bytes": 13942,
+            "sha256": "ea17af9975f1da3050d0fdc3efa56e82f22291ddb562f0ae934b323c7a66a0be"
+          },
+          "source/runtime/nvidia/register_blackwell.cu": {
+            "bytes": 1866,
+            "sha256": "14e53eb38080865b1389159d28fbda6c747b2e33e3437b256a811f6535bfa8f5"
+          },
+          "source/runtime/nvidia/register_hopper.cu": {
+            "bytes": 3543,
+            "sha256": "6dbb5000eec1bbd1fb6f6935414474b8b01364dc6f52002a8f0636d707c4e961"
+          },
+          "source/runtime/nvidia/register_rtx6000.cu": {
+            "bytes": 4605,
+            "sha256": "65e6e6c62a9304f9859925f88f84bbe6f294e47f7d24ae4daaedd74ccc11ac12"
+          },
+          "source/runtime/nvidia/row.cu": {
+            "bytes": 6451,
+            "sha256": "ba2e941c29b23eb793bdfe7ab51e80425d7e730f2b0d31e7ec9c9f66289990ee"
+          },
+          "source/runtime/nvidia/sample_sm120.cu": {
+            "bytes": 11077,
+            "sha256": "572a7f30928b4432e32d75814412c24d183cce8fe77fb1173d404152bfffc8ac"
+          },
+          "source/runtime/nvidia/sm120_common.cuh": {
+            "bytes": 5922,
+            "sha256": "5cd89fa717633eeb0066840d96ba7913a413443d28f2ae2474b083211afa4e07"
+          },
+          "source/runtime/nvidia/sm90_wgmma.cuh": {
+            "bytes": 21342,
+            "sha256": "73ca9b991d981fd20800c959bf07e21d345e2763530ed7571f7891bc0435a7d9"
+          },
+          "source/runtime/tests/qwen_primitives.py": {
+            "bytes": 46753,
+            "sha256": "d4de543de0fe1ce6f8b6d442c3308002d1c5e11c097d8cb150929602b3ff8803"
+          },
+          "validate-operator.py": {
+            "bytes": 777,
+            "sha256": "67d86095208329283db25720a8627ccdf4fe15de99d8b6d39639d48da92bfe68"
+          }
+        }
+      }
+    },
+    "ACCURACY-FREEZE.json": {
+      "sha256": "f3b8c975e548f355f170cc1e052b9584917807ac03d262277697d0913277ec9b",
+      "content": {
+        "status": "Operator passed; independent local accuracy improvement supports next native block gate only",
+        "files": {
+          "analyze-accuracy.py": {
+            "bytes": 4137,
+            "sha256": "a331726226ef919b99766c3611a4e194269d7b88f025e23c8fb569d88b88c604"
+          },
+          "accuracy-analysis.json": {
+            "bytes": 12069,
+            "sha256": "8d8ed7530f4d98eb2c02db8dd2b69ddcff5ae84c0f2239de2cf773ae3f8606ef"
+          },
+          "ACCURACY-RESULTS.md": {
+            "bytes": 1895,
+            "sha256": "ce85c685e87908fe892b7a78c63089ac632e8c0dad415ca3bb5269b5061af0dd"
+          },
+          "input-provenance.json": {
+            "bytes": 3536,
+            "sha256": "907e131c9296d2285054c50544d4413b05510cc1cc2b175437de10aa7582dd22"
+          },
+          "validate-block.py": {
+            "bytes": 2892,
+            "sha256": "a50132a3d6049ad4793ec93190d8cf81e084fa6818d3285714f84105e4a1eded"
+          },
+          "gpu-block-ready.json": {
+            "bytes": 3745,
+            "sha256": "08ee6a2205cde67bba8d84e3f281f2ee7e6ccfba16855982932a66caf807ceda"
+          },
+          "results/operator-numerical.json": {
+            "bytes": 6925,
+            "sha256": "113f5e6e5086cff91291605037dcfb86c698991566cf94835f3fcaef27bdbb83"
+          },
+          "results/operator-numerical-tensors/candidate-step0-mlpart.raw": {
+            "bytes": 4224,
+            "sha256": "3ecee787599f9eace3785509346bf92cc74f58e2911e00eaecb7530962d0a572"
+          },
+          "results/operator-numerical-tensors/candidate-step0-opart.raw": {
+            "bytes": 1081344,
+            "sha256": "46f3aa729b2d7281c03663c98ddddaf74a653c3258fdbe9e6a2bb48624ff7f01"
+          },
+          "results/operator-numerical-tensors/candidate-step0-out.raw": {
+            "bytes": 16384,
+            "sha256": "d028fc6a85d6b3a4147cf361627f541607fd6ceead8f6425d9886a29ad3576fc"
+          },
+          "results/operator-numerical-tensors/candidate-step1-mlpart.raw": {
+            "bytes": 4224,
+            "sha256": "397a45086b1bd06407292b68715b485d04c824d7fb43495679ef2981147eb491"
+          },
+          "results/operator-numerical-tensors/candidate-step1-opart.raw": {
+            "bytes": 1081344,
+            "sha256": "1f2f7d170084cbd9ecd310f807e1458d34a3a5e0694362e21dc4da9b2bbaca3e"
+          },
+          "results/operator-numerical-tensors/candidate-step1-out.raw": {
+            "bytes": 16384,
+            "sha256": "f4e39843d3b59bce0bbb1db8151568dc285745b11da7d1c154b2e3464aa659df"
+          },
+          "results/operator-numerical-tensors/candidate-step2-mlpart.raw": {
+            "bytes": 4224,
+            "sha256": "b51ea6e64b7381575201d8665caa3f5b3c8e4ebab8c80a7a9282fbc802387348"
+          },
+          "results/operator-numerical-tensors/candidate-step2-opart.raw": {
+            "bytes": 1081344,
+            "sha256": "3849a4caf916f22edcad724923ae3150efc4c583865c3d4c977f0ad0c71a474f"
+          },
+          "results/operator-numerical-tensors/candidate-step2-out.raw": {
+            "bytes": 16384,
+            "sha256": "7387bacfbc5fb1aa77f74d17226f8b611cf3e5ebd1332bf59e7d78eb8334a147"
+          },
+          "results/operator-numerical-tensors/control-step0-mlpart.raw": {
+            "bytes": 4224,
+            "sha256": "e72b246b263ee5d87c8bb4c79bd1ec601497a78ed6e983b7bf1c6ce5a0333702"
+          },
+          "results/operator-numerical-tensors/control-step0-opart.raw": {
+            "bytes": 1081344,
+            "sha256": "5668ac77b5d7abce88c7eac4cc805fc2ca8d483b0711b14295b80bdf509ef11c"
+          },
+          "results/operator-numerical-tensors/control-step0-out.raw": {
+            "bytes": 16384,
+            "sha256": "d028fc6a85d6b3a4147cf361627f541607fd6ceead8f6425d9886a29ad3576fc"
+          },
+          "results/operator-numerical-tensors/control-step1-mlpart.raw": {
+            "bytes": 4224,
+            "sha256": "80fba6436dd80206c86dc77782cb7331ccbf12838a78c706177f079c79663456"
+          },
+          "results/operator-numerical-tensors/control-step1-opart.raw": {
+            "bytes": 1081344,
+            "sha256": "0522debe361cd89b3768f2e0b8736a918ce3efb2ef54b0b21895e7d87006211f"
+          },
+          "results/operator-numerical-tensors/control-step1-out.raw": {
+            "bytes": 16384,
+            "sha256": "ed1168f36a68c6eede8af1600dc2fadca0663c30c04ae90fb146f7bb6eb6e3ec"
+          },
+          "results/operator-numerical-tensors/control-step2-mlpart.raw": {
+            "bytes": 4224,
+            "sha256": "7e03351d0927b52bfbe384adfa319d816cddc79547235a68a5de29d7111b6037"
+          },
+          "results/operator-numerical-tensors/control-step2-opart.raw": {
+            "bytes": 1081344,
+            "sha256": "ad362cdfd7344f663b929290f3bdb6618e9a0ea4c84996e53e74bac5440d6204"
+          },
+          "results/operator-numerical-tensors/control-step2-out.raw": {
+            "bytes": 16384,
+            "sha256": "5da60b8d6967f1ac7da40ccb1bad0fd15c096d995cc3f7dcd68fb934405dbeaf"
+          }
+        }
+      }
+    },
+    "BLOCK-RESULTS-FREEZE.json": {
+      "sha256": "8306f5ad6ec748cda249e62fcb384e2d4b2264ff86d1ba1f7b0aa38a9c4987be",
+      "content": {
+        "status": "Native block numerical PASS; all six block outputs byte-exact scalar",
+        "files": {
+          "results/block-numerical.json": {
+            "bytes": 9604,
+            "sha256": "a34977ec64db5e644946d4c9876fcb056e54bd23c2e37bcd6c57837c10849c12"
+          },
+          "BLOCK-RESULTS.md": {
+            "bytes": 1038,
+            "sha256": "da1669b1dbdf360b667901a8500b8bed1e19d6b8bb0ef9311aeae15d3a65d628"
+          },
+          "results/e1-block5-k64/manifest.json": {
+            "bytes": 6836,
+            "sha256": "9a3054e9524282bfc72a8187620021bf0cc5615cdc2270ebe9a671266fdf5512"
+          },
+          "results/e1-block5-k64/step0000-tensor000.raw": {
+            "bytes": 4,
+            "sha256": "b29d58df745bbf5987eef0ad36036f493346be8540da52f7594302094decef5d"
+          },
+          "results/e1-block5-k64/step0000-tensor001.raw": {
+            "bytes": 16384,
+            "sha256": "24b39cb8e068d846d377485954b3db33a53d60eb5a9d03e7aec2b71658691de8"
+          },
+          "results/e1-block5-k64/step0000-tensor002.raw": {
+            "bytes": 1054720,
+            "sha256": "b812817f3b10145ee2efc61fc2e19dfadf222210877a02aec8be6275ab1b862f"
+          },
+          "results/e1-block5-k64/step0000-tensor003.raw": {
+            "bytes": 1054720,
+            "sha256": "1f766b32c1016f718660d82813aebd390dc4e06d098a177e97e637aef4b536e1"
+          },
+          "results/e1-block5-k64/step0000-tensor004.raw": {
+            "bytes": 1081344,
+            "sha256": "46f3aa729b2d7281c03663c98ddddaf74a653c3258fdbe9e6a2bb48624ff7f01"
+          },
+          "results/e1-block5-k64/step0000-tensor005.raw": {
+            "bytes": 4224,
+            "sha256": "3ecee787599f9eace3785509346bf92cc74f58e2911e00eaecb7530962d0a572"
+          },
+          "results/e1-block5-k64/step0000-tensor006.raw": {
+            "bytes": 16384,
+            "sha256": "d028fc6a85d6b3a4147cf361627f541607fd6ceead8f6425d9886a29ad3576fc"
+          },
+          "results/e1-block5-k64/step0000-tensor007.raw": {
+            "bytes": 7680,
+            "sha256": "c2991e824b3722314d70ed674c995347d6f87e6e0d9692274c4403fd20f21e2c"
+          },
+          "results/e1-block5-k64/step0001-tensor000.raw": {
+            "bytes": 4,
+            "sha256": "6641161dc1faf1293662e9d81dc994fed6a720d6e0e1ab5702c6a866254a9076"
+          },
+          "results/e1-block5-k64/step0001-tensor001.raw": {
+            "bytes": 16384,
+            "sha256": "a9e92fda29fdfe93207319a8e0d0ab2808357d95302b051dba3dfd983bb88e27"
+          },
+          "results/e1-block5-k64/step0001-tensor002.raw": {
+            "bytes": 1054720,
+            "sha256": "9dae191d713547f5594583d84966bad36fb53ca5da186d1022ce8400372b202e"
+          },
+          "results/e1-block5-k64/step0001-tensor003.raw": {
+            "bytes": 1054720,
+            "sha256": "83d5c7466dc6fe3fff60da099ec0eb466fa7d73d6d1e3577696755112ad85342"
+          },
+          "results/e1-block5-k64/step0001-tensor004.raw": {
+            "bytes": 1081344,
+            "sha256": "1f2f7d170084cbd9ecd310f807e1458d34a3a5e0694362e21dc4da9b2bbaca3e"
+          },
+          "results/e1-block5-k64/step0001-tensor005.raw": {
+            "bytes": 4224,
+            "sha256": "397a45086b1bd06407292b68715b485d04c824d7fb43495679ef2981147eb491"
+          },
+          "results/e1-block5-k64/step0001-tensor006.raw": {
+            "bytes": 16384,
+            "sha256": "f4e39843d3b59bce0bbb1db8151568dc285745b11da7d1c154b2e3464aa659df"
+          },
+          "results/e1-block5-k64/step0001-tensor007.raw": {
+            "bytes": 7680,
+            "sha256": "20e0e813519f72240234a907a9b8f0b4c3f06820c22623899b5b779b1464f40f"
+          },
+          "results/e1-block5-k64/step0002-tensor000.raw": {
+            "bytes": 4,
+            "sha256": "9f07a1d473ac7214c792fbad73557633daf7631c55752d48eaa4b62b2d5583b8"
+          },
+          "results/e1-block5-k64/step0002-tensor001.raw": {
+            "bytes": 16384,
+            "sha256": "2aceee06f0deca0db636022383602a7f6ed7f09ff1a5ce9ec7bde32ec8bfaf34"
+          },
+          "results/e1-block5-k64/step0002-tensor002.raw": {
+            "bytes": 1054720,
+            "sha256": "7493c0c56cc72e60f3b208da2277fc4d14db556a1ce3c06780ccc974554b2bb4"
+          },
+          "results/e1-block5-k64/step0002-tensor003.raw": {
+            "bytes": 1054720,
+            "sha256": "efe1bfcc57202fd52d2d7ecfd50a2f4439fa289f7adb10938e965ee173e4f119"
+          },
+          "results/e1-block5-k64/step0002-tensor004.raw": {
+            "bytes": 1081344,
+            "sha256": "3849a4caf916f22edcad724923ae3150efc4c583865c3d4c977f0ad0c71a474f"
+          },
+          "results/e1-block5-k64/step0002-tensor005.raw": {
+            "bytes": 4224,
+            "sha256": "b51ea6e64b7381575201d8665caa3f5b3c8e4ebab8c80a7a9282fbc802387348"
+          },
+          "results/e1-block5-k64/step0002-tensor006.raw": {
+            "bytes": 16384,
+            "sha256": "7387bacfbc5fb1aa77f74d17226f8b611cf3e5ebd1332bf59e7d78eb8334a147"
+          },
+          "results/e1-block5-k64/step0002-tensor007.raw": {
+            "bytes": 7680,
+            "sha256": "eadbc028b611d2f4750b683421dec07735d8c08d3f78313c657d5fc5cb46eb71"
+          },
+          "results/e1-block5-k64/step0003-tensor000.raw": {
+            "bytes": 4,
+            "sha256": "b29d58df745bbf5987eef0ad36036f493346be8540da52f7594302094decef5d"
+          },
+          "results/e1-block5-k64/step0003-tensor001.raw": {
+            "bytes": 16384,
+            "sha256": "24b39cb8e068d846d377485954b3db33a53d60eb5a9d03e7aec2b71658691de8"
+          },
+          "results/e1-block5-k64/step0003-tensor002.raw": {
+            "bytes": 1054720,
+            "sha256": "b812817f3b10145ee2efc61fc2e19dfadf222210877a02aec8be6275ab1b862f"
+          },
+          "results/e1-block5-k64/step0003-tensor003.raw": {
+            "bytes": 1054720,
+            "sha256": "1f766b32c1016f718660d82813aebd390dc4e06d098a177e97e637aef4b536e1"
+          },
+          "results/e1-block5-k64/step0003-tensor004.raw": {
+            "bytes": 1081344,
+            "sha256": "46f3aa729b2d7281c03663c98ddddaf74a653c3258fdbe9e6a2bb48624ff7f01"
+          },
+          "results/e1-block5-k64/step0003-tensor005.raw": {
+            "bytes": 4224,
+            "sha256": "3ecee787599f9eace3785509346bf92cc74f58e2911e00eaecb7530962d0a572"
+          },
+          "results/e1-block5-k64/step0003-tensor006.raw": {
+            "bytes": 16384,
+            "sha256": "d028fc6a85d6b3a4147cf361627f541607fd6ceead8f6425d9886a29ad3576fc"
+          },
+          "results/e1-block5-k64/step0003-tensor007.raw": {
+            "bytes": 7680,
+            "sha256": "c2991e824b3722314d70ed674c995347d6f87e6e0d9692274c4403fd20f21e2c"
+          },
+          "results/e1-block5-k64/step0004-tensor000.raw": {
+            "bytes": 4,
+            "sha256": "6641161dc1faf1293662e9d81dc994fed6a720d6e0e1ab5702c6a866254a9076"
+          },
+          "results/e1-block5-k64/step0004-tensor001.raw": {
+            "bytes": 16384,
+            "sha256": "a9e92fda29fdfe93207319a8e0d0ab2808357d95302b051dba3dfd983bb88e27"
+          },
+          "results/e1-block5-k64/step0004-tensor002.raw": {
+            "bytes": 1054720,
+            "sha256": "9dae191d713547f5594583d84966bad36fb53ca5da186d1022ce8400372b202e"
+          },
+          "results/e1-block5-k64/step0004-tensor003.raw": {
+            "bytes": 1054720,
+            "sha256": "83d5c7466dc6fe3fff60da099ec0eb466fa7d73d6d1e3577696755112ad85342"
+          },
+          "results/e1-block5-k64/step0004-tensor004.raw": {
+            "bytes": 1081344,
+            "sha256": "1f2f7d170084cbd9ecd310f807e1458d34a3a5e0694362e21dc4da9b2bbaca3e"
+          },
+          "results/e1-block5-k64/step0004-tensor005.raw": {
+            "bytes": 4224,
+            "sha256": "397a45086b1bd06407292b68715b485d04c824d7fb43495679ef2981147eb491"
+          },
+          "results/e1-block5-k64/step0004-tensor006.raw": {
+            "bytes": 16384,
+            "sha256": "f4e39843d3b59bce0bbb1db8151568dc285745b11da7d1c154b2e3464aa659df"
+          },
+          "results/e1-block5-k64/step0004-tensor007.raw": {
+            "bytes": 7680,
+            "sha256": "20e0e813519f72240234a907a9b8f0b4c3f06820c22623899b5b779b1464f40f"
+          },
+          "results/e1-block5-k64/step0005-tensor000.raw": {
+            "bytes": 4,
+            "sha256": "9f07a1d473ac7214c792fbad73557633daf7631c55752d48eaa4b62b2d5583b8"
+          },
+          "results/e1-block5-k64/step0005-tensor001.raw": {
+            "bytes": 16384,
+            "sha256": "2aceee06f0deca0db636022383602a7f6ed7f09ff1a5ce9ec7bde32ec8bfaf34"
+          },
+          "results/e1-block5-k64/step0005-tensor002.raw": {
+            "bytes": 1054720,
+            "sha256": "7493c0c56cc72e60f3b208da2277fc4d14db556a1ce3c06780ccc974554b2bb4"
+          },
+          "results/e1-block5-k64/step0005-tensor003.raw": {
+            "bytes": 1054720,
+            "sha256": "efe1bfcc57202fd52d2d7ecfd50a2f4439fa289f7adb10938e965ee173e4f119"
+          },
+          "results/e1-block5-k64/step0005-tensor004.raw": {
+            "bytes": 1081344,
+            "sha256": "3849a4caf916f22edcad724923ae3150efc4c583865c3d4c977f0ad0c71a474f"
+          },
+          "results/e1-block5-k64/step0005-tensor005.raw": {
+            "bytes": 4224,
+            "sha256": "b51ea6e64b7381575201d8665caa3f5b3c8e4ebab8c80a7a9282fbc802387348"
+          },
+          "results/e1-block5-k64/step0005-tensor006.raw": {
+            "bytes": 16384,
+            "sha256": "7387bacfbc5fb1aa77f74d17226f8b611cf3e5ebd1332bf59e7d78eb8334a147"
+          },
+          "results/e1-block5-k64/step0005-tensor007.raw": {
+            "bytes": 7680,
+            "sha256": "eadbc028b611d2f4750b683421dec07735d8c08d3f78313c657d5fc5cb46eb71"
+          }
+        }
+      }
+    },
+    "k64.cubin.resources.txt": {
+      "sha256": "a0a7e5ef50afe96374fb66586f1b281e468a4b391e4a38abcf7f5822321e1474",
+      "content": "\nResource usage:\n Common:\n  GLOBAL:48 CONSTANT[4]:96\n Function _Z12interp_sm90a11PlowProgram:\n  REG:255 STACK:152 SHARED:2448 LOCAL:0 CONSTANT[0]:696 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjj:\n  REG:40 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:588 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z27plow_moe_group_down_fp8_blkPfPK13__nv_bfloat16PKhPKyS6_jjjj:\n  REG:46 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:584 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z26plow_moe_group_glu_fp8_blkP13__nv_bfloat16PKS_PKhPKyS6_jjjjjj:\n  REG:48 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:592 TEXTURE:0 SURFACE:0 SAMPLER:0\n"
+    },
+    "k64.so.resources.txt": {
+      "sha256": "fd9f40790d36f8af817c1117020e54c4c4e9301b421e33e519838eab9b04ede8",
+      "content": "\nFatbin elf code:\n================\narch = sm_90a\ncode version = [1,8]\nhost = linux\ncompile_size = 64bit\n\nResource usage:\n Common:\n  GLOBAL:0\n\nFatbin elf code:\n================\narch = sm_90a\ncode version = [1,8]\nhost = linux\ncompile_size = 64bit\n\nResource usage:\n Common:\n  GLOBAL:0\n Function _Z16attention_decodeILi512ELi16EEv13AttentionArgs:\n  REG:254 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z16attention_decodeILi512ELi8EEv13AttentionArgs:\n  REG:134 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z16attention_decodeILi256ELi6EEv13AttentionArgs:\n  REG:124 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z17attention_prefillILi256EEv13AttentionArgs:\n  REG:124 STACK:16 SHARED:1040 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z15attention_mergeILi256EEv13AttentionArgs:\n  REG:32 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z16attention_decodeILi256ELi2EEv13AttentionArgs:\n  REG:72 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z17attention_prefillILi512EEv13AttentionArgs:\n  REG:194 STACK:16 SHARED:1040 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z15attention_mergeILi512EEv13AttentionArgs:\n  REG:32 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z16attention_decodeILi512ELi4EEv13AttentionArgs:\n  REG:82 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:648 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z13decode_launchILi8EEvPfS0_PK13__nv_bfloat16S3_S3_PKijjjjfjj:\n  REG:134 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:604 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z13decode_launchILi4EEvPfS0_PK13__nv_bfloat16S3_S3_PKijjjjfjj:\n  REG:84 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:604 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z13decode_launchILi2EEvPfS0_PK13__nv_bfloat16S3_S3_PKijjjjfjj:\n  REG:79 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:604 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z11stream_readPK6float4mPf:\n  REG:16 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:552 TEXTURE:0 SURFACE:0 SAMPLER:0\n Function _Z12merge_launchP13__nv_bfloat16PKfS2_jj:\n  REG:32 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:560 TEXTURE:0 SURFACE:0 SAMPLER:0\n"
+    }
+  },
+  "root_block_capture": {
+    "results": {
+      "e1-block5-k64": {
+        "passed": true,
+        "returncode": 0
+      }
+    },
+    "clocks_power": "#Date        Time         gpu    pwr  gtemp  mtemp   mclk   pclk \n#YYYYMMDD    HH:MM:SS     Idx      W      C      C    MHz    MHz \n 20260906    05:55:22       0    131     35     39   2619   1830 \n 20260906    05:55:23       0    128     35     39   2619   1830 \n 20260906    05:55:24       0    127     35     40   2619   1830 \n 20260906    05:55:25       0    127     35     40   2619   1830 \n",
+    "events": "{\"status\": \"waiting_for_existing_supervisors\", \"pids\": [], \"utc\": \"2026-09-06T05:55:22Z\"}\n{\"status\": \"running\", \"job\": \"e1-block5-k64\", \"utc\": \"2026-09-06T05:55:22Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-block5-k64\", \"passed\": true, \"returncode\": 0, \"utc\": \"2026-09-06T05:55:26Z\"}\n{\"status\": \"complete\", \"passed\": 1, \"jobs\": 1, \"utc\": \"2026-09-06T05:55:26Z\"}\n{\"status\": \"finished\", \"gpu_pids\": \"\", \"jobs\": 1, \"utc\": \"2026-09-06T05:55:26Z\"}\n"
+  },
+  "limitations": "Existing full-model .01 gate remains unresolved. Native attention step2 differs in one word from scalar but agrees with rounded float64. Block inputs do not feed output back into QKV."
+}
