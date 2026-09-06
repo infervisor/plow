@@ -680,12 +680,12 @@ fn loaded(p: &DevProg, n_cu: u32, per_node: &[Vec<u32>], nodes: usize, physical:
     } else {
         None
     };
-    // Width per program: see `dense_row_decode`. A worker outside the active set owns no cu here
-    // and idles through the run; nothing is respawned.
-    let active = if dense_row_decode(p) { logical } else { physical };
-    let cus_of = Some(crate::exec::cpu::workers::cu_map(n_cu, per_node, nodes, active.max(1)));
+    // No per-program narrowing: an idle worker still polls on the SMT sibling of a busy core, which
+    // cost more than the narrowing gained (see the module note on worker width). The pool is sized
+    // once for the model and every program uses all of it.
+    let _ = (per_node, nodes, physical, logical);
     LoadedProgram {
-        cus_of,
+        cus_of: None,
         insts: p.insts.clone(),
         stream: p.stream.clone(),
         stream_ofs: p.stream_ofs.clone(),
@@ -830,11 +830,23 @@ impl CpuEngine {
             physical_w = threads;
             logical_w = threads;
         }
-        // Spawn the MAX any program wants, not always the logical count. A worker with no cus for
-        // the running program still polls (200 us re-park) on the SMT sibling of a busy core, and
-        // eight such idlers cost GPT-OSS 455 -> 402 tok/s of prefill even though every one of its
-        // programs uses the physical width. A model with no dense single-row decode never spawns
-        // them, so MoE models keep the full physical-core win.
+        // WORKER WIDTH IS PER MODEL. The wide execution resources are per core (both SMT siblings
+        // issue into the same TMUL and the same pair of 512-bit FMA ports), so compute-bound work
+        // wants one worker per physical core; a dense single-row decode is pure weight streaming and
+        // wants the siblings for their extra outstanding loads. Measured through serve on
+        // Gemma-12B fp8, chat_short c=1, TTFT / TPOT in ms:
+        //
+        //   physical (8)  410 / 147      logical (16)  474 / 132
+        //
+        // For a 64-token reply that is 9.7 s against 8.8 s, so a dense model takes logical. GPT-OSS
+        // measured better on physical for BOTH phases (prefill 445 vs 399 tok/s, decode 24.5 vs
+        // 25.5 ms), so anything MoE takes physical.
+        //
+        // Deliberately NOT per program, though prefill and decode do want different widths: a worker
+        // with no cus for the running program still polls (200 us re-park) on the sibling of a busy
+        // core, and that tax exceeded the gain — the same fp8 cell measured 626 / 132 with a logical
+        // pool whose prefill was narrowed to 8. Fixing that needs the idle worker to stop polling,
+        // which is the real prerequisite for per-phase widths.
         let wants_logical = model.blob.progs.iter().any(dense_row_decode);
         let threads = threads.max(if wants_logical { logical_w } else { physical_w });
         tracing::info!(
