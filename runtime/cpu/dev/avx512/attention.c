@@ -11,6 +11,7 @@
 #define FA_BKV 32u
 #define FA_GF 2u
 #define FA_KB 8u /* decode keys per softmax block: FA_KB x FA_GF = 16 dpbf16 chains */
+#define FA_NG 4u /* decode head groups folded onto one K/V pass; FA_NG * FA_GF * 512 f32 of acc */
 
 typedef uint32_t __attribute__((may_alias)) v_u32a;
 
@@ -430,29 +431,48 @@ V_K(v_flash_decode) {
         return;
     }
     const uint32_t gqa = n_head / n_kv_head;
-    const uint32_t n_grp = (n_head + FA_GF - 1) / FA_GF;
+    /* The gqa q heads behind one kv head read the same K/V rows, so a work item covers ng head
+     * groups at once and each row is fetched once instead of ng times (measured: 4.0x the needed
+     * load traffic at gqa 8, which put the kernel at the streaming roofline). Per-head arithmetic
+     * and its block order are untouched, so every ng gives bit-identical output. Folding is also
+     * what shrinks the work list, so ng is capped by the acc footprint (FA_NG) and by leaving at
+     * least two evenly divided work items per slice — at batch 1 that pins ng to 1. */
+    uint32_t ng = 1u;
+    if (nblk && gqa >= FA_GF && (gqa % FA_GF) == 0u && (n_head % FA_GF) == 0u) {
+        for (uint32_t c = FA_NG; c > 1u; c >>= 1) {
+            if (((gqa / FA_GF) % c) != 0u) continue;
+            const uint32_t nw = n_batch * (n_head / (FA_GF * c)) * nsplit;
+            if (nw >= 2u * nblk && (nw % nblk) == 0u) { ng = c; break; }
+        }
+    }
+    const uint32_t gs = FA_GF * ng;
+    const uint32_t n_grp = (n_head + gs - 1u) / gs;
     const uint32_t n_work = n_batch * n_grp * nsplit;
     const size_t row_bytes = (size_t)D * 2u;
-    float acc[FA_GF * 512] __attribute__((aligned(64)));
-    float m[FA_GF], l[FA_GF];
+    float acc[FA_NG][FA_GF * 512] __attribute__((aligned(64)));
+    float m[FA_NG][FA_GF], l[FA_NG][FA_GF];
+    const plow_bf16* q[FA_NG][FA_GF];
+    uint32_t nh[FA_NG];
 
     for (uint32_t w = slice; w < n_work; w += nblk) {
         const uint32_t sp = w % nsplit, hg = (w / nsplit) % n_grp, b = w / (nsplit * n_grp);
-        const uint32_t h0 = hg * FA_GF, hkv = h0 / gqa;
-        const uint32_t nh = n_head - h0 < FA_GF ? n_head - h0 : FA_GF;
+        const uint32_t h0 = hg * gs, hkv = h0 / gqa;
         const uint32_t len = (uint32_t)kv_len[b];
         const uint32_t first = (window && len > window) ? len - window : 0u;
         const uint32_t span = len - first, per = (span + nsplit - 1) / nsplit;
         const uint32_t lo = first + sp * per, hi = lo + per < len ? lo + per : len;
         const plow_bf16* kbase = K + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
         const plow_bf16* vbase = V + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
-        const plow_bf16* q[FA_GF];
-        for (uint32_t h = 0; h < FA_GF; h++) {
-            q[h] = Q + ((size_t)b * n_head + h0 + (h < nh ? h : 0)) * D;
-            m[h] = G_NEG_INF;
-            l[h] = 0.0f;
+        for (uint32_t g = 0; g < ng; g++) {
+            const uint32_t gh0 = h0 + g * FA_GF;
+            nh[g] = n_head - gh0 < FA_GF ? n_head - gh0 : FA_GF;
+            for (uint32_t h = 0; h < FA_GF; h++) {
+                q[g][h] = Q + ((size_t)b * n_head + gh0 + (h < nh[g] ? h : 0)) * D;
+                m[g][h] = G_NEG_INF;
+                l[g][h] = 0.0f;
+            }
+            memset(acc[g], 0, sizeof(float) * 512 * nh[g]);
         }
-        memset(acc, 0, sizeof(float) * 512 * nh);
         if (lo < hi) {
             const size_t n0 = row_bytes * (hi - lo < FA_KB ? hi - lo : FA_KB);
             for (size_t off = 0; off < n0; off += 64) {
@@ -481,17 +501,22 @@ V_K(v_flash_decode) {
                     }
                 }
             }
-            if (nk == FA_KB && nh == FA_GF) v_dec_block(q, kr, vr, acc, m, l, D, scale, FA_KB, FA_GF);
-            else if (nk == FA_KB) v_dec_block(q, kr, vr, acc, m, l, D, scale, FA_KB, 1u);
-            else v_dec_block(q, kr, vr, acc, m, l, D, scale, nk, nh);
+            for (uint32_t g = 0; g < ng; g++) {
+                if (nk == FA_KB && nh[g] == FA_GF)
+                    v_dec_block(q[g], kr, vr, acc[g], m[g], l[g], D, scale, FA_KB, FA_GF);
+                else if (nk == FA_KB) v_dec_block(q[g], kr, vr, acc[g], m[g], l[g], D, scale, FA_KB, 1u);
+                else v_dec_block(q[g], kr, vr, acc[g], m[g], l[g], D, scale, nk, nh[g]);
+            }
         }
-        for (uint32_t h = 0; h < nh; h++) {
-            float* op = Opart + ((size_t)(b * n_head + h0 + h) * nsplit + sp) * D;
-            float* ml = mlpart + ((size_t)(b * n_head + h0 + h) * nsplit + sp) * 2;
-            for (uint32_t d = 0; d < D; d += 32) v_pv_unperm(op + d, acc + h * 512 + d);
-            ml[0] = m[h];
-            ml[1] = l[h];
-        }
+        for (uint32_t g = 0; g < ng; g++)
+            for (uint32_t h = 0; h < nh[g]; h++) {
+                const uint32_t hh = h0 + g * FA_GF + h;
+                float* op = Opart + ((size_t)(b * n_head + hh) * nsplit + sp) * D;
+                float* ml = mlpart + ((size_t)(b * n_head + hh) * nsplit + sp) * 2;
+                for (uint32_t d = 0; d < D; d += 32) v_pv_unperm(op + d, acc[g] + h * 512 + d);
+                ml[0] = m[g][h];
+                ml[1] = l[g][h];
+            }
     }
 }
 
