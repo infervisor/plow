@@ -1,8 +1,0 @@
-{
-  "accepted": true,
-  "correctness_rows": 2560,
-  "timing_rows": 1008,
-  "scope": "standalone scalar projections only; no full-model promotion",
-  "atomic_drift_max_abs": 0.125,
-  "atomic_drift_max_mismatched_values": 3
-}

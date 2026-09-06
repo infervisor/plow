@@ -309,7 +309,7 @@ Record one row per `(candidate, scope, shape, artifact digest)`, with `scope` =
 requires every scope. Never multiply an isolated speedup by layer count to claim
 a network win.
 
-Use [`perf-data/fusion-ladder-row-v1.schema.json`](../../../perf-data/fusion-ladder-row-v1.schema.json)
+Use [`docs/schemas/fusion-ladder-row-v1.schema.json`](../../schemas/fusion-ladder-row-v1.schema.json)
 for those rows. Keep one JSON object per line and validate before recording a
 decision:
 
