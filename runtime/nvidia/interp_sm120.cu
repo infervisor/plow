@@ -72,6 +72,10 @@ extern "C" __device__ unsigned plow_mixed_interpreter
 /* 0 = a GENERAL object: built with every arm, pairs with any packet. */
 #define PLOW_PACKET_HASH 0ull
 #endif
+/* HD64 was introduced as a packet-specialized arm; general objects retain the old inventory. */
+#ifndef PLOW_HAS_FLASH_HD64
+#define PLOW_HAS_FLASH_HD64 0
+#endif
 /* Defaults for the arms gated below. `1` = compile it, which is the pre-existing behaviour. */
 #ifndef PLOW_HAS_GEMV_FP8
 #define PLOW_HAS_GEMV_FP8 1
