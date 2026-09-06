@@ -71,16 +71,69 @@ pub struct Plan {
     pub mapped_ends: Vec<(u32, u32)>,
 }
 
-/// Build an owned reference plan. Serving runtimes should materialize the same
-/// contract into persistent staging buffers rather than allocate this per tick.
-pub fn plan(
+impl Plan {
+    /// Allocate persistent storage for repeated [`plan_into`] calls.
+    pub fn with_capacity(
+        row_capacity: usize,
+        prefill_capacity: usize,
+        active_capacity: usize,
+    ) -> Self {
+        Self {
+            decode_rows: 0,
+            real_rows: 0,
+            rows: Vec::with_capacity(row_capacity),
+            prefill_spans: Vec::with_capacity(prefill_capacity),
+            parked: Vec::with_capacity(row_capacity),
+            mapped_ends: Vec::with_capacity(active_capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.decode_rows = 0;
+        self.real_rows = 0;
+        self.rows.clear();
+        self.prefill_spans.clear();
+        self.parked.clear();
+        self.mapped_ends.clear();
+    }
+}
+
+/// Build a mixed plan in caller-owned storage. With sufficient capacities, the
+/// successful path performs no heap allocation and never grows an output vector.
+pub fn plan_into(
     decode: &[DecodeRequest],
     prefill: &[PrefillRequest<'_>],
     frontiers: &[u32],
     rows: u32,
     max_ctx: u32,
     auxiliary_program: u32,
-) -> Result<Plan> {
+    out: &mut Plan,
+) -> Result<()> {
+    out.clear();
+    let result = plan_into_inner(
+        decode,
+        prefill,
+        frontiers,
+        rows,
+        max_ctx,
+        auxiliary_program,
+        out,
+    );
+    if result.is_err() {
+        out.clear();
+    }
+    result
+}
+
+fn plan_into_inner(
+    decode: &[DecodeRequest],
+    prefill: &[PrefillRequest<'_>],
+    frontiers: &[u32],
+    rows: u32,
+    max_ctx: u32,
+    auxiliary_program: u32,
+    out: &mut Plan,
+) -> Result<()> {
     require(
         (!decode.is_empty() || !prefill.is_empty()) && rows > 0 && max_ctx > 0,
         "empty work or capacity",
@@ -91,30 +144,41 @@ pub fn plan(
     )?;
 
     let capacity = usize::try_from(rows).map_err(|_| "mixed step: row capacity")?;
-    let mut seen = vec![false; frontiers.len()];
-    let mut seen_state = vec![false; frontiers.len()];
-    let mut dense = Vec::with_capacity(capacity);
-    let mut spans = Vec::with_capacity(prefill.len());
-    let mut mapped = Vec::with_capacity(decode.len() + prefill.len());
+    let active = decode
+        .len()
+        .checked_add(prefill.len())
+        .ok_or("mixed step: active request overflow")?;
+    require(
+        out.rows.capacity() >= capacity
+            && out.prefill_spans.capacity() >= prefill.len()
+            && out.parked.capacity() >= capacity
+            && out.mapped_ends.capacity() >= active,
+        "output buffer capacity",
+    )?;
 
-    for request in decode {
+    for (index, request) in decode.iter().enumerate() {
         let slot = request.slot as usize;
         let state_slot = request.state_slot as usize;
         require(
             slot < frontiers.len()
                 && state_slot < frontiers.len()
-                && !seen[slot]
-                && !seen_state[state_slot],
+                && !decode[..index]
+                    .iter()
+                    .any(|prior| prior.slot == request.slot)
+                && !decode[..index]
+                    .iter()
+                    .any(|prior| prior.state_slot == request.state_slot),
             "physical/state slot or duplicate",
         )?;
-        seen[slot] = true;
-        seen_state[state_slot] = true;
         let position = frontiers[slot];
         let kv_len = position
             .checked_add(1)
             .ok_or("mixed step: decode position overflow")?;
-        require(kv_len <= max_ctx && dense.len() < capacity, "decode extent")?;
-        dense.push(Row {
+        require(
+            kv_len <= max_ctx && out.rows.len() < capacity,
+            "decode extent",
+        )?;
+        out.rows.push(Row {
             token: request.token,
             slot: request.slot,
             state_slot: request.state_slot,
@@ -122,22 +186,30 @@ pub fn plan(
             kv_len,
             phase: RowPhase::Decode,
         });
-        mapped.push((request.slot, kv_len));
+        out.mapped_ends.push((request.slot, kv_len));
     }
-    let decode_rows = u32::try_from(dense.len()).map_err(|_| "mixed step: decode rows")?;
+    let decode_rows = u32::try_from(out.rows.len()).map_err(|_| "mixed step: decode rows")?;
 
-    for request in prefill {
+    for (index, request) in prefill.iter().enumerate() {
         let slot = request.slot as usize;
         let state_slot = request.state_slot as usize;
+        let duplicate_physical = decode.iter().any(|prior| prior.slot == request.slot)
+            || prefill[..index]
+                .iter()
+                .any(|prior| prior.slot == request.slot);
+        let duplicate_state = decode
+            .iter()
+            .any(|prior| prior.state_slot == request.state_slot)
+            || prefill[..index]
+                .iter()
+                .any(|prior| prior.state_slot == request.state_slot);
         require(
             slot < frontiers.len()
                 && state_slot < frontiers.len()
-                && !seen[slot]
-                && !seen_state[state_slot],
+                && !duplicate_physical
+                && !duplicate_state,
             "physical/state slot or duplicate",
         )?;
-        seen[slot] = true;
-        seen_state[state_slot] = true;
         let n_rows =
             u32::try_from(request.tokens.len()).map_err(|_| "mixed step: prefill row count")?;
         let end = request
@@ -149,11 +221,11 @@ pub fn plan(
                 && request.start == frontiers[slot]
                 && end <= request.prompt_len
                 && end <= max_ctx
-                && dense.len().saturating_add(request.tokens.len()) <= capacity,
+                && out.rows.len().saturating_add(request.tokens.len()) <= capacity,
             "prefill frontier or extent",
         )?;
-        let row0 = u32::try_from(dense.len()).map_err(|_| "mixed step: prefill row offset")?;
-        spans.push(PrefillSpan {
+        let row0 = u32::try_from(out.rows.len()).map_err(|_| "mixed step: prefill row offset")?;
+        out.prefill_spans.push(PrefillSpan {
             row0,
             n_rows,
             slot: request.slot,
@@ -165,7 +237,7 @@ pub fn plan(
         });
         for (offset, &token) in request.tokens.iter().enumerate() {
             let position = request.start + offset as u32;
-            dense.push(Row {
+            out.rows.push(Row {
                 token,
                 slot: request.slot,
                 state_slot: request.state_slot,
@@ -174,24 +246,27 @@ pub fn plan(
                 phase: RowPhase::Prefill,
             });
         }
-        mapped.push((request.slot, end));
+        out.mapped_ends.push((request.slot, end));
     }
 
-    let real_rows = u32::try_from(dense.len()).map_err(|_| "mixed step: real rows")?;
-    let owner = dense.last().copied().ok_or("mixed step: padding owner")?;
-    let pad = capacity - dense.len();
+    let real_rows = u32::try_from(out.rows.len()).map_err(|_| "mixed step: real rows")?;
+    let owner = out
+        .rows
+        .last()
+        .copied()
+        .ok_or("mixed step: padding owner")?;
+    let pad = capacity - out.rows.len();
     let padded_end = owner
         .position
         .checked_add(1)
         .and_then(|end| end.checked_add(pad as u32))
         .ok_or("mixed step: padding extent overflow")?;
     require(padded_end <= max_ctx, "padding exceeds physical context")?;
-    let mut parked = vec![0; capacity];
+    out.parked.resize(capacity, 0);
+    out.parked[real_rows as usize..].fill(1);
     for offset in 0..pad {
-        let row = real_rows + offset as u32;
         let position = owner.position + 1 + offset as u32;
-        parked[row as usize] = 1;
-        dense.push(Row {
+        out.rows.push(Row {
             token: 0,
             slot: owner.slot,
             state_slot: owner.state_slot,
@@ -201,21 +276,43 @@ pub fn plan(
         });
     }
     if pad > 0 {
-        let end = mapped
+        let end = out
+            .mapped_ends
             .iter_mut()
             .find(|(slot, _)| *slot == owner.slot)
             .ok_or("mixed step: padding owner mapping")?;
         end.1 = padded_end;
     }
+    out.decode_rows = decode_rows;
+    out.real_rows = real_rows;
+    Ok(())
+}
 
-    Ok(Plan {
-        decode_rows,
-        real_rows,
-        rows: dense,
-        prefill_spans: spans,
-        parked,
-        mapped_ends: mapped,
-    })
+/// Allocate an owned reference plan and delegate to [`plan_into`].
+pub fn plan(
+    decode: &[DecodeRequest],
+    prefill: &[PrefillRequest<'_>],
+    frontiers: &[u32],
+    rows: u32,
+    max_ctx: u32,
+    auxiliary_program: u32,
+) -> Result<Plan> {
+    let row_capacity = usize::try_from(rows).map_err(|_| "mixed step: row capacity")?;
+    let active_capacity = decode
+        .len()
+        .checked_add(prefill.len())
+        .ok_or("mixed step: active request overflow")?;
+    let mut out = Plan::with_capacity(row_capacity, prefill.len(), active_capacity);
+    plan_into(
+        decode,
+        prefill,
+        frontiers,
+        rows,
+        max_ctx,
+        auxiliary_program,
+        &mut out,
+    )?;
+    Ok(out)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

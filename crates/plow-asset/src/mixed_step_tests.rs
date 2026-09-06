@@ -20,41 +20,71 @@ fn sparse_decode_and_ragged_prefill_preserve_absolute_identity() {
     frontiers[7] = 31;
     frontiers[12] = 4096;
     frontiers[15] = 63;
-    let plan = plan(
-        &[
-            DecodeRequest {
-                slot: 12,
-                state_slot: 2,
-                token: 9,
-            },
-            DecodeRequest {
-                slot: 0,
-                state_slot: 3,
-                token: 5,
-            },
-        ],
-        &[
-            PrefillRequest {
-                slot: 15,
-                state_slot: 4,
-                start: 63,
-                tokens: &[101, 102],
-                prompt_len: 100,
-            },
-            PrefillRequest {
-                slot: 7,
-                state_slot: 5,
-                start: 31,
-                tokens: &[201, 202, 203],
-                prompt_len: 100,
-            },
-        ],
-        &frontiers,
-        8,
-        8192,
-        6,
-    )
-    .unwrap();
+    let decode = [
+        DecodeRequest {
+            slot: 12,
+            state_slot: 2,
+            token: 9,
+        },
+        DecodeRequest {
+            slot: 0,
+            state_slot: 3,
+            token: 5,
+        },
+    ];
+    let prefill = [
+        PrefillRequest {
+            slot: 15,
+            state_slot: 4,
+            start: 63,
+            tokens: &[101, 102],
+            prompt_len: 100,
+        },
+        PrefillRequest {
+            slot: 7,
+            state_slot: 5,
+            start: 31,
+            tokens: &[201, 202, 203],
+            prompt_len: 100,
+        },
+    ];
+    let plan = plan(&decode, &prefill, &frontiers, 8, 8192, 6).unwrap();
+
+    let mut reusable = Plan::with_capacity(8, 2, 4);
+    plan_into(&decode, &prefill, &frontiers, 8, 8192, 6, &mut reusable).unwrap();
+    assert_eq!(reusable, plan);
+    let pointers = (
+        reusable.rows.as_ptr(),
+        reusable.prefill_spans.as_ptr(),
+        reusable.parked.as_ptr(),
+        reusable.mapped_ends.as_ptr(),
+    );
+    let capacities = (
+        reusable.rows.capacity(),
+        reusable.prefill_spans.capacity(),
+        reusable.parked.capacity(),
+        reusable.mapped_ends.capacity(),
+    );
+    plan_into(&decode, &prefill, &frontiers, 8, 8192, 6, &mut reusable).unwrap();
+    assert_eq!(reusable, plan);
+    assert_eq!(
+        pointers,
+        (
+            reusable.rows.as_ptr(),
+            reusable.prefill_spans.as_ptr(),
+            reusable.parked.as_ptr(),
+            reusable.mapped_ends.as_ptr(),
+        )
+    );
+    assert_eq!(
+        capacities,
+        (
+            reusable.rows.capacity(),
+            reusable.prefill_spans.capacity(),
+            reusable.parked.capacity(),
+            reusable.mapped_ends.capacity(),
+        )
+    );
 
     assert_eq!(plan.decode_rows, 2);
     assert_eq!(plan.real_rows, 7);
@@ -119,6 +149,73 @@ fn sparse_decode_and_ragged_prefill_preserve_absolute_identity() {
     malformed.rows[0].slot = 16;
     malformed.mapped_ends[0].0 = 16;
     assert!(validated.validate_plan(&malformed).is_err());
+}
+
+fn buffers(rows: usize, spans: usize, parked: usize, mapped: usize) -> Plan {
+    Plan {
+        decode_rows: 0,
+        real_rows: 0,
+        rows: Vec::with_capacity(rows),
+        prefill_spans: Vec::with_capacity(spans),
+        parked: Vec::with_capacity(parked),
+        mapped_ends: Vec::with_capacity(mapped),
+    }
+}
+
+#[test]
+fn plan_into_rejects_each_short_buffer_and_clears_partial_output() {
+    let decode = [DecodeRequest {
+        slot: 0,
+        state_slot: 0,
+        token: 7,
+    }];
+    let prefill = [PrefillRequest {
+        slot: 1,
+        state_slot: 1,
+        start: 4,
+        tokens: &[8, 9],
+        prompt_len: 12,
+    }];
+    let frontiers = [0, 4];
+    for mut out in [
+        buffers(0, 1, 4, 2),
+        buffers(4, 0, 4, 2),
+        buffers(4, 1, 0, 2),
+        buffers(4, 1, 4, 0),
+    ] {
+        let capacities = (
+            out.rows.capacity(),
+            out.prefill_spans.capacity(),
+            out.parked.capacity(),
+            out.mapped_ends.capacity(),
+        );
+        assert!(plan_into(&decode, &prefill, &frontiers, 4, 16, 3, &mut out).is_err());
+        assert_eq!(out.decode_rows, 0);
+        assert_eq!(out.real_rows, 0);
+        assert!(out.rows.is_empty());
+        assert!(out.prefill_spans.is_empty());
+        assert!(out.parked.is_empty());
+        assert!(out.mapped_ends.is_empty());
+        assert_eq!(
+            capacities,
+            (
+                out.rows.capacity(),
+                out.prefill_spans.capacity(),
+                out.parked.capacity(),
+                out.mapped_ends.capacity(),
+            )
+        );
+    }
+
+    let mut out = Plan::with_capacity(4, 1, 2);
+    plan_into(&decode, &prefill, &frontiers, 4, 16, 3, &mut out).unwrap();
+    let duplicate = [PrefillRequest {
+        slot: 0,
+        state_slot: 1,
+        ..prefill[0]
+    }];
+    assert!(plan_into(&decode, &duplicate, &frontiers, 4, 16, 3, &mut out).is_err());
+    assert_eq!(out, buffers(4, 1, 4, 2));
 }
 
 #[test]
