@@ -26,6 +26,7 @@ fn main() {
     let mut dump_logits: Option<PathBuf> = None;
     let mut dump_dir: Option<PathBuf> = None;
     let mut seeds: Vec<String> = Vec::new();
+    let mut seed_files: Vec<String> = Vec::new();
     let mut opts = CpuEngineOpts::default();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -40,6 +41,9 @@ fn main() {
             // `--seed act.x:1.0`: fill a tensor with deterministic Gaussian bf16 (std) before the run —
             // block assets take the residual stream as input instead of token ids.
             "--seed" => seeds.push(args.next().unwrap()),
+            // `--seed-file act.x:/path/h0.bin`: raw bytes (e.g. an HF hidden_states dump) copied into
+            // the tensor's head before the run — the single-block validation path.
+            "--seed-file" => seed_files.push(args.next().unwrap()),
             "--threads" => opts.threads = args.next().unwrap().parse().unwrap(),
             "--isa" => {
                 opts.isa = match args.next().unwrap().as_str() {
@@ -85,6 +89,17 @@ fn main() {
             c.copy_from_slice(&(b as u16).to_le_bytes());
         }
         println!("seeded {name} ({} bytes) with N(0,{std})", bytes.len());
+    }
+    for sf in &seed_files {
+        let (name, path) = sf.split_once(':').expect("--seed-file name:path");
+        let data = std::fs::read(path).expect("seed file");
+        let m = eng.model();
+        let h = m.names.iter().position(|n| n == name).expect("seed tensor name");
+        // SAFETY: quiescent (no run in flight).
+        let bytes = unsafe { m.tensor(h).as_mut_slice() };
+        assert!(data.len() <= bytes.len(), "seed file {} B > tensor {} B", data.len(), bytes.len());
+        bytes[..data.len()].copy_from_slice(&data);
+        println!("seeded {name} with {} bytes from {path}", data.len());
     }
     let first = eng.prefill(&ids).expect("prefill");
     println!("prefill -> token {first} {:?}", tok.decode(&[first]));
