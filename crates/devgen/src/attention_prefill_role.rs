@@ -12,8 +12,8 @@ const OBJECT_ENTRY: &str = "plow_sm90a_pfattn_hd512";
 const OBJECT_GLOBALS: [(&str, u32); 7] = [
     ("plow_attention_sm90_hd512_wg32_abi", 1),
     ("plow_attention_head_dim", 512),
-    ("plow_attention_query_tile", 64),
-    ("plow_attention_kv_tile", 32),
+    ("plow_attention_query_tile", 32),
+    ("plow_attention_kv_tile", 16),
     ("plow_attention_warps", 8),
     ("plow_block_pfattn_hd512", 256),
     ("plow_arena_bytes_pfattn_hd512", 201_728),
@@ -38,8 +38,8 @@ fn capability() -> AttentionCapability {
         profile: "sm90a".into(),
         dtype: "bf16".into(),
         head_dim: 512,
-        query_tile: 64,
-        kv_tile: 32,
+        query_tile: 32,
+        kv_tile: 16,
         warps: 8,
     }
 }
