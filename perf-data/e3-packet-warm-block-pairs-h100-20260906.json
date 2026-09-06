@@ -1,0 +1,231 @@
+{
+  "scope": "Gemma12 actualfullattentionblock5,M16,onlydownprojection pc11 replaced byS8 triple. Warm persistent complete-block AB/BA ranking; no explicitL2 eviction, no serving or library winclaim. Full-model/liveKV/rungtransition qualification pending.",
+  "rows": [
+    {
+      "ctx": 1024,
+      "repeat": 0,
+      "order": "control,candidate",
+      "control_us": 1137.45,
+      "candidate_us": 887.81,
+      "reduction_us": 249.6400000000001,
+      "reduction_fraction": 0.21947338344542622
+    },
+    {
+      "ctx": 1024,
+      "repeat": 1,
+      "order": "candidate,control",
+      "control_us": 1137.63,
+      "candidate_us": 887.77,
+      "reduction_us": 249.86000000000013,
+      "reduction_fraction": 0.219632042052337
+    },
+    {
+      "ctx": 8192,
+      "repeat": 0,
+      "order": "control,candidate",
+      "control_us": 1626.66,
+      "candidate_us": 1380.17,
+      "reduction_us": 246.49,
+      "reduction_fraction": 0.15153135873507673
+    },
+    {
+      "ctx": 8192,
+      "repeat": 1,
+      "order": "candidate,control",
+      "control_us": 1623.25,
+      "candidate_us": 1377.54,
+      "reduction_us": 245.71000000000004,
+      "reduction_fraction": 0.15136916679501
+    },
+    {
+      "ctx": 32768,
+      "repeat": 0,
+      "order": "control,candidate",
+      "control_us": 3318.27,
+      "candidate_us": 3074.05,
+      "reduction_us": 244.2199999999998,
+      "reduction_fraction": 0.07359859203741703
+    },
+    {
+      "ctx": 32768,
+      "repeat": 1,
+      "order": "candidate,control",
+      "control_us": 3315.71,
+      "candidate_us": 3066.75,
+      "reduction_us": 248.96000000000004,
+      "reduction_fraction": 0.07508497425890681
+    }
+  ],
+  "raw_results": {
+    "e3-phaseA-timing-control-ctx1024-r0": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 1024,
+        "latency_us_median": 1137.45,
+        "latency_us_p95": 1150.14,
+        "prefill_ms_median": 143.638,
+        "prefill_ms_p95": 143.638,
+        "prefill_tok_s": 114064.5,
+        "tok_s": 14066.6
+      }
+    },
+    "e3-phaseA-timing-s8-ctx1024-r0": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 1024,
+        "latency_us_median": 887.81,
+        "latency_us_p95": 908.11,
+        "prefill_ms_median": 143.797,
+        "prefill_ms_p95": 143.797,
+        "prefill_tok_s": 113938.4,
+        "tok_s": 18021.9
+      }
+    },
+    "e3-phaseA-timing-control-ctx8192-r0": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 8192,
+        "latency_us_median": 1626.66,
+        "latency_us_p95": 1634.46,
+        "prefill_ms_median": 1532.943,
+        "prefill_ms_p95": 1532.943,
+        "prefill_tok_s": 85503.5,
+        "tok_s": 9836.1
+      }
+    },
+    "e3-phaseA-timing-s8-ctx8192-r0": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 8192,
+        "latency_us_median": 1380.17,
+        "latency_us_p95": 1385.84,
+        "prefill_ms_median": 1529.675,
+        "prefill_ms_p95": 1529.675,
+        "prefill_tok_s": 85686.2,
+        "tok_s": 11592.8
+      }
+    },
+    "e3-phaseA-timing-control-ctx32768-r0": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 32768,
+        "latency_us_median": 3318.27,
+        "latency_us_p95": 3336.69,
+        "prefill_ms_median": 11294.971,
+        "prefill_ms_p95": 11294.971,
+        "prefill_tok_s": 46417.8,
+        "tok_s": 4821.8
+      }
+    },
+    "e3-phaseA-timing-s8-ctx32768-r0": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 32768,
+        "latency_us_median": 3074.05,
+        "latency_us_p95": 3087.92,
+        "prefill_ms_median": 11251.429,
+        "prefill_ms_p95": 11251.429,
+        "prefill_tok_s": 46597.5,
+        "tok_s": 5204.9
+      }
+    },
+    "e3-phaseA-timing-s8-ctx32768-r1": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 32768,
+        "latency_us_median": 3066.75,
+        "latency_us_p95": 3085.54,
+        "prefill_ms_median": 11253.211,
+        "prefill_ms_p95": 11253.211,
+        "prefill_tok_s": 46590.1,
+        "tok_s": 5217.3
+      }
+    },
+    "e3-phaseA-timing-control-ctx32768-r1": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 32768,
+        "latency_us_median": 3315.71,
+        "latency_us_p95": 3335.38,
+        "prefill_ms_median": 11290.496,
+        "prefill_ms_p95": 11290.496,
+        "prefill_tok_s": 46436.2,
+        "tok_s": 4825.5
+      }
+    },
+    "e3-phaseA-timing-s8-ctx8192-r1": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 8192,
+        "latency_us_median": 1377.54,
+        "latency_us_p95": 1388.4,
+        "prefill_ms_median": 1527.704,
+        "prefill_ms_p95": 1527.704,
+        "prefill_tok_s": 85796.7,
+        "tok_s": 11614.9
+      }
+    },
+    "e3-phaseA-timing-control-ctx8192-r1": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 8192,
+        "latency_us_median": 1623.25,
+        "latency_us_p95": 1637.03,
+        "prefill_ms_median": 1537.229,
+        "prefill_ms_p95": 1537.229,
+        "prefill_tok_s": 85265.1,
+        "tok_s": 9856.8
+      }
+    },
+    "e3-phaseA-timing-s8-ctx1024-r1": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 1024,
+        "latency_us_median": 887.77,
+        "latency_us_p95": 903.93,
+        "prefill_ms_median": 143.672,
+        "prefill_ms_p95": 143.672,
+        "prefill_tok_s": 114037.8,
+        "tok_s": 18022.7
+      }
+    },
+    "e3-phaseA-timing-control-ctx1024-r1": {
+      "passed": true,
+      "returncode": 0,
+      "warm_block_row": {
+        "batch": 16,
+        "ctx": 1024,
+        "latency_us_median": 1137.63,
+        "latency_us_p95": 1155.04,
+        "prefill_ms_median": 143.363,
+        "prefill_ms_p95": 143.363,
+        "prefill_tok_s": 114283.1,
+        "tok_s": 14064.4
+      }
+    }
+  },
+  "source": "/tmp/plow-model-support-checks/e3-phaseA-warm-timing-window-20260906/results.json",
+  "sha256": "0b08ff9f4bd39da78773aff48cf49e02912b427aee1aa3ab75c45a9ccf3a26c2"
+}

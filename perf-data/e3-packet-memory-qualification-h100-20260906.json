@@ -1,0 +1,1594 @@
+{
+  "device_memory_check_qualified_with_expected_api_probes": true,
+  "tool_exit_zero": false,
+  "host_sha256": "8f2762f2c0c1fc17c7ff173a4c59dfc701584138c94d5071879a4338a4de9424",
+  "records": [
+    {
+      "api_error_count": 2,
+      "api": "cuModuleGetGlobal_v2",
+      "error": "CUDA_ERROR_NOT_FOUND",
+      "result": 500,
+      "reported_call_instruction_offsets": [
+        "0x16232b",
+        "0x162373"
+      ],
+      "other_sanitizer_records": 0,
+      "xml": {
+        "records": 2,
+        "all_api_probes": true
+      },
+      "raw_returncode": 99,
+      "tool_exit_zero": false,
+      "log": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseA/results/e3-phaseA-control-seed0-memcheck.log",
+      "log_sha256": "7f84c111a5fc23c07ab1b2b746cfffb65991f6f77f57074b170f474733e55d89",
+      "xml_sha256": "f618fc0442fa728f7c5fac3f0372fa571946a94d1c0a7cfcd4fa5371bb8a1187",
+      "job": "e3-phaseA-control-seed0-memcheck"
+    },
+    {
+      "api_error_count": 2,
+      "api": "cuModuleGetGlobal_v2",
+      "error": "CUDA_ERROR_NOT_FOUND",
+      "result": 500,
+      "reported_call_instruction_offsets": [
+        "0x16232b",
+        "0x162373"
+      ],
+      "other_sanitizer_records": 0,
+      "xml": {
+        "records": 2,
+        "all_api_probes": true
+      },
+      "raw_returncode": 99,
+      "tool_exit_zero": false,
+      "log": "/tmp/plow-model-support-checks/e3-splitk-interpreter-phaseA/results/e3-phaseA-s8-seed0-memcheck.log",
+      "log_sha256": "65f932948609866a3d5598eb052493b9bffef6cc47d0098763db7e89df146a77",
+      "xml_sha256": "f618fc0442fa728f7c5fac3f0372fa571946a94d1c0a7cfcd4fa5371bb8a1187",
+      "job": "e3-phaseA-s8-seed0-memcheck"
+    }
+  ],
+  "numerical": {
+    "steps_per_arm": 6,
+    "physical_rows_per_step": 16,
+    "per_row_comparisons": [
+      {
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.00021011919731363818,
+        "max_abs": 0.25,
+        "max_ref": 256.0
+      },
+      {
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 6.670645561812615e-05,
+        "max_abs": 0.125,
+        "max_ref": 198.0
+      },
+      {
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 9.382435108871228e-06,
+        "max_abs": 0.03125,
+        "max_ref": 292.0
+      },
+      {
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 9.105241924677003e-05,
+        "max_abs": 0.25,
+        "max_ref": 282.0
+      },
+      {
+        "step": 0,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 6.352728242901986e-05,
+        "max_abs": 0.25,
+        "max_ref": 426.0
+      },
+      {
+        "step": 0,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001506257870868329,
+        "max_abs": 1.0,
+        "max_ref": 1408.0
+      },
+      {
+        "step": 0,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.00011520622846073414,
+        "max_abs": 1.0,
+        "max_ref": 1016.0
+      },
+      {
+        "step": 0,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.00018143581707786292,
+        "max_abs": 2.0,
+        "max_ref": 880.0
+      },
+      {
+        "step": 0,
+        "slot": 8,
+        "tensor": "act.dg",
+        "rel_l2": 1.236568770945538e-05,
+        "max_abs": 0.125,
+        "max_ref": 1120.0
+      },
+      {
+        "step": 0,
+        "slot": 9,
+        "tensor": "act.dg",
+        "rel_l2": 7.625972712977774e-06,
+        "max_abs": 0.0625,
+        "max_ref": 1720.0
+      },
+      {
+        "step": 0,
+        "slot": 10,
+        "tensor": "act.dg",
+        "rel_l2": 3.156409679258804e-05,
+        "max_abs": 0.5,
+        "max_ref": 1360.0
+      },
+      {
+        "step": 0,
+        "slot": 11,
+        "tensor": "act.dg",
+        "rel_l2": 4.395973942402201e-05,
+        "max_abs": 1.0,
+        "max_ref": 2592.0
+      },
+      {
+        "step": 0,
+        "slot": 12,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001559059655459015,
+        "max_abs": 2.0,
+        "max_ref": 1512.0
+      },
+      {
+        "step": 0,
+        "slot": 13,
+        "tensor": "act.dg",
+        "rel_l2": 6.692290452942496e-06,
+        "max_abs": 0.125,
+        "max_ref": 4928.0
+      },
+      {
+        "step": 0,
+        "slot": 14,
+        "tensor": "act.dg",
+        "rel_l2": 3.384716092259024e-05,
+        "max_abs": 1.0,
+        "max_ref": 6944.0
+      },
+      {
+        "step": 0,
+        "slot": 15,
+        "tensor": "act.dg",
+        "rel_l2": 7.298860155952389e-05,
+        "max_abs": 2.0,
+        "max_ref": 4224.0
+      },
+      {
+        "step": 0,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0003099276457014844,
+        "max_abs": 0.015625,
+        "max_ref": 17.5
+      },
+      {
+        "step": 0,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.00017818038113906587,
+        "max_abs": 0.015625,
+        "max_ref": 10.5625
+      },
+      {
+        "step": 0,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 1.0476865012530433e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 9.5625
+      },
+      {
+        "step": 0,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 8.417130059933261e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 7.78125
+      },
+      {
+        "step": 0,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 8.553715131859756e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 8.625
+      },
+      {
+        "step": 0,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.000190559663926333,
+        "max_abs": 0.015625,
+        "max_ref": 7.625
+      },
+      {
+        "step": 0,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.00019695558180884108,
+        "max_abs": 0.015625,
+        "max_ref": 12.0
+      },
+      {
+        "step": 0,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0002543183741952642,
+        "max_abs": 0.015625,
+        "max_ref": 7.34375
+      },
+      {
+        "step": 0,
+        "slot": 8,
+        "tensor": "act.x",
+        "rel_l2": 1.2820629205173302e-06,
+        "max_abs": 0.0001220703125,
+        "max_ref": 15.0625
+      },
+      {
+        "step": 0,
+        "slot": 9,
+        "tensor": "act.x",
+        "rel_l2": 5.3880234594606966e-06,
+        "max_abs": 0.00048828125,
+        "max_ref": 10.5625
+      },
+      {
+        "step": 0,
+        "slot": 10,
+        "tensor": "act.x",
+        "rel_l2": 2.4054115172972285e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 8.75
+      },
+      {
+        "step": 0,
+        "slot": 11,
+        "tensor": "act.x",
+        "rel_l2": 6.346758384377758e-05,
+        "max_abs": 0.005859375,
+        "max_ref": 8.25
+      },
+      {
+        "step": 0,
+        "slot": 12,
+        "tensor": "act.x",
+        "rel_l2": 0.0002092385526365429,
+        "max_abs": 0.015625,
+        "max_ref": 6.90625
+      },
+      {
+        "step": 0,
+        "slot": 13,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.375
+      },
+      {
+        "step": 0,
+        "slot": 14,
+        "tensor": "act.x",
+        "rel_l2": 2.76535795478503e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 8.625
+      },
+      {
+        "step": 0,
+        "slot": 15,
+        "tensor": "act.x",
+        "rel_l2": 7.464698530821116e-05,
+        "max_abs": 0.0068359375,
+        "max_ref": 20.375
+      },
+      {
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.000109931746482815,
+        "max_abs": 0.125,
+        "max_ref": 218.0
+      },
+      {
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.00010293483837421624,
+        "max_abs": 0.25,
+        "max_ref": 466.0
+      },
+      {
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 9.649081186608057e-05,
+        "max_abs": 0.25,
+        "max_ref": 510.0
+      },
+      {
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 6.168255613858479e-05,
+        "max_abs": 0.25,
+        "max_ref": 488.0
+      },
+      {
+        "step": 1,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.00017238336833838602,
+        "max_abs": 1.0,
+        "max_ref": 712.0
+      },
+      {
+        "step": 1,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 1.938783248214273e-05,
+        "max_abs": 0.125,
+        "max_ref": 648.0
+      },
+      {
+        "step": 1,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 1.6672527002100656e-05,
+        "max_abs": 0.125,
+        "max_ref": 1288.0
+      },
+      {
+        "step": 1,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 2.530310450678372e-05,
+        "max_abs": 0.25,
+        "max_ref": 1776.0
+      },
+      {
+        "step": 1,
+        "slot": 8,
+        "tensor": "act.dg",
+        "rel_l2": 8.02985697123117e-05,
+        "max_abs": 1.0,
+        "max_ref": 1720.0
+      },
+      {
+        "step": 1,
+        "slot": 9,
+        "tensor": "act.dg",
+        "rel_l2": 5.45139550239493e-05,
+        "max_abs": 1.0,
+        "max_ref": 2880.0
+      },
+      {
+        "step": 1,
+        "slot": 10,
+        "tensor": "act.dg",
+        "rel_l2": 0.0002726919822613082,
+        "max_abs": 4.0,
+        "max_ref": 1648.0
+      },
+      {
+        "step": 1,
+        "slot": 11,
+        "tensor": "act.dg",
+        "rel_l2": 0.00011400108927913193,
+        "max_abs": 2.0,
+        "max_ref": 1624.0
+      },
+      {
+        "step": 1,
+        "slot": 12,
+        "tensor": "act.dg",
+        "rel_l2": 0.00011250557025673552,
+        "max_abs": 2.0,
+        "max_ref": 2320.0
+      },
+      {
+        "step": 1,
+        "slot": 13,
+        "tensor": "act.dg",
+        "rel_l2": 8.884787840200464e-05,
+        "max_abs": 2.0,
+        "max_ref": 4576.0
+      },
+      {
+        "step": 1,
+        "slot": 14,
+        "tensor": "act.dg",
+        "rel_l2": 3.615395172200268e-05,
+        "max_abs": 1.0,
+        "max_ref": 4000.0
+      },
+      {
+        "step": 1,
+        "slot": 15,
+        "tensor": "act.dg",
+        "rel_l2": 7.35967711347621e-05,
+        "max_abs": 1.0,
+        "max_ref": 2432.0
+      },
+      {
+        "step": 1,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.00010449197409451421,
+        "max_abs": 0.0078125,
+        "max_ref": 9.1875
+      },
+      {
+        "step": 1,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.00010137636486858614,
+        "max_abs": 0.0078125,
+        "max_ref": 9.375
+      },
+      {
+        "step": 1,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.00010055092904354391,
+        "max_abs": 0.0078125,
+        "max_ref": 17.125
+      },
+      {
+        "step": 1,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 9.554113253139903e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 7.96875
+      },
+      {
+        "step": 1,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.00024134165375736685,
+        "max_abs": 0.015625,
+        "max_ref": 8.875
+      },
+      {
+        "step": 1,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 1.0445877890641332e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 12.5
+      },
+      {
+        "step": 1,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "step": 1,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 4.4834518747329365e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 6.84375
+      },
+      {
+        "step": 1,
+        "slot": 8,
+        "tensor": "act.x",
+        "rel_l2": 0.00016531970264498688,
+        "max_abs": 0.015625,
+        "max_ref": 15.625
+      },
+      {
+        "step": 1,
+        "slot": 9,
+        "tensor": "act.x",
+        "rel_l2": 8.68222139044196e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 7.125
+      },
+      {
+        "step": 1,
+        "slot": 10,
+        "tensor": "act.x",
+        "rel_l2": 0.0005694208077395617,
+        "max_abs": 0.03125,
+        "max_ref": 6.5
+      },
+      {
+        "step": 1,
+        "slot": 11,
+        "tensor": "act.x",
+        "rel_l2": 0.00023535530485269636,
+        "max_abs": 0.015625,
+        "max_ref": 12.5625
+      },
+      {
+        "step": 1,
+        "slot": 12,
+        "tensor": "act.x",
+        "rel_l2": 0.00016927286763237143,
+        "max_abs": 0.015625,
+        "max_ref": 10.25
+      },
+      {
+        "step": 1,
+        "slot": 13,
+        "tensor": "act.x",
+        "rel_l2": 0.00019187980146787354,
+        "max_abs": 0.015625,
+        "max_ref": 7.75
+      },
+      {
+        "step": 1,
+        "slot": 14,
+        "tensor": "act.x",
+        "rel_l2": 2.172718603847394e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 7.71875
+      },
+      {
+        "step": 1,
+        "slot": 15,
+        "tensor": "act.x",
+        "rel_l2": 9.371288766150764e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 9.6875
+      },
+      {
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001599275071221506,
+        "max_abs": 0.25,
+        "max_ref": 186.0
+      },
+      {
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 2.6674031703592936e-05,
+        "max_abs": 0.0625,
+        "max_ref": 209.0
+      },
+      {
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 5.066372232104e-05,
+        "max_abs": 0.125,
+        "max_ref": 230.0
+      },
+      {
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 1.3995614245018386e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 868.0
+      },
+      {
+        "step": 2,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 7.966748769479378e-05,
+        "max_abs": 0.5,
+        "max_ref": 756.0
+      },
+      {
+        "step": 2,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.00010613487708554495,
+        "max_abs": 1.0,
+        "max_ref": 1240.0
+      },
+      {
+        "step": 2,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 4.2148456588887655e-06,
+        "max_abs": 0.03125,
+        "max_ref": 460.0
+      },
+      {
+        "step": 2,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 9.003221307009356e-05,
+        "max_abs": 1.0,
+        "max_ref": 1240.0
+      },
+      {
+        "step": 2,
+        "slot": 8,
+        "tensor": "act.dg",
+        "rel_l2": 8.738054385851341e-05,
+        "max_abs": 1.0,
+        "max_ref": 1600.0
+      },
+      {
+        "step": 2,
+        "slot": 9,
+        "tensor": "act.dg",
+        "rel_l2": 6.452371385419962e-05,
+        "max_abs": 1.0,
+        "max_ref": 1568.0
+      },
+      {
+        "step": 2,
+        "slot": 10,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001593661084014396,
+        "max_abs": 2.0,
+        "max_ref": 1832.0
+      },
+      {
+        "step": 2,
+        "slot": 11,
+        "tensor": "act.dg",
+        "rel_l2": 0.00012395776408346068,
+        "max_abs": 2.0,
+        "max_ref": 2288.0
+      },
+      {
+        "step": 2,
+        "slot": 12,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001294449549013033,
+        "max_abs": 2.0,
+        "max_ref": 1592.0
+      },
+      {
+        "step": 2,
+        "slot": 13,
+        "tensor": "act.dg",
+        "rel_l2": 2.3742577324121683e-05,
+        "max_abs": 0.5,
+        "max_ref": 2432.0
+      },
+      {
+        "step": 2,
+        "slot": 14,
+        "tensor": "act.dg",
+        "rel_l2": 2.937031643979934e-06,
+        "max_abs": 0.0625,
+        "max_ref": 2640.0
+      },
+      {
+        "step": 2,
+        "slot": 15,
+        "tensor": "act.dg",
+        "rel_l2": 8.439370195917058e-05,
+        "max_abs": 2.0,
+        "max_ref": 5024.0
+      },
+      {
+        "step": 2,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.00017447005984736258,
+        "max_abs": 0.015625,
+        "max_ref": 9.125
+      },
+      {
+        "step": 2,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 3.155835529749217e-05,
+        "max_abs": 0.0029296875,
+        "max_ref": 6.78125
+      },
+      {
+        "step": 2,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 1.3307149587367998e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 8.0
+      },
+      {
+        "step": 2,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 11.75
+      },
+      {
+        "step": 2,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 2.15237812266736e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 9.8125
+      },
+      {
+        "step": 2,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 9.556229309877228e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 17.375
+      },
+      {
+        "step": 2,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.84375
+      },
+      {
+        "step": 2,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.00025452051863849207,
+        "max_abs": 0.015625,
+        "max_ref": 11.75
+      },
+      {
+        "step": 2,
+        "slot": 8,
+        "tensor": "act.x",
+        "rel_l2": 6.117148106471543e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 19.0
+      },
+      {
+        "step": 2,
+        "slot": 9,
+        "tensor": "act.x",
+        "rel_l2": 8.81398808442345e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 7.03125
+      },
+      {
+        "step": 2,
+        "slot": 10,
+        "tensor": "act.x",
+        "rel_l2": 0.00022782010358192274,
+        "max_abs": 0.015625,
+        "max_ref": 7.65625
+      },
+      {
+        "step": 2,
+        "slot": 11,
+        "tensor": "act.x",
+        "rel_l2": 5.050425061858554e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 6.5
+      },
+      {
+        "step": 2,
+        "slot": 12,
+        "tensor": "act.x",
+        "rel_l2": 5.553861788988162e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 12.0625
+      },
+      {
+        "step": 2,
+        "slot": 13,
+        "tensor": "act.x",
+        "rel_l2": 4.2678807130242626e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 12.625
+      },
+      {
+        "step": 2,
+        "slot": 14,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.3125
+      },
+      {
+        "step": 2,
+        "slot": 15,
+        "tensor": "act.x",
+        "rel_l2": 0.0001241581961196678,
+        "max_abs": 0.0078125,
+        "max_ref": 23.75
+      },
+      {
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.00021011919731363818,
+        "max_abs": 0.25,
+        "max_ref": 256.0
+      },
+      {
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 6.62213111837539e-05,
+        "max_abs": 0.125,
+        "max_ref": 198.0
+      },
+      {
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 9.382435108871228e-06,
+        "max_abs": 0.03125,
+        "max_ref": 292.0
+      },
+      {
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 9.105241924677003e-05,
+        "max_abs": 0.25,
+        "max_ref": 282.0
+      },
+      {
+        "step": 3,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 6.352728242901986e-05,
+        "max_abs": 0.25,
+        "max_ref": 426.0
+      },
+      {
+        "step": 3,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001506257870868329,
+        "max_abs": 1.0,
+        "max_ref": 1408.0
+      },
+      {
+        "step": 3,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 0.00011520622846073414,
+        "max_abs": 1.0,
+        "max_ref": 1016.0
+      },
+      {
+        "step": 3,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 0.00018143581707786292,
+        "max_abs": 2.0,
+        "max_ref": 880.0
+      },
+      {
+        "step": 3,
+        "slot": 8,
+        "tensor": "act.dg",
+        "rel_l2": 1.236568770945538e-05,
+        "max_abs": 0.125,
+        "max_ref": 1120.0
+      },
+      {
+        "step": 3,
+        "slot": 9,
+        "tensor": "act.dg",
+        "rel_l2": 7.625972712977774e-06,
+        "max_abs": 0.0625,
+        "max_ref": 1720.0
+      },
+      {
+        "step": 3,
+        "slot": 10,
+        "tensor": "act.dg",
+        "rel_l2": 3.1564096616907046e-05,
+        "max_abs": 0.5,
+        "max_ref": 1360.0
+      },
+      {
+        "step": 3,
+        "slot": 11,
+        "tensor": "act.dg",
+        "rel_l2": 4.395973942402201e-05,
+        "max_abs": 1.0,
+        "max_ref": 2592.0
+      },
+      {
+        "step": 3,
+        "slot": 12,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001559059655459015,
+        "max_abs": 2.0,
+        "max_ref": 1512.0
+      },
+      {
+        "step": 3,
+        "slot": 13,
+        "tensor": "act.dg",
+        "rel_l2": 6.692290452942496e-06,
+        "max_abs": 0.125,
+        "max_ref": 4928.0
+      },
+      {
+        "step": 3,
+        "slot": 14,
+        "tensor": "act.dg",
+        "rel_l2": 3.384716092259024e-05,
+        "max_abs": 1.0,
+        "max_ref": 6944.0
+      },
+      {
+        "step": 3,
+        "slot": 15,
+        "tensor": "act.dg",
+        "rel_l2": 7.298860155952389e-05,
+        "max_abs": 2.0,
+        "max_ref": 4224.0
+      },
+      {
+        "step": 3,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.0003099276457014844,
+        "max_abs": 0.015625,
+        "max_ref": 17.5
+      },
+      {
+        "step": 3,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.00017818038113906587,
+        "max_abs": 0.015625,
+        "max_ref": 10.5625
+      },
+      {
+        "step": 3,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 1.0476865012530433e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 9.5625
+      },
+      {
+        "step": 3,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 8.417130059933261e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 7.78125
+      },
+      {
+        "step": 3,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 8.553715131859756e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 8.625
+      },
+      {
+        "step": 3,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 0.000190559663926333,
+        "max_abs": 0.015625,
+        "max_ref": 7.625
+      },
+      {
+        "step": 3,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.00019695558180884108,
+        "max_abs": 0.015625,
+        "max_ref": 12.0
+      },
+      {
+        "step": 3,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.0002543183741952642,
+        "max_abs": 0.015625,
+        "max_ref": 7.34375
+      },
+      {
+        "step": 3,
+        "slot": 8,
+        "tensor": "act.x",
+        "rel_l2": 1.2820629205173302e-06,
+        "max_abs": 0.0001220703125,
+        "max_ref": 15.0625
+      },
+      {
+        "step": 3,
+        "slot": 9,
+        "tensor": "act.x",
+        "rel_l2": 5.3880234594606966e-06,
+        "max_abs": 0.00048828125,
+        "max_ref": 10.5625
+      },
+      {
+        "step": 3,
+        "slot": 10,
+        "tensor": "act.x",
+        "rel_l2": 2.4054115172972285e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 8.75
+      },
+      {
+        "step": 3,
+        "slot": 11,
+        "tensor": "act.x",
+        "rel_l2": 6.346758384377758e-05,
+        "max_abs": 0.005859375,
+        "max_ref": 8.25
+      },
+      {
+        "step": 3,
+        "slot": 12,
+        "tensor": "act.x",
+        "rel_l2": 0.0002092385526365429,
+        "max_abs": 0.015625,
+        "max_ref": 6.90625
+      },
+      {
+        "step": 3,
+        "slot": 13,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 16.375
+      },
+      {
+        "step": 3,
+        "slot": 14,
+        "tensor": "act.x",
+        "rel_l2": 2.76535795478503e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 8.625
+      },
+      {
+        "step": 3,
+        "slot": 15,
+        "tensor": "act.x",
+        "rel_l2": 7.464698530821116e-05,
+        "max_abs": 0.0068359375,
+        "max_ref": 20.375
+      },
+      {
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.00010993172028609555,
+        "max_abs": 0.125,
+        "max_ref": 218.0
+      },
+      {
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 0.00010293684872211692,
+        "max_abs": 0.25,
+        "max_ref": 466.0
+      },
+      {
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 9.649081186608057e-05,
+        "max_abs": 0.25,
+        "max_ref": 510.0
+      },
+      {
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 6.168255613858479e-05,
+        "max_abs": 0.25,
+        "max_ref": 488.0
+      },
+      {
+        "step": 4,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 0.00017238338767916486,
+        "max_abs": 1.0,
+        "max_ref": 712.0
+      },
+      {
+        "step": 4,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 1.938783248214273e-05,
+        "max_abs": 0.125,
+        "max_ref": 648.0
+      },
+      {
+        "step": 4,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 1.667252786936914e-05,
+        "max_abs": 0.125,
+        "max_ref": 1288.0
+      },
+      {
+        "step": 4,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 2.530310450678372e-05,
+        "max_abs": 0.25,
+        "max_ref": 1776.0
+      },
+      {
+        "step": 4,
+        "slot": 8,
+        "tensor": "act.dg",
+        "rel_l2": 7.967869059312153e-05,
+        "max_abs": 1.0,
+        "max_ref": 1720.0
+      },
+      {
+        "step": 4,
+        "slot": 9,
+        "tensor": "act.dg",
+        "rel_l2": 5.45139550239493e-05,
+        "max_abs": 1.0,
+        "max_ref": 2880.0
+      },
+      {
+        "step": 4,
+        "slot": 10,
+        "tensor": "act.dg",
+        "rel_l2": 0.0002726919822613082,
+        "max_abs": 4.0,
+        "max_ref": 1648.0
+      },
+      {
+        "step": 4,
+        "slot": 11,
+        "tensor": "act.dg",
+        "rel_l2": 0.00011400028328852101,
+        "max_abs": 2.0,
+        "max_ref": 1624.0
+      },
+      {
+        "step": 4,
+        "slot": 12,
+        "tensor": "act.dg",
+        "rel_l2": 0.00013709022783808345,
+        "max_abs": 2.0,
+        "max_ref": 2320.0
+      },
+      {
+        "step": 4,
+        "slot": 13,
+        "tensor": "act.dg",
+        "rel_l2": 8.884787806119611e-05,
+        "max_abs": 2.0,
+        "max_ref": 4576.0
+      },
+      {
+        "step": 4,
+        "slot": 14,
+        "tensor": "act.dg",
+        "rel_l2": 3.615395172200268e-05,
+        "max_abs": 1.0,
+        "max_ref": 4000.0
+      },
+      {
+        "step": 4,
+        "slot": 15,
+        "tensor": "act.dg",
+        "rel_l2": 7.35967711347621e-05,
+        "max_abs": 1.0,
+        "max_ref": 2432.0
+      },
+      {
+        "step": 4,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.00010449197409451421,
+        "max_abs": 0.0078125,
+        "max_ref": 9.1875
+      },
+      {
+        "step": 4,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 0.00010137636486858614,
+        "max_abs": 0.0078125,
+        "max_ref": 9.375
+      },
+      {
+        "step": 4,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 0.00010055092904354391,
+        "max_abs": 0.0078125,
+        "max_ref": 17.125
+      },
+      {
+        "step": 4,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 9.554113253139903e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 7.96875
+      },
+      {
+        "step": 4,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 0.00024134165375736685,
+        "max_abs": 0.015625,
+        "max_ref": 8.875
+      },
+      {
+        "step": 4,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 1.0445877890641332e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 12.5
+      },
+      {
+        "step": 4,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 17.5
+      },
+      {
+        "step": 4,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 4.4834518747329365e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 6.84375
+      },
+      {
+        "step": 4,
+        "slot": 8,
+        "tensor": "act.x",
+        "rel_l2": 0.00016531970264498688,
+        "max_abs": 0.015625,
+        "max_ref": 15.625
+      },
+      {
+        "step": 4,
+        "slot": 9,
+        "tensor": "act.x",
+        "rel_l2": 8.68222139044196e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 7.125
+      },
+      {
+        "step": 4,
+        "slot": 10,
+        "tensor": "act.x",
+        "rel_l2": 0.0005694208077395617,
+        "max_abs": 0.03125,
+        "max_ref": 6.5
+      },
+      {
+        "step": 4,
+        "slot": 11,
+        "tensor": "act.x",
+        "rel_l2": 0.00023535530485269636,
+        "max_abs": 0.015625,
+        "max_ref": 12.5625
+      },
+      {
+        "step": 4,
+        "slot": 12,
+        "tensor": "act.x",
+        "rel_l2": 0.0001692932913267601,
+        "max_abs": 0.015625,
+        "max_ref": 10.25
+      },
+      {
+        "step": 4,
+        "slot": 13,
+        "tensor": "act.x",
+        "rel_l2": 0.00019187980146787354,
+        "max_abs": 0.015625,
+        "max_ref": 7.75
+      },
+      {
+        "step": 4,
+        "slot": 14,
+        "tensor": "act.x",
+        "rel_l2": 2.172718603847394e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 7.71875
+      },
+      {
+        "step": 4,
+        "slot": 15,
+        "tensor": "act.x",
+        "rel_l2": 9.371288766150764e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 9.6875
+      },
+      {
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001599275071221506,
+        "max_abs": 0.25,
+        "max_ref": 186.0
+      },
+      {
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.dg",
+        "rel_l2": 2.6674031703592936e-05,
+        "max_abs": 0.0625,
+        "max_ref": 209.0
+      },
+      {
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.dg",
+        "rel_l2": 5.066372232104e-05,
+        "max_abs": 0.125,
+        "max_ref": 230.0
+      },
+      {
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.dg",
+        "rel_l2": 1.3995614245018386e-06,
+        "max_abs": 0.0078125,
+        "max_ref": 868.0
+      },
+      {
+        "step": 5,
+        "slot": 4,
+        "tensor": "act.dg",
+        "rel_l2": 7.966763949935223e-05,
+        "max_abs": 0.5,
+        "max_ref": 756.0
+      },
+      {
+        "step": 5,
+        "slot": 5,
+        "tensor": "act.dg",
+        "rel_l2": 0.000106134927694574,
+        "max_abs": 1.0,
+        "max_ref": 1240.0
+      },
+      {
+        "step": 5,
+        "slot": 6,
+        "tensor": "act.dg",
+        "rel_l2": 4.2148456588887655e-06,
+        "max_abs": 0.03125,
+        "max_ref": 460.0
+      },
+      {
+        "step": 5,
+        "slot": 7,
+        "tensor": "act.dg",
+        "rel_l2": 9.003221307009356e-05,
+        "max_abs": 1.0,
+        "max_ref": 1240.0
+      },
+      {
+        "step": 5,
+        "slot": 8,
+        "tensor": "act.dg",
+        "rel_l2": 8.738054385851341e-05,
+        "max_abs": 1.0,
+        "max_ref": 1600.0
+      },
+      {
+        "step": 5,
+        "slot": 9,
+        "tensor": "act.dg",
+        "rel_l2": 6.452371385419962e-05,
+        "max_abs": 1.0,
+        "max_ref": 1568.0
+      },
+      {
+        "step": 5,
+        "slot": 10,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001593662732645517,
+        "max_abs": 2.0,
+        "max_ref": 1832.0
+      },
+      {
+        "step": 5,
+        "slot": 11,
+        "tensor": "act.dg",
+        "rel_l2": 0.00012395776408346068,
+        "max_abs": 2.0,
+        "max_ref": 2288.0
+      },
+      {
+        "step": 5,
+        "slot": 12,
+        "tensor": "act.dg",
+        "rel_l2": 0.0001294449549013033,
+        "max_abs": 2.0,
+        "max_ref": 1592.0
+      },
+      {
+        "step": 5,
+        "slot": 13,
+        "tensor": "act.dg",
+        "rel_l2": 2.9449927641589277e-06,
+        "max_abs": 0.0625,
+        "max_ref": 2432.0
+      },
+      {
+        "step": 5,
+        "slot": 14,
+        "tensor": "act.dg",
+        "rel_l2": 2.9374471715058495e-06,
+        "max_abs": 0.0625,
+        "max_ref": 2640.0
+      },
+      {
+        "step": 5,
+        "slot": 15,
+        "tensor": "act.dg",
+        "rel_l2": 8.439370195917058e-05,
+        "max_abs": 2.0,
+        "max_ref": 5024.0
+      },
+      {
+        "step": 5,
+        "slot": 0,
+        "tensor": "act.x",
+        "rel_l2": 0.00017447005984736258,
+        "max_abs": 0.015625,
+        "max_ref": 9.125
+      },
+      {
+        "step": 5,
+        "slot": 1,
+        "tensor": "act.x",
+        "rel_l2": 3.155835529749217e-05,
+        "max_abs": 0.0029296875,
+        "max_ref": 6.78125
+      },
+      {
+        "step": 5,
+        "slot": 2,
+        "tensor": "act.x",
+        "rel_l2": 1.3307149587367998e-05,
+        "max_abs": 0.0009765625,
+        "max_ref": 8.0
+      },
+      {
+        "step": 5,
+        "slot": 3,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 11.75
+      },
+      {
+        "step": 5,
+        "slot": 4,
+        "tensor": "act.x",
+        "rel_l2": 2.15237812266736e-05,
+        "max_abs": 0.001953125,
+        "max_ref": 9.8125
+      },
+      {
+        "step": 5,
+        "slot": 5,
+        "tensor": "act.x",
+        "rel_l2": 9.556229309877228e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 17.375
+      },
+      {
+        "step": 5,
+        "slot": 6,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.84375
+      },
+      {
+        "step": 5,
+        "slot": 7,
+        "tensor": "act.x",
+        "rel_l2": 0.00025452051863849207,
+        "max_abs": 0.015625,
+        "max_ref": 11.75
+      },
+      {
+        "step": 5,
+        "slot": 8,
+        "tensor": "act.x",
+        "rel_l2": 6.117148106471543e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 19.0
+      },
+      {
+        "step": 5,
+        "slot": 9,
+        "tensor": "act.x",
+        "rel_l2": 8.81398808442345e-05,
+        "max_abs": 0.0078125,
+        "max_ref": 7.03125
+      },
+      {
+        "step": 5,
+        "slot": 10,
+        "tensor": "act.x",
+        "rel_l2": 0.00022782010358192274,
+        "max_abs": 0.015625,
+        "max_ref": 7.65625
+      },
+      {
+        "step": 5,
+        "slot": 11,
+        "tensor": "act.x",
+        "rel_l2": 5.050425061858554e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 6.5
+      },
+      {
+        "step": 5,
+        "slot": 12,
+        "tensor": "act.x",
+        "rel_l2": 5.553861788988162e-05,
+        "max_abs": 0.00390625,
+        "max_ref": 12.0625
+      },
+      {
+        "step": 5,
+        "slot": 13,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 12.625
+      },
+      {
+        "step": 5,
+        "slot": 14,
+        "tensor": "act.x",
+        "rel_l2": 0.0,
+        "max_abs": 0.0,
+        "max_ref": 7.3125
+      },
+      {
+        "step": 5,
+        "slot": 15,
+        "tensor": "act.x",
+        "rel_l2": 0.0001241581961196678,
+        "max_abs": 0.0078125,
+        "max_ref": 23.75
+      }
+    ],
+    "scratch_guard_and_exact_cast_checks": 6,
+    "reset_histories_pass": true
+  },
+  "scope": "Six-step M16 block control/S8, all16 physical rows, reset and guarded partial plane. Two exact optional API probes retained per process; no suppression; no full-model qualification."
+}

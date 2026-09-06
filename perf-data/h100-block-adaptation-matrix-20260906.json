@@ -1,0 +1,962 @@
+[
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 1,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 1,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 1,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 1,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 4,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 4,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 4,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 4,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 8,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 8,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 8,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 8,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 16,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 16,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 16,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 16,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 32,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 32,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 32,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma12",
+    "layer": 5,
+    "decode_m": 32,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 1,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 1,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 1,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 1,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 4,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 4,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 4,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 4,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 8,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 8,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 8,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 8,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 16,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 16,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 16,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 16,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 32,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 32,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 32,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "gemma31",
+    "layer": 5,
+    "decode_m": 32,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 1,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 1024,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 4096,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 8192,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 4,
+    "context": 32768,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 1024,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 4096,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 8192,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 8,
+    "context": 32768,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 1024,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 4096,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 8192,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 16,
+    "context": 32768,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 1024,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 4096,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 8192,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 0,
+    "decode_m": 32,
+    "context": 32768,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 1,
+    "context": 1024,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 1,
+    "context": 4096,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 1,
+    "context": 8192,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 1,
+    "context": 32768,
+    "status": "requires_exact_asset_and_baseline_qualification",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 4,
+    "context": 1024,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 4,
+    "context": 4096,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 4,
+    "context": 8192,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 4,
+    "context": 32768,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 8,
+    "context": 1024,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 8,
+    "context": 4096,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 8,
+    "context": 8192,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 8,
+    "context": 32768,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 16,
+    "context": 1024,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 16,
+    "context": 4096,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 16,
+    "context": 8192,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 16,
+    "context": 32768,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 32,
+    "context": 1024,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 32,
+    "context": 4096,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 32,
+    "context": 8192,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  },
+  {
+    "model": "qwen",
+    "layer": 3,
+    "decode_m": 32,
+    "context": 32768,
+    "status": "blocked_compiler_batched_block_contract",
+    "ready_for_gpu": false
+  }
+]
