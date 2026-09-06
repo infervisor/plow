@@ -118,20 +118,6 @@ cell and every c<=2 decode cell. For this model the vLLM comparison is therefore
 number but a capability one.
 
 
-## AVX-512 router scoring (commit d2dc0af)
-
-The Gemma MoE router scoring GEMV previously fell through to the scalar kernel. The AVX-512
-arm produced these fresh-prompt TTFT / TPOT means in ms:
-
-| workload | c=1 | c=2 | c=4 | c=8 |
-|---|---:|---:|---:|---:|
-| chat_short | 331 / 35 | 487 / 58 | 804 / 87 | 1705 / 125 |
-| chat_long | 1019 / 38 | 1335 / 68 | 1883 / 106 | 4538 / 191 |
-| code | 919 / 38 | 1851 / 69 | 2892 / 128 | 4184 / 167 |
-
-Against the balanced-MoE campaign, TTFT fell 29-54% and TPOT fell 7-38% across these
-12 cells. The c=1 decode range is now 35-38 ms vs llama.cpp's 50-63 ms.
-
 ## After the vectorized MoE router (commit d2dc0af, 19:5x)
 
 Op 73 had no AVX-512 arm, so the router's 128x2816 scoring GEMV ran scalar and accounted for 56% of
