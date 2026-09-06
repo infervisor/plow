@@ -550,12 +550,15 @@ fn main() -> ExitCode {
     // that was missing. Defaulting it here moves the decision to the only place that knows the
     // arch. `deny_uniseg` still wins downstream for targets that must read `seg` (AMD).
     // Opt out with PLOW_UNISEG=0.
-    if cli.arch.starts_with("sm_120") && std::env::var_os("PLOW_UNISEG").is_none() {
-        // The real gate is `packet::devbuild::Builder`'s own `std::env::var("PLOW_UNISEG")` read,
-        // not this struct field — set both so the emitted manifest and the diagnostic agree.
-        std::env::set_var("PLOW_UNISEG", "1");
-        cli.emit_cfg.uniseg = true;
-    }
+    cli.emit_cfg.uniseg = effective_uniseg(
+        &cli.arch,
+        cli.emit_cfg.uniseg,
+        cli.segmented,
+        std::env::var_os("PLOW_UNISEG").is_some(),
+    );
+    // Builder still consumes this legacy switch directly. Keep it synchronized
+    // with the parsed emit config until that input is carried in BuilderConfig.
+    std::env::set_var("PLOW_UNISEG", if cli.emit_cfg.uniseg { "1" } else { "0" });
     let cli = cli;
 
     // Log the parsed CLI arguments so every invocation is self-describing in logs.
@@ -1268,13 +1271,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             l2_layout,
             gpu: cli.gpu.clone(),
             arch: cli.arch.clone(),
-            emit_cfg: Some({
-                let mut cfg = cli.emit_cfg.clone();
-                if cli.segmented {
-                    cfg.uniseg = false;
-                }
-                cfg
-            }),
+            emit_cfg: Some(cli.emit_cfg.clone()),
             whole_graph_fusions,
         },
         verify,
@@ -1473,6 +1470,16 @@ fn build_cubin_from_manifest(
     }
     info!(out = %out_dir.display(), "interpreter object built");
     Ok(())
+}
+
+fn effective_uniseg(arch: &str, configured: bool, segmented: bool, env_present: bool) -> bool {
+    if segmented {
+        false
+    } else if arch.starts_with("sm_120") && !env_present {
+        true
+    } else {
+        configured
+    }
 }
 
 fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
@@ -2148,6 +2155,14 @@ mod cli_tests {
         assert!(cubin_arch_option("gfx950")
             .unwrap_err()
             .contains("hipcc/.hsaco"));
+    }
+
+    #[test]
+    fn uniseg_cli_state_reaches_the_legacy_builder_switch() {
+        assert!(effective_uniseg("sm_90a", true, false, false));
+        assert!(!effective_uniseg("sm_90a", true, true, false));
+        assert!(effective_uniseg("sm_120a", false, false, false));
+        assert!(!effective_uniseg("sm_120a", false, false, true));
     }
 
     /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be
