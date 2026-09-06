@@ -1,0 +1,1274 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8096",
+  "model": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+  "server_models": [
+   "4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+  ],
+  "timestamp": "2026-09-06T07:57:32+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8096",
+   "--model",
+   "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+   "--workload",
+   "code",
+   "--concurrency",
+   "1,2,4,8",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/",
+   "--out",
+   "perf-data/cpu-gemma26b/h2h/g26b-bf16-code.json",
+   "--md",
+   "perf-data/cpu-gemma26b/h2h/g26b-bf16-code.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "code",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 63.472654657998646,
+    "ttft_s": {
+     "mean": 2.4842550417488383,
+     "p50": 2.5095456689959974,
+     "p90": 2.854279231003602,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.08648242564684927,
+     "p50": 0.08633319244443786,
+     "p90": 0.08721487311113234,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 7.932745813873225,
+     "p50": 7.9446050170008675,
+     "p90": 8.34734298499825,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 365.375,
+     "p50": 369,
+     "p90": 449,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 8.06646583097465,
+    "req_per_s": 0.1260385286089789,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "code": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 63.472654657998646,
+     "ttft_s": {
+      "mean": 2.4842550417488383,
+      "p50": 2.5095456689959974,
+      "p90": 2.854279231003602,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.08648242564684927,
+      "p50": 0.08633319244443786,
+      "p90": 0.08721487311113234,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 7.932745813873225,
+      "p50": 7.9446050170008675,
+      "p90": 8.34734298499825,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 365.375,
+      "p50": 369,
+      "p90": 449,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 8.06646583097465,
+     "req_per_s": 0.1260385286089789,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.9430216170003405,
+     "tpot_s": 0.08721487311113234,
+     "latency_s": 8.437661359996127,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 476,
+      "completion_tokens": 64,
+      "total_tokens": 540,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Explanation\nThe issue is caused by **variable hoisting** and **closures**. B",
+     "text_chars": 289,
+     "index": 0,
+     "kind": "code",
+     "t_start": 1788681460.5499747,
+     "prompt_tokens_client": 463,
+     "prompt_tokens_server": 476,
+     "prompt_chars": 2072,
+     "prompt_tokens": 463
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.1807777249996434,
+     "tpot_s": 0.08452305795245116,
+     "latency_s": 7.505825837004522,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 317,
+      "completion_tokens": 64,
+      "total_tokens": 381,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Since the request asks for a \"query\" but provides context regarding \"malformed i",
+     "text_chars": 289,
+     "index": 1,
+     "kind": "code",
+     "t_start": 1788681468.9892218,
+     "prompt_tokens_client": 304,
+     "prompt_tokens_server": 317,
+     "prompt_chars": 1339,
+     "prompt_tokens": 304
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.0389025939948624,
+     "tpot_s": 0.08599705269848022,
+     "latency_s": 7.456816615995194,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 285,
+      "completion_tokens": 64,
+      "total_tokens": 349,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Analysis of Bugs\n\nThe original implementation contained three primary issues",
+     "text_chars": 234,
+     "index": 2,
+     "kind": "code",
+     "t_start": 1788681476.4961138,
+     "prompt_tokens_client": 272,
+     "prompt_tokens_server": 285,
+     "prompt_chars": 1142,
+     "prompt_tokens": 272
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.1951967040004092,
+     "tpot_s": 0.08601414066663618,
+     "latency_s": 7.614180412994756,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 313,
+      "completion_tokens": 64,
+      "total_tokens": 377,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```go\npackage retry\n\nimport (\n\t\"context\"\n\t\"errors\"\n\t\"time\"\n)\n\nvar (\n\tErrInvalidA",
+     "text_chars": 207,
+     "index": 3,
+     "kind": "code",
+     "t_start": 1788681483.9538598,
+     "prompt_tokens_client": 300,
+     "prompt_tokens_server": 313,
+     "prompt_chars": 1397,
+     "prompt_tokens": 300
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.7868305609954405,
+     "tpot_s": 0.08633319244443786,
+     "latency_s": 8.225921465993451,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 437,
+      "completion_tokens": 64,
+      "total_tokens": 501,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```sql\n/*\n * This query calculates customer engagement metrics per country for t",
+     "text_chars": 260,
+     "index": 4,
+     "kind": "code",
+     "t_start": 1788681491.5692177,
+     "prompt_tokens_client": 424,
+     "prompt_tokens_server": 437,
+     "prompt_chars": 2040,
+     "prompt_tokens": 424
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.854279231003602,
+     "tpot_s": 0.08718993284128373,
+     "latency_s": 8.34734298499825,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 462,
+      "completion_tokens": 64,
+      "total_tokens": 526,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Explanation of the Deadlock\n\nThe original code deadlocks because the `result",
+     "text_chars": 290,
+     "index": 5,
+     "kind": "code",
+     "t_start": 1788681499.7967288,
+     "prompt_tokens_client": 449,
+     "prompt_tokens_server": 462,
+     "prompt_chars": 2014,
+     "prompt_tokens": 449
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.3654862330004107,
+     "tpot_s": 0.08831782071432653,
+     "latency_s": 7.929612817002635,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 355,
+      "completion_tokens": 64,
+      "total_tokens": 419,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport unittest\nfrom itertools import islice\n\ndef chunked(iterable, n)",
+     "text_chars": 283,
+     "index": 6,
+     "kind": "code",
+     "t_start": 1788681508.1455235,
+     "prompt_tokens_client": 342,
+     "prompt_tokens_server": 355,
+     "prompt_chars": 1595,
+     "prompt_tokens": 342
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.5095456689959974,
+     "tpot_s": 0.08626933474604609,
+     "latency_s": 7.9446050170008675,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 382,
+      "completion_tokens": 64,
+      "total_tokens": 446,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Identified Problems\n\n1.  **Logic Error (Incrementing):** The `if/else` logic",
+     "text_chars": 230,
+     "index": 7,
+     "kind": "code",
+     "t_start": 1788681516.0764658,
+     "prompt_tokens_client": 369,
+     "prompt_tokens_server": 382,
+     "prompt_chars": 1613,
+     "prompt_tokens": 369
+    }
+   ]
+  },
+  {
+   "workload": "code",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 51.69699586099887,
+    "ttft_s": {
+     "mean": 4.017730832751113,
+     "p50": 4.5047599080062355,
+     "p90": 5.536640852005803,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.14110439626784638,
+     "p50": 0.15552059187295583,
+     "p90": 0.16295321136509763,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 12.907416879000266,
+     "p50": 13.200672195998777,
+     "p90": 13.316467106997152,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 374.375,
+     "p50": 388,
+     "p90": 443,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 9.903863686328085,
+    "req_per_s": 0.15474787009887633,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "code": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 51.69699586099887,
+     "ttft_s": {
+      "mean": 4.017730832751113,
+      "p50": 4.5047599080062355,
+      "p90": 5.536640852005803,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.14110439626784638,
+      "p50": 0.15552059187295583,
+      "p90": 0.16295321136509763,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 12.907416879000266,
+      "p50": 13.200672195998777,
+      "p90": 13.316467106997152,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 374.375,
+      "p50": 388,
+      "p90": 443,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 9.903863686328085,
+     "req_per_s": 0.15474787009887633,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.1153698839989374,
+     "tpot_s": 0.15552059187295583,
+     "latency_s": 12.913293572994007,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 510,
+      "completion_tokens": 64,
+      "total_tokens": 574,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Identified Problems\n\n1.  **Logic Error (Incrementing):** The current code se",
+     "text_chars": 221,
+     "index": 8,
+     "kind": "code",
+     "t_start": 1788681532.285632,
+     "prompt_tokens_client": 497,
+     "prompt_tokens_server": 510,
+     "prompt_chars": 2244,
+     "prompt_tokens": 497
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.355400530999759,
+     "tpot_s": 0.1217894728094781,
+     "latency_s": 13.02824166299979,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 296,
+      "completion_tokens": 64,
+      "total_tokens": 360,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Identified Problems\n\n1.  **Logic Error (Incrementing):** The `if/else` logic",
+     "text_chars": 230,
+     "index": 9,
+     "kind": "code",
+     "t_start": 1788681532.285859,
+     "prompt_tokens_client": 283,
+     "prompt_tokens_server": 296,
+     "prompt_chars": 1206,
+     "prompt_tokens": 283
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.0863273340000887,
+     "tpot_s": 0.15953945436506597,
+     "latency_s": 12.137420769002347,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 257,
+      "completion_tokens": 64,
+      "total_tokens": 321,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```sql\n/*\nAPPROACH:\nTo ensure correctness and performance, we use a two-step agg",
+     "text_chars": 252,
+     "index": 10,
+     "kind": "code",
+     "t_start": 1788681545.200689,
+     "prompt_tokens_client": 244,
+     "prompt_tokens_server": 257,
+     "prompt_chars": 1145,
+     "prompt_tokens": 244
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.5047599080062355,
+     "tpot_s": 0.12117442877772394,
+     "latency_s": 12.13886661700235,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 355,
+      "completion_tokens": 64,
+      "total_tokens": 419,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Since the original prompt asks for a fix to a SQL query but provides context reg",
+     "text_chars": 322,
+     "index": 11,
+     "kind": "code",
+     "t_start": 1788681545.31525,
+     "prompt_tokens_client": 342,
+     "prompt_tokens_server": 355,
+     "prompt_chars": 1536,
+     "prompt_tokens": 342
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.9345143899990944,
+     "tpot_s": 0.16295321136509763,
+     "latency_s": 13.200672195998777,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 434,
+      "completion_tokens": 64,
+      "total_tokens": 498,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```javascript\n/**\n * Returns a debounced version of the provided function.\n * \n ",
+     "text_chars": 248,
+     "index": 12,
+     "kind": "code",
+     "t_start": 1788681557.3394804,
+     "prompt_tokens_client": 421,
+     "prompt_tokens_server": 434,
+     "prompt_chars": 2070,
+     "prompt_tokens": 421
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.536640852005803,
+     "tpot_s": 0.12166645911109675,
+     "latency_s": 13.201737066003261,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 390,
+      "completion_tokens": 64,
+      "total_tokens": 454,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nclass LRUCache:\n    \"\"\"\n    An LRU Cache implementation using a Hash M",
+     "text_chars": 232,
+     "index": 13,
+     "kind": "code",
+     "t_start": 1788681557.455363,
+     "prompt_tokens_client": 377,
+     "prompt_tokens_server": 390,
+     "prompt_chars": 1649,
+     "prompt_tokens": 377
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.000235025996517,
+     "tpot_s": 0.1637479264285907,
+     "latency_s": 13.316467106997152,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 456,
+      "completion_tokens": 64,
+      "total_tokens": 520,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```javascript\n/**\n * Calculates the sum of the 'price' field across an array of ",
+     "text_chars": 244,
+     "index": 14,
+     "kind": "code",
+     "t_start": 1788681570.541765,
+     "prompt_tokens_client": 443,
+     "prompt_tokens_server": 456,
+     "prompt_chars": 1994,
+     "prompt_tokens": 443
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.608598737002467,
+     "tpot_s": 0.12244362541276219,
+     "latency_s": 13.322636041004444,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 401,
+      "completion_tokens": 64,
+      "total_tokens": 465,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```sql\n/*\n * This query calculates customer engagement metrics per country for t",
+     "text_chars": 262,
+     "index": 15,
+     "kind": "code",
+     "t_start": 1788681570.658409,
+     "prompt_tokens_client": 388,
+     "prompt_tokens_server": 401,
+     "prompt_chars": 1793,
+     "prompt_tokens": 388
+    }
+   ]
+  },
+  {
+   "workload": "code",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 46.13450431000092,
+    "ttft_s": {
+     "mean": 5.871230968001328,
+     "p50": 5.5952957090048585,
+     "p90": 8.451346044996171,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.2707450761825327,
+     "p50": 0.27671521398414844,
+     "p90": 0.3179547501428123,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 22.928274785125723,
+     "p50": 23.038283055997454,
+     "p90": 25.76343901099608,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 401.375,
+     "p50": 435,
+     "p90": 452,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 11.09798420201103,
+    "req_per_s": 0.17340600315642235,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "code": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 46.13450431000092,
+     "ttft_s": {
+      "mean": 5.871230968001328,
+      "p50": 5.5952957090048585,
+      "p90": 8.451346044996171,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.2707450761825327,
+      "p50": 0.27671521398414844,
+      "p90": 0.3179547501428123,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 22.928274785125723,
+      "p50": 23.038283055997454,
+      "p90": 25.76343901099608,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 401.375,
+      "p50": 435,
+      "p90": 452,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 11.09798420201103,
+     "req_per_s": 0.17340600315642235,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.5951931909949053,
+     "tpot_s": 0.32449181285714046,
+     "latency_s": 23.038283055997454,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 388,
+      "completion_tokens": 64,
+      "total_tokens": 452,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```javascript\nfunction totalPrice(items) {\n    // Handle cases where items is nu",
+     "text_chars": 218,
+     "index": 16,
+     "kind": "code",
+     "t_start": 1788681592.245818,
+     "prompt_tokens_client": 375,
+     "prompt_tokens_server": 388,
+     "prompt_chars": 1699,
+     "prompt_tokens": 375
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.478589698999713,
+     "tpot_s": 0.2816718964445283,
+     "latency_s": 23.224045028000546,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 448,
+      "completion_tokens": 64,
+      "total_tokens": 512,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport logging\n\n# Configure logging for operations to monitor malforme",
+     "text_chars": 268,
+     "index": 17,
+     "kind": "code",
+     "t_start": 1788681592.2461076,
+     "prompt_tokens_client": 435,
+     "prompt_tokens_server": 448,
+     "prompt_chars": 2040,
+     "prompt_tokens": 435
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 8.451346044996171,
+     "tpot_s": 0.27479400838095147,
+     "latency_s": 25.76343901099608,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 451,
+      "completion_tokens": 64,
+      "total_tokens": 515,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```rust\nuse std::fmt;\n\n/// Represents specific failures encountered during the p",
+     "text_chars": 272,
+     "index": 18,
+     "kind": "code",
+     "t_start": 1788681592.2463245,
+     "prompt_tokens_client": 438,
+     "prompt_tokens_server": 451,
+     "prompt_chars": 2053,
+     "prompt_tokens": 438
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 11.570006986999942,
+     "tpot_s": 0.27671521398414844,
+     "latency_s": 29.00313660300162,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 465,
+      "completion_tokens": 64,
+      "total_tokens": 529,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```go\npackage retry\n\nimport (\n    \"context\"\n    \"errors\"\n    \"fmt\"\n    \"log\"\n   ",
+     "text_chars": 196,
+     "index": 19,
+     "kind": "code",
+     "t_start": 1788681592.2470546,
+     "prompt_tokens_client": 452,
+     "prompt_tokens_server": 465,
+     "prompt_chars": 2120,
+     "prompt_tokens": 452
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.508421675003774,
+     "tpot_s": 0.3179547501428123,
+     "latency_s": 22.53968390299997,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 341,
+      "completion_tokens": 64,
+      "total_tokens": 405,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Identified Problems\n\n1.  **Logic Error (Incrementing):** The `if/else` block",
+     "text_chars": 228,
+     "index": 20,
+     "kind": "code",
+     "t_start": 1788681615.2856076,
+     "prompt_tokens_client": 328,
+     "prompt_tokens_server": 341,
+     "prompt_chars": 1467,
+     "prompt_tokens": 328
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.5952957090048585,
+     "tpot_s": 0.2690348705078895,
+     "latency_s": 22.544607334006287,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 502,
+      "completion_tokens": 64,
+      "total_tokens": 566,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```go\n// process converts a slice of strings to uppercase concurrently.\n// It pr",
+     "text_chars": 272,
+     "index": 21,
+     "kind": "code",
+     "t_start": 1788681615.471702,
+     "prompt_tokens_client": 489,
+     "prompt_tokens_server": 502,
+     "prompt_chars": 2233,
+     "prompt_tokens": 489
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.785656363004819,
+     "tpot_s": 0.2285738813491965,
+     "latency_s": 20.18592951800383,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 388,
+      "completion_tokens": 64,
+      "total_tokens": 452,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\ndef median(numbers):\n    \"\"\"\n    Calculates the median value of a non-",
+     "text_chars": 262,
+     "index": 22,
+     "kind": "code",
+     "t_start": 1788681618.0113556,
+     "prompt_tokens_client": 375,
+     "prompt_tokens_server": 388,
+     "prompt_chars": 1639,
+     "prompt_tokens": 375
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.985338075006439,
+     "tpot_s": 0.1927241757935946,
+     "latency_s": 17.127073827999993,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 332,
+      "completion_tokens": 64,
+      "total_tokens": 396,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```sql\n/*\n * Calculates customer engagement and spending metrics per country for",
+     "text_chars": 229,
+     "index": 23,
+     "kind": "code",
+     "t_start": 1788681621.2518375,
+     "prompt_tokens_client": 319,
+     "prompt_tokens_server": 332,
+     "prompt_chars": 1491,
+     "prompt_tokens": 319
+    }
+   ]
+  },
+  {
+   "workload": "code",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 40.87998372500442,
+    "ttft_s": {
+     "mean": 11.42702304062459,
+     "p50": 12.671269940001366,
+     "p90": 18.29040754699963,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.4510230196428171,
+     "p50": 0.4733318765078337,
+     "p90": 0.5466668767935877,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 39.841586175123666,
+     "p50": 39.9925849259962,
+     "p90": 40.602663965997635,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 359.25,
+     "p50": 374,
+     "p90": 408,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 12.524466825725103,
+    "req_per_s": 0.19569479415195473,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "code": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 40.87998372500442,
+     "ttft_s": {
+      "mean": 11.42702304062459,
+      "p50": 12.671269940001366,
+      "p90": 18.29040754699963,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.4510230196428171,
+      "p50": 0.4733318765078337,
+      "p90": 0.5466668767935877,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 39.841586175123666,
+      "p50": 39.9925849259962,
+      "p90": 40.602663965997635,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 359.25,
+      "p50": 374,
+      "p90": 408,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 12.524466825725103,
+     "req_per_s": 0.19569479415195473,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.4513161520007998,
+     "tpot_s": 0.576460743523808,
+     "latency_s": 38.768457464000676,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 367,
+      "completion_tokens": 64,
+      "total_tokens": 431,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport string\nfrom collections import Counter\n\ndef top_words(text):\n  ",
+     "text_chars": 256,
+     "index": 24,
+     "kind": "code",
+     "t_start": 1788681646.5816977,
+     "prompt_tokens_client": 354,
+     "prompt_tokens_server": 367,
+     "prompt_chars": 1537,
+     "prompt_tokens": 354
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 21.27551693299756,
+     "tpot_s": 0.3111514086825385,
+     "latency_s": 40.87815773799957,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 421,
+      "completion_tokens": 64,
+      "total_tokens": 485,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```rust\nfn lower_bound(xs: &[i32], target: i32) -> Option<usize> {\n    // Handle",
+     "text_chars": 197,
+     "index": 25,
+     "kind": "code",
+     "t_start": 1788681646.58195,
+     "prompt_tokens_client": 408,
+     "prompt_tokens_server": 421,
+     "prompt_chars": 1655,
+     "prompt_tokens": 408
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 15.077621182994335,
+     "tpot_s": 0.4006722429841166,
+     "latency_s": 40.32008797999879,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 292,
+      "completion_tokens": 64,
+      "total_tokens": 356,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```rust\n/// Finds the index of the first element in a sorted slice that is great",
+     "text_chars": 219,
+     "index": 26,
+     "kind": "code",
+     "t_start": 1788681646.5820847,
+     "prompt_tokens_client": 279,
+     "prompt_tokens_server": 292,
+     "prompt_chars": 1047,
+     "prompt_tokens": 279
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.627811284000927,
+     "tpot_s": 0.5466668767935877,
+     "latency_s": 39.06793037599709,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 291,
+      "completion_tokens": 64,
+      "total_tokens": 355,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```bash\n#!/bin/bash\n\n# Check if exactly one argument is provided\nif [ \"$#\" -ne 1",
+     "text_chars": 208,
+     "index": 27,
+     "kind": "code",
+     "t_start": 1788681646.5822387,
+     "prompt_tokens_client": 278,
+     "prompt_tokens_server": 291,
+     "prompt_chars": 1314,
+     "prompt_tokens": 278
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 7.140203310998913,
+     "tpot_s": 0.5120702853015419,
+     "latency_s": 39.40074797700072,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 357,
+      "completion_tokens": 64,
+      "total_tokens": 421,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport string\nfrom collections import Counter\n\ndef get_top_three_words",
+     "text_chars": 246,
+     "index": 28,
+     "kind": "code",
+     "t_start": 1788681646.5823867,
+     "prompt_tokens_client": 344,
+     "prompt_tokens_server": 357,
+     "prompt_chars": 1460,
+     "prompt_tokens": 344
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.671269940001366,
+     "tpot_s": 0.43366966674592633,
+     "latency_s": 39.9925849259962,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 399,
+      "completion_tokens": 64,
+      "total_tokens": 463,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```javascript\n/**\n * Calculates the sum of the 'price' property for all items in",
+     "text_chars": 259,
+     "index": 29,
+     "kind": "code",
+     "t_start": 1788681646.5837579,
+     "prompt_tokens_client": 386,
+     "prompt_tokens_server": 399,
+     "prompt_chars": 1729,
+     "prompt_tokens": 386
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 9.882037975003186,
+     "tpot_s": 0.4733318765078337,
+     "latency_s": 39.702058973998646,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 387,
+      "completion_tokens": 64,
+      "total_tokens": 451,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```rust\nuse std::collections::{BinaryHeap, HashMap};\nuse std::cmp::Ordering;\n\n//",
+     "text_chars": 236,
+     "index": 30,
+     "kind": "code",
+     "t_start": 1788681646.5840619,
+     "prompt_tokens_client": 374,
+     "prompt_tokens_server": 387,
+     "prompt_chars": 1713,
+     "prompt_tokens": 374
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 18.29040754699963,
+     "tpot_s": 0.35416105660318403,
+     "latency_s": 40.602663965997635,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 464,
+      "completion_tokens": 64,
+      "total_tokens": 528,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport asyncio\nimport aiohttp\n\nasync def fetch_all(session, urls):\n   ",
+     "text_chars": 267,
+     "index": 31,
+     "kind": "code",
+     "t_start": 1788681646.584467,
+     "prompt_tokens_client": 451,
+     "prompt_tokens_server": 464,
+     "prompt_chars": 2105,
+     "prompt_tokens": 451
+    }
+   ]
+  }
+ ]
+}
