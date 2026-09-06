@@ -3,7 +3,8 @@
 Box: Sapphire Rapids, 8 cores / 16 threads, 58 GB, AVX-512 + AMX. All figures are **through the
 OpenAI API** (`plowrt serve`, `llama-server`, `vllm serve`), `tools/bench-api/bench.py` with
 `--fresh-prompts`, 8 requests per cell, 64 max tokens, one server at a time on a quiet box, matched
-server slots (8 everywhere). TTFT and TPOT are means in ms.
+server slots (8 everywhere). TTFT and TPOT are means in ms. Raw JSON and per-run Markdown
+were removed after consolidation.
 
 Read the per-model files for the full 16-cell tables: `cpu-gptoss/SUMMARY.md`,
 `cpu-gemma26b/h2h/SUMMARY.md`, `cpu-gemma26b/llamacpp/SUMMARY.md`, `cpu-gemma/h2h/SUMMARY.md`.
@@ -15,7 +16,7 @@ Read the per-model files for the full 16-cell tables: `cpu-gptoss/SUMMARY.md`,
 | GPT-OSS-20B MXFP4, decode c=1 | 24-25 | 41-59 | 71-76 | win both, 1.7-3.0x |
 | GPT-OSS-20B MXFP4, TTFT | wins 14/16 vs both | | | win |
 | GPT-OSS-20B MXFP4, decode c>=4 long | 142-195 | 177-430 | 137-153 | beats llama, loses vLLM |
-| Gemma-4-26B-A4B MXFP4, decode c=1 | 41-45 | 50-63 | cannot load | win vs llama |
+| Gemma-4-26B-A4B MXFP4, decode c=1 | 35-38 | 50-63 | cannot load | win vs llama |
 | Gemma-4-26B-A4B MXFP4, TTFT | wins all 16 vs llama | | cannot load | win |
 | Gemma-4-12B MXFP4, decode c=1 | 88 | 121 | 460 | win both, 1.38x / 5.2x |
 | Gemma-4-12B bf16, decode c=1 | 232 | 267 | 460 | win both, 1.15x / 2.0x |
@@ -56,6 +57,8 @@ kernels.
 | Worker width per model (physical for MoE, logical for dense) | GPT-OSS prefill 399 -> 455 tok/s |
 | AMX pack-free prefill GEMM (weights as the A operand) | GEMM +21-33%, no weight pack at all |
 | Kernel asm pass (spills, MXFP4 dequant, attention, Gemma MoE) | decode 1.2-2.2x per op |
+| Gemma AVX-512 router scoring | TTFT -29-54%, TPOT -7-38% across 12 serve cells |
+| Experimental int16 VNNI MXFP4 decode (opt-in) | GPT-OSS c=1 decode 24-25 -> 22-23 ms |
 
 ## Methodology notes that cost real time
 

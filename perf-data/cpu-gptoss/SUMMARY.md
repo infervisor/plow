@@ -223,3 +223,19 @@ prompt, while ours alternates. For chat_long at c=8 our 3512 prefill tokens cost
 64 rung-8 decode steps cost 9.7 s, which serialize to 18.4 s against vLLM's 13.25 s; fusing the decode
 rows into the prefill pass gives max(8.7, 9.7) = 9.7 s, i.e. 1.37x ahead. That remains the one
 structural item, and a GEMM does not care about sequence boundaries -- only attention needs the split.
+
+
+## Experimental int16 VNNI MXFP4 decode (commit 53d4f3d, opt-in)
+
+`PLOW_MXFP4_INT16=1` converts MXFP4 blocks to int16 and uses VNNI for decode. It remains
+off by default. Fresh-prompt results; TTFT / TPOT mean ms:
+
+| workload | c=1 | c=2 | c=4 | c=8 |
+|---|---:|---:|---:|---:|
+| chat_short | 350 / 22 | 485 / 41 | 788 / 64 | 1710 / 110 |
+| chat_long | 960 / 22 | 1375 / 53 | 2115 / 84 | 4329 / 171 |
+| code | 811 / 23 | 1286 / 42 | 1872 / 81 | 3667 / 149 |
+| summarize | 2333 / 23 | 2721 / 76 | 4464 / 139 | 10752 / 246 |
+
+The opt-in path improves default MXFP4 decode from 24-25 ms to 22-23 ms at c=1 and
+from 142-288 ms to 110-246 ms at c=8. Sampled outputs remained coherent in this campaign.

@@ -116,3 +116,55 @@ must materialise ~47 GB of weights on a 58 GB machine. plow serves the same mode
 MXFP4 twin at ~21 GB resident, answers correctly, and beats both llama.cpp builds on every TTFT
 cell and every c<=2 decode cell. For this model the vLLM comparison is therefore not a latency
 number but a capability one.
+
+
+## AVX-512 router scoring (commit d2dc0af)
+
+The Gemma MoE router scoring GEMV previously fell through to the scalar kernel. The AVX-512
+arm produced these fresh-prompt TTFT / TPOT means in ms:
+
+| workload | c=1 | c=2 | c=4 | c=8 |
+|---|---:|---:|---:|---:|
+| chat_short | 331 / 35 | 487 / 58 | 804 / 87 | 1705 / 125 |
+| chat_long | 1019 / 38 | 1335 / 68 | 1883 / 106 | 4538 / 191 |
+| code | 919 / 38 | 1851 / 69 | 2892 / 128 | 4184 / 167 |
+
+Against the balanced-MoE campaign, TTFT fell 29-54% and TPOT fell 7-38% across these
+12 cells. The c=1 decode range is now 35-38 ms vs llama.cpp's 50-63 ms.
+
+## After the vectorized MoE router (commit d2dc0af, 19:5x)
+
+Op 73 had no AVX-512 arm, so the router's 128x2816 scoring GEMV ran scalar and accounted for 56% of
+all 26B prefill work (1193 of 2118 ms/thread). With the vector arm it is 24 ms/thread, prefill wall
+for 512 tokens went 2304 -> 1005 ms, and single-stream prefill went 201.5 -> 465.1 tok/s. Lossless:
+selected expert ids are bit-identical to golden, tie order included. Decode is unchanged.
+
+Against the FAIR llama.cpp Q4_K_M baseline (8 server slots, matching our 8 and the benchmark
+concurrency). TTFT / TPOT means in ms; bold = plow wins.
+
+| workload | conc | plow TTFT | Q4_K_M TTFT | plow TPOT | Q4_K_M TPOT |
+|---|---|---|---|---|---|
+| chat_short | 1 | **331** | 649 | **35** | 50 |
+| chat_short | 2 | **487** | 1226 | **58** | 80 |
+| chat_short | 4 | **804** | 2302 | **87** | 111 |
+| chat_short | 8 | **1705** | 4948 | **125** | 178 |
+| chat_long | 1 | **1019** | 4187 | **38** | 52 |
+| chat_long | 2 | **1335** | 7009 | **68** | 125 |
+| chat_long | 4 | **1883** | 11944 | **106** | 237 |
+| chat_long | 8 | **4538** | 34445 | **191** | 217 |
+| code | 1 | **919** | 3858 | **38** | 52 |
+| code | 2 | **1851** | 7914 | **69** | 90 |
+| code | 4 | **2892** | 15773 | **128** | 185 |
+| code | 8 | **4184** | 32080 | **167** | 183 |
+| summarize | 1 | **2806** | 11237 | **40** | 56 |
+| summarize | 2 | **3396** | 23241 | **97** | 105 |
+| summarize | 4 | **5905** | 47619 | 191 | 172 |
+| summarize | 8 | **16562** | 92495 | 389 | 257 |
+
+plow wins 16 of 16 TTFT cells and 14 of 16 TPOT cells, i.e. **30 of 32 against llama.cpp**, up from
+roughly 24 before the router fix. The only remaining losses are summarize TPOT at c=4 and c=8, where
+1100-token prompts mean decode still waits behind other slots' prefills - the same prefill-interference
+term as GPT-OSS, and the thing prefill+decode fusion would remove.
+
+Single-stream cpu_bench after the fix: prefill 241.3 / 326.3 / 465.1 tok/s at 64 / 128 / 512 prompt
+tokens (was 128.8 / 171.1 / 201.5), decode p50 35.1-37.0 ms (unchanged).
