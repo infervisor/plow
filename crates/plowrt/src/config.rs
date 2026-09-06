@@ -683,6 +683,10 @@ impl RuntimeConfig {
         std::env::var(var).ok()?.parse().ok()
     }
 
+    fn env_nonempty(var: &str) -> Option<String> {
+        std::env::var(var).ok().filter(|value| !value.is_empty())
+    }
+
     #[cfg(feature = "cuda")]
     pub(crate) fn nv_vmm_live(&self) -> bool {
         select_compat(
@@ -741,7 +745,7 @@ impl RuntimeConfig {
     pub(crate) fn nv_dev_sample(&self) -> Option<String> {
         select_compat(
             self.nv.dev_sample.clone(),
-            std::env::var("PLOW_DEV_SAMPLE").ok().map(Some),
+            Self::env_nonempty("PLOW_DEV_SAMPLE").map(Some),
             !Self::is_initialized(),
         )
     }
@@ -750,7 +754,7 @@ impl RuntimeConfig {
     pub(crate) fn nv_cubin_sample(&self) -> Option<String> {
         select_compat(
             self.nv.cubin_sample.clone(),
-            std::env::var("PLOW_NV_CUBIN_SAMPLE").ok().map(Some),
+            Self::env_nonempty("PLOW_NV_CUBIN_SAMPLE").map(Some),
             !Self::is_initialized(),
         )
     }
@@ -782,9 +786,7 @@ impl RuntimeConfig {
 
     #[cfg(feature = "cuda")]
     pub(crate) fn drain_timeout_ms(&self) -> Option<u64> {
-        let environment = std::env::var("PLOW_DRAIN_TIMEOUT_MS")
-            .ok()
-            .map(|value| value.parse().ok());
+        let environment = Self::env_parse("PLOW_DRAIN_TIMEOUT_MS").map(Some);
         select_compat(self.drain_timeout_ms, environment, !Self::is_initialized())
     }
 
@@ -847,7 +849,7 @@ mod tests {
             super::select_compat(Some(7_u64), Some(None), false),
             Some(7)
         );
-        assert_eq!(super::select_compat(Some(7_u64), Some(None), true), None);
+        assert_eq!(super::select_compat(Some(7_u64), None, true), Some(7));
     }
 
     #[test]
