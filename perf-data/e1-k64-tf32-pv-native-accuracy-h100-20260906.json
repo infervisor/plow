@@ -1,0 +1,3134 @@
+{
+  "scope": "Private attention operator, three saved native synthetic-prefix histories at 1025\u20131027 KV rows, BF16 QKV, NS33. No timing or broad/full-model qualification.",
+  "decision": "Advance to unfiltered memory and native operator timing gates. Original BF16PV130 FP64-RNE output mismatches versus candidate0 of24576.",
+  "artifacts": {
+    "HANDOFF.md": {
+      "sha256": "04340e60108c389db7c4ca091c84c29037223a1fc3b24e31caac40f3542e7641",
+      "content": "# K64 QK + two-term TF32 PV: operator-only gate\n\nOne private operator build. No GPU execution, broad interpreter build, production edits or scheduling change. Existing sliding24-job queue is untouched.\n\nCandidate math: retained K64 QK, same FP32 softmax/correction/merge, P_hi=RN_TF32(P), P_lo=RN_TF32(P-P_hi), then low\u00d7BF16V and high\u00d7BF16V MMA contributions into original FP32 output accumulator. Signed low residual is retained. V staging remains the same64-row cp.async tile, identical waits/barriers and tail zero fill. BF16P packing is skipped; allocated arena still126592bytes. B1/HD512/GQA16/NS33 gives33 useful tasks on132CTAs; underfill remains explicit.\n\nActual CPU resource gate: candidateHD512/GF16=124registers/0spills/0stack vs originalBF16PV121. HD512/GF8=85,HD256/GF6=80, zero spills. SASS shows32BF16 QK HMMA plus128TF32 PV HMMA; unchanged merge and scalar fallback instruction text. Compiler emits one unusedPS constant warning because BF16 probability packing is bypassed; no compilation error. Source-isolation proof confirms all code outside privatePV helper region is byte-identical to K64source. No register cap applied.\n\nCoordinates are cross-checked with NVIDIA PTX m16n8k8 TF32 formulas and local CUTLASS SM80 traits. A: row=lane/4+8*(element%2), K=lane%4+4*(element/2). B: K=lane%4+4*element, N=lane/4. Accumulator mapping matches the existing kernel. CPU195shape/tailcases include all0..64 live rows forHD512/GF16,HD512/GF8,HD256/GF6; signed residual and nearest-even checks pass;65,280finiteBF16 bit patterns are exactly representable inTF32. These prove indexing/representation, not GPU accumulation or subnormal execution behavior.\n\nPrimary source: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-1688\nLocal reference: /opt/pytorch/lib/python3.13/site-packages/tilelang/3rdparty/cutlass/include/cute/atom/mma_traits_sm80.hpp:163 and cute/arch/mma_sm80.hpp:290.\n\nThe single queue job reuses qwen_primitives saved-native mode and the qualified explicit-primary-context launcher. Three actual captured native histories \u00d7 originalBF16PV/candidate =six cells, each with two exact repeats, finite/outercanary checks and unchanged .003 native bound. Control merged output must match the captured originalBF16PV broad output. Both arms write all Opart/MLpart/BF16 outputs. No FA or timing calls occur.\n\nThe explicit CPU validator verifies provenance/library identity and recomputes normalized per-split FP64 reference on exact savedQKV. It requires fewer total RNE mismatches than originalBF16PV, no per-history mismatch-count regression, and at least2\u00d7 reduction in worst normalized-partial relative error. This is an additional experiment advancement criterion, not a relaxed original gate. It preserves full diagnostic rows even if accuracy improvement fails. Initial histories have limited synthetic V diversity; no full-model accuracy claim.\n\nRoot runs gpu-queue.json serially then its explicit validator. GPU memory and timing remain subsequent gates; do not build broad until this numeric/resource result is reviewed.\n"
+    },
+    "kernel.patch": {
+      "sha256": "1e8bb903c6ec25434d0c91f27d36245edb13b517ea1ad72a6ce66e5f8b6aac35",
+      "content": "--- k64-control/op_attention.cuh\n+++ artifact/op_attention.cuh\n@@ -471,6 +471,25 @@\n #endif\n \n \n+#ifndef E1_PV_TF32_HILO\n+#define E1_PV_TF32_HILO 0\n+#endif\n+#if E1_PV_TF32_HILO\n+__device__ __forceinline__ unsigned fa_pv_tf32_rn(float value) {\n+    unsigned bits;\n+    asm volatile(\"cvt.rn.tf32.f32 %0, %1;\" : \"=r\"(bits) : \"f\"(value));\n+    return bits;\n+}\n+__device__ __forceinline__ void fa_pv_mma_tf32(float (&d)[4], const unsigned (&a)[4],\n+    const unsigned (&b)[2], const float (&c)[4]) {\n+    asm volatile(\"mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 \"\n+                 \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\"\n+        : \"=f\"(d[0]), \"=f\"(d[1]), \"=f\"(d[2]), \"=f\"(d[3])\n+        : \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"r\"(b[0]), \"r\"(b[1]),\n+          \"f\"(c[0]), \"f\"(c[1]), \"f\"(c[2]), \"f\"(c[3]));\n+}\n+#endif\n+\n #if PLOW_NV_FA_PV_TC\n template <int D, int GF>\n __device__ __forceinline__ void fa_decode_pv_tc(float (&acc)[D / 64][4],\n@@ -487,10 +506,12 @@\n         for (unsigned e = 0; e < 4; ++e) acc[j][e] *= resc[e / 2];\n     for (unsigned first = 0; first < live_rows; first += 64) {\n         const unsigned nr = live_rows - first < 64 ? live_rows - first : 64;\n+#if !E1_PV_TF32_HILO\n         for (unsigned i = tid; i < 16u * 64; i += PLOW_NV_THREADS) {\n             const unsigned g = i / 64, r = i % 64;\n             ptile[g * PS + r] = __float2bfloat16(g < GF && r < nr ? scores[g * FA_DEC_TILE + first + r] : 0.0f);\n         }\n+#endif\n         for (unsigned i = tid; i < 64u * (D / 8); i += PLOW_NV_THREADS) {\n             const unsigned r = i / (D / 8), c = (i % (D / 8)) * 8;\n             const bool live = r < nr;\n@@ -500,6 +521,29 @@\n         fa_cp_commit();\n         fa_cp_wait<0>();\n         __syncthreads();\n+#if E1_PV_TF32_HILO\n+#pragma unroll\n+        for (unsigned k = 0; k < 64; k += 8) {\n+            unsigned hi[4], lo[4];\n+#pragma unroll\n+            for (unsigned e = 0; e < 4; ++e) {\n+                const unsigned g = lane / 4 + (e & 1) * 8;\n+                const unsigned r = k + lane % 4 + (e / 2) * 4;\n+                const float p = g < GF && r < nr ? scores[g * FA_DEC_TILE + first + r] : 0.0f;\n+                hi[e] = fa_pv_tf32_rn(p);\n+                lo[e] = fa_pv_tf32_rn(__fsub_rn(p, __uint_as_float(hi[e])));\n+            }\n+#pragma unroll\n+            for (unsigned j = 0; j < NJ; ++j) {\n+                const unsigned col = (warp * NJ + j) * 8 + lane / 4;\n+                unsigned b[2] = {\n+                    __float_as_uint(__bfloat162float(vtile[(k + lane % 4) * STRIDE + col])),\n+                    __float_as_uint(__bfloat162float(vtile[(k + lane % 4 + 4) * STRIDE + col]))};\n+                fa_pv_mma_tf32(acc[j], lo, b, acc[j]);\n+                fa_pv_mma_tf32(acc[j], hi, b, acc[j]);\n+            }\n+        }\n+#else\n #pragma unroll\n         for (unsigned k = 0; k < 64; k += 16) {\n             unsigned a[4];\n@@ -511,6 +555,7 @@\n                 fa_mma(acc[j], a, b, acc[j]);\n             }\n         }\n+#endif\n         __syncthreads();\n     }\n }\n"
+    },
+    "comparator.patch": {
+      "sha256": "bc1bfc66a26171ecff948dacea01fa537352924ace5c7ed60567e2008913a2b9",
+      "content": "--- previous/qwen_primitives.py\n+++ artifact/qwen_primitives.py\n@@ -7,7 +7,7 @@\n p.add_argument(\"--gdn-step-library\", help=\"benchmark-only recurrent candidate; exact native state/output gate before timing\")\n p.add_argument(\"--gdn-timing-only\", action=\"store_true\", help=\"native recurrent step vs reachable vLLM FLA packed decode, batches1/4/16\")\n p.add_argument(\"--attention-native-replay\", help=\"artifact-only saved native blockQKV numerical replay; noFA or timing\")\n-p.add_argument(\"--attention-control-library\", help=\"matched QK-only native numerical control\")\n+p.add_argument(\"--attention-control-library\", help=\"matched original BF16 QK+PV numerical control\")\n p.add_argument(\"--attention-only\", action=\"store_true\", help=\"native attention vs installed serving FA3/FA4; excludes projections/cache writes\")\n p.add_argument(\"--attention-gf\", type=int, choices=(0,2,4,6,8,16), default=0, help=\"benchmark-only native decode grouping; 0 preserves fixed controls\")\n p.add_argument(\"--attention-native-splits\", default=\"baseline\", help=\"baseline, fill, fill2, fill4, or positive integer; fill targets132 work items\")\n@@ -60,11 +60,11 @@\n     contract=json.loads((audit/\"exact-attention-contract.json\").read_text())\n     assert contract[\"i\"]==[1,16,1,65536,0,33,512,4294967295] and contract[\"scale_f32\"]==1\n     captured=saved.load(\"control\")\n-    captured_qk=saved.load(\"qk-only\")\n+    captured_qk=saved.load(\"qk-pv\")\n     assert args.attention_control_library and torch.cuda.get_device_capability()==(9,0)\n     assert torch.cuda.get_device_properties(0).multi_processor_count==132\n     libraries={\"control\":C.CDLL(args.attention_control_library),\"candidate\":lib}\n-    report=dict(scope=\"existing native attention C ABI bodies andmerge, savedblockQKV; noFA/timing/fullmodel\",rows=[],libraries={n:dict(path=path,sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest()) for n,path in [(\"control\",args.attention_control_library),(\"candidate\",args.library)]})\n+    report=dict(scope=\"existing native attention C ABI bodies andmerge, savedblockQKV; noFA/timing/fullmodel\",candidate_math=\"K64 QK + two-term TF32 PV; unchangedFP32softmax/merge/NS33\",control_math=\"originalBF16QK/PV\",rows=[],libraries={n:dict(path=path,sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest()) for n,path in [(\"control\",args.attention_control_library),(\"candidate\",args.library)]})\n     def save():\n         if args.output:Path(args.output).write_text(json.dumps(report,indent=2)+\"\\n\")\n     def guarded(shape,dtype):\n@@ -95,7 +95,7 @@\n                 first=data\n             bits,part,stat=first;values=fp64.decode(bits).reshape(16,512)\n             native=saved.metrics(cpu[\"act.at\"].reshape(16,512),values);assert native[\"relative_l2\"]<=.003\n-            if arm==\"control\":assert bits.reshape(-1).tobytes()==captured_qk[step][0][\"act.at\"], \"operator control differs from captured QK-only broad output\"\n+            if arm==\"control\":assert bits.reshape(-1).tobytes()==captured_qk[step][0][\"act.at\"], \"operator control differs from captured original BF16 QK+PV broad output\"\n             rec=dict(step=step,arm=arm,length=length,splits=33,scale=1.,kv_stride=65536,mask=4294967295,finite=True,canaries=True,repeats_exact=True,native=native,float64=saved.metrics(truth,values),reference_rne_mismatches=int(np.count_nonzero(bits.reshape(16,512)!=fp64.bf16(truth,\"rne\"))),reference_trunc_mismatches=int(np.count_nonzero(bits.reshape(16,512)!=fp64.bf16(truth,\"trunc\"))))\n             outputs=Path(args.output).parent/(Path(args.output).stem+\"-tensors\");outputs.mkdir(exist_ok=True)\n             for name,data in [(\"out\",bits),(\"opart\",part),(\"mlpart\",stat)]:\n@@ -103,7 +103,7 @@\n             report[\"rows\"].append(rec);outcomes[arm]=values;save()\n         assert saved.metrics(outcomes[\"control\"],outcomes[\"candidate\"])[\"relative_l2\"]<=.003\n     assert len(report[\"rows\"])==6;report[\"passed\"]=True;save()\n-    print(\"PASS native saved-QKV K64 comparison:6cells,2exact repeats, fixed.003nativegate; no timing\")\n+    print(\"PASS native saved-QKV K64 plus TF32 PV comparison:6cells,2exact repeats, fixed.003nativegate; no timing\")\n     return True\n \n def check_attention():\n"
+    },
+    "source-isolation.json": {
+      "sha256": "b2f579ea6d098973a980e754379ca0065cc5f924e1c0f467f82aa99d83b3abb8",
+      "content": {
+        "passed": true,
+        "only_changed_region": "private PV helper/arithmetic, plus TF32 helper declarations",
+        "K64_QK_unchanged": true,
+        "softmax_merge_dispatch_rest_unchanged": true,
+        "V_stage_width": 64,
+        "arena_unchanged": true
+      }
+    },
+    "sass-resources.json": {
+      "sha256": "09cf663fe4c3a96e3566bcd879ea5aa36b54d2fe23ecc155f968a5aa349b86a6",
+      "content": {
+        "variants": {
+          "control": {
+            "sha256": "0f1dec1ec726f4b360118a749a02f74d0d9fe8f19f283777d8fdb9fa92e64d8b",
+            "sass_counts": {
+              "HMMA": 64,
+              "LDL": 0,
+              "STL": 0,
+              "FADD": 69,
+              "F2FP": 7,
+              "LDGSTS": 14,
+              "LDSM": 100
+            },
+            "tf32_mma": 0,
+            "bf16_mma": 64,
+            "function_sass_sha256": "0b8692bf2ba11f11cb4039bab4fcd27484161d9421617f4e4733eada44e36673",
+            "regs": 121,
+            "stack": 0,
+            "static_smem": 1024
+          },
+          "candidate": {
+            "sha256": "2f462128debb16c1f07d329250d5eb2a9ad80d8732609990af0156071556d870",
+            "sass_counts": {
+              "HMMA": 160,
+              "LDL": 0,
+              "STL": 0,
+              "FADD": 133,
+              "F2FP": 64,
+              "LDGSTS": 14,
+              "LDSM": 64
+            },
+            "tf32_mma": 128,
+            "bf16_mma": 32,
+            "function_sass_sha256": "f20b3387727c5d023a1c657057f6d04a771b0d76cf28a8784d23fa4f6fab874c",
+            "regs": 124,
+            "stack": 0,
+            "static_smem": 1024
+          }
+        },
+        "unchanged_instruction_text": {
+          "_Z15attention_mergeILi256EEv13AttentionArgs": true,
+          "_Z15attention_mergeILi512EEv13AttentionArgs": true,
+          "_Z16attention_decodeILi256ELi2EEv13AttentionArgs": true,
+          "_Z16attention_decodeILi512ELi4EEv13AttentionArgs": true
+        },
+        "HD512_dynamic_arena_bytes": 126592,
+        "threads": 256,
+        "grid": 132,
+        "NS": 33,
+        "GF16_B1_useful_tasks": 33
+      }
+    },
+    "layout-proof.json": {
+      "sha256": "b862e472f94a363584da07972c59bcdd8af399da5a72439922410abdc8b69aa4",
+      "content": {
+        "passed": true,
+        "layout_cases": 195,
+        "fragment_A_entries": 128,
+        "fragment_B_entries": 64,
+        "fragment_C_entries": 128,
+        "GF": [
+          16,
+          8,
+          6
+        ],
+        "head_dims": [
+          512,
+          256
+        ],
+        "tails": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63,
+          64
+        ],
+        "signed_residual": true,
+        "finite_bf16_exact_tf32": 65280,
+        "scope": "CPU indexing/representation proof only; does not simulate GPU MMA accumulation/subnormal behavior"
+      }
+    },
+    "FREEZE.json": {
+      "sha256": "57b0d82670a35d5192f755ca73f58b47247162daa4d7c11d6f55234ca1529e5d",
+      "content": {
+        "status": "CPU-ready; GPU unqualified; broad/timing held",
+        "files": {
+          "HANDOFF.md": {
+            "bytes": 3101,
+            "sha256": "04340e60108c389db7c4ca091c84c29037223a1fc3b24e31caac40f3542e7641"
+          },
+          "analyze-accuracy.py": {
+            "bytes": 5219,
+            "sha256": "f436653050a41ffdb50dc3249abe7a112b678d634579487747aefac3a4cc3d7e"
+          },
+          "bf16-pv-control.so": {
+            "bytes": 1579576,
+            "sha256": "0f1dec1ec726f4b360118a749a02f74d0d9fe8f19f283777d8fdb9fa92e64d8b"
+          },
+          "build-command.json": {
+            "bytes": 860,
+            "sha256": "8a9af766c7d2aee1c4e1479359258c6157286b284d7b36e905123dee4f6e50d1"
+          },
+          "build-status.json": {
+            "bytes": 18,
+            "sha256": "df4d721d233a2334088d2d2e0110346ae9e509ff46bf0b379fbcfa85c715af4d"
+          },
+          "build.log": {
+            "bytes": 6246,
+            "sha256": "f83c3bde4854352cab31554fa58ac4dbade14267883645a3e924ced3b588417a"
+          },
+          "build.py": {
+            "bytes": 329,
+            "sha256": "b80bbb5d7aeaacaf76f16ac2a35627555c3de15536a969d1afaa7b660985d8f4"
+          },
+          "candidate.resources.txt": {
+            "bytes": 2287,
+            "sha256": "ba0d0c39eac9bf26976a459140ec76b9afeef1e5c2dcc39fbd233d9e46a39e6b"
+          },
+          "candidate.sass.txt": {
+            "bytes": 6937464,
+            "sha256": "d0e515a230507c5e1e245353468d91a3e595ad892158dfb1480a10bc07e9ef75"
+          },
+          "comparator.patch": {
+            "bytes": 4147,
+            "sha256": "bc1bfc66a26171ecff948dacea01fa537352924ace5c7ed60567e2008913a2b9"
+          },
+          "control.resources.txt": {
+            "bytes": 2287,
+            "sha256": "a4c3cd3463516b6e1eebf1c5ba8ae2bc18c9f7299c0b41812ea89d3eae5a42c6"
+          },
+          "control.sass.txt": {
+            "bytes": 6579288,
+            "sha256": "33ebda7c6db31857adf294fca171a9796a7a89357eaf8abc8b9d78ef82f6a929"
+          },
+          "gpu-queue.json": {
+            "bytes": 1724,
+            "sha256": "5e350460fc3e381a6ae89939922503e535798054573d8d4f5b69c3a54f99bbff"
+          },
+          "k64-tf32-pv.so": {
+            "bytes": 1604152,
+            "sha256": "2f462128debb16c1f07d329250d5eb2a9ad80d8732609990af0156071556d870"
+          },
+          "kernel.patch": {
+            "bytes": 3039,
+            "sha256": "1e8bb903c6ec25434d0c91f27d36245edb13b517ea1ad72a6ce66e5f8b6aac35"
+          },
+          "layout-proof.json": {
+            "bytes": 906,
+            "sha256": "b862e472f94a363584da07972c59bcdd8af399da5a72439922410abdc8b69aa4"
+          },
+          "layout-proof.py": {
+            "bytes": 2538,
+            "sha256": "ad3fdf516b93e417c08f31d3d503490aaa74d7915da6f1be1b99c56e24f150e5"
+          },
+          "primary_context.py": {
+            "bytes": 1488,
+            "sha256": "e057403a0cf9165409e145527c63720565b942b9711218739412d88abe76cd2e"
+          },
+          "qwen_primitives.py": {
+            "bytes": 52411,
+            "sha256": "1a59aeb0f3c83edd4a0989a602df24aa2c85a0c3f0e832d86b14c20e92645ef6"
+          },
+          "reference-provenance.json": {
+            "bytes": 394,
+            "sha256": "0de5d3479df2f423f9ca3cdd078a45110e3a7b4dd13328da95200cd1801cd9fe"
+          },
+          "sass-resources.json": {
+            "bytes": 1381,
+            "sha256": "09cf663fe4c3a96e3566bcd879ea5aa36b54d2fe23ecc155f968a5aa349b86a6"
+          },
+          "saved-input-provenance.json": {
+            "bytes": 34367,
+            "sha256": "e0c5ba08ef7f706bb7bcc8f29974888113b10c0f43110d0a75ffe57caaeacb5e"
+          },
+          "source/runtime/common/control_queue_probe.h": {
+            "bytes": 4734,
+            "sha256": "433db5c952a111da21a823ce14d186f600233bd940080396063ecebaa8575d7c"
+          },
+          "source/runtime/common/decode.h": {
+            "bytes": 1569,
+            "sha256": "444ce685929bd60cfc6fb76272ecb3c0edcd30f2eb8703eb7baf74608e3c3534"
+          },
+          "source/runtime/common/dev_blob.h": {
+            "bytes": 10941,
+            "sha256": "8be2c3734d2dfffb933d819cb4c43eb2c10c639725e59cf0fc2ad2cf3fd1fdb2"
+          },
+          "source/runtime/common/dev_isa.h": {
+            "bytes": 109775,
+            "sha256": "c177dec4fc888e2ced03863c8a2c482a62dfa7a2de2669ec6384ec95279311ed"
+          },
+          "source/runtime/common/dispatch.h": {
+            "bytes": 1224,
+            "sha256": "19018f27b7be4d8d767d97985262f8f2dd5ed13e149f1ca907a1e6cd98d62070"
+          },
+          "source/runtime/common/interp.h": {
+            "bytes": 1133,
+            "sha256": "23b86369065f75b3b728843e9c7f701716712b90fc30a292f88af464a62a6a23"
+          },
+          "source/runtime/common/kernel.h": {
+            "bytes": 3787,
+            "sha256": "00c6dd6618a9e4d8549b9c8b7ce27c81bbaf480d61288a6d2eb10f0c59ee6497"
+          },
+          "source/runtime/common/memmap.h": {
+            "bytes": 4557,
+            "sha256": "c47143732c5204108199d872d6f1d21fcb731f128a32f4bfbab46d8ef738bdd1"
+          },
+          "source/runtime/common/safetensors.h": {
+            "bytes": 4261,
+            "sha256": "8c5a61e3b97211c959b89ff740d49918fb5c7f7b18c7bde89116657a830ff3b2"
+          },
+          "source/runtime/nvidia/dma.cu": {
+            "bytes": 1037,
+            "sha256": "707b0a746f937d3d47dea01e977d2c5d670420479656ee51ddcefb013e02895e"
+          },
+          "source/runtime/nvidia/experiments/fa_gf_full_h100_ab.cu": {
+            "bytes": 28625,
+            "sha256": "15b2d3ae7361291b61ad33927acb714fa6d3926d0de065cf78f98be4f80b5425"
+          },
+          "source/runtime/nvidia/flash.cu": {
+            "bytes": 3901,
+            "sha256": "ad10078c8658cf1cee9bc8b67f811adc0cf5829ddf08114dba725f0f352e1f6b"
+          },
+          "source/runtime/nvidia/gemm.cu": {
+            "bytes": 5275,
+            "sha256": "c73565666b682b88de3dc154ce33a6ffb7dc4d5e1f2e6004776eb2e223560c9a"
+          },
+          "source/runtime/nvidia/gemma_sm120.cu": {
+            "bytes": 45810,
+            "sha256": "3905308f8cb096805d5657a263815b9d90bac1a115c18b301455baac93272beb"
+          },
+          "source/runtime/nvidia/gpu_common.h": {
+            "bytes": 783,
+            "sha256": "797ac2c3089063209d203bbeb2b2e9a6c5b4d756fbda4498bd1f2082778ff011"
+          },
+          "source/runtime/nvidia/interp_sm120.cu": {
+            "bytes": 143193,
+            "sha256": "44f4f5eeeafe6337e12471b2da30ef8eb70128e9b1e34f5f2492888de3a12890"
+          },
+          "source/runtime/nvidia/interp_sm120_poc.cu": {
+            "bytes": 13607,
+            "sha256": "d0d640fd6c9c219e3d5f291bcb94c45ab0bc8e77a7b31278c277fb81debbf029"
+          },
+          "source/runtime/nvidia/interp_sm90a.cu": {
+            "bytes": 1798,
+            "sha256": "7d88bf14fcc6e42e8d7ccdcc112000fb2cb99373c0bfa1a5be8e870a86d555d1"
+          },
+          "source/runtime/nvidia/interp_sm90a_gemv512.cu": {
+            "bytes": 838,
+            "sha256": "fd1a745d84c3e4acc3f5655465899749c627d95aba31d3b7cd5e55c4555e745a"
+          },
+          "source/runtime/nvidia/layout.cu": {
+            "bytes": 4334,
+            "sha256": "273ef8e6904403f5173f57fbb34f02fa92f9962ff8b40f46fdaaaa58642eb584"
+          },
+          "source/runtime/nvidia/op_attention.cuh": {
+            "bytes": 197650,
+            "sha256": "3629208775dbee3a0dfe51c825a857770d965d89d79e5633e250da90042ffee8"
+          },
+          "source/runtime/nvidia/op_attention_sm90.cuh": {
+            "bytes": 47167,
+            "sha256": "82d13d8aad180c81c3b0fa2cf3e8ea6d008d08da47ad1ee9b3dc2e9258f96bca"
+          },
+          "source/runtime/nvidia/op_dsa.cuh": {
+            "bytes": 31052,
+            "sha256": "b6cb35ba9ecc2787c1f5accfde2de35736a34eb8aad1320c205ee62af29cc1f6"
+          },
+          "source/runtime/nvidia/op_elementwise.cuh": {
+            "bytes": 8842,
+            "sha256": "7c63310d5438280cff524293fde75ec08de7347cd48037e2da275c7d2dab5663"
+          },
+          "source/runtime/nvidia/op_gemm.cuh": {
+            "bytes": 144973,
+            "sha256": "861cce8de5c88575e4105282fd4a8098eff6ce91bf8ac4536847135e6870cdfc"
+          },
+          "source/runtime/nvidia/op_gemm_sm90.cuh": {
+            "bytes": 113836,
+            "sha256": "1b5de2a57ec3a6dae38c246a4e7ce5d23d747961aedf11d5771037c3e8fa0dfa"
+          },
+          "source/runtime/nvidia/op_mamba.cuh": {
+            "bytes": 8649,
+            "sha256": "f37ff61085f71542b04f85dc63bf15a0c74a843c0b1576bfafbfeda2a87315db"
+          },
+          "source/runtime/nvidia/op_mla.cuh": {
+            "bytes": 20554,
+            "sha256": "fde05716b1cc47912f4fd38f56cfe6e0441f916cdde90b6accb21efabd446e8e"
+          },
+          "source/runtime/nvidia/op_moe.cuh": {
+            "bytes": 134755,
+            "sha256": "c8430f25cfeb28166d58b9087c5429542594233ee846d2b9b565a2417b526672"
+          },
+          "source/runtime/nvidia/op_moe_sm90.cuh": {
+            "bytes": 26171,
+            "sha256": "0620ab1515bbc5816b7be6da645abd117fc465850093b18d8d19b8dc614a0132"
+          },
+          "source/runtime/nvidia/op_norm.cuh": {
+            "bytes": 51216,
+            "sha256": "d320b65c2e730f841a07d110407c1061d13760971af43e14fa199907ae7ffc78"
+          },
+          "source/runtime/nvidia/op_qwen_gdn.cuh": {
+            "bytes": 13942,
+            "sha256": "ea17af9975f1da3050d0fdc3efa56e82f22291ddb562f0ae934b323c7a66a0be"
+          },
+          "source/runtime/nvidia/register_blackwell.cu": {
+            "bytes": 1866,
+            "sha256": "14e53eb38080865b1389159d28fbda6c747b2e33e3437b256a811f6535bfa8f5"
+          },
+          "source/runtime/nvidia/register_hopper.cu": {
+            "bytes": 3543,
+            "sha256": "6dbb5000eec1bbd1fb6f6935414474b8b01364dc6f52002a8f0636d707c4e961"
+          },
+          "source/runtime/nvidia/register_rtx6000.cu": {
+            "bytes": 4605,
+            "sha256": "65e6e6c62a9304f9859925f88f84bbe6f294e47f7d24ae4daaedd74ccc11ac12"
+          },
+          "source/runtime/nvidia/row.cu": {
+            "bytes": 6451,
+            "sha256": "ba2e941c29b23eb793bdfe7ab51e80425d7e730f2b0d31e7ec9c9f66289990ee"
+          },
+          "source/runtime/nvidia/sample_sm120.cu": {
+            "bytes": 11077,
+            "sha256": "572a7f30928b4432e32d75814412c24d183cce8fe77fb1173d404152bfffc8ac"
+          },
+          "source/runtime/nvidia/sm120_common.cuh": {
+            "bytes": 5922,
+            "sha256": "5cd89fa717633eeb0066840d96ba7913a413443d28f2ae2474b083211afa4e07"
+          },
+          "source/runtime/nvidia/sm90_wgmma.cuh": {
+            "bytes": 21342,
+            "sha256": "73ca9b991d981fd20800c959bf07e21d345e2763530ed7571f7891bc0435a7d9"
+          },
+          "source/runtime/tests/qwen_primitives.py": {
+            "bytes": 46753,
+            "sha256": "d4de543de0fe1ce6f8b6d442c3308002d1c5e11c097d8cb150929602b3ff8803"
+          },
+          "source-isolation.json": {
+            "bytes": 236,
+            "sha256": "b2f579ea6d098973a980e754379ca0065cc5f924e1c0f467f82aa99d83b3abb8"
+          },
+          "test-improvement.py": {
+            "bytes": 981,
+            "sha256": "eb6d66c6a54ca089fbb3b23e132473dda6a5913c9478041dcb912bd1f55e830d"
+          },
+          "test-primary-context.py": {
+            "bytes": 1670,
+            "sha256": "af07def7734db585f07d9fd0e925f10daff6ad6e478bc375abaec7541404b750"
+          },
+          "validate-operator.py": {
+            "bytes": 299,
+            "sha256": "6b8c71a8678c09821158fc64239d17fb791752f8cd1fa03377d2260a22264327"
+          }
+        }
+      }
+    },
+    "gpu-queue.json": {
+      "sha256": "5e350460fc3e381a6ae89939922503e535798054573d8d4f5b69c3a54f99bbff",
+      "content": {
+        "jobs": [
+          {
+            "name": "e1-k64-tf32-pv-saved-native",
+            "kind": "native_attention_operator_numerical",
+            "command": [
+              "sudo",
+              "-n",
+              "env",
+              "-i",
+              "PATH=/usr/local/cuda/bin:/usr/bin:/bin",
+              "LD_LIBRARY_PATH=/tmp/plow-model-support-checks/e0-h100-rebaseline/driver-only:/usr/local/cuda/lib64",
+              "OPENBLAS_NUM_THREADS=1",
+              "/opt/pytorch/bin/python",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/primary_context.py",
+              "--run-gpu",
+              "--attention-only",
+              "--attention-native-replay",
+              "/tmp/plow-model-support-checks/e1-qk-numerical-audit-20260906",
+              "--attention-control-library",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/bf16-pv-control.so",
+              "--library",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/k64-tf32-pv.so",
+              "--output",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical.json"
+            ],
+            "log": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical.log",
+            "output": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical.json",
+            "timeout": 900,
+            "validator_command": [
+              "/opt/pytorch/bin/python3",
+              "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/validate-operator.py"
+            ],
+            "required_returncode": 0,
+            "scope": "Six saved-native operator cells, exactNS33; originalBF16PV vsK64QK+TF32hi/loPV; explicitprimarycontext; noFA/timing/broad"
+          }
+        ],
+        "timing_jobs": [],
+        "status": "CPU-ready numerical arithmetic gate only; no broad build until root accuracy/resource review"
+      }
+    },
+    "accuracy-analysis.json": {
+      "sha256": "946e3c42ae301e17ea73b062094fbdffcd4f8a7e95647fdd2c71d43215047036",
+      "content": {
+        "passed": true,
+        "failure": null,
+        "decision": "Operator accuracy improvement PASS; broad build requires root review",
+        "scope": "Three captured native synthetic-prefix histories; no timing/full-model qualification",
+        "rows": [
+          {
+            "step": 0,
+            "length": 1025,
+            "arms": {
+              "scalar": {
+                "output_vs_fp64": {
+                  "relative_l2": 3.316955908151579e-08,
+                  "max_abs": 1.7366272510171976e-06,
+                  "max_ref": 4.156250000000002,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 5.863175709456535e-08,
+                  "max_abs": 8.419266848136431e-07,
+                  "max_ref": 4.156250000000003,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 4.9530917599634904e-08,
+                  "max_abs": 1.3197660528874167e-06,
+                  "max_ref": 12.82690774548053,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 2.1460406923103495e-07,
+                  "max_abs": 1.7028661762452657e-05,
+                  "max_ref": 23.74621352944241,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": []
+              },
+              "control": {
+                "output_vs_fp64": {
+                  "relative_l2": 3.316955908151579e-08,
+                  "max_abs": 1.7366272510171976e-06,
+                  "max_ref": 4.156250000000002,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 0.0002831160428636947,
+                  "max_abs": 0.003198840378313861,
+                  "max_ref": 4.156250000000003,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 4.5534940159950245e-07,
+                  "max_abs": 7.263302794768833e-06,
+                  "max_ref": 12.82690774548053,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 4.2862584809546153e-07,
+                  "max_abs": 3.18353104304947e-05,
+                  "max_ref": 23.74621352944241,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": []
+              },
+              "candidate": {
+                "output_vs_fp64": {
+                  "relative_l2": 3.316955908151579e-08,
+                  "max_abs": 1.7366272510171976e-06,
+                  "max_ref": 4.156250000000002,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 1.1626259470755817e-07,
+                  "max_abs": 1.3829030840462053e-06,
+                  "max_ref": 4.156250000000003,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 8.57620400091659e-08,
+                  "max_abs": 1.9401958617493165e-06,
+                  "max_ref": 12.82690774548053,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 1.980200407918909e-07,
+                  "max_abs": 1.1433345658673488e-05,
+                  "max_ref": 23.74621352944241,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": []
+              }
+            }
+          },
+          {
+            "step": 1,
+            "length": 1026,
+            "arms": {
+              "scalar": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.0015245345993152525,
+                  "max_abs": 0.012615309855275036,
+                  "max_ref": 4.155750832400932,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 5.929543379834801e-08,
+                  "max_abs": 8.525717483109929e-07,
+                  "max_ref": 5.153704232261815,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 7.510927516246062e-08,
+                  "max_abs": 5.407664973589021e-07,
+                  "max_ref": 10.419732081775374,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 1.008156239206848e-07,
+                  "max_abs": 6.813458988119692e-06,
+                  "max_ref": 26.952500172568627,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": [
+                  {
+                    "head": 1,
+                    "dimension": 89,
+                    "reference": 1.097615703703942,
+                    "rne": 1.09375,
+                    "old_bf16_pv": 1.1015625,
+                    "actual": 1.09375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 175,
+                    "reference": -0.7753580467302018,
+                    "rne": -0.7734375,
+                    "old_bf16_pv": -0.77734375,
+                    "actual": -0.7734375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 208,
+                    "reference": -0.17822060350520053,
+                    "rne": -0.177734375,
+                    "old_bf16_pv": -0.1787109375,
+                    "actual": -0.177734375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 303,
+                    "reference": 1.3398238946756837,
+                    "rne": 1.3359375,
+                    "old_bf16_pv": 1.34375,
+                    "actual": 1.3359375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 420,
+                    "reference": -1.769465554160221,
+                    "rne": -1.765625,
+                    "old_bf16_pv": -1.7734375,
+                    "actual": -1.765625
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 496,
+                    "reference": 0.40721642592598567,
+                    "rne": 0.40625,
+                    "old_bf16_pv": 0.408203125,
+                    "actual": 0.40625
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 105,
+                    "reference": -1.449224341686902,
+                    "rne": -1.453125,
+                    "old_bf16_pv": -1.4453125,
+                    "actual": -1.453125
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 190,
+                    "reference": -0.32715839453390305,
+                    "rne": -0.328125,
+                    "old_bf16_pv": -0.326171875,
+                    "actual": -0.328125
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 389,
+                    "reference": 0.6504060657182846,
+                    "rne": 0.65234375,
+                    "old_bf16_pv": 0.6484375,
+                    "actual": 0.65234375
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 511,
+                    "reference": 0.42090796252382073,
+                    "rne": 0.421875,
+                    "old_bf16_pv": 0.419921875,
+                    "actual": 0.421875
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 148,
+                    "reference": 0.17529208704075053,
+                    "rne": 0.1748046875,
+                    "old_bf16_pv": 0.17578125,
+                    "actual": 0.1748046875
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 228,
+                    "reference": -0.0016213395983392456,
+                    "rne": -0.00162506103515625,
+                    "old_bf16_pv": -0.001617431640625,
+                    "actual": -0.00162506103515625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 11,
+                    "reference": 0.46584547562189454,
+                    "rne": 0.466796875,
+                    "old_bf16_pv": 0.46484375,
+                    "actual": 0.466796875
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 89,
+                    "reference": 1.3398903285707053,
+                    "rne": 1.34375,
+                    "old_bf16_pv": 1.3359375,
+                    "actual": 1.34375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 174,
+                    "reference": 1.011738712244588,
+                    "rne": 1.015625,
+                    "old_bf16_pv": 1.0078125,
+                    "actual": 1.015625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 246,
+                    "reference": -0.8691980259576366,
+                    "rne": -0.87109375,
+                    "old_bf16_pv": -0.8671875,
+                    "actual": -0.87109375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 308,
+                    "reference": 0.013226854784386788,
+                    "rne": 0.01324462890625,
+                    "old_bf16_pv": 0.01318359375,
+                    "actual": 0.01324462890625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 409,
+                    "reference": -0.9316842971622593,
+                    "rne": -0.93359375,
+                    "old_bf16_pv": -0.9296875,
+                    "actual": -0.93359375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 454,
+                    "reference": 0.20361765036711515,
+                    "rne": 0.2041015625,
+                    "old_bf16_pv": 0.203125,
+                    "actual": 0.2041015625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 496,
+                    "reference": 0.46778508214267633,
+                    "rne": 0.46875,
+                    "old_bf16_pv": 0.466796875,
+                    "actual": 0.46875
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 292,
+                    "reference": -0.013153014114188882,
+                    "rne": -0.01312255859375,
+                    "old_bf16_pv": -0.01318359375,
+                    "actual": -0.01312255859375
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 102,
+                    "reference": -1.6133008220758067,
+                    "rne": -1.6171875,
+                    "old_bf16_pv": -1.609375,
+                    "actual": -1.6171875
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 139,
+                    "reference": -0.09399473856253342,
+                    "rne": -0.09423828125,
+                    "old_bf16_pv": -0.09375,
+                    "actual": -0.09423828125
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 161,
+                    "reference": -0.6933818872679254,
+                    "rne": -0.6953125,
+                    "old_bf16_pv": -0.69140625,
+                    "actual": -0.6953125
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 164,
+                    "reference": 0.5957129110379036,
+                    "rne": 0.59765625,
+                    "old_bf16_pv": 0.59375,
+                    "actual": 0.59765625
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 299,
+                    "reference": 1.0586167449986996,
+                    "rne": 1.0625,
+                    "old_bf16_pv": 1.0546875,
+                    "actual": 1.0625
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 470,
+                    "reference": 0.1665041366635186,
+                    "rne": 0.1669921875,
+                    "old_bf16_pv": 0.166015625,
+                    "actual": 0.1669921875
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 39,
+                    "reference": 1.9024096240114863,
+                    "rne": 1.90625,
+                    "old_bf16_pv": 1.8984375,
+                    "actual": 1.90625
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 49,
+                    "reference": 0.9550903777544583,
+                    "rne": 0.95703125,
+                    "old_bf16_pv": 0.953125,
+                    "actual": 0.95703125
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 230,
+                    "reference": -1.449284624011486,
+                    "rne": -1.453125,
+                    "old_bf16_pv": -1.4453125,
+                    "actual": -1.453125
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 254,
+                    "reference": 1.5430208345106298,
+                    "rne": 1.546875,
+                    "old_bf16_pv": 1.5390625,
+                    "actual": 1.546875
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 275,
+                    "reference": -0.5136875751296724,
+                    "rne": -0.515625,
+                    "old_bf16_pv": -0.51171875,
+                    "actual": -0.515625
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 392,
+                    "reference": 0.010834399634886534,
+                    "rne": 0.0108642578125,
+                    "old_bf16_pv": 0.01080322265625,
+                    "actual": 0.0108642578125
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 504,
+                    "reference": -0.5371212538720406,
+                    "rne": -0.5390625,
+                    "old_bf16_pv": -0.53515625,
+                    "actual": -0.5390625
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 241,
+                    "reference": 0.19775470045713728,
+                    "rne": 0.1982421875,
+                    "old_bf16_pv": 0.197265625,
+                    "actual": 0.1982421875
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 183,
+                    "reference": 1.253904949812194,
+                    "rne": 1.25,
+                    "old_bf16_pv": 1.2578125,
+                    "actual": 1.25
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 292,
+                    "reference": -7.720870449592215e-05,
+                    "rne": -7.724761962890625e-05,
+                    "old_bf16_pv": -7.772445678710938e-05,
+                    "actual": -7.724761962890625e-05
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 458,
+                    "reference": 0.7988374758020932,
+                    "rne": 0.80078125,
+                    "old_bf16_pv": 0.796875,
+                    "actual": 0.80078125
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 32,
+                    "reference": 0.5566466735404263,
+                    "rne": 0.55859375,
+                    "old_bf16_pv": 0.5546875,
+                    "actual": 0.55859375
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 77,
+                    "reference": -0.5410216987021391,
+                    "rne": -0.54296875,
+                    "old_bf16_pv": -0.5390625,
+                    "actual": -0.54296875
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 86,
+                    "reference": -1.3164183470808526,
+                    "rne": -1.3203125,
+                    "old_bf16_pv": -1.3125,
+                    "actual": -1.3203125
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 194,
+                    "reference": -0.00035751144281607333,
+                    "rne": -0.0003566741943359375,
+                    "old_bf16_pv": -0.00035858154296875,
+                    "actual": -0.0003566741943359375
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 235,
+                    "reference": -1.0430050412425578,
+                    "rne": -1.046875,
+                    "old_bf16_pv": -1.0390625,
+                    "actual": -1.046875
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 243,
+                    "reference": -0.411147940141494,
+                    "rne": -0.412109375,
+                    "old_bf16_pv": -0.41015625,
+                    "actual": -0.412109375
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 284,
+                    "reference": 0.5644712706212789,
+                    "rne": 0.56640625,
+                    "old_bf16_pv": 0.5625,
+                    "actual": 0.56640625
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 303,
+                    "reference": 1.2226925664042707,
+                    "rne": 1.2265625,
+                    "old_bf16_pv": 1.21875,
+                    "actual": 1.2265625
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 320,
+                    "reference": -0.38380116272606685,
+                    "rne": -0.384765625,
+                    "old_bf16_pv": -0.3828125,
+                    "actual": -0.384765625
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 419,
+                    "reference": 1.1289425915659839,
+                    "rne": 1.1328125,
+                    "old_bf16_pv": 1.125,
+                    "actual": 1.1328125
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 88,
+                    "reference": 0.44434333271460297,
+                    "rne": 0.4453125,
+                    "old_bf16_pv": 0.443359375,
+                    "actual": 0.4453125
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 133,
+                    "reference": -0.21824518211580302,
+                    "rne": -0.2177734375,
+                    "old_bf16_pv": -0.21875,
+                    "actual": -0.2177734375
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 147,
+                    "reference": -0.04064248054186537,
+                    "rne": -0.04052734375,
+                    "old_bf16_pv": -0.040771484375,
+                    "actual": -0.04052734375
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 350,
+                    "reference": 0.09205472775439105,
+                    "rne": 0.09228515625,
+                    "old_bf16_pv": 0.091796875,
+                    "actual": 0.09228515625
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 388,
+                    "reference": 0.9394819353545758,
+                    "rne": 0.94140625,
+                    "old_bf16_pv": 0.9375,
+                    "actual": 0.94140625
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 419,
+                    "reference": -0.7636461969462092,
+                    "rne": -0.76171875,
+                    "old_bf16_pv": -0.765625,
+                    "actual": -0.76171875
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 437,
+                    "reference": -0.2221607787327164,
+                    "rne": -0.2216796875,
+                    "old_bf16_pv": -0.22265625,
+                    "actual": -0.2216796875
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 235,
+                    "reference": -1.074215881047266,
+                    "rne": -1.0703125,
+                    "old_bf16_pv": -1.078125,
+                    "actual": -1.0703125
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 284,
+                    "reference": 0.5800766905236331,
+                    "rne": 0.578125,
+                    "old_bf16_pv": 0.58203125,
+                    "actual": 0.578125
+                  }
+                ]
+              },
+              "control": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.001525028815503382,
+                  "max_abs": 0.012615309855275036,
+                  "max_ref": 4.155750832400932,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 0.00029398038240608163,
+                  "max_abs": 0.004717462486716784,
+                  "max_ref": 5.153704232261815,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 6.03553151451435e-07,
+                  "max_abs": 4.756335920674815e-06,
+                  "max_ref": 10.419732081775374,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 3.3367753374160356e-07,
+                  "max_abs": 1.2983005754918509e-05,
+                  "max_ref": 26.952500172568627,
+                  "exact": false
+                },
+                "rne_mismatches": 57,
+                "native": {
+                  "relative_l2": 0.000415018383556908,
+                  "max_abs": 0.0078125,
+                  "max_ref": 4.15625,
+                  "exact": false
+                },
+                "changed_words": []
+              },
+              "candidate": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.0015245345993152525,
+                  "max_abs": 0.012615309855275036,
+                  "max_ref": 4.155750832400932,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 1.1789122413051119e-07,
+                  "max_abs": 1.555619458137869e-06,
+                  "max_ref": 5.153704232261815,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 1.0606831025634259e-07,
+                  "max_abs": 8.745073314386786e-07,
+                  "max_ref": 10.419732081775374,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 8.3775139827938e-08,
+                  "max_abs": 4.903589340798931e-06,
+                  "max_ref": 26.952500172568627,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": [
+                  {
+                    "head": 1,
+                    "dimension": 89,
+                    "reference": 1.097615703703942,
+                    "rne": 1.09375,
+                    "old_bf16_pv": 1.1015625,
+                    "actual": 1.09375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 175,
+                    "reference": -0.7753580467302018,
+                    "rne": -0.7734375,
+                    "old_bf16_pv": -0.77734375,
+                    "actual": -0.7734375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 208,
+                    "reference": -0.17822060350520053,
+                    "rne": -0.177734375,
+                    "old_bf16_pv": -0.1787109375,
+                    "actual": -0.177734375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 303,
+                    "reference": 1.3398238946756837,
+                    "rne": 1.3359375,
+                    "old_bf16_pv": 1.34375,
+                    "actual": 1.3359375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 420,
+                    "reference": -1.769465554160221,
+                    "rne": -1.765625,
+                    "old_bf16_pv": -1.7734375,
+                    "actual": -1.765625
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 496,
+                    "reference": 0.40721642592598567,
+                    "rne": 0.40625,
+                    "old_bf16_pv": 0.408203125,
+                    "actual": 0.40625
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 105,
+                    "reference": -1.449224341686902,
+                    "rne": -1.453125,
+                    "old_bf16_pv": -1.4453125,
+                    "actual": -1.453125
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 190,
+                    "reference": -0.32715839453390305,
+                    "rne": -0.328125,
+                    "old_bf16_pv": -0.326171875,
+                    "actual": -0.328125
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 389,
+                    "reference": 0.6504060657182846,
+                    "rne": 0.65234375,
+                    "old_bf16_pv": 0.6484375,
+                    "actual": 0.65234375
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 511,
+                    "reference": 0.42090796252382073,
+                    "rne": 0.421875,
+                    "old_bf16_pv": 0.419921875,
+                    "actual": 0.421875
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 148,
+                    "reference": 0.17529208704075053,
+                    "rne": 0.1748046875,
+                    "old_bf16_pv": 0.17578125,
+                    "actual": 0.1748046875
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 228,
+                    "reference": -0.0016213395983392456,
+                    "rne": -0.00162506103515625,
+                    "old_bf16_pv": -0.001617431640625,
+                    "actual": -0.00162506103515625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 11,
+                    "reference": 0.46584547562189454,
+                    "rne": 0.466796875,
+                    "old_bf16_pv": 0.46484375,
+                    "actual": 0.466796875
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 89,
+                    "reference": 1.3398903285707053,
+                    "rne": 1.34375,
+                    "old_bf16_pv": 1.3359375,
+                    "actual": 1.34375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 174,
+                    "reference": 1.011738712244588,
+                    "rne": 1.015625,
+                    "old_bf16_pv": 1.0078125,
+                    "actual": 1.015625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 246,
+                    "reference": -0.8691980259576366,
+                    "rne": -0.87109375,
+                    "old_bf16_pv": -0.8671875,
+                    "actual": -0.87109375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 308,
+                    "reference": 0.013226854784386788,
+                    "rne": 0.01324462890625,
+                    "old_bf16_pv": 0.01318359375,
+                    "actual": 0.01324462890625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 409,
+                    "reference": -0.9316842971622593,
+                    "rne": -0.93359375,
+                    "old_bf16_pv": -0.9296875,
+                    "actual": -0.93359375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 454,
+                    "reference": 0.20361765036711515,
+                    "rne": 0.2041015625,
+                    "old_bf16_pv": 0.203125,
+                    "actual": 0.2041015625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 496,
+                    "reference": 0.46778508214267633,
+                    "rne": 0.46875,
+                    "old_bf16_pv": 0.466796875,
+                    "actual": 0.46875
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 292,
+                    "reference": -0.013153014114188882,
+                    "rne": -0.01312255859375,
+                    "old_bf16_pv": -0.01318359375,
+                    "actual": -0.01312255859375
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 102,
+                    "reference": -1.6133008220758067,
+                    "rne": -1.6171875,
+                    "old_bf16_pv": -1.609375,
+                    "actual": -1.6171875
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 139,
+                    "reference": -0.09399473856253342,
+                    "rne": -0.09423828125,
+                    "old_bf16_pv": -0.09375,
+                    "actual": -0.09423828125
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 161,
+                    "reference": -0.6933818872679254,
+                    "rne": -0.6953125,
+                    "old_bf16_pv": -0.69140625,
+                    "actual": -0.6953125
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 164,
+                    "reference": 0.5957129110379036,
+                    "rne": 0.59765625,
+                    "old_bf16_pv": 0.59375,
+                    "actual": 0.59765625
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 299,
+                    "reference": 1.0586167449986996,
+                    "rne": 1.0625,
+                    "old_bf16_pv": 1.0546875,
+                    "actual": 1.0625
+                  },
+                  {
+                    "head": 6,
+                    "dimension": 470,
+                    "reference": 0.1665041366635186,
+                    "rne": 0.1669921875,
+                    "old_bf16_pv": 0.166015625,
+                    "actual": 0.1669921875
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 39,
+                    "reference": 1.9024096240114863,
+                    "rne": 1.90625,
+                    "old_bf16_pv": 1.8984375,
+                    "actual": 1.90625
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 49,
+                    "reference": 0.9550903777544583,
+                    "rne": 0.95703125,
+                    "old_bf16_pv": 0.953125,
+                    "actual": 0.95703125
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 230,
+                    "reference": -1.449284624011486,
+                    "rne": -1.453125,
+                    "old_bf16_pv": -1.4453125,
+                    "actual": -1.453125
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 254,
+                    "reference": 1.5430208345106298,
+                    "rne": 1.546875,
+                    "old_bf16_pv": 1.5390625,
+                    "actual": 1.546875
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 275,
+                    "reference": -0.5136875751296724,
+                    "rne": -0.515625,
+                    "old_bf16_pv": -0.51171875,
+                    "actual": -0.515625
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 392,
+                    "reference": 0.010834399634886534,
+                    "rne": 0.0108642578125,
+                    "old_bf16_pv": 0.01080322265625,
+                    "actual": 0.0108642578125
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 504,
+                    "reference": -0.5371212538720406,
+                    "rne": -0.5390625,
+                    "old_bf16_pv": -0.53515625,
+                    "actual": -0.5390625
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 241,
+                    "reference": 0.19775470045713728,
+                    "rne": 0.1982421875,
+                    "old_bf16_pv": 0.197265625,
+                    "actual": 0.1982421875
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 183,
+                    "reference": 1.253904949812194,
+                    "rne": 1.25,
+                    "old_bf16_pv": 1.2578125,
+                    "actual": 1.25
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 292,
+                    "reference": -7.720870449592215e-05,
+                    "rne": -7.724761962890625e-05,
+                    "old_bf16_pv": -7.772445678710938e-05,
+                    "actual": -7.724761962890625e-05
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 458,
+                    "reference": 0.7988374758020932,
+                    "rne": 0.80078125,
+                    "old_bf16_pv": 0.796875,
+                    "actual": 0.80078125
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 32,
+                    "reference": 0.5566466735404263,
+                    "rne": 0.55859375,
+                    "old_bf16_pv": 0.5546875,
+                    "actual": 0.55859375
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 77,
+                    "reference": -0.5410216987021391,
+                    "rne": -0.54296875,
+                    "old_bf16_pv": -0.5390625,
+                    "actual": -0.54296875
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 86,
+                    "reference": -1.3164183470808526,
+                    "rne": -1.3203125,
+                    "old_bf16_pv": -1.3125,
+                    "actual": -1.3203125
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 194,
+                    "reference": -0.00035751144281607333,
+                    "rne": -0.0003566741943359375,
+                    "old_bf16_pv": -0.00035858154296875,
+                    "actual": -0.0003566741943359375
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 235,
+                    "reference": -1.0430050412425578,
+                    "rne": -1.046875,
+                    "old_bf16_pv": -1.0390625,
+                    "actual": -1.046875
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 243,
+                    "reference": -0.411147940141494,
+                    "rne": -0.412109375,
+                    "old_bf16_pv": -0.41015625,
+                    "actual": -0.412109375
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 284,
+                    "reference": 0.5644712706212789,
+                    "rne": 0.56640625,
+                    "old_bf16_pv": 0.5625,
+                    "actual": 0.56640625
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 303,
+                    "reference": 1.2226925664042707,
+                    "rne": 1.2265625,
+                    "old_bf16_pv": 1.21875,
+                    "actual": 1.2265625
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 320,
+                    "reference": -0.38380116272606685,
+                    "rne": -0.384765625,
+                    "old_bf16_pv": -0.3828125,
+                    "actual": -0.384765625
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 419,
+                    "reference": 1.1289425915659839,
+                    "rne": 1.1328125,
+                    "old_bf16_pv": 1.125,
+                    "actual": 1.1328125
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 88,
+                    "reference": 0.44434333271460297,
+                    "rne": 0.4453125,
+                    "old_bf16_pv": 0.443359375,
+                    "actual": 0.4453125
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 133,
+                    "reference": -0.21824518211580302,
+                    "rne": -0.2177734375,
+                    "old_bf16_pv": -0.21875,
+                    "actual": -0.2177734375
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 147,
+                    "reference": -0.04064248054186537,
+                    "rne": -0.04052734375,
+                    "old_bf16_pv": -0.040771484375,
+                    "actual": -0.04052734375
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 350,
+                    "reference": 0.09205472775439105,
+                    "rne": 0.09228515625,
+                    "old_bf16_pv": 0.091796875,
+                    "actual": 0.09228515625
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 388,
+                    "reference": 0.9394819353545758,
+                    "rne": 0.94140625,
+                    "old_bf16_pv": 0.9375,
+                    "actual": 0.94140625
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 419,
+                    "reference": -0.7636461969462092,
+                    "rne": -0.76171875,
+                    "old_bf16_pv": -0.765625,
+                    "actual": -0.76171875
+                  },
+                  {
+                    "head": 13,
+                    "dimension": 437,
+                    "reference": -0.2221607787327164,
+                    "rne": -0.2216796875,
+                    "old_bf16_pv": -0.22265625,
+                    "actual": -0.2216796875
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 235,
+                    "reference": -1.074215881047266,
+                    "rne": -1.0703125,
+                    "old_bf16_pv": -1.078125,
+                    "actual": -1.0703125
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 284,
+                    "reference": 0.5800766905236331,
+                    "rne": 0.578125,
+                    "old_bf16_pv": 0.58203125,
+                    "actual": 0.578125
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "step": 2,
+            "length": 1027,
+            "arms": {
+              "scalar": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.00157371990195374,
+                  "max_abs": 0.01525225024501875,
+                  "max_ref": 4.153745435643849,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 6.036785709165448e-08,
+                  "max_abs": 7.499718481795981e-07,
+                  "max_ref": 4.391592063902198,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 5.915659107357409e-08,
+                  "max_abs": 7.352746216326977e-07,
+                  "max_ref": 8.470760446495747,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 1.2115431086991826e-07,
+                  "max_abs": 9.204701822085326e-06,
+                  "max_ref": 25.465208626965726,
+                  "exact": false
+                },
+                "rne_mismatches": 1,
+                "native": {
+                  "relative_l2": 0.0,
+                  "max_abs": 0.0,
+                  "max_ref": 4.15625,
+                  "exact": true
+                },
+                "changed_words": [
+                  {
+                    "head": 0,
+                    "dimension": 178,
+                    "reference": -0.0007671097626808371,
+                    "rne": -0.000766754150390625,
+                    "old_bf16_pv": -0.00077056884765625,
+                    "actual": -0.000766754150390625
+                  },
+                  {
+                    "head": 0,
+                    "dimension": 377,
+                    "reference": -0.12328788810216026,
+                    "rne": -0.123046875,
+                    "old_bf16_pv": -0.12353515625,
+                    "actual": -0.123046875
+                  },
+                  {
+                    "head": 0,
+                    "dimension": 497,
+                    "reference": 0.779280123794271,
+                    "rne": 0.77734375,
+                    "old_bf16_pv": 0.78125,
+                    "actual": 0.77734375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 17,
+                    "reference": 0.7636825502841907,
+                    "rne": 0.765625,
+                    "old_bf16_pv": 0.76171875,
+                    "actual": 0.765625
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 83,
+                    "reference": -0.2548876013182901,
+                    "rne": -0.255859375,
+                    "old_bf16_pv": -0.25390625,
+                    "actual": -0.255859375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 266,
+                    "reference": 0.8730568530383386,
+                    "rne": 0.875,
+                    "old_bf16_pv": 0.87109375,
+                    "actual": 0.875
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 395,
+                    "reference": -0.5644623184609798,
+                    "rne": -0.56640625,
+                    "old_bf16_pv": -0.5625,
+                    "actual": -0.56640625
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 35,
+                    "reference": 0.4443254331409367,
+                    "rne": 0.443359375,
+                    "old_bf16_pv": 0.4453125,
+                    "actual": 0.443359375
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 166,
+                    "reference": -0.448238027508024,
+                    "rne": -0.447265625,
+                    "old_bf16_pv": -0.44921875,
+                    "actual": -0.447265625
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 231,
+                    "reference": -0.5214791641864436,
+                    "rne": -0.51953125,
+                    "old_bf16_pv": -0.5234375,
+                    "actual": -0.51953125
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 272,
+                    "reference": 0.9277311043841865,
+                    "rne": 0.92578125,
+                    "old_bf16_pv": 0.9296875,
+                    "actual": 0.92578125
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 415,
+                    "reference": -0.7089774856840516,
+                    "rne": -0.70703125,
+                    "old_bf16_pv": -0.7109375,
+                    "actual": -0.70703125
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 66,
+                    "reference": -0.49705661437807397,
+                    "rne": -0.49609375,
+                    "old_bf16_pv": -0.498046875,
+                    "actual": -0.49609375
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 230,
+                    "reference": -1.4257431866881916,
+                    "rne": -1.421875,
+                    "old_bf16_pv": -1.4296875,
+                    "actual": -1.421875
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 420,
+                    "reference": -1.7538691826377923,
+                    "rne": -1.75,
+                    "old_bf16_pv": -1.7578125,
+                    "actual": -1.75
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 449,
+                    "reference": -0.7910063429008708,
+                    "rne": -0.7890625,
+                    "old_bf16_pv": -0.79296875,
+                    "actual": -0.7890625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 31,
+                    "reference": 0.37989235530326154,
+                    "rne": 0.380859375,
+                    "old_bf16_pv": 0.37890625,
+                    "actual": 0.380859375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 66,
+                    "reference": -0.5019683846127293,
+                    "rne": -0.50390625,
+                    "old_bf16_pv": -0.5,
+                    "actual": -0.50390625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 100,
+                    "reference": -0.01516850627758372,
+                    "rne": -0.01519775390625,
+                    "old_bf16_pv": -0.01513671875,
+                    "actual": -0.01519775390625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 176,
+                    "reference": 0.8418405223657761,
+                    "rne": 0.84375,
+                    "old_bf16_pv": 0.83984375,
+                    "actual": 0.84375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 227,
+                    "reference": 0.5917993097761561,
+                    "rne": 0.59375,
+                    "old_bf16_pv": 0.58984375,
+                    "actual": 0.59375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 278,
+                    "reference": 0.9980966688984164,
+                    "rne": 1.0,
+                    "old_bf16_pv": 0.99609375,
+                    "actual": 1.0
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 357,
+                    "reference": 1.1992242746490647,
+                    "rne": 1.203125,
+                    "old_bf16_pv": 1.1953125,
+                    "actual": 1.203125
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 417,
+                    "reference": 0.638699477378249,
+                    "rne": 0.640625,
+                    "old_bf16_pv": 0.63671875,
+                    "actual": 0.640625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 442,
+                    "reference": 0.19971036306287923,
+                    "rne": 0.2001953125,
+                    "old_bf16_pv": 0.19921875,
+                    "actual": 0.2001953125
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 42,
+                    "reference": -0.8418162143585688,
+                    "rne": -0.84375,
+                    "old_bf16_pv": -0.83984375,
+                    "actual": -0.84375
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 104,
+                    "reference": 0.05652236045768881,
+                    "rne": 0.056640625,
+                    "old_bf16_pv": 0.056396484375,
+                    "actual": 0.056640625
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 242,
+                    "reference": 0.0006701710003367833,
+                    "rne": 0.00067138671875,
+                    "old_bf16_pv": 0.00066375732421875,
+                    "actual": 0.00067138671875
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 296,
+                    "reference": -0.40137348735720346,
+                    "rne": -0.40234375,
+                    "old_bf16_pv": -0.400390625,
+                    "actual": -0.40234375
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 325,
+                    "reference": -0.1782320560985061,
+                    "rne": -0.1787109375,
+                    "old_bf16_pv": -0.177734375,
+                    "actual": -0.1787109375
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 495,
+                    "reference": 0.27637298641022867,
+                    "rne": 0.27734375,
+                    "old_bf16_pv": 0.275390625,
+                    "actual": 0.27734375
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 41,
+                    "reference": -0.29980429742092807,
+                    "rne": -0.298828125,
+                    "old_bf16_pv": -0.30078125,
+                    "actual": -0.298828125
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 252,
+                    "reference": -0.7480396903244217,
+                    "rne": -0.74609375,
+                    "old_bf16_pv": -0.75,
+                    "actual": -0.74609375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 29,
+                    "reference": -1.6367990108024562,
+                    "rne": -1.640625,
+                    "old_bf16_pv": -1.6328125,
+                    "actual": -1.640625
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 79,
+                    "reference": 0.06519313525732168,
+                    "rne": 0.0654296875,
+                    "old_bf16_pv": 0.06494140625,
+                    "actual": 0.0654296875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 115,
+                    "reference": -0.6816504868035793,
+                    "rne": -0.68359375,
+                    "old_bf16_pv": -0.6796875,
+                    "actual": -0.68359375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 118,
+                    "reference": -0.7402751734815068,
+                    "rne": -0.7421875,
+                    "old_bf16_pv": -0.73828125,
+                    "actual": -0.7421875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 141,
+                    "reference": 0.6425785501438143,
+                    "rne": 0.64453125,
+                    "old_bf16_pv": 0.640625,
+                    "actual": 0.64453125
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 193,
+                    "reference": 1.1446224353281216,
+                    "rne": 1.1484375,
+                    "old_bf16_pv": 1.140625,
+                    "actual": 1.1484375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 194,
+                    "reference": 0.0225239675773972,
+                    "rne": 0.0225830078125,
+                    "old_bf16_pv": 0.0224609375,
+                    "actual": 0.0225830078125
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 326,
+                    "reference": -0.23878582275197804,
+                    "rne": -0.2392578125,
+                    "old_bf16_pv": -0.23828125,
+                    "actual": -0.2392578125
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 350,
+                    "reference": 1.3712393027543606,
+                    "rne": 1.375,
+                    "old_bf16_pv": 1.3671875,
+                    "actual": 1.375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 365,
+                    "reference": 1.8711856724533311,
+                    "rne": 1.875,
+                    "old_bf16_pv": 1.8671875,
+                    "actual": 1.875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 417,
+                    "reference": 0.6855480644424188,
+                    "rne": 0.6875,
+                    "old_bf16_pv": 0.68359375,
+                    "actual": 0.6875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 434,
+                    "reference": -2.148723781049945,
+                    "rne": -2.15625,
+                    "old_bf16_pv": -2.140625,
+                    "actual": -2.15625
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 441,
+                    "reference": 0.9512556716381838,
+                    "rne": 0.953125,
+                    "old_bf16_pv": 0.94921875,
+                    "actual": 0.953125
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 456,
+                    "reference": -0.426810440475595,
+                    "rne": -0.427734375,
+                    "old_bf16_pv": -0.42578125,
+                    "actual": -0.427734375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 459,
+                    "reference": 2.1799748859960277,
+                    "rne": 2.1875,
+                    "old_bf16_pv": 2.171875,
+                    "actual": 2.1875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 508,
+                    "reference": 0.42680672393751173,
+                    "rne": 0.427734375,
+                    "old_bf16_pv": 0.42578125,
+                    "actual": 0.427734375
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 101,
+                    "reference": -1.2695393327270155,
+                    "rne": -1.2734375,
+                    "old_bf16_pv": -1.265625,
+                    "actual": -1.2734375
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 130,
+                    "reference": -1.9961203713614204,
+                    "rne": -2.0,
+                    "old_bf16_pv": -1.9921875,
+                    "actual": -2.0
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 222,
+                    "reference": 0.6113319011882656,
+                    "rne": 0.61328125,
+                    "old_bf16_pv": 0.609375,
+                    "actual": 0.61328125
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 464,
+                    "reference": 0.5253942015491645,
+                    "rne": 0.52734375,
+                    "old_bf16_pv": 0.5234375,
+                    "actual": 0.52734375
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 470,
+                    "reference": 0.22607862077756616,
+                    "rne": 0.2265625,
+                    "old_bf16_pv": 0.2255859375,
+                    "actual": 0.2265625
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 41,
+                    "reference": -0.09838886915449888,
+                    "rne": -0.0986328125,
+                    "old_bf16_pv": -0.09814453125,
+                    "actual": -0.0986328125
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 123,
+                    "reference": -0.004775392088247357,
+                    "rne": -0.0047607421875,
+                    "old_bf16_pv": -0.004791259765625,
+                    "actual": -0.0047607421875
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 242,
+                    "reference": 0.0067607201473875445,
+                    "rne": 0.00677490234375,
+                    "old_bf16_pv": 0.006744384765625,
+                    "actual": 0.00677490234375
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 434,
+                    "reference": -1.9257976173948754,
+                    "rne": -1.9296875,
+                    "old_bf16_pv": -1.921875,
+                    "actual": -1.9296875
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 457,
+                    "reference": 0.02423015804532308,
+                    "rne": 0.024169921875,
+                    "old_bf16_pv": 0.0242919921875,
+                    "actual": 0.024169921875
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 126,
+                    "reference": 0.8691681194689324,
+                    "rne": 0.87109375,
+                    "old_bf16_pv": 0.8671875,
+                    "actual": 0.87109375
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 206,
+                    "reference": -1.4492915225819025,
+                    "rne": -1.453125,
+                    "old_bf16_pv": -1.4453125,
+                    "actual": -1.453125
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 219,
+                    "reference": 0.9199489953854795,
+                    "rne": 0.921875,
+                    "old_bf16_pv": 0.91796875,
+                    "actual": 0.921875
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 347,
+                    "reference": 0.14990936289013448,
+                    "rne": 0.150390625,
+                    "old_bf16_pv": 0.1494140625,
+                    "actual": 0.150390625
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 406,
+                    "reference": -1.652357867972022,
+                    "rne": -1.65625,
+                    "old_bf16_pv": -1.6484375,
+                    "actual": -1.65625
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 445,
+                    "reference": 0.41310082524708336,
+                    "rne": 0.4140625,
+                    "old_bf16_pv": 0.412109375,
+                    "actual": 0.4140625
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 448,
+                    "reference": -1.043000097865785,
+                    "rne": -1.046875,
+                    "old_bf16_pv": -1.0390625,
+                    "actual": -1.046875
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 491,
+                    "reference": -1.4180381017073889,
+                    "rne": -1.421875,
+                    "old_bf16_pv": -1.4140625,
+                    "actual": -1.421875
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 243,
+                    "reference": -0.0002179442247662866,
+                    "rne": -0.00021839141845703125,
+                    "old_bf16_pv": -0.000213623046875,
+                    "actual": -0.000217437744140625
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 163,
+                    "reference": 0.35058057085572814,
+                    "rne": 0.349609375,
+                    "old_bf16_pv": 0.3515625,
+                    "actual": 0.349609375
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 210,
+                    "reference": 0.20067828215072353,
+                    "rne": 0.2001953125,
+                    "old_bf16_pv": 0.201171875,
+                    "actual": 0.2001953125
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 374,
+                    "reference": -0.5292865231223579,
+                    "rne": -0.52734375,
+                    "old_bf16_pv": -0.53125,
+                    "actual": -0.52734375
+                  },
+                  {
+                    "head": 15,
+                    "dimension": 69,
+                    "reference": -0.06066701294555006,
+                    "rne": -0.060546875,
+                    "old_bf16_pv": -0.060791015625,
+                    "actual": -0.060546875
+                  },
+                  {
+                    "head": 15,
+                    "dimension": 104,
+                    "reference": 0.22899525218225436,
+                    "rne": 0.228515625,
+                    "old_bf16_pv": 0.2294921875,
+                    "actual": 0.228515625
+                  }
+                ]
+              },
+              "control": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.0015751174880020713,
+                  "max_abs": 0.01525225024501875,
+                  "max_ref": 4.153745435643849,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 0.0002924779348908648,
+                  "max_abs": 0.0038520006144073804,
+                  "max_ref": 4.391592063902198,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 5.71370155629966e-07,
+                  "max_abs": 6.7767569777998915e-06,
+                  "max_ref": 8.470760446495747,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 4.080705186258318e-07,
+                  "max_abs": 2.2073217863294303e-05,
+                  "max_ref": 25.465208626965726,
+                  "exact": false
+                },
+                "rne_mismatches": 73,
+                "native": {
+                  "relative_l2": 0.0004825032948835416,
+                  "max_abs": 0.015625,
+                  "max_ref": 4.15625,
+                  "exact": false
+                },
+                "changed_words": []
+              },
+              "candidate": {
+                "output_vs_fp64": {
+                  "relative_l2": 0.0015737199019513865,
+                  "max_abs": 0.01525225024501875,
+                  "max_ref": 4.153745435643849,
+                  "exact": false
+                },
+                "normalized_partial_vs_fp64": {
+                  "relative_l2": 1.1723678274368386e-07,
+                  "max_abs": 1.4184062004929388e-06,
+                  "max_ref": 4.391592063902198,
+                  "exact": false
+                },
+                "maxima_vs_fp64": {
+                  "relative_l2": 8.298593302646304e-08,
+                  "max_abs": 9.381600865054907e-07,
+                  "max_ref": 8.470760446495747,
+                  "exact": false
+                },
+                "sums_vs_fp64": {
+                  "relative_l2": 1.2035735156043781e-07,
+                  "max_abs": 7.687003957812522e-06,
+                  "max_ref": 25.465208626965726,
+                  "exact": false
+                },
+                "rne_mismatches": 0,
+                "native": {
+                  "relative_l2": 1.0914091768940346e-08,
+                  "max_abs": 9.5367431640625e-07,
+                  "max_ref": 4.15625,
+                  "exact": false
+                },
+                "changed_words": [
+                  {
+                    "head": 0,
+                    "dimension": 178,
+                    "reference": -0.0007671097626808371,
+                    "rne": -0.000766754150390625,
+                    "old_bf16_pv": -0.00077056884765625,
+                    "actual": -0.000766754150390625
+                  },
+                  {
+                    "head": 0,
+                    "dimension": 377,
+                    "reference": -0.12328788810216026,
+                    "rne": -0.123046875,
+                    "old_bf16_pv": -0.12353515625,
+                    "actual": -0.123046875
+                  },
+                  {
+                    "head": 0,
+                    "dimension": 497,
+                    "reference": 0.779280123794271,
+                    "rne": 0.77734375,
+                    "old_bf16_pv": 0.78125,
+                    "actual": 0.77734375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 17,
+                    "reference": 0.7636825502841907,
+                    "rne": 0.765625,
+                    "old_bf16_pv": 0.76171875,
+                    "actual": 0.765625
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 83,
+                    "reference": -0.2548876013182901,
+                    "rne": -0.255859375,
+                    "old_bf16_pv": -0.25390625,
+                    "actual": -0.255859375
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 266,
+                    "reference": 0.8730568530383386,
+                    "rne": 0.875,
+                    "old_bf16_pv": 0.87109375,
+                    "actual": 0.875
+                  },
+                  {
+                    "head": 1,
+                    "dimension": 395,
+                    "reference": -0.5644623184609798,
+                    "rne": -0.56640625,
+                    "old_bf16_pv": -0.5625,
+                    "actual": -0.56640625
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 35,
+                    "reference": 0.4443254331409367,
+                    "rne": 0.443359375,
+                    "old_bf16_pv": 0.4453125,
+                    "actual": 0.443359375
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 166,
+                    "reference": -0.448238027508024,
+                    "rne": -0.447265625,
+                    "old_bf16_pv": -0.44921875,
+                    "actual": -0.447265625
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 231,
+                    "reference": -0.5214791641864436,
+                    "rne": -0.51953125,
+                    "old_bf16_pv": -0.5234375,
+                    "actual": -0.51953125
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 272,
+                    "reference": 0.9277311043841865,
+                    "rne": 0.92578125,
+                    "old_bf16_pv": 0.9296875,
+                    "actual": 0.92578125
+                  },
+                  {
+                    "head": 2,
+                    "dimension": 415,
+                    "reference": -0.7089774856840516,
+                    "rne": -0.70703125,
+                    "old_bf16_pv": -0.7109375,
+                    "actual": -0.70703125
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 66,
+                    "reference": -0.49705661437807397,
+                    "rne": -0.49609375,
+                    "old_bf16_pv": -0.498046875,
+                    "actual": -0.49609375
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 230,
+                    "reference": -1.4257431866881916,
+                    "rne": -1.421875,
+                    "old_bf16_pv": -1.4296875,
+                    "actual": -1.421875
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 420,
+                    "reference": -1.7538691826377923,
+                    "rne": -1.75,
+                    "old_bf16_pv": -1.7578125,
+                    "actual": -1.75
+                  },
+                  {
+                    "head": 3,
+                    "dimension": 449,
+                    "reference": -0.7910063429008708,
+                    "rne": -0.7890625,
+                    "old_bf16_pv": -0.79296875,
+                    "actual": -0.7890625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 31,
+                    "reference": 0.37989235530326154,
+                    "rne": 0.380859375,
+                    "old_bf16_pv": 0.37890625,
+                    "actual": 0.380859375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 66,
+                    "reference": -0.5019683846127293,
+                    "rne": -0.50390625,
+                    "old_bf16_pv": -0.5,
+                    "actual": -0.50390625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 100,
+                    "reference": -0.01516850627758372,
+                    "rne": -0.01519775390625,
+                    "old_bf16_pv": -0.01513671875,
+                    "actual": -0.01519775390625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 176,
+                    "reference": 0.8418405223657761,
+                    "rne": 0.84375,
+                    "old_bf16_pv": 0.83984375,
+                    "actual": 0.84375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 227,
+                    "reference": 0.5917993097761561,
+                    "rne": 0.59375,
+                    "old_bf16_pv": 0.58984375,
+                    "actual": 0.59375
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 278,
+                    "reference": 0.9980966688984164,
+                    "rne": 1.0,
+                    "old_bf16_pv": 0.99609375,
+                    "actual": 1.0
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 357,
+                    "reference": 1.1992242746490647,
+                    "rne": 1.203125,
+                    "old_bf16_pv": 1.1953125,
+                    "actual": 1.203125
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 417,
+                    "reference": 0.638699477378249,
+                    "rne": 0.640625,
+                    "old_bf16_pv": 0.63671875,
+                    "actual": 0.640625
+                  },
+                  {
+                    "head": 4,
+                    "dimension": 442,
+                    "reference": 0.19971036306287923,
+                    "rne": 0.2001953125,
+                    "old_bf16_pv": 0.19921875,
+                    "actual": 0.2001953125
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 42,
+                    "reference": -0.8418162143585688,
+                    "rne": -0.84375,
+                    "old_bf16_pv": -0.83984375,
+                    "actual": -0.84375
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 104,
+                    "reference": 0.05652236045768881,
+                    "rne": 0.056640625,
+                    "old_bf16_pv": 0.056396484375,
+                    "actual": 0.056640625
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 242,
+                    "reference": 0.0006701710003367833,
+                    "rne": 0.00067138671875,
+                    "old_bf16_pv": 0.00066375732421875,
+                    "actual": 0.00067138671875
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 296,
+                    "reference": -0.40137348735720346,
+                    "rne": -0.40234375,
+                    "old_bf16_pv": -0.400390625,
+                    "actual": -0.40234375
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 325,
+                    "reference": -0.1782320560985061,
+                    "rne": -0.1787109375,
+                    "old_bf16_pv": -0.177734375,
+                    "actual": -0.1787109375
+                  },
+                  {
+                    "head": 5,
+                    "dimension": 495,
+                    "reference": 0.27637298641022867,
+                    "rne": 0.27734375,
+                    "old_bf16_pv": 0.275390625,
+                    "actual": 0.27734375
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 41,
+                    "reference": -0.29980429742092807,
+                    "rne": -0.298828125,
+                    "old_bf16_pv": -0.30078125,
+                    "actual": -0.298828125
+                  },
+                  {
+                    "head": 7,
+                    "dimension": 252,
+                    "reference": -0.7480396903244217,
+                    "rne": -0.74609375,
+                    "old_bf16_pv": -0.75,
+                    "actual": -0.74609375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 29,
+                    "reference": -1.6367990108024562,
+                    "rne": -1.640625,
+                    "old_bf16_pv": -1.6328125,
+                    "actual": -1.640625
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 79,
+                    "reference": 0.06519313525732168,
+                    "rne": 0.0654296875,
+                    "old_bf16_pv": 0.06494140625,
+                    "actual": 0.0654296875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 115,
+                    "reference": -0.6816504868035793,
+                    "rne": -0.68359375,
+                    "old_bf16_pv": -0.6796875,
+                    "actual": -0.68359375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 118,
+                    "reference": -0.7402751734815068,
+                    "rne": -0.7421875,
+                    "old_bf16_pv": -0.73828125,
+                    "actual": -0.7421875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 141,
+                    "reference": 0.6425785501438143,
+                    "rne": 0.64453125,
+                    "old_bf16_pv": 0.640625,
+                    "actual": 0.64453125
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 193,
+                    "reference": 1.1446224353281216,
+                    "rne": 1.1484375,
+                    "old_bf16_pv": 1.140625,
+                    "actual": 1.1484375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 194,
+                    "reference": 0.0225239675773972,
+                    "rne": 0.0225830078125,
+                    "old_bf16_pv": 0.0224609375,
+                    "actual": 0.0225830078125
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 326,
+                    "reference": -0.23878582275197804,
+                    "rne": -0.2392578125,
+                    "old_bf16_pv": -0.23828125,
+                    "actual": -0.2392578125
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 350,
+                    "reference": 1.3712393027543606,
+                    "rne": 1.375,
+                    "old_bf16_pv": 1.3671875,
+                    "actual": 1.375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 365,
+                    "reference": 1.8711856724533311,
+                    "rne": 1.875,
+                    "old_bf16_pv": 1.8671875,
+                    "actual": 1.875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 417,
+                    "reference": 0.6855480644424188,
+                    "rne": 0.6875,
+                    "old_bf16_pv": 0.68359375,
+                    "actual": 0.6875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 434,
+                    "reference": -2.148723781049945,
+                    "rne": -2.15625,
+                    "old_bf16_pv": -2.140625,
+                    "actual": -2.15625
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 441,
+                    "reference": 0.9512556716381838,
+                    "rne": 0.953125,
+                    "old_bf16_pv": 0.94921875,
+                    "actual": 0.953125
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 456,
+                    "reference": -0.426810440475595,
+                    "rne": -0.427734375,
+                    "old_bf16_pv": -0.42578125,
+                    "actual": -0.427734375
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 459,
+                    "reference": 2.1799748859960277,
+                    "rne": 2.1875,
+                    "old_bf16_pv": 2.171875,
+                    "actual": 2.1875
+                  },
+                  {
+                    "head": 8,
+                    "dimension": 508,
+                    "reference": 0.42680672393751173,
+                    "rne": 0.427734375,
+                    "old_bf16_pv": 0.42578125,
+                    "actual": 0.427734375
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 101,
+                    "reference": -1.2695393327270155,
+                    "rne": -1.2734375,
+                    "old_bf16_pv": -1.265625,
+                    "actual": -1.2734375
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 130,
+                    "reference": -1.9961203713614204,
+                    "rne": -2.0,
+                    "old_bf16_pv": -1.9921875,
+                    "actual": -2.0
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 222,
+                    "reference": 0.6113319011882656,
+                    "rne": 0.61328125,
+                    "old_bf16_pv": 0.609375,
+                    "actual": 0.61328125
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 464,
+                    "reference": 0.5253942015491645,
+                    "rne": 0.52734375,
+                    "old_bf16_pv": 0.5234375,
+                    "actual": 0.52734375
+                  },
+                  {
+                    "head": 9,
+                    "dimension": 470,
+                    "reference": 0.22607862077756616,
+                    "rne": 0.2265625,
+                    "old_bf16_pv": 0.2255859375,
+                    "actual": 0.2265625
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 41,
+                    "reference": -0.09838886915449888,
+                    "rne": -0.0986328125,
+                    "old_bf16_pv": -0.09814453125,
+                    "actual": -0.0986328125
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 123,
+                    "reference": -0.004775392088247357,
+                    "rne": -0.0047607421875,
+                    "old_bf16_pv": -0.004791259765625,
+                    "actual": -0.0047607421875
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 242,
+                    "reference": 0.0067607201473875445,
+                    "rne": 0.00677490234375,
+                    "old_bf16_pv": 0.006744384765625,
+                    "actual": 0.00677490234375
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 434,
+                    "reference": -1.9257976173948754,
+                    "rne": -1.9296875,
+                    "old_bf16_pv": -1.921875,
+                    "actual": -1.9296875
+                  },
+                  {
+                    "head": 10,
+                    "dimension": 457,
+                    "reference": 0.02423015804532308,
+                    "rne": 0.024169921875,
+                    "old_bf16_pv": 0.0242919921875,
+                    "actual": 0.024169921875
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 126,
+                    "reference": 0.8691681194689324,
+                    "rne": 0.87109375,
+                    "old_bf16_pv": 0.8671875,
+                    "actual": 0.87109375
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 206,
+                    "reference": -1.4492915225819025,
+                    "rne": -1.453125,
+                    "old_bf16_pv": -1.4453125,
+                    "actual": -1.453125
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 219,
+                    "reference": 0.9199489953854795,
+                    "rne": 0.921875,
+                    "old_bf16_pv": 0.91796875,
+                    "actual": 0.921875
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 347,
+                    "reference": 0.14990936289013448,
+                    "rne": 0.150390625,
+                    "old_bf16_pv": 0.1494140625,
+                    "actual": 0.150390625
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 406,
+                    "reference": -1.652357867972022,
+                    "rne": -1.65625,
+                    "old_bf16_pv": -1.6484375,
+                    "actual": -1.65625
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 445,
+                    "reference": 0.41310082524708336,
+                    "rne": 0.4140625,
+                    "old_bf16_pv": 0.412109375,
+                    "actual": 0.4140625
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 448,
+                    "reference": -1.043000097865785,
+                    "rne": -1.046875,
+                    "old_bf16_pv": -1.0390625,
+                    "actual": -1.046875
+                  },
+                  {
+                    "head": 11,
+                    "dimension": 491,
+                    "reference": -1.4180381017073889,
+                    "rne": -1.421875,
+                    "old_bf16_pv": -1.4140625,
+                    "actual": -1.421875
+                  },
+                  {
+                    "head": 12,
+                    "dimension": 243,
+                    "reference": -0.0002179442247662866,
+                    "rne": -0.00021839141845703125,
+                    "old_bf16_pv": -0.000213623046875,
+                    "actual": -0.00021839141845703125
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 163,
+                    "reference": 0.35058057085572814,
+                    "rne": 0.349609375,
+                    "old_bf16_pv": 0.3515625,
+                    "actual": 0.349609375
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 210,
+                    "reference": 0.20067828215072353,
+                    "rne": 0.2001953125,
+                    "old_bf16_pv": 0.201171875,
+                    "actual": 0.2001953125
+                  },
+                  {
+                    "head": 14,
+                    "dimension": 374,
+                    "reference": -0.5292865231223579,
+                    "rne": -0.52734375,
+                    "old_bf16_pv": -0.53125,
+                    "actual": -0.52734375
+                  },
+                  {
+                    "head": 15,
+                    "dimension": 69,
+                    "reference": -0.06066701294555006,
+                    "rne": -0.060546875,
+                    "old_bf16_pv": -0.060791015625,
+                    "actual": -0.060546875
+                  },
+                  {
+                    "head": 15,
+                    "dimension": 104,
+                    "reference": 0.22899525218225436,
+                    "rne": 0.228515625,
+                    "old_bf16_pv": 0.2294921875,
+                    "actual": 0.228515625
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "words": 24576,
+        "original_bf16_pv_rne_mismatches": 130,
+        "candidate_rne_mismatches": 0,
+        "notes": [
+          "Unchanged BF16QKV,scale1,NS33,FP32softmax/merge",
+          "Candidate K64QK+two-termTF32PV; controloriginalBF16PV",
+          "RNE mismatches must decrease, no per-history mismatch regression, max normalized-partial error must improve at least2x",
+          "Fixed native.003 gate remains separate and unchanged"
+        ]
+      }
+    },
+    "results/operator-numerical.json": {
+      "sha256": "668fa45e3432b23f36d6fd32ca548aae849191ddfc06f9121815389b8636033c",
+      "content": {
+        "scope": "existing native attention C ABI bodies andmerge, savedblockQKV; noFA/timing/fullmodel",
+        "candidate_math": "K64 QK + two-term TF32 PV; unchangedFP32softmax/merge/NS33",
+        "control_math": "originalBF16QK/PV",
+        "rows": [
+          {
+            "step": 0,
+            "arm": "control",
+            "length": 1025,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 4.15625,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 3.316955908151579e-08,
+              "max_abs": 1.7366272510171976e-06,
+              "max_ref": 4.156250000000002,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 16,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/control-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/control-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/control-step0-mlpart.raw"
+          },
+          {
+            "step": 0,
+            "arm": "candidate",
+            "length": 1025,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 4.15625,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 3.316955908151579e-08,
+              "max_abs": 1.7366272510171976e-06,
+              "max_ref": 4.156250000000002,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 16,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/candidate-step0-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/candidate-step0-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/candidate-step0-mlpart.raw"
+          },
+          {
+            "step": 1,
+            "arm": "control",
+            "length": 1026,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.000415018383556908,
+              "max_abs": 0.0078125,
+              "max_ref": 4.15625,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.001525028815503382,
+              "max_abs": 0.012615309855275036,
+              "max_ref": 4.155750832400932,
+              "exact": false
+            },
+            "reference_rne_mismatches": 57,
+            "reference_trunc_mismatches": 4494,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/control-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/control-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/control-step1-mlpart.raw"
+          },
+          {
+            "step": 1,
+            "arm": "candidate",
+            "length": 1026,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0,
+              "max_abs": 0.0,
+              "max_ref": 4.15625,
+              "exact": true
+            },
+            "float64": {
+              "relative_l2": 0.0015245345993152525,
+              "max_abs": 0.012615309855275036,
+              "max_ref": 4.155750832400932,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 4518,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/candidate-step1-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/candidate-step1-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/candidate-step1-mlpart.raw"
+          },
+          {
+            "step": 2,
+            "arm": "control",
+            "length": 1027,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 0.0004825032948835416,
+              "max_abs": 0.015625,
+              "max_ref": 4.15625,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0015751174880020713,
+              "max_abs": 0.01525225024501875,
+              "max_ref": 4.153745435643849,
+              "exact": false
+            },
+            "reference_rne_mismatches": 73,
+            "reference_trunc_mismatches": 4435,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/control-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/control-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/control-step2-mlpart.raw"
+          },
+          {
+            "step": 2,
+            "arm": "candidate",
+            "length": 1027,
+            "splits": 33,
+            "scale": 1.0,
+            "kv_stride": 65536,
+            "mask": 4294967295,
+            "finite": true,
+            "canaries": true,
+            "repeats_exact": true,
+            "native": {
+              "relative_l2": 1.0914091768940346e-08,
+              "max_abs": 9.5367431640625e-07,
+              "max_ref": 4.15625,
+              "exact": false
+            },
+            "float64": {
+              "relative_l2": 0.0015737199019513865,
+              "max_abs": 0.01525225024501875,
+              "max_ref": 4.153745435643849,
+              "exact": false
+            },
+            "reference_rne_mismatches": 0,
+            "reference_trunc_mismatches": 4464,
+            "out_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/candidate-step2-out.raw",
+            "opart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/candidate-step2-opart.raw",
+            "mlpart_file": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/results/operator-numerical-tensors/candidate-step2-mlpart.raw"
+          }
+        ],
+        "libraries": {
+          "control": {
+            "path": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/bf16-pv-control.so",
+            "sha256": "0f1dec1ec726f4b360118a749a02f74d0d9fe8f19f283777d8fdb9fa92e64d8b"
+          },
+          "candidate": {
+            "path": "/tmp/plow-model-support-checks/e1-k64-tf32-pv-20260906/k64-tf32-pv.so",
+            "sha256": "2f462128debb16c1f07d329250d5eb2a9ad80d8732609990af0156071556d870"
+          }
+        },
+        "passed": true
+      }
+    },
+    "validate-operator.py": {
+      "sha256": "6b8c71a8678c09821158fc64239d17fb791752f8cd1fa03377d2260a22264327",
+      "content": "import subprocess,sys\nfrom pathlib import Path\nR=Path(__file__).parent;K=R.parent/\"e1-qk-k64-promote-20260906\"\nsubprocess.run([sys.executable,str(K/\"validate-operator.py\"),str(R/\"results/operator-numerical.json\")],check=True)\nsubprocess.run([sys.executable,str(R/\"analyze-accuracy.py\")],check=True)\n"
+    },
+    "analyze-accuracy.py": {
+      "sha256": "f436653050a41ffdb50dc3249abe7a112b678d634579487747aefac3a4cc3d7e",
+      "content": "import hashlib, importlib.util, json\nfrom pathlib import Path\nimport numpy as np\nR=Path(__file__).parent\nA=R.parent/\"e1-qk-numerical-audit-20260906\"\ndef module(name,path):\n spec=importlib.util.spec_from_file_location(name,path); m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m\nC=module(\"compare\",A/\"compare-block.py\"); F=module(\"reference\",A/\"float64-reference.py\")\ndef check_improvement(rows):\n control_rne=sum(r[\"arms\"][\"control\"][\"rne_mismatches\"] for r in rows)\n candidate_rne=sum(r[\"arms\"][\"candidate\"][\"rne_mismatches\"] for r in rows)\n assert len(rows)==3 and candidate_rne < control_rne, (\"no BF16 rounding accuracy improvement\",candidate_rne,control_rne)\n assert all(r[\"arms\"][\"candidate\"][\"rne_mismatches\"]<=r[\"arms\"][\"control\"][\"rne_mismatches\"] for r in rows)\n assert max(r[\"arms\"][\"candidate\"][\"normalized_partial_vs_fp64\"][\"relative_l2\"] for r in rows) < .5*max(r[\"arms\"][\"control\"][\"normalized_partial_vs_fp64\"][\"relative_l2\"] for r in rows), \"no substantive partial precision improvement\"\n return control_rne,candidate_rne\nfor path,spec in json.loads((R/\"saved-input-provenance.json\").read_text()).items():\n assert hashlib.sha256(Path(path).read_bytes()).hexdigest()==spec[\"sha256\"],path\nfor path,spec in json.loads((R/\"FREEZE.json\").read_text())[\"files\"].items():\n assert hashlib.sha256((R/path).read_bytes()).hexdigest()==spec[\"sha256\"],path\nreport=json.loads((R/\"results/operator-numerical.json\").read_text()); assert report[\"passed\"] and len(report[\"rows\"])==6\nfor arm,name in [(\"control\",\"bf16-pv-control.so\"),(\"candidate\",\"k64-tf32-pv.so\")]:\n assert Path(report[\"libraries\"][arm][\"path\"])==R/name\n assert report[\"libraries\"][arm][\"sha256\"]==hashlib.sha256((R/name).read_bytes()).hexdigest()\n\nnative=C.load(\"control\"); old=C.load(\"qk-pv\"); rows=[]\nfor step in range(3):\n raw,c=native[step]; length=1025+step\n q=c[\"act.q\"].reshape(16,512).astype(np.float64); k=c[\"kv.5.k\"].reshape(length,512).astype(np.float64); v=c[\"kv.5.v\"].reshape(length,512).astype(np.float64)\n logs=(q@k.T)*float(np.float32(1.4426950408889634)); ideal_o=np.empty((16,33,512)); ideal_ml=np.empty((16,33,2)); per=(length+32)//33\n for s in range(33):\n  lo=s*per;hi=min(lo+per,length);assert lo<hi\n  mx=logs[:,lo:hi].max(1); p=np.exp2(logs[:,lo:hi]-mx[:,None]);ideal_ml[:,s,0]=mx;ideal_ml[:,s,1]=p.sum(1);ideal_o[:,s]=p@v[lo:hi]\n ref=np.fromfile(A/f\"reference-step{step}.f64\",dtype=\"<f8\").reshape(16,512); rn=F.bf16(ref,\"rne\")\n row=dict(step=step,length=length,arms={})\n for arm in [\"scalar\",\"control\",\"candidate\"]:\n  if arm==\"scalar\": out=c[\"act.at\"].reshape(16,512); bits=np.frombuffer(raw[\"act.at\"],dtype=\"<u2\").reshape(16,512);op=c[\"act.opart\"].reshape(16,33,512).astype(np.float64);ml=c[\"act.mlpart\"].reshape(16,33,2).astype(np.float64)\n  else:\n   record=next(r for r in report[\"rows\"] if r[\"step\"]==step and r[\"arm\"]==arm)\n   bits=np.fromfile(record[\"out_file\"],dtype=\"<u2\").reshape(16,512);out=F.decode(bits);op=np.fromfile(record[\"opart_file\"],dtype=\"<f4\").reshape(16,33,512).astype(np.float64);ml=np.fromfile(record[\"mlpart_file\"],dtype=\"<f4\").reshape(16,33,2).astype(np.float64)\n   if arm==\"control\":\n    assert Path(record[\"out_file\"]).read_bytes()==old[step][0][\"act.at\"],(step,\"original broad/DSO output mismatch\")\n  assert np.isfinite(op).all() and np.isfinite(ml).all() and (ml[:,:,1]>0).all()\n  entry=dict(output_vs_fp64=C.metrics(ref,out),normalized_partial_vs_fp64=C.metrics(ideal_o/ideal_ml[:,:,1,None],op/ml[:,:,1,None]),maxima_vs_fp64=C.metrics(ideal_ml[:,:,0],ml[:,:,0]),sums_vs_fp64=C.metrics(ideal_ml[:,:,1],ml[:,:,1]),rne_mismatches=int(np.count_nonzero(bits!=rn)),native=C.metrics(c[\"act.at\"].reshape(16,512),out),changed_words=[])\n  for h,d in np.argwhere(out!=old[step][1][\"act.at\"].reshape(16,512)):\n   entry[\"changed_words\"].append(dict(head=int(h),dimension=int(d),reference=float(ref[h,d]),rne=float(F.decode(rn)[h,d]),old_bf16_pv=float(old[step][1][\"act.at\"].reshape(16,512)[h,d]),actual=float(out[h,d])))\n  row[\"arms\"][arm]=entry\n rows.append(row)\nfailure=None\ntry:control_rne,candidate_rne=check_improvement(rows)\nexcept AssertionError as e:\n failure=str(e)\n control_rne=sum(r[\"arms\"][\"control\"][\"rne_mismatches\"] for r in rows)\n candidate_rne=sum(r[\"arms\"][\"candidate\"][\"rne_mismatches\"] for r in rows)\nresult=dict(passed=failure is None,failure=failure,decision=\"Operator accuracy improvement PASS; broad build requires root review\" if failure is None else \"HOLD: accuracy criterion failed\",scope=\"Three captured native synthetic-prefix histories; no timing/full-model qualification\",rows=rows,words=24576,original_bf16_pv_rne_mismatches=control_rne,candidate_rne_mismatches=candidate_rne,notes=[\"Unchanged BF16QKV,scale1,NS33,FP32softmax/merge\", \"Candidate K64QK+two-termTF32PV; controloriginalBF16PV\", \"RNE mismatches must decrease, no per-history mismatch regression, max normalized-partial error must improve at least2x\", \"Fixed native.003 gate remains separate and unchanged\"])\n\n(R/\"accuracy-analysis.json\").write_text(json.dumps(result,indent=2)+\"\\n\")\nfor r in rows:\n print(r[\"step\"],[(a,round(e[\"normalized_partial_vs_fp64\"][\"relative_l2\"],12),e[\"maxima_vs_fp64\"][\"max_abs\"],e[\"rne_mismatches\"]) for a,e in r[\"arms\"].items()])\n\nif failure:raise SystemExit(1)\n"
+    },
+    "root-window/events.jsonl": {
+      "sha256": "ca08427124b5768859a0522f81581661162facdbb27813974ad82588ff233a26",
+      "content": "{\"status\": \"waiting_for_existing_supervisors\", \"pids\": [], \"utc\": \"2026-09-06T06:35:42Z\"}\n{\"status\": \"running\", \"job\": \"e1-k64-tf32-pv-saved-native\", \"utc\": \"2026-09-06T06:35:42Z\"}\n{\"status\": \"job_finished\", \"job\": \"e1-k64-tf32-pv-saved-native\", \"passed\": true, \"returncode\": 0, \"validated_native_block\": true, \"utc\": \"2026-09-06T06:35:45Z\"}\n{\"status\": \"complete\", \"passed\": 1, \"jobs\": 1, \"utc\": \"2026-09-06T06:35:45Z\"}\n{\"status\": \"finished\", \"gpu_pids\": \"\", \"jobs\": 1, \"utc\": \"2026-09-06T06:35:45Z\"}\n"
+    },
+    "root-window/clocks-power.log": {
+      "sha256": "58f1f6b59986f636b5ff3bdd7d745ff958de34ade765230f062fe63915698b66",
+      "content": "#Date        Time         gpu    pwr  gtemp  mtemp   mclk   pclk \n#YYYYMMDD    HH:MM:SS     Idx      W      C      C    MHz    MHz \n 20260906    06:35:42       0    132     35     41   2619   1830 \n 20260906    06:35:43       0    129     35     41   2619   1830 \n 20260906    06:35:44       0    128     35     41   2619   1830 \n"
+    },
+    "root-window/e1-k64-tf32-pv-saved-native.log": {
+      "sha256": "edad967c1c6e352fd7435b94196027af5c4505488b7ae15e8f81c8b134f45bbd",
+      "content": "/opt/pytorch/lib/python3.13/site-packages/torch/cuda/__init__.py:64: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.\n  import pynvml  # type: ignore[import]\nPASS native saved-QKV K64 plus TF32 PV comparison:6cells,2exact repeats, fixed.003nativegate; no timing\n"
+    },
+    "root-window/e1-k64-tf32-pv-saved-native.log.validation": {
+      "sha256": "ee2e6be9b2932c116240e1a4d6495324cefd98e7206163cae0aef5052d7e3574",
+      "content": "PASS sixnative savedinput numericalcells; accuracyimprovement/timingrequiresseparateanalysis\n0 [('scalar', 5.8632e-08, 1.3197660528874167e-06, 0), ('control', 0.000283116043, 7.263302794768833e-06, 0), ('candidate', 1.16263e-07, 1.9401958617493165e-06, 0)]\n1 [('scalar', 5.9295e-08, 5.407664973589021e-07, 0), ('control', 0.000293980382, 4.756335920674815e-06, 57), ('candidate', 1.17891e-07, 8.745073314386786e-07, 0)]\n2 [('scalar', 6.0368e-08, 7.352746216326977e-07, 1), ('control', 0.000292477935, 6.7767569777998915e-06, 73), ('candidate', 1.17237e-07, 9.381600865054907e-07, 0)]\n"
+    }
+  }
+}
