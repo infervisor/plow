@@ -40,12 +40,14 @@ __device__ __forceinline__ void attention_body(const PlowDevInst* in, void* cons
                                              unsigned slice, unsigned nblk, float* arena) {
     const unsigned t0 = in->t[0], t1 = in->t[1], t2 = in->t[2], t3 = in->t[3];
     const unsigned t4 = in->t[4], t5 = in->t[5], t7 = in->t[7];
+    __nv_bfloat16* const output =
+        t5 == PLOW_TENSOR_NONE ? nullptr : static_cast<__nv_bfloat16*>(tensors[t5]);
     d_flash_prefill<512, 64, 32>(
         static_cast<float*>(tensors[t0]), static_cast<float*>(tensors[t1]),
         static_cast<const __nv_bfloat16*>(tensors[t2]),
         static_cast<const __nv_bfloat16*>(tensors[t3]),
         static_cast<const __nv_bfloat16*>(tensors[t4]),
-        static_cast<__nv_bfloat16*>(tensors[t5]), in->i[0], in->i[1], in->i[2], in->i[3],
+        output, in->i[0], in->i[1], in->i[2], in->i[3],
         in->i[4], in->i[5], in->i[7], in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk,
         arena, nullptr, tensors[t7]);
 }

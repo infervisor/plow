@@ -2,7 +2,7 @@ use super::*;
 use packet::devbuild::Builder;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-fn fixture(hd: u32, with_map: bool) -> Model {
+fn fixture(hd: u32, with_map: bool, fused: bool) -> Model {
     let mut builder = Builder::new(132);
     let q = builder.tensor("q", 128 * 32 * u64::from(hd) * 2);
     let k = builder.tensor("k", 4 * 65536 * u64::from(hd) * 2);
@@ -14,17 +14,22 @@ fn fixture(hd: u32, with_map: bool) -> Model {
     let before = builder.emit(DevOp::Nop, builder.all(), &[], |_| {});
     let flash = builder.emit(DevOp::FlashPrefill, builder.all(), &[before], |op| {
         op.t[..5].copy_from_slice(&[partial, ml, q, k, v]);
+        op.t[5] = if fused { out } else { TENSOR_NONE };
         op.t[7] = if with_map { map } else { TENSOR_NONE };
         op.i = [128, 128, 32, 4, 0, 0, hd, 1];
         op.j[0] = 65536;
         op.j[1] = u32::MAX;
         op.f[0] = 1.0;
     });
-    let merge = builder.emit(DevOp::FlashMerge, builder.all(), &[flash], |op| {
-        op.t[..3].copy_from_slice(&[out, partial, ml]);
-        op.i[..4].copy_from_slice(&[128, 32, 1, hd]);
-    });
-    builder.emit(DevOp::Nop, builder.all(), &[merge], |_| {});
+    let after = if fused {
+        flash
+    } else {
+        builder.emit(DevOp::FlashMerge, builder.all(), &[flash], |op| {
+            op.t[..3].copy_from_slice(&[out, partial, ml]);
+            op.i[..4].copy_from_slice(&[128, 32, 1, hd]);
+        })
+    };
+    builder.emit(DevOp::Nop, builder.all(), &[after], |_| {});
     let prefill = builder.finish();
     let mut decode = Builder::new(132);
     decode.adopt_tensors(prefill.tensors.clone());
@@ -61,7 +66,7 @@ fn object_image(globals: &[(&str, u32)]) -> Vec<u8> {
 
 #[test]
 fn isolates_only_compatible_hd512_instructions_and_binds_hash() {
-    let mut model = fixture(512, true);
+    let mut model = fixture(512, true, false);
     let original_insts = model.progs[0].insts.clone();
     let mut sections = Vec::new();
     apply(&mut model, &mut sections, &selection(), "sm90a").unwrap();
@@ -80,15 +85,15 @@ fn isolates_only_compatible_hd512_instructions_and_binds_hash() {
 
 #[test]
 fn stays_inert_without_apply_and_rejects_incompatible_geometry() {
-    let model = fixture(512, true);
+    let model = fixture(512, true, false);
     assert_eq!(model.to_blob(), model.to_blob());
-    for mut model in [fixture(256, true), fixture(512, false)] {
+    for mut model in [fixture(256, true, false), fixture(512, false, false)] {
         assert!(apply(&mut model, &mut Vec::new(), &selection(), "sm90a").is_err());
     }
-    let mut model = fixture(512, true);
+    let mut model = fixture(512, true, false);
     model.tensors.last_mut().unwrap().bytes = 128;
     assert!(apply(&mut model, &mut Vec::new(), &selection(), "sm90a").is_err());
-    let mut model = fixture(512, true);
+    let mut model = fixture(512, true, false);
     assert!(apply(&mut model, &mut Vec::new(), &selection(), "gfx950").is_err());
 }
 
@@ -96,7 +101,7 @@ fn stays_inert_without_apply_and_rejects_incompatible_geometry() {
 fn output_object_is_explicit_inert_and_validated_before_mutation() {
     let directory = output_dir("selection");
     let output = directory.join("model.pkt");
-    let mut model = fixture(512, true);
+    let mut model = fixture(512, true, false);
     let before = model.to_blob();
     let mut sections = Vec::new();
     assert!(!apply_output_object(&mut model, &mut sections, "sm90a", &output).unwrap());
@@ -128,7 +133,7 @@ fn output_object_is_explicit_inert_and_validated_before_mutation() {
 
 #[test]
 fn composes_with_existing_role_objects_and_preserves_their_segments() {
-    let mut model = fixture(512, true);
+    let mut model = fixture(512, true, false);
     let program = &mut model.progs[0];
     let split = program
         .gq_stream
@@ -170,4 +175,32 @@ fn composes_with_existing_role_objects_and_preserves_their_segments() {
         })
         .collect();
     assert_eq!(roles_for_inst, [1, 6, 0, 0]);
+}
+
+#[test]
+fn accepts_fused_output_and_rejects_unsafe_fused_contracts() {
+    let mut model = fixture(512, true, true);
+    let mut sections = Vec::new();
+    apply(&mut model, &mut sections, &selection(), "sm90a").unwrap();
+    let metadata = SegmentRoles::from_bytes(&sections[0].data).unwrap();
+    assert_eq!(metadata.programs[0].roles, [0, 6, 0]);
+
+    let mut short = fixture(512, true, true);
+    let output = short.progs[0]
+        .insts
+        .iter()
+        .find(|op| op.op == DevOp::FlashPrefill as u16)
+        .unwrap()
+        .t[5] as usize;
+    short.tensors[output].bytes -= 1;
+    assert!(apply(&mut short, &mut Vec::new(), &selection(), "sm90a").is_err());
+
+    let mut split = fixture(512, true, true);
+    split.progs[0]
+        .insts
+        .iter_mut()
+        .find(|op| op.op == DevOp::FlashPrefill as u16)
+        .unwrap()
+        .i[7] = 2;
+    assert!(apply(&mut split, &mut Vec::new(), &selection(), "sm90a").is_err());
 }

@@ -55,7 +55,7 @@ fn eligible(op: &packet::dev::DevInst, n_cu: u16) -> bool {
                 && op.i[2] % op.i[3] == 0
                 && op.i[6] == 512
                 && op.i[7] > 0
-                && op.t[5] == TENSOR_NONE
+                && (op.t[5] == TENSOR_NONE || op.i[7] == 1)
                 && op.t[6] == TENSOR_NONE
                 && op.t[7] != TENSOR_NONE
                 && op.f[0].is_finite()
@@ -185,19 +185,31 @@ fn apply(
                     && tensor_bytes
                         .get(op.t[7] as usize)
                         .is_some_and(|&bytes| bytes == 256)
+                    && (op.t[5] == TENSOR_NONE
+                        || (op.t[..5].iter().all(|&tensor| tensor != op.t[5])
+                            && u64::from(op.i[0])
+                                .checked_mul(u64::from(op.i[2]))
+                                .and_then(|elements| elements.checked_mul(512 * 2))
+                                .is_some_and(|bytes| {
+                                    tensor_bytes
+                                        .get(op.t[5] as usize)
+                                        .is_some_and(|&extent| extent >= bytes)
+                                })))
             })
             .collect();
-        let full_flash = program
+        let unfused_flash = program
             .insts
             .iter()
-            .filter(|op| op.op == DevOp::FlashPrefill as u16 && op.i[6] == 512)
+            .filter(|op| {
+                op.op == DevOp::FlashPrefill as u16 && op.i[6] == 512 && op.t[5] == TENSOR_NONE
+            })
             .count();
         let full_merge = program
             .insts
             .iter()
             .filter(|op| op.op == DevOp::FlashMerge as u16 && op.i[3] == 512)
             .count();
-        if full_flash != full_merge {
+        if unfused_flash != full_merge {
             return Err(format!(
                 "incompatible HD512 prefill attention pairing in program {index}"
             ));

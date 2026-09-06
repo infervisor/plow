@@ -745,6 +745,7 @@ fn validate_attention_role_inst(
     tensors: &[crate::asset::devblob::DevTensor],
     hd_required: u32,
     require_tma_map: bool,
+    allow_fused: bool,
 ) -> Result<()> {
     let reject =
         || RuntimeError::Rejected("unsupported attention role operands or geometry".into());
@@ -782,10 +783,11 @@ fn validate_attention_role_inst(
         }
     }
     if prefill {
+        let fused = d.t[5] != TENSOR_NONE16;
         if d.i[1] == 0
             || d.i[3] == 0
             || heads % d.i[3] != 0
-            || d.t[5] != TENSOR_NONE16
+            || (fused && (!allow_fused || splits != 1))
             || d.t[6] != TENSOR_NONE16
             || (require_tma_map
                 && (d.t[7] == TENSOR_NONE16
@@ -812,6 +814,12 @@ fn validate_attention_role_inst(
         extent(2, output_bytes)?;
         extent(3, kv_bytes)?;
         extent(4, kv_bytes)?;
+        if fused {
+            if d.t[..5].contains(&d.t[5]) {
+                return Err(reject());
+            }
+            extent(5, output_bytes)?;
+        }
     } else {
         extent(0, output_bytes)?;
         extent(1, partial_bytes)?;
@@ -895,14 +903,14 @@ fn packet_role_segments(
                     ));
                 }
             } else if role == plow_asset::segment_roles::PREFILL_ATTENTION {
-                validate_attention_role_inst(d, g.t, tensors, 256, false)?;
+                validate_attention_role_inst(d, g.t, tensors, 256, false, false)?;
             } else if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 {
                 if d.op != DevOp::FlashPrefill as u16 {
                     return Err(RuntimeError::Rejected(
                         "HD512 WG32 role requires FlashPrefill".into(),
                     ));
                 }
-                validate_attention_role_inst(d, g.t, tensors, 512, true)?;
+                validate_attention_role_inst(d, g.t, tensors, 512, true, true)?;
             } else if role == plow_asset::segment_roles::GEMV_CTA512 {
                 validate_gemv_decode_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
             } else if role == plow_asset::segment_roles::FP8_M1
