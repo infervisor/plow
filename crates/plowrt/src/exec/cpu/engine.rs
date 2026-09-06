@@ -245,7 +245,11 @@ impl CpuModel {
                 "act.logits" => wk.logits = Some(h),
                 _ => {}
             }
-            if packet::names::is_host_filled_table(&td.name) {
+            // Gemma's fused-expert pointer tables (`moe.ewt.<l>` / `moe.est.<l>`) are runtime
+            // tensors filled below from the bound expert tensors; the MLA/GLM per-projection
+            // tables are not wired yet.
+            let gemma_table = td.name.starts_with("moe.ewt.") || td.name.starts_with("moe.est.");
+            if !gemma_table && packet::names::is_host_filled_table(&td.name) {
                 return Err(RuntimeError::Device(format!(
                     "host-filled expert table `{}` is not supported by the CPU engine yet",
                     td.name
@@ -302,6 +306,48 @@ impl CpuModel {
             };
             tensors.push(t);
             names.push(td.name.clone());
+        }
+        // Fused-expert pointer tables: ewt[e*2] = gate_up rows of expert e, ewt[e*2+1] = its down
+        // rows (host addresses, u64), stride = tensor bytes / E — the CPU twin of exec::gpu's
+        // `build_fused_expert_table`. fp8 packets also get `moe.est.<l>` with the scale rows.
+        for h in 0..names.len() {
+            let Some(layer) = names[h].strip_prefix("moe.ewt.").map(str::to_string) else {
+                continue;
+            };
+            let find = |suf: &str| names.iter().rposition(|n| n.ends_with(suf));
+            let gu = find(&format!("layers.{layer}.experts.gate_up_proj"));
+            let dn = find(&format!("layers.{layer}.experts.down_proj"));
+            let (Some(gu), Some(dn)) = (gu, dn) else {
+                return Err(RuntimeError::Device(format!(
+                    "MoE: layer {layer} missing fused expert tensor(s) for moe.ewt"
+                )));
+            };
+            let e = tensors[h].bytes / 16;
+            if e == 0 || tensors[h].bytes % 16 != 0 {
+                return Err(RuntimeError::Device(format!("moe.ewt.{layer}: bad size {}", tensors[h].bytes)));
+            }
+            let fill = |dst: &HostTensor, a: &HostTensor, b: &HostTensor| {
+                let (sa, sb) = (a.bytes / e, b.bytes / e);
+                // SAFETY: dst is a fresh runtime tensor of e*16 bytes; a/b are live allocations.
+                let out = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut u64, e * 2) };
+                for i in 0..e {
+                    out[2 * i] = a.as_ptr() as u64 + (i * sa) as u64;
+                    out[2 * i + 1] = b.as_ptr() as u64 + (i * sb) as u64;
+                }
+            };
+            fill(&tensors[h], &tensors[gu], &tensors[dn]);
+            if names[gu].starts_with("fp8/") {
+                let est = names.iter().position(|n| *n == format!("moe.est.{layer}"));
+                let gs = find(&format!("layers.{layer}.experts.gate_up_proj_scale"));
+                let ds = find(&format!("layers.{layer}.experts.down_proj_scale"));
+                let (Some(est), Some(gs), Some(ds)) = (est, gs, ds) else {
+                    return Err(RuntimeError::Device(format!(
+                        "MoE fp8: layer {layer} missing expert scale tensor/table"
+                    )));
+                };
+                fill(&tensors[est], &tensors[gs], &tensors[ds]);
+            }
+            tracing::debug!(layer, experts = e, "moe: fused expert pointer table filled");
         }
         let table = Arc::new(TensorTable::new(
             tensors.iter().map(|t| t.as_ptr() as *mut c_void).collect(),

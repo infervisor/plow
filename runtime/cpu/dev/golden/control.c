@@ -44,4 +44,15 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_MOE_ROUTER_TOPK_PF] = g_moe_router_topk_pf;
     tab[PLOW_DOP_MOE_ALIGN_PF] = g_moe_align_pf;
     tab[PLOW_DOP_MOE_COMBINE_PF] = g_moe_combine_pf;
+    tab[PLOW_DOP_MOE_ROUTER_GEMMA_SCORE_FAST] = g_moe_router_gemma_score_fast;
+    tab[PLOW_DOP_MOE_ROUTER_GEMMA_SCORE] = g_moe_router_gemma_score_fast; /* exact = same serial f32 math here */
+    tab[PLOW_DOP_MOE_ROUTER_GEMMA_TOPK] = g_moe_router_gemma_topk;
+    tab[PLOW_DOP_MOE_EXPERT_GLU_NORM_GEMMA] = g_moe_expert_glu_norm_gemma;
+    tab[PLOW_DOP_MOE_EXPERT_DOWN_GEMMA] = g_moe_expert_down_gemma;
+    tab[PLOW_DOP_MOE_COMBINE_NORM_GEMMA] = g_moe_combine_norm_gemma;
+    tab[PLOW_DOP_MOE_ROUTER_GEMMA_PF] = g_moe_router_gemma_pf;
+    tab[PLOW_DOP_MOE_ALIGN_GEMMA_PF] = g_moe_align_pf;
+    tab[PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF] = g_moe_group_glu_gemma_pf;
+    tab[PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF] = g_moe_group_down_gemma_pf;
+    tab[PLOW_DOP_MOE_COMBINE_NORM_GEMMA_PF] = g_moe_combine_norm_gemma_pf;
 }

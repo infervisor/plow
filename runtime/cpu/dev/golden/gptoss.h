@@ -33,4 +33,16 @@ G_K(g_moe_router_topk_pf);
 G_K(g_moe_align_pf);
 G_K(g_moe_combine_pf);
 
+/* moe_gemma.c — Gemma-4 26B-A4B hybrid MoE (dev_isa.h 63/68/69/70/71 decode, 73/75/76/77 prefill;
+ * 74 = g_moe_align_pf). `ewt` operands are host-filled u64[n_exp*2] {gate_up base, down base}. */
+G_K(g_moe_router_gemma_score_fast);
+G_K(g_moe_router_gemma_topk);
+G_K(g_moe_expert_glu_norm_gemma);
+G_K(g_moe_expert_down_gemma);
+G_K(g_moe_combine_norm_gemma);
+G_K(g_moe_router_gemma_pf);
+G_K(g_moe_group_glu_gemma_pf);
+G_K(g_moe_group_down_gemma_pf);
+G_K(g_moe_combine_norm_gemma_pf);
+
 #endif /* PLOW_CPU_GOLDEN_GPTOSS_H */
