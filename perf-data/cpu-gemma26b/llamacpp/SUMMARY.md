@@ -35,3 +35,27 @@ Notes
   should allow ~20 ms).
 * c=1 prefill ≈ 85–95 tok/s at 400–1100 prompt tokens (TTFT includes one decode step).
 * Q8_0 chat cells in `results-q8_0.md` were measured with `-c 4096 -np 4` (same slots, same numbers otherwise).
+
+## Correction: the earlier 26B llama.cpp run used 4 server slots (14:2x)
+
+`ls_start.sh` passed `-np 4` while the bench went to concurrency 8, so at c=8 only four requests
+decoded concurrently and llama.cpp's per-token latency was measured on half the load it was being
+compared against. That is not apples to apples, and it biased llama.cpp favourably on TPOT (and
+unfavourably on TTFT). Re-run with `-np 8`, matching plow's 8 slots and vLLM's `--max-num-seqs 8`;
+the GPT-OSS and 12B llama.cpp baselines already used 8 (`serve.sh --parallel 8`) and are unaffected.
+
+| workload | conc | Q4_K_M TPOT, 4 slots | Q4_K_M TPOT, 8 slots (fair) | plow MXFP4 TPOT |
+|---|---|---|---|---|
+| chat_short | 4 | 107 | 111 | **102** |
+| chat_short | 8 | 105 | 178 | **151** |
+| chat_long | 4 | 119 | 237 | **152** |
+| chat_long | 8 | 118 | 217 | 308 |
+| code | 4 | 120 | 185 | **155** |
+| code | 8 | 119 | 183 | 248 |
+| summarize | 4 | 146 | 172 | 323 |
+| summarize | 8 | 190 | 257 | 507 |
+
+Raw: `results-q4_k_m-np8*.md`. With the fair slot count plow wins four more decode cells than the
+earlier table showed; it still loses the long-prompt c=8 cells and both summarize cells at c>=4.
+TTFT under 8 slots gets worse for llama.cpp everywhere (e.g. chat_long c=8 29.0 s -> 34.4 s), so
+plow's TTFT wins widen.
