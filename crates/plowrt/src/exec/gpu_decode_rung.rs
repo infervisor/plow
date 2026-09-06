@@ -176,7 +176,7 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
     let pos = tensor_id("in.pos").ok_or_else(|| reject("missing position tensor"))?;
     let kvlen = tensor_id("in.kvlen").ok_or_else(|| reject("missing KV length tensor"))?;
     let ids = tensor_id("in.ids").ok_or_else(|| reject("missing token tensor"))?;
-    if blob.tensors[kvlen].bytes != u64::from(widest.t) * 4
+    if blob.tensors[kvlen].bytes < u64::from(widest.t) * 4
         || blob.tensors[pos].bytes < u64::from(widest.t) * 4
         || blob.tensors[ids].bytes < u64::from(widest.t) * 4
     {
