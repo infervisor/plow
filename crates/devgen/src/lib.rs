@@ -1714,6 +1714,7 @@ fn declare(
     block: std::ops::Range<usize>,
     nrn_fold: bool,
     merge_fold: bool,
+    mixed_total_rows: Option<u32>,
     mixed_decode_rows: Option<u32>,
 ) -> Tn {
     // ACTIVATIONS ARE SIZED BY THE CHUNK, NOT THE CONTEXT.
@@ -1814,7 +1815,10 @@ fn declare(
         ids: b.tensor("in.ids", ctx as u64 * I32),
         pos: b.tensor("in.pos", ctx as u64 * I32),
         // BATCH>1 (serving pending #4): one KV length per sequence. dbatch==1 => I32, identical.
-        kvlen: b.tensor("in.kvlen", dbatch as u64 * I32),
+        kvlen: b.tensor(
+            "in.kvlen",
+            u64::from(mixed_total_rows.unwrap_or(dbatch).max(dbatch)) * I32,
+        ),
         decode_slot: mixed_decode_rows
             .map(|rows| b.tensor(plow_asset::mixed_step::DECODE_SLOT_TENSOR, u64::from(rows) * I32))
             .unwrap_or(TENSOR_NONE),
@@ -6085,6 +6089,7 @@ impl<'a> DenseGqaEmitter<'a> {
         dbatch: u32,
         moe_pf: bool,
         amd: bool,
+        mixed_total_rows: Option<u32>,
         mixed_decode_rows: Option<u32>,
     ) -> (Self, Vec<packet::devbuild::TensorDecl>, Vec<GenTensor>) {
         let mut tb = Builder::new(n_cu);
@@ -6127,6 +6132,7 @@ impl<'a> DenseGqaEmitter<'a> {
             block.clone(),
             nrn_fold,
             merge_fold,
+            mixed_total_rows,
             mixed_decode_rows,
         );
         let tensors = tb.tensors();
@@ -7375,6 +7381,9 @@ fn emit_dense_gqa(
     // slot `s`'s offset into the KV cache is `s * (kv_head*ring*hd)` — INVARIANT in B — so a
     // sequence keeps its slot while the program under it changes rung to rung.
     let dbatch: u32 = *rungs.last().expect("decode_rungs is non-empty");
+    let mixed_total_rows = mixed_step
+        .as_ref()
+        .and_then(|mixed| mixed.rows.iter().map(|rows| rows.total_rows).max());
     let mixed_decode_rows = mixed_step
         .as_ref()
         .and_then(|mixed| mixed.rows.iter().map(|rows| rows.decode_rows).max());
@@ -7439,6 +7448,7 @@ fn emit_dense_gqa(
         dbatch,
         moe_pf,
         amd,
+        mixed_total_rows,
         mixed_decode_rows,
     );
 

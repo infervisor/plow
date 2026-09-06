@@ -435,6 +435,22 @@ fn dense_mixed_step_is_reachable_and_keeps_the_stock_blob_stable_when_absent() {
     });
     let blob = std::fs::read(out).unwrap();
     let tensor_count = u32::from_le_bytes(blob[12..16].try_into().unwrap()) as usize;
+    let decl_size = std::mem::size_of::<packet::devbuild::BlobTensor>();
+    let kvlen_bytes = (0..tensor_count)
+        .find_map(|index| {
+            let at = 64 + index * decl_size;
+            let name = &blob[at..at + packet::devbuild::NAME_LEN];
+            let end = name.iter().position(|&byte| byte == 0)?;
+            (&name[..end] == b"in.kvlen").then(|| {
+                u64::from_le_bytes(
+                    blob[at + packet::devbuild::NAME_LEN..at + packet::devbuild::NAME_LEN + 8]
+                        .try_into()
+                        .unwrap(),
+                )
+            })
+        })
+        .unwrap();
+    assert_eq!(kvlen_bytes, 128 * 4);
     let programs = plow_asset::aux_program::parse(
         section(&blob, packet::devbuild::SECT_PROGRAMS, "mixed.programs"),
         128,

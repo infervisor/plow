@@ -108,22 +108,24 @@ impl LoadedMixedPacket<'_> {
         self.backend
     }
 
+    pub fn variants(&self) -> impl ExactSizeIterator<Item = SelectedVariant<'_>> {
+        self.variants.iter().map(|variant| SelectedVariant {
+            rows: variant.rows,
+            decode_rows: variant.decode_rows,
+            program_index: variant.program_index,
+            program: &self.programs[variant.program_section].parsed.programs
+                [variant.program_index as usize],
+            object: self.objects[variant.object_section],
+            decode_slot: variant.decode_slot,
+            physical_slot_capacity: self.physical_slot_capacity,
+        })
+    }
+
     /// Select a compiler-emitted variant. This is a linear scan over the small
     /// load-time catalog and does not allocate.
     pub fn select(&self, rows: u32, decode_rows: u32) -> Option<SelectedVariant<'_>> {
-        self.variants
-            .iter()
+        self.variants()
             .find(|variant| variant.rows == rows && variant.decode_rows == decode_rows)
-            .map(|variant| SelectedVariant {
-                rows: variant.rows,
-                decode_rows: variant.decode_rows,
-                program_index: variant.program_index,
-                program: &self.programs[variant.program_section].parsed.programs
-                    [variant.program_index as usize],
-                object: self.objects[variant.object_section],
-                decode_slot: variant.decode_slot,
-                physical_slot_capacity: self.physical_slot_capacity,
-            })
     }
 }
 
