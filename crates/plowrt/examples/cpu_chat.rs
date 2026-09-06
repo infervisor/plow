@@ -4,6 +4,11 @@
 //! `cargo run --release --features cpu --example cpu_chat -- <model.pkt> <checkpoint-dir> [--tokens N] [--threads T] [--isa amx|avx512|scalar] [--prompt "..."]`
 
 #[cfg(feature = "cpu")]
+fn gemma4_chat(q: &str) -> String {
+    format!("<bos><|turn>user\n{q}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
+}
+
+#[cfg(feature = "cpu")]
 fn main() {
     use plowrt::exec::cpu::engine::{CpuEngine, CpuEngineOpts};
     use plowrt::exec::cpu::ffi::Isa;
@@ -37,12 +42,14 @@ fn main() {
             }
             "--prompt" => prompt = args.next().unwrap(),
             "--prompt-file" => prompt = std::fs::read_to_string(args.next().unwrap()).expect("prompt file"),
-            // Gemma chat template (text-only subset of chat_template.jinja), as serve/chat.rs builds it.
+            // Gemma-4 chat template (chat_template.jinja, thinking off): `<|turn>` 105 / `<turn|>` 106 /
+            // `<|channel>` 100 / `<channel|>` 101 are single added tokens; the generation prompt opens
+            // an EMPTY thought channel exactly as HF's apply_chat_template does. (`<start_of_turn>`
+            // is Gemma-3's spelling and tokenizes as plain text here — measured: both 12B and 26B
+            // then emitted the turn markers themselves before answering.)
             "--chat-file" => {
                 let q = std::fs::read_to_string(args.next().unwrap()).expect("chat file");
-                prompt = format!(
-                    "<bos><start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n"
-                );
+                prompt = gemma4_chat(q.trim());
             }
             // OpenAI harmony format (gpt-oss): force the final channel so the answer comes first.
             "--harmony" => {
@@ -53,9 +60,7 @@ fn main() {
             }
             "--chat" => {
                 let q = args.next().unwrap();
-                prompt = format!(
-                    "<bos><start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n"
-                );
+                prompt = gemma4_chat(&q);
             }
             other => panic!("unknown arg {other}"),
         }

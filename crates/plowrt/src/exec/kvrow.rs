@@ -255,6 +255,10 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::MoeRouterTopkPf, RowField::Rows(4)),
     (DevOp::MoeAlignPf, RowField::Rows(0)),
     (DevOp::MoeCombinePf, RowField::Rows(2)),
+    // Gemma-4 26B-A4B MoE prefill (dev_isa.h 73/74/77): T rides in i3 / i0 / i2; 75/76 have no T.
+    (DevOp::MoeRouterGemmaPf, RowField::Rows(3)),
+    (DevOp::MoeAlignGemmaPf, RowField::Rows(0)),
+    (DevOp::MoeCombineNormGemmaPf, RowField::Rows(2)),
     (DevOp::XReduce, RowField::RowsTimes(0)),
     (DevOp::XReduceTwoShot, RowField::RowsTimes(0)),
 ];
