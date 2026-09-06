@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "experiment": "M1 register-panel full decode object CPU resource gate",
+  "base_commit": "f4c02b94ce23f5ef6500e01da81e80a5546646bc",
+  "decision": "REJECT combined object;no production/compiler selection,no metadata emitted",
+  "scope": "CPU compilation and SASS only; no new GPU measurements",
+  "object_binding_constraint": "decode_objects v1 binds a whole program; distinct per-projection objects cannot be selected within the existing M1 program",
+  "candidate_dispatch": {
+    "rows": 1,
+    "threads": 256,
+    "xreg_k": [
+      3840,
+      4096
+    ],
+    "xreg_n_min": 1024,
+    "kpanel_k": [
+      8192,
+      15360
+    ],
+    "kpanel_n": 3840,
+    "kpanel_rows_per_warp": 4,
+    "kpanel_max_owned_rows_per_cta": 32,
+    "unroll": 8,
+    "fallback": "same generic GEMV with constant M1",
+    "capability": "plow_m1_gemv_register_panels_abi=1"
+  },
+  "shared_recipe": {
+    "grid_assumed_for_static_capacity": 132,
+    "threads": 256,
+    "dynamic_arena_bytes": 16384,
+    "gemv_staging_bytes": 16384,
+    "gemv_mm_cap": 16,
+    "register_cap_added": false
+  },
+  "results": {
+    "control": {
+      "cubin_sha256": "7e05966990999a5298be2601181c36f782face169362177198efe3f1f1f5365e",
+      "registers_per_thread": 193,
+      "stack_bytes": 0,
+      "spill_stores_bytes": 0,
+      "spill_loads_bytes": 0,
+      "static_shared_bytes": 2448,
+      "cuobjdump_local_field": 0,
+      "sass_local_access_instructions": [],
+      "register_limited_ctas_per_h100_sm": 1,
+      "occupancy_scope": "static register-capacity bound only; no CUDA occupancy query/device executed",
+      "build_returncode": 0
+    },
+    "candidate": {
+      "cubin_sha256": "17e2c84b8c992a6b7ea82a780af3144c50c1181445d0c321d373ee3ba378da62",
+      "registers_per_thread": 255,
+      "stack_bytes": 8,
+      "spill_stores_bytes": 8,
+      "spill_loads_bytes": 8,
+      "static_shared_bytes": 2448,
+      "cuobjdump_local_field": 0,
+      "sass_local_access_instructions": [
+        "/*01e0*/                   STL [R1], R2 ;                                                    /* 0x0000000201007387 */",
+        "/*01f0*/                   STL [R1+0x4], R4 ;                                                /* 0x0000040401007387 */",
+        "/*0300*/                   LDL R3, [R1+0x4] ;                                                /* 0x0000040001037983 */",
+        "/*0310*/                   LDL R2, [R1] ;                                                    /* 0x0000000001027983 */"
+      ],
+      "register_limited_ctas_per_h100_sm": 1,
+      "occupancy_scope": "static register-capacity bound only; no CUDA occupancy query/device executed",
+      "build_returncode": 0
+    }
+  },
+  "prerequisite_scope": "Individual shapes have prior primitive numerical/memory/timing qualification in gemma12-bf16-m1-register-panels-h100-20260906.json. Those results do not qualify this combined interpreter object. N>=1024 dispatch includes unmeasured shapes such as lm_head; no compiler record may infer their performance from K alone.",
+  "production_state": "unchanged; rejected prototype retained only under CHECKS",
+  "source_paths": {
+    "runtime/nvidia/interp_sm120.cu": "d5e60e26c6e7f7b338ec54debdcef00948320b47e4d46d6b58936adc8a831268",
+    "runtime/nvidia/op_gemm_sm90.cuh": "f7be0382749aaf92eeed74584d39ea759709140c96fd2369638380c11e05d2c4"
+  },
+  "gate": {
+    "required_zero_spills": true,
+    "candidate_pass": false,
+    "explanation": "ptxas reports8B stores+loads and SASS confirms2STL+2LDL despite cuobjdump LOCAL0; candidate fails zero-spill gate. No native block or serving test is released."
+  },
+  "artifacts": {
+    "root": "/tmp/plow-model-support-checks/m1-register-panel-decode-object-20260906",
+    "raw_archive": "/opt/dlami/nvme/tmp/plow-h100-campaign/raw-checks-20260906/m1-register-panel-decode-object-20260906",
+    "raw_archive_sorted_sha256_manifest_sha256": "016bdc4d101aff51bbb793ba285c8c7d62dd504d2cfb568762aa3af5876edf61",
+    "recipe_sha256": "4b5bb76c5746f49da5d12ec52860f40eed536e0b5f703e6917befff72e12a7d1",
+    "rejected_source_patch_sha256": "c0c655ff2abe74eeea454d5671c9189b87f45dc98619bbb71d2f349ab76cf666"
+  }
+}
