@@ -1,0 +1,658 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8094",
+  "model": "gpt-oss-20b",
+  "server_models": [
+   "gpt-oss-20b"
+  ],
+  "timestamp": "2026-09-06T09:44:51+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8094",
+   "--model",
+   "gpt-oss-20b",
+   "--workload",
+   "chat_short",
+   "--concurrency",
+   "1,2",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee",
+   "--out",
+   "perf-data/cpu-gptoss/vllm/vllm-gptoss-probe.json",
+   "--md",
+   "perf-data/cpu-gptoss/vllm/vllm-gptoss-probe.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "chat_short",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 39.795127011006116,
+    "ttft_s": {
+     "mean": 0.6406228190026013,
+     "p50": 0.6435203699948033,
+     "p90": 0.6720046639966313,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.06878248100988531,
+     "p50": 0.06838236965094915,
+     "p90": 0.07065362809526195,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 4.974007969753075,
+     "p50": 4.951697062002495,
+     "p90": 5.096174892009003,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 32.25,
+     "p50": 33,
+     "p90": 38,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 12.865896868689386,
+    "req_per_s": 0.20102963857327166,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 39.795127011006116,
+     "ttft_s": {
+      "mean": 0.6406228190026013,
+      "p50": 0.6435203699948033,
+      "p90": 0.6720046639966313,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.06878248100988531,
+      "p50": 0.06838236965094915,
+      "p90": 0.07065362809526195,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 4.974007969753075,
+      "p50": 4.951697062002495,
+      "p90": 5.096174892009003,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 32.25,
+      "p50": 33,
+      "p90": 38,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 12.865896868689386,
+     "req_per_s": 0.20102963857327166,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6396522060094867,
+     "tpot_s": 0.070705738111024,
+     "latency_s": 5.094204070002888,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 92,
+      "total_tokens": 156,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: Why do bees kick drones out of the hive at the end of summer?",
+     "text_chars": 304,
+     "index": 0,
+     "kind": "chat_short",
+     "t_start": 1788687896.8603373,
+     "prompt_tokens_client": 25,
+     "prompt_tokens_server": 92,
+     "prompt_chars": 94,
+     "prompt_tokens": 25
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6449137000017799,
+     "tpot_s": 0.07065362809526195,
+     "latency_s": 5.096174892009003,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 89,
+      "total_tokens": 153,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "The user asks: \"Hi! What are the tradeoffs between washed and natural processed ",
+     "text_chars": 301,
+     "index": 1,
+     "kind": "chat_short",
+     "t_start": 1788687901.9548657,
+     "prompt_tokens_client": 22,
+     "prompt_tokens_server": 89,
+     "prompt_chars": 106,
+     "prompt_tokens": 22
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6720046639966313,
+     "tpot_s": 0.07039575634911353,
+     "latency_s": 5.107022343989229,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 104,
+      "total_tokens": 168,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain why grinding coffee makes it go stale faster. Provide clear, ",
+     "text_chars": 319,
+     "index": 2,
+     "kind": "chat_short",
+     "t_start": 1788687907.0513766,
+     "prompt_tokens_client": 37,
+     "prompt_tokens_server": 104,
+     "prompt_chars": 184,
+     "prompt_tokens": 37
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6036081050115172,
+     "tpot_s": 0.06833539285700739,
+     "latency_s": 4.908836999005871,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 92,
+      "total_tokens": 156,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"How did lighthouse keepers stop sailors from confusing one l",
+     "text_chars": 307,
+     "index": 3,
+     "kind": "chat_short",
+     "t_start": 1788687912.1587732,
+     "prompt_tokens_client": 25,
+     "prompt_tokens_server": 92,
+     "prompt_chars": 121,
+     "prompt_tokens": 25
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6165665270091267,
+     "tpot_s": 0.0683033156665116,
+     "latency_s": 4.9197649780107895,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 93,
+      "total_tokens": 157,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain tradeoffs between washed and natural processed coffee, simple",
+     "text_chars": 302,
+     "index": 4,
+     "kind": "chat_short",
+     "t_start": 1788687917.0679865,
+     "prompt_tokens_client": 26,
+     "prompt_tokens_server": 93,
+     "prompt_chars": 139,
+     "prompt_tokens": 26
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6435203699948033,
+     "tpot_s": 0.06838236965094915,
+     "latency_s": 4.951697062002495,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 105,
+      "total_tokens": 169,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"I'm preparing notes for a talk at our local club next week. ",
+     "text_chars": 261,
+     "index": 5,
+     "kind": "chat_short",
+     "t_start": 1788687921.9881058,
+     "prompt_tokens_client": 38,
+     "prompt_tokens_server": 105,
+     "prompt_chars": 165,
+     "prompt_tokens": 38
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6738395900028991,
+     "tpot_s": 0.06709385468252188,
+     "latency_s": 4.900839972004178,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 119,
+      "total_tokens": 183,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"My sourdough starter smells like nail polish remover after t",
+     "text_chars": 260,
+     "index": 6,
+     "kind": "chat_short",
+     "t_start": 1788687926.940177,
+     "prompt_tokens_client": 52,
+     "prompt_tokens_server": 119,
+     "prompt_chars": 240,
+     "prompt_tokens": 52
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6308773899945663,
+     "tpot_s": 0.06638979266669291,
+     "latency_s": 4.813523441000143,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 100,
+      "total_tokens": 164,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What are the four main variables in brewing coffee that affe",
+     "text_chars": 282,
+     "index": 7,
+     "kind": "chat_short",
+     "t_start": 1788687931.8414254,
+     "prompt_tokens_client": 33,
+     "prompt_tokens_server": 100,
+     "prompt_chars": 159,
+     "prompt_tokens": 33
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 24.4635150799877,
+    "ttft_s": {
+     "mean": 1.022307725625069,
+     "p50": 1.0661916480021318,
+     "p90": 1.0937490350042935,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.08069688654567081,
+     "p50": 0.0815052165398522,
+     "p90": 0.08276036649199557,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 6.106293216125778,
+     "p50": 6.2089170860126615,
+     "p90": 6.304106320996652,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 42.375,
+     "p50": 46,
+     "p90": 51,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 20.9291264287216,
+    "req_per_s": 0.327017600448775,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 24.4635150799877,
+     "ttft_s": {
+      "mean": 1.022307725625069,
+      "p50": 1.0661916480021318,
+      "p90": 1.0937490350042935,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.08069688654567081,
+      "p50": 0.0815052165398522,
+      "p90": 0.08276036649199557,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 6.106293216125778,
+      "p50": 6.2089170860126615,
+      "p90": 6.304106320996652,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 42.375,
+      "p50": 46,
+      "p90": 51,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 20.9291264287216,
+     "req_per_s": 0.327017600448775,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.9502628670015838,
+     "tpot_s": 0.07864381577787248,
+     "latency_s": 5.904908407013863,
+     "output_tokens": 64,
+     "content_chunks": 57,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 113,
+      "total_tokens": 177,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain the 50% rule for fixed costs in a household budget. Provide c",
+     "text_chars": 323,
+     "index": 8,
+     "kind": "chat_short",
+     "t_start": 1788687941.5073693,
+     "prompt_tokens_client": 46,
+     "prompt_tokens_server": 113,
+     "prompt_chars": 200,
+     "prompt_tokens": 46
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.9502278180007124,
+     "tpot_s": 0.07865389374603096,
+     "latency_s": 5.905479305991321,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 113,
+      "total_tokens": 177,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"How did the printing press change the way books looked, not ",
+     "text_chars": 282,
+     "index": 9,
+     "kind": "chat_short",
+     "t_start": 1788687941.5075266,
+     "prompt_tokens_client": 46,
+     "prompt_tokens_server": 113,
+     "prompt_chars": 215,
+     "prompt_tokens": 46
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.9462418479961343,
+     "tpot_s": 0.07975778765080216,
+     "latency_s": 5.971037206996698,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 118,
+      "total_tokens": 182,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: which debt to pay off first: credit card debt at 22% vs car l",
+     "text_chars": 268,
+     "index": 10,
+     "kind": "chat_short",
+     "t_start": 1788687947.412667,
+     "prompt_tokens_client": 51,
+     "prompt_tokens_server": 118,
+     "prompt_chars": 206,
+     "prompt_tokens": 51
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.9456071830063593,
+     "tpot_s": 0.07974800799990864,
+     "latency_s": 5.9698171469935915,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 103,
+      "total_tokens": 167,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to produce a two-sentence explanation, under 100 words, for a hobbyist. ",
+     "text_chars": 277,
+     "index": 11,
+     "kind": "chat_short",
+     "t_start": 1788687947.4132423,
+     "prompt_tokens_client": 36,
+     "prompt_tokens_server": 103,
+     "prompt_chars": 156,
+     "prompt_tokens": 36
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0661916480021318,
+     "tpot_s": 0.08162913953983372,
+     "latency_s": 6.2089170860126615,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 121,
+      "total_tokens": 185,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: sourdough starter smells like nail polish remover after two d",
+     "text_chars": 319,
+     "index": 12,
+     "kind": "chat_short",
+     "t_start": 1788687953.3833954,
+     "prompt_tokens_client": 54,
+     "prompt_tokens_server": 121,
+     "prompt_chars": 249,
+     "prompt_tokens": 54
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.1434212349995505,
+     "tpot_s": 0.0815052165398522,
+     "latency_s": 6.278337064999505,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 102,
+      "total_tokens": 166,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "The user wants a simple explanation: why Fresnel's lens mattered for lighthouses",
+     "text_chars": 287,
+     "index": 13,
+     "kind": "chat_short",
+     "t_start": 1788687953.3839753,
+     "prompt_tokens_client": 35,
+     "prompt_tokens_server": 102,
+     "prompt_chars": 160,
+     "prompt_tokens": 35
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0827601709897863,
+     "tpot_s": 0.0828768646190708,
+     "latency_s": 6.304106320996652,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 99,
+      "total_tokens": 163,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to settle a debate: why were first steam engines built at coal mines rat",
+     "text_chars": 336,
+     "index": 14,
+     "kind": "chat_short",
+     "t_start": 1788687959.592775,
+     "prompt_tokens_client": 32,
+     "prompt_tokens_server": 99,
+     "prompt_chars": 144,
+     "prompt_tokens": 32
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0937490350042935,
+     "tpot_s": 0.08276036649199557,
+     "latency_s": 6.307743190001929,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 106,
+      "total_tokens": 170,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain the windowpane test for dough kneading. The user wants to set",
+     "text_chars": 263,
+     "index": 15,
+     "kind": "chat_short",
+     "t_start": 1788687959.6626348,
+     "prompt_tokens_client": 39,
+     "prompt_tokens_server": 106,
+     "prompt_chars": 170,
+     "prompt_tokens": 39
+    }
+   ]
+  }
+ ]
+}

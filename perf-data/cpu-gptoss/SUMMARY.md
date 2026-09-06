@@ -88,3 +88,36 @@ Reading: plow wins TTFT everywhere (1.2–5×) and decode at c=1 (33 vs 41–59,
 at parity on short prompts and 10–45 % behind on long prompts, where other slots' whole-prompt prefills stall
 the decode steps (TPOT p90 ≫ p50). Next: chunked prefill (PLOW_CPU_PF_CHUNK) by default at c≥2, then the
 dense MXFP4 GEMV at batch ≥ 5 (AMX x_gemv_mxfp4 path) and per-row dequant cost in the grouped MoE decode.
+
+## Three-way: plow (MXFP4 dense+experts) vs llama.cpp vs vLLM 0.28 CPU (09:4x–09:5x, fresh prompts)
+
+vLLM: `vllm serve <hf gpt-oss-20b> --dtype bfloat16 --max-model-len 4096 --max-num-seqs 8` (CPU backend; its
+MXFP4 module has no CPU path, so the experts are dequantized at load — 22 GB resident). vLLM streams GPT-OSS's
+reasoning as a separate `reasoning` delta; bench.py now counts reasoning deltas as generated tokens (llama.cpp ran
+with reasoning folded into content, plow emits the final channel directly), so TPOT/TTFT are comparable. Raw:
+`vllm/vllm-gptoss-*.md`. TTFT/TPOT mean ms; bold = best.
+
+| workload | conc | plow TTFT | llama TTFT | vLLM TTFT | plow TPOT | llama TPOT | vLLM TPOT |
+|---|---|---|---|---|---|---|---|
+| chat_short | 1 | **602** | 748 | 637 | **33** | 41 | 71 |
+| chat_short | 2 | **829** | 1625 | 1220 | **61** | 65 | 95 |
+| chat_short | 4 | **1369** | 3059 | 1657 | 109 | **104** | 103 |
+| chat_short | 8 | 2876 | 5260 | **2120** | 174 | 177 | **136** |
+| chat_long | 1 | 2070 | 4823 | **1346** | **32** | 51 | 71 |
+| chat_long | 2 | 2969 | 9520 | **1962** | **75** | 81 | 80 |
+| chat_long | 4 | 3837 | 14432 | **2550** | 146 | 133 | **102** |
+| chat_long | 8 | 10469 | 35666 | **4591** | 285 | 215 | **137** |
+| code | 1 | 1697 | 4212 | **1253** | **33** | 50 | 76 |
+| code | 2 | 2705 | 8780 | **2151** | **68** | 73 | 81 |
+| code | 4 | 3971 | 18762 | **2944** | 148 | 123 | **115** |
+| code | 8 | 7692 | 35120 | **4156** | 243 | 207 | **152** |
+| summarize | 1 | 5437 | 10693 | **1829** | **33** | 59 | 71 |
+| summarize | 2 | 6200 | 23777 | **3593** | 128 | 113 | **85** |
+| summarize | 4 | 11179 | 57888 | **6735** | 283 | 195 | **116** |
+| summarize | 8 | 24319 | 73138 | **7219** | 466 | 430 | **153** |
+
+Reading: plow owns single-stream decode (33 ms vs 41–59 llama.cpp and 71–76 vLLM) and short-prompt TTFT. vLLM
+owns prefill throughput (summarize c=1: 1111 tokens in 1.8 s ≈ 600 tok/s vs plow ≈ 200, llama.cpp ≈ 100) and
+therefore every long-prompt cell at c ≥ 2, plus decode at c = 8 (its batched MoE/attention scale better: 136–153
+ms at 8 rows vs plow 174–466). The gap to close is prefill throughput (prepacked AMX weights, MoE prefill
+efficiency) and batched-decode scaling — the same two items on the plan.

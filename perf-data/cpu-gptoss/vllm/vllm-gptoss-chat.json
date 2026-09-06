@@ -1,0 +1,2506 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8094",
+  "model": "gpt-oss-20b",
+  "server_models": [
+   "gpt-oss-20b"
+  ],
+  "timestamp": "2026-09-06T09:48:45+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8094",
+   "--model",
+   "gpt-oss-20b",
+   "--workload",
+   "chat_short,chat_long",
+   "--concurrency",
+   "1,2,4,8",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee",
+   "--out",
+   "perf-data/cpu-gptoss/vllm/vllm-gptoss-chat.json",
+   "--md",
+   "perf-data/cpu-gptoss/vllm/vllm-gptoss-chat.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "chat_short",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 40.749553802001174,
+    "ttft_s": {
+     "mean": 0.637163061001047,
+     "p50": 0.6332315180043224,
+     "p90": 0.6454044179990888,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.07073101448215657,
+     "p50": 0.07075369195242981,
+     "p90": 0.07287633957134353,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 5.093307546751021,
+     "p50": 5.091322418011259,
+     "p90": 5.233747374004452,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 32.25,
+     "p50": 33,
+     "p90": 38,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 12.564554755317497,
+    "req_per_s": 0.1963211680518359,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 40.749553802001174,
+     "ttft_s": {
+      "mean": 0.637163061001047,
+      "p50": 0.6332315180043224,
+      "p90": 0.6454044179990888,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.07073101448215657,
+      "p50": 0.07075369195242981,
+      "p90": 0.07287633957134353,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 5.093307546751021,
+      "p50": 5.091322418011259,
+      "p90": 5.233747374004452,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 32.25,
+      "p50": 33,
+      "p90": 38,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 12.564554755317497,
+     "req_per_s": 0.1963211680518359,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6230733359989244,
+     "tpot_s": 0.06810942963495599,
+     "latency_s": 4.91406220299541,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 92,
+      "total_tokens": 156,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: Why do bees kick drones out of the hive at the end of summer?",
+     "text_chars": 304,
+     "index": 0,
+     "kind": "chat_short",
+     "t_start": 1788688130.1243129,
+     "prompt_tokens_client": 25,
+     "prompt_tokens_server": 92,
+     "prompt_chars": 94,
+     "prompt_tokens": 25
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.5977311250026105,
+     "tpot_s": 0.07075369195242981,
+     "latency_s": 5.055303557994193,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 89,
+      "total_tokens": 153,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "The user asks: \"Hi! What are the tradeoffs between washed and natural processed ",
+     "text_chars": 301,
+     "index": 1,
+     "kind": "chat_short",
+     "t_start": 1788688135.038718,
+     "prompt_tokens_client": 22,
+     "prompt_tokens_server": 89,
+     "prompt_chars": 106,
+     "prompt_tokens": 22
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6332315180043224,
+     "tpot_s": 0.06692161223812339,
+     "latency_s": 4.849382789005176,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 104,
+      "total_tokens": 168,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain why grinding coffee makes it go stale faster. Provide clear, ",
+     "text_chars": 319,
+     "index": 2,
+     "kind": "chat_short",
+     "t_start": 1788688140.0943518,
+     "prompt_tokens_client": 37,
+     "prompt_tokens_server": 104,
+     "prompt_chars": 184,
+     "prompt_tokens": 37
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6324793100066017,
+     "tpot_s": 0.0790988465395501,
+     "latency_s": 5.615802522006561,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 92,
+      "total_tokens": 156,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"How did lighthouse keepers stop sailors from confusing one l",
+     "text_chars": 307,
+     "index": 3,
+     "kind": "chat_short",
+     "t_start": 1788688144.9441345,
+     "prompt_tokens_client": 25,
+     "prompt_tokens_server": 92,
+     "prompt_chars": 121,
+     "prompt_tokens": 25
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6424485610041302,
+     "tpot_s": 0.07287633957134353,
+     "latency_s": 5.233747374004452,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 93,
+      "total_tokens": 157,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain tradeoffs between washed and natural processed coffee, simple",
+     "text_chars": 302,
+     "index": 4,
+     "kind": "chat_short",
+     "t_start": 1788688150.5602765,
+     "prompt_tokens_client": 26,
+     "prompt_tokens_server": 93,
+     "prompt_chars": 139,
+     "prompt_tokens": 26
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6454044179990888,
+     "tpot_s": 0.0705687002540337,
+     "latency_s": 5.091322418011259,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 105,
+      "total_tokens": 169,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"I'm preparing notes for a talk at our local club next week. ",
+     "text_chars": 261,
+     "index": 5,
+     "kind": "chat_short",
+     "t_start": 1788688155.7943587,
+     "prompt_tokens_client": 38,
+     "prompt_tokens_server": 105,
+     "prompt_chars": 165,
+     "prompt_tokens": 38
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6975280589977046,
+     "tpot_s": 0.07076108353979339,
+     "latency_s": 5.155566443994758,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 119,
+      "total_tokens": 183,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"My sourdough starter smells like nail polish remover after t",
+     "text_chars": 260,
+     "index": 6,
+     "kind": "chat_short",
+     "t_start": 1788688160.8860583,
+     "prompt_tokens_client": 52,
+     "prompt_tokens_server": 119,
+     "prompt_chars": 240,
+     "prompt_tokens": 52
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6254081609949935,
+     "tpot_s": 0.06675841212702271,
+     "latency_s": 4.831273065996356,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 100,
+      "total_tokens": 164,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What are the four main variables in brewing coffee that affe",
+     "text_chars": 282,
+     "index": 7,
+     "kind": "chat_short",
+     "t_start": 1788688166.0420656,
+     "prompt_tokens_client": 33,
+     "prompt_tokens_server": 100,
+     "prompt_chars": 159,
+     "prompt_tokens": 33
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 28.94014336800319,
+    "ttft_s": {
+     "mean": 1.220158434498444,
+     "p50": 1.2518382499984,
+     "p90": 1.2724521740019554,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.09532631502377857,
+     "p50": 0.09919765303170101,
+     "p90": 0.10222638857140694,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 7.225799994746922,
+     "p50": 7.411504381991108,
+     "p90": 7.712815595994471,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 42.375,
+     "p50": 46,
+     "p90": 51,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 17.691688444296982,
+    "req_per_s": 0.27643263194214035,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 28.94014336800319,
+     "ttft_s": {
+      "mean": 1.220158434498444,
+      "p50": 1.2518382499984,
+      "p90": 1.2724521740019554,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.09532631502377857,
+      "p50": 0.09919765303170101,
+      "p90": 0.10222638857140694,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 7.225799994746922,
+      "p50": 7.411504381991108,
+      "p90": 7.712815595994471,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 42.375,
+      "p50": 46,
+      "p90": 51,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 17.691688444296982,
+     "req_per_s": 0.27643263194214035,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.1486553079885198,
+     "tpot_s": 0.09940929704767075,
+     "latency_s": 7.411504381991108,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 113,
+      "total_tokens": 177,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain the 50% rule for fixed costs in a household budget, and evalu",
+     "text_chars": 262,
+     "index": 8,
+     "kind": "chat_short",
+     "t_start": 1788688175.8512304,
+     "prompt_tokens_client": 46,
+     "prompt_tokens_server": 113,
+     "prompt_chars": 200,
+     "prompt_tokens": 46
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.24406782699225,
+     "tpot_s": 0.09919765303170101,
+     "latency_s": 7.493609758996172,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 113,
+      "total_tokens": 177,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"How did the printing press change the way books looked, not ",
+     "text_chars": 284,
+     "index": 9,
+     "kind": "chat_short",
+     "t_start": 1788688175.8513727,
+     "prompt_tokens_client": 46,
+     "prompt_tokens_server": 113,
+     "prompt_chars": 215,
+     "prompt_tokens": 46
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.2518382499984,
+     "tpot_s": 0.10260277715883964,
+     "latency_s": 7.715876942995237,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 118,
+      "total_tokens": 182,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: which debt to pay off first: credit card debt at 22% vs car l",
+     "text_chars": 268,
+     "index": 10,
+     "kind": "chat_short",
+     "t_start": 1788688183.263188,
+     "prompt_tokens_client": 51,
+     "prompt_tokens_server": 118,
+     "prompt_chars": 206,
+     "prompt_tokens": 51
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.2724521740019554,
+     "tpot_s": 0.10222638857140694,
+     "latency_s": 7.712815595994471,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 103,
+      "total_tokens": 167,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to produce a two-sentence explanation, under 100 words, for a hobbyist, ",
+     "text_chars": 297,
+     "index": 11,
+     "kind": "chat_short",
+     "t_start": 1788688183.3453383,
+     "prompt_tokens_client": 36,
+     "prompt_tokens_server": 103,
+     "prompt_chars": 156,
+     "prompt_tokens": 36
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.2536623869964387,
+     "tpot_s": 0.09736843123807505,
+     "latency_s": 7.387960515989107,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 121,
+      "total_tokens": 185,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: sourdough starter smells like nail polish remover after two d",
+     "text_chars": 319,
+     "index": 12,
+     "kind": "chat_short",
+     "t_start": 1788688190.9795208,
+     "prompt_tokens_client": 54,
+     "prompt_tokens_server": 121,
+     "prompt_chars": 249,
+     "prompt_tokens": 54
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.27723010101181,
+     "tpot_s": 0.09698200919032503,
+     "latency_s": 7.38719404200674,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 102,
+      "total_tokens": 166,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "The user wants a simple explanation: why Fresnel's lens mattered for lighthouses",
+     "text_chars": 287,
+     "index": 13,
+     "kind": "chat_short",
+     "t_start": 1788688191.0585206,
+     "prompt_tokens_client": 35,
+     "prompt_tokens_server": 102,
+     "prompt_chars": 160,
+     "prompt_tokens": 35
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.1498744080017786,
+     "tpot_s": 0.08258390355539243,
+     "latency_s": 6.3527247099991655,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 99,
+      "total_tokens": 163,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to settle a debate: why were first steam engines built at coal mines rat",
+     "text_chars": 336,
+     "index": 14,
+     "kind": "chat_short",
+     "t_start": 1788688198.3679695,
+     "prompt_tokens_client": 32,
+     "prompt_tokens_server": 99,
+     "prompt_chars": 144,
+     "prompt_tokens": 32
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.1634870209963992,
+     "tpot_s": 0.08224006039681771,
+     "latency_s": 6.344714010003372,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 106,
+      "total_tokens": 170,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain the windowpane test for dough kneading. The user wants to set",
+     "text_chars": 263,
+     "index": 15,
+     "kind": "chat_short",
+     "t_start": 1788688198.4461453,
+     "prompt_tokens_client": 39,
+     "prompt_tokens_server": 106,
+     "prompt_chars": 170,
+     "prompt_tokens": 39
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 16.365577555989148,
+    "ttft_s": {
+     "mean": 1.6565339184999175,
+     "p50": 1.6446887619968038,
+     "p90": 1.6937609400047222,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.10338703105553,
+     "p50": 0.1038752377619006,
+     "p90": 0.10388339411107904,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 8.169995182752245,
+     "p50": 8.186538648005808,
+     "p90": 8.187059286006843,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 38.5,
+     "p50": 41,
+     "p90": 47,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 31.285177577654657,
+    "req_per_s": 0.488830899650854,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 16.365577555989148,
+     "ttft_s": {
+      "mean": 1.6565339184999175,
+      "p50": 1.6446887619968038,
+      "p90": 1.6937609400047222,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.10338703105553,
+      "p50": 0.1038752377619006,
+      "p90": 0.10388339411107904,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 8.169995182752245,
+      "p50": 8.186538648005808,
+      "p90": 8.187059286006843,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 38.5,
+      "p50": 41,
+      "p90": 47,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 31.285177577654657,
+     "req_per_s": 0.488830899650854,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6941283640044276,
+     "tpot_s": 0.10291470426974618,
+     "latency_s": 8.177823081001407,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 99,
+      "total_tokens": 163,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What is propolis and what do bees use it for? A short exampl",
+     "text_chars": 262,
+     "index": 16,
+     "kind": "chat_short",
+     "t_start": 1788688209.635975,
+     "prompt_tokens_client": 32,
+     "prompt_tokens_server": 99,
+     "prompt_chars": 133,
+     "prompt_tokens": 32
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.5995668590039713,
+     "tpot_s": 0.10281055273016035,
+     "latency_s": 8.07671918500273,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 108,
+      "total_tokens": 172,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: Why did Trevithick's first locomotive break the rails it ran ",
+     "text_chars": 261,
+     "index": 17,
+     "kind": "chat_short",
+     "t_start": 1788688209.6361206,
+     "prompt_tokens_client": 41,
+     "prompt_tokens_server": 108,
+     "prompt_chars": 181,
+     "prompt_tokens": 41
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6937609400047222,
+     "tpot_s": 0.10292307052383429,
+     "latency_s": 8.178001719003078,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 109,
+      "total_tokens": 173,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to produce a two-sentence explanation. Keep it simple. Mention why the M",
+     "text_chars": 309,
+     "index": 18,
+     "kind": "chat_short",
+     "t_start": 1788688209.636191,
+     "prompt_tokens_client": 42,
+     "prompt_tokens_server": 109,
+     "prompt_chars": 210,
+     "prompt_tokens": 42
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6931432190031046,
+     "tpot_s": 0.10290565355546913,
+     "latency_s": 8.176319236998097,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 105,
+      "total_tokens": 169,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "The user wants a simple explanation of propolis and what bees use it for, and if",
+     "text_chars": 289,
+     "index": 19,
+     "kind": "chat_short",
+     "t_start": 1788688209.6367984,
+     "prompt_tokens_client": 38,
+     "prompt_tokens_server": 105,
+     "prompt_chars": 173,
+     "prompt_tokens": 38
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6446887619968038,
+     "tpot_s": 0.10390391238107687,
+     "latency_s": 8.190706619003322,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 114,
+      "total_tokens": 178,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What is the 50% rule for fixed costs in a household budget, ",
+     "text_chars": 241,
+     "index": 20,
+     "kind": "chat_short",
+     "t_start": 1788688217.7132971,
+     "prompt_tokens_client": 47,
+     "prompt_tokens_server": 114,
+     "prompt_chars": 199,
+     "prompt_tokens": 47
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6428300489933463,
+     "tpot_s": 0.1038752377619006,
+     "latency_s": 8.187059286006843,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 95,
+      "total_tokens": 159,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "The user asks: \"Quick question: What are the four main variables in brewing coff",
+     "text_chars": 310,
+     "index": 21,
+     "kind": "chat_short",
+     "t_start": 1788688217.813448,
+     "prompt_tokens_client": 28,
+     "prompt_tokens_server": 95,
+     "prompt_chars": 146,
+     "prompt_tokens": 28
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6423152369970921,
+     "tpot_s": 0.10387972311097353,
+     "latency_s": 8.18679368699668,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 116,
+      "total_tokens": 180,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain difference between baking soda and baking powder, and whether",
+     "text_chars": 321,
+     "index": 22,
+     "kind": "chat_short",
+     "t_start": 1788688217.8141172,
+     "prompt_tokens_client": 49,
+     "prompt_tokens_server": 116,
+     "prompt_chars": 250,
+     "prompt_tokens": 49
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.641837917995872,
+     "tpot_s": 0.10388339411107904,
+     "latency_s": 8.186538648005808,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 98,
+      "total_tokens": 162,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain why some coffee bags have a little plastic valve. The answer:",
+     "text_chars": 295,
+     "index": 23,
+     "kind": "chat_short",
+     "t_start": 1788688217.814632,
+     "prompt_tokens_client": 31,
+     "prompt_tokens_server": 98,
+     "prompt_chars": 152,
+     "prompt_tokens": 31
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 10.71024968700658,
+    "ttft_s": {
+     "mean": 2.12014529975022,
+     "p50": 2.1316719430033118,
+     "p90": 2.132162051013438,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.13603987814487828,
+     "p50": 0.13613429761908408,
+     "p90": 0.13614021260328296,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 10.690726365375667,
+     "p50": 10.707946312992135,
+     "p90": 10.70893248199718,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 34.25,
+     "p50": 34,
+     "p90": 38,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 47.80467449056264,
+    "req_per_s": 0.7469480389150412,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 10.71024968700658,
+     "ttft_s": {
+      "mean": 2.12014529975022,
+      "p50": 2.1316719430033118,
+      "p90": 2.132162051013438,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.13603987814487828,
+      "p50": 0.13613429761908408,
+      "p90": 0.13614021260328296,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 10.690726365375667,
+      "p50": 10.707946312992135,
+      "p90": 10.70893248199718,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 34.25,
+      "p50": 34,
+      "p90": 38,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 47.80467449056264,
+     "req_per_s": 0.7469480389150412,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.0384721149894176,
+     "tpot_s": 0.13538772457150838,
+     "latency_s": 10.567989638002473,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 100,
+      "total_tokens": 164,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "The user asks: \"I've read conflicting things online about this. Why did early ra",
+     "text_chars": 303,
+     "index": 24,
+     "kind": "chat_short",
+     "t_start": 1788688230.905198,
+     "prompt_tokens_client": 33,
+     "prompt_tokens_server": 100,
+     "prompt_chars": 169,
+     "prompt_tokens": 33
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.132477115999791,
+     "tpot_s": 0.13614021260328296,
+     "latency_s": 10.709358723004698,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 93,
+      "total_tokens": 157,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: Why do bees kick drones out of the hive at the end of summer?",
+     "text_chars": 274,
+     "index": 25,
+     "kind": "chat_short",
+     "t_start": 1788688230.9053636,
+     "prompt_tokens_client": 26,
+     "prompt_tokens_server": 93,
+     "prompt_chars": 115,
+     "prompt_tokens": 26
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.132162051013438,
+     "tpot_s": 0.13611996995233414,
+     "latency_s": 10.707826557001681,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 101,
+      "total_tokens": 165,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to settle a debate: what is propolis and what do bees use it for? Provid",
+     "text_chars": 267,
+     "index": 26,
+     "kind": "chat_short",
+     "t_start": 1788688230.9054494,
+     "prompt_tokens_client": 34,
+     "prompt_tokens_server": 101,
+     "prompt_chars": 146,
+     "prompt_tokens": 34
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.1319046459975652,
+     "tpot_s": 0.13614220915885183,
+     "latency_s": 10.70893248199718,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 105,
+      "total_tokens": 169,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: Why does a fog signal at a lighthouse burn so much fuel? Unde",
+     "text_chars": 287,
+     "index": 27,
+     "kind": "chat_short",
+     "t_start": 1788688230.905978,
+     "prompt_tokens_client": 38,
+     "prompt_tokens_server": 105,
+     "prompt_chars": 173,
+     "prompt_tokens": 38
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.1316719430033118,
+     "tpot_s": 0.13612678703170136,
+     "latency_s": 10.707723659012117,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 101,
+      "total_tokens": 165,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "The user asks: \"Why were the first steam engines built at coal mines rather than",
+     "text_chars": 309,
+     "index": 28,
+     "kind": "chat_short",
+     "t_start": 1788688230.9060724,
+     "prompt_tokens_client": 34,
+     "prompt_tokens_server": 101,
+     "prompt_chars": 184,
+     "prompt_tokens": 34
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.1316443130053813,
+     "tpot_s": 0.1361305203174688,
+     "latency_s": 10.707928154995898,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 111,
+      "total_tokens": 175,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain what a sinking fund is in a household context, simple. Then h",
+     "text_chars": 292,
+     "index": 29,
+     "kind": "chat_short",
+     "t_start": 1788688230.9061491,
+     "prompt_tokens_client": 44,
+     "prompt_tokens_server": 111,
+     "prompt_chars": 199,
+     "prompt_tokens": 44
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.1315873010025825,
+     "tpot_s": 0.13613429761908408,
+     "latency_s": 10.708105395999155,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 99,
+      "total_tokens": 163,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What is propolis and what do bees use it for?\" Provide one-s",
+     "text_chars": 273,
+     "index": 30,
+     "kind": "chat_short",
+     "t_start": 1788688230.9062262,
+     "prompt_tokens_client": 32,
+     "prompt_tokens_server": 99,
+     "prompt_chars": 153,
+     "prompt_tokens": 32
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.131242912990274,
+     "tpot_s": 0.1361373039047947,
+     "latency_s": 10.707946312992135,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 100,
+      "total_tokens": 164,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain why grinding coffee makes it go stale faster. The question: \"",
+     "text_chars": 293,
+     "index": 31,
+     "kind": "chat_short",
+     "t_start": 1788688230.9065857,
+     "prompt_tokens_client": 33,
+     "prompt_tokens_server": 100,
+     "prompt_chars": 151,
+     "prompt_tokens": 33
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 46.65125499499845,
+    "ttft_s": {
+     "mean": 1.3457807547511038,
+     "p50": 1.4618265760072973,
+     "p90": 1.4826353370008292,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.0711759029444303,
+     "p50": 0.06912400122220991,
+     "p90": 0.07487833409524886,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 5.829960264749388,
+     "p50": 5.817788218992064,
+     "p90": 5.9455913589918055,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 391.875,
+     "p50": 464,
+     "p90": 506,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 10.975053083885786,
+    "req_per_s": 0.1714852044357154,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 46.65125499499845,
+     "ttft_s": {
+      "mean": 1.3457807547511038,
+      "p50": 1.4618265760072973,
+      "p90": 1.4826353370008292,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.0711759029444303,
+      "p50": 0.06912400122220991,
+      "p90": 0.07487833409524886,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 5.829960264749388,
+      "p50": 5.817788218992064,
+      "p90": 5.9455913589918055,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 391.875,
+      "p50": 464,
+      "p90": 506,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 10.975053083885786,
+     "req_per_s": 0.1714852044357154,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4826353370008292,
+     "tpot_s": 0.0691146508731421,
+     "latency_s": 5.83696253701055,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 573,
+      "total_tokens": 637,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: Where does the passage recommend keeping an emergency fund, a",
+     "text_chars": 321,
+     "index": 0,
+     "kind": "chat_long",
+     "t_start": 1788688247.0744686,
+     "prompt_tokens_client": 506,
+     "prompt_tokens_server": 573,
+     "prompt_chars": 2651,
+     "prompt_tokens": 506
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.3806182559928857,
+     "tpot_s": 0.06870129084124947,
+     "latency_s": 5.7088939959940035,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 450,
+      "total_tokens": 514,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What is an escapement and what does it do? Give a clear answ",
+     "text_chars": 277,
+     "index": 1,
+     "kind": "chat_long",
+     "t_start": 1788688252.9133623,
+     "prompt_tokens_client": 383,
+     "prompt_tokens_server": 450,
+     "prompt_chars": 1824,
+     "prompt_tokens": 383
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.1498878410056932,
+     "tpot_s": 0.0688723685554347,
+     "latency_s": 5.488942413998302,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 294,
+      "total_tokens": 358,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to give advice on beekeeping: two hives, one active, one quiet. It's ear",
+     "text_chars": 258,
+     "index": 2,
+     "kind": "chat_long",
+     "t_start": 1788688258.6236274,
+     "prompt_tokens_client": 227,
+     "prompt_tokens_server": 294,
+     "prompt_chars": 1035,
+     "prompt_tokens": 227
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.474373001998174,
+     "tpot_s": 0.06894144944436405,
+     "latency_s": 5.817788218992064,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 531,
+      "total_tokens": 595,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"How does a swarm decide where to move, as described here?\" U",
+     "text_chars": 291,
+     "index": 3,
+     "kind": "chat_long",
+     "t_start": 1788688264.1135428,
+     "prompt_tokens_client": 464,
+     "prompt_tokens_server": 531,
+     "prompt_chars": 2273,
+     "prompt_tokens": 464
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4618265760072973,
+     "tpot_s": 0.06912400122220991,
+     "latency_s": 5.816747739008861,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 549,
+      "total_tokens": 613,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"How did the tide affect the travellers' journey on the lower",
+     "text_chars": 293,
+     "index": 4,
+     "kind": "chat_long",
+     "t_start": 1788688269.9331827,
+     "prompt_tokens_client": 482,
+     "prompt_tokens_server": 549,
+     "prompt_chars": 2148,
+     "prompt_tokens": 482
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.2281635489925975,
+     "tpot_s": 0.07487833409524886,
+     "latency_s": 5.9455913589918055,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 302,
+      "total_tokens": 366,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: keep Saturday morning workflow fast without pre-grinding ever",
+     "text_chars": 319,
+     "index": 5,
+     "kind": "chat_long",
+     "t_start": 1788688275.751528,
+     "prompt_tokens_client": 235,
+     "prompt_tokens_server": 302,
+     "prompt_chars": 1105,
+     "prompt_tokens": 235
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.089889745009714,
+     "tpot_s": 0.06948718680937346,
+     "latency_s": 6.467672583996318,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 669,
+      "total_tokens": 733,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: difference between spring tides and neap tides, and what caus",
+     "text_chars": 272,
+     "index": 6,
+     "kind": "chat_long",
+     "t_start": 1788688281.6980999,
+     "prompt_tokens_client": 602,
+     "prompt_tokens_server": 669,
+     "prompt_chars": 2855,
+     "prompt_tokens": 602
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.4988517320016399,
+     "tpot_s": 0.08028794171441982,
+     "latency_s": 5.557083270003204,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 303,
+      "total_tokens": 367,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain freshness importance, likely cause flat taste, and suggest ch",
+     "text_chars": 315,
+     "index": 7,
+     "kind": "chat_long",
+     "t_start": 1788688288.1675563,
+     "prompt_tokens_client": 236,
+     "prompt_tokens_server": 303,
+     "prompt_chars": 1085,
+     "prompt_tokens": 236
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 28.06907767399389,
+    "ttft_s": {
+     "mean": 1.962022630375941,
+     "p50": 2.0439271119976183,
+     "p90": 2.6621098710020306,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.08007816516672189,
+     "p50": 0.0804421491586023,
+     "p90": 0.08047174904768037,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 7.00702795037796,
+     "p50": 7.111873634989024,
+     "p90": 7.7471202880115015,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 439.25,
+     "p50": 473,
+     "p90": 596,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 18.240713355336574,
+    "req_per_s": 0.28501114617713397,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 28.06907767399389,
+     "ttft_s": {
+      "mean": 1.962022630375941,
+      "p50": 2.0439271119976183,
+      "p90": 2.6621098710020306,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.08007816516672189,
+      "p50": 0.0804421491586023,
+      "p90": 0.08047174904768037,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 7.00702795037796,
+      "p50": 7.111873634989024,
+      "p90": 7.7471202880115015,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 439.25,
+      "p50": 473,
+      "p90": 596,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 18.240713355336574,
+     "req_per_s": 0.28501114617713397,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.0442008780082688,
+     "tpot_s": 0.08047174904768037,
+     "latency_s": 7.114002354006516,
+     "output_tokens": 64,
+     "content_chunks": 55,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 568,
+      "total_tokens": 632,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: difference between spring tides and neap tides, and what caus",
+     "text_chars": 264,
+     "index": 8,
+     "kind": "chat_long",
+     "t_start": 1788688298.6754472,
+     "prompt_tokens_client": 501,
+     "prompt_tokens_server": 568,
+     "prompt_chars": 2383,
+     "prompt_tokens": 501
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.0439271119976183,
+     "tpot_s": 0.0804421491586023,
+     "latency_s": 7.111873634989024,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 540,
+      "total_tokens": 604,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What does a halo around the sun or moon signify, and why?\" P",
+     "text_chars": 260,
+     "index": 9,
+     "kind": "chat_long",
+     "t_start": 1788688298.6756325,
+     "prompt_tokens_client": 473,
+     "prompt_tokens_server": 540,
+     "prompt_chars": 2229,
+     "prompt_tokens": 473
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6261243369954173,
+     "tpot_s": 0.07957339346051283,
+     "latency_s": 6.639336780004669,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 303,
+      "total_tokens": 367,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain freshness importance, likely cause flat taste, and suggest ch",
+     "text_chars": 315,
+     "index": 10,
+     "kind": "chat_long",
+     "t_start": 1788688305.789101,
+     "prompt_tokens_client": 236,
+     "prompt_tokens_server": 303,
+     "prompt_chars": 1085,
+     "prompt_tokens": 236
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6246637589938473,
+     "tpot_s": 0.07959165201602791,
+     "latency_s": 6.638993547996506,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 663,
+      "total_tokens": 727,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: difference between till and an esker, based on the text. Expl",
+     "text_chars": 262,
+     "index": 11,
+     "kind": "chat_long",
+     "t_start": 1788688305.7906713,
+     "prompt_tokens_client": 596,
+     "prompt_tokens_server": 663,
+     "prompt_chars": 2868,
+     "prompt_tokens": 596
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4747527550061932,
+     "tpot_s": 0.0797066434444989,
+     "latency_s": 6.496332477006945,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 445,
+      "total_tokens": 509,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: Why can't tide tables be computed from first principles, acco",
+     "text_chars": 314,
+     "index": 12,
+     "kind": "chat_long",
+     "t_start": 1788688312.429348,
+     "prompt_tokens_client": 378,
+     "prompt_tokens_server": 445,
+     "prompt_chars": 1783,
+     "prompt_tokens": 378
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4727028040069854,
+     "tpot_s": 0.07968127509530094,
+     "latency_s": 6.49271365700406,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 462,
+      "total_tokens": 526,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"Why are there two high tides a day rather than one, accordin",
+     "text_chars": 271,
+     "index": 13,
+     "kind": "chat_long",
+     "t_start": 1788688312.4313366,
+     "prompt_tokens_client": 395,
+     "prompt_tokens_server": 462,
+     "prompt_chars": 1868,
+     "prompt_tokens": 395
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.6621098710020306,
+     "tpot_s": 0.0807129848888883,
+     "latency_s": 7.7471202880115015,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 330,
+      "total_tokens": 394,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: what details or records to look for in the local archive to m",
+     "text_chars": 325,
+     "index": 14,
+     "kind": "chat_long",
+     "t_start": 1788688318.9253666,
+     "prompt_tokens_client": 263,
+     "prompt_tokens_server": 330,
+     "prompt_chars": 1157,
+     "prompt_tokens": 263
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.7476995269971667,
+     "tpot_s": 0.08044547422226363,
+     "latency_s": 7.81585086400446,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 739,
+      "total_tokens": 803,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What does a halo around the sun or moon signify, and why? Be",
+     "text_chars": 265,
+     "index": 15,
+     "kind": "chat_long",
+     "t_start": 1788688318.9266286,
+     "prompt_tokens_client": 672,
+     "prompt_tokens_server": 739,
+     "prompt_chars": 3159,
+     "prompt_tokens": 672
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 17.950616367990733,
+    "ttft_s": {
+     "mean": 2.550086738625396,
+     "p50": 2.7406378779996885,
+     "p90": 2.743064800990396,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.10175667119048219,
+     "p50": 0.10207898749199341,
+     "p90": 0.10214043019056719,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 8.960839153498455,
+     "p50": 9.128349557999172,
+     "p90": 9.130824708990986,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 344.125,
+     "p50": 357,
+     "p90": 467,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 28.522697466421857,
+    "req_per_s": 0.4456671479128415,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 17.950616367990733,
+     "ttft_s": {
+      "mean": 2.550086738625396,
+      "p50": 2.7406378779996885,
+      "p90": 2.743064800990396,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.10175667119048219,
+      "p50": 0.10207898749199341,
+      "p90": 0.10214043019056719,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 8.960839153498455,
+      "p50": 9.128349557999172,
+      "p90": 9.130824708990986,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 344.125,
+      "p50": 357,
+      "p90": 467,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 28.522697466421857,
+     "req_per_s": 0.4456671479128415,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.2872790840046946,
+     "tpot_s": 0.10207898749199341,
+     "latency_s": 8.718338756996673,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 303,
+      "total_tokens": 367,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: most likely cause of flat taste, changes to buying and grindi",
+     "text_chars": 314,
+     "index": 16,
+     "kind": "chat_long",
+     "t_start": 1788688331.634604,
+     "prompt_tokens_client": 236,
+     "prompt_tokens_server": 303,
+     "prompt_chars": 1085,
+     "prompt_tokens": 236
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.381180130993016,
+     "tpot_s": 0.10214043019056719,
+     "latency_s": 8.816119494993472,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 424,
+      "total_tokens": 488,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What distinguishes winter bees from summer bees?\" Explanatio",
+     "text_chars": 329,
+     "index": 17,
+     "kind": "chat_long",
+     "t_start": 1788688331.6348069,
+     "prompt_tokens_client": 357,
+     "prompt_tokens_server": 424,
+     "prompt_chars": 1737,
+     "prompt_tokens": 357
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.3809710139903473,
+     "tpot_s": 0.10212336461907918,
+     "latency_s": 8.814834702992812,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 302,
+      "total_tokens": 366,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: how to tell difference between colony about to starve vs dead",
+     "text_chars": 287,
+     "index": 18,
+     "kind": "chat_long",
+     "t_start": 1788688331.6349328,
+     "prompt_tokens_client": 235,
+     "prompt_tokens_server": 302,
+     "prompt_chars": 1075,
+     "prompt_tokens": 235
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.380710651006666,
+     "tpot_s": 0.10215885276187374,
+     "latency_s": 8.816772749007214,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 432,
+      "total_tokens": 496,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: According to the passage, what did Gutenberg actually contrib",
+     "text_chars": 312,
+     "index": 19,
+     "kind": "chat_long",
+     "t_start": 1788688331.635376,
+     "prompt_tokens_client": 365,
+     "prompt_tokens_server": 432,
+     "prompt_chars": 1822,
+     "prompt_tokens": 365
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.7449164990102872,
+     "tpot_s": 0.1013230533650448,
+     "latency_s": 9.128349557999172,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 534,
+      "total_tokens": 598,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What are the three categories of costs described in the pass",
+     "text_chars": 302,
+     "index": 20,
+     "kind": "chat_long",
+     "t_start": 1788688340.3541613,
+     "prompt_tokens_client": 467,
+     "prompt_tokens_server": 534,
+     "prompt_chars": 2376,
+     "prompt_tokens": 467
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.743064800990396,
+     "tpot_s": 0.10139170006362884,
+     "latency_s": 9.130842685000971,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 330,
+      "total_tokens": 394,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: what details or records to look for in the local archive to m",
+     "text_chars": 325,
+     "index": 21,
+     "kind": "chat_long",
+     "t_start": 1788688340.4505801,
+     "prompt_tokens_client": 263,
+     "prompt_tokens_server": 330,
+     "prompt_chars": 1157,
+     "prompt_tokens": 263
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.7419338510080706,
+     "tpot_s": 0.10140675250791929,
+     "latency_s": 9.13063057200634,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 563,
+      "total_tokens": 627,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "The user wants: \"What are striations and what do they record? Give a clear answe",
+     "text_chars": 272,
+     "index": 22,
+     "kind": "chat_long",
+     "t_start": 1788688340.4518652,
+     "prompt_tokens_client": 496,
+     "prompt_tokens_server": 563,
+     "prompt_chars": 2360,
+     "prompt_tokens": 496
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.7406378779996885,
+     "tpot_s": 0.10143022852375112,
+     "latency_s": 9.130824708990986,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 401,
+      "total_tokens": 465,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What is a sinking fund and how does it apply to household bu",
+     "text_chars": 304,
+     "index": 23,
+     "kind": "chat_long",
+     "t_start": 1788688340.4531388,
+     "prompt_tokens_client": 334,
+     "prompt_tokens_server": 401,
+     "prompt_chars": 1724,
+     "prompt_tokens": 334
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 13.315300692003802,
+    "ttft_s": {
+     "mean": 4.5914949605030415,
+     "p50": 4.591996041999664,
+     "p90": 4.592579914999078,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.13722141806347138,
+     "p50": 0.13735499215868507,
+     "p90": 0.13739660963492786,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 13.236540357000194,
+     "p50": 13.246946730010677,
+     "p90": 13.250657985990983,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 422.625,
+     "p50": 506,
+     "p90": 586,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 38.452004340200126,
+    "req_per_s": 0.600812567815627,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 13.315300692003802,
+     "ttft_s": {
+      "mean": 4.5914949605030415,
+      "p50": 4.591996041999664,
+      "p90": 4.592579914999078,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.13722141806347138,
+      "p50": 0.13735499215868507,
+      "p90": 0.13739660963492786,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 13.236540357000194,
+      "p50": 13.246946730010677,
+      "p90": 13.250657985990983,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 422.625,
+      "p50": 506,
+      "p90": 586,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 38.452004340200126,
+     "req_per_s": 0.600812567815627,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.592579914999078,
+     "tpot_s": 0.1374279238096076,
+     "latency_s": 13.250657985990983,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 329,
+      "total_tokens": 393,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to produce an outline for a 1,200-word piece, with sections, each with a",
+     "text_chars": 287,
+     "index": 24,
+     "kind": "chat_long",
+     "t_start": 1788688354.2887619,
+     "prompt_tokens_client": 262,
+     "prompt_tokens_server": 329,
+     "prompt_chars": 1154,
+     "prompt_tokens": 262
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.490418380009942,
+     "tpot_s": 0.13669829957149296,
+     "latency_s": 13.102490249002585,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 648,
+      "total_tokens": 712,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"According to the passage, what did Fresnel's lens change abo",
+     "text_chars": 297,
+     "index": 25,
+     "kind": "chat_long",
+     "t_start": 1788688354.289005,
+     "prompt_tokens_client": 581,
+     "prompt_tokens_server": 648,
+     "prompt_chars": 2935,
+     "prompt_tokens": 581
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.591996041999664,
+     "tpot_s": 0.13731531830160834,
+     "latency_s": 13.242964214994572,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 449,
+      "total_tokens": 513,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"Why were ancient hours elastic, according to the passage?\" T",
+     "text_chars": 284,
+     "index": 26,
+     "kind": "chat_long",
+     "t_start": 1788688354.2891436,
+     "prompt_tokens_client": 382,
+     "prompt_tokens_server": 449,
+     "prompt_chars": 1841,
+     "prompt_tokens": 382
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.591999388008844,
+     "tpot_s": 0.13733760930139513,
+     "latency_s": 13.244389076004154,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 294,
+      "total_tokens": 358,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to give advice for beekeeping. The user has two hives, one active, one q",
+     "text_chars": 270,
+     "index": 27,
+     "kind": "chat_long",
+     "t_start": 1788688354.2892468,
+     "prompt_tokens_client": 227,
+     "prompt_tokens_server": 294,
+     "prompt_chars": 1035,
+     "prompt_tokens": 227
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.591955591997248,
+     "tpot_s": 0.1373834399047256,
+     "latency_s": 13.247213971990277,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 302,
+      "total_tokens": 366,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: how to tell difference between starving colony and dead colon",
+     "text_chars": 296,
+     "index": 28,
+     "kind": "chat_long",
+     "t_start": 1788688354.2893384,
+     "prompt_tokens_client": 235,
+     "prompt_tokens_server": 302,
+     "prompt_chars": 1075,
+     "prompt_tokens": 235
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.591802454000572,
+     "tpot_s": 0.13735499215868507,
+     "latency_s": 13.245255614005146,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 653,
+      "total_tokens": 717,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What are striations and what do they record?\" Explanation fo",
+     "text_chars": 301,
+     "index": 29,
+     "kind": "chat_long",
+     "t_start": 1788688354.2894623,
+     "prompt_tokens_client": 586,
+     "prompt_tokens_server": 653,
+     "prompt_chars": 2800,
+     "prompt_tokens": 586
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.6903179210057715,
+     "tpot_s": 0.13685715182532837,
+     "latency_s": 13.312405014003161,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 573,
+      "total_tokens": 637,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to answer: \"What is an escapement and what does it do?\" in <=150 words. ",
+     "text_chars": 296,
+     "index": 30,
+     "kind": "chat_long",
+     "t_start": 1788688354.2899485,
+     "prompt_tokens_client": 506,
+     "prompt_tokens_server": 573,
+     "prompt_chars": 2399,
+     "prompt_tokens": 506
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.590889992003213,
+     "tpot_s": 0.13739660963492786,
+     "latency_s": 13.246946730010677,
+     "output_tokens": 64,
+     "content_chunks": 61,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 669,
+      "total_tokens": 733,
+      "completion_tokens": 64,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      }
+     },
+     "text_head": "We need to explain difference between washed and natural processes. Provide a sh",
+     "text_chars": 344,
+     "index": 31,
+     "kind": "chat_long",
+     "t_start": 1788688354.2904449,
+     "prompt_tokens_client": 602,
+     "prompt_tokens_server": 669,
+     "prompt_chars": 2993,
+     "prompt_tokens": 602
+    }
+   ]
+  }
+ ]
+}

@@ -90,13 +90,25 @@ async def _body_chunks(reader, headers):
             yield data
 
 
+def _delta_text(delta):
+    """Generated text in a streamed delta: `content`, or a reasoning channel split off by a
+    server-side reasoning parser (vLLM `reasoning`, llama.cpp/others `reasoning_content`). Both are
+    generated tokens and count the same for TTFT/TPOT — servers only differ in where they file them."""
+    for k in ("content", "reasoning", "reasoning_content"):
+        v = delta.get(k)
+        if v is not None:
+            return k, v
+    return None, None
+
+
 def _delta_is_token(delta):
     # vLLM's first frame is role-only with content "" (not a token). plowrt's
     # role rides the first real token. Empty-content frames without a role are
     # plowrt partial-UTF-8 tokens and count.
-    if "content" not in delta or delta["content"] is None:
+    k, v = _delta_text(delta)
+    if k is None:
         return False
-    return delta["content"] != "" or "role" not in delta
+    return v != "" or "role" not in delta
 
 
 async def stream_chat(url, body, timeout):
@@ -161,8 +173,9 @@ async def stream_chat(url, body, timeout):
                         d = ch.get("delta") or {}
                         if _delta_is_token(d):
                             times.append(t_arr)
-                            if d["content"]:
-                                text.append(d["content"])
+                            _, dv = _delta_text(d)
+                            if dv:
+                                text.append(dv)
                         if ch.get("finish_reason"):
                             rec["finish_reason"] = ch["finish_reason"]
                 if done:
