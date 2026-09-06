@@ -110,12 +110,20 @@ impl SegmentRoles {
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 })
             };
-            let hd512 = AttentionCapability {
+            let hd512_wg = AttentionCapability {
                 profile: "sm90a".into(),
                 dtype: "bf16".into(),
                 head_dim: 512,
                 query_tile: 64,
                 kv_tile: 32,
+                warps: 8,
+            };
+            let hd512_px4 = AttentionCapability {
+                profile: "sm90a".into(),
+                dtype: "bf16".into(),
+                head_dim: 512,
+                query_tile: 32,
+                kv_tile: 16,
                 warps: 8,
             };
             if object.abi != abi
@@ -130,7 +138,10 @@ impl SegmentRoles {
                 || (id == PREFILL_ATTENTION_HD512_WG32
                     && (!valid_hash(object.sha256.as_deref())
                         || object.promote_k512.is_some()
-                        || object.attention.as_ref() != Some(&hd512)))
+                        || object
+                            .attention
+                            .as_ref()
+                            .is_none_or(|a| a != &hd512_wg && a != &hd512_px4)))
                 || (!matches!(id, FP8_M1 | PREFILL_ATTENTION_HD512_WG32)
                     && (object.sha256.is_some()
                         || object.promote_k512.is_some()
@@ -212,6 +223,14 @@ mod tests {
             "a".repeat(64)
         );
         SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        SegmentRoles::from_bytes(
+            raw.replace(
+                "\"query_tile\":64,\"kv_tile\":32",
+                "\"query_tile\":32,\"kv_tile\":16",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         for bad in [
             raw.replace(&"a".repeat(64), "bad"),
             raw.replace("\"head_dim\":512", "\"head_dim\":256"),
