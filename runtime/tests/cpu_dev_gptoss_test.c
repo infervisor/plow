@@ -45,34 +45,49 @@ static void* xmalloc(size_t n) {
 
 static int fails = 0;
 static float g_floor = 1e-2f; /* relative-error denominator floor */
+/* Accuracy mode: report the deviation of a deliberately lower-precision path (PLOW_MOE_INT8) as
+ * numbers instead of counting it against the shared tolerance. */
+static int g_soft = 0;
+/* l2 = ||a-b|| / ||a||: the per-element relative error saturates on near-zero references (the
+ * g_floor denominator), so this is the number to read for a lower-precision path. */
+static void report(const char* what, double mean, double maxrel, double d2, double a2, size_t bad,
+                   size_t n, size_t where) {
+    printf("  %-62s mean|a| %.3g max rel %.4f l2 %.5f  bad %zu/%zu (%.1f%%)%s\n", what,
+           mean / (double)(n ? n : 1), maxrel, a2 > 0 ? sqrt(d2 / a2) : 0.0, bad, n,
+           100.0 * (double)bad / (double)(n ? n : 1), bad ? (g_soft ? "  [accuracy]" : "  <-- FAIL") : "");
+    if (bad && !g_soft) fails++;
+    (void)where;
+}
 static void cmp(const char* what, const plow_bf16* a, const plow_bf16* b, size_t n, float tol) {
-    double maxrel = 0, mean = 0; size_t bad = 0, where = 0;
+    double maxrel = 0, mean = 0, d2 = 0, a2 = 0; size_t bad = 0, where = 0;
     for (size_t i = 0; i < n; i++) {
         const float x = plow_bf2f(a[i]), y = plow_bf2f(b[i]);
         if (isnan(x) || isnan(y)) { if (isnan(x) != isnan(y)) { bad++; where = i; } continue; }
         mean += fabsf(x);
         const float d = fabsf(x - y), ref = fmaxf(fabsf(x), g_floor);
         const double rel = d / ref;
+        d2 += (double)d * d; a2 += (double)x * x;
         if (rel > maxrel) { maxrel = rel; where = i; }
         if (rel > tol) bad++;
     }
     /* A reference that is (almost) all zero would pass trivially: flag it. */
     if (n && mean / (double)n < 1e-3) { bad++; where = 0; }
-    printf("  %-62s mean|a| %.3g max rel %.4f  bad %zu/%zu%s\n", what, mean / (double)(n ? n : 1), maxrel, bad, n, bad ? "  <-- FAIL" : "");
-    if (bad) { fails++; printf("    e.g. [%zu] a=%g b=%g\n", where, plow_bf2f(a[where]), plow_bf2f(b[where])); }
+    report(what, mean, maxrel, d2, a2, bad, n, where);
+    if (bad && !g_soft) printf("    e.g. [%zu] a=%g b=%g\n", where, plow_bf2f(a[where]), plow_bf2f(b[where]));
 }
 static void cmp_f32(const char* what, const float* a, const float* b, size_t n, float tol) {
-    double maxrel = 0, mean = 0; size_t bad = 0, where = 0;
+    double maxrel = 0, mean = 0, d2 = 0, a2 = 0; size_t bad = 0, where = 0;
     for (size_t i = 0; i < n; i++) {
         mean += fabsf(a[i]);
         const float d = fabsf(a[i] - b[i]), ref = fmaxf(fabsf(a[i]), g_floor);
         const double rel = d / ref;
+        d2 += (double)d * d; a2 += (double)a[i] * a[i];
         if (rel > maxrel) { maxrel = rel; where = i; }
         if (rel > tol || isnan(d)) bad++;
     }
     if (n && mean / (double)n < 1e-3) { bad++; where = 0; }
-    printf("  %-62s mean|a| %.3g max rel %.4f  bad %zu/%zu%s\n", what, mean / (double)(n ? n : 1), maxrel, bad, n, bad ? "  <-- FAIL" : "");
-    if (bad) { fails++; printf("    e.g. [%zu] a=%g b=%g\n", where, a[where], b[where]); }
+    report(what, mean, maxrel, d2, a2, bad, n, where);
+    if (bad && !g_soft) printf("    e.g. [%zu] a=%g b=%g\n", where, a[where], b[where]);
 }
 static void check(const char* what, int ok) {
     printf("  %-62s %s\n", what, ok ? "ok" : "<-- FAIL");
@@ -97,7 +112,7 @@ static PlowDevInst inst(uint16_t op) {
 }
 static const uint32_t NBLKS[] = {1, 3, 16};
 #define NNB (sizeof(NBLKS) / sizeof(*NBLKS))
-static int have_v = 0, have_x = 0;
+static int have_v = 0, have_x = 0, g_i8 = 0;
 #define ALPHA 1.702f
 #define LIMIT 7.0f
 
@@ -704,7 +719,7 @@ static void test_moe_prefill(uint32_t Tn, uint32_t k, uint32_t E, uint32_t I, ui
             TG[0] = fu_g;
             for (uint32_t r = 0; r < rows; r++) if (row_token[r] == PLOW_EXPERT_UNUSED) memset(fu_v + (size_t)r * I, 0, (size_t)I * 2);
             snprintf(what, sizeof what, "MOE_GLU_MX_PF avx512 vs golden lay=%u nblk=%u", layout, nblk);
-            cmp(what, fu_g, fu_v, (size_t)rows * I, 1e-2f);
+            g_soft = g_i8; cmp(what, fu_g, fu_v, (size_t)rows * I, 1e-2f); g_soft = 0;
         }
         g_floor = 1e-2f;
         for (uint32_t e = 0; e < E; e++)
@@ -719,7 +734,7 @@ static void test_moe_prefill(uint32_t Tn, uint32_t k, uint32_t E, uint32_t I, ui
             run_all(plow_cpu_kernel(PLOW_DOP_MOE_DOWN_MX_PF), &di, nblk, TD, &ctx);
             TD[0] = part_g;
             snprintf(what, sizeof what, "MOE_DOWN_MX_PF avx512 vs golden nblk=%u", nblk);
-            cmp_f32(what, part_g, part_v, (size_t)Tn * k * H, 1e-2f);
+            g_soft = g_i8; cmp_f32(what, part_g, part_v, (size_t)Tn * k * H, 1e-2f); g_soft = 0;
         }
     }
     free(x); free(sel); free(gate); free(meta); free(row_token); free(row_partidx); free(row_gate); free(fillp);
@@ -729,7 +744,62 @@ static void test_moe_prefill(uint32_t Tn, uint32_t k, uint32_t E, uint32_t I, ui
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
-static void bench(void) {
+/* Grouped MXFP4 PREFILL (152/153) at the GPT-OSS layer shape: T tokens, top-k of E experts, so
+ * ~T*k/E live rows per expert -- the shape MoE prefill actually runs at. One thread. */
+static void bench_moe_prefill(uint8_t* We, uint8_t* Se, uint32_t E, uint32_t T, PlowCpuCtx* ctx) {
+    const uint32_t k = 4, I = 2880, K = 2880, H = 2880, PAD = 8;
+    plow_bf16* x = xmalloc((size_t)T * K * 2);
+    fill_bf16(x, (size_t)T * K, 1.0f);
+    int32_t* meta = xmalloc((size_t)(3 * E + 1) * 4);
+    uint32_t* sel = xmalloc((size_t)T * k * 4);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t j = 0; j < k; j++) {
+            uint32_t e = (uint32_t)((next64() >> 20) % E);
+            for (uint32_t q = 0; q < j; q++) if (sel[t * k + q] == e) e = (e + 1) % E;
+            sel[t * k + j] = e; meta[E + e]++;
+        }
+    uint32_t rows = 0;
+    for (uint32_t e = 0; e < E; e++) { meta[e] = (int32_t)rows; rows += ((uint32_t)meta[E + e] + PAD - 1) / PAD * PAD; }
+    uint32_t* row_token = xmalloc((size_t)rows * 4);
+    uint32_t* row_partidx = xmalloc((size_t)rows * 4);
+    float* row_gate = xmalloc((size_t)rows * 4);
+    for (uint32_t r = 0; r < rows; r++) { row_token[r] = PLOW_EXPERT_UNUSED; row_partidx[r] = PLOW_EXPERT_UNUSED; }
+    uint32_t* fillp = xmalloc((size_t)E * 4);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t j = 0; j < k; j++) {
+            const uint32_t e = sel[t * k + j], r = (uint32_t)meta[e] + fillp[e]++;
+            row_token[r] = t; row_partidx[r] = t * k + j; row_gate[r] = 0.25f;
+        }
+    plow_bf16* fu = xmalloc((size_t)rows * I * 2);
+    float* part = xmalloc((size_t)T * k * H * 4);
+    void* TG[8] = {fu, x, We, Se, meta, row_token, NULL, NULL};
+    PlowDevInst gi = inst(PLOW_DOP_MOE_GLU_MX_PF);
+    gi.t[0] = 0; gi.t[1] = 1; gi.t[2] = 2; gi.t[3] = 3; gi.t[4] = 4; gi.t[5] = 5;
+    gi.i[0] = I; gi.i[1] = K; gi.i[2] = E; gi.i[3] = 0; gi.i[5] = 3;
+    gi.fj[0].f = ALPHA; gi.fj[1].f = LIMIT;
+    kfn fg = plow_cpu_kernel(PLOW_DOP_MOE_GLU_MX_PF);
+    double bg = 1e9;
+    for (int r = 0; r < 3; r++) { double t0 = now(); fg(&gi, 0, 1, TG, ctx); double dt = now() - t0; if (dt < bg) bg = dt; }
+    const double gflops = 2.0 * (double)T * k * 2.0 * I * K;
+    printf("bench MOE_GLU_MX_PF tier %d T=%u k=%u E=%u I=K=%u (%u live rows, %.0f rows/expert): %.2f ms, %.3f TFLOPS\n",
+           plow_cpu_tier_of(PLOW_DOP_MOE_GLU_MX_PF), T, k, E, I, T * k, (double)(T * k) / E, bg * 1e3, gflops / bg / 1e12);
+    void* TD[8] = {part, fu, We, Se, meta, NULL, row_partidx, row_gate};
+    PlowDevInst di = inst(PLOW_DOP_MOE_DOWN_MX_PF);
+    di.t[0] = 0; di.t[1] = 1; di.t[2] = 2; di.t[3] = 3; di.t[4] = 4; di.t[6] = 6; di.t[7] = 7;
+    di.i[0] = H; di.i[1] = I; di.i[2] = E;
+    kfn fd = plow_cpu_kernel(PLOW_DOP_MOE_DOWN_MX_PF);
+    double bd = 1e9;
+    for (int r = 0; r < 3; r++) { double t0 = now(); fd(&di, 0, 1, TD, ctx); double dt = now() - t0; if (dt < bd) bd = dt; }
+    const double dflops = 2.0 * (double)T * k * H * I;
+    printf("bench MOE_DOWN_MX_PF tier %d T=%u k=%u E=%u H=I=%u: %.2f ms, %.3f TFLOPS\n",
+           plow_cpu_tier_of(PLOW_DOP_MOE_DOWN_MX_PF), T, k, E, H, bd * 1e3, dflops / bd / 1e12);
+    printf("bench MOE prefill layer total: %.2f ms, %.3f TFLOPS\n", (bg + bd) * 1e3,
+           (gflops + dflops) / (bg + bd) / 1e12);
+    free(x); free(meta); free(sel); free(row_token); free(row_partidx); free(row_gate); free(fillp);
+    free(fu); free(part);
+}
+
+static void bench(int pf_only) {
     const uint32_t N = 5760, K = 2880; /* one expert's gate_up: 8.3 MB packed */
     plow_bf16* x = xmalloc((size_t)8 * K * 2);
     uint8_t* W = xmalloc((size_t)N * K / 2); uint8_t* S = xmalloc((size_t)N * K / 32);
@@ -742,7 +812,7 @@ static void bench(void) {
     kfn f = plow_cpu_kernel(PLOW_DOP_GEMV_MXFP4);
     const double bytes = (double)N * K / 2 + (double)N * K / 32;
     double best = 1e9;
-    for (uint32_t M = 1; M <= 4; M *= 4) { /* M >= 5 is the AMX tier's */
+    for (uint32_t M = 1; M <= 4 && !pf_only; M *= 4) { /* M >= 5 is the AMX tier's */
         in.i[0] = M;
         f(&in, 0, 1, T, &ctx);
         double b = 1e9;
@@ -758,16 +828,20 @@ static void bench(void) {
     uint8_t* We = xmalloc((size_t)E * N * K / 2); uint8_t* Se = xmalloc((size_t)E * N * K / 32);
     fill_fp4(We, (size_t)E * N * K / 2); fill_e8m0(Se, (size_t)E * N * K / 32);
     double tot = 0;
-    for (uint32_t e = 0; e < E; e++) {
+    for (uint32_t e = 0; e < E && !pf_only; e++) {
         T[2] = We + (size_t)e * N * K / 2; T[3] = Se + (size_t)e * N * K / 32;
         double t0 = now(); f(&in, 0, 1, T, &ctx); tot += now() - t0;
     }
-    printf("bench GEMV_MXFP4 DRAM-streaming over %u experts: %.3f ms/expert, %.1f GB/s packed\n", E, tot / E * 1e3, bytes * E / tot / 1e9);
-    double t0 = now(); g_gemv_mxfp4(&in, 0, 1, T, &ctx); double tg = now() - t0;
-    printf("      golden: %.2f ms (%.1fx)\n", tg * 1e3, tg / best);
+    if (!pf_only) {
+        printf("bench GEMV_MXFP4 DRAM-streaming over %u experts: %.3f ms/expert, %.1f GB/s packed\n", E, tot / E * 1e3, bytes * E / tot / 1e9);
+        double t0 = now(); g_gemv_mxfp4(&in, 0, 1, T, &ctx); double tg = now() - t0;
+        printf("      golden: %.2f ms (%.1fx)\n", tg * 1e3, tg / best);
+    }
+    bench_moe_prefill(We, Se, E, 512, &ctx);   /* 64 live rows per expert */
+    bench_moe_prefill(We, Se, E, 2048, &ctx);  /* 256: the dequant amortizes over a full pass */
     /* MOE_GLU_MX / MOE_DOWN_MX at the GPT-OSS layer shape, k=4, B tokens all routed to the same 4
      * experts (B >= 2 takes the grouped path: each expert dequantized once for M = B rows), 1 thread. */
-    for (uint32_t B = 1; B <= 8; B *= 2) {
+    for (uint32_t B = 1; B <= 8 && !pf_only; B *= 2) {
         const uint32_t k = 4, I = 2880, KK = 2880, H = 2880;
         plow_moe_route tab[32];
         for (uint32_t b = 0; b < B; b++) {
@@ -807,7 +881,8 @@ int main(int argc, char** argv) {
     const int tier = plow_cpu_init(PLOW_CPU_ISA_AMX);
     printf("isa tier: %d\n", tier);
     if (tier < 0) return 2;
-    if (argc > 1 && !strcmp(argv[1], "--bench")) { bench(); return 0; }
+    { const char* e = getenv("PLOW_MOE_INT8"); g_i8 = (e && *e && *e != '0') ? 1 : 0; }
+    if (argc > 1 && !strcmp(argv[1], "--bench")) { bench(argc > 2 && !strcmp(argv[2], "pf")); return 0; }
     have_v = tier >= PLOW_CPU_ISA_AVX512;
     have_x = tier >= PLOW_CPU_ISA_AMX;
     printf("tiers: gemv_mxfp4=%d moe_glu=%d moe_down=%d moe_glu_pf=%d moe_down_pf=%d gemv=%d gemm=%d gemm_glu=%d merge=%d rope=%d\n",
