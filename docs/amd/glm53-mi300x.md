@@ -107,11 +107,9 @@ drift-free.
 1. **No vLLM arm yet.** All eight cards were leased throughout by a concurrent agent session
    running an unrelated Gemma-4-31B campaign, so the matched vLLM 0.28 reference — which needs
    four of them — has not been taken. Nothing here says anything about beating vLLM.
-2. **The tuning store is fully stale.** 868 records, zero usable against build
-   `gfx942-f390fbaa86c582ff`; both blobs report `tile_source: analytical`,
-   `tile_measured: 0`. Prefill GEMM tiles come from the analytical model, so **the TTFT column
-   is unmeasured-tile** and is the first thing to re-derive
-   (`plowc tune gemm --obj build-glm53/hsaco`, which needs a quiet card and no live plowrt).
+2. **The tuning store was fully stale for this table** — 868 records, zero usable — so both
+   blobs reported `tile_source: analytical`, `tile_measured: 0` and the TTFT column above is
+   unmeasured-tile. **FIXED since**, see §5b: the store was fine; the PROBE was wrong.
 3. **Measured under contention.** Four to six foreign GPU processes were live on the other
    cards. TP4 collectives cross the fabric those processes also touch. gpulease's own rule is
    that a contended run invalidates timings. Re-measure on a quiet box.
@@ -120,6 +118,68 @@ drift-free.
 armed (`index_topk` 2048) while this blob is emitted `PLOW_GLM_DSA=0` and reads EVERY KV row.
 Above ~2k context plow is doing strictly more attention work per token. A plow win under that
 asymmetry is a real win; a plow loss is not by itself evidence about plow's kernels.
+
+## 5a. DEC_SQUEEZE decode tier — a rung-1 lever, and not yet adoptable
+
+`PLOW_DEC_SQUEEZE=1` (WPE=3 register recut, `MPF_BK=32`, `NO_MLA_DEC`) built into
+`build-glm53/hsaco-squeeze` and served as `PLOW_HSACO_LOWRUNG=<dir>:4`. Its K3 rows fail to
+compile, which does not matter — GLM loads `interp_decode_gq.elf`. Both arms ran on the same
+four cards minutes apart.
+
+| input | conc | TPOT base | TPOT squeeze | delta | TTFT base | TTFT squeeze |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 1 | 38.70 | 34.98 | **−9.6%** | 383.1 | 380.4 |
+| 1024 | 4 | 95.06 | 95.23 | +0.2% | 839.9 | 841.4 |
+| 4096 | 1 | 47.02 | 45.53 | −3.2% | 1023.8 | 1033.9 |
+| 4096 | 4 | 122.23 | 122.07 | −0.1% | 1697.8 | 1698.4 |
+
+TTFT unmoved is the correct negative control: the tier swaps only the decode object. The win is
+confined to rung 1, matching GLM-5.2's record that this is a rung-1 lever.
+
+**It is a measurement, not an adoption.** The same greedy prompt diverges between the two arms
+(they agree for ~250 characters, then the baseline stops at 214 tokens and the squeeze arm runs
+to the 220 cap), so on GLM-5.3 this is a new numerics class and needs the paired accuracy gate.
+DEC_SQUEEZE was recorded byte-identical on GLM-5.2; that record does not transfer.
+
+The conc-4 aggregate-throughput cell (38.93 -> 29.07 tok/s) is NOT a regression: medians agree
+to within 0.2% and the whole difference is one request that waited 11 s to first token on a
+contended box.
+
+## 5b. The tuning store was never stale — the probe was
+
+`plowc` folds the TOOLCHAIN into the tuning digest, and a plowc run outside `nix develop` sees a
+different toolchain from the one that built the objects. Every emit above ran outside nix:
+
+    outside nix: build digest gfx942-f390fbaa86c582ff -> 868 records, all "stale"
+    inside  nix: build digest gfx942-d042b33e5e07ea56 -> matches the campaign
+
+The fix is procedural. Run plowc inside `nix develop`, the same shell that built the objects.
+Two campaigns (`scripts/glm53_tune_gemm_inner.sh`, ~50 s each on one leased GPU) cover TP4 and
+TP8 — the per-rank N halves at TP8, so it is a different shape set and the TP4 campaign alone
+leaves TP8 at `mixed`, 1236/2472.
+
+    build-glm53/tp4m   tile_source measured  2472/2472
+    build-glm53/tp8m   tile_source measured  2472/2472
+    build-glm53/tp4f   + PLOW_GLM_XR_RES=1 GLM_FUSE_XRN=1  (see the collectives analysis)
+    build-glm53/tp4q   + GLM_LINEAR_FP8=1 against GLM-5.3-plow-q
+
+## 5c. vLLM 0.28 above TP1 on this host — three breakages, one root cause
+
+The vLLM interpreter needs the nix glibc (the wheel wants >= 2.39; the host has 2.35), and its
+workers inherit that `LD_LIBRARY_PATH`. Every SYSTEM binary they fork then dies.
+
+1. `ROCm version file not found` — workers read `<ROCM_PATH>/.info/version` at `init_device`;
+   `/opt/rocm` has no `.info`. TP1 never reached this path.
+2. `Get GPU arch from rocminfo failed ... exit status 127` — AITER forks `rocminfo`. Both
+   `/opt/rocm/core-7.14/bin/rocminfo` and `/opt/rocm-7.2.4/bin/rocminfo` return 127 under that
+   `LD_LIBRARY_PATH` and 0 without it.
+3. Triton forks `/usr/bin/gcc` for `hip_utils.c`, same death.
+
+The shim has to be on PATH (`aiter/jit/utils/cpp_extension.py:78` tries `shutil.which` first),
+its shebang has to be a nix binary (a system `/bin/sh` cannot load), and it has to clear the
+variable with a SHELL BUILTIN — coreutils `env -u` is itself a system binary and dies with
+`undefined symbol: __tunable_is_initialized`. `build-glm53/rocm-shim/bin/{rocminfo,vllm-cc}`.
+With those, vLLM 0.28 loads GLM-5.3 at TP4: 176.22 GiB/rank in 161.8 s.
 
 ## 6. Open levers, in the order worth taking
 
