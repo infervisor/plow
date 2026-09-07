@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut verify_lifecycle = false;
     let mut prefill_prefix = None;
     let mut batch_reference = None;
+    let mut mixed_spans = None;
     while let Some(arg) = args.next() {
         if arg == "--verify-batch-reference" {
             batch_reference = Some(PathBuf::from(
@@ -43,6 +44,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefill_prefix = Some(
                 args.next()
                     .ok_or("missing prefill prefix length")?
+                    .parse::<usize>()?,
+            );
+        } else if arg == "--verify-mixed-spans" {
+            mixed_spans = Some(
+                args.next()
+                    .ok_or("missing mixed span count")?
                     .parse::<usize>()?,
             );
         } else if arg == "--input-f32" {
@@ -88,6 +95,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    if mixed_spans.is_some()
+        && (input.is_some()
+            || verify_lifecycle
+            || prefill_prefix.is_some()
+            || batch_reference.is_some())
+    {
+        return Err(
+            "mixed span verification cannot be combined with another verification mode".into(),
+        );
+    }
     let mut engine = GpuEngine::load(Arc::new(CudaBackend::new(0)?), &assets, &checkpoint)?;
     if ids.iter().any(|&id| id as usize >= engine.vocab()) {
         return Err("token ID exceeds vocabulary".into());
@@ -102,6 +119,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect::<Result<_, _>>()?;
     std::fs::create_dir_all(&out)?;
+    if let Some(spans) = mixed_spans {
+        return verify_mixed_spans(&mut engine, &checkpoint, &out, &ids, spans);
+    }
     engine.begin_slot(0, ids.len())?;
     let mut tokens = Vec::new();
     let mut logits = Vec::new();
@@ -162,6 +182,279 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         verify_reuse(&mut engine, &checkpoint, &out, &ids, &reference_rows)?;
     }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn verify_mixed_spans(
+    engine: &mut plowrt::exec::gpu::GpuEngine,
+    checkpoint: &std::path::Path,
+    out: &std::path::Path,
+    ids: &[u32],
+    spans: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const REL_L2_LIMIT: f64 = 0.02;
+    if spans == 0 || engine.batch() < 2 {
+        return Err("mixed verification needs at least one span and two packet slots".into());
+    }
+    let rows = engine
+        .mixed_step_rows(1, u32::MAX as usize)
+        .ok_or("packet has no sampled D1 mixed variant")? as usize;
+    let prefill_rows = rows - 1;
+    let total = spans
+        .checked_mul(prefill_rows)
+        .ok_or("mixed span row overflow")?;
+    if ids.len() < total {
+        return Err(format!("mixed verification needs at least {total} token IDs").into());
+    }
+
+    let kv = kv_tensors(engine, checkpoint)?;
+    struct Reference {
+        decode_token: u32,
+        decode_logits: Vec<f32>,
+        decode_activation: Vec<f32>,
+        prefill_activation: Vec<f32>,
+        kv: Vec<u8>,
+    }
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(checkpoint.join("config.json"))?)?;
+    let text = config.get("text_config").unwrap_or(&config);
+    let hidden = text["hidden_size"].as_u64().ok_or("missing hidden size")? as usize;
+    if engine
+        .tensor_bytes("act.x")
+        .is_none_or(|bytes| bytes < (rows * hidden * 2) as u64)
+    {
+        return Err("invalid act.x row geometry".into());
+    }
+
+    engine.begin_slot(0, spans + 1)?;
+    engine.begin_slot(1, total + 1)?;
+    let mut references = Vec::with_capacity(spans);
+    let mut sampled = Vec::new();
+    let mut logits = Vec::new();
+    for span in 0..spans {
+        engine.step_slots(&[(0, ids[span])], &mut sampled)?;
+        engine.logits_row(0, &mut logits)?;
+        let decode_logits = logits.clone();
+        let decode_activation = engine.download_activation("act.x")?[..hidden].to_vec();
+        let end = (span + 1) * prefill_rows;
+        engine.prefill_slot(1, &ids[..end])?;
+        let prefill_activation =
+            engine.download_activation("act.x")?[..prefill_rows * hidden].to_vec();
+        references.push(Reference {
+            decode_token: sampled[0],
+            decode_logits,
+            decode_activation,
+            prefill_activation,
+            kv: snapshot_active_kv(engine, &kv, &[(0, span + 1), (1, end)])?,
+        });
+    }
+
+    engine.begin_slot(0, spans + 1)?;
+    engine.begin_slot(1, total + 1)?;
+    let mut records = Vec::with_capacity(spans);
+    let mut failed = false;
+    for span in 0..spans {
+        let start = span * prefill_rows;
+        let decode = [plow_asset::mixed_step::DecodeRequest {
+            slot: 0,
+            state_slot: 0,
+            token: ids[span],
+        }];
+        let prefill = [plow_asset::mixed_step::PrefillRequest {
+            slot: 1,
+            state_slot: 1,
+            start: start as u32,
+            tokens: &ids[start..start + prefill_rows],
+            prompt_len: total as u32,
+        }];
+        let mut token = [0u32; 1];
+        engine.mixed_step(rows as u32, &decode, &prefill, &mut token)?;
+        engine.logits_row(0, &mut logits)?;
+        let activation = engine.download_activation("act.x")?;
+        let active_kv =
+            snapshot_active_kv(engine, &kv, &[(0, span + 1), (1, start + prefill_rows)])?;
+        let reference = &references[span];
+        let decode_logits = f32_metrics(&logits, &reference.decode_logits)?;
+        let decode_activation = f32_metrics(&activation[..hidden], &reference.decode_activation)?;
+        let prefill_activation = f32_metrics(
+            &activation[hidden..rows * hidden],
+            &reference.prefill_activation,
+        )?;
+        let active_kv = bf16_metrics(&active_kv, &reference.kv)?;
+        failed |= token[0] != reference.decode_token
+            || !decode_logits.2
+            || decode_logits.0 > REL_L2_LIMIT
+            || decode_activation.0 > REL_L2_LIMIT
+            || prefill_activation.0 > REL_L2_LIMIT
+            || active_kv.0 > REL_L2_LIMIT;
+        records.push(serde_json::json!({
+            "span": span + 1,
+            "frontiers": {"decode": span + 1, "prefill": start + prefill_rows},
+            "decode_token": {"mixed": token[0], "sequential": reference.decode_token},
+            "decode_logits": metric_json(decode_logits),
+            "decode_activation": metric_json(decode_activation),
+            "prefill_activation": metric_json(prefill_activation),
+            "active_kv": metric_json(active_kv),
+        }));
+        std::fs::write(
+            out.join("mixed-spans.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "rows": rows,
+                "decode_rows": 1,
+                "prefill_rows": prefill_rows,
+                "spans": spans,
+                "relative_l2_limit": REL_L2_LIMIT,
+                "records": records,
+                "complete": span + 1 == spans,
+            }))?,
+        )?;
+    }
+    if failed {
+        return Err("mixed span verification failed; see mixed-spans.json".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn metric_json(metric: (f64, f32, bool)) -> serde_json::Value {
+    serde_json::json!({"rel_l2":metric.0,"max_abs":metric.1,"top1_equal":metric.2})
+}
+
+#[cfg(feature = "cuda")]
+fn f32_metrics(
+    got: &[f32],
+    reference: &[f32],
+) -> Result<(f64, f32, bool), Box<dyn std::error::Error>> {
+    if got.len() != reference.len() || got.iter().chain(reference).any(|x| !x.is_finite()) {
+        return Err("invalid metric vectors".into());
+    }
+    let mut err = 0.0f64;
+    let mut norm = 0.0f64;
+    let mut max_abs = 0.0f32;
+    for (&a, &b) in got.iter().zip(reference) {
+        err += f64::from(a - b).powi(2);
+        norm += f64::from(b).powi(2);
+        max_abs = max_abs.max((a - b).abs());
+    }
+    let top = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|x| x.0)
+    };
+    Ok((
+        (err / norm.max(1e-30)).sqrt(),
+        max_abs,
+        top(got) == top(reference),
+    ))
+}
+
+#[cfg(feature = "cuda")]
+fn bf16_metrics(
+    got: &[u8],
+    reference: &[u8],
+) -> Result<(f64, f32, bool), Box<dyn std::error::Error>> {
+    if got.len() != reference.len() || got.len() % 2 != 0 {
+        return Err("invalid BF16 metric vectors".into());
+    }
+    let decode = |bytes: &[u8]| {
+        bytes
+            .chunks_exact(2)
+            .map(|x| f32::from_bits(u32::from(u16::from_le_bytes([x[0], x[1]])) << 16))
+            .collect::<Vec<_>>()
+    };
+    f32_metrics(&decode(got), &decode(reference))
+}
+
+#[cfg(feature = "cuda")]
+struct KvTensor {
+    name: String,
+    heads: usize,
+    row_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+fn kv_tensors(
+    engine: &plowrt::exec::gpu::GpuEngine,
+    checkpoint: &std::path::Path,
+) -> Result<Vec<KvTensor>, Box<dyn std::error::Error>> {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(checkpoint.join("config.json"))?)?;
+    let text = config.get("text_config").unwrap_or(&config);
+    let layers = text["layer_types"]
+        .as_array()
+        .ok_or("mixed verification requires layer_types")?;
+    let slide_heads = text["num_key_value_heads"]
+        .as_u64()
+        .ok_or("missing KV heads")? as usize;
+    let slide_hd = text["head_dim"].as_u64().ok_or("missing head dim")? as usize;
+    let full_heads = text["num_global_key_value_heads"]
+        .as_u64()
+        .ok_or("missing global KV heads")? as usize;
+    let full_hd = text["global_head_dim"]
+        .as_u64()
+        .ok_or("missing global head dim")? as usize;
+    let mut tensors = Vec::with_capacity(layers.len() * 2);
+    for (layer, kind) in layers.iter().enumerate() {
+        let full = kind.as_str() == Some("full_attention");
+        let (heads, hd) = if full {
+            (full_heads, full_hd)
+        } else {
+            (slide_heads, slide_hd)
+        };
+        for suffix in ["k", "v"] {
+            let name = format!("kv.{layer}.{suffix}");
+            if engine.tensor_bytes(&name).is_some() {
+                tensors.push(KvTensor {
+                    name,
+                    heads,
+                    row_bytes: hd * 2,
+                });
+            }
+        }
+    }
+    if tensors.is_empty() {
+        return Err("mixed verification found no KV tensors".into());
+    }
+    Ok(tensors)
+}
+
+#[cfg(feature = "cuda")]
+fn snapshot_active_kv(
+    engine: &plowrt::exec::gpu::GpuEngine,
+    tensors: &[KvTensor],
+    active: &[(usize, usize)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    for tensor in tensors {
+        let bytes = engine
+            .tensor_bytes(&tensor.name)
+            .ok_or("missing KV tensor")? as usize;
+        let slot_bytes = bytes / engine.batch();
+        let head_bytes = slot_bytes / tensor.heads;
+        if slot_bytes * engine.batch() != bytes
+            || head_bytes * tensor.heads != slot_bytes
+            || head_bytes % tensor.row_bytes != 0
+        {
+            return Err(format!("invalid KV geometry for {}", tensor.name).into());
+        }
+        for &(slot, rows) in active {
+            let n = rows
+                .checked_mul(tensor.row_bytes)
+                .ok_or("active KV byte overflow")?;
+            if n > head_bytes {
+                return Err(format!("active KV extent exceeds {}", tensor.name).into());
+            }
+            for head in 0..tensor.heads {
+                let begin = out.len();
+                out.resize(begin + n, 0);
+                let offset = slot * slot_bytes + head * head_bytes;
+                engine.read_tensor_range(&tensor.name, offset as u64, &mut out[begin..])?;
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(feature = "cuda")]
