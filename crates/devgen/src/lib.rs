@@ -487,11 +487,9 @@ impl Drop for EmitAppleGuard {
     }
 }
 
-/// Apple prefill GEMM tile: the Metal interpreter implements 256x256 / 128x128 / 64x128 tiles
-/// (ops Gemm/GemmMed/GemmSmall and their fp8 twins), one threadgroup per tile, on a 16-core
-/// part. Take the largest tile that still gives every core a tile: 256x256 on a 1024-wide
-/// k/v projection is 4 threadgroups for 16 cores (measured 0.8 TFLOPS on the fp8 GEMM against
-/// 1.8 on the GLU GEMM whose N is 8x wider).
+/// Apple prefill GEMM tile: the Metal interpreter partitions work in 128x128 or 64x128 tiles
+/// (ops GemmMed/GemmSmall and their fp8 twins; Gemm = 256x256 is never chosen here), one
+/// threadgroup per tile, on a 16-core part: 128x128 unless it leaves cores idle.
 fn apple_prefill_tile(m: u32, n: u32, n_cu: u32, quant: kernelcaps::QuantScheme) -> DevOp {
     let fp8 = matches!(
         quant,
@@ -501,10 +499,10 @@ fn apple_prefill_tile(m: u32, n: u32, n_cu: u32, quant: kernelcaps::QuantScheme)
         matches!(quant, kernelcaps::QuantScheme::None) || fp8,
         "Apple pick_tile: no prefill GEMM opcode for quant {quant:?}"
     );
+    // Measured (v3 tiles, M4 Pro): 128x128 beats 256x256 at every shape (3.8 vs 2.9 TFLOPS at
+    // 512x3072x3072) and 64x128 wins only where 128x128 leaves cores idle.
     let tiles = |bm: u32, bn: u32| m.div_ceil(bm) * n.div_ceil(bn);
-    if tiles(256, 256) >= n_cu {
-        if fp8 { DevOp::GemmFp8 } else { DevOp::Gemm }
-    } else if tiles(128, 128) >= n_cu {
+    if tiles(128, 128) >= n_cu {
         if fp8 { DevOp::GemmMedFp8 } else { DevOp::GemmMed }
     } else if fp8 {
         DevOp::GemmSmallFp8

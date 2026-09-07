@@ -1136,6 +1136,69 @@ impl MetalEngine {
     }
 
     /// Diagnostic: run ONE instruction of program `p` (all its slices) as its own dispatch.
+    /// As [`Self::run_inst`] but committed without waiting: the caller overlaps host work with it
+    /// and then waits on the returned command buffer (`check_fault` reads the fault word).
+    pub fn run_inst_async(
+        &mut self,
+        p: usize,
+        i: usize,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let pg = &self.progs[p];
+        let d = pg.insts_host[i];
+        // SAFETY: shared buffers sized at load; no run in flight.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                pg.insts_host.as_ptr() as *const u8,
+                pg.insts.contents().as_ptr() as *mut u8,
+                std::mem::size_of_val(pg.insts_host.as_slice()),
+            );
+            std::ptr::write_bytes(self.fault.contents().as_ptr() as *mut u8, 0, 64);
+        }
+        let cb = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| RuntimeError::Device("metal: no command buffer".into()))?;
+        let enc = cb
+            .computeCommandEncoder()
+            .ok_or_else(|| RuntimeError::Device("metal: no encoder".into()))?;
+        enc.setComputePipelineState(&self.pso_single);
+        let sp = i as u32;
+        // SAFETY: bindings match `plow_single`; `sp` outlives the call.
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&pg.insts), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&self.tab), 0, 7);
+            enc.setBytes_length_atIndex(
+                NonNull::new(&sp as *const u32 as *mut c_void).unwrap(),
+                4,
+                8,
+            );
+            enc.setBuffer_offset_atIndex(Some(&self.fault), 0, 9);
+        }
+        if self.resset.is_none() {
+            for b in &self.bufs {
+                enc.useResource_usage(
+                    ProtocolObject::from_ref(&**b),
+                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                );
+            }
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (d.blocks as usize).max(1),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: THREADS,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.endEncoding();
+        cb.commit();
+        Ok(cb)
+    }
+
     pub fn run_inst(&mut self, p: usize, i: usize) -> Result<()> {
         let pg = &self.progs[p];
         let d = pg.insts_host[i];

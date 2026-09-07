@@ -399,8 +399,6 @@ void op_gemv_glu_fp8(const thread Inst& in, device const ulong* tab, uint slice,
 // where the prefill rate comes from. The epilogue dumps one 8x8 accumulator at a time through a
 // per-simdgroup scratch, so no full output tile is needed in threadgroup memory. Weights are bf16
 // or e4m3 (per-column scale in the epilogue); GLU shares the machinery on 64x32 sub-tiles.
-constant uint GK = 16;
-constant uint TILE_FLOATS = 4096;   // two (A 64x16 | B 64x16) chunk buffers
 struct GemmArgs {
     device const ushort* A;      // [M][K] bf16 (row m offset applied by caller)
     device const ushort* B16;    // [N][K] bf16, or
@@ -410,37 +408,6 @@ struct GemmArgs {
     uint K;
     uint M, N;                   // bounds for zero fill
 };
-// Thread `lid` owns A group (row lid/4, k-quad lid%4) of a 64x16 chunk.
-inline float4 load_a(device const ushort* A, uint M, uint K, uint m0, uint k0, uint lid) {
-    uint m = m0 + lid / 4u, k = k0 + (lid % 4u) * 4u;
-    if (m >= M || k >= K) return float4(0.0f);
-    if ((K & 3u) == 0u) return bf4(*(device const ushort4*)(A + m * K + k));
-    float4 v = 0.0f;
-    for (uint j = 0; j < 4u && k + j < K; j++) v[j] = bf2f(A[m * K + k + j]);
-    return v;
-}
-// Thread `t` (0..4*bn) owns B group (row t/4, k-quad t%4) of a bn x 16 chunk.
-inline float4 load_b(device const ushort* B16, device const uchar* B8, uint N, uint K, uint n0, uint k0, uint t) {
-    uint n = n0 + t / 4u, k = k0 + (t % 4u) * 4u;
-    if (n >= N || k >= K) return float4(0.0f);
-    if ((K & 3u) == 0u) return B8 ? e4m3x4(*(device const uchar4*)(B8 + n * K + k)) : bf4(*(device const ushort4*)(B16 + n * K + k));
-    float4 v = 0.0f;
-    for (uint j = 0; j < 4u && k + j < K; j++) v[j] = B8 ? e4m3(B8[n * K + k + j]) : bf2f(B16[n * K + k + j]);
-    return v;
-}
-inline void put4(threadgroup float* buf, uint t, float4 v) { *(threadgroup float4*)(buf + (t / 4u) * GK + (t % 4u) * 4u) = v; }
-
-// acc[2] (rows sg/4*8.., cols sg%4*16..) += As[64][16] . Bs[64][16]^T   (32 simdgroups x 8x16)
-inline void mma_chunk(threadgroup const float* As, threadgroup const float* Bs, uint sg,
-                      thread simdgroup_float8x8 (&acc)[2]) {
-    uint r0 = (sg / 4u) * 8u, c0 = (sg % 4u) * 16u;
-    for (uint kk = 0; kk < GK; kk += 8u) {
-        simdgroup_float8x8 a, b[2];
-        simdgroup_load(a, As + r0 * GK + kk, GK);
-        for (uint j = 0; j < 2; j++) simdgroup_load(b[j], Bs + (c0 + j * 8u) * GK + kk, GK, ulong2(0, 0), true);
-        for (uint j = 0; j < 2; j++) simdgroup_multiply_accumulate(acc[j], a, b[j], acc[j]);
-    }
-}
 // One 8x8 accumulator through the simdgroup's scratch: lane l handles elements 2l, 2l+1.
 inline void epilogue8x8(simdgroup_float8x8 acc, threadgroup float* scratch, uint lane, uint m_base, uint n_base,
                         uint m1, uint n1, thread const GemmArgs& g, device ushort* C, uint ldc) {
@@ -457,42 +424,212 @@ inline void epilogue8x8(simdgroup_float8x8 acc, threadgroup float* scratch, uint
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 }
-inline void gemm_tile(thread const GemmArgs& g, device ushort* C, uint ldc, uint m0, uint m1, uint n0, uint n1,
-                      threadgroup float* tile, uint lid, uint sg, uint lane) {
-    const uint nchunk = (g.K + GK - 1) / GK;
-    // Staging ownership: threads 0..255 carry the A chunk (one float4 each), 256..511 the B chunk.
-    const bool a_side = lid < 256u, b_side = lid >= 256u && lid < 512u;
-    const uint bt = lid - 256u;
-    for (uint mm = m0; mm < m1; mm += 64u)
-        for (uint nn = n0; nn < n1; nn += 64u) {
-            simdgroup_float8x8 acc[2];
-            for (uint j = 0; j < 2; j++) acc[j] = simdgroup_float8x8(0.0f);
-            float4 r = a_side ? load_a(g.A, g.M, g.K, mm, 0, lid)
-                     : (b_side ? load_b(g.B16, g.B8, g.N, g.K, nn, 0, bt) : float4(0.0f));
-            if (a_side) put4(tile, lid, r);
-            if (b_side) put4(tile + 1024u, bt, r);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint c = 0; c < nchunk; c++) {
-                threadgroup float* cur = tile + (c & 1u) * 2048u;
-                threadgroup float* nxt = tile + ((c + 1u) & 1u) * 2048u;
-                bool more = c + 1u < nchunk;
-                if (more) {
-                    if (a_side) r = load_a(g.A, g.M, g.K, mm, (c + 1u) * GK, lid);
-                    if (b_side) r = load_b(g.B16, g.B8, g.N, g.K, nn, (c + 1u) * GK, bt);
-                }
-                mma_chunk(cur, cur + 1024u, sg, acc);
-                if (more) {
-                    if (a_side) put4(nxt, lid, r);
-                    if (b_side) put4(nxt + 1024u, bt, r);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            uint r0 = (sg / 4u) * 8u, c0 = (sg % 4u) * 16u;
-            threadgroup float* scratch = tile + sg * 64u;
-            for (uint j = 0; j < 2; j++)
-                epilogue8x8(acc[j], scratch, lane, mm + r0, nn + c0 + j * 8u, m1, n1, g, C, ldc);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+// ---- v3 tiles: bf16 staging in 8x8 blocks, K chunks of 32, 128-wide sub-tiles ---------------------
+// One threadgroup per core (the persistent grid) cannot hide latency by occupancy, so the kernel
+// pipelines inside the threadgroup: the next chunk's device loads sit in registers while this
+// chunk's matrix ops run, and inside a chunk each simdgroup fetches the fragments of step kb+1
+// from threadgroup memory before multiplying step kb. Chunks are staged as bf16 (exact for e4m3
+// weights) in 8x8 blocks — block ib = (row/8)*(GK/8) + k/8, element (row%8)*8 + k%8 — so
+// simdgroup_load reads one block with ld = 8. Two (SM + 128) x 32 stages fill the 32 KB of
+// threadgroup memory at SM = 128. Products are bf16 x bf16 into f32 accumulators.
+constant uint GK = 32;
+constant uint SN2 = 128;
+constant uint TILE_FLOATS = 8192;   // the whole 32 KB; `red`/`keys` alias into it (see plow_interp)
+inline void stage_put(threadgroup ushort* buf, uint row, uint q, ushort4 v) {
+    uint ib = (row / 8u) * (GK / 8u) + (q / 2u);
+    *(threadgroup ushort4*)(buf + 64u * ib + (row % 8u) * 8u + (q % 2u) * 4u) = v;
+}
+inline ushort4 f4bf(float4 v) { return ushort4(f2bf(v.x), f2bf(v.y), f2bf(v.z), f2bf(v.w)); }
+inline ushort4 load_a16(device const ushort* A, uint M, uint K, uint m, uint k) {
+    if (m >= M || k >= K) return ushort4(0);
+    if ((K & 3u) == 0u) return *(device const ushort4*)(A + m * K + k);
+    ushort4 v = ushort4(0);
+    for (uint j = 0; j < 4u && k + j < K; j++) v[j] = A[m * K + k + j];
+    return v;
+}
+inline ushort4 load_b16(device const ushort* B16, device const uchar* B8, uint N, uint K, uint n, uint k) {
+    if (n >= N || k >= K) return ushort4(0);
+    if ((K & 3u) == 0u)
+        return B8 ? f4bf(e4m3x4(*(device const uchar4*)(B8 + n * K + k))) : *(device const ushort4*)(B16 + n * K + k);
+    ushort4 v = ushort4(0);
+    for (uint j = 0; j < 4u && k + j < K; j++) v[j] = B8 ? f2bf(e4m3(B8[n * K + k + j])) : B16[n * K + k + j];
+    return v;
+}
+// Fragments of step kb for a simdgroup at grid (sgr, sgc): RB A blocks, CB B blocks (transposed).
+template <uint RB, uint CB>
+inline void frag_load(threadgroup const bfloat* As, threadgroup const bfloat* Bs, uint sgr, uint sgc, uint kb,
+                      thread simdgroup_bfloat8x8 (&a)[RB], thread simdgroup_bfloat8x8 (&b)[CB]) {
+    for (uint i = 0; i < RB; i++) simdgroup_load(a[i], As + 64u * ((sgr * RB + i) * (GK / 8u) + kb), 8u);
+    for (uint j = 0; j < CB; j++) simdgroup_load(b[j], Bs + 64u * ((sgc * CB + j) * (GK / 8u) + kb), 8u, ulong2(0, 0), true);
+}
+// One SM x 128 sub-tile at (mm, nn). Simdgroups form an RS x CS grid (RS*CS == 32), each owning
+// RB x CB 8x8 accumulators. Thread lid stages A group (row lid/8, k-quad lid%8) and B group
+// (same indexing over the 128 B rows) of every chunk: two ushort4 device loads per chunk.
+template <uint SM, uint RB, uint CB>
+inline void gemm_sub(thread const GemmArgs& g, device ushort* C, uint ldc, uint mm, uint nn, uint m1, uint n1,
+                     threadgroup ushort* stage, uint lid, uint sg, uint lane) {
+    constexpr uint RS = SM / (8u * RB), CS = NSG / RS;
+    constexpr uint A_ELTS = SM * GK, STAGE = (SM + SN2) * GK;
+    constexpr uint QK = GK / 4u;                   // k-quads per row
+    const uint nchunk = (g.K + GK - 1u) / GK;
+    const bool a_side = lid < SM * QK;
+    const uint ar = lid / QK, aq = lid % QK, br = lid / QK, bq = lid % QK;
+    const uint sgr = sg / CS, sgc = sg % CS;
+    simdgroup_float8x8 acc[RB][CB];
+    for (uint i = 0; i < RB; i++) for (uint j = 0; j < CB; j++) acc[i][j] = simdgroup_float8x8(0.0f);
+    ushort4 ra = a_side ? load_a16(g.A, g.M, g.K, mm + ar, aq * 4u) : ushort4(0);
+    ushort4 rb = load_b16(g.B16, g.B8, g.N, g.K, nn + br, bq * 4u);
+    if (a_side) stage_put(stage, ar, aq, ra);
+    stage_put(stage + A_ELTS, br, bq, rb);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = 0; c < nchunk; c++) {
+        threadgroup ushort* cur = stage + (c & 1u) * STAGE;
+        threadgroup ushort* nxt = stage + ((c + 1u) & 1u) * STAGE;
+        bool more = c + 1u < nchunk;
+        if (more) {
+            uint k0 = (c + 1u) * GK;
+            if (a_side) ra = load_a16(g.A, g.M, g.K, mm + ar, k0 + aq * 4u);
+            rb = load_b16(g.B16, g.B8, g.N, g.K, nn + br, k0 + bq * 4u);
         }
+        threadgroup const bfloat* As = (threadgroup const bfloat*)cur;
+        threadgroup const bfloat* Bs = As + A_ELTS;
+        simdgroup_bfloat8x8 a0[RB], b0[CB], a1[RB], b1[CB];
+        frag_load<RB, CB>(As, Bs, sgr, sgc, 0u, a0, b0);
+        for (uint kb = 0; kb < GK / 8u; kb += 2u) {
+            frag_load<RB, CB>(As, Bs, sgr, sgc, kb + 1u, a1, b1);
+            for (uint i = 0; i < RB; i++)
+                for (uint j = 0; j < CB; j++) simdgroup_multiply_accumulate(acc[i][j], a0[i], b0[j], acc[i][j]);
+            if (kb + 2u < GK / 8u) frag_load<RB, CB>(As, Bs, sgr, sgc, kb + 2u, a0, b0);
+            for (uint i = 0; i < RB; i++)
+                for (uint j = 0; j < CB; j++) simdgroup_multiply_accumulate(acc[i][j], a1[i], b1[j], acc[i][j]);
+        }
+        if (more) {
+            if (a_side) stage_put(nxt, ar, aq, ra);
+            stage_put(nxt + A_ELTS, br, bq, rb);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float* scratch = (threadgroup float*)stage + sg * 64u;
+    for (uint i = 0; i < RB; i++)
+        for (uint j = 0; j < CB; j++)
+            epilogue8x8(acc[i][j], scratch, lane, mm + (sgr * RB + i) * 8u, nn + (sgc * CB + j) * 8u, m1, n1, g, C, ldc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// Sub-tile rows follow the remaining M: 128 (16x32 blocks), 64 (8x32) or 32 (8x16).
+inline void gemm_tile2(thread const GemmArgs& g, device ushort* C, uint ldc, uint m0, uint m1, uint n0, uint n1,
+                       threadgroup float* tile, uint lid, uint sg, uint lane) {
+    threadgroup ushort* stage = (threadgroup ushort*)tile;
+    for (uint mm = m0; mm < m1;) {
+        uint rem = m1 - mm;
+        uint sm = rem > 64u ? 128u : (rem > 32u ? 64u : 32u);
+        for (uint nn = n0; nn < n1; nn += SN2) {
+            if (sm == 128u) gemm_sub<128, 2, 4>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+            else if (sm == 64u) gemm_sub<64, 1, 4>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+            else gemm_sub<32, 1, 2>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+        }
+        mm += sm;
+    }
+}
+// GLU sub-tile: SM x (64 gate | 64 up) with one A chunk; each simdgroup owns RB x CB accumulators
+// for gate and for up. Thread lid stages A (row lid/8) and, for lid < 512, one gate and one up
+// group (row lid/8 of the 64-row halves).
+template <uint SM, uint RB, uint CB>
+inline void gemm_sub_glu(thread const GemmArgs& gg, thread const GemmArgs& gu, device ushort* C, uint act,
+                         float f0, float f1, bool fp8, uint mm, uint nn, uint m1, uint n1,
+                         threadgroup ushort* stage, uint lid, uint sg, uint lane) {
+    constexpr uint RS = SM / (8u * RB), CS = NSG / RS, HN = 64u;
+    constexpr uint A_ELTS = SM * GK, H_ELTS = HN * GK, STAGE = (SM + 2u * HN) * GK;
+    constexpr uint QK = GK / 4u;
+    const uint K = gg.K, M = gg.M, N = gg.N;
+    const uint nchunk = (K + GK - 1u) / GK;
+    const bool a_side = lid < SM * QK, h_side = lid < HN * QK;
+    const uint ar = lid / QK, aq = lid % QK;
+    const uint sgr = sg / CS, sgc = sg % CS;
+    simdgroup_float8x8 ag[RB][CB], au[RB][CB];
+    for (uint i = 0; i < RB; i++) for (uint j = 0; j < CB; j++) { ag[i][j] = simdgroup_float8x8(0.0f); au[i][j] = simdgroup_float8x8(0.0f); }
+    ushort4 ra = a_side ? load_a16(gg.A, M, K, mm + ar, aq * 4u) : ushort4(0);
+    ushort4 rg = h_side ? load_b16(gg.B16, gg.B8, N, K, nn + ar, aq * 4u) : ushort4(0);
+    ushort4 ru = h_side ? load_b16(gu.B16, gu.B8, N, K, nn + ar, aq * 4u) : ushort4(0);
+    if (a_side) stage_put(stage, ar, aq, ra);
+    if (h_side) { stage_put(stage + A_ELTS, ar, aq, rg); stage_put(stage + A_ELTS + H_ELTS, ar, aq, ru); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = 0; c < nchunk; c++) {
+        threadgroup ushort* cur = stage + (c & 1u) * STAGE;
+        threadgroup ushort* nxt = stage + ((c + 1u) & 1u) * STAGE;
+        bool more = c + 1u < nchunk;
+        if (more) {
+            uint k0 = (c + 1u) * GK;
+            if (a_side) ra = load_a16(gg.A, M, K, mm + ar, k0 + aq * 4u);
+            if (h_side) {
+                rg = load_b16(gg.B16, gg.B8, N, K, nn + ar, k0 + aq * 4u);
+                ru = load_b16(gu.B16, gu.B8, N, K, nn + ar, k0 + aq * 4u);
+            }
+        }
+        threadgroup const bfloat* As = (threadgroup const bfloat*)cur;
+        threadgroup const bfloat* Bg = As + A_ELTS;
+        threadgroup const bfloat* Bu = Bg + H_ELTS;
+        simdgroup_bfloat8x8 a0[RB], g0[CB], u0[CB], a1[RB], g1[CB], u1[CB];
+        frag_load<RB, CB>(As, Bg, sgr, sgc, 0u, a0, g0);
+        frag_load<RB, CB>(As, Bu, sgr, sgc, 0u, a0, u0);
+        for (uint kb = 0; kb < GK / 8u; kb += 2u) {
+            frag_load<RB, CB>(As, Bg, sgr, sgc, kb + 1u, a1, g1);
+            frag_load<RB, CB>(As, Bu, sgr, sgc, kb + 1u, a1, u1);
+            for (uint i = 0; i < RB; i++)
+                for (uint j = 0; j < CB; j++) {
+                    simdgroup_multiply_accumulate(ag[i][j], a0[i], g0[j], ag[i][j]);
+                    simdgroup_multiply_accumulate(au[i][j], a0[i], u0[j], au[i][j]);
+                }
+            if (kb + 2u < GK / 8u) {
+                frag_load<RB, CB>(As, Bg, sgr, sgc, kb + 2u, a0, g0);
+                frag_load<RB, CB>(As, Bu, sgr, sgc, kb + 2u, a0, u0);
+            }
+            for (uint i = 0; i < RB; i++)
+                for (uint j = 0; j < CB; j++) {
+                    simdgroup_multiply_accumulate(ag[i][j], a1[i], g1[j], ag[i][j]);
+                    simdgroup_multiply_accumulate(au[i][j], a1[i], u1[j], au[i][j]);
+                }
+        }
+        if (more) {
+            if (a_side) stage_put(nxt, ar, aq, ra);
+            if (h_side) { stage_put(nxt + A_ELTS, ar, aq, rg); stage_put(nxt + A_ELTS + H_ELTS, ar, aq, ru); }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Epilogue: gate and up 8x8 blocks side by side in the simdgroup's 128-float scratch.
+    threadgroup float* scratch = (threadgroup float*)stage + sg * 128u;
+    for (uint i = 0; i < RB; i++)
+        for (uint j = 0; j < CB; j++) {
+            simdgroup_store(ag[i][j], scratch, 8u);
+            simdgroup_store(au[i][j], scratch + 64u, 8u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            uint mb = mm + (sgr * RB + i) * 8u, nb = nn + (sgc * CB + j) * 8u;
+            for (uint e = lane * 2u; e < lane * 2u + 2u; e++) {
+                uint m = mb + e / 8u, n = nb + e % 8u;
+                if (m >= m1 || n >= n1) continue;
+                float gv = scratch[e], uv = scratch[64u + e];
+                if (fp8) { gv *= gg.wscale[n]; uv *= gu.wscale[n]; }
+                if (gg.bias) gv += bf2f(gg.bias[n]);
+                if (gu.bias) uv += bf2f(gu.bias[n]);
+                C[m * N + n] = f2bf(fp8 ? act_gate_only(gv, act) * uv : glu_pair(gv, uv, act, f0, f1));
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+inline void gemm_tile2_glu(thread const GemmArgs& gg, thread const GemmArgs& gu, device ushort* C, uint act,
+                           float f0, float f1, bool fp8, uint m0, uint m1, uint n0, uint n1,
+                           threadgroup float* tile, uint lid, uint sg, uint lane) {
+    threadgroup ushort* stage = (threadgroup ushort*)tile;
+    for (uint mm = m0; mm < m1;) {
+        uint rem = m1 - mm;
+        uint sm = rem > 64u ? 128u : (rem > 32u ? 64u : 32u);
+        for (uint nn = n0; nn < n1; nn += 64u) {
+            if (sm == 128u) gemm_sub_glu<128, 2, 2>(gg, gu, C, act, f0, f1, fp8, mm, nn, m1, n1, stage, lid, sg, lane);
+            else if (sm == 64u) gemm_sub_glu<64, 1, 2>(gg, gu, C, act, f0, f1, fp8, mm, nn, m1, n1, stage, lid, sg, lane);
+            else gemm_sub_glu<32, 1, 1>(gg, gu, C, act, f0, f1, fp8, mm, nn, m1, n1, stage, lid, sg, lane);
+        }
+        mm += sm;
+    }
 }
 // t0=C t1=A t2=B t7=bias?  i0=M i1=N i2=K i4=a_row0 i5=c_row0   (bf16)
 // t0=C t1=A t2=B(e4m3) t3=a_scale? t4=w_scale i0=M i1=N i2=K i4=a_row0 i5=c_row0 (fp8; a_scale -> poison)
@@ -517,7 +654,7 @@ void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nb
                 C[(m0 + e / (n1 - n0)) * N + n0 + e % (n1 - n0)] = ushort(0x7fc1);
             continue;
         }
-        gemm_tile(g, C, N, m0, m1, n0, n1, tile, lid, sg, lane);
+        gemm_tile2(g, C, N, m0, m1, n0, n1, tile, lid, sg, lane);
     }
 }
 // GLU: t0=fu t1=A t2=Wg t5=Wu t6=bias_g? t7=bias_u? i5=act (bf16) / t3=a_scale? t4=g_scale t6=u_scale (fp8)
@@ -544,71 +681,16 @@ void op_gemm_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     }
     bool poison = fp8 && (ten<float>(tab, in, 3) != 0 || !gg.wscale || !gu.wscale);
     const uint BM = 256, BN = 128;
-    const uint nchunk = (K + GK - 1) / GK;
     uint tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN;
-    // Staging ownership: threads 0..255 A, 256..383 Bg, 384..511 Bu (32 rows x 4 quads each).
-    const bool a_side = lid < 256u, g_side = lid >= 256u && lid < 384u, u_side = lid >= 384u && lid < 512u;
-    const uint bt = lid >= 384u ? lid - 384u : lid - 256u;
     for (uint lin = slice; lin < tm * tn; lin += nblk) {
         uint m0 = (lin / tn) * BM, n0 = (lin % tn) * BN;
         uint m1 = min(m0 + BM, M), n1 = min(n0 + BN, N);
-        for (uint mm = m0; mm < m1; mm += 64u)
-            for (uint nn = n0; nn < n1; nn += 32u) {
-                simdgroup_float8x8 ag = simdgroup_float8x8(0.0f), au = simdgroup_float8x8(0.0f);
-                const uint r0 = (sg / 4u) * 8u, c0 = (sg % 4u) * 8u;
-                if (!poison) {
-                    float4 r = a_side ? load_a(gg.A, M, K, mm, 0, lid)
-                             : (g_side ? load_b(gg.B16, gg.B8, N, K, nn, 0, bt)
-                             : (u_side ? load_b(gu.B16, gu.B8, N, K, nn, 0, bt) : float4(0.0f)));
-                    if (a_side) put4(tile, lid, r);
-                    if (g_side) put4(tile + 1024u, bt, r);
-                    if (u_side) put4(tile + 1536u, bt, r);
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    for (uint c = 0; c < nchunk; c++) {
-                        threadgroup float* cur = tile + (c & 1u) * 2048u;
-                        threadgroup float* nxt = tile + ((c + 1u) & 1u) * 2048u;
-                        bool more = c + 1u < nchunk;
-                        if (more) {
-                            if (a_side) r = load_a(gg.A, M, K, mm, (c + 1u) * GK, lid);
-                            if (g_side) r = load_b(gg.B16, gg.B8, N, K, nn, (c + 1u) * GK, bt);
-                            if (u_side) r = load_b(gu.B16, gu.B8, N, K, nn, (c + 1u) * GK, bt);
-                        }
-                        threadgroup const float* As = cur;
-                        threadgroup const float* Bg = cur + 1024u;
-                        threadgroup const float* Bu = cur + 1536u;
-                        for (uint kk = 0; kk < GK; kk += 8u) {
-                            simdgroup_float8x8 a, bg, bu;
-                            simdgroup_load(a, As + r0 * GK + kk, GK);
-                            simdgroup_load(bg, Bg + c0 * GK + kk, GK, ulong2(0, 0), true);
-                            simdgroup_load(bu, Bu + c0 * GK + kk, GK, ulong2(0, 0), true);
-                            simdgroup_multiply_accumulate(ag, a, bg, ag);
-                            simdgroup_multiply_accumulate(au, a, bu, au);
-                        }
-                        if (more) {
-                            if (a_side) put4(nxt, lid, r);
-                            if (g_side) put4(nxt + 1024u, bt, r);
-                            if (u_side) put4(nxt + 1536u, bt, r);
-                        }
-                        threadgroup_barrier(mem_flags::mem_threadgroup);
-                    }
-                }
-                // epilogue: gate and up 8x8 blocks side by side in the simdgroup's scratch
-                threadgroup float* scratch = tile + sg * 128u;
-                simdgroup_store(ag, scratch, 8u);
-                simdgroup_store(au, scratch + 64u, 8u);
-                simdgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint e = lane * 2u; e < lane * 2u + 2u; e++) {
-                    uint m = mm + r0 + e / 8u, n = nn + c0 + e % 8u;
-                    if (m >= m1 || n >= n1) continue;
-                    float g = scratch[e], u = scratch[64u + e];
-                    if (fp8) { g *= gg.wscale[n]; u *= gu.wscale[n]; }
-                    if (gg.bias) g += bf2f(gg.bias[n]);
-                    if (gu.bias) u += bf2f(gu.bias[n]);
-                    float o = poison ? NAN : (fp8 ? act_gate_only(g, act) * u : glu_pair(g, u, act, f0, f1));
-                    C[m * N + n] = f2bf(o);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
+        if (poison) {
+            for (uint e = lid; e < (m1 - m0) * (n1 - n0); e += NT)
+                C[(m0 + e / (n1 - n0)) * N + n0 + e % (n1 - n0)] = ushort(0x7fc1);
+            continue;
+        }
+        gemm_tile2_glu(gg, gu, C, act, f0, f1, fp8, m0, m1, n0, n1, tile, lid, sg, lane);
     }
 }
 
@@ -1172,10 +1254,14 @@ kernel void plow_interp(device const Inst* insts [[buffer(0)]],
                         uint lid [[thread_index_in_threadgroup]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
+    // The whole 32 KB. The norm reduction scratch and the argmax keys alias into it: no op uses
+    // them together with the region they overlap (red = the last 32 floats, keys = the first 8 KB).
     threadgroup float tile[TILE_FLOATS];
-    threadgroup float red[NSG];
-    threadgroup ulong keys[NT];
-    threadgroup uint gate;
+    threadgroup float* red = tile + TILE_FLOATS - NSG;
+    threadgroup ulong* keys = (threadgroup ulong*)tile;
+    // The wait-gate flag also aliases into `tile` (one slot below `red`); nothing is live there
+    // between ops.
+    threadgroup uint* gate = (threadgroup uint*)(tile + TILE_FLOATS - NSG - 1u);
     if (cu >= P.n_cu) return;
     uint head = stream_ofs[cu], end = head + stream_len[cu];
     for (; head < end; head++) {
@@ -1194,10 +1280,10 @@ kernel void plow_interp(device const Inst* insts [[buffer(0)]],
                 }
                 if (!ok) break;
             }
-            gate = ok;
+            *gate = ok;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (gate == 0u) {
+        if (*gate == 0u) {
             if (lid == 0) fault[0] = 0x80000000u | e.inst;
             return;
         }
@@ -1231,9 +1317,11 @@ kernel void plow_single(device const Inst* insts [[buffer(0)]],
                         uint lid [[thread_index_in_threadgroup]],
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
+    // The whole 32 KB. The norm reduction scratch and the argmax keys alias into it: no op uses
+    // them together with the region they overlap (red = the last 32 floats, keys = the first 8 KB).
     threadgroup float tile[TILE_FLOATS];
-    threadgroup float red[NSG];
-    threadgroup ulong keys[NT];
+    threadgroup float* red = tile + TILE_FLOATS - NSG;
+    threadgroup ulong* keys = (threadgroup ulong*)tile;
     Inst in = insts[S.inst];
     if (tg >= in.blocks) return;
     if (!exec_op(in, tab, tg, in.blocks, tile, red, keys, lid, sg, lane))
