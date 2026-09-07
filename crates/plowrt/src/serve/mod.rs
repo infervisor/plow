@@ -15,6 +15,7 @@ pub mod models;
 pub mod mux;
 pub mod openai;
 pub mod stream;
+pub mod template;
 pub mod tokenize;
 
 use std::sync::Arc;
@@ -49,6 +50,13 @@ pub struct GenParams {
     /// request on the same prompts, i.e. 3.2x the prefill churn per output
     /// token). Default `false` — normal serving is unchanged.
     pub ignore_eos: bool,
+    /// OpenAI `stop`. Generation ends at the first match and the matched text
+    /// is withheld. Previously the request field was not even parsed, so a
+    /// LangChain agent relying on `stop` to end a ReAct step over-generated and
+    /// then mis-parsed its own output.
+    pub stop: Vec<String>,
+    /// OpenAI `seed`, mixed into the sampling draw for reproducibility.
+    pub seed: Option<u64>,
 }
 
 impl Default for GenParams {
@@ -57,6 +65,8 @@ impl Default for GenParams {
             max_tokens: 4096,
             params: SamplingParams::default(),
             ignore_eos: false,
+            stop: Vec::new(),
+            seed: None,
         }
     }
 }
@@ -234,11 +244,27 @@ pub(crate) fn bucket_has_sample_batch(bucket: &Bucket) -> bool {
 /// A deterministic `[0,1)` draw seeded by the request state (for stochastic
 /// sampling in the reference path — reproducible, no wall-clock entropy).
 pub(crate) fn seeded_unit(prompt: &[u32], out: &[u32], step: usize) -> f32 {
-    (fnv_seed(prompt, out, step) % 10_000) as f32 / 10_000.0
+    seeded_unit_with(prompt, out, step, None)
 }
 
-fn fnv_seed(prompt: &[u32], out: &[u32], step: usize) -> u64 {
+/// The same draw, with an optional caller-supplied OpenAI `seed` mixed in.
+/// Without it the draw is derived from the token stream alone — deterministic,
+/// but not something a client can choose, which is what `seed` is for.
+pub(crate) fn seeded_unit_with(
+    prompt: &[u32],
+    out: &[u32],
+    step: usize,
+    seed: Option<u64>,
+) -> f32 {
+    (fnv_seed(prompt, out, step, seed) % 10_000) as f32 / 10_000.0
+}
+
+fn fnv_seed(prompt: &[u32], out: &[u32], step: usize, seed: Option<u64>) -> u64 {
     let mut h = 1469598103934665603u64;
+    if let Some(s) = seed {
+        h ^= s;
+        h = h.wrapping_mul(1099511628211);
+    }
     for &t in prompt.iter().chain(out.iter()) {
         h ^= t as u64;
         h = h.wrapping_mul(1099511628211);
@@ -267,7 +293,7 @@ pub(crate) fn reference_logits_row(prompt: &[u32], out: &[u32], row: &mut [f32])
         return;
     }
     let vocab = row.len();
-    let h = fnv_seed(prompt, out, out.len());
+    let h = fnv_seed(prompt, out, out.len(), None);
     for x in row.iter_mut() {
         *x = -12.0;
     }
@@ -581,6 +607,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
+        // BOTH spellings. vLLM serves `/health`, and every k8s probe and
+        // benchmark harness copied from vLLM asks for it; plowrt served only
+        // `/healthz`, so all of them got a 404 from a healthy server.
+        .route("/health", get(healthz))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .route("/trace", get(trace_handler))
@@ -634,6 +664,43 @@ async fn metrics_handler(
     out
 }
 
+/// Build an OpenAI-shaped error response: `{"error": {message, type, code}}`.
+///
+/// Every error path in this server used to emit a bare `{"error": "<string>"}`.
+/// openai-python reads `body["error"]["message"]` and branches on
+/// `body["error"]["code"]`, so a string body gave clients an unusable message
+/// and nothing to branch on.
+pub(crate) fn api_error(
+    status: axum::http::StatusCode,
+    message: impl Into<String>,
+    kind: &'static str,
+    code: Option<&'static str>,
+    param: Option<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        status,
+        axum::Json(openai::ApiErrorBody::new(message, kind, code, param)),
+    )
+        .into_response()
+}
+
+/// The same, for a `RuntimeError`: status and code derived from the variant.
+pub(crate) fn api_error_for(err: &RuntimeError) -> axum::response::Response {
+    let status = status_for(err);
+    let (kind, code) = match err {
+        RuntimeError::UnknownModel(_) => ("invalid_request_error", Some("model_not_found")),
+        RuntimeError::ContextLength(_) => {
+            ("invalid_request_error", Some("context_length_exceeded"))
+        }
+        RuntimeError::Rejected(_) | RuntimeError::Oom(_) => {
+            ("rate_limit_error", Some("server_overloaded"))
+        }
+        _ => ("server_error", None),
+    };
+    api_error(status, err.to_string(), kind, code, None)
+}
+
 /// Map a runtime error to an HTTP status. A fatal device fault means the
 /// device context is dead — 503 (retry another instance), not a 500 that
 /// reads as a plowrt bug; a non-fatal fault stays a 500.
@@ -641,6 +708,10 @@ pub(crate) fn status_for(err: &RuntimeError) -> axum::http::StatusCode {
     use axum::http::StatusCode;
     match err {
         RuntimeError::UnknownModel(_) => StatusCode::NOT_FOUND,
+        // A prompt longer than the compiled context can NEVER succeed, so a
+        // 429 was actively harmful: every OpenAI-compatible client treats 429
+        // as retryable and backs off in a loop against a permanent failure.
+        RuntimeError::ContextLength(_) => StatusCode::BAD_REQUEST,
         RuntimeError::Rejected(_) | RuntimeError::Oom(_) => StatusCode::TOO_MANY_REQUESTS,
         RuntimeError::DeviceFault { info } if info.fatal => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,

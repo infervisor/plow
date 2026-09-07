@@ -2411,6 +2411,32 @@ async fn bringup_runtime(
         if target_vendor.is_some() && target_vendor == vendor {
             tracing::info!(dir = %dir.display(), %target, "loaded model bundle");
         } else {
+            // A DEVICE BLOB WITH NO DEVICE IS A REFUSAL, NOT A WARNING.
+            //
+            // This warned and carried on, and the CPU reference interpreter
+            // then served the bundle: its logits are a stand-in, the chat path
+            // falls back to a bare `role:\ncontent` flatten, and stops are
+            // matched on a newline byte. The result is fluent, fast, wrong, and
+            // indistinguishable from a working server unless someone reads the
+            // log — which is exactly how a GLM-5.3 serve here came up on the
+            // CPU backend and answered correctly at fictional speed.
+            //
+            // A bundle with NO blob is a genuine CPU-reference asset and still
+            // warns, because for that one the CPU path is the intended path.
+            let has_blob = plowrt::asset::devblob::DevBlob::find_in_dir(dir)
+                .ok()
+                .flatten()
+                .is_some();
+            if has_blob {
+                return Err(format!(
+                    "{}: this bundle carries a compiled device blob for {target}, but no \
+                     matching GPU driver was found. Serving it would fall back to the CPU \
+                     reference interpreter, which produces fluent WRONG output at fictional \
+                     speed. Refusing to start.",
+                    dir.display()
+                )
+                .into());
+            }
             tracing::warn!(
                 dir = %dir.display(), %target,
                 "loaded model bundle — no matching GPU driver; \

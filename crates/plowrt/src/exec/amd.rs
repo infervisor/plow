@@ -12887,7 +12887,7 @@ impl AmdEngine {
             return Err(RuntimeError::Device("prefill of an empty prompt".into()));
         }
         if prompt.len() > self.max_ctx {
-            return Err(RuntimeError::Device(format!(
+            return Err(RuntimeError::ContextLength(format!(
                 "prompt of {} tokens exceeds max_ctx {}",
                 prompt.len(),
                 self.max_ctx
@@ -13043,7 +13043,7 @@ impl AmdEngine {
     fn refuse_overlong_cover(&self, n_prompt: u32) -> Result<()> {
         let cover = self.prefill_rows(n_prompt);
         if cover as usize > self.max_ctx {
-            return Err(RuntimeError::Rejected(format!(
+            return Err(RuntimeError::ContextLength(format!(
                 "prompt of {n_prompt} tokens plans as {:?} = {cover} padded rows, past max_ctx \
                  {}. The kernels write every row of the last bucket, so this would write KV rows \
                  [{}, {cover}) outside the cache. Shorten the prompt, or recompile with a \

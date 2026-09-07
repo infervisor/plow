@@ -352,6 +352,11 @@ struct Slot {
     /// the gfx950 arm does.
     #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
     arrived: Instant,
+    /// Tail of the text streamed so far, for OpenAI `stop` matching. Only the
+    /// last `max(stop)` bytes are kept — a stop sequence can straddle token
+    /// boundaries, so matching per-delta would miss it, and keeping the whole
+    /// answer to scan it would be O(n^2) over a long generation.
+    stop_tail: String,
 }
 
 /// Buffers reused across ticks for one bucket. Reallocated only when the live
@@ -1104,6 +1109,7 @@ fn admit_into(
         out_ids: Vec::new(),
         gen: job.gen,
         arrived: job.arrived,
+            stop_tail: String::new(),
         respond: job.respond,
         prefix_offset: 0,
         read_offset: 0,
@@ -2468,7 +2474,12 @@ fn run_one_tick(
                     // logits. Matches the fallback in generate_with_bucket.
                     obs.host.tokens.clear();
                     obs.host.rng01 =
-                        crate::serve::seeded_unit(&slot.prompt_ids, &slot.out_ids, slot.step);
+                        crate::serve::seeded_unit_with(
+                            &slot.prompt_ids,
+                            &slot.out_ids,
+                            slot.step,
+                            slot.gen.seed,
+                        );
                     crate::serve::reference_logits(
                         &slot.prompt_ids,
                         &slot.out_ids,
@@ -3056,6 +3067,54 @@ fn handle_produced_token(
             Some(ids) => ids.contains(&token),
             None => token % 256 == u32::from(b'\n'),
         };
+
+    // OPENAI `stop` STRINGS. The request field was not parsed at all before, so
+    // a client that relied on `stop` to end a step — every LangChain ReAct or
+    // structured-output chain does — got an over-generated answer it then
+    // mis-parsed. Matched on the streamed TEXT, not on ids, because a stop
+    // sequence need not be a token and can straddle a token boundary.
+    //
+    // `ignore_eos` suppresses this too: a benchmark that asks for exactly
+    // `--random-output-len` tokens must not be cut short by an accidental match.
+    let mut stop_str_cut: Option<usize> = None;
+    if !slot.gen.ignore_eos && !slot.gen.stop.is_empty() && !delta.is_empty() {
+        let keep = slot
+            .gen
+            .stop
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let base = slot.stop_tail.len();
+        slot.stop_tail.push_str(&delta);
+        for pat in &slot.gen.stop {
+            if let Some(i) = slot.stop_tail.find(pat.as_str()) {
+                // Bytes of THIS delta that precede the match; the match itself
+                // and everything after it are withheld, as OpenAI specifies.
+                stop_str_cut = Some(i.saturating_sub(base).min(delta.len()));
+                break;
+            }
+        }
+        if stop_str_cut.is_none() && slot.stop_tail.len() > keep {
+            let cut = slot.stop_tail.len() - keep;
+            let cut = (0..=cut)
+                .rev()
+                .find(|&c| slot.stop_tail.is_char_boundary(c))
+                .unwrap_or(0);
+            slot.stop_tail.drain(..cut);
+        }
+    }
+    let (delta, stop_string) = match stop_str_cut {
+        Some(cut) => {
+            let cut = (0..=cut)
+                .rev()
+                .find(|&c| delta.is_char_boundary(c))
+                .unwrap_or(0);
+            (delta[..cut].to_string(), true)
+        }
+        None => (delta, false),
+    };
     if !stop_token
         && slot
             .respond
@@ -3071,8 +3130,8 @@ fn handle_produced_token(
         return;
     }
     let stop_max = slot.step >= slot.gen.max_tokens.max(1);
-    if stop_token || stop_max {
-        let reason = if stop_max && !stop_token {
+    if stop_token || stop_max || stop_string {
+        let reason = if stop_max && !stop_token && !stop_string {
             FinishReason::Length
         } else {
             FinishReason::Stop

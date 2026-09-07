@@ -3748,7 +3748,15 @@ impl GpuEngine {
         }
 
         // Stop set from the checkpoint's generation_config (fallback config).
-        let stop_ids = crate::asset::checkpoint::read_eos_ids(checkpoint_dir);
+        // BOTH sources, matching the AMD and CPU engines. This read only
+        // `read_eos_ids`, so a family whose turn actually ends at a token that
+        // lives in `tokenizer_config.json` rather than in the eos list — K3
+        // closes on `<|close|>` — ran past its own turn boundary on NVIDIA
+        // while stopping correctly on the other two backends.
+        let mut stop_ids = crate::asset::checkpoint::read_eos_ids(checkpoint_dir);
+        stop_ids.extend(crate::asset::checkpoint::chat_stop_ids(checkpoint_dir));
+        stop_ids.sort_unstable();
+        stop_ids.dedup();
         if let Some(tm) = load_tim.as_mut() {
             let ms = t_decode.elapsed().as_secs_f64() * 1e3;
             tm.decode_tables_ms = ms;
@@ -4968,7 +4976,7 @@ impl GpuEngine {
             )));
         }
         if total > self.max_ctx {
-            return Err(RuntimeError::Rejected(format!(
+            return Err(RuntimeError::ContextLength(format!(
                 "prompt + max_tokens = {total} exceeds the compiled context {}",
                 self.max_ctx
             )));
@@ -6392,7 +6400,7 @@ impl GpuEngine {
             return Err(RuntimeError::Rejected("empty prompt".into()));
         }
         if n > self.max_ctx {
-            return Err(RuntimeError::Rejected(format!(
+            return Err(RuntimeError::ContextLength(format!(
                 "prompt {n} exceeds the compiled context {}",
                 self.max_ctx
             )));

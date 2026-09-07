@@ -46,7 +46,19 @@ emit)
   # refuses on a shard-size mismatch or (with folds armed) faults the GPU at load.
   ln -sfn "$CKPT" "$b/checkpoint"
   ln -sfn "$OBJ"  "$b/hsaco"
-  ln -sfn "$RAW/tokenizer.json" "$b/tokenizer.json"
+  # EVERY tokenizer-side file, not just tokenizer.json. The bundle used to carry
+  # tokenizer.json alone, which meant:
+  #   * `tokenizer_config.json` was absent, so the Qwen2 pre-tokenizer fix-up in
+  #     `text/tokenizer.rs` could never fire for a Qwen-family bundle built this
+  #     way, and it would have tokenized against the raw regex and silently
+  #     mismatched the reference;
+  #   * `generation_config.json` was absent, so the eos set came from the
+  #     `config.json` FALLBACK — identical for GLM-5.3 by luck, not by design;
+  #   * `chat_template.jinja` was absent, which nothing reads today but which
+  #     any template-driven prompt build will need.
+  for f in tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do
+    [ -e "$RAW/$f" ] && ln -sfn "$RAW/$f" "$b/$f"
+  done
   # plowc --emit devblob writes model.pkt + build.json but NOT weights.json, which
   # `plowrt serve` opens unconditionally.
   cat > "$b/weights.json" <<JSON

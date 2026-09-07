@@ -13,7 +13,18 @@ use crate::serve::openai::*;
 use crate::serve::stream::{self as stream_mod, StreamChunk};
 use crate::serve::{status_for, AppState};
 
-static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Seeded per PROCESS, not from zero. A counter starting at 0 made the first
+/// response of every server exactly `cmpl-0000000000000000` and made ids
+/// collide across restarts and replicas, which breaks any log correlation or
+/// dedup keyed on `id`.
+static REQ_SEQ: std::sync::LazyLock<AtomicU64> = std::sync::LazyLock::new(|| {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    AtomicU64::new(nonce)
+});
 
 fn validate_return_token_ids(stream: bool, return_token_ids: bool) -> Result<(), &'static str> {
     if stream && return_token_ids {
@@ -29,14 +40,60 @@ fn request_id() -> String {
 
 pub async fn completions(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CompletionRequest>,
+    // `Result<Json<..>, JsonRejection>` rather than `Json<..>`: axum's default
+    // rejection is a PLAIN-TEXT 400/415/422, and a client that calls
+    // `resp.json()` on a 4xx — every OpenAI SDK does — raises a decode error
+    // instead of showing the user what was wrong with their request.
+    req: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(req) = match req {
+        Ok(r) => r,
+        Err(e) => {
+            return crate::serve::api_error(
+                e.status(),
+                e.body_text(),
+                "invalid_request_error",
+                Some("invalid_json"),
+                None,
+            )
+        }
+    };
     if let Err(error) = validate_return_token_ids(req.stream, req.return_token_ids) {
-        return (
+        return crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": error})),
-        )
-            .into_response();
+            error,
+            "invalid_request_error",
+            Some("unsupported_parameter"),
+            Some("return_token_ids".into()),
+        );
+    }
+    // Refuse rather than drop, as on the chat endpoint.
+    if req.n.is_some_and(|n| n != 1) || req.best_of.is_some_and(|b| b != 1) {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "this server returns exactly one choice; n and best_of must be 1 if present",
+            "invalid_request_error",
+            Some("unsupported_parameter"),
+            Some("n".into()),
+        );
+    }
+    if req.echo == Some(true) || req.suffix.is_some() {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`echo` and `suffix` are not implemented by this server",
+            "invalid_request_error",
+            Some("unsupported_parameter"),
+            Some("echo".into()),
+        );
+    }
+    if req.logprobs.as_ref().is_some_and(|v| !v.is_null()) {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`logprobs` is not implemented; it is refused rather than returned as null",
+            "invalid_request_error",
+            Some("unsupported_parameter"),
+            Some("logprobs".into()),
+        );
     }
     #[cfg(feature = "cuda")]
     if let Some(mgr) = state.manager() {
@@ -76,26 +133,59 @@ pub async fn completions(
     if let Some(ignore) = req.ignore_eos {
         gen.ignore_eos = ignore;
     }
+    if let Some(stop) = &req.stop {
+        gen.stop = stop.list();
+    }
+    gen.seed = req.seed;
 
     crate::obs::Metrics::inc(&state.metrics.requests);
     let (Some(mux), Ok(bundle)) = (state.mux(&req.model), state.registry.get(&req.model)) else {
-        return (
+        return crate::serve::api_error(
             axum::http::StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("no model registered for '{}'.", req.model)})),
-        )
-            .into_response();
+            format!("no model registered for '{}'.", req.model),
+            "invalid_request_error",
+            Some("model_not_found"),
+            Some("model".into()),
+        );
     };
-    let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
-        bundle
-            .tokenizer()
-            .encode_with_special_tokens(&req.prompt, req.add_special_tokens)
-    });
-    if prompt_ids.is_empty() {
-        return (
+    // OpenAI's four prompt forms. Token-id prompts skip the tokenizer entirely;
+    // batches are refused explicitly rather than silently serving element 0.
+    let batch_refusal = || {
+        crate::serve::api_error(
             axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "prompt encodes to zero tokens"})),
+            "a batched prompt is not supported; send one prompt per request",
+            "invalid_request_error",
+            Some("unsupported_parameter"),
+            Some("prompt".into()),
         )
-            .into_response();
+    };
+    let encode = |text: &str| {
+        crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
+            bundle
+                .tokenizer()
+                .encode_with_special_tokens(text, req.add_special_tokens)
+        })
+    };
+    let prompt_ids = match &req.prompt {
+        PromptSpec::Text(text) => encode(text),
+        PromptSpec::Tokens(ids) => ids.clone(),
+        PromptSpec::Batch(v) => match v.as_slice() {
+            [one] => encode(one),
+            _ => return batch_refusal(),
+        },
+        PromptSpec::TokenBatch(v) => match v.as_slice() {
+            [one] => one.clone(),
+            _ => return batch_refusal(),
+        },
+    };
+    if prompt_ids.is_empty() {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "prompt encodes to zero tokens",
+            "invalid_request_error",
+            Some("invalid_prompt"),
+            Some("prompt".into()),
+        );
     }
     let n_prompt = prompt_ids.len();
     let (tx, rx) = stream_mod::channel();
@@ -110,26 +200,40 @@ pub async fn completions(
         return match err {
             crate::serve::mux::SubmitError::Full(_) => {
                 crate::obs::Metrics::inc(&state.metrics.rejected);
-                (
+                crate::serve::api_error(
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({"error": "model request queue full"})),
+                    "model request queue full",
+                    "rate_limit_error",
+                    Some("server_overloaded"),
+                    None,
                 )
-                    .into_response()
             }
-            crate::serve::mux::SubmitError::Closed(_) => (
+            crate::serve::mux::SubmitError::Closed(_) => crate::serve::api_error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "model dispatcher unavailable"})),
-            )
-                .into_response(),
+                "model dispatcher unavailable",
+                "server_error",
+                None,
+                None,
+            ),
         };
     }
 
     let id = request_id();
+    let created = now_secs();
     if req.stream {
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
-        sse_response(id, req.model, rx, include_usage, t_arrive, n_prompt).into_response()
+        sse_response(
+            id,
+            req.model,
+            rx,
+            include_usage,
+            t_arrive,
+            n_prompt,
+            created,
+        )
+        .into_response()
     } else {
-        buffer_and_reply(id, req.model, rx, response_prompt_ids).await
+        buffer_and_reply(id, req.model, rx, response_prompt_ids, created).await
     }
 }
 
@@ -138,6 +242,7 @@ async fn buffer_and_reply(
     model: String,
     mut rx: stream_mod::ChunkReceiver,
     prompt_token_ids: Option<Vec<u32>>,
+    created: u64,
 ) -> Response {
     let mut text = String::new();
     let mut completion_token_ids = Vec::new();
@@ -154,40 +259,36 @@ async fn buffer_and_reply(
             StreamChunk::Done {
                 reason, usage: u, ..
             } => {
-                finish = Some(reason.as_str());
+                finish = Some(reason);
                 usage = Some(u.into());
                 break;
             }
             StreamChunk::Err(e) => {
                 tracing::warn!(%model, error = %e, partial_chars = text.len(), "completion stream error");
-                return (
-                    status_for(&e),
-                    Json(serde_json::json!({"error": e.to_string(), "partial": text})),
-                )
-                    .into_response();
+                return crate::serve::api_error_for(&e);
             }
         }
     }
     let Some(finish) = finish else {
         tracing::warn!(%model, partial_chars = text.len(), "completion stream ended without terminal chunk");
-        return (
+        return crate::serve::api_error(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "generation stream ended without a finish reason (slot cut)",
-                "partial": text,
-            })),
-        )
-            .into_response();
+            "generation stream ended without a finish reason (slot cut)",
+            "server_error",
+            None,
+            None,
+        );
     };
     Json(CompletionResponse {
         id: request_id,
         object: "text_completion",
+        created,
         model,
         choices: vec![CompletionChoice {
             index: 0,
             text,
             logprobs: None,
-            finish_reason: Some(finish),
+            finish_reason: Some(finish.as_openai()),
         }],
         usage,
         token_ids: prompt_token_ids.map(|prompt| CompletionTokenIds {
@@ -205,6 +306,7 @@ fn sse_response(
     include_usage: bool,
     t_arrive: std::time::Instant,
     n_prompt: usize,
+    created: u64,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     struct SseState {
         rx: stream_mod::ChunkReceiver,
@@ -260,28 +362,35 @@ fn sse_response(
                             index: 0,
                             text: String::new(),
                             logprobs: None,
-                            finish_reason: Some(reason.as_str()),
+                            finish_reason: Some(reason.as_openai()),
                         }],
                         include_usage.then(|| usage.into()),
                         true,
                     ),
                     StreamChunk::Err(e) => {
+                        // An error object in its own frame and NO `[DONE]`, not
+                        // the error text dressed as generated output with
+                        // `finish_reason: "stop"` — see the matching comment on
+                        // the chat endpoint for why that scored as success.
                         tracing::warn!(%model, error = %e, "completion SSE stream error");
-                        (
-                            vec![CompletionChoice {
-                                index: 0,
-                                text: format!("[error: {e}]"),
-                                logprobs: None,
-                                finish_reason: Some("stop"),
-                            }],
+                        let body = crate::serve::openai::ApiErrorBody::new(
+                            e.to_string(),
+                            "server_error",
                             None,
-                            true,
-                        )
+                            None,
+                        );
+                        let data = serde_json::to_string(&body).unwrap_or_else(|_| {
+                            "{\"error\":{\"message\":\"stream error\",\"type\":\"server_error\"}}"
+                                .to_string()
+                        });
+                        st.done = true;
+                        return Some((Ok(Event::default().data(data)), st));
                     }
                 };
                 let frame = CompletionResponse {
                     id: request_id,
                     object: "text_completion",
+                    created,
                     model: model.clone(),
                     choices: choice,
                     usage: None,
@@ -291,6 +400,7 @@ fn sse_response(
                     let usage_frame = CompletionResponse {
                         id: frame.id.clone(),
                         object: "text_completion",
+                        created,
                         model,
                         choices: Vec::new(),
                         usage: Some(usage),
@@ -317,7 +427,7 @@ fn sse_response(
 mod tests {
     use super::{request_id, validate_return_token_ids};
     use crate::serve::openai::{
-        CompletionChoice, CompletionRequest, CompletionResponse, CompletionTokenIds,
+        CompletionChoice, CompletionRequest, CompletionResponse, CompletionTokenIds, PromptSpec,
     };
 
     #[test]
@@ -340,7 +450,7 @@ mod tests {
             "best_of": 1
         }))
         .unwrap();
-        assert_eq!(req.prompt, "raw prompt");
+        assert!(matches!(&req.prompt, PromptSpec::Text(t) if t == "raw prompt"));
         assert_eq!(req.max_tokens, Some(1024));
         assert_eq!(req.ignore_eos, Some(true));
         assert!(req.stream_options.unwrap().include_usage);
@@ -352,6 +462,7 @@ mod tests {
         let response = CompletionResponse {
             id: "cmpl-test".into(),
             object: "text_completion",
+            created: 0,
             model: "model".into(),
             choices: vec![CompletionChoice {
                 index: 0,

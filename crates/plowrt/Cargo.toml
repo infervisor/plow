@@ -18,6 +18,11 @@ name = "plowrt"
 path = "src/lib.rs"
 
 [dependencies]
+# Renders the CHECKPOINT'S OWN `chat_template.jinja`. Without it every model
+# family needs a hand-written Rust prompt builder, and a family that matches no
+# builder is served another model's markers as literal text. `loop_controls` is
+# required, not optional: GLM's template uses `{% break %}`.
+minijinja = { version = "2", default-features = false, features = ["builtins", "loop_controls", "macros", "multi_template"] }
 plow-asset = { workspace = true }
 packet = { workspace = true }
 hwspec = { workspace = true }

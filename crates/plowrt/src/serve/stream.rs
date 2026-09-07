@@ -62,12 +62,31 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
+    /// The internal name, for logs and metrics. NOT for the wire.
     pub fn as_str(self) -> &'static str {
         match self {
             FinishReason::Stop => "stop",
             FinishReason::Length => "length",
             FinishReason::Preempted => "preempted",
         }
+    }
+
+    /// The value that goes on the wire. `Preempted` is NOT an OpenAI
+    /// `finish_reason`, and a client typed against
+    /// `Literal["stop","length","tool_calls","content_filter","function_call"]`
+    /// rejects the whole response when it sees one. It maps to `"length"` —
+    /// which is honest, the answer really was cut short — and the true cause
+    /// stays visible in `x_plow_finish_reason` and in the server log.
+    pub fn as_openai(self) -> &'static str {
+        match self {
+            FinishReason::Stop => "stop",
+            FinishReason::Length | FinishReason::Preempted => "length",
+        }
+    }
+
+    /// Whether the wire value hides a plow-specific cause worth reporting.
+    pub fn is_vendor_specific(self) -> bool {
+        matches!(self, FinishReason::Preempted)
     }
 }
 
