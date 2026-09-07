@@ -461,6 +461,58 @@ fn pick_tile(m: u32, n: u32, k: u32, n_cu: u32, quant: kernelcaps::QuantScheme) 
     pick_tile_tiered(m, n, k, n_cu, quant).0
 }
 
+thread_local! {
+    static EMIT_IS_APPLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn emit_is_apple() -> bool {
+    EMIT_IS_APPLE.with(|c| c.get())
+}
+
+/// Scoped "the target is an Apple GPU (metal3)" flag, as [`EmitAmdGuard`] for AMD.
+struct EmitAppleGuard {
+    prev: bool,
+}
+
+impl EmitAppleGuard {
+    fn set(apple: bool) -> Self {
+        let prev = EMIT_IS_APPLE.with(|c| c.replace(apple));
+        Self { prev }
+    }
+}
+
+impl Drop for EmitAppleGuard {
+    fn drop(&mut self) {
+        EMIT_IS_APPLE.with(|c| c.set(self.prev));
+    }
+}
+
+/// Apple prefill GEMM tile: the Metal interpreter implements 256x256 / 128x128 / 64x128 tiles
+/// (ops Gemm/GemmMed/GemmSmall and their fp8 twins), one threadgroup per tile, on a 16-core
+/// part. Take the largest tile that still gives every core a tile: 256x256 on a 1024-wide
+/// k/v projection is 4 threadgroups for 16 cores (measured 0.8 TFLOPS on the fp8 GEMM against
+/// 1.8 on the GLU GEMM whose N is 8x wider).
+fn apple_prefill_tile(m: u32, n: u32, n_cu: u32, quant: kernelcaps::QuantScheme) -> DevOp {
+    let fp8 = matches!(
+        quant,
+        kernelcaps::QuantScheme::W8A16 | kernelcaps::QuantScheme::W8A8
+    );
+    assert!(
+        matches!(quant, kernelcaps::QuantScheme::None) || fp8,
+        "Apple pick_tile: no prefill GEMM opcode for quant {quant:?}"
+    );
+    let tiles = |bm: u32, bn: u32| m.div_ceil(bm) * n.div_ceil(bn);
+    if tiles(256, 256) >= n_cu {
+        if fp8 { DevOp::GemmFp8 } else { DevOp::Gemm }
+    } else if tiles(128, 128) >= n_cu {
+        if fp8 { DevOp::GemmMedFp8 } else { DevOp::GemmMed }
+    } else if fp8 {
+        DevOp::GemmSmallFp8
+    } else {
+        DevOp::GemmSmall
+    }
+}
+
 pub(crate) fn pick_gemm_emit_plan(
     m: u32,
     n: u32,
@@ -519,6 +571,12 @@ fn pick_tile_tiered(
     // from the gfx950 analytical inventory while emitting for Hopper/Blackwell put
     // `PLOW_DOP_GEMM_WIDE` into GH200 packets; the NVIDIA interp has no case → `default:
     // __trap()` → `CUDA_ERROR_LAUNCH_FAILED` on first prefill.
+    if emit_is_apple() {
+        return (
+            apple_prefill_tile(m, n, n_cu, quant),
+            kernelcaps::CalibrationTier::Portable,
+        );
+    }
     if !emit_is_amd() {
         return (
             nvidia_prefill_gemm_op(quant),
@@ -7316,6 +7374,7 @@ fn emit_dense_gqa(
     let amd = target_is_amd(&arch, &gpu);
     // Same no-target rule as run_verified's guard: legacy (golden) emission stays AMD.
     let _emit_target = EmitAmdGuard::set(amd || (arch.is_empty() && gpu.is_empty()));
+    let _apple_target = EmitAppleGuard::set(arch == "metal3");
     // Same reason as the other entry: the tile selector must cost against THIS part, and
     // `--arch` is the fallback when --gpu cannot answer.
     if amd {
