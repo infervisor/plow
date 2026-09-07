@@ -1164,7 +1164,29 @@ fn analysis(progs: &[ProgramArms]) -> Value {
 /// backend that renders flags knows what it is rendering for; it is metadata,
 /// not something this module interprets.
 pub fn build(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
-    let mut v = build_inner(m, arch, lean);
+    build_with_packed_prefill(m, arch, lean, false)
+}
+
+pub fn build_for_packet(
+    m: &Model,
+    arch: &str,
+    lean: &crate::LeanReport,
+    sections: &[packet::devbuild::SectionData],
+) -> Value {
+    let packed_prefill = sections.iter().any(|section| {
+        section.kind == packet::devbuild::SECT_METADATA
+            && section.name == plow_asset::packed_prefill::SECTION
+    });
+    build_with_packed_prefill(m, arch, lean, packed_prefill)
+}
+
+fn build_with_packed_prefill(
+    m: &Model,
+    arch: &str,
+    lean: &crate::LeanReport,
+    packed_prefill: bool,
+) -> Value {
+    let mut v = build_inner(m, arch, lean, packed_prefill);
     // Stamped last: it is a hash OF the manifest's compiled-set fields, so it
     // cannot be one of them.
     let h = pairing_hash(&v);
@@ -1207,7 +1229,7 @@ fn lean_block(lean: &crate::LeanReport) -> Value {
     })
 }
 
-fn object_inventory(progs: &[ProgramArms], arch: &str) -> Value {
+fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) -> Value {
     let phase = |kind: &str| -> BTreeSet<Arm> {
         progs
             .iter()
@@ -1216,6 +1238,14 @@ fn object_inventory(progs: &[ProgramArms], arch: &str) -> Value {
             .collect()
     };
     let prefill = phase("prefill");
+    let mut packed_prefill: BTreeSet<Arm> = progs
+        .iter()
+        .filter(|p| p.kind == "prefill" && p.packed_prefill_only)
+        .flat_map(|p| p.arms.iter().cloned())
+        .collect();
+    if packed_metadata && packed_prefill.is_empty() {
+        packed_prefill = prefill.clone();
+    }
     let decode_mla_segment = |p: &&ProgramArms| {
         p.kind == "decode"
             && p.seg.is_some()
@@ -1293,6 +1323,16 @@ fn object_inventory(progs: &[ProgramArms], arch: &str) -> Value {
     let key_factor_carry = singleton_arm("KdaChunkCarry");
     let key_factor_pair = !key_factor_wu.is_empty() && !key_factor_carry.is_empty();
     json!({
+        "packed_prefill": {
+            "required": !packed_prefill.is_empty(),
+            "topology": "packed",
+            "arms": keys(&packed_prefill),
+            "families": families(&packed_prefill),
+            "capability": {
+                "symbol": plow_asset::packed_prefill::CAPABILITY,
+                "value": plow_asset::packed_prefill::CAPABILITY_VALUE,
+            },
+        },
         "ordinary": {
             "prefill": {
                 "arms": keys(&prefill),
@@ -1459,10 +1499,10 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
     out
 }
 
-fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
+fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: bool) -> Value {
     let progs = program_arms(m);
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
-    let mut objects = object_inventory(&progs, arch);
+    let mut objects = object_inventory(&progs, arch, packed_prefill);
     let kda_intra_wave_items_required = m.progs.iter().any(|p| {
         p.stream.iter().any(|e| {
             e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0
@@ -1807,6 +1847,10 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/ordinary/decode_mla/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let packed_prefill_required = manifest
+        .pointer("/objects/packed_prefill/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let kda_intra_wave_items_required = manifest
         .pointer("/objects/lean/kda_intra_wave_items/required")
         .and_then(Value::as_bool)
@@ -1838,6 +1882,10 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str(&format!(
         "#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS {}\n",
         if decode_mla_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY {}\n",
+        if packed_prefill_required { 1 } else { 0 }
     ));
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS {}\n",
@@ -2331,6 +2379,57 @@ mod tests {
         assert_eq!(p[1]["kind"], "decode");
         assert_eq!(p[1]["batch"], 8);
         assert!(p[0]["segment"].is_null());
+    }
+
+    #[test]
+    fn packed_prefill_topology_gets_a_dedicated_object_contract() {
+        let mut m = model();
+        m.progs.insert(
+            1,
+            prog(vec![
+                inst(DevOp::FlashPrefill, [0, 0, 8, 4, 0, 0, 256, 0]),
+                inst(DevOp::Gemm, [0; 8]),
+            ]),
+        );
+        m.prog_t
+            .insert(1, packet::devbuild::packed_prefill_program_t(1024));
+
+        let man = build(&m, "sm_90a");
+        let object = &man["objects"]["packed_prefill"];
+        assert_eq!(object["required"], true);
+        assert_eq!(object["topology"], "packed");
+        assert_eq!(
+            object["capability"]["symbol"],
+            plow_asset::packed_prefill::CAPABILITY
+        );
+        assert_eq!(
+            object["capability"]["value"],
+            plow_asset::packed_prefill::CAPABILITY_VALUE
+        );
+        assert_eq!(man["programs"][1]["topology"], "packed");
+        assert!(config_header(&man).contains("#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 1\n"));
+
+        let ordinary = build(&model(), "sm_90a");
+        assert_eq!(ordinary["objects"]["packed_prefill"]["required"], false);
+        assert!(config_header(&ordinary)
+            .contains("#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 0\n"));
+
+        let section = packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::packed_prefill::SECTION.into(),
+            data: vec![],
+        };
+        let dense = build_for_packet(
+            &model(),
+            "sm_90a",
+            &crate::LeanReport::skipped("test: gate not run"),
+            &[section],
+        );
+        assert_eq!(dense["objects"]["packed_prefill"]["required"], true);
+        assert_eq!(
+            dense["objects"]["packed_prefill"]["arms"],
+            dense["objects"]["ordinary"]["prefill"]["arms"]
+        );
     }
 
     /// The nvcc rendering is a BACKEND of the neutral facts, and `requires` is
@@ -2884,9 +2983,9 @@ mod tests {
         let wu = segment("KdaChunkWu");
         let carry = segment("KdaChunkCarry");
 
-        let incomplete = object_inventory(std::slice::from_ref(&wu), "gfx950");
+        let incomplete = object_inventory(std::slice::from_ref(&wu), "gfx950", false);
         assert_eq!(incomplete["lean"]["kda_key_factor_pair"]["required"], false);
-        let paired = object_inventory(&[wu, carry], "gfx950");
+        let paired = object_inventory(&[wu, carry], "gfx950", false);
         assert_eq!(paired["lean"]["kda_key_factor_pair"]["required"], true);
         assert_eq!(
             paired["lean"]["kda_key_factor_pair"]["wu_arms"][0],
@@ -2916,7 +3015,7 @@ mod tests {
             insts,
         };
         let pure = segment(2, &["FlashMlaDecode", "MlaMergeFold"]);
-        let inv = object_inventory(std::slice::from_ref(&pure), "gfx950");
+        let inv = object_inventory(std::slice::from_ref(&pure), "gfx950", false);
         assert_eq!(inv["ordinary"]["decode_mla"]["required"], true);
         let manifest = json!({"union": [], "objects": inv});
         assert!(config_header(&manifest).contains("#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS 1"));
@@ -2926,7 +3025,8 @@ mod tests {
             segment(3, &["FlashMlaDecode", "MlaMergeFold", "Gemv"]),
         ] {
             assert_eq!(
-                object_inventory(&[rejected], "gfx950")["ordinary"]["decode_mla"]["required"],
+                object_inventory(&[rejected], "gfx950", false)["ordinary"]["decode_mla"]
+                    ["required"],
                 false
             );
         }
