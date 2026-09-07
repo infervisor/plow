@@ -359,3 +359,32 @@ the 21% a naive roofline suggests.**
 ~3x the strip's compute, which is why kv_proj gets 281 GFLOP/s/core against q_proj's 900. Splitting
 the slice over M rather than N whenever N < M makes the pack 1x instead of 16x. Bit-exact, worth
 about 1.2-1.5% of prefill wall.
+
+### Negative result: a wider prefill bucket does not help (2026-09-07, 04:3x)
+
+A 1111-token summarize prompt runs the 1024 bucket PLUS the 128 bucket. Fitting cost against
+chunk width (128 rows at 265 tok/s, 1024 rows at 1686.6 ms) gives a fixed ~311 ms per chunk --
+one full sweep of the weights -- plus 1.34 ms/row, so the second chunk appeared to be paying a
+whole extra sweep to process 87 real tokens.
+
+Partially-filled buckets do NOT compute their padding: `rebase_chunk_rows` rewrites the row-count
+fields from `t` down to `clen` when `clen < t` (`kvrow.rs`), so a wider bucket costs nothing extra
+in rows. That predicted ~311 ms back on the cell.
+
+The ladder is capped by `default_chunk(window)`, which pins GPT-OSS to 1024 because it has
+128-token sliding layers; `PLOW_MAX_CHUNK=2048` overrides it and emits a T=2048 bucket (verified
+in the program list). Measured through serve, summarize c=1 TTFT:
+
+| ladder | p50 | mean |
+|---|---|---|
+| 128/512/1024 (default) | 2122 | 2469 |
+| 128/512/1024/2048 | 2184 | 2507 |
+
+**No gain; if anything slightly worse.** The saved sweep is cancelled because the wider program is
+less efficient per row: the T=1024 program runs 607 tok/s where T=2048 runs 554, about 9% worse,
+and 1111 rows placed in the T=2048 program inherit that program's tiling. The two effects are the
+same size, so they cancel.
+
+Worth knowing for anyone tempted by the same idea: widening the ladder also doubles the sliding
+layers' KV ring, since it is `next_pow2(window + chunk - 1)` = 2048 -> 4096. So it costs memory
+for no throughput.
