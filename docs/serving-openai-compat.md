@@ -91,7 +91,12 @@ the template's message. That is the designed path, not a divergence.
 Template support is not serving support. `gpt_oss` and `llama` compile (`devgen`'s `gptoss.rs`
 emitter and the dense-GQA path respectively; `llama` also has an `nn-graph` builder), and both
 load a stock `tokenizer.json` through the `tokenizers` crate with no per-family fix-up — only
-Qwen2 needs one. `muse_glimmer` is **refused by the compiler** (`nn-graph`'s config parser
+Qwen2 needs one. Every marker their templates emit resolves to ONE id, which is the property
+that makes a rendered prompt real rather than literal text: gpt-oss `<|start|>` 200006,
+`<|message|>` 200008, `<|end|>` 200007, `<|channel|>` 200005, `<|return|>` 200002 (the ids
+`harmony_chat_prompt` documents); Llama `<|begin_of_text|>` 128000, `<|start_header_id|>`
+128006, `<|end_header_id|>` 128007, `<|eot_id|>` 128009. `cargo build -p plowrt --features
+hf-tokenizer --example tok_probe` checks that for any checkpoint. `muse_glimmer` is **refused by the compiler** (`nn-graph`'s config parser
 rejects it, and `devgen` has no arm), so its template rendering correctly is moot until an
 emitter exists. Likewise `kimi_k25` — the two Kimi-K2.5 checkpoints on this host hit the
 `other =>` arm and cannot be built, and Gemma-4-26B-A4B is refused as MoE.
