@@ -1675,7 +1675,8 @@ fn run_one_tick(
                 // frees it (mid-quantum EOS — extra device tokens past the stop
                 // are discarded). Remaining output budgets cap K. Any sampling adjustment
                 // falls through to the per-token path below.
-                let use_multi = e.multistep_quantum().is_some()
+                let use_multi = steps > 1
+                    && e.multistep_quantum().is_some()
                     && feeds.iter().all(|&(i, _)| {
                         slots[i]
                             .as_ref()
@@ -1689,7 +1690,12 @@ fn run_one_tick(
                         .map(|slot| slot.gen.max_tokens.max(1).saturating_sub(slot.step))
                         .min()
                         .unwrap_or(1);
-                    match e.multi_step_at_most(&feeds, remaining, &mut toks) {
+                    let requested = multistep_requested(
+                        remaining,
+                        steps as usize,
+                        e.multistep_quantum().unwrap_or(1),
+                    );
+                    match e.multi_step_at_most(&feeds, requested, &mut toks) {
                         Ok(k) => {
                             for (ri, &(i, _)) in feeds.iter().enumerate() {
                                 for s in 0..k {
@@ -2215,10 +2221,10 @@ fn run_one_tick(
                 .map(|slot| slot.gen.max_tokens.saturating_sub(slot.out_ids.len()))
                 .min()
                 .unwrap_or(1);
-            let requested = amd_multistep_requested(
+            let requested = multistep_requested(
                 remaining,
                 steps as usize,
-                crate::config::RuntimeConfig::get().nv.multistep,
+                crate::config::RuntimeConfig::get().nv.multistep as usize,
             );
             let multi = e.multistep_quantum(&feeds, requested);
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
@@ -2586,11 +2592,9 @@ fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
     enabled && prefill_remains
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
-fn amd_multistep_requested(remaining: usize, scheduler_steps: usize, configured: u32) -> usize {
-    remaining
-        .min(scheduler_steps)
-        .min(configured.max(1) as usize)
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+fn multistep_requested(remaining: usize, scheduler_steps: usize, configured: usize) -> usize {
+    remaining.min(scheduler_steps).min(configured.max(1))
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
@@ -3105,12 +3109,19 @@ mod tests {
         assert!(deferred_token(&ring, 2, 0, 3).is_err());
     }
 
-    #[cfg(feature = "hsa")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     #[test]
-    fn amd_multistep_honors_the_runtime_cap() {
-        assert_eq!(amd_multistep_requested(16, 8, 4), 4);
-        assert_eq!(amd_multistep_requested(16, 8, 1), 1);
-        assert_eq!(amd_multistep_requested(3, 8, 4), 3);
+    fn multistep_honors_scheduler_runtime_and_output_caps() {
+        for (batch, expected) in [(1, 4), (4, 2), (16, 1)] {
+            let steps = MultiStep::for_batch(batch).steps as usize;
+            assert_eq!(multistep_requested(16, steps, 8), expected);
+        }
+        assert_eq!(multistep_requested(16, 1, 8), 1);
+        assert_eq!(multistep_requested(16, 8, 4), 4);
+        assert_eq!(multistep_requested(16, 8, 1), 1);
+        assert_eq!(multistep_requested(16, 8, 0), 1);
+        assert_eq!(multistep_requested(3, 8, 4), 3);
+        assert_eq!(multistep_requested(0, 8, 4), 0);
     }
 
     #[test]
