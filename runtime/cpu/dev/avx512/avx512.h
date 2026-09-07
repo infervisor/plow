@@ -18,6 +18,7 @@ V_K(v_gemv_argmax);
 V_K(v_residual);
 V_K(v_glu);
 V_K(v_softcap);
+V_K(v_cast_f32_bf16);
 V_K(v_embed);
 V_K(v_argmax);
 V_K(v_argmax_fin);

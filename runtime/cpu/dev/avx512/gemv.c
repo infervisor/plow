@@ -363,6 +363,7 @@ void plow_cpu_register_avx512(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_RESIDUAL] = v_residual;
     tab[PLOW_DOP_GLU] = v_glu;
     tab[PLOW_DOP_SOFTCAP] = v_softcap;
+    tab[PLOW_DOP_CAST_F32_BF16] = v_cast_f32_bf16;
     tab[PLOW_DOP_EMBED] = v_embed;
     tab[PLOW_DOP_ARGMAX] = v_argmax;
     tab[PLOW_DOP_ARGMAX_FIN] = v_argmax_fin;

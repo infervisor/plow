@@ -15,6 +15,7 @@ G_K(g_nop);
 G_K(g_residual);
 G_K(g_glu);
 G_K(g_softcap);
+G_K(g_cast_f32_bf16);
 G_K(g_embed);
 G_K(g_argmax);
 G_K(g_argmax_fin);
@@ -27,6 +28,8 @@ G_K(g_norm_residual);
 G_K(g_add_norm);
 G_K(g_norm_residual_norm);
 /* gemm.c */
+G_K(g_zero_f32);
+G_K(g_gemm_splitk);
 G_K(g_gemm);
 G_K(g_gemm_small);
 G_K(g_gemm_med);

@@ -10,6 +10,9 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_RESIDUAL] = g_residual;
     tab[PLOW_DOP_GLU] = g_glu;
     tab[PLOW_DOP_SOFTCAP] = g_softcap;
+    tab[PLOW_DOP_CAST_F32_BF16] = g_cast_f32_bf16;
+    tab[PLOW_DOP_ZERO_F32] = g_zero_f32;
+    tab[PLOW_DOP_GEMM_SPLITK] = g_gemm_splitk;
     tab[PLOW_DOP_EMBED] = g_embed;
     tab[PLOW_DOP_ARGMAX] = g_argmax;
     tab[PLOW_DOP_ARGMAX_FIN] = g_argmax_fin;

@@ -118,3 +118,19 @@ V_K(v_argmax_fin) {
         ids[b] = (int32_t) ~(uint32_t)(best & 0xFFFFFFFFull);
     }
 }
+
+/* t0=out(bf16) t1=src(f32); i0*i1 = element count. Split-K tail: narrow the f32 accumulator.
+ * A plain load/convert/store pair, so it is bandwidth-bound and needs no unrolling. */
+V_K(v_cast_f32_bf16) {
+    (void)ctx;
+    plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
+    const float* src = PLOW_CPU_TEN(in, T, 1);
+    const uint64_t total = (uint64_t)in->i[0] * (uint64_t)in->i[1];
+    const uint32_t n = total > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)total;
+    uint32_t lo, hi;
+    g_range(n, slice, nblk, &lo, &hi);
+    for (uint32_t i = lo; i < hi; i += 16) {
+        const __mmask16 m = i + 16 <= hi ? 0xFFFF : v_tail16(hi - i);
+        v_store_bf16_mask(out + i, m, _mm512_maskz_loadu_ps(m, src + i));
+    }
+}

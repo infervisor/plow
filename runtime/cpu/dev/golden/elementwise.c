@@ -93,3 +93,17 @@ G_K(g_argmax_fin) {
         ids[b] = (int32_t) ~(uint32_t)(best & 0xFFFFFFFFull);
     }
 }
+
+/* t0=out(bf16) t1=src(f32); i0*i1 = element count. The split-K tail: a GEMM accumulates in f32,
+ * this narrows it. Element count is i0*i1 as a size_t on the device side, but a CPU packet's
+ * slice bounds are u32, so the product is clamped -- no blob emits a cast wider than that. */
+G_K(g_cast_f32_bf16) {
+    (void)ctx;
+    plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
+    const float* src = PLOW_CPU_TEN(in, T, 1);
+    const uint64_t total = (uint64_t)in->i[0] * (uint64_t)in->i[1];
+    const uint32_t n = total > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)total;
+    uint32_t lo, hi;
+    g_range(n, slice, nblk, &lo, &hi);
+    for (uint32_t i = lo; i < hi; i++) out[i] = plow_f2bf(src[i]);
+}
