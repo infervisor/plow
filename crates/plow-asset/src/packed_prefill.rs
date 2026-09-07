@@ -313,19 +313,22 @@ pub fn plan(
         out.mapped_ends.push((r.slot, end as u32));
         total = next;
     }
-    let last = requests.last().unwrap();
-    let end = last.start + last.len;
-    let padded = end
-        .checked_add(bucket - total)
-        .ok_or("packed padding overflow")?;
-    need(
-        padded <= max_ctx,
-        "padding exceeds physical context; clamping forbidden",
-    )?;
+    let padding = bucket - total;
+    let (padding_index, padding_request, padded) = requests
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, request)| {
+            let end = request.start.checked_add(request.len)?;
+            let padded = end.checked_add(padding)?;
+            (padded <= max_ctx).then_some((index, request, padded))
+        })
+        .ok_or("packed prefill: padding exceeds every request's physical context")?;
+    let end = padding_request.start + padding_request.len;
     out.slots
-        .extend(std::iter::repeat_n(last.slot as i32, bucket - total));
+        .extend(std::iter::repeat_n(padding_request.slot as i32, padding));
     out.positions.extend((end..padded).map(|x| x as i32));
-    out.mapped_ends.last_mut().unwrap().1 = padded as u32;
+    out.mapped_ends[padding_index].1 = padded as u32;
     Ok(out)
 }
 #[cfg(test)]
@@ -393,6 +396,34 @@ mod tests {
             ..r
         };
         assert!(plan(&[tail], &[7], 2, 8).is_err());
+    }
+    #[test]
+    fn padding_uses_a_request_with_remaining_context_capacity() {
+        let frontiers = [2, 7];
+        let p = plan(
+            &[
+                Request {
+                    slot: 0,
+                    start: 2,
+                    len: 2,
+                    prompt: 8,
+                },
+                Request {
+                    slot: 1,
+                    start: 7,
+                    len: 1,
+                    prompt: 8,
+                },
+            ],
+            &frontiers,
+            4,
+            8,
+        )
+        .unwrap();
+        assert_eq!(p.table, [2, 0, 2, 0, 4, 2, 1, 1, 8]);
+        assert_eq!(p.slots, [0, 0, 1, 0]);
+        assert_eq!(p.positions, [2, 3, 7, 4]);
+        assert_eq!(p.mapped_ends, [(0, 5), (1, 8)]);
     }
     #[test]
     fn real_partial_rows_and_padding_have_disjoint_ownership() {

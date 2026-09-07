@@ -2621,41 +2621,16 @@ fn amd_prefill_pack(
     cap: usize,
     program_rows: impl Fn(u32) -> Option<u32>,
 ) -> Vec<packet::dev::PrefillSpan> {
-    if row_budget == 0 {
-        return Vec::new();
-    }
-    let cap = cap.max(1);
-    let mut candidates: Vec<_> = candidates
-        .into_iter()
-        .filter(|s| {
-            s.n_rows != 0
-                && s.n_rows <= row_budget
-                && s.slot < cap as u32
-                && s.state_slot == s.slot
-                && s.kv_row0.checked_add(s.n_rows) == Some(s.kv_len)
-        })
-        .collect();
-    candidates.sort_unstable_by_key(|s| ((s.slot as usize + cap - start % cap) % cap, s.slot));
-    let Some(program) = candidates.first().map(|s| s.program) else {
-        return Vec::new();
-    };
-    let Some(row_budget) = program_rows(program).map(|rows| rows.min(row_budget)) else {
-        return Vec::new();
-    };
-    let mut rows = 0u32;
-    let mut out = Vec::new();
-    for mut span in candidates.into_iter().filter(|s| s.program == program) {
-        let Some(next) = rows.checked_add(span.n_rows) else {
-            break;
-        };
-        if next > row_budget {
-            continue;
-        }
-        span.row0 = rows;
-        rows = next;
-        out.push(span);
-    }
-    out
+    crate::sched::prefill::admit(
+        candidates,
+        row_budget,
+        start,
+        cap,
+        crate::sched::prefill::SpanPolicy::Whole,
+        program_rows,
+    )
+    .spans()
+    .to_vec()
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
@@ -2720,10 +2695,8 @@ fn gpu_prefill_batched_pass(
     } else {
         pf_interleave_rows().min(budget_max)
     };
-    // RTX-12: per-request slice cap. With `chunk_cap < per_launch`, the first
-    // big prompt no longer consumes the whole budget, so the slot-order pack
-    // loop below hands the remaining budget to the next waiting request(s) —
-    // P1 single-slice-per-request co-packing (R ≈ per_launch / chunk_cap).
+    // Bound each candidate before fair sharing. Short requests return unused
+    // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows();
     loop {
         // Minimal-padding budget: cap this pack at the largest bucket the
@@ -2740,28 +2713,55 @@ fn gpu_prefill_batched_pass(
             return tick_fault;
         }
         let per_launch = e.pf_pack_budget(avail.min(per_launch)).min(per_launch);
-        // Assemble one pack: (slot, c0, len) per waiting request, in slot order.
-        let mut pack: Vec<(usize, usize, usize)> = Vec::new();
-        let mut budget = per_launch;
-        for i in 0..slots.len().min(cap) {
-            if budget == 0 {
-                break;
-            }
-            let Some(s) = slots[i].as_ref() else { continue };
-            if s.step != 0 {
-                continue;
-            }
-            let n = s.prompt_ids.len();
-            if n == 0 || s.pf_pos + 1 >= n {
-                continue; // empty / ready — handled by the feed collection
-            }
-            if s.respond.is_closed() {
-                if let Some(taken) = slots[i].take() {
+        // Form one fair, rotating pack. The packet bucket supplies the row
+        // budget; request-local positions remain absolute in every span.
+        for slot in slots.iter_mut().take(cap) {
+            if slot
+                .as_ref()
+                .is_some_and(|request| request.step == 0 && request.respond.is_closed())
+            {
+                if let Some(taken) = slot.take() {
                     release_kv(arena, taken.kv);
                 }
-                continue;
             }
-            if s.pf_pos == 0 {
+        }
+        let candidates = slots.iter().enumerate().take(cap).filter_map(|(i, slot)| {
+            let s = slot.as_ref()?;
+            let n = s.prompt_ids.len();
+            if s.step != 0 || n == 0 || s.pf_pos + 1 >= n {
+                return None;
+            }
+            let remaining = (n - 1 - s.pf_pos).min(chunk_cap);
+            let n_rows = u32::try_from(remaining).ok()?;
+            let slot = u32::try_from(i).ok()?;
+            let kv_row0 = u32::try_from(s.pf_pos).ok()?;
+            Some(packet::dev::PrefillSpan {
+                row0: 0,
+                n_rows,
+                slot,
+                flags: 0,
+                kv_row0,
+                kv_len: kv_row0 + n_rows,
+                state_slot: slot,
+                program: 0,
+            })
+        });
+        let admission = crate::sched::prefill::admit(
+            candidates,
+            u32::try_from(per_launch).unwrap_or(u32::MAX),
+            e.prefill_turn(),
+            cap.min(slots.len()),
+            crate::sched::prefill::SpanPolicy::FairSplit,
+            |_| u32::try_from(per_launch).ok(),
+        );
+        let mut pack = Vec::with_capacity(admission.spans().len());
+        for span in admission.spans().iter().copied() {
+            let i = span.slot as usize;
+            let c0 = span.kv_row0 as usize;
+            let len = span.n_rows as usize;
+            if c0 == 0 {
+                let s = slots[i].as_ref().expect("admitted slot is Some");
+                let n = s.prompt_ids.len();
                 if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
                     tracing::warn!(
                         slot = i,
@@ -2778,10 +2778,7 @@ fn gpu_prefill_batched_pass(
                     continue;
                 }
             }
-            let s = slots[i].as_ref().expect("checked Some");
-            let take = (n - 1 - s.pf_pos).min(budget).min(chunk_cap);
-            pack.push((i, s.pf_pos, take));
-            budget -= take;
+            pack.push((i, c0, len));
         }
         if pack.is_empty() {
             return tick_fault;
@@ -2802,6 +2799,7 @@ fn gpu_prefill_batched_pass(
                 for &(i, c0, len) in &pack {
                     slots[i].as_mut().expect("packed slot is Some").pf_pos = c0 + len;
                 }
+                e.advance_prefill_turn(pack.last().expect("pack is non-empty").0);
             }
             Err(err) => {
                 // The shared launch failed — every packed request loses.
