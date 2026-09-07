@@ -6770,6 +6770,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             embed_cubin.is_none() && embed_hsaco.is_none(),
             "gpt_oss has no GPU interpreter object to embed (CPU-tier ops only)"
         );
+        let _apple_target = EmitAppleGuard::set(arch == "metal3");
         gptoss::run(
             &dir,
             ctx,

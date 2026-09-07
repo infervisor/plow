@@ -75,8 +75,15 @@ impl Emitter<'_> {
     /// `out[t, n] = src[t, k] . W[n, k]^T + bias`. Decode is the GEMV family, prefill the plain
     /// GEMM: the CPU tier has one GEMM body, so the GPU tile rungs are not selected here.
     fn proj(&mut self, out: u32, src: u32, w: u32, bias: u32, n: u32, k: u32, dep: u32) -> u32 {
-        let op = if self.prefill { DevOp::Gemm } else { DevOp::Gemv };
         let t = self.t;
+        let op = if !self.prefill {
+            DevOp::Gemv
+        } else if crate::emit_is_apple() {
+            // The Metal interpreter tiles 128x128; its 256x256 case idles most cores.
+            crate::apple_prefill_tile(t, n, self.b.n_cu(), kernelcaps::QuantScheme::None)
+        } else {
+            DevOp::Gemm
+        };
         self.b.emit(op, self.b.all(), &[dep], |d| {
             d.t[0] = out;
             d.t[1] = src;

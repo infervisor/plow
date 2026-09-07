@@ -112,6 +112,8 @@ inline ulong amax_pack(ushort b, uint i) {
 
 // ---- dots: one simdgroup per output, lanes over K ------------------------------------------------
 // K may be any multiple of 4 (every model here has K % 8 == 0); the tail is scalar per lane.
+// The 8-wide sweeps cover [0, K & ~7) for every lane, so the tail starts there — not at the
+// last 256-chunk, which the sweeps already consumed when K % 256 >= 8 (GPT-OSS: K = 2880).
 // Bytes in flight: each lane issues 4 independent 16 B loads (bf16) / 4 x 8 B (fp8) per step,
 // 1024 K per step per simdgroup, so a threadgroup keeps ~16 KB of weight reads outstanding.
 inline float dot_bf16(device const ushort* w, device const ushort* x, uint K, uint lane) {
@@ -132,7 +134,7 @@ inline float dot_bf16(device const ushort* w, device const ushort* x, uint K, ui
         float4 x0 = bf4(*(device const ushort4*)(x + k)), x1 = bf4(*(device const ushort4*)(x + k + 4));
         acc += dot(w0, x0) + dot(w1, x1);
     }
-    for (k = (K & ~255u) + lane; k < K; k += 32u) acc += bf2f(w[k]) * bf2f(x[k]);
+    for (k = (K & ~7u) + lane; k < K; k += 32u) acc += bf2f(w[k]) * bf2f(x[k]);
     return simd_sum(acc);
 }
 inline float4 e4m3x4(uchar4 c) { return e4m3x4_raw(c) * E4M3_REBIAS; }
@@ -157,7 +159,7 @@ inline float4 dot4_bf16(device const ushort* W, uint ldw, device const ushort* x
         acc.z += dot(bf4(c0), x0) + dot(bf4(c1), x1);
         acc.w += dot(bf4(d0), x0) + dot(bf4(d1), x1);
     }
-    for (k = (K & ~255u) + lane; k < K; k += 32u) {
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
         float xv = bf2f(x[k]);
         acc.x += bf2f(W[k]) * xv;
         acc.y += bf2f(W[ldw + k]) * xv;
@@ -184,7 +186,7 @@ inline float4 dot4_fp8(device const uchar* W, uint ldw, device const ushort* x, 
         acc.z += dot(e4m3x4_raw(c0), x0) + dot(e4m3x4_raw(c1), x1);
         acc.w += dot(e4m3x4_raw(d0), x0) + dot(e4m3x4_raw(d1), x1);
     }
-    for (k = (K & ~255u) + lane; k < K; k += 32u) {
+    for (k = (K & ~7u) + lane; k < K; k += 32u) {
         float xv = bf2f(x[k]);
         acc.x += e4m3_raw(W[k]) * xv;
         acc.y += e4m3_raw(W[ldw + k]) * xv;
@@ -211,7 +213,7 @@ inline float dot_fp8(device const uchar* w, device const ushort* x, uint K, uint
         float4 x0 = bf4(*(device const ushort4*)(x + k)), x1 = bf4(*(device const ushort4*)(x + k + 4));
         acc += dot(e4m3x4_raw(a), x0) + dot(e4m3x4_raw(b), x1);
     }
-    for (k = (K & ~255u) + lane; k < K; k += 32u) acc += e4m3_raw(w[k]) * bf2f(x[k]);
+    for (k = (K & ~7u) + lane; k < K; k += 32u) acc += e4m3_raw(w[k]) * bf2f(x[k]);
     return simd_sum(acc) * E4M3_REBIAS;
 }
 // norm==2 / q-norm fold: dot(w, bf16(x * inv * gamma))
@@ -406,10 +408,22 @@ struct GemmArgs {
     device const uchar* B4;      //          e2m1 packed (row stride K/2) with
     device const uchar* S8;      //          E8M0 scales (row stride ceil(K/32)), folded at staging
     device const float* wscale;  // [N] for B8
-    device const ushort* bias;   // [N] bf16 or null
+    device const ushort* bias;   // [N] bf16 or null (indexed n*rs+ro like the B rows)
     uint K;
     uint M, N;                   // bounds for zero fill
+    // MoE extensions (plain GEMMs: arow/Cf/crow/rowscale null, rs 1, ro 0):
+    device const uint* arow;     // A row m is A + arow[m]*K (EXPERT_UNUSED -> zeros)
+    device float* Cf;            // f32 output instead of bf16 C
+    device const uint* crow;     // C row m lands at crow[m] (EXPERT_UNUSED -> dropped)
+    device const float* rowscale;// per-row output scale (applied after the bias)
+    uint rs, ro;                 // B row of output n = n*rs + ro
 };
+inline void gemm_args_reset(thread GemmArgs& g) {
+    g.B16 = (device const ushort*)0; g.B8 = (device const uchar*)0; g.B4 = (device const uchar*)0;
+    g.S8 = (device const uchar*)0; g.wscale = (device const float*)0; g.bias = (device const ushort*)0;
+    g.arow = (device const uint*)0; g.Cf = (device float*)0; g.crow = (device const uint*)0;
+    g.rowscale = (device const float*)0; g.rs = 1u; g.ro = 0u;
+}
 // One 8x8 accumulator through the simdgroup's scratch: lane l handles elements 2l, 2l+1.
 inline void epilogue8x8(simdgroup_float8x8 acc, threadgroup float* scratch, uint lane, uint m_base, uint n_base,
                         uint m1, uint n1, thread const GemmArgs& g, device ushort* C, uint ldc) {
@@ -420,8 +434,12 @@ inline void epilogue8x8(simdgroup_float8x8 acc, threadgroup float* scratch, uint
         if (m < m1 && n < n1) {
             float v = scratch[e];
             if (g.B8) v *= g.wscale[n];
-            if (g.bias) v += bf2f(g.bias[n]);
-            C[m * ldc + n] = f2bf(v);
+            if (g.bias) v += bf2f(g.bias[n * g.rs + g.ro]);
+            if (g.rowscale) v *= g.rowscale[m];
+            uint cm = g.crow ? g.crow[m] : m;
+            if (cm == 0xffffffffu) continue;
+            if (g.Cf) g.Cf[cm * ldc + n] = v;
+            else C[cm * ldc + n] = f2bf(v);
         }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -564,9 +582,17 @@ inline ushort4 load_a16(device const ushort* A, uint M, uint K, uint m, uint k) 
     for (uint j = 0; j < 4u && k + j < K; j++) v[j] = A[m * K + k + j];
     return v;
 }
+// A row through the optional gather map.
+inline ushort4 load_arow(thread const GemmArgs& g, uint m, uint k) {
+    if (m >= g.M) return ushort4(0);
+    uint r = g.arow ? g.arow[m] : m;
+    if (r == 0xffffffffu) return ushort4(0);
+    return load_a16(g.A, 0xffffffffu, g.K, r, k);
+}
 inline ushort4 load_b16(thread const GemmArgs& g, uint n, uint k) {
     const uint N = g.N, K = g.K;
     if (n >= N || k >= K) return ushort4(0);
+    n = n * g.rs + g.ro;
     if (g.B4) {
         // Two packed bytes hold the k-quad; the block scale is a power of two, so the product is
         // exact in bf16.
@@ -611,7 +637,7 @@ inline void gemm_sub(thread const GemmArgs& g, device ushort* C, uint ldc, uint 
     const uint sgr = sg / CS, sgc = sg % CS;
     simdgroup_float8x8 acc[RB][CB];
     for (uint i = 0; i < RB; i++) for (uint j = 0; j < CB; j++) acc[i][j] = simdgroup_float8x8(0.0f);
-    ushort4 ra = a_side ? load_a16(g.A, g.M, g.K, mm + ar, aq * 4u) : ushort4(0);
+    ushort4 ra = a_side ? load_arow(g, mm + ar, aq * 4u) : ushort4(0);
     ushort4 rb = b_side ? load_b16(g, nn + br, bq * 4u) : ushort4(0);
     if (a_side) stage_put(stage, ar, aq, ra);
     if (b_side) stage_put(stage + A_ELTS, br, bq, rb);
@@ -622,7 +648,7 @@ inline void gemm_sub(thread const GemmArgs& g, device ushort* C, uint ldc, uint 
         bool more = c + 1u < nchunk;
         if (more) {
             uint k0 = (c + 1u) * GK;
-            if (a_side) ra = load_a16(g.A, g.M, g.K, mm + ar, k0 + aq * 4u);
+            if (a_side) ra = load_arow(g, mm + ar, k0 + aq * 4u);
             if (b_side) rb = load_b16(g, nn + br, k0 + bq * 4u);
         }
         threadgroup const bfloat* As = (threadgroup const bfloat*)cur;
@@ -691,7 +717,7 @@ inline void gemm_sub_glu(thread const GemmArgs& gg, thread const GemmArgs& gu, d
     const uint sgr = sg / CS, sgc = sg % CS;
     simdgroup_float8x8 ag[RB][CB], au[RB][CB];
     for (uint i = 0; i < RB; i++) for (uint j = 0; j < CB; j++) { ag[i][j] = simdgroup_float8x8(0.0f); au[i][j] = simdgroup_float8x8(0.0f); }
-    ushort4 ra = a_side ? load_a16(gg.A, M, K, mm + ar, aq * 4u) : ushort4(0);
+    ushort4 ra = a_side ? load_arow(gg, mm + ar, aq * 4u) : ushort4(0);
     ushort4 rg = h_side ? load_b16(gg, nn + ar, aq * 4u) : ushort4(0);
     ushort4 ru = h_side ? load_b16(gu, nn + ar, aq * 4u) : ushort4(0);
     if (a_side) stage_put(stage, ar, aq, ra);
@@ -703,7 +729,7 @@ inline void gemm_sub_glu(thread const GemmArgs& gg, thread const GemmArgs& gu, d
         bool more = c + 1u < nchunk;
         if (more) {
             uint k0 = (c + 1u) * GK;
-            if (a_side) ra = load_a16(gg.A, M, K, mm + ar, k0 + aq * 4u);
+            if (a_side) ra = load_arow(gg, mm + ar, k0 + aq * 4u);
             if (h_side) {
                 rg = load_b16(gg, nn + ar, k0 + aq * 4u);
                 ru = load_b16(gu, nn + ar, k0 + aq * 4u);
@@ -752,8 +778,8 @@ inline void gemm_sub_glu(thread const GemmArgs& gg, thread const GemmArgs& gu, d
                 if (m >= m1 || n >= n1) continue;
                 float gv = scratch[e], uv = scratch[64u + e];
                 if (fp8) { gv *= gg.wscale[n]; uv *= gu.wscale[n]; }
-                if (gg.bias) gv += bf2f(gg.bias[n]);
-                if (gu.bias) uv += bf2f(gu.bias[n]);
+                if (gg.bias) gv += bf2f(gg.bias[n * gg.rs + gg.ro]);
+                if (gu.bias) uv += bf2f(gu.bias[n * gu.rs + gu.ro]);
                 C[m * N + n] = f2bf(fp8 ? act_gate_only(gv, act) * uv : glu_pair(gv, uv, act, f0, f1));
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -784,6 +810,7 @@ void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nb
     bool fp8 = enc == 1u, mx4 = enc == 2u;
     device ushort* C = ten<ushort>(tab, in, 0) + in.i[5] * N;
     GemmArgs g;
+    gemm_args_reset(g);
     g.A = ten<ushort>(tab, in, 1) + in.i[4] * K;
     g.B16 = enc == 0u ? ten<ushort>(tab, in, 2) : (device const ushort*)0;
     g.B8 = fp8 ? ten<uchar>(tab, in, 2) : (device const uchar*)0;
@@ -821,6 +848,8 @@ void op_gemm_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
     device ushort* C = ten<ushort>(tab, in, 0);
     GemmArgs gg, gu;
+    gemm_args_reset(gg);
+    gemm_args_reset(gu);
     gg.A = gu.A = ten<ushort>(tab, in, 1);
     gg.K = gu.K = K; gg.M = gu.M = M; gg.N = gu.N = N;
     gg.B16 = gu.B16 = (device const ushort*)0;
@@ -1360,6 +1389,360 @@ void op_per_layer_input(const thread Inst& in, device const ulong* tab, uint sli
     }
 }
 
+// ---- GPT-OSS flat MXFP4 MoE: router/align/combine (83/84/87) and the expert GEMMs (150-153) ----
+// Expert e of W(fp4 [E][N][K/2]) starts at W + e*N*(K/2), scales at S + e*N*(K/32), bias at b + e*N.
+// Decode ops are GEMV-shaped (one slot = one row); the prefill twins run the v3 tiles over each
+// expert's token-sorted segment (MPF_BM-row tiles, A gathered through row_token).
+struct MoeRoute { uint eid; float gate; };
+constant uint EXPERT_UNUSED = 0xffffffffu;
+constant uint MPF_BM = 64u;
+constant uint ROUTE_MAX_TOPK = 16u;
+constant uint MOE_CW = 512u;   // output columns per prefill work item
+// Segments of at most this many rows take the per-row dot4 sweep in the prefill twins. Measured
+// (GPT-OSS-20B, 37 tokens = ~5 rows per expert): tiles 268 ms, per-row sweep 242 ms; a
+// decode-once/8-rows variant and a depth-2 prefetch in the tiles were both slower. The tiled
+// path costs ~1.4 us per 128x32 chunk whatever M is (fragment traffic through threadgroup
+// memory), the sweep re-decodes the weights per row (~250 G weights/s): neither is near the
+// weight-bandwidth floor at small M; the open item for MoE prefill.
+constant uint MOE_SMALL_ROWS = 16u;
+
+// t0=table([T*k]) t1=logit([T,n_exp] bf16) t3=bias?(f32)  i1=n_exp i2=k i3=flags i4=T i6=n_group  f0=route_scale
+// flags: bit0 sigmoid (else softmax), bit1 renormalise the winners. Selection order = the golden's:
+// by (score + bias) descending, lower expert id on ties; gates are the unbiased scores.
+void op_moe_router_topk_pf(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
+    uint n_exp = in.i[1], k = in.i[2], flags = in.i[3], nt = in.i[4] ? in.i[4] : 1u;
+    float route_scale = as_type<float>(in.fj[0]);
+    device MoeRoute* table = ten<MoeRoute>(tab, in, 0);
+    device const ushort* logit = ten<ushort>(tab, in, 1);
+    device const float* bias = ten<float>(tab, in, 3);
+    bool sigm = (flags & 1u) != 0u, norm_topk = (flags & 2u) != 0u;
+    uint ni = min((n_exp + 31u) / 32u, 16u);   // n_exp <= 512
+    uint kk = min(k, ROUTE_MAX_TOPK);
+    for (uint tok = slice + sg * nblk; tok < nt; tok += nblk * NSG) {
+        device MoeRoute* tr = table + tok * k;
+        if (in.i[6] > 1u) {   // group-limited routing is not ported: poison, as the golden does
+            for (uint j = lane; j < k; j += 32u) { tr[j].eid = EXPERT_UNUSED; tr[j].gate = NAN; }
+            continue;
+        }
+        for (uint j = ROUTE_MAX_TOPK + lane; j < k; j += 32u) { tr[j].eid = EXPERT_UNUSED; tr[j].gate = 0.0f; }
+        device const ushort* lr = logit + tok * n_exp;
+        float sc[16];
+        float m = -INFINITY;
+        for (uint i = 0; i < ni; i++) {
+            uint e = lane + 32u * i;
+            sc[i] = e < n_exp ? bf2f(lr[e]) : -INFINITY;
+            m = max(m, sc[i]);
+        }
+        if (sigm) {
+            for (uint i = 0; i < ni; i++) sc[i] = 1.0f / (1.0f + exp(-sc[i]));
+        } else {
+            m = simd_max(m);
+            float s = 0.0f;
+            for (uint i = 0; i < ni; i++) { sc[i] = exp(sc[i] - m); s += sc[i]; }
+            s = simd_sum(s);
+            for (uint i = 0; i < ni; i++) sc[i] /= s;
+        }
+        uint claimed = 0u;
+        float gsum = 0.0f;
+        uint my_e = EXPERT_UNUSED;     // winner j owned by lane j (k <= 16 < 32)
+        float my_g = 0.0f;
+        for (uint j = 0; j < kk; j++) {
+            float best = -INFINITY;
+            uint be = EXPERT_UNUSED;
+            for (uint i = 0; i < ni; i++) {
+                uint e = lane + 32u * i;
+                if (e >= n_exp || (claimed & (1u << i))) continue;
+                float v = sc[i] + (bias ? bias[e] : 0.0f);
+                if (v > best) { best = v; be = e; }
+            }
+            float gm = simd_max(best);
+            uint we = simd_min(best == gm ? be : EXPERT_UNUSED);
+            uint wi = (we - lane) / 32u;               // meaningful on the owning lane only
+            bool owner = (we & 31u) == lane;
+            if (owner) claimed |= 1u << wi;
+            float g = simd_shuffle(sc[min(wi, ni - 1u)], we & 31u);
+            gsum += g;
+            if (lane == j) { my_e = we; my_g = g; }
+        }
+        if (lane < kk) {
+            float g = my_g;
+            if (norm_topk && gsum != 0.0f) g /= gsum;
+            tr[lane].eid = my_e;
+            tr[lane].gate = g * route_scale;
+        }
+    }
+}
+// t0=meta(i32 [3*n_exp+1]) t1=table t2=row_token(u32) t3=row_partidx(u32) t4=row_gate(f32)  i0=T i1=n_exp i2=k
+// One thread: histogram, MPF_BM-padded prefix, scatter in ascending slot order (T*k <= a few thousand).
+void op_moe_align_pf(const thread Inst& in, device const ulong* tab, uint slice, uint lid) {
+    if (slice != 0u || lid != 0u) return;
+    device int* meta = ten<int>(tab, in, 0);
+    device const MoeRoute* table = ten<MoeRoute>(tab, in, 1);
+    device uint* row_token = ten<uint>(tab, in, 2);
+    device uint* row_partidx = ten<uint>(tab, in, 3);
+    device float* row_gate = ten<float>(tab, in, 4);
+    uint nt = in.i[0], n_exp = in.i[1], k = in.i[2], nslot = nt * k;
+    device int* rowoff = meta;
+    device int* cnt = meta + n_exp;
+    device int* tilep = meta + 2u * n_exp;
+    for (uint e = 0; e < n_exp; e++) cnt[e] = 0;
+    for (uint s = 0; s < nslot; s++) {
+        uint eid = table ? table[s].eid : 0u;
+        if (eid < n_exp) cnt[eid]++;
+    }
+    uint off = 0, tiles = 0;
+    for (uint e = 0; e < n_exp; e++) {
+        rowoff[e] = int(off);
+        tilep[e] = int(tiles);
+        uint t = (uint(cnt[e]) + MPF_BM - 1u) / MPF_BM;
+        tiles += t;
+        off += t * MPF_BM;
+    }
+    tilep[n_exp] = int(tiles);
+    for (uint r = 0; r < off; r++) { row_token[r] = EXPERT_UNUSED; row_partidx[r] = EXPERT_UNUSED; row_gate[r] = 0.0f; }
+    for (uint s = 0; s < nslot; s++) {
+        uint eid = table ? table[s].eid : 0u;
+        if (eid >= n_exp) continue;
+        uint pos = uint(rowoff[eid]++);
+        row_token[pos] = s / k;
+        row_partidx[pos] = s;
+        row_gate[pos] = table ? table[s].gate : 1.0f;
+    }
+    for (uint e = 0; e < n_exp; e++) rowoff[e] -= cnt[e];
+}
+// t0=out([T,H] bf16) t1=residual? t2=shared? t3=part([T*k,H] f32)  i0=H i1=k i2=T
+void op_moe_combine_pf(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint lid) {
+    uint H = in.i[0], k = in.i[1], nt = in.i[2] ? in.i[2] : 1u;
+    device ushort* out = ten<ushort>(tab, in, 0);
+    device const ushort* residual = ten<ushort>(tab, in, 1);
+    device const ushort* shared = ten<ushort>(tab, in, 2);
+    device const float* part = ten<float>(tab, in, 3);
+    uint lo, hi;
+    range(nt * H, slice, nblk, lo, hi);
+    for (uint i = lo + lid; i < hi; i += NT) {
+        uint tok = i / H, h = i - tok * H;
+        float acc = residual ? bf2f(residual[i]) : 0.0f;
+        if (shared) acc += bf2f(shared[i]);
+        device const float* pt = part + tok * k * H;
+        for (uint j = 0; j < k; j++) acc += pt[j * H + h];
+        out[i] = f2bf(acc);
+    }
+}
+// DECODE gate|up + act. t0=fu(bf16 [B*k][I]) t1=x(bf16 [B][K]) t2=table t3=W_gu(fp4 [E][2I][K/2])
+// t4=S_gu t5=bias_gu?  i0=k i1=I i2=K i3=n_exp i4=layout(0 interleaved, 1 blocked) i5=act i6=B  f0/f1
+// Each threadgroup owns a column range of every slot; simdgroups take output pairs (interleaved
+// layout: rows 2n..2n+3 are one dot4).
+void op_moe_glu_mx(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
+    uint k = in.i[0], I = in.i[1], K = in.i[2], E = in.i[3], layout = in.i[4], act = in.i[5];
+    uint B = in.i[6] ? in.i[6] : 1u;
+    float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
+    device ushort* fu = ten<ushort>(tab, in, 0);
+    device const ushort* x = ten<ushort>(tab, in, 1);
+    device const MoeRoute* table = ten<MoeRoute>(tab, in, 2);
+    device const uchar* W = ten<uchar>(tab, in, 3);
+    device const uchar* S = ten<uchar>(tab, in, 4);
+    device const ushort* bias = ten<ushort>(tab, in, 5);
+    uint ldw = K / 2u, lds = (K + 31u) / 32u, N2 = 2u * I;
+    uint n0, n1;
+    range(I, slice, nblk, n0, n1);
+    for (uint s = 0; s < B * k; s++) {
+        uint eid = table[s].eid;
+        if (eid >= E) continue;
+        device const ushort* xr = x + (s / k) * K;
+        device const uchar* We = W + ulong(eid) * N2 * ldw;
+        device const uchar* Se = S + ulong(eid) * N2 * lds;
+        device const ushort* be = bias ? bias + ulong(eid) * N2 : (device const ushort*)0;
+        device ushort* fr = fu + s * I;
+        if (layout == 0u) {
+            uint n = n0 + sg * 2u;
+            for (; n + 2u <= n1; n += NSG * 2u) {
+                float4 a = dot4_mx4(We + (2u * n) * ldw, Se + (2u * n) * lds, ldw, lds, xr, K, lane);
+                if (be) a += float4(bf2f(be[2u * n]), bf2f(be[2u * n + 1u]), bf2f(be[2u * n + 2u]), bf2f(be[2u * n + 3u]));
+                if (lane == 0) { fr[n] = f2bf(glu_pair(a.x, a.y, act, f0, f1)); fr[n + 1u] = f2bf(glu_pair(a.z, a.w, act, f0, f1)); }
+            }
+            for (; n < n1; n++) {
+                float g = dot_mx4(We + (2u * n) * ldw, Se + (2u * n) * lds, xr, K, lane);
+                float u = dot_mx4(We + (2u * n + 1u) * ldw, Se + (2u * n + 1u) * lds, xr, K, lane);
+                if (be) { g += bf2f(be[2u * n]); u += bf2f(be[2u * n + 1u]); }
+                if (lane == 0) fr[n] = f2bf(glu_pair(g, u, act, f0, f1));
+            }
+        } else {
+            for (uint n = n0 + sg; n < n1; n += NSG) {
+                float g = dot_mx4(We + n * ldw, Se + n * lds, xr, K, lane);
+                float u = dot_mx4(We + (I + n) * ldw, Se + (I + n) * lds, xr, K, lane);
+                if (be) { g += bf2f(be[n]); u += bf2f(be[I + n]); }
+                if (lane == 0) fr[n] = f2bf(glu_pair(g, u, act, f0, f1));
+            }
+        }
+    }
+}
+// DECODE down + gate. t0=part(f32 [B*k][H]) t1=fu(bf16 [B*k][I]) t2=table t3=W_d(fp4 [E][H][I/2])
+// t4=S_d t5=bias_d?  i0=k i1=H i2=I i3=n_exp i6=B.  part[s][h] = gate * (W_e[h] . fu[s] + b_e[h]).
+void op_moe_down_mx(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
+    uint k = in.i[0], H = in.i[1], I = in.i[2], E = in.i[3];
+    uint B = in.i[6] ? in.i[6] : 1u;
+    device float* part = ten<float>(tab, in, 0);
+    device const ushort* fu = ten<ushort>(tab, in, 1);
+    device const MoeRoute* table = ten<MoeRoute>(tab, in, 2);
+    device const uchar* W = ten<uchar>(tab, in, 3);
+    device const uchar* S = ten<uchar>(tab, in, 4);
+    device const ushort* bias = ten<ushort>(tab, in, 5);
+    uint ldw = I / 2u, lds = (I + 31u) / 32u;
+    uint h0, h1;
+    range(H, slice, nblk, h0, h1);
+    for (uint s = 0; s < B * k; s++) {
+        device float* pr = part + s * H;
+        uint eid = table[s].eid;
+        if (eid >= E) {
+            for (uint h = h0 + sg * 32u + lane; h < h1; h += NSG * 32u) pr[h] = 0.0f;
+            continue;
+        }
+        float gate = table[s].gate;
+        device const ushort* fr = fu + s * I;
+        device const uchar* We = W + ulong(eid) * H * ldw;
+        device const uchar* Se = S + ulong(eid) * H * lds;
+        device const ushort* be = bias ? bias + ulong(eid) * H : (device const ushort*)0;
+        uint h = h0 + sg * 4u;
+        for (; h + 4u <= h1; h += NSG * 4u) {
+            float4 a = dot4_mx4(We + h * ldw, Se + h * lds, ldw, lds, fr, I, lane);
+            if (be) a += float4(bf2f(be[h]), bf2f(be[h + 1u]), bf2f(be[h + 2u]), bf2f(be[h + 3u]));
+            if (lane == 0) { pr[h] = gate * a.x; pr[h + 1u] = gate * a.y; pr[h + 2u] = gate * a.z; pr[h + 3u] = gate * a.w; }
+        }
+        for (; h < h1; h++) {
+            float acc = dot_mx4(We + h * ldw, Se + h * lds, fr, I, lane);
+            if (be) acc += bf2f(be[h]);
+            if (lane == 0) pr[h] = gate * acc;
+        }
+    }
+}
+// Prefill work item lin -> (expert tile, column chunk) through meta's tile prefix.
+inline bool moe_tile(device const int* meta, uint E, uint lin, uint nch, thread uint& e, thread uint& r0,
+                     thread uint& m0, thread uint& m1, thread uint& c0) {
+    uint tl = lin / nch;
+    c0 = (lin % nch) * MOE_CW;
+    device const int* tilep = meta + 2u * E;
+    e = 0;
+    for (uint x = 1; x < E; x++) if (uint(tilep[x]) <= tl) e = x;
+    r0 = uint(meta[e]);
+    uint cnt = uint(meta[E + e]);
+    m0 = (tl - uint(tilep[e])) * MPF_BM;
+    m1 = min(m0 + MPF_BM, cnt);
+    return m0 < m1;
+}
+// PREFILL gate|up: t0=fu_g(bf16 [rows][I]) t1=xn2(bf16 [T][K]) t2=W_gu t3=S_gu t4=meta t5=row_token
+// t6=bias_gu?  i0=I i1=K i2=n_exp i3=layout i5=act  f0/f1. Rows of expert e = [rowoff[e], +cnt[e]).
+void op_moe_glu_mx_pf(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+                      threadgroup float* tile, uint lid, uint sg, uint lane) {
+    uint I = in.i[0], K = in.i[1], E = in.i[2], layout = in.i[3], act = in.i[5];
+    float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
+    device ushort* fu = ten<ushort>(tab, in, 0);
+    device const ushort* x = ten<ushort>(tab, in, 1);
+    device const uchar* W = ten<uchar>(tab, in, 2);
+    device const uchar* S = ten<uchar>(tab, in, 3);
+    device const int* meta = ten<int>(tab, in, 4);
+    device const uint* row_token = ten<uint>(tab, in, 5);
+    device const ushort* bias = ten<ushort>(tab, in, 6);
+    uint ldw = K / 2u, lds = (K + 31u) / 32u, N2 = 2u * I;
+    uint ntile = uint(meta[3u * E]), nch = (I + MOE_CW - 1u) / MOE_CW;
+    for (uint lin = slice; lin < ntile * nch; lin += nblk) {
+        uint e, r0, m0, m1, c0;
+        if (!moe_tile(meta, E, lin, nch, e, r0, m0, m1, c0)) continue;
+        if (m1 <= MOE_SMALL_ROWS) {
+            device const uchar* We = W + ulong(e) * N2 * ldw;
+            device const uchar* Se = S + ulong(e) * N2 * lds;
+            device const ushort* be = bias ? bias + ulong(e) * N2 : (device const ushort*)0;
+            uint c1 = min(c0 + MOE_CW, I);
+            for (uint n = c0 + sg * 2u; n < c1; n += NSG * 2u) {
+                bool pair = layout == 0u && n + 2u <= c1;
+                for (uint r = 0; r < m1; r++) {
+                    uint tok = row_token[r0 + r];
+                    if (tok == EXPERT_UNUSED) continue;
+                    device const ushort* xr = x + tok * K;
+                    device ushort* fr = fu + (r0 + r) * I;
+                    if (pair) {
+                        float4 a = dot4_mx4(We + (2u * n) * ldw, Se + (2u * n) * lds, ldw, lds, xr, K, lane);
+                        if (be) a += float4(bf2f(be[2u * n]), bf2f(be[2u * n + 1u]), bf2f(be[2u * n + 2u]), bf2f(be[2u * n + 3u]));
+                        if (lane == 0) { fr[n] = f2bf(glu_pair(a.x, a.y, act, f0, f1)); fr[n + 1u] = f2bf(glu_pair(a.z, a.w, act, f0, f1)); }
+                    } else {
+                        for (uint q = n; q < min(n + 2u, c1); q++) {
+                            uint rg = layout ? q : 2u * q, ru = layout ? I + q : 2u * q + 1u;
+                            float g = dot_mx4(We + rg * ldw, Se + rg * lds, xr, K, lane);
+                            float u = dot_mx4(We + ru * ldw, Se + ru * lds, xr, K, lane);
+                            if (be) { g += bf2f(be[rg]); u += bf2f(be[ru]); }
+                            if (lane == 0) fr[q] = f2bf(glu_pair(g, u, act, f0, f1));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        GemmArgs gg, gu;
+        gemm_args_reset(gg);
+        gg.A = x; gg.K = K; gg.M = m1; gg.N = I; gg.arow = row_token + r0;
+        gg.B4 = W + ulong(e) * N2 * ldw; gg.S8 = S + ulong(e) * N2 * lds;
+        gg.bias = bias ? bias + ulong(e) * N2 : (device const ushort*)0;
+        gu = gg;
+        if (layout == 0u) { gg.rs = 2u; gu.rs = 2u; gu.ro = 1u; }
+        else { gu.B4 = gg.B4 + ulong(I) * ldw; gu.S8 = gg.S8 + ulong(I) * lds; if (gu.bias) gu.bias = gg.bias + I; }
+        gemm_tile2_glu(gg, gu, fu + r0 * I, act, f0, f1, false, m0, m1, c0, min(c0 + MOE_CW, I), tile, lid, sg, lane);
+    }
+}
+// PREFILL down: t0=part(f32 [T*k][H]) t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx t7=row_gate
+// i0=H i1=I i2=n_exp.  part[row_partidx[r]][h] = row_gate[r] * (W_e[h] . fu_g[r] + b_e[h]).
+void op_moe_down_mx_pf(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+                       threadgroup float* tile, uint lid, uint sg, uint lane) {
+    uint H = in.i[0], I = in.i[1], E = in.i[2];
+    device float* part = ten<float>(tab, in, 0);
+    device const ushort* fu = ten<ushort>(tab, in, 1);
+    device const uchar* W = ten<uchar>(tab, in, 2);
+    device const uchar* S = ten<uchar>(tab, in, 3);
+    device const int* meta = ten<int>(tab, in, 4);
+    device const ushort* bias = ten<ushort>(tab, in, 5);
+    device const uint* row_partidx = ten<uint>(tab, in, 6);
+    device const float* row_gate = ten<float>(tab, in, 7);
+    uint ldw = I / 2u, lds = (I + 31u) / 32u;
+    uint ntile = uint(meta[3u * E]), nch = (H + MOE_CW - 1u) / MOE_CW;
+    for (uint lin = slice; lin < ntile * nch; lin += nblk) {
+        uint e, r0, m0, m1, c0;
+        if (!moe_tile(meta, E, lin, nch, e, r0, m0, m1, c0)) continue;
+        if (m1 <= MOE_SMALL_ROWS) {
+            device const uchar* We = W + ulong(e) * H * ldw;
+            device const uchar* Se = S + ulong(e) * H * lds;
+            device const ushort* be = bias ? bias + ulong(e) * H : (device const ushort*)0;
+            uint c1 = min(c0 + MOE_CW, H);
+            for (uint h = c0 + sg * 4u; h < c1; h += NSG * 4u) {
+                bool quad = h + 4u <= c1;
+                for (uint r = 0; r < m1; r++) {
+                    uint pidx = row_partidx[r0 + r];
+                    if (pidx == EXPERT_UNUSED) continue;
+                    float gate = row_gate[r0 + r];
+                    device const ushort* fr = fu + (r0 + r) * I;
+                    device float* pr = part + pidx * H;
+                    if (quad) {
+                        float4 a = dot4_mx4(We + h * ldw, Se + h * lds, ldw, lds, fr, I, lane);
+                        if (be) a += float4(bf2f(be[h]), bf2f(be[h + 1u]), bf2f(be[h + 2u]), bf2f(be[h + 3u]));
+                        if (lane == 0) { pr[h] = gate * a.x; pr[h + 1u] = gate * a.y; pr[h + 2u] = gate * a.z; pr[h + 3u] = gate * a.w; }
+                    } else {
+                        for (uint q = h; q < c1; q++) {
+                            float acc = dot_mx4(We + q * ldw, Se + q * lds, fr, I, lane);
+                            if (be) acc += bf2f(be[q]);
+                            if (lane == 0) pr[q] = gate * acc;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        GemmArgs g;
+        gemm_args_reset(g);
+        g.A = fu + r0 * I; g.K = I; g.M = m1; g.N = H;
+        g.B4 = W + ulong(e) * H * ldw; g.S8 = S + ulong(e) * H * lds;
+        g.bias = bias ? bias + ulong(e) * H : (device const ushort*)0;
+        g.Cf = part; g.crow = row_partidx + r0; g.rowscale = row_gate + r0;
+        gemm_tile2(g, (device ushort*)0, H, m0, m1, c0, min(c0 + MOE_CW, H), SN2, tile, lid, sg, lane);
+    }
+}
+
 bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
              threadgroup float* tile, threadgroup float* red, threadgroup ulong* keys,
              uint lid, uint sg, uint lane) {
@@ -1404,6 +1787,13 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 21: op_add_norm(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 23: op_norm_residual_norm(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 154: op_per_layer_input(in, tab, slice, nblk, tile, red, lid, sg, lane); return true;
+        case 83: op_moe_router_topk_pf(in, tab, slice, nblk, sg, lane); return true;
+        case 84: op_moe_align_pf(in, tab, slice, lid); return true;
+        case 87: op_moe_combine_pf(in, tab, slice, nblk, lid); return true;
+        case 150: op_moe_glu_mx(in, tab, slice, nblk, sg, lane); return true;
+        case 151: op_moe_down_mx(in, tab, slice, nblk, sg, lane); return true;
+        case 152: op_moe_glu_mx_pf(in, tab, slice, nblk, tile, lid, sg, lane); return true;
+        case 153: op_moe_down_mx_pf(in, tab, slice, nblk, tile, lid, sg, lane); return true;
         default: return false;
     }
 }

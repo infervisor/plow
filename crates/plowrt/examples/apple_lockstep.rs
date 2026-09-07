@@ -64,6 +64,7 @@ fn main() {
             12 => vec![0, 1],
             22 => vec![0, 3, 5],
             21 | 23 => vec![0, 1],
+            84 => vec![0, 2, 3, 4],
             _ => vec![0],
         }
     };
@@ -165,7 +166,10 @@ fn main() {
                 let name = &gpu.model.names[h];
                 let (vg, vc, kind) = match d.op {
                     11 | 12 if k < 2 => (f32s(g), f32s(c), "f32"),
-                    17 | 18 => (Vec::new(), Vec::new(), "raw"),
+                    // MoE: f32 partials; the route table is {u32 eid, f32 gate} (an eid
+                    // mismatch shows as a huge diff); align outputs are integer/f32 exact.
+                    83 | 151 | 153 => (f32s(g), f32s(c), "f32"),
+                    17 | 18 | 84 => (Vec::new(), Vec::new(), "raw"),
                     _ => (bf(g), bf(c), "bf16"),
                 };
                 let (mut worst, mut wi, mut bad, mut nn) = (0f32, 0usize, 0usize, 0usize);
