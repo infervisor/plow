@@ -1190,7 +1190,9 @@ fn live_kv_rows(slots: &[Option<Slot>]) -> impl Iterator<Item = SlotHandle> + '_
 ///
 /// **Batched path.** When the bucket carries `TOKEN_SAMPLE_BATCH` the mux
 /// packs every live slot's logits into a `B×vocab` tile, sets per-row
-/// params/rng, and fires the bucket **once** via `AppState::step_batch`. The
+/// params/rng, and fires the bucket **once** via `AppState::step_batch`. A GPU
+/// packet may instead cover those decode rows and waiting prefill rows in one
+/// mixed launch. The
 /// produced tokens land in `obs.host.slot_tokens[row]`. This is the phase-3
 /// "one bucket walk per tick" path.
 ///
@@ -1231,8 +1233,9 @@ fn run_one_tick(
     // its stand-in logits are bypassed entirely. The engine drives B
     // independent sequence slots (the compiled PLOW_DECODE_BATCH; the slot
     // table is sized to it at spawn, so mux slot i IS engine slot i). Per
-    // tick: prefill each new arrival into its own KV slot (sequential), then
-    // ONE batched decode launch advances every already-running slot.
+    // tick: a packet-declared mixed variant combines live decode and waiting
+    // prefill rows when available; otherwise prefill runs before one batched
+    // decode launch.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if let Some(eng) = state.gpu_engine(bundle.network()) {
         let mut guard = eng.lock();
@@ -1292,6 +1295,178 @@ fn run_one_tick(
             let defer_decode = pf_defer_decode();
             if defer_decode && did_prefill {
                 feeds.clear();
+            }
+
+            // A mixed packet variant executes existing decode rows and a
+            // prefix of waiting prefill rows in one compiler-emitted program.
+            // Keep each prompt's last token for the ordinary decode path so
+            // it can produce that request's first output token.
+            if !feeds.is_empty() && did_prefill {
+                let available_prefill: usize = slots
+                    .iter()
+                    .take(cap)
+                    .filter_map(|slot| slot.as_ref())
+                    .filter(|slot| slot.step == 0 && !slot.respond.is_closed())
+                    .map(|slot| {
+                        slot.prompt_ids
+                            .len()
+                            .saturating_sub(1)
+                            .saturating_sub(slot.pf_pos)
+                    })
+                    .sum();
+                if let Some(rows) = e.mixed_step_rows(feeds.len(), available_prefill) {
+                    let prefill_capacity = rows as usize - feeds.len();
+                    let mut pack = Vec::<(usize, usize, usize)>::new();
+                    let mut remaining = prefill_capacity;
+                    for i in 0..slots.len().min(cap) {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let Some(slot) = slots[i].as_ref() else {
+                            continue;
+                        };
+                        if slot.step != 0 || slot.respond.is_closed() {
+                            continue;
+                        }
+                        let available = slot
+                            .prompt_ids
+                            .len()
+                            .saturating_sub(1)
+                            .saturating_sub(slot.pf_pos);
+                        if available == 0 {
+                            continue;
+                        }
+                        if slot.pf_pos == 0 {
+                            let reserve = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
+                            if let Err(err) = e.begin_slot(i, reserve) {
+                                tracing::warn!(
+                                    slot = i,
+                                    error = %err,
+                                    error_code = ?err.device_code(),
+                                    fatal = err.is_fatal(),
+                                    "gpu: mixed-step begin failed"
+                                );
+                                note_fault(&mut tick_fault, &err);
+                                if let Some(taken) = slots[i].take() {
+                                    release_kv(&arena, taken.kv);
+                                    let _ = taken.respond.try_send(StreamChunk::Err(err));
+                                }
+                                continue;
+                            }
+                        }
+                        let start = slots[i].as_ref().expect("checked Some").pf_pos;
+                        let take = available.min(remaining).min(pf_chunk_rows());
+                        pack.push((i, start, take));
+                        remaining -= take;
+                    }
+                    if pack.last().is_some_and(|&(_, start, len)| {
+                        start
+                            .checked_add(len)
+                            .and_then(|end| end.checked_add(remaining))
+                            .is_none_or(|end| end > e.max_ctx())
+                    }) {
+                        pack.clear();
+                    }
+                    if !pack.is_empty() {
+                        let decode: Vec<_> = feeds
+                            .iter()
+                            .map(|&(slot, token)| plow_asset::mixed_step::DecodeRequest {
+                                slot: slot as u32,
+                                state_slot: slot as u32,
+                                token,
+                            })
+                            .collect();
+                        let prefill: Vec<_> = pack
+                            .iter()
+                            .map(|&(slot, start, len)| {
+                                let request = slots[slot].as_ref().expect("packed slot is Some");
+                                plow_asset::mixed_step::PrefillRequest {
+                                    slot: slot as u32,
+                                    state_slot: slot as u32,
+                                    start: start as u32,
+                                    tokens: &request.prompt_ids[start..start + len],
+                                    prompt_len: request.prompt_ids.len() as u32,
+                                }
+                            })
+                            .collect();
+                        let mut toks = std::mem::take(&mut obs.host.slot_tokens);
+                        toks.resize(feeds.len(), 0);
+                        let mixed = e.mixed_step(rows, &decode, &prefill, &mut toks);
+                        drop(prefill);
+                        match mixed {
+                            Ok(()) => {
+                                for &(slot, start, len) in &pack {
+                                    slots[slot].as_mut().expect("packed slot is Some").pf_pos =
+                                        start + len;
+                                }
+                                for (row, &(slot, _)) in feeds.iter().enumerate() {
+                                    let slot_opt = &mut slots[slot];
+                                    let Some(request) = slot_opt.as_mut() else {
+                                        continue;
+                                    };
+                                    match gpu_finish_token(&mut *e, row, request, toks[row]) {
+                                        Ok(token) => handle_produced_token(
+                                            slot_opt,
+                                            &arena,
+                                            bundle,
+                                            token,
+                                            1,
+                                            &mut tokens_this_tick,
+                                            Some(stop.as_slice()),
+                                        ),
+                                        Err(err) => {
+                                            note_fault(&mut tick_fault, &err);
+                                            if let Some(taken) = slot_opt.take() {
+                                                release_kv(&arena, taken.kv);
+                                                let _ =
+                                                    taken.respond.try_send(StreamChunk::Err(err));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    error_code = ?err.device_code(),
+                                    fatal = err.is_fatal(),
+                                    decode = feeds.len(),
+                                    prefill = pack.len(),
+                                    rows,
+                                    "gpu: mixed-step launch failed"
+                                );
+                                note_fault(&mut tick_fault, &err);
+                                let msg = err.to_string();
+                                for &(slot, _) in &feeds {
+                                    if let Some(taken) = slots[slot].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken
+                                            .respond
+                                            .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                    }
+                                }
+                                for &(slot, _, _) in &pack {
+                                    if let Some(taken) = slots[slot].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken
+                                            .respond
+                                            .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                    }
+                                }
+                            }
+                        }
+                        obs.host.slot_tokens = toks;
+                        return (
+                            slots,
+                            bufs,
+                            obs,
+                            tokens_this_tick,
+                            true,
+                            tick_fault,
+                            decode_feed_extent(&feeds),
+                        );
+                    }
+                }
             }
 
             let pack_t = packlog::on().then(Instant::now);

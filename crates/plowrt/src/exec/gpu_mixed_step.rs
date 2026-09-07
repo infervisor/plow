@@ -360,6 +360,36 @@ impl MixedCudaStep {
                 ))
             })
     }
+
+    fn row_capacity(&self, decode_rows: u32, prefill_rows: u32) -> Option<u32> {
+        select_row_capacity(
+            self.programs
+                .iter()
+                .map(|program| (program.rows, program.decode_rows, program.sample_outputs)),
+            decode_rows,
+            prefill_rows,
+        )
+    }
+}
+
+fn select_row_capacity(
+    variants: impl Iterator<Item = (u32, u32, bool)>,
+    decode_rows: u32,
+    prefill_rows: u32,
+) -> Option<u32> {
+    if decode_rows == 0 || prefill_rows == 0 {
+        return None;
+    }
+    variants
+        .filter(|&(rows, decode, samples)| samples && decode == decode_rows && rows > decode)
+        .min_by_key(|&(rows, decode, _)| {
+            let capacity = rows - decode;
+            (
+                prefill_rows.saturating_sub(capacity),
+                capacity.abs_diff(prefill_rows),
+            )
+        })
+        .map(|(rows, _, _)| rows)
 }
 
 fn upload_program(
@@ -440,6 +470,15 @@ fn upload_program(
 }
 
 impl GpuEngine {
+    /// Select the packet-declared mixed variant that covers the most waiting
+    /// prefill rows for this decode width, preferring less padding on ties.
+    pub fn mixed_step_rows(&self, decode_rows: usize, prefill_rows: usize) -> Option<u32> {
+        self.mixed_step.as_ref()?.row_capacity(
+            u32::try_from(decode_rows).ok()?,
+            u32::try_from(prefill_rows).ok()?,
+        )
+    }
+
     /// Execute one compiler-emitted mixed dense block. `rows` selects an
     /// exact packet variant; decode outputs retain the input request order.
     pub fn mixed_step(
@@ -675,5 +714,19 @@ mod tests {
             assert_eq!(words.as_ptr(), pointer);
             assert_eq!(words.capacity(), capacity);
         }
+    }
+
+    #[test]
+    fn mixed_row_capacity_prefers_a_cover_then_the_largest_partial() {
+        let variants = [(64, 1, true), (128, 1, true), (256, 1, true)];
+        assert_eq!(select_row_capacity(variants.into_iter(), 1, 70), Some(128));
+        assert_eq!(select_row_capacity(variants.into_iter(), 1, 300), Some(256));
+    }
+
+    #[test]
+    fn mixed_row_capacity_requires_sampled_matching_decode_width() {
+        let variants = [(128, 1, false), (128, 2, true)];
+        assert_eq!(select_row_capacity(variants.into_iter(), 1, 64), None);
+        assert_eq!(select_row_capacity(variants.into_iter(), 2, 64), Some(128));
     }
 }
