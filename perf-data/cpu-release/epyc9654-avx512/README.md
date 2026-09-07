@@ -46,8 +46,9 @@ balanced residency or local memory access for every worker.
 Batch one, 32 timed decode steps after each warm complete prefill. All profiles
 below explicitly use ordinary pages. This campaign's experiments were serialized
 on a shared node; unrelated system activity and allocation fallback were not
-controlled. Raw rows and commands are in `performance.json`; actual pinned CPU
-IDs, physical-core counts, and page placement are in `placement.json`.
+controlled. The tables below retain the measured results. Affinity checks confirmed
+24 cores on node 0 for the bound run, and 3/12/24 distinct physical cores per node
+for the distributed 24/96/192-worker runs. Raw JSON artifacts were removed.
 
 | Profile | 32-token prefill | Decode mean | 512-token prefill | Decode mean |
 | --- | ---: | ---: | ---: | ---: |
@@ -94,18 +95,25 @@ BF16/W8A16 counterparts also match all eight texts and token-ID sequences.
 12B W8A16 and W8A8 each pass the separate eight-case HTTP lifecycle probe.
 26B BF16 passes 44 answers; W8A16 passes 268 (12 initial/context cases plus
 256 soak requests) and all eight HTTP lifecycle checks. Both scalar paths pass
-the eight short cases and match BF16 AVX-512 texts/token IDs. See
-`quality-comparison.json`. The 26B W8A16 process RSS grew from 26.39 GiB after
-loading to 27.14 GiB after the full probes; cold-to-warm growth is recorded in
-`quality-memory.json`, without claiming a long-duration leak test.
+the eight short cases and match BF16 AVX-512 texts/token IDs.
+The 26B W8A16 process RSS grew from 26.39 GiB after
+loading to 27.14 GiB after the full probes. This cold-to-warm observation is not
+a long-duration leak test.
 
 FP8 twins use the existing per-output-channel quantizer with CPU-only PyTorch
 2.10.0. Norms, routers, embeddings, and the output head retain BF16 storage.
-See `fp8-checkpoints.json` for artifact sizes and SHA-256 hashes. This is Plow's
+This is Plow's
 per-row FP8 recipe, not a claim of vLLM W8A8 arithmetic parity. Existing dense
 FP8 decode GEMVs still approximate FP8 subnormals; the new GEMMs and expert
 kernels decode them exactly. Optional INT8/INT16/MXFP4 full-model quality is not
 certified by these runs.
+
+FP8 checkpoint identities retained from the removed JSON artifacts:
+
+| Checkpoint | Bytes | SHA-256 |
+| --- | ---: | --- |
+| gemma-4-12B-it-fp8-cpu | 10908999424 | `de53c4a04f58e16e34045587345e4bd748365a3dc18f3681e2af29dcdbd5d9b4` |
+| gemma-4-26B-A4B-it-fp8-cpu | 24550570272 | `08958474ac662b155bc5f188210f69634c9b426d030ce01f701512b376c44f21` |
 
 ## Reproduce
 
@@ -128,8 +136,8 @@ nix develop --command target/release/plowrt serve \
   --cpu-threads 96 --cpu-isa avx512 --cpu-numa auto --port 18680
 # Separate terminal:
 nix develop --command python3 perf-data/probes/cpu_quality_gate.py \
-  --output quality.json --soak-requests 32
-nix develop --command python3 perf-data/probes/cpu_http_e2e.py --output http.json
+  --output /tmp/cpu-quality.json --soak-requests 32
+nix develop --command python3 perf-data/probes/cpu_http_e2e.py --output /tmp/cpu-http.json
 ```
 
 For W8A8, replace `--w8a16` with `--w8a8`; use a separate bundle directory.
@@ -143,7 +151,7 @@ Direct performance measurements use:
 nix develop --command env PLOW_CPU_HUGE_PAGES=false \
   target/release/examples/cpu_bench build-cpu-12b/assets/model.pkt \
   /workspace/models/gemma-4-12B-it-cpu --threads 96 --numa auto --isa avx512 \
-  --prompt-lens 32,512 --decode 32 --json perf.json
+  --prompt-lens 32,512 --decode 32 --json /tmp/cpu-perf.json
 ```
 
 For FP8, set `PLOW_FP8_DIR` and use the corresponding bundle. For the NUMA
@@ -154,7 +162,7 @@ after warm-up; load time, HTTP scheduling, and prefix reuse are excluded.
 
 ## Merge checks
 
-`verification.json` records the checks and limitations. CPU Rust tests: 252 pass,
+CPU Rust tests: 252 pass,
 7 ignored. All ten C targets pass; the AMX hardware portion self-skips. The new
 quantization/expert tests also pass ASan/UBSan. Live NUMA policy/residency/advice
 checks pass, and a real qnorm-fused bundle is rejected before inference.

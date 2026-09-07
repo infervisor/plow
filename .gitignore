@@ -46,3 +46,6 @@ plow_profile.sqlite
 
 # plowc/plowrt emitted serve-asset bundles for this campaign (model.pkt, weights.json, cubins)
 assets-run/
+
+# Performance measurements are summarized in Markdown.
+/perf-data/**/*.json

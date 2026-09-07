@@ -122,7 +122,7 @@ The full Gemma-4-26B BF16 network passed HTTP generation, streaming, four-client
 concurrency, 932-token multi-chunk prefill, disconnect recovery, and the direct
 slot lifecycle test on this host. Four longer responses produced 512 tokens in
 16.225 seconds with 96 AVX-512 workers. See the
-[run report](../../perf-data/cpu-gemma26b/epyc9654-avx512/README.md) for raw results,
+[run report](../../perf-data/cpu-gemma26b/epyc9654-avx512/README.md) for summarized results,
 commands, and the observed imbalance in physical NUMA placement.
 
 The full 48-layer Gemma-4-12B BF16 network also passed the HTTP checks with both

@@ -1,1 +1,0 @@
-[{"prompt_len":32,"decode":32,"batch":1,"threads":96,"isa":"Avx512","ttft_ms":800.25,"tpot_ms":27.304,"tpot_p50_ms":25.235},{"prompt_len":512,"decode":32,"batch":1,"threads":96,"isa":"Avx512","ttft_ms":13396.00,"tpot_ms":25.922,"tpot_p50_ms":25.996}]

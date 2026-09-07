@@ -22,7 +22,8 @@ correctness/serving checks before performance measurements.
 Checkpoint: `google/gemma-4-12B-it` at revision
 `707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7`. The 22.28 GiB safetensors file
 passed SHA-256 verification against the Hugging Face LFS hash. The runtime
-loaded 22.18 GiB of weights. [Checkpoint identity](checkpoint.json).
+loaded 22.18 GiB of weights. Checkpoint SHA-256:
+`5a84cb313260ac447237b890387116dfa8682e49a6b44bc585ae8353abbff18d`.
 
 ## Performance
 
@@ -54,9 +55,7 @@ output rate by about 3.1%, while increasing first-content latency. These are
 small samples on a shared node, with different physical page distributions
 between loads. They do not isolate the effect of core count or establish an SLA.
 
-Raw data: [summary](summary.json), [96-core serial](short-c1.json),
-[96-core batch](short-c4.json), [192-core serial](short-c1-192.json),
-[192-core batch](short-c4-192.json), [96-core long prompts](long-c1.json).
+Raw JSON artifacts were removed; the measured results are retained above.
 
 ## Correctness and memory
 
@@ -65,7 +64,6 @@ answers, four concurrent capital-city questions, multi-chunk prefill, and
 generation after disconnecting an active stream. The 932-token prompt correctly
 returned `Paris` in 10.497 s at 96 cores and 11.337 s at 192 cores. These checks
 cover basic text correctness and serving behavior, not broad model-quality parity.
-[96-core HTTP results](http-e2e.json), [192-core HTTP results](http-e2e-192.json).
 
 The 96-core engine loaded in 5.947 s. Its measured resident memory was 26.29 GiB;
 the 192-core sample was 27.09 GiB. Peak RSS during loading was approximately
@@ -77,7 +75,6 @@ pages spanned all eight nodes but node 3 still held nearly half. This host had
 little free memory and substantial file cache; allocation fallback and huge-page
 availability were not isolated. No global kernel/cache settings were changed.
 NUMA is enabled, but balanced memory bandwidth is not established by this run.
-[96-core snapshot](host.json), [192-core snapshot and affinity proof](host-192.json).
 
 The compiler's Lean verifier was unavailable and it recorded an unverified
 manifest. Runtime checks are not a formal ordering certificate.

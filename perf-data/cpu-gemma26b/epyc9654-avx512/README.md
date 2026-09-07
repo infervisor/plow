@@ -52,9 +52,8 @@ may contribute; the cause was not isolated. An accepted interleave policy is
 not proof of balanced physical placement. Do not claim NUMA scaling from this
 run. No system memory policy or cache settings were changed.
 
-Raw observations: [HTTP checks](http-e2e.json), [longer decode](http-decode.json),
-[worker affinity and page counts](host.json), [slot test](live-slots.log),
-[compiler output](compile.log).
+Raw JSON artifacts were removed; results and NUMA observations are summarized
+above. Retained logs: [slot test](live-slots.log), [compiler output](compile.log).
 
 ## Reproduce
 
