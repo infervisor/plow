@@ -964,6 +964,14 @@ fn packet_role_segments(
     Ok(selected)
 }
 
+fn packet_role_index(roles: &[u8], segment: usize) -> Option<usize> {
+    roles
+        .get(segment)
+        .copied()
+        .filter(|&role| role != plow_asset::segment_roles::INTERPRETER)
+        .map(|role| role as usize - 1)
+}
+
 struct SegPf {
     f_flash: KernelFn,
     smem_flash: u32,
@@ -3683,11 +3691,9 @@ impl GpuEngine {
                 );
                 continue;
             }
-            if id != plow_asset::segment_roles::GEMV_CTA512
-                && (prefill.is_empty() || seg_pf.is_some())
-            {
+            if id != plow_asset::segment_roles::GEMV_CTA512 && prefill.is_empty() {
                 return Err(RuntimeError::Rejected(
-                    "packet roles require prefill without a legacy role pair".into(),
+                    "prefill packet roles require a prefill object".into(),
                 ));
             }
             if matches!(
@@ -5897,12 +5903,7 @@ impl GpuEngine {
             let declared_roles = segment_roles.and_then(|r| r.program(program_index));
             let mut qwen_segments = qwen_prefill_segments(g, &blob.tensors)?;
             let packet_segment_roles = if let Some(p) = declared_roles {
-                if seg_mode {
-                    return Err(RuntimeError::Rejected(
-                        "packet roles cannot mix with legacy role pair".into(),
-                    ));
-                }
-                if qwen_segments.is_empty() {
+                if qwen_segments.is_empty() && !seg_mode {
                     qwen_segments = vec![None; p.roles.len()];
                 }
                 let selected = packet_role_segments(g, &p.roles, &blob.tensors)?;
@@ -6517,16 +6518,12 @@ impl GpuEngine {
                         native.launch(tensors, inst.i[0] as usize, &self.stream)?;
                     }
                 }
-                let role_id = self.prefill[bi]
-                    .packet_segment_roles
-                    .get(seg)
-                    .copied()
-                    .unwrap_or(0);
-                let role = role_id.checked_sub(1).map(|id| {
-                    self.packet_roles[id as usize]
-                        .as_ref()
-                        .expect("validated packet role object")
-                });
+                let role =
+                    packet_role_index(&self.prefill[bi].packet_segment_roles, seg).map(|index| {
+                        self.packet_roles[index]
+                            .as_ref()
+                            .expect("validated packet role object")
+                    });
                 segment_window(&mut arg, &self.prefill[bi].kernarg, seg, role.is_some());
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
                 self.be.launch_cooperative(
@@ -6538,7 +6535,13 @@ impl GpuEngine {
                     Some(&self.stream),
                 )?;
             }
-        } else if seg_class.len() > 1 && self.seg_pf.is_some() {
+        } else if self.seg_pf.is_some()
+            && (seg_class.len() > 1
+                || self.prefill[bi]
+                    .packet_segment_roles
+                    .iter()
+                    .any(|&role| role != plow_asset::segment_roles::INTERPRETER))
+        {
             let sp = self.seg_pf.as_ref().expect("checked");
             // T35 (PLOW_PF_SEG_GRAPH=1): submit the whole per-chunk segment chain as ONE
             // CUDA graph. Per-node kernargs (cur_seg baked per node) are copied at build;
@@ -6561,6 +6564,14 @@ impl GpuEngine {
                         .iter()
                         .enumerate()
                         .map(|(seg, &cls)| {
+                            if let Some(index) =
+                                packet_role_index(&self.prefill[bi].packet_segment_roles, seg)
+                            {
+                                let role = self.packet_roles[index]
+                                    .as_ref()
+                                    .expect("validated packet role object");
+                                return Ok((role.function, self.grid, role.block, role.smem));
+                            }
                             Ok(match cls {
                                 4 => (sp.f_flash, sp.grid_flash, BLOCK, sp.smem_flash),
                                 2 => {
@@ -6626,7 +6637,15 @@ impl GpuEngine {
             let mut evs: Vec<(u8, CudaEvent, CudaEvent)> = Vec::new();
             for (seg, &cls) in seg_class.iter().enumerate() {
                 arg.cur_seg = seg as u32;
-                let (f, gr, sm, blk) = if fat_only || cls == 4 {
+                let role =
+                    packet_role_index(&self.prefill[bi].packet_segment_roles, seg).map(|index| {
+                        self.packet_roles[index]
+                            .as_ref()
+                            .expect("validated packet role object")
+                    });
+                let (f, gr, sm, blk) = if let Some(role) = role {
+                    (role.function, self.grid, role.smem, role.block)
+                } else if fat_only || cls == 4 {
                     (sp.f_flash, sp.grid_flash, sp.smem_flash, BLOCK)
                 } else if cls == 2 {
                     // T12: hd512 flash segments on the dedicated *_pffa object.
