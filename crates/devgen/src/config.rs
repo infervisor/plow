@@ -88,7 +88,10 @@ pub(crate) fn cfg_gpt_oss(v: &Value) -> GptOssCfg {
         v["attention_bias"], true,
         "gpt_oss: attention_bias=false is not implemented"
     );
-    assert_eq!(v["hidden_act"], "silu", "gpt_oss: swiglu_oai is built on silu");
+    assert_eq!(
+        v["hidden_act"], "silu",
+        "gpt_oss: swiglu_oai is built on silu"
+    );
     let rs = &v["rope_scaling"];
     assert_eq!(
         rs["rope_type"].as_str(),
@@ -106,7 +109,8 @@ pub(crate) fn cfg_gpt_oss(v: &Value) -> GptOssCfg {
         );
     }
     let f = |k: &str| {
-        rs[k].as_f64()
+        rs[k]
+            .as_f64()
             .unwrap_or_else(|| panic!("gpt_oss: rope_scaling.{k}"))
     };
     let rope_scale = RopeScale::Yarn {

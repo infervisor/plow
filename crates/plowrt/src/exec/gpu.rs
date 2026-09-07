@@ -310,21 +310,14 @@ fn resolve_interp_image(
     // 2. Embedded sections. The section NAME is not load-bearing: `plowc
     //    --embed-cubin` labels every image `interp_sm120` regardless of the arch
     //    it just compiled, so only the content can decide.
-    if let Some(image) =
-        embedded_interp_image(blob, raw, profile, want_sm, role, &mut rejected)
-    {
+    if let Some(image) = embedded_interp_image(blob, raw, profile, want_sm, role, &mut rejected) {
         return Ok(Some(image));
     }
 
     // 3. The assets dir — the profile's expected name first, then everything
     //    else that looks like a cubin, so a misnamed bundle still serves.
-    if let Some(image) = filesystem_interp_image(
-        assets_dir,
-        profile,
-        want_sm,
-        role,
-        &mut rejected,
-    ) {
+    if let Some(image) = filesystem_interp_image(assets_dir, profile, want_sm, role, &mut rejected)
+    {
         return Ok(Some(image));
     }
 
@@ -860,8 +853,16 @@ fn validate_mxfp4_moe_role_inst(
             let hidden = u64::from(d.i[2]);
             extent(0, checked(&[ksel, inter, 2])?, false)?;
             extent(1, checked(&[hidden, 2])?, false)?;
-            extent(3, checked(&[experts, 2 * inter, hidden.div_ceil(2)])?, false)?;
-            extent(4, checked(&[experts, 2 * inter, hidden.div_ceil(32)])?, false)?;
+            extent(
+                3,
+                checked(&[experts, 2 * inter, hidden.div_ceil(2)])?,
+                false,
+            )?;
+            extent(
+                4,
+                checked(&[experts, 2 * inter, hidden.div_ceil(32)])?,
+                false,
+            )?;
             extent(5, checked(&[experts, 2 * inter, 2])?, true)?;
         }
         Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 => {
@@ -3840,10 +3841,8 @@ impl GpuEngine {
             }
             if !matches!(
                 id,
-                plow_asset::segment_roles::GEMV_CTA512
-                    | plow_asset::segment_roles::MXFP4_MOE
-            )
-                && prefill.is_empty()
+                plow_asset::segment_roles::GEMV_CTA512 | plow_asset::segment_roles::MXFP4_MOE
+            ) && prefill.is_empty()
             {
                 return Err(RuntimeError::Rejected(
                     "prefill packet roles require a prefill object".into(),
@@ -3954,9 +3953,7 @@ impl GpuEngine {
                 }
                 plow_asset::segment_roles::MXFP4_MOE => {
                     if capability != Some(1) || block != Some(BLOCK) {
-                        return Err(RuntimeError::Rejected(
-                            "incompatible MXFP4 MoE role".into(),
-                        ));
+                        return Err(RuntimeError::Rejected("incompatible MXFP4 MoE role".into()));
                     }
                 }
                 _ => unreachable!("object role validated above"),
@@ -3982,9 +3979,8 @@ impl GpuEngine {
                     .ok_or_else(|| {
                         RuntimeError::Rejected("MXFP4 MoE role lacks CTA capability".into())
                     })?;
-                grid.checked_mul(multiplier).ok_or_else(|| {
-                    RuntimeError::Rejected("MXFP4 MoE role grid overflows".into())
-                })?
+                grid.checked_mul(multiplier)
+                    .ok_or_else(|| RuntimeError::Rejected("MXFP4 MoE role grid overflows".into()))?
             } else {
                 grid
             };
@@ -3992,8 +3988,7 @@ impl GpuEngine {
                 || (id == plow_asset::segment_roles::MXFP4_MOE && capacity < role_grid)
                 || (!matches!(
                     id,
-                    plow_asset::segment_roles::GEMV_CTA512
-                        | plow_asset::segment_roles::MXFP4_MOE
+                    plow_asset::segment_roles::GEMV_CTA512 | plow_asset::segment_roles::MXFP4_MOE
                 ) && capacity != grid)
             {
                 return Err(RuntimeError::Rejected(
@@ -7795,8 +7790,8 @@ mod prefill_patch_tests {
         let live = crate::memory::vmm::LiveKvLayout::manifest(&blob, &bytes)
             .unwrap()
             .unwrap();
-        let live_requested = config.nv_vmm_live()
-            || live.caches.iter().any(|cache| cache.window == 0);
+        let live_requested =
+            config.nv_vmm_live() || live.caches.iter().any(|cache| cache.window == 0);
         let block: serde_json::Value =
             serde_json::from_slice(&std::fs::read(assets.join("block.json")).unwrap()).unwrap();
         let hidden = block["hidden"].as_u64().unwrap() as usize;
@@ -8126,8 +8121,7 @@ mod profile_tests {
         };
         let mut rejected = Vec::new();
         let selected =
-            embedded_interp_image(&blob, &raw, &profile, 90, Role::Prefill, &mut rejected)
-                .unwrap();
+            embedded_interp_image(&blob, &raw, &profile, 90, Role::Prefill, &mut rejected).unwrap();
         assert_eq!(selected.image, ordinary);
         assert_eq!(selected.source, "embedded section 'ordinary'");
         assert!(rejected[0].contains("mixed-step auxiliary object"));

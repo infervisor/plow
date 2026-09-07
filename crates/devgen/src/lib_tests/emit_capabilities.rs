@@ -53,33 +53,18 @@ fn production_defaults_are_capability_and_target_driven() {
     ])
     .unwrap()
     .emit;
-    apply_production_defaults(
-        &mut disabled,
-        emit_capabilities("gemma4"),
-        "sm_90a",
-        1,
-    );
+    apply_production_defaults(&mut disabled, emit_capabilities("gemma4"), "sm_90a", 1);
     assert_eq!(disabled.decode_rungs(), [1]);
     assert!(!disabled.decode_ladder_default);
     assert!(!disabled.packed_prefill_on());
 
     let mut unsupported = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
-    apply_production_defaults(
-        &mut unsupported,
-        emit_capabilities("qwen3_5"),
-        "sm_90a",
-        1,
-    );
+    apply_production_defaults(&mut unsupported, emit_capabilities("qwen3_5"), "sm_90a", 1);
     assert_eq!(unsupported.decode_rungs(), [1]);
     assert!(!unsupported.packed_prefill_on());
 
     let mut other_target = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
-    apply_production_defaults(
-        &mut other_target,
-        emit_capabilities("gemma4"),
-        "gfx950",
-        1,
-    );
+    apply_production_defaults(&mut other_target, emit_capabilities("gemma4"), "gfx950", 1);
     assert_eq!(other_target.decode_rungs(), [1]);
     assert!(!other_target.packed_prefill_on());
 }

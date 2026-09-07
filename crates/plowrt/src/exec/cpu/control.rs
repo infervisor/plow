@@ -218,10 +218,16 @@ mod tests {
     #[test]
     fn fault_packing_roundtrips_and_keeps_first() {
         assert_eq!(unpack_fault(pack_fault(0, 7, 3)), Some((0, 7, 3)));
-        assert_eq!(unpack_fault(pack_fault(146, u32::MAX, 65535)), Some((146, u32::MAX, 65535)));
+        assert_eq!(
+            unpack_fault(pack_fault(146, u32::MAX, 65535)),
+            Some((146, u32::MAX, 65535))
+        );
         let f = Feedback::default();
         f.fault(5, 1, 2);
         f.fault(6, 9, 9);
-        assert_eq!(unpack_fault(f.fault.load(Ordering::Acquire)), Some((5, 1, 2)));
+        assert_eq!(
+            unpack_fault(f.fault.load(Ordering::Acquire)),
+            Some((5, 1, 2))
+        );
     }
 }
