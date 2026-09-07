@@ -1,0 +1,358 @@
+{
+  "status": "Integrated into consolidated worktree;496 combined CPU/CUDA/HSA library tests and8API tests pass.",
+  "base_revision": "bf04fd380570c6447956e58a831d2452dd656d8c",
+  "patch": {
+    "path": "/app/plow/build-gemma31/pf-gfuse/runtime-desugaring-marker.patch",
+    "sha256": "d91cba50e9ace5448f368a846c1efb12c61fb8aee64e2a2d480bb99be812afd4"
+  },
+  "source_files": [
+    {
+      "path": "/app/plow/build-gemma31/pf-gfuse/src/crates/plowrt/src/exec/amd.rs",
+      "sha256": "08fb4bb66c21a321753397a1f51754a069b3911d674d92c17c36a64cd48f1311"
+    },
+    {
+      "path": "/app/plow/build-gemma31/pf-gfuse/src/crates/plowrt/src/exec/mixed_program.rs",
+      "sha256": "0689881fd65f36c4216d950b44a973a51e23a1269459cc65a78d6bb26c506463"
+    },
+    {
+      "path": "/app/plow/build-gemma31/pf-gfuse/src/crates/plowrt/src/exec/mixed_program_tests.rs",
+      "sha256": "67c38eda5b1ad2fe2f05c0db8e310611de8a08587c8ddeda168b9c2bc384bc68"
+    },
+    {
+      "path": "/app/plow/build-gemma31/pf-gfuse/src/runtime/amd/interp.hip",
+      "sha256": "97fb156c8731bbd7fd8a7dbc17e382c6f6984c96337e321e36130ef35c323568"
+    }
+  ],
+  "frozen_host_binary": {
+    "path": "/app/plow/build-gemma31/pf-gfuse/qualified-marker-plowrt",
+    "sha256": "a53ffe5765133f8f8d245e1c0e2de858bb2f1fb9bf8f1f5bceddacb0c99eb9b0"
+  },
+  "object_and_packet_hashes": {
+    "/app/plow/build-gemma31/pf-gfuse/on-assets/model.pkt": "a7c1b5c335fe6ac5873389081bb11c251a791b1526e9c765c98941a7abf10eb2",
+    "/app/plow/build-gemma31/pf-gfuse/off-assets/model.pkt": "59df5045781261d3c9aafe27804af667c95008a3a602775695d2ab68c0d45dc6",
+    "/app/plow/build-gemma31/pf-gfuse/runtime-desugaring-marker.patch": "d91cba50e9ace5448f368a846c1efb12c61fb8aee64e2a2d480bb99be812afd4",
+    "/app/plow/build-gemma31/pf-gfuse/hsaco-nrn/interp_prefill_gq.elf": "8062ab51b86e36bfba26a4bb2fdb7cf8bf14e6628cdd17137c16b1bf76ee4c9e",
+    "/app/plow/build-gemma31/pf-gfuse/hsaco-nrn/interp_decode_gq.elf": "8008b9f79564f6bf99feb78a5679464e5628040ad555e4fc2ef3b6275169610f",
+    "/app/plow/build-gemma31/pf-gfuse/hsaco-nrn/interp_flash_gq.elf": "9d3c3949441ad7167b91d78b4ab80cc024c431092b92dc6a324dd103d8ba8e21",
+    "/app/plow/build-gemma31/pf-gfuse/hsaco-nrn/interp_mixed_gq.elf": "b1deafe6490f3f57c18ba47a803785177a260884a7ba91d2f2dc952782bc86a5",
+    "/app/plow/build-gemma31/hsaco-occ4-b1-clean/interp_decode_gq.elf": "84296e1e397f6767364243d24e97f77804b001b40533cdae81d1b6ac2ea28ea1"
+  },
+  "compiler": "Nix ROCm7.14.0; shipping -O3, no fast-math",
+  "changes": [
+    "Desugar NRN only while synthesizing mixed programs into existing NormResidual\u2192RmsNorm with preserved BF16 rounding, aliases, optional gammas and scale.",
+    "Admit row-local NRN in ordinary packed-prefill programs.",
+    "Derive NRN object requirement directly from prefill instructions and reuse existing object-capability check before HSA module loading.",
+    "Export the NRN marker only from an ordinary prefill object with the dispatch arm compiled."
+  ],
+  "defaults": "PLOW_PF_GFUSE remains false; runtime fusion remains opt-in. No model mixed-row variants or GPU arithmetic added.",
+  "cpu": {
+    "tests_passed": 5,
+    "logs": [
+      {
+        "path": "/tmp/gemma31-pf-gfuse-marker-unit.log",
+        "sha256": "56f2aed9d7613e4deb34388f51cf04a7aece225fd1e8e17749f4e7430342d667"
+      },
+      {
+        "path": "/tmp/gemma31-pf-gfuse-marker-packed-unit.log",
+        "sha256": "950254ad244f5a84551a47d44c9b13cfa740afcc5e28584486861ec67eb5e2c8"
+      },
+      {
+        "path": "/tmp/gemma31-pf-gfuse-marker-admission.log",
+        "sha256": "c7b8703da28a31bd877460f1ccdd62d7484af697c5cd32ae704770d5935e61ce"
+      }
+    ],
+    "synthesis": [
+      {
+        "capacity": 128,
+        "instructions": 1016,
+        "program_and_dependencies_exact": true
+      },
+      {
+        "capacity": 512,
+        "instructions": 1016,
+        "program_and_dependencies_exact": true
+      },
+      {
+        "capacity": 1024,
+        "instructions": 1016,
+        "program_and_dependencies_exact": true
+      }
+    ]
+  },
+  "gpu": {
+    "marker-numerical": {
+      "report": {
+        "path": "/app/plow/build-gemma31/pf-gfuse/marker-numerical-qualification.json",
+        "sha256": "556f26a1e648c3aa4cb116a393dd357b2b04b3d43eeb60fdb686867542d3d3b2"
+      },
+      "gpu": "5",
+      "tests": [
+        {
+          "case": "one_capacity_program_handles_changing_decode_counts_and_live_rows",
+          "command": [
+            "/app/plow/build-gemma31/pf-gfuse/target/release/deps/hsa_mixed_step-587fd0df6c24fc1e",
+            "one_capacity_program_handles_changing_decode_counts_and_live_rows",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "passed": true,
+          "log_sha256": "e0e159e1e4e8169eb5c3e7bc030dd453a8e3a2a3b8235a3b3bff2e5a83fe5789",
+          "binary_sha256": "2d57c9d9960536e26a09891c116adff618b1422f34e6d3d2df972ef4d562c0c5"
+        },
+        {
+          "case": "mixed_prefill_decode_matches_sequential_across_slots_and_ring_wrap",
+          "command": [
+            "/app/plow/build-gemma31/pf-gfuse/target/release/deps/hsa_mixed_step-587fd0df6c24fc1e",
+            "mixed_prefill_decode_matches_sequential_across_slots_and_ring_wrap",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "passed": true,
+          "log_sha256": "0feefcdee3bd6f209f2a196b201127fd21fddbab4e454ab915b3262c08300569",
+          "binary_sha256": "2d57c9d9960536e26a09891c116adff618b1422f34e6d3d2df972ef4d562c0c5"
+        }
+      ]
+    },
+    "marker-lifecycle": {
+      "report": {
+        "path": "/app/plow/build-gemma31/pf-gfuse/marker-lifecycle-qualification.json",
+        "sha256": "036c1aefe8c644a21bd6dcb96f1e8f85bec869073c7e1160e2e3ad28037ab918"
+      },
+      "gpu": "4",
+      "tests": [
+        {
+          "case": "packed_terminal_prefill_matches_native_decode_and_preserves_slots",
+          "command": [
+            "/app/plow/build-gemma31/pf-gfuse/target/release/deps/hsa_terminal_prefill-96e031a5dd3616ab",
+            "packed_terminal_prefill_matches_native_decode_and_preserves_slots",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "passed": true,
+          "log_sha256": "532c4d65d4de5867cb97818c1ef55aa8a5b081b5d2b3e95eb1ad15dcbefbba6e",
+          "binary_sha256": "3a49edb707ba2b9ad78ec88979c8dedaed8ab806c3d8b97f45ce373d9df26692"
+        },
+        {
+          "case": "dynamic_serving::capacity_mixed_mux_preserves_limits_cancellation_and_terminal_fallback",
+          "command": [
+            "/app/plow/build-gemma31/pf-gfuse/target/release/deps/hsa_mixed_step-587fd0df6c24fc1e",
+            "dynamic_serving::capacity_mixed_mux_preserves_limits_cancellation_and_terminal_fallback",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "passed": true,
+          "log_sha256": "e8e4cdf292ab4d0ce94b9210a6b311f057109b1f45bca29d33496be8286a0634",
+          "binary_sha256": "2d57c9d9960536e26a09891c116adff618b1422f34e6d3d2df972ef4d562c0c5"
+        },
+        {
+          "case": "fusion_disabled_preserves_ordinary_inference",
+          "command": [
+            "/app/plow/build-gemma31/pf-gfuse/target/release/deps/hsa_mixed_step-587fd0df6c24fc1e",
+            "fusion_disabled_preserves_ordinary_inference",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "passed": true,
+          "log_sha256": "2a78c0a298d804dbe31eaf385e63930955d610a8182ca785b0c4924dd8325901",
+          "binary_sha256": "2d57c9d9960536e26a09891c116adff618b1422f34e6d3d2df972ef4d562c0c5"
+        },
+        {
+          "case": "gfuse_cold_terminal_covers_three_packed_buckets",
+          "command": [
+            "/app/plow/build-gemma31/pf-gfuse/target/release/deps/pf_gfuse_cold_buckets-add168aa9dbf71d6",
+            "gfuse_cold_terminal_covers_three_packed_buckets",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "passed": true,
+          "log_sha256": "1036dc34832d3cd0ede7a7f661d15d47f471abd5c26f8580fa39a38ebea3aaab",
+          "binary_sha256": "c18e1afba0e9a38c20e4130e0a765c35b5fd4bb095559c00906c91620d71184e"
+        }
+      ]
+    },
+    "marker-ordinary-cross": {
+      "report": {
+        "path": "/app/plow/build-gemma31/pf-gfuse/marker-ordinary-cross-qualification.json",
+        "sha256": "bd8911aaca7424cedc58f5143aa9a786ba4d4c54b0ea7f3db95840a33e1924c8"
+      },
+      "gpu": "3",
+      "tests": [
+        {
+          "case": "pf_gfuse_marker_ordinary_numerics_and_timing",
+          "command": [
+            "/app/plow/build-gemma31/pf-gfuse/target/release/deps/pf_gfuse_marker_ordinary-26dc556c5b0f0cea",
+            "pf_gfuse_marker_ordinary_numerics_and_timing",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "passed": true,
+          "log_sha256": "13212d1aa19830f5ec97aabb45e854c4da5d6d8cf09e3bf3ea340ff90c9e4d41",
+          "binary_sha256": "772b3831cce33e055a2d0649baac55d182592f4310339e64c9c8a3fbff00a71a"
+        }
+      ]
+    }
+  },
+  "ordinary": {
+    "bitwise_full_vocabulary_rows": 12,
+    "report": {
+      "path": "/app/plow/build-gemma31/pf-gfuse/ordinary-marker-results.json",
+      "sha256": "d290b984f3427aa7da518104485076215547a018fd5d432003beb4be2fa85b04"
+    },
+    "timing": [
+      {
+        "bucket": 128,
+        "mean_ms": {
+          "off": 92.64714839999999,
+          "on": 90.1899522
+        },
+        "change_percent": -2.652209207121159,
+        "measured_repetitions_per_mode": 5
+      },
+      {
+        "bucket": 512,
+        "mean_ms": {
+          "off": 160.9540412,
+          "on": 157.7422084
+        },
+        "change_percent": -1.9954968362732806,
+        "measured_repetitions_per_mode": 5
+      },
+      {
+        "bucket": 1024,
+        "mean_ms": {
+          "off": 269.8434794,
+          "on": 266.160387
+        },
+        "change_percent": -1.3648995366459693,
+        "measured_repetitions_per_mode": 5
+      }
+    ],
+    "scope": "Same GPU; shipping off object/assets vs marked on object/assets. One warmup plus5 alternating paired measured repetitions. Enqueue-to-drain only; no serving speedup claim."
+  },
+  "mixed_numerics": {
+    "gated_decode_or_matched_prefill_comparisons": 107,
+    "nonzero_comparisons": [
+      "capacity 128 mixed vs matched ordinary prefill start 0: logit relative_l2=0.006337, max_abs=0.500000",
+      "capacity 128 mixed vs matched ordinary prefill start 1984: logit relative_l2=0.003602, max_abs=0.281250"
+    ],
+    "thresholds": {
+      "relative_l2": 0.01,
+      "max_abs": 0.5
+    },
+    "note": "All gates and greedy tokens pass. Whole-vs-chunk diagnostics remain separate and are not relabeled as fusion errors."
+  },
+  "http": {
+    "report": {
+      "path": "/app/plow/build-gemma31/pf-gfuse/marker-http-qualification.json",
+      "sha256": "fb38bee5f2394b873d90887950732708f25b10036ab1e0275d38256bbd27b740"
+    },
+    "completed_requests": 27,
+    "deliberate_disconnections": 8,
+    "exact_text_usage_limits": true,
+    "valid_near_context": [
+      {
+        "prompt_tokens": 8189,
+        "completion_tokens": 3
+      },
+      {
+        "prompt_tokens": 8175,
+        "completion_tokens": 17
+      },
+      {
+        "prompt_tokens": 129,
+        "completion_tokens": 9
+      }
+    ],
+    "scheduler_counts": {
+      "AMD mixed prefill/decode launch": 22,
+      "AMD packed prefill advanced": 40,
+      "AMD batched prefill completion": 16
+    },
+    "scheduler_count_unit": "Completed serving operations; a packed prefill pass may launch multiple segmented GPU kernels."
+  },
+  "marker": {
+    "inventory": {
+      "path": "/app/plow/build-gemma31/pf-gfuse/marker-inventory.json",
+      "sha256": "07a81b6e4f9264e921d7e61f757ecc8aeebe596c921efcf5a985d418d88c0bc7"
+    },
+    "real_loader_rejection": {
+      "path": "/app/plow/build-gemma31/pf-gfuse/marker-rejection.json",
+      "sha256": "2e31036ceb86cd9cde55c8e2f556320c3a1015d926dbe934ce020d1377d16ff4"
+    },
+    "object_comparison": {
+      "path": "/app/plow/build-gemma31/pf-gfuse/marker-object-comparison.json",
+      "sha256": "38fd02090f407edc357fc79978acbec29fe1131b7a3810978701e650a9d9c521"
+    },
+    "marker_only_executable_text_exact": true,
+    "note": "Fresh marked and unmarked builds have identical executable text. Fresh unmarked text differs from the older stored shipping object, so full GPU and HTTP gates were repeated."
+  },
+  "server_manifests": [
+    {
+      "path": "/app/plow/build-gemma31/pf-gfuse/marker-off-server.json",
+      "sha256": "87f082778aeb2a8267c53662729a843dd3c7992f205cda7f1c04d04fc1e8252b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/pf-gfuse/marker-on-server.json",
+      "sha256": "4912c065540b5e258542cbd89e9594ca9d980b5ff607f57971a4914da89ef2ef"
+    }
+  ],
+  "gpu_cleanup": "Both HTTP children stopped after zero established-client checks; server leases exited143. Numerical/lifecycle/ordinary/rejection leases exited0.",
+  "follow_up": "Stock PF_GFUSE off/on comparison with combined direct GEMV objects is being prepared; default unchanged until measured.",
+  "migration": "Existing NRN-prefill packets require rebuilt objects carrying the marker. No-NRN packets remain compatible with legacy objects.",
+  "commands": {
+    "build_runtime": "nix develop --command bash -c \"CARGO_TARGET_DIR=/app/plow/build-gemma31/pf-gfuse/target cargo test -p plowrt --features hsa,cuda --release --lib --test hsa_mixed_step --test hsa_terminal_prefill --test pf_gfuse_cold_buckets --no-run\"",
+    "build_pf_object": "nix develop --command bash -c \"PLOW_ROWS_ONLY==interp_prefill JOBS=2 scripts/build_gfx942.sh /app/plow/build-gemma31/pf-gfuse/hsaco-nrn\"",
+    "gpu": "nix develop --command bash -c \"PATH=/nix/store/3i4w73bg0ak00b1rx6p3n6ks1sjfpykc-python3-3.13.13-env/bin:$PATH perf-data/tools/gpulease -n 1 LABEL python3 /app/plow/build-gemma31/pf-gfuse/run_gpu.py GROUP\"; GROUP=marker-numerical,marker-lifecycle,marker-ordinary-cross; exact environment and binaries in group reports",
+    "http": "Under separate gpuleases: python3 start_server.py off marker / on marker. Then python3 qualify_http.py marker.",
+    "negative": "Under gpulease: python3 reject_missing_marker.py"
+  },
+  "production_checks": {
+    "library_tests_passed": 496,
+    "api_tests_passed": 8,
+    "exact_asset_synthesis_passed": true,
+    "synthesis": [
+      {
+        "capacity": 128,
+        "instructions": 1016,
+        "program_and_dependencies_exact": true
+      },
+      {
+        "capacity": 512,
+        "instructions": 1016,
+        "program_and_dependencies_exact": true
+      },
+      {
+        "capacity": 1024,
+        "instructions": 1016,
+        "program_and_dependencies_exact": true
+      }
+    ],
+    "logs": [
+      {
+        "path": "/tmp/gemma31-direct-nrn-runtime-tests.log",
+        "sha256": "fd82dc06fe4bce351ba8c591d377f4a00a93ecd5aaf8ec123c8e7ea913ee6842"
+      },
+      {
+        "path": "/tmp/gemma31-direct-nrn-synthesis-test.log",
+        "sha256": "8c324969bd16766d6836c482508a6f2f9b37a5e2bab510f6cfc747711e43af61"
+      }
+    ],
+    "nix_build": {
+      "passed": true,
+      "derivation": "/nix/store/0qrdh7wff7yx2k9k75rp381wfkfag9pb-plowrt-0.1.0.drv",
+      "log": "/tmp/gemma31-direct-nrn-nix-details.log",
+      "log_sha256": "02415b3cbb65cf4320cac4bda538dd28485b103133cf90d84445ddc5ec2a3d6c"
+    }
+  },
+  "private_qualification_source": {
+    "path": "pf-gfuse/final-qualification.json",
+    "sha256": "61bdd2ed9f30ad26bc1fa1b52f9e0bc838bbfa9596529b440030703cc56ce066"
+  }
+}

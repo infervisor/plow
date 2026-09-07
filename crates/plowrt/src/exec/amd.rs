@@ -3256,6 +3256,10 @@ const MOE_PF_ENC_SLOT: usize = 3;
 const MOE_ENC_MXFP4: u32 = 2;
 
 const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
+    (
+        "PLOW_HAS_NORM_RESIDUAL_NORM",
+        &["plow_prefill_nrn_consumer_1"],
+    ),
     // `#if PLOW_MLA_PREFILL` in runtime/amd/interp.hip gates ops 51/55 (via
     // `exec_flash_mla_prefill` -> `d_flash_mla_decode`) AND the latent epilogue
     // ops 53/54, which is why the fold names count as proof of the same flag.
@@ -3786,6 +3790,9 @@ fn packet_decode_arm_requirements(progs: &[DevProg]) -> Vec<String> {
 fn packet_prefill_arm_requirements(progs: &[DevProg]) -> Vec<String> {
     let insts = || progs.iter().flat_map(|p| &p.insts);
     let mut requires = Vec::new();
+    if insts().any(|inst| inst.op == DevOp::NormResidualNorm as u16) {
+        requires.push("PLOW_HAS_NORM_RESIDUAL_NORM=1".to_owned());
+    }
     if insts().any(|inst| {
         matches!(
             DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op),
@@ -5277,6 +5284,7 @@ fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
                     | DevOp::GemmWide
                     | DevOp::GemmGlu
                     | DevOp::NormResidual
+                    | DevOp::NormResidualNorm
             )
         ) {
             return Err(RuntimeError::Device(format!(
@@ -15008,6 +15016,9 @@ mod tests {
         p.insts[3].i[7] = 4;
         p.insts[3].t[5] = packet::dev::TENSOR_NONE16;
         assert!(super::check_packed_dense_program(&p.insts).is_ok());
+        p.insts[0].op = DevOp::NormResidualNorm as u16;
+        assert!(super::check_packed_dense_program(&p.insts).is_ok());
+        p.insts[0].op = DevOp::RmsNorm as u16;
         p.insts[3].i[6] = 64;
         assert!(super::check_packed_dense_program(&p.insts).is_err());
         p.insts[3].i[6] = 512;
@@ -15022,6 +15033,26 @@ mod tests {
             p.insts[3].op = op as u16;
             assert!(super::check_packed_dense_program(&p.insts).is_err());
         }
+    }
+
+    #[test]
+    fn prefill_sandwich_norm_requires_dispatch_marker() {
+        let plain = segmented_prog(&[DevOp::RmsNorm], &[0]);
+        let fused = segmented_prog(&[DevOp::NormResidualNorm], &[0]);
+        let path = Path::new("interp_prefill_gq.elf");
+        let legacy = [
+            "plow_packed_prefill_dense_consumers_1",
+            "d_norm_residual_norm",
+        ];
+        let plain_requires = packet_prefill_arm_requirements(&[plain]);
+        assert!(plain_requires.is_empty());
+        assert!(check_prefill_object(&legacy, path, &plain_requires).is_ok());
+        let requires = packet_prefill_arm_requirements(&[fused]);
+        assert_eq!(requires, ["PLOW_HAS_NORM_RESIDUAL_NORM=1"]);
+        for syms in [&legacy[..], &[][..]] {
+            assert!(check_prefill_object(syms, path, &requires).is_err());
+        }
+        assert!(check_prefill_object(&["plow_prefill_nrn_consumer_1"], path, &requires).is_ok());
     }
 
     fn phase_chain_manifest() -> serde_json::Value {

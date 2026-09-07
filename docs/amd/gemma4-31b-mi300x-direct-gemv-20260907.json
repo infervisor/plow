@@ -1,0 +1,2934 @@
+{
+  "date": "2026-09-07",
+  "scope": "Gemma4 31B BF16 TP1 gfx942 interpreter call-boundary traffic and direct-GEMV qualification. This is not a vLLM performance win.",
+  "toolchain": "Nix ROCm 7.14.0, gfx942 MI300X",
+  "launch": {
+    "workgroups": 304,
+    "threads_per_workgroup": 512,
+    "waves_per_workgroup": 8,
+    "pair": {
+      "M": 4,
+      "N": 21504,
+      "K": 5376,
+      "independent_ops": 2,
+      "slices_per_op": 152
+    },
+    "down": {
+      "M": 4,
+      "N": 5376,
+      "K": 21504,
+      "independent_ops": 1,
+      "slices": 304
+    }
+  },
+  "sampling": "Six identical dispatches per process; first three discarded, remaining three reported. Each metric group runs a fresh process, not simultaneous counters. Baseline event timings are uninstrumented; counter CSV timestamps are separate profiling observations.",
+  "counter_scope": "Every counter CSV row is the exact interpreter symbol and joins its dispatch ID to matching kernel trace. hipMemset, copies, profiler helpers have other dispatch IDs and are excluded. Empty queue and NOP controls use the same object, launch grid, buffer initialization and cursor reset.",
+  "counter_units": "KiB (1024 bytes), not decimal kB; external traffic is not scratch-exclusive.",
+  "counter_results": {
+    "pair": {
+      "shipping": {
+        "FETCH_SIZE": {
+          "median": 522097.0,
+          "min": 522095.875,
+          "max": 522098.375,
+          "n": 3,
+          "raw": "control/fetch/pair_counter_collection.csv",
+          "sha256": "d55b2e8993892fa5a1d79c613831b928da0f5b450b59e3aaed2e78f633b7e5dd"
+        },
+        "WRITE_SIZE": {
+          "median": 69847.5625,
+          "min": 69835.96875,
+          "max": 69853.28125,
+          "n": 3,
+          "raw": "control/write/pair_counter_collection.csv",
+          "sha256": "c0083a52532e558cd5bfa3c36a6147fde8735f168ca1b90073e48af95c29322c"
+        }
+      },
+      "initial_candidate": {
+        "FETCH_SIZE": {
+          "median": 452056.75,
+          "min": 452055.625,
+          "max": 452058.0625,
+          "n": 3,
+          "raw": "direct-shipping-results/fetch/pair_counter_collection.csv",
+          "sha256": "6810aeb03137d74b614fbee87f0936e380d792cdb57821c6c23e424571cf9448"
+        },
+        "WRITE_SIZE": {
+          "median": 370.125,
+          "min": 365.1875,
+          "max": 370.5,
+          "n": 3,
+          "raw": "direct-shipping-results/write/pair_counter_collection.csv",
+          "sha256": "ced3ec54fddf3ab7a48bfd95829a20cf55df07d7d19fa6ffbc1a246a37ead16c"
+        }
+      }
+    },
+    "down": {
+      "shipping": {
+        "FETCH_SIZE": {
+          "median": 297244.8125,
+          "min": 297218.8125,
+          "max": 297272.3125,
+          "n": 3,
+          "raw": "control/fetch/down_counter_collection.csv",
+          "sha256": "11593087fba3608d4c1f025192d719be809802c57e097a586304262adfd39891"
+        },
+        "WRITE_SIZE": {
+          "median": 69405.53125,
+          "min": 69405.0,
+          "max": 69408.03125,
+          "n": 3,
+          "raw": "control/write/down_counter_collection.csv",
+          "sha256": "f234a45328524d2e059b2c6bdb5c19b41935c4b4d5dbb83ab02f3334ffd66695"
+        }
+      },
+      "initial_candidate": {
+        "FETCH_SIZE": {
+          "median": 227257.625,
+          "min": 227257.375,
+          "max": 227258.1875,
+          "n": 3,
+          "raw": "direct-shipping-results/fetch/down_counter_collection.csv",
+          "sha256": "33964560c12ef358d6e1821c1fcab872cebc2990a588ca514a991a72e9179b65"
+        },
+        "WRITE_SIZE": {
+          "median": 69.0,
+          "min": 68.5,
+          "max": 69.375,
+          "n": 3,
+          "raw": "direct-shipping-results/write/down_counter_collection.csv",
+          "sha256": "c3f44a3b56f06bf2909a2ecb206ba9572ea7a0440597f7ad01f978ce92a024e9"
+        }
+      }
+    },
+    "nop": {
+      "shipping": {
+        "FETCH_SIZE": {
+          "median": 63701.875,
+          "min": 63669.625,
+          "max": 64226.125,
+          "n": 3,
+          "raw": "control/fetch/nop_counter_collection.csv",
+          "sha256": "48e25d17cd36ffc4dbaabda7af9289a9792a2b4a3be9c7ff0e5d694fb0c604f4"
+        },
+        "WRITE_SIZE": {
+          "median": 69331.0,
+          "min": 69331.0,
+          "max": 69331.0,
+          "n": 3,
+          "raw": "control/write/nop_counter_collection.csv",
+          "sha256": "3d322b20e60f8a8883e81013373e7f153edc7078a058db28e2c87ce87121660c"
+        }
+      },
+      "initial_candidate": {
+        "FETCH_SIZE": {
+          "median": 63837.875,
+          "min": 63711.5625,
+          "max": 64283.6875,
+          "n": 3,
+          "raw": "direct-shipping-results/fetch/nop_counter_collection.csv",
+          "sha256": "4a9c85e48b33956c26fedfdc775b722cfdca497e06e2dec1b51e113b8d4c9dfd"
+        },
+        "WRITE_SIZE": {
+          "median": 69331.0,
+          "min": 69331.0,
+          "max": 69331.0,
+          "n": 3,
+          "raw": "direct-shipping-results/write/nop_counter_collection.csv",
+          "sha256": "511e7e3183816f6957272a16460883142f74f7d7d19916b2826a85d9abb415e4"
+        }
+      }
+    },
+    "empty": {
+      "shipping": {
+        "FETCH_SIZE": {
+          "median": 27.5,
+          "min": 27.5,
+          "max": 27.5,
+          "n": 3,
+          "raw": "control/fetch/empty_counter_collection.csv",
+          "sha256": "654586fd1e54369fcd3e86d0f1dfec73c2b89ca7c2f79a597f319ab0a31b20ac"
+        },
+        "WRITE_SIZE": {
+          "median": 9.5,
+          "min": 9.5,
+          "max": 9.5,
+          "n": 3,
+          "raw": "control/write/empty_counter_collection.csv",
+          "sha256": "2182f1a404949563bd8e51904c7c1486276122fb9652985a4b194cdbe5a6ff9c"
+        }
+      },
+      "initial_candidate": {
+        "FETCH_SIZE": {
+          "median": 24.0,
+          "min": 24.0,
+          "max": 24.0,
+          "n": 3,
+          "raw": "direct-shipping-results/fetch/empty_counter_collection.csv",
+          "sha256": "a76a6846210bc894f1f0972e4c89533cf4181ee08d4615185b6f85074f16e91d"
+        },
+        "WRITE_SIZE": {
+          "median": 9.5,
+          "min": 9.5,
+          "max": 9.5,
+          "n": 3,
+          "raw": "direct-shipping-results/write/empty_counter_collection.csv",
+          "sha256": "bb549589570ec0f3d142cf8d66c1dd67279c9647caf67ad266ec2317bf7ac761"
+        }
+      }
+    }
+  },
+  "metric_definitions": {
+    "FETCH_SIZE": {
+      "Description": "The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.",
+      "Expression": "(TCC_BUBBLE_sum*128 + (TCC_EA0_RDREQ_sum-TCC_BUBBLE_sum-TCC_EA0_RDREQ_32B_sum)*64 + TCC_EA0_RDREQ_32B_sum*32)/1024",
+      "Dimensions": "DIMENSION_INSTANCE[0:0]"
+    },
+    "WRITE_SIZE": {
+      "Description": "The total kilobytes written to the video memory. This is measured with all extra fetches and any cache or memory effects taken into account.",
+      "Expression": "((TCC_EA0_WRREQ_sum-TCC_EA0_WRREQ_64B_sum)*32+TCC_EA0_WRREQ_64B_sum*64)/1024",
+      "Dimensions": "DIMENSION_INSTANCE[0:0]"
+    }
+  },
+  "static_prologue": {
+    "function": "plow_exec",
+    "address": "0xb3840",
+    "unconditional_scratch_dword_stores": 112,
+    "bytes_per_lane": 448,
+    "logical_store_bytes_per_304_slices": 69730304,
+    "logical_store_KiB_per_304_slices": 68096.0,
+    "raw": "plow-exec-prologue.txt",
+    "sha256": "95f5a6db87eb962bbc86675e63788a788c953abbcebbf1bbe391b396ce1c0225"
+  },
+  "finding": "The general plow_exec call saves 112 VGPR dwords per lane before opcode selection. The NOP control retains about 69,331 KiB of writes while an empty queue has 9.5 KiB. A direct call to the existing inlined GEMV helper removes most of this traffic without changing projection arithmetic or queue synchronization.",
+  "counter_candidate_sha256": "40546a3561585e4a81e6208f2d3dec7b17f1587b64902ef70b7a076c43e5a8ed",
+  "final_candidate_sha256": "00dd848f26075d132facebc5bb534b18b774a19d597a8f7236c55557aa9414cb",
+  "final_candidate_patch_sha256": "6c47a15662b76619fac6a06acba4b5b6c18875dc75508e8ce774421698083722",
+  "final_candidate_scope": "Explicit gfx942 GQ ordinary-path guards and scalarized instruction/tensor pointers. Full model uses shipping MM1 lowrung and changes only MM4 decode GQ.",
+  "full_model": {
+    "steps": 51,
+    "rows": 107,
+    "bitwise": true,
+    "timings": {
+      "128": {
+        "control": {
+          "mean_ms": 37.29062833333333,
+          "median_ms": 37.294858000000005,
+          "samples_ms": [
+            37.086066,
+            37.512283,
+            37.106036,
+            37.48368,
+            37.000979,
+            37.554726
+          ]
+        },
+        "candidate": {
+          "mean_ms": 34.40803666666667,
+          "median_ms": 34.369481,
+          "samples_ms": [
+            34.250303,
+            34.548668,
+            34.232817,
+            34.699924,
+            34.227849,
+            34.488659
+          ]
+        },
+        "median_change_pct": -7.84391510486514
+      },
+      "4096": {
+        "control": {
+          "mean_ms": 39.4958555,
+          "median_ms": 39.427367000000004,
+          "samples_ms": [
+            39.300362,
+            39.762241,
+            39.25181,
+            39.805986,
+            39.493901,
+            39.360833
+          ]
+        },
+        "candidate": {
+          "mean_ms": 42.1232245,
+          "median_ms": 36.653831,
+          "samples_ms": [
+            36.755693,
+            36.637927,
+            36.641162,
+            69.519676,
+            36.518389,
+            36.6665
+          ]
+        },
+        "median_change_pct": -7.034545319752161
+      },
+      "8176": {
+        "control": {
+          "mean_ms": 41.00386683333333,
+          "median_ms": 41.061346,
+          "samples_ms": [
+            40.907802,
+            41.339026,
+            40.628825,
+            41.227929,
+            40.704729,
+            41.21489
+          ]
+        },
+        "candidate": {
+          "mean_ms": 38.165218833333334,
+          "median_ms": 38.1563935,
+          "samples_ms": [
+            38.096384,
+            38.216403,
+            38.017657,
+            38.244656,
+            38.051918,
+            38.364295
+          ]
+        },
+        "median_change_pct": -7.074664576265965
+      }
+    }
+  },
+  "full_model_control_sha256": "8008b9f79564f6bf99feb78a5679464e5628040ad555e4fc2ef3b6275169610f",
+  "model_cases": "51 steps / 107 full-vocabulary logit rows, contexts128/4096/8176, B1-B4 transitions and sparse mixed steps. All rows compared byte-for-byte against the restored shipping control.",
+  "artifact_recovery": "An llvm-objcopy dump command reserialized nonallocated ELF string tables. Original shipping and rebuilt-control containers were recovered with exact original whole-file hashes; loaded sections and symbol semantics were unchanged. Both restored controls requalified all107 rows bitwise before final-model qualification.",
+  "serving_status": "Complete:36 stock vllm bench serve runs,144requests/18432outputtokens;48/48 measured paired texts exact. C4 throughput improves4.30\u20137.56%; short median TTFT regresses12.89%. Not an all-metrics improvement.",
+  "limitations": [
+    "Counter capture uses the initial candidate40546a; final-model qualification uses explicitly scoped/scalarized candidate00dd848f.",
+    "Control and candidate full-model timings come from separate bounded leases; retain all samples, including candidate69.52ms atctx4096. Its median improves but its mean regresses.",
+    "Hardware counters establish call-boundary traffic, not that bandwidth saturation, cache misses or occupancy dominate the whole model or explain the entire vLLM gap.",
+    "MM1 passes107full-logitrows bitwise with same-GPU shipping/candidate/shipping bracket; solo model medians improve17.54\u201318.05%. MM8 remains unqualified at full-model level and its primitive head latency regresses up to12%.",
+    "Short C4 TTFT spans191.53\u2013430.36ms in controls and189.57\u2013275.22ms in candidates. Per-request first-token times show differing groups; this is consistent with variable packing/admission, not proof of the cause. No runs are excluded."
+  ],
+  "evidence": [
+    {
+      "path": "projection-counters/summary.json",
+      "sha256": "57375306780b24e23fdbca110b16d1debb016c51f511b70bfc34284ebb609a64"
+    },
+    {
+      "path": "projection-counters/provenance.json",
+      "sha256": "a1b7fe37ab5b9efae2ae6d2d017bbdadb5ed78173f7ead27a32ef3ffbdf41294"
+    },
+    {
+      "path": "projection-counters/elf-recovery.json",
+      "sha256": "a3a1c3f41a4f0b770a4ea1154b35b04b9b928d1c3d11599f46526dd560debf2d"
+    },
+    {
+      "path": "projection-counters/README.md",
+      "sha256": "ee143189f20004a624c3e03a8ca972cf99a9cb37ff78d53e99ef813afaac5c25"
+    },
+    {
+      "path": "projection-counters/direct-gemv-final/width-summary.json",
+      "sha256": "c9e6eb9bffc1b24d8c9f1825effdf0a0ac229a92077fce787299354501a6c140"
+    },
+    {
+      "path": "direct-gemv-serving/final-model/summary.json",
+      "sha256": "3e9b8d9a842bb58013acd4c3292aa59deb2580296a61d15d83f7d3efcb03a2c8"
+    },
+    {
+      "path": "direct-gemv-serving/stock-results.zip",
+      "sha256": "ba2dae3cd7f0ed8c49e7ee357629d19098f580bf269e4b72f2ad5b6e657c6c1f"
+    },
+    {
+      "path": "direct-gemv-serving/serving-summary.json",
+      "sha256": "8805afedf2c5f9b286f22187eae6e34b300679e469bb5c5847bc3fce5f3ff109"
+    },
+    {
+      "path": "direct-gemv-serving/run.py",
+      "sha256": "669ce53884342a703b836e6527a169cecfe050dc90b94e2355548aa48f58d319"
+    },
+    {
+      "path": "direct-gemv-serving/summarize.py",
+      "sha256": "955c6a39b947178c35a2d03230ccc5f6520a41f624e3b11291e72616d629ce8a"
+    },
+    {
+      "path": "projection-counters/mm1-model/summary.json",
+      "sha256": "6116236a8576535644ffcae08750c1b3654fdd7601f53409945ac83f5a214908"
+    },
+    {
+      "path": "direct-gemv-mm1-serving/stock-results.zip",
+      "sha256": "4f970cb00e7629d5e10fbd7ddedca667398e9959cacdd2e5b5e62b1c1ff58dba"
+    },
+    {
+      "path": "direct-gemv-mm1-serving/serving-summary.json",
+      "sha256": "e34c9d74acd8851e30338240f41d79c05e0f24f48ff7bacf433e97cb0e4ddec0"
+    },
+    {
+      "path": "direct-gemv-combined-model/summary.json",
+      "sha256": "bc2000930cd77e0f1d7fdcfe76d65384a1a02a95847df894ca05b4ca59539d66"
+    },
+    {
+      "path": "projection-counters/direct-gemv-bf16/section-equivalence.json",
+      "sha256": "6ce2a011e81ff46059b22a508156405cb3f7f6751b6eae5b83fde150d92f9af7"
+    }
+  ],
+  "serving": {
+    "complete": true,
+    "date": "2026-09-07",
+    "comparison": "Gfx942 direct GEMV dispatch versus shipping interpreter",
+    "timing_provider": "Unmodified installed vllm bench serve",
+    "aggregation": "Two GPU assignments; full-corpus warmup plus two measured repetitions per assignment and cell; median of four measured runs",
+    "cells": [
+      {
+        "input": 128,
+        "concurrency": 4,
+        "modes": {
+          "control": {
+            "output_throughput": 100.03583957456888,
+            "median_ttft_ms": 243.08031299733557,
+            "p95_ttft_ms": 361.86564767558593,
+            "median_tpot_ms": 37.95733805319595,
+            "p95_tpot_ms": 37.95803080519843,
+            "p95_itl_ms": 75.39774055185262,
+            "p99_itl_ms": 75.71431486343499,
+            "median_e2el_ms": 5083.7905230000615
+          },
+          "candidate": {
+            "output_throughput": 107.569859687828,
+            "median_ttft_ms": 274.41578802245203,
+            "p95_ttft_ms": 372.5572358685895,
+            "median_tpot_ms": 35.15692403715096,
+            "p95_tpot_ms": 35.54763748095321,
+            "p95_itl_ms": 69.66515669191722,
+            "p99_itl_ms": 70.1076787954662,
+            "median_e2el_ms": 4724.875973741291
+          }
+        },
+        "candidate_change_percent": {
+          "output_throughput": 7.531320919882023,
+          "median_ttft_ms": 12.890996658153853,
+          "p95_ttft_ms": 2.954573959059137,
+          "median_tpot_ms": -7.377793490471596,
+          "p95_tpot_ms": -6.350153770134758,
+          "p95_itl_ms": -7.603124202366496,
+          "p99_itl_ms": -7.404988182329086,
+          "median_e2el_ms": -7.059979116664438
+        },
+        "exact_paired_text_matches": 16,
+        "paired_texts": 16,
+        "gpu_assignments": {
+          "control": {
+            "0": 1,
+            "1": 2
+          },
+          "candidate": {
+            "0": 2,
+            "1": 1
+          }
+        }
+      },
+      {
+        "input": 1024,
+        "concurrency": 4,
+        "modes": {
+          "control": {
+            "output_throughput": 81.61227579128504,
+            "median_ttft_ms": 1087.328893263475,
+            "p95_ttft_ms": 1318.5981654634816,
+            "median_tpot_ms": 40.32859045670251,
+            "p95_tpot_ms": 42.04455430381776,
+            "p95_itl_ms": 78.05383931117831,
+            "p99_itl_ms": 78.38034542684909,
+            "median_e2el_ms": 6234.36402376683
+          },
+          "candidate": {
+            "output_throughput": 87.78056389904899,
+            "median_ttft_ms": 1077.2008942585671,
+            "p95_ttft_ms": 1305.4988555260934,
+            "median_tpot_ms": 37.16530945272584,
+            "p95_tpot_ms": 38.68531311852317,
+            "p95_itl_ms": 71.7875740272575,
+            "p99_itl_ms": 72.31623203464551,
+            "median_e2el_ms": 5797.167671262287
+          }
+        },
+        "candidate_change_percent": {
+          "output_throughput": 7.558039581617226,
+          "median_ttft_ms": -0.9314568082992802,
+          "p95_ttft_ms": -0.9934269802949314,
+          "median_tpot_ms": -7.843767828614833,
+          "p95_tpot_ms": -7.989717671925856,
+          "p95_itl_ms": -8.028132042216395,
+          "p99_itl_ms": -7.736778090450114,
+          "median_e2el_ms": -7.012685669907148
+        },
+        "exact_paired_text_matches": 16,
+        "paired_texts": 16,
+        "gpu_assignments": {
+          "control": {
+            "0": 1,
+            "1": 2
+          },
+          "candidate": {
+            "0": 2,
+            "1": 1
+          }
+        }
+      },
+      {
+        "input": 4096,
+        "concurrency": 4,
+        "modes": {
+          "control": {
+            "output_throughput": 50.46261858724064,
+            "median_ttft_ms": 4826.313954996294,
+            "p95_ttft_ms": 5079.755022449535,
+            "median_tpot_ms": 41.57945026774656,
+            "p95_tpot_ms": 43.272161841902175,
+            "p95_itl_ms": 80.19245290051913,
+            "p99_itl_ms": 81.07490672380663,
+            "median_e2el_ms": 10106.883811255102
+          },
+          "candidate": {
+            "output_throughput": 52.63211059597732,
+            "median_ttft_ms": 4811.910542513942,
+            "p95_ttft_ms": 5063.800845963124,
+            "median_tpot_ms": 38.42307963969064,
+            "p95_tpot_ms": 40.12607206926428,
+            "p95_itl_ms": 73.97085860138759,
+            "p99_itl_ms": 74.43896311771823,
+            "median_e2el_ms": 9691.619097997318
+          }
+        },
+        "candidate_change_percent": {
+          "output_throughput": 4.299206163837943,
+          "median_ttft_ms": -0.2984350503647093,
+          "p95_ttft_ms": -0.314073738121301,
+          "median_tpot_ms": -7.591179315096275,
+          "p95_tpot_ms": -7.270470525906125,
+          "p95_itl_ms": -7.758328962514205,
+          "p99_itl_ms": -8.184953735062194,
+          "median_e2el_ms": -4.10873144495183
+        },
+        "exact_paired_text_matches": 16,
+        "paired_texts": 16,
+        "gpu_assignments": {
+          "control": {
+            "0": 1,
+            "1": 2
+          },
+          "candidate": {
+            "0": 2,
+            "1": 1
+          }
+        }
+      }
+    ],
+    "runs": [
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p128-c4-rwarmup-20260907T192802.801304Z/result.json",
+        "sha256": "7f21711435a9cbe468dc4caa85038de37f55d1ee4b0acabf45a489708ce49bb7",
+        "metrics": {
+          "output_throughput": 98.04817538571972,
+          "median_ttft_ms": 284.7788585058879,
+          "p95_ttft_ms": 385.8208877092693,
+          "median_tpot_ms": 38.57372946465227,
+          "p95_tpot_ms": 39.07469678250797,
+          "p95_itl_ms": 76.6108135052491,
+          "p99_itl_ms": 76.72142897150479,
+          "median_e2el_ms": 5183.678148518084
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p1024-c4-rwarmup-20260907T192858.312416Z/result.json",
+        "sha256": "58fea079d118cff6bbaedd7fb4840833cef023ae397e3fe7f9a79375f2948668",
+        "metrics": {
+          "output_throughput": 79.28112963015616,
+          "median_ttft_ms": 1205.7985835126601,
+          "p95_ttft_ms": 1459.8691649764078,
+          "median_tpot_ms": 40.75953553524235,
+          "p95_tpot_ms": 43.35946217259506,
+          "p95_itl_ms": 78.53011605911888,
+          "p99_itl_ms": 79.05083488905802,
+          "median_e2el_ms": 6382.259596488439
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p4096-c4-r4-20260907T193045.447358Z/result.json",
+        "sha256": "2d26a0f13c347e5f026a691555650f70029d045dd6241340c6e338d055f551a9",
+        "metrics": {
+          "output_throughput": 50.216564441302154,
+          "median_ttft_ms": 4848.400733986637,
+          "p95_ttft_ms": 5104.631832821178,
+          "median_tpot_ms": 41.79087261450257,
+          "p95_tpot_ms": 43.499533473408604,
+          "p95_itl_ms": 80.5735988804372,
+          "p99_itl_ms": 81.0136055725161,
+          "median_e2el_ms": 10155.841556028463
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p1024-c4-r3-20260907T192917.958240Z/result.json",
+        "sha256": "327458d83855fcd6abb277b7b6c121c802ae974011716c6b4e25e9ad46b82ac1",
+        "metrics": {
+          "output_throughput": 81.63146149134829,
+          "median_ttft_ms": 1086.9677165173925,
+          "p95_ttft_ms": 1318.1027702259598,
+          "median_tpot_ms": 40.52116818117403,
+          "p95_tpot_ms": 42.03818312870874,
+          "p95_itl_ms": 78.36010690662079,
+          "p99_itl_ms": 78.88697344635146,
+          "median_e2el_ms": 6233.075134514365
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p1024-c4-r4-20260907T192938.266728Z/result.json",
+        "sha256": "bc8f50606ce47eabd2e4dbe6fd0465c700c141c3bba7a7de0fabd03e714aa3d4",
+        "metrics": {
+          "output_throughput": 81.59309009122178,
+          "median_ttft_ms": 1087.6900700095575,
+          "p95_ttft_ms": 1319.0935607010033,
+          "median_tpot_ms": 40.5354547874881,
+          "p95_tpot_ms": 42.05092547892678,
+          "p95_itl_ms": 78.70491591456812,
+          "p99_itl_ms": 78.95848885236774,
+          "median_e2el_ms": 6235.652913019294
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p1024-c4-r2-20260907T192604.233448Z/result.json",
+        "sha256": "e774133e409e9ba9c6f3696010d1b4fcbe6b3e350db1c1f1b31ebef2f82cbc1d",
+        "metrics": {
+          "output_throughput": 82.57242104166014,
+          "median_ttft_ms": 1078.5694005026016,
+          "p95_ttft_ms": 1306.9769728550455,
+          "median_tpot_ms": 40.027822633677225,
+          "p95_tpot_ms": 41.52614990096653,
+          "p95_itl_ms": 77.74757171573583,
+          "p99_itl_ms": 77.8737174073467,
+          "median_e2el_ms": 6162.065553973662
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p128-c4-r2-20260907T192506.489027Z/result.json",
+        "sha256": "8bf1b7a8fc6b6f89f23e65e838dffb348c2e9ba6c2807f3743f3fccfc3d7af42",
+        "metrics": {
+          "output_throughput": 99.41920243722801,
+          "median_ttft_ms": 430.36441449658014,
+          "p95_ttft_ms": 430.8005518192658,
+          "median_tpot_ms": 37.15554805904238,
+          "p95_tpot_ms": 37.906117330045866,
+          "p95_itl_ms": 74.85364516614936,
+          "p99_itl_ms": 75.27843480522279,
+          "median_e2el_ms": 5149.119017994963
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p128-c4-r1-20260907T192448.140738Z/result.json",
+        "sha256": "c9f5482869cc970c637bcef7e6659bf566de06afea3a2be21179f6de1baef98b",
+        "metrics": {
+          "output_throughput": 100.65247671190976,
+          "median_ttft_ms": 191.5324055007659,
+          "p95_ttft_ms": 344.1203136753756,
+          "median_tpot_ms": 37.969125527567705,
+          "p95_tpot_ms": 37.97012801792227,
+          "p95_itl_ms": 74.66437321272679,
+          "p99_itl_ms": 74.9255869659828,
+          "median_e2el_ms": 5013.611347501865
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p4096-c4-r1-20260907T192647.391716Z/result.json",
+        "sha256": "1d953ab1df56153ca258dc5265109c8beedf251af494e2dd775f0e91a1b54654",
+        "metrics": {
+          "output_throughput": 50.75737522768633,
+          "median_ttft_ms": 4800.923443486681,
+          "p95_ttft_ms": 5053.12042265432,
+          "median_tpot_ms": 41.312620208752676,
+          "p95_tpot_ms": 42.99054161111978,
+          "p95_itl_ms": 79.92541525454726,
+          "p99_itl_ms": 80.02216861059424,
+          "median_e2el_ms": 10047.666084457887
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p4096-c4-rwarmup-20260907T192623.836099Z/result.json",
+        "sha256": "dafa63ec47426139703311574925174563aac149f95bedd90179bba7f86e58d2",
+        "metrics": {
+          "output_throughput": 50.96014120478417,
+          "median_ttft_ms": 4787.888368533459,
+          "p95_ttft_ms": 5039.970380318118,
+          "median_tpot_ms": 41.10367164954426,
+          "p95_tpot_ms": 42.78540647713335,
+          "p95_itl_ms": 79.44210542773362,
+          "p99_itl_ms": 79.73448411154095,
+          "median_e2el_ms": 10008.05466802558
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p128-c4-r3-20260907T192821.154170Z/result.json",
+        "sha256": "9b45aa1ca7e50893d869256a7cf82dbfef1c726b693c3b7348032dca353516f1",
+        "metrics": {
+          "output_throughput": 101.86432284615009,
+          "median_ttft_ms": 206.6368015075568,
+          "p95_ttft_ms": 206.92183121864218,
+          "median_tpot_ms": 37.94555057882419,
+          "p95_tpot_ms": 37.94593359247459,
+          "p95_itl_ms": 76.63795145053882,
+          "p99_itl_ms": 76.74559015315026,
+          "median_e2el_ms": 5025.750117492862
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p1024-c4-rwarmup-20260907T192525.342211Z/result.json",
+        "sha256": "be2f8c129e5ba1c6530a861c9e1cd0f6a3d3ef21fdc2728cdc0d7f7707f8115f",
+        "metrics": {
+          "output_throughput": 82.80168153941138,
+          "median_ttft_ms": 1076.9611044961493,
+          "p95_ttft_ms": 1305.4354418825824,
+          "median_tpot_ms": 39.90445235023627,
+          "p95_tpot_ms": 41.402102750840626,
+          "p95_itl_ms": 77.31369645625819,
+          "p99_itl_ms": 77.6830908114789,
+          "median_e2el_ms": 6144.837008498143
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p128-c4-r4-20260907T192840.059775Z/result.json",
+        "sha256": "717e120a6224ac582b6f7fc0731a370a9003f6506b3ae87f812c13a65503c254",
+        "metrics": {
+          "output_throughput": 98.84247611029204,
+          "median_ttft_ms": 279.5238244871143,
+          "p95_ttft_ms": 379.6109816757962,
+          "median_tpot_ms": 38.286471622079375,
+          "p95_tpot_ms": 38.780054778266724,
+          "p95_itl_ms": 75.94183593755588,
+          "p99_itl_ms": 76.1501949216472,
+          "median_e2el_ms": 5141.830928507261
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p4096-c4-rwarmup-20260907T192957.970041Z/result.json",
+        "sha256": "1180d7e6ffd5d49cef3b15fbf778bee51adeff54a3096beb0d602a9816b54bd8",
+        "metrics": {
+          "output_throughput": 50.345852510233165,
+          "median_ttft_ms": 4836.404960486107,
+          "p95_ttft_ms": 5091.145493049407,
+          "median_tpot_ms": 41.67973949628017,
+          "p95_tpot_ms": 43.37801367853856,
+          "p95_itl_ms": 80.64705227734521,
+          "p99_itl_ms": 80.7860992429778,
+          "median_e2el_ms": 10129.693524504546
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p128-c4-rwarmup-20260907T192429.241031Z/result.json",
+        "sha256": "e4ce022ca23e3a847de825af7bd27ba4e762284ffd49a6293e39f37940ed6343",
+        "metrics": {
+          "output_throughput": 100.42871567219115,
+          "median_ttft_ms": 279.91062100045383,
+          "p95_ttft_ms": 379.39039239718113,
+          "median_tpot_ms": 37.64468964141625,
+          "p95_tpot_ms": 38.13817007726106,
+          "p95_itl_ms": 74.98961819219403,
+          "p99_itl_ms": 75.23319025523959,
+          "median_e2el_ms": 5060.873845970491
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p1024-c4-r1-20260907T192544.538724Z/result.json",
+        "sha256": "af8586286a5fad037acab8e4522c509ecdc98cf081130bb6b0481e4e1f55e3bf",
+        "metrics": {
+          "output_throughput": 80.43673633724273,
+          "median_ttft_ms": 1193.1221869890578,
+          "p95_ttft_ms": 1445.6442128575873,
+          "median_tpot_ms": 40.13601273223098,
+          "p95_tpot_ms": 42.69966298260994,
+          "p95_itl_ms": 77.46999225928448,
+          "p99_itl_ms": 77.74667055229656,
+          "median_e2el_ms": 6290.395803982392
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p4096-c4-r3-20260907T193021.983422Z/result.json",
+        "sha256": "bfde06c7fbc9a3a8f8f41aa7b0e92642a9ad84b1731194365b1a448c983adf2f",
+        "metrics": {
+          "output_throughput": 50.263878983408695,
+          "median_ttft_ms": 4845.317215513205,
+          "p95_ttft_ms": 5099.981104466133,
+          "median_tpot_ms": 41.7433358148184,
+          "p95_tpot_ms": 43.44495143381582,
+          "p95_itl_ms": 80.42728349100798,
+          "p99_itl_ms": 81.13620787509716,
+          "median_e2el_ms": 10146.680208505131
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-control/results/plow-p4096-c4-r2-20260907T192710.492463Z/result.json",
+        "sha256": "b742d15913505813791fe103854575e33e8a5ac1a0843f89ad8eb2ed122eae2c",
+        "metrics": {
+          "output_throughput": 50.66135819107258,
+          "median_ttft_ms": 4807.3106944793835,
+          "p95_ttft_ms": 5059.528940432938,
+          "median_tpot_ms": 41.415564720674716,
+          "p95_tpot_ms": 43.099372249988534,
+          "p95_itl_ms": 79.95762231003027,
+          "p99_itl_ms": 84.55886151874437,
+          "median_e2el_ms": 10067.087414005073
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p4096-c4-rwarmup-20260907T192957.971825Z/result.json",
+        "sha256": "35be3540bdfc9fb2324e9135bfca9117687c06d84e1aa8d45a542702c772f4b4",
+        "metrics": {
+          "output_throughput": 52.983683289297446,
+          "median_ttft_ms": 4785.122946515912,
+          "p95_ttft_ms": 5034.958056529285,
+          "median_tpot_ms": 38.128566362172755,
+          "p95_tpot_ms": 39.82056101974774,
+          "p95_itl_ms": 73.74204794759862,
+          "p99_itl_ms": 73.83639008679893,
+          "median_e2el_ms": 9627.381756494287
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p1024-c4-r3-20260907T192917.960331Z/result.json",
+        "sha256": "65fd4de99cce817ca2adfe08b338ac009fb262e7f6c83b1f90710a4f1d02a838",
+        "metrics": {
+          "output_throughput": 88.13566263434005,
+          "median_ttft_ms": 1074.4904245075304,
+          "p95_ttft_ms": 1301.8697544262977,
+          "median_tpot_ms": 37.002063275674196,
+          "p95_tpot_ms": 38.516225192125695,
+          "p95_itl_ms": 71.67151845351327,
+          "p99_itl_ms": 72.2514327627141,
+          "median_e2el_ms": 5773.6974135332275
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p128-c4-r3-20260907T192821.155198Z/result.json",
+        "sha256": "ffce714d59d937b44ff8a9a137665178376087d2dd3db431508d4b110e822edb",
+        "metrics": {
+          "output_throughput": 107.91703912199196,
+          "median_ttft_ms": 189.57260152092203,
+          "p95_ttft_ms": 340.89720188349014,
+          "median_tpot_ms": 35.322841889578775,
+          "p95_tpot_ms": 35.32340159939004,
+          "p95_itl_ms": 69.67933843843639,
+          "p99_itl_ms": 70.0746635091491,
+          "median_e2el_ms": 4675.573521497427
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p128-c4-rwarmup-20260907T192429.241508Z/result.json",
+        "sha256": "542feb376a78a9732d350446ec53dfb7f992c077ea2784108447a5c9fd27cb61",
+        "metrics": {
+          "output_throughput": 107.23463971741796,
+          "median_ttft_ms": 275.8461030316539,
+          "p95_ttft_ms": 374.93635771388654,
+          "median_tpot_ms": 35.14743634631608,
+          "p95_tpot_ms": 35.65854655095655,
+          "p95_itl_ms": 69.55649922892917,
+          "p99_itl_ms": 70.46163405932019,
+          "median_e2el_ms": 4739.522237534402
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p1024-c4-r2-20260907T192604.235739Z/result.json",
+        "sha256": "d8ff978f54a337c96dadab9adc716b48d5398b865ed1627293e27de5f6da3049",
+        "metrics": {
+          "output_throughput": 87.35705515708614,
+          "median_ttft_ms": 1081.1468079918995,
+          "p95_ttft_ms": 1310.3955149446847,
+          "median_tpot_ms": 37.35369197633777,
+          "p95_tpot_ms": 38.8782764892928,
+          "p95_itl_ms": 71.87049369385932,
+          "p99_itl_ms": 72.59986011253203,
+          "median_e2el_ms": 5825.072138482938
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p1024-c4-rwarmup-20260907T192858.311150Z/result.json",
+        "sha256": "2515e176e5d7294ad5650a95e97471ee176715dfe24a5be411a879b377c97c22",
+        "metrics": {
+          "output_throughput": 85.60730478842085,
+          "median_ttft_ms": 1189.6790134778712,
+          "p95_ttft_ms": 1440.020970653859,
+          "median_tpot_ms": 37.18216285841928,
+          "p95_tpot_ms": 39.768295536481396,
+          "p95_itl_ms": 71.20523175399285,
+          "p99_itl_ms": 72.01672539638821,
+          "median_e2el_ms": 5911.81369649712
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p1024-c4-rwarmup-20260907T192525.343172Z/result.json",
+        "sha256": "7ba72a1783fcb3394d323f1c3b161e078390dafcee2f1d44cc7ccf9e07cef2a2",
+        "metrics": {
+          "output_throughput": 84.74253397850137,
+          "median_ttft_ms": 1195.693896501325,
+          "p95_ttft_ms": 1447.9462934803448,
+          "median_tpot_ms": 37.61197051572371,
+          "p95_tpot_ms": 40.22514449641489,
+          "p95_itl_ms": 72.31703388679307,
+          "p99_itl_ms": 72.74353807559237,
+          "median_e2el_ms": 5972.414151998237
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p128-c4-r4-20260907T192840.059852Z/result.json",
+        "sha256": "3b5c8afc45d690a2fafc87fc789c26be066cc0e51e6d611dcdc793437c9b644f",
+        "metrics": {
+          "output_throughput": 107.87100663416726,
+          "median_ttft_ms": 274.6904540108517,
+          "p95_ttft_ms": 372.70094299165066,
+          "median_tpot_ms": 34.93649132667095,
+          "p95_tpot_ms": 35.441281094892304,
+          "p95_itl_ms": 69.65097494539805,
+          "p99_itl_ms": 69.88708959019277,
+          "median_e2el_ms": 4711.645397997927
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p4096-c4-r4-20260907T193045.446823Z/result.json",
+        "sha256": "62b7f9ec213ddd7d79e1db87da748673308aed3c655fd49c6d6fdccb2084ec50",
+        "metrics": {
+          "output_throughput": 52.85710650138586,
+          "median_ttft_ms": 4795.14349650708,
+          "p95_ttft_ms": 5046.084745560074,
+          "median_tpot_ms": 38.22797362593655,
+          "p95_tpot_ms": 39.924603160039894,
+          "p95_itl_ms": 73.85495799826458,
+          "p99_itl_ms": 73.96443448029459,
+          "median_e2el_ms": 9650.090438488405
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p1024-c4-r1-20260907T192544.539816Z/result.json",
+        "sha256": "e14ac6597cf97696e5571a377e84d04cc4eb688c01b0cd6aa04cdcf38d1cb733",
+        "metrics": {
+          "output_throughput": 87.42546516375792,
+          "median_ttft_ms": 1079.9113640096039,
+          "p95_ttft_ms": 1309.127956625889,
+          "median_tpot_ms": 37.32855562977749,
+          "p95_tpot_ms": 38.85440104492064,
+          "p95_itl_ms": 71.84987563814502,
+          "p99_itl_ms": 72.38103130657692,
+          "median_e2el_ms": 5820.637928991346
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p4096-c4-r1-20260907T192647.393250Z/result.json",
+        "sha256": "2d8dd02702bd93451ac428c3ca9aac0f1f1c4f112ddc64f2e66bfddab5a77853",
+        "metrics": {
+          "output_throughput": 52.40711469056879,
+          "median_ttft_ms": 4828.677588520804,
+          "p95_ttft_ms": 5081.516946366173,
+          "median_tpot_ms": 38.61818565344474,
+          "p95_tpot_ms": 40.32754097848867,
+          "p95_itl_ms": 74.0867592045106,
+          "p99_itl_ms": 74.84744734654669,
+          "median_e2el_ms": 9733.14775750623
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p128-c4-r2-20260907T192506.489772Z/result.json",
+        "sha256": "0b05181438ef11d209d0f3ab3e02c9c2654f8cd96a887757a4ed51574e11fa9a",
+        "metrics": {
+          "output_throughput": 107.19294678621924,
+          "median_ttft_ms": 275.2203435229603,
+          "p95_ttft_ms": 373.58690107648727,
+          "median_tpot_ms": 35.164553913155814,
+          "p95_tpot_ms": 35.668732835562885,
+          "p95_itl_ms": 70.10828268539626,
+          "p99_itl_ms": 70.57791673229076,
+          "median_e2el_ms": 4741.152220987715
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p4096-c4-r2-20260907T192710.492410Z/result.json",
+        "sha256": "bdbc58aacd6333d2934a861ed2dfebb8ae3e1440a315d17b3ae0554691357e7f",
+        "metrics": {
+          "output_throughput": 52.23364719383783,
+          "median_ttft_ms": 4840.799885481829,
+          "p95_ttft_ms": 5093.750953674316,
+          "median_tpot_ms": 38.777982405667366,
+          "p95_tpot_ms": 40.488487203430395,
+          "p95_itl_ms": 74.59360057255253,
+          "p99_itl_ms": 78.62414501025341,
+          "median_e2el_ms": 9765.603651001584
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p128-c4-r1-20260907T192448.140936Z/result.json",
+        "sha256": "a16818c1923edc0351eaaea9c3248294a805811a13ce41178af5dcd9b4ccb810",
+        "metrics": {
+          "output_throughput": 107.26871274148876,
+          "median_ttft_ms": 274.1411220340524,
+          "p95_ttft_ms": 372.4135287455283,
+          "median_tpot_ms": 35.14929416114611,
+          "p95_tpot_ms": 35.65399386701412,
+          "p95_itl_ms": 69.639601331437,
+          "p99_itl_ms": 70.1406940817833,
+          "median_e2el_ms": 4738.106549484655
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 2,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p4096-c4-rwarmup-20260907T192623.836424Z/result.json",
+        "sha256": "82291af0a434a793c663835ecad70ccd12b975207f66d2080012bc29e6a0d333",
+        "metrics": {
+          "output_throughput": 52.50550866015669,
+          "median_ttft_ms": 4820.88792900322,
+          "p95_ttft_ms": 5073.3192181709455,
+          "median_tpot_ms": 38.53294726000094,
+          "p95_tpot_ms": 40.23812077462849,
+          "p95_itl_ms": 74.02361351705622,
+          "p99_itl_ms": 74.81055810698308,
+          "median_e2el_ms": 9714.572451019194
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p4096-c4-r3-20260907T193021.983789Z/result.json",
+        "sha256": "e884a8a320f841b64d0d31c348c820e61026e1b856644b23be667d00f777b427",
+        "metrics": {
+          "output_throughput": 52.87288516980453,
+          "median_ttft_ms": 4794.034486025339,
+          "p95_ttft_ms": 5044.468019163469,
+          "median_tpot_ms": 38.212321948912724,
+          "p95_tpot_ms": 39.90254734398057,
+          "p95_itl_ms": 73.845247211284,
+          "p99_itl_ms": 74.03047888888977,
+          "median_e2el_ms": 9647.056884510675
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p1024-c4-r4-20260907T192938.265926Z/result.json",
+        "sha256": "b8ca2fdf91615dcea443f5dc66b0ce580bd827fc23ff3eb4c64e70eb358ae082",
+        "metrics": {
+          "output_throughput": 88.1533951321001,
+          "median_ttft_ms": 1074.0682789764833,
+          "p95_ttft_ms": 1301.616375418962,
+          "median_tpot_ms": 36.997723173144756,
+          "p95_tpot_ms": 38.51480147909963,
+          "p95_itl_ms": 71.72527241636999,
+          "p99_itl_ms": 71.91659587493632,
+          "median_e2el_ms": 5772.779121965868
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 1,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-candidate/results/plow-p128-c4-rwarmup-20260907T192802.803990Z/result.json",
+        "sha256": "bd06bca529f654a8c9cc98738419af7d442a3ead72b532da26bf22f5cf36404f",
+        "metrics": {
+          "output_throughput": 107.48724737740277,
+          "median_ttft_ms": 275.3947939781938,
+          "p95_ttft_ms": 373.834257083945,
+          "median_tpot_ms": 35.06461602377185,
+          "p95_tpot_ms": 35.57211080919878,
+          "p95_itl_ms": 69.80305992183276,
+          "p99_itl_ms": 69.87909311719704,
+          "median_e2el_ms": 4728.607354016276
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      }
+    ],
+    "accounting": {
+      "completed_requests": 144,
+      "output_tokens": 18432
+    },
+    "limitations": [
+      "Plow-only candidate/control study, not a new vLLM backend comparison.",
+      "Same frozen binary, checkpoint, BF16 weights/activations/KV, assets, PF512, multistep4, fusion and MM1 lowrung; only the ordinary decode GQ object changes.",
+      "Separate exclusively leased MI300X GPUs with candidate/control assignment reversed halfway; clocks and power remain unpinned.",
+      "SSE intervals include multistep delivery bursts and the empty finishing event; these are not isolated GPU token durations."
+    ]
+  },
+  "mm1_full_model": {
+    "arms": {
+      "shipping": {
+        "steps": 51,
+        "logit_rows": 107,
+        "bitwise_step_dumps": 51,
+        "greedy_token_steps_equal": 51,
+        "groups": {
+          "ctx128-d1": {
+            "n": 10,
+            "median_ms": 27.4942415,
+            "min_ms": 26.788713,
+            "max_ms": 27.789397
+          },
+          "ctx128-d4": {
+            "n": 6,
+            "median_ms": 36.934970500000006,
+            "min_ms": 36.722673,
+            "max_ms": 37.021921
+          },
+          "ctx4096-d1": {
+            "n": 10,
+            "median_ms": 28.1086885,
+            "min_ms": 28.01969,
+            "max_ms": 28.375111
+          },
+          "ctx4096-d4": {
+            "n": 6,
+            "median_ms": 39.1115095,
+            "min_ms": 39.081415,
+            "max_ms": 39.337247
+          },
+          "ctx8176-d1": {
+            "n": 10,
+            "median_ms": 28.7587445,
+            "min_ms": 28.28706,
+            "max_ms": 28.970871
+          },
+          "ctx8176-d4": {
+            "n": 6,
+            "median_ms": 40.662786,
+            "min_ms": 40.496047,
+            "max_ms": 41.092257
+          },
+          "mixed": {
+            "n": 3,
+            "median_ms": 118.534671,
+            "min_ms": 117.869047,
+            "max_ms": 127.45623
+          }
+        }
+      },
+      "candidate": {
+        "steps": 51,
+        "logit_rows": 107,
+        "bitwise_step_dumps": 51,
+        "greedy_token_steps_equal": 51,
+        "groups": {
+          "ctx128-d1": {
+            "n": 10,
+            "median_ms": 22.5891235,
+            "min_ms": 22.015417,
+            "max_ms": 23.429808
+          },
+          "ctx128-d4": {
+            "n": 6,
+            "median_ms": 37.3805005,
+            "min_ms": 36.852377,
+            "max_ms": 37.615617
+          },
+          "ctx4096-d1": {
+            "n": 10,
+            "median_ms": 23.267211,
+            "min_ms": 22.975531,
+            "max_ms": 24.178626
+          },
+          "ctx4096-d4": {
+            "n": 6,
+            "median_ms": 39.6899385,
+            "min_ms": 39.248855,
+            "max_ms": 40.039044
+          },
+          "ctx8176-d1": {
+            "n": 10,
+            "median_ms": 23.7988395,
+            "min_ms": 23.524821,
+            "max_ms": 24.583261
+          },
+          "ctx8176-d4": {
+            "n": 6,
+            "median_ms": 41.153538499999996,
+            "min_ms": 40.637789,
+            "max_ms": 41.418224
+          },
+          "mixed": {
+            "n": 3,
+            "median_ms": 118.873937,
+            "min_ms": 118.514251,
+            "max_ms": 127.795867
+          }
+        }
+      },
+      "shipping-repeat": {
+        "steps": 51,
+        "logit_rows": 107,
+        "bitwise_step_dumps": 51,
+        "greedy_token_steps_equal": 51,
+        "groups": {
+          "ctx128-d1": {
+            "n": 10,
+            "median_ms": 27.632513000000003,
+            "min_ms": 27.260197,
+            "max_ms": 28.618996
+          },
+          "ctx128-d4": {
+            "n": 6,
+            "median_ms": 37.4217625,
+            "min_ms": 37.138004,
+            "max_ms": 37.519112
+          },
+          "ctx4096-d1": {
+            "n": 10,
+            "median_ms": 28.4885905,
+            "min_ms": 27.906101,
+            "max_ms": 29.41858
+          },
+          "ctx4096-d4": {
+            "n": 6,
+            "median_ms": 39.5699695,
+            "min_ms": 39.237428,
+            "max_ms": 39.834049
+          },
+          "ctx8176-d1": {
+            "n": 10,
+            "median_ms": 28.962298,
+            "min_ms": 28.485506,
+            "max_ms": 29.761441
+          },
+          "ctx8176-d4": {
+            "n": 6,
+            "median_ms": 41.199231499999996,
+            "min_ms": 40.732791,
+            "max_ms": 41.37593
+          },
+          "mixed": {
+            "n": 3,
+            "median_ms": 119.070511,
+            "min_ms": 118.34576,
+            "max_ms": 127.786854
+          }
+        }
+      }
+    },
+    "config": "Only lowrungMM1 changes: shipping84296e\u2192candidate1dc5c9\u2192shipping84296e repeat, sameGPU0exclusivelease. OrdinaryMM48008b9, prefill/mixed, packet, hostbinary unchanged. Native host+device stepwall; no servingclaim.",
+    "comparisons": {
+      "ctx128-d1": {
+        "baseline_before_ms": 27.4942415,
+        "candidate_ms": 22.5891235,
+        "baseline_after_ms": 27.632513000000003,
+        "candidate_change_vs_mean_baseline_pct": -18.04660475704225,
+        "baseline_bracket_change_pct": 0.502910764059461
+      },
+      "ctx128-d4": {
+        "baseline_before_ms": 36.934970500000006,
+        "candidate_ms": 37.3805005,
+        "baseline_after_ms": 37.4217625,
+        "candidate_change_vs_mean_baseline_pct": 0.5436871466636184,
+        "baseline_bracket_change_pct": 1.317970458376272
+      },
+      "ctx4096-d1": {
+        "baseline_before_ms": 28.1086885,
+        "candidate_ms": 23.267211,
+        "baseline_after_ms": 28.4885905,
+        "candidate_change_vs_mean_baseline_pct": -17.77975404082589,
+        "baseline_bracket_change_pct": 1.3515465155907291
+      },
+      "ctx4096-d4": {
+        "baseline_before_ms": 39.1115095,
+        "candidate_ms": 39.6899385,
+        "baseline_after_ms": 39.5699695,
+        "candidate_change_vs_mean_baseline_pct": 0.8876269344148868,
+        "baseline_bracket_change_pct": 1.1721869236471338
+      },
+      "ctx8176-d1": {
+        "baseline_before_ms": 28.7587445,
+        "candidate_ms": 23.7988395,
+        "baseline_after_ms": 28.962298,
+        "candidate_change_vs_mean_baseline_pct": -17.538428035148524,
+        "baseline_bracket_change_pct": 0.7077968928720146
+      },
+      "ctx8176-d4": {
+        "baseline_before_ms": 40.662786,
+        "candidate_ms": 41.153538499999996,
+        "baseline_after_ms": 41.199231499999996,
+        "candidate_change_vs_mean_baseline_pct": 0.5436703291608946,
+        "baseline_bracket_change_pct": 1.3192541701397387
+      },
+      "mixed": {
+        "baseline_before_ms": 118.534671,
+        "candidate_ms": 118.873937,
+        "baseline_after_ms": 119.070511,
+        "candidate_change_vs_mean_baseline_pct": 0.06005424578661156,
+        "baseline_bracket_change_pct": 0.4520533911972491
+      }
+    },
+    "input_hashes": {
+      "/app/plow/build-gemma31/hsaco-occ4-b1-clean/interp_decode_gq.elf": "84296e1e397f6767364243d24e97f77804b001b40533cdae81d1b6ac2ea28ea1",
+      "/app/plow/build-gemma31/projection-counters/direct-gemv-final/hsaco-mm1-wpe5/interp_decode_gq.elf": "1dc5c9ace23734759b0ca796680716b4ed430eaf3c32673b38d6896d2f1e6693",
+      "/app/plow/build-gemma31/hsaco/interp_decode_gq.elf": "8008b9f79564f6bf99feb78a5679464e5628040ad555e4fc2ef3b6275169610f",
+      "/app/plow/build-gemma31/hsaco/interp_prefill_gq.elf": "7d065efe67f149b82da7bff5fbfbc2e4f4fe974d55a640a434d59caf56c2e884",
+      "/app/plow/build-gemma31/hsaco/interp_mixed_gq.elf": "b1deafe6490f3f57c18ba47a803785177a260884a7ba91d2f2dc952782bc86a5",
+      "/app/plow/build-gemma31/decode-placed-assets/model.pkt": "59df5045781261d3c9aafe27804af667c95008a3a602775695d2ab68c0d45dc6",
+      "/app/plow/build-gemma31/target-profile/debug/deps/hsa_mixed_step-f12f839d1f47cfbd": "886cb42fc689a8f331dadde2ecadc45f172cca632ef501c0aa0f1cb5d43aa649",
+      "/app/plow/build-gemma31/projection-counters/mm1-model/model.py": "b13699ba0d42b754c51735ec75a6a122029dbf5c6501b24cf94069834eb593aa"
+    },
+    "statuses": [
+      {
+        "arm": "shipping",
+        "exit": 0,
+        "timeout": false,
+        "gpu": "0"
+      },
+      {
+        "arm": "candidate",
+        "exit": 0,
+        "timeout": false,
+        "gpu": "0"
+      },
+      {
+        "arm": "shipping-repeat",
+        "exit": 0,
+        "timeout": false,
+        "gpu": "0"
+      }
+    ],
+    "resource_change": "SameMM1WPE5 buildprofile, LDS30776 andprivatesegment1404 unchanged, allocatedVGPR110\u2192189. No occupancycounter wascollectedforthecandidate; do not infer achievedoccupancyfromallocation. ExistingGEMV mathhelper reusedexactly; otheropcode fallbacksretained."
+  },
+  "mm1_serving_status": "Complete:36runs,144requests,18432tokens;48/48 measuredpairedtexts exact. C1 throughput improves11.22\u201320.65%; medium/long TTFT regress3.31/2.46%. Not an all-metrics improvement.",
+  "mm1_serving": {
+    "complete": true,
+    "date": "2026-09-07",
+    "comparison": "Gfx942 MM1 direct GEMV dispatch versus shipping MM1 interpreter",
+    "timing_provider": "Unmodified installed vllm bench serve",
+    "aggregation": "Two GPU assignments; full-corpus warmup plus two measured repetitions per assignment and cell; median of four measured runs",
+    "cells": [
+      {
+        "input": 128,
+        "concurrency": 1,
+        "modes": {
+          "control": {
+            "output_throughput": 35.07189068305442,
+            "median_ttft_ms": 103.57243299949914,
+            "p95_ttft_ms": 103.76260909688426,
+            "median_tpot_ms": 27.9329814881684,
+            "p95_tpot_ms": 27.94240736411738,
+            "p95_itl_ms": 111.98994484147988,
+            "p99_itl_ms": 112.28354185266653,
+            "median_e2el_ms": 3651.2479730008636
+          },
+          "candidate": {
+            "output_throughput": 42.31341546890003,
+            "median_ttft_ms": 98.14094401372131,
+            "p95_ttft_ms": 98.55121625878382,
+            "median_tpot_ms": 23.06042887982234,
+            "p95_tpot_ms": 23.114367341760207,
+            "p95_itl_ms": 92.67118568532169,
+            "p99_itl_ms": 93.25793990894454,
+            "median_e2el_ms": 3026.177426741924
+          }
+        },
+        "candidate_change_percent": {
+          "output_throughput": 20.647660119859125,
+          "median_ttft_ms": -5.2441454047952085,
+          "p95_ttft_ms": -5.022418849582422,
+          "median_tpot_ms": -17.44372547703128,
+          "p95_tpot_ms": -17.278539960580364,
+          "p95_itl_ms": -17.25044081725695,
+          "p99_itl_ms": -16.944248132719707,
+          "median_e2el_ms": -17.11936715558682
+        },
+        "exact_paired_text_matches": 16,
+        "paired_texts": 16,
+        "gpu_assignments": {
+          "control": {
+            "0": 0,
+            "1": 3
+          },
+          "candidate": {
+            "0": 3,
+            "1": 0
+          }
+        }
+      },
+      {
+        "input": 1024,
+        "concurrency": 1,
+        "modes": {
+          "control": {
+            "output_throughput": 32.45880867139748,
+            "median_ttft_ms": 339.64241223293357,
+            "p95_ttft_ms": 339.84234528179513,
+            "median_tpot_ms": 28.38519444873861,
+            "p95_tpot_ms": 28.406578052079023,
+            "p95_itl_ms": 113.76950147241587,
+            "p99_itl_ms": 114.08560646377737,
+            "median_e2el_ms": 3944.289435239625
+          },
+          "candidate": {
+            "output_throughput": 36.68509428594845,
+            "median_ttft_ms": 350.89719423558563,
+            "p95_ttft_ms": 354.11871198011795,
+            "median_tpot_ms": 24.69502743111289,
+            "p95_tpot_ms": 24.903853647809612,
+            "p95_itl_ms": 99.67267414176604,
+            "p99_itl_ms": 100.47888411500026,
+            "median_e2el_ms": 3487.1656779869227
+          }
+        },
+        "candidate_change_percent": {
+          "output_throughput": 13.020458197762363,
+          "median_ttft_ms": 3.3137151301744217,
+          "p95_ttft_ms": 4.200879289037673,
+          "median_tpot_ms": -13.000323194156248,
+          "p95_tpot_ms": -12.330680583376541,
+          "p95_itl_ms": -12.390690956897355,
+          "p99_itl_ms": -11.926765146396711,
+          "median_e2el_ms": -11.589508446530395
+        },
+        "exact_paired_text_matches": 16,
+        "paired_texts": 16,
+        "gpu_assignments": {
+          "control": {
+            "0": 0,
+            "1": 3
+          },
+          "candidate": {
+            "0": 3,
+            "1": 0
+          }
+        }
+      },
+      {
+        "input": 4096,
+        "concurrency": 1,
+        "modes": {
+          "control": {
+            "output_throughput": 25.18839725157683,
+            "median_ttft_ms": 1436.8925994931487,
+            "p95_ttft_ms": 1438.6452634062152,
+            "median_tpot_ms": 28.71529094695653,
+            "p95_tpot_ms": 28.74073260216277,
+            "p95_itl_ms": 115.1396211280371,
+            "p99_itl_ms": 115.41506311914418,
+            "median_e2el_ms": 5083.562217245344
+          },
+          "candidate": {
+            "output_throughput": 28.014744958082865,
+            "median_ttft_ms": 1472.2831010149093,
+            "p95_ttft_ms": 1474.004920970765,
+            "median_tpot_ms": 24.475009836587418,
+            "p95_tpot_ms": 24.501804061376994,
+            "p95_itl_ms": 98.29006995132659,
+            "p99_itl_ms": 98.587999115407,
+            "median_e2el_ms": 4580.186924751615
+          }
+        },
+        "candidate_change_percent": {
+          "output_throughput": 11.220831870630832,
+          "median_ttft_ms": 2.4629886418960023,
+          "p95_ttft_ms": 2.4578440887387476,
+          "median_tpot_ms": -14.766631193818803,
+          "p95_tpot_ms": -14.748853480745272,
+          "p95_itl_ms": -14.634016519798642,
+          "p99_itl_ms": -14.579608197559468,
+          "median_e2el_ms": -9.90201891866478
+        },
+        "exact_paired_text_matches": 16,
+        "paired_texts": 16,
+        "gpu_assignments": {
+          "control": {
+            "0": 0,
+            "1": 3
+          },
+          "candidate": {
+            "0": 3,
+            "1": 0
+          }
+        }
+      }
+    ],
+    "runs": [
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p1024-c1-r1-20260907T193236.183764Z/result.json",
+        "sha256": "e9f7d57385c7edfb1bd29cfc024879a6aecc92e72c9398cd6dc35d03c2d00331",
+        "metrics": {
+          "output_throughput": 33.047980643436105,
+          "median_ttft_ms": 335.638803022448,
+          "p95_ttft_ms": 335.8655447809724,
+          "median_tpot_ms": 27.85086549207106,
+          "p95_tpot_ms": 27.869739288791436,
+          "p95_itl_ms": 111.62677698594052,
+          "p99_itl_ms": 111.90327624033671,
+          "median_e2el_ms": 3872.874247492291
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p4096-c1-r2-20260907T193441.298223Z/result.json",
+        "sha256": "47525180caffc894813769014a37c5ce443e3d703875db8c7f2483773c01d19d",
+        "metrics": {
+          "output_throughput": 25.632439717240306,
+          "median_ttft_ms": 1419.4087805226445,
+          "p95_ttft_ms": 1419.8107190895826,
+          "median_tpot_ms": 28.142826988244444,
+          "p95_tpot_ms": 28.169726786354012,
+          "p95_itl_ms": 112.85314350971021,
+          "p99_itl_ms": 113.08232720475644,
+          "median_e2el_ms": 4993.203143007122
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p1024-c1-rwarmup-20260907T193710.137435Z/result.json",
+        "sha256": "2d500a58609cfdaba8098d4184757439beab5e20d4d3e0d4c5f4b8b830710ff7",
+        "metrics": {
+          "output_throughput": 31.8950310765654,
+          "median_ttft_ms": 343.0153905355837,
+          "p95_ttft_ms": 343.16955232352484,
+          "median_tpot_ms": 28.902202818724216,
+          "p95_tpot_ms": 28.93011392214277,
+          "p95_itl_ms": 115.87322683481034,
+          "p99_itl_ms": 116.08750909101218,
+          "median_e2el_ms": 4012.929755495861
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p4096-c1-r4-20260907T193944.776642Z/result.json",
+        "sha256": "f1a90a781d72f7a2060cc4237fc7aebef9e5b44ff91f2f9ed407f63af6fc2892",
+        "metrics": {
+          "output_throughput": 24.74435478591335,
+          "median_ttft_ms": 1454.376418463653,
+          "p95_ttft_ms": 1457.3819468001602,
+          "median_tpot_ms": 29.28775490566861,
+          "p95_tpot_ms": 29.311738417971526,
+          "p95_itl_ms": 117.426098746364,
+          "p99_itl_ms": 117.74779903353192,
+          "median_e2el_ms": 5173.921291483566
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p1024-c1-rwarmup-20260907T193207.622272Z/result.json",
+        "sha256": "8007e5a58bc69efa10b4c70650ef650dc0917ea427cc06139bc53ddd9a87e5ff",
+        "metrics": {
+          "output_throughput": 33.01421726863208,
+          "median_ttft_ms": 336.7064814956393,
+          "p95_ttft_ms": 337.07695763441734,
+          "median_tpot_ms": 27.877020519675952,
+          "p95_tpot_ms": 27.88527150178699,
+          "p95_itl_ms": 111.77780574944336,
+          "p99_itl_ms": 112.03327511728276,
+          "median_e2el_ms": 3876.851284003351
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p1024-c1-r3-20260907T193739.109491Z/result.json",
+        "sha256": "537fb6852ae845d02acfe5efa292638d9badfcd95ccc23b71f82cc64877a91d2",
+        "metrics": {
+          "output_throughput": 31.869636699358846,
+          "median_ttft_ms": 343.29909397638403,
+          "p95_ttft_ms": 343.60766462341417,
+          "median_tpot_ms": 28.92067737022129,
+          "p95_tpot_ms": 28.94341681536661,
+          "p95_itl_ms": 115.91222595889121,
+          "p99_itl_ms": 116.26793668721803,
+          "median_e2el_ms": 4015.7046229869593
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p4096-c1-rwarmup-20260907T193334.581584Z/result.json",
+        "sha256": "4086611bad47660cf6a6d29b99627bfd1be6555558256220c240f4dae874c109",
+        "metrics": {
+          "output_throughput": 25.640269610052794,
+          "median_ttft_ms": 1419.2612860060763,
+          "p95_ttft_ms": 1419.8290262167575,
+          "median_tpot_ms": 28.12480381882464,
+          "p95_tpot_ms": 28.16203363928632,
+          "p95_itl_ms": 112.77363595436327,
+          "p99_itl_ms": 112.99780388886575,
+          "median_e2el_ms": 4990.54841051111
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p128-c1-rwarmup-20260907T193545.828418Z/result.json",
+        "sha256": "9e59283cac2e41ca6d0715ab4e4a74b67104239141af57d91e9c045f81bdbbf3",
+        "metrics": {
+          "output_throughput": 34.58113134231698,
+          "median_ttft_ms": 103.64725449471734,
+          "p95_ttft_ms": 103.86717993533239,
+          "median_tpot_ms": 28.336261157551416,
+          "p95_tpot_ms": 28.355988092935007,
+          "p95_itl_ms": 113.566374531365,
+          "p99_itl_ms": 113.94627821573522,
+          "median_e2el_ms": 3702.367713995045
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p4096-c1-r1-20260907T193407.663559Z/result.json",
+        "sha256": "e216bc97b9f93ae4738c53417a6e04869b2de1a369eaf0068c8327b5a75de856",
+        "metrics": {
+          "output_throughput": 25.638788846731547,
+          "median_ttft_ms": 1419.1821975109633,
+          "p95_ttft_ms": 1419.9085800122702,
+          "median_tpot_ms": 28.12641524016769,
+          "p95_tpot_ms": 28.162173364553453,
+          "p95_itl_ms": 112.75927110109478,
+          "p99_itl_ms": 113.06784342159517,
+          "median_e2el_ms": 4991.2355364940595
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p128-c1-r2-20260907T193139.815089Z/result.json",
+        "sha256": "8d428f8054cc7140c46d3a25dd64258a72f5b813fbb6881afde57cfe35bcdf8a",
+        "metrics": {
+          "output_throughput": 35.65261704480977,
+          "median_ttft_ms": 103.68232199107297,
+          "p95_ttft_ms": 103.9051284402376,
+          "median_tpot_ms": 27.448546130156995,
+          "p95_tpot_ms": 27.473979557870784,
+          "p95_itl_ms": 110.120978395571,
+          "p99_itl_ms": 110.32114259083755,
+          "median_e2el_ms": 3589.66677900753
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p4096-c1-rwarmup-20260907T193837.461084Z/result.json",
+        "sha256": "f3f34e0f6523119c69ae2624112c3f684fbf4648bdab5b3ac05503512a7efc16",
+        "metrics": {
+          "output_throughput": 24.768034841523523,
+          "median_ttft_ms": 1453.2517544867005,
+          "p95_ttft_ms": 1456.2847835477442,
+          "median_tpot_ms": 29.240641027723814,
+          "p95_tpot_ms": 29.311737546369095,
+          "p95_itl_ms": 117.30734155862592,
+          "p99_itl_ms": 117.64576295390725,
+          "median_e2el_ms": 5166.813165007625
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p4096-c1-r3-20260907T193911.143479Z/result.json",
+        "sha256": "4a335f46682d93b4fb0d6036f0903dcceb3a8f502473d4d6d5b8246461b987be",
+        "metrics": {
+          "output_throughput": 24.73184099388056,
+          "median_ttft_ms": 1456.3884920207784,
+          "p95_ttft_ms": 1458.1589474517386,
+          "median_tpot_ms": 29.2890454960096,
+          "p95_tpot_ms": 29.334464770449348,
+          "p95_itl_ms": 117.44296545803081,
+          "p99_itl_ms": 117.76621646247804,
+          "median_e2el_ms": 5176.097270013997
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p128-c1-r1-20260907T193111.652549Z/result.json",
+        "sha256": "a1a20df3f2a4236ee3251b20a9e958ef2597b4edffed7620efd8d9c79dcf5f69",
+        "metrics": {
+          "output_throughput": 35.6298571715364,
+          "median_ttft_ms": 103.9576625043992,
+          "p95_ttft_ms": 104.29697599320207,
+          "median_tpot_ms": 27.47125526790243,
+          "p95_tpot_ms": 27.483527460291352,
+          "p95_itl_ms": 110.15262645378243,
+          "p99_itl_ms": 110.44601376575883,
+          "median_e2el_ms": 3592.898563510971
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p128-c1-r3-20260907T193614.304816Z/result.json",
+        "sha256": "695897da5aed33595381a318a84b5d4e273406b00b8b9e671cdc7007afcfbd6c",
+        "metrics": {
+          "output_throughput": 34.513924194572446,
+          "median_ttft_ms": 103.2769360463135,
+          "p95_ttft_ms": 103.62008975353092,
+          "median_tpot_ms": 28.39470770843437,
+          "p95_tpot_ms": 28.401287267943406,
+          "p95_itl_ms": 113.82726322917733,
+          "p99_itl_ms": 114.12106993957423,
+          "median_e2el_ms": 3709.597382490756
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p128-c1-rwarmup-20260907T193043.535551Z/result.json",
+        "sha256": "5761b8d0e608063be0012839171d8820f684b36df51d2f0e7251ed3462236ad1",
+        "metrics": {
+          "output_throughput": 35.70650368406555,
+          "median_ttft_ms": 103.67117999703623,
+          "p95_ttft_ms": 104.88336452690419,
+          "median_tpot_ms": 27.419126145706663,
+          "p95_tpot_ms": 27.438352001930852,
+          "p95_itl_ms": 109.92016431118827,
+          "p99_itl_ms": 110.22368314210325,
+          "median_e2el_ms": 3586.7255229968578
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p1024-c1-r2-20260907T193305.557857Z/result.json",
+        "sha256": "e3212b76d76991fc8b9d4e3923ca480bbed738187cbc5d48fce80c0338267de1",
+        "metrics": {
+          "output_throughput": 33.057589602805805,
+          "median_ttft_ms": 335.9857304894831,
+          "p95_ttft_ms": 336.1808280023979,
+          "median_tpot_ms": 27.839917173026144,
+          "p95_tpot_ms": 27.855553079325905,
+          "p95_itl_ms": 111.55986166268121,
+          "p99_itl_ms": 111.81423818168696,
+          "median_e2el_ms": 3871.798655978637
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p1024-c1-r4-20260907T193808.235158Z/result.json",
+        "sha256": "242cc1424088181d9af77e35ee8dba3454bde03221a675beae19d717e5f127d1",
+        "metrics": {
+          "output_throughput": 31.866868270696003,
+          "median_ttft_ms": 343.3305505022872,
+          "p95_ttft_ms": 343.50386256119236,
+          "median_tpot_ms": 28.919523405406157,
+          "p95_tpot_ms": 28.963789937139566,
+          "p95_itl_ms": 115.9715743502602,
+          "p99_itl_ms": 116.36627142608631,
+          "median_e2el_ms": 4016.1177745030727
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "control",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-control/results/plow-p128-c1-r4-20260907T193642.365535Z/result.json",
+        "sha256": "eab76b52634bb6c8477d39bd730efa89d94e4563b4411189238cc0092ffc2f50",
+        "metrics": {
+          "output_throughput": 34.4900682735481,
+          "median_ttft_ms": 103.46254400792532,
+          "p95_ttft_ms": 103.52375471557025,
+          "median_tpot_ms": 28.41294674004802,
+          "p95_tpot_ms": 28.426942701669642,
+          "p95_itl_ms": 113.84861113911029,
+          "p99_itl_ms": 114.22472817124799,
+          "median_e2el_ms": 3711.906779994024
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p1024-c1-r4-20260907T193808.234089Z/result.json",
+        "sha256": "17cba2894144ae0d23f171bc9f0b8e7a0d717146a2efc3d01d1835398a0a2d70",
+        "metrics": {
+          "output_throughput": 36.274019890337,
+          "median_ttft_ms": 354.5273710042238,
+          "p95_ttft_ms": 355.2067358570639,
+          "median_tpot_ms": 24.99172911432931,
+          "p95_tpot_ms": 25.009849427981067,
+          "p95_itl_ms": 100.44980094244238,
+          "p99_itl_ms": 100.59143868216779,
+          "median_e2el_ms": 3528.1505265447777
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p1024-c1-r2-20260907T193305.558656Z/result.json",
+        "sha256": "ab977d5d96d54b5ee38633d82f2766d71234fad32aa8999fb7f2099d92ef0068",
+        "metrics": {
+          "output_throughput": 37.08531824764895,
+          "median_ttft_ms": 347.55191748263314,
+          "p95_ttft_ms": 353.4400102245854,
+          "median_tpot_ms": 24.410046393686066,
+          "p95_tpot_ms": 24.79785786763816,
+          "p95_itl_ms": 98.93389382341411,
+          "p99_itl_ms": 100.36632954783272,
+          "median_e2el_ms": 3447.627809480764
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p1024-c1-rwarmup-20260907T193710.136666Z/result.json",
+        "sha256": "efde969c54b116cab25983c3b666ff5834900a75a8eb3073544a0aabce33fceb",
+        "metrics": {
+          "output_throughput": 36.94094502378067,
+          "median_ttft_ms": 348.20441200281493,
+          "p95_ttft_ms": 354.1082962707151,
+          "median_tpot_ms": 24.54583611826075,
+          "p95_tpot_ms": 24.96799450547812,
+          "p95_itl_ms": 100.09733200713526,
+          "p99_itl_ms": 100.43680616712663,
+          "median_e2el_ms": 3465.5255990219302
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p4096-c1-r3-20260907T193911.144158Z/result.json",
+        "sha256": "c381a7ec0af13e960d1c89475fd50097638f16667276a1df1f517d6e1e2dd168",
+        "metrics": {
+          "output_throughput": 29.392514358243158,
+          "median_ttft_ms": 1420.887483021943,
+          "p95_ttft_ms": 1421.5509820583975,
+          "median_tpot_ms": 23.103416011637574,
+          "p95_tpot_ms": 23.115221135947102,
+          "p95_itl_ms": 92.5775169453118,
+          "p99_itl_ms": 92.77652530523483,
+          "median_e2el_ms": 4354.461235488998
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p128-c1-rwarmup-20260907T193545.829566Z/result.json",
+        "sha256": "22376bf0b1cbbe31a1fc20370d23657df579043778b250c3bba173c48a693d67",
+        "metrics": {
+          "output_throughput": 42.88466309306095,
+          "median_ttft_ms": 97.39834550418891,
+          "p95_ttft_ms": 98.22730875166599,
+          "median_tpot_ms": 22.73714435827647,
+          "p95_tpot_ms": 22.801569254938734,
+          "p95_itl_ms": 91.47976748063229,
+          "p99_itl_ms": 91.84251328697428,
+          "median_e2el_ms": 2985.365416505374
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p128-c1-r1-20260907T193111.654481Z/result.json",
+        "sha256": "fdd7787b40485cdb993f25ef609decd806a5d0323e4acc86408b1e2a20951f99",
+        "metrics": {
+          "output_throughput": 42.3747652256676,
+          "median_ttft_ms": 97.24141101469286,
+          "p95_ttft_ms": 97.89198689395562,
+          "median_tpot_ms": 23.023444570703653,
+          "p95_tpot_ms": 23.07776696423131,
+          "p95_itl_ms": 92.43197053438053,
+          "p99_itl_ms": 93.15331121440977,
+          "median_e2el_ms": 3021.798301488161
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p4096-c1-r2-20260907T193441.298946Z/result.json",
+        "sha256": "dac894fd9291b811ef8c2daf02838bbfe67bac55e1966980eaf01f7cf3183375",
+        "metrics": {
+          "output_throughput": 26.62115974080795,
+          "median_ttft_ms": 1524.9691459757742,
+          "p95_ttft_ms": 1526.5465868491447,
+          "median_tpot_ms": 25.84725455128896,
+          "p95_tpot_ms": 25.925090430028497,
+          "p95_itl_ms": 104.01379945978988,
+          "p99_itl_ms": 104.44528707012068,
+          "median_e2el_ms": 4807.570473989472
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p1024-c1-r1-20260907T193236.185678Z/result.json",
+        "sha256": "a30078ac4869e59081c2b142f5fdddb58d1195471c50888edbb8fec221ac16cf",
+        "metrics": {
+          "output_throughput": 38.02676422045417,
+          "median_ttft_ms": 342.35828899545595,
+          "p95_ttft_ms": 342.8143082128372,
+          "median_tpot_ms": 23.807297889729888,
+          "p95_tpot_ms": 23.940784042709375,
+          "p95_itl_ms": 95.7892603619257,
+          "p99_itl_ms": 96.37709982867817,
+          "median_e2el_ms": 3366.277421999257
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p4096-c1-rwarmup-20260907T193334.582807Z/result.json",
+        "sha256": "5bf6412302245f0c3ddf2279667ea5be77febaabb1adad437b0bbc0764814688",
+        "metrics": {
+          "output_throughput": 26.756679929924818,
+          "median_ttft_ms": 1523.6755244841333,
+          "p95_ttft_ms": 1524.4668595783878,
+          "median_tpot_ms": 25.815399629925558,
+          "p95_tpot_ms": 25.8401008364772,
+          "p95_itl_ms": 103.74579160707071,
+          "p99_itl_ms": 104.17281904723495,
+          "median_e2el_ms": 4802.603888994781
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "2",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p128-c1-r2-20260907T193139.814898Z/result.json",
+        "sha256": "b1645a4e83843d59013380b40ae51297a317eedaf56fcc1fa187b552909d6e74",
+        "metrics": {
+          "output_throughput": 42.25206571213246,
+          "median_ttft_ms": 97.26574251544662,
+          "p95_ttft_ms": 97.38321581389755,
+          "median_tpot_ms": 23.09741318894103,
+          "p95_tpot_ms": 23.150967719289106,
+          "p95_itl_ms": 92.91040083626285,
+          "p99_itl_ms": 93.3625686034793,
+          "median_e2el_ms": 3030.556551995687
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p128-c1-r3-20260907T193614.306641Z/result.json",
+        "sha256": "9139127cecf15fa4633d850437f44328eae6a6dd481b182a63b55faa31484e4e",
+        "metrics": {
+          "output_throughput": 42.66513719615094,
+          "median_ttft_ms": 99.016145511996,
+          "p95_ttft_ms": 99.21044562361203,
+          "median_tpot_ms": 22.85028646074925,
+          "p95_tpot_ms": 22.915889591337947,
+          "p95_itl_ms": 91.70936623413581,
+          "p99_itl_ms": 92.57716371910647,
+          "median_e2el_ms": 3001.085800526198
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p1024-c1-rwarmup-20260907T193207.624488Z/result.json",
+        "sha256": "944aa793f201643e432db5eff217c72bccfb7687f3431590d427f2f53787f713",
+        "metrics": {
+          "output_throughput": 38.34945510094221,
+          "median_ttft_ms": 337.7582970133517,
+          "p95_ttft_ms": 340.26333437359426,
+          "median_tpot_ms": 23.62461284253981,
+          "p95_tpot_ms": 23.72987086948385,
+          "p95_itl_ms": 94.9636989244027,
+          "p99_itl_ms": 95.70915901975239,
+          "median_e2el_ms": 3338.6606635176577
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p128-c1-r4-20260907T193642.365507Z/result.json",
+        "sha256": "101c1801982171d81d19cd32890af054b490a1125132d29d8026065ee38414f8",
+        "metrics": {
+          "output_throughput": 41.988879383389964,
+          "median_ttft_ms": 102.08723548566923,
+          "p95_ttft_ms": 104.6090830990579,
+          "median_tpot_ms": 23.169501082821363,
+          "p95_tpot_ms": 23.447515541599607,
+          "p95_itl_ms": 93.57961686619092,
+          "p99_itl_ms": 94.66033781063743,
+          "median_e2el_ms": 3044.613873003982
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 0,
+        "repetition": "1",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p4096-c1-r1-20260907T193407.664989Z/result.json",
+        "sha256": "7bd1b2fa6fd27afe3ad49e65bb4e6a74d40370a9daa74f3efde066d6f75bb4ac",
+        "metrics": {
+          "output_throughput": 26.636975557922568,
+          "median_ttft_ms": 1523.3939489990007,
+          "p95_ttft_ms": 1525.8629422576632,
+          "median_tpot_ms": 25.84660366153726,
+          "p95_tpot_ms": 25.888386986806886,
+          "p95_itl_ms": 104.00262295734137,
+          "p99_itl_ms": 104.36982031096704,
+          "median_e2el_ms": 4805.9126140142325
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "4",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p4096-c1-r4-20260907T193944.777374Z/result.json",
+        "sha256": "303ccc992781b82e16bfa304f1ef758a45a813418714607e55b5a1eedade8390",
+        "metrics": {
+          "output_throughput": 29.397836001726986,
+          "median_ttft_ms": 1421.172253030818,
+          "p95_ttft_ms": 1422.1468996838666,
+          "median_tpot_ms": 23.093174582697436,
+          "p95_tpot_ms": 23.09792501587003,
+          "p95_itl_ms": 92.57674025720917,
+          "p99_itl_ms": 92.80617791984696,
+          "median_e2el_ms": 4354.278807993978
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 4096,
+        "crossover_block": 1,
+        "repetition": "warmup",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p4096-c1-rwarmup-20260907T193837.460070Z/result.json",
+        "sha256": "2ac13cdd86d20e7cea822b1b9dede148cc8f2bdc0b199ba7b9f2e2b1f4428e41",
+        "metrics": {
+          "output_throughput": 27.72636785847003,
+          "median_ttft_ms": 1493.2907934999093,
+          "p95_ttft_ms": 1496.3254520640476,
+          "median_tpot_ms": 25.265976881945697,
+          "p95_tpot_ms": 25.32017080050959,
+          "p95_itl_ms": 101.54068143747281,
+          "p99_itl_ms": 101.78667217434848,
+          "median_e2el_ms": 4702.069857507013
+        },
+        "text_sha256": [
+          "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+          "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+          "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+          "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 128,
+        "crossover_block": 0,
+        "repetition": "warmup",
+        "gpu": 3,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p128-c1-rwarmup-20260907T193043.534629Z/result.json",
+        "sha256": "5c3dd8800c18113f35d4887b41fa956e326eedadc9c5b8959bac35df81357339",
+        "metrics": {
+          "output_throughput": 42.36738123672494,
+          "median_ttft_ms": 96.08040799503215,
+          "p95_ttft_ms": 96.43489307491109,
+          "median_tpot_ms": 23.04299462583891,
+          "p95_tpot_ms": 23.117104783176636,
+          "p95_itl_ms": 92.59201973618474,
+          "p99_itl_ms": 93.0806539801415,
+          "median_e2el_ms": 3022.642422001809
+        },
+        "text_sha256": [
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+          "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+          "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+        ]
+      },
+      {
+        "arm": "candidate",
+        "input": 1024,
+        "crossover_block": 1,
+        "repetition": "3",
+        "gpu": 0,
+        "result": "/app/plow/build-gemma31/bench-direct-gemv-mm1-candidate/results/plow-p1024-c1-r3-20260907T193739.110091Z/result.json",
+        "sha256": "b26807d03144c43bf3ec2965ef0eb2b46c6692d310334909f8d37b3bee97ab8d",
+        "metrics": {
+          "output_throughput": 36.28487032424796,
+          "median_ttft_ms": 354.2424709885381,
+          "p95_ttft_ms": 354.7974137356505,
+          "median_tpot_ms": 24.98000846853971,
+          "p95_tpot_ms": 25.034056720300942,
+          "p95_itl_ms": 100.41145446011797,
+          "p99_itl_ms": 100.68574169185013,
+          "median_e2el_ms": 3526.7035464930814
+        },
+        "text_sha256": [
+          "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+          "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+          "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+          "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+        ]
+      }
+    ],
+    "accounting": {
+      "completed_requests": 144,
+      "output_tokens": 18432
+    },
+    "limitations": [
+      "Plow-only candidate/control study, not a new vLLM backend comparison.",
+      "Same frozen binary, checkpoint, BF16 weights/activations/KV, assets, PF512, multistep4, fusion and ordinary MM4 decode GQ object; only the MM1 lowrung decode GQ object changes.",
+      "Separate exclusively leased MI300X GPUs with candidate/control assignment reversed halfway; clocks and power remain unpinned.",
+      "SSE intervals include multistep delivery bursts and the empty finishing event; these are not isolated GPU token durations."
+    ]
+  },
+  "combined_full_model": {
+    "bitwise": true,
+    "steps": 51,
+    "full_logit_rows": 107,
+    "status": [
+      {
+        "arm": "combined",
+        "exit": 0,
+        "timeout": false,
+        "gpu": "2"
+      }
+    ],
+    "groups": {
+      "ctx128-d1": {
+        "median_ms": 22.180563,
+        "mean_ms": 22.376763,
+        "samples_ms": [
+          21.647598,
+          22.334002,
+          22.107494,
+          23.093035,
+          22.035998,
+          21.99748,
+          23.121968,
+          22.253632,
+          22.001035,
+          23.175388
+        ]
+      },
+      "ctx128-d4": {
+        "median_ms": 34.218374499999996,
+        "mean_ms": 34.245485,
+        "samples_ms": [
+          33.923304,
+          34.467487,
+          33.999397,
+          34.645973,
+          34.242801,
+          34.193948
+        ]
+      },
+      "ctx4096-d1": {
+        "median_ms": 22.988379000000002,
+        "mean_ms": 23.1580807,
+        "samples_ms": [
+          22.430706,
+          22.880348,
+          22.954038,
+          23.716436,
+          22.907609,
+          23.076631,
+          23.828995,
+          23.02272,
+          22.913458,
+          23.849866
+        ]
+      },
+      "ctx4096-d4": {
+        "median_ms": 36.6282675,
+        "mean_ms": 36.590157,
+        "samples_ms": [
+          36.476355,
+          36.703805,
+          36.55273,
+          36.886458,
+          36.119362,
+          36.802232
+        ]
+      },
+      "ctx8176-d1": {
+        "median_ms": 23.546097500000002,
+        "mean_ms": 23.6829363,
+        "samples_ms": [
+          23.395497,
+          23.585811,
+          23.349819,
+          24.390552,
+          23.5176,
+          23.574595,
+          24.135943,
+          23.445672,
+          23.177742,
+          24.256132
+        ]
+      },
+      "ctx8176-d4": {
+        "median_ms": 38.185702500000005,
+        "mean_ms": 38.181140166666665,
+        "samples_ms": [
+          37.942984,
+          38.308371,
+          38.063034,
+          38.392275,
+          37.962604,
+          38.417573
+        ]
+      }
+    }
+  },
+  "production_scope": {
+    "patch_sha256": "df76f815c83f4fbf8b45d9c90f86075a32281fda1a10e1e58723e15a28d93ced",
+    "changes": "Direct existing GEMV helper call for gfx942 ordinary BF16 GQ MM1/MM4 only; FP8,FP8KV,MXFP4,MLA-prefill,K3,mixed,prefill and MM8 paths excluded. No arithmetic or synchronization change.",
+    "source_byte_identical_to_built_candidate_before_independent_nrn_marker_addition": true,
+    "object_equivalence": [
+      {
+        "profile": "mm1",
+        "candidate": "/app/plow/build-gemma31/projection-counters/direct-gemv-bf16/hsaco-mm1/interp_decode_gq.elf",
+        "candidate_sha256": "e9c4862c39ae653d299dff07c2bbd4fa3bd96960fc5137e9b214f64c4d1460a4",
+        "reference": "/app/plow/build-gemma31/projection-counters/direct-gemv-final/hsaco-mm1-wpe5/interp_decode_gq.elf",
+        "reference_sha256": "1dc5c9ace23734759b0ca796680716b4ed430eaf3c32673b38d6896d2f1e6693",
+        "allocated_section_byte_identity": {
+          ".note": true,
+          ".dynsym": false,
+          ".gnu.hash": false,
+          ".hash": false,
+          ".dynstr": false,
+          ".rodata": true,
+          ".text": true,
+          ".dynamic": true,
+          ".relro_padding": true,
+          ".data": true,
+          ".bss": true
+        },
+        "dynamic_string_differences": {
+          "candidate": [
+            "__hip_cuid_cb0661c24c96b27a"
+          ],
+          "reference": [
+            "__hip_cuid_624d103cd748a089"
+          ]
+        },
+        "normalized_dynamic_symbols_equal": true,
+        "interpretation": "Instructions,rodata,data,AMDGPUmetadata,dynamic symboladdresses/values andrelocationsarebitwiseidentical; onlycompiler-generatedHIPcompile-unit-IDsymbolstring anditslookuphashes/orderingdiffer."
+      },
+      {
+        "profile": "mm4",
+        "candidate": "/app/plow/build-gemma31/projection-counters/direct-gemv-bf16/hsaco-mm4/interp_decode_gq.elf",
+        "candidate_sha256": "6afd78e4cc5c4505296a4d2e92f383057815984b12e29296e2a9cdc919553bdb",
+        "reference": "/app/plow/build-gemma31/projection-counters/direct-gemv-final/hsaco/interp_decode_gq.elf",
+        "reference_sha256": "00dd848f26075d132facebc5bb534b18b774a19d597a8f7236c55557aa9414cb",
+        "allocated_section_byte_identity": {
+          ".note": true,
+          ".dynsym": false,
+          ".gnu.hash": false,
+          ".hash": false,
+          ".dynstr": false,
+          ".rodata": true,
+          ".text": true,
+          ".dynamic": true,
+          ".relro_padding": true,
+          ".data": true,
+          ".bss": true
+        },
+        "dynamic_string_differences": {
+          "candidate": [
+            "__hip_cuid_9770dc1b9be96cd1"
+          ],
+          "reference": [
+            "__hip_cuid_4ae195c64bc70f4a"
+          ]
+        },
+        "normalized_dynamic_symbols_equal": true,
+        "interpretation": "Instructions,rodata,data,AMDGPUmetadata,dynamic symboladdresses/values andrelocationsarebitwiseidentical; onlycompiler-generatedHIPcompile-unit-IDsymbolstring anditslookuphashes/orderingdiffer."
+      },
+      {
+        "profile": "mm8",
+        "candidate": "/app/plow/build-gemma31/projection-counters/direct-gemv-bf16/hsaco-mm8/interp_decode_gq.elf",
+        "candidate_sha256": "cdd4f2b9a1d80ddcadc4890a1e6bccc6dbaab6902542232ccd82f0df6ebe15b2",
+        "reference": "/app/plow/build-gemma31/projection-counters/control-hsaco-mm8/interp_decode_gq.elf",
+        "reference_sha256": "ff770b40f50753d3ca361035ee2cb0f345cf24896e8db308bc99069b031f74fb",
+        "allocated_section_byte_identity": {
+          ".note": true,
+          ".dynsym": false,
+          ".gnu.hash": false,
+          ".hash": false,
+          ".dynstr": false,
+          ".rodata": true,
+          ".text": true,
+          ".dynamic": false,
+          ".relro_padding": true,
+          ".data": true,
+          ".bss": true
+        },
+        "dynamic_string_differences": {
+          "candidate": [
+            "__hip_cuid_d80bf17fb3699e7"
+          ],
+          "reference": [
+            "__hip_cuid_6912496d2e096d23"
+          ]
+        },
+        "normalized_dynamic_symbols_equal": true,
+        "interpretation": "Instructions,rodata,data,AMDGPUmetadata,dynamic symboladdresses/values andrelocationsarebitwiseidentical; onlycompiler-generatedHIPcompile-unit-IDsymbolstring anditslookuphashes/orderingdiffer."
+      }
+    ]
+  },
+  "fresh_backend_comparison": "72 stock runs on verified fresh vLLM0.28 ROCm7.14 and combined guardedMM1/MM4 Plow servers running; no backend win claimed."
+}

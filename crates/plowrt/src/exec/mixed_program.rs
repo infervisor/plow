@@ -39,6 +39,41 @@ fn gemm(op: DevOp) -> bool {
     )
 }
 
+fn split_norm_residual_norm(inst: &DevInst64, rows: u32) -> Result<[DevInst64; 2]> {
+    if inst.i[0] != rows
+        || inst.i[1] == 0
+        || inst.i[2..] != [0; 6]
+        || inst.fj[2] != 0
+        || inst.t[6..] != [TENSOR_NONE16; 2]
+        || inst.t[..4].contains(&TENSOR_NONE16)
+        || inst.t[0] == inst.t[1]
+        || inst.t[4..6]
+            .iter()
+            .any(|g| *g != TENSOR_NONE16 && inst.t[..2].contains(g))
+    {
+        return Err(reject("unsupported sandwich norm operands"));
+    }
+    // Keep the BF16 residual store and its dependent reload. Both mixed consumers
+    // already implement the ordinary logical reduction width and runtime rows.
+    let mut residual = DevInst64 {
+        op: DevOp::NormResidual as u16,
+        t: [TENSOR_NONE16; 8],
+        ..Default::default()
+    };
+    residual.t[..4].copy_from_slice(&inst.t[1..5]);
+    residual.i[..2].copy_from_slice(&inst.i[..2]);
+    residual.fj = inst.fj;
+    let mut norm = DevInst64 {
+        op: DevOp::RmsNorm as u16,
+        t: [TENSOR_NONE16; 8],
+        ..Default::default()
+    };
+    norm.t[..3].copy_from_slice(&[inst.t[0], inst.t[1], inst.t[5]]);
+    norm.i[..2].copy_from_slice(&inst.i[..2]);
+    norm.fj[0] = inst.fj[0];
+    Ok([residual, norm])
+}
+
 fn bytes(factors: &[u32]) -> Result<u64> {
     factors.iter().try_fold(1u64, |size, &factor| {
         size.checked_mul(factor as u64)
@@ -280,6 +315,11 @@ pub(crate) fn synthesize(blob: &DevBlob, physical_batch: usize) -> Result<Synthe
                 continue;
             }
             match code {
+                DevOp::NormResidualNorm => {
+                    instructions.extend(split_norm_residual_norm(&inst, source.t)?);
+                    index += 1;
+                    continue;
+                }
                 DevOp::Embed | DevOp::RmsNorm | DevOp::NormResidual | DevOp::GemmGlu => {
                     if inst.i[0] != source.t {
                         return Err(reject("body row count mismatch"));

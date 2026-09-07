@@ -190,11 +190,16 @@
     "Ordinary prefill retains121 RMSNorm and120 NormResidual operations; existing PLOW_PF_GFUSE is a bounded next experiment, subject to object support and numerical checks.",
     "All phases use HeadNormRope to combine head normalization/rotation/KV placement as applicable to each head and projection.",
     "Mixed launch combines scheduling but preserves sequential decode GEMV and prefill GEMM within projection helpers.",
-    "PLOW_PF_GFUSE currently cannot combine with mixed runtime: NormResidualNorm is rejected in mixed_program.rs, and mixed NRN lacks dynamic logical512 reduction handling. Do not force the unsupported opcode."
+    "At the original audit, mixed synthesis rejected NRN. The runtime follow-up below now expands NRN into the existing mixed consumers and checks ordinary prefill object support."
   ],
   "reuse_findings": [
     "Actual vLLM decode trace selects its custom ROCm wvSplitK_hf_sml; Plow shipping projections remain its own GEMV helpers.",
     "Actual vLLM attention uses TRITON_ATTN with AITER disabled in the matched baseline. No claim of AITER backend performance or universal kernel-port completeness.",
     "Packing and phase selection remain runtime-controlled; no new model compilation for mixed-row combinations."
-  ]
+  ],
+  "runtime_follow_up": {
+    "report": "gemma4-31b-mi300x-prefill-nrn-20260907.json",
+    "status": "Runtime now admits ordinary packed NRN prefill with a checked opcode marker and expands NRN to the existing mixed NormResidual/RmsNorm consumers. The original instruction inventory above remains the captured shipping assets, with PF_GFUSE off.",
+    "qualification": "Three capacities, exact mixed-program/dependency parity, mixed/terminal/lifecycle/HTTP gates; PF_GFUSE default remains off until stock comparison."
+  }
 }

@@ -558,6 +558,13 @@ extern "C" __device__ unsigned plow_l2_place_dispatch_1 = 1;
 #endif
 #define PLOW_BUCKET_PREFILL (!PLOW_BUCKET_DECODE)
 
+#if PLOW_BUCKET_PREFILL && !PLOW_MIXED_STEP && !defined(PLOW_BUCKET_FLASH) && \
+    !defined(PLOW_BUCKET_PACKED_MLA_NORM) && !defined(PLOW_BUCKET_PACKED_KDA) && \
+    !defined(PLOW_BUCKET_XREDUCE) && \
+    (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_NORM_RESIDUAL_NORM)
+extern "C" __device__ unsigned plow_prefill_nrn_consumer_1 = 1;
+#endif
+
 /* ---------------------------------------------------------------------------
  * THE FOUR PRECISION AXES, AND WHICH FLAG IS WHICH.
  *
@@ -5095,6 +5102,17 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
          * is the only I-cache lever the ISA gives this part, so bounding from above is the only
          * experiment available. */
         __asm__ __volatile__("s_icache_inv" ::: "memory");
+#endif
+#if defined(__gfx942__) && PLOW_GLOBAL_QUEUE && !PLOW_BUCKET_PREFILL && \
+    !PLOW_BUCKET_FLASH && !PLOW_MIXED_STEP && \
+    (PLOW_GEMV_MM == 1 || PLOW_GEMV_MM == 4) && \
+    !PLOW_FP8 && !PLOW_FP8_KV && !PLOW_MXFP4 && \
+    !PLOW_MLA_PREFILL && !PLOW_K3 && \
+    (!PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV)
+        if (in->op == PLOW_DOP_GEMV) {
+            const CInst gemv_in = plow_scalar_ptr(in);
+            exec_gemv(gemv_in, plow_scalar_ptr(tens), e.slice, gemv_in->blocks, sm.gm);
+        } else
 #endif
         plow_exec(in, e.slice, tens, &sm, &prog);
 #endif
