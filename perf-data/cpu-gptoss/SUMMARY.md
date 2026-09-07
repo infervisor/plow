@@ -418,3 +418,33 @@ request handling. Closing it needs ~27% more prefill throughput. Worker idle at 
 of wall (busy mean 1514.8, min 1461.4, max 1620.5 against a 1780.3 ms wall), of which only the
 ~106 ms mean-to-max spread is imbalance; the rest is dependency stalls on the critical path. That
 caps the remaining bit-exact headroom well below what the cell needs.
+
+#### MXFP4 dense prefill on GPT-OSS: a memory-for-latency trade, unlike the 12B (96ad1d5)
+
+Back-to-back serve A/B, same session, pre-96ad1d5 blob (bf16 dense prefill) against a re-emitted
+one (fp4 dense prefill), summarize c=1, two pairs:
+
+| | TTFT mean | RSS |
+|---|---|---|
+| bf16 dense prefill | 2604 / 2603 | 15.27 GiB |
+| fp4 dense prefill | 2705 / 2680 | 12.88 GiB |
+
+So on GPT-OSS the fp4 dense prefill costs about **3.4% TTFT to save 2.39 GiB**. That is the
+opposite balance from Gemma-4-12B, where the same change is -30% prefill AND -20.4 GiB, because
+the 12B is dense (prefill streams its whole 22 GiB weight set per chunk) while GPT-OSS is MoE and
+only q/k/v/o plus lm_head move inside a much larger expert read. `PLOW_MX4_PREFILL` is per-emit,
+so a GPT-OSS blob can be emitted with it off when TTFT matters more than 2.4 GB; the default stays
+on because the dense case is where it is dramatic. Decode is unaffected either way (25-26 ms).
+
+**Methodology warning, and it invalidated a reading of mine.** This box drifted **5.4% over nine
+hours**: the recorded 22:25 figure for summarize c=1 is 2469 ms, and the SAME blob re-measured at
+06:53 gives 2603. My first pass at this comparison used the recorded number as the baseline and
+concluded fp4 prefill had made everything worse; the controlled back-to-back A/B shows most of
+that was drift. Cross-session absolute comparisons on this box are unsafe below ~10%, even
+serve-to-serve with identical settings. Only interleaved or same-session pairs should be trusted.
+
+This does not change the contested cell: summarize TTFT at c=1 is 2603 (or 2693 with fp4 prefill)
+against vLLM's 1829, a ~42% gap either way. Note also that the vLLM GPT-OSS baseline is itself from
+an earlier session and was never re-verified here, unlike the Gemma-4-12B vLLM baseline which was;
+given the drift measured above that number carries the same uncertainty, though not nearly enough
+to close a 42% gap.

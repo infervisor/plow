@@ -1,0 +1,350 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8096",
+  "model": "6cee5e81ee83917806bbde320786a8fb61efebee",
+  "server_models": [
+   "6cee5e81ee83917806bbde320786a8fb61efebee"
+  ],
+  "timestamp": "2026-09-07T06:54:52+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8096",
+   "--model",
+   "6cee5e81ee83917806bbde320786a8fb61efebee",
+   "--workload",
+   "summarize",
+   "--concurrency",
+   "1",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/",
+   "--out",
+   "perf-data/cpu-gemma26b/h2h/oss-old2-abold2.json",
+   "--md",
+   "perf-data/cpu-gemma26b/h2h/oss-old2-abold2.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "summarize",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 31.051617614983115,
+    "ttft_s": {
+     "mean": 2.2632895834976807,
+     "p50": 2.602554212004179,
+     "p90": 2.8600576820026617,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.025636526430707095,
+     "p50": 0.025590179968507043,
+     "p90": 0.02654453814316112,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 3.878488833001029,
+     "p50": 4.232438795996131,
+     "p90": 4.545649642008357,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1105.125,
+     "p50": 1243,
+     "p90": 1411,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 16.48867399915901,
+    "req_per_s": 0.2576355312368595,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 31.051617614983115,
+     "ttft_s": {
+      "mean": 2.2632895834976807,
+      "p50": 2.602554212004179,
+      "p90": 2.8600576820026617,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.025636526430707095,
+      "p50": 0.025590179968507043,
+      "p90": 0.02654453814316112,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 3.878488833001029,
+      "p50": 4.232438795996131,
+      "p90": 4.545649642008357,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1105.125,
+      "p50": 1243,
+      "p90": 1411,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 16.48867399915901,
+     "req_per_s": 0.2576355312368595,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.5791084740194492,
+     "tpot_s": 0.024928742269929943,
+     "latency_s": 3.149716102023376,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 822,
+      "completion_tokens": 64,
+      "total_tokens": 886,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "- **Early time\u2011keeping**:  \n  * Sundials and water clocks were the first devices",
+     "text_chars": 263,
+     "index": 0,
+     "kind": "summarize",
+     "t_start": 1788764096.8268926,
+     "prompt_tokens_client": 812,
+     "prompt_tokens_server": 822,
+     "prompt_chars": 3908,
+     "prompt_tokens": 812
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.894491847982863,
+     "tpot_s": 0.02654453814316112,
+     "latency_s": 4.566912014997797,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1443,
+      "completion_tokens": 64,
+      "total_tokens": 1507,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**  \nGlaciers erode valleys by sliding, plucking, and melt\u2011water action",
+     "text_chars": 270,
+     "index": 1,
+     "kind": "summarize",
+     "t_start": 1788764099.979005,
+     "prompt_tokens_client": 1411,
+     "prompt_tokens_server": 1443,
+     "prompt_chars": 7075,
+     "prompt_tokens": 1411
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.734023648983566,
+     "tpot_s": 0.025590179968507043,
+     "latency_s": 4.346308832988143,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1337,
+      "completion_tokens": 64,
+      "total_tokens": 1401,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Honeybee colony cycle** \u2013 In late winter the queen resumes laying, raising bro",
+     "text_chars": 245,
+     "index": 2,
+     "kind": "summarize",
+     "t_start": 1788764104.5495706,
+     "prompt_tokens_client": 1327,
+     "prompt_tokens_server": 1337,
+     "prompt_chars": 6348,
+     "prompt_tokens": 1327
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4139988159877248,
+     "tpot_s": 0.024867134793783493,
+     "latency_s": 2.980732349999016,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 706,
+      "completion_tokens": 64,
+      "total_tokens": 770,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Two\u2011sentence summary**  \nCoffee is harvested by hand, processed either by wash",
+     "text_chars": 315,
+     "index": 3,
+     "kind": "summarize",
+     "t_start": 1788764108.8991501,
+     "prompt_tokens_client": 693,
+     "prompt_tokens_server": 706,
+     "prompt_chars": 3460,
+     "prompt_tokens": 693
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.4984096490079537,
+     "tpot_s": 0.025330181666908577,
+     "latency_s": 4.094302970013814,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1153,
+      "completion_tokens": 64,
+      "total_tokens": 1217,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Summary**\n\nThe article explains the coffee production process from harvest to ",
+     "text_chars": 332,
+     "index": 4,
+     "kind": "summarize",
+     "t_start": 1788764111.8820472,
+     "prompt_tokens_client": 1134,
+     "prompt_tokens_server": 1153,
+     "prompt_chars": 5429,
+     "prompt_tokens": 1134
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.5236723379930481,
+     "tpot_s": 0.025207658412881077,
+     "latency_s": 3.1118499559815973,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 783,
+      "completion_tokens": 64,
+      "total_tokens": 847,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Headline:**  \n**How a Honeybee Colony Cycles Through the Seasons**\n\n**Key Take",
+     "text_chars": 295,
+     "index": 5,
+     "kind": "summarize",
+     "t_start": 1788764115.9792523,
+     "prompt_tokens_client": 777,
+     "prompt_tokens_server": 783,
+     "prompt_chars": 3759,
+     "prompt_tokens": 777
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.8600576820026617,
+     "tpot_s": 0.02675400904771532,
+     "latency_s": 4.545649642008357,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1466,
+      "completion_tokens": 64,
+      "total_tokens": 1530,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Honeybee colony cycle** \u2013 In late winter the queen resumes laying, raising a b",
+     "text_chars": 256,
+     "index": 6,
+     "kind": "summarize",
+     "t_start": 1788764119.0934339,
+     "prompt_tokens_client": 1444,
+     "prompt_tokens_server": 1466,
+     "prompt_chars": 7044,
+     "prompt_tokens": 1444
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.602554212004179,
+     "tpot_s": 0.02586976714277019,
+     "latency_s": 4.232438795996131,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1252,
+      "completion_tokens": 64,
+      "total_tokens": 1316,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The article traces the evolution of time\u2011keeping from ancient water clocks to mo",
+     "text_chars": 358,
+     "index": 7,
+     "kind": "summarize",
+     "t_start": 1788764123.6426349,
+     "prompt_tokens_client": 1243,
+     "prompt_tokens_server": 1252,
+     "prompt_chars": 6126,
+     "prompt_tokens": 1243
+    }
+   ]
+  }
+ ]
+}
