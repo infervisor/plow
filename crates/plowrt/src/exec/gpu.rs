@@ -570,7 +570,9 @@ impl SegmentRoleValidation for SegmentRoles {
             let object_decode = p.roles.iter().any(|&role| {
                 matches!(
                     role,
-                    plow_asset::segment_roles::GEMV_CTA512 | plow_asset::segment_roles::FP8_M1
+                    plow_asset::segment_roles::GEMV_CTA512
+                        | plow_asset::segment_roles::FP8_M1
+                        | plow_asset::segment_roles::MXFP4_MOE
                 )
             });
             let library_decode = p.roles.contains(&plow_asset::segment_roles::CUBLASLT);
@@ -589,6 +591,7 @@ impl SegmentRoleValidation for SegmentRoles {
                                 plow_asset::segment_roles::INTERPRETER
                                     | plow_asset::segment_roles::GEMV_CTA512
                                     | plow_asset::segment_roles::FP8_M1
+                                    | plow_asset::segment_roles::MXFP4_MOE
                                     | plow_asset::segment_roles::CUBLASLT
                             )
                         })))
@@ -639,6 +642,7 @@ impl SegmentRoleValidation for SegmentRoles {
 
 struct PacketRole {
     function: KernelFn,
+    grid: u32,
     smem: u32,
     block: u32,
     _module: Arc<DecodeModule>,
@@ -742,6 +746,76 @@ fn validate_gemv_decode_role_inst(
         Some(DevOp::GemvGlu) if d.i[5] <= 2 => {
             extent(1, k)?;
             extent(5, n * k)?;
+        }
+        _ => return Err(reject()),
+    }
+    Ok(())
+}
+
+fn validate_mxfp4_moe_role_inst(
+    d: &DevInst64,
+    rows: u32,
+    slices: usize,
+    tensors: &[crate::asset::devblob::DevTensor],
+) -> Result<()> {
+    let reject = || RuntimeError::Rejected("invalid MXFP4 MoE role geometry".into());
+    if rows != 1
+        || d.i[6] != rows
+        || usize::from(d.blocks) != slices
+        || d.i[0] == 0
+        || d.i[0] > 16
+        || d.i[3] == 0
+    {
+        return Err(reject());
+    }
+    let extent = |slot: usize, bytes: u64, optional: bool| -> Result<()> {
+        if optional && d.t[slot] == TENSOR_NONE16 {
+            return Ok(());
+        }
+        if d.t[slot] == TENSOR_NONE16
+            || tensors
+                .get(d.t[slot] as usize)
+                .is_none_or(|tensor| tensor.bytes < bytes)
+        {
+            return Err(reject());
+        }
+        Ok(())
+    };
+    let checked = |values: &[u64]| {
+        values
+            .iter()
+            .try_fold(1u64, |acc, &value| acc.checked_mul(value))
+            .ok_or_else(reject)
+    };
+    let ksel = u64::from(d.i[0]);
+    let experts = u64::from(d.i[3]);
+    extent(2, ksel.checked_mul(8).ok_or_else(reject)?, false)?;
+    match DevOp::from_u16(d.op) {
+        Some(DevOp::MoeGluMx)
+            if d.i[1] > 0
+                && d.i[2] > 0
+                && d.i[2] % 32 == 0
+                && d.i[4] <= 1
+                && d.i[5] <= 3
+                && f32::from_bits(d.fj[0]).is_finite()
+                && f32::from_bits(d.fj[1]).is_finite() =>
+        {
+            let inter = u64::from(d.i[1]);
+            let hidden = u64::from(d.i[2]);
+            extent(0, checked(&[ksel, inter, 2])?, false)?;
+            extent(1, checked(&[hidden, 2])?, false)?;
+            extent(3, checked(&[experts, 2 * inter, hidden.div_ceil(2)])?, false)?;
+            extent(4, checked(&[experts, 2 * inter, hidden.div_ceil(32)])?, false)?;
+            extent(5, checked(&[experts, 2 * inter, 2])?, true)?;
+        }
+        Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 => {
+            let hidden = u64::from(d.i[1]);
+            let inter = u64::from(d.i[2]);
+            extent(0, checked(&[ksel, hidden, 4])?, false)?;
+            extent(1, checked(&[ksel, inter, 2])?, false)?;
+            extent(3, checked(&[experts, hidden, inter.div_ceil(2)])?, false)?;
+            extent(4, checked(&[experts, hidden, inter.div_ceil(32)])?, false)?;
+            extent(5, checked(&[experts, hidden, 2])?, true)?;
         }
         _ => return Err(reject()),
     }
@@ -922,6 +996,8 @@ fn packet_role_segments(
                 validate_attention_role_inst(d, g.t, tensors, 512, true, true)?;
             } else if role == plow_asset::segment_roles::GEMV_CTA512 {
                 validate_gemv_decode_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
+            } else if role == plow_asset::segment_roles::MXFP4_MOE {
+                validate_mxfp4_moe_role_inst(d, g.t, g.stream_ofs.len(), tensors)?;
             } else if role == plow_asset::segment_roles::FP8_M1
                 && (g.t != 1 || d.op != DevOp::GemmFp8 as u16)
             {
@@ -2469,7 +2545,9 @@ impl GpuEngine {
             .any(|&role| {
                 matches!(
                     role,
-                    plow_asset::segment_roles::GEMV_CTA512 | plow_asset::segment_roles::FP8_M1
+                    plow_asset::segment_roles::GEMV_CTA512
+                        | plow_asset::segment_roles::FP8_M1
+                        | plow_asset::segment_roles::MXFP4_MOE
                 )
             })
             .then(|| decode_roles.clone())
@@ -3691,7 +3769,13 @@ impl GpuEngine {
                 );
                 continue;
             }
-            if id != plow_asset::segment_roles::GEMV_CTA512 && prefill.is_empty() {
+            if !matches!(
+                id,
+                plow_asset::segment_roles::GEMV_CTA512
+                    | plow_asset::segment_roles::MXFP4_MOE
+            )
+                && prefill.is_empty()
+            {
                 return Err(RuntimeError::Rejected(
                     "prefill packet roles require a prefill object".into(),
                 ));
@@ -3730,6 +3814,12 @@ impl GpuEngine {
                     "_Z20interp_sm90a_gemv51211PlowProgram",
                     "plow_arena_bytes_gemv512",
                 ),
+                plow_asset::segment_roles::MXFP4_MOE => (
+                    "plow_mxfp4_moe_sm90_abi",
+                    "plow_block_mxfp4_moe",
+                    "plow_sm90a_mxfp4_moe",
+                    "plow_arena_bytes_mxfp4_moe",
+                ),
                 _ => {
                     return Err(RuntimeError::Rejected(
                         "unsupported packet object role".into(),
@@ -3745,6 +3835,14 @@ impl GpuEngine {
             {
                 return Err(RuntimeError::Rejected(
                     "HD512 attention role object hash mismatch".into(),
+                ));
+            }
+            if id == plow_asset::segment_roles::MXFP4_MOE
+                && object.sha256.as_deref()
+                    != Some(plow_asset::decode_objects::image_sha256(&image).as_str())
+            {
+                return Err(RuntimeError::Rejected(
+                    "MXFP4 MoE role object hash mismatch".into(),
                 ));
             }
             let module = DecodeModule::load(&be, &image)?;
@@ -3783,6 +3881,13 @@ impl GpuEngine {
                         return Err(RuntimeError::Rejected("incompatible GEMV512 role".into()));
                     }
                 }
+                plow_asset::segment_roles::MXFP4_MOE => {
+                    if capability != Some(1) || block != Some(BLOCK) {
+                        return Err(RuntimeError::Rejected(
+                            "incompatible MXFP4 MoE role".into(),
+                        ));
+                    }
+                }
                 _ => unreachable!("object role validated above"),
             }
             let block = block.expect("validated role block");
@@ -3799,8 +3904,26 @@ impl GpuEngine {
             }
             let capacity =
                 be.occupancy_blocks_per_sm(function, block, smem as usize)? * be.sm_count();
+            let role_grid = if id == plow_asset::segment_roles::MXFP4_MOE {
+                let multiplier = be
+                    .module_global_u32(&module, "plow_mxfp4_moe_ctas_per_sm")?
+                    .filter(|&value| value == 4)
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected("MXFP4 MoE role lacks CTA capability".into())
+                    })?;
+                grid.checked_mul(multiplier).ok_or_else(|| {
+                    RuntimeError::Rejected("MXFP4 MoE role grid overflows".into())
+                })?
+            } else {
+                grid
+            };
             if (id == plow_asset::segment_roles::GEMV_CTA512 && capacity < grid)
-                || (id != plow_asset::segment_roles::GEMV_CTA512 && capacity != grid)
+                || (id == plow_asset::segment_roles::MXFP4_MOE && capacity < role_grid)
+                || (!matches!(
+                    id,
+                    plow_asset::segment_roles::GEMV_CTA512
+                        | plow_asset::segment_roles::MXFP4_MOE
+                ) && capacity != grid)
             {
                 return Err(RuntimeError::Rejected(
                     "packet role occupancy must equal packet grid".into(),
@@ -3808,6 +3931,7 @@ impl GpuEngine {
             }
             packet_roles[id as usize - 1] = Some(PacketRole {
                 function,
+                grid: role_grid,
                 smem,
                 block,
                 _module: module,
@@ -8125,6 +8249,10 @@ mod decode_rung_tests;
 #[cfg(test)]
 #[path = "gpu_gemv_role_tests.rs"]
 mod gemv_role_tests;
+
+#[cfg(test)]
+#[path = "gpu_mxfp4_moe_role_tests.rs"]
+mod mxfp4_moe_role_tests;
 
 #[path = "gpu_fp8_m1_role.rs"]
 mod fp8_m1_role;

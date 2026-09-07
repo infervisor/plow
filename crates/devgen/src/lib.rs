@@ -66,6 +66,7 @@ mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
 mod decode_objects;
 mod gemv_decode_role;
+mod mxfp4_moe_role;
 pub mod manifest;
 mod projection_rewrite;
 pub mod tune_demand;

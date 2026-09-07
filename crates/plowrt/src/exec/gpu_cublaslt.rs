@@ -119,7 +119,7 @@ impl GpuEngine {
             let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
             self.be.launch_cooperative(
                 role.map_or(self.f, |r| r.function),
-                self.grid,
+                role.map_or(self.grid, |r| r.grid),
                 role.map_or(BLOCK, |r| r.block),
                 role.map_or(self.smem, |r| r.smem),
                 &mut params,

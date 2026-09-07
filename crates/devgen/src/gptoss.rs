@@ -857,6 +857,11 @@ pub(super) fn run(
     let lean = apply_verify_gate(&m, verify);
     let outp = Path::new(out);
     let mut sections = Vec::new();
+    if let Some(section) = mxfp4_moe_role::apply_output_object(&mut m, arch, outp)
+        .unwrap_or_else(|error| panic!("MXFP4 MoE object: {error}"))
+    {
+        sections.push(section);
+    }
     if block.is_some() {
         use plow_asset::*;
         let l = layers.start;
