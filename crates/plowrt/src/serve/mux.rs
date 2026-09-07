@@ -1669,17 +1669,17 @@ fn run_one_tick(
             if !feeds.is_empty() {
                 let mut toks = std::mem::take(&mut obs.host.slot_tokens);
                 // Bounded device multi-step (plan stage 5): when enabled and EVERY
-                // fed row is greedy (temp==0; the device advance uses the argmax
+                // fed row uses unmodified greedy logits (the device advance uses the argmax
                 // token), run a K-token quantum with one host sync and stream up to
                 // K tokens per row, stopping a row as soon as handle_produced_token
                 // frees it (mid-quantum EOS — extra device tokens past the stop
-                // are discarded). Remaining output budgets cap K. Any stochastic row
+                // are discarded). Remaining output budgets cap K. Any sampling adjustment
                 // falls through to the per-token path below.
                 let use_multi = e.multistep_quantum().is_some()
                     && feeds.iter().all(|&(i, _)| {
                         slots[i]
                             .as_ref()
-                            .map(|s| s.gen.params.temperature <= 0.0)
+                            .map(|s| gpu_argmax_eligible(&s.gen.params))
                             .unwrap_or(true)
                     });
                 if use_multi {
@@ -2933,9 +2933,8 @@ fn dev_sample_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
     })
 }
 
-/// Turn a slot's device-argmax token into the slot's produced token: greedy
-/// passes it through untouched; `temperature > 0` downloads logits row `row`
-/// and reuses the host sampler with penalties.
+/// Unmodified greedy requests keep the device argmax. Sampling adjustments
+/// download logits row `row` and use the host sampler.
 #[cfg(feature = "cuda")]
 fn gpu_finish_token(
     e: &mut crate::exec::gpu::GpuEngine,
@@ -2943,7 +2942,7 @@ fn gpu_finish_token(
     slot: &mut Slot,
     argmax_tok: u32,
 ) -> Result<u32> {
-    if slot.gen.params.temperature > 0.0 {
+    if !gpu_argmax_eligible(&slot.gen.params) {
         let mut logits = e.take_logits_buf();
         logits.clear();
         e.logits_row(row, &mut logits)?;
@@ -2954,6 +2953,13 @@ fn gpu_finish_token(
         return Ok(tok);
     }
     Ok(argmax_tok)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_argmax_eligible(params: &crate::text::sample::SamplingParams) -> bool {
+    params.temperature <= 0.0
+        && params.repetition_penalty == 1.0
+        && params.logit_bias.is_empty()
 }
 
 /// Incremental detokenize over a bounded window (TGI scheme): decode only
@@ -3288,6 +3294,20 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_argmax_requires_unmodified_greedy_logits() {
+        let mut params = crate::text::sample::SamplingParams::default();
+        assert!(!gpu_argmax_eligible(&params));
+        params.temperature = 0.0;
+        assert!(gpu_argmax_eligible(&params));
+        params.repetition_penalty = 1.1;
+        assert!(!gpu_argmax_eligible(&params));
+        params.repetition_penalty = 1.0;
+        params.logit_bias.push((1, 10.0));
+        assert!(!gpu_argmax_eligible(&params));
     }
 
     #[cfg(feature = "cuda")]

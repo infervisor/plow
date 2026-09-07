@@ -532,6 +532,10 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     endif()
     # The generated header rides the BASE, so a specialised build cannot reach one
     # object and miss its sibling — the same property the axes below give the flags.
+    file(GLOB_RECURSE _cubin_headers CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/*.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/*.cuh"
+        "${CMAKE_CURRENT_SOURCE_DIR}/common/*.h")
     if(PLOW_CUBIN_CONFIG)
         get_filename_component(_cfg_dir "${PLOW_CUBIN_CONFIG}" DIRECTORY)
         get_filename_component(_cfg_name "${PLOW_CUBIN_CONFIG}" NAME)
@@ -654,7 +658,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
                 COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_out}" "${_sym}" required
                         -arch=${_varch} -O3 -cubin ${_cubin_inc}
                         ${_defs} ${_cubin_extra} "${_vsrc}"
-                DEPENDS "${_vsrc}" "${_cubin_run}"
+                DEPENDS "${_vsrc}" "${_cubin_run}" ${PLOW_CUBIN_CONFIG} ${_cubin_headers}
                 COMMENT "nvcc ${_stem}.cubin (${_defs})"
                 VERBATIM)
             list(APPEND _cubin_outs "${_out}")
