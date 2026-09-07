@@ -6797,6 +6797,15 @@ impl GpuEngine {
                     }
                 };
                 if seg_time {
+                    tracing::debug!(
+                        segment = seg,
+                        class = cls,
+                        grid = gr,
+                        block = blk,
+                        smem = sm,
+                        packet_role = role.is_some(),
+                        "prefill segment launch"
+                    );
                     let e0 = self.be.event_create(true)?;
                     let e1 = self.be.event_create(true)?;
                     self.be.event_record(&e0, &self.stream)?;
