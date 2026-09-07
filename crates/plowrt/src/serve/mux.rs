@@ -1672,8 +1672,8 @@ fn run_one_tick(
                 // fed row is greedy (temp==0; the device advance uses the argmax
                 // token), run a K-token quantum with one host sync and stream up to
                 // K tokens per row, stopping a row as soon as handle_produced_token
-                // frees it (mid-quantum EOS / max_tokens — the extra device tokens
-                // past the stop are discarded, bounded by K). Any stochastic row
+                // frees it (mid-quantum EOS — extra device tokens past the stop
+                // are discarded). Remaining output budgets cap K. Any stochastic row
                 // falls through to the per-token path below.
                 let use_multi = e.multistep_quantum().is_some()
                     && feeds.iter().all(|&(i, _)| {
@@ -1683,7 +1683,13 @@ fn run_one_tick(
                             .unwrap_or(true)
                     });
                 if use_multi {
-                    match e.multi_step(&feeds, &mut toks) {
+                    let remaining = feeds
+                        .iter()
+                        .filter_map(|&(i, _)| slots[i].as_ref())
+                        .map(|slot| slot.gen.max_tokens.max(1).saturating_sub(slot.step))
+                        .min()
+                        .unwrap_or(1);
+                    match e.multi_step_at_most(&feeds, remaining, &mut toks) {
                         Ok(k) => {
                             for (ri, &(i, _)) in feeds.iter().enumerate() {
                                 for s in 0..k {
