@@ -1,0 +1,208 @@
+{
+  "date": "2026-09-07",
+  "source_revision": "19cc50f7",
+  "scope": "Diagnostic BF16 B1 full-model numerical control; two fixed synthetic prompt-token sequences of16 and128 tokens, four outputs each. Not a serving benchmark or broad model-quality evaluation.",
+  "precision": "BF16 weights/activations/KV, TP1, same complete Gemma4 31B checkpoint",
+  "vllm_settings": {
+    "vllm_version": "0.28.0",
+    "quantization": null,
+    "effective_compilation_config": {
+      "mode": "VLLM_COMPILE",
+      "cudagraph_mode": "FULL_AND_PIECEWISE",
+      "backend": "inductor",
+      "custom_ops": [
+        "none",
+        "+gelu_and_mul",
+        "+sparse_attn_indexer"
+      ]
+    },
+    "effective_ir_op_priority": {
+      "rms_norm": [
+        "native"
+      ],
+      "fused_add_rms_norm": [
+        "native"
+      ]
+    },
+    "max_model_len": 2048,
+    "max_num_batched_tokens": 512,
+    "max_num_seqs": 1,
+    "max_output_tokens": 4,
+    "suppression": {
+      "source": "vllm.model_config.try_get_generation_config().suppress_tokens",
+      "token_ids": [],
+      "allowed_nonfinite": "negative_infinity_only_at_declared_ids",
+      "raw_layout": "full_vocabulary_in_original_token_id_order",
+      "repeat_metrics_exclude_token_ids": []
+    }
+  },
+  "plow_settings": {
+    "assets": "decode-placed-assets",
+    "physical_capacity": 4,
+    "active_rows": 1,
+    "lowrung": "hsaco-occ4-b1-clean:1",
+    "fusion": false,
+    "max_model_len": 8192,
+    "ordinary_prefill_capacity": 128,
+    "decode_teacher_forced_from_vllm": true,
+    "compiler": "Nix ROCm7.14.0"
+  },
+  "native_reference_repeat": [
+    {
+      "id": "p16.step0000",
+      "bitwise_equal": true,
+      "sha256": "cebf67b595047887a9022a9da365de5ca9ad0769e058876075cb70593cef0ef5"
+    },
+    {
+      "id": "p16.step0001",
+      "bitwise_equal": true,
+      "sha256": "deccc6b481eb6911c8336ba69a38fb1f1cf7f6d867a51299e0d09c5232ccdf47"
+    },
+    {
+      "id": "p16.step0002",
+      "bitwise_equal": true,
+      "sha256": "bfd9874c2ddd9ea303a32fbc1273073a0b73f0139ba9f7aac910ba6b6e29f736"
+    },
+    {
+      "id": "p16.step0003",
+      "bitwise_equal": true,
+      "sha256": "63ccfa2204982662d30111f7f4d5160d3a6476d985b4fbad59d24363767aead7"
+    },
+    {
+      "id": "p128.step0000",
+      "bitwise_equal": true,
+      "sha256": "cdb3a771b4d96b4f0cae2707acbd5e6fb764c4056a489775904e939d482d09b3"
+    },
+    {
+      "id": "p128.step0001",
+      "bitwise_equal": true,
+      "sha256": "c1be6d78b4b54f127a6f5d1126be2eefbaa1d4af597bb9e8966e13588d448bb2"
+    },
+    {
+      "id": "p128.step0002",
+      "bitwise_equal": true,
+      "sha256": "f1f31e5000ed6458fc03c9f34d886abbf6996f03859dc689e463812123d765a6"
+    },
+    {
+      "id": "p128.step0003",
+      "bitwise_equal": true,
+      "sha256": "a2890bb421397e8895dabb6842e6340c1e39ca5c9cdc0682656c1aa539795cc0"
+    }
+  ],
+  "comparison": {
+    "failures": [
+      "p16.step0001",
+      "p16.step0002",
+      "p16.step0003",
+      "p128.step0000",
+      "p128.step0001",
+      "p128.step0002",
+      "p128.step0003"
+    ],
+    "max_abs_limit": 0.5,
+    "measurements": [
+      {
+        "actual_token": 240017,
+        "finite_compared": 262144,
+        "id": "p16.step0000",
+        "max_abs": 0.5,
+        "reference_token": 240017,
+        "relative_l2": 0.009835323580700593,
+        "same_argmax": true,
+        "teacher_forced": true
+      },
+      {
+        "actual_token": 240017,
+        "finite_compared": 262144,
+        "id": "p16.step0001",
+        "max_abs": 0.5,
+        "reference_token": 240017,
+        "relative_l2": 0.018943353516426294,
+        "same_argmax": true,
+        "teacher_forced": true
+      },
+      {
+        "actual_token": 240017,
+        "finite_compared": 262144,
+        "id": "p16.step0002",
+        "max_abs": 0.4453125,
+        "reference_token": 240017,
+        "relative_l2": 0.014719117878409023,
+        "same_argmax": true,
+        "teacher_forced": true
+      },
+      {
+        "actual_token": 240017,
+        "finite_compared": 262144,
+        "id": "p16.step0003",
+        "max_abs": 0.4423828125,
+        "reference_token": 240017,
+        "relative_l2": 0.026314502887574153,
+        "same_argmax": true,
+        "teacher_forced": true
+      },
+      {
+        "actual_token": 240017,
+        "finite_compared": 262144,
+        "id": "p128.step0000",
+        "max_abs": 0.625,
+        "reference_token": 240017,
+        "relative_l2": 0.01754624816329368,
+        "same_argmax": true,
+        "teacher_forced": true
+      },
+      {
+        "actual_token": 240017,
+        "finite_compared": 262144,
+        "id": "p128.step0001",
+        "max_abs": 0.5625,
+        "reference_token": 240017,
+        "relative_l2": 0.023170075916246046,
+        "same_argmax": true,
+        "teacher_forced": true
+      },
+      {
+        "actual_token": 240017,
+        "finite_compared": 262144,
+        "id": "p128.step0002",
+        "max_abs": 0.75,
+        "reference_token": 240017,
+        "relative_l2": 0.02785587917817152,
+        "same_argmax": true,
+        "teacher_forced": true
+      },
+      {
+        "actual_token": 240017,
+        "finite_compared": 262144,
+        "id": "p128.step0003",
+        "max_abs": 0.474609375,
+        "reference_token": 240017,
+        "relative_l2": 0.020747947575988076,
+        "same_argmax": true,
+        "teacher_forced": true
+      }
+    ],
+    "mode": "actual AMD full-model B1; teacher-forced native-vLLM tokens",
+    "profile": "shipping-bf16-native-control",
+    "relative_l2_limit": 0.01
+  },
+  "source_artifact_sha256": {
+    "/app/plow/build-gemma31/bf16-native-control/native_vllm_oracle.py": "6c08f71086943a2754d2ed6cc050b0a0cdbbc630245922b6f3929d501bdf9ec7",
+    "/app/plow/build-gemma31/bf16-native-control/cases.json": "ad29c9398847621009eb9d6b34175a8c04e63f939834f880d14247bd7be75ea4",
+    "/app/plow/build-gemma31/bf16-native-control/src/crates/plowrt/tests/hsa_bf16_native.rs": "53c4b7317e8a2cf316140d4dd12768a098bf09015eb8bd7f349bba27b759d6cd",
+    "/app/plow/build-gemma31/bf16-native-control/vllm/manifest.json": "ee214e124c0ff36f1804bd06c43ec74dfbbe3b6406c7213379fa6f50ac11afea",
+    "/app/plow/build-gemma31/bf16-native-control/vllm-repeat/manifest.json": "ee214e124c0ff36f1804bd06c43ec74dfbbe3b6406c7213379fa6f50ac11afea",
+    "/app/plow/build-gemma31/bf16-native-control/plow/comparison.json": "9f6efed7dd6f874eb7a4a1c6922d0c66891ea02b6735a71c0af6a909b4f903d6",
+    "/app/plow/build-gemma31/decode-placed-assets/model.pkt": "59df5045781261d3c9aafe27804af667c95008a3a602775695d2ab68c0d45dc6",
+    "/app/plow/build-gemma31/hsaco/interp_decode_gq.elf": "8008b9f79564f6bf99feb78a5679464e5628040ad555e4fc2ef3b6275169610f",
+    "/app/plow/build-gemma31/hsaco/interp_prefill_gq.elf": "7d065efe67f149b82da7bff5fbfbc2e4f4fe974d55a640a434d59caf56c2e884",
+    "/app/plow/build-gemma31/hsaco-occ4-b1-clean/interp_decode_gq.elf": "84296e1e397f6767364243d24e97f77804b001b40533cdae81d1b6ac2ea28ea1"
+  },
+  "interpretation": [
+    "Native vLLM repeats bitwise across independent engine processes with identical settings and request history.",
+    "Seven of eight shipping BF16 rows fail the unchanged1% relativeL2/.5 maxabs native-reference gates; all eight greedy tokens agree.",
+    "Some discrepancy predates FP8, but its separate larger error cannot be corrected by subtracting BF16 error norms.",
+    "Existing fusion qualification compares matched phase arithmetic against ordinary Plow; this new native-reference control is a different requirement.",
+    "No production arithmetic change or threshold relaxation. Native graph/context capacities differ from Plow; all diagnostic requests fit both."
+  ]
+}

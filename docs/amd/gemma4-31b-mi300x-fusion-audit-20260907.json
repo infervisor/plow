@@ -1,0 +1,200 @@
+{
+  "date": "2026-09-07",
+  "scope": "Actual shipping BF16 ordinary/mixed instruction inventory from native trace; not a claim that every AITER/vLLM kernel has been adapted.",
+  "inventory_sha256": "269919ddae79c8f8ebe12e9d22bf3508b7a7378e7ab89e09d473a8f7792176d6",
+  "programs": [
+    {
+      "kind": "mixed",
+      "rows": 128,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 60,
+        "FlashMerge": 120,
+        "FlashPrefill": 60,
+        "Gemm": 291,
+        "GemmGlu": 60,
+        "HeadNormRope": 180,
+        "NormResidual": 120,
+        "RmsNorm": 121,
+        "SoftCap": 1
+      }
+    },
+    {
+      "kind": "mixed",
+      "rows": 512,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 60,
+        "FlashMerge": 120,
+        "FlashPrefill": 60,
+        "Gemm": 291,
+        "GemmGlu": 60,
+        "HeadNormRope": 180,
+        "NormResidual": 120,
+        "RmsNorm": 121,
+        "SoftCap": 1
+      }
+    },
+    {
+      "kind": "mixed",
+      "rows": 1024,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 60,
+        "FlashMerge": 120,
+        "FlashPrefill": 60,
+        "Gemm": 291,
+        "GemmGlu": 60,
+        "HeadNormRope": 180,
+        "NormResidual": 120,
+        "RmsNorm": 121,
+        "SoftCap": 1
+      }
+    },
+    {
+      "kind": "ordinary",
+      "rows": 128,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashMerge": 60,
+        "FlashPrefill": 60,
+        "GemmMed": 120,
+        "GemmSmall": 290,
+        "Gemv": 1,
+        "Glu": 60,
+        "HeadNormRope": 180,
+        "NormResidual": 120,
+        "RmsNorm": 121,
+        "SoftCap": 1
+      }
+    },
+    {
+      "kind": "ordinary",
+      "rows": 512,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashMerge": 60,
+        "FlashPrefill": 60,
+        "GemmGlu": 60,
+        "GemmMed": 170,
+        "GemmSmall": 110,
+        "GemmWide": 10,
+        "Gemv": 1,
+        "HeadNormRope": 180,
+        "NormResidual": 120,
+        "RmsNorm": 121,
+        "SoftCap": 1
+      }
+    },
+    {
+      "kind": "ordinary",
+      "rows": 1024,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashMerge": 60,
+        "FlashPrefill": 60,
+        "GemmGlu": 60,
+        "GemmMed": 100,
+        "GemmSmall": 10,
+        "GemmWide": 180,
+        "Gemv": 1,
+        "HeadNormRope": 180,
+        "NormResidual": 120,
+        "RmsNorm": 121,
+        "SoftCap": 1
+      }
+    },
+    {
+      "kind": "ordinary",
+      "rows": 1,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 60,
+        "FlashMerge": 60,
+        "Gemv": 141,
+        "GemvGlu": 60,
+        "GemvQkv": 50,
+        "HeadNormRope": 180,
+        "NormResidualNorm": 120,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      }
+    },
+    {
+      "kind": "ordinary",
+      "rows": 2,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 60,
+        "FlashMerge": 60,
+        "Gemv": 141,
+        "GemvGlu": 60,
+        "GemvQkv": 50,
+        "HeadNormRope": 180,
+        "NormResidualNorm": 120,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      }
+    },
+    {
+      "kind": "ordinary",
+      "rows": 4,
+      "op_counts": {
+        "Argmax": 1,
+        "ArgmaxFin": 1,
+        "Embed": 1,
+        "FlashDecode": 60,
+        "FlashMerge": 60,
+        "Gemv": 411,
+        "Glu": 60,
+        "HeadNormRope": 180,
+        "NormResidualNorm": 120,
+        "RmsNorm": 1,
+        "SoftCap": 1
+      }
+    }
+  ],
+  "used_features": {
+    "ordinary_prefill_segments_per_bucket": 121,
+    "decode_l2_placement": true,
+    "decode_hierarchical_gates": true,
+    "normal_and_mm1_object_symbols": [
+      "plow_gate_hier_1",
+      "plow_l2_place_dispatch_1"
+    ],
+    "ordinary_general_waves": 8,
+    "ordinary_flash_prefill_waves": 4,
+    "mixed_waves": 4,
+    "prefill_l2_placement": false
+  },
+  "fusion_findings": [
+    "DecodeB1/B2:50 fused QKV operations,60 fused gate/up/GLU operations,120 sandwich norm/residual/norm operations.",
+    "DecodeB4:411 separate GEMV operations including output head,60 GLU operations; fused QKV/GLU emitter eligibility fails the conservative shared-memory capacity bound.",
+    "OrdinaryPF512/1024:60 fused GemmGlu operations; PF128 retains separate gate/up plus60 GLU operations.",
+    "Ordinary prefill retains121 RMSNorm and120 NormResidual operations; existing PLOW_PF_GFUSE is a bounded next experiment, subject to object support and numerical checks.",
+    "All phases use HeadNormRope to combine head normalization/rotation/KV placement as applicable to each head and projection.",
+    "Mixed launch combines scheduling but preserves sequential decode GEMV and prefill GEMM within projection helpers.",
+    "PLOW_PF_GFUSE currently cannot combine with mixed runtime: NormResidualNorm is rejected in mixed_program.rs, and mixed NRN lacks dynamic logical512 reduction handling. Do not force the unsupported opcode."
+  ],
+  "reuse_findings": [
+    "Actual vLLM decode trace selects its custom ROCm wvSplitK_hf_sml; Plow shipping projections remain its own GEMV helpers.",
+    "Actual vLLM attention uses TRITON_ATTN with AITER disabled in the matched baseline. No claim of AITER backend performance or universal kernel-port completeness.",
+    "Packing and phase selection remain runtime-controlled; no new model compilation for mixed-row combinations."
+  ]
+}
