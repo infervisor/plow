@@ -111,3 +111,43 @@ Best realistic fp8 step is therefore ~121 ms against llama.cpp's 133, i.e. ~1.10
 about 1.04x through the server. MXFP4 is where the margin lives on this data-type axis (1.38x), and
 it is the same model at better quality-per-byte. Beating an 8-bit baseline by a margin needs either
 fewer bits or a machine whose compute-to-bandwidth ratio leaves room, and this one does not.
+
+## All three data types re-measured on current kernels (2026-09-07, 23:0x-23:3x)
+
+The table above is from commit 25e0875 and predates the physical-core default, the per-model worker
+width, the AVX-512 router arm, the MoE prefill epilogue (0d07dfa) and the flash-decode GQA fold
+(55f9e7f). Re-measured through `plowrt serve`, fresh prompts, 8 slots, threads=16 as before.
+Decode is the c=1 TPOT mean; llama.cpp columns are the fixed recorded baselines.
+
+| data type | plow decode ms (c=1) | recorded | llama.cpp | vLLM bf16 | verdict |
+|---|---|---|---|---|---|
+| bf16 | 233 | 232 | 267 (bf16 GGUF) | 460-544 | win 1.15x |
+| fp8 | 141 | 133 | 133 (Q8_0) | 460-544 | **loses** |
+| mxfp4 | 93 | 88 | 121 (Q4_K_M) | 460-544 | win 1.30x |
+
+bf16 is unchanged (233 vs 232) while fp8 and mxfp4 are each ~6% off their recorded values. That is
+NOT a general dense-decode regression: bf16 is bandwidth-saturated at 2.0 GB/token and would mask a
+compute-side change, whereas the quantized paths would not. An interleaved A/B against the commit
+before the GQA fold rules that fold out as the cause -- fp8 137.1 vs 138.3 ms and mxfp4 90.8 vs 92.5,
+medians of 3, with p50s identical -- so the delta predates it.
+
+### Why fp8 loses: the tied lm_head is bf16
+
+Gemma-4 ties `lm_head` to `model.language_model.embed_tokens.weight`, and on the 12B that tensor is
+2,013,265,920 bytes of bf16 (262144 x 3840 x 2). **It is in neither quantized twin.** So every decode
+step streams 2.01 GB for the output projection while every other weight in the model is quantized.
+`cpu_profile --prompt-tokens 32 --batch 1`, threads=16:
+
+| twin | decode wall | `PLOW_DOP_GEMV` (the bf16 lm_head) | share |
+|---|---|---|---|
+| fp8 | 131.5 ms | 17.06 ms/thr, span 17.53 ms | 13% |
+| mxfp4 | 84.5 ms | 17.06 ms/thr, span 17.53 ms | 21% |
+
+The span almost equals the busy time, so it runs as a serial tail with essentially no overlap. This
+is the whole fp8 deficit: 141 - 133 = 8 ms against a 17.5 ms tail. Quantizing that one tensor for the
+GEMV while keeping bf16 for the `EMBED` lookup (which reads a single 7.7 KB row per token, so its
+bandwidth is irrelevant) should give roughly fp8 132 ms and mxfp4 80 ms.
+
+This supersedes the earlier reading that the fp8 tie was a pure scheduling limit. The 11% worker idle
+from pipeline fill and drain is real, but the larger and more tractable term is that 2.01 GB of bf16
+weights are being read every token in a model whose other weights are 1 byte or less per parameter.

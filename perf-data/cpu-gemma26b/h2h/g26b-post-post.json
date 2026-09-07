@@ -1,0 +1,4980 @@
+{
+ "meta": {
+  "base_url": "http://localhost:8096",
+  "model": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+  "server_models": [
+   "4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+  ],
+  "timestamp": "2026-09-06T22:34:27+00:00",
+  "seed": 1234,
+  "max_tokens": 64,
+  "requests": 8,
+  "warmup": 1,
+  "arrival": "closed",
+  "ignore_eos": false,
+  "prompt_token_source": "tokenizer",
+  "samples": 2,
+  "argv": [
+   "--base-url",
+   "http://localhost:8096",
+   "--model",
+   "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+   "--workload",
+   "chat_short,chat_long,code,summarize",
+   "--concurrency",
+   "1,2,4,8",
+   "--requests",
+   "8",
+   "--max-tokens",
+   "64",
+   "--fresh-prompts",
+   "--tokenizer",
+   "/home/lava/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/",
+   "--out",
+   "perf-data/cpu-gemma26b/h2h/g26b-post-post.json",
+   "--md",
+   "perf-data/cpu-gemma26b/h2h/g26b-post-post.md"
+  ],
+  "fresh_prompts": true
+ },
+ "runs": [
+  {
+   "workload": "chat_short",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 20.509645566009567,
+    "ttft_s": {
+     "mean": 0.3175391578733979,
+     "p50": 0.321293943998171,
+     "p90": 0.3274659519956913,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.035645790436492894,
+     "p50": 0.03560334217451912,
+     "p90": 0.03576419590478061,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 2.5633133969986375,
+     "p50": 2.566619796998566,
+     "p90": 2.603841766002006,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 33.875,
+     "p50": 37,
+     "p90": 42,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 24.963863873324684,
+    "req_per_s": 0.3900603730206982,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 20.509645566009567,
+     "ttft_s": {
+      "mean": 0.3175391578733979,
+      "p50": 0.321293943998171,
+      "p90": 0.3274659519956913,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.035645790436492894,
+      "p50": 0.03560334217451912,
+      "p90": 0.03576419590478061,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 2.5633133969986375,
+      "p50": 2.566619796998566,
+      "p90": 2.603841766002006,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 33.875,
+      "p50": 37,
+      "p90": 42,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 24.963863873324684,
+     "req_per_s": 0.3900603730206982,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.29240880299767014,
+     "tpot_s": 0.03553342698432971,
+     "latency_s": 2.531108873998164,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 40,
+      "completion_tokens": 64,
+      "total_tokens": 104,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Bees kick drones out at the end of summer to ensure the colony's survival during",
+     "text_chars": 313,
+     "index": 0,
+     "kind": "chat_short",
+     "t_start": 1788734069.587248,
+     "prompt_tokens_client": 27,
+     "prompt_tokens_server": 40,
+     "prompt_chars": 94,
+     "prompt_tokens": 27
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.299810222000815,
+     "tpot_s": 0.03559206903169286,
+     "latency_s": 2.5422124589968007,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 34,
+      "completion_tokens": 64,
+      "total_tokens": 98,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "When choosing between washed and natural processed coffee, you are essentially c",
+     "text_chars": 325,
+     "index": 1,
+     "kind": "chat_short",
+     "t_start": 1788734072.1186986,
+     "prompt_tokens_client": 21,
+     "prompt_tokens_server": 34,
+     "prompt_chars": 106,
+     "prompt_tokens": 21
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.321293943998171,
+     "tpot_s": 0.03572035322218971,
+     "latency_s": 2.5717730710020987,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 52,
+      "completion_tokens": 64,
+      "total_tokens": 116,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a clear, accurate explanation you can use for your newsletter.\n\n### The ",
+     "text_chars": 303,
+     "index": 2,
+     "kind": "chat_short",
+     "t_start": 1788734074.6612647,
+     "prompt_tokens_client": 39,
+     "prompt_tokens_server": 52,
+     "prompt_chars": 184,
+     "prompt_tokens": 39
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.31404246400052216,
+     "tpot_s": 0.03524591636498429,
+     "latency_s": 2.5346203099907143,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 39,
+      "completion_tokens": 64,
+      "total_tokens": 103,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Lighthouse keepers used **characteristics** to make each light unique. Since man",
+     "text_chars": 292,
+     "index": 3,
+     "kind": "chat_short",
+     "t_start": 1788734077.2334547,
+     "prompt_tokens_client": 26,
+     "prompt_tokens_server": 39,
+     "prompt_chars": 121,
+     "prompt_tokens": 26
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.30784272600430995,
+     "tpot_s": 0.03560334217451912,
+     "latency_s": 2.550935744002345,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 40,
+      "completion_tokens": 64,
+      "total_tokens": 104,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To understand the difference, you first have to understand one thing: **Coffee \"",
+     "text_chars": 291,
+     "index": 4,
+     "kind": "chat_short",
+     "t_start": 1788734079.7684205,
+     "prompt_tokens_client": 27,
+     "prompt_tokens_server": 40,
+     "prompt_chars": 139,
+     "prompt_tokens": 27
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.32528638700023293,
+     "tpot_s": 0.035575410063352644,
+     "latency_s": 2.566619796998566,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 55,
+      "completion_tokens": 64,
+      "total_tokens": 119,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A sinking fund is a strategic way to save money by setting aside small amounts r",
+     "text_chars": 326,
+     "index": 5,
+     "kind": "chat_short",
+     "t_start": 1788734082.3197176,
+     "prompt_tokens_client": 42,
+     "prompt_tokens_server": 55,
+     "prompt_chars": 165,
+     "prompt_tokens": 42
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.35216276498977095,
+     "tpot_s": 0.03576419590478061,
+     "latency_s": 2.605395154998405,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 65,
+      "completion_tokens": 64,
+      "total_tokens": 129,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Your starter is not dead; the nail polish remover smell is caused by a buildup o",
+     "text_chars": 309,
+     "index": 6,
+     "kind": "chat_short",
+     "t_start": 1788734084.8867116,
+     "prompt_tokens_client": 52,
+     "prompt_tokens_server": 65,
+     "prompt_chars": 240,
+     "prompt_tokens": 52
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.3274659519956913,
+     "tpot_s": 0.036131609746094216,
+     "latency_s": 2.603841766002006,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 50,
+      "completion_tokens": 64,
+      "total_tokens": 114,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To achieve the perfect extraction, you must balance these four key variables:\n\n1",
+     "text_chars": 312,
+     "index": 7,
+     "kind": "chat_short",
+     "t_start": 1788734087.4925199,
+     "prompt_tokens_client": 37,
+     "prompt_tokens_server": 50,
+     "prompt_chars": 159,
+     "prompt_tokens": 37
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 16.473517181002535,
+    "ttft_s": {
+     "mean": 0.48068493225036946,
+     "p50": 0.4039800010068575,
+     "p90": 0.7537377730041044,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.057949338687011534,
+     "p50": 0.05997666461894008,
+     "p90": 0.06218569787308788,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 4.059167145876927,
+     "p50": 4.182591817007051,
+     "p90": 4.282580586004769,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 44.75,
+     "p50": 49,
+     "p90": 54,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 62.5,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 500,
+    "output_tok_per_s": 30.351745441259272,
+    "req_per_s": 0.48562792706014835,
+    "finish_reasons": {
+     "length": 7,
+     "stop": 1
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 16.473517181002535,
+     "ttft_s": {
+      "mean": 0.48068493225036946,
+      "p50": 0.4039800010068575,
+      "p90": 0.7537377730041044,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.057949338687011534,
+      "p50": 0.05997666461894008,
+      "p90": 0.06218569787308788,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 4.059167145876927,
+      "p50": 4.182591817007051,
+      "p90": 4.282580586004769,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 44.75,
+      "p50": 49,
+      "p90": 54,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 62.5,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 500,
+     "output_tok_per_s": 30.351745441259272,
+     "req_per_s": 0.48562792706014835,
+     "finish_reasons": {
+      "length": 7,
+      "stop": 1
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.3620630649966188,
+     "tpot_s": 0.0571715146033389,
+     "latency_s": 3.9639613580075093,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 62,
+      "completion_tokens": 64,
+      "total_tokens": 126,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To keep your talk engaging and practical, it is best to present this rule as a \"",
+     "text_chars": 253,
+     "index": 8,
+     "kind": "chat_short",
+     "t_start": 1788734092.7010872,
+     "prompt_tokens_client": 49,
+     "prompt_tokens_server": 62,
+     "prompt_chars": 200,
+     "prompt_tokens": 49
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7537377730041044,
+     "tpot_s": 0.05179472144444599,
+     "latency_s": 4.016885143995751,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 63,
+      "completion_tokens": 64,
+      "total_tokens": 127,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The printing press changed books from unique, hand-drawn objects into standardiz",
+     "text_chars": 314,
+     "index": 9,
+     "kind": "chat_short",
+     "t_start": 1788734092.7012205,
+     "prompt_tokens_client": 50,
+     "prompt_tokens_server": 63,
+     "prompt_chars": 215,
+     "prompt_tokens": 50
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.4190838479989907,
+     "tpot_s": 0.0646584685873388,
+     "latency_s": 4.492629658998339,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 67,
+      "completion_tokens": 64,
+      "total_tokens": 131,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "*Disclaimer: I am an AI, not a financial advisor. The following is based on math",
+     "text_chars": 313,
+     "index": 10,
+     "kind": "chat_short",
+     "t_start": 1788734096.6654737,
+     "prompt_tokens_client": 54,
+     "prompt_tokens_server": 67,
+     "prompt_chars": 206,
+     "prompt_tokens": 54
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7620134379976662,
+     "tpot_s": 0.05276676535311922,
+     "latency_s": 3.5071816090057837,
+     "output_tokens": 52,
+     "content_chunks": 51,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 53,
+      "completion_tokens": 52,
+      "total_tokens": 105,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The Moon is moving away because Earth\u2019s gravity creates tidal bulges in our ocea",
+     "text_chars": 258,
+     "index": 11,
+     "kind": "chat_short",
+     "t_start": 1788734096.71845,
+     "prompt_tokens_client": 40,
+     "prompt_tokens_server": 53,
+     "prompt_chars": 156,
+     "prompt_tokens": 40
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.4010193940048339,
+     "tpot_s": 0.060219177730023006,
+     "latency_s": 4.194891286999336,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 67,
+      "completion_tokens": 64,
+      "total_tokens": 131,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a clear, accurate explanation you can use for your newsletter.\n\n### The ",
+     "text_chars": 269,
+     "index": 12,
+     "kind": "chat_short",
+     "t_start": 1788734100.2260354,
+     "prompt_tokens_client": 54,
+     "prompt_tokens_server": 67,
+     "prompt_chars": 249,
+     "prompt_tokens": 54
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.4039800010068575,
+     "tpot_s": 0.05997666461894008,
+     "latency_s": 4.182591817007051,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 50,
+      "completion_tokens": 64,
+      "total_tokens": 114,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Before the Fresnel lens, lighthouse lights were weak and scattered in all direct",
+     "text_chars": 339,
+     "index": 13,
+     "kind": "chat_short",
+     "t_start": 1788734101.1585062,
+     "prompt_tokens_client": 37,
+     "prompt_tokens_server": 50,
+     "prompt_chars": 160,
+     "prompt_tokens": 37
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.3648127369961003,
+     "tpot_s": 0.06218569787308788,
+     "latency_s": 4.282580586004769,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 47,
+      "completion_tokens": 64,
+      "total_tokens": 111,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The first steam engines were built at coal mines because they solved a specific,",
+     "text_chars": 333,
+     "index": 14,
+     "kind": "chat_short",
+     "t_start": 1788734104.4213545,
+     "prompt_tokens_client": 34,
+     "prompt_tokens_server": 47,
+     "prompt_chars": 144,
+     "prompt_tokens": 34
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.37876920199778397,
+     "tpot_s": 0.05482169928579843,
+     "latency_s": 3.832615706996876,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 53,
+      "completion_tokens": 64,
+      "total_tokens": 117,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To settle the debate: The **windowpane test** is a manual technique used to dete",
+     "text_chars": 287,
+     "index": 15,
+     "kind": "chat_short",
+     "t_start": 1788734105.3414733,
+     "prompt_tokens_client": 40,
+     "prompt_tokens_server": 53,
+     "prompt_chars": 170,
+     "prompt_tokens": 40
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 12.605772865994368,
+    "ttft_s": {
+     "mean": 0.7749946557505609,
+     "p50": 0.7390351780049969,
+     "p90": 1.087999112001853,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.08686002321623423,
+     "p50": 0.08694338114282656,
+     "p90": 0.09143215790483361,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 6.2472556049979175,
+     "p50": 6.309188009996433,
+     "p90": 6.5654914710030425,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 41.25,
+     "p50": 46,
+     "p90": 51,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 40.616311704392466,
+    "req_per_s": 0.6346298703811323,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 12.605772865994368,
+     "ttft_s": {
+      "mean": 0.7749946557505609,
+      "p50": 0.7390351780049969,
+      "p90": 1.087999112001853,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.08686002321623423,
+      "p50": 0.08694338114282656,
+      "p90": 0.09143215790483361,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 6.2472556049979175,
+      "p50": 6.309188009996433,
+      "p90": 6.5654914710030425,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 41.25,
+      "p50": 46,
+      "p90": 51,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 40.616311704392466,
+     "req_per_s": 0.6346298703811323,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.3114793889981229,
+     "tpot_s": 0.09143215790483361,
+     "latency_s": 6.071792232993175,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 47,
+      "completion_tokens": 64,
+      "total_tokens": 111,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Since you are a hobbyist, the easiest way to think about propolis is to view it ",
+     "text_chars": 244,
+     "index": 16,
+     "kind": "chat_short",
+     "t_start": 1788734112.3395996,
+     "prompt_tokens_client": 34,
+     "prompt_tokens_server": 47,
+     "prompt_chars": 133,
+     "prompt_tokens": 34
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.087999112001853,
+     "tpot_s": 0.08694338114282656,
+     "latency_s": 6.5654914710030425,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 59,
+      "completion_tokens": 64,
+      "total_tokens": 123,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Richard Trevithick\u2019s 1804 locomotive broke the rails because of a mismatch betwe",
+     "text_chars": 267,
+     "index": 17,
+     "kind": "chat_short",
+     "t_start": 1788734112.3397424,
+     "prompt_tokens_client": 46,
+     "prompt_tokens_server": 59,
+     "prompt_chars": 181,
+     "prompt_tokens": 46
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4937276560085593,
+     "tpot_s": 0.08674208479351364,
+     "latency_s": 6.958537348997197,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 59,
+      "completion_tokens": 64,
+      "total_tokens": 123,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The Moon is moving away because Earth\u2019s gravity pulls on the Moon, but the Moon\u2019",
+     "text_chars": 287,
+     "index": 18,
+     "kind": "chat_short",
+     "t_start": 1788734112.3398046,
+     "prompt_tokens_client": 46,
+     "prompt_tokens_server": 59,
+     "prompt_chars": 210,
+     "prompt_tokens": 46
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6797607089974917,
+     "tpot_s": 0.08679198371412765,
+     "latency_s": 6.147741285996744,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 53,
+      "completion_tokens": 64,
+      "total_tokens": 117,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Think of **propolis** as \"bee glue.\" \n\nWhile honey is the bees' food, propolis i",
+     "text_chars": 269,
+     "index": 19,
+     "kind": "chat_short",
+     "t_start": 1788734112.3403807,
+     "prompt_tokens_client": 40,
+     "prompt_tokens_server": 53,
+     "prompt_chars": 173,
+     "prompt_tokens": 40
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.41659402099321596,
+     "tpot_s": 0.09353169431750079,
+     "latency_s": 6.309188009996433,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 65,
+      "completion_tokens": 64,
+      "total_tokens": 129,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The **50% rule** suggests that your essential fixed costs (housing, utilities, g",
+     "text_chars": 271,
+     "index": 20,
+     "kind": "chat_short",
+     "t_start": 1788734118.411759,
+     "prompt_tokens_client": 52,
+     "prompt_tokens_server": 65,
+     "prompt_chars": 199,
+     "prompt_tokens": 52
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7215717060025781,
+     "tpot_s": 0.088723909523752,
+     "latency_s": 6.311234705004608,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 41,
+      "completion_tokens": 64,
+      "total_tokens": 105,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The four main variables in coffee brewing are **Grind Size**, **Water Temperatur",
+     "text_chars": 288,
+     "index": 21,
+     "kind": "chat_short",
+     "t_start": 1788734118.4884531,
+     "prompt_tokens_client": 28,
+     "prompt_tokens_server": 41,
+     "prompt_chars": 146,
+     "prompt_tokens": 28
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7497894749976695,
+     "tpot_s": 0.08282811677781865,
+     "latency_s": 5.968051157993614,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 64,
+      "completion_tokens": 64,
+      "total_tokens": 128,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To understand the difference, it helps to think of them as two different types o",
+     "text_chars": 283,
+     "index": 22,
+     "kind": "chat_short",
+     "t_start": 1788734118.9055989,
+     "prompt_tokens_client": 51,
+     "prompt_tokens_server": 64,
+     "prompt_chars": 250,
+     "prompt_tokens": 51
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7390351780049969,
+     "tpot_s": 0.077886857555501,
+     "latency_s": 5.646008627998526,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 46,
+      "completion_tokens": 64,
+      "total_tokens": 110,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a clear, accurate explanation you can use for your newsletter. I have pr",
+     "text_chars": 268,
+     "index": 23,
+     "kind": "chat_short",
+     "t_start": 1788734119.2988858,
+     "prompt_tokens_client": 33,
+     "prompt_tokens_server": 46,
+     "prompt_chars": 152,
+     "prompt_tokens": 33
+    }
+   ]
+  },
+  {
+   "workload": "chat_short",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 10.025848537989077,
+    "ttft_s": {
+     "mean": 1.6653266842513403,
+     "p50": 1.8417500790092163,
+     "p90": 2.688360942993313,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.12735482234319223,
+     "p50": 0.12974814211095995,
+     "p90": 0.13986284293617032,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 9.4245554752506,
+     "p50": 9.712412306005717,
+     "p90": 9.926394093999988,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 35.875,
+     "p50": 34,
+     "p90": 42,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 62.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 496,
+    "output_tok_per_s": 49.47212179803034,
+    "req_per_s": 0.797937448355328,
+    "finish_reasons": {
+     "length": 7,
+     "stop": 1
+    }
+   },
+   "by_kind": {
+    "chat_short": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 10.025848537989077,
+     "ttft_s": {
+      "mean": 1.6653266842513403,
+      "p50": 1.8417500790092163,
+      "p90": 2.688360942993313,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.12735482234319223,
+      "p50": 0.12974814211095995,
+      "p90": 0.13986284293617032,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 9.4245554752506,
+      "p50": 9.712412306005717,
+      "p90": 9.926394093999988,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 35.875,
+      "p50": 34,
+      "p90": 42,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 62.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 496,
+     "output_tok_per_s": 49.47212179803034,
+     "req_per_s": 0.797937448355328,
+     "finish_reasons": {
+      "length": 7,
+      "stop": 1
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.3099553970096167,
+     "tpot_s": 0.14195864058713178,
+     "latency_s": 9.253416059000301,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 47,
+      "completion_tokens": 64,
+      "total_tokens": 111,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The reason for this conflict boils down to a simple physical problem: **before t",
+     "text_chars": 285,
+     "index": 24,
+     "kind": "chat_short",
+     "t_start": 1788734127.597569,
+     "prompt_tokens_client": 34,
+     "prompt_tokens_server": 47,
+     "prompt_chars": 169,
+     "prompt_tokens": 34
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0160109429998556,
+     "tpot_s": 0.13986284293617032,
+     "latency_s": 7.713850480999099,
+     "output_tokens": 48,
+     "content_chunks": 47,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 39,
+      "completion_tokens": 48,
+      "total_tokens": 87,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Bees expel drones at the end of summer to conserve the hive's limited food suppl",
+     "text_chars": 233,
+     "index": 25,
+     "kind": "chat_short",
+     "t_start": 1788734127.5977013,
+     "prompt_tokens_client": 26,
+     "prompt_tokens_server": 39,
+     "prompt_chars": 115,
+     "prompt_tokens": 26
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.253415628001676,
+     "tpot_s": 0.12009347425399548,
+     "latency_s": 9.819393475001561,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 47,
+      "completion_tokens": 64,
+      "total_tokens": 111,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "**Propolis is a resinous-gum substance created by bees from plant sources that t",
+     "text_chars": 269,
+     "index": 26,
+     "kind": "chat_short",
+     "t_start": 1788734127.5977607,
+     "prompt_tokens_client": 34,
+     "prompt_tokens_server": 47,
+     "prompt_chars": 146,
+     "prompt_tokens": 34
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8417500790092163,
+     "tpot_s": 0.12493016469843929,
+     "latency_s": 9.712412306005717,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 55,
+      "completion_tokens": 64,
+      "total_tokens": 119,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A fog signal burns significant fuel because it must overcome the \"masking\" effec",
+     "text_chars": 289,
+     "index": 27,
+     "kind": "chat_short",
+     "t_start": 1788734127.5978105,
+     "prompt_tokens_client": 42,
+     "prompt_tokens_server": 55,
+     "prompt_chars": 173,
+     "prompt_tokens": 42
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4106811380042927,
+     "tpot_s": 0.12974814211095995,
+     "latency_s": 9.584873946005246,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 49,
+      "completion_tokens": 64,
+      "total_tokens": 113,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The reason steam engines started in mines rather than factories comes down to a ",
+     "text_chars": 268,
+     "index": 28,
+     "kind": "chat_short",
+     "t_start": 1788734127.5978577,
+     "prompt_tokens_client": 36,
+     "prompt_tokens_server": 49,
+     "prompt_chars": 184,
+     "prompt_tokens": 36
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.129948632995365,
+     "tpot_s": 0.10943728960317833,
+     "latency_s": 10.024593028996605,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 61,
+      "completion_tokens": 64,
+      "total_tokens": 125,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Think of a **sinking fund** as a \"savings bucket\" specifically labeled for a fut",
+     "text_chars": 289,
+     "index": 29,
+     "kind": "chat_short",
+     "t_start": 1788734127.598325,
+     "prompt_tokens_client": 48,
+     "prompt_tokens_server": 61,
+     "prompt_chars": 199,
+     "prompt_tokens": 48
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6724907129973872,
+     "tpot_s": 0.13791994998413545,
+     "latency_s": 9.361510411996278,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 47,
+      "completion_tokens": 64,
+      "total_tokens": 111,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Propolis is a resinous-gum substance collected by honeybees from tree buds and s",
+     "text_chars": 279,
+     "index": 30,
+     "kind": "chat_short",
+     "t_start": 1788734127.5986936,
+     "prompt_tokens_client": 34,
+     "prompt_tokens_server": 47,
+     "prompt_chars": 153,
+     "prompt_tokens": 34
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.688360942993313,
+     "tpot_s": 0.11488807457152732,
+     "latency_s": 9.926394093999988,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 46,
+      "completion_tokens": 64,
+      "total_tokens": 110,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "It is not a basic question at all; it is a fundamental principle of chemistry an",
+     "text_chars": 311,
+     "index": 31,
+     "kind": "chat_short",
+     "t_start": 1788734127.5987496,
+     "prompt_tokens_client": 33,
+     "prompt_tokens_server": 46,
+     "prompt_chars": 151,
+     "prompt_tokens": 33
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 24.20194156099751,
+    "ttft_s": {
+     "mean": 0.9893840532513423,
+     "p50": 1.0398378519894322,
+     "p90": 1.3151475229969947,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.03756990019342093,
+     "p50": 0.03750922016667944,
+     "p90": 0.03790661038083416,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 3.023935118502777,
+     "p50": 3.066374119996908,
+     "p90": 3.3781856010027695,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 398.25,
+     "p50": 470,
+     "p90": 512,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 54.625,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 437,
+    "output_tok_per_s": 18.05640257822309,
+    "req_per_s": 0.33055199227868354,
+    "finish_reasons": {
+     "stop": 3,
+     "length": 5
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 24.20194156099751,
+     "ttft_s": {
+      "mean": 0.9893840532513423,
+      "p50": 1.0398378519894322,
+      "p90": 1.3151475229969947,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.03756990019342093,
+      "p50": 0.03750922016667944,
+      "p90": 0.03790661038083416,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 3.023935118502777,
+      "p50": 3.066374119996908,
+      "p90": 3.3781856010027695,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 398.25,
+      "p50": 470,
+      "p90": 512,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 54.625,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 437,
+     "output_tok_per_s": 18.05640257822309,
+     "req_per_s": 0.33055199227868354,
+     "finish_reasons": {
+      "stop": 3,
+      "length": 5
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.3151475229969947,
+     "tpot_s": 0.03750922016667944,
+     "latency_s": 3.3781856010027695,
+     "output_tokens": 55,
+     "content_chunks": 54,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 525,
+      "completion_tokens": 55,
+      "total_tokens": 580,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage recommends keeping an emergency fund in a **\"separate savings accoun",
+     "text_chars": 263,
+     "index": 0,
+     "kind": "chat_long",
+     "t_start": 1788734140.7581296,
+     "prompt_tokens_client": 512,
+     "prompt_tokens_server": 525,
+     "prompt_chars": 2651,
+     "prompt_tokens": 512
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.8982176999998046,
+     "tpot_s": 0.03790661038083416,
+     "latency_s": 3.2864254960004473,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 394,
+      "completion_tokens": 64,
+      "total_tokens": 458,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "An escapement is the core mechanism of a mechanical clock that regulates the rel",
+     "text_chars": 327,
+     "index": 1,
+     "kind": "chat_long",
+     "t_start": 1788734144.137946,
+     "prompt_tokens_client": 381,
+     "prompt_tokens_server": 394,
+     "prompt_chars": 1824,
+     "prompt_tokens": 381
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.647285662998911,
+     "tpot_s": 0.037319210777659755,
+     "latency_s": 2.998476198001299,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 243,
+      "completion_tokens": 64,
+      "total_tokens": 307,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "*Disclaimer: I am an AI, not a professional apiarist. Beekeeping involves risks ",
+     "text_chars": 302,
+     "index": 2,
+     "kind": "chat_long",
+     "t_start": 1788734147.4257243,
+     "prompt_tokens_client": 230,
+     "prompt_tokens_server": 243,
+     "prompt_chars": 1035,
+     "prompt_tokens": 230
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0501092960039387,
+     "tpot_s": 0.03676032403419758,
+     "latency_s": 2.1542190890031634,
+     "output_tokens": 30,
+     "content_chunks": 29,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 483,
+      "completion_tokens": 30,
+      "total_tokens": 513,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A swarm decides where to move when scout bees reach a clear consensus. The scout",
+     "text_chars": 157,
+     "index": 3,
+     "kind": "chat_long",
+     "t_start": 1788734150.4250844,
+     "prompt_tokens_client": 470,
+     "prompt_tokens_server": 483,
+     "prompt_chars": 2273,
+     "prompt_tokens": 470
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0398378519894322,
+     "tpot_s": 0.037007457839095995,
+     "latency_s": 2.223873263996211,
+     "output_tokens": 32,
+     "content_chunks": 31,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 491,
+      "completion_tokens": 32,
+      "total_tokens": 523,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The text does not mention a tide; the journey takes place on a river, where the ",
+     "text_chars": 140,
+     "index": 4,
+     "kind": "chat_long",
+     "t_start": 1788734152.5807083,
+     "prompt_tokens_client": 478,
+     "prompt_tokens_server": 491,
+     "prompt_chars": 2148,
+     "prompt_tokens": 478
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7081163840048248,
+     "tpot_s": 0.03743134893634955,
+     "latency_s": 3.066374119996908,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 263,
+      "completion_tokens": 64,
+      "total_tokens": 327,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The \"flat\" taste you are experiencing is a classic symptom of **oxidation and st",
+     "text_chars": 300,
+     "index": 5,
+     "kind": "chat_long",
+     "t_start": 1788734154.8060505,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 263,
+     "prompt_chars": 1105,
+     "prompt_tokens": 250
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.5607766440080013,
+     "tpot_s": 0.03906103214276733,
+     "latency_s": 4.021707389008952,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 628,
+      "completion_tokens": 64,
+      "total_tokens": 692,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The difference between spring and neap tides lies in the range of the water leve",
+     "text_chars": 304,
+     "index": 6,
+     "kind": "chat_long",
+     "t_start": 1788734157.8733861,
+     "prompt_tokens_client": 615,
+     "prompt_tokens_server": 628,
+     "prompt_chars": 2855,
+     "prompt_tokens": 615
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6955813640088309,
+     "tpot_s": 0.03756399726978363,
+     "latency_s": 3.062219791012467,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 263,
+      "completion_tokens": 64,
+      "total_tokens": 327,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Part 1: The Customer Perspective\n*Imagine you are sitting at the stall, and ",
+     "text_chars": 282,
+     "index": 7,
+     "kind": "chat_long",
+     "t_start": 1788734161.8966992,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 263,
+     "prompt_chars": 1085,
+     "prompt_tokens": 250
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 21.40264699399995,
+    "ttft_s": {
+     "mean": 1.2878932996300136,
+     "p50": 1.339054758005659,
+     "p90": 1.6636600960046053,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.06780892062877271,
+     "p50": 0.07534222622237553,
+     "p90": 0.08039289252395512,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 5.3284555105037725,
+     "p50": 5.688937435013941,
+     "p90": 5.982872911001323,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 442.0,
+     "p50": 472,
+     "p90": 578,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 59.25,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 474,
+    "output_tok_per_s": 22.14679334443454,
+    "req_per_s": 0.37378554167822003,
+    "finish_reasons": {
+     "length": 5,
+     "stop": 3
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 21.40264699399995,
+     "ttft_s": {
+      "mean": 1.2878932996300136,
+      "p50": 1.339054758005659,
+      "p90": 1.6636600960046053,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.06780892062877271,
+      "p50": 0.07534222622237553,
+      "p90": 0.08039289252395512,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 5.3284555105037725,
+      "p50": 5.688937435013941,
+      "p90": 5.982872911001323,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 442.0,
+      "p50": 472,
+      "p90": 578,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 59.25,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 474,
+     "output_tok_per_s": 22.14679334443454,
+     "req_per_s": 0.37378554167822003,
+     "finish_reasons": {
+      "length": 5,
+      "stop": 3
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.339054758005659,
+     "tpot_s": 0.08048328026987812,
+     "latency_s": 6.4095895850041416,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 515,
+      "completion_tokens": 64,
+      "total_tokens": 579,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The difference between spring and neap tides lies in the range of the tidal heig",
+     "text_chars": 327,
+     "index": 8,
+     "kind": "chat_long",
+     "t_start": 1788734168.0517673,
+     "prompt_tokens_client": 502,
+     "prompt_tokens_server": 515,
+     "prompt_chars": 2383,
+     "prompt_tokens": 502
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.4244224170106463,
+     "tpot_s": 0.052670937892669044,
+     "latency_s": 5.428422520999447,
+     "output_tokens": 57,
+     "content_chunks": 56,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 485,
+      "completion_tokens": 57,
+      "total_tokens": 542,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Based on the provided text, there is no mention of a halo around the sun or moon",
+     "text_chars": 296,
+     "index": 9,
+     "kind": "chat_long",
+     "t_start": 1788734168.0519657,
+     "prompt_tokens_client": 472,
+     "prompt_tokens_server": 485,
+     "prompt_chars": 2229,
+     "prompt_tokens": 472
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7016359239933081,
+     "tpot_s": 0.07534222622237553,
+     "latency_s": 5.448258934993646,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 263,
+      "completion_tokens": 64,
+      "total_tokens": 327,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Part 1: The Customer Perspective\n*Imagine you are sitting at the stall, and ",
+     "text_chars": 282,
+     "index": 10,
+     "kind": "chat_long",
+     "t_start": 1788734173.4818535,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 263,
+     "prompt_chars": 1085,
+     "prompt_tokens": 250
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4712901350139873,
+     "tpot_s": 0.0669451303013678,
+     "latency_s": 5.688937435013941,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 591,
+      "completion_tokens": 64,
+      "total_tokens": 655,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Think of it this way: the difference comes down to **how** they were made and **",
+     "text_chars": 293,
+     "index": 11,
+     "kind": "chat_long",
+     "t_start": 1788734174.4629736,
+     "prompt_tokens_client": 578,
+     "prompt_tokens_server": 591,
+     "prompt_chars": 2868,
+     "prompt_tokens": 578
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.9463788840075722,
+     "tpot_s": 0.07994320138084096,
+     "latency_s": 5.982872911001323,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 395,
+      "completion_tokens": 64,
+      "total_tokens": 459,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Think of it this way: if the Earth were just one giant, smooth ball covered in a",
+     "text_chars": 288,
+     "index": 12,
+     "kind": "chat_long",
+     "t_start": 1788734178.931023,
+     "prompt_tokens_client": 382,
+     "prompt_tokens_server": 395,
+     "prompt_chars": 1783,
+     "prompt_tokens": 382
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.9920369550090982,
+     "tpot_s": 0.052454080092883125,
+     "latency_s": 3.30289831700793,
+     "output_tokens": 44,
+     "content_chunks": 43,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 413,
+      "completion_tokens": 44,
+      "total_tokens": 457,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The provided passage does not explain why there are two high tides a day; it onl",
+     "text_chars": 206,
+     "index": 13,
+     "kind": "chat_long",
+     "t_start": 1788734180.15395,
+     "prompt_tokens_client": 400,
+     "prompt_tokens_server": 413,
+     "prompt_chars": 1868,
+     "prompt_tokens": 400
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7646672279952327,
+     "tpot_s": 0.08039289252395512,
+     "latency_s": 5.829486175003694,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 297,
+      "completion_tokens": 64,
+      "total_tokens": 361,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To avoid the \"romantic\" trap (the lonely watcher staring at the sea), you should",
+     "text_chars": 274,
+     "index": 14,
+     "kind": "chat_long",
+     "t_start": 1788734183.4584057,
+     "prompt_tokens_client": 284,
+     "prompt_tokens_server": 297,
+     "prompt_chars": 1157,
+     "prompt_tokens": 284
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6636600960046053,
+     "tpot_s": 0.054239616346211945,
+     "latency_s": 4.537178205006057,
+     "output_tokens": 53,
+     "content_chunks": 52,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 681,
+      "completion_tokens": 53,
+      "total_tokens": 734,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A halo around the sun or moon signifies that a **warm front is advancing** and r",
+     "text_chars": 235,
+     "index": 15,
+     "kind": "chat_long",
+     "t_start": 1788734184.9151437,
+     "prompt_tokens_client": 668,
+     "prompt_tokens_server": 681,
+     "prompt_chars": 3159,
+     "prompt_tokens": 668
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 17.153205947004608,
+    "ttft_s": {
+     "mean": 1.792752140247103,
+     "p50": 1.8984084809926571,
+     "p90": 2.2679190119961277,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.10675874095636934,
+     "p50": 0.11043297203182842,
+     "p90": 0.11685232779367767,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 8.51862452174828,
+     "p50": 8.863702235001256,
+     "p90": 9.225264177002828,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 349.0,
+     "p50": 358,
+     "p90": 472,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 29.848647627845242,
+    "req_per_s": 0.4663851191850819,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 17.153205947004608,
+     "ttft_s": {
+      "mean": 1.792752140247103,
+      "p50": 1.8984084809926571,
+      "p90": 2.2679190119961277,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.10675874095636934,
+      "p50": 0.11043297203182842,
+      "p90": 0.11685232779367767,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 8.51862452174828,
+      "p50": 8.863702235001256,
+      "p90": 9.225264177002828,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 349.0,
+      "p50": 358,
+      "p90": 472,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 29.848647627845242,
+     "req_per_s": 0.4663851191850819,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.6952275879884837,
+     "tpot_s": 0.11685232779367767,
+     "latency_s": 8.056991399993422,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 263,
+      "completion_tokens": 64,
+      "total_tokens": 327,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### The Diagnosis\n\nThe most likely cause of the \"flat\" taste is **oxidation and ",
+     "text_chars": 285,
+     "index": 16,
+     "kind": "chat_long",
+     "t_start": 1788734192.6107147,
+     "prompt_tokens_client": 250,
+     "prompt_tokens_server": 263,
+     "prompt_chars": 1085,
+     "prompt_tokens": 250
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.2679190119961277,
+     "tpot_s": 0.11043297203182842,
+     "latency_s": 9.225264177002828,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 371,
+      "completion_tokens": 64,
+      "total_tokens": 435,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Think of it this way: a honeybee colony is like a massive, living machine, and t",
+     "text_chars": 297,
+     "index": 17,
+     "kind": "chat_long",
+     "t_start": 1788734192.6108847,
+     "prompt_tokens_client": 358,
+     "prompt_tokens_server": 371,
+     "prompt_chars": 1737,
+     "prompt_tokens": 358
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.367326535997563,
+     "tpot_s": 0.10743316144443169,
+     "latency_s": 8.135670673989807,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 252,
+      "completion_tokens": 64,
+      "total_tokens": 316,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "*Disclaimer: I am an AI, not a professional apiarist. Beekeeping involves living",
+     "text_chars": 295,
+     "index": 18,
+     "kind": "chat_long",
+     "t_start": 1788734192.6109667,
+     "prompt_tokens_client": 239,
+     "prompt_tokens_server": 252,
+     "prompt_chars": 1075,
+     "prompt_tokens": 239
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.22071610900457,
+     "tpot_s": 0.10824870344437104,
+     "latency_s": 10.0404403010034,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 382,
+      "completion_tokens": 64,
+      "total_tokens": 446,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Johannes Gutenberg\u2019s contribution was not a single invention, but the integratio",
+     "text_chars": 376,
+     "index": 19,
+     "kind": "chat_long",
+     "t_start": 1788734192.6110494,
+     "prompt_tokens_client": 369,
+     "prompt_tokens_server": 382,
+     "prompt_chars": 1822,
+     "prompt_tokens": 369
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.09027063800022,
+     "tpot_s": 0.12339003199996937,
+     "latency_s": 8.863933145999908,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 485,
+      "completion_tokens": 64,
+      "total_tokens": 549,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "So, think of your money like it\u2019s being split into three different \"buckets\" bas",
+     "text_chars": 268,
+     "index": 20,
+     "kind": "chat_long",
+     "t_start": 1788734200.6687117,
+     "prompt_tokens_client": 472,
+     "prompt_tokens_server": 485,
+     "prompt_chars": 2376,
+     "prompt_tokens": 472
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8242174019978847,
+     "tpot_s": 0.1117369111429619,
+     "latency_s": 8.863702235001256,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 297,
+      "completion_tokens": 64,
+      "total_tokens": 361,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To avoid the \"romantic\" trap (the lonely watcher staring at the sea), you should",
+     "text_chars": 274,
+     "index": 21,
+     "kind": "chat_long",
+     "t_start": 1788734200.747445,
+     "prompt_tokens_client": 284,
+     "prompt_tokens_server": 297,
+     "prompt_chars": 1157,
+     "prompt_tokens": 284
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8984084809926571,
+     "tpot_s": 0.0945207697620231,
+     "latency_s": 7.853308463993017,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 497,
+      "completion_tokens": 64,
+      "total_tokens": 561,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Striations are parallel grooves etched into bedrock caused by rock fragments fro",
+     "text_chars": 335,
+     "index": 22,
+     "kind": "chat_long",
+     "t_start": 1788734201.8375683,
+     "prompt_tokens_client": 484,
+     "prompt_tokens_server": 497,
+     "prompt_chars": 2360,
+     "prompt_tokens": 484
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.977931355999317,
+     "tpot_s": 0.0814550500316915,
+     "latency_s": 7.109685777002596,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 349,
+      "completion_tokens": 64,
+      "total_tokens": 413,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "A sinking fund is a budgeting strategy where a household sets aside a fixed amou",
+     "text_chars": 362,
+     "index": 23,
+     "kind": "chat_long",
+     "t_start": 1788734202.6529262,
+     "prompt_tokens_client": 336,
+     "prompt_tokens_server": 349,
+     "prompt_chars": 1724,
+     "prompt_tokens": 336
+    }
+   ]
+  },
+  {
+   "workload": "chat_long",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 16.630889761989238,
+    "ttft_s": {
+     "mean": 4.3431356227483775,
+     "p50": 4.4704130070022075,
+     "p90": 7.671609252996859,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.18979614260945057,
+     "p50": 0.20969232058730938,
+     "p90": 0.2322428059207076,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 15.747234763250162,
+     "p50": 16.285640428992338,
+     "p90": 16.525039191008545,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 425.125,
+     "p50": 511,
+     "p90": 587,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 59.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 472,
+    "output_tok_per_s": 28.380922894382987,
+    "req_per_s": 0.48103259143022015,
+    "finish_reasons": {
+     "length": 7,
+     "stop": 1
+    }
+   },
+   "by_kind": {
+    "chat_long": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 16.630889761989238,
+     "ttft_s": {
+      "mean": 4.3431356227483775,
+      "p50": 4.4704130070022075,
+      "p90": 7.671609252996859,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.18979614260945057,
+      "p50": 0.20969232058730938,
+      "p90": 0.2322428059207076,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 15.747234763250162,
+      "p50": 16.285640428992338,
+      "p90": 16.525039191008545,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 425.125,
+      "p50": 511,
+      "p90": 587,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 59.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 472,
+     "output_tok_per_s": 28.380922894382987,
+     "req_per_s": 0.48103259143022015,
+     "finish_reasons": {
+      "length": 7,
+      "stop": 1
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7430334050004603,
+     "tpot_s": 0.24114491111120312,
+     "latency_s": 15.93522384800599,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 296,
+      "completion_tokens": 64,
+      "total_tokens": 360,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "To avoid the \"romantic\" trap, you should frame the lighthouse not as a lonely se",
+     "text_chars": 297,
+     "index": 24,
+     "kind": "chat_long",
+     "t_start": 1788734212.891764,
+     "prompt_tokens_client": 283,
+     "prompt_tokens_server": 296,
+     "prompt_chars": 1154,
+     "prompt_tokens": 283
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 9.24458384900936,
+     "tpot_s": 0.1134026284783866,
+     "latency_s": 11.963987712006201,
+     "output_tokens": 24,
+     "content_chunks": 23,
+     "finish_reason": "stop",
+     "usage": {
+      "prompt_tokens": 600,
+      "completion_tokens": 24,
+      "total_tokens": 624,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The passage does not mention Fresnel's lens, nor does it state how far a lightho",
+     "text_chars": 104,
+     "index": 25,
+     "kind": "chat_long",
+     "t_start": 1788734212.891962,
+     "prompt_tokens_client": 587,
+     "prompt_tokens_server": 600,
+     "prompt_chars": 2935,
+     "prompt_tokens": 587
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.0749707439972553,
+     "tpot_s": 0.20969232058730938,
+     "latency_s": 16.285640428992338,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 394,
+      "completion_tokens": 64,
+      "total_tokens": 458,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Actually, the passage doesn't explicitly say that ancient hours were \"elastic\"\u2014i",
+     "text_chars": 300,
+     "index": 26,
+     "kind": "chat_long",
+     "t_start": 1788734212.8920565,
+     "prompt_tokens_client": 381,
+     "prompt_tokens_server": 394,
+     "prompt_chars": 1841,
+     "prompt_tokens": 381
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.4211810169945238,
+     "tpot_s": 0.2322428059207076,
+     "latency_s": 16.05254357699596,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 243,
+      "completion_tokens": 64,
+      "total_tokens": 307,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "*Disclaimer: I am an AI, not a professional apiarist. Beekeeping involves risks ",
+     "text_chars": 296,
+     "index": 27,
+     "kind": "chat_long",
+     "t_start": 1788734212.8922331,
+     "prompt_tokens_client": 230,
+     "prompt_tokens_server": 243,
+     "prompt_chars": 1035,
+     "prompt_tokens": 230
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.106842629989842,
+     "tpot_s": 0.22330196100007188,
+     "latency_s": 16.174924438993912,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 252,
+      "completion_tokens": 64,
+      "total_tokens": 316,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "*Disclaimer: I am an AI, not a professional apiarist. Beekeeping involves living",
+     "text_chars": 305,
+     "index": 28,
+     "kind": "chat_long",
+     "t_start": 1788734212.8922937,
+     "prompt_tokens_client": 239,
+     "prompt_tokens_server": 252,
+     "prompt_chars": 1075,
+     "prompt_tokens": 239
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.012451076996513,
+     "tpot_s": 0.1668651929683706,
+     "latency_s": 16.525039191008545,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 582,
+      "completion_tokens": 64,
+      "total_tokens": 646,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Think of **striations** as the \"scratches\" left behind by a glacier. \n\nWhen a gl",
+     "text_chars": 266,
+     "index": 29,
+     "kind": "chat_long",
+     "t_start": 1788734212.8923678,
+     "prompt_tokens_client": 569,
+     "prompt_tokens_server": 582,
+     "prompt_chars": 2800,
+     "prompt_tokens": 569
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.4704130070022075,
+     "tpot_s": 0.18956434466674674,
+     "latency_s": 16.413061238999944,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 524,
+      "completion_tokens": 64,
+      "total_tokens": 588,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "An escapement is the mechanical \"heart\" of a clock. It is a device designed to r",
+     "text_chars": 301,
+     "index": 30,
+     "kind": "chat_long",
+     "t_start": 1788734212.8929043,
+     "prompt_tokens_client": 511,
+     "prompt_tokens_server": 524,
+     "prompt_chars": 2399,
+     "prompt_tokens": 511
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 7.671609252996859,
+     "tpot_s": 0.14215497614280875,
+     "latency_s": 16.62745767099841,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 614,
+      "completion_tokens": 64,
+      "total_tokens": 678,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The primary difference between the washed and natural processes lies in how the ",
+     "text_chars": 338,
+     "index": 31,
+     "kind": "chat_long",
+     "t_start": 1788734212.8934433,
+     "prompt_tokens_client": 601,
+     "prompt_tokens_server": 614,
+     "prompt_chars": 2993,
+     "prompt_tokens": 601
+    }
+   ]
+  },
+  {
+   "workload": "code",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 26.11973878099525,
+    "ttft_s": {
+     "mean": 0.8693940120028856,
+     "p50": 0.8640892539988272,
+     "p90": 0.9883172679983545,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.03800223985516433,
+     "p50": 0.03809069165066513,
+     "p90": 0.03826411930166946,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 3.2636226206268475,
+     "p50": 3.263886853994336,
+     "p90": 3.4243563110067043,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 365.375,
+     "p50": 369,
+     "p90": 449,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 19.602033706881166,
+    "req_per_s": 0.3062817766700182,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "code": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 26.11973878099525,
+     "ttft_s": {
+      "mean": 0.8693940120028856,
+      "p50": 0.8640892539988272,
+      "p90": 0.9883172679983545,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.03800223985516433,
+      "p50": 0.03809069165066513,
+      "p90": 0.03826411930166946,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 3.2636226206268475,
+      "p50": 3.263886853994336,
+      "p90": 3.4243563110067043,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 365.375,
+      "p50": 369,
+      "p90": 449,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 19.602033706881166,
+     "req_per_s": 0.3062817766700182,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0349632360012038,
+     "tpot_s": 0.03826411930166946,
+     "latency_s": 3.445686368009774,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 476,
+      "completion_tokens": 64,
+      "total_tokens": 540,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Explanation\nThe issue is caused by the use of `var`, which has function-leve",
+     "text_chars": 289,
+     "index": 0,
+     "kind": "code",
+     "t_start": 1788734232.8123474,
+     "prompt_tokens_client": 463,
+     "prompt_tokens_server": 476,
+     "prompt_chars": 2072,
+     "prompt_tokens": 463
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7583130500133848,
+     "tpot_s": 0.038158620491952795,
+     "latency_s": 3.1623970420041587,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 317,
+      "completion_tokens": 64,
+      "total_tokens": 381,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Since the prompt provides a SQL query but asks for a solution that handles \"inpu",
+     "text_chars": 295,
+     "index": 1,
+     "kind": "code",
+     "t_start": 1788734236.259495,
+     "prompt_tokens_client": 304,
+     "prompt_tokens_server": 317,
+     "prompt_chars": 1339,
+     "prompt_tokens": 304
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7217002770048566,
+     "tpot_s": 0.03791038100011758,
+     "latency_s": 3.110143429003074,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 285,
+      "completion_tokens": 64,
+      "total_tokens": 349,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Analysis of Bugs\n\nThe original implementation had three primary issues:\n1.  ",
+     "text_chars": 228,
+     "index": 2,
+     "kind": "code",
+     "t_start": 1788734239.4229655,
+     "prompt_tokens_client": 272,
+     "prompt_tokens_server": 285,
+     "prompt_chars": 1142,
+     "prompt_tokens": 272
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7739007860072888,
+     "tpot_s": 0.03746784931752786,
+     "latency_s": 3.1344599930016557,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 313,
+      "completion_tokens": 64,
+      "total_tokens": 377,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```go\npackage retry\n\nimport (\n\t\"context\"\n\t\"errors\"\n\t\"time\"\n)\n\n// Retry executes ",
+     "text_chars": 232,
+     "index": 3,
+     "kind": "code",
+     "t_start": 1788734242.5341582,
+     "prompt_tokens_client": 300,
+     "prompt_tokens_server": 313,
+     "prompt_chars": 1397,
+     "prompt_tokens": 300
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.9564505510061281,
+     "tpot_s": 0.03788945868256546,
+     "latency_s": 3.3435757590050343,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 437,
+      "completion_tokens": 64,
+      "total_tokens": 501,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```sql\n/*\n * This query calculates customer engagement metrics per country for t",
+     "text_chars": 233,
+     "index": 4,
+     "kind": "code",
+     "t_start": 1788734245.6697915,
+     "prompt_tokens_client": 424,
+     "prompt_tokens_server": 437,
+     "prompt_chars": 2040,
+     "prompt_tokens": 424
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.9883172679983545,
+     "tpot_s": 0.038665870301580675,
+     "latency_s": 3.4243563110067043,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 462,
+      "completion_tokens": 64,
+      "total_tokens": 526,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Explanation of the Deadlock\n\nThe original code deadlocks because the `result",
+     "text_chars": 298,
+     "index": 5,
+     "kind": "code",
+     "t_start": 1788734249.0150287,
+     "prompt_tokens_client": 449,
+     "prompt_tokens_server": 462,
+     "prompt_chars": 2014,
+     "prompt_tokens": 449
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.8574176739930408,
+     "tpot_s": 0.03757092809523567,
+     "latency_s": 3.224475208990043,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 355,
+      "completion_tokens": 64,
+      "total_tokens": 419,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport itertools\n\ndef chunked(iterable, n):\n    \"\"\"\n    Yield successi",
+     "text_chars": 262,
+     "index": 6,
+     "kind": "code",
+     "t_start": 1788734252.4408984,
+     "prompt_tokens_client": 342,
+     "prompt_tokens_server": 355,
+     "prompt_chars": 1595,
+     "prompt_tokens": 342
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.8640892539988272,
+     "tpot_s": 0.03809069165066513,
+     "latency_s": 3.263886853994336,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 382,
+      "completion_tokens": 64,
+      "total_tokens": 446,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Identified Problems\n1.  **Logic Error (Counting):** The `if/else` logic is i",
+     "text_chars": 231,
+     "index": 7,
+     "kind": "code",
+     "t_start": 1788734255.666726,
+     "prompt_tokens_client": 369,
+     "prompt_tokens_server": 382,
+     "prompt_chars": 1613,
+     "prompt_tokens": 369
+    }
+   ]
+  },
+  {
+   "workload": "code",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 20.621556112004328,
+    "ttft_s": {
+     "mean": 1.39165975137621,
+     "p50": 1.5597072600066895,
+     "p90": 1.9212484720046632,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.0596104276924413,
+     "p50": 0.06305292503176523,
+     "p90": 0.06756473023796432,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 5.147197885873538,
+     "p50": 5.291803234998952,
+     "p90": 5.338914708991069,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 374.375,
+     "p50": 388,
+     "p90": 443,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 24.828388178812165,
+    "req_per_s": 0.3879435652939401,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "code": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 20.621556112004328,
+     "ttft_s": {
+      "mean": 1.39165975137621,
+      "p50": 1.5597072600066895,
+      "p90": 1.9212484720046632,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.0596104276924413,
+      "p50": 0.06305292503176523,
+      "p90": 0.06756473023796432,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 5.147197885873538,
+      "p50": 5.291803234998952,
+      "p90": 5.338914708991069,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 374.375,
+      "p50": 388,
+      "p90": 443,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 24.828388178812165,
+     "req_per_s": 0.3879435652939401,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0719730150012765,
+     "tpot_s": 0.06305292503176523,
+     "latency_s": 5.044406400003936,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 510,
+      "completion_tokens": 64,
+      "total_tokens": 574,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Identified Problems\n\n1.  **Logic Error (Incrementing):** The `if/else` logic",
+     "text_chars": 230,
+     "index": 8,
+     "kind": "code",
+     "t_start": 1788734262.2559788,
+     "prompt_tokens_client": 497,
+     "prompt_tokens_server": 510,
+     "prompt_chars": 2244,
+     "prompt_tokens": 497
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8237975960073527,
+     "tpot_s": 0.05202915731749113,
+     "latency_s": 5.101724079009728,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 296,
+      "completion_tokens": 64,
+      "total_tokens": 360,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Identified Problems\n\n1.  **Logic Error (Incrementing):** The `if/else` logic",
+     "text_chars": 240,
+     "index": 9,
+     "kind": "code",
+     "t_start": 1788734262.2561855,
+     "prompt_tokens_client": 283,
+     "prompt_tokens_server": 296,
+     "prompt_chars": 1206,
+     "prompt_tokens": 283
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7469091419916367,
+     "tpot_s": 0.0656785531110862,
+     "latency_s": 4.884720981994178,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 257,
+      "completion_tokens": 64,
+      "total_tokens": 321,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```sql\n/*\nAPPROACH:\nThis query calculates customer engagement and order averages",
+     "text_chars": 240,
+     "index": 10,
+     "kind": "code",
+     "t_start": 1788734267.3019497,
+     "prompt_tokens_client": 244,
+     "prompt_tokens_server": 257,
+     "prompt_chars": 1145,
+     "prompt_tokens": 244
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.5597072600066895,
+     "tpot_s": 0.052697485666685105,
+     "latency_s": 4.87973243399756,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 355,
+      "completion_tokens": 64,
+      "total_tokens": 419,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### The Fix: SQL Analysis\n\n**The Problem:**\nThe original query uses an **Implici",
+     "text_chars": 257,
+     "index": 11,
+     "kind": "code",
+     "t_start": 1788734267.3588693,
+     "prompt_tokens_client": 342,
+     "prompt_tokens_server": 355,
+     "prompt_chars": 1536,
+     "prompt_tokens": 342
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0364630810072413,
+     "tpot_s": 0.06756473023796432,
+     "latency_s": 5.293101021001348,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 434,
+      "completion_tokens": 64,
+      "total_tokens": 498,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```javascript\n/**\n * Returns a debounced version of the provided function.\n * \n ",
+     "text_chars": 245,
+     "index": 12,
+     "kind": "code",
+     "t_start": 1788734272.1878223,
+     "prompt_tokens_client": 421,
+     "prompt_tokens_server": 434,
+     "prompt_chars": 2070,
+     "prompt_tokens": 421
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.9212484720046632,
+     "tpot_s": 0.053499607682516354,
+     "latency_s": 5.291803234998952,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 390,
+      "completion_tokens": 64,
+      "total_tokens": 454,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nclass LRUCache:\n    \"\"\"\n    A Least Recently Used (LRU) cache implemen",
+     "text_chars": 225,
+     "index": 13,
+     "kind": "code",
+     "t_start": 1788734272.2397952,
+     "prompt_tokens_client": 377,
+     "prompt_tokens_server": 390,
+     "prompt_chars": 1649,
+     "prompt_tokens": 377
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.0349774139904184,
+     "tpot_s": 0.06831552658741924,
+     "latency_s": 5.338914708991069,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 456,
+      "completion_tokens": 64,
+      "total_tokens": 520,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```javascript\n/**\n * Calculates the sum of the 'price' field across an array of ",
+     "text_chars": 226,
+     "index": 14,
+     "kind": "code",
+     "t_start": 1788734277.482453,
+     "prompt_tokens_client": 443,
+     "prompt_tokens_server": 456,
+     "prompt_chars": 1994,
+     "prompt_tokens": 443
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.938202031000401,
+     "tpot_s": 0.05404543590460283,
+     "latency_s": 5.343180226991535,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 401,
+      "completion_tokens": 64,
+      "total_tokens": 465,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```sql\n/*\n * This query calculates customer engagement and spending metrics per ",
+     "text_chars": 231,
+     "index": 15,
+     "kind": "code",
+     "t_start": 1788734277.532769,
+     "prompt_tokens_client": 388,
+     "prompt_tokens_server": 401,
+     "prompt_chars": 1793,
+     "prompt_tokens": 388
+    }
+   ]
+  },
+  {
+   "workload": "code",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 17.906765908002853,
+    "ttft_s": {
+     "mean": 2.0587594837488723,
+     "p50": 1.9339907369867433,
+     "p90": 2.9739145720086526,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.10847937769840572,
+     "p50": 0.10985087963478965,
+     "p90": 0.1257345321429302,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 8.893046693872748,
+     "p50": 8.855128551993403,
+     "p90": 9.824774136999622,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 401.375,
+     "p50": 435,
+     "p90": 452,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 28.592544439930276,
+    "req_per_s": 0.44675850687391055,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "code": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 17.906765908002853,
+     "ttft_s": {
+      "mean": 2.0587594837488723,
+      "p50": 1.9339907369867433,
+      "p90": 2.9739145720086526,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.10847937769840572,
+      "p50": 0.10985087963478965,
+      "p90": 0.1257345321429302,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 8.893046693872748,
+      "p50": 8.855128551993403,
+      "p90": 9.824774136999622,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 401.375,
+      "p50": 435,
+      "p90": 452,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 28.592544439930276,
+     "req_per_s": 0.44675850687391055,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.8780286620021798,
+     "tpot_s": 0.12661907296823632,
+     "latency_s": 8.855128551993403,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 388,
+      "completion_tokens": 64,
+      "total_tokens": 452,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```javascript\nfunction totalPrice(items) {\n    // Handle cases where items is nu",
+     "text_chars": 221,
+     "index": 16,
+     "kind": "code",
+     "t_start": 1788734286.3342786,
+     "prompt_tokens_client": 375,
+     "prompt_tokens_server": 388,
+     "prompt_chars": 1699,
+     "prompt_tokens": 375
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.036619735008571,
+     "tpot_s": 0.10985087963478965,
+     "latency_s": 10.957295708009042,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 448,
+      "completion_tokens": 64,
+      "total_tokens": 512,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport logging\n\n# Configure logger for operations visibility\nlogger = ",
+     "text_chars": 280,
+     "index": 17,
+     "kind": "code",
+     "t_start": 1788734286.3345323,
+     "prompt_tokens_client": 435,
+     "prompt_tokens_server": 448,
+     "prompt_chars": 2040,
+     "prompt_tokens": 435
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.9739145720086526,
+     "tpot_s": 0.10874286661892833,
+     "latency_s": 9.824774136999622,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 451,
+      "completion_tokens": 64,
+      "total_tokens": 515,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```rust\nuse std::fmt;\n\n/// Represents errors encountered during the parsing of a",
+     "text_chars": 257,
+     "index": 18,
+     "kind": "code",
+     "t_start": 1788734286.3347228,
+     "prompt_tokens_client": 438,
+     "prompt_tokens_server": 451,
+     "prompt_chars": 2053,
+     "prompt_tokens": 438
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.9323822399892379,
+     "tpot_s": 0.11119363942859872,
+     "latency_s": 8.937663213000633,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 465,
+      "completion_tokens": 64,
+      "total_tokens": 529,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```go\npackage retry\n\nimport (\n    \"context\"\n    \"errors\"\n    \"time\"\n)\n\n// MaxBac",
+     "text_chars": 239,
+     "index": 19,
+     "kind": "code",
+     "t_start": 1788734286.334949,
+     "prompt_tokens_client": 452,
+     "prompt_tokens_server": 465,
+     "prompt_chars": 2120,
+     "prompt_tokens": 452
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.8880802450003102,
+     "tpot_s": 0.1257345321429302,
+     "latency_s": 8.809451984998304,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 341,
+      "completion_tokens": 64,
+      "total_tokens": 405,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Identified Problems\n\n1.  **Logic Error (The \"Counter\" Bug):** The logic for ",
+     "text_chars": 257,
+     "index": 20,
+     "kind": "code",
+     "t_start": 1788734295.1909504,
+     "prompt_tokens_client": 328,
+     "prompt_tokens_server": 341,
+     "prompt_chars": 1467,
+     "prompt_tokens": 328
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.9339907369867433,
+     "tpot_s": 0.10913435157156542,
+     "latency_s": 8.809550854988629,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 502,
+      "completion_tokens": 64,
+      "total_tokens": 566,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```go\n// process transforms a slice of strings to uppercase concurrently.\n// It ",
+     "text_chars": 274,
+     "index": 21,
+     "kind": "code",
+     "t_start": 1788734295.2743962,
+     "prompt_tokens_client": 489,
+     "prompt_tokens_server": 502,
+     "prompt_chars": 2233,
+     "prompt_tokens": 489
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.0333128299971577,
+     "tpot_s": 0.0947798866190068,
+     "latency_s": 8.004536847001873,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 388,
+      "completion_tokens": 64,
+      "total_tokens": 452,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\ndef median(numbers):\n    \"\"\"\n    Calculates the median value of a non-",
+     "text_chars": 257,
+     "index": 22,
+     "kind": "code",
+     "t_start": 1788734296.16112,
+     "prompt_tokens_client": 375,
+     "prompt_tokens_server": 388,
+     "prompt_chars": 1639,
+     "prompt_tokens": 375
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.7937468489981256,
+     "tpot_s": 0.08177979260319031,
+     "latency_s": 6.945972253990476,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 332,
+      "completion_tokens": 64,
+      "total_tokens": 396,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```sql\n/*\n * Approach:\n * 1. Filter orders to only include those placed in the y",
+     "text_chars": 235,
+     "index": 23,
+     "kind": "code",
+     "t_start": 1788734297.2936757,
+     "prompt_tokens_client": 319,
+     "prompt_tokens_server": 332,
+     "prompt_chars": 1491,
+     "prompt_tokens": 319
+    }
+   ]
+  },
+  {
+   "workload": "code",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 14.786564890993759,
+    "ttft_s": {
+     "mean": 4.037323942879084,
+     "p50": 4.408859287010273,
+     "p90": 6.519908547998057,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.16444156226186482,
+     "p50": 0.17300931950786247,
+     "p90": 0.196446638603303,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 14.397225862128835,
+     "p50": 14.45519575101207,
+     "p90": 14.675346492003882,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 359.25,
+     "p50": 374,
+     "p90": 408,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 34.62602732781096,
+    "req_per_s": 0.5410316769970462,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "code": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 14.786564890993759,
+     "ttft_s": {
+      "mean": 4.037323942879084,
+      "p50": 4.408859287010273,
+      "p90": 6.519908547998057,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.16444156226186482,
+      "p50": 0.17300931950786247,
+      "p90": 0.196446638603303,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 14.397225862128835,
+      "p50": 14.45519575101207,
+      "p90": 14.675346492003882,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 359.25,
+      "p50": 374,
+      "p90": 408,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 34.62602732781096,
+     "req_per_s": 0.5410316769970462,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.385293348997948,
+     "tpot_s": 0.14559895246029123,
+     "latency_s": 14.558086873003049,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 367,
+      "completion_tokens": 64,
+      "total_tokens": 431,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport string\nfrom collections import Counter\n\ndef top_words(text):\n  ",
+     "text_chars": 261,
+     "index": 24,
+     "kind": "code",
+     "t_start": 1788734307.6265862,
+     "prompt_tokens_client": 354,
+     "prompt_tokens_server": 367,
+     "prompt_chars": 1537,
+     "prompt_tokens": 354
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.7459285810036818,
+     "tpot_s": 0.196446638603303,
+     "latency_s": 14.122166676010238,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 421,
+      "completion_tokens": 64,
+      "total_tokens": 485,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```rust\nfn lower_bound(xs: &[i32], target: i32) -> Option<usize> {\n    // Handle",
+     "text_chars": 199,
+     "index": 25,
+     "kind": "code",
+     "t_start": 1788734307.6268303,
+     "prompt_tokens_client": 408,
+     "prompt_tokens_server": 421,
+     "prompt_chars": 1655,
+     "prompt_tokens": 408
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 0.7508424590050709,
+     "tpot_s": 0.210441225571447,
+     "latency_s": 14.008749309999985,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 292,
+      "completion_tokens": 64,
+      "total_tokens": 356,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```rust\n/// Finds the index of the first element in a sorted slice that is great",
+     "text_chars": 271,
+     "index": 26,
+     "kind": "code",
+     "t_start": 1788734307.6269794,
+     "prompt_tokens_client": 279,
+     "prompt_tokens_server": 292,
+     "prompt_chars": 1047,
+     "prompt_tokens": 279
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.5295799580053426,
+     "tpot_s": 0.18575965877763728,
+     "latency_s": 14.232518024000456,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 291,
+      "completion_tokens": 64,
+      "total_tokens": 355,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```bash\n#!/bin/bash\n\n# Check if exactly one argument is provided\nif [ \"$#\" -ne 1",
+     "text_chars": 208,
+     "index": 27,
+     "kind": "code",
+     "t_start": 1788734307.6271455,
+     "prompt_tokens_client": 278,
+     "prompt_tokens_server": 291,
+     "prompt_chars": 1314,
+     "prompt_tokens": 278
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.4419913000019733,
+     "tpot_s": 0.17300931950786247,
+     "latency_s": 14.341672958995332,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 357,
+      "completion_tokens": 64,
+      "total_tokens": 421,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport string\nfrom collections import Counter\n\ndef get_top_three_words",
+     "text_chars": 254,
+     "index": 28,
+     "kind": "code",
+     "t_start": 1788734307.6272945,
+     "prompt_tokens_client": 344,
+     "prompt_tokens_server": 357,
+     "prompt_chars": 1460,
+     "prompt_tokens": 344
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.408859287010273,
+     "tpot_s": 0.15946436890457305,
+     "latency_s": 14.45519575101207,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 399,
+      "completion_tokens": 64,
+      "total_tokens": 463,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```javascript\n/**\n * Calculates the sum of the 'price' property from an array of",
+     "text_chars": 297,
+     "index": 29,
+     "kind": "code",
+     "t_start": 1788734307.6274784,
+     "prompt_tokens_client": 386,
+     "prompt_tokens_server": 399,
+     "prompt_chars": 1729,
+     "prompt_tokens": 386
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 7.516188061010325,
+     "tpot_s": 0.11536181679352127,
+     "latency_s": 14.784070812005666,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 387,
+      "completion_tokens": 64,
+      "total_tokens": 451,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```rust\nuse std::collections::HashMap;\n\n/// Returns the `k` most frequent words ",
+     "text_chars": 247,
+     "index": 30,
+     "kind": "code",
+     "t_start": 1788734307.6276634,
+     "prompt_tokens_client": 374,
+     "prompt_tokens_server": 387,
+     "prompt_chars": 1713,
+     "prompt_tokens": 374
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.519908547998057,
+     "tpot_s": 0.12945051747628317,
+     "latency_s": 14.675346492003882,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 464,
+      "completion_tokens": 64,
+      "total_tokens": 528,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "```python\nimport asyncio\nimport pytest\n\nasync def fetch_all(session, urls):\n    ",
+     "text_chars": 271,
+     "index": 31,
+     "kind": "code",
+     "t_start": 1788734307.6283233,
+     "prompt_tokens_client": 451,
+     "prompt_tokens_server": 464,
+     "prompt_chars": 2105,
+     "prompt_tokens": 451
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 1,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 41.69503120001173,
+    "ttft_s": {
+     "mean": 2.694079604001672,
+     "p50": 3.1921069560048636,
+     "p90": 3.4308957050088793,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.039920674956322594,
+     "p50": 0.0399122366507072,
+     "p90": 0.0404356716030706,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 5.209171812874047,
+     "p50": 5.706683419994079,
+     "p90": 5.978437458004919,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1105.125,
+     "p50": 1243,
+     "p90": 1411,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 12.279640649360061,
+    "req_per_s": 0.19186938514625096,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 41.69503120001173,
+     "ttft_s": {
+      "mean": 2.694079604001672,
+      "p50": 3.1921069560048636,
+      "p90": 3.4308957050088793,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.039920674956322594,
+      "p50": 0.0399122366507072,
+      "p90": 0.0404356716030706,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 5.209171812874047,
+      "p50": 5.706683419994079,
+      "p90": 5.978437458004919,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1105.125,
+      "p50": 1243,
+      "p90": 1411,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 12.279640649360061,
+     "req_per_s": 0.19186938514625096,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.862021029999596,
+     "tpot_s": 0.03974467104749887,
+     "latency_s": 4.366018517990597,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 825,
+      "completion_tokens": 64,
+      "total_tokens": 889,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a summary of the article:\n\n* **Early Timekeeping:** Ancient methods like",
+     "text_chars": 335,
+     "index": 0,
+     "kind": "summarize",
+     "t_start": 1788734328.3803372,
+     "prompt_tokens_client": 812,
+     "prompt_tokens_server": 825,
+     "prompt_chars": 3908,
+     "prompt_tokens": 812
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.4308957050088793,
+     "tpot_s": 0.0404356716030706,
+     "latency_s": 5.978437458004919,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1424,
+      "completion_tokens": 64,
+      "total_tokens": 1488,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text provides a detailed overview of two distinct subjects: the geological ",
+     "text_chars": 395,
+     "index": 1,
+     "kind": "summarize",
+     "t_start": 1788734332.7484467,
+     "prompt_tokens_client": 1411,
+     "prompt_tokens_server": 1424,
+     "prompt_chars": 7075,
+     "prompt_tokens": 1411
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.3041354790038895,
+     "tpot_s": 0.04014871146027294,
+     "latency_s": 5.833592196009704,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1340,
+      "completion_tokens": 64,
+      "total_tokens": 1404,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The article details the honeybee colony's seasonal cycle and cloud-based weather",
+     "text_chars": 319,
+     "index": 2,
+     "kind": "summarize",
+     "t_start": 1788734338.7300456,
+     "prompt_tokens_client": 1327,
+     "prompt_tokens_server": 1340,
+     "prompt_chars": 6348,
+     "prompt_tokens": 1327
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.6715636909939349,
+     "tpot_s": 0.03942630803194045,
+     "latency_s": 4.155504174996167,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 706,
+      "completion_tokens": 64,
+      "total_tokens": 770,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text traces the journey of coffee from the labor-intensive harvesting of ch",
+     "text_chars": 347,
+     "index": 3,
+     "kind": "summarize",
+     "t_start": 1788734344.5665917,
+     "prompt_tokens_client": 693,
+     "prompt_tokens_server": 706,
+     "prompt_chars": 3460,
+     "prompt_tokens": 693
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.713992621997022,
+     "tpot_s": 0.03967998285721507,
+     "latency_s": 5.213915806991281,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1147,
+      "completion_tokens": 64,
+      "total_tokens": 1211,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\n\nThe provided text consists of two distinct, unrelated narratives. \n",
+     "text_chars": 323,
+     "index": 4,
+     "kind": "summarize",
+     "t_start": 1788734348.724173,
+     "prompt_tokens_client": 1134,
+     "prompt_tokens_server": 1147,
+     "prompt_chars": 5429,
+     "prompt_tokens": 1134
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8548694199998863,
+     "tpot_s": 0.03936392434924427,
+     "latency_s": 4.334887862001779,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 790,
+      "completion_tokens": 64,
+      "total_tokens": 854,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "# The Lifecycle and Seasonal Management of a Honeybee Colony\n\n* **Colony Dynamic",
+     "text_chars": 332,
+     "index": 5,
+     "kind": "summarize",
+     "t_start": 1788734353.940741,
+     "prompt_tokens_client": 777,
+     "prompt_tokens_server": 790,
+     "prompt_chars": 3759,
+     "prompt_tokens": 777
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.5230519290053053,
+     "tpot_s": 0.04065389365063138,
+     "latency_s": 6.084335067003849,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1457,
+      "completion_tokens": 64,
+      "total_tokens": 1521,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The first text describes the honeybee colony as a single organism. In midsummer,",
+     "text_chars": 266,
+     "index": 6,
+     "kind": "summarize",
+     "t_start": 1788734358.277774,
+     "prompt_tokens_client": 1444,
+     "prompt_tokens_server": 1457,
+     "prompt_chars": 7044,
+     "prompt_tokens": 1444
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.1921069560048636,
+     "tpot_s": 0.0399122366507072,
+     "latency_s": 5.706683419994079,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1256,
+      "completion_tokens": 64,
+      "total_tokens": 1320,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This article explores the historical evolution of precision measurement and mari",
+     "text_chars": 391,
+     "index": 7,
+     "kind": "summarize",
+     "t_start": 1788734364.3653686,
+     "prompt_tokens_client": 1243,
+     "prompt_tokens_server": 1256,
+     "prompt_chars": 6126,
+     "prompt_tokens": 1243
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 2,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 36.980115401995135,
+    "ttft_s": {
+     "mean": 3.2153400318729837,
+     "p50": 3.215166447000229,
+     "p90": 3.4553037879959447,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.09533001979963003,
+     "p50": 0.10660398595237416,
+     "p90": 0.10816203268237472,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 9.221211295372996,
+     "p50": 9.041582081001252,
+     "p90": 10.275743373000296,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1119.125,
+     "p50": 1187,
+     "p90": 1223,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 13.845278589162456,
+    "req_per_s": 0.21633247795566338,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 36.980115401995135,
+     "ttft_s": {
+      "mean": 3.2153400318729837,
+      "p50": 3.215166447000229,
+      "p90": 3.4553037879959447,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.09533001979963003,
+      "p50": 0.10660398595237416,
+      "p90": 0.10816203268237472,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 9.221211295372996,
+      "p50": 9.041582081001252,
+      "p90": 10.275743373000296,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1119.125,
+      "p50": 1187,
+      "p90": 1223,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 13.845278589162456,
+     "req_per_s": 0.21633247795566338,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.1366053499950795,
+     "tpot_s": 0.10660398595237416,
+     "latency_s": 9.852726123994216,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1236,
+      "completion_tokens": 64,
+      "total_tokens": 1300,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The first section outlines household budgeting, emphasizing the distinction betw",
+     "text_chars": 391,
+     "index": 8,
+     "kind": "summarize",
+     "t_start": 1788734376.0916917,
+     "prompt_tokens_client": 1223,
+     "prompt_tokens_server": 1236,
+     "prompt_chars": 6181,
+     "prompt_tokens": 1223
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.333491265992052,
+     "tpot_s": 0.0906304540953392,
+     "latency_s": 12.043286232990795,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1200,
+      "completion_tokens": 64,
+      "total_tokens": 1264,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a summary of the article:\n\n* **The Role of the Keeper:** Lighthouse keep",
+     "text_chars": 346,
+     "index": 9,
+     "kind": "summarize",
+     "t_start": 1788734376.091938,
+     "prompt_tokens_client": 1187,
+     "prompt_tokens_server": 1200,
+     "prompt_chars": 5793,
+     "prompt_tokens": 1187
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.1299011719966074,
+     "tpot_s": 0.10700185598421191,
+     "latency_s": 8.871111187996576,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 958,
+      "completion_tokens": 64,
+      "total_tokens": 1022,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\n\nThe provided text consists of two distinct sections: a history of t",
+     "text_chars": 333,
+     "index": 10,
+     "kind": "summarize",
+     "t_start": 1788734385.948234,
+     "prompt_tokens_client": 945,
+     "prompt_tokens_server": 958,
+     "prompt_chars": 4566,
+     "prompt_tokens": 945
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.215166447000229,
+     "tpot_s": 0.09216367557140377,
+     "latency_s": 9.02154605400574,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1185,
+      "completion_tokens": 64,
+      "total_tokens": 1249,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "# Executive Summary: Evolution of Precision and Planning\n\n* **Technological Prog",
+     "text_chars": 337,
+     "index": 11,
+     "kind": "summarize",
+     "t_start": 1788734388.1390889,
+     "prompt_tokens_client": 1172,
+     "prompt_tokens_server": 1185,
+     "prompt_chars": 5720,
+     "prompt_tokens": 1172
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.223031469999114,
+     "tpot_s": 0.10816203268237472,
+     "latency_s": 9.037319871989894,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1007,
+      "completion_tokens": 64,
+      "total_tokens": 1071,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text explores the chemical and biological processes involved in bread makin",
+     "text_chars": 317,
+     "index": 12,
+     "kind": "summarize",
+     "t_start": 1788734394.8220847,
+     "prompt_tokens_client": 994,
+     "prompt_tokens_server": 1007,
+     "prompt_chars": 4942,
+     "prompt_tokens": 994
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.2541683680028655,
+     "tpot_s": 0.11145241328585331,
+     "latency_s": 10.275743373000296,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1221,
+      "completion_tokens": 64,
+      "total_tokens": 1285,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a summary of the provided text:\n\n*   **Glacial Erosion and Movement:** G",
+     "text_chars": 309,
+     "index": 13,
+     "kind": "summarize",
+     "t_start": 1788734397.1641855,
+     "prompt_tokens_client": 1208,
+     "prompt_tokens_server": 1221,
+     "prompt_chars": 5923,
+     "prompt_tokens": 1208
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.4553037879959447,
+     "tpot_s": 0.08866962596833233,
+     "latency_s": 9.041582081001252,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1376,
+      "completion_tokens": 64,
+      "total_tokens": 1440,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text provides a detailed overview of the physical mechanisms and biological",
+     "text_chars": 347,
+     "index": 14,
+     "kind": "summarize",
+     "t_start": 1788734403.8620708,
+     "prompt_tokens_client": 1363,
+     "prompt_tokens_server": 1376,
+     "prompt_chars": 6617,
+     "prompt_tokens": 1363
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.9750523940019775,
+     "tpot_s": 0.05795611485715083,
+     "latency_s": 5.626375438005198,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 874,
+      "completion_tokens": 64,
+      "total_tokens": 938,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text provides a detailed overview of the biological and chemical processes ",
+     "text_chars": 327,
+     "index": 15,
+     "kind": "summarize",
+     "t_start": 1788734407.4429686,
+     "prompt_tokens_client": 861,
+     "prompt_tokens_server": 874,
+     "prompt_chars": 4337,
+     "prompt_tokens": 861
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 4,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 34.37327531800838,
+    "ttft_s": {
+     "mean": 5.449841735751761,
+     "p50": 3.755940497008851,
+     "p90": 9.424628359003691,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.1841672244642853,
+     "p50": 0.20458955738101237,
+     "p90": 0.22480050625398734,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 17.052448589878622,
+     "p50": 18.026630610998836,
+     "p90": 22.313827603007667,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1178.125,
+     "p50": 1205,
+     "p90": 1397,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 14.895292789621356,
+    "req_per_s": 0.2327389498378337,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 34.37327531800838,
+     "ttft_s": {
+      "mean": 5.449841735751761,
+      "p50": 3.755940497008851,
+      "p90": 9.424628359003691,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.1841672244642853,
+      "p50": 0.20458955738101237,
+      "p90": 0.22480050625398734,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 17.052448589878622,
+      "p50": 18.026630610998836,
+      "p90": 22.313827603007667,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1178.125,
+      "p50": 1205,
+      "p90": 1397,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 14.895292789621356,
+     "req_per_s": 0.2327389498378337,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.1930937610013643,
+     "tpot_s": 0.23545184539675357,
+     "latency_s": 18.026630610998836,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1218,
+      "completion_tokens": 64,
+      "total_tokens": 1282,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\n\nThe provided text consists of two distinct articles: one detailing ",
+     "text_chars": 338,
+     "index": 16,
+     "kind": "summarize",
+     "t_start": 1788734419.1585982,
+     "prompt_tokens_client": 1205,
+     "prompt_tokens_server": 1218,
+     "prompt_chars": 5985,
+     "prompt_tokens": 1205
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 5.838942664995557,
+     "tpot_s": 0.22480050625398734,
+     "latency_s": 20.001432578996173,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1096,
+      "completion_tokens": 64,
+      "total_tokens": 1160,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\nThe invention of the printing press revolutionized Europe by making ",
+     "text_chars": 405,
+     "index": 17,
+     "kind": "summarize",
+     "t_start": 1788734419.1588583,
+     "prompt_tokens_client": 1083,
+     "prompt_tokens_server": 1096,
+     "prompt_chars": 5472,
+     "prompt_tokens": 1083
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 12.95998123800382,
+     "tpot_s": 0.20042055403182674,
+     "latency_s": 25.586542091012234,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1410,
+      "completion_tokens": 64,
+      "total_tokens": 1474,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "# Summary of Glacial Processes and the Impact of the Printing Press\n\n* **Glacial",
+     "text_chars": 311,
+     "index": 18,
+     "kind": "summarize",
+     "t_start": 1788734419.159062,
+     "prompt_tokens_client": 1397,
+     "prompt_tokens_server": 1410,
+     "prompt_chars": 7053,
+     "prompt_tokens": 1397
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 9.424628359003691,
+     "tpot_s": 0.20458955738101237,
+     "latency_s": 22.313827603007667,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1478,
+      "completion_tokens": 64,
+      "total_tokens": 1542,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a summary of the provided text:\n\n*   **Glacial Formation and Movement:**",
+     "text_chars": 327,
+     "index": 19,
+     "kind": "summarize",
+     "t_start": 1788734419.1592624,
+     "prompt_tokens_client": 1465,
+     "prompt_tokens_server": 1478,
+     "prompt_chars": 7150,
+     "prompt_tokens": 1465
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 1.8848832459916594,
+     "tpot_s": 0.2203356311746618,
+     "latency_s": 15.766122268003528,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 818,
+      "completion_tokens": 64,
+      "total_tokens": 882,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\n\nThe article provides a comprehensive overview of the coffee lifecyc",
+     "text_chars": 343,
+     "index": 20,
+     "kind": "summarize",
+     "t_start": 1788734437.1897984,
+     "prompt_tokens_client": 805,
+     "prompt_tokens_server": 818,
+     "prompt_chars": 4018,
+     "prompt_tokens": 805
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.2697063160012476,
+     "tpot_s": 0.17104553320631755,
+     "latency_s": 14.045650150001165,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1255,
+      "completion_tokens": 64,
+      "total_tokens": 1319,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text covers two distinct subjects. First, it details glacial processes: ice",
+     "text_chars": 332,
+     "index": 21,
+     "kind": "summarize",
+     "t_start": 1788734439.164167,
+     "prompt_tokens_client": 1242,
+     "prompt_tokens_server": 1255,
+     "prompt_chars": 6176,
+     "prompt_tokens": 1242
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.755940497008851,
+     "tpot_s": 0.12928577228555538,
+     "latency_s": 11.901010861009127,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1121,
+      "completion_tokens": 64,
+      "total_tokens": 1185,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This text provides a detailed overview of the physical mechanisms and ecological",
+     "text_chars": 378,
+     "index": 22,
+     "kind": "summarize",
+     "t_start": 1788734441.4776347,
+     "prompt_tokens_client": 1108,
+     "prompt_tokens_server": 1121,
+     "prompt_chars": 5420,
+     "prompt_tokens": 1108
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 3.271557804007898,
+     "tpot_s": 0.08740839598416757,
+     "latency_s": 8.77837255600025,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1133,
+      "completion_tokens": 64,
+      "total_tokens": 1197,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "This article provides an overview of two distinct scientific and historical phen",
+     "text_chars": 357,
+     "index": 23,
+     "kind": "summarize",
+     "t_start": 1788734444.750576,
+     "prompt_tokens_client": 1120,
+     "prompt_tokens_server": 1133,
+     "prompt_chars": 5489,
+     "prompt_tokens": 1120
+    }
+   ]
+  },
+  {
+   "workload": "summarize",
+   "concurrency": 8,
+   "agg": {
+    "n": 8,
+    "ok": 8,
+    "errors": 0,
+    "wall_s": 30.612727081999765,
+    "ttft_s": {
+     "mean": 11.382887067999036,
+     "p50": 11.770050381004694,
+     "p90": 19.026835910000955,
+     "n": 8
+    },
+    "tpot_s": {
+     "mean": 0.29317076391666813,
+     "p50": 0.32856727420631426,
+     "p90": 0.3937087015873412,
+     "n": 8
+    },
+    "latency_s": {
+     "mean": 29.85272273312512,
+     "p50": 29.94350370700704,
+     "p90": 30.40066735900473,
+     "n": 8
+    },
+    "prompt_tokens": {
+     "mean": 1133.0,
+     "p50": 1122,
+     "p90": 1366,
+     "n": 8
+    },
+    "output_tokens": {
+     "mean": 64.0,
+     "p50": 64,
+     "p90": 64,
+     "n": 8
+    },
+    "output_tokens_total": 512,
+    "output_tok_per_s": 16.725069890981885,
+    "req_per_s": 0.26132921704659196,
+    "finish_reasons": {
+     "length": 8
+    }
+   },
+   "by_kind": {
+    "summarize": {
+     "n": 8,
+     "ok": 8,
+     "errors": 0,
+     "wall_s": 30.612727081999765,
+     "ttft_s": {
+      "mean": 11.382887067999036,
+      "p50": 11.770050381004694,
+      "p90": 19.026835910000955,
+      "n": 8
+     },
+     "tpot_s": {
+      "mean": 0.29317076391666813,
+      "p50": 0.32856727420631426,
+      "p90": 0.3937087015873412,
+      "n": 8
+     },
+     "latency_s": {
+      "mean": 29.85272273312512,
+      "p50": 29.94350370700704,
+      "p90": 30.40066735900473,
+      "n": 8
+     },
+     "prompt_tokens": {
+      "mean": 1133.0,
+      "p50": 1122,
+      "p90": 1366,
+      "n": 8
+     },
+     "output_tokens": {
+      "mean": 64.0,
+      "p50": 64,
+      "p90": 64,
+      "n": 8
+     },
+     "output_tokens_total": 512,
+     "output_tok_per_s": 16.725069890981885,
+     "req_per_s": 0.26132921704659196,
+     "finish_reasons": {
+      "length": 8
+     }
+    }
+   },
+   "requests": [
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 2.6569667180010583,
+     "tpot_s": 0.4213405926665661,
+     "latency_s": 29.20148736498959,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1124,
+      "completion_tokens": 64,
+      "total_tokens": 1188,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The first text details the life of lighthouse keepers, whose precise maintenance",
+     "text_chars": 348,
+     "index": 24,
+     "kind": "summarize",
+     "t_start": 1788734459.3479965,
+     "prompt_tokens_client": 1111,
+     "prompt_tokens_server": 1124,
+     "prompt_chars": 5567,
+     "prompt_tokens": 1111
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 15.27324523999414,
+     "tpot_s": 0.2367194563969009,
+     "latency_s": 30.186664833003306,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1379,
+      "completion_tokens": 64,
+      "total_tokens": 1443,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The provided text consists of two distinct articles. Here is a summary of each:\n",
+     "text_chars": 281,
+     "index": 25,
+     "kind": "summarize",
+     "t_start": 1788734459.348289,
+     "prompt_tokens_client": 1366,
+     "prompt_tokens_server": 1379,
+     "prompt_chars": 6563,
+     "prompt_tokens": 1366
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 19.026835910000955,
+     "tpot_s": 0.18053591550796272,
+     "latency_s": 30.40066735900473,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1525,
+      "completion_tokens": 64,
+      "total_tokens": 1589,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "The first steam engines, like Newcomen\u2019s 1712 model, were mine pumps. James Watt",
+     "text_chars": 240,
+     "index": 26,
+     "kind": "summarize",
+     "t_start": 1788734459.348498,
+     "prompt_tokens_client": 1512,
+     "prompt_tokens_server": 1525,
+     "prompt_chars": 7308,
+     "prompt_tokens": 1512
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 11.770050381004694,
+     "tpot_s": 0.2884660285397706,
+     "latency_s": 29.94350370700704,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1135,
+      "completion_tokens": 64,
+      "total_tokens": 1199,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\n\nThe article explores the historical evolution of timekeeping and th",
+     "text_chars": 365,
+     "index": 27,
+     "kind": "summarize",
+     "t_start": 1788734459.3486853,
+     "prompt_tokens_client": 1122,
+     "prompt_tokens_server": 1135,
+     "prompt_chars": 5371,
+     "prompt_tokens": 1122
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 6.306258329001139,
+     "tpot_s": 0.36746010825403835,
+     "latency_s": 29.456329778011423,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 781,
+      "completion_tokens": 64,
+      "total_tokens": 845,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Glaciers are massive bodies of ice formed by the accumulation and compression of",
+     "text_chars": 356,
+     "index": 28,
+     "kind": "summarize",
+     "t_start": 1788734459.348822,
+     "prompt_tokens_client": 768,
+     "prompt_tokens_server": 781,
+     "prompt_chars": 3835,
+     "prompt_tokens": 768
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 8.99887279199902,
+     "tpot_s": 0.32856727420631426,
+     "latency_s": 29.6986793679971,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1056,
+      "completion_tokens": 64,
+      "total_tokens": 1120,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\n\nThe provided text consists of two distinct sections: a detailed ove",
+     "text_chars": 329,
+     "index": 29,
+     "kind": "summarize",
+     "t_start": 1788734459.3490045,
+     "prompt_tokens_client": 1043,
+     "prompt_tokens_server": 1056,
+     "prompt_chars": 5151,
+     "prompt_tokens": 1043
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 22.508578155000578,
+     "tpot_s": 0.1285680341744511,
+     "latency_s": 30.608443855991936,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 1350,
+      "completion_tokens": 64,
+      "total_tokens": 1414,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "Here is a summary of the article:\n\n* **The Evolution of Lighthouses:** Originall",
+     "text_chars": 334,
+     "index": 30,
+     "kind": "summarize",
+     "t_start": 1788734459.3491895,
+     "prompt_tokens_client": 1337,
+     "prompt_tokens_server": 1350,
+     "prompt_chars": 6535,
+     "prompt_tokens": 1337
+    },
+    {
+     "status": 200,
+     "error": null,
+     "ttft_s": 4.522289018990705,
+     "tpot_s": 0.3937087015873412,
+     "latency_s": 29.326005598995835,
+     "output_tokens": 64,
+     "content_chunks": 64,
+     "finish_reason": "length",
+     "usage": {
+      "prompt_tokens": 818,
+      "completion_tokens": 64,
+      "total_tokens": 882,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "text_head": "### Summary\n\nThe article provides a comprehensive overview of the coffee lifecyc",
+     "text_chars": 343,
+     "index": 31,
+     "kind": "summarize",
+     "t_start": 1788734459.350011,
+     "prompt_tokens_client": 805,
+     "prompt_tokens_server": 818,
+     "prompt_chars": 4018,
+     "prompt_tokens": 805
+    }
+   ]
+  }
+ ]
+}
