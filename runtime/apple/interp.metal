@@ -926,7 +926,8 @@ void op_flash_prefill(const thread Inst& in, device const ulong* tab, uint slice
 }
 // t0=Opart t1=mlpart t2=Q t3=K t4=V t5=kv_len(i32)  i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window
 // i5=nsplit i6=hd i7=kv_mask  f0=scale   (i1 bit 16 NRF fold -> poison)
-void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
+void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+                     threadgroup float* tile, uint sg, uint lane) {
     device float* Opart = ten<float>(tab, in, 0);
     device float* mlpart = ten<float>(tab, in, 1);
     device const ushort* Q = ten<ushort>(tab, in, 2);
@@ -947,6 +948,13 @@ void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice,
     uint n_grp = (n_head + gf - 1) / gf;
     uint n_work = n_batch * n_grp * nsplit;
     uint per = D / 32u;
+    // The whole threadgroup takes one work item: every simdgroup attends a slice of the key
+    // range with its own online-softmax state, the partials go through `tile` (m, l, acc[D]
+    // per simdgroup) and simdgroup 0 merges them. A head's keys are otherwise a serial chain
+    // (dot, simd_sum, exp per key) on one simdgroup, which is 0.18 ms per key of context
+    // per token with 30 simdgroups idle.
+    uint stride = D + 2u;
+    uint nsg_a = min(NSG, TILE_FLOATS / stride);
     for (uint w = slice; w < n_work; w += nblk) {
         uint sp = w % nsplit, hg = (w / nsplit) % n_grp, b = w / (nsplit * n_grp);
         uint h0 = hg * gf, hkv = h0 / gqa;
@@ -956,22 +964,50 @@ void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice,
         uint lo = first + sp * perp, hi = min(lo + perp, len);
         device const ushort* kbase = K + (ulong(b) * n_kv_head + hkv) * kv_stride * D;
         device const ushort* vbase = V + (ulong(b) * n_kv_head + hkv) * kv_stride * D;
-        // simdgroup sg handles head h0 + sg (gf <= 2, so only the first gf simdgroups work)
-        uint h = h0 + sg;
-        if (sg >= gf || h >= n_head) continue;
-        device float* op = Opart + ((ulong(b) * n_head + h) * nsplit + sp) * D;
-        device float* ml = mlpart + ((ulong(b) * n_head + h) * nsplit + sp) * 2;
-        if (nrf) {
-            for (uint j = 0; j < per; j++) op[lane + 32u * j] = NAN;
-            if (lane == 0) { ml[0] = NAN; ml[1] = NAN; }
-            continue;
+        for (uint hh = 0; hh < gf; hh++) {
+            uint h = h0 + hh;
+            if (h >= n_head) break;
+            device float* op = Opart + ((ulong(b) * n_head + h) * nsplit + sp) * D;
+            device float* ml = mlpart + ((ulong(b) * n_head + h) * nsplit + sp) * 2;
+            if (nrf) {
+                if (sg == 0) {
+                    for (uint j = 0; j < per; j++) op[lane + 32u * j] = NAN;
+                    if (lane == 0) { ml[0] = NAN; ml[1] = NAN; }
+                }
+                continue;
+            }
+            device const ushort* q = Q + (ulong(b) * n_head + h) * D;
+            if (sg < nsg_a) {
+                uint n = hi > lo ? hi - lo : 0u;
+                uint chunk = (n + nsg_a - 1u) / nsg_a;
+                uint my_lo = lo + sg * chunk, my_hi = min(my_lo + chunk, hi);
+                float m = NEG_INF, l = 0.0f, acc[16];
+                for (uint j = 0; j < 16; j++) acc[j] = 0.0f;
+                if (my_lo < my_hi)
+                    attend_rows(q, kbase, vbase, D, kv_mask, scale, my_lo, my_hi, qpos, window, false, lane, acc, m, l);
+                threadgroup float* part = tile + sg * stride;
+                if (lane == 0) { part[0] = m; part[1] = l; }
+                for (uint j = 0; j < per; j++) part[2u + lane + 32u * j] = acc[j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                float M = NEG_INF;
+                for (uint i = 0; i < nsg_a; i++) M = max(M, tile[i * stride]);
+                float L = 0.0f, o[16];
+                for (uint j = 0; j < per; j++) o[j] = 0.0f;
+                for (uint i = 0; i < nsg_a; i++) {
+                    threadgroup const float* part = tile + i * stride;
+                    float mi = part[0];
+                    if (mi == NEG_INF) continue;
+                    float e = exp(mi - M);
+                    L += part[1] * e;
+                    for (uint j = 0; j < per; j++) o[j] += part[2u + lane + 32u * j] * e;
+                }
+                for (uint j = 0; j < per; j++) op[lane + 32u * j] = o[j];
+                if (lane == 0) { ml[0] = M; ml[1] = L; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        device const ushort* q = Q + (ulong(b) * n_head + h) * D;
-        float m = NEG_INF, l = 0.0f, acc[16];
-        for (uint j = 0; j < 16; j++) acc[j] = 0.0f;
-        attend_rows(q, kbase, vbase, D, kv_mask, scale, lo, hi, qpos, window, false, lane, acc, m, l);
-        for (uint j = 0; j < per; j++) op[lane + 32u * j] = acc[j];
-        if (lane == 0) { ml[0] = m; ml[1] = l; }
     }
 }
 // t0=O t1=Opart t2=mlpart t3=sinks?  i0=n_batch i1=n_head i2=nsplit i3=hd
@@ -1036,7 +1072,7 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 30: op_gemv_fp8(in, tab, slice, nblk, sg, lane); return true;
         case 31: op_gemv_glu_fp8(in, tab, slice, nblk, sg, lane); return true;
         case 11: op_flash_prefill(in, tab, slice, nblk, sg, lane); return true;
-        case 12: op_flash_decode(in, tab, slice, nblk, sg, lane); return true;
+        case 12: op_flash_decode(in, tab, slice, nblk, tile, sg, lane); return true;
         case 13: op_flash_merge(in, tab, slice, nblk, lid); return true;
         case 16: op_norm_residual(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 17: op_argmax(in, tab, slice, nblk, keys, lid); return true;

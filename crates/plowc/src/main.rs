@@ -636,7 +636,15 @@ fn main() -> ExitCode {
                 let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
                 let ane = doc["chosen"]["ane_pct"].as_u64().unwrap_or(0);
                 let cpu = doc["chosen"]["cpu_pct"].as_u64().unwrap_or(0);
-                if ane + cpu > 0 {
+                // The split was measured for ONE model (its ANE programs are that model's layers);
+                // another checkpoint on the same part stays GPU-only until it is calibrated.
+                let this_model = cli
+                    .hf_dir
+                    .as_ref()
+                    .and_then(|d| d.file_name())
+                    .map(|s| s.to_string_lossy().to_string());
+                let same_model = doc["model"].as_str().is_some_and(|m| Some(m.to_string()) == this_model);
+                if ane + cpu > 0 && same_model {
                     let rs = format!("ane={ane},cpu={cpu}");
                     tracing::info!(record = %path.display(), split = %rs, "apple: calibrated prefill row split");
                     std::env::set_var("PLOW_ROW_SPLIT", &rs);

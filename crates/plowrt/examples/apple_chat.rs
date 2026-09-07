@@ -110,6 +110,17 @@ fn main() {
         let t = Instant::now();
         let next = eng.decode_step(pos, pos + 1).expect("decode");
         step_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        if step_ms.len() % 100 == 0 {
+            let w = &step_ms[step_ms.len() - 100..];
+            println!(
+                "  steps {}..{}: mean {:.1} ms/tok, min {:.1}, max {:.1}",
+                step_ms.len() - 100,
+                step_ms.len(),
+                w.iter().sum::<f64>() / 100.0,
+                w.iter().cloned().fold(f64::INFINITY, f64::min),
+                w.iter().cloned().fold(0.0, f64::max)
+            );
+        }
         out.push(next);
         pos += 1;
     }
