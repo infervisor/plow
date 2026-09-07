@@ -37,6 +37,33 @@ conversation failed to render at all until `strip`/`lstrip`/`rstrip`/`startswith
 `lower`/`upper`/`split` were added through an unknown-method callback. That gap was invisible
 to the type checker and to a single-turn smoke test; only the live battery caught it.
 
+**They call real `dict` methods too, and that one was fatal.** `message.get('tool_calls')` is
+how a template reads an optional key, and Gemma-4's and Kimi-K2.5's both do it on their first
+pass over `messages` — Gemma-4 at `chat_template.jinja:239`, Kimi-K2.5 at `:19`. minijinja has
+no dict methods, so `render` failed for **every** conversation with `map has no method named
+get`; and because the template itself COMPILED, `ChatTemplate::load` returned `Some` and the
+built-in builders were never reached. The server answered **400 to every chat request** for
+those families. `get`/`items`/`keys`/`values` are now handled by the same unknown-method
+callback, with `get` returning Python's `None` for a missing key so the `a.get(x) or a.get(y)`
+idiom stays falsy.
+
+Rendering is verified against a Jinja env configured the way `transformers` configures it
+(`ImmutableSandboxedEnvironment`, `trim_blocks`, `lstrip_blocks`, `loopcontrols`,
+`raise_exception`, `tojson`), over six conversation shapes — user-only, system+user,
+multi-turn, `developer` role, a tool result, and a null-content assistant turn.
+`scripts/chat_template_check.py` is that diff, runnable against any models root
+(`cargo build -p plowrt --example tmpl_probe` first); the two real-checkpoint tests in
+`serve::template` pin GLM-5.3 and Gemma-4 where the weights are present.
+
+| checkpoint | template | render |
+|---|---|---|
+| `zai-org/GLM-5.3` (`glm_moe_dsa`) | `chat_template.jinja` | 6/6 byte-identical |
+| `zai-org/GLM-5.2` (`glm_moe_dsa`) | `chat_template.jinja` | 6/6 byte-identical |
+| `google/gemma-4-12B-it` (`gemma4_unified`) | `chat_template.jinja` | 6/6 byte-identical |
+| `google/gemma-4-26B-A4B-it` (`gemma4`) | `chat_template.jinja` | 6/6 byte-identical |
+| Kimi-K2.5 (`kimi_k25`) | `chat_template.jinja` | 6/6 byte-identical |
+| Kimi-K3 | ships none | built-in `k3_chat_prompt` |
+
 **Reasoning is split from the answer.** With thinking left open the raw generation is
 `<trace></think><answer>`, and `</think>` is `special: false` in GLM's added tokens, so
 `skip_special_tokens` does NOT remove it. `content` now carries the answer alone and the trace
@@ -99,5 +126,19 @@ blob is a genuine CPU-reference asset and still only warns.
   is to wire the host resample path into the AMD arm.
 - **Tool calling is refused, not implemented.** The templates can render tool blocks; nothing
   parses a tool call back out of the generation.
+- **The handler projects each message to `{role, content}` before rendering**, so a template
+  never sees `tool_calls`, `name` or `reasoning_content`, and `tools` is passed as none. Kimi's
+  template keys the speaker off `message.get('name')`, and every family renders an assistant
+  turn that carried a tool call as an empty one. Latent while `tools` is refused at the API
+  boundary; it is the thing to fix first when tool calling lands.
+- **Only two of the four places HF puts a template are read.** `ChatTemplate::load` reads
+  `chat_template.jinja` and the `chat_template` string in `tokenizer_config.json`. It does not
+  read `chat_template.json`, the `chat_templates/*.jinja` directory, or the list form of
+  `chat_template` (`[{"name": "default", …}]`) — even though `nn-graph`'s `METADATA_FILES`
+  stages the first two into the bundle. No checkpoint on this host uses them, so the gap is
+  latent, but a checkpoint that does would fall through to the built-in builders.
+- **`tojson` takes no keyword arguments.** GLM's template calls
+  `tojson(ensure_ascii=False)` on the tool path, which minijinja rejects as too many arguments.
+  Unreachable while tool calls are stripped before rendering.
 - **No `/v1/embeddings`, no `/v1/models/{id}`.**
 - **No auth, CORS, body-size limit or request timeout** on the router.

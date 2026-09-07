@@ -106,7 +106,50 @@ impl ChatTemplate {
         // so without this an ordinary multi-turn conversation fails to render
         // with "string has no method named strip".
         env.set_unknown_method_callback(|_state, value, method, args| {
-            use minijinja::value::from_args;
+            use minijinja::value::{from_args, ValueKind};
+            // PYTHON DICT METHODS, for the same reason as the string methods
+            // below: `message.get('tool_calls')` is how a template reads an
+            // OPTIONAL key, and Gemma-4's and Kimi-K2.5's templates open with
+            // one. Without it `render` fails for EVERY conversation, and
+            // because the template compiled fine the built-in builders are
+            // never reached — the server answers 400 to every chat request.
+            if value.kind() == ValueKind::Map {
+                match method {
+                    "get" => {
+                        let (key, default): (Value, Option<Value>) = from_args(args)?;
+                        let got = value.get_item(&key)?;
+                        // Python yields None for a missing key, which the
+                        // `a.get(x) or a.get(y)` idiom relies on being falsy.
+                        return Ok(if got.is_undefined() {
+                            default.unwrap_or_else(|| Value::from(()))
+                        } else {
+                            got
+                        });
+                    }
+                    "items" => {
+                        let () = from_args(args)?;
+                        let mut out = Vec::new();
+                        for k in value.try_iter()? {
+                            let v = value.get_item(&k)?;
+                            out.push(Value::from(vec![k, v]));
+                        }
+                        return Ok(Value::from(out));
+                    }
+                    "keys" => {
+                        let () = from_args(args)?;
+                        return Ok(Value::from(value.try_iter()?.collect::<Vec<_>>()));
+                    }
+                    "values" => {
+                        let () = from_args(args)?;
+                        let mut out = Vec::new();
+                        for k in value.try_iter()? {
+                            out.push(value.get_item(&k)?);
+                        }
+                        return Ok(Value::from(out));
+                    }
+                    _ => {}
+                }
+            }
             let Some(s) = value.as_str() else {
                 return Err(minijinja::Error::from(
                     minijinja::ErrorKind::UnknownMethod,
@@ -249,6 +292,55 @@ mod tests {
         let out = t.render(&msgs).expect("multi-turn renders");
         assert!(out.contains("<|assistant|>"), "{out}");
         assert!(out.ends_with("<|assistant|><think>"), "{out}");
+    }
+
+    /// HF templates read an OPTIONAL message key with `message.get(...)`.
+    /// Gemma-4's and Kimi-K2.5's both do it on the first pass over `messages`,
+    /// so without dict methods `render` failed for every conversation — and
+    /// because the template itself COMPILED, the built-in builders were never
+    /// reached and the server answered 400 to every chat request for those
+    /// families. Host-independent, so it gates everywhere the string-method
+    /// test cannot.
+    #[test]
+    fn python_dict_methods_render() {
+        let d = std::env::temp_dir().join("plow-template-dict-methods-test");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("chat_template.jinja"),
+            "{% for m in messages %}{{ m.get('name') or m['role'] }}\
+             ={{ m.get('missing', 'dflt') }};{% endfor %}\
+             |{% for k, v in messages[0].items() %}[{{ k }}]{% endfor %}",
+        )
+        .unwrap();
+        let t = ChatTemplate::load(&d).expect("template compiles");
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "name": "bot", "content": "yo"}),
+        ];
+        let out = t.render(&msgs).expect("renders");
+        let (turns, items) = out.split_once('|').expect("both halves rendered");
+        assert_eq!(turns, "user=dflt;bot=dflt;");
+        assert!(items.contains("[role]") && items.contains("[content]"), "{items}");
+    }
+
+    /// The REAL Gemma-4 template, which is the one `.get()` was blocking.
+    #[test]
+    fn the_real_gemma4_template_renders_what_transformers_renders() {
+        let dir = std::path::Path::new("/workspace/models/gemma-4-12B-it-cpu");
+        if !dir.join("chat_template.jinja").exists() {
+            eprintln!("skipped: no Gemma-4 checkpoint on this host");
+            return;
+        }
+        let t = ChatTemplate::load(dir).expect("template compiles");
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": "You are helpful."}),
+            serde_json::json!({"role": "user", "content": "Hi"}),
+        ];
+        assert_eq!(
+            t.render(&msgs).expect("renders"),
+            "<bos><|turn>system\nYou are helpful.<turn|>\n\
+             <|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        );
     }
 
     /// A checkpoint with no template must return `None`, not panic — that is
