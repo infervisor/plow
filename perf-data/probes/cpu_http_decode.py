@@ -8,7 +8,11 @@ import urllib.request
 parser = argparse.ArgumentParser()
 parser.add_argument('--url', default='http://127.0.0.1:18680')
 parser.add_argument('--output', default='cpu-http-decode.json')
+parser.add_argument('--concurrency', type=int, choices=(1, 4), default=4)
+parser.add_argument('--padding-repeats', type=int, default=0)
 args = parser.parse_args()
+if args.padding_repeats < 0:
+    parser.error('--padding-repeats must be nonnegative')
 base = args.url.rstrip('/')
 with urllib.request.urlopen(base + '/v1/models') as response:
     model = json.load(response)['data'][0]['id']
@@ -20,6 +24,9 @@ questions = [
 ]
 
 def run(question):
+    if args.padding_repeats:
+        question = ('The garden has green trees and yellow flowers. ' * args.padding_repeats
+                    + '\nIgnore the garden description. ' + question)
     body = {'model': model, 'messages': [{'role': 'user', 'content': question}],
             'stream': True, 'stream_options': {'include_usage': True},
             'temperature': 0, 'max_tokens': 128}
@@ -55,10 +62,10 @@ def run(question):
     return result
 
 start = time.monotonic()
-with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
     results = list(pool.map(run, questions))
 elapsed = time.monotonic() - start
-summary = {'model': model, 'concurrency': 4, 'seconds': elapsed,
+summary = {'model': model, 'concurrency': args.concurrency, 'seconds': elapsed,
            'output_tokens_per_second': sum(r['usage']['completion_tokens'] for r in results)/elapsed,
            'results': results}
 pathlib.Path(args.output).write_text(json.dumps(summary, indent=2) + '\n')

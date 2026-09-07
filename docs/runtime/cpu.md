@@ -109,6 +109,12 @@ slot lifecycle test on this host. Four longer responses produced 512 tokens in
 [run report](../../perf-data/cpu-gemma26b/epyc9654-avx512/README.md) for raw results,
 commands, and the observed imbalance in physical NUMA placement.
 
+The full 48-layer Gemma-4-12B BF16 network also passed the HTTP checks with both
+96 and 192 physical cores. The all-core run verified 24 pinned workers per NUMA
+node and measured 3.33 output tokens/s serially or 11.34 tokens/s at concurrency
+four. See the [12B report](../../perf-data/cpu-gemma/epyc9654-avx512/README.md)
+for first-token latency, prefill measurements, and the limits of this comparison.
+
 Production certification still requires full-network scalar/quantized quality
 comparisons, extended context/soak tests, and NUMA scaling measurements. The
 original gitignored CPU plans were absent; their outstanding items cannot be

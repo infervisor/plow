@@ -1,0 +1,72 @@
+{
+  "model": "gemma-4-12b-it-cpu",
+  "concurrency": 1,
+  "seconds": 153.87409719399875,
+  "output_tokens_per_second": 3.3273956392705224,
+  "results": [
+    {
+      "prompt": "Explain how a refrigerator transfers heat. Use about 150 words.",
+      "text": "A refrigerator transfers heat by utilizing a continuous cycle of evaporation and condensation involving a specialized chemical called a **refrigerant**. The process relies on the principle that fluids absorb heat when they evaporate into a gas and release heat when they condense into a liquid.\n\nThe cycle begins with the **compressor**, which squeezes the refrigerant gas, increasing its pressure and temperature. This hot gas flows through the **condenser coils** (usually located on the back or bottom of the unit), where it releases its heat into the surrounding room air, turning back into a liquid.\n\nThe liquid then passes through an **expansion valve**, where its pressure drops",
+      "seconds": 38.60873740003444,
+      "ttft_seconds": 1.7023519750218838,
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 28,
+        "completion_tokens": 128,
+        "total_tokens": 156,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "mean_post_first_token_ms": 290.601460039469
+    },
+    {
+      "prompt": "Explain why the sky appears blue. Use about 150 words.",
+      "text": "The sky appears blue due to a phenomenon called **Rayleigh scattering**. This occurs when sunlight interacts with the Earth's atmosphere, which is filled with gases (mostly nitrogen and oxygen) and small particles.\n\nSunlight is composed of a spectrum of colors, each with a different wavelength. Red light travels in longer, lazier waves, while blue and violet light travel in shorter, choppier waves. When sunlight enters the atmosphere, these shorter wavelengths strike the gas molecules and scatter in every direction. Because blue light scatters much more efficiently than red light, our eyes perceive the entire dome of the sky as blue.\n\nWhile violet",
+      "seconds": 38.58505771198543,
+      "ttft_seconds": 1.64212349394802,
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 28,
+        "completion_tokens": 128,
+        "total_tokens": 156,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "mean_post_first_token_ms": 290.8892458113182
+    },
+    {
+      "prompt": "Explain how a bicycle stays balanced while moving. Use about 150 words.",
+      "text": "A bicycle stays balanced through a combination of physics principles, primarily **gyroscopic effects**, **caster effect**, and **steering geometry**.\n\nWhen a bicycle moves, the spinning wheels act as gyroscopes. Their angular momentum resists changes in orientation, helping the bike maintain its upright position. However, this is only part of the story. The most critical factor is the **caster effect** and **trail**. The front fork is angled so that the contact point of the tire is slightly ahead of the steering axis. This creates a self-centering force: if the bike leans to the left, the geometry naturally causes the front wheel to turn into",
+      "seconds": 38.29361088795122,
+      "ttft_seconds": 1.4019523249589838,
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 30,
+        "completion_tokens": 128,
+        "total_tokens": 158,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "mean_post_first_token_ms": 290.48550049600186
+    },
+    {
+      "prompt": "Explain how plants turn sunlight into stored energy. Use about 150 words.",
+      "text": "Plants convert sunlight into stored energy through a biological process called **photosynthesis**. This transformation occurs primarily within the leaves, inside specialized organelles known as chloroplasts. These chloroplasts contain a green pigment called chlorophyll, which captures light energy from the sun.\n\nThe process begins when the plant absorbs water from the soil through its roots and carbon dioxide from the air through tiny pores in its leaves. Using the energy captured from sunlight, the plant triggers a chemical reaction that breaks down these raw materials. \n\nThe result of this reaction is the production of **glucose**, a simple sugar that serves as the plant's primary food source. The plant uses",
+      "seconds": 38.38353230798384,
+      "ttft_seconds": 1.5244295799639076,
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 30,
+        "completion_tokens": 128,
+        "total_tokens": 158,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "mean_post_first_token_ms": 290.22915533873964
+    }
+  ]
+}
