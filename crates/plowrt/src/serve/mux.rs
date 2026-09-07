@@ -2000,6 +2000,111 @@ fn run_one_tick(
                 nv.pf_defer_decode,
                 nv.pf_interleave,
             );
+            if nv.pf_batch
+                && slots[..b.min(slots.len())]
+                    .iter()
+                    .flatten()
+                    .filter(|slot| slot.step == 0)
+                    .take(2)
+                    .count()
+                    == 2
+            {
+                for (i, slot_opt) in slots.iter_mut().enumerate().take(b) {
+                    let Some(slot) = slot_opt.as_ref().filter(|slot| slot.step == 0) else {
+                        continue;
+                    };
+                    if let Err(err) = e.prepare_packed_prefill_slot(i, &slot.prompt_ids, tick_max) {
+                        note_fault(&mut tick_fault, &err);
+                        if let Some(taken) = slot_opt.take() {
+                            release_kv(&arena, taken.kv);
+                            let _ = taken.respond.try_send(StreamChunk::Err(err));
+                        }
+                        e.release(i);
+                    }
+                }
+            }
+            let terminal: Vec<_> = slots
+                .iter()
+                .enumerate()
+                .take(b)
+                .filter_map(|(i, slot)| {
+                    let slot = slot.as_ref()?;
+                    (slot.step == 0 && e.terminal_prefill_ready(i, &slot.prompt_ids)).then_some(i)
+                })
+                .collect();
+            if !terminal.is_empty() {
+                let feeds: Vec<_> = slots
+                    .iter()
+                    .enumerate()
+                    .take(b)
+                    .filter_map(|(i, slot)| {
+                        if no_interleave || nv.pf_defer_decode {
+                            return None;
+                        }
+                        let slot = slot.as_ref()?;
+                        slot.out_ids.last().map(|&token| (i, token))
+                    })
+                    .collect();
+                let result = {
+                    let members: Vec<_> = terminal
+                        .iter()
+                        .map(|&i| {
+                            (
+                                i,
+                                slots[i]
+                                    .as_ref()
+                                    .expect("terminal slot")
+                                    .prompt_ids
+                                    .as_slice(),
+                            )
+                        })
+                        .collect();
+                    e.finish_prefill_batch(&feeds, &members)
+                };
+                match result {
+                    Ok(output) => {
+                        e.advance_prefill_turn(*terminal.last().expect("terminal slots"));
+                        tracing::debug!(
+                            prefill = terminal.len(),
+                            decode = feeds.len(),
+                            "AMD batched prefill completion"
+                        );
+                        for (i, token) in output {
+                            if let Some(slot) = slots[i].as_mut() {
+                                if slot.step == 0 {
+                                    slot.pf_pos = slot.prompt_ids.len();
+                                }
+                            }
+                            handle_produced_token(
+                                &mut slots[i],
+                                &arena,
+                                bundle,
+                                token,
+                                1,
+                                &mut tokens_this_tick,
+                                Some(stop.as_slice()),
+                            );
+                            if slots[i].is_none() {
+                                e.release(i);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        note_fault(&mut tick_fault, &err);
+                        let msg = err.to_string();
+                        for i in terminal.into_iter().chain(feeds.iter().map(|&(i, _)| i)) {
+                            if let Some(taken) = slots[i].take() {
+                                release_kv(&arena, taken.kv);
+                                let _ = taken
+                                    .respond
+                                    .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                            }
+                            e.release(i);
+                        }
+                    }
+                }
+                return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
+            }
             if has_decode
                 && !no_interleave
                 && !nv.pf_defer_decode
@@ -2324,6 +2429,16 @@ fn run_one_tick(
                     tracing::debug!("amd: decode deferred while prefill remains");
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                 }
+            }
+
+            if did_prefill
+                && slots.iter().enumerate().take(b).any(|(i, slot)| {
+                    slot.as_ref().is_some_and(|slot| {
+                        slot.step == 0 && e.terminal_prefill_ready(i, &slot.prompt_ids)
+                    })
+                })
+            {
+                return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
             }
 
             // Decode: every live slot feeds the token it last produced.

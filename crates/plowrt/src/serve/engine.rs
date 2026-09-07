@@ -77,6 +77,26 @@ pub trait SeqEngine {
     fn mixed_prefill_fits(&self, _slot: usize, _prefill_capacity: u32) -> bool {
         false
     }
+    fn prepare_packed_prefill_slot(
+        &mut self,
+        _slot: usize,
+        _prompt: &[u32],
+        _max_rows: u32,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+    fn terminal_prefill_ready(&self, _slot: usize, _prompt: &[u32]) -> bool {
+        false
+    }
+    fn finish_prefill_batch(
+        &mut self,
+        _feeds: &[(usize, u32)],
+        _members: &[(usize, &[u32])],
+    ) -> crate::Result<Vec<(usize, u32)>> {
+        Err(crate::RuntimeError::Rejected(
+            "batched prefill completion unavailable".into(),
+        ))
+    }
     fn mixed_step(
         &mut self,
         _rows: u32,
@@ -626,6 +646,32 @@ mod amd_serve {
             step.c0 += rows;
             step.clen -= rows;
         }
+    }
+
+    fn split_terminal_prefill(cur: &mut PfCursor) {
+        if cur.snap_after.is_some() {
+            return;
+        }
+        let Some(last) = cur.steps.last_mut() else {
+            return;
+        };
+        if last.clen > 1 {
+            let mut terminal = *last;
+            last.clen -= 1;
+            terminal.c0 += last.clen;
+            terminal.clen = 1;
+            cur.steps.push(terminal);
+        }
+    }
+
+    fn terminal_prefill_cursor(cur: &PfCursor, prompt_rows: usize) -> bool {
+        cur.snap_after.is_none()
+            && cur.next + 1 == cur.steps.len()
+            && cur.steps.get(cur.next).is_some_and(|step| {
+                step.clen == 1
+                    && step.c0 == cur.frontier
+                    && (cur.frontier as usize).checked_add(1) == Some(prompt_rows)
+            })
     }
 
     /// Shortest prefix worth caching. Below this the snapshot/restore pair costs more than the
@@ -1237,6 +1283,87 @@ mod amd_serve {
                 Ranks::One(e) => e.mixed_step_rows(decode_rows, prefill_rows),
                 Ranks::Tp(_) => None,
             }
+        }
+
+        pub fn prepare_packed_prefill_slot(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            max_rows: u32,
+        ) -> Result<()> {
+            if prompt.len() <= 1 || self.mixed_step_rows(1, 1).is_none() {
+                return Ok(());
+            }
+            self.check_slot(slot)?;
+            if self.live[slot] {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill cannot initialize a live decode slot".into(),
+                ));
+            }
+            self.prepare_prefill_cursor(slot, prompt, max_rows)?;
+            split_terminal_prefill(self.pf[slot].as_mut().expect("prepared cursor"));
+            Ok(())
+        }
+
+        pub fn terminal_prefill_ready(&self, slot: usize, prompt: &[u32]) -> bool {
+            self.mixed_step_rows(1, 1).is_some()
+                && self.live.get(slot) == Some(&false)
+                && prompt.len() < self.max_ctx
+                && self
+                    .pf
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|cur| terminal_prefill_cursor(cur, prompt.len()))
+        }
+
+        pub fn finish_prefill_batch(
+            &mut self,
+            feeds: &[(usize, u32)],
+            members: &[(usize, &[u32])],
+        ) -> Result<Vec<(usize, u32)>> {
+            if members.is_empty() || self.mixed_step_rows(1, 1).is_none() {
+                return Err(RuntimeError::Rejected(
+                    "batched prefill completion unavailable".into(),
+                ));
+            }
+            for (index, &(slot, _)) in feeds.iter().enumerate() {
+                self.check_slot(slot)?;
+                if !self.live[slot]
+                    || self.pf[slot].is_some()
+                    || self.pos[slot] as usize >= self.max_ctx
+                    || feeds[..index].iter().any(|&(prior, _)| prior == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "invalid prefill completion decode slot {slot}"
+                    )));
+                }
+            }
+            for (index, &(slot, prompt)) in members.iter().enumerate() {
+                if !self.terminal_prefill_ready(slot, prompt)
+                    || feeds.iter().any(|&(prior, _)| prior == slot)
+                    || members[..index].iter().any(|&(prior, _)| prior == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "invalid terminal prefill slot {slot}"
+                    )));
+                }
+            }
+            let mut all = Vec::with_capacity(feeds.len() + members.len());
+            all.extend_from_slice(feeds);
+            all.extend(
+                members
+                    .iter()
+                    .map(|&(slot, prompt)| (slot, prompt[prompt.len() - 1])),
+            );
+            // Pending cursors stage their frontier as the decode position. Commit
+            // their transition to live only after the sampled rows are available.
+            let output = self.step_batch(&all)?;
+            for &(slot, prompt) in members {
+                self.pf[slot] = None;
+                self.pos[slot] = prompt.len() as u32;
+                self.live[slot] = true;
+            }
+            Ok(output)
         }
 
         pub fn mixed_prefill_rows(&self, slot: usize, prompt: &[u32], max_rows: u32) -> u32 {
@@ -2056,10 +2183,73 @@ mod amd_serve {
             commit_mixed_prefill, commit_packed_prefill, invalidate_prefix_metadata,
             mixed_cursor_rows, mixed_prefill_continuation_fits, mixed_prefill_padding_fits,
             packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
-            split_pending_prefill, stage_parked, AmdServe, PfCursor, DEFAULT_SNAPSHOT_TENSORS,
-            MAX_SNAPSHOT_TENSORS,
+            split_pending_prefill, split_terminal_prefill, stage_parked, terminal_prefill_cursor,
+            AmdServe, PfCursor, DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
+
+        #[test]
+        fn terminal_prefill_split_preserves_frontier_and_original_bucket() {
+            let mut cur = PfCursor {
+                steps: vec![ChunkStep {
+                    prog: 7,
+                    c0: 4096,
+                    clen: 128,
+                }],
+                next: 0,
+                frontier: 4096,
+                snap_after: None,
+                resume: 0,
+                arm: 0,
+            };
+            split_terminal_prefill(&mut cur);
+            split_terminal_prefill(&mut cur);
+            assert_eq!(cur.steps.len(), 2);
+            assert_eq!(cur.frontier, 4096);
+            assert_eq!(
+                cur.steps[0],
+                ChunkStep {
+                    prog: 7,
+                    c0: 4096,
+                    clen: 127
+                }
+            );
+            assert_eq!(
+                cur.steps[1],
+                ChunkStep {
+                    prog: 7,
+                    c0: 4223,
+                    clen: 1
+                }
+            );
+            assert!(!terminal_prefill_cursor(&cur, 4224));
+            commit_mixed_prefill(&mut cur, 127);
+            assert!(terminal_prefill_cursor(&cur, 4224));
+            assert!(!terminal_prefill_cursor(&cur, 4223));
+            cur.snap_after = Some(1);
+            assert!(!terminal_prefill_cursor(&cur, 4224));
+        }
+
+        #[test]
+        fn terminal_prefill_split_preserves_snapshot_boundaries() {
+            let mut cur = PfCursor {
+                steps: vec![ChunkStep {
+                    prog: 3,
+                    c0: 0,
+                    clen: 128,
+                }],
+                next: 0,
+                frontier: 0,
+                snap_after: Some(0),
+                resume: 0,
+                arm: 128,
+            };
+            split_terminal_prefill(&mut cur);
+            assert_eq!(cur.steps.len(), 1);
+            assert_eq!(cur.steps[0].clen, 128);
+            assert_eq!(cur.snap_after, Some(0));
+            assert!(!terminal_prefill_cursor(&cur, 128));
+        }
 
         #[test]
         fn packet_trace_paths_cover_single_and_all_tp_ranks() {
@@ -2371,6 +2561,24 @@ impl SeqEngine for AmdServe {
     }
     fn mixed_prefill_fits(&self, slot: usize, prefill_capacity: u32) -> bool {
         AmdServe::mixed_prefill_fits(self, slot, prefill_capacity)
+    }
+    fn prepare_packed_prefill_slot(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        max_rows: u32,
+    ) -> crate::Result<()> {
+        AmdServe::prepare_packed_prefill_slot(self, slot, prompt, max_rows)
+    }
+    fn terminal_prefill_ready(&self, slot: usize, prompt: &[u32]) -> bool {
+        AmdServe::terminal_prefill_ready(self, slot, prompt)
+    }
+    fn finish_prefill_batch(
+        &mut self,
+        feeds: &[(usize, u32)],
+        members: &[(usize, &[u32])],
+    ) -> crate::Result<Vec<(usize, u32)>> {
+        AmdServe::finish_prefill_batch(self, feeds, members)
     }
     fn mixed_step(
         &mut self,

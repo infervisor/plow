@@ -2,10 +2,58 @@
 
 Qualified on 2026-09-07: one MI300X, TP1, BF16, context 8192. Runtime fusion
 passed four-slot and eight-slot numerical and serving checks and remains opt-in.
-The current stock `vllm bench serve` comparison below still favors vLLM in every
-throughput, TTFT and TPOT cell.
+The stock `vllm bench serve` baseline below favors vLLM in every throughput,
+TTFT and TPOT cell. Batched terminal-prefill completion subsequently improves
+Plow's concurrent throughput by about 9–10%; the overall vLLM gap remains open.
 
-## Current runtime-fusion serving comparison
+## Batched terminal-prefill completion
+
+With runtime fusion enabled, the scheduler can initialize multiple cold cursors
+before selecting packed prefixes. It reserves each prompt's final token for an
+ordinary batched decode operation, which returns that request's first generated
+token. Ready terminal rows can share that operation with live decode requests.
+Positions and cursor-to-live transitions commit after successful execution.
+The no-interleave/defer-decode policies park live decoders during completion.
+This follows the existing CUDA packed-prefix/terminal-decode phase design and
+requires no new kernel ABI or compiler row combinations.
+
+Four cold 128-token requests pack 508 prefix rows into T512, then complete
+together through native decode. Eight such requests pack 1016 rows into T1024.
+The runtime flag remains opt-in; unsupported configurations retain ordinary
+execution. Prefix-cache configurations retain their isolated snapshot boundaries.
+
+A stock-client Plow before/after experiment uses the same BF16 checkpoint,
+ordinary assets, WPE5 MM1 tier, kernels, PF512 and configured multistep 4. Each
+cell has four requests, 128 output tokens, one full-corpus warmup and three
+measured repetitions. Both clients run concurrently on separately leased GPUs;
+clocks and power remain unpinned. All 24 runs pass actual token accounting.
+
+| Input / concurrency | Output tokens/s, before → after | Median TTFT ms, before → after | Median TPOT ms, before → after |
+|---|---:|---:|---:|
+| 128 / 4 | 91.29 → 100.06 | 548.36 → 278.87 | 38.94 → 37.80 |
+| 1024 / 4 | 73.08 → 80.29 | 1753.86 → 1195.38 | 40.43 → 40.21 |
+| 4096 / 4 | 46.71 → 50.91 | 5565.46 → 4793.25 | 41.59 → 41.13 |
+
+The final-token transformer uses native GEMV arithmetic, whereas the former
+isolated prefill completion used MFMA. Numerical batching checks therefore replay
+identical packed prefixes and physical decode widths, then compare separate
+terminal completion with batched completion. All 15 checked full-vocabulary
+first/next-token logit rows are bitwise equal. Independent HTTP isolated/concurrent
+greedy parity, cancellation, output limits, slot reuse and context recovery pass.
+The B8 GPU suite also covers eight cold requests and reordered slots 7/2/5;
+long-context cases reach prompt lengths 8191 and 8175.
+
+The synthetic benchmark's full completion texts match before/after in 12/12,
+10/12 and 9/12 measured requests at input lengths 128/1024/4096. This experiment
+does not establish universal text equality across different phase schedules or
+production tail SLOs. The numerical check above controls the phase schedule
+explicitly. Separate no-interleave/defer-decode HTTP suites complete 78 requests,
+58 exact parity checks and 24 intentional disconnects with successful recovery;
+logs confirm live decoding is parked during terminal completion.
+
+[Measurements, phase-matched logits and policy qualification](gemma4-31b-mi300x-terminal-20260907.json).
+
+## Runtime-fusion baseline before batched completion
 
 These results use source `5feeb384`, the ordinary `decode-placed-assets`,
 runtime fusion enabled, packed 512-token prefill chunks, multistep 4, decode
@@ -89,8 +137,9 @@ The project compiler is the Nix ROCm 7.14.0 toolchain enforced by the build scri
 
 ## Runtime contract
 
-- Initialized middle chunks can share a larger compiled prefill rung. Initial
-  admission, final sampling and prefix snapshot boundaries remain isolated.
+- Initialized middle chunks can share a larger compiled prefill rung. Runtime
+  fusion additionally initializes cold cursors and batches terminal prompt tokens
+  through decode; ordinary fallback and prefix snapshots retain their boundaries.
 - Dense BF16 attention uses each request's KV slot and position, including ring
   wraparound and split attention partials. Parked rows do not write request state.
 - Ordinary packed-prefill kernel objects must advertise
@@ -157,7 +206,7 @@ still compared. Request isolation is checked bitwise in both directions.
 
 ## Verification
 
-492 CPU/CUDA/HSA library tests and eight API tests passed together.
+494 CPU/CUDA/HSA library tests and eight API tests passed together.
 Runtime-only fusion passed full-model capacity and multispan GPU suites on
 ordinary assets, without mixed metadata. A separate fusion-disabled process
 verified rejection before launch or state mutation and exact ordinary recovery.

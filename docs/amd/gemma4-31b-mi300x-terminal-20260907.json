@@ -1,0 +1,1291 @@
+{
+  "date": "2026-09-07",
+  "timing_provider": "Unmodified installed vLLM 0.28.0+rocm723 bench serve",
+  "experiment": "Terminal prompt rows complete through native batched decode; cold cursor initialization before packed selection",
+  "aggregation": "Median of three measured runs, four requests each; one full-corpus warmup excluded",
+  "server_manifests": {
+    "control": {
+      "verified": true,
+      "backend": "plow",
+      "base_url": "http://127.0.0.1:18927",
+      "dtype": "bfloat16",
+      "kv_dtype": "bfloat16",
+      "tensor_parallel_size": 1,
+      "max_num_seqs": 4,
+      "prefix_caching": false,
+      "seed": 0,
+      "pf_interleave": 0,
+      "pf_chunk": 512,
+      "multistep": 4,
+      "mixed_fusion": true,
+      "budget_policy": "nonbinding",
+      "gpu_uuid": "0x3a166016777c610a",
+      "server_log": "/tmp/gemma31-runtime-fusion-bench-serve.log",
+      "launch_command": "env PLOW_FUSION=1 PLOW_PF_CHUNK=512 PLOW_PF_BATCH=1 PLOW_PF_INTERLEAVE=0 PLOW_MULTISTEP=4 PLOW_PREFIX_CACHE=0 PLOW_L2_PLACE_DISPATCH=1 PLOW_HSACO=/app/plow/build-gemma31/hsaco PLOW_HSACO_LOWRUNG=/app/plow/build-gemma31/hsaco-occ4-b1-clean:1 ROCR_VISIBLE_DEVICES=0 /app/plow/build-gemma31/target-isolated/release/plowrt serve --assets /app/plow/build-gemma31/decode-placed-assets --port 18927",
+      "source_revision": "5feeb384ea521ee4bc40621f41f320744e31534f",
+      "object_hashes": {
+        "interp_prefill_gq.elf": "7d065efe67f149b82da7bff5fbfbc2e4f4fe974d55a640a434d59caf56c2e884",
+        "interp_decode_gq.elf": "8008b9f79564f6bf99feb78a5679464e5628040ad555e4fc2ef3b6275169610f",
+        "interp_flash_gq.elf": "9d3c3949441ad7167b91d78b4ab80cc024c431092b92dc6a324dd103d8ba8e21",
+        "interp_mixed_gq.elf": "b1deafe6490f3f57c18ba47a803785177a260884a7ba91d2f2dc952782bc86a5",
+        "lowrung/interp_decode_gq.elf": "84296e1e397f6767364243d24e97f77804b001b40533cdae81d1b6ac2ea28ea1"
+      },
+      "process_id": 615434,
+      "gpu_index": 0,
+      "gpu_model": "AMD Instinct MI300X",
+      "environment": {
+        "PLOW_FUSION": "1",
+        "PLOW_PF_CHUNK": "512",
+        "PLOW_PF_BATCH": "1",
+        "PLOW_PF_INTERLEAVE": "0",
+        "PLOW_MULTISTEP": "4",
+        "PLOW_PREFIX_CACHE": "0",
+        "PLOW_L2_PLACE_DISPATCH": "1",
+        "PLOW_HSACO": "/app/plow/build-gemma31/hsaco",
+        "PLOW_HSACO_LOWRUNG": "/app/plow/build-gemma31/hsaco-occ4-b1-clean:1",
+        "ROCR_VISIBLE_DEVICES": "0"
+      },
+      "verified_at": "2026-09-07T17:19:29.949075+00:00",
+      "max_model_len": 8192,
+      "clocks_and_power": "Not pinned; each server has an exclusive gpulease.",
+      "checkpoint_hashes": {
+        "model-00001-of-00002.safetensors": "eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa",
+        "model-00002-of-00002.safetensors": "018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10",
+        "config.json": "e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1",
+        "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+      },
+      "binary_sha256": "220a688c277f8130e659dd5299697d49704e1732134a2d804bbbb79a7d262383",
+      "packet_sha256": "59df5045781261d3c9aafe27804af667c95008a3a602775695d2ab68c0d45dc6",
+      "compiler": "Nix ROCm 7.14.0",
+      "seed_scope": "Corpus seed 0; AMD serving uses deterministic argmax, without a server RNG seed.",
+      "variant": "control",
+      "source_patch_sha256": null
+    },
+    "candidate": {
+      "verified": true,
+      "backend": "plow",
+      "base_url": "http://127.0.0.1:18934",
+      "dtype": "bfloat16",
+      "kv_dtype": "bfloat16",
+      "tensor_parallel_size": 1,
+      "max_num_seqs": 4,
+      "prefix_caching": false,
+      "seed": 0,
+      "pf_interleave": 0,
+      "pf_chunk": 512,
+      "multistep": 4,
+      "mixed_fusion": true,
+      "budget_policy": "nonbinding",
+      "gpu_uuid": "0x6dbba48a71ce2d3e",
+      "server_log": "/tmp/gemma31-terminal-http-server.log",
+      "launch_command": "env PLOW_FUSION=1 PLOW_PF_CHUNK=512 PLOW_PF_BATCH=1 PLOW_PF_INTERLEAVE=0 PLOW_MULTISTEP=4 PLOW_PREFIX_CACHE=0 PLOW_L2_PLACE_DISPATCH=1 PLOW_HSACO=/app/plow/build-gemma31/hsaco PLOW_HSACO_LOWRUNG=/app/plow/build-gemma31/hsaco-occ4-b1-clean:1 ROCR_VISIBLE_DEVICES=1 /app/plow/build-gemma31/target-isolated/release/plowrt serve --assets /app/plow/build-gemma31/decode-placed-assets --port 18934",
+      "source_revision": "3c85c2720ef73d2139d857edcea94213d3a32ea1",
+      "object_hashes": {
+        "interp_prefill_gq.elf": "7d065efe67f149b82da7bff5fbfbc2e4f4fe974d55a640a434d59caf56c2e884",
+        "interp_decode_gq.elf": "8008b9f79564f6bf99feb78a5679464e5628040ad555e4fc2ef3b6275169610f",
+        "interp_flash_gq.elf": "9d3c3949441ad7167b91d78b4ab80cc024c431092b92dc6a324dd103d8ba8e21",
+        "interp_mixed_gq.elf": "b1deafe6490f3f57c18ba47a803785177a260884a7ba91d2f2dc952782bc86a5",
+        "lowrung/interp_decode_gq.elf": "84296e1e397f6767364243d24e97f77804b001b40533cdae81d1b6ac2ea28ea1"
+      },
+      "process_id": 796888,
+      "gpu_index": 1,
+      "gpu_model": "AMD Instinct MI300X",
+      "environment": {
+        "PLOW_FUSION": "1",
+        "PLOW_PF_CHUNK": "512",
+        "PLOW_PF_BATCH": "1",
+        "PLOW_PF_INTERLEAVE": "0",
+        "PLOW_MULTISTEP": "4",
+        "PLOW_PREFIX_CACHE": "0",
+        "PLOW_L2_PLACE_DISPATCH": "1",
+        "PLOW_HSACO": "/app/plow/build-gemma31/hsaco",
+        "PLOW_HSACO_LOWRUNG": "/app/plow/build-gemma31/hsaco-occ4-b1-clean:1",
+        "ROCR_VISIBLE_DEVICES": "1"
+      },
+      "verified_at": "2026-09-07T17:19:29.958597+00:00",
+      "max_model_len": 8192,
+      "clocks_and_power": "Not pinned; each server has an exclusive gpulease.",
+      "checkpoint_hashes": {
+        "model-00001-of-00002.safetensors": "eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa",
+        "model-00002-of-00002.safetensors": "018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10",
+        "config.json": "e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1",
+        "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+      },
+      "binary_sha256": "050b8808b38db7dceda91f6666218207f91bc1747aad4031607d79f54280ca7b",
+      "packet_sha256": "59df5045781261d3c9aafe27804af667c95008a3a602775695d2ab68c0d45dc6",
+      "compiler": "Nix ROCm 7.14.0",
+      "seed_scope": "Corpus seed 0; AMD serving uses deterministic argmax, without a server RNG seed.",
+      "variant": "candidate",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c"
+    }
+  },
+  "summary": [
+    {
+      "input_tokens": 128,
+      "output_tokens": 128,
+      "concurrency": 4,
+      "measured_requests_per_variant": 12,
+      "control": {
+        "output_throughput": 91.28756082041029,
+        "request_throughput": 0.7131840689094554,
+        "duration": 5.608650241047144,
+        "median_ttft_ms": 548.3630275120959,
+        "p95_ttft_ms": 755.2360360859893,
+        "median_tpot_ms": 38.944677248098486,
+        "p95_tpot_ms": 40.499124835212314,
+        "mean_itl_ms": 38.851668673601125,
+        "median_itl_ms": 0.03751050098799169,
+        "p95_itl_ms": 76.85155308572575,
+        "p99_itl_ms": 152.7689319557976,
+        "median_e2el_ms": 5495.555981469806,
+        "p95_e2el_ms": 5596.743027924094,
+        "output_throughput_range": [
+          91.12913528046097,
+          91.33672462101993
+        ]
+      },
+      "candidate": {
+        "output_throughput": 100.06306558754318,
+        "request_throughput": 0.7817426999026811,
+        "duration": 5.116773076995742,
+        "median_ttft_ms": 278.87451750575565,
+        "p95_ttft_ms": 378.55766366701573,
+        "median_tpot_ms": 37.79782775187255,
+        "p95_tpot_ms": 38.289779882376656,
+        "mean_itl_ms": 37.50261240452346,
+        "median_itl_ms": 38.08515251148492,
+        "p95_itl_ms": 75.28365744219627,
+        "p99_itl_ms": 75.39371511316858,
+        "median_e2el_ms": 5079.253925010562,
+        "p95_e2el_ms": 5116.009798969026,
+        "output_throughput_range": [
+          99.89680192114368,
+          100.18283241680274
+        ]
+      },
+      "paired_exact_completion_text_matches": 12,
+      "throughput_change_percent": 9.613034556150435,
+      "ttft_change_percent": -49.14417940046037
+    },
+    {
+      "input_tokens": 1024,
+      "output_tokens": 128,
+      "concurrency": 4,
+      "measured_requests_per_variant": 12,
+      "control": {
+        "output_throughput": 73.0848061946716,
+        "request_throughput": 0.5709750483958719,
+        "duration": 7.005560069985222,
+        "median_ttft_ms": 1753.86219547363,
+        "p95_ttft_ms": 1993.8416508608495,
+        "median_tpot_ms": 40.43467584254924,
+        "p95_tpot_ms": 45.54654769562771,
+        "mean_itl_ms": 41.29935712705901,
+        "median_itl_ms": 40.111266484018415,
+        "p95_itl_ms": 79.18754380370956,
+        "p99_itl_ms": 176.178742251941,
+        "median_e2el_ms": 6889.066027477384,
+        "p95_e2el_ms": 6993.623708497034,
+        "output_throughput_range": [
+          72.93499905304544,
+          73.2332703316006
+        ]
+      },
+      "candidate": {
+        "output_throughput": 80.28608059379316,
+        "request_throughput": 0.627235004639009,
+        "duration": 6.377195102977566,
+        "median_ttft_ms": 1195.3772210108582,
+        "p95_ttft_ms": 1448.3855515223693,
+        "median_tpot_ms": 40.206034543124716,
+        "p95_tpot_ms": 42.78638662880848,
+        "mean_itl_ms": 40.20744877152538,
+        "median_itl_ms": 39.07533999881707,
+        "p95_itl_ms": 77.51344841381069,
+        "p99_itl_ms": 77.85272690933198,
+        "median_e2el_ms": 6302.543426019838,
+        "p95_e2el_ms": 6365.396226456505,
+        "output_throughput_range": [
+          80.27175057986042,
+          80.31189295569716
+        ]
+      },
+      "paired_exact_completion_text_matches": 10,
+      "throughput_change_percent": 9.85331257490094,
+      "ttft_change_percent": -31.843150271675313
+    },
+    {
+      "input_tokens": 4096,
+      "output_tokens": 128,
+      "concurrency": 4,
+      "measured_requests_per_variant": 12,
+      "control": {
+        "output_throughput": 46.707308609238794,
+        "request_throughput": 0.3649008485096781,
+        "duration": 10.96188188198721,
+        "median_ttft_ms": 5565.456784504931,
+        "p95_ttft_ms": 5828.529968767543,
+        "median_tpot_ms": 41.588624429203364,
+        "p95_tpot_ms": 47.3816042546665,
+        "mean_itl_ms": 42.58636119732273,
+        "median_itl_ms": 41.1147550039459,
+        "p95_itl_ms": 81.20692693919409,
+        "p99_itl_ms": 195.12604360701516,
+        "median_e2el_ms": 10846.369849517941,
+        "p95_e2el_ms": 10949.592736168415,
+        "output_throughput_range": [
+          46.696082872576795,
+          46.75975518361481
+        ]
+      },
+      "candidate": {
+        "output_throughput": 50.906820842982206,
+        "request_throughput": 0.3977095378357985,
+        "duration": 10.057591331016738,
+        "median_ttft_ms": 4793.251592986053,
+        "p95_ttft_ms": 5044.694246238214,
+        "median_tpot_ms": 41.13408598446609,
+        "p95_tpot_ms": 42.8238530051812,
+        "mean_itl_ms": 40.81280097261697,
+        "median_itl_ms": 39.95126750669442,
+        "p95_itl_ms": 79.62683965160977,
+        "p99_itl_ms": 79.7869067126885,
+        "median_e2el_ms": 10018.449406488799,
+        "p95_e2el_ms": 10056.789899567957,
+        "output_throughput_range": [
+          50.90337899616635,
+          50.92621596761176
+        ]
+      },
+      "paired_exact_completion_text_matches": 9,
+      "throughput_change_percent": 8.991124427393672,
+      "ttft_change_percent": -13.874965190077726
+    }
+  ],
+  "runs": [
+    {
+      "variant": "control",
+      "input_tokens": 1024,
+      "repetition": "1",
+      "metrics": {
+        "output_throughput": 72.93499905304544,
+        "request_throughput": 0.5698046801019175,
+        "duration": 7.019949361041654,
+        "median_ttft_ms": 1755.3211380145513,
+        "p95_ttft_ms": 1994.000035795034,
+        "median_tpot_ms": 40.53845242519247,
+        "p95_tpot_ms": 45.63130677352736,
+        "mean_itl_ms": 41.398757379056406,
+        "median_itl_ms": 40.36131000611931,
+        "p95_itl_ms": 79.40409640723374,
+        "p99_itl_ms": 176.16321069072,
+        "median_e2el_ms": 6903.704596013995,
+        "p95_e2el_ms": 7007.825415523257
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p1024-c4-r1-20260907T172105.971202Z/result.json",
+      "sha256": "72a3fc9f93882a3c326eb1438d29e0d1fa3027d9691058b61a7e4932705235bc",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+        "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 1024,
+      "repetition": "2",
+      "metrics": {
+        "output_throughput": 73.2332703316006,
+        "request_throughput": 0.5721349244656296,
+        "duration": 6.99135785800172,
+        "median_ttft_ms": 1753.253016504459,
+        "p95_ttft_ms": 1991.5152060799298,
+        "median_tpot_ms": 40.33856301964444,
+        "p95_tpot_ms": 45.43698731604523,
+        "mean_itl_ms": 41.20145847457479,
+        "median_itl_ms": 40.111266484018415,
+        "p95_itl_ms": 78.89611212012824,
+        "p99_itl_ms": 176.178742251941,
+        "median_e2el_ms": 6876.250519999303,
+        "p95_e2el_ms": 6979.694277286762
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p1024-c4-r2-20260907T172126.140204Z/result.json",
+      "sha256": "faf8e125b55cfa55cf39933030e0558f4917bb9b22e1b279019f113afb7081d5",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+        "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 1024,
+      "repetition": "3",
+      "metrics": {
+        "output_throughput": 73.0848061946716,
+        "request_throughput": 0.5709750483958719,
+        "duration": 7.005560069985222,
+        "median_ttft_ms": 1753.86219547363,
+        "p95_ttft_ms": 1993.8416508608495,
+        "median_tpot_ms": 40.43467584254924,
+        "p95_tpot_ms": 45.54654769562771,
+        "mean_itl_ms": 41.29935712705901,
+        "median_itl_ms": 39.893851993838325,
+        "p95_itl_ms": 79.18754380370956,
+        "p99_itl_ms": 176.45113634644076,
+        "median_e2el_ms": 6889.066027477384,
+        "p95_e2el_ms": 6993.623708497034
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p1024-c4-r3-20260907T172146.245187Z/result.json",
+      "sha256": "05169d2f7a8c3590837425aca8c742fad989ea6596aa70457f1dab33cb0d5b91",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+        "9fa03af73b8d34d70b94d015d8f2f1587bcbf59d23206e26b562a02abc4ad67b",
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 1024,
+      "repetition": "warmup",
+      "metrics": {
+        "output_throughput": 73.02429242920171,
+        "request_throughput": 0.5705022846031383,
+        "duration": 7.0113654370070435,
+        "median_ttft_ms": 1755.4900835093576,
+        "p95_ttft_ms": 1994.1908710839923,
+        "median_tpot_ms": 40.47483207078606,
+        "p95_tpot_ms": 45.57869788717595,
+        "mean_itl_ms": 41.33701209559604,
+        "median_itl_ms": 40.67312000552192,
+        "p95_itl_ms": 79.32895090780221,
+        "p99_itl_ms": 176.89791244803928,
+        "median_e2el_ms": 6895.793756499188,
+        "p95_e2el_ms": 6999.137714901008
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p1024-c4-rwarmup-20260907T172045.997694Z/result.json",
+      "sha256": "1aba701f85173d0d05b14657e227112dc60623011b931e4cd91adc84d7cfa2f6",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+        "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 128,
+      "repetition": "1",
+      "metrics": {
+        "output_throughput": 91.33672462101993,
+        "request_throughput": 0.7135681611017182,
+        "duration": 5.605631273996551,
+        "median_ttft_ms": 547.3782760091126,
+        "p95_ttft_ms": 754.7247396287275,
+        "median_tpot_ms": 38.939172220526366,
+        "p95_tpot_ms": 40.477166533301485,
+        "mean_itl_ms": 38.840435908014115,
+        "median_itl_ms": 0.03867803025059402,
+        "p95_itl_ms": 76.68173691199627,
+        "p99_itl_ms": 152.6779802737292,
+        "median_e2el_ms": 5492.653148015961,
+        "p95_e2el_ms": 5594.096386586898
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p128-c4-r1-20260907T171948.639964Z/result.json",
+      "sha256": "0c0c4c1da90cb60be65ef70b23122f05a8b36267657ba32c9f85d41408329861",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+        "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+        "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 128,
+      "repetition": "2",
+      "metrics": {
+        "output_throughput": 91.28756082041029,
+        "request_throughput": 0.7131840689094554,
+        "duration": 5.608650241047144,
+        "median_ttft_ms": 549.5819709612988,
+        "p95_ttft_ms": 756.2505665991921,
+        "median_tpot_ms": 38.944677248098486,
+        "p95_tpot_ms": 40.499124835212314,
+        "mean_itl_ms": 38.851668673601125,
+        "median_itl_ms": 0.03751050098799169,
+        "p95_itl_ms": 76.85155308572575,
+        "p99_itl_ms": 152.7689319557976,
+        "median_e2el_ms": 5495.555981469806,
+        "p95_e2el_ms": 5596.743027924094
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p128-c4-r2-20260907T172007.238652Z/result.json",
+      "sha256": "51d09b1139cfdcc9ec7d9cd0a04fb59c525fe9e4c4a831cdaf03c483db7f36a7",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+        "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+        "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 128,
+      "repetition": "3",
+      "metrics": {
+        "output_throughput": 91.12913528046097,
+        "request_throughput": 0.7119463693786013,
+        "duration": 5.61840072798077,
+        "median_ttft_ms": 548.3630275120959,
+        "p95_ttft_ms": 755.2360360859893,
+        "median_tpot_ms": 39.02184291729908,
+        "p95_tpot_ms": 40.5624146491434,
+        "mean_itl_ms": 38.92594976559849,
+        "median_itl_ms": 0.020845967810600996,
+        "p95_itl_ms": 76.87664346012753,
+        "p99_itl_ms": 152.78754067607224,
+        "median_e2el_ms": 5504.13707800908,
+        "p95_e2el_ms": 5606.29771266249
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p128-c4-r3-20260907T172026.242165Z/result.json",
+      "sha256": "ab93134ed53627680fa48313b8a9843f3de28e6ce7ef0f0e112640832b79c2e7",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+        "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+        "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 128,
+      "repetition": "warmup",
+      "metrics": {
+        "output_throughput": 91.73817561624006,
+        "request_throughput": 0.7167044970018754,
+        "duration": 5.581100741983391,
+        "median_ttft_ms": 547.7884694992099,
+        "p95_ttft_ms": 753.5065833362751,
+        "median_tpot_ms": 38.738318661449654,
+        "p95_tpot_ms": 40.286178499076144,
+        "mean_itl_ms": 38.64807072079657,
+        "median_itl_ms": 0.022198015358299017,
+        "p95_itl_ms": 76.42235073435586,
+        "p99_itl_ms": 152.48193899868056,
+        "median_e2el_ms": 5467.554939503316,
+        "p95_e2el_ms": 5569.128160097171
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p128-c4-rwarmup-20260907T171930.049597Z/result.json",
+      "sha256": "4a5fb17d8542bfb2ac4051da05f2033a15dbb6c110923482ce496f3412d632e0",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+        "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+        "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 4096,
+      "repetition": "1",
+      "metrics": {
+        "output_throughput": 46.75975518361481,
+        "request_throughput": 0.3653105873719907,
+        "duration": 10.94958683999721,
+        "median_ttft_ms": 5565.456784504931,
+        "p95_ttft_ms": 5828.529968767543,
+        "median_tpot_ms": 41.4850479056032,
+        "p95_tpot_ms": 47.27665538300108,
+        "mean_itl_ms": 42.48378090630922,
+        "median_itl_ms": 40.64021600061096,
+        "p95_itl_ms": 80.89728297200054,
+        "p99_itl_ms": 195.12604360701516,
+        "median_e2el_ms": 10834.057868516538,
+        "p95_e2el_ms": 10937.2936556465
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p4096-c4-r1-20260907T172230.265622Z/result.json",
+      "sha256": "3a9013c680adb45b3c8018a384bd140e330c99a48ccb174cae1c0fa9df1f7ced",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+        "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+        "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+        "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 4096,
+      "repetition": "2",
+      "metrics": {
+        "output_throughput": 46.696082872576795,
+        "request_throughput": 0.3648131474420062,
+        "duration": 10.964517118001822,
+        "median_ttft_ms": 5566.524573980132,
+        "p95_ttft_ms": 5829.622343892697,
+        "median_tpot_ms": 41.59293366929766,
+        "p95_tpot_ms": 47.38924916096647,
+        "mean_itl_ms": 42.59239600003184,
+        "median_itl_ms": 41.1147550039459,
+        "p95_itl_ms": 81.2968444544822,
+        "p99_itl_ms": 194.9930676096119,
+        "median_e2el_ms": 10848.827149980934,
+        "p95_e2el_ms": 10952.1728765656
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p4096-c4-r2-20260907T172254.656617Z/result.json",
+      "sha256": "6c7735a88e8873a9c509e0897a39dfb8e6e4e8a754adf4fb2ea43d7bd6c4202e",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+        "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+        "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+        "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 4096,
+      "repetition": "3",
+      "metrics": {
+        "output_throughput": 46.707308609238794,
+        "request_throughput": 0.3649008485096781,
+        "duration": 10.96188188198721,
+        "median_ttft_ms": 5564.614547009114,
+        "p95_ttft_ms": 5827.930970661691,
+        "median_tpot_ms": 41.588624429203364,
+        "p95_tpot_ms": 47.3816042546665,
+        "mean_itl_ms": 42.58636119732273,
+        "median_itl_ms": 41.188134491676465,
+        "p95_itl_ms": 81.20692693919409,
+        "p99_itl_ms": 195.23088560672477,
+        "median_e2el_ms": 10846.369849517941,
+        "p95_e2el_ms": 10949.592736168415
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p4096-c4-r3-20260907T172318.890656Z/result.json",
+      "sha256": "9460b530e2b3b429d6b8af91592e53481fa3e1615fbacdcbe562e06bf3908b2e",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+        "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+        "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+        "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+      ]
+    },
+    {
+      "variant": "control",
+      "input_tokens": 4096,
+      "repetition": "warmup",
+      "metrics": {
+        "output_throughput": 46.74470964099102,
+        "request_throughput": 0.36519304407024233,
+        "duration": 10.953111142036505,
+        "median_ttft_ms": 5563.950070500141,
+        "p95_ttft_ms": 5826.891434402205,
+        "median_tpot_ms": 41.52398634638718,
+        "p95_tpot_ms": 47.32149615290292,
+        "mean_itl_ms": 42.52494333013601,
+        "median_itl_ms": 40.70948949083686,
+        "p95_itl_ms": 81.25128050160129,
+        "p99_itl_ms": 194.97384430724196,
+        "median_e2el_ms": 10837.496336491313,
+        "p95_e2el_ms": 10940.950310765766
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-control/results/plow-p4096-c4-rwarmup-20260907T172206.264987Z/result.json",
+      "sha256": "d01fca68873ecc6ab2c4898b113a5b94701f8f3dac5df07be29d7a9cafd6df76",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+        "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+        "fee0c21b2da5847627272a995ad4db0b64c48f90b4b409644913565e921e4b8e",
+        "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 1024,
+      "repetition": "1",
+      "metrics": {
+        "output_throughput": 80.31189295569716,
+        "request_throughput": 0.6274366637163841,
+        "duration": 6.375145462981891,
+        "median_ttft_ms": 1195.3772210108582,
+        "p95_ttft_ms": 1448.3855515223693,
+        "median_tpot_ms": 40.194518496117404,
+        "p95_tpot_ms": 42.77534953579325,
+        "mean_itl_ms": 40.19829325000046,
+        "median_itl_ms": 39.56454497529194,
+        "p95_itl_ms": 77.46301042789128,
+        "p99_itl_ms": 77.92378237121738,
+        "median_e2el_ms": 6300.081070017768,
+        "p95_e2el_ms": 6363.642966293264
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p1024-c4-r1-20260907T172105.971709Z/result.json",
+      "sha256": "1849e3e46422d190ca90cc79b1a43bb275797da9854acb911dcc6fc0b7fb85d2",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+        "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 1024,
+      "repetition": "2",
+      "metrics": {
+        "output_throughput": 80.27175057986042,
+        "request_throughput": 0.6271230514051596,
+        "duration": 6.378333551983815,
+        "median_ttft_ms": 1196.5843640209641,
+        "p95_ttft_ms": 1450.9738418477355,
+        "median_tpot_ms": 40.206034543124716,
+        "p95_tpot_ms": 42.78638662880848,
+        "mean_itl_ms": 40.20744877152538,
+        "median_itl_ms": 39.01072850567289,
+        "p95_itl_ms": 77.63795094215311,
+        "p99_itl_ms": 77.85272690933198,
+        "median_e2el_ms": 6302.750750997802,
+        "p95_e2el_ms": 6366.7709449946415
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p1024-c4-r2-20260907T172126.139368Z/result.json",
+      "sha256": "f97b31f471680c87a9396e3e580d67c3bdc5e5a80c265dc49d62df448cf795e1",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+        "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 1024,
+      "repetition": "3",
+      "metrics": {
+        "output_throughput": 80.28608059379316,
+        "request_throughput": 0.627235004639009,
+        "duration": 6.377195102977566,
+        "median_ttft_ms": 1194.9528330005705,
+        "p95_ttft_ms": 1447.3973196552831,
+        "median_tpot_ms": 40.217248763931245,
+        "p95_tpot_ms": 42.79075525540632,
+        "mean_itl_ms": 40.218369722651914,
+        "median_itl_ms": 39.07533999881707,
+        "p95_itl_ms": 77.51344841381069,
+        "p99_itl_ms": 77.82459541980643,
+        "median_e2el_ms": 6302.543426019838,
+        "p95_e2el_ms": 6365.396226456505
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p1024-c4-r3-20260907T172146.243815Z/result.json",
+      "sha256": "68cce77aa28c196049cbf0e37f9a71fa893c9901c7901937d19439b3d0047664",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+        "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 1024,
+      "repetition": "warmup",
+      "metrics": {
+        "output_throughput": 82.71914872969019,
+        "request_throughput": 0.6462433494507046,
+        "duration": 6.1896188230020925,
+        "median_ttft_ms": 1080.2907525212504,
+        "p95_ttft_ms": 1308.609258243814,
+        "median_tpot_ms": 39.9288517953718,
+        "p95_tpot_ms": 41.4288208153746,
+        "mean_itl_ms": 39.61719985363743,
+        "median_itl_ms": 39.16563998791389,
+        "p95_itl_ms": 77.41010822355747,
+        "p99_itl_ms": 77.83099586958997,
+        "median_e2el_ms": 6151.197775034234,
+        "p95_e2el_ms": 6189.2839466105215
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p1024-c4-rwarmup-20260907T172045.997432Z/result.json",
+      "sha256": "516e5d265cf4663b1579e42a5930af35716e3b862177d1e9f71f6df158c6e7ed",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "e402143a7f1e500ae8cb09ee18ed31fac5fbf61a9f9ae6b526e2f909b33fa94b",
+        "c59571a1042a1a99dca5a60006335052650bb53bf0456c10dc0aa261d87e4ca8",
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "cb1155bb20bd4c775fc23db32b68e6368dc85ab47bbd2d81d0b13af270a4df82"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 128,
+      "repetition": "1",
+      "metrics": {
+        "output_throughput": 100.18283241680274,
+        "request_throughput": 0.7826783782562714,
+        "duration": 5.110656064003706,
+        "median_ttft_ms": 278.98171747801825,
+        "p95_ttft_ms": 378.9542214857647,
+        "median_tpot_ms": 37.746405629780305,
+        "p95_tpot_ms": 38.241167321244774,
+        "mean_itl_ms": 37.45163367761961,
+        "median_itl_ms": 38.08515251148492,
+        "p95_itl_ms": 75.11810887081083,
+        "p99_itl_ms": 75.27136573859025,
+        "median_e2el_ms": 5072.778436995577,
+        "p95_e2el_ms": 5109.991556062596
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p128-c4-r1-20260907T171948.641756Z/result.json",
+      "sha256": "bb806583a1b3e55a866d9fe4d131b0067bb1692f85035b68749006bf6ff79416",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+        "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+        "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 128,
+      "repetition": "2",
+      "metrics": {
+        "output_throughput": 100.06306558754318,
+        "request_throughput": 0.7817426999026811,
+        "duration": 5.116773076995742,
+        "median_ttft_ms": 278.87451750575565,
+        "p95_ttft_ms": 378.1161057704594,
+        "median_tpot_ms": 37.79782775187255,
+        "p95_tpot_ms": 38.289779882376656,
+        "mean_itl_ms": 37.50261240452346,
+        "median_itl_ms": 37.72559552453458,
+        "p95_itl_ms": 75.28365744219627,
+        "p99_itl_ms": 75.39371511316858,
+        "median_e2el_ms": 5079.253925010562,
+        "p95_e2el_ms": 5116.009798969026
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p128-c4-r2-20260907T172007.238298Z/result.json",
+      "sha256": "4aa84f98d2e3a247c80a03cc5011bbacf2215f078d34a1648b452df8cae51e39",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+        "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+        "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 128,
+      "repetition": "3",
+      "metrics": {
+        "output_throughput": 99.89680192114368,
+        "request_throughput": 0.780443765008935,
+        "duration": 5.12528919999022,
+        "median_ttft_ms": 278.68008700897917,
+        "p95_ttft_ms": 378.55766366701573,
+        "median_tpot_ms": 37.86232258242694,
+        "p95_tpot_ms": 38.35404193616384,
+        "mean_itl_ms": 37.566450029203224,
+        "median_itl_ms": 38.33540098275989,
+        "p95_itl_ms": 75.35066729760729,
+        "p99_itl_ms": 75.52070900448598,
+        "median_e2el_ms": 5087.1981244999915,
+        "p95_e2el_ms": 5124.610411617323
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p128-c4-r3-20260907T172026.242355Z/result.json",
+      "sha256": "892342034aaf70500d4a086ad5f795aa6ec6a461dc1fdbdfc1501f81774894fc",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+        "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+        "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 128,
+      "repetition": "warmup",
+      "metrics": {
+        "output_throughput": 100.4956519155102,
+        "request_throughput": 0.7851222805899234,
+        "duration": 5.094747785013169,
+        "median_ttft_ms": 278.2603199884761,
+        "p95_ttft_ms": 377.87719972839113,
+        "median_tpot_ms": 37.62706715772185,
+        "p95_tpot_ms": 38.12055036707004,
+        "mean_itl_ms": 37.33336510742902,
+        "median_itl_ms": 37.594834953779355,
+        "p95_itl_ms": 74.8898830381222,
+        "p99_itl_ms": 75.22129314369522,
+        "median_e2el_ms": 5056.911944993772,
+        "p95_e2el_ms": 5093.970455400995
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p128-c4-rwarmup-20260907T171930.049125Z/result.json",
+      "sha256": "81801f6a41f26967591a2e3a989e30337e130234e404e1b381edff8aa8297c5a",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "73a16f75c3cae7d16e8787845576b2ad4b59cc2b84d80f74d927cf0bf5a70873",
+        "dc7ddef225239ce8087957db2ab62ed0086e514be522e5c8873b1bc9cd0e9c75",
+        "b8746a87346900b06e31468ebff842a9720b82e0bb191dcd3e3e2c0fa8ce6367",
+        "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 4096,
+      "repetition": "1",
+      "metrics": {
+        "output_throughput": 50.90337899616635,
+        "request_throughput": 0.39768264840754963,
+        "duration": 10.058271377987694,
+        "median_ttft_ms": 4791.236212506192,
+        "p95_ttft_ms": 5043.395085062366,
+        "median_tpot_ms": 41.165558854347154,
+        "p95_tpot_ms": 42.84998451148281,
+        "mean_itl_ms": 40.843843857601314,
+        "median_itl_ms": 39.95126750669442,
+        "p95_itl_ms": 79.63966595707461,
+        "p99_itl_ms": 79.7869067126885,
+        "median_e2el_ms": 10019.259548018454,
+        "p95_e2el_ms": 10057.454718320514
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p4096-c4-r1-20260907T172230.265473Z/result.json",
+      "sha256": "e4513619f67854667e203b27f802ac0bce7fd50b1e817aaa3c29f5614237aaf2",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+        "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+        "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+        "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 4096,
+      "repetition": "2",
+      "metrics": {
+        "output_throughput": 50.906820842982206,
+        "request_throughput": 0.3977095378357985,
+        "duration": 10.057591331016738,
+        "median_ttft_ms": 4794.443565973779,
+        "p95_ttft_ms": 5047.243624969269,
+        "median_tpot_ms": 41.13408598446609,
+        "p95_tpot_ms": 42.8238530051812,
+        "mean_itl_ms": 40.81280097261697,
+        "median_itl_ms": 40.08188351872377,
+        "p95_itl_ms": 79.58961153344717,
+        "p99_itl_ms": 79.75092816341203,
+        "median_e2el_ms": 10018.449406488799,
+        "p95_e2el_ms": 10056.789899567957
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p4096-c4-r2-20260907T172254.656741Z/result.json",
+      "sha256": "e9c4113c8a8400f53557f8463654284cc3ee2da3987ccfcba7d02008032a5121",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+        "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+        "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+        "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 4096,
+      "repetition": "3",
+      "metrics": {
+        "output_throughput": 50.92621596761176,
+        "request_throughput": 0.3978610622469669,
+        "duration": 10.053760921990033,
+        "median_ttft_ms": 4793.251592986053,
+        "p95_ttft_ms": 5044.694246238214,
+        "median_tpot_ms": 41.113494204698256,
+        "p95_tpot_ms": 42.79410440901452,
+        "mean_itl_ms": 40.792204857439174,
+        "median_itl_ms": 39.886591490358114,
+        "p95_itl_ms": 79.62683965160977,
+        "p99_itl_ms": 79.78841931559145,
+        "median_e2el_ms": 10014.58836699021,
+        "p95_e2el_ms": 10052.741817673086
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p4096-c4-r3-20260907T172318.891645Z/result.json",
+      "sha256": "92dcf1a67623bdadc4503cf5cf91d779b10a2c507bd976c725d7190d457902a0",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+        "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+        "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+        "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+      ]
+    },
+    {
+      "variant": "candidate",
+      "input_tokens": 4096,
+      "repetition": "warmup",
+      "metrics": {
+        "output_throughput": 50.892016124362115,
+        "request_throughput": 0.397593875971579,
+        "duration": 10.060517130012158,
+        "median_ttft_ms": 4791.075892979279,
+        "p95_ttft_ms": 5042.6824578258675,
+        "median_tpot_ms": 41.183371551281695,
+        "p95_tpot_ms": 42.86441831410895,
+        "mean_itl_ms": 40.86162765224799,
+        "median_itl_ms": 40.14829147490673,
+        "p95_itl_ms": 79.67206447210629,
+        "p99_itl_ms": 79.95638927444816,
+        "median_e2el_ms": 10021.361906488892,
+        "p95_e2el_ms": 10059.480662972783
+      },
+      "path": "/app/plow/build-gemma31/bench-terminal-candidate/results/plow-p4096-c4-rwarmup-20260907T172206.263996Z/result.json",
+      "sha256": "7de3da7adfcafbdc6de5d099a88850fee1b2f58793c3815b67a131fc3f13d54e",
+      "source_patch_sha256": "d4c142a949e9bbb22f4cfc854677d1a48fa6be3337cfad0f5bdbe398cb21db3c",
+      "generated_text_sha256": [
+        "a393bd780f60839a38926ba2b26d2a57b1d5ca5e95ee2abd86ed231f653c75c2",
+        "db2041ce6cfa42269f49b25548fb4aacefac4fd7803b966dfca8ab3c152f8f8e",
+        "e83168b5a988da01de9cd72fa69c99b7a4fb6249589b2784ae21fb10be4f982e",
+        "5398d7416d992a9e94dc3f93d40a6673d45aa33dad1e31f83c168924816fb39b"
+      ]
+    }
+  ],
+  "numerical": {
+    "rows": [
+      {
+        "phase": "first",
+        "slot": 0,
+        "reference": "/tmp/gemma31-terminal-snaps/t00004_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00012_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "d6207ddb262c4c3fbc69a7ebf90c0cb1838d43e9a7e35e4d17501093cb7b0b54",
+        "candidate_sha256": "d6207ddb262c4c3fbc69a7ebf90c0cb1838d43e9a7e35e4d17501093cb7b0b54"
+      },
+      {
+        "phase": "next",
+        "slot": 0,
+        "reference": "/tmp/gemma31-terminal-snaps/t00008_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00013_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "e7c79092aa61492d057feedc1752b19748d7e75025c541c0a4843a79b1a224c1",
+        "candidate_sha256": "e7c79092aa61492d057feedc1752b19748d7e75025c541c0a4843a79b1a224c1"
+      },
+      {
+        "phase": "first",
+        "slot": 1,
+        "reference": "/tmp/gemma31-terminal-snaps/t00005_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00012_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "8b5346297dfbd45622dc8af8b79ca4f1e692b4aee430f8ea2b8567753cd4431d",
+        "candidate_sha256": "8b5346297dfbd45622dc8af8b79ca4f1e692b4aee430f8ea2b8567753cd4431d"
+      },
+      {
+        "phase": "next",
+        "slot": 1,
+        "reference": "/tmp/gemma31-terminal-snaps/t00009_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00014_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "1746f80df05dddb0430373d1c436ccce093496ebcafd3c6d3c7b4c98b901998e",
+        "candidate_sha256": "1746f80df05dddb0430373d1c436ccce093496ebcafd3c6d3c7b4c98b901998e"
+      },
+      {
+        "phase": "first",
+        "slot": 2,
+        "reference": "/tmp/gemma31-terminal-snaps/t00006_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00012_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "56f43ebc594a8ab9f980f359b22766286d8380486c723ecac46d008c34af113d",
+        "candidate_sha256": "56f43ebc594a8ab9f980f359b22766286d8380486c723ecac46d008c34af113d"
+      },
+      {
+        "phase": "next",
+        "slot": 2,
+        "reference": "/tmp/gemma31-terminal-snaps/t00010_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00015_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "2eaca3787b3f5a18f30cdfe59b4113f1f046d36c5f2ea44cd9a1776d22fb3438",
+        "candidate_sha256": "2eaca3787b3f5a18f30cdfe59b4113f1f046d36c5f2ea44cd9a1776d22fb3438"
+      },
+      {
+        "phase": "first",
+        "slot": 3,
+        "reference": "/tmp/gemma31-terminal-snaps/t00007_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00012_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "85afce9b366faffe10ffc7d42931f8810e023a4b6b0cc61a80972024bf0574f2",
+        "candidate_sha256": "85afce9b366faffe10ffc7d42931f8810e023a4b6b0cc61a80972024bf0574f2"
+      },
+      {
+        "phase": "next",
+        "slot": 3,
+        "reference": "/tmp/gemma31-terminal-snaps/t00011_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00016_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "f6266cc9f8999c339206f8899ffb508f03a0e806e0fc15edbb90b044138c4d46",
+        "candidate_sha256": "f6266cc9f8999c339206f8899ffb508f03a0e806e0fc15edbb90b044138c4d46"
+      },
+      {
+        "phase": "first",
+        "slot": 3,
+        "reference": "/tmp/gemma31-terminal-snaps/t00019_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00023_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "304f73c978a8638f09e11fff82b6af017bd5b2a7d66d0046cb31e2c1a49879ed",
+        "candidate_sha256": "304f73c978a8638f09e11fff82b6af017bd5b2a7d66d0046cb31e2c1a49879ed"
+      },
+      {
+        "phase": "next",
+        "slot": 3,
+        "reference": "/tmp/gemma31-terminal-snaps/t00021_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00024_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "d645d82eb385cfbec57593a87df5d53af3a787c779c38239ccea38b015153138",
+        "candidate_sha256": "d645d82eb385cfbec57593a87df5d53af3a787c779c38239ccea38b015153138"
+      },
+      {
+        "phase": "first",
+        "slot": 1,
+        "reference": "/tmp/gemma31-terminal-snaps/t00020_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00023_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "82d00c6bdddbd33052f55b33c748693872cbc54e642cf191f38d96c120488cfe",
+        "candidate_sha256": "82d00c6bdddbd33052f55b33c748693872cbc54e642cf191f38d96c120488cfe"
+      },
+      {
+        "phase": "next",
+        "slot": 1,
+        "reference": "/tmp/gemma31-terminal-snaps/t00022_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00025_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "5195b60581ba4deaa535b1755a3c9b361c120019e690d8011daaba07e5d668e3",
+        "candidate_sha256": "5195b60581ba4deaa535b1755a3c9b361c120019e690d8011daaba07e5d668e3"
+      },
+      {
+        "phase": "first",
+        "slot": 2,
+        "reference": "/tmp/gemma31-terminal-snaps/t00028_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00031_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "9b8e9452527af55f10f105054478c530e40f7e9e5f3d4de4366ef468eae5588b",
+        "candidate_sha256": "9b8e9452527af55f10f105054478c530e40f7e9e5f3d4de4366ef468eae5588b"
+      },
+      {
+        "phase": "first",
+        "slot": 0,
+        "reference": "/tmp/gemma31-terminal-snaps/t00029_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00031_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "de058023d6088878d9c9a63bf5808164d432edcebc9d2249c95bbf7c7a4a106c",
+        "candidate_sha256": "de058023d6088878d9c9a63bf5808164d432edcebc9d2249c95bbf7c7a4a106c"
+      },
+      {
+        "phase": "next",
+        "slot": 0,
+        "reference": "/tmp/gemma31-terminal-snaps/t00030_r4_act.logits.bin",
+        "candidate": "/tmp/gemma31-terminal-snaps/t00032_r4_act.logits.bin",
+        "bitwise": true,
+        "reference_sha256": "410247244b0e81b54250f217089d3b8dd7e8c55c45c2808e1891946f3d85a597",
+        "candidate_sha256": "410247244b0e81b54250f217089d3b8dd7e8c55c45c2808e1891946f3d85a597"
+      }
+    ],
+    "bitwise_rows": 15,
+    "total_rows": 15
+  },
+  "policy_qualification": [
+    {
+      "flag": "PLOW_PF_NO_INTERLEAVE",
+      "value": 1,
+      "url": "http://127.0.0.1:18935",
+      "server_log": "/app/plow/build-gemma31/terminal-policy/plow_pf_no_interleave-server.log",
+      "command": [
+        "/app/plow/build-gemma31/terminal-policy/plowrt",
+        "serve",
+        "--assets",
+        "/app/plow/build-gemma31/decode-placed-assets",
+        "--port",
+        "18935"
+      ],
+      "gpu": "2",
+      "binary_sha256": "050b8808b38db7dceda91f6666218207f91bc1747aad4031607d79f54280ca7b",
+      "environment": {
+        "PLOW_READELF": "/nix/store/9i3g77yxafyrsiphzmpljmq6j5xj4imx-rocm-therock-gfx94X-dcgpu-7.14.0/lib/llvm/bin/llvm-readelf",
+        "PLOW_HIPCC": "/nix/store/9i3g77yxafyrsiphzmpljmq6j5xj4imx-rocm-therock-gfx94X-dcgpu-7.14.0/bin/hipcc",
+        "PLOW_NVCC": "/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9/bin/nvcc",
+        "PLOW_BUNDLER": "/nix/store/9i3g77yxafyrsiphzmpljmq6j5xj4imx-rocm-therock-gfx94X-dcgpu-7.14.0/lib/llvm/bin/clang-offload-bundler",
+        "PLOW_HOST_CC": "cc",
+        "PLOW_NVCC_PATH": "/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9/bin:/nix/store/5yxzjciaa3bhizp7z51iy0v27wj3bdjb-gcc-wrapper-14.3.0/bin:/nix/store/9ypz3flqsrl5xl495mm8h645gadjsxi1-coreutils-9.11/bin:/nix/store/gn94gpcp5q08x4v6g8mvw8v4r65rcjzk-gnugrep-3.12/bin:/nix/store/kgxafhycw2kybbqih759ykc2043qyi5j-gnused-4.9/bin:/nix/store/cgjr3kj3hs7ngznyws5qfg16c8scpys0-bash-interactive-5.3p9/bin",
+        "PLOW_TOOLCHAIN_LABEL": "rocm-7.14.0-nix",
+        "PLOW_FUSION": "1",
+        "PLOW_PF_BATCH": "1",
+        "PLOW_PF_CHUNK": "512",
+        "PLOW_PF_INTERLEAVE": "0",
+        "PLOW_MULTISTEP": "4",
+        "PLOW_PREFIX_CACHE": "0",
+        "PLOW_L2_PLACE_DISPATCH": "1",
+        "PLOW_PF_NO_INTERLEAVE": "1",
+        "PLOW_PF_DEFER_DECODE": "0",
+        "PLOW_HSACO": "/app/plow/build-gemma31/hsaco",
+        "PLOW_HSACO_LOWRUNG": "/app/plow/build-gemma31/hsaco-occ4-b1-clean:1",
+        "RUST_LOG": "info,plowrt::serve::mux=debug"
+      },
+      "started_utc": "2026-09-07T17:20:28Z",
+      "server_pid": 807349,
+      "standard_verifier_passed": true,
+      "passed": true,
+      "staggered_live_decoder_passed": true,
+      "staggered_log_lines": [
+        413,
+        592
+      ],
+      "terminal_events": [
+        "2026-09-07T17:21:07.779915Z DEBUG plowrt::serve::mux: AMD batched prefill completion prefill=3 decode=0"
+      ],
+      "near_context_cases": [
+        {
+          "prompt": 8191,
+          "output": 1
+        },
+        {
+          "prompt": 8175,
+          "output": 17
+        }
+      ],
+      "near_context_concurrent_checks": 8,
+      "additional_cancellations": 4,
+      "server_exit_code": -15,
+      "server_log_sha256": "3a07c13ce0357e0af68021cbb59569bfdd92ed380a040e36c20d86b6b1484433",
+      "finished_utc": "2026-09-07T17:21:36Z",
+      "completed_requests": 39,
+      "isolated_baselines": 10,
+      "exact_greedy_parity_checks": 29,
+      "deliberate_disconnects": 12,
+      "context_rejections": 1,
+      "server_error_lines": [],
+      "server_child_stopped": true,
+      "request_count_scope": "standard verifier plus added staggered/near-context cases",
+      "parked_live_evidence": [
+        {
+          "line": 417,
+          "text": "2026-09-07T17:21:07.600300Z DEBUG plowrt::serve::mux: amd: token (deferred read) token=240017 slot=0"
+        },
+        {
+          "line": 420,
+          "text": "2026-09-07T17:21:07.779915Z DEBUG plowrt::serve::mux: AMD batched prefill completion prefill=3 decode=0"
+        },
+        {
+          "line": 421,
+          "text": "2026-09-07T17:21:07.855741Z DEBUG plowrt::serve::mux: amd: token (deferred read) token=240017 slot=0"
+        }
+      ],
+      "packet_sha256": "59df5045781261d3c9aafe27804af667c95008a3a602775695d2ab68c0d45dc6",
+      "qualifier_sha256": "6c23cb0676535dd8900132bb71d330e3b890355705bb4538f41e058f2c6631a3"
+    },
+    {
+      "flag": "PLOW_PF_DEFER_DECODE",
+      "value": 1,
+      "url": "http://127.0.0.1:18935",
+      "server_log": "/app/plow/build-gemma31/terminal-policy/plow_pf_defer_decode-server.log",
+      "command": [
+        "/app/plow/build-gemma31/terminal-policy/plowrt",
+        "serve",
+        "--assets",
+        "/app/plow/build-gemma31/decode-placed-assets",
+        "--port",
+        "18935"
+      ],
+      "gpu": "2",
+      "binary_sha256": "050b8808b38db7dceda91f6666218207f91bc1747aad4031607d79f54280ca7b",
+      "environment": {
+        "PLOW_READELF": "/nix/store/9i3g77yxafyrsiphzmpljmq6j5xj4imx-rocm-therock-gfx94X-dcgpu-7.14.0/lib/llvm/bin/llvm-readelf",
+        "PLOW_HIPCC": "/nix/store/9i3g77yxafyrsiphzmpljmq6j5xj4imx-rocm-therock-gfx94X-dcgpu-7.14.0/bin/hipcc",
+        "PLOW_NVCC": "/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9/bin/nvcc",
+        "PLOW_BUNDLER": "/nix/store/9i3g77yxafyrsiphzmpljmq6j5xj4imx-rocm-therock-gfx94X-dcgpu-7.14.0/lib/llvm/bin/clang-offload-bundler",
+        "PLOW_HOST_CC": "cc",
+        "PLOW_NVCC_PATH": "/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9/bin:/nix/store/5yxzjciaa3bhizp7z51iy0v27wj3bdjb-gcc-wrapper-14.3.0/bin:/nix/store/9ypz3flqsrl5xl495mm8h645gadjsxi1-coreutils-9.11/bin:/nix/store/gn94gpcp5q08x4v6g8mvw8v4r65rcjzk-gnugrep-3.12/bin:/nix/store/kgxafhycw2kybbqih759ykc2043qyi5j-gnused-4.9/bin:/nix/store/cgjr3kj3hs7ngznyws5qfg16c8scpys0-bash-interactive-5.3p9/bin",
+        "PLOW_TOOLCHAIN_LABEL": "rocm-7.14.0-nix",
+        "PLOW_FUSION": "1",
+        "PLOW_PF_BATCH": "1",
+        "PLOW_PF_CHUNK": "512",
+        "PLOW_PF_INTERLEAVE": "0",
+        "PLOW_MULTISTEP": "4",
+        "PLOW_PREFIX_CACHE": "0",
+        "PLOW_L2_PLACE_DISPATCH": "1",
+        "PLOW_PF_NO_INTERLEAVE": "0",
+        "PLOW_PF_DEFER_DECODE": "1",
+        "PLOW_HSACO": "/app/plow/build-gemma31/hsaco",
+        "PLOW_HSACO_LOWRUNG": "/app/plow/build-gemma31/hsaco-occ4-b1-clean:1",
+        "RUST_LOG": "info,plowrt::serve::mux=debug"
+      },
+      "started_utc": "2026-09-07T17:21:36Z",
+      "server_pid": 811144,
+      "standard_verifier_passed": true,
+      "passed": true,
+      "staggered_live_decoder_passed": true,
+      "staggered_log_lines": [
+        498,
+        678
+      ],
+      "terminal_events": [
+        "2026-09-07T17:22:15.932939Z DEBUG plowrt::serve::mux: AMD batched prefill completion prefill=3 decode=0"
+      ],
+      "near_context_cases": [
+        {
+          "prompt": 8191,
+          "output": 1
+        },
+        {
+          "prompt": 8175,
+          "output": 17
+        }
+      ],
+      "near_context_concurrent_checks": 8,
+      "additional_cancellations": 4,
+      "server_exit_code": -15,
+      "server_log_sha256": "941775d612ee7e4155a5886d55f6bb2e564a0db2f5a44aeaaa4f50bfd4cbc454",
+      "finished_utc": "2026-09-07T17:22:44Z",
+      "completed_requests": 39,
+      "isolated_baselines": 10,
+      "exact_greedy_parity_checks": 29,
+      "deliberate_disconnects": 12,
+      "context_rejections": 1,
+      "server_error_lines": [],
+      "server_child_stopped": true,
+      "request_count_scope": "standard verifier plus added staggered/near-context cases",
+      "parked_live_evidence": [
+        {
+          "line": 502,
+          "text": "2026-09-07T17:22:15.753879Z DEBUG plowrt::serve::mux: amd: token (deferred read) token=240017 slot=0"
+        },
+        {
+          "line": 506,
+          "text": "2026-09-07T17:22:15.932939Z DEBUG plowrt::serve::mux: AMD batched prefill completion prefill=3 decode=0"
+        },
+        {
+          "line": 507,
+          "text": "2026-09-07T17:22:16.009400Z DEBUG plowrt::serve::mux: amd: token (deferred read) token=240017 slot=0"
+        }
+      ],
+      "packet_sha256": "59df5045781261d3c9aafe27804af667c95008a3a602775695d2ab68c0d45dc6",
+      "qualifier_sha256": "6c23cb0676535dd8900132bb71d330e3b890355705bb4538f41e058f2c6631a3"
+    }
+  ],
+  "limits": [
+    "Plow before/after comparison; not a fresh vLLM server comparison.",
+    "Same BF16 checkpoint/tokenizer/objects/WPE5, PF512, configured multistep4, nonbinding token budgets and greedy output lengths.",
+    "Separate exclusive GPU leases, concurrent paired clients, clocks/power unpinned, shared host resources.",
+    "Stock ITL measures delivered SSE-event spacing; multistep bursts are not per-token GPU timing.",
+    "Numerical reference replays identical packed prefixes and occupied decode widths, completing terminal rows separately.",
+    "Native final-token decode changes the phase arithmetic relative to an ordinary MFMA prefill completion. Independent HTTP isolated/concurrent greedy parity also passed.",
+    "Small closed-loop workload; no saturation or production tail-SLO claim."
+  ]
+}
