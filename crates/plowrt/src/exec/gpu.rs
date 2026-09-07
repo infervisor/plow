@@ -1673,9 +1673,11 @@ pub struct GpuEngine {
     /// VMM prefix sharing (`PLOW_VMM_PREFIX=1`); `None` = the cudaMalloc
     /// default path, byte-identical behavior to before this feature.
     vmm: Option<VmmServe>,
-    /// PX-1 cross-request batched prefill (`PLOW_PF_BATCH=1`); `None` = the
-    /// per-slot serialized prefill, byte-identical behavior to before.
+    /// Cross-request batched prefill selected by packet metadata or legacy
+    /// runtime opt-in; `None` uses per-slot serialized prefill.
     pf_batch: Option<PfBatch>,
+    /// Next physical slot considered first by cross-request prefill admission.
+    prefill_turn: usize,
     packed_prefill: Option<plow_asset::packed_prefill::Manifest>,
     mixed_step: Option<gpu_mixed_step::MixedCudaStep>,
 }
@@ -4249,6 +4251,7 @@ impl GpuEngine {
             timing,
             vmm,
             pf_batch,
+            prefill_turn: 0,
             packed_prefill,
             mixed_step,
         };
@@ -5745,6 +5748,14 @@ impl GpuEngine {
     /// each request's first token from a decode step of its last prompt token.
     pub fn pf_batch_enabled(&self) -> bool {
         self.pf_batch.is_some()
+    }
+
+    pub fn prefill_turn(&self) -> usize {
+        self.prefill_turn % self.batch.max(1)
+    }
+
+    pub fn advance_prefill_turn(&mut self, slot: usize) {
+        self.prefill_turn = (slot + 1) % self.batch.max(1);
     }
 
     /// Largest prefill bucket's row count — the mux's per-launch token budget.
