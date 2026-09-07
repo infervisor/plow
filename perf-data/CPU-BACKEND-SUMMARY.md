@@ -22,9 +22,16 @@ Read the per-model files for the full 16-cell tables: `cpu-gptoss/SUMMARY.md`,
 | Gemma-4-12B bf16, decode c=1 | 233 | 267 | 460-544 | win both, 1.15x / 2.0x |
 | Gemma-4-12B fp8, decode c=1 | 127 | 133 | 460-544 | win both, 1.05x / 3.6x |
 
-vLLM cannot serve the 26B on this machine at all: the checkpoint is bf16 (47 GB), its CPU backend
-has no 4-bit path for it, and the worker is OOM-killed at load even at 2048 context. plow serves the
-same model from a 13 GB MXFP4 twin at ~21 GB resident.
+vLLM cannot serve the 26B on this machine at all, and the reason is not the one recorded earlier.
+Its CPU backend *does* have four quantized MoE expert paths for x86 (fp8, MXFP4, int4, int8, all
+AMX-gated, and this box has AMX) — but every one of them requires a SILU-family activation, and
+Gemma-4's MoE is GELU-tanh (`gemma4.py:368`). The only GELU-capable x86 expert path is the
+unquantized one, so vLLM must hold the experts in bf16: 47.00 GiB of text weights (42.54 GiB of
+that in experts) against a 58.85 GiB box, and the engine core dies during init at 180 s even at
+2048 context with one sequence. A bigger box would only let the bf16 path fit; the quantized
+kernels stay refused. plow serves the same model from a 13 GB MXFP4 twin at ~21 GB resident.
+Full trace, with the byte accounting and the class-by-class activation gates, in
+`cpu-gemma26b/vllm-baseline.md`.
 
 ## The two unmet items, and why
 
@@ -79,6 +86,11 @@ kernels.
 * **Always `--fresh-prompts`.** Prefix caches inflate a server's c>=2 TTFT several-fold.
 * **Single prefill measurements vary ~10% on this box.** Repeat three times.
 * **Re-emit every blob after an opcode renumber.** A merge silently gave three opcodes two meanings.
+* **When a baseline "cannot run", find the gate before recording why.** "vLLM has no 4-bit path for
+  the 26B" was recorded here and was wrong: it has four, and they are refused on an activation
+  check, not a memory or format one. Reading `CpuPlatform.supported_quantization == []`
+  as "nothing supported" is the specific trap — vLLM treats an empty list as *no restriction*
+  (`platforms/interface.py:966`). Static source tracing settled this in minutes with no model load.
 
 ## MXFP4 dense prefill: a 4-bit blob no longer carries bf16 too (commit 96ad1d5)
 
