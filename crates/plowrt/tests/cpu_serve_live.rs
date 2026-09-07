@@ -42,7 +42,10 @@ fn step(e: &mut CpuServe, feeds: &[(usize, u32)], what: &'static str) -> Vec<(us
     let t = Instant::now();
     let out = SeqEngine::step_batch(e, feeds).unwrap_or_else(|err| panic!("{what}: {err}"));
     let _ = wd.send(());
-    eprintln!("{what}: feeds={feeds:?} -> {out:?} in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    eprintln!(
+        "{what}: feeds={feeds:?} -> {out:?} in {:.0} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
     assert_eq!(out.len(), feeds.len(), "{what}: one output per feed");
     for (k, &(s, _)) in feeds.iter().enumerate() {
         assert_eq!(out[k].0, s, "{what}: outputs follow feed order");
@@ -70,7 +73,10 @@ fn live_slot_lifecycle_with_gaps() {
     let d = prompt("What is the capital of Japan? Answer in one word.");
 
     let mut opts = CpuEngineOpts::default();
-    opts.threads = std::env::var("PLOW_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    opts.threads = std::env::var("PLOW_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
     let mut e = CpuServe::load(&blob, &ckpt, &opts).expect("load");
     assert!(e.batch() >= 4, "ladder blob must serve >= 4 slots");
 
@@ -80,7 +86,11 @@ fn live_slot_lifecycle_with_gaps() {
     let t1 = e.prefill(1, &b).expect("prefill 1");
     let o2 = step(&mut e, &[(0, o[0].1), (1, t1)], "step rung2");
     let t2 = e.prefill(2, &c).expect("prefill 2");
-    let o3 = step(&mut e, &[(0, o2[0].1), (1, o2[1].1), (2, t2)], "step rung4 contiguous");
+    let o3 = step(
+        &mut e,
+        &[(0, o2[0].1), (1, o2[1].1), (2, t2)],
+        "step rung4 contiguous",
+    );
 
     // Release the MIDDLE slot: live {0,2}, idle 1 inside the rung -> the log's `rung=4 occupied=3`.
     SeqEngine::release(&mut e, 1);
@@ -88,7 +98,11 @@ fn live_slot_lifecycle_with_gaps() {
 
     // Re-admit into the gap while the others decode.
     let t3 = e.prefill(1, &d).expect("prefill 1 again");
-    let _o5 = step(&mut e, &[(0, o4[0].1), (1, t3), (2, o4[1].1)], "step rung4 refilled");
+    let _o5 = step(
+        &mut e,
+        &[(0, o4[0].1), (1, t3), (2, o4[1].1)],
+        "step rung4 refilled",
+    );
 
     // Release all but the highest slot: live {2} -> rows 3 -> still rung 4 with two idle rows.
     SeqEngine::release(&mut e, 0);
@@ -108,6 +122,9 @@ fn live_slot_lifecycle_with_gaps() {
     // A block asset (plowc --block) has no embed/lm_head, so its tokens are meaningless;
     // set PLOW_EXPECT_TEXT=0 to exercise only the slot lifecycle on it.
     if std::env::var("PLOW_EXPECT_TEXT").map_or(true, |v| v != "0") {
-        assert!(text.contains("Rome"), "slot 2 should answer Rome, got {text:?}");
+        assert!(
+            text.contains("Rome"),
+            "slot 2 should answer Rome, got {text:?}"
+        );
     }
 }

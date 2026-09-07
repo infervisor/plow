@@ -174,6 +174,11 @@ pub struct CpuRuntimeConfig {
     )]
     pub numa: crate::exec::cpu::topology::NumaMode,
 
+    /// Override transparent huge-page advice. By default, use ordinary pages
+    /// for interleaved tensors and huge-page advice for single-node/OS placement.
+    #[arg(long = "cpu-huge-pages", env = "PLOW_CPU_HUGE_PAGES", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub huge_pages: Option<bool>,
+
     /// Kernel tier ceiling (for A/B and hosts without AMX).
     #[arg(
         long = "cpu-isa",

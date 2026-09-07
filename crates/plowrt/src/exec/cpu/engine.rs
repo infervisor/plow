@@ -62,9 +62,50 @@ mod allocation_tests {
                 }),
                 "{entry}"
             );
-            for node in nodes {
-                assert!(entry.contains(&format!(" N{node}=")), "{entry}");
+            let policy = entry.split_whitespace().nth(1).unwrap();
+            let requested: Vec<u32> = policy
+                .split_once(':')
+                .unwrap()
+                .1
+                .split(',')
+                .flat_map(|part| {
+                    let (lo, hi) = part.split_once('-').unwrap_or((part, part));
+                    lo.parse::<u32>().unwrap()..=hi.parse::<u32>().unwrap()
+                })
+                .collect();
+            assert_eq!(requested, nodes);
+            let resident: Vec<(u32, usize)> = entry
+                .split_whitespace()
+                .filter_map(|part| part.strip_prefix('N'))
+                .map(|part| {
+                    let (node, pages) = part.split_once('=').unwrap();
+                    (node.parse().unwrap(), pages.parse().unwrap())
+                })
+                .collect();
+            assert_eq!(
+                resident.iter().map(|(_, pages)| pages).sum::<usize>() * 4096,
+                t.layout.size()
+            );
+            if nodes.len() == 1 {
+                assert!(
+                    resident.iter().all(|(node, _)| *node == nodes[0]),
+                    "{entry}"
+                );
             }
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let header = format!("{:x}-", t.as_ptr() as usize);
+            let mapping = smaps.split_once(&header).expect("tensor mapping").1;
+            let flags = mapping.lines().find(|l| l.starts_with("VmFlags:")).unwrap();
+            let huge = crate::config::RuntimeConfig::get()
+                .cpu
+                .huge_pages
+                .unwrap_or(nodes.len() <= 1);
+            assert!(
+                flags
+                    .split_whitespace()
+                    .any(|f| f == if huge { "hg" } else { "nh" }),
+                "{flags}"
+            );
             eprintln!("{entry}");
         }
     }
@@ -155,9 +196,20 @@ impl HostTensor {
         }
         #[cfg(target_os = "linux")]
         if huge {
-            // Best effort; a refusal costs TLB misses, not correctness.
+            let use_huge = crate::config::RuntimeConfig::get()
+                .cpu
+                .huge_pages
+                .unwrap_or(nodes.len() <= 1);
+            // THP allocation can fall back to a different node instead of reclaiming
+            // base pages on the interleave target, concentrating shared weights.
+            let advice = if use_huge {
+                libc::MADV_HUGEPAGE
+            } else {
+                libc::MADV_NOHUGEPAGE
+            };
+            // Best effort; this does not change the allocation's size or alignment.
             // SAFETY: ptr/size describe our own mapping.
-            unsafe { libc::madvise(ptr as *mut c_void, size, libc::MADV_HUGEPAGE) };
+            unsafe { libc::madvise(ptr as *mut c_void, size, advice) };
         }
         let tensor = HostTensor { ptr, layout, bytes };
         #[cfg(target_os = "linux")]
@@ -416,6 +468,40 @@ fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
                         "program {pi} instruction {ii} tensor slot {slot} has handle {handle} of {}",
                         blob.tensors.len()
                     )));
+                }
+            }
+            if inst.op == DevOp::RmsNorm as u16
+                && (inst.t[3] != TENSOR_NONE16 || inst.t[4] != TENSOR_NONE16)
+            {
+                return Err(RuntimeError::Device(
+                    "CPU RMSNorm FP8 fusion is unsupported; compile without --qnorm-fuse".into(),
+                ));
+            }
+            if inst.op == DevOp::QuantFp8 as u16 {
+                let fused = inst.t[3] != TENSOR_NONE16;
+                if fused != (inst.t[4] != TENSOR_NONE16) {
+                    return Err(RuntimeError::Device(
+                        "CPU QUANT_FP8 requires both gate and up tensors".into(),
+                    ));
+                }
+                let elements = u64::from(inst.i[0]) * u64::from(inst.i[1]);
+                let bf16_bytes = elements.checked_mul(2).ok_or_else(|| {
+                    RuntimeError::Device("CPU QUANT_FP8 dimensions overflow".into())
+                })?;
+                let sizes = [
+                    elements,
+                    bf16_bytes,
+                    u64::from(inst.i[0]) * 4,
+                    bf16_bytes,
+                    bf16_bytes,
+                ];
+                for (slot, &bytes) in sizes[..if fused { 5 } else { 3 }].iter().enumerate() {
+                    let handle = inst.t[slot];
+                    if handle == TENSOR_NONE16 || blob.tensors[handle as usize].bytes < bytes {
+                        return Err(RuntimeError::Device(format!(
+                            "CPU QUANT_FP8 tensor slot {slot} is missing or smaller than {bytes} bytes"
+                        )));
+                    }
                 }
             }
             if inst.op == DevOp::GemvQkv as u16 {
@@ -1385,8 +1471,11 @@ impl CpuEngine {
         self.last_token()
     }
 
-    /// The compiled prefill buckets as `(program, rows)`.
+    /// Prefill buckets as `(program, rows)`, falling back to single-token decode.
     pub fn prefill_buckets(&self) -> Vec<(usize, u32)> {
+        if self.model.dec_ix == 0 {
+            return vec![(0, 1)];
+        }
         (0..self.model.dec_ix)
             .map(|i| (i, self.model.blob.progs[i].t))
             .collect()
@@ -1403,8 +1492,9 @@ impl CpuEngine {
     /// chunk that covers the last token, [`Self::last_token`] is the first generated token.
     pub fn prefill_chunk(&mut self, prompt: &[u32], ch: Chunk) -> Result<()> {
         let end = ch.c0.checked_add(ch.clen);
-        if ch.prog >= self.model.dec_ix
-            || end.is_none_or(|end| end as usize > prompt.len())
+        let decode_prefill = self.model.dec_ix == 0 && ch.prog == 0 && ch.clen == 1;
+        if (ch.prog >= self.model.dec_ix && !decode_prefill)
+            || end.is_none_or(|end| end as usize > prompt.len() || end as usize > self.max_ctx)
             || ch.clen == 0
         {
             return Err(RuntimeError::Device(format!("bad prefill chunk {ch:?}")));
@@ -1438,6 +1528,11 @@ impl CpuEngine {
                 }
             }
             self.model.write_u32(t_kvlen, ch.c0 + ch.clen);
+            if decode_prefill {
+                // Decode reads the absolute position from in.pos; its KV pointers are
+                // already rebased to the prefill slot by the caller.
+                return self.run_prog(ch.prog);
+            }
             // Rebase the program from its pristine copy: KV write rows at c0,
             // flash window [c0, c0+clen), row counts for a partial chunk.
             let lp = Arc::make_mut(&mut self.progs[ch.prog]);

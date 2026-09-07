@@ -35,6 +35,17 @@ accepts BF16 or scaled FP8 activations and decodes all e4m3fn codes, including
 subnormals and NaNs. MXFP4 uses the existing packed even-K row layout and E8M0
 block scales. Packet tile/slice ownership is preserved.
 
+`QUANT_FP8` supports per-row BF16-to-e4m3fn activation quantization with FP32
+scales, round-to-nearest ties-to-even, and finite saturation. Its ordinary path
+uses AVX-512; fused gate/up activation uses the scalar reference. Compile W8A8
+without `--qnorm-fuse`: CPU loading rejects that unsupported RMSNorm fusion.
+W8A16 uses FP8 weights and BF16 activations; neither mode requires native FP8
+arithmetic instructions. Gemma FP8 expert GLU/down kernels have scalar and
+AVX-512 implementations, with exact e4m3fn weight decoding and per-expert row scales.
+A decode-only bundle uses its single-row decode program to prefill one token at
+a time. This supports the current Gemma-26B W8A16 bundle, whose compiler emits no
+grouped-prefill program; long-prompt latency is consequently higher.
+
 NOP, zero fill, expert alignment, and the exact Gemma router-score opcode retain
 their scalar implementations. The fast router-score opcode has vector coverage.
 Unsupported opcodes are rejected during model loading. This is not support for
@@ -60,9 +71,12 @@ then places SMT siblings. Worker metadata uses the same placement list.
 | `0` or `0,1` | Requested nodes | Require successful binding/interleaving; reject unavailable nodes |
 
 Tensors of at least 256 KiB use fresh, 2 MiB-aligned anonymous mappings. Apply
-`mbind` before initializing or copying tensor data, then advise transparent huge
-pages. Fresh mappings avoid stale placement from allocator reuse and release the
-VMA policy on drop. Smaller allocations retain the ordinary heap path. Per-worker
+`mbind` before initializing or copying tensor data. Multi-node interleave uses
+ordinary pages by default; single-node binding and OS placement advise transparent
+huge pages. Override with `--cpu-huge-pages=true|false` or
+`PLOW_CPU_HUGE_PAGES=true|false`. This changes allocation advice, not the system's
+THP setting. Fresh mappings avoid stale placement from allocator reuse and release
+the VMA policy on drop. Smaller allocations retain the ordinary heap path. Per-worker
 scratch is first touched after pinning to its worker CPU. No memory-policy syscall
 or tensor allocation is added to a kernel invocation.
 
@@ -78,8 +92,10 @@ not guarantee local access or a multi-socket inference speedup.
 The local checks passed: Rust CPU runtime tests, all 10 C test targets, sliced/tail
 GEMMs, FP8 activation/weight codes, restricted affinity using CPUs 192 and 216,
 and live NUMA placement. ASan/UBSan passed the vector and new GEMM suites. The
-AMX-specific test self-skips on this AMD host. The live check observed 1,024 pages on each of eight
-nodes for a 32 MiB mapping, and all pages on node 0 for a bound mapping.
+AMX-specific test self-skips on this AMD host. The live test checks the requested
+node mask, full residency, single-node binding, and huge-page advice. Interleaved
+allocations can fall back under memory pressure; equal residency on every node is
+not a guaranteed property of the policy.
 
 One single-thread, warm `M=64,N=512,K=1024` microbenchmark measured:
 

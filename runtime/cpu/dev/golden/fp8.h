@@ -4,6 +4,10 @@
 
 #include "golden.h"
 
+G_K(g_quant_fp8);
+G_K(g_moe_expert_glu_gemma_fp8);
+G_K(g_moe_expert_down_gemma_fp8);
+
 /* Decode (op 30/31): t0=C t1=x t2=W(e4m3) t5=w_scale(f32[N]) i0=M i1=N i2=K i4=a_row0;
  * GLU: t0=fu t1=x t2=Wg t3=g_scale t4=u_scale t5=Wu i5=act. i3 != 0 (AMD NRN fold) poisons. */
 G_K(g_gemv_fp8);
