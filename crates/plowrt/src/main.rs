@@ -2569,10 +2569,21 @@ async fn bringup_runtime(
                 "loading CPU engine"
             );
             let t0 = std::time::Instant::now();
+            // The Metal engine rides the same slot-serve engine; `PLOW_BACKEND=cpu` keeps the
+            // worker-pool engine on a Metal-enabled build.
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            let eng = if std::env::var("PLOW_BACKEND").map_or(true, |v| v != "cpu") {
+                let m = plowrt::exec::apple::MetalEngine::load(&blob, &ckpt)?;
+                plowrt::serve::engine::CpuServe::from_engine(Box::new(m), &ckpt)?
+            } else {
+                plowrt::serve::engine::CpuServe::load(&blob, &ckpt, &opts)?
+            };
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
             let eng = plowrt::serve::engine::CpuServe::load(&blob, &ckpt, &opts)?;
             tracing::info!(
                 %slug, secs = t0.elapsed().as_secs_f64(), max_ctx = eng.max_ctx(),
-                "CPU engine loaded"
+                engine = %eng.engine().describe(),
+                "slot engine loaded"
             );
             state.install_gpu_engine(slug, plowrt::serve::engine::ServeEngine::Cpu(eng));
         }

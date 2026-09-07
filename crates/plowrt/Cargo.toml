@@ -60,6 +60,14 @@ libloading = { version = "0.8", optional = true }
 # (`exec::cpu`). Optional because only the `cpu` feature links the kernel lib.
 libc = { version = "0.2", optional = true }
 
+# Metal GPU backend (`exec::apple`): objc2 bindings to Metal/Foundation. Frameworks are part of
+# the OS, so they are linked, not dlopen'd. macOS only.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-core-ml = { version = "0.3", optional = true }
+
 [build-dependencies]
 # Compiles the CPU kernel library `runtime/cpu/dev/` into the binary (see
 # build.rs). The GPU backends dlopen their drivers instead, so this is the only
@@ -73,6 +81,12 @@ default = []
 # reached through `exec::cpu::ffi`. Real-weight loading (safetensors, tokenizer)
 # joins this feature in P2 — see `plans/cpu-backend.md`.
 cpu = ["dep:cc", "dep:libc", "dep:safetensors", "hf-tokenizer"]
+# Metal GPU engine for Apple Silicon (plans/apple-silicon-backend.md rung 2). Builds on the CPU
+# engine's loader (unified memory: the host tensors ARE the device buffers), so it implies `cpu`.
+metal = ["cpu", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+# Apple Neural Engine executor (rung 4): CoreML programs run at segment boundaries of the
+# Metal engine's walk (Event mode). Implies `metal`.
+ane = ["metal", "dep:objc2-core-ml"]
 # Real Hugging Face tokenizer (loads a model's `tokenizer.json`). Enable this
 # alone for tokenization without pulling the checkpoint/download deps.
 hf-tokenizer = ["dep:tokenizers"]

@@ -24,6 +24,9 @@ void plow_cpu_register_amx(plow_cpu_kernel_fn* tab);
 void plow_cpu_register_golden_fp8(plow_cpu_kernel_fn* tab);
 void plow_cpu_register_avx512_fp8(plow_cpu_kernel_fn* tab);
 void plow_cpu_register_amx_fp8(plow_cpu_kernel_fn* tab);
+/* aarch64 vector tier (neon/). Only the arm64 build references these. */
+void plow_cpu_register_neon(plow_cpu_kernel_fn* tab);
+void plow_cpu_register_neon_fp8(plow_cpu_kernel_fn* tab);
 /* Per-thread AMX setup (LDTILECFG palette 1, 8 tiles of 16x64 B). 0 or -errno. */
 int plow_cpu_thread_init_amx(PlowCpuCtx* ctx);
 

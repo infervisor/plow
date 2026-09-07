@@ -271,8 +271,13 @@ impl Checkpoint {
     /// not reduce by one byte.
     pub fn populate(&self, span: Span) -> bool {
         let (map, _) = &self.shards[span.shard];
-        map.advise_range(memmap2::Advice::PopulateRead, span.off, span.len)
-            .is_ok()
+        // MADV_POPULATE_READ is Linux 5.14+; elsewhere WILLNEED is the closest
+        // (async readahead, PTEs still fault in one at a time).
+        #[cfg(target_os = "linux")]
+        let advice = memmap2::Advice::PopulateRead;
+        #[cfg(not(target_os = "linux"))]
+        let advice = memmap2::Advice::WillNeed;
+        map.advise_range(advice, span.off, span.len).is_ok()
     }
 }
 

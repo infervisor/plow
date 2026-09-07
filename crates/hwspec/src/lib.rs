@@ -18,6 +18,7 @@
 //! ```
 
 pub mod amd;
+pub mod apple;
 pub mod isa;
 pub mod nvidia;
 pub mod registry;
@@ -27,6 +28,6 @@ pub mod units;
 pub use isa::{ArchGeometry, CalibrationTier, GemmTile, HardwareFingerprint, IsaCaps, IsaLevel};
 pub use spec::{
     Arch, ChipletGrouping, DsmDomainKind, DsmGrouping, GpuSpec, Interconnect, InterconnectKind,
-    L2Partitioning, MatrixThroughput, MemKind, MemorySpec, MmaDtype, SmSpec, Vendor,
+    L2Partitioning, MatrixThroughput, MemKind, MemorySpec, MmaDtype, SmSpec, SocSpec, Vendor,
 };
 pub use units::{Bytes, GBps, Hertz};

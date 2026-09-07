@@ -411,7 +411,18 @@ fn pin_to_cpu(cpu: u32) {
     }
 }
 
-#[cfg(not(all(feature = "cpu", target_os = "linux")))]
+/// Darwin has no thread-to-core affinity. The scheduler places threads by QoS class, and
+/// USER_INTERACTIVE is the one it keeps on the performance cluster — the whole point of the
+/// P-core-only topology (`Topology::fallback`).
+#[cfg(all(feature = "cpu", target_os = "macos"))]
+fn pin_to_cpu(_cpu: u32) {
+    // SAFETY: sets the calling thread's QoS class; no pointers involved.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+#[cfg(not(all(feature = "cpu", any(target_os = "linux", target_os = "macos"))))]
 fn pin_to_cpu(_cpu: u32) {}
 
 fn worker_main(init: WorkerInit, sh: Arc<Shared>, exec: Arc<dyn Exec>) {

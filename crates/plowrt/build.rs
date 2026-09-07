@@ -88,7 +88,7 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
         let dev = root.join("runtime/cpu/dev");
         let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-        for d in ["", "golden", "avx512", "amx"] {
+        for d in ["", "golden", "avx512", "amx", "neon"] {
             println!("cargo:rerun-if-changed={}", dev.join(d).display());
         }
         println!("cargo:rerun-if-changed={}", dev.join("cpu_dev.h").display());
@@ -101,8 +101,27 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
             .into_iter()
             .chain(c_files(&dev.join("golden")))
             .collect();
-        let avx = c_files(&dev.join("avx512"));
-        let amx = c_files(&dev.join("amx"));
+        // Tier directories are per target ISA: the x86 tiers carry `-mavx512*` /
+        // `-mamx-*`, which clang rejects outright on arm64, so they must not even
+        // be compiled there (and vice versa).
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let x86 = arch == "x86_64";
+        let arm = arch == "aarch64";
+        let avx = if x86 {
+            c_files(&dev.join("avx512"))
+        } else {
+            Vec::new()
+        };
+        let amx = if x86 {
+            c_files(&dev.join("amx"))
+        } else {
+            Vec::new()
+        };
+        let neon = if arm {
+            c_files(&dev.join("neon"))
+        } else {
+            Vec::new()
+        };
 
         // One object set per flag group, all archived into a single library.
         // `cargo_metadata(false)` on the parts so only the final archive is
@@ -111,7 +130,7 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
 
         let mut plain_srcs = plain.clone();
         let stub = out.join("cpu_dev_stub.c");
-        if plain.is_empty() && avx.is_empty() && amx.is_empty() {
+        if plain.is_empty() && avx.is_empty() && amx.is_empty() && neon.is_empty() {
             std::fs::write(&stub, STUB).unwrap();
             plain_srcs.push(stub);
             println!(
@@ -155,6 +174,14 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
                 b.flag(f);
             }
             b.files(&amx);
+            objects.extend(b.compile_intermediates());
+        }
+        if !neon.is_empty() {
+            let mut b = base(&root);
+            // bf16 dot/matmul (`bfdot`/`bfmmla`) and int8 `mmla` need armv8.6; every
+            // Apple M-series part and Neoverse-V1+ have them.
+            b.flag("-march=armv8.6-a+bf16+i8mm+fp16");
+            b.files(&neon);
             objects.extend(b.compile_intermediates());
         }
 

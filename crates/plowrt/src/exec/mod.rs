@@ -14,6 +14,14 @@ pub mod amd;
 /// all-ranks, with a host barrier — see the module note for why the two differ.
 #[cfg(feature = "hsa")]
 pub mod amd_tp;
+/// Apple Neural Engine executor: CoreML programs built from plow weights, run at segment
+/// boundaries of the Metal walk. See `plans/apple-silicon-backend.md` §4.5.
+#[cfg(all(feature = "ane", target_os = "macos"))]
+pub mod ane;
+/// Apple Silicon GPU engine: the device-ISA interpreter as a Metal kernel over the CPU
+/// engine's unified-memory tensors. See `plans/apple-silicon-backend.md`.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod apple;
 pub mod counters;
 /// CPU engine: device-ISA interpreter on persistent pinned worker threads,
 /// C kernels via `cpu::ffi`. See `plans/cpu-backend.md`.

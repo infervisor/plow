@@ -542,6 +542,15 @@ fn main() -> ExitCode {
     init_logging();
     let mut cli = Cli::parse();
 
+    // An Apple target has no `sm_*`/`gfx*` object: the Metal interpreter compiles its MSL at
+    // load and executes the same single-segment (uniseg) packet shape as sm_120. Resolve the
+    // arch from the part unless one was named explicitly.
+    if let Some(spec) = hwspec::registry::lookup(&cli.gpu) {
+        if spec.vendor == hwspec::Vendor::Apple && cli.arch == "sm_120a" {
+            cli.arch = hwspec::IsaLevel::Metal3.arch_flag().to_string();
+        }
+    }
+
     // DEFAULT ON FOR sm_120. The persistent sm_120 interpreter runs every op in one cooperative
     // launch and implements the coarse single-segment path only, so a segmented blob is not
     // something that target can express. Without this, a plain `--hf-dir --arch sm_120a` compile
@@ -550,7 +559,9 @@ fn main() -> ExitCode {
     // that was missing. Defaulting it here moves the decision to the only place that knows the
     // arch. `deny_uniseg` still wins downstream for targets that must read `seg` (AMD).
     // Opt out with PLOW_UNISEG=0.
-    if cli.arch.starts_with("sm_120") && std::env::var_os("PLOW_UNISEG").is_none() {
+    if (cli.arch.starts_with("sm_120") || cli.arch == "metal3")
+        && std::env::var_os("PLOW_UNISEG").is_none()
+    {
         // The real gate is `packet::devbuild::Builder`'s own `std::env::var("PLOW_UNISEG")` read,
         // not this struct field — set both so the emitted manifest and the diagnostic agree.
         std::env::set_var("PLOW_UNISEG", "1");

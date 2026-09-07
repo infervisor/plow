@@ -24,11 +24,16 @@
 extern "C" {
 #endif
 
-/* Kernel tiers, ordered; plow_cpu_init(cap) never activates above `cap`. */
+/* Kernel tiers, ordered; plow_cpu_init(cap) never activates above `cap`.
+ * Tier numbers are per target ISA: 1 is the vector tier, 2 the matrix tier.
+ *   x86_64:  1 = AVX-512 (F/BW/VL + BF16, +FP16/VNNI when present), 2 = AMX-TILE/BF16 (+INT8)
+ *   aarch64: 1 = NEON (armv8.6 bf16 `bfdot`/`bfmmla` + i8mm), 2 = SME2 (reserved, not built) */
 enum {
     PLOW_CPU_ISA_SCALAR = 0,
-    PLOW_CPU_ISA_AVX512 = 1, /* F/BW/VL + BF16 (+FP16/VNNI when present) */
-    PLOW_CPU_ISA_AMX    = 2, /* AVX512 tier + AMX-TILE/BF16 (+INT8) */
+    PLOW_CPU_ISA_AVX512 = 1,
+    PLOW_CPU_ISA_NEON   = 1,
+    PLOW_CPU_ISA_AMX    = 2,
+    PLOW_CPU_ISA_SME    = 2,
 };
 
 /* Dispatch table extent: PLOW_DOP_* are dense small integers (< 200 today). */

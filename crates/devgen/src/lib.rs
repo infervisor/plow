@@ -2179,10 +2179,22 @@ fn declare(
                 let gu = gu_n * c.hidden as u64;
                 let dn = dn_n * c.moe_inter as u64;
                 ex4 = [
-                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj"), gu / 2),
-                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj_scale"), gu / 32),
-                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.down_proj"), dn / 2),
-                    b.tensor(&format!("mxfp4/{prefix}layers.{l}.experts.down_proj_scale"), dn / 32),
+                    b.tensor(
+                        &format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj"),
+                        gu / 2,
+                    ),
+                    b.tensor(
+                        &format!("mxfp4/{prefix}layers.{l}.experts.gate_up_proj_scale"),
+                        gu / 32,
+                    ),
+                    b.tensor(
+                        &format!("mxfp4/{prefix}layers.{l}.experts.down_proj"),
+                        dn / 2,
+                    ),
+                    b.tensor(
+                        &format!("mxfp4/{prefix}layers.{l}.experts.down_proj_scale"),
+                        dn / 32,
+                    ),
                 ];
             } else if fp8 {
                 b.tensor(
@@ -2265,17 +2277,52 @@ fn declare(
             wg8: w8(b, "mlp.gate_proj.weight", (inter_sh * c.hidden) as u64),
             wu8: w8(b, "mlp.up_proj.weight", (inter_sh * c.hidden) as u64),
             wd8: w8(b, "mlp.down_proj.weight", (c.hidden * inter_sh) as u64),
-            sq: sc(b, "self_attn.q_proj.weight", qd as u64, (qd * c.hidden) as u64),
-            sk: sc(b, "self_attn.k_proj.weight", kd as u64, (kd * c.hidden) as u64),
+            sq: sc(
+                b,
+                "self_attn.q_proj.weight",
+                qd as u64,
+                (qd * c.hidden) as u64,
+            ),
+            sk: sc(
+                b,
+                "self_attn.k_proj.weight",
+                kd as u64,
+                (kd * c.hidden) as u64,
+            ),
             sv: if keqv {
                 TENSOR_NONE
             } else {
-                sc(b, "self_attn.v_proj.weight", kd as u64, (kd * c.hidden) as u64)
+                sc(
+                    b,
+                    "self_attn.v_proj.weight",
+                    kd as u64,
+                    (kd * c.hidden) as u64,
+                )
             },
-            so: sc(b, "self_attn.o_proj.weight", c.hidden as u64, (c.hidden * qd) as u64),
-            sg: sc(b, "mlp.gate_proj.weight", inter_sh as u64, (inter_sh * c.hidden) as u64),
-            su: sc(b, "mlp.up_proj.weight", inter_sh as u64, (inter_sh * c.hidden) as u64),
-            sd: sc(b, "mlp.down_proj.weight", c.hidden as u64, (c.hidden * inter_sh) as u64),
+            so: sc(
+                b,
+                "self_attn.o_proj.weight",
+                c.hidden as u64,
+                (c.hidden * qd) as u64,
+            ),
+            sg: sc(
+                b,
+                "mlp.gate_proj.weight",
+                inter_sh as u64,
+                (inter_sh * c.hidden) as u64,
+            ),
+            su: sc(
+                b,
+                "mlp.up_proj.weight",
+                inter_sh as u64,
+                (inter_sh * c.hidden) as u64,
+            ),
+            sd: sc(
+                b,
+                "mlp.down_proj.weight",
+                c.hidden as u64,
+                (c.hidden * inter_sh) as u64,
+            ),
             g_in: w(b, "input_layernorm.weight", c.hidden as u64 * BF16),
             g_pa: w(b, "post_attention_layernorm.weight", c.hidden as u64 * BF16),
             // Gemma's sandwich has two extra norms; Llama/Qwen do not.
@@ -3341,7 +3388,10 @@ fn emit_phase(
         if gemv_family && mx4 {
             // Op 91 has no norm-fold slot; every caller passes TENSOR_NONE (the norm is a shared
             // packet), so a gamma here would be a silently dropped norm — refuse instead.
-            assert_eq!(gamma, TENSOR_NONE, "mxfp4 GEMV cannot fold a norm (gamma) — emit it as a packet");
+            assert_eq!(
+                gamma, TENSOR_NONE,
+                "mxfp4 GEMV cannot fold a norm (gamma) — emit it as a packet"
+            );
             return b.emit(DevOp::GemvMxfp4, gemv_wg_cap(cus), deps, |d| {
                 d.t[0] = out;
                 d.t[1] = a;
@@ -4740,18 +4790,23 @@ fn emit_phase(
                 })
             } else if mx4 {
                 // w.wg8/wu8 and w.sg/su carry the mxfp4 twins (e2m1 rows + E8M0 scale rows).
-                b.emit(DevOp::GemvGluMxfp4, gemv_wg_cap(all.clone()), &[c_pf], |d| {
-                    d.t[0] = n.fu;
-                    d.t[1] = mlp_src;
-                    d.t[2] = w.wg8;
-                    d.t[5] = w.wu8;
-                    d.t[3] = w.sg;
-                    d.t[4] = w.su;
-                    d.i[0] = t;
-                    d.i[1] = inter_l;
-                    d.i[2] = c.hidden;
-                    d.i[5] = c.mlp_act;
-                })
+                b.emit(
+                    DevOp::GemvGluMxfp4,
+                    gemv_wg_cap(all.clone()),
+                    &[c_pf],
+                    |d| {
+                        d.t[0] = n.fu;
+                        d.t[1] = mlp_src;
+                        d.t[2] = w.wg8;
+                        d.t[5] = w.wu8;
+                        d.t[3] = w.sg;
+                        d.t[4] = w.su;
+                        d.i[0] = t;
+                        d.i[1] = inter_l;
+                        d.i[2] = c.hidden;
+                        d.i[5] = c.mlp_act;
+                    },
+                )
             } else {
                 b.emit(DevOp::GemvGlu, all.clone(), &[c_pf], |d| {
                     d.t[0] = n.fu;
@@ -5040,66 +5095,66 @@ fn emit_phase(
                         d.i[6] = nb;
                     })]
                 } else {
-                let c_glu = if fp8 {
-                    // fp8 path: separate norm + expert GLU (no fused fp8 norm variant)
-                    let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
-                        d.t[0] = n.moe_xn2;
-                        d.t[1] = n.x;
-                        d.t[2] = w.g_pre2;
-                        d.i[0] = t;
-                        d.i[1] = c.hidden;
-                        d.f[0] = c.eps;
-                    });
-                    b.emit(
-                        DevOp::MoeExpertGluGemmaFp8,
-                        glu_cus,
-                        &[c_rt, c_xn2_local],
-                        |d| {
+                    let c_glu = if fp8 {
+                        // fp8 path: separate norm + expert GLU (no fused fp8 norm variant)
+                        let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
+                            d.t[0] = n.moe_xn2;
+                            d.t[1] = n.x;
+                            d.t[2] = w.g_pre2;
+                            d.i[0] = t;
+                            d.i[1] = c.hidden;
+                            d.f[0] = c.eps;
+                        });
+                        b.emit(
+                            DevOp::MoeExpertGluGemmaFp8,
+                            glu_cus,
+                            &[c_rt, c_xn2_local],
+                            |d| {
+                                d.t[0] = n.moe_mfu;
+                                d.t[1] = n.moe_xn2;
+                                d.t[2] = n.moe_tab;
+                                d.t[3] = w.ewt;
+                                d.t[4] = w.est;
+                                d.i[0] = c.top_k;
+                                d.i[1] = c.moe_inter;
+                                d.i[2] = c.hidden;
+                                d.i[3] = c.n_exp;
+                                d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
+                            },
+                        )
+                    } else {
+                        // bf16 path: fused norm + expert GLU (one fewer gate)
+                        b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_rt, c_pf], |d| {
                             d.t[0] = n.moe_mfu;
-                            d.t[1] = n.moe_xn2;
+                            d.t[1] = n.x;
                             d.t[2] = n.moe_tab;
                             d.t[3] = w.ewt;
-                            d.t[4] = w.est;
+                            d.t[4] = w.g_pre2;
                             d.i[0] = c.top_k;
                             d.i[1] = c.moe_inter;
                             d.i[2] = c.hidden;
                             d.i[3] = c.n_exp;
                             d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                        },
-                    )
-                } else {
-                    // bf16 path: fused norm + expert GLU (one fewer gate)
-                    b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_rt, c_pf], |d| {
-                        d.t[0] = n.moe_mfu;
-                        d.t[1] = n.x;
+                            d.f[0] = c.eps;
+                        })
+                    };
+                    let down_op = if fp8 {
+                        DevOp::MoeExpertDownGemmaFp8
+                    } else {
+                        DevOp::MoeExpertDownGemma
+                    };
+                    vec![b.emit(down_op, down_cus, &[c_glu], |d| {
+                        d.t[0] = n.moe_part;
+                        d.t[1] = n.moe_mfu;
                         d.t[2] = n.moe_tab;
                         d.t[3] = w.ewt;
-                        d.t[4] = w.g_pre2;
+                        d.t[4] = w.est;
                         d.i[0] = c.top_k;
-                        d.i[1] = c.moe_inter;
-                        d.i[2] = c.hidden;
+                        d.i[1] = c.hidden;
+                        d.i[2] = c.moe_inter;
                         d.i[3] = c.n_exp;
                         d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                        d.f[0] = c.eps;
-                    })
-                };
-                let down_op = if fp8 {
-                    DevOp::MoeExpertDownGemmaFp8
-                } else {
-                    DevOp::MoeExpertDownGemma
-                };
-                vec![b.emit(down_op, down_cus, &[c_glu], |d| {
-                    d.t[0] = n.moe_part;
-                    d.t[1] = n.moe_mfu;
-                    d.t[2] = n.moe_tab;
-                    d.t[3] = w.ewt;
-                    d.t[4] = w.est;
-                    d.i[0] = c.top_k;
-                    d.i[1] = c.hidden;
-                    d.i[2] = c.moe_inter;
-                    d.i[3] = c.n_exp;
-                    d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                })]
+                    })]
                 };
                 // fused combine + rmsnorm + residual: saves 2 counter gates per layer.
                 let mut comb_deps: Vec<u32> = c_dn;

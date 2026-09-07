@@ -138,6 +138,11 @@ impl HostTensor {
         // (e.g. 128 x 3840 bf16 = 960 KiB) sit below 2 MiB yet are tile-loaded at a multi-KiB
         // row stride, where 4 KiB pages cost a TLB miss per tile row. Slack <= 2 MiB each.
         let huge = bytes >= HUGE / 8;
+        // macOS: every tensor is page-aligned (16 KiB) and page-sized so the Metal engine can wrap
+        // it as an `MTLBuffer` without a copy (`newBufferWithBytesNoCopy` requires both).
+        #[cfg(target_os = "macos")]
+        let align = if huge { HUGE } else { 16384 };
+        #[cfg(not(target_os = "macos"))]
         let align = if huge { HUGE } else { ALIGN };
         let size = bytes
             .max(1)
@@ -910,6 +915,13 @@ impl CpuModel {
 
     pub fn kv_slot(&self) -> usize {
         self.kv_slot
+    }
+
+    /// The pointer kernels currently receive for handle `h` (the tensor base, or the slot-rebased
+    /// KV block after [`Self::kv_rebase`]).
+    pub fn table_ptr(&self, h: usize) -> *mut c_void {
+        // SAFETY: `h` indexes the table (validated at load); quiescent point.
+        unsafe { *self.table.as_ptr().add(h) }
     }
 
     /// Decode rungs (sequence widths), ascending, one per decode program.
