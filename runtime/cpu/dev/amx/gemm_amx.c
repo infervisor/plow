@@ -458,7 +458,8 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
  * L3 (the strip-outer, full-K order) would cap the K loop at ~40% of the TMUL, both operands from
  * L2 run at ~94%.
  * The next strip's W panel is software-prefetched (T1) at ~2 lines per K step so its first token
- * block does not stall on DRAM. Slices own contiguous 32-row weight strips. */
+ * block does not stall on DRAM. Slices own contiguous 32-row weight strips, except at narrow N
+ * where they own row ranges instead (see the split-axis choice in wm_run). */
 #define WM_KP 1024u
 #define WM_L2_BUDGET (1536u << 10) /* token-chunk cache budget: 3/4 of the 2 MiB L2 of every AMX part */
 #define WM_TB_BYTES (WM_KP * 64u) /* one token block's x tiles over a panel: 16 kb x 2 tiles */
@@ -588,10 +589,28 @@ static void wm_block(const uint8_t* W0, const uint8_t* W1, size_t ldw, uint32_t 
 static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx* ctx) {
     const int dbg = amx_debug_flags();
     const int glu = g->Wu != NULL;
-    const uint32_t S = (g->N + 31u) / 32u;
-    const uint32_t s0 = (uint32_t)((uint64_t)S * slice / nblk), s1 = (uint32_t)((uint64_t)S * (slice + 1u) / nblk);
-    if (s0 >= s1) return 1;
-    const uint32_t nstrip = s1 - s0, nacc = glu ? 2u : 1u;
+    const uint32_t nacc = glu ? 2u : 1u;
+    const uint32_t S = (g->N + 31u) / 32u, MB = (g->M + 31u) / 32u;
+    /* Split axis. Normally N: a slice owns 32-column weight strips and W is read once per call.
+     * But pack_x_panel is per slice, so every slice packs the WHOLE M x K activation and the
+     * pack is done nblk times over. A narrow N makes that dominate -- at N=512, nblk=16 a
+     * slice's single strip does less compute than its pack -- and at N < 32*nblk most slices
+     * get no strip at all and the op serializes onto the few that do.
+     * Split over M instead when the whole-N W panel is L2-resident (so no slice has to re-chunk
+     * to hold it), every slice still gets a full 32-row token block, and M is worth at least
+     * half of N. The pack drops to 1x; each slice re-reads W, which those conditions keep small
+     * and L3-warm after the first slice. Output stays disjoint either way -- and the slice ->
+     * region map is already driver-dependent, since the strip driver splits (m, n) tiles. */
+    const int msplit = g->M >= 32u * nblk && (uint64_t)g->M * 2u > (uint64_t)g->N &&
+                       (size_t)S * nacc * 32u * WM_KP * 2u + WM_TB_BYTES + (size_t)S * nacc * 4096u <=
+                           WM_L2_BUDGET;
+    const uint32_t s0 = msplit ? 0u : (uint32_t)((uint64_t)S * slice / nblk);
+    const uint32_t s1 = msplit ? S : (uint32_t)((uint64_t)S * (slice + 1u) / nblk);
+    const uint32_t mlo = msplit ? (uint32_t)((uint64_t)MB * slice / nblk) * 32u : 0u;
+    uint32_t mhi = msplit ? (uint32_t)((uint64_t)MB * (slice + 1u) / nblk) * 32u : g->M;
+    if (mhi > g->M) mhi = g->M;
+    if (s0 >= s1 || mlo >= mhi) return 1;
+    const uint32_t nstrip = s1 - s0;
     const size_t ldw = (size_t)g->K * 2u;
     uint8_t* sc = ctx->scratch;
     float* cbT = (float*)(sc + WM_CB_OFF);
@@ -613,14 +632,14 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
         if (ntb_l2 < ntb_max) ntb_max = ntb_l2;
         /* Even chunks: every chunk costs one pass over the slice's W, so a ragged tail would pay
          * a full pass for a handful of tokens. */
-        const uint32_t ntb_all = (g->M + 31u) / 32u;
+        const uint32_t ntb_all = (mhi - mlo + 31u) / 32u;
         if (ntb_max < ntb_all) ntb_max = (ntb_all + (ntb_all + ntb_max - 1u) / ntb_max - 1u) /
                                          ((ntb_all + ntb_max - 1u) / ntb_max);
     }
     memset(wt, 0, 2048u);
     const uint32_t npanel = (g->K + WM_KP - 1u) / WM_KP;
-    for (uint32_t m0 = 0; m0 < g->M; m0 += ntb_max * 32u) {
-        const uint32_t rows = g->M - m0 < ntb_max * 32u ? g->M - m0 : ntb_max * 32u;
+    for (uint32_t m0 = mlo; m0 < mhi; m0 += ntb_max * 32u) {
+        const uint32_t rows = mhi - m0 < ntb_max * 32u ? mhi - m0 : ntb_max * 32u;
         const uint32_t ntb = (rows + 31u) / 32u;
         float* cp = (float*)(xp + (size_t)ntb * WM_TB_BYTES);
         ils_t pend = {0};

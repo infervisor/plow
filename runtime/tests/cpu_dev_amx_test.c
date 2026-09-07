@@ -528,6 +528,10 @@ int main(int argc, char** argv) {
         test_shape(ops[o], 16, 3840, 15360, &ctx);
         test_shape(ops[o], 37, 15360, 3840, &ctx); /* odd M, K-panel tail, N strips */
     }
+    /* Narrow N with many rows: wm_run splits these slices over M, not over N strips. */
+    test_shape(PLOW_DOP_GEMM, 1024, 512, 2880, &ctx);       /* kv_proj prefill */
+    test_shape(PLOW_DOP_GEMM_NORM, 544, 500, 2080, &ctx);   /* ragged M blocks, N and K tails */
+    test_shape(PLOW_DOP_GEMM_GLU, 1024, 320, 1024, &ctx);   /* two accumulators per strip */
     /* Odd geometry: N not a multiple of 32, M partial second tile. */
     test_shape(PLOW_DOP_GEMM_SMALL, 21, 100, 128, &ctx);
     test_shape(PLOW_DOP_GEMM_GLU, 21, 100, 128, &ctx);
