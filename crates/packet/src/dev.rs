@@ -153,7 +153,7 @@ pub enum DevOp {
     /// requires the LDS-staged arm and `d_rmsnorm`'s register path; the kernel re-checks both and
     /// demotes to `norm = 0` rather than reduce over an arena it never staged.
     Gemv = 10,
-    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=O_final` ·
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=O_final?` ·
     /// `i0=n_q i1=n_kv i2=n_head i3=n_kv_head i4=q_pos0 i5=window i6=hd i7=nsplit` ·
     /// `f0=scale j0=kv_stride j1=kv_mask`.
     /// `window = 0` is full causal. `hd` must be 256 or 512.

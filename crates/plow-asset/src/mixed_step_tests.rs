@@ -312,6 +312,138 @@ fn dense_mixed_consumers_share_decode_slots_and_canonical_prefill_spans() {
         dense_consumer_contract(&program(vec![decode, writer, split_prefill]), 2, &tensors)
             .is_err()
     );
+
+    split_prefill.i[2] = 2;
+    split_prefill.i[6] = 8;
+    split_prefill.t[0] = 2;
+    split_prefill.t[1] = 3;
+    split_prefill.t[5] = packet::dev::TENSOR_NONE16;
+    let mut merge = inst(DevOp::FlashMerge);
+    merge.t[0] = 1;
+    merge.t[1] = 2;
+    merge.t[2] = 3;
+    merge.i[..5].copy_from_slice(&[8, 2, 2, 8, 2]);
+    let mut split_tensors = tensors.to_vec();
+    split_tensors[1].bytes = 256;
+    split_tensors.extend([
+        TensorContract {
+            name: "act.prefill_opart",
+            bytes: 1024,
+            initialized: false,
+        },
+        TensorContract {
+            name: "act.prefill_mlpart",
+            bytes: 256,
+            initialized: false,
+        },
+    ]);
+    let valid = vec![decode, writer, split_prefill, merge];
+    assert_eq!(
+        dense_amd_consumer_contract(&program(valid.clone()), 2, &split_tensors).unwrap(),
+        0
+    );
+    assert!(dense_consumer_contract(&program(valid.clone()), 2, &split_tensors).is_err());
+    assert!(dense_amd_consumer_contract(&program(valid[..3].to_vec()), 2, &split_tensors).is_err());
+    for (field, value) in [(0, 7), (1, 3), (2, 3), (3, 16), (4, 1)] {
+        let mut bad = valid.clone();
+        bad[3].i[field] = value;
+        assert!(dense_amd_consumer_contract(&program(bad), 2, &split_tensors).is_err());
+    }
+    for tensor in [1, 2, 3] {
+        let mut bad = split_tensors.clone();
+        bad[tensor].bytes -= 1;
+        assert!(dense_amd_consumer_contract(&program(valid.clone()), 2, &bad).is_err());
+    }
+    let mut alias = valid.clone();
+    alias[0].t[0] = split_prefill.t[0];
+    assert!(dense_amd_consumer_contract(&program(alias), 2, &split_tensors).is_err());
+    let mut softcap = inst(DevOp::SoftCap);
+    softcap.t[0] = 1;
+    softcap.i[0] = 16;
+    softcap.i[1] = 2;
+    let mut capacity = valid.clone();
+    capacity.push(softcap);
+    assert!(
+        dense_amd_capacity_consumer_contract(&program(capacity.clone()), 2, &split_tensors).is_ok()
+    );
+    capacity.last_mut().unwrap().i[1] = 0;
+    assert!(dense_amd_capacity_consumer_contract(&program(capacity), 2, &split_tensors).is_err());
+
+    for op in [
+        DevOp::Embed,
+        DevOp::RmsNorm,
+        DevOp::HeadNormRope,
+        DevOp::NormResidual,
+        DevOp::GemmGlu,
+    ] {
+        let mut body = inst(op);
+        body.i[0] = 8;
+        let mut candidate = valid.clone();
+        candidate.push(body);
+        assert!(dense_amd_capacity_consumer_contract(
+            &program(candidate.clone()),
+            2,
+            &split_tensors
+        )
+        .is_ok());
+        for rows in [0, 1, 2, 7, 9] {
+            candidate.last_mut().unwrap().i[0] = rows;
+            assert!(
+                dense_amd_capacity_consumer_contract(
+                    &program(candidate.clone()),
+                    2,
+                    &split_tensors
+                )
+                .is_err(),
+                "{op:?} rows={rows}"
+            );
+            assert!(
+                dense_amd_consumer_contract(&program(candidate.clone()), 2, &split_tensors).is_ok(),
+                "legacy {op:?} validation unchanged"
+            );
+        }
+    }
+    for rows in [2, 8] {
+        let mut gemm = inst(DevOp::Gemm);
+        gemm.i[0] = rows;
+        let mut candidate = valid.clone();
+        candidate.push(gemm);
+        assert!(dense_amd_capacity_consumer_contract(
+            &program(candidate.clone()),
+            2,
+            &split_tensors
+        )
+        .is_ok());
+        for field in [4, 5] {
+            candidate.last_mut().unwrap().i[field] = 1;
+            assert!(dense_amd_capacity_consumer_contract(
+                &program(candidate.clone()),
+                2,
+                &split_tensors
+            )
+            .is_err());
+            candidate.last_mut().unwrap().i[field] = 0;
+        }
+    }
+    for rows in [0, 1, 3, 7, 9] {
+        let mut gemm = inst(DevOp::Gemm);
+        gemm.i[0] = rows;
+        let mut candidate = valid.clone();
+        candidate.push(gemm);
+        assert!(
+            dense_amd_capacity_consumer_contract(&program(candidate), 2, &split_tensors).is_err()
+        );
+    }
+    let mut decode_merge = inst(DevOp::FlashMerge);
+    decode_merge.i[0] = 2;
+    let mut candidate = valid;
+    candidate.push(decode_merge);
+    assert!(
+        dense_amd_capacity_consumer_contract(&program(candidate.clone()), 2, &split_tensors)
+            .is_ok()
+    );
+    candidate.last_mut().unwrap().i[0] = 8;
+    assert!(dense_amd_capacity_consumer_contract(&program(candidate), 2, &split_tensors).is_err());
 }
 
 fn buffers(rows: usize, spans: usize, parked: usize, mapped: usize) -> Plan {

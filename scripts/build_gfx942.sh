@@ -841,6 +841,7 @@ ROWS=(
   "interp_prefill|$AX_PREFILL"
   "interp_decode|$AX_DECODE"
   "interp_flash|$AX_FLASH"
+  "interp_mixed|-DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=64 -DGM_BN=128 -DFA_DC=256 -DFA_DBUF=1"
   "interp_prefill_fp8|$AX_PREFILL $AX_FP8"
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"
@@ -978,10 +979,40 @@ for row in "${ROWS[@]}"; do
     # that only has 512 -- so adding them fails every 4-wave row for no reason.
     [ "$l" -le 65536 ] || { echo "  OVER LDS: $l > 65536"; fail=1; }
     case "$stem" in
-      interp_flash*) [ "$v" -le 512 ] || { echo "  OVER REG: $v > 512"; fail=1; } ;;
+      interp_flash*|interp_mixed*) [ "$v" -le 512 ] || { echo "  OVER REG: $v > 512"; fail=1; } ;;
       *)             [ "$v" -le 256 ] || { echo "  OVER REG: $v > 256"; fail=1; } ;;
     esac
     case "$stem" in
+      interp_mixed*)
+        grep -qE "OBJECT .* plow_mixed_step_bf16_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED BF16 CONSUMERS: expected plow_mixed_step_bf16_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_block$" <<<"$symbols" || {
+          echo "  MISSING MIXED BLOCK CONTRACT: expected plow_mixed_block"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_gemm_glu_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED GLU: expected plow_mixed_gemm_glu_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_prefill_split_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED PREFILL MERGE: expected plow_mixed_prefill_split_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_dynamic_rows_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED DYNAMIC ROWS: expected plow_mixed_dynamic_rows_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_mixed_glu_lds_halves$" <<<"$symbols" || {
+          echo "  MISSING MIXED GLU LDS CAPACITY: expected plow_mixed_glu_lds_halves"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_gemv_mm_cap_4$" <<<"$symbols" || {
+          echo "  MISSING MIXED SMALL-M CAPACITY: expected plow_gemv_mm_cap_4"
+          fail=1
+        }
+        ;;
       interp_prefill_k3*|interp_prefill_fp8kv_k3*)
         if [ -n "$AX_KDA_CHUNK" ]; then
           grep -qE "OBJECT .* plow_kda_chunk_bt64_arm_1$" <<<"$symbols" || {

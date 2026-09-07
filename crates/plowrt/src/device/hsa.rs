@@ -517,6 +517,10 @@ impl HsaKernel {
         self.kernarg_size
     }
 
+    pub(crate) fn group_segment_size(&self) -> u32 {
+        self.group_segment_size
+    }
+
     /// Per-lane scratch bytes baked into the code object.
     pub fn private_segment_size(&self) -> u32 {
         self.private_segment_size

@@ -24,25 +24,6 @@ use tracing_subscriber::EnvFilter;
 
 mod fusion_coverage;
 
-fn parse_mixed_rows(value: &str) -> Result<devgen::MixedRows, String> {
-    let (total, decode) = value
-        .split_once(':')
-        .ok_or("expected TOTAL_ROWS:DECODE_ROWS")?;
-    let total_rows = total
-        .parse::<u32>()
-        .map_err(|_| "invalid total row count".to_string())?;
-    let decode_rows = decode
-        .parse::<u32>()
-        .map_err(|_| "invalid decode row count".to_string())?;
-    if decode_rows == 0 || decode_rows >= total_rows {
-        return Err("require 0 < DECODE_ROWS < TOTAL_ROWS".into());
-    }
-    Ok(devgen::MixedRows {
-        total_rows,
-        decode_rows,
-    })
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "plowc",
@@ -176,15 +157,6 @@ struct Cli {
     /// `gemma4 --embed-hsaco`).
     #[arg(long)]
     embed_hsaco: Option<String>,
-
-    /// Emit an auxiliary dense mixed-step shape as TOTAL_ROWS:DECODE_ROWS.
-    /// May be repeated; requires --mixed-object.
-    #[arg(long, value_parser = parse_mixed_rows)]
-    mixed_rows: Vec<devgen::MixedRows>,
-
-    /// Mixed-step interpreter CUBIN or HSACO carrying plow_mixed_interpreter.
-    #[arg(long)]
-    mixed_object: Option<PathBuf>,
 
     /// Disable the Lean ORDERING CERTIFICATE (on by default). Affects only
     /// verification — `--lean-oracle` is a separate switch and keeps running.
@@ -1300,20 +1272,6 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             arch: cli.arch.clone(),
             emit_cfg: Some(cli.emit_cfg.clone()),
             whole_graph_fusions,
-            mixed_step: if cli.mixed_rows.is_empty() && cli.mixed_object.is_none() {
-                None
-            } else {
-                if cli.mixed_rows.is_empty() {
-                    return Err("--mixed-object requires at least one --mixed-rows".into());
-                }
-                Some(devgen::MixedStepCompile {
-                    rows: cli.mixed_rows.clone(),
-                    object: cli
-                        .mixed_object
-                        .clone()
-                        .ok_or("--mixed-rows requires --mixed-object")?,
-                })
-            },
         },
         verify,
     );
@@ -2206,17 +2164,17 @@ mod cli_tests {
     use clap::Parser;
 
     #[test]
-    fn mixed_rows_are_explicit_and_bounded() {
-        assert_eq!(
-            parse_mixed_rows("128:16").unwrap(),
-            devgen::MixedRows {
-                total_rows: 128,
-                decode_rows: 16,
-            }
-        );
-        assert!(parse_mixed_rows("16:16").is_err());
-        assert!(parse_mixed_rows("16:0").is_err());
-        assert!(parse_mixed_rows("16").is_err());
+    fn mixed_fusion_has_no_compiler_options() {
+        for (flag, value) in [
+            ("--mixed-rows", "512:3"),
+            ("--mixed-object", "/tmp/mixed.hsaco"),
+        ] {
+            let error = Cli::try_parse_from([
+                "plowc", "--hf-dir", "/tmp/x", "--emit", "devblob", flag, value,
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 
     fn parse(extra: &[&str]) -> Cli {

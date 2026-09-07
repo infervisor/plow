@@ -24,6 +24,44 @@
 #include "packed_prefill.h"
 #include "mixed_step.h"
 
+#if PLOW_MIXED_STEP && PLOW_WAVES == 4
+constexpr unsigned rn_groups = 2;
+#else
+constexpr unsigned rn_groups = 1;
+#endif
+constexpr unsigned rn_threads = PLOW_THREADS * rn_groups;
+constexpr unsigned rn_vecs = RN_VEC * rn_groups;
+
+__device__ __forceinline__ unsigned rn_index(unsigned c) {
+    return (threadIdx.x + (c % RN_VEC) * rn_threads +
+            (c / RN_VEC) * PLOW_THREADS) * 8;
+}
+
+__device__ __forceinline__ float rn_sumsq(const bf16v8* v, float* part) {
+    // Mixed workgroups reproduce the ordinary 512-thread element and reduction order.
+#pragma unroll
+    for (unsigned group = 0; group < rn_groups; ++group) {
+        float ss = 0.0f;
+#pragma unroll
+        for (unsigned c = 0; c < RN_VEC; ++c)
+#pragma unroll
+            for (unsigned j = 0; j < 8; ++j) {
+                const float f = bf2f(v[group * RN_VEC + c][j]);
+                ss += f * f;
+            }
+        if constexpr (rn_groups == 1) return block_sum(ss, part);
+        ss = wave_sum(ss);
+        if ((threadIdx.x & 63) == 0)
+            part[(threadIdx.x >> 6) + group * PLOW_WAVES] = ss;
+    }
+    __syncthreads();
+    float sum = 0.0f;
+#pragma unroll
+    for (unsigned wave = 0; wave < rn_threads / 64; ++wave) sum += part[wave];
+    __syncthreads();
+    return sum;
+}
+
 /* RN_REG / RN_VEC moved to amd_common.h: op_gemm.h's fused-norm GEMV (`norm == 2`,
  * `gemv_norm_lds`) must reduce with the SAME per-thread element map as `d_rmsnorm` below to
  * stay bit-exact, and it is included BEFORE this header. A constant two headers must agree on
@@ -76,7 +114,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
 #endif
                           ) {
     /* feat % 8 == 0 is what lets the row be read 16 bytes at a time; Gemma's 5376 is. */
-    const bool fits = (feat <= RN_REG * PLOW_THREADS) && ((feat & 7u) == 0);
+    const bool fits = (feat <= RN_REG * rn_threads) && ((feat & 7u) == 0);
     const auto* xg = as_glob(x);
     const auto* gg = as_glob(gamma);
     auto* og = as_glob(out);
@@ -101,10 +139,10 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
         if (fits) {
             /* PRODUCE: the row AND its weight, in one burst. Both are issued before anything
              * is waited on, so they cost ONE round trip between them, not one each. */
-            bf16v8 v[RN_VEC], w[RN_VEC];
+            bf16v8 v[rn_vecs], w[rn_vecs];
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++) {
-                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
                 v[c] = bf16v8_zero();
                 w[c] = bf16v8_zero();
                 if (i < feat) {
@@ -113,18 +151,10 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                 }
             }
             /* CONSUME: reduce, scale, store. No HBM read from here on. */
-            float ss = 0.0f;
+            const float inv = rsqrtf(rn_sumsq(v, part) / (float)feat + eps);
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++)
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const float f = bf2f(v[c][j]);
-                    ss += f * f;
-                }
-            const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
-#pragma unroll
-            for (int c = 0; c < RN_VEC; c++) {
-                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
                 if (i < feat) {
                     bf16v8 o;
 #pragma unroll
@@ -145,8 +175,8 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
             if (xq) {
                 float amax = 0.0f;
 #pragma unroll
-                for (int c = 0; c < RN_VEC; c++) {
-                    const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+                for (int c = 0; c < rn_vecs; c++) {
+                    const unsigned i = rn_index(c);
                     if (i < feat)
 #pragma unroll
                         for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bf2f(v[c][j])));
@@ -157,8 +187,8 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                 auto* const xqg = as_glob(xq);
                 if (threadIdx.x == 0) st_act<float>(&as_glob(ascale)[row], as);
 #pragma unroll
-                for (int c = 0; c < RN_VEC; c++) {
-                    const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+                for (int c = 0; c < rn_vecs; c++) {
+                    const unsigned i = rn_index(c);
                     if (i < feat) {
 #pragma unroll
                         for (int j = 0; j < 8; j += 2) {
@@ -606,7 +636,7 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
                                 const bf16* __restrict__ b, const bf16* __restrict__ gamma,
                                 unsigned rows, unsigned feat, float eps, float scale,
                                 unsigned slice, unsigned nblk, float* part) {
-    const bool fits = (feat <= RN_REG * PLOW_THREADS) && ((feat & 7u) == 0);
+    const bool fits = (feat <= RN_REG * rn_threads) && ((feat & 7u) == 0);
     const auto* ag = as_glob(a);
     const auto* bg = as_glob(b);
     const auto* gg = as_glob(gamma);
@@ -617,10 +647,10 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
             /* PRODUCE: all THREE operands -- the sublayer output b, the residual a, and the
              * weight -- issued together. This op used to fetch a and gamma only AFTER the
              * barrier, which is why it cost 3.2 us against rmsnorm's 2.8: two round trips. */
-            bf16v8 v[RN_VEC], av[RN_VEC], w[RN_VEC];
+            bf16v8 v[rn_vecs], av[rn_vecs], w[rn_vecs];
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++) {
-                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
                 v[c] = bf16v8_zero();
                 av[c] = bf16v8_zero();
                 w[c] = bf16v8_zero();
@@ -631,18 +661,10 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
                 }
             }
             /* CONSUME. */
-            float ss = 0.0f;
+            const float inv = rsqrtf(rn_sumsq(v, part) / (float)feat + eps);
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++)
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const float f = bf2f(v[c][j]);
-                    ss += f * f;
-                }
-            const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
-#pragma unroll
-            for (int c = 0; c < RN_VEC; c++) {
-                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
                 if (i < feat) {
                     bf16v8 o;
 #pragma unroll

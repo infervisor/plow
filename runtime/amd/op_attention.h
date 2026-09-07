@@ -749,12 +749,11 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
              * non-null O_final so the golden wrappers (which pass null and validate the
              * partial+merge path even at nsplit==1) still exercise the old path.
              *
-             * Compiled into the standalone flash object (PLOW_BUCKET_FLASH, Gemma) AND into the
-             * D=128 inline path (PLOW_FLASH_HD128, Llama/Qwen): both actually RUN flash and so
-             * both need the fused write. It is kept OUT of the 8-wave Gemma prefill interpreter
+             * Compiled into flash, inline HD128, and mixed objects, which all execute this
+             * final-output path. It is kept OUT of the 8-wave Gemma prefill interpreter
              * (neither macro) where the D=256/512 arms are compiled-but-never-run: adding the
              * fused write there pushes it 258 > 256 over the cliff for no benefit. */
-#if defined(PLOW_BUCKET_FLASH) || defined(PLOW_FLASH_HD128)
+#if defined(PLOW_BUCKET_FLASH) || defined(PLOW_FLASH_HD128) || PLOW_MIXED_STEP
             if (nsplit == 1 && O_final != nullptr) {
                 const unsigned qd = n_head * DV; /* row stride of n.at */
 #pragma unroll
@@ -828,6 +827,12 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
  *   mlpart[b][h][split][2]  f32   (running max, running sum)
  * ------------------------------------------------------------------------- */
 #define FA_DEC_TILE PLOW_THREADS /* KV rows per pass: one per thread */
+#if PLOW_MIXED_STEP && PLOW_WAVES == 4
+/* Preserve the ordinary 512-thread softmax and V accumulation order. */
+#define FA_DEC_GROUPS 2
+#else
+#define FA_DEC_GROUPS 1
+#endif
 /* Interleave the K-phase row->wave map instead of blocking it. Default OFF (byte-identical);
  * see the note at the map itself for why it matters when a split is shorter than the tile. */
 #ifndef FA_DEC_ILV
@@ -934,7 +939,8 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
  * g), so all GF of them happen concurrently and the tile still costs 3 barriers, not 3*GF.
  * ------------------------------------------------------------------------- */
 #define FA_DEC_LDS_FLOATS(D, GF) \
-    ((GF) * FA_DEC_TILE + 2 * PLOW_WAVES + (GF) * ((D) / 2) + FA_DEC_NG(D) * (D))
+    ((GF) * FA_DEC_TILE * FA_DEC_GROUPS + 2 * PLOW_WAVES + (GF) * ((D) / 2) + \
+     FA_DEC_GROUPS * FA_DEC_NG(D) * (D))
 
 /* V rows in flight. A fused row feeds GF accumulators, so there is 8x more arithmetic per load
  * to hide its latency with — and 8 accumulators of 8 floats is already 64 VGPRs. Trade depth for
@@ -1090,14 +1096,15 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
      * GQA = n_head, and then this simply forms n_head/GF groups per KV head and still reads each
      * row once per group. Indexing by head-group rather than by kv_head is what makes that work;
      * the earlier form silently computed only the first GF heads of each KV head. */
+    constexpr unsigned DTILE = FA_DEC_TILE * FA_DEC_GROUPS;
     const unsigned gqa = n_head / n_kv_head;
     const unsigned n_grp = n_head / GF; /* head-groups; == n_kv_head when GF == gqa */
     const unsigned n_work = n_batch * n_grp * nsplit;
     const unsigned tid = threadIdx.x;
     const unsigned wave = tid >> 6, lane = tid & 63;
 
-    float* Ssm = lds;                                   /* [GF][FA_DEC_TILE] scores        */
-    float* hmax = lds + GF * FA_DEC_TILE;               /* [PLOW_WAVES] per-head tile max   */
+    float* Ssm = lds;                                   /* [GF][DTILE] scores        */
+    float* hmax = lds + GF * DTILE;               /* [PLOW_WAVES] per-head tile max   */
     float* hsum = hmax + PLOW_WAVES;                    /* [PLOW_WAVES] per-head tile sum   */
     bf16* qsm = (bf16*)(hsum + PLOW_WAVES);             /* [GF][D] query rows, staged once  */
     float* osm = (float*)(qsm + GF * D);                /* [NG][D] O, per row-group         */
@@ -1292,22 +1299,24 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
          * (m, l, corr) is block-wide and unaffected: it is computed from Ssm by all threads, as
          * before, and `corr` rescales every group's partial identically. */
         constexpr unsigned NDT = FA_DEC_NDT(D); /* threads covering one row  */
-        constexpr unsigned NG = FA_DEC_NG(D);   /* row-groups                */
+        constexpr unsigned NG = FA_DEC_NG(D) * FA_DEC_GROUPS;   /* row-groups                */
         const unsigned dbase = (tid % NDT) * 8;
         const unsigned grp = tid / NDT;
-        float oacc[GF][8];
+        float oacc[FA_DEC_GROUPS][GF][8];
+#pragma unroll
+        for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
 #pragma unroll
         for (int g = 0; g < GF; g++)
 #pragma unroll
-            for (int u = 0; u < 8; u++) oacc[g][u] = 0.0f;
+            for (int u = 0; u < 8; u++) oacc[vg][g][u] = 0.0f;
 
         /* ABLATION (FA_ABL=2): retire the WHOLE kv loop -- K phase, softmax and V. What is left
          * is the packet's own cost (gate, dispatch, Q staging, epilogue), which separates "this
          * kernel is slow" from "this packet is expensive". Probe only. */
 #if FA_ABL >= 2
-        for (unsigned kv0 = lo; kv0 < lo; kv0 += FA_DEC_TILE) { /* ablation: loop never runs */
+        for (unsigned kv0 = lo; kv0 < lo; kv0 += DTILE) { /* ablation: loop never runs */
 #else
-        for (unsigned kv0 = lo; kv0 < hi; kv0 += FA_DEC_TILE) {
+        for (unsigned kv0 = lo; kv0 < hi; kv0 += DTILE) {
 #endif
             /* SCORES.  EIGHT LANES PER K ROW.                            [K-PHASE-KL8]
              *
@@ -1339,7 +1348,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
              * all GF query rows out of LDS, so the row still crosses HBM once, not GQA times. */
             constexpr unsigned KL = FA_DEC_KL;              /* lanes per K row              */
             constexpr unsigned KR = 64 / KL;                /* K rows per wave-pass         */
-            constexpr unsigned KRW = FA_DEC_TILE / PLOW_WAVES; /* rows a wave owns per tile */
+            constexpr unsigned KRW = DTILE / PLOW_WAVES; /* rows a wave owns per tile */
             constexpr unsigned KPASS = KRW / KR;            /* passes to cover them         */
             constexpr unsigned KSTEP = KL * 8;              /* elems a pass advances        */
             const unsigned ksub = lane % KL, krl = lane / KL;
@@ -1347,14 +1356,14 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             for (unsigned p = 0; p < KPASS; p++) {
                 /* ROW->WAVE MAP. The default BLOCKS the tile: wave w owns rows [w*KRW,(w+1)*KRW),
                  * which is exactly right when the tile is full. It is pathological when it is not.
-                 * A split covers `per = ceil(span/nsplit)` rows of a FA_DEC_TILE(=512)-row tile,
+                 * A split covers `per = ceil(span/nsplit)` rows of a DTILE(=512)-row tile,
                  * and at Gemma-4's 1024-token sliding window with nsplit=38 that is 27 -- so every
                  * live row lands in wave 0's block and SEVEN OF EIGHT WAVES DO NOTHING. Measured
                  * 233 GB/s against the 4030 GB/s this same load map reaches on a full tile.
                  *
                  * FA_DEC_ILV INTERLEAVES instead: pass p covers rows [p*W*KR,(p+1)*W*KR) spread
                  * across all waves, so the first `per` rows occupy ceil(per/KR) waves rather than
-                 * one. Same bijection onto [0,FA_DEC_TILE) -- every Ssm slot is still written
+                 * one. Same bijection onto [0,DTILE) -- every Ssm slot is still written
                  * exactly once, which is what the block-wide max and the `Ssm[g*TILE+rl]` store
                  * below require -- and a pass is now CONTIGUOUS in kv (rows p*64..p*64+63) where
                  * the blocked map strided it by KRW across waves. */
@@ -1362,7 +1371,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                  * optimisation looks free. Under FA_DEC_ILV pass p covers [kv0+p*W*KR, ...) for the
                  * whole workgroup, so `if (kv0 + p*W*KR >= hi) break` would retire 7 of 8 passes at
                  * per=27 -- but a retired pass never writes its Ssm slots, and the softmax max
-                 * below is `for (i = lane; i < FA_DEC_TILE; i += 64) fmaxf(mx, Ssm[...])`, i.e.
+                 * below is `for (i = lane; i < DTILE; i += 64) fmaxf(mx, Ssm[...])`, i.e.
                  * UNBOUNDED over the tile. The skipped slots would hold the previous tile's scores
                  * and poison the block-wide max. Retiring them needs the -inf fill hoisted out of
                  * the pass loop first; until then the predicate below is what keeps them correct. */
@@ -1418,24 +1427,24 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 }
                 if (ksub == 0) {
 #pragma unroll
-                    for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + rl] = s0[g];
+                    for (int g = 0; g < GF; g++) Ssm[g * DTILE + rl] = s0[g];
                 }
             }
             /* This thread's OWN row's scores, for the pe below: it computed partials for KPASS
              * other rows, not for row `tid`. One LDS read per head after the barrier, which the
              * softmax needs anyway. */
-            float s[GF];
+            float s[FA_DEC_GROUPS][GF];
 
-#if FA_DEC_VPIPE
+#if FA_DEC_VPIPE && FA_DEC_GROUPS == 1
             /* PIPELINE: the KV loop is single-tile per split at the shipped nsplit=16 (span/16 ==
-             * FA_DEC_TILE at 8k), so there is no "next tile" to double-buffer. The one overlap the
+             * DTILE at 8k), so there is no "next tile" to double-buffer. The one overlap the
              * compiler cannot take is the V stream: a __syncthreads() is a hard scheduling barrier,
              * so V loads are pinned AFTER the whole softmax reduction (5 barriers, waves >= GF idle,
              * HBM drained). Issue this thread's FIRST V-group loads HERE -- their addresses do not
              * depend on the softmax result, only the multiply does -- so the HBM read of V flies
              * DURING the reduction instead of after it. Costs VU bf16v8 held across softmax. */
             constexpr int VU_ = FA_DEC_VPIPE; /* prefetch depth (rows/thread) held over softmax */
-            const unsigned rmax_pf = (hi - kv0 < FA_DEC_TILE) ? (hi - kv0) : FA_DEC_TILE;
+            const unsigned rmax_pf = (hi - kv0 < DTILE) ? (hi - kv0) : DTILE;
             /* vpipe_ok: the whole first VU_-group is in range (a full 512-row tile, i.e. long
              * context). Only then does the peel below consume vpre. NOTE: the load MUST stay a
              * branchless predicated load -- wrapping it in `if (vpipe_ok)` makes the allocator spill
@@ -1458,7 +1467,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #endif
             __syncthreads();
 #pragma unroll
-            for (int g = 0; g < GF; g++) s[g] = Ssm[g * FA_DEC_TILE + tid];
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
+#pragma unroll
+            for (int g = 0; g < GF; g++) s[vg][g] = Ssm[g * DTILE + tid + vg * PLOW_THREADS];
 
             /* BOUND THE SOFTMAX REDUCTIONS BY THE LIVE ROW COUNT (FA_DEC_LIVE).
              *
@@ -1470,14 +1481,14 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
              * -inf fill itself must STAY -- the `s[g]` read below and the V phase rely on it -- so
              * this bounds the READS only. Same quantity `rmax_pf` already computes for VPIPE. */
             const unsigned live_ =
-                ((hi - kv0) < (unsigned)FA_DEC_TILE) ? (hi - kv0) : (unsigned)FA_DEC_TILE;
-            const unsigned red_n = FA_DEC_LIVE ? live_ : (unsigned)FA_DEC_TILE;
+                ((hi - kv0) < (unsigned)DTILE) ? (hi - kv0) : (unsigned)DTILE;
+            const unsigned red_n = FA_DEC_LIVE ? live_ : (unsigned)DTILE;
             /* GF softmax reductions, ONE PER WAVE, so they all run concurrently: the tile still
              * costs 3 barriers, not 3*GF. (There are PLOW_WAVES=8 waves and GF <= 8.) */
             if (wave < GF) {
                 float mx = FA_NEG_INF;
                 for (unsigned i = lane; i < red_n; i += 64)
-                    mx = fmaxf(mx, Ssm[wave * FA_DEC_TILE + i]);
+                    mx = fmaxf(mx, Ssm[wave * DTILE + i]);
 #pragma unroll
                 for (int off = 32; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 64));
                 if (lane == 0) hmax[wave] = mx;
@@ -1490,21 +1501,25 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 mnew[g] = fmaxf(m_st[g], hmax[g]);
                 corr[g] = (m_st[g] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[g] - mnew[g]);
             }
-            float pe[GF];
+            float pe[FA_DEC_GROUPS][GF];
+#pragma unroll
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
 #pragma unroll
             for (int g = 0; g < GF; g++)
-                pe[g] = (mnew[g] == FA_NEG_INF || s[g] == FA_NEG_INF)
+                pe[vg][g] = (mnew[g] == FA_NEG_INF || s[vg][g] == FA_NEG_INF)
                             ? 0.0f
-                            : FA_EXP(s[g] - mnew[g]);
+                            : FA_EXP(s[vg][g] - mnew[g]);
             __syncthreads();
 #pragma unroll
-            for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + tid] = pe[g];
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
+#pragma unroll
+            for (int g = 0; g < GF; g++) Ssm[g * DTILE + tid + vg * PLOW_THREADS] = pe[vg][g];
             __syncthreads();
 
             if (wave < GF) {
                 float sm = 0.0f;
                 for (unsigned i = lane; i < red_n; i += 64)   /* see FA_DEC_LIVE above */
-                    sm += Ssm[wave * FA_DEC_TILE + i];
+                    sm += Ssm[wave * DTILE + i];
                 sm = wave_sum(sm);
                 if (lane == 0) hsum[wave] = sm;
             }
@@ -1522,9 +1537,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
              * `if (pw != 0)` is gone too: it made every V load conditional, so the compiler
              * could not batch them at all. Multiplying by an exact zero costs one FMA. */
 #pragma unroll
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
+#pragma unroll
             for (int g = 0; g < GF; g++)
 #pragma unroll
-                for (int u = 0; u < 8; u++) oacc[g][u] *= corr[g];
+                for (int u = 0; u < 8; u++) oacc[vg][g][u] *= corr[g];
 
             /* The other half of the fusion: the V row is loaded ONCE and accumulated into all GF
              * outputs. Same bytes off HBM, GF times the arithmetic — which is also why the unroll
@@ -1536,10 +1553,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #if FA_ABL
             const unsigned rmax = 0u; /* ablation: retires every V loop below */
 #else
-            const unsigned rmax = (hi - kv0 < FA_DEC_TILE) ? (hi - kv0) : FA_DEC_TILE;
+            const unsigned rmax = (hi - kv0 < DTILE) ? (hi - kv0) : DTILE;
 #endif
-            unsigned r = grp;
-#if FA_DEC_VPIPE
+#pragma unroll
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg) {
+                unsigned r = grp + vg * FA_DEC_NG(D);
+#if FA_DEC_VPIPE && FA_DEC_GROUPS == 1
             /* First VU-group was PREFETCHED over the softmax barriers (vpre). Consume it here
              * instead of re-loading; the loads already flew during the reduction. Only when the
              * whole first group was in range (vpipe_ok) -- otherwise fall through to the loops
@@ -1549,9 +1568,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 for (int c = 0; c < FA_DEC_VPIPE; c++) {
 #pragma unroll
                     for (int g = 0; g < GF; g++) {
-                        const float pw = Ssm[g * FA_DEC_TILE + r + (unsigned)c * NG];
+                        const float pw = Ssm[g * DTILE + r + (unsigned)c * NG];
 #pragma unroll
-                        for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(vpre[c][u]);
+                        for (int u = 0; u < 8; u++) oacc[vg][g][u] += pw * bf2f(vpre[c][u]);
                     }
                 }
                 r += FA_DEC_VPIPE * NG;
@@ -1577,9 +1596,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 for (int c = 0; c < VU; c++) {
 #pragma unroll
                     for (int g = 0; g < GF; g++) {
-                        const float pw = Ssm[g * FA_DEC_TILE + r + (unsigned)c * NG] * vsf[c];
+                        const float pw = Ssm[g * DTILE + r + (unsigned)c * NG] * vsf[c];
 #pragma unroll
-                        for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(vv[c][u]);
+                        for (int u = 0; u < 8; u++) oacc[vg][g][u] += pw * bf2f(vv[c][u]);
                     }
                 }
             }
@@ -1596,10 +1615,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 }
 #pragma unroll
                 for (int g = 0; g < GF; g++) {
-                    const float pw = Ssm[g * FA_DEC_TILE + r] * vsf;
+                    const float pw = Ssm[g * DTILE + r] * vsf;
 #pragma unroll
-                    for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(v[u]);
+                    for (int u = 0; u < 8; u++) oacc[vg][g][u] += pw * bf2f(v[u]);
                 }
+            }
             }
             __syncthreads();
         }
@@ -1617,7 +1637,10 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         for (int g = 0; g < GF; g++) {
             __syncthreads();
 #pragma unroll
-            for (int u = 0; u < 8; u++) osm[grp * D + dbase + u] = oacc[g][u];
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
+#pragma unroll
+            for (int u = 0; u < 8; u++)
+                osm[(grp + vg * FA_DEC_NG(D)) * D + dbase + u] = oacc[vg][g][u];
             __syncthreads();
 
             const unsigned h = h0 + (unsigned)g;

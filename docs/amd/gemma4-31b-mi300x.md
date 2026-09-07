@@ -48,7 +48,7 @@ The project compiler is the Nix ROCm 7.14.0 toolchain enforced by the build scri
   admission, final sampling and prefix snapshot boundaries remain isolated.
 - Dense BF16 attention uses each request's KV slot and position, including ring
   wraparound and split attention partials. Parked rows do not write request state.
-- Every routed kernel object must advertise
+- Ordinary packed-prefill kernel objects must advertise
   `plow_packed_prefill_dense_consumers_1`. Unsupported operator families and legacy
   L2-domain packets fall back to isolated scheduling; explicit staging rejects them.
 - Cursor frontiers commit after successful execution. Binding cleanup runs on
@@ -59,13 +59,78 @@ The project compiler is the Nix ROCm 7.14.0 toolchain enforced by the build scri
 - AMD and NVIDIA share context-budget calculation. Single-GPU AMD and TP reuse
   host cursor scheduling. AMD packed and mixed dense attention share span dispatch.
   Intel support here is the CPU backend; no Intel GPU backend was added.
-- On AMD, packed prefill and multistep decode execute sequentially within a mux
-  tick. The mixed prefill/decode kernel path has no AMD serving adapter and is
-  not qualified as a single fused launch.
+- Runtime fusion executes prefill and one token per active decode request in a
+  single launch. With fusion disabled, packed prefill and multistep decode run
+  sequentially within a mux tick.
+
+### Runtime fusion
+
+Enable fusion on the same ordinary assets:
+
+Set `PLOW_FUSION=1` in the serving command above, or add `--fusion` to
+`plowrt serve`. `--fusion=false` disables it.
+
+Fusion defaults off. The ordinary gfx942 build includes `interp_mixed_gq.elf`.
+At model load, the runtime derives one immutable schedule per ordinary prefill
+bucket, reusing the packet's attention splits, tensor bindings and numerical
+parameters. Private input metadata and attention scratch keep the ordinary
+execution path independent. No fusion compiler options or mixed asset metadata
+are required. The former `--mixed-rows` and `--mixed-object` options were removed.
+
+The scheduler packs requests automatically. With 500 prefill tokens and two
+active decode requests, the 512-row schedule uses two leading decode rows and 500
+prefill rows. The runtime supplies token IDs, positions,
+decode-slot mappings and prefill spans. No request-side row flags are needed.
+The same schedule accepts one, two or three decode rows with four physical slots.
+The interpreter derives
+active row counts from the spans, runs GEMV on decode rows in bands of up to
+four, and GEMM on prefill rows. This keeps each phase's arithmetic consistent
+when the pack changes, at the cost of reading projection weights for both phases.
+Fused GLU bands also respect the object's activation scratch capacity. Attention uses
+request-local KV positions; sampling covers only active decode rows. Inactive
+work still completes the fixed dependency schedule. Unsupported batches use the
+ordinary path. `PLOW_MULTISTEP` separately controls consecutive decode steps.
+
+The runtime validates every synthesized schedule and the object's capabilities
+before enabling fusion. Shared validation and staging serve AMD and NVIDIA;
+runtime schedule synthesis and dynamic interpreter dispatch currently target AMD.
+
+Mixed serving requires dense BF16, one GPU and a compatible
+object. Context and continuation bounds are checked before admission; prefix
+cache and unsupported configurations use ordinary execution. An unsupported
+schedule or object produces a startup warning and leaves ordinary execution
+available. The qualified
+Gemma 4 31B profile uses capacities 64/128/256/512/1024/2048 and up to three decode requests
+alongside prefill, with four physical request slots.
+An eight-slot profile also passed capacities 128/512/1024 with one through seven
+decode rows, including reordered slots and decode bands crossing row four.
+
+Numerical prefill checks replay identical chunk boundaries and row buckets in
+the ordinary path. Whole-prompt prefill can produce different BF16 logits even
+without fusion; those differences are reported separately, with greedy tokens
+still compared. Request isolation is checked bitwise in both directions.
 
 ## Verification
 
-482 combined CPU/CUDA/HSA library tests and eight API integration tests passed.
+492 CPU/CUDA/HSA library tests and eight API tests passed together.
+Runtime-only fusion passed full-model capacity and multispan GPU suites on
+ordinary assets, without mixed metadata. A separate fusion-disabled process
+verified rejection before launch or state mutation and exact ordinary recovery.
+Every tested decode logit was bitwise equal to ordinary execution. Matched
+prefill at capacities 256/512/1024/2048 and all multispan cases was bitwise equal;
+capacities 64/128 passed relative L2 <=1% and maximum absolute logit error <=0.5.
+The expanded profile exercised the actual 4096-row sliding KV ring. Both request
+isolation directions were bitwise exact. The tracked attention primitive has ten
+cases: corrected arithmetic passes and the old four-wave arithmetic fails.
+Runtime-only mux and HTTP checks passed with observed fused launches, including
+cancellation, output limits, slot reuse and context rejection/recovery.
+
+The normal CMake mixed GQ object SHA256 is
+`b1deafe6490f3f57c18ba47a803785177a260884a7ba91d2f2dc952782bc86a5`.
+It uses 256 threads, 64,544 bytes LDS and 468 VGPRs, with no VGPR spills;
+the resource report lists 1,596 private bytes per thread. Numerical qualification
+does not establish a performance win over vLLM or ordinary execution.
+
 Three full-model GPU cases compare packed prefill and two four-token decode
 quanta with isolated greedy execution: short padded packs, unequal positions
 crossing ring boundaries, and a full 1024-row pack. Rejected members, duplicate
@@ -90,6 +155,30 @@ through host tests. This is functional qualification, not a long-running soak.
 An earlier separate VMM pool test failed on its mutable-environment assumption
 with the immutable runtime configuration; that unchanged test is outside this
 qualification, which uses the default non-VMM AMD KV path.
+
+## Earlier prototype cost
+
+This historical measurement used the retired compiler-emitted capacity prototype,
+not the runtime-only schedule builder. Five paired repetitions, one warmup per
+case, four concurrent requests and 128
+output tokens compare ordinary Plow with dynamic fusion. Both servers use the
+same runtime binary, checkpoint, precision, decode objects, 512-token prefill
+chunks, multistep 4 and disabled prefix caching. Engine order alternates between
+repetitions. All paired completion texts match.
+
+| Input tokens | Output tokens/s, ordinary → fusion | TTFT ms, ordinary → fusion | TPOT ms, ordinary → fusion |
+|---|---:|---:|---:|
+| 1024 | 78.83 → 74.88 | 1163 → 1697 | 41.07 → 39.59 |
+| 4096 | 49.40 → 47.71 | 4866 → 5435 | 42.32 → 40.80 |
+
+Fusion reduces median TPOT by about 3.6%, but throughput falls 3–5% and TTFT
+increases. It remains opt-in. The phase-specific projection paths preserve
+arithmetic while reading weights for both phases; the universal interpreter also
+has different resource and matrix-tile choices from ordinary execution. This
+measurement does not isolate those costs. GPUs were separately leased and clocks
+were not pinned. This is a Plow comparison, not a new vLLM result.
+
+[Measurements and provenance](gemma4-31b-mi300x-dynamic-20260907.json).
 
 ## Comparison
 
@@ -131,12 +220,14 @@ HIP kernels were built with the Nix 7.14 compiler throughout.
 
 [Raw measurements and provenance](gemma4-31b-mi300x-20260907.json).
 
-For new comparisons, pass `--manifest FILE` to `scripts/bench_packed_serve.py`.
+For new comparisons, use `vllm bench serve` against both HTTP endpoints after
+the runtime fusion qualification passes.
 Record checkpoint and tokenizer hashes, weight/activation/KV precision, TP,
 GPU identity, toolchain, maximum context and sequences, token budgets, prefix
 caching and backend flags. Use the same input/output/concurrency matrix and
-warmups. The runner verifies exact token counts and records prompt hashes,
-request latency, TPOT and text delivery timestamps. Text chunk gaps are not
+warmups. Save the benchmark JSON and exact command/environment alongside the
+manifest. Verify server usage counts against the benchmark's requested lengths.
+Text chunk gaps are not
 token ITL: decoding and transport can combine multiple tokens in one chunk.
 
 Current Plow FP8 prefill and decode use different activation precisions;

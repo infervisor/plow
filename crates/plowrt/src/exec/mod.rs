@@ -35,6 +35,8 @@ pub mod indirection;
 #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 pub mod kvrow;
 pub mod mixed_packet;
+#[cfg(feature = "hsa")]
+pub(crate) mod mixed_program;
 pub mod mixed_step_staging;
 pub mod oob;
 pub mod queue;

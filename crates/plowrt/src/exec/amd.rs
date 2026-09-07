@@ -7177,8 +7177,12 @@ struct AmdGq {
     cur_span: u64,
 }
 
+#[path = "amd_mixed_step.rs"]
+mod amd_mixed_step;
+
 /// The AMD serving engine.
 pub struct AmdEngine {
+    mixed_step: Option<amd_mixed_step::MixedAmdStep>,
     be: Arc<HsaBackend>,
     arch: String,
     n_cu: u32,
@@ -7513,6 +7517,7 @@ impl AmdEngine {
         be: &Arc<HsaBackend>,
         blob: &DevBlob,
         checkpoint: Option<&Path>,
+        batch: usize,
     ) -> Option<VmmKv> {
         if !crate::config::RuntimeConfig::get().amd.vmm_kv {
             return None;
@@ -7525,7 +7530,7 @@ impl AmdEngine {
         let find = |name: &str| blob.tensors.iter().position(|t| t.name == name);
         let bytes_of = |name: &str| find(name).map(|i| blob.tensors[i].bytes);
         let max_ctx = (bytes_of("in.pos")? / 4) as u32;
-        let batch = (bytes_of("in.kvlen")? / 4).max(1) as u32;
+        let batch = u32::try_from(batch).ok()?;
 
         let mut geo = match VmmGeometry::from_config(ckpt, max_ctx, batch) {
             Some(g) => g,
@@ -9608,7 +9613,7 @@ impl AmdEngine {
 
         // Must precede the tensor loop: it decides whether each full-layer KV
         // tensor gets an allocation or a view onto the pool's VA reservation.
-        let vmm = Self::vmm_bringup(&be, &blob, checkpoint);
+        let vmm = Self::vmm_bringup(&be, &blob, checkpoint, max_decode_batch as usize);
 
         let prof = LoadProf::default();
         let do_prefault = profile_faults();
@@ -10465,15 +10470,15 @@ impl AmdEngine {
         } else {
             (None, 0)
         };
-        // `in.kvlen` is [batch] i32. Cross-check against the decode program's
-        // compiled `t`, which is `PLOW_DECODE_BATCH`: they must agree, and a
-        // mismatch means the blob was assembled from parts.
-        let batch = t_kvlen.map_or(1, |t| (blob.tensors[t].bytes / 4).max(1) as usize);
-        if t_kvlen.is_some() && batch != progs[decode].t as usize {
-            return Err(RuntimeError::Device(format!(
-                "in.kvlen is {batch} rows but the decode program is compiled for t={} \
-                 — blob/tensor mismatch",
-                progs[decode].t
+        let metadata_rows = t_kvlen.map_or(1, |t| (blob.tensors[t].bytes / 4).max(1) as usize);
+        let batch = if t_kvlen.is_none() {
+            1
+        } else {
+            max_decode_batch as usize
+        };
+        if metadata_rows != batch {
+            return Err(RuntimeError::Rejected(format!(
+                "in.kvlen has {metadata_rows} rows incompatible with decode capacity {batch}"
             )));
         }
 
@@ -10764,7 +10769,23 @@ impl AmdEngine {
             "decode scalar tensors"
         );
 
+        let mixed_step = if crate::config::RuntimeConfig::get().fusion && tp.is_none() && batch > 1
+        {
+            match amd_mixed_step::MixedAmdStep::load(&be, &blob, &devp, hsaco_dir, batch) {
+                Ok(mixed) => {
+                    tracing::info!("runtime prefill/decode fusion enabled");
+                    Some(mixed)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "runtime fusion unavailable; using ordinary execution");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(AmdEngine {
+            mixed_step,
             be,
             arch,
             n_cu: blob.n_cu,

@@ -195,7 +195,7 @@ fn preflight(bytes: &[u8], expected_n_cu: u32) -> Result<(u32, usize)> {
 }
 
 impl Section {
-    fn validate(&self, tensor_count: usize) -> Result<()> {
+    pub fn validate(&self, tensor_count: usize) -> Result<()> {
         require(
             self.n_cu > 0 && tensor_count <= TENSOR_NONE16 as usize && !self.programs.is_empty(),
             "section geometry",

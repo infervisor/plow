@@ -68,6 +68,26 @@ pub trait SeqEngine {
         quantum: usize,
         out: &mut Vec<u32>,
     ) -> crate::Result<usize>;
+    fn mixed_step_rows(&self, _decode_rows: usize, _prefill_rows: usize) -> Option<u32> {
+        None
+    }
+    fn mixed_prefill_rows(&self, _slot: usize, _prompt: &[u32], _max_rows: u32) -> u32 {
+        0
+    }
+    fn mixed_prefill_fits(&self, _slot: usize, _prefill_capacity: u32) -> bool {
+        false
+    }
+    fn mixed_step(
+        &mut self,
+        _rows: u32,
+        _feeds: &[(usize, u32)],
+        _members: &[(usize, &[u32], u32)],
+        _output: &mut [u32],
+    ) -> crate::Result<()> {
+        Err(crate::RuntimeError::Rejected(
+            "mixed step unavailable".into(),
+        ))
+    }
     fn step_batch(&mut self, feeds: &[(usize, u32)]) -> crate::Result<Vec<(usize, u32)>>;
 }
 
@@ -561,6 +581,53 @@ mod amd_serve {
             .then_some(step)
     }
 
+    fn mixed_cursor_rows(cur: &PfCursor, prompt_rows: u32, max_rows: u32) -> u32 {
+        let Some(step) = cur.steps.get(cur.next) else {
+            return 0;
+        };
+        if cur.snap_after == Some(cur.next) || step.c0 != cur.frontier {
+            return 0;
+        }
+        step.clen
+            .min(prompt_rows.saturating_sub(1).saturating_sub(cur.frontier))
+            .min(max_rows)
+    }
+
+    fn mixed_prefill_padding_fits(frontier: u32, capacity: u32, max_ctx: usize) -> bool {
+        capacity > 0
+            && frontier
+                .checked_add(capacity)
+                .is_some_and(|end| end as usize <= max_ctx)
+    }
+
+    fn mixed_prefill_continuation_fits(
+        frontier: u32,
+        capacity: u32,
+        pending_rows: u32,
+        bucket: u32,
+        max_ctx: usize,
+    ) -> bool {
+        // A partial mixed step retains its ordinary bucket at an advanced row offset.
+        let partial = capacity.min(pending_rows.saturating_sub(1));
+        mixed_prefill_padding_fits(frontier, capacity, max_ctx)
+            && frontier
+                .checked_add(partial)
+                .and_then(|row| row.checked_add(bucket))
+                .is_some_and(|end| end as usize <= max_ctx)
+    }
+
+    fn commit_mixed_prefill(cur: &mut PfCursor, rows: u32) {
+        let step = &mut cur.steps[cur.next];
+        debug_assert!(rows > 0 && rows <= step.clen);
+        cur.frontier = step.c0 + rows;
+        if rows == step.clen {
+            cur.next += 1;
+        } else {
+            step.c0 += rows;
+            step.clen -= rows;
+        }
+    }
+
     /// Shortest prefix worth caching. Below this the snapshot/restore pair costs more than the
     /// prefill it skips, and it churns the slot's cached prompt for nothing.
     const MIN_PREFIX: u32 = 128;
@@ -1015,17 +1082,13 @@ mod amd_serve {
             self.prefill_chunked_at_most(slot, prompt, u32::MAX)
         }
 
-        /// Advance one chunk, selecting only compiled packet rungs within this tick's budget.
-        pub fn prefill_chunked_at_most(
+        fn prepare_prefill_cursor(
             &mut self,
             slot: usize,
             prompt: &[u32],
             tick_max_bucket: u32,
-        ) -> Result<Option<u32>> {
-            let chunked = self.chunk_prefill && !self.decode_only && prompt.len() > 1;
-            if !chunked {
-                return self.prefill(slot, prompt).map(Some);
-            }
+        ) -> Result<()> {
+            self.check_slot(slot)?;
             if self.pf[slot].is_none() {
                 if prompt.is_empty() {
                     return Err(RuntimeError::Rejected("empty prompt".into()));
@@ -1037,7 +1100,6 @@ mod amd_serve {
                         self.max_ctx
                     )));
                 }
-                self.check_slot(slot)?;
                 crate::obs::ttft::timed(&crate::obs::ttft::PF_STATE_CLEAR, || {
                     match &mut self.ranks {
                         Ranks::One(e) => e.begin_slot(slot),
@@ -1083,6 +1145,21 @@ mod amd_serve {
                     arm,
                 });
             }
+            Ok(())
+        }
+
+        /// Advance one chunk, selecting only compiled packet rungs within this tick's budget.
+        pub fn prefill_chunked_at_most(
+            &mut self,
+            slot: usize,
+            prompt: &[u32],
+            tick_max_bucket: u32,
+        ) -> Result<Option<u32>> {
+            let chunked = self.chunk_prefill && !self.decode_only && prompt.len() > 1;
+            if !chunked {
+                return self.prefill(slot, prompt).map(Some);
+            }
+            self.prepare_prefill_cursor(slot, prompt, tick_max_bucket)?;
             let g = &mut self.ranks;
             let max_bucket = self.prefill_chunk_rows.min(tick_max_bucket);
             let pending = {
@@ -1152,6 +1229,165 @@ mod amd_serve {
             Ok(Some(tok))
         }
 
+        pub fn mixed_step_rows(&self, decode_rows: usize, prefill_rows: usize) -> Option<u32> {
+            if !self.chunk_prefill || self.decode_only || self.prefix_cache {
+                return None;
+            }
+            match &self.ranks {
+                Ranks::One(e) => e.mixed_step_rows(decode_rows, prefill_rows),
+                Ranks::Tp(_) => None,
+            }
+        }
+
+        pub fn mixed_prefill_rows(&self, slot: usize, prompt: &[u32], max_rows: u32) -> u32 {
+            if slot >= self.batch || self.live[slot] || prompt.len() >= self.max_ctx {
+                return 0;
+            }
+            let cap = max_rows.min(self.prefill_chunk_rows);
+            match &self.pf[slot] {
+                Some(cur) => mixed_cursor_rows(cur, prompt.len() as u32, cap),
+                None => (prompt.len().saturating_sub(1) as u32).min(cap),
+            }
+        }
+
+        pub fn mixed_prefill_fits(&self, slot: usize, prefill_capacity: u32) -> bool {
+            self.pf.get(slot).is_some_and(|cursor| {
+                // A shorter preceding chunk can increase the final span's parked suffix.
+                // Reserve the full mixed prefill capacity before touching any cursor.
+                let engine = self.ranks.rank0();
+                let (frontier, pending_rows, bucket) = if let Some(cursor) = cursor {
+                    let Some(step) = cursor.steps.get(cursor.next) else {
+                        return false;
+                    };
+                    (cursor.frontier, step.clen, engine.prog_t(step.prog))
+                } else {
+                    let bucket = (0..engine.n_programs())
+                        .filter_map(|prog| engine.prefill_prog_t(prog))
+                        .filter(|&rows| rows <= self.prefill_chunk_rows)
+                        .max()
+                        .unwrap_or(0);
+                    (0, bucket, bucket)
+                };
+                bucket > 0
+                    && mixed_prefill_continuation_fits(
+                        frontier,
+                        prefill_capacity,
+                        pending_rows,
+                        bucket,
+                        self.max_ctx,
+                    )
+            })
+        }
+
+        pub fn mixed_step(
+            &mut self,
+            rows: u32,
+            feeds: &[(usize, u32)],
+            members: &[(usize, &[u32], u32)],
+            output: &mut [u32],
+        ) -> Result<()> {
+            use plow_asset::mixed_step::{DecodeRequest, PrefillRequest};
+            if !self.chunk_prefill
+                || self.decode_only
+                || self.prefix_cache
+                || !matches!(self.ranks, Ranks::One(_))
+                || feeds.is_empty()
+                || members.is_empty()
+                || output.len() != feeds.len()
+                || self.mixed_step_rows(
+                    feeds.len(),
+                    rows.saturating_sub(feeds.len() as u32) as usize,
+                ) != Some(rows)
+            {
+                return Err(RuntimeError::Rejected("invalid AMD mixed step".into()));
+            }
+            for (index, &(slot, _)) in feeds.iter().enumerate() {
+                self.check_slot(slot)?;
+                if !self.live[slot]
+                    || self.pf[slot].is_some()
+                    || self.pos[slot] as usize >= self.max_ctx
+                    || feeds[..index].iter().any(|&(prior, _)| prior == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "invalid mixed decode slot {slot}"
+                    )));
+                }
+            }
+            let mut admitted = feeds.len() as u32;
+            for (index, &(slot, prompt, take)) in members.iter().enumerate() {
+                self.check_slot(slot)?;
+                if take == 0
+                    || !self.mixed_prefill_fits(slot, rows.saturating_sub(feeds.len() as u32))
+                    || take > self.mixed_prefill_rows(slot, prompt, u32::MAX)
+                    || feeds.iter().any(|&(prior, _)| prior == slot)
+                    || members[..index].iter().any(|&(prior, _, _)| prior == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "invalid mixed prefill slot {slot}"
+                    )));
+                }
+                admitted = admitted
+                    .checked_add(take)
+                    .ok_or_else(|| RuntimeError::Rejected("mixed row count overflow".into()))?;
+            }
+            if admitted > rows {
+                return Err(RuntimeError::Rejected(
+                    "mixed rows exceed packet capacity".into(),
+                ));
+            }
+            // Cursor setup may choose a shorter first chunk than admission estimated.
+            // Retain the unused capacity as padding rather than crossing a planned boundary.
+            let mut completed = Vec::with_capacity(members.len());
+            for &(slot, prompt, take) in members {
+                self.prepare_prefill_cursor(slot, prompt, self.prefill_chunk_rows)?;
+                let take = self.mixed_prefill_rows(slot, prompt, take);
+                if take == 0 {
+                    return Err(RuntimeError::Rejected(format!(
+                        "mixed prefill slot {slot} reached a boundary"
+                    )));
+                }
+                completed.push((slot, take));
+            }
+            for slot in 0..self.batch {
+                self.pos_stage[slot] = self.pf[slot]
+                    .as_ref()
+                    .map_or(self.pos[slot], |cursor| cursor.frontier);
+            }
+            let decode: Vec<_> = feeds
+                .iter()
+                .map(|&(slot, token)| DecodeRequest {
+                    slot: slot as u32,
+                    state_slot: slot as u32,
+                    token,
+                })
+                .collect();
+            let prefill: Vec<_> = members
+                .iter()
+                .zip(&completed)
+                .map(|(&(slot, prompt, _), &(_, take))| {
+                    let start = self.pos_stage[slot];
+                    PrefillRequest {
+                        slot: slot as u32,
+                        state_slot: slot as u32,
+                        start,
+                        tokens: &prompt[start as usize..(start + take) as usize],
+                        prompt_len: prompt.len() as u32,
+                    }
+                })
+                .collect();
+            let Ranks::One(e) = &mut self.ranks else {
+                unreachable!()
+            };
+            e.mixed_step(rows, &decode, &prefill, &mut self.pos_stage, output)?;
+            for &(slot, _) in feeds {
+                self.pos[slot] = self.pos_stage[slot];
+            }
+            for (slot, take) in completed {
+                commit_mixed_prefill(self.pf[slot].as_mut().expect("staged mixed cursor"), take);
+            }
+            Ok(())
+        }
+
         /// Rows completed by a request whose chunked prefill is still active.
         pub fn prefill_frontier(&self, slot: usize) -> Option<usize> {
             self.pf
@@ -1162,9 +1398,9 @@ mod amd_serve {
 
         /// Device-independent metadata for the next already-planned chunk.
         ///
-        /// A fresh request has no cursor yet and returns `None`; the caller must
-        /// take the isolated path once to perform admission-time state clear and
-        /// prefix-cache planning. Subsequent chunks can participate in compatible-
+        /// A fresh request has no cursor yet and returns `None`; isolated or mixed
+        /// admission must first initialize its state and prefix plan.
+        /// Subsequent chunks can participate in compatible-
         /// rung pack formation without duplicating either side effect.
         pub fn prefill_span(&self, slot: usize, max_rows: u32) -> Option<packet::dev::PrefillSpan> {
             let cur = self.pf.get(slot)?.as_ref()?;
@@ -1189,8 +1425,8 @@ mod amd_serve {
         }
 
         /// The next span iff it can complete without producing a token or crossing a prefix-cache
-        /// snapshot boundary. Fresh cursors remain ineligible until isolated admission initializes
-        /// their state and prefix plan.
+        /// snapshot boundary. Fresh requests remain ineligible until admission initializes
+        /// their cursor and state.
         pub fn packable_prefill_span(
             &self,
             slot: usize,
@@ -1817,9 +2053,11 @@ mod amd_serve {
     #[cfg(test)]
     mod tests {
         use super::{
-            commit_packed_prefill, invalidate_prefix_metadata, packable_prefill_step,
-            parse_snapshot_tensors, snapshot_file_component, split_pending_prefill, stage_parked,
-            AmdServe, PfCursor, DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
+            commit_mixed_prefill, commit_packed_prefill, invalidate_prefix_metadata,
+            mixed_cursor_rows, mixed_prefill_continuation_fits, mixed_prefill_padding_fits,
+            packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
+            split_pending_prefill, stage_parked, AmdServe, PfCursor, DEFAULT_SNAPSHOT_TENSORS,
+            MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
 
@@ -1977,6 +2215,70 @@ mod amd_serve {
         }
 
         #[test]
+        fn mixed_prefill_padding_near_context_end_requires_isolated_fallback() {
+            assert!(mixed_prefill_padding_fits(0, 1023, 8192));
+            assert!(mixed_prefill_padding_fits(7900, 127, 8192));
+            assert!(!mixed_prefill_padding_fits(7900, 1023, 8192));
+            assert!(!mixed_prefill_padding_fits(8192, 1, 8192));
+            assert!(!mixed_prefill_padding_fits(u32::MAX, 2, usize::MAX));
+        }
+
+        #[test]
+        fn mixed_prefill_retained_bucket_near_context_end_requires_isolated_fallback() {
+            assert!(mixed_prefill_padding_fits(7680, 127, 8192));
+            assert!(!mixed_prefill_continuation_fits(7680, 127, 511, 512, 8192));
+            assert!(mixed_prefill_continuation_fits(7553, 127, 511, 512, 8192));
+            assert!(mixed_prefill_continuation_fits(0, 1023, 1024, 1024, 8192));
+            assert!(!mixed_prefill_continuation_fits(0, 1023, 1024, 1024, 1024));
+            assert!(!mixed_prefill_continuation_fits(
+                u32::MAX - 1,
+                1,
+                2,
+                2,
+                usize::MAX
+            ));
+        }
+
+        #[test]
+        fn mixed_cursor_continuations_preserve_final_sampling_and_snapshot_boundaries() {
+            let mut cur = PfCursor {
+                steps: vec![ChunkStep {
+                    prog: 2,
+                    c0: 2048,
+                    clen: 512,
+                }],
+                next: 0,
+                frontier: 2048,
+                snap_after: None,
+                resume: 0,
+                arm: 0,
+            };
+            assert_eq!(mixed_cursor_rows(&cur, 2560, 1024), 511);
+            commit_mixed_prefill(&mut cur, 127);
+            assert_eq!(cur.frontier, 2175);
+            assert_eq!(
+                cur.steps[0],
+                ChunkStep {
+                    prog: 2,
+                    c0: 2175,
+                    clen: 385
+                }
+            );
+            assert_eq!(mixed_cursor_rows(&cur, 2560, 1024), 384);
+            commit_mixed_prefill(&mut cur, 384);
+            assert_eq!(cur.next, 0);
+            assert_eq!(cur.steps[0].clen, 1);
+            assert_eq!(mixed_cursor_rows(&cur, 2560, 1024), 0);
+            assert_eq!(mixed_cursor_rows(&cur, 3000, 128), 1);
+            cur.snap_after = Some(0);
+            assert_eq!(mixed_cursor_rows(&cur, 3000, 128), 0);
+            cur.snap_after = None;
+            commit_mixed_prefill(&mut cur, 1);
+            assert_eq!(cur.next, 1);
+            assert_eq!(cur.frontier, 2560);
+        }
+
+        #[test]
         fn parked_rows_follow_the_advance_set_not_liveness() {
             let mut parked = vec![0; 4];
             stage_parked(&mut parked, &[2]);
@@ -2060,6 +2362,24 @@ impl SeqEngine for AmdServe {
         out: &mut Vec<u32>,
     ) -> crate::Result<usize> {
         AmdServe::multi_step(self, feeds, quantum, out)
+    }
+    fn mixed_step_rows(&self, decode_rows: usize, prefill_rows: usize) -> Option<u32> {
+        AmdServe::mixed_step_rows(self, decode_rows, prefill_rows)
+    }
+    fn mixed_prefill_rows(&self, slot: usize, prompt: &[u32], max_rows: u32) -> u32 {
+        AmdServe::mixed_prefill_rows(self, slot, prompt, max_rows)
+    }
+    fn mixed_prefill_fits(&self, slot: usize, prefill_capacity: u32) -> bool {
+        AmdServe::mixed_prefill_fits(self, slot, prefill_capacity)
+    }
+    fn mixed_step(
+        &mut self,
+        rows: u32,
+        feeds: &[(usize, u32)],
+        members: &[(usize, &[u32], u32)],
+        output: &mut [u32],
+    ) -> crate::Result<()> {
+        AmdServe::mixed_step(self, rows, feeds, members, output)
     }
     fn step_batch(&mut self, feeds: &[(usize, u32)]) -> crate::Result<Vec<(usize, u32)>> {
         AmdServe::step_batch(self, feeds)

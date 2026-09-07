@@ -1,3 +1,5 @@
+use crate::RuntimeError;
+use packet::dev::PrefillSpan;
 use plow_asset::mixed_step::{self, DecodeRequest, Plan, PrefillRequest};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -171,3 +173,95 @@ fn check_frontier(frontiers: &[u32], slot: u32, expected: u32) -> Result<(), Sta
 #[cfg(test)]
 #[path = "mixed_step_staging_tests.rs"]
 mod tests;
+
+pub(crate) const SPAN_WORDS: usize = std::mem::size_of::<PrefillSpan>() / 4;
+
+#[derive(Clone)]
+pub(crate) struct HostLayout {
+    pub(crate) rows: usize,
+    pub(crate) decode: usize,
+    pub(crate) spans: usize,
+    pub(crate) ids: std::ops::Range<usize>,
+    pub(crate) pos: std::ops::Range<usize>,
+    pub(crate) kvlen: std::ops::Range<usize>,
+    pub(crate) decode_slot: std::ops::Range<usize>,
+    pub(crate) parked: std::ops::Range<usize>,
+    pub(crate) prefill_spans: std::ops::Range<usize>,
+}
+
+impl HostLayout {
+    pub(crate) fn new(rows: usize, decode: usize, spans: usize) -> crate::Result<Self> {
+        let mut next = 0usize;
+        let mut take = |count: usize| -> crate::Result<std::ops::Range<usize>> {
+            let start = next;
+            next = next
+                .checked_add(count)
+                .ok_or_else(|| RuntimeError::Rejected("mixed step staging overflow".into()))?;
+            Ok(start..next)
+        };
+        let ids = take(rows)?;
+        let pos = take(rows)?;
+        let kvlen = take(rows)?;
+        let decode_slot = take(decode)?;
+        let parked = take(rows)?;
+        let prefill_spans =
+            take(spans.checked_mul(SPAN_WORDS).ok_or_else(|| {
+                RuntimeError::Rejected("mixed step span staging overflow".into())
+            })?)?;
+        Ok(Self {
+            rows,
+            decode,
+            spans,
+            ids,
+            pos,
+            kvlen,
+            decode_slot,
+            parked,
+            prefill_spans,
+        })
+    }
+
+    pub(crate) fn words(&self) -> usize {
+        self.prefill_spans.end
+    }
+}
+
+pub(crate) fn fill_words(
+    layout: &HostLayout,
+    words: &mut [u32],
+    plan: &plow_asset::mixed_step::Plan,
+) -> crate::Result<()> {
+    if words.len() < layout.words()
+        || plan.rows.len() > layout.rows
+        || plan.decode_slots.len() > layout.decode
+        || plan.prefill_spans.len() > layout.spans
+    {
+        return Err(RuntimeError::Rejected(
+            "mixed step exceeds preallocated staging".into(),
+        ));
+    }
+    for (index, row) in plan.rows.iter().enumerate() {
+        words[layout.ids.start + index] = row.token;
+        words[layout.pos.start + index] = row.position;
+        words[layout.kvlen.start + index] = row.kv_len;
+    }
+    for (index, &slot) in plan.decode_slots.iter().enumerate() {
+        words[layout.decode_slot.start + index] = slot as u32;
+    }
+    words[layout.parked.start..layout.parked.start + plan.parked.len()]
+        .copy_from_slice(&plan.parked);
+    for (index, span) in plan.prefill_spans.iter().enumerate() {
+        let at = layout.prefill_spans.start + index * SPAN_WORDS;
+        words[at..at + SPAN_WORDS].copy_from_slice(&[
+            span.row0,
+            span.n_rows,
+            span.slot,
+            span.flags,
+            span.kv_row0,
+            span.kv_len,
+            span.state_slot,
+            span.program,
+        ]);
+    }
+    Ok(())
+}

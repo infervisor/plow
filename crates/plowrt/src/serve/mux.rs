@@ -1890,10 +1890,9 @@ fn run_one_tick(
         // them. Mux slot `i` IS engine slot `i`, so no owner map is needed —
         // the engine's slot table and this one are the same indices.
         //
-        // A tick is EITHER one prefill (the prefill program is single-sequence
-        // and holds the whole device, so at most one per tick) followed by one
-        // batched decode step across every live slot. The two phases interleave
-        // by tick but never overlap on the device because they share scratch.
+        // A packet-bound mixed program can advance prefill and decode together.
+        // Otherwise, a tick runs one isolated/packed prefill submission followed
+        // by bounded decode. Those separate programs share scratch and run sequentially.
         //
         // Irrefutable in an hsa-only build (the enum then has one variant) and
         // refutable alongside `cuda` — the same arm has to compile as both.
@@ -1981,8 +1980,8 @@ fn run_one_tick(
             //     (`seed_ids` + `decode_prepare_batched` on one side,
             //     `prefill_prepare` on the other) before it reads them.
             //
-            // Prefill and decode remain sequential inside the tick because they
-            // share input/activation buffers. The parked-row mask prevents a
+            // The separate prefill/decode fallback runs sequentially because it
+            // shares input/activation buffers. The parked-row mask prevents a
             // mid-prefill KDA state from advancing during the decode dispatch.
             //
             // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
@@ -1990,15 +1989,149 @@ fn run_one_tick(
             let mut did_prefill = false;
             let nv = &crate::config::RuntimeConfig::get().nv;
             let no_interleave = nv.pf_no_interleave;
-            let has_decode = slots[..b.min(slots.len())]
+            let decode_rows = slots[..b.min(slots.len())]
                 .iter()
-                .any(|s| s.as_ref().is_some_and(|s| s.step > 0));
+                .filter(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
+                .count();
+            let has_decode = decode_rows > 0;
             let tick_max = amd_prefill_tick_cap(
                 has_decode,
                 no_interleave,
                 nv.pf_defer_decode,
                 nv.pf_interleave,
             );
+            if has_decode
+                && !no_interleave
+                && !nv.pf_defer_decode
+                && e.mixed_step_rows(decode_rows, 1).is_some()
+            {
+                let mut candidates: Vec<_> = slots
+                    .iter()
+                    .enumerate()
+                    .take(b)
+                    .filter_map(|(i, slot)| {
+                        let slot = slot.as_ref()?;
+                        if slot.step != 0 || slot.respond.is_closed() {
+                            return None;
+                        }
+                        let rows = e.mixed_prefill_rows(i, &slot.prompt_ids, tick_max);
+                        (rows > 0).then_some((i, slot.arrived, rows))
+                    })
+                    .collect();
+                let available = candidates
+                    .iter()
+                    .fold(0u32, |sum, candidate| sum.saturating_add(candidate.2))
+                    .min(tick_max);
+                if let Some(rows) = e.mixed_step_rows(decode_rows, available as usize) {
+                    let prefill_capacity = rows.saturating_sub(decode_rows as u32);
+                    candidates.retain(|&(slot, _, _)| e.mixed_prefill_fits(slot, prefill_capacity));
+                    let capacity = prefill_capacity.min(tick_max);
+                    let pack = amd_mixed_prefill_pack(
+                        candidates,
+                        capacity,
+                        nv.pf_batch,
+                        e.prefill_turn(),
+                        b,
+                    );
+                    if !pack.is_empty() {
+                        let feeds: Vec<_> = slots
+                            .iter()
+                            .enumerate()
+                            .take(b)
+                            .filter_map(|(i, slot)| {
+                                let slot = slot.as_ref()?;
+                                (slot.step > 0)
+                                    .then(|| (i, *slot.out_ids.last().expect("decode output")))
+                            })
+                            .collect();
+                        let mut tokens = std::mem::take(&mut obs.host.slot_tokens);
+                        tokens.resize(feeds.len(), 0);
+                        let started = Instant::now();
+                        let mut result = {
+                            let members: Vec<_> = pack
+                                .iter()
+                                .map(|&(slot, take)| {
+                                    (
+                                        slot,
+                                        slots[slot]
+                                            .as_ref()
+                                            .expect("mixed member")
+                                            .prompt_ids
+                                            .as_slice(),
+                                        take,
+                                    )
+                                })
+                                .collect();
+                            e.mixed_step(rows, &feeds, &members, &mut tokens)
+                        };
+                        crate::obs::ttft::PREFILL.add(started.elapsed().as_nanos() as u64);
+                        if result.is_ok() {
+                            match amd_packed_frontier_updates(
+                                pack.iter().map(|&(slot, _)| slot),
+                                |slot| e.prefill_frontier(slot),
+                            ) {
+                                Ok(updates) => {
+                                    for (slot, frontier) in updates {
+                                        slots[slot].as_mut().expect("mixed member").pf_pos =
+                                            frontier;
+                                    }
+                                }
+                                Err(slot) => {
+                                    result = Err(crate::RuntimeError::Device(format!(
+                                        "mixed prefill slot {slot} lost its cursor after dispatch"
+                                    )))
+                                }
+                            }
+                        }
+                        e.advance_prefill_turn(pack.last().expect("mixed pack").0);
+                        match result {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    decode = feeds.len(),
+                                    prefill = pack.len(),
+                                    rows,
+                                    "AMD mixed prefill/decode launch"
+                                );
+                                for (row, &(slot, _)) in feeds.iter().enumerate() {
+                                    handle_produced_token(
+                                        &mut slots[slot],
+                                        &arena,
+                                        bundle,
+                                        tokens[row],
+                                        1,
+                                        &mut tokens_this_tick,
+                                        Some(stop.as_slice()),
+                                    );
+                                    if slots[slot].is_none() {
+                                        e.release(slot);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, error_code = ?err.device_code(), fatal = err.is_fatal(), "AMD mixed prefill/decode failed");
+                                note_fault(&mut tick_fault, &err);
+                                let msg = err.to_string();
+                                for slot in feeds
+                                    .iter()
+                                    .map(|&(slot, _)| slot)
+                                    .chain(pack.iter().map(|&(slot, _)| slot))
+                                {
+                                    if let Some(taken) = slots[slot].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken
+                                            .respond
+                                            .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                    }
+                                    e.release(slot);
+                                }
+                            }
+                        }
+                        obs.host.slot_tokens = tokens;
+                        // Mixed latency includes prefill and must not train decode-rung service estimates.
+                        return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
+                    }
+                }
+            }
             let isolated = amd_prefill_pick(
                 (0..b.min(slots.len())).filter_map(|i| {
                     let slot = slots[i].as_ref()?;
@@ -2620,6 +2753,39 @@ fn amd_prefill_pick(
             }
         })
         .map(|(slot, _)| slot)
+}
+
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn amd_mixed_prefill_pack(
+    mut candidates: Vec<(usize, Instant, u32)>,
+    mut budget: u32,
+    fair: bool,
+    start: usize,
+    cap: usize,
+) -> Vec<(usize, u32)> {
+    let mut selected = Vec::new();
+    while budget > 0 {
+        let Some(slot) = amd_prefill_pick(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.2 > 0)
+                .map(|&(slot, arrived, _)| (slot, arrived)),
+            fair,
+            start,
+            cap,
+        ) else {
+            break;
+        };
+        let index = candidates
+            .iter()
+            .position(|candidate| candidate.0 == slot)
+            .expect("selected candidate");
+        let (_, _, rows) = candidates.remove(index);
+        let take = rows.min(budget);
+        selected.push((slot, take));
+        budget -= take;
+    }
+    selected
 }
 
 /// Form one ragged AMD prefill pack from already-planned request spans.
@@ -3403,7 +3569,27 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hsa")]
+    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[test]
+    fn amd_mixed_admission_obeys_rotation_age_and_total_prefill_budget() {
+        let now = Instant::now();
+        let candidates = vec![
+            (0, now, 512),
+            (2, now - std::time::Duration::from_secs(1), 512),
+            (3, now, 0),
+        ];
+        assert_eq!(
+            amd_mixed_prefill_pack(candidates.clone(), 700, true, 1, 4),
+            [(2, 512), (0, 188)]
+        );
+        assert_eq!(
+            amd_mixed_prefill_pack(candidates.clone(), 127, false, 0, 4),
+            [(2, 127)]
+        );
+        assert!(amd_mixed_prefill_pack(candidates, 0, true, 0, 4).is_empty());
+    }
+
+    #[cfg(any(feature = "hsa", feature = "cpu"))]
     #[test]
     fn amd_prefill_scheduler_controls_are_bounded() {
         assert_eq!(amd_prefill_tick_cap(false, false, false, 2048), u32::MAX);

@@ -1266,16 +1266,17 @@ __device__ void d_gemm_fp8_blk(bf16* C, const bf16* A, const unsigned char* W,
  * d_gemv_glu: three packets (gemm, gemm, glu) collapse to one, gt/ut never reach HBM, and
  * the GLU's own global gate goes with them. Same tile, same registers, same MFMA count --
  * see the wave->column remap in d_gemm_t. */
-/* The GLU epilogue's wave->column map needs SN==2, i.e. the 8-wave grid. A 4-wave build (the
- * segmented-dispatch flash code object) omits it; plowc keeps gate/up as the tiled GEMM triple. */
-#if PLOW_WAVES == 8
+/* SN==2 holds for the ordinary 8-wave tile and the mixed 4-wave 64x128 tile. */
+#if PLOW_WAVES == 8 || PLOW_MIXED_STEP
 __device__ void d_gemm_glu(bf16* C, const bf16* A, const bf16* Bg, const bf16* Bu, unsigned M,
                            unsigned N, unsigned K, unsigned act, unsigned slice, unsigned nblk,
                            bf16* lds) {
     d_gemm_t<GM_BM, GM_BN, GM_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, true>(
         C, A, Bg, nullptr, nullptr, M, N, K, slice, nblk, lds, Bu, act);
 }
+#endif
 
+#if PLOW_WAVES == 8
 /* MXFP4 (w4a16) GEMM over gate|up in ONE pass -- the fp4 twin of d_gemm_glu, and the arm whose
  * absence made the SHARED-EXPERT PREFILL the one place an mxfp4 packet paid for its encoding in
  * HBM TRAFFIC rather than only in a different weight fetch. Without it the pair unfuses into two

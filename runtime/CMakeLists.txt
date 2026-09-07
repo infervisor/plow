@@ -1344,6 +1344,13 @@ if(PLOW_GFX950_HSACO)
         "interp_prefill|${_hs_kpf}|_hs_ax_prefill|_hs_ax_none|256|2"
         "interp_decode|${_hs_kdec}|_hs_ax_decode|_hs_ax_none|256|2"
         "interp_flash|${_hs_kfl}|_hs_ax_flash|_hs_ax_none|512|1")
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+        set(_hs_ax_mixed -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0
+            -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=64 -DGM_BN=128
+            -DFA_DC=256 -DFA_DBUF=1)
+        list(APPEND _hs_rows
+            "interp_mixed|plow_interp_mixed_gfx942|_hs_ax_mixed|_hs_ax_none|512|1")
+    endif()
     if(PLOW_HSACO_FP8)
         # MIXED-PRECISION OBJECTS, and the names do not say so. `interp_*_fp8` carries the fp8
         # arms IN ADDITION TO the bf16 ones, and the fp8 arms themselves are not one precision:
@@ -1496,6 +1503,11 @@ if(PLOW_GFX950_HSACO)
             set(_sfx "")
             set(_gq "")
             set(_row_kind_extra "")
+            set(_row_extra ${_hs_extra})
+            if(_a1 STREQUAL "_hs_ax_mixed")
+                # Runtime-built schedules require the universal qualified object.
+                set(_row_extra "")
+            endif()
             if(_kind STREQUAL "gq")
                 # Both the filename and the kernel symbol take the suffix, and
                 # gemma4_chat.c resolves both by name.
@@ -1511,7 +1523,7 @@ if(PLOW_GFX950_HSACO)
                 COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
                         "${PLOW_HSACO_ARCH}" "${_out}" "${_sym}${_sfx}" ${_maxreg} ${_minocc}
                         ${_hs_inc} ${_hs_arch_def} ${${_a1}} ${${_a2}} ${_gq}
-                        ${_row_kind_extra} ${_hs_extra} "${_hs_src}"
+                        ${_row_kind_extra} ${_row_extra} "${_hs_src}"
                 DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
                 COMMENT "hipcc ${_stem}${_sfx}.elf"
                 VERBATIM)

@@ -63,6 +63,10 @@ pub struct RuntimeConfig {
     #[arg(long = "rt-weight-slab", env = "PLOW_WEIGHT_SLAB", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_slab: bool,
 
+    /// Pack prefill and decode into a shared GPU launch when supported.
+    #[arg(long = "fusion", env = "PLOW_FUSION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub fusion: bool,
+
     /// Override whether freed slabs remain in the process reuse pool.
     #[arg(long = "rt-slab-keep", env = "PLOW_SLAB_KEEP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub slab_keep: Option<bool>,
@@ -935,6 +939,29 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fusion_is_an_opt_in_runtime_flag() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "fusion")
+            .unwrap();
+        assert_eq!(arg.get_default_values(), ["false"]);
+        for (flag, enabled) in [("--fusion", true), ("--fusion=false", false)] {
+            let matches = command
+                .clone()
+                .try_get_matches_from(["test", flag])
+                .unwrap();
+            assert_eq!(
+                super::RuntimeConfig::from_arg_matches(&matches)
+                    .unwrap()
+                    .fusion,
+                enabled
+            );
+        }
+    }
+
     #[test]
     fn compatibility_overrides_apply_only_without_initialized_cli() {
         assert_eq!(super::select_compat(true, Some(false), false), true);

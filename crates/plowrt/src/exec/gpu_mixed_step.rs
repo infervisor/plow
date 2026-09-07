@@ -1,11 +1,8 @@
 use super::*;
 use crate::exec::mixed_packet::LoadedMixedPacket;
-use crate::exec::mixed_step_staging::MixedStepStaging;
-use packet::dev::PrefillSpan;
+use crate::exec::mixed_step_staging::{fill_words, HostLayout, MixedStepStaging, SPAN_WORDS};
 use plow_asset::mixed_step::{DecodeRequest, PrefillRequest};
 use std::collections::BTreeMap;
-
-const SPAN_WORDS: usize = std::mem::size_of::<PrefillSpan>() / 4;
 
 struct MixedObject {
     function: KernelFn,
@@ -26,56 +23,6 @@ struct MixedProgram {
     counter_base: u64,
     counter_bytes: usize,
     _tables: Vec<DeviceMem>,
-}
-
-#[derive(Clone)]
-struct HostLayout {
-    rows: usize,
-    decode: usize,
-    spans: usize,
-    ids: std::ops::Range<usize>,
-    pos: std::ops::Range<usize>,
-    kvlen: std::ops::Range<usize>,
-    decode_slot: std::ops::Range<usize>,
-    parked: std::ops::Range<usize>,
-    prefill_spans: std::ops::Range<usize>,
-}
-
-impl HostLayout {
-    fn new(rows: usize, decode: usize, spans: usize) -> Result<Self> {
-        let mut next = 0usize;
-        let mut take = |count: usize| -> Result<std::ops::Range<usize>> {
-            let start = next;
-            next = next
-                .checked_add(count)
-                .ok_or_else(|| RuntimeError::Rejected("mixed step staging overflow".into()))?;
-            Ok(start..next)
-        };
-        let ids = take(rows)?;
-        let pos = take(rows)?;
-        let kvlen = take(rows)?;
-        let decode_slot = take(decode)?;
-        let parked = take(rows)?;
-        let prefill_spans =
-            take(spans.checked_mul(SPAN_WORDS).ok_or_else(|| {
-                RuntimeError::Rejected("mixed step span staging overflow".into())
-            })?)?;
-        Ok(Self {
-            rows,
-            decode,
-            spans,
-            ids,
-            pos,
-            kvlen,
-            decode_slot,
-            parked,
-            prefill_spans,
-        })
-    }
-
-    fn words(&self) -> usize {
-        self.prefill_spans.end
-    }
 }
 
 struct MixedHostStage {
@@ -121,46 +68,6 @@ impl MixedHostStage {
     fn decode_tokens(&self, count: usize) -> &[u32] {
         &self.words()[self.layout.ids.start..self.layout.ids.start + count]
     }
-}
-
-fn fill_words(
-    layout: &HostLayout,
-    words: &mut [u32],
-    plan: &plow_asset::mixed_step::Plan,
-) -> Result<()> {
-    if words.len() < layout.words()
-        || plan.rows.len() > layout.rows
-        || plan.decode_slots.len() > layout.decode
-        || plan.prefill_spans.len() > layout.spans
-    {
-        return Err(RuntimeError::Rejected(
-            "mixed step exceeds preallocated staging".into(),
-        ));
-    }
-    for (index, row) in plan.rows.iter().enumerate() {
-        words[layout.ids.start + index] = row.token;
-        words[layout.pos.start + index] = row.position;
-        words[layout.kvlen.start + index] = row.kv_len;
-    }
-    for (index, &slot) in plan.decode_slots.iter().enumerate() {
-        words[layout.decode_slot.start + index] = slot as u32;
-    }
-    words[layout.parked.start..layout.parked.start + plan.parked.len()]
-        .copy_from_slice(&plan.parked);
-    for (index, span) in plan.prefill_spans.iter().enumerate() {
-        let at = layout.prefill_spans.start + index * SPAN_WORDS;
-        words[at..at + SPAN_WORDS].copy_from_slice(&[
-            span.row0,
-            span.n_rows,
-            span.slot,
-            span.flags,
-            span.kv_row0,
-            span.kv_len,
-            span.state_slot,
-            span.program,
-        ]);
-    }
-    Ok(())
 }
 
 pub(super) struct MixedCudaStep {
@@ -220,7 +127,7 @@ impl MixedCudaStep {
         let (_, kvlen_base) = tensor("in.kvlen", max_rows * 4)?;
 
         let span_bytes = max_spans
-            .checked_mul(std::mem::size_of::<PrefillSpan>())
+            .checked_mul(std::mem::size_of::<packet::dev::PrefillSpan>())
             .ok_or_else(|| RuntimeError::Rejected("mixed step span bytes overflow".into()))?;
         let parked_bytes = max_rows
             .checked_mul(4)

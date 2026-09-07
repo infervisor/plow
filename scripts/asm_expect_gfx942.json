@@ -29,6 +29,14 @@
   "-> checks. _arch is asserted against each object's ELF header before any rule runs."
  ],
  "_arch": "gfx942",
+ "interp_mixed": {
+  "plow_exec": {
+   "require_min": {
+    "v_mfma_f32_32x32x8_bf16": 1
+   },
+   "forbid": ["v_mfma_f32_32x32x64_f8f6f4", "v_mfma_scale"]
+  }
+ },
  "_k3_decode_note": [
   "K3 decode is MXFP4 expert GEMV, not a matrix-core path on CDNA3. The two outlined expert",
   "bodies must retain the software fp4 -> fp16 decode and f32 accumulation used by gfx942.",

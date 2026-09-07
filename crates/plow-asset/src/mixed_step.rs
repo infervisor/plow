@@ -831,6 +831,80 @@ pub fn dense_consumer_contract(
     decode_rows: u32,
     tensors: &[TensorContract<'_>],
 ) -> Result<u16> {
+    validate_dense_consumers(program, decode_rows, tensors, false)
+}
+
+pub fn dense_amd_consumer_contract(
+    program: &aux_program::Program,
+    decode_rows: u32,
+    tensors: &[TensorContract<'_>],
+) -> Result<u16> {
+    validate_dense_consumers(program, decode_rows, tensors, true)
+}
+
+pub fn dense_amd_capacity_consumer_contract(
+    program: &aux_program::Program,
+    decode_capacity: u32,
+    tensors: &[TensorContract<'_>],
+) -> Result<u16> {
+    let slot = dense_amd_consumer_contract(program, decode_capacity, tensors)?;
+    for inst in &program.insts {
+        match DevOp::from_u16(inst.op) {
+            Some(
+                DevOp::Embed
+                | DevOp::RmsNorm
+                | DevOp::HeadNormRope
+                | DevOp::NormResidual
+                | DevOp::GemmGlu,
+            ) => {
+                require(inst.i[0] == program.rows, "mixed dynamic body row capacity")?;
+            }
+            Some(DevOp::Gemm) => {
+                require(
+                    (inst.i[0] == program.rows || inst.i[0] == decode_capacity)
+                        && inst.i[4] == 0
+                        && inst.i[5] == 0,
+                    "mixed dynamic GEMM row capacity or offset",
+                )?;
+            }
+            Some(DevOp::FlashMerge) if inst.i[4] == 0 => {
+                require(
+                    inst.i[0] == decode_capacity,
+                    "mixed dynamic decode merge row capacity",
+                )?;
+            }
+            _ => {}
+        }
+        if inst.op == DevOp::SoftCap as u16 {
+            require(
+                inst.i[1] == decode_capacity && inst.i[0] > 0 && inst.i[0] % decode_capacity == 0,
+                "mixed dynamic softcap row capacity",
+            )?;
+            require(
+                tensors
+                    .get(inst.t[0] as usize)
+                    .is_some_and(|t| !t.initialized && t.bytes >= u64::from(inst.i[0]) * 2),
+                "mixed dynamic softcap tensor capacity",
+            )?;
+        } else if matches!(
+            DevOp::from_u16(inst.op),
+            Some(DevOp::Argmax | DevOp::ArgmaxFin)
+        ) {
+            require(
+                inst.i[1].max(1) == decode_capacity,
+                "mixed dynamic argmax row capacity",
+            )?;
+        }
+    }
+    Ok(slot)
+}
+
+fn validate_dense_consumers(
+    program: &aux_program::Program,
+    decode_rows: u32,
+    tensors: &[TensorContract<'_>],
+    split_prefill: bool,
+) -> Result<u16> {
     require(
         decode_rows > 0 && decode_rows < program.rows,
         "mixed dense row geometry",
@@ -840,7 +914,7 @@ pub fn dense_consumer_contract(
     let mut decode_attention = 0usize;
     let mut prefill_attention = 0usize;
     let mut kv_writers = 0usize;
-    for inst in &program.insts {
+    for (index, inst) in program.insts.iter().enumerate() {
         let op = DevOp::from_u16(inst.op).ok_or("mixed step: unknown opcode")?;
         match op {
             DevOp::FlashDecode if inst.i[1] & (1 << 16) == 0 => {
@@ -850,12 +924,80 @@ pub fn dense_consumer_contract(
                 require(
                     inst.i[0] == program.rows
                         && inst.i[1] == program.rows
-                        && inst.i[7] == 1
-                        && inst.t[5] != TENSOR_NONE16
+                        && (if inst.i[7] == 1 {
+                            inst.t[5] != TENSOR_NONE16
+                        } else {
+                            split_prefill && inst.i[7] > 1 && inst.t[5] == TENSOR_NONE16
+                        })
                         && inst.t[6] == TENSOR_NONE16,
                     "mixed dense FlashPrefill span contract",
                 )?;
+                if inst.i[7] > 1 {
+                    let merge = program
+                        .insts
+                        .get(index + 1)
+                        .ok_or("mixed step: split prefill missing merge")?;
+                    require(
+                        merge.op == DevOp::FlashMerge as u16
+                            && merge.i[0] == program.rows
+                            && merge.i[1] == inst.i[2]
+                            && merge.i[2] == inst.i[7]
+                            && merge.i[3] == inst.i[6]
+                            && merge.i[4] == decode_rows
+                            && merge.t[1] == inst.t[0]
+                            && merge.t[2] == inst.t[1],
+                        "mixed dense split prefill merge pairing",
+                    )?;
+                    require(
+                        inst.t[0] != inst.t[1]
+                            && inst.t[0] != merge.t[0]
+                            && inst.t[1] != merge.t[0]
+                            && program
+                                .insts
+                                .iter()
+                                .filter(|d| d.op == DevOp::FlashDecode as u16)
+                                .all(|d| {
+                                    ![d.t[0], d.t[1]]
+                                        .iter()
+                                        .any(|t| *t == inst.t[0] || *t == inst.t[1])
+                                }),
+                        "mixed dense split prefill scratch isolation",
+                    )?;
+                    let extent = |factors: &[u32]| -> Result<u64> {
+                        factors.iter().try_fold(1u64, |bytes, &factor| {
+                            require(factor != 0, "mixed dense split prefill zero extent")?;
+                            bytes
+                                .checked_mul(factor as u64)
+                                .ok_or_else(|| "mixed step: split prefill extent overflow".into())
+                        })
+                    };
+                    let rows = program.rows;
+                    let heads = inst.i[2];
+                    let hd = inst.i[6];
+                    let ns = inst.i[7];
+                    for (tensor, bytes) in [
+                        (inst.t[0], extent(&[rows, heads, ns, hd, 4])?),
+                        (inst.t[1], extent(&[rows, heads, ns, 2, 4])?),
+                        (merge.t[0], extent(&[rows, heads, hd, 2])?),
+                    ] {
+                        require(
+                            tensors
+                                .get(tensor as usize)
+                                .is_some_and(|t| !t.initialized && t.bytes >= bytes),
+                            "mixed dense split prefill tensor capacity",
+                        )?;
+                    }
+                }
                 prefill_attention += 1;
+            }
+            DevOp::FlashMerge if inst.i[4] != 0 => {
+                require(
+                    split_prefill
+                        && index > 0
+                        && program.insts[index - 1].op == DevOp::FlashPrefill as u16
+                        && program.insts[index - 1].i[7] > 1,
+                    "mixed dense unexpected prefill merge tag",
+                )?;
             }
             DevOp::HeadNormRope if inst.fj[1] != 0 => {
                 require(
