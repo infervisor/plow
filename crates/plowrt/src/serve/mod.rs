@@ -701,6 +701,45 @@ pub(crate) fn api_error_for(err: &RuntimeError) -> axum::response::Response {
     api_error(status, err.to_string(), kind, code, None)
 }
 
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::{api_error_for, status_for};
+    use crate::error::RuntimeError;
+    use axum::http::StatusCode;
+
+    /// A prompt longer than the compiled context can NEVER succeed. It used to
+    /// come back 429 from the CUDA and AMD padded-cover paths and 500 from the
+    /// AMD raw-prompt path, and every OpenAI-compatible client treats 429 as
+    /// retryable — so a permanent failure was answered with "try again", in a
+    /// backoff loop.
+    #[test]
+    fn context_length_is_a_client_error_not_a_retry() {
+        assert_eq!(
+            status_for(&RuntimeError::ContextLength("too long".into())),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// A shed request IS retryable and must stay 429 — the two must not be
+    /// collapsed just because both refuse the request.
+    #[test]
+    fn a_shed_request_is_still_retryable() {
+        assert_eq!(
+            status_for(&RuntimeError::Rejected("no slot".into())),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    /// Clients branch on `error.code`; a bare string body gives them nothing.
+    #[test]
+    fn the_error_envelope_carries_a_machine_readable_code() {
+        let resp = api_error_for(&RuntimeError::ContextLength("too long".into()));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = api_error_for(&RuntimeError::UnknownModel("nope".into()));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
 /// Map a runtime error to an HTTP status. A fatal device fault means the
 /// device context is dead — 503 (retry another instance), not a 500 that
 /// reads as a plowrt bug; a non-fatal fault stays a 500.
