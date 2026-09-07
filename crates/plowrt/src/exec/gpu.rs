@@ -5571,16 +5571,25 @@ impl GpuEngine {
     /// kernel advances each row's device-owned pos/kvlen and appends its token
     /// to the ring between launches, so no per-token host round trip happens.
     /// `out` is filled row-major (`feeds.len() × K`, fed row r → `out[r*K..]`)
-    /// and `K` is returned. Token-identical to K [`Self::step_slots`] calls.
-    /// Requires the multi-step bringup (`has_multistep`); errors otherwise so
-    /// the caller falls back to per-token stepping.
+    /// and the executed `K` is returned, capped by remaining context.
+    /// Token-identical to K [`Self::step_slots`] calls.
     pub fn multi_step(&mut self, feeds: &[(usize, u32)], out: &mut Vec<u32>) -> Result<usize> {
+        self.multi_step_at_most(feeds, usize::MAX, out)
+    }
+
+    /// Cap a quantum by the caller's remaining output budget and live context.
+    pub fn multi_step_at_most(
+        &mut self,
+        feeds: &[(usize, u32)],
+        requested: usize,
+        out: &mut Vec<u32>,
+    ) -> Result<usize> {
         out.clear();
         let Some(ms) = self.multistep.as_ref() else {
             return Err(RuntimeError::Rejected("multi-step not enabled".into()));
         };
-        let (k, f_adv) = (ms.quantum, ms.f_advance);
-        if feeds.is_empty() {
+        let (mut k, f_adv) = (ms.quantum.min(requested), ms.f_advance);
+        if feeds.is_empty() || k == 0 {
             return Ok(k);
         }
         let bsz = self.batch;
@@ -5588,12 +5597,13 @@ impl GpuEngine {
             if b >= bsz {
                 return Err(RuntimeError::Rejected(format!("slot {b} out of range")));
             }
-            if self.pos[b] as usize + k > self.max_ctx {
+            if self.pos[b] as usize >= self.max_ctx {
                 return Err(RuntimeError::Rejected(format!(
-                    "multi-step quantum {k} from pos {} exceeds context {}",
+                    "context exhausted at {} (compiled max {})",
                     self.pos[b], self.max_ctx
                 )));
             }
+            k = k.min(self.max_ctx - self.pos[b] as usize);
         }
         let rung = self.select_decode(feeds.iter().map(|&(slot, _)| slot))?;
         let launch_rows = self.selected_decode(rung).map_or(bsz, |r| r.rows);
