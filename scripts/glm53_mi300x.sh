@@ -105,6 +105,12 @@ bench)
   ;;
 
 # ---------------------------------------------------------------- vLLM 0.28 reference (own lease)
+# GPU_MEM_UTIL matters at TP4 and only there: the raw checkpoint is 703.7 GiB, so a TP4 rank
+# holds 175.9 GiB = 188.9 GB of a 206.1 GB card. vLLM's default 0.9 budget is 185.5 GB — LESS
+# than the weights — so TP4 refuses before it reaches the KV cache. TP8 (94.4 GB/rank) is fine
+# at any of these. Also note the ATTENTION ASYMMETRY when reading any result: vLLM serves this
+# checkpoint with DSA armed (index_topk 2048) while plow emits PLOW_GLM_DSA=0 and reads EVERY
+# KV row, so above ~2k context plow is doing strictly more attention work per token.
 vllm)
   tp="${2:?tp}"; port="${3:?port}"
   exec env GPU_LEASE_TIMEOUT="${GPU_LEASE_TIMEOUT:-7200}" "$LEASE" -n "$tp" "vllm028-glm53-tp$tp" \
@@ -113,8 +119,27 @@ vllm)
     "$WT/build-gemma31/vllm-python" -m vllm.entrypoints.openai.api_server \
       --model "$RAW" --served-model-name glm-5.3 --tensor-parallel-size "$tp" \
       --max-model-len "$MAXCTX" --max-num-seqs "${VLLM_SEQS:-8}" \
+      --gpu-memory-utilization "${GPU_MEM_UTIL:-0.95}" \
       --no-enable-prefix-caching --trust-remote-code --port "$port"
   ;;
 
-*) echo "usage: $0 {emit|serve|smoke|bench|vllm} ..."; exit 2 ;;
+# ---------------------------------------------------------------- STOP (clean teardown)
+# Kill the plowrt ITSELF, not the gpulease wrapper. gpulease runs the child and releases the
+# lease when it returns; killing the wrapper instead orphans a live plowrt that keeps the port
+# and the cards, which is exactly what happened here on the first attempt.
+stop)
+  pat="${2:-/app/plow/build-glm53/tp}"
+  pids=$(pgrep -f "plowrt serve --assets $pat" || true)
+  [ -z "$pids" ] && { echo "no plowrt serving $pat"; exit 0; }
+  echo "stopping: $pids"
+  kill -TERM $pids 2>/dev/null
+  for i in $(seq 1 60); do
+    pgrep -f "plowrt serve --assets $pat" >/dev/null 2>&1 || break
+    sleep 2
+  done
+  pgrep -f "plowrt serve --assets $pat" >/dev/null 2>&1 && { echo "escalating to KILL"; kill -KILL $pids 2>/dev/null; sleep 5; }
+  echo "stopped"
+  ;;
+
+*) echo "usage: $0 {emit|serve|smoke|bench|vllm|stop} ..."; exit 2 ;;
 esac

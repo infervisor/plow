@@ -12,4 +12,8 @@ export LD_LIBRARY_PATH="${ROCM_PATH:?nix develop did not set ROCM_PATH}/lib:${LD
 export PLOW_HSACO="$OBJ"
 export PLOW_MLA_PF_V2=1
 export PLOW_L2_PLACE_DISPATCH=1
+# Optional narrower decode tier, e.g. PLOW_HSACO_LOWRUNG=<dir>:4 to serve rungs 1..4 from a
+# register-squeezed object. Echoed because build.json cannot record it and two runs that differ
+# only in this knob are otherwise indistinguishable in the log.
+echo "serve tiers: PLOW_HSACO=$PLOW_HSACO PLOW_HSACO_LOWRUNG=${PLOW_HSACO_LOWRUNG:-<none>}"
 exec "$BIN/plowrt" serve --assets "$ASSETS" --port "$PORT"
