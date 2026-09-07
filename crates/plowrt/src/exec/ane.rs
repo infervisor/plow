@@ -193,6 +193,8 @@ impl AneGemm {
                     compiled.display()
                 ))
             })?;
+            // The compiled form carries the weights; the source doubles the disk footprint.
+            let _ = std::fs::remove_file(&src);
         }
         let cfg = unsafe { MLModelConfiguration::init(MLModelConfiguration::alloc()) };
         unsafe { cfg.setComputeUnits(units) };

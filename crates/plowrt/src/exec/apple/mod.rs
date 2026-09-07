@@ -102,9 +102,10 @@ pub struct MetalEngine {
     spin_max: u32,
     pub last_run_us: f64,
     pub gpu_name: String,
+    /// ANE-delegated instructions, ascending by (prog, inst).
     #[cfg(feature = "ane")]
-    ane: Option<AneSlot>,
-    /// `(instruction, ANE ms)` of the last program run that used the ANE.
+    ane: Vec<AneSlot>,
+    /// `(ops run on the ANE, summed ANE ms)` for the last program run that used it.
     pub last_ane: Option<(usize, f64)>,
 }
 
@@ -308,7 +309,7 @@ impl MetalEngine {
             "metal engine ready"
         );
         #[cfg(feature = "ane")]
-        let ane = Self::ane_slot(&model, &progs)?;
+        let ane = Self::ane_slots(&model)?;
         Ok(MetalEngine {
             #[cfg(feature = "ane")]
             ane,
@@ -336,50 +337,51 @@ impl MetalEngine {
         self.max_ctx
     }
 
-    /// `PLOW_ANE=1`: delegate the first fp8/bf16 prefill GEMM of the widest prefill program that
-    /// fits the ANE (no bias, no activation scale) to the Neural Engine; `PLOW_ANE=<prog>:<inst>`
-    /// names one explicitly. Weights are dequantized to fp16 once at load (option B of §2.3).
+    /// `PLOW_ANE=1|<n>|all`: delegate the first n (or every) eligible GEMM of the 128-row
+    /// prefill bucket to the Neural Engine — fp8 (op 33, no activation scale) or bf16 (op 8, no
+    /// bias). `PLOW_ANE=<prog>:<inst>` names one instruction. Weights are dequantized to fp16
+    /// once at load (option B of §2.3); each op is its own CoreML program, cached on disk.
     #[cfg(feature = "ane")]
-    fn ane_slot(model: &CpuModel, progs: &[ProgGpu]) -> Result<Option<AneSlot>> {
+    fn ane_slots(model: &CpuModel) -> Result<Vec<AneSlot>> {
         use crate::exec::ane::{f32_to_f16, AneGemm};
         use packet::dev::TENSOR_NONE16;
         let Ok(spec) = std::env::var("PLOW_ANE") else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         if spec.is_empty() || spec == "0" {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        let pick = |p: usize| -> Option<usize> {
-            model.blob.progs[p].insts.iter().position(|d| {
-                (d.op == 33 && d.t[3] == TENSOR_NONE16 && d.t[4] != TENSOR_NONE16)
-                    || (d.op == 8 && d.t[7] == TENSOR_NONE16)
-            })
+        let eligible = |d: &DevInst64| {
+            (d.op == 33 && d.t[3] == TENSOR_NONE16 && d.t[4] != TENSOR_NONE16)
+                || (d.op == 8 && d.t[7] == TENSOR_NONE16)
         };
-        let (prog, inst) = if let Some((a, b)) = spec.split_once(':') {
-            (
+        let mut picks: Vec<(usize, usize)> = Vec::new();
+        if let Some((a, b)) = spec.split_once(':') {
+            picks.push((
                 a.parse::<usize>()
                     .map_err(|e| RuntimeError::Device(format!("PLOW_ANE: {e}")))?,
                 b.parse::<usize>()
                     .map_err(|e| RuntimeError::Device(format!("PLOW_ANE: {e}")))?,
-            )
+            ));
         } else {
-            // The narrowest prefill bucket: what a short prompt runs. `PLOW_ANE=<prog>:<inst>`
-            // targets another bucket.
+            let limit = if spec == "all" {
+                usize::MAX
+            } else {
+                spec.parse::<usize>()
+                    .map_err(|e| RuntimeError::Device(format!("PLOW_ANE: {e}")))?
+            };
+            // The narrowest prefill bucket: what a short prompt runs.
             let p = 0usize;
-            match pick(p) {
-                Some(i) => (p, i),
-                None => {
-                    tracing::warn!("PLOW_ANE: no eligible prefill GEMM in program {p}");
-                    return Ok(None);
-                }
-            }
-        };
-        let d = model.blob.progs[prog].insts[inst];
-        let (t, n, k) = (
-            model.blob.progs[prog].t as usize,
-            d.i[1] as usize,
-            d.i[2] as usize,
-        );
+            picks.extend(
+                model.blob.progs[p]
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| eligible(d))
+                    .map(|(i, _)| (p, i))
+                    .take(limit),
+            );
+        }
         let e4m3 = |c: u8| -> f32 {
             let e = (c >> 3) & 15;
             let m = c & 7;
@@ -394,77 +396,91 @@ impl MetalEngine {
                 v
             }
         };
-        let wbytes = unsafe { model.tensor(d.t[2] as usize).as_slice() };
-        let mut w16 = vec![0u16; n * k];
-        match d.op {
-            33 => {
-                let ws = unsafe { model.tensor(d.t[4] as usize).as_slice() };
-                for r in 0..n {
-                    let sc = f32::from_le_bytes(ws[r * 4..r * 4 + 4].try_into().unwrap());
-                    for c in 0..k {
-                        w16[r * k + c] = f32_to_f16(e4m3(wbytes[r * k + c]) * sc);
+        let dir = std::env::temp_dir().join("plow-ane");
+        let t0 = Instant::now();
+        let mut slots = Vec::with_capacity(picks.len());
+        for (prog, inst) in picks {
+            let d = model.blob.progs[prog].insts[inst];
+            let (t, n, k) = (
+                model.blob.progs[prog].t as usize,
+                d.i[1] as usize,
+                d.i[2] as usize,
+            );
+            let wbytes = unsafe { model.tensor(d.t[2] as usize).as_slice() };
+            let mut w16 = vec![0u16; n * k];
+            match d.op {
+                33 => {
+                    let ws = unsafe { model.tensor(d.t[4] as usize).as_slice() };
+                    for r in 0..n {
+                        let sc = f32::from_le_bytes(ws[r * 4..r * 4 + 4].try_into().unwrap());
+                        for c in 0..k {
+                            w16[r * k + c] = f32_to_f16(e4m3(wbytes[r * k + c]) * sc);
+                        }
                     }
                 }
-            }
-            8 => {
-                for i in 0..n * k {
-                    let b = f32::from_bits(
-                        (u16::from_le_bytes([wbytes[2 * i], wbytes[2 * i + 1]]) as u32) << 16,
-                    );
-                    w16[i] = f32_to_f16(b);
+                8 => {
+                    for i in 0..n * k {
+                        let b = f32::from_bits(
+                            (u16::from_le_bytes([wbytes[2 * i], wbytes[2 * i + 1]]) as u32) << 16,
+                        );
+                        w16[i] = f32_to_f16(b);
+                    }
+                }
+                other => {
+                    return Err(RuntimeError::Device(format!(
+                        "PLOW_ANE: instruction {inst} is op {other}, not a GEMM"
+                    )))
                 }
             }
-            other => {
-                return Err(RuntimeError::Device(format!(
-                    "PLOW_ANE: instruction {inst} is op {other}, not a GEMM"
-                )))
-            }
-        }
-        let dir = std::env::temp_dir().join("plow-ane");
-        let name = format!(
-            "{}_p{prog}_i{inst}_{t}x{k}x{n}",
-            model.names[d.t[2] as usize].replace(['/', '.'], "_")
-        );
-        let gemm = AneGemm::new(
-            &dir,
-            &name,
-            t,
-            k,
-            n,
-            &w16,
-            objc2_core_ml::MLComputeUnits::CPUAndNeuralEngine,
-        )?;
-        let p = &model.blob.progs[prog];
-        let mut succ_bumps = Vec::new();
-        for e in p.stream.iter().filter(|e| e.inst as usize == inst) {
-            succ_bumps.extend_from_slice(
-                &p.succs[e.succ_ofs as usize..e.succ_ofs as usize + e.succ_len as usize],
+            let name = format!(
+                "{}_p{prog}_i{inst}_{t}x{k}x{n}",
+                model.names[d.t[2] as usize].replace(['/', '.'], "_")
             );
+            let gemm = AneGemm::new(
+                &dir,
+                &name,
+                t,
+                k,
+                n,
+                &w16,
+                objc2_core_ml::MLComputeUnits::CPUAndNeuralEngine,
+            )?;
+            let p = &model.blob.progs[prog];
+            let mut succ_bumps = Vec::new();
+            for e in p.stream.iter().filter(|e| e.inst as usize == inst) {
+                succ_bumps.extend_from_slice(
+                    &p.succs[e.succ_ofs as usize..e.succ_ofs as usize + e.succ_len as usize],
+                );
+            }
+            slots.push(AneSlot {
+                prog,
+                inst,
+                gemm,
+                x: vec![0.0; t * k],
+                y: vec![0.0; t * n],
+                succ_bumps,
+                last_ms: 0.0,
+            });
         }
-        let _ = progs;
-        tracing::info!(prog, inst, op = d.op, t, k, n, compile_ms = format!("{:.0}", gemm.compile_ms).as_str(),
-            weight = %model.names[d.t[2] as usize], "ANE slot ready");
-        Ok(Some(AneSlot {
-            prog,
-            inst,
-            gemm,
-            x: vec![0.0; t * k],
-            y: vec![0.0; t * n],
-            succ_bumps,
-            last_ms: 0.0,
-        }))
+        slots.sort_by_key(|s| (s.prog, s.inst));
+        tracing::info!(
+            ops = slots.len(),
+            load_ms = format!("{:.0}", t0.elapsed().as_secs_f64() * 1e3).as_str(),
+            "ANE slots ready"
+        );
+        Ok(slots)
     }
 
     /// Run the ANE slot's GEMM on the current instruction operands and publish its counters.
     #[cfg(feature = "ane")]
-    fn run_ane(&mut self, p: usize) -> Result<()> {
-        let inst = self.ane.as_ref().unwrap().inst;
+    fn run_ane(&mut self, p: usize, si: usize) -> Result<()> {
+        let inst = self.ane[si].inst;
         let d = self.progs[p].insts_host[inst];
         let (n, k) = (d.i[1] as usize, d.i[2] as usize);
         let a_row0 = d.i[4] as usize;
         let c_row0 = d.i[5] as usize;
         let (ha, hc) = (d.t[1] as usize, d.t[0] as usize);
-        let slot = self.ane.as_mut().unwrap();
+        let slot = &mut self.ane[si];
         let t = slot.gemm.t;
         // SAFETY: quiescent between command buffers; the tensors hold (a_row0 + t) x K and (c_row0 + t) x N.
         unsafe {
@@ -492,7 +508,11 @@ impl MetalEngine {
             }
         }
         slot.last_ms = slot.gemm.last_ms;
-        self.last_ane = Some((inst, slot.last_ms));
+        let ms = slot.last_ms;
+        self.last_ane = Some(match self.last_ane {
+            Some((c, acc)) if c != usize::MAX => (c + 1, acc + ms),
+            _ => (1, ms),
+        });
         Ok(())
     }
 
@@ -551,16 +571,24 @@ impl MetalEngine {
         }
         #[cfg(feature = "ane")]
         {
-            if let Some(slot) = self.ane.as_ref() {
-                if slot.prog == p && !self.serial {
-                    let n = self.progs[p].insts_host.len() as u32;
-                    let i = slot.inst as u32;
-                    self.dispatch_range(p, 0, i)?;
-                    self.run_ane(p)?;
-                    self.dispatch_range(p, i + 1, n)?;
-                    self.last_run_us = t0.elapsed().as_secs_f64() * 1e6;
-                    return self.check_fault(p);
+            let mine: Vec<usize> = (0..self.ane.len())
+                .filter(|&i| self.ane[i].prog == p)
+                .collect();
+            if !mine.is_empty() && !self.serial {
+                // Event mode: GPU segments between consecutive ANE instructions, the host runs
+                // each ANE op and publishes its counters in between.
+                self.last_ane = None;
+                let n = self.progs[p].insts_host.len() as u32;
+                let mut lo = 0u32;
+                for si in mine {
+                    let i = self.ane[si].inst as u32;
+                    self.dispatch_range(p, lo, i)?;
+                    self.run_ane(p, si)?;
+                    lo = i + 1;
                 }
+                self.dispatch_range(p, lo, n)?;
+                self.last_run_us = t0.elapsed().as_secs_f64() * 1e6;
+                return self.check_fault(p);
             }
         }
         self.dispatch_range(p, 0, u32::MAX)?;

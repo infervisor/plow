@@ -31,8 +31,10 @@ fn main() {
         .expect("usage: apple_lockstep <model.pkt> <ckpt>")
         .into();
     let mut prompt = String::from("The capital of France is");
+    let mut time_only = false;
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--time" => time_only = true,
             "--prompt" => prompt = args.next().unwrap(),
             "--chat" => {
                 let q = args.next().unwrap();
@@ -82,6 +84,33 @@ fn main() {
     let mut check_program = |gpu: &mut MetalEngine, p: usize, label: &str| {
         let insts: Vec<DevInst64> = gpu.insts_host(p).to_vec();
         println!("== {label}: program {p}, {} instructions", insts.len());
+        if time_only {
+            // GPU time per op class, one dispatch per instruction (includes per-dispatch overhead
+            // of ~0.1 ms; a persistent run has none of that, so read this as relative weight).
+            let mut by_op: std::collections::BTreeMap<u16, (usize, f64)> =
+                std::collections::BTreeMap::new();
+            let t_all = std::time::Instant::now();
+            for (i, d) in insts.iter().enumerate() {
+                let t = std::time::Instant::now();
+                gpu.run_inst(p, i).expect("run_inst");
+                let e = by_op.entry(d.op).or_default();
+                e.0 += 1;
+                e.1 += t.elapsed().as_secs_f64() * 1e3;
+            }
+            let total = t_all.elapsed().as_secs_f64() * 1e3;
+            let mut rows: Vec<_> = by_op.into_iter().collect();
+            rows.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+            println!("  {:<24} {:>6} {:>10} {:>7}", "op", "insts", "ms", "%");
+            for (op, (n, ms)) in rows {
+                let name = DevOp::from_u16(op).map(|o| o.c_name()).unwrap_or("?");
+                println!(
+                    "  {name:<24} {n:>6} {ms:>10.1} {:>6.1}%",
+                    100.0 * ms / total
+                );
+            }
+            println!("  total {total:.1} ms (serial dispatch)");
+            return;
+        }
         let mut bad_ops = 0;
         for (i, d) in insts.iter().enumerate() {
             let op = DevOp::from_u16(d.op).map(|o| o.c_name()).unwrap_or("?");

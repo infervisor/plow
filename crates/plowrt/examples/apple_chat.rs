@@ -68,8 +68,8 @@ fn main() {
         first,
         tok.decode(&[first])
     );
-    if let Some((inst, ms)) = eng.last_ane {
-        println!("ane: prefill instruction {inst} ran on the Neural Engine in {ms:.2} ms");
+    if let Some((ops, ms)) = eng.last_ane {
+        println!("ane: {ops} prefill GEMMs ran on the Neural Engine, {ms:.1} ms of ANE time");
     }
     let mut out = vec![first];
     let mut pos = ids.len() as u32;
