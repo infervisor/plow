@@ -59,6 +59,9 @@ The project compiler is the Nix ROCm 7.14.0 toolchain enforced by the build scri
 - AMD and NVIDIA share context-budget calculation. Single-GPU AMD and TP reuse
   host cursor scheduling. AMD packed and mixed dense attention share span dispatch.
   Intel support here is the CPU backend; no Intel GPU backend was added.
+- On AMD, packed prefill and multistep decode execute sequentially within a mux
+  tick. The mixed prefill/decode kernel path has no AMD serving adapter and is
+  not qualified as a single fused launch.
 
 ## Verification
 
@@ -150,6 +153,8 @@ sampling. vLLM uses a 2048-token batching budget and its custom tanh-GELU
 kernel; compilation and GPU graphs remain enabled. Plow uses a 2048-token
 prefill interleave budget, packed 512-row chunks and multistep 4. Those budget
 settings have different scheduler semantics, recorded in the result manifest.
+Plow counts prefill rows only: 2048 prefill rows plus four decode rows can total
+2052 tokens, whereas vLLM counts both phases toward its 2048-token limit.
 
 Plow's existing decode tier mechanism selects a dedicated MM1 object for one
 request and retains MM4 for batches. This improves solo throughput by 16–17%
@@ -205,3 +210,18 @@ The comparison masks FN negative zero, reinterprets FN bytes as FNUZ and
 doubles scales. Actual exporter tests also passed zero/tiny/midpoint inputs,
 existing-output refusal and nonfinite-source rejection. The export and its
 provenance live in `build-gemma31/fp8-ptpc-export`.
+
+## Optional decode placement
+
+For dense Gemma emission, `PLOW_L2_PLACE=1 PLOW_L2_PLACE_PREFILL=0` places decode
+queues across L2 domains while retaining the ordinary prefill programs. The
+runtime identifies placement per program using its ordered segment count; an
+unplaced prefill with an even number of segments must not be mistaken for a
+placed program. The new option defaults to true, preserving existing emission.
+
+The decode-only configuration passed the 13 asset parser tests, the emitter
+wave-class placement regression, all three full-model packed/multistep HSA
+parity cases, and HTTP parity, cancellation, context-limit and slot-reuse checks.
+All three emitted prefill program bodies and queue appendices were byte-identical
+to the unplaced assets. The full-model runs used the Nix ROCm 7.14 objects and
+MM1 decode tier above. This option is separate from mixed-phase kernel fusion.

@@ -946,9 +946,7 @@ fn a_mxfp4_tied_head_keeps_the_bf16_embedding_table() {
         let _e = EnvScope::set(&[("PLOW_MX4_HEAD", "1")]);
         emit(&dir, 512, 128, 1)
     };
-    let has = |b: &[u8], n: &str| {
-        b.windows(n.len()).any(|w| w == n.as_bytes())
-    };
+    let has = |b: &[u8], n: &str| b.windows(n.len()).any(|w| w == n.as_bytes());
     assert!(
         has(&quantized, "mxfp4/model.embed_tokens.weight_scale"),
         "the E8M0 block scales are `<weight name>_scale`, the same suffix rule as the fp8 twins"

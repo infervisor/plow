@@ -94,9 +94,23 @@ impl Emitter<'_> {
     /// MXFP4 twin of `proj`: `out[t, n] = src[t] . dequant(W4[n]) + bias[n]`. Decode takes the
     /// GEMV (91), prefill the tiled GEMM (93); both carry the bias in t7 (CPU tiers). Prefill on
     /// the fp4 weight is what lets the bf16 projections go undeclared — see `w4` below.
-    fn proj_mx4(&mut self, out: u32, src: u32, w4: u32, s4: u32, bias: u32, n: u32, k: u32, dep: u32) -> u32 {
+    fn proj_mx4(
+        &mut self,
+        out: u32,
+        src: u32,
+        w4: u32,
+        s4: u32,
+        bias: u32,
+        n: u32,
+        k: u32,
+        dep: u32,
+    ) -> u32 {
         debug_assert!(w4 != TENSOR_NONE);
-        let op = if self.prefill { DevOp::GemmMxfp4 } else { DevOp::GemvMxfp4 };
+        let op = if self.prefill {
+            DevOp::GemmMxfp4
+        } else {
+            DevOp::GemvMxfp4
+        };
         let t = self.t;
         self.b.emit(op, self.b.all(), &[dep], |d| {
             d.t[0] = out;
@@ -174,15 +188,35 @@ impl Emitter<'_> {
         // dead weight (the coverage gate accepts the `mxfp4/` twin as covering the bf16 name).
         let bf16w = !mx4_prefill_on();
         let wp = |em: &mut Self, s: &str, sz: u64| -> u32 {
-            if bf16w { em.w(s, sz) } else { TENSOR_NONE }
+            if bf16w {
+                em.w(s, sz)
+            } else {
+                TENSOR_NONE
+            }
         };
-        let wq = wp(self, &format!("{p}.self_attn.q_proj.weight"), qd as u64 * h as u64 * BF16);
+        let wq = wp(
+            self,
+            &format!("{p}.self_attn.q_proj.weight"),
+            qd as u64 * h as u64 * BF16,
+        );
         let bq = self.w(&format!("{p}.self_attn.q_proj.bias"), qd as u64 * BF16);
-        let wk = wp(self, &format!("{p}.self_attn.k_proj.weight"), kd as u64 * h as u64 * BF16);
+        let wk = wp(
+            self,
+            &format!("{p}.self_attn.k_proj.weight"),
+            kd as u64 * h as u64 * BF16,
+        );
         let bk = self.w(&format!("{p}.self_attn.k_proj.bias"), kd as u64 * BF16);
-        let wv = wp(self, &format!("{p}.self_attn.v_proj.weight"), kd as u64 * h as u64 * BF16);
+        let wv = wp(
+            self,
+            &format!("{p}.self_attn.v_proj.weight"),
+            kd as u64 * h as u64 * BF16,
+        );
         let bv = self.w(&format!("{p}.self_attn.v_proj.bias"), kd as u64 * BF16);
-        let wo = wp(self, &format!("{p}.self_attn.o_proj.weight"), h as u64 * qd as u64 * BF16);
+        let wo = wp(
+            self,
+            &format!("{p}.self_attn.o_proj.weight"),
+            h as u64 * qd as u64 * BF16,
+        );
         let bo = self.w(&format!("{p}.self_attn.o_proj.bias"), h as u64 * BF16);
         // PLOW_MXFP4: q/k/v/o read the `mxfp4/<name>` twins (e2m1 + E8M0, quantize_mxfp4.py) —
         // decode through biased GEMV_MXFP4, prefill through biased GEMM_MXFP4 (t7 = bias, CPU
@@ -653,7 +687,11 @@ fn phase_range(
     let head_mx4 = emit_config::active().mxfp4 && (!prefill || mx4_prefill_on());
     // Untied, so nothing else reads the bf16 head: once BOTH phases score through the fp4 twin it
     // is 1.16 GB of dead weight, and the coverage gate takes `mxfp4/<head>` as covering it.
-    let lm = if head_mx4 { TENSOR_NONE } else { em.w(&head, c.vocab as u64 * h as u64 * BF16) };
+    let lm = if head_mx4 {
+        TENSOR_NONE
+    } else {
+        em.w(&head, c.vocab as u64 * h as u64 * BF16)
+    };
     let (vocab, all) = (c.vocab, em.b.all());
     dep = if head_mx4 {
         // PLOW_MXFP4 head: the 1.16 GB bf16 lm_head is ~1/4 of a GPT-OSS decode step's bytes.

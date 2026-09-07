@@ -196,6 +196,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_DECODE_TILED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_tiled: bool,
 
+    /// Apply requested L2 placement to prefill as well as decode.
+    #[arg(long, env = "PLOW_L2_PLACE_PREFILL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub l2_place_prefill: bool,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Fusion (generic, cross-model)
     // ──────────────────────────────────────────────────────────────────────────
@@ -842,6 +846,7 @@ impl EmitConfig {
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
+            l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),
             fuse_argmax: env_bool("PLOW_FUSE_ARGMAX"),
             no_fuse_qkv: env_bool("PLOW_NO_FUSE_QKV"),
             fuse_qkv_fp8: env_bool("PLOW_FUSE_QKV_FP8"),

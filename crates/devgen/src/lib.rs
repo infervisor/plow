@@ -4984,7 +4984,10 @@ fn emit_phase(
         } else if mx4_pf && !gemv_family && glu_fusion_wins_mxfp4(t, inter_l, c.hidden, n_cu) {
             // PREFILL fp4 GLU (op 113): gate|up as two e2m1 matrices with their own E8M0 scale
             // rows, SwiGLU/GeGLU fused in the epilogue. Same slot map as the decode twin (92).
-            assert!(w.wg8 != TENSOR_NONE && w.sg != TENSOR_NONE, "mxfp4 prefill GLU has no fp4 twin");
+            assert!(
+                w.wg8 != TENSOR_NONE && w.sg != TENSOR_NONE,
+                "mxfp4 prefill GLU has no fp4 twin"
+            );
             b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_pf], |d| {
                 d.t[0] = n.fu;
                 d.t[1] = mlp_src;
@@ -7684,7 +7687,7 @@ fn emit_dense_gqa(
         let mut b = Builder::new(n_cu);
         b.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
         b.adopt_tensors(tensors.clone());
-        b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
+        b.set_l2_placement(l2_layout.filter(|_| ecfg.l2_place_prefill));
         b.set_lean_moe_stage2_segments(amd && emit_config::active().moe_stage2_lean);
         b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
         b.set_lean_moe_combine_segments(amd && emit_config::active().moe_combine_lean);

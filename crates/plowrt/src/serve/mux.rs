@@ -2119,13 +2119,8 @@ fn run_one_tick(
                 if nv.pf_batch {
                     e.advance_prefill_turn(i);
                 }
-                // §DISAGG phase-0. The AMD tick is EITHER a prefill OR a decode
-                // (this arm returns before the decode launch below), so unlike
-                // the CUDA arm there is no fused launch and `mixed_decode_ns`
-                // is ZERO BY CONSTRUCTION. What disaggregation can recover here
-                // is therefore the WHOLE prefill tick, during which every live
-                // decode stream is stalled — so `prefill_ns / (prefill_ns +
-                // decode_ns)` is the ceiling, not the mixed ratio.
+                // AMD prefill and decode share scratch and run sequentially.
+                // This interval measures isolated prefill, not mixed-kernel overlap.
                 let pk_t = packlog::on().then(Instant::now);
                 let slot_ref = slots[i].as_ref().expect("found above");
                 // §TTFT: everything between `mux.submit` and this line — the
