@@ -143,15 +143,15 @@ extern "C" __device__ unsigned plow_mixed_interpreter
 #endif
 
 #include "op_attention.cuh" /* validated: d_flash_decode / d_flash_merge (harvested) */
-#if PLOW_PACKET_ATTENTION_SINKS && PLOW_NV_PACKED_REQUEST
-#error "attention sinks and packed-request FlashMerge currently share t3"
+#if PLOW_NV_PACKED_REQUEST && defined(PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY) && !PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY
+#error "packed-request object requires packed-prefill packet topology"
 #endif
 #if PLOW_NV_PACKED_REQUEST
-#define PLOW_PF_REQ_ARG , (const int*)TEN(3)
+#define PLOW_PF_REQ_ARG , (const int*)TEN(7)
 #if !defined(PLOW_NV_HOPPER) || !PLOW_NV_HOPPER || !PLOW_NV_PREFILL || PLOW_FP8_KV
 #error "packed request ABI requires Hopper BF16 prefill"
 #endif
-extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 1;
+extern "C" __device__ __constant__ unsigned plow_pf_request_abi = 2;
 #else
 #define PLOW_PF_REQ_ARG
 #endif
@@ -641,6 +641,10 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _fp8m1)
 #elif PLOW_NV_GEMV512_ROLE
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gemv512)
+#elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_SEG_GEMM
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _pfpackedgemm)
+#elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_SEGMENTS
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _pfpackedseg)
 #elif PLOW_NV_PREFILL && PLOW_NV_SEG_GEMM
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _pfgemm)
 #elif PLOW_NV_PREFILL && PLOW_NV_FA_ONLY
@@ -2104,7 +2108,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[3] == 64 && PLOW_HAS_FLASH_HD64 && PLOW_PACKET_ATTENTION_SINKS)
             d_flash_merge<64, true>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                     (const float*)TEN(2), in->i[0], in->i[1], in->i[2],
-                                    slice, nblk, nullptr, (const __nv_bfloat16*)TEN(3));
+                                    slice, nblk,
+#if PLOW_NV_PACKED_REQUEST
+                                    (const int*)TEN(7),
+#else
+                                    nullptr,
+#endif
+                                    (const __nv_bfloat16*)TEN(3));
         else
 #endif
 #if PLOW_NV_GEMMA

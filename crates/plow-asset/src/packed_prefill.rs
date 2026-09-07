@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 pub const SECTION: &str = "packed_prefill";
 pub const CAPABILITY: &str = "plow_pf_request_abi";
+pub const CAPABILITY_VALUE: u32 = 2;
 type Result<T> = std::result::Result<T, String>;
 fn need(ok: bool, text: &str) -> Result<()> {
     if ok {
@@ -240,8 +241,8 @@ impl Manifest {
                 }
                 if op == DevOp::FlashMerge {
                     need(
-                        d.t[3..].iter().all(|&h| h == TENSOR_NONE16),
-                        "merge optional operands",
+                        d.t[4..].iter().all(|&h| h == TENSOR_NONE16),
+                        "merge request operand",
                     )?;
                 }
             }

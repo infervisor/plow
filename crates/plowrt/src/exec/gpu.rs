@@ -158,6 +158,9 @@ fn interp_candidate(
     if cubin::global_u32(image, plow_asset::mixed_step::OBJECT_CAPABILITY).is_some() {
         return Err("mixed-step auxiliary object is not an ordinary interpreter".into());
     }
+    if cubin::global_u32(image, plow_asset::packed_prefill::CAPABILITY).is_some() {
+        return Err("packed-prefill auxiliary object is not an ordinary interpreter".into());
+    }
     if info.sm != want_sm {
         return Err(format!("built for sm_{}, device is sm_{want_sm}", info.sm));
     }
@@ -2463,7 +2466,6 @@ struct MultiStep {
     /// `[batch]` i32 active-row flags (device) + pinned staging.
     d_fed: DeviceMem,
     fed_host: PinnedHost,
-    batch: usize,
 }
 
 /// Outcome of one [`GpuEngine::prefill_chunk`] call.
@@ -2541,7 +2543,7 @@ impl GpuEngine {
             "parsed PLOWDEV blob"
         );
         let live_kv_manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
-        let packed_prefill = blob
+        let packed_prefill_metadata = blob
             .reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)?
             .map(|bytes| {
                 serde_json::from_slice::<plow_asset::packed_prefill::Manifest>(bytes)
@@ -2562,19 +2564,22 @@ impl GpuEngine {
         } else {
             None
         };
-        if let Some(pack) = &packed_prefill {
+        if let Some(pack) = &packed_prefill_metadata {
             let live = live_kv_manifest.as_ref().ok_or_else(|| {
                 RuntimeError::Rejected("packed prefill requires compiled LIVE contract".into())
             })?;
             blob.with_packet_view(|p| pack.validate(p, live))
                 .map_err(RuntimeError::Rejected)?;
-            let config = RuntimeConfig::get();
-            if config.nv_vmm_prefix() || config.nv.prefix_cache {
-                return Err(RuntimeError::Rejected(
-                    "packed prefill does not support prefix reuse".into(),
-                ));
-            }
         }
+        let config = RuntimeConfig::get();
+        let packed_prefill = if config.nv_vmm_prefix() || config.nv.prefix_cache {
+            if packed_prefill_metadata.is_some() {
+                tracing::info!("packed prefill disabled because prefix reuse is active");
+            }
+            None
+        } else {
+            packed_prefill_metadata.clone()
+        };
         let decode_objects = decode_object::parse(&blob, &raw)?;
         let prepared_contexts = decode_context::prepare(&blob, &raw, assets_dir)?;
         if blob
@@ -2614,8 +2619,7 @@ impl GpuEngine {
             || prepared_contexts.is_some()
             || !decode_packet_roles.is_empty()
             || cublaslt_enabled
-            || recurrent.is_some()
-            || nv_config.vmm_live;
+            || recurrent.is_some();
         let effective_multistep = if multistep_disabled_by_decode {
             if configured_multistep > 1 {
                 tracing::info!(
@@ -2847,7 +2851,14 @@ impl GpuEngine {
         let vmm = {
             let run = || {
                 let config = RuntimeConfig::get();
-                let live = config.nv_vmm_live();
+                let packet_live = packed_prefill.is_some()
+                    && live_kv_manifest.as_ref().is_some_and(|manifest| {
+                        manifest.caches.iter().any(|cache| cache.window == 0)
+                    });
+                let live = config.nv_vmm_live() || packet_live;
+                if packet_live && !config.nv_vmm_live() {
+                    tracing::info!("live KV allocation enabled by packet metadata");
+                }
                 let rings = config.nv_vmm_live_rings();
                 if rings && !live {
                     return Err(RuntimeError::Rejected(
@@ -3025,7 +3036,7 @@ impl GpuEngine {
             while *cur < blob.tensors.len() && n < budget {
                 let td = &blob.tensors[*cur];
                 *cur += 1;
-                if !is_checkpoint_tensor(*cur - 1, &td.name, packed_prefill.as_ref()) {
+                if !is_checkpoint_tensor(*cur - 1, &td.name, packed_prefill_metadata.as_ref()) {
                     continue;
                 }
                 if let Some(s) = ckpt.span(&td.name, 0, td.bytes as usize) {
@@ -3093,7 +3104,9 @@ impl GpuEngine {
                         td.name
                     )));
                 }
-                if !packet_cache && is_checkpoint_tensor(i, &td.name, packed_prefill.as_ref()) {
+                if !packet_cache
+                    && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
+                {
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {
                         RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name))
                     })?;
@@ -3902,11 +3915,13 @@ impl GpuEngine {
             }
             let module = DecodeModule::load(&be, &image)?;
             if packed_prefill.is_some()
-                && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)? != Some(1)
+                && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)?
+                    != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
             {
-                return Err(RuntimeError::Rejected(
-                    "packet role lacks packed request ABI1".into(),
-                ));
+                return Err(RuntimeError::Rejected(format!(
+                    "packet role lacks packed request ABI{}",
+                    plow_asset::packed_prefill::CAPABILITY_VALUE
+                )));
             }
             let capability = be.module_global_u32(&module, marker)?;
             let block = be.module_global_u32(&module, block)?;
@@ -4281,9 +4296,20 @@ impl GpuEngine {
         module: &Module,
         assets_dir: &Path,
     ) -> Result<()> {
+        Self::check_packet_pairing_suffix(be, module, assets_dir, "")
+    }
+
+    fn check_packet_pairing_suffix(
+        be: &Arc<CudaBackend>,
+        module: &Module,
+        assets_dir: &Path,
+        suffix: &str,
+    ) -> Result<()> {
+        let lo_name = format!("plow_packet_hash_lo{suffix}");
+        let hi_name = format!("plow_packet_hash_hi{suffix}");
         let (lo, hi) = (
-            be.module_global_u32(module, "plow_packet_hash_lo")?,
-            be.module_global_u32(module, "plow_packet_hash_hi")?,
+            be.module_global_u32(module, &lo_name)?,
+            be.module_global_u32(module, &hi_name)?,
         );
         let (Some(lo), Some(hi)) = (lo, hi) else {
             // Unstamped ⇒ a general object. Nothing to check.
@@ -4709,7 +4735,6 @@ impl GpuEngine {
             ring_host,
             d_fed,
             fed_host,
-            batch,
         }))
     }
 
@@ -4881,7 +4906,7 @@ impl GpuEngine {
         effective_decode_widths(
             self.decode_rungs.iter().map(|r| r.rows),
             self.batch,
-            self.multistep.is_some() || self.decode_rungs.is_empty(),
+            self.decode_rungs.is_empty(),
         )
     }
 
@@ -5570,10 +5595,17 @@ impl GpuEngine {
                 )));
             }
         }
-        // VMM: map every row this quantum will write (fed rows pos..pos+K).
-        if let Some(v) = &self.vmm {
-            for &(b, _) in feeds {
-                let need = self.pos[b] + k as u32;
+        let rung = self.select_decode(feeds.iter().map(|&(slot, _)| slot))?;
+        let launch_rows = self.selected_decode(rung).map_or(bsz, |r| r.rows);
+        // VMM: map every row this quantum will write. Fed rows need the full
+        // quantum; idle rows in the selected rung need their one garbage row.
+        if let Some(v) = &mut self.vmm {
+            if let Some(rings) = &mut v.rings {
+                rings.ensure_prefix(launch_rows)?;
+            }
+            for b in 0..launch_rows {
+                let active = feeds.iter().any(|&(slot, _)| slot == b);
+                let need = self.pos[b] + if active { k as u32 } else { 1 };
                 if v.kv.mapped_rows(b) < need {
                     v.kv.ensure_rows(b, need)?;
                 }
@@ -5632,22 +5664,8 @@ impl GpuEngine {
         // Enqueue [memset → decode → advance] × K on the stream — no sync.
         let advance_grid = (bsz as u32).div_ceil(256);
         for step in 0..k {
-            self.be.memset_d8_async(
-                self.d_ctr.base,
-                0,
-                self.ctr_bytes.max(4) + self.cursor_bytes,
-                &self.stream,
-            )?;
-            let mut arg = self.kernarg;
-            let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-            self.be.launch_cooperative(
-                self.f,
-                self.grid,
-                BLOCK,
-                self.smem,
-                &mut params,
-                Some(&self.stream),
-            )?;
+            self.reset_selected_decode_counters(rung)?;
+            self.launch_selected_decode(rung)?;
             let mut a_ids = self.devp[self.t_ids].base;
             let mut a_pos = self.devp[self.t_pos].base;
             let mut a_kvl = self.devp[self.t_kvlen].base;
@@ -5797,13 +5815,7 @@ impl GpuEngine {
         packed_requests: bool,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
         let module = be.module_load(&pf.image)?;
-        if packed_requests
-            && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)? != Some(1)
-        {
-            return Err(RuntimeError::Rejected(
-                "prefill object lacks packed request ABI1".into(),
-            ));
-        }
+        Self::check_packet_pairing_suffix(be, &module, assets_dir, "_pf")?;
         let kname = crate::config::RuntimeConfig::get()
             .nv
             .kernel_pf
@@ -5858,18 +5870,21 @@ impl GpuEngine {
                 }
                 let load = |file: &str,
                             sym: &str,
+                            suffix: &str,
                             arena: &str|
                  -> Result<(Module, KernelFn, u32, u32)> {
                     let img = std::fs::read(dir.join(file)).map_err(|e| {
                         RuntimeError::Device(format!("segmented prefill object: read {file}: {e}"))
                     })?;
                     let m = be.module_load(&img)?;
+                    Self::check_packet_pairing_suffix(be, &m, assets_dir, suffix)?;
                     if packed_requests
                         && be.module_global_u32(&m, plow_asset::packed_prefill::CAPABILITY)?
-                            != Some(1)
+                            != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
                     {
                         return Err(RuntimeError::Rejected(format!(
-                            "{file} lacks packed request ABI1"
+                            "{file} lacks packed request ABI{}",
+                            plow_asset::packed_prefill::CAPABILITY_VALUE
                         )));
                     }
                     let f = be.get_function(&m, sym)?;
@@ -5878,19 +5893,23 @@ impl GpuEngine {
                     let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
                     Ok((m, f, sm, occ * be.sm_count()))
                 };
-                let seg_file = format!("interp_{interp_tag}_pfseg.cubin");
-                let gemm_file = format!("interp_{interp_tag}_pfgemm.cubin");
-                let seg_sym_name = format!("interp_{interp_tag}_pfseg");
-                let gemm_sym_name = format!("interp_{interp_tag}_pfgemm");
+                let suffix = if packed_requests { "pfpacked" } else { "pf" };
+                let seg_file = format!("interp_{interp_tag}_{suffix}seg.cubin");
+                let gemm_file = format!("interp_{interp_tag}_{suffix}gemm.cubin");
+                let seg_sym_name = format!("interp_{interp_tag}_{suffix}seg");
+                let gemm_sym_name = format!("interp_{interp_tag}_{suffix}gemm");
                 let seg_sym = format!("_Z{}{}11PlowProgram", seg_sym_name.len(), seg_sym_name);
                 let gemm_sym = format!("_Z{}{}11PlowProgram", gemm_sym_name.len(), gemm_sym_name);
-                let (m1, f1, s1, g1) = load(&seg_file, &seg_sym, "plow_arena_bytes_pfseg")?;
+                let seg_global_suffix = format!("_{suffix}seg");
+                let gemm_global_suffix = format!("_{suffix}gemm");
+                let seg_arena = format!("plow_arena_bytes{seg_global_suffix}");
+                let gemm_arena = format!("plow_arena_bytes{gemm_global_suffix}");
+                let (m1, f1, s1, g1) = load(&seg_file, &seg_sym, &seg_global_suffix, &seg_arena)?;
                 let (m2, f2, s2, _g2unused) =
-                    load(&gemm_file, &gemm_sym, "plow_arena_bytes_pfgemm")?;
+                    load(&gemm_file, &gemm_sym, &gemm_global_suffix, &gemm_arena)?;
                 // T31: the GEMM object may declare its own launch block size (384-thread ws).
-                let blk2 = be
-                    .module_global_u32(&m2, "plow_block_pfgemm")?
-                    .unwrap_or(BLOCK);
+                let gemm_block = format!("plow_block{gemm_global_suffix}");
+                let blk2 = be.module_global_u32(&m2, &gemm_block)?.unwrap_or(BLOCK);
                 let g2 = be.occupancy_blocks_per_sm(f2, blk2, s2 as usize)? * be.sm_count();
                 let small_gemm = if let Some(path) = small_gemm_path {
                     if blk2 != 384 {
@@ -5904,11 +5923,12 @@ impl GpuEngine {
                     let module = be.module_load(&img)?;
                     if packed_requests
                         && be.module_global_u32(&module, plow_asset::packed_prefill::CAPABILITY)?
-                            != Some(1)
+                            != Some(plow_asset::packed_prefill::CAPABILITY_VALUE)
                     {
-                        return Err(RuntimeError::Rejected(
-                            "small GEMM object lacks packed request ABI1".into(),
-                        ));
+                        return Err(RuntimeError::Rejected(format!(
+                            "small GEMM object lacks packed request ABI{}",
+                            plow_asset::packed_prefill::CAPABILITY_VALUE
+                        )));
                     }
                     let abi = be
                         .module_global_u32(&module, "plow_gemm_shape_abi_pfgemm")?
@@ -5954,10 +5974,11 @@ impl GpuEngine {
                 // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
                 // segments are emitted at all.
                 let fa_file = format!("interp_{interp_tag}_pffa.cubin");
-                let fa = if dir.join(&fa_file).exists() {
+                let fa = if !packed_requests && dir.join(&fa_file).exists() {
                     let fa_sym_name = format!("interp_{interp_tag}_pffa");
                     let fa_sym = format!("_Z{}{}11PlowProgram", fa_sym_name.len(), fa_sym_name);
-                    let (m3, f3, s3, g3) = load(&fa_file, &fa_sym, "plow_arena_bytes_pffa")?;
+                    let (m3, f3, s3, g3) =
+                        load(&fa_file, &fa_sym, "_pffa", "plow_arena_bytes_pffa")?;
                     // PLOW_PF_SEG_FA512=all classes hd256 FlashPrefill onto this object too,
                     // but its hd256 arm exists only when built PLOW_BUILD_FA_HD256=1 —
                     // without it the dispatch hits a bare __trap(): LAUNCH_FAILED, poisoned
@@ -6980,7 +7001,7 @@ impl GpuEngine {
                 }
             }
             for &pc in &b.merge_sites {
-                b.h_inst[pc].t[3] = pack.request;
+                b.h_inst[pc].t[7] = pack.request;
             }
             for &pc in &b.lmhead_sites {
                 b.h_inst[pc].i[4] = 0;
@@ -7757,13 +7778,14 @@ mod prefill_patch_tests {
         let config = crate::config::RuntimeConfig::get();
         assert!(!config.nv.pf_batch);
         assert!(!config.nv_vmm_prefix());
-        let live_requested = config.nv_vmm_live();
         let assets = std::path::PathBuf::from(std::env::var("TEST_PACKED_PREFILL_ASSETS").unwrap());
         let bytes = std::fs::read(assets.join("model.pkt")).unwrap();
         let blob = DevBlob::parse(&bytes).unwrap();
         let live = crate::memory::vmm::LiveKvLayout::manifest(&blob, &bytes)
             .unwrap()
             .unwrap();
+        let live_requested = config.nv_vmm_live()
+            || live.caches.iter().any(|cache| cache.window == 0);
         let block: serde_json::Value =
             serde_json::from_slice(&std::fs::read(assets.join("block.json")).unwrap()).unwrap();
         let hidden = block["hidden"].as_u64().unwrap() as usize;
@@ -8037,6 +8059,26 @@ mod profile_tests {
         assert!(interp_candidate(&mixed, &profile, 90, Role::Prefill)
             .unwrap_err()
             .contains("mixed-step auxiliary object"));
+    }
+
+    #[test]
+    fn auxiliary_packed_object_cannot_win_ordinary_prefill_discovery() {
+        let (profile, ordinary, _) = prefill_images();
+        let packed = plow_asset::cubin::synthetic_elf(
+            profile.prefill_symbol,
+            &[(
+                plow_asset::packed_prefill::CAPABILITY,
+                plow_asset::packed_prefill::CAPABILITY_VALUE,
+            )],
+            90,
+        );
+        assert_eq!(
+            interp_candidate(&ordinary, &profile, 90, Role::Prefill).unwrap(),
+            profile.prefill_symbol
+        );
+        assert!(interp_candidate(&packed, &profile, 90, Role::Prefill)
+            .unwrap_err()
+            .contains("packed-prefill auxiliary object"));
     }
 
     #[test]

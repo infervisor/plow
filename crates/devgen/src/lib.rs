@@ -4543,7 +4543,7 @@ fn emit_phase(
                 d.j[1] = kvm; // head-major; RING on a sliding layer
             })
         };
-        if !gemv_family && emit_config::active().emit_packed_prefill {
+        if !gemv_family && emit_config::active().packed_prefill_on() {
             b.isolate(c_fa);
         }
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
@@ -6260,15 +6260,45 @@ struct EmitCapabilities {
     dense_packet_contracts: bool,
     decode_objects: bool,
     cublaslt_decode: bool,
+    decode_ladder: bool,
 }
 
 fn emit_capabilities(model_type: &str) -> EmitCapabilities {
-    let dense = matches!(model_type, "gemma4" | "gemma4_text" | "llama" | "qwen3");
+    let dense = matches!(
+        model_type,
+        "gemma4"
+            | "gemma4_text"
+            | "gemma4_unified"
+            | "gemma4_unified_text"
+            | "llama"
+            | "qwen3"
+    );
     EmitCapabilities {
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
         cublaslt_decode: model_type == "qwen3_5",
+        decode_ladder: dense || model_type == "gpt_oss",
     }
+}
+
+fn apply_production_defaults(
+    cfg: &mut emit_config::EmitConfig,
+    capabilities: EmitCapabilities,
+    arch: &str,
+    tp: u32,
+) {
+    if cfg.decode_ladder.is_none()
+        && cfg.decode_batch == 1
+        && capabilities.decode_ladder
+        && arch == "sm_90a"
+        && tp == 1
+    {
+        cfg.decode_ladder = Some("1,2,4,8,16".into());
+    }
+    cfg.packed_prefill_default = capabilities.dense_packet_contracts
+        && arch == "sm_90a"
+        && tp == 1
+        && !cfg.fp8_kv;
 }
 
 fn cublaslt_emit_supported(
@@ -6301,9 +6331,21 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         mixed_step,
     } = args;
 
-    // Resolve the unified emit config: either from the CLI (plowc path) or from env vars (legacy).
+    let model_type =
+        serde_json::from_slice::<Value>(&std::fs::read(dir.join("config.json")).unwrap())
+            .ok()
+            .and_then(|v| {
+                v.get("model_type")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+    let capabilities = emit_capabilities(&model_type);
+    let mut emit_cfg = _emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env);
+    apply_production_defaults(&mut emit_cfg, capabilities, &arch, tp);
+
     // Installed process-wide so deeply nested emit functions can call emit_config::active().
-    emit_config::install(_emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env));
+    emit_config::install(emit_cfg);
     install_whole_graph_fusions(whole_graph_fusions);
     clear_attention_decisions();
 
@@ -6316,15 +6358,6 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
 
     // GLM-5.2 (GlmMoeDsa) — MLA + DSA + block-fp8 MoE — is a wholly separate emit path (glm_main).
     // Dispatch on model_type before the dense-GQA cfg parse, which would panic on GLM's config.
-    let model_type =
-        serde_json::from_slice::<Value>(&std::fs::read(dir.join("config.json")).unwrap())
-            .ok()
-            .and_then(|v| {
-                v.get("model_type")
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
     // GPT-OSS: its own emitter (gptoss.rs) over the CPU-tier contracts; `cfg_from` would panic
     // on its config and the dense path has no MoE-with-bias/sinks arm.
     if model_type == "gpt_oss" {
@@ -6346,7 +6379,6 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         );
         return;
     }
-    let capabilities = emit_capabilities(&model_type);
     if emit_config::active().decode_cublaslt {
         assert!(
             cublaslt_emit_supported(
@@ -6362,7 +6394,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         !emit_config::active().gemv_decode_role || capabilities.dense_packet_contracts,
         "GEMV decode role currently requires the dense BF16 emitter"
     );
-    if emit_config::active().emit_packed_prefill {
+    if emit_config::active().packed_prefill_on() {
         assert!(
             arch == "sm_90a" && tp == 1 && !emit_config::active().fp8_kv,
             "packed request emission requires Hopper single-GPU BF16 KV"
@@ -7490,7 +7522,7 @@ fn emit_dense_gqa(
                 && (emit_config::active().kda_wu_lean || emit_config::active().kda_carry_keyfeed),
         );
         b.set_kda_carry_keyfeed_segments(emit_config::active().kda_carry_keyfeed);
-        if amd || emit_config::active().emit_packed_prefill {
+        if amd || emit_config::active().packed_prefill_on() {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }
         // T18 (PLOW_UNISEG_MAX_T=<t>): small buckets emit ONE segment so the serve side takes
@@ -7795,11 +7827,13 @@ fn emit_dense_gqa(
     // site's — to downgrade "no usable verifier here" into an `Ok` carrying a
     // skip reason. Anything that reaches this `Err` is the verifier saying the
     // program is wrong, i.e. a real bug caught, and must be loud.
-    if ecfg.emit_packed_prefill {
+    let mut packed_prefill_emitted = false;
+    if ecfg.packed_prefill_on() {
         assert!(
             !emit_is_amd() && !fp8_kv,
             "packed prefill requires dense BF16 KV NVIDIA packet"
         );
+        let packed_tensor_base = m.tensors.len();
         let max_rows = m.prog_t[..packet::devbuild::decode_rung_lo(&m.prog_t)]
             .iter()
             .copied()
@@ -7835,8 +7869,8 @@ fn emit_dense_gqa(
             });
             maps.push(plow_asset::packed_prefill::Map { original, slots });
         }
-        let manifest = plow_asset::program::with_model(&m, |p| {
-            let live = plow_asset::live_kv::emit(p).expect("packed LIVE geometry");
+        let manifest = plow_asset::program::with_model(&m, |p| -> Result<_, String> {
+            let live = plow_asset::live_kv::emit(p)?;
             let request = plow_asset::packed_prefill::Manifest {
                 version: 1,
                 slot,
@@ -7847,16 +7881,26 @@ fn emit_dense_gqa(
                     .map(plow_asset::live_kv::program_digest)
                     .collect(),
             };
-            request.validate(p, &live).expect("packed request contract");
-            request
+            request.validate(p, &live)?;
+            Ok(request)
         });
-        sections.push(packet::devbuild::SectionData {
-            kind: packet::devbuild::SECT_METADATA,
-            name: plow_asset::packed_prefill::SECTION.into(),
-            data: serde_json::to_vec(&manifest).unwrap(),
-        });
+        match manifest {
+            Ok(manifest) => {
+                sections.push(packet::devbuild::SectionData {
+                    kind: packet::devbuild::SECT_METADATA,
+                    name: plow_asset::packed_prefill::SECTION.into(),
+                    data: serde_json::to_vec(&manifest).unwrap(),
+                });
+                packed_prefill_emitted = true;
+            }
+            Err(error) if ecfg.emit_packed_prefill.is_none() => {
+                m.tensors.truncate(packed_tensor_base);
+                eprintln!("  packed prefill not selected: {error}");
+            }
+            Err(error) => panic!("packed request contract: {error}"),
+        }
     }
-    if projection_bindings.is_some() || ecfg.emit_packed_prefill {
+    if projection_bindings.is_some() || packed_prefill_emitted {
         let manifest = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
             .unwrap_or_else(|error| panic!("compiled LIVE KV geometry: {error}"));
         sections.push(packet::devbuild::SectionData {
@@ -7939,7 +7983,7 @@ fn emit_dense_gqa(
     // Skipped when `arch` is empty (the legacy `gemma4` CLI), so that path's output
     // is unchanged.
     if !arch.is_empty() {
-        let man = manifest::build(&m, &arch, &lean);
+        let man = manifest::build_for_packet(&m, &arch, &lean, &sections);
         let mpath = std::path::Path::new(&out).with_file_name("build.json");
         let cpath = std::path::Path::new(&out).with_file_name("plow_config.h");
         manifest::write_config_header(&cpath, &man)

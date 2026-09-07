@@ -1231,7 +1231,7 @@ fn k3_build_model(
 
     let mut decode = Vec::with_capacity(rungs.len());
     let packed_prefill_topology =
-        crate::emit_is_amd() && crate::emit_config::active().emit_packed_prefill;
+        crate::emit_is_amd() && crate::emit_config::active().packed_prefill_on();
     let mut prefill = Vec::with_capacity(pf.len() * (1 + usize::from(packed_prefill_topology)));
     for (i, &t) in decode_build_order.iter().enumerate() {
         let fallback_ns = k3_nsplit_fallback(ctx);

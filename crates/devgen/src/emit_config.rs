@@ -101,9 +101,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_UNISEG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub uniseg: bool,
 
-    /// Emit the packet ABI for packed cross-request prefill.
-    #[arg(long = "emit-packed-prefill", env = "PLOW_EMIT_PACKED_PREFILL", default_value_t = false, action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
-    pub emit_packed_prefill: bool,
+    /// Emit the packet ABI for packed cross-request prefill. Unset lets plowc
+    /// select it from the target and packet capabilities.
+    #[arg(long = "emit-packed-prefill", env = "PLOW_EMIT_PACKED_PREFILL", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
+    pub emit_packed_prefill: Option<bool>,
+
+    #[arg(skip)]
+    pub packed_prefill_default: bool,
 
     /// Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs in their own gfx950 segment.
     /// Default on; `=0` is the rollback to the interpreter-resident pair.
@@ -130,11 +134,9 @@ pub struct EmitConfig {
     /// rung that covers the live sequences instead of being committed to one
     /// `PLOW_DECODE_BATCH` at emit.
     ///
-    /// Unset (the default) is BYTE-IDENTICAL to today's blob: [`EmitConfig::decode_rungs`]
-    /// then returns the single `decode_batch` rung and the emitter takes the exact code
-    /// path it always took. Set, the WIDEST rung sizes every per-slot tensor (the KV
-    /// cache above all), because a sequence keeps its slot across a rung change and the
-    /// per-slot stride must not move with `B`.
+    /// Supported serving emitters default an unset ladder to `1,2,4,8,16`.
+    /// Set it to `1` for a single B1 program. The widest rung sizes every
+    /// per-slot tensor because a sequence keeps its slot across rung changes.
     #[arg(long = "emit-decode-batch-ladder", env = "PLOW_DECODE_BATCH_LADDER")]
     pub decode_ladder: Option<String>,
 
@@ -790,7 +792,8 @@ impl EmitConfig {
             fp8_kv_full: env_bool("PLOW_FP8_KV_FULL"),
             fp8_head: env_bool("PLOW_FP8_HEAD"),
             uniseg: env_bool("PLOW_UNISEG"),
-            emit_packed_prefill: env_bool("PLOW_EMIT_PACKED_PREFILL"),
+            emit_packed_prefill: env_bool_opt("PLOW_EMIT_PACKED_PREFILL"),
+            packed_prefill_default: false,
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
             // value; direct legacy callers must name the feature explicitly.
             decode_mla_segments: env_bool("PLOW_SEG_DECODE_MLA"),
@@ -1053,11 +1056,16 @@ impl EmitConfig {
         self.fp8 || self.w8a8 || self.w8a16
     }
 
+    pub fn packed_prefill_on(&self) -> bool {
+        self.emit_packed_prefill
+            .unwrap_or(self.packed_prefill_default)
+    }
+
     /// The decode widths this emit builds programs for, ASCENDING.
     ///
-    /// Without `PLOW_DECODE_BATCH_LADDER` this is exactly `[decode_batch]`, which is
-    /// what makes an unset ladder byte-identical: the emitter runs its one-decode-program
-    /// loop once, at the same `B`, with the same builder settings.
+    /// Without `PLOW_DECODE_BATCH_LADDER` this is exactly `[decode_batch]`.
+    /// [`super::apply_production_defaults`] resolves an unset ladder before
+    /// production emission; direct configuration tests retain this fallback.
     ///
     /// With it, the list is parsed, clamped to `1..=`[`packet::devbuild::DECODE_RUNG_MAX`],
     /// sorted and deduped. `decode_batch` is IGNORED when a ladder is given — two records

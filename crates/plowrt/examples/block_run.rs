@@ -9,6 +9,7 @@
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
 //!                              [--pf-chunk N]
 //!   block_run <asset-dir> mixed-check --rows 128 --decode 1
+//!   block_run <asset-dir> packed-check
 //!
 //! `check` feeds a hidden-state into `act.x` (an .npy or a seeded synthetic),
 //! launches one prefill bucket, reads `act.x` back, and prints shape / min /
@@ -207,8 +208,110 @@ mod cuda {
                 bench(&mut e, hidden, &flag)
             }
             "mixed-check" => mixed_check(&mut e, &desc, hidden, &out_name, &flag),
+            "packed-check" => packed_check(&mut e, &desc, hidden, &out_name),
             other => Err(format!("unknown verb {other:?} (check|bench|mixed-check)").into()),
         }
+    }
+
+    fn packed_check(
+        e: &mut plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        hidden: usize,
+        out_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use plowrt::exec::gpu::PfBatchReq;
+
+        let slots = [3usize, 15];
+        let starts = [31usize, 95];
+        let rows = [33usize, 31];
+        if !e.pf_batch_enabled()
+            || e.batch() <= slots[1]
+            || e.max_ctx() < starts[1] + rows[1]
+            || e.pf_max_rows() < rows.iter().sum()
+        {
+            return Err("packed-check asset lacks B16 packed-prefill capacity".into());
+        }
+        let prompts: Vec<Vec<u32>> = starts
+            .iter()
+            .zip(rows)
+            .enumerate()
+            .map(|(request, (&start, rows))| {
+                (0..start + rows + 1)
+                    .map(|position| 100 + ((position * 17 + request * 101) % 1000) as u32)
+                    .collect()
+            })
+            .collect();
+        let inputs = synth(rows.iter().sum(), hidden);
+
+        let prepare = |e: &mut plowrt::exec::gpu::GpuEngine| {
+            for request in 0..slots.len() {
+                e.begin_slot(slots[request], prompts[request].len() + 1)?;
+                e.upload_activation("act.x", &synth(starts[request], hidden))?;
+                e.prefill_batched(&[PfBatchReq {
+                    slot: slots[request],
+                    prompt: &prompts[request],
+                    c0: 0,
+                    len: starts[request],
+                }])?;
+            }
+            Ok::<_, plowrt::RuntimeError>(())
+        };
+
+        prepare(e)?;
+        let mut reference = Vec::new();
+        let mut row0 = 0;
+        for request in 0..slots.len() {
+            let row1 = row0 + rows[request];
+            e.upload_activation("act.x", &inputs[row0 * hidden..row1 * hidden])?;
+            e.prefill_batched(&[PfBatchReq {
+                slot: slots[request],
+                prompt: &prompts[request],
+                c0: starts[request],
+                len: rows[request],
+            }])?;
+            reference.push(e.download_activation(out_name)?[..rows[request] * hidden].to_vec());
+            row0 = row1;
+        }
+        let ranges: Vec<_> = (0..slots.len())
+            .map(|request| (slots[request], starts[request], rows[request]))
+            .collect();
+        let reference_kv = snapshot_kv_requests(e, desc, &ranges)?;
+
+        prepare(e)?;
+        e.upload_activation("act.x", &inputs)?;
+        let requests: Vec<_> = (0..slots.len())
+            .map(|request| PfBatchReq {
+                slot: slots[request],
+                prompt: &prompts[request],
+                c0: starts[request],
+                len: rows[request],
+            })
+            .collect();
+        e.prefill_batched(&requests)?;
+        let packed = e.download_activation(out_name)?;
+        let mut row0 = 0;
+        for (request, expected) in reference.iter().enumerate() {
+            let row1 = row0 + rows[request];
+            compare_f32(
+                &format!("packed request {request} activation"),
+                &packed[row0 * hidden..row1 * hidden],
+                expected,
+                6.0e-3,
+                7.5e-2,
+            )?;
+            row0 = row1;
+        }
+        compare_bf16(
+            "packed sparse-slot KV",
+            &snapshot_kv_requests(e, desc, &ranges)?,
+            &reference_kv,
+            6.0e-3,
+            5.0e-2,
+        )?;
+        println!(
+            "packed-check: sparse slots 3/15, absolute starts 31/95, ragged rows 33/31 parity=PASS"
+        );
+        Ok(())
     }
 
     fn mixed_check(
@@ -335,6 +438,22 @@ mod cuda {
         prefill_rows: usize,
         prefill_position: usize,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let ranges: Vec<_> = (0..decode_rows)
+            .map(|slot| (slot, decode_position, 1))
+            .chain(std::iter::once((
+                decode_rows,
+                prefill_position,
+                prefill_rows,
+            )))
+            .collect();
+        snapshot_kv_requests(e, desc, &ranges)
+    }
+
+    fn snapshot_kv_requests(
+        e: &plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        ranges: &[(usize, usize, usize)],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let heads = usize::try_from(desc.dims.kv_heads.ok_or("block has no KV-head count")?)?;
         let head_dim = usize::try_from(desc.dims.head_dim.ok_or("block has no head dimension")?)?;
         let row_bytes = head_dim.checked_mul(2).ok_or("KV row size overflow")?;
@@ -349,14 +468,7 @@ mod cuda {
                     .ok_or_else(|| format!("missing carried-state tensor {name:?}"))?;
                 let slot_bytes = tensor_bytes / e.batch() as u64;
                 let head_bytes = slot_bytes / heads as u64;
-                for (slot, position, written_rows) in (0..decode_rows)
-                    .map(|slot| (slot, decode_position, 1))
-                    .chain(std::iter::once((
-                        decode_rows,
-                        prefill_position,
-                        prefill_rows,
-                    )))
-                {
+                for &(slot, position, written_rows) in ranges {
                     for head in 0..heads {
                         let offset = slot as u64 * slot_bytes
                             + head as u64 * head_bytes
