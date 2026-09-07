@@ -1307,9 +1307,7 @@ fn run_one_tick(
                     .iter()
                     .take(cap)
                     .filter_map(|slot| slot.as_ref())
-                    .filter(|slot| {
-                        slot.step == 0 && slot.pf_pos == 0 && !slot.respond.is_closed()
-                    })
+                    .filter(|slot| slot.step == 0 && slot.pf_pos == 0 && !slot.respond.is_closed())
                     .map(|slot| {
                         slot.prompt_ids
                             .len()
@@ -2961,9 +2959,7 @@ fn gpu_finish_token(
 
 #[cfg(feature = "cuda")]
 fn gpu_argmax_eligible(params: &crate::text::sample::SamplingParams) -> bool {
-    params.temperature <= 0.0
-        && params.repetition_penalty == 1.0
-        && params.logit_bias.is_empty()
+    params.temperature <= 0.0 && params.repetition_penalty == 1.0 && params.logit_bias.is_empty()
 }
 
 /// Incremental detokenize over a bounded window (TGI scheme): decode only

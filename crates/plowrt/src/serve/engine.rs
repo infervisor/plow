@@ -51,7 +51,8 @@ pub trait SeqEngine {
     fn prefill_turn(&self) -> usize;
     fn advance_prefill_turn(&mut self, slot: usize);
     fn prefill_prog_t(&self, prog: usize) -> Option<u32>;
-    fn packable_prefill_span(&self, slot: usize, max_rows: u32) -> Option<packet::dev::PrefillSpan>;
+    fn packable_prefill_span(&self, slot: usize, max_rows: u32)
+        -> Option<packet::dev::PrefillSpan>;
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()>;
     fn prefill_frontier(&self, slot: usize) -> Option<usize>;
     fn prefill_chunked_at_most(
@@ -1976,7 +1977,11 @@ impl SeqEngine for AmdServe {
     fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
         AmdServe::prefill_prog_t(self, prog)
     }
-    fn packable_prefill_span(&self, slot: usize, max_rows: u32) -> Option<packet::dev::PrefillSpan> {
+    fn packable_prefill_span(
+        &self,
+        slot: usize,
+        max_rows: u32,
+    ) -> Option<packet::dev::PrefillSpan> {
         AmdServe::packable_prefill_span(self, slot, max_rows)
     }
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()> {

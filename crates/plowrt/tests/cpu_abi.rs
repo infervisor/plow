@@ -22,15 +22,30 @@ fn ctx_layout_matches_c() {
     unsafe {
         assert_eq!(abi::plow_cpu_abi_sizeof_ctx(), size_of::<PlowCpuCtx>());
         assert_eq!(size_of::<PlowCpuCtx>(), 64, "PlowCpuCtx is one cache line");
-        assert_eq!(abi::plow_cpu_abi_offsetof_ctx_scratch(), offset_of!(PlowCpuCtx, scratch));
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_ctx_scratch(),
+            offset_of!(PlowCpuCtx, scratch)
+        );
         assert_eq!(
             abi::plow_cpu_abi_offsetof_ctx_scratch_bytes(),
             offset_of!(PlowCpuCtx, scratch_bytes)
         );
-        assert_eq!(abi::plow_cpu_abi_offsetof_ctx_worker(), offset_of!(PlowCpuCtx, worker));
-        assert_eq!(abi::plow_cpu_abi_offsetof_ctx_node(), offset_of!(PlowCpuCtx, node));
-        assert_eq!(abi::plow_cpu_abi_offsetof_ctx_isa(), offset_of!(PlowCpuCtx, isa));
-        assert_eq!(abi::plow_cpu_abi_offsetof_ctx_reserved(), offset_of!(PlowCpuCtx, reserved));
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_ctx_worker(),
+            offset_of!(PlowCpuCtx, worker)
+        );
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_ctx_node(),
+            offset_of!(PlowCpuCtx, node)
+        );
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_ctx_isa(),
+            offset_of!(PlowCpuCtx, isa)
+        );
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_ctx_reserved(),
+            offset_of!(PlowCpuCtx, reserved)
+        );
     }
 }
 
@@ -40,11 +55,26 @@ fn inst_layout_matches_c() {
     unsafe {
         assert_eq!(abi::plow_cpu_abi_sizeof_inst(), size_of::<DevInst64>());
         assert_eq!(size_of::<DevInst64>(), 64);
-        assert_eq!(abi::plow_cpu_abi_offsetof_inst_op(), offset_of!(DevInst64, op));
-        assert_eq!(abi::plow_cpu_abi_offsetof_inst_blocks(), offset_of!(DevInst64, blocks));
-        assert_eq!(abi::plow_cpu_abi_offsetof_inst_fj(), offset_of!(DevInst64, fj));
-        assert_eq!(abi::plow_cpu_abi_offsetof_inst_t(), offset_of!(DevInst64, t));
-        assert_eq!(abi::plow_cpu_abi_offsetof_inst_i(), offset_of!(DevInst64, i));
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_inst_op(),
+            offset_of!(DevInst64, op)
+        );
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_inst_blocks(),
+            offset_of!(DevInst64, blocks)
+        );
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_inst_fj(),
+            offset_of!(DevInst64, fj)
+        );
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_inst_t(),
+            offset_of!(DevInst64, t)
+        );
+        assert_eq!(
+            abi::plow_cpu_abi_offsetof_inst_i(),
+            offset_of!(DevInst64, i)
+        );
     }
 }
 
@@ -102,7 +132,10 @@ fn nop_dispatch_is_consistent_with_has() {
         assert!(ffi::kernel(NOP).is_none());
         // SAFETY: exec must reject without touching operands.
         assert!(unsafe { ffi::exec(&inst, 0, 1, &tensors, &mut ctx) }.is_err());
-        assert_eq!(KernelTable::resolve([NOP].into_iter()).unwrap_err(), vec![NOP]);
+        assert_eq!(
+            KernelTable::resolve([NOP].into_iter()).unwrap_err(),
+            vec![NOP]
+        );
     }
     // Unknown ops are never present, in either library.
     assert!(!ffi::has(0xFFFE));

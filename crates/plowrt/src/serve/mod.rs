@@ -3,12 +3,12 @@
 pub mod bench;
 pub mod chat;
 pub mod completion;
+#[cfg(feature = "cpu")]
+pub mod cpu_serve;
 /// The loaded device engine behind a slug, as one type over both backends —
 /// the seam that lets `serve` stop being CUDA-only.
 #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
 pub mod engine;
-#[cfg(feature = "cpu")]
-pub mod cpu_serve;
 #[cfg(feature = "cuda")]
 pub mod manager;
 pub mod models;

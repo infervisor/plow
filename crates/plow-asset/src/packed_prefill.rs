@@ -21,8 +21,7 @@ fn downstream_merge(insts: &[DevInst64], pc: usize) -> Result<&DevInst64> {
     let mut merges = insts[pc + 1..]
         .iter()
         .take_while(|m| {
-            !(m.op == DevOp::FlashPrefill as u16
-                && m.t[..2].iter().any(|h| d.t[..2].contains(h)))
+            !(m.op == DevOp::FlashPrefill as u16 && m.t[..2].iter().any(|h| d.t[..2].contains(h)))
         })
         .filter(|m| m.op == DevOp::FlashMerge as u16 && m.t[1] == d.t[0] && m.t[2] == d.t[1]);
     let merge = merges

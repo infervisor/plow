@@ -16,8 +16,7 @@ fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
     let mut args = std::env::args().skip(1);
@@ -49,9 +48,18 @@ fn main() {
     ids.truncate(n_prompt);
 
     let mut eng = CpuEngine::load(&blob, &ckpt, &opts).expect("load");
-    println!("engine: isa={:?} threads={} n_cu={}", eng.isa, eng.threads, eng.model().blob.n_cu);
+    println!(
+        "engine: isa={:?} threads={} n_cu={}",
+        eng.isa,
+        eng.threads,
+        eng.model().blob.n_cu
+    );
 
-    let report = |title: &str, evs: &[TraceEv], insts: &[packet::dev::DevInst64], wall_ms: f64, threads: usize| {
+    let report = |title: &str,
+                  evs: &[TraceEv],
+                  insts: &[packet::dev::DevInst64],
+                  wall_ms: f64,
+                  threads: usize| {
         // per op: count, busy sum, span (first start .. last end)
         let mut per_op: BTreeMap<u16, (usize, u64, u64, u64)> = BTreeMap::new();
         let mut per_worker = vec![0u64; threads.max(1)];
@@ -70,8 +78,14 @@ fn main() {
             t_max = t_max.max(e.t1_ns);
         }
         let traced_ms = (t_max.saturating_sub(t_min)) as f64 / 1e6;
-        println!("\n== {title}: wall {wall_ms:.1} ms, traced span {traced_ms:.1} ms, {} packets", evs.len());
-        println!("{:<28} {:>7} {:>10} {:>10} {:>9}", "op", "packets", "busy ms", "busy/thr", "span ms");
+        println!(
+            "\n== {title}: wall {wall_ms:.1} ms, traced span {traced_ms:.1} ms, {} packets",
+            evs.len()
+        );
+        println!(
+            "{:<28} {:>7} {:>10} {:>10} {:>9}",
+            "op", "packets", "busy ms", "busy/thr", "span ms"
+        );
         let mut rows: Vec<_> = per_op.iter().collect();
         rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
         for (op, (n, busy, t0, t1)) in rows {
@@ -120,18 +134,28 @@ fn main() {
             kv_v[s] = pos + 1;
         }
         let dp = eng.model().decode_prog_for(bb);
-        let _ = eng.decode_step_batched_at(&pos_v, &kv_v, &id_v, dp).expect("warm decode");
+        let _ = eng
+            .decode_step_batched_at(&pos_v, &kv_v, &id_v, dp)
+            .expect("warm decode");
         for s in 0..bb {
             pos_v[s] += 1;
             kv_v[s] += 1;
         }
         trace_begin();
         let t = Instant::now();
-        let out = eng.decode_step_batched_at(&pos_v, &kv_v, &id_v, dp).expect("decode");
+        let out = eng
+            .decode_step_batched_at(&pos_v, &kv_v, &id_v, dp)
+            .expect("decode");
         let wall = t.elapsed().as_secs_f64() * 1e3;
         let evs = trace_take();
         let insts = eng.model().blob.progs[dp].insts.clone();
-        report(&format!("decode step B={bb} (rung program {dp})"), &evs, &insts, wall, eng.threads);
+        report(
+            &format!("decode step B={bb} (rung program {dp})"),
+            &evs,
+            &insts,
+            wall,
+            eng.threads,
+        );
         println!("tokens: first {first} next {:?}", &out[..bb]);
         return;
     }
@@ -144,7 +168,10 @@ fn main() {
     let evs = trace_take();
     let insts = eng.model().decode_prog().insts.clone();
     report("decode step", &evs, &insts, wall, eng.threads);
-    println!("tokens: first {first} next {next} {:?}", tok.decode(&[first, next]));
+    println!(
+        "tokens: first {first} next {next} {:?}",
+        tok.decode(&[first, next])
+    );
 }
 
 #[cfg(not(feature = "cpu"))]
