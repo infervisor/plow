@@ -108,6 +108,24 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MX4_HEAD")]
     pub mx4_head: Option<String>,
 
+    /// MXFP4 dense PREFILL: route the tiled projection GEMMs (and the fused gate|up GLU) at the
+    /// fp4 rungs instead of the bf16 ones. "1"/"0" to force; DEFAULT ON under --mxfp4 on gfx950
+    /// and the CPU tier, OFF on sm_90a/sm_120a (no fp4 prefill kernel there — see
+    /// `mx4_prefill_on`).
+    ///
+    /// This is what makes an mxfp4 blob actually SMALLER than its bf16 original. With decode on
+    /// GEMV_MXFP4 and prefill on the plain bf16 GEMM the blob had to declare BOTH forms of every
+    /// projection: Gemma-4-12B's fp4 twin measured 34.7 GiB resident against its own bf16 build's
+    /// 28.5 — a 4-bit configuration using MORE memory than 16-bit. With prefill on the fp4 rungs
+    /// the bf16 projections are dead and the emitter stops declaring them, exactly as the fp8 axis
+    /// already does: 14.3 GiB, and a -26%..-33% CPU TTFT because a dense prefill streams the whole
+    /// weight set once per chunk.
+    ///
+    /// Prefill answers change (it is the quantized weight now), so this is not bit-identical to
+    /// a bf16-prefill blob — the model already carries that error at decode.
+    #[arg(long, env = "PLOW_MX4_PREFILL")]
+    pub mx4_prefill: Option<String>,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Scheduling / segmentation
     // ──────────────────────────────────────────────────────────────────────────
@@ -805,6 +823,7 @@ impl EmitConfig {
             fp8_kv_full: env_bool("PLOW_FP8_KV_FULL"),
             fp8_head: env_bool("PLOW_FP8_HEAD"),
             mx4_head: env_str("PLOW_MX4_HEAD"),
+            mx4_prefill: env_str("PLOW_MX4_PREFILL"),
             uniseg: env_bool("PLOW_UNISEG"),
             emit_packed_prefill: env_bool("PLOW_EMIT_PACKED_PREFILL"),
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on

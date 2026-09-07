@@ -10,6 +10,16 @@ G_K(g_gemv_mxfp4);
 /* gptoss.c: fused gate|up GEMV+GLU (op 92): t0=C t1=x t2=Wg t5=Wu t3=Sg t4=Su i0=M i1=N i2=K
  * i5=act (0 GeGLU tanh, 1 SwiGLU). C = act(g) * u; the mxfp4 twin of GEMV_GLU_FP8. */
 G_K(g_gemv_glu_mxfp4);
+/* gptoss.c: MXFP4 (w4a16) PREFILL GEMM family — the bf16 GEMM tile rungs one encoding over.
+ * t0=C t1=A t2=W(fp4) t3=wscale(e8m0) t7=bias?  i0=M i1=N i2=K i4=a_row0 i5=c_row0. */
+G_K(g_gemm_mxfp4);
+G_K(g_gemm_med_mxfp4);
+G_K(g_gemm_small_mxfp4);
+G_K(g_gemm_wide_mxfp4);
+G_K(g_gemm_c5_mxfp4);
+/* gptoss.c: fused gate|up prefill GEMM+GLU (op 113), the T-row twin of g_gemv_glu_mxfp4.
+ * t0=fu t1=A t2=Wg t5=Wu t3=Sg t4=Su  i0=M i1=N i2=K i5=act. */
+G_K(g_gemm_glu_mxfp4);
 
 /* moe.c — routing table entry (dev_isa.h: {u32 eid, f32 gate}, PLOW_EXPERT_UNUSED = skip). */
 typedef struct {

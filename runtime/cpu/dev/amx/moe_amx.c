@@ -267,28 +267,11 @@ extern plow_mx_vlut plow_v_mx_lut; /* avx512/gptoss.c */
  * unpack serves every token block of that expert. The per-tile-load variant below (dot_block_mx)
  * re-unpacks the whole expert matrix for each 32-token block, and the unpack is ~3x the tile work,
  * so at prefill widths (64+ rows per expert) hoisting it here is the difference between MoE prefill
- * being unpack-bound and tile-bound. Same math as stage_mx4_rows, strided output. */
+ * being unpack-bound and tile-bound. The decode itself is mxfp4_common.h's, shared with the dense
+ * w4a16 prefill GEMM (amx/gemm_amx.c), which hoists it for the same reason. */
 static void dequant_strip(plow_bf16* out, size_t ldo, const uint8_t* W, size_t rs, const uint8_t* S,
                           size_t ss, uint32_t rows, uint32_t nkb) {
-    const __m512i il = _mm512_set_epi16(47, 15, 46, 14, 45, 13, 44, 12, 43, 11, 42, 10, 41, 9, 40, 8,
-                                        39, 7, 38, 6, 37, 5, 36, 4, 35, 3, 34, 2, 33, 1, 32, 0);
-    const __m512i mag = _mm512_set1_epi16(0x7FFF);
-    for (uint32_t r = 0; r < rows; r++) {
-        const uint8_t* w = W + (size_t)r * rs;
-        const uint8_t* sc = S + (size_t)r * ss;
-        plow_bf16* o = out + (size_t)r * ldo;
-        for (uint32_t kb = 0; kb < nkb; kb++) {
-            const __m512i b = _mm512_cvtepu8_epi16(
-                _mm256_zextsi128_si256(_mm_loadu_si128((const __m128i*)(w + (size_t)kb * 16u))));
-            const __m512i ev = _mm512_permutexvar_epi16(b, plow_v_mx_lut.lut);
-            const __m512i od = _mm512_permutexvar_epi16(_mm512_srli_epi16(b, 4), plow_v_mx_lut.lut);
-            __m512i v = _mm512_permutex2var_epi16(ev, il, od);
-            const int e = (int)sc[kb] - 127;
-            const __mmask32 nz = _mm512_test_epi16_mask(v, mag);
-            v = _mm512_mask_add_epi16(v, nz, v, _mm512_set1_epi16((short)(e << 7)));
-            _mm512_storeu_si512((void*)(o + (size_t)kb * 32u), v);
-        }
-    }
+    plow_mx_dequant_strip(&plow_v_mx_lut, out, ldo, W, rs, S, ss, rows, nkb);
 }
 
 /* Take up to `cap` live rows of segment [*r, rend) (key == UNUSED is padding). */

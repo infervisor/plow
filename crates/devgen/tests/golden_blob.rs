@@ -715,6 +715,55 @@ fn w8a8_is_emitted_where_it_exists_and_refused_where_it_does_not() {
     );
 }
 
+/// The defect `PLOW_MX4_PREFILL` closes: an mxfp4 blob that declares BOTH encodings of every
+/// projection, because decode consumed the fp4 twin and prefill the bf16 original. Measured on
+/// Gemma-4-12B before this — 34.7 GiB resident against 28.5 GiB for the same model built plain
+/// bf16, i.e. a 4-bit configuration using MORE memory than 16-bit; after, 14.3 GiB. The property
+/// that fixes it is structural, so it is pinned here rather than left to a byte-hash: with prefill
+/// at fp4 the bf16 projection name must be GONE from the blob, and the opt-out must bring it back.
+#[test]
+fn a_mxfp4_prefill_drops_the_bf16_projection_twins() {
+    let _g = emit_guard();
+    let dir = tempdir("mx4_prefill_gemma");
+    write_gemma_config(&dir);
+    let has = |b: &[u8], n: &str| b.windows(n.len()).any(|w| w == n.as_bytes());
+    let both = {
+        let _e = EnvScope::set(&[("PLOW_MXFP4", "1"), ("PLOW_MX4_PREFILL", "0")]);
+        emit(&dir, 512, 128, 1)
+    };
+    let fp4_only = {
+        let _e = EnvScope::set(&[("PLOW_MXFP4", "1")]);
+        emit(&dir, 512, 128, 1)
+    };
+    for n in [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+    ] {
+        assert!(
+            has(&both, n),
+            "PLOW_MX4_PREFILL=0 keeps prefill on bf16, so {n} must still be bound"
+        );
+        assert!(
+            has(&fp4_only, &format!("mxfp4/{n}")),
+            "the fp4 twin {n} must be bound in both directions"
+        );
+        // The bf16 name is a SUBSTRING of the twin's, so test the twin-stripped blob.
+        let stripped: Vec<u8> = String::from_utf8_lossy(&fp4_only)
+            .replace(&format!("mxfp4/{n}"), "")
+            .into_bytes();
+        assert!(
+            !has(&stripped, n),
+            "prefill at fp4 makes the bf16 {n} dead; declaring it is the memory defect"
+        );
+    }
+    assert!(
+        fp4_only.len() < both.len(),
+        "dropping an encoding must shrink the tensor table"
+    );
+}
+
 /// `PLOW_MX4_HEAD` splits a TIED embedding: the `Embed` lookup keeps the bf16 table (one 7.7 KB
 /// row per token — its bandwidth is irrelevant) while the decode lm_head GEMV reads an MXFP4
 /// twin. Three parties must agree on the twin's spelling — this emitter, `quantize_mxfp4.py`,

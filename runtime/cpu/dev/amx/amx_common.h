@@ -50,6 +50,13 @@ typedef struct {
     const plow_bf16* Wu; /* GLU up weight, else NULL */
     const uint8_t* Wq;   /* fp8 e4m3 weight (dequantized into the B strip while packing) */
     const uint8_t* Wuq;  /* fp8 GLU up weight */
+    /* MXFP4 (w4a16) prefill: e2m1 rows (K/2 B) + their E8M0 scale rows (K/32 B). The pack-free
+     * driver dequantizes one 32-row strip per K panel into scratch and runs the ordinary bf16
+     * tiles over it; NULL off the fp4 path. Wu4/Su4 are the GLU up matrix, as Wu is for bf16. */
+    const uint8_t* W4;
+    const uint8_t* S4;
+    const uint8_t* Wu4;
+    const uint8_t* Su4;
     const float* ws;     /* fp8 per-output-channel scale [N], applied in the epilogue */
     const float* us;     /* fp8 GLU up scale [N] */
     const float* rms;    /* GEMM_NORM */

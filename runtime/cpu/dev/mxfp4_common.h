@@ -263,6 +263,35 @@ static inline __attribute__((always_inline)) void plow_mx_dot_rm(
                 plow_mx_dot_rm(v, W + r * ldw, ldw, S + r * lds, lds,                             \
                                (const plow_bf16*)XP + m * ldx, ldx, K, 1, 1, I16_, out + r * M + m);
 
+/* Dequantize `rows` MXFP4 weight rows (32 * nkb wide) into a bf16 buffer with row stride `ldo`
+ * elements. The E8M0 scale folds into the bf16 EXPONENT (an MX scale is a power of two, so the
+ * fold is exact and the result feeds a plain bf16 matmul with no per-block epilogue). Shared by
+ * the MoE grouped prefill and the dense w4a16 prefill GEMM, both of which unpack a strip once and
+ * then run many token blocks over it. */
+static inline void plow_mx_dequant_strip(const plow_mx_vlut* v, plow_bf16* out, size_t ldo,
+                                         const uint8_t* W, size_t rs, const uint8_t* S, size_t ss,
+                                         uint32_t rows, uint32_t nkb) {
+    const __m512i il = _mm512_set_epi16(47, 15, 46, 14, 45, 13, 44, 12, 43, 11, 42, 10, 41, 9, 40, 8,
+                                        39, 7, 38, 6, 37, 5, 36, 4, 35, 3, 34, 2, 33, 1, 32, 0);
+    const __m512i mag = _mm512_set1_epi16(0x7FFF);
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint8_t* w = W + (size_t)r * rs;
+        const uint8_t* sc = S + (size_t)r * ss;
+        plow_bf16* o = out + (size_t)r * ldo;
+        for (uint32_t kb = 0; kb < nkb; kb++) {
+            const __m512i b = _mm512_cvtepu8_epi16(
+                _mm256_zextsi128_si256(_mm_loadu_si128((const __m128i*)(w + (size_t)kb * 16u))));
+            const __m512i ev = _mm512_permutexvar_epi16(b, v->lut);
+            const __m512i od = _mm512_permutexvar_epi16(_mm512_srli_epi16(b, 4), v->lut);
+            __m512i z = _mm512_permutex2var_epi16(ev, il, od);
+            const int e = (int)sc[kb] - 127;
+            const __mmask32 nz = _mm512_test_epi16_mask(z, mag);
+            z = _mm512_mask_add_epi16(z, nz, z, _mm512_set1_epi16((short)(e << 7)));
+            _mm512_storeu_si512((void*)(o + (size_t)kb * 32u), z);
+        }
+    }
+}
+
 /* Row block width for M activation rows (register budget: 2*RB*M + 2*RB + 3 <= 32). */
 static inline uint32_t plow_mx_rb_for(uint32_t M) { return M <= 2u ? 4u : M <= 4u ? 2u : 1u; }
 
