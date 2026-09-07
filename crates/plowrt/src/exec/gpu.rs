@@ -7540,9 +7540,10 @@ mod prefill_patch_tests {
     #[ignore = "GPU Gemma direct-KV block qualification; root-owned launch only"]
     fn packed_segmented_block_matches_serialized() -> Result<()> {
         assert_eq!(std::env::var("TEST_PACKED_PREFILL_GPU").as_deref(), Ok("1"));
-        assert_ne!(std::env::var("PLOW_PF_BATCH").as_deref(), Ok("1"));
-        assert_ne!(std::env::var("PLOW_VMM_PREFIX").as_deref(), Ok("1"));
-        let live_requested = std::env::var("PLOW_VMM_LIVE").as_deref() == Ok("1");
+        let config = crate::config::RuntimeConfig::get();
+        assert!(!config.nv.pf_batch);
+        assert!(!config.nv_vmm_prefix());
+        let live_requested = config.nv_vmm_live();
         let assets = std::path::PathBuf::from(std::env::var("TEST_PACKED_PREFILL_ASSETS").unwrap());
         let bytes = std::fs::read(assets.join("model.pkt")).unwrap();
         let blob = DevBlob::parse(&bytes).unwrap();
