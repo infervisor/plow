@@ -100,6 +100,58 @@ impl ChatTemplate {
                 msg,
             ))
         });
+        // PYTHON STRING METHODS. HF templates are written for Jinja2 running on
+        // Python, so they call real `str` methods on content — GLM's calls
+        // `.strip()` on an assistant turn. minijinja has filters, not methods,
+        // so without this an ordinary multi-turn conversation fails to render
+        // with "string has no method named strip".
+        env.set_unknown_method_callback(|_state, value, method, args| {
+            use minijinja::value::from_args;
+            let Some(s) = value.as_str() else {
+                return Err(minijinja::Error::from(
+                    minijinja::ErrorKind::UnknownMethod,
+                ));
+            };
+            match method {
+                "strip" => {
+                    let () = from_args(args)?;
+                    Ok(Value::from(s.trim()))
+                }
+                "lstrip" => {
+                    let () = from_args(args)?;
+                    Ok(Value::from(s.trim_start()))
+                }
+                "rstrip" => {
+                    let () = from_args(args)?;
+                    Ok(Value::from(s.trim_end()))
+                }
+                "startswith" => {
+                    let (p,): (&str,) = from_args(args)?;
+                    Ok(Value::from(s.starts_with(p)))
+                }
+                "endswith" => {
+                    let (p,): (&str,) = from_args(args)?;
+                    Ok(Value::from(s.ends_with(p)))
+                }
+                "lower" => {
+                    let () = from_args(args)?;
+                    Ok(Value::from(s.to_lowercase()))
+                }
+                "upper" => {
+                    let () = from_args(args)?;
+                    Ok(Value::from(s.to_uppercase()))
+                }
+                "split" => {
+                    let (sep,): (Option<&str>,) = from_args(args)?;
+                    let parts: Vec<Value> = match sep {
+                        Some(sep) => s.split(sep).map(Value::from).collect(),
+                        None => s.split_whitespace().map(Value::from).collect(),
+                    };
+                    Ok(Value::from(parts))
+                }
+                _ => Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod)),
+            }
+        });
         // `tojson` under a different spelling, used by tool-calling templates.
         env.add_filter("tojson", |v: Value| -> Result<String, minijinja::Error> {
             serde_json::to_string(&v)
@@ -175,6 +227,28 @@ mod tests {
             "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are helpful.\
              <|user|>Hi there<|assistant|><think>"
         );
+    }
+
+    /// A MULTI-TURN conversation, which is what exercises the Python string
+    /// methods HF templates call (`content.strip()` on an assistant turn).
+    /// Without them minijinja fails the whole render with "string has no method
+    /// named strip" and every conversation with history 400s.
+    #[test]
+    fn a_multi_turn_conversation_renders() {
+        let dir = std::path::Path::new("/workspace/models/GLM-5.3-FP8");
+        if !dir.join("chat_template.jinja").exists() {
+            eprintln!("skipped: no GLM-5.3 checkpoint on this host");
+            return;
+        }
+        let t = ChatTemplate::load(dir).expect("template compiles");
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "one"}),
+            serde_json::json!({"role": "assistant", "content": "two"}),
+            serde_json::json!({"role": "user", "content": "three"}),
+        ];
+        let out = t.render(&msgs).expect("multi-turn renders");
+        assert!(out.contains("<|assistant|>"), "{out}");
+        assert!(out.ends_with("<|assistant|><think>"), "{out}");
     }
 
     /// A checkpoint with no template must return `None`, not panic — that is

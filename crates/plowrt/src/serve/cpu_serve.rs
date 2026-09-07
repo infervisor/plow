@@ -117,7 +117,7 @@ impl CpuServe {
             return Err(RuntimeError::Rejected("empty prompt".into()));
         }
         if prompt.len() >= self.max_ctx {
-            return Err(RuntimeError::Rejected(format!(
+            return Err(RuntimeError::ContextLength(format!(
                 "prompt is {} tokens, max_ctx is {}",
                 prompt.len(),
                 self.max_ctx
