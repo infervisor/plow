@@ -478,6 +478,7 @@ option(PLOW_SM120_CUBIN "Emit the sm_120a .cubin artifacts `plowrt serve` loads"
 option(PLOW_SM90A_CUBIN "Emit the sm_90a .cubin artifacts `plowrt serve` loads" OFF)
 option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants (all enabled arches)" OFF)
 option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2) segmented prefill cubins" OFF)
+option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented prefill pairs" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -553,10 +554,14 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # __maxnreg__(128) for occ-2 (2 blocks/SM).
     set(_ax_seg_fat -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1)
     set(_ax_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1)
+    set(_ax_packed_seg_fat -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_PACKED_REQUEST=1)
+    set(_ax_packed_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPLOW_NV_PACKED_REQUEST=1)
     if(PLOW_NV_PF_GEMV_HEAD)
         list(APPEND _ax_prefill -DPLOW_NV_PF_GEMV_HEAD=1)
         list(APPEND _ax_seg_fat -DPLOW_NV_PF_GEMV_HEAD=1)
         list(APPEND _ax_seg_gemm -DPLOW_NV_PF_GEMV_HEAD=1)
+        list(APPEND _ax_packed_seg_fat -DPLOW_NV_PF_GEMV_HEAD=1)
+        list(APPEND _ax_packed_seg_gemm -DPLOW_NV_PF_GEMV_HEAD=1)
     endif()
     # AXIS 2 — bf16 KV vs fp8 (e4m3) KV. On the PREFILL side fp8-KV also fixes the
     # staging arm, and it comes from the OPTION, never a literal: FLASH_PREFILL_FP8
@@ -615,7 +620,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
                 "${_vstem}_fp8kv|${_ksym_dec}|_ax_decode|_ax_fp8kv"
                 "${_vstem}_pf_fp8kv|${_ksym_pf}|_ax_prefill|_ax_fp8kv_pf")
         endif()
-        if(PLOW_SM120_CUBIN_SEG)
+        if(PLOW_SM120_CUBIN_SEG OR PLOW_CUBIN_PACKED_PREFILL)
             string(LENGTH "${_vstem}_pfseg" _len_pfseg)
             string(LENGTH "${_vstem}_pfgemm" _len_pfgemm)
             set(_ksym_pfseg "_Z${_len_pfseg}${_vstem}_pfseg11PlowProgram")
@@ -623,6 +628,15 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(APPEND _cubin_rows
                 "${_vstem}_pfseg|${_ksym_pfseg}|_ax_seg_fat|"
                 "${_vstem}_pfgemm|${_ksym_pfgemm}|_ax_seg_gemm|")
+        endif()
+        if(PLOW_CUBIN_PACKED_PREFILL)
+            string(LENGTH "${_vstem}_pfpackedseg" _len_pfpackedseg)
+            string(LENGTH "${_vstem}_pfpackedgemm" _len_pfpackedgemm)
+            set(_ksym_pfpackedseg "_Z${_len_pfpackedseg}${_vstem}_pfpackedseg11PlowProgram")
+            set(_ksym_pfpackedgemm "_Z${_len_pfpackedgemm}${_vstem}_pfpackedgemm11PlowProgram")
+            list(APPEND _cubin_rows
+                "${_vstem}_pfpackedseg|${_ksym_pfpackedseg}|_ax_packed_seg_fat|"
+                "${_vstem}_pfpackedgemm|${_ksym_pfpackedgemm}|_ax_packed_seg_gemm|")
         endif()
 
         foreach(_row ${_cubin_rows})
@@ -651,7 +665,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # defines, so it is not a row in the table above. A failure here is non-fatal:
     # serving falls back to host sampling (hence `optional`).
     set(_smp_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/sample_sm120.cu")
-    if(PLOW_SM120_CUBIN AND EXISTS "${_smp_src}")
+    if((PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN) AND EXISTS "${_smp_src}")
         set(_smp_out "${PLOW_CUBIN_DIR}/sample_sm120.cubin")
         add_custom_command(OUTPUT "${_smp_out}"
             COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_smp_out}" plow_sample optional

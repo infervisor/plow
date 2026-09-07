@@ -149,9 +149,8 @@ struct Cli {
     #[arg(long)]
     block: Option<String>,
 
-    /// devblob+cubin: also build segmented prefill cubins (_pfseg, _pfgemm).
-    /// Implies NOT setting PLOW_UNISEG=1, so the emitted programs carry
-    /// wave-class segments the SegPf runtime dispatches per-class.
+    /// devblob+cubin: force segmented prefill cubins (_pfseg, _pfgemm).
+    /// Segmented packet manifests select these objects automatically.
     #[arg(long)]
     segmented: bool,
 
@@ -1474,7 +1473,10 @@ fn build_cubin_from_manifest(
     if req.iter().any(|d| d.starts_with("PLOW_NV_PF_GEMV_HEAD")) {
         args.push("-DPLOW_NV_PF_GEMV_HEAD=ON".into());
     }
-    if segmented {
+    if let Some(option) = packed_prefill_cubin_option(&man) {
+        args.push(option.into());
+    }
+    if segmented || manifest_requires_segmented_prefill(&man) {
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
     let mut extra = Vec::new();
@@ -1538,6 +1540,29 @@ fn effective_uniseg(arch: &str, configured: bool, segmented: bool, env_present: 
 
 fn cubin_config_option(config: &Path) -> String {
     format!("-DPLOW_CUBIN_CONFIG={}", config.display())
+}
+
+fn packed_prefill_cubin_option(manifest: &serde_json::Value) -> Option<&'static str> {
+    manifest
+        .pointer("/objects/packed_prefill/required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        .then_some("-DPLOW_CUBIN_PACKED_PREFILL=ON")
+}
+
+fn manifest_requires_segmented_prefill(manifest: &serde_json::Value) -> bool {
+    manifest
+        .get("programs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|programs| {
+            programs.iter().any(|program| {
+                program.get("kind").and_then(serde_json::Value::as_str) == Some("prefill")
+                    && program
+                        .get("segment")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|segment| segment > 0)
+            })
+        })
 }
 
 fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
@@ -2236,6 +2261,36 @@ mod cli_tests {
             cubin_config_option(&pkt.with_file_name("plow_config.h")),
             "-DPLOW_CUBIN_CONFIG=/tmp/model-assets/plow_config.h"
         );
+    }
+
+    #[test]
+    fn cubin_build_adds_packed_object_only_for_packed_topology() {
+        let packed = serde_json::json!({
+            "objects": { "packed_prefill": { "required": true } }
+        });
+        assert_eq!(
+            packed_prefill_cubin_option(&packed),
+            Some("-DPLOW_CUBIN_PACKED_PREFILL=ON")
+        );
+        assert_eq!(packed_prefill_cubin_option(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn segmented_prefill_objects_follow_the_packet_manifest() {
+        let segmented = serde_json::json!({
+            "programs": [
+                {"kind": "prefill", "segment": 0},
+                {"kind": "prefill", "segment": 1},
+                {"kind": "decode", "segment": 2}
+            ]
+        });
+        assert!(manifest_requires_segmented_prefill(&segmented));
+        assert!(!manifest_requires_segmented_prefill(&serde_json::json!({
+            "programs": [
+                {"kind": "prefill", "segment": 0},
+                {"kind": "decode", "segment": 1}
+            ]
+        })));
     }
 
     #[test]
