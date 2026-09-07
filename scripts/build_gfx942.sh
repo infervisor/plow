@@ -637,6 +637,15 @@ fi
 # is only reached when the packet arms i[5]); a new blob on a PRE-ARM object is a LOUD refusal.
 if [ "${PLOW_MOE_PF_DET:-1}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_DET=${PLOW_MOE_PF_DET:-1}"
+  # THE DECODE ROW NEEDS IT TOO ONCE A DECODE BATCH IS COMPILED IN, for exactly the reason
+  # $AX_MOE is added to $AX_DECODE above: at rows>1 the GLM decode program emits its MoE seam
+  # with the grouped PREFILL family (ops 83-87), so op 86/87's deterministic arm is reached from
+  # the DECODE object. Without this a blob emitted PLOW_MOE_PF_DET=1 is refused at load —
+  # "requires PLOW_MOE_PF_DET=1 but the DECODE object was built WITHOUT it" — which is what a
+  # GLM-5.3 TP4 serve did here on its first attempt.
+  if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
+    AX_DECODE="$AX_DECODE -DPLOW_MOE_PF_DET=${PLOW_MOE_PF_DET:-1}"
+  fi
 fi
 
 # CEILING INSTRUMENT ONLY (PLOW_MLA_PF2_ABL=1..4): the V2 MLA prefill's ablation probes —
