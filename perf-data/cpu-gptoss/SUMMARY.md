@@ -293,3 +293,69 @@ Two notes for later. Reducing decode further needs fewer bytes, not faster kerne
 already 4-bit. And the `FA_GF=2` head pairing computes `hkv = h0 / gqa` for both heads of a pair,
 which is wrong for MHA (`gqa == 1`); no local checkpoint is MHA (Gemma-4 is gqa 2 and 4, GPT-OSS is 8)
 so it is latent, and the GQA fold guards itself to `ng=1` there.
+
+## Long-prompt prefill: the AMX GEMM had an L2 capacity knee (commit 6ad987a)
+
+Profiling at 512 vs 1024 tokens showed GEMM scaling 2.82x for 2x the tokens, where a dense GEMM
+should be linear. That anomaly is invisible at 512 tokens, which is why earlier profiles missed it,
+and it lands exactly at the prompt lengths where we lose cells to vLLM.
+
+It was not a bucket-ladder artifact: the T=128/512/1024 programs are the same shape (413 insts,
+6281 slices, 120 GEMM insts x 16 slices) and differ only in M. In an isolated harness the per-token
+cost is flat to M=512 then steps: 3.24 / 3.26 / 4.11 / 4.47 / 4.91 us/tok at M=256/512/768/1024/1536.
+
+**Cause.** `wm_run` sized its token chunk against the 8 MiB scratch only. The packed x panel is
+2 KiB/token, so x plus the fp32 partials crossed the 2 MiB private L2 between M=512 (1.5 MiB) and
+M=768 (2.25 MiB) -- exactly the knee. Decomposed with `PLOW_AMX_DEBUG`, the x-pack scaled linearly
+(0.554 -> 1.055 ms) while the TDP loop went 4.0x for 2x tokens (0.756 -> 2.998 ms): both tile
+operands had started coming from L3.
+
+**Fix.** Bound the token chunk so x + partials + the slice's W panel stay under 3/4 of L2, and split
+M evenly across chunks (a ragged tail otherwise paid a whole extra W pass for a few tokens). The
+extra W pass per chunk is an L3 hit -- one op's W is 23.6 MB against a 260 MB L3 -- far cheaper than
+the L2 miss it replaces. Budget swept on the real model: baseline / 2.0 / 1.5 / 1.25 MiB gave GEMM
+294.9 / 223.7 / 217.7 / 225.5 ms/thr.
+
+Verified here at 1024 tokens: GEMM 306.1 -> 245.1 ms/thr, prefill wall 1860.5 -> 1765.2 ms. Decode
+is unchanged (the decode program contains no GEMM op) and output is bit-identical, since chunking
+reorders no output tile's K accumulation. C suite 12/12, Rust suite green.
+
+### It does not close the summarize cell, and the arithmetic says why
+
+summarize TTFT at c=1 is the one lost cell with NO interference component, so it is pure prefill
+speed. After this fix we run 1024 tokens in 1765 ms = 580 tok/s, against vLLM's 1111 tokens in
+1829 ms = 607 tok/s. We are 4.7% slower on raw rate. Our prefill COMPUTE alone for that prompt
+(the 1024 bucket plus the 128 bucket) is about 1986 ms, already more than vLLM's entire 1829 ms
+TTFT, so no amount of serve-overhead removal can close this cell. It needs real prefill speed.
+
+Where the remaining time is at 1024 tokens: MoE 928 ms/thr (57%), FLASH_PREFILL 264 (16%),
+GEMM 245 (15%).
+
+### Attention on AMX: measured and rejected
+
+A roofline correction first: **VDPBF16PS is 1/cycle on this part, not 2.** Measured 105.3 GMAC/s per
+core; calibrating against vfmadd132ps (known 2/cycle) shows the core turbos to ~3.56 GHz. Assuming
+2/cycle at 2.3 GHz overstates the ceiling by 2x. Accounting for the shuffles PV actually issues
+(4 dpbf16 plus 2 vpunpck, which cost 44% by contending for port 5) gives a realistic ceiling of
+75.2 GMAC/s. FLASH_PREFILL achieves 42.6 GMAC/s at the real shape, i.e. **57% of that ceiling, not
+the 21% a naive roofline suggests.**
+
+* `FA_RB` sweep (2/4/6/8/12/16, bit-exact): 2 is 12% worse, 4 through 16 all within 2%. So it is not
+  latency-bound on the 4-row softmax chain and widening the register-resident state buys nothing.
+* `FA_BQ_TILE` sweep (128/64/32): 128 is best for causal layers. 64 helps the sliding-window layers
+  by 9%, but those are only ~4 ms/thr of 232, inside noise, and it costs 3% on causal. The apparent
+  2x window overcompute is not real: `v_pf_block` already skips fully-masked blocks, so true
+  overcompute is ~1.25x.
+* AMX is the only real lever (TDPBF16PS is 13.9x vdpbf16ps per core) but 43% of the kernel is
+  already non-MAC work -- online softmax, K^T build, masking, loads -- so even a free MAC unit caps
+  the win at ~2.3x on 15% of prefill, about 7% of wall, for a change that cannot be bit-exact (P
+  must be bf16 for the PV tile op) and that needs the 4-row softmax restructured to feed 16- or
+  32-row tiles. Not attempted.
+
+### Identified, not taken
+
+`pack_x_panel` runs once per SLICE, so all 16 slices pack the same full M x K activation. It is
+25-38% of q_proj/o_proj time, and for kv_proj (N=512, one 32-column strip per slice) the pack is
+~3x the strip's compute, which is why kv_proj gets 281 GFLOP/s/core against q_proj's 900. Splitting
+the slice over M rather than N whenever N < M makes the pack 1x instead of 16x. Bit-exact, worth
+about 1.2-1.5% of prefill wall.
