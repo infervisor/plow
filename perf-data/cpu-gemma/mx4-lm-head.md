@@ -111,3 +111,39 @@ python perf-data/tools/quantize_mxfp4.py <hf-dir> <twin-dir> --no-layers \
 
 A twin without those two keys fails at load with `MISSING WEIGHT:
 mxfp4/model.language_model.embed_tokens.weight`, which names its own fix.
+
+## Correction: re-measured with MEANS, and the margins are smaller
+
+The table above reports plow TPOT **p50** against llama.cpp figures that are **means**. Every other
+comparison in this repo uses means, and mixing the two flatters us, so the configurations were
+re-measured through serve and read from the mean column. The improvement reproduces; the margin is
+smaller than stated.
+
+Gemma-4-12B, `plowrt serve`, fresh prompts, 8 slots, threads=16, chat_short c=1, TPOT mean ms:
+
+| configuration | before | after | llama.cpp | margin | vLLM | margin |
+|---|---|---|---|---|---|---|
+| bf16 (control, unchanged) | 233 | 233 | 267 (bf16 GGUF) | 1.15x | 460-544 | 2.0x |
+| fp8 + MXFP4 head | 141 | **127** | 133 (Q8_0) | **1.05x** | 460-544 | 3.6x |
+| MXFP4 + MXFP4 head | 93 | **81** | 121 (Q4_K_M) | **1.49x** | 460-544 | 5.7x |
+
+At chat_long c=1 the same configurations read 131 and 83 ms, so the ordering holds.
+
+The headline result stands and is the one that mattered: **fp8 no longer loses.** It was 141 against
+llama.cpp's 133 and is now 127, so all three Gemma-4-12B data types beat both baselines. But the
+fp8 margin is 1.05x, not the 1.10x above, and MXFP4 is 1.49x rather than 1.59x. The relative gain
+from the quantized head is consistent either way, about 9-10% on fp8 and 13% on MXFP4, which is in
+line with what the byte counts predicted (2.01 GB of bf16 down to ~0.53 GB, a 17.5 ms serial tail).
+
+Note also that the p50/mean gap is not stable on this box: an earlier fp8 run read 140/141 for
+p50/mean while the agent's read 132 for p50, so cross-session absolute comparisons need the same
+statistic AND ideally the same session. Only interleaved or same-session before/after should be
+trusted for a margin this narrow.
+
+### Follow-up this exposes
+
+The MXFP4 twin is 36.36 GB resident, larger than bf16's 29.85 GB, because its blob declares BOTH the
+bf16 originals for the prefill GEMM and the mxfp4 decode twins. That is not from this change, but it
+is the same duplicate-weight problem already logged for GPT-OSS: implementing the `GEMM_MXFP4` family
+(present in the ISA, no CPU kernel at any tier) would let prefill read MXFP4 directly and drop the
+bf16 copies.
