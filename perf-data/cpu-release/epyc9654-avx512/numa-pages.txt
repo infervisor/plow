@@ -1,0 +1,4 @@
+trial=0 huge=1 seconds=0.171 7fff77a00000 interleave:0-7 anon=524288 dirty=524288 active=0 N0=65536 N1=65536 N2=65536 N3=65536 N4=30208 N5=100864 N6=65536 N7=65536 kernelpagesize_kB=4
+trial=1 huge=0 seconds=1.151 7fff77a00000 interleave:0-7 anon=524288 dirty=524288 active=8 N0=65536 N1=65536 N2=65536 N3=65536 N4=65536 N5=65536 N6=65536 N7=65536 kernelpagesize_kB=4
+trial=2 huge=1 seconds=0.174 7fff77a00000 interleave:0-7 anon=524288 dirty=524288 active=0 N0=65536 N1=65536 N2=65536 N3=65536 N4=14848 N5=116224 N6=65536 N7=65536 kernelpagesize_kB=4
+trial=3 huge=0 seconds=1.061 7fff77a00000 interleave:0-7 anon=524288 dirty=524288 active=8 N0=65536 N1=65536 N2=65536 N3=65536 N4=65536 N5=65536 N6=65536 N7=65536 kernelpagesize_kB=4

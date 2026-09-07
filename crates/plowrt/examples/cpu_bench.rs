@@ -13,13 +13,18 @@ fn main() {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
     let mut args = std::env::args().skip(1);
-    let blob: PathBuf = args.next().expect("usage: cpu_bench <model.pkt> <ckpt>").into();
-    let ckpt: PathBuf = args.next().expect("usage: cpu_bench <model.pkt> <ckpt>").into();
+    let blob: PathBuf = args
+        .next()
+        .expect("usage: cpu_bench <model.pkt> <ckpt>")
+        .into();
+    let ckpt: PathBuf = args
+        .next()
+        .expect("usage: cpu_bench <model.pkt> <ckpt>")
+        .into();
     let mut lens: Vec<usize> = vec![32, 128, 512];
     let mut n_dec = 32usize;
     let mut json: Option<PathBuf> = None;
@@ -28,10 +33,16 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--prompt-lens" => {
-                lens = args.next().unwrap().split(',').map(|s| s.parse().unwrap()).collect()
+                lens = args
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .map(|s| s.parse().unwrap())
+                    .collect()
             }
             "--decode" => n_dec = args.next().unwrap().parse().unwrap(),
             "--threads" => opts.threads = args.next().unwrap().parse().unwrap(),
+            "--numa" => opts.numa = args.next().unwrap().parse().unwrap(),
             "--spin-us" => opts.spin_us = args.next().unwrap().parse().unwrap(),
             "--isa" => {
                 opts.isa = match args.next().unwrap().as_str() {
@@ -106,7 +117,8 @@ fn main() {
                 // latter always picked the widest rung on a ladder blob and made every
                 // "batch=1" number a rung-8 measurement.
                 let dp = eng.model().decode_prog_for(batch);
-                eng.decode_step_batched_at(&pos_v, &kv_v, &ids_v, dp).expect("decode batched")
+                eng.decode_step_batched_at(&pos_v, &kv_v, &ids_v, dp)
+                    .expect("decode batched")
             };
             steps.push(t.elapsed().as_secs_f64() * 1e3);
             out.push(toks[0]);

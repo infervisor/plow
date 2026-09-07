@@ -16,8 +16,8 @@ use crate::exec::cpu::control::{
     Cmd, ControlRing, Feedback, CMD_BARRIER, CMD_CANCEL, CMD_RESET_SLOT, CMD_RUN, CMD_STOP,
 };
 use crate::exec::cpu::interp::{
-    run_gq, run_static, wait_until, Exec, GqState, LoadedProgram, Parker, RunShared,
-    StaticState, WorkerCtx,
+    run_gq, run_static, wait_until, Exec, GqState, LoadedProgram, Parker, RunShared, StaticState,
+    WorkerCtx,
 };
 use crate::exec::cpu::topology::{NumaMode, Topology};
 
@@ -43,10 +43,16 @@ struct Shared {
 /// first `active` workers. Used both at spawn (for the pool's own bookkeeping) and per program, so
 /// prefill and decode can run on different widths without respawning threads.
 pub fn cu_map(n_cu: u32, per_node: &[Vec<u32>], nodes: usize, active: usize) -> Vec<Vec<u32>> {
-    let mut out: Vec<Vec<u32>> = vec![Vec::new(); per_node.iter().map(Vec::len).sum::<usize>().max(active)];
+    let mut out: Vec<Vec<u32>> =
+        vec![Vec::new(); per_node.iter().map(Vec::len).sum::<usize>().max(active)];
     let live: Vec<Vec<u32>> = per_node
         .iter()
-        .map(|ws| ws.iter().copied().filter(|&w| (w as usize) < active).collect())
+        .map(|ws| {
+            ws.iter()
+                .copied()
+                .filter(|&w| (w as usize) < active)
+                .collect()
+        })
         .collect();
     for cu in 0..n_cu {
         let np = (cu as usize) % nodes.max(1);
@@ -111,34 +117,15 @@ impl WorkerPool {
         exec: Arc<dyn Exec>,
     ) -> WorkerPool {
         let nodes = topo.select_nodes(numa);
-        // Logical cpus, physical cores first then their SMT siblings, so `k` threads
-        // pin to `k` distinct logical cpus and low counts spread across cores. On this
-        // class of Xeon the siblings ADD read bandwidth (measured 114 -> 219 GB/s at 8 -> 16
-        // threads), which is why the default is every online cpu, not physical cores.
-        let mut cpus: Vec<(u32, u32)> = Vec::new(); // (cpu, node)
-        let max_sib = nodes
-            .iter()
-            .flat_map(|&n| topo.cores_on_node(n).map(|c| c.siblings.len().max(1)))
-            .max()
-            .unwrap_or(1);
-        for rank in 0..max_sib {
-            for &n in &nodes {
-                for c in topo.cores_on_node(n) {
-                    let cpu = if rank == 0 {
-                        Some(c.cpu)
-                    } else {
-                        c.siblings.iter().copied().filter(|&x| x != c.cpu).nth(rank - 1)
-                    };
-                    if let Some(cpu) = cpu {
-                        cpus.push((cpu, n));
-                    }
-                }
-            }
-        }
+        let mut cpus = topo.worker_cpus(&nodes);
         if cpus.is_empty() {
             cpus.push((0, nodes[0]));
         }
-        let threads = if threads == 0 { cpus.len() } else { threads.max(1) };
+        let threads = if threads == 0 {
+            cpus.len()
+        } else {
+            threads.max(1)
+        };
         // Round-robin over logical cpus when oversubscribed.
         let placement: Vec<(u32, u32)> = (0..threads).map(|k| cpus[k % cpus.len()]).collect();
         let node_pos = |n: u32| nodes.iter().position(|&x| x == n).unwrap_or(0) as u32;
@@ -413,8 +400,14 @@ fn pin_to_cpu(cpu: u32) {
     // SAFETY: cpu_set_t is POD; sched_setaffinity on the calling thread.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if cpu as usize >= libc::CPU_SETSIZE as usize {
+            tracing::warn!(cpu, "CPU id exceeds affinity mask capacity");
+            return;
+        }
         libc::CPU_SET(cpu as usize, &mut set);
-        let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            tracing::warn!(cpu, error = %std::io::Error::last_os_error(), "CPU affinity failed");
+        }
     }
 }
 

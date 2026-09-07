@@ -52,7 +52,11 @@ pub fn select(executors: u32) -> Arc<dyn Backend> {
         }
     }
 
-    tracing::warn!("all GPU probes failed — selecting CPU reference backend");
+    if cfg!(any(feature = "cuda", feature = "hsa")) {
+        tracing::warn!("all GPU probes failed — selecting CPU reference backend");
+    } else {
+        tracing::info!("CPU backend selected");
+    }
     Arc::new(cpu::CpuBackend::new(executors))
 }
 

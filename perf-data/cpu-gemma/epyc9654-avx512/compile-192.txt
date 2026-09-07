@@ -1,0 +1,21 @@
+2026-09-07T12:30:13.980417Z  INFO plowc invoked source=--hf-dir /workspace/models/gemma-4-12B-it-cpu gpu=rtx6000pro num_gpus=1 batch=[1, 4, 8] seq=[512, 2048, 8192] phase=Both emit=Devblob preset=None parallel=Tp page_kib=16 weight_dtype=auto
+2026-09-07T12:30:13.980837Z  INFO devblob emit started gpu=rtx6000pro
+2026-09-07T12:30:13.982879Z  WARN lean gates skipped — this blob is NOT verified (build.json: lean.verified=false) reason="no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)"
+  counter granularity: 0 fine edges kept, 48 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 48 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 216 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 216 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter granularity: 0 fine edges kept, 216 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  compile config -> build-cpu-12b-192/assets/plow_config.h
+  build manifest -> build-cpu-12b-192/assets/build.json
+gemma4: 48 layers (8 full)  hidden=3840 inter=15360  heads=16  hd=256/512  kvh=8/1  vocab=262144
+  max_ctx=2048  prefill buckets [128, 512] + decode
+  layer_scalar[0..4] = [0.052978516, 0.16601563, 0.25585938, 0.515625]
+    prog 0 (T= 128):   718 packets,  108097 workgroup-packets
+    prog 1 (T= 512):   718 packets,  120513 workgroup-packets
+    prog 2 (T=   1):   542 packets,   47555 workgroup-packets
+    prog 3 (T=   2):   542 packets,   48773 workgroup-packets
+    prog 4 (T=   4):   542 packets,   51145 workgroup-packets
+  weights 22.2 GiB   KV cache 2.62 GiB   activations 0.18 GiB   -> build-cpu-12b-192/assets/model.pkt
+2026-09-07T12:30:16.499043Z  INFO devblob written slug=gemma-4-12b-it-cpu n_cu=192 tp=1 bundle=true out=build-cpu-12b-192/assets/model.pkt
+2026-09-07T12:30:16.499055Z  INFO devblob emit completed out=build-cpu-12b-192/assets/model.pkt

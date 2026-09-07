@@ -26,6 +26,91 @@ use crate::{Result, RuntimeError};
 const ALIGN: usize = 64;
 const HUGE: usize = 2 << 20;
 
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn tensor_allocation_checks_overflow_and_zeroes_padding() {
+        assert!(HostTensor::alloc(usize::MAX, false).is_err());
+        for bytes in [0, 65, HUGE / 8, HUGE + 1] {
+            let t = HostTensor::alloc(bytes, true).unwrap();
+            assert_eq!(t.as_ptr() as usize % t.layout.align(), 0);
+            let data = unsafe { std::slice::from_raw_parts(t.as_ptr(), t.layout.size()) };
+            assert!(data.iter().all(|&v| v == 0));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Linux mbind permission; validates actual NUMA VMA policy"]
+    #[cfg(target_os = "linux")]
+    fn live_numa_policy() {
+        let topo = Topology::detect();
+        for nodes in [&topo.nodes[..1], &topo.nodes[..]] {
+            let t = HostTensor::alloc_on_nodes(HUGE * 2 * nodes.len(), true, nodes, true).unwrap();
+            let maps = std::fs::read_to_string("/proc/self/numa_maps").unwrap();
+            let addr = format!("{:x} ", t.as_ptr() as usize);
+            let entry = maps
+                .lines()
+                .find(|l| l.starts_with(&addr))
+                .expect("NUMA VMA entry");
+            assert!(
+                entry.contains(if nodes.len() == 1 {
+                    "bind:"
+                } else {
+                    "interleave:"
+                }),
+                "{entry}"
+            );
+            let policy = entry.split_whitespace().nth(1).unwrap();
+            let requested: Vec<u32> = policy
+                .split_once(':')
+                .unwrap()
+                .1
+                .split(',')
+                .flat_map(|part| {
+                    let (lo, hi) = part.split_once('-').unwrap_or((part, part));
+                    lo.parse::<u32>().unwrap()..=hi.parse::<u32>().unwrap()
+                })
+                .collect();
+            assert_eq!(requested, nodes);
+            let resident: Vec<(u32, usize)> = entry
+                .split_whitespace()
+                .filter_map(|part| part.strip_prefix('N'))
+                .map(|part| {
+                    let (node, pages) = part.split_once('=').unwrap();
+                    (node.parse().unwrap(), pages.parse().unwrap())
+                })
+                .collect();
+            assert_eq!(
+                resident.iter().map(|(_, pages)| pages).sum::<usize>() * 4096,
+                t.layout.size()
+            );
+            if nodes.len() == 1 {
+                assert!(
+                    resident.iter().all(|(node, _)| *node == nodes[0]),
+                    "{entry}"
+                );
+            }
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let header = format!("{:x}-", t.as_ptr() as usize);
+            let mapping = smaps.split_once(&header).expect("tensor mapping").1;
+            let flags = mapping.lines().find(|l| l.starts_with("VmFlags:")).unwrap();
+            let huge = crate::config::RuntimeConfig::get()
+                .cpu
+                .huge_pages
+                .unwrap_or(nodes.len() <= 1);
+            assert!(
+                flags
+                    .split_whitespace()
+                    .any(|f| f == if huge { "hg" } else { "nh" }),
+                "{flags}"
+            );
+            eprintln!("{entry}");
+        }
+    }
+}
+
 /// One host tensor. Owns its allocation; freed on drop.
 pub struct HostTensor {
     ptr: *mut u8,
@@ -40,32 +125,140 @@ unsafe impl Sync for HostTensor {}
 
 impl HostTensor {
     fn alloc(bytes: usize, zeroed: bool) -> Result<HostTensor> {
+        Self::alloc_on_nodes(bytes, zeroed, &[], false)
+    }
+
+    fn alloc_on_nodes(
+        bytes: usize,
+        zeroed: bool,
+        nodes: &[u32],
+        strict: bool,
+    ) -> Result<HostTensor> {
         // Tensors from 256 KiB up are rounded to whole huge pages: the prefill A operands
         // (e.g. 128 x 3840 bf16 = 960 KiB) sit below 2 MiB yet are tile-loaded at a multi-KiB
         // row stride, where 4 KiB pages cost a TLB miss per tile row. Slack <= 2 MiB each.
         let huge = bytes >= HUGE / 8;
         let align = if huge { HUGE } else { ALIGN };
-        let size = bytes.max(1).next_multiple_of(align);
+        let size = bytes
+            .max(1)
+            .checked_next_multiple_of(align)
+            .ok_or_else(|| RuntimeError::Oom(format!("tensor size overflow: {bytes}")))?;
         let layout = Layout::from_size_align(size, align)
             .map_err(|e| RuntimeError::Oom(format!("tensor layout {bytes} B: {e}")))?;
         // SAFETY: non-zero size layout.
-        let ptr = unsafe {
-            if zeroed {
+        let heap_alloc = || unsafe {
+            if zeroed && !huge {
                 std::alloc::alloc_zeroed(layout)
             } else {
                 std::alloc::alloc(layout)
             }
         };
+        #[cfg(target_os = "linux")]
+        let ptr = if huge {
+            let reserve = size
+                .checked_add(align)
+                .ok_or_else(|| RuntimeError::Oom(format!("tensor mapping overflow: {bytes}")))?;
+            // A fresh mapping lets mbind establish placement before the first page fault,
+            // and prevents allocator reuse from inheriting a previous tensor's policy.
+            unsafe {
+                let raw = libc::mmap(
+                    std::ptr::null_mut(),
+                    reserve,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if raw == libc::MAP_FAILED {
+                    return Err(RuntimeError::Oom(format!(
+                        "host mapping {bytes} B: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                let addr = (raw as usize).next_multiple_of(align);
+                let prefix = addr - raw as usize;
+                if prefix > 0 {
+                    libc::munmap(raw, prefix);
+                }
+                let suffix = reserve - prefix - size;
+                if suffix > 0 {
+                    libc::munmap((addr + size) as *mut c_void, suffix);
+                }
+                addr as *mut u8
+            }
+        } else {
+            heap_alloc()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let ptr = heap_alloc();
         if ptr.is_null() {
             return Err(RuntimeError::Oom(format!("host tensor {bytes} B")));
         }
         #[cfg(target_os = "linux")]
         if huge {
-            // Best effort; a refusal costs TLB misses, not correctness.
+            let use_huge = crate::config::RuntimeConfig::get()
+                .cpu
+                .huge_pages
+                .unwrap_or(nodes.len() <= 1);
+            // THP allocation can fall back to a different node instead of reclaiming
+            // base pages on the interleave target, concentrating shared weights.
+            let advice = if use_huge {
+                libc::MADV_HUGEPAGE
+            } else {
+                libc::MADV_NOHUGEPAGE
+            };
+            // Best effort; this does not change the allocation's size or alignment.
             // SAFETY: ptr/size describe our own mapping.
-            unsafe { libc::madvise(ptr as *mut c_void, size, libc::MADV_HUGEPAGE) };
+            unsafe { libc::madvise(ptr as *mut c_void, size, advice) };
         }
-        Ok(HostTensor { ptr, layout, bytes })
+        let tensor = HostTensor { ptr, layout, bytes };
+        #[cfg(target_os = "linux")]
+        if huge && !nodes.is_empty() {
+            let maxnode = nodes.iter().copied().max().unwrap() as usize + 1;
+            let bits = libc::c_ulong::BITS as usize;
+            let mut mask = vec![0 as libc::c_ulong; maxnode.div_ceil(bits)];
+            for &node in nodes {
+                mask[node as usize / bits] |= 1 << (node as usize % bits);
+            }
+            // Linux's nodemask ABI consumes maxnode - 1 bits, including for node zero.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_mbind,
+                    ptr,
+                    size,
+                    if nodes.len() == 1 {
+                        libc::MPOL_BIND
+                    } else {
+                        libc::MPOL_INTERLEAVE
+                    },
+                    mask.as_ptr(),
+                    mask.len() * bits + 1,
+                    0u32,
+                )
+            };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                if strict {
+                    return Err(RuntimeError::Device(format!(
+                        "NUMA placement on {nodes:?}: {error}"
+                    )));
+                }
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(%error, ?nodes, "NUMA placement unavailable; retaining OS memory policy");
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if strict && !nodes.is_empty() {
+            return Err(RuntimeError::Device(
+                "explicit NUMA placement requires Linux".into(),
+            ));
+        }
+        if huge && zeroed {
+            unsafe { std::ptr::write_bytes(ptr, 0, size) };
+        }
+        Ok(tensor)
     }
 
     #[inline]
@@ -82,6 +275,11 @@ impl HostTensor {
 
 impl Drop for HostTensor {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.layout.align() == HUGE {
+            unsafe { libc::munmap(self.ptr.cast(), self.layout.size()) };
+            return;
+        }
         // SAFETY: allocated with exactly this layout in `alloc`.
         unsafe { std::alloc::dealloc(self.ptr, self.layout) };
     }
@@ -272,6 +470,40 @@ fn validate_cpu_blob(blob: &DevBlob) -> Result<()> {
                     )));
                 }
             }
+            if inst.op == DevOp::RmsNorm as u16
+                && (inst.t[3] != TENSOR_NONE16 || inst.t[4] != TENSOR_NONE16)
+            {
+                return Err(RuntimeError::Device(
+                    "CPU RMSNorm FP8 fusion is unsupported; compile without --qnorm-fuse".into(),
+                ));
+            }
+            if inst.op == DevOp::QuantFp8 as u16 {
+                let fused = inst.t[3] != TENSOR_NONE16;
+                if fused != (inst.t[4] != TENSOR_NONE16) {
+                    return Err(RuntimeError::Device(
+                        "CPU QUANT_FP8 requires both gate and up tensors".into(),
+                    ));
+                }
+                let elements = u64::from(inst.i[0]) * u64::from(inst.i[1]);
+                let bf16_bytes = elements.checked_mul(2).ok_or_else(|| {
+                    RuntimeError::Device("CPU QUANT_FP8 dimensions overflow".into())
+                })?;
+                let sizes = [
+                    elements,
+                    bf16_bytes,
+                    u64::from(inst.i[0]) * 4,
+                    bf16_bytes,
+                    bf16_bytes,
+                ];
+                for (slot, &bytes) in sizes[..if fused { 5 } else { 3 }].iter().enumerate() {
+                    let handle = inst.t[slot];
+                    if handle == TENSOR_NONE16 || blob.tensors[handle as usize].bytes < bytes {
+                        return Err(RuntimeError::Device(format!(
+                            "CPU QUANT_FP8 tensor slot {slot} is missing or smaller than {bytes} bytes"
+                        )));
+                    }
+                }
+            }
             if inst.op == DevOp::GemvQkv as u16 {
                 for slot in 5..8 {
                     let handle = inst.i[slot] as usize;
@@ -384,6 +616,15 @@ impl CpuModel {
     /// weights / blob init data / generated tables, and resolve kernels for
     /// every program. `ffi::init` must have run.
     pub fn load(blob_path: &Path, checkpoint: &Path) -> Result<CpuModel> {
+        Self::load_on_nodes(blob_path, checkpoint, &[], false)
+    }
+
+    fn load_on_nodes(
+        blob_path: &Path,
+        checkpoint: &Path,
+        nodes: &[u32],
+        strict: bool,
+    ) -> Result<CpuModel> {
         let t0 = Instant::now();
         let raw = std::fs::read(blob_path)
             .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
@@ -466,7 +707,7 @@ impl CpuModel {
                         src.len()
                     )));
                 }
-                let t = HostTensor::alloc(bytes, false)?;
+                let t = HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?;
                 // SAFETY: fresh allocation of `bytes`, no other reference yet.
                 unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
                 weight_bytes += td.bytes;
@@ -481,7 +722,7 @@ impl CpuModel {
                         src.len()
                     )));
                 }
-                let t = HostTensor::alloc(bytes, false)?;
+                let t = HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?;
                 unsafe { std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(src) };
                 t
             } else if let Some(g) = gen_of.get(&(h as u32)) {
@@ -499,14 +740,14 @@ impl CpuModel {
                         data.len()
                     )));
                 }
-                let t = HostTensor::alloc(bytes, false)?;
+                let t = HostTensor::alloc_on_nodes(bytes, false, nodes, strict)?;
                 unsafe {
                     std::slice::from_raw_parts_mut(t.as_ptr(), t.bytes).copy_from_slice(&data)
                 };
                 t
             } else {
                 // Runtime tensor (activations, KV, inputs): zeroed.
-                HostTensor::alloc(bytes, true)?
+                HostTensor::alloc_on_nodes(bytes, true, nodes, strict)?
             };
             tensors.push(t);
             names.push(td.name.clone());
@@ -798,7 +1039,7 @@ impl KernelExec {
         let scratch_bytes = ffi::scratch_bytes().max(64) as usize;
         let mut slots = Vec::with_capacity(workers);
         for w in 0..workers {
-            let scratch = HostTensor::alloc(scratch_bytes, true)?;
+            let scratch = HostTensor::alloc(scratch_bytes, false)?;
             let mut ctx = PlowCpuCtx::new(w as u32, worker_node(w));
             ctx.scratch = scratch.as_ptr() as *mut c_void;
             ctx.scratch_bytes = scratch_bytes as u32;
@@ -823,6 +1064,9 @@ impl Exec for KernelExec {
         // SAFETY: only this worker thread touches its slot.
         let ctx = unsafe { &mut *slot.ctx.get() };
         if !slot.inited.load(Ordering::Relaxed) {
+            unsafe {
+                std::ptr::write_bytes(ctx.scratch.cast::<u8>(), 0, ctx.scratch_bytes as usize)
+            };
             ffi::thread_init(ctx).expect("cpu kernel thread init");
             slot.inited.store(true, Ordering::Relaxed);
         }
@@ -1018,9 +1262,26 @@ pub struct CpuEngine {
 impl CpuEngine {
     pub fn load(blob: &Path, checkpoint: &Path, opts: &CpuEngineOpts) -> Result<CpuEngine> {
         let isa = ffi::init(opts.isa)?;
-        let model = CpuModel::load(blob, checkpoint)?;
-        let n_cu = model.blob.n_cu;
         let topo = Topology::detect();
+        if let NumaMode::Nodes(requested) = &opts.numa {
+            if requested.is_empty() || requested.iter().any(|n| !topo.nodes.contains(n)) {
+                return Err(RuntimeError::Device(format!(
+                    "NUMA nodes {requested:?} unavailable in allowed nodes {:?}",
+                    topo.nodes
+                )));
+            }
+        }
+        let memory_nodes = match &opts.numa {
+            NumaMode::Off => Vec::new(),
+            _ => topo.select_nodes(&opts.numa),
+        };
+        let model = CpuModel::load_on_nodes(
+            blob,
+            checkpoint,
+            &memory_nodes,
+            matches!(opts.numa, NumaMode::Nodes(_)),
+        )?;
+        let n_cu = model.blob.n_cu;
         // The pool needs the Exec before it exists; build the exec against the
         // node placement the pool will use (same rule: round-robin over nodes).
         let nodes = topo.select_nodes(&opts.numa);
@@ -1107,9 +1368,9 @@ impl CpuEngine {
             physical_cores = topo.physical_cores(),
             "cpu: worker count"
         );
+        let placement = topo.worker_cpus(&nodes);
         let exec = Arc::new(KernelExec::new(&model, threads, |w| {
-            // Mirrors WorkerPool::spawn's placement; only informational for kernels.
-            nodes[w % nodes.len()]
+            placement[w % placement.len()].1
         })?);
         let pool = WorkerPool::spawn(&topo, threads, &opts.numa, opts.spin_us, n_cu, exec);
         let progs: Vec<Arc<LoadedProgram>> = model
@@ -1210,8 +1471,11 @@ impl CpuEngine {
         self.last_token()
     }
 
-    /// The compiled prefill buckets as `(program, rows)`.
+    /// Prefill buckets as `(program, rows)`, falling back to single-token decode.
     pub fn prefill_buckets(&self) -> Vec<(usize, u32)> {
+        if self.model.dec_ix == 0 {
+            return vec![(0, 1)];
+        }
         (0..self.model.dec_ix)
             .map(|i| (i, self.model.blob.progs[i].t))
             .collect()
@@ -1228,8 +1492,9 @@ impl CpuEngine {
     /// chunk that covers the last token, [`Self::last_token`] is the first generated token.
     pub fn prefill_chunk(&mut self, prompt: &[u32], ch: Chunk) -> Result<()> {
         let end = ch.c0.checked_add(ch.clen);
-        if ch.prog >= self.model.dec_ix
-            || end.is_none_or(|end| end as usize > prompt.len())
+        let decode_prefill = self.model.dec_ix == 0 && ch.prog == 0 && ch.clen == 1;
+        if (ch.prog >= self.model.dec_ix && !decode_prefill)
+            || end.is_none_or(|end| end as usize > prompt.len() || end as usize > self.max_ctx)
             || ch.clen == 0
         {
             return Err(RuntimeError::Device(format!("bad prefill chunk {ch:?}")));
@@ -1263,6 +1528,11 @@ impl CpuEngine {
                 }
             }
             self.model.write_u32(t_kvlen, ch.c0 + ch.clen);
+            if decode_prefill {
+                // Decode reads the absolute position from in.pos; its KV pointers are
+                // already rebased to the prefill slot by the caller.
+                return self.run_prog(ch.prog);
+            }
             // Rebase the program from its pristine copy: KV write rows at c0,
             // flash window [c0, c0+clen), row counts for a partial chunk.
             let lp = Arc::make_mut(&mut self.progs[ch.prog]);

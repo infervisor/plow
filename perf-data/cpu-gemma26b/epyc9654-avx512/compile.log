@@ -1,0 +1,27 @@
+2026-09-07T11:45:42.358277Z  INFO plowc invoked source=--hf-dir /workspace/models/gemma-4-26B-A4B-it-cpu gpu=rtx6000pro num_gpus=1 batch=[1, 4, 8] seq=[512, 2048, 8192] phase=Both emit=Devblob preset=None parallel=Tp page_kib=16 weight_dtype=auto
+2026-09-07T11:45:42.358333Z  INFO devblob emit started gpu=rtx6000pro
+2026-09-07T11:45:42.358632Z  WARN whole-graph fusion coverage unavailable; no structurally eligible KDA graph was established error=graph build failed: unsupported architecture: Gemma 4 MoE routing and exhaustive expert checkpoint binding are not implemented; refusing dense or representative-expert fallback
+2026-09-07T11:45:42.359227Z  WARN lean gates skipped — this blob is NOT verified (build.json: lean.verified=false) reason="no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)"
+  counter granularity: 0 fine edges kept, 30 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter-graph reduction: 30 of 810 distinct coarse edges implied by a path, 0 duplicate waits; 30 wait entries removed
+  counter granularity: 0 fine edges kept, 30 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter-graph reduction: 30 of 810 distinct coarse edges implied by a path, 0 duplicate waits; 30 wait entries removed
+  counter granularity: 0 fine edges kept, 135 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter-graph reduction: 30 of 640 distinct coarse edges implied by a path, 0 duplicate waits; 30 wait entries removed
+  counter granularity: 0 fine edges kept, 135 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter-graph reduction: 30 of 640 distinct coarse edges implied by a path, 0 duplicate waits; 30 wait entries removed
+  counter granularity: 0 fine edges kept, 135 downgraded to coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)
+  counter-graph reduction: 30 of 640 distinct coarse edges implied by a path, 0 duplicate waits; 30 wait entries removed
+  compile config -> build-cpu-e2e/assets/plow_config.h
+  build manifest -> build-cpu-e2e/assets/build.json
+gemma4: 30 layers (5 full)  hidden=2816 inter=2112  heads=16  hd=256/512  kvh=8/2  vocab=262144
+  max_ctx=2048  prefill buckets [128, 512] + decode
+  layer_scalar[0..4] = [0.0703125, 0.203125, 0.16992188, 0.515625]
+    prog 0 (T= 128):   661 packets,   55167 workgroup-packets
+    prog 1 (T= 512):   661 packets,   55167 workgroup-packets
+    prog 2 (T=   1):   521 packets,   21677 workgroup-packets
+    prog 3 (T=   2):   521 packets,   23001 workgroup-packets
+    prog 4 (T=   4):   521 packets,   25585 workgroup-packets
+  weights 47.0 GiB   KV cache 1.72 GiB   activations 0.17 GiB   -> build-cpu-e2e/assets/model.pkt
+2026-09-07T11:45:44.609540Z  INFO devblob written slug=gemma-4-26b-a4b-it-cpu n_cu=96 tp=1 bundle=true out=build-cpu-e2e/assets/model.pkt
+2026-09-07T11:45:44.609557Z  INFO devblob emit completed out=build-cpu-e2e/assets/model.pkt

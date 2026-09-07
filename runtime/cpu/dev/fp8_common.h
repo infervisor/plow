@@ -13,6 +13,24 @@
 
 #define PLOW_FP8_E4M3_MAX 448.0f
 
+/* Round to nearest, ties to even; saturate overflow and preserve signed zero. */
+static inline uint8_t plow_f32_to_e4m3(float x) {
+    union { float f; uint32_t u; } v = { .f = x };
+    const uint8_t sign = (v.u >> 24) & 0x80u;
+    v.u &= 0x7fffffffu;
+    if (v.u > 0x7f800000u) return sign | 0x7fu;
+    if (v.f >= PLOW_FP8_E4M3_MAX) return sign | 0x7eu;
+    if (v.f < 0x1p-6f) {
+        const float scaled = v.f * 512.0f;
+        uint32_t q = (uint32_t)scaled;
+        const float rem = scaled - (float)q;
+        q += rem > 0.5f || (rem == 0.5f && (q & 1u));
+        return sign | (uint8_t)q;
+    }
+    v.u += 0x7ffffu + ((v.u >> 20) & 1u);
+    return sign | (uint8_t)((v.u - 0x3c000000u) >> 20);
+}
+
 static inline float plow_e4m3_to_f32(uint8_t b) {
     const uint32_t e = (b >> 3) & 0xFu, m = b & 7u;
     float v;

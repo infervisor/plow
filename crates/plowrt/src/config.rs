@@ -164,7 +164,8 @@ pub struct CpuRuntimeConfig {
     )]
     pub threads: u32,
 
-    /// NUMA placement: `auto` (all nodes), `off`, or a node list (`0,1`).
+    /// NUMA: auto interleaves large tensors across allowed nodes (best effort);
+    /// off keeps OS memory policy; a node list (0,1) requires successful placement.
     #[arg(
         long = "cpu-numa",
         env = "PLOW_CPU_NUMA",
@@ -172,6 +173,11 @@ pub struct CpuRuntimeConfig {
         global = true
     )]
     pub numa: crate::exec::cpu::topology::NumaMode,
+
+    /// Override transparent huge-page advice. By default, use ordinary pages
+    /// for interleaved tensors and huge-page advice for single-node/OS placement.
+    #[arg(long = "cpu-huge-pages", env = "PLOW_CPU_HUGE_PAGES", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub huge_pages: Option<bool>,
 
     /// Kernel tier ceiling (for A/B and hosts without AMX).
     #[arg(

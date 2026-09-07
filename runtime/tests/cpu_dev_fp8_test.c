@@ -177,8 +177,8 @@ static void test_glu(uint32_t M, uint32_t N, uint32_t K, uint32_t act, int have_
     free(x); free(Wg); free(Wu); free(gs); free(us); free(Cref); free(Cg); free(Cv); free(ctx.scratch);
 }
 
-/* GEMM_FP8 (w8a16: t3 absent) — golden vs the GEMV reference (same math, M rows), then AMX. */
-static void test_gemm(uint16_t op, kfn golden, uint32_t M, uint32_t N, uint32_t K, int have_x) {
+/* Compare both accumulation orders to the independent f64 reference. */
+static void test_gemm(uint16_t op, kfn golden, uint32_t M, uint32_t N, uint32_t K, int have_fast) {
     plow_bf16* A = xmalloc((size_t)M * K * 2);
     uint8_t* W = xmalloc((size_t)N * K);
     float* ws = xmalloc((size_t)N * 4);
@@ -198,18 +198,18 @@ static void test_gemm(uint16_t op, kfn golden, uint32_t M, uint32_t N, uint32_t 
         run_all(golden, &in, nblk, T, &ctx);
         snprintf(what, sizeof what, "op%u golden M=%u N=%u K=%u nblk=%u", op, M, N, K, nblk);
         cmp(what, Cref, Cg, (size_t)M * N, 2e-2f);
-        if (have_x && plow_cpu_tier_of(op) == PLOW_CPU_ISA_AMX) {
+        if (have_fast && plow_cpu_tier_of(op) >= PLOW_CPU_ISA_AVX512) {
             T[0] = Cx; memset(Cx, 0, (size_t)M * N * 2);
             run_all(plow_cpu_kernel(op), &in, nblk, T, &ctx);
             T[0] = Cg;
-            snprintf(what, sizeof what, "op%u amx vs golden nblk=%u", op, nblk);
-            cmp(what, Cg, Cx, (size_t)M * N, 1e-2f);
+            snprintf(what, sizeof what, "op%u fast vs f64 nblk=%u", op, nblk);
+            cmp(what, Cref, Cx, (size_t)M * N, 1e-2f);
         }
     }
     free(A); free(W); free(ws); free(Cref); free(Cg); free(Cx); free(ctx.scratch);
 }
 
-static void test_gemm_glu(uint32_t M, uint32_t N, uint32_t K, uint32_t act, int have_x) {
+static void test_gemm_glu(uint32_t M, uint32_t N, uint32_t K, uint32_t act, int have_fast) {
     plow_bf16* A = xmalloc((size_t)M * K * 2);
     uint8_t* Wg = xmalloc((size_t)N * K); uint8_t* Wu = xmalloc((size_t)N * K);
     float* gs = xmalloc((size_t)N * 4); float* us = xmalloc((size_t)N * 4);
@@ -230,11 +230,11 @@ static void test_gemm_glu(uint32_t M, uint32_t N, uint32_t K, uint32_t act, int 
         run_all(g_gemm_glu_fp8, &in, nblk, T, &ctx);
         snprintf(what, sizeof what, "GEMM_GLU_FP8 golden M=%u N=%u K=%u act=%u nblk=%u", M, N, K, act, nblk);
         cmp(what, Cref, Cg, (size_t)M * N, 3e-2f);
-        if (have_x && plow_cpu_tier_of(PLOW_DOP_GEMM_GLU_FP8) == PLOW_CPU_ISA_AMX) {
+        if (have_fast && plow_cpu_tier_of(PLOW_DOP_GEMM_GLU_FP8) >= PLOW_CPU_ISA_AVX512) {
             T[0] = Cx; memset(Cx, 0, (size_t)M * N * 2);
             run_all(plow_cpu_kernel(PLOW_DOP_GEMM_GLU_FP8), &in, nblk, T, &ctx);
             T[0] = Cg;
-            snprintf(what, sizeof what, "GEMM_GLU_FP8 amx vs golden nblk=%u", nblk);
+            snprintf(what, sizeof what, "GEMM_GLU_FP8 fast vs golden nblk=%u", nblk);
             cmp(what, Cg, Cx, (size_t)M * N, 2e-2f);
         }
     }
@@ -357,7 +357,7 @@ int main(int argc, char** argv) {
     printf("isa tier: %d\n", tier);
     if (tier < 0) return 2;
     if (argc > 1 && !strcmp(argv[1], "--bench")) { bench(); return 0; }
-    const int have_v = tier >= PLOW_CPU_ISA_AVX512, have_x = tier >= PLOW_CPU_ISA_AMX;
+    const int have_v = tier >= PLOW_CPU_ISA_AVX512;
     for (uint16_t op = PLOW_DOP_GEMV_FP8; op <= PLOW_DOP_GEMM_GLU_FP8; op++)
         if (op != PLOW_DOP_QUANT_FP8 && !plow_cpu_has(op)) { printf("missing op %u\n", op); fails++; }
     printf("tiers: gemv_fp8=%d gemv_glu_fp8=%d gemm_fp8=%d gemm_glu_fp8=%d\n",
@@ -370,13 +370,13 @@ int main(int argc, char** argv) {
     test_gemv(1, 100, 3840, 0, have_v);    /* N tail vs RB */
     test_glu(1, 2048, 3840, 0, have_v);
     test_glu(3, 1024, 3840, 1, have_v);
-    test_gemm(PLOW_DOP_GEMM_FP8, g_gemm_fp8, 128, 4096, 3840, have_x);
-    test_gemm(PLOW_DOP_GEMM_FP8, g_gemm_fp8, 37, 512, 3840, have_x);
-    test_gemm(PLOW_DOP_GEMM_MED_FP8, g_gemm_med_fp8, 128, 2048, 3840, have_x);
-    test_gemm(PLOW_DOP_GEMM_SMALL_FP8, g_gemm_small_fp8, 5, 256, 3840, have_x);
-    test_gemm(PLOW_DOP_GEMM_WIDE_FP8, g_gemm_wide_fp8, 512, 1024, 3840, have_x);
-    test_gemm_glu(128, 1024, 3840, 0, have_x);
-    test_gemm_glu(37, 512, 3840, 1, have_x);
+    test_gemm(PLOW_DOP_GEMM_FP8, g_gemm_fp8, 128, 4096, 3840, have_v);
+    test_gemm(PLOW_DOP_GEMM_FP8, g_gemm_fp8, 37, 512, 3840, have_v);
+    test_gemm(PLOW_DOP_GEMM_MED_FP8, g_gemm_med_fp8, 128, 2048, 3840, have_v);
+    test_gemm(PLOW_DOP_GEMM_SMALL_FP8, g_gemm_small_fp8, 5, 256, 3840, have_v);
+    test_gemm(PLOW_DOP_GEMM_WIDE_FP8, g_gemm_wide_fp8, 512, 1024, 3840, have_v);
+    test_gemm_glu(128, 1024, 3840, 0, have_v);
+    test_gemm_glu(37, 512, 3840, 1, have_v);
     printf(fails ? "FAILED (%d)\n" : "all passed\n", fails);
     return fails ? 1 : 0;
 }

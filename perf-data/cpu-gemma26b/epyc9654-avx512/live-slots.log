@@ -1,0 +1,35 @@
+warning: associated function `env_nonempty` is never used
+   --> crates/plowrt/src/config.rs:769:8
+    |
+756 | impl RuntimeConfig {
+    | ------------------ associated function in this implementation
+...
+769 |     fn env_nonempty(var: &str) -> Option<String> {
+    |        ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `plowrt` (lib) generated 1 warning
+warning: `plowrt` (lib) generated 1 warning (1 duplicate)
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running tests/cpu_serve_live.rs (target/release/deps/cpu_serve_live-25c9b99acdeb19d1)
+
+running 1 test
+step rung1: feeds=[(0, 50429)] -> [(0, 106)] in 65 ms
+step rung2: feeds=[(0, 106), (1, 89946)] -> [(0, 106), (1, 106)] in 80 ms
+step rung4 contiguous: feeds=[(0, 106), (1, 106), (2, 97375)] -> [(0, 715), (1, 106), (2, 106)] in 99 ms
+step rung4 with gap: feeds=[(0, 715), (2, 106)] -> [(0, 107), (2, 106)] in 97 ms
+step rung4 refilled: feeds=[(0, 107), (1, 89265), (2, 106)] -> [(0, 1), (1, 106), (2, 236829)] in 104 ms
+step rung4 single high slot: feeds=[(2, 236829)] -> [(2, 139)] in 96 ms
+decode slot 2: feeds=[(2, 139)] -> [(2, 1018)] in 97 ms
+decode slot 2: feeds=[(2, 1018)] -> [(2, 4661)] in 99 ms
+decode slot 2: feeds=[(2, 4661)] -> [(2, 53121)] in 102 ms
+decode slot 2: feeds=[(2, 53121)] -> [(2, 623)] in 99 ms
+decode slot 2: feeds=[(2, 623)] -> [(2, 3689)] in 99 ms
+decode slot 2: feeds=[(2, 3689)] -> [(2, 563)] in 100 ms
+decode slot 2: feeds=[(2, 563)] -> [(2, 506)] in 102 ms
+decode slot 2: feeds=[(2, 506)] -> [(2, 5279)] in 99 ms
+slot 2 text: "Rome*   **Input:** \"What is the"
+test live_slot_lifecycle_with_gaps ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.14s
