@@ -22,8 +22,19 @@
 #      coreutils `env` is itself a system binary and dies with
 #      "undefined symbol: __tunable_is_initialized, version GLIBC_PRIVATE".
 #
+# THE SHIM IS A `PATH` OVERLAY, NOT A ROCM ROOT. Point ROCM_PATH at the COMPLETE
+# tree (/opt/rocm-7.2.4). An earlier attempt pointed ROCM_PATH at this directory,
+# whose lib/include are symlinks but which has no `amdgcn/bitcode` and no
+# `llvm/`; AITER's flydsl MLIR pipeline needs both to link a GPU module and died
+# with a bare "lld invocation failed" that reads like a missing binary.
+#
 #   scripts/glm53_vllm_shim.sh [outdir]        # default build-glm53/rocm-shim
-#   PATH=<outdir>/bin:$PATH CC=<outdir>/bin/vllm-cc ... vllm serve ...
+#   PATH=<outdir>/bin:$PATH CC=<outdir>/bin/vllm-cc ROCM_PATH=/opt/rocm-7.2.4 vllm serve ...
+#
+# AND NOTE: `VLLM_ROCM_USE_AITER=0` is NOT an escape hatch for GLM-5.3. vLLM
+# refuses outright — "Sparse attention indexer ROCm path is only supported on
+# AITER" — because the DSA indexer has no non-AITER ROCm kernel. AITER is
+# mandatory for this model, so these shims are mandatory with it.
 set -euo pipefail
 OUT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build-glm53/rocm-shim}"
 ROCM="${SHIM_ROCM:-/opt/rocm-7.2.4}"
