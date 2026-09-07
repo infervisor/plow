@@ -1,0 +1,67 @@
+{
+  "capture_valid_for_localization": true,
+  "settings_identical": {
+    "vllm_version": true,
+    "model": true,
+    "tensor_parallel_size": true,
+    "max_num_batched_tokens": true,
+    "max_num_seqs": true,
+    "enable_prefix_caching": true,
+    "max_model_len": true,
+    "max_output_tokens": true,
+    "enforce_eager": true,
+    "disable_cuda_graphs": true,
+    "effective_compilation_config": true,
+    "quantization": true
+  },
+  "rows": [
+    {
+      "file": "logits_p128.step0000.f32",
+      "bitwise": true,
+      "relative_l2": 0.0,
+      "max_abs": 0.0
+    },
+    {
+      "file": "logits_p128.step0001.f32",
+      "bitwise": true,
+      "relative_l2": 0.0,
+      "max_abs": 0.0
+    },
+    {
+      "file": "logits_p128.step0002.f32",
+      "bitwise": true,
+      "relative_l2": 0.0,
+      "max_abs": 0.0
+    },
+    {
+      "file": "logits_p128.step0003.f32",
+      "bitwise": true,
+      "relative_l2": 0.0,
+      "max_abs": 0.0
+    },
+    {
+      "file": "logits_p16.step0000.f32",
+      "bitwise": true,
+      "relative_l2": 0.0,
+      "max_abs": 0.0
+    },
+    {
+      "file": "logits_p16.step0001.f32",
+      "bitwise": true,
+      "relative_l2": 0.0,
+      "max_abs": 0.0
+    },
+    {
+      "file": "logits_p16.step0002.f32",
+      "bitwise": true,
+      "relative_l2": 0.0,
+      "max_abs": 0.0
+    },
+    {
+      "file": "logits_p16.step0003.f32",
+      "bitwise": true,
+      "relative_l2": 0.0,
+      "max_abs": 0.0
+    }
+  ]
+}

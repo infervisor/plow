@@ -1,0 +1,342 @@
+{
+  "status": "INTERRUPTED_BY_USER",
+  "observed_at": "2026-09-07T20:12:12.941084+00:00",
+  "planned_runs": 72,
+  "completed_runs": 44,
+  "completed_requests": 176,
+  "output_tokens": 22528,
+  "incomplete_runs": [
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p4096-c1-rwarmup-20260907T200728.527566Z",
+      "status": "INTERRUPTED_BEFORE_VALID_ACCOUNTING"
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p4096-c1-rwarmup-20260907T200728.528887Z",
+      "status": "INTERRUPTED_BEFORE_VALID_ACCOUNTING"
+    }
+  ],
+  "runs": [
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p1024-c1-r1-20260907T200126.107700Z/result.json",
+      "sha256": "b500589f4c557b9c810d0bf896f004830f89b7173507b0778610b23c03e15c78",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p1024-c1-r2-20260907T200350.554964Z/result.json",
+      "sha256": "e6f54a75b6da533bb793a6691157e3d69e131851c92f99d5cd3d24eb5606fd21",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p1024-c1-rwarmup-20260907T195902.821943Z/result.json",
+      "sha256": "04c1e0792187fd877d021f1cbd19e0252e2be720d2e4de02ed9bc083c8fe5dad",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p1024-c1-rwarmup-20260907T200642.275095Z/result.json",
+      "sha256": "0a90fae6a9b19a9d6d0f6341959bdfd896b61b52871161a931963016d0df06fc",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p1024-c4-r1-20260907T200152.518904Z/result.json",
+      "sha256": "58a83222e1067bff60dd8ba49481bcfea79616abb3d9b484f20aa9256e9221fc",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p1024-c4-r2-20260907T200416.963003Z/result.json",
+      "sha256": "83f9da488cf0d00e94810d36e4466b544f629b83a0bf91b62749fd95e8709849",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p1024-c4-rwarmup-20260907T195929.032585Z/result.json",
+      "sha256": "4e09d5e03614c6a7c376e4a2e99e827e735ec1aa41919fd3d190a77faac3c31f",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p1024-c4-rwarmup-20260907T200709.132631Z/result.json",
+      "sha256": "290892e2c3f40f0b3a4a977046ced49de9bc33edce207e09f8bb86b1db1d39ba",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p128-c1-r1-20260907T200042.157222Z/result.json",
+      "sha256": "d351e2612272180da3a08a92d61a5f2b1b0d986ca5318b69c4bcc89bd4c7c029",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p128-c1-r2-20260907T200306.898645Z/result.json",
+      "sha256": "c30ff3a14462bb5ec78960b87331a6042c6d7dbb7924f4b782904b9fd1240388",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p128-c1-rwarmup-20260907T195818.670470Z/result.json",
+      "sha256": "140fcc8dfd711530fba5caa0fe6bd9c38442609d3d3041d48bafdc2f05cf7df2",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p128-c1-rwarmup-20260907T200559.226299Z/result.json",
+      "sha256": "6760215a39d15f4a497d3ae92a52462a37a6b0f8b133516dcb3d2b761b9fbfc6",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p128-c4-r1-20260907T200107.507741Z/result.json",
+      "sha256": "b6a2c62e6ba3bd624499fed0704ba49dad95cac6f0f7ff864c68fa14caa03750",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p128-c4-r2-20260907T200332.610445Z/result.json",
+      "sha256": "37bd5f20e70d5e8e8df4db1b112ea7b384822cf57bd5b3e67e122a52eb960cc2",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p128-c4-rwarmup-20260907T195844.126621Z/result.json",
+      "sha256": "37cf533fea303ac1212337253fbea8b31994eb9a911a2e42b1ddf738a749a9c4",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p128-c4-rwarmup-20260907T200624.133298Z/result.json",
+      "sha256": "02bb73b125ce1905a1286bb5ca51c7dca215dcc294e481558a908aade4e4dc63",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p4096-c1-r1-20260907T200212.114813Z/result.json",
+      "sha256": "210d6bc159b5afe4ee4cf606211286bfb0707d05e20a1cc4eea8bd62e2be97a6",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p4096-c1-r2-20260907T200436.212027Z/result.json",
+      "sha256": "e1291518cb4ee8aaf4607c9c2af9f3018d0226c272e96a8c2b879e13ea6021d2",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p4096-c1-rwarmup-20260907T195948.380188Z/result.json",
+      "sha256": "d24336871751a077b8bf8a315da4b6680bc10b0a2f4e56790968c5cfe9ac0706",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p4096-c4-r1-20260907T200243.136227Z/result.json",
+      "sha256": "fdd35518a1dc350675645a1d68e2d28415317b0602a08c75f056837e63b1b576",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p4096-c4-r2-20260907T200506.830911Z/result.json",
+      "sha256": "715670a47a57c8c6935ae73249fb84a68c73be4d2b92fac2aff4b08bcab5cbf3",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "off",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-off/results/plow-p4096-c4-rwarmup-20260907T200019.046617Z/result.json",
+      "sha256": "eb486583b59fa856e5897bfe8399ea80b1bf76d1436d468f176b74911e0c4f8d",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p1024-c1-r1-20260907T200126.109340Z/result.json",
+      "sha256": "2454881e5b132cd809aaff052074aa8283c047e3d4885a1874a1844e3c7f50cd",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p1024-c1-r2-20260907T200350.554077Z/result.json",
+      "sha256": "3e7183432f886264be3c34cbffa7c524b63ac41393773b1d49f775ebb74bb46a",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p1024-c1-rwarmup-20260907T195902.823238Z/result.json",
+      "sha256": "b0b416a3a3dce0389d4c4455246ed9ccd1ec63640ea4f95131a2381deb3d2579",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p1024-c1-rwarmup-20260907T200642.276216Z/result.json",
+      "sha256": "696f79bc315e519589d5c93774ff19f1692fec452e8233ec9c35ee3a79e96c09",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p1024-c4-r1-20260907T200152.518205Z/result.json",
+      "sha256": "3a36f643d63432f8ddd9ae6c1e11a351285a837d6cdc45afdfaf5e5d6f15299f",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p1024-c4-r2-20260907T200416.962393Z/result.json",
+      "sha256": "2a2e7585582e8ca6354394bda491465ec9ba2706516f9b410fdea0d62f4e5e48",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p1024-c4-rwarmup-20260907T195929.033509Z/result.json",
+      "sha256": "67add632f9c3cb2d3f1de4fd4d967494e4e54c81af8b77e074e3636a2fae9143",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p1024-c4-rwarmup-20260907T200709.132696Z/result.json",
+      "sha256": "1e9b07c0c1a316c0a450933bbff3f9abfc4eda124d98e30d5964fba1fb32316a",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p128-c1-r1-20260907T200042.155837Z/result.json",
+      "sha256": "8045dad066198c5c25b97836a6f0d451a7db2f14b7ec2592055d184ad8e78fe9",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p128-c1-r2-20260907T200306.900270Z/result.json",
+      "sha256": "39dd56f85ac2ea94ffe28119f7162ee4d6c93c97f400fec4856f52783c1ab2f0",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p128-c1-rwarmup-20260907T195818.670677Z/result.json",
+      "sha256": "b748c6be9afd1dbb5c6d78c0ee2c4c02c04f9830f32bcf49525359ee62293441",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p128-c1-rwarmup-20260907T200559.225529Z/result.json",
+      "sha256": "35d7b433d42ad6c7f389231e81a434c40387e59b14f01049a2dcfb121ecbb396",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p128-c4-r1-20260907T200107.508434Z/result.json",
+      "sha256": "836e53d7597fa70025387fc6606bc30993fb4fad68cee5f99678bb3d312361e7",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p128-c4-r2-20260907T200332.612450Z/result.json",
+      "sha256": "75962bab2f48d2dd3e1dd4600ed94f228ce80549fe0a4755610a4c242c99109e",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p128-c4-rwarmup-20260907T195844.126754Z/result.json",
+      "sha256": "8c879d4bf90b5966a824ec19e370657604e04aeef5cc186155591a13bf81ba8a",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p128-c4-rwarmup-20260907T200624.135301Z/result.json",
+      "sha256": "0c7bfff0a33bb49dea0b08c00342d680eb6de76670b13a564ea847820dd18835",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p4096-c1-r1-20260907T200212.115057Z/result.json",
+      "sha256": "ad03b8a0d95c5b6d4275a54d48e00fe039f2adc31fba9481fcafe3a955426186",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p4096-c1-r2-20260907T200436.212875Z/result.json",
+      "sha256": "e1d2645d4bafaf73615fbba1af7567002724d78f20c8aeab5d7b6250e9c2ec88",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p4096-c1-rwarmup-20260907T195948.381793Z/result.json",
+      "sha256": "a2ec62ffcd74c260fbdd6bb9b7d8bc32f44a3a2450cac3273e78050e67110eb2",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p4096-c4-r1-20260907T200243.137872Z/result.json",
+      "sha256": "ff224d91d1118c867d91ba2b0af7819259cb5ec4ab78a96eb2b46500711d09a4",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p4096-c4-r2-20260907T200506.831320Z/result.json",
+      "sha256": "61f55a61f9cae798928f495a2becbc403aabd6957c38d48f821824238f42862f",
+      "completed_requests": 4,
+      "output_tokens": 512
+    },
+    {
+      "arm": "on",
+      "path": "/app/plow/build-gemma31/bench-pf-gfuse-direct-on/results/plow-p4096-c4-rwarmup-20260907T200019.046805Z/result.json",
+      "sha256": "4aa935af9ff0f9fd045b51b62371b038eeda9e0a6fa2168f17eeef23aff96aed",
+      "completed_requests": 4,
+      "output_tokens": 512
+    }
+  ],
+  "performance_conclusion": "None: the two-GPU assignment crossover was not completed. Retain every completed and interrupted result; no partial-study promotion.",
+  "cleanup": "No owned GFUSE processes/lease wrappers or listeners on ports18940\u201318949 remained after root cleanup.",
+  "stop_record": {
+    "status": "INTERRUPTED_BY_USER",
+    "requested_at": "2026-09-07T20:07:56.483132+00:00",
+    "instruction": "Freeze into perf/gemma31-mi300x-consolidated and stop experiments. Do not resume without explicit user instruction.",
+    "root_orchestrators": [
+      1188248
+    ]
+  },
+  "raw_archive": "/app/plow/build-gemma31/pf-gfuse-stock/root-freeze-results.zip",
+  "raw_archive_sha256": "55852a793be8f168ebdc2ba7aee60366039022a171f3fe3f0a8478518ed1913f"
+}

@@ -1,0 +1,60 @@
+[
+  {
+    "rows": 1,
+    "mode": "compiled_vs_eager_control",
+    "different": 1401,
+    "max_abs": 1.0,
+    "relative_l2": 0.002571690594777465
+  },
+  {
+    "rows": 1,
+    "mode": 0,
+    "different": 0,
+    "relative_l2": 0.0,
+    "max_abs": 0.0,
+    "quant_byte_differences": 0,
+    "quant_scale_differences": 0,
+    "fused_native_byte_differences": 93,
+    "fused_native_scale_differences": 0
+  },
+  {
+    "rows": 1,
+    "mode": 1,
+    "different": 1401,
+    "relative_l2": 0.0025734242517501116,
+    "max_abs": 1.0,
+    "quant_byte_differences": 93,
+    "quant_scale_differences": 0,
+    "fused_native_byte_differences": 0,
+    "fused_native_scale_differences": 0
+  },
+  {
+    "rows": 128,
+    "mode": "compiled_vs_eager_control",
+    "different": 175502,
+    "max_abs": 4.0,
+    "relative_l2": 0.003005617531016469
+  },
+  {
+    "rows": 128,
+    "mode": 0,
+    "different": 6,
+    "relative_l2": 1.1465403076726943e-05,
+    "max_abs": 0.0625,
+    "quant_byte_differences": 0,
+    "quant_scale_differences": 0,
+    "fused_native_byte_differences": 20617,
+    "fused_native_scale_differences": 43
+  },
+  {
+    "rows": 128,
+    "mode": 1,
+    "different": 175502,
+    "relative_l2": 0.0030050098430365324,
+    "max_abs": 4.0,
+    "quant_byte_differences": 20617,
+    "quant_scale_differences": 43,
+    "fused_native_byte_differences": 0,
+    "fused_native_scale_differences": 0
+  }
+]

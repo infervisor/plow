@@ -2930,5 +2930,5 @@
       }
     ]
   },
-  "fresh_backend_comparison": "72 stock runs on verified fresh vLLM0.28 ROCm7.14 and combined guardedMM1/MM4 Plow servers running; no backend win claimed."
+  "fresh_backend_comparison": "Complete:72runs,288requests,36864outputtokens,zero failedrequests. vLLM remains faster in all six throughput/TTFT/TPOT cells. See gemma4-31b-mi300x-direct-bench-serve-20260907.json. All servers stopped; experiments frozen by user."
 }

@@ -1,0 +1,890 @@
+{
+  "frozen_utc": "2026-09-07T20:06:58.361521+00:00",
+  "checkout": "/app/plow/build-gemma31/fp8-native-private",
+  "base_commit": "3c85c2720ef73d2139d857edcea94213d3a32ea1",
+  "status": "frozen; full-model qualification fails; no production promotion",
+  "owned_gpu_jobs_running": false,
+  "pending_runtime_fix": "matching native fused RMSNorm+PTPC quant BF16 normalized-value rounding; primitive only",
+  "validated_capture_controls": [
+    "dispatch-capture-control.json",
+    "fused-dispatch-capture-control.json"
+  ],
+  "invalid_capture_control": "quant-capture-control.json",
+  "artifacts": [
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/devgen/src/emit_config.rs",
+      "bytes": 96819,
+      "sha256": "73e5a252263405be44bb3a1df6eddd93d7bb754cf04dba39123ae767e24df6cd"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/devgen/src/lib.rs",
+      "bytes": 383595,
+      "sha256": "d35df8eb5db83b022a780726d6dc2654f97542a0363995c7475977f66f76e85f"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/devgen/src/manifest.rs",
+      "bytes": 143381,
+      "sha256": "b0687c7da8a641309692640782bfb9660f225d2287dd129c1267d39b9a0df467"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/devgen/tests/native_ptpc.rs",
+      "bytes": 4116,
+      "sha256": "84cfaa7ea9e2cc5b495f32ab6a5769f8e1c2e766e50f46cfd5b8ed3b02551355"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/packet/src/slots.rs",
+      "bytes": 43741,
+      "sha256": "05f3a63c32c78624806340db83ee95d0ad896651e9de3c1be75c1e524859ddee"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/plowrt/src/asset/mod.rs",
+      "bytes": 4062,
+      "sha256": "fa40b3cc0ab3665db9042780fc30fcf8cb2c7ee9d75027a3e536512fa0f80345"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/plowrt/src/asset/native_ptpc.rs",
+      "bytes": 12492,
+      "sha256": "ec62ca5ae837819575fdbdc02bf4263c2cab798a7267fed09ecff231a7f9fc5b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/plowrt/src/exec/amd.rs",
+      "bytes": 776966,
+      "sha256": "dc31059ea5db4c110960f1ed7db76f4acb9cc0779e8a8dbef8895202af1f9ec9"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/plowrt/src/exec/cpu/engine.rs",
+      "bytes": 68277,
+      "sha256": "b3e910d7c3774158ee994ea09462c7713884c3024dad2caa5be9f0cf9dc64dd6"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/plowrt/src/exec/gpu.rs",
+      "bytes": 351901,
+      "sha256": "21f8dc762cb4012a724849910829d4255fad973f00455ba59d66a93e40ce7939"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/crates/plowrt/tests/hsa_native_ptpc.rs",
+      "bytes": 7025,
+      "sha256": "846cd75fcc8c28d1caf08f3903b899b4ed5ee039986bff6b10768ebcbadbd206"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/FROZEN-HANDOFF.md",
+      "bytes": 6246,
+      "sha256": "5c188159041c19591360c17e7d64b275010bd57d692bbcc61a98e070abc6aed0"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/README.md",
+      "bytes": 10141,
+      "sha256": "495a936090ec583daa6080fb1d689b036477fcf07c3c4f36fa75ca34e780a55c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/capture-repeat-cases.json",
+      "bytes": 3765,
+      "sha256": "ea5a7c0f532b669b03fa0c768121acfb1731cfdc45ece50d20242d4052d84dab"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/check-quant-capture.py",
+      "bytes": 1381,
+      "sha256": "802dacf7bb909222d303de05a0bceadaa41565d7b567b915d0eb803a683d7e2c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/dispatch-capture-control.json",
+      "bytes": 1449,
+      "sha256": "ae08f8e22be1c42c313f25618445baaee6c8464fcf229a79038252b8c7094db4"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/dispatch_capture/sitecustomize.py",
+      "bytes": 3401,
+      "sha256": "c019621a8e91553796240c9eb74403e6e252ad34de237e8751b9e11bb42089ce"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fullmodel-assets/build.json",
+      "bytes": 427728,
+      "sha256": "85606ef9e87a1ce1bcb12a2f345b4b6a80a7cc6af669b938e4075739594df6c1"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fullmodel-assets/model.pkt",
+      "bytes": 32525372,
+      "sha256": "57f672369ecd219cbcec69af83ba1017cd5701cfc0a4163dfb5b45ebbc4bf427"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fullmodel-assets/weights.json",
+      "bytes": 267,
+      "sha256": "966808c9a720bb2da6a014502fcd3578b2855121c2dbbbc3ccb33ef836b2cb70"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fullmodel-assets-gelu/build.json",
+      "bytes": 427793,
+      "sha256": "79281edb9388ab68663131179838fbc9626f32076bc87186bf86529c593178aa"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fullmodel-assets-gelu/model.pkt",
+      "bytes": 32525372,
+      "sha256": "e522c7afb17305a791e82fdcd13bc533e344cfe2c570995031367fbb708bce14"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fullmodel-assets-gelu/weights.json",
+      "bytes": 267,
+      "sha256": "966808c9a720bb2da6a014502fcd3578b2855121c2dbbbc3ccb33ef836b2cb70"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fullmodel-cases.json",
+      "bytes": 2026,
+      "sha256": "ad29c9398847621009eb9d6b34175a8c04e63f939834f880d14247bd7be75ea4"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fullmodel-gelu-run.log",
+      "bytes": 2151,
+      "sha256": "0698c286d17710bc4beabd19d3fbf9b56106cdc80c7716de5dbb2d20d61da8be"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fullmodel-run.log",
+      "bytes": 5910,
+      "sha256": "a243a1b4c57a16f74fe4a6430ef73d803af6240a4c2f491ff3f82787ec7c15d9"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/fused-dispatch-capture-control.json",
+      "bytes": 1449,
+      "sha256": "ae08f8e22be1c42c313f25618445baaee6c8464fcf229a79038252b8c7094db4"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/gelu-emitter-tests.log",
+      "bytes": 1384,
+      "sha256": "4a74c0219efa2b0e8621d1147ab22dc67358af2d67ddadc53307ffc8cd4a7094"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/gelu-round-results.json",
+      "bytes": 2228,
+      "sha256": "60d85514891926daaf0eaf023661f367bc366651e8681301610cbdc08548cc93"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/gelu-runtime-tests.log",
+      "bytes": 4330,
+      "sha256": "ce70954fc2ab972efd8ce00623ef28b586aeea546afaf9efaef5237235cfcb51"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/gelu_round.hip",
+      "bytes": 939,
+      "sha256": "d9c494c530df1ad4ee2c68232718dc4d6c3d48091a71ab061802d2e2d401a739"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/gelu_round.py",
+      "bytes": 1416,
+      "sha256": "3bd45d4f334a93b2e9544c80d8f0073de9ba78e3e9b5cce89f6fdad81cf197de"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/gelu_round.so",
+      "bytes": 20680,
+      "sha256": "c125022895a77cbc4b1cc0597687a748b93285420c186680a4131592b1288b7d"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco/interp_decode_fp8.elf",
+      "bytes": 943488,
+      "sha256": "c4666a02514847637fe49d21c849e79b537f29a186c2621bf361289308c36c65"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco/interp_decode_fp8_gq.elf",
+      "bytes": 944304,
+      "sha256": "4b6ee1cab5fa978cbf943b8f3b087f45b3bb5c4bcb6da8c9c8792e426fe7f7b4"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco/interp_flash.elf",
+      "bytes": 158072,
+      "sha256": "a0a4114475be17d2190b1d022a697a99da2e0efb8a1f568d736f74adc336c4ad"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco/interp_flash_gq.elf",
+      "bytes": 158848,
+      "sha256": "9d3c3949441ad7167b91d78b4ab80cc024c431092b92dc6a324dd103d8ba8e21"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco/interp_prefill_fp8.elf",
+      "bytes": 429024,
+      "sha256": "547f2adc7d69cb2d1e7bdf5a68859c727ec9b2f84525fa50dd2e67e966c08bf1"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco/interp_prefill_fp8_gq.elf",
+      "bytes": 429032,
+      "sha256": "8094f2352f32fae305cff320cd30cc70a5113810ef461166333dec0ea4d42a46"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco-gelu/interp_decode_fp8.elf",
+      "bytes": 947888,
+      "sha256": "265c04892def1cd625e36f5bd9c83ab11c467174c12dd492a91d437deced3fc5"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco-gelu/interp_decode_fp8_gq.elf",
+      "bytes": 948712,
+      "sha256": "654c11a5042d710c069d8ae080b9f88fcf4e632b0bc9b42d2ef5d10cbbe3eda1"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco-gelu/interp_flash.elf",
+      "bytes": 158072,
+      "sha256": "a0a4114475be17d2190b1d022a697a99da2e0efb8a1f568d736f74adc336c4ad"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco-gelu/interp_flash_gq.elf",
+      "bytes": 158848,
+      "sha256": "9d3c3949441ad7167b91d78b4ab80cc024c431092b92dc6a324dd103d8ba8e21"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco-gelu/interp_prefill_fp8.elf",
+      "bytes": 433680,
+      "sha256": "8e1577e80e5a761adebc43edc4aad26be09ecf95e2a4f273d06e9f9da0bb6765"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/hsaco-gelu/interp_prefill_fp8_gq.elf",
+      "bytes": 433688,
+      "sha256": "9f6dbd18845aec7fecabc295998e96a8966d98e875e62f2f3317b654644e1bc7"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/layer0-comparison.json",
+      "bytes": 5322,
+      "sha256": "796521e60753d13d3769a3ec2369dc4624a892ec2236c75f9dbd273b7fc5f643"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/native_ptpc.hip",
+      "bytes": 3166,
+      "sha256": "479122f242220de7f85d09d75c0a9e659d46b3f5d3f8538988d0a44972582489"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/native_ptpc.so",
+      "bytes": 175648,
+      "sha256": "e38395b47aa0e1de3c7c7cfce3b5a40cdadf7b71985a9a68075e85e3c6ca3067"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/native_vllm_oracle.py",
+      "bytes": 13089,
+      "sha256": "6e7fca3fb237094cca2d47f6f9b23022dcbae5fd2a1c7a7a9f8b985ec70f0c0c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/norm-round-fused-results.json",
+      "bytes": 1385,
+      "sha256": "301f3134d08d07852154f306b7d980cb700cf187212aaaed56c4035dbefde2ac"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/norm-round-results.json",
+      "bytes": 1054,
+      "sha256": "add7115ae664c118e462d6acf5bd2861f5691219e41231c47e9bbdbbf8ec412c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/norm_round.hip",
+      "bytes": 1060,
+      "sha256": "b43a2fe365af50bd835dc8c6aa8e6bd546b4b48ac46b09aa727d66885965fc1d"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/norm_round.py",
+      "bytes": 2592,
+      "sha256": "ab537aaa96d292f804b3b9500685b5e986d53f8e25b65665b2836fe77cb767a1"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/norm_round.so",
+      "bytes": 26008,
+      "sha256": "9de75a12dd212633509f58279171c522eeeb122eb1658402aeffda79d37f3932"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits/comparison.json",
+      "bytes": 2469,
+      "sha256": "71ab07d946e895129c89582e16eb5a012c7c286d6b582f3882843f8bd146ac00"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits/logits_p128.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "9de1758f71fb92b67c06956245dc587ee99c59521d4e08d6a1f8a10e02c24ff5"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits/logits_p128.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "72913f743480be309cf6c14207a0737c4b6c36932c909761d8fc4ce88b1c99bd"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits/logits_p128.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "c37ba547c4a03775ac5e8889a6f8f6d5451439fdc8ed58d5b1948163c0c16b3b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits/logits_p128.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "6450b2348249f4215583a5411a3e67af77916e0eb15e091e95f0d96bc51b73ec"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits/logits_p16.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "ddb389054c3ce770832273cd84afab582c897cc9e3a95c394860ae24223c8c6c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits/logits_p16.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "f61b520186b09851b4cd62b8f121e686daf8b5d8f7cfdc5b3f3a8622422be612"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits/logits_p16.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "f7c9dfbd34ca951590186258e4f8cc329d56aa84c94cf1bd0962f61816b14fc0"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits/logits_p16.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "ba16cccae7c3a791430f7d89d9dca42df747570b13d3c3afea7d66774c3117e5"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits-gelu/comparison.json",
+      "bytes": 2468,
+      "sha256": "1777a5293ec738faa89179050b99741558888eb762e902a290df37cbe524ec44"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits-gelu/logits_p128.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "bd38e5dfb0da908781e0f6bd488f6f51d4b467fefea778a8221f218223d98443"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits-gelu/logits_p128.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "e0755068da25756cc1dba260805a37dc22ebcbbdd74c6057a52bd05f50d68451"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits-gelu/logits_p128.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "b65a826399d417e495780b0cd181210315350f63a0b631692919ee55b253a205"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits-gelu/logits_p128.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "7fa03287ebbd2cb59a22e96e6c1ecbd9e70ae51c0987bbf8fca8373e285e3a75"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits-gelu/logits_p16.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "e0759f7afd7f107936ef7924b664071ae56466895bb5ae530f85105a73747e9d"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits-gelu/logits_p16.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "6b21b6a1156286f1d46041167ff7c2ddd05f4cc53cdfbe1641b7bac70fa5daf0"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits-gelu/logits_p16.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "0bc54d8323894c2c6e2a5e01207a875c762ef84c3786daca1c037a0a7160a68d"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/plow-native-logits-gelu/logits_p16.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "334e8aeb1f75bc5e09bf43d854b67d09dec316676d9283a855585b0ceab5c41b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/private-native-ptpc.patch",
+      "bytes": 64531,
+      "sha256": "8df925a0cf76b0f6b49e85f5765dbe81c04fdad3b4d45fc2b5b622b9cbc9383a"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/production-repeat-control.json",
+      "bytes": 894,
+      "sha256": "91956ee593f7a7ba7190e73e17192afac8c31c10aa24998af2151fe66e6ac73f"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/quant-capture-control.json",
+      "bytes": 1620,
+      "sha256": "f164b6234e98e7047b3ba15e0f0560dd6eccbb089536c6793418ce894e2c8df3"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/quant_capture/sitecustomize.py",
+      "bytes": 1997,
+      "sha256": "a8d88dc6dda3e5242fce3fdfdb7518725145da3964eb0eb858c4128a3b5e2316"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/run-dispatch-capture.sh",
+      "bytes": 805,
+      "sha256": "a03061200bf4a5893c1bfde0ccc5ec2f111928652a7deea7394b16683524ea9f"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/run-fullmodel-gelu.sh",
+      "bytes": 800,
+      "sha256": "18463759c87eee274311e340e62546fad82c3f481c4e33e33257e3f655711251"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/run-fused-dispatch-capture.sh",
+      "bytes": 823,
+      "sha256": "c16d4e0d5394256b018dcc947c734a7c69d9f6c0603b5fb17164637d65444433"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/run-norm-fused.sh",
+      "bytes": 396,
+      "sha256": "7a42ef320d21ee87a8a0c08a51b5d9cf11c98f71e904eb0db30ea4b7cdd58456"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-activation-kernels-v0.28.0.cu",
+      "bytes": 38571,
+      "sha256": "4b9339f37553bc6f1f369a2c4b2a2222536f638e73b61c9d5bda87d3a4e478d7"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/invocation.json",
+      "bytes": 1354,
+      "sha256": "270f33a0548fa916202badd83be85b1e1e2b342f9e03d0a4e6b675359071a07b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p128-repeat.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "0df64f780a0f384d5b9ada55257080c861b4c2f5397306ca3b824663d0f2aa92"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p128-repeat.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "d76959bd865c3c9ba1dca0be8609fa13148e1f2119f8c55c213fd4c98d539d8c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p128-repeat.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "c6bb4d947aa8d39429ca525b6e50526ff06c658ccfa36652765065bcfbd1b6f6"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p128-repeat.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "e8f13a5f24e5d6543126394bf3bf17d665e773c03cb9b0f464f08c4efb2e6ecf"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p128.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "0df64f780a0f384d5b9ada55257080c861b4c2f5397306ca3b824663d0f2aa92"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p128.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "d76959bd865c3c9ba1dca0be8609fa13148e1f2119f8c55c213fd4c98d539d8c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p128.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "c6bb4d947aa8d39429ca525b6e50526ff06c658ccfa36652765065bcfbd1b6f6"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p128.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "e8f13a5f24e5d6543126394bf3bf17d665e773c03cb9b0f464f08c4efb2e6ecf"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p16.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "dd4f941b507138b7db6c570d6e81b754ed7550fd1f9ead9adf1dd419935d4d40"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p16.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "04a6fc8c9e1e6bb763e486a55c9660faef1b2821770ea23cddb6312b9d1c10be"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p16.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "66adfe7b079e8e3f999e33eae8dddf1f9fb5650575b77572f49c9e3570b65b7b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/logits_p16.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "1791d79b314eb041dd582d8449a3bec4d3fcbc16c9a61ef04beb36c342f3557a"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture-logits/manifest.json",
+      "bytes": 11939,
+      "sha256": "949d0b0976e006d62620b2b8ac37cac6c452f7bddd0a5f5c214960fbe7b2ced5"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-capture.log",
+      "bytes": 15013,
+      "sha256": "b91c7798eddcf211760b6dcf8c54dc155affa680e9dd995eb97cc3d48d83b19a"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-layer0/manifest.json",
+      "bytes": 566,
+      "sha256": "7aa85bc24e88133fd38b1972be50d0fc787db317f1803783dbcc8847e493ff18"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-layer0/quant00.bf16",
+      "bytes": 2097152,
+      "sha256": "ad372dfeb90be69bdb63930d946a64024e0fbf17c49a2852d0be4f84fa4fea7d"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-layer0/quant01.bf16",
+      "bytes": 5505024,
+      "sha256": "b0c18569620216470a7d382e2e65e6be1b4e68f3f106a46a0afa0fead6144ba2"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-layer0/quant02.bf16",
+      "bytes": 2097152,
+      "sha256": "0e146c6dda9eac6864975f2b59da5d6d558934d0bde444aacc7acc393fefe9e4"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-dispatch-layer0/quant03.bf16",
+      "bytes": 5505024,
+      "sha256": "eb86db588ae1e968c67c963292c07c322fb82590a01dcb9d2c34936a5bf68dcc"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/invocation.json",
+      "bytes": 1354,
+      "sha256": "270f33a0548fa916202badd83be85b1e1e2b342f9e03d0a4e6b675359071a07b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p128-repeat.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "0df64f780a0f384d5b9ada55257080c861b4c2f5397306ca3b824663d0f2aa92"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p128-repeat.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "d76959bd865c3c9ba1dca0be8609fa13148e1f2119f8c55c213fd4c98d539d8c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p128-repeat.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "c6bb4d947aa8d39429ca525b6e50526ff06c658ccfa36652765065bcfbd1b6f6"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p128-repeat.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "e8f13a5f24e5d6543126394bf3bf17d665e773c03cb9b0f464f08c4efb2e6ecf"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p128.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "0df64f780a0f384d5b9ada55257080c861b4c2f5397306ca3b824663d0f2aa92"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p128.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "d76959bd865c3c9ba1dca0be8609fa13148e1f2119f8c55c213fd4c98d539d8c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p128.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "c6bb4d947aa8d39429ca525b6e50526ff06c658ccfa36652765065bcfbd1b6f6"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p128.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "e8f13a5f24e5d6543126394bf3bf17d665e773c03cb9b0f464f08c4efb2e6ecf"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p16.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "dd4f941b507138b7db6c570d6e81b754ed7550fd1f9ead9adf1dd419935d4d40"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p16.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "04a6fc8c9e1e6bb763e486a55c9660faef1b2821770ea23cddb6312b9d1c10be"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p16.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "66adfe7b079e8e3f999e33eae8dddf1f9fb5650575b77572f49c9e3570b65b7b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/logits_p16.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "1791d79b314eb041dd582d8449a3bec4d3fcbc16c9a61ef04beb36c342f3557a"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture-logits/manifest.json",
+      "bytes": 11939,
+      "sha256": "949d0b0976e006d62620b2b8ac37cac6c452f7bddd0a5f5c214960fbe7b2ced5"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-capture.log",
+      "bytes": 15013,
+      "sha256": "a39d2f744f9e6ab852de7920b307b9bd7dd374200bedf92a504fd1cdfd9d1806"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/fused00.input.bin",
+      "bytes": 1376256,
+      "sha256": "afbfa5108ad72d77bec01c4f290187fb1e7732a49365336d6ad429ed7f7b987d"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/fused00.result.bin",
+      "bytes": 688128,
+      "sha256": "2a7be944940cd5b41f7a48f4fa9087f891de3d39015509714d307347c42f307f"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/fused00.scale.bin",
+      "bytes": 512,
+      "sha256": "568f836b19b27c7b12e53da9bb7e2e59d4d68cf55e502071d2c2f80a992d5304"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/fused00.weight.bin",
+      "bytes": 10752,
+      "sha256": "87f1eacc388fa1fefebe8a1f00e47a46fffc2a6e055d1e6225262b6f89cef2c0"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/fused01.input.bin",
+      "bytes": 1376256,
+      "sha256": "ae17957cbf3eace668cd43e1f9f5254bde428a51e9a2e19478ca108232c9f53d"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/fused01.result.bin",
+      "bytes": 688128,
+      "sha256": "1b7dd848264dface38f3696b867f0a5e76bae10e3519b90f6e454b8d1416e419"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/fused01.scale.bin",
+      "bytes": 512,
+      "sha256": "71c3a5a79abc1044a278cffd4a8867ccdffbeb108f79b501977c5568f373b7c2"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/fused01.weight.bin",
+      "bytes": 10752,
+      "sha256": "d3f54da04fa40dee7072855d3caf654e472084a272803f813c06e8cd06da9863"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/manifest.json",
+      "bytes": 2188,
+      "sha256": "47312338f428a03b124aa7b1d3c3323eaca552acfc2e2fa3128ddc2a062edfd4"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/quant00.bf16",
+      "bytes": 2097152,
+      "sha256": "ad372dfeb90be69bdb63930d946a64024e0fbf17c49a2852d0be4f84fa4fea7d"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/quant01.bf16",
+      "bytes": 5505024,
+      "sha256": "b0c18569620216470a7d382e2e65e6be1b4e68f3f106a46a0afa0fead6144ba2"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/quant02.bf16",
+      "bytes": 2097152,
+      "sha256": "0e146c6dda9eac6864975f2b59da5d6d558934d0bde444aacc7acc393fefe9e4"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-dispatch-layer0/quant03.bf16",
+      "bytes": 5505024,
+      "sha256": "eb86db588ae1e968c67c963292c07c322fb82590a01dcb9d2c34936a5bf68dcc"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-fused-norm-quant-v0.28.0.cu",
+      "bytes": 14935,
+      "sha256": "a4382350283818b48d1104ce4f5d03139235ba8d329a1482fcf364a5e05b73e1"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-layernorm-utils-v0.28.0.cuh",
+      "bytes": 21071,
+      "sha256": "8836bfeb84a0d4e832769dc66bd199cb4e234ac9ce9f5853db30ec97d5ff9a0e"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/invocation.json",
+      "bytes": 1354,
+      "sha256": "270f33a0548fa916202badd83be85b1e1e2b342f9e03d0a4e6b675359071a07b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/logits_p128.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "0df64f780a0f384d5b9ada55257080c861b4c2f5397306ca3b824663d0f2aa92"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/logits_p128.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "d76959bd865c3c9ba1dca0be8609fa13148e1f2119f8c55c213fd4c98d539d8c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/logits_p128.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "c6bb4d947aa8d39429ca525b6e50526ff06c658ccfa36652765065bcfbd1b6f6"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/logits_p128.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "e8f13a5f24e5d6543126394bf3bf17d665e773c03cb9b0f464f08c4efb2e6ecf"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/logits_p16.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "dd4f941b507138b7db6c570d6e81b754ed7550fd1f9ead9adf1dd419935d4d40"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/logits_p16.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "04a6fc8c9e1e6bb763e486a55c9660faef1b2821770ea23cddb6312b9d1c10be"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/logits_p16.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "66adfe7b079e8e3f999e33eae8dddf1f9fb5650575b77572f49c9e3570b65b7b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/logits_p16.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "1791d79b314eb041dd582d8449a3bec4d3fcbc16c9a61ef04beb36c342f3557a"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-native-logits/manifest.json",
+      "bytes": 6891,
+      "sha256": "76969feff3ceb6c4ef384deb09decd71003afbf3ee9b02ed4d7ec8bef9a0894f"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/invocation.json",
+      "bytes": 1354,
+      "sha256": "270f33a0548fa916202badd83be85b1e1e2b342f9e03d0a4e6b675359071a07b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p128-repeat.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "0df64f780a0f384d5b9ada55257080c861b4c2f5397306ca3b824663d0f2aa92"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p128-repeat.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "d76959bd865c3c9ba1dca0be8609fa13148e1f2119f8c55c213fd4c98d539d8c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p128-repeat.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "c6bb4d947aa8d39429ca525b6e50526ff06c658ccfa36652765065bcfbd1b6f6"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p128-repeat.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "e8f13a5f24e5d6543126394bf3bf17d665e773c03cb9b0f464f08c4efb2e6ecf"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p128.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "0df64f780a0f384d5b9ada55257080c861b4c2f5397306ca3b824663d0f2aa92"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p128.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "d76959bd865c3c9ba1dca0be8609fa13148e1f2119f8c55c213fd4c98d539d8c"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p128.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "c6bb4d947aa8d39429ca525b6e50526ff06c658ccfa36652765065bcfbd1b6f6"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p128.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "e8f13a5f24e5d6543126394bf3bf17d665e773c03cb9b0f464f08c4efb2e6ecf"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p16.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "dd4f941b507138b7db6c570d6e81b754ed7550fd1f9ead9adf1dd419935d4d40"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p16.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "04a6fc8c9e1e6bb763e486a55c9660faef1b2821770ea23cddb6312b9d1c10be"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p16.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "66adfe7b079e8e3f999e33eae8dddf1f9fb5650575b77572f49c9e3570b65b7b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/logits_p16.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "1791d79b314eb041dd582d8449a3bec4d3fcbc16c9a61ef04beb36c342f3557a"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-production-repeat-logits/manifest.json",
+      "bytes": 11939,
+      "sha256": "949d0b0976e006d62620b2b8ac37cac6c452f7bddd0a5f5c214960fbe7b2ced5"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/invocation.json",
+      "bytes": 1354,
+      "sha256": "270f33a0548fa916202badd83be85b1e1e2b342f9e03d0a4e6b675359071a07b"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p128-repeat.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "f922e186f4e13f463c394b24fbe48b6ac3f0adafdb78149998d25b1a9e6297c9"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p128-repeat.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "709f6ea9b24e5d06722a2a04a6f14b483da3965363ef5a7e87a1869480aadd90"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p128-repeat.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "a663b6429bf4d4ae534ad2a929612bba0956ddb3c752209bf8057546a8683895"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p128-repeat.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "6c70827d298ed95a053106dd1a1a9c8421f75727494daf9e9102f564869432e0"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p128.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "f922e186f4e13f463c394b24fbe48b6ac3f0adafdb78149998d25b1a9e6297c9"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p128.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "709f6ea9b24e5d06722a2a04a6f14b483da3965363ef5a7e87a1869480aadd90"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p128.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "a663b6429bf4d4ae534ad2a929612bba0956ddb3c752209bf8057546a8683895"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p128.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "6c70827d298ed95a053106dd1a1a9c8421f75727494daf9e9102f564869432e0"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p16.step0000.f32",
+      "bytes": 1048576,
+      "sha256": "6e1c4b9020c13e9d51674740236929a75784497771b9d671cd5f71b027464ecc"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p16.step0001.f32",
+      "bytes": 1048576,
+      "sha256": "06cb6e95ab9c07223f0c3b3a1a4447caa5e79badf03f36d4ffe9d8202bfa4586"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p16.step0002.f32",
+      "bytes": 1048576,
+      "sha256": "938da874e5878e1df1f41795548ea204af2e0af4a36636d47944cbef4822a2c9"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/logits_p16.step0003.f32",
+      "bytes": 1048576,
+      "sha256": "956a705b2799b75fac5509702212dc59a8248bcaf0ca5475e17e0a25ead63962"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture-logits/manifest.json",
+      "bytes": 11939,
+      "sha256": "949d0b0976e006d62620b2b8ac37cac6c452f7bddd0a5f5c214960fbe7b2ced5"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/probe/vllm-quant-capture.log",
+      "bytes": 14989,
+      "sha256": "e73f1f33a0114a037f767cdefd2dccb3569b601ede6229328db07f148adbc2ef"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/runtime/amd/interp.hip",
+      "bytes": 310652,
+      "sha256": "136cb752b156e30fb21bbb5b0ec05d2436ab8eeb9be3b42c04f059ebf6622ab1"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/runtime/amd/op_elementwise.h",
+      "bytes": 13859,
+      "sha256": "5f064bef68c6634c200ca4c8e0f4933e8a0b85ff84cd536b22f21d604373b8db"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/runtime/amd/op_gemm.h",
+      "bytes": 317067,
+      "sha256": "11d1bd2945c03c96693d090b00aceeeb0302f24c025eec4fd7041b86359b99aa"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-native-private/runtime/amd/ptpc_fp8.h",
+      "bytes": 2685,
+      "sha256": "90894a92226241408e144667bef15c78b651c6c55cddc0e478378066a11a0828"
+    },
+    {
+      "path": "/app/plow/build-gemma31/fp8-ptpc-export/quantization.json",
+      "bytes": 85751,
+      "sha256": "d7765b956e0228e16a3411bf7831c831e8ad0153c7317ed40cba51bb999c93f5"
+    }
+  ]
+}

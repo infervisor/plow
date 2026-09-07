@@ -1,0 +1,82 @@
+{
+  "status": "FROZEN_PENDING_NOT_APPLIED",
+  "frozen_at": "2026-09-07T20:07:10.820172+00:00",
+  "branch": "perf/gemma31-mi300x-consolidated",
+  "qualified_implementation_commit": "39cb856ea9aaf843c8e3adafd942679382956b22",
+  "instructions": "Saved experiment patches are review material, not applied production changes. Resume only on explicit user request. Base revisions and source context differ; review before applying on an integration branch.",
+  "artifacts": [
+    {
+      "file": "mm1-fused-dispatch.patch",
+      "original_path": "/app/plow/build-gemma31/projection-counters/mm1-fused-final/candidate.patch",
+      "sha256": "5df187a04d9d6d64efc59f20c1e489bee4a6ad74723d3a0d96673c108f7d0919"
+    },
+    {
+      "file": "mm1-fused-model.json",
+      "original_path": "/app/plow/build-gemma31/projection-counters/mm1-fused-model/summary.json",
+      "sha256": "75bbb302b3d9c2cd03f2a1b8a4a12b3c3864c52b104908546b1f6cecc0983934"
+    },
+    {
+      "file": "flash-direct-dispatch.patch",
+      "original_path": "/app/plow/build-gemma31/flash-direct/candidate.patch",
+      "sha256": "c7be68f15b041f1cc8bbbecacb578c6fe89414e515ebe7a43741430ce9863d13"
+    },
+    {
+      "file": "flash-direct-summary.json",
+      "original_path": "/app/plow/build-gemma31/flash-direct/summary.json",
+      "sha256": "0d3c04f4b8ae64591b3cf1ecb2a28a5f1b083ee7c149a2dce33a646c1ecc5699"
+    },
+    {
+      "file": "streaming-host-capture.patch",
+      "original_path": "/app/plow/build-gemma31/host-capture-prototype/prototype.patch",
+      "sha256": "ea3a4ddaa49bc961c47233b166e6542ec820626862f1f02c7362d3c200f013bb"
+    },
+    {
+      "file": "streaming-fence-ablation.patch",
+      "original_path": "/app/plow/build-gemma31/host-capture-prototype/fence-ablation.patch",
+      "sha256": "3afdd60e87d740cb9db0b9569180522e1709b4e721441f3e098bc13e93e4c948"
+    },
+    {
+      "file": "fp8-native-ptpc.patch",
+      "original_path": "/app/plow/build-gemma31/fp8-native-private/probe/private-native-ptpc.patch",
+      "sha256": "8df925a0cf76b0f6b49e85f5765dbe81c04fdad3b4d45fc2b5b622b9cbc9383a"
+    },
+    {
+      "file": "fp8-handoff.md",
+      "original_path": "/app/plow/build-gemma31/fp8-native-private/probe/FROZEN-HANDOFF.md",
+      "sha256": "5c188159041c19591360c17e7d64b275010bd57d692bbcc61a98e070abc6aed0"
+    },
+    {
+      "file": "fp8-provenance.json",
+      "original_path": "/app/plow/build-gemma31/fp8-native-private/probe/frozen-provenance.json",
+      "sha256": "765ef3cdccfb261cc8681013ffa37f93399a2c27dbe0ddcfa944ec7ca2fd41a9"
+    },
+    {
+      "file": "fp8-dispatch-observer.py",
+      "original_path": "/app/plow/build-gemma31/fp8-native-private/probe/dispatch_capture/sitecustomize.py",
+      "sha256": "c019621a8e91553796240c9eb74403e6e252ad34de237e8751b9e11bb42089ce"
+    },
+    {
+      "file": "fp8-dispatch-control.json",
+      "original_path": "/app/plow/build-gemma31/fp8-native-private/probe/dispatch-capture-control.json",
+      "sha256": "ae08f8e22be1c42c313f25618445baaee6c8464fcf229a79038252b8c7094db4"
+    },
+    {
+      "file": "fp8-fused-dispatch-control.json",
+      "original_path": "/app/plow/build-gemma31/fp8-native-private/probe/fused-dispatch-capture-control.json",
+      "sha256": "ae08f8e22be1c42c313f25618445baaee6c8464fcf229a79038252b8c7094db4"
+    },
+    {
+      "file": "fp8-fused-norm-primitive.json",
+      "original_path": "/app/plow/build-gemma31/fp8-native-private/probe/norm-round-fused-results.json",
+      "sha256": "301f3134d08d07852154f306b7d980cb700cf187212aaaed56c4035dbefde2ac"
+    },
+    {
+      "file": "gfuse-interrupted.json",
+      "sha256": "151c61b96a0f96c895d90bf2d5288a4fb4660441fc5371c009676e5013b6bdf3"
+    },
+    {
+      "file": "gfuse-provenance.json",
+      "sha256": "73298dcd90802a2518061e0eee5987e6017e41bc29092f21e40cb90870cda243"
+    }
+  ]
+}

@@ -304,7 +304,7 @@
     }
   ],
   "gpu_cleanup": "Both HTTP children stopped after zero established-client checks; server leases exited143. Numerical/lifecycle/ordinary/rejection leases exited0.",
-  "follow_up": "Stock PF_GFUSE off/on comparison with combined direct GEMV objects is being prepared; default unchanged until measured.",
+  "follow_up": "GFUSE stock crossover interrupted at user request. Preserve partial results; full serving comparison and broader bucket qualification are pending. No experiments may resume without explicit user instruction.",
   "migration": "Existing NRN-prefill packets require rebuilt objects carrying the marker. No-NRN packets remain compatible with legacy objects.",
   "commands": {
     "build_runtime": "nix develop --command bash -c \"CARGO_TARGET_DIR=/app/plow/build-gemma31/pf-gfuse/target cargo test -p plowrt --features hsa,cuda --release --lib --test hsa_mixed_step --test hsa_terminal_prefill --test pf_gfuse_cold_buckets --no-run\"",

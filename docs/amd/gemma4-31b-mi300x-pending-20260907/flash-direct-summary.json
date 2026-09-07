@@ -1,0 +1,34 @@
+{
+  "scope": "Privategfx942BF16ordinaryMM4GQFlashDecode direct dispatch; fixed arithmetic/grouping/splits/scratch and packetwait/publication. Baseline already has qualified plainGEMVdirect; MM1/PF/mixed unchanged.",
+  "inline": {
+    "object_sha256": "e7baaa7ca2c52a884ec83dbe7ff38307ea4d5274fbb648d1ec31c1eb0d5ad0ec",
+    "decision": "Numerically qualified but unpromoted; needs stockserving qualification and explicit projectiontradeoff review.",
+    "primitive": "GPU3 samelease baseline/candidate/baseline;16attention+3GEMV cases bitwise. Attention\u22129to41%B4; GEMV+3to9%.",
+    "model": "GPU2 samelease baseline/candidate/baseline;51steps107rows each bitwise, contexts128/4096/8176, B1/B4 transitions andmixed; nativeB4\u22122.806/\u22121.981/\u22122.460% vsmeanbaseline, baseline drift1.063/1.530/.890%."
+  },
+  "noinline": {
+    "object_sha256": "1e83cfce387d1ad10126f6dd0b9cdac726ace21db256d5aa05dd630e30be6888",
+    "decision": "Rejected atprimitive; nofullmodel launched.",
+    "primitive": "GPU2samelease;16attention+3GEMV cases bitwise, B4attention+1.9to13.2% slower. Static wrapperprologue112scratchstores beforefirstbranch, samecount asplow_exec; no hardwarecounters collected forthisvariant."
+  },
+  "hashes": {
+    "candidate.patch": "c7be68f15b041f1cc8bbbecacb578c6fe89414e515ebe7a43741430ce9863d13",
+    "source.json": "dd14599fffaad13d7dbd273855ee8a1c4972f295c23538ae8f2328c92708ab11",
+    "resources.json": "3e1987a5f164f48153178d54f52e0089e6a3624ed542ce94895a7fb50364c868",
+    "primitive-summary.json": "74ec0055e4f50827fdf27194577e9a98b042902069d07ef13eff9f43041cc260",
+    "status.json": "7b1fa467dd5e9eeffae1ea6a4c0704a0c6b4c7f55a578c730b1a6cfae3f0dbc6",
+    "model/summary.json": "c23541b2babb897e8ab2e8be1d5bdfa3314889a01c794c9dc8864a2a115437d1",
+    "model/input-hashes.json": "91950ce97aef182988411b31b594763f9f05d318d010bed7259a827dd7ea01de",
+    "noinline/candidate.patch": "4d9a44a1b5f5b55784afbf9fb5ccad134f57dcd6fae8a3cfc2490171c663913f",
+    "noinline/resources.json": "b05b82f2b4a3106dad4ba69a2ac7b395243527f0f8337b716e95a4e360b2329c",
+    "noinline/prologue-summary.json": "56699f9119156f8812f266bf02b50910edd0c9f70f038c896cd20562b91a2d47",
+    "noinline/primitive-summary.json": "d429ec51224bcf159805060eb3c3b38ca8346bfe7e1330ee30bf69ac5a21fdaf",
+    "noinline/status.json": "242f8973debd441ef7d5eb41a09d7eb28fbca108c74660436ad14cedc32950e6"
+  },
+  "limitations": [
+    "Primitive timing separate fromfullmodel. Native modelhost+device wall isnotstockserving throughput.",
+    "Attention-only probe tests partialO/mloutputs, actualmodel tests include merge/norm/projection/finecounter dependencies.",
+    "Runtimeprofile/numericalarithmetic preserved; buildresource counts arestatic anddo notprove achievedoccupancy or dynamictraffic.",
+    "Noproductionedits; all leasesreleased; noGPUfaults/timeouts."
+  ]
+}

@@ -1,0 +1,231 @@
+{
+  "binary_sha256": "a53ffe5765133f8f8d245e1c0e2de858bb2f1fb9bf8f1f5bceddacb0c99eb9b0",
+  "source_base": "bf04fd380570c6447956e58a831d2452dd656d8c",
+  "source_patch_sha256": "d91cba50e9ace5448f368a846c1efb12c61fb8aee64e2a2d480bb99be812afd4",
+  "source_parity": [
+    {
+      "file": "crates/plowrt/src/exec/amd.rs",
+      "normalized_sha256": "08fb4bb66c21a321753397a1f51754a069b3911d674d92c17c36a64cd48f1311",
+      "equal": true
+    },
+    {
+      "file": "crates/plowrt/src/exec/mixed_program.rs",
+      "normalized_sha256": "0689881fd65f36c4216d950b44a973a51e23a1269459cc65a78d6bb26c506463",
+      "equal": true
+    },
+    {
+      "file": "crates/plowrt/src/exec/mixed_program_tests.rs",
+      "normalized_sha256": "67c38eda5b1ad2fe2f05c0db8e310611de8a08587c8ddeda168b9c2bc384bc68",
+      "equal": true
+    },
+    {
+      "file": "crates/plowrt/src/serve/engine.rs",
+      "normalized_sha256": "656bc838730c199f7716f85ce814fd3cd23bb9c4043c2763a0078ca15314f054",
+      "equal": true
+    },
+    {
+      "file": "crates/plowrt/src/serve/mux.rs",
+      "normalized_sha256": "957c28e22e98d0eef9c6185d80bed3819b0d62c3b636de036923762bace576eb",
+      "equal": true
+    }
+  ],
+  "object_hashes": {
+    "interp_prefill_fp8kv_k3_moe_a4w4.elf": "83f1366d862f0bf0bd18f2399955eadfaa15b3e15d52e793dc413f861f1d9d24",
+    "interp_prefill_mla_moe_gq.elf": "7e771d5add7f677ef920bbc2a5c02c0b2513e27bcd9118d6f759c8d9a3ada864",
+    "interp_prefill_fp8_mla_gq.elf": "728adfc2addcbfef77a7e49bc0d053502fd118ede954609dc2b39f698dbb4b9a",
+    "interp_prefill.elf": "3a871fb45175d22460c5176b8cc739838be1a2dae7413cc863ad7de58a6d8ab9",
+    "interp_prefill_fp8kv.elf": "cbd5161d94dd9abf44efbf6921faa64ede0d371699fe8de30267a0401e2b7580",
+    "interp_prefill_fp8kv_mla_gq.elf": "135413b8972d9aea0435f18bf9b7564f15d990f7708b4ad67d043ff91dead642",
+    "interp_prefill_fp8.elf": "40d0485417d73826d6f2e38f71bd9f10beeabd3ad0ce1e0b5b661b3b179ff885",
+    "interp_prefill_fp8kv_k3.elf": "a8d42fecc76552b14048b87ff49f0792abeeed116d1160f01c05e7a0c89b7541",
+    "interp_prefill_mla.elf": "5eb77fb484294bc3195a472ff544a2a11269b633036d1a6f4572b870c87cfc9c",
+    "interp_prefill_fp8_mla.elf": "269aa5d0186d3dc8badf58b5fdf87427c585cd4fc8a8c086973d0be1450ff5fe",
+    "interp_prefill_k3_moe.elf": "0d700f10cd114d727b112401caee062d8abbfc778d12448841fb94c125b81509",
+    "interp_prefill_fp8_mla_moe.elf": "c47795db7e3fa711e52d6a39ebf4f14ef11a572b0c2202d7de87e879ec24474a",
+    "interp_mixed_gq.elf": "b1deafe6490f3f57c18ba47a803785177a260884a7ba91d2f2dc952782bc86a5",
+    "interp_prefill_fp8_gq.elf": "33507b43671175ce1c475b9f52d530178eeea71f8ab841d9afbb9cab18b6e91d",
+    "interp_decode_fp8_gq.elf": "771fe8226fae6e99868bf22290c774a7191073fbbff7516adddd58afe527e991",
+    "interp_prefill_fp8kv_k3_gq.elf": "a2d81c813eb2e3379274f10f5f1e5a351e747eab0eeb5002fe0efe0eadbcd318",
+    "interp_prefill_gq.elf": "8062ab51b86e36bfba26a4bb2fdb7cf8bf14e6628cdd17137c16b1bf76ee4c9e",
+    "interp_prefill_fp8_mla_moe_gq.elf": "c0b40ac80b4366af465a3e710ad0fe43d470e88ac07f7649f8d681572249406e",
+    "interp_flash_fp8kv.elf": "53d55ffc089578b295b061da2a47adc70a619d0d1831658515233b56548aa119",
+    "interp_prefill_fp8kv_mla_moe_gq.elf": "59dc059e66afaddd75494777cf574819886fe246857dcc5262ac92521f5b290f",
+    "interp_prefill_k3_moe_a4w4_gq.elf": "2aa601983ca223180a240c8f5e75dc899794ec4bea531d65f66980005544adbd",
+    "interp_decode_fp8kv_gq.elf": "7d8182ca613cb91fe129f69ef6818cc5072a1f388d9311ad2c0fe927e00e1fb5",
+    "interp_decode_k3_gq.elf": "b5bc83be261eec867cb47db161a3254dba72d4552ea8364533c690439560f7f4",
+    "interp_flash_gq.elf": "9d3c3949441ad7167b91d78b4ab80cc024c431092b92dc6a324dd103d8ba8e21",
+    "interp_prefill_k3_gq.elf": "19c9400d3875506251c9164ba5a9e2f1604da5f61b56242dcb16e0ce98dad346",
+    "interp_prefill_mla_moe.elf": "f128ef985f9bc93891e92d86436460e6e9abf553c0d379a009c20f0287831451",
+    "interp_prefill_fp8kv_gq.elf": "6549a90135e591fc08657febd9bf421b67b0cba361661999dbd8b9433c66add6",
+    "interp_prefill_k3_moe_a4w4.elf": "9cbb97b9dd962eea6a010836efbdf975c6e4c1cb426193b203c8c0921521c490",
+    "interp_prefill_fp8kv_k3_moe_a4w4_gq.elf": "b44b23da7f83530463259a31db537348c303ebcb4652840e6da4847f6067856d",
+    "interp_prefill_fp8kv_mla_moe.elf": "a69276adfd9e29cd123d486491768c3102dc77f7979fad515f4cfb262c9f709a",
+    "interp_prefill_fp8kv_mla.elf": "fb6ca6a06fce65f3e69a0e604a3512939fd7e4788c8e3caa02051ef464aaa83e",
+    "interp_decode_fp8kv_k3_gq.elf": "c32fb178e7d7f70a1392663cd9be4ecbee03159742896af66587e8daea6a8641",
+    "interp_prefill_k3_moe_gq.elf": "d72aceff4dade0f3cd65cdd1fa8e8d54931b9df1526c858da6aa3e0238abec55",
+    "interp_prefill_mla_gq.elf": "dcaff66c3a5cd3e5c7d03bcf58aab0d40bee94ba9eb0a03bed4ac45082f323db",
+    "interp_flash.elf": "a0a4114475be17d2190b1d022a697a99da2e0efb8a1f568d736f74adc336c4ad",
+    "interp_decode_gq.elf": "6afd78e4cc5c4505296a4d2e92f383057815984b12e29296e2a9cdc919553bdb",
+    "interp_flash_fp8kv_gq.elf": "3ceeac299256b6f3bc6126c0bf7797ab8edd7764305d0674999c5839bf74327e",
+    "interp_prefill_k3.elf": "03f0ff2790ab0ec97579c59c5e83127e33d936755c5ad3c50940a71f461fea1c",
+    "lowrung/interp_decode.elf": "2a6e4431f635616b9fa77217621430f793202921ff877dfe326e4ea1194c5cf3",
+    "lowrung/interp_decode_gq.elf": "e9c4862c39ae653d299dff07c2bbd4fa3bd96960fc5137e9b214f64c4d1460a4"
+  },
+  "packet_hashes": {
+    "off": "59df5045781261d3c9aafe27804af667c95008a3a602775695d2ab68c0d45dc6",
+    "on": "a7c1b5c335fe6ac5873389081bb11c251a791b1526e9c765c98941a7abf10eb2"
+  },
+  "environment": {
+    "PLOW_FUSION": "1",
+    "PLOW_PF_CHUNK": "512",
+    "PLOW_PF_BATCH": "1",
+    "PLOW_PF_INTERLEAVE": "0",
+    "PLOW_MULTISTEP": "4",
+    "PLOW_PREFIX_CACHE": "0",
+    "PLOW_L2_PLACE_DISPATCH": "1",
+    "PLOW_HSACO": "/app/plow/build-gemma31/pf-gfuse-stock/hsaco",
+    "PLOW_HSACO_LOWRUNG": "/app/plow/build-gemma31/pf-gfuse-stock/lowrung:1",
+    "PLOW_PF_NO_INTERLEAVE": "0",
+    "PLOW_PF_DEFER_DECODE": "0",
+    "RUST_LOG": "plowrt=debug"
+  },
+  "benchmark_wrapper_sha256": "ad9a4db0305ec2a87b1b71ade0479280553282f4ad5fefa76f7ae928621f9119",
+  "cards": [
+    "4",
+    "5"
+  ],
+  "corpus": {
+    "schema": 1,
+    "seed": 0,
+    "requests_per_case": 4,
+    "checkpoint": "/app/plow/build-gemma31/checkpoint",
+    "max_prompt_tokens": 4096,
+    "output_tokens": 128,
+    "concurrencies": [
+      1,
+      4
+    ],
+    "full_corpus_warmups": 2,
+    "measured_repetitions": 4,
+    "dtype": "bfloat16",
+    "kv_dtype": "bfloat16",
+    "tensor_parallel_size": 1,
+    "prefix_caching": false,
+    "max_num_seqs": 4,
+    "budget_policy": "nonbinding",
+    "plow_pf_interleave": 0,
+    "vllm_max_num_batched_tokens": 16384,
+    "packages": {
+      "vllm": "0.28.0+rocm723",
+      "torch": "2.12.0+git6bbd260",
+      "transformers": "5.16.1",
+      "tokenizers": "0.23.2"
+    },
+    "checkpoint_hashes": {
+      "model-00001-of-00002.safetensors": "eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa",
+      "model-00002-of-00002.safetensors": "018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10",
+      "config.json": "e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1",
+      "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+    },
+    "tokenizer_sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+    "datasets": {
+      "p128": {
+        "path": "/app/plow/build-gemma31/bench-serve/p128.jsonl",
+        "sha256": "2182bc72a53ee01f7f95049e1110d5e55dc020f60377290a542ad7b64eba780c",
+        "requests": [
+          {
+            "prompt_tokens": 128,
+            "output_tokens": 128,
+            "prompt_sha256": "4db862194c41eb5ed4767781e0bff7dee68a1f481666afa73a64d36568a23ec2",
+            "token_ids_sha256": "2d9b254634c337ecf8583659a8706eef2d9d65f5de29340c1bea8a1654378272"
+          },
+          {
+            "prompt_tokens": 128,
+            "output_tokens": 128,
+            "prompt_sha256": "26f6d9bedebb970213b3c6b2c20f0d15d46909033394ac6c007a3ab374369f32",
+            "token_ids_sha256": "de290aa36afef97a4a2f2433e7ccd65f0cdff608061042e3485de96c67c28d83"
+          },
+          {
+            "prompt_tokens": 128,
+            "output_tokens": 128,
+            "prompt_sha256": "981b62d1133a25505df2836fbb77dfce469d2e1d610ec46d8a6cb912acfbb5d3",
+            "token_ids_sha256": "f78b282ecf1b875706e7aa160ffe0af5ff853c26db2b180f23adb38fd80781f4"
+          },
+          {
+            "prompt_tokens": 128,
+            "output_tokens": 128,
+            "prompt_sha256": "81000302998c840310849c59da4f51233984cff0daf42a32f7038cbd3f657c53",
+            "token_ids_sha256": "01d4bac8e94d42b19d48d040b07fd19706f4fac7cc5657cd152d5cb2cbada6a5"
+          }
+        ],
+        "total_input_tokens": 512,
+        "total_output_tokens": 512
+      },
+      "p1024": {
+        "path": "/app/plow/build-gemma31/bench-serve/p1024.jsonl",
+        "sha256": "8eb7443037d1bb7ad23663fce05128d656af044b0c89b87e85f726363b3cc149",
+        "requests": [
+          {
+            "prompt_tokens": 1024,
+            "output_tokens": 128,
+            "prompt_sha256": "69570405435cf5637d44af6488291fd742dac9e472feef9657de8b0e52b4cadc",
+            "token_ids_sha256": "6776a718277c94033fa571986c9b6837d7615c3def94a50ca078455786419bf2"
+          },
+          {
+            "prompt_tokens": 1024,
+            "output_tokens": 128,
+            "prompt_sha256": "d5d683154d196cd05b7f3d76417d5a2b24142763321916083f02c5c4109dbb25",
+            "token_ids_sha256": "10818c0c03a4ffbd2d8c7eb228299b2ab654034e78fdc610b436ff64e9b350db"
+          },
+          {
+            "prompt_tokens": 1024,
+            "output_tokens": 128,
+            "prompt_sha256": "d19b77087abfd73588ede5e59a02d53fb344f1213c42b70118cff698c5071420",
+            "token_ids_sha256": "7c1caf3a589d5c487b8c208cd8d10cd0441a994afd9fb7186fdcea50b426db6e"
+          },
+          {
+            "prompt_tokens": 1024,
+            "output_tokens": 128,
+            "prompt_sha256": "5d998cc86dedb262c5b71b031fc886c711a505a6fd3e98e6bf05136c37bfa12f",
+            "token_ids_sha256": "2794616c40ad66df6711545283c346a533e87e5342bbd16c591bcf9c76bb7a9d"
+          }
+        ],
+        "total_input_tokens": 4096,
+        "total_output_tokens": 512
+      },
+      "p4096": {
+        "path": "/app/plow/build-gemma31/bench-serve/p4096.jsonl",
+        "sha256": "4bd1385ea0b682deb31f1a4f04207b84e7fc02ddb463aa1eef9f801ff5667fd1",
+        "requests": [
+          {
+            "prompt_tokens": 4096,
+            "output_tokens": 128,
+            "prompt_sha256": "67e002b5c02f45d126bb2c5aab205e9b6da4602076a6d92f06dc0d61ec2567c2",
+            "token_ids_sha256": "a01eb912320bfc387d40d732ed5631544d576d1ece7c59490d48c07dad9ddea6"
+          },
+          {
+            "prompt_tokens": 4096,
+            "output_tokens": 128,
+            "prompt_sha256": "9111b24a028f612f3bae3664ab9b8d14bf0ab9ef8104f0f7def8407c926dbc82",
+            "token_ids_sha256": "b9644f6dc8b030eb3ce87365e960a5343c78b87cb516fefac6bbe95c484119ee"
+          },
+          {
+            "prompt_tokens": 4096,
+            "output_tokens": 128,
+            "prompt_sha256": "092de09ce96fc250e58f8223f15879c02bf9764582fc5231d1cc5b995f8873d7",
+            "token_ids_sha256": "8f3df26a9152b58206f853e485addf60849af42a9a998e618827a9a6910c72f8"
+          },
+          {
+            "prompt_tokens": 4096,
+            "output_tokens": 128,
+            "prompt_sha256": "bbf8c270fbafc0adfbad46dbd4cc7e8fd9d40398fa141a4358ed28cc50feb8e7",
+            "token_ids_sha256": "968ef0ece15c6ecacf7457058300604486955918accff557469339e610f6d048"
+          }
+        ],
+        "total_input_tokens": 16384,
+        "total_output_tokens": 512
+      }
+    },
+    "crossover": "Two GPU assignments, one full-corpus warmup and two measured repetitions per assignment"
+  }
+}
