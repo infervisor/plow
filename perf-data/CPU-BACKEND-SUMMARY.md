@@ -33,7 +33,7 @@ kernels stay refused. plow serves the same model from a 13 GB MXFP4 twin at ~21 
 Full trace, with the byte accounting and the class-by-class activation gates, in
 `cpu-gemma26b/vllm-baseline.md`.
 
-## The two unmet items, and why
+## The unmet items, and why
 
 **fp8 no longer ties llama.cpp Q8_0 — RESOLVED.** The earlier reading, that fp8 was pinned at the
 memory ceiling with no margin available at equal bit width, was wrong about where the bytes were
@@ -56,6 +56,13 @@ GPU included (program shape is an enum of prefill / decode / decode-tiled, and t
 prefill+decode tick" in the scheduler is a tick, not a step). Chunking the prefill instead does not
 help: `--pf-interleave 512` moved chat_long c=4/c=8 TPOT from 100/195 to 100/198, because the work
 is throughput-bound rather than stall-bound.
+
+**summarize TTFT c=1 is 18.3% short bit-exact, 11.2% short with int8 MoE prefill.** This is the one
+lost cell with no interference component, so it is pure prefill speed. Paired means on 2026-09-07:
+2238 ms bit-exact, 2034 ms with `PLOW_MOE_INT8=1`, against vLLM's 1829 ms. The int8 expert prefill
+is a real, reproducible -9.1% (two pairs agreeing to 0.4 points, decode untouched) that still does
+not claim the cell, so it stays default off — it trades activation-int8 error for 9% of long-prompt
+TTFT. Details in `cpu-gptoss/SUMMARY.md`.
 
 Not implemented at all: int8 (w8a8) weights, and an fp8 KV cache. Both have emitter flags and no CPU
 kernels.

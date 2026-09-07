@@ -360,6 +360,37 @@ the 21% a naive roofline suggests.**
 the slice over M rather than N whenever N < M makes the pack 1x instead of 16x. Bit-exact, worth
 about 1.2-1.5% of prefill wall.
 
+### INT8 MoE prefill closes 9% of the summarize cell, not the 11.2% needed (2026-09-07, 09:5x)
+
+`PLOW_MOE_INT8=1` is the one already-built lever never measured against this cell through serve.
+It is a **runtime** gate on `x_moe_glu_mx_pf` / `x_moe_down_mx_pf` only, so both arms share one
+blob and decode is untouched — no re-emit, and none of the stale-blob trap that invalidated the
+first `PLOW_MX4_PREFILL` A/B.
+
+Interleaved, same session, same blob, summarize c=1, 1111-token prompts, 8 requests, means:
+
+| `PLOW_MOE_INT8` | rep 1 | rep 2 | mean TTFT | TPOT |
+|---|---|---|---|---|
+| 0 | 2251 | 2226 | **2238 ms** | 25/25/26 |
+| 1 | 2041 | 2027 | **2034 ms** | 26/26/26 |
+
+**-9.1%**, and the two pairs agree to 0.4 points (-9.3% / -8.9%), so it is above this box's ~10%
+single-prefill noise only because it is paired. It also lands where the profile predicts: MoE is
+928 of 1628 ms/thr (57%) at 1024 tokens, and 1.25x on 57% is 11%.
+
+**It does not claim the cell.** 2034 against vLLM's 1829 is still 1.11x slower. The arithmetic
+above still binds: prefill compute alone for this prompt was ~1986 ms, and -186 ms puts it at
+~1800 ms, a hair under vLLM's entire TTFT with nothing left for serve overhead. To win by a margin
+the MoE prefill kernel itself has to get faster; int8 is not a substitute for that.
+
+TPOT is unchanged in every arm, which is the useful confirmation that the gate is prefill-only.
+
+So this stays **default OFF**: it is a 9% TTFT gain on long prompts for activation-int8 error
+(weights stay lossless — the E8M0 block scale is a power of two and is absorbed; only activations
+are quantized per token row at amax/127). Turning it on is a quality call, not a free win, and it
+is not enough to flip the cell either way.
+Reproduce with `perf-data/tools/gptoss-moe-int8-ab.sh`.
+
 ### Negative result: a wider prefill bucket does not help (2026-09-07, 04:3x)
 
 A 1111-token summarize prompt runs the 1024 bucket PLUS the 128 bucket. Fitting cost against
@@ -414,7 +445,10 @@ power-of-two programs and this cost structure, two chunks is already the cheaper
 
 Also worth recording: serve adds almost nothing. `cpu_bench` TTFT at 1111 tokens is 2446-2528 ms
 against serve's 2471, so the summarize c=1 gap to vLLM (1829 ms) is entirely prefill compute, not
-request handling. Closing it needs ~27% more prefill throughput. Worker idle at 1024 tokens is 15%
+request handling. Closing it needs ~18% more prefill throughput — the earlier "~27%" here was
+computed against a 2603 ms reading that was a p50, and against a since-improved baseline; the
+paired means on 2026-09-07 are 2238 ms bit-exact and 2034 ms with `PLOW_MOE_INT8=1`, so the gap to
+vLLM's 1829 ms is 18.3% bit-exact and 11.2% with int8. Worker idle at 1024 tokens is 15%
 of wall (busy mean 1514.8, min 1461.4, max 1620.5 against a 1780.3 ms wall), of which only the
 ~106 ms mean-to-max spread is imbalance; the rest is dependency stalls on the critical path. That
 caps the remaining bit-exact headroom well below what the cell needs.
