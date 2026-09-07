@@ -144,6 +144,14 @@ fn main() {
             }
         }
     }
+    // The tied embedding / lm_head as well (`PLOW_FP8_HEAD=1` at emit reads `fp8/<prefix>embed_tokens.weight`):
+    // on a 262k-vocab model the bf16 head is the largest single per-token read (E4B: 1.3 GB).
+    let head = format!("{prefix}embed_tokens.weight");
+    if let Some((_, info)) = index.get(&head) {
+        if info.dtype == safetensors::Dtype::BF16 && info.shape.len() == 2 {
+            plan.push((head, info.shape[0], info.shape[1]));
+        }
+    }
     assert!(
         !plan.is_empty(),
         "no supported projection weights found under prefix {prefix:?}"

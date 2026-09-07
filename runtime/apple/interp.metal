@@ -1196,7 +1196,7 @@ kernel void plow_interp(device const Inst* insts [[buffer(0)]],
             }
             gate = ok;
         }
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (gate == 0u) {
             if (lid == 0) fault[0] = 0x80000000u | e.inst;
             return;
