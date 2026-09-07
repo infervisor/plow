@@ -312,6 +312,22 @@ fn accepts_exact_hd512_wg32_contract_and_rejects_drift() {
 }
 
 #[test]
+fn packet_role_overrides_only_its_legacy_prefill_segment() {
+    let (program, tensors) = hd512_fixture();
+    let roles = packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).unwrap();
+    let legacy_classes = [4, 8, 2, 4, 8];
+    let dispatch: Vec<_> = legacy_classes
+        .iter()
+        .enumerate()
+        .map(|(segment, &class)| (packet_role_index(&roles, segment), class))
+        .collect();
+    assert_eq!(
+        dispatch,
+        [(None, 4), (None, 8), (Some(5), 2), (None, 4), (None, 8),]
+    );
+}
+
+#[test]
 fn accepts_hd512_fused_output_and_rejects_unsafe_contracts() {
     let (mut program, mut tensors) = hd512_fixture();
     program.insts[2].t[5] = 5;
