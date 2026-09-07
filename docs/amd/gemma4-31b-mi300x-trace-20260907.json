@@ -1,0 +1,4537 @@
+{
+  "date": "2026-09-07",
+  "source_revision": "5feeb384ea521ee4bc40621f41f320744e31534f",
+  "serving_scorecard": "gemma4-31b-mi300x-bench-serve-20260907.json",
+  "scope": "Diagnostic traces; instrumented times do not replace the stock serving scorecard.",
+  "plow_native": {
+    "medians": {
+      "decode-d1-ctx128": {
+        "wall_ms": 27.61942,
+        "envelope_ms": 27.47432,
+        "gate_ms": 0.7891699999999999,
+        "gap_ms": 1.4210854715202004e-14,
+        "host_minus_envelope_ms": 0.14353900000000053,
+        "projection_and_glu_ms": 22.664879999999975,
+        "body_ms": {
+          "projection": 22.664879999999975,
+          "glu": 0,
+          "attention": 2.354040000000001,
+          "norm": 1.6385000000000005,
+          "other": 0.03676
+        }
+      },
+      "decode-d1-ctx4096": {
+        "wall_ms": 28.536109,
+        "envelope_ms": 28.40932,
+        "gate_ms": 0.8155700000000005,
+        "gap_ms": 0.0,
+        "host_minus_envelope_ms": 0.1520949999999992,
+        "projection_and_glu_ms": 22.70128,
+        "body_ms": {
+          "projection": 22.70128,
+          "glu": 0,
+          "attention": 3.071509999999998,
+          "norm": 1.7151100000000001,
+          "other": 0.03977
+        }
+      },
+      "decode-d2-ctx128": {
+        "wall_ms": 34.528174,
+        "envelope_ms": 34.39459,
+        "gate_ms": 0.8602500000000007,
+        "gap_ms": 7.105427357601002e-15,
+        "host_minus_envelope_ms": 0.134172999999997,
+        "projection_and_glu_ms": 27.003790000000013,
+        "body_ms": {
+          "projection": 27.003790000000013,
+          "glu": 0,
+          "attention": 3.8051899999999987,
+          "norm": 2.640179999999999,
+          "other": 0.08087
+        }
+      },
+      "decode-d2-ctx4096": {
+        "wall_ms": 35.86547,
+        "envelope_ms": 35.71866,
+        "gate_ms": 0.8538300000000008,
+        "gap_ms": 0.0,
+        "host_minus_envelope_ms": 0.14616500000000343,
+        "projection_and_glu_ms": 27.098130000000012,
+        "body_ms": {
+          "projection": 27.098130000000012,
+          "glu": 0,
+          "attention": 5.069980000000002,
+          "norm": 2.6157300000000014,
+          "other": 0.08288999999999999
+        }
+      },
+      "decode-d4-ctx128": {
+        "wall_ms": 37.195185,
+        "envelope_ms": 37.05332,
+        "gate_ms": 1.0311400000000004,
+        "gap_ms": 1.4210854715202004e-14,
+        "host_minus_envelope_ms": 0.1401960000000031,
+        "projection_and_glu_ms": 28.954069999999984,
+        "body_ms": {
+          "projection": 28.072219999999984,
+          "glu": 0.8763199999999999,
+          "attention": 4.0753900000000005,
+          "norm": 2.8683000000000014,
+          "other": 0.11821999999999999
+        }
+      },
+      "decode-d4-ctx4096": {
+        "wall_ms": 39.393848,
+        "envelope_ms": 39.24543,
+        "gate_ms": 1.0534000000000006,
+        "gap_ms": 7.105427357601002e-15,
+        "host_minus_envelope_ms": 0.14928199999999947,
+        "projection_and_glu_ms": 28.895319999999987,
+        "body_ms": {
+          "projection": 28.000559999999986,
+          "glu": 0.9025900000000002,
+          "attention": 6.222220000000003,
+          "norm": 2.9527500000000013,
+          "other": 0.12153
+        }
+      },
+      "mixed-t1024-d1-p3": {
+        "wall_ms": 399.014836,
+        "envelope_ms": 398.19333,
+        "gate_ms": 4.430779999999999,
+        "gap_ms": -5.684341886080802e-14,
+        "host_minus_envelope_ms": 0.8196419999999875,
+        "projection_and_glu_ms": 333.56088000000005,
+        "body_ms": {
+          "projection": 333.56088000000005,
+          "glu": 0,
+          "attention": 36.37737000000001,
+          "norm": 23.72881000000001,
+          "other": 0.08363
+        }
+      },
+      "mixed-t512-d1-p3": {
+        "wall_ms": 252.16746,
+        "envelope_ms": 251.59793,
+        "gate_ms": 4.25891000000001,
+        "gap_ms": -8.526512829121202e-14,
+        "host_minus_envelope_ms": 0.5763259999999946,
+        "projection_and_glu_ms": 206.89925000000002,
+        "body_ms": {
+          "projection": 206.89925000000002,
+          "glu": 0,
+          "attention": 25.43691000000001,
+          "norm": 15.054779999999989,
+          "other": 0.07780999999999999
+        }
+      },
+      "prefill-t1024": {
+        "wall_ms": 263.829238,
+        "envelope_ms": 263.36416,
+        "gate_ms": 6.932830000000003,
+        "gap_ms": 1.2942999999999358,
+        "host_minus_envelope_ms": 0.46277300000002697,
+        "projection_and_glu_ms": 203.40729,
+        "body_ms": {
+          "projection": 203.40729,
+          "glu": 0,
+          "attention": 40.900330000000004,
+          "norm": 10.715780000000008,
+          "other": 0.0564
+        }
+      },
+      "prefill-t128": {
+        "wall_ms": 94.062147,
+        "envelope_ms": 93.59149,
+        "gate_ms": 7.590819999999999,
+        "gap_ms": 1.6240999999999985,
+        "host_minus_envelope_ms": 0.21745699999999601,
+        "projection_and_glu_ms": 69.90268,
+        "body_ms": {
+          "projection": 68.90324000000001,
+          "glu": 0.9994399999999997,
+          "attention": 6.727169999999999,
+          "norm": 7.683019999999998,
+          "other": 0.04724
+        }
+      },
+      "prefill-t512": {
+        "wall_ms": 158.122698,
+        "envelope_ms": 157.81689,
+        "gate_ms": 7.282750000000002,
+        "gap_ms": 1.422990000000084,
+        "host_minus_envelope_ms": 0.304600999999991,
+        "projection_and_glu_ms": 123.61917999999996,
+        "body_ms": {
+          "projection": 123.61917999999996,
+          "glu": 0,
+          "attention": 17.995520000000003,
+          "norm": 7.49249,
+          "other": 0.05467
+        }
+      }
+    },
+    "ranges": {
+      "decode-d1-ctx128": {
+        "wall_ms": [
+          27.614313,
+          27.625499
+        ],
+        "envelope_ms": [
+          27.45848,
+          27.48196
+        ],
+        "gate_ms": [
+          0.7880200000000005,
+          0.7898899999999995
+        ],
+        "gap_ms": [
+          7.105427357601002e-15,
+          2.4868995751603507e-14
+        ],
+        "host_minus_envelope_ms": [
+          0.13999300000000048,
+          0.16094000000000008
+        ],
+        "projection_and_glu_ms": [
+          22.587409999999988,
+          22.67579999999999
+        ],
+        "body_ms": {
+          "projection": [
+            22.587409999999988,
+            22.67579999999999
+          ],
+          "glu": [
+            0,
+            0
+          ],
+          "attention": [
+            2.3347999999999995,
+            2.3787899999999995
+          ],
+          "norm": [
+            1.6377900000000007,
+            1.6589699999999996
+          ],
+          "other": [
+            0.036520000000000004,
+            0.04342
+          ]
+        }
+      },
+      "decode-d1-ctx4096": {
+        "wall_ms": [
+          28.32903,
+          28.600735
+        ],
+        "envelope_ms": [
+          28.1768,
+          28.44864
+        ],
+        "gate_ms": [
+          0.7950100000000001,
+          0.8335999999999997
+        ],
+        "gap_ms": [
+          -3.552713678800501e-15,
+          1.0658141036401503e-14
+        ],
+        "host_minus_envelope_ms": [
+          0.1267889999999987,
+          0.15222999999999942
+        ],
+        "projection_and_glu_ms": [
+          22.647660000000002,
+          22.80667999999999
+        ],
+        "body_ms": {
+          "projection": [
+            22.647660000000002,
+            22.80667999999999
+          ],
+          "glu": [
+            0,
+            0
+          ],
+          "attention": [
+            3.0261099999999996,
+            3.0933
+          ],
+          "norm": [
+            1.6715099999999998,
+            1.74003
+          ],
+          "other": [
+            0.03651,
+            0.04111
+          ]
+        }
+      },
+      "decode-d2-ctx128": {
+        "wall_ms": [
+          34.493783,
+          34.557618
+        ],
+        "envelope_ms": [
+          34.35961,
+          34.42043
+        ],
+        "gate_ms": [
+          0.8578099999999993,
+          0.86541
+        ],
+        "gap_ms": [
+          -1.4210854715202004e-14,
+          2.1316282072803006e-14
+        ],
+        "host_minus_envelope_ms": [
+          0.13358399999999904,
+          0.13718799999999476
+        ],
+        "projection_and_glu_ms": [
+          26.999339999999982,
+          27.019249999999992
+        ],
+        "body_ms": {
+          "projection": [
+            26.999339999999982,
+            27.019249999999992
+          ],
+          "glu": [
+            0,
+            0
+          ],
+          "attention": [
+            3.7912700000000017,
+            3.8346300000000006
+          ],
+          "norm": [
+            2.6131000000000015,
+            2.64345
+          ],
+          "other": [
+            0.07818,
+            0.08191
+          ]
+        }
+      },
+      "decode-d2-ctx4096": {
+        "wall_ms": [
+          35.842165,
+          35.868084
+        ],
+        "envelope_ms": [
+          35.696,
+          35.72754
+        ],
+        "gate_ms": [
+          0.8515300000000005,
+          0.8626499999999994
+        ],
+        "gap_ms": [
+          -1.4210854715202004e-14,
+          0.0
+        ],
+        "host_minus_envelope_ms": [
+          0.14054400000000555,
+          0.1468100000000021
+        ],
+        "projection_and_glu_ms": [
+          27.067689999999992,
+          27.106229999999996
+        ],
+        "body_ms": {
+          "projection": [
+            27.067689999999992,
+            27.106229999999996
+          ],
+          "glu": [
+            0,
+            0
+          ],
+          "attention": [
+            5.0517400000000015,
+            5.07471
+          ],
+          "norm": [
+            2.597390000000001,
+            2.6443300000000005
+          ],
+          "other": [
+            0.07855999999999999,
+            0.08681
+          ]
+        }
+      },
+      "decode-d4-ctx128": {
+        "wall_ms": [
+          37.192992,
+          37.195576
+        ],
+        "envelope_ms": [
+          37.05083,
+          37.05538
+        ],
+        "gate_ms": [
+          1.0223800000000007,
+          1.03817
+        ],
+        "gap_ms": [
+          -3.552713678800501e-14,
+          1.4210854715202004e-14
+        ],
+        "host_minus_envelope_ms": [
+          0.13967199999999735,
+          0.14435500000000445
+        ],
+        "projection_and_glu_ms": [
+          28.948539999999984,
+          29.022090000000038
+        ],
+        "body_ms": {
+          "projection": [
+            28.064769999999985,
+            28.148120000000038
+          ],
+          "glu": [
+            0.8739699999999999,
+            0.8893000000000002
+          ],
+          "attention": [
+            4.053919999999998,
+            4.0790999999999995
+          ],
+          "norm": [
+            2.834830000000001,
+            2.8761999999999985
+          ],
+          "other": [
+            0.11502000000000001,
+            0.12215999999999999
+          ]
+        }
+      },
+      "decode-d4-ctx4096": {
+        "wall_ms": [
+          39.344784,
+          39.396852
+        ],
+        "envelope_ms": [
+          39.19146,
+          39.24757
+        ],
+        "gate_ms": [
+          1.0452099999999986,
+          1.0688299999999988
+        ],
+        "gap_ms": [
+          0.0,
+          7.105427357601002e-15
+        ],
+        "host_minus_envelope_ms": [
+          0.1484179999999995,
+          0.1533239999999978
+        ],
+        "projection_and_glu_ms": [
+          28.713979999999996,
+          28.975800000000003
+        ],
+        "body_ms": {
+          "projection": [
+            27.792809999999996,
+            28.073210000000003
+          ],
+          "glu": [
+            0.89476,
+            0.9211699999999998
+          ],
+          "attention": [
+            6.1987000000000005,
+            6.29962
+          ],
+          "norm": [
+            2.906329999999999,
+            2.9902899999999986
+          ],
+          "other": [
+            0.11874,
+            0.12174
+          ]
+        }
+      },
+      "mixed-t1024-d1-p3": {
+        "wall_ms": [
+          398.448239,
+          399.066212
+        ],
+        "envelope_ms": [
+          397.62952,
+          398.24657
+        ],
+        "gate_ms": [
+          4.427740000000003,
+          4.440860000000001
+        ],
+        "gap_ms": [
+          -5.684341886080802e-14,
+          1.7053025658242404e-13
+        ],
+        "host_minus_envelope_ms": [
+          0.8187189999999873,
+          0.8215059999999994
+        ],
+        "projection_and_glu_ms": [
+          332.8512400000001,
+          333.70469999999983
+        ],
+        "body_ms": {
+          "projection": [
+            332.8512400000001,
+            333.70469999999983
+          ],
+          "glu": [
+            0,
+            0
+          ],
+          "attention": [
+            36.34593999999999,
+            36.45620000000001
+          ],
+          "norm": [
+            23.68859999999999,
+            23.807669999999987
+          ],
+          "other": [
+            0.07959,
+            0.08541000000000001
+          ]
+        }
+      },
+      "mixed-t512-d1-p3": {
+        "wall_ms": [
+          252.085016,
+          253.972414
+        ],
+        "envelope_ms": [
+          251.50869,
+          253.01993
+        ],
+        "gate_ms": [
+          4.23511999999999,
+          4.27238
+        ],
+        "gap_ms": [
+          -8.526512829121202e-14,
+          0.0
+        ],
+        "host_minus_envelope_ms": [
+          0.5695300000000145,
+          0.9524839999999983
+        ],
+        "projection_and_glu_ms": [
+          206.76952000000006,
+          207.86897000000008
+        ],
+        "body_ms": {
+          "projection": [
+            206.76952000000006,
+            207.86897000000008
+          ],
+          "glu": [
+            0,
+            0
+          ],
+          "attention": [
+            25.31417,
+            25.590399999999992
+          ],
+          "norm": [
+            14.979899999999994,
+            15.213000000000013
+          ],
+          "other": [
+            0.07518,
+            0.08024999999999999
+          ]
+        }
+      },
+      "prefill-t1024": {
+        "wall_ms": [
+          263.443623,
+          264.017509
+        ],
+        "envelope_ms": [
+          262.98085,
+          263.55562
+        ],
+        "gate_ms": [
+          6.719820000000009,
+          7.225970000000006
+        ],
+        "gap_ms": [
+          1.2417199999997877,
+          1.383620000000036
+        ],
+        "host_minus_envelope_ms": [
+          0.46188900000004196,
+          0.4650779999999486
+        ],
+        "projection_and_glu_ms": [
+          203.18457000000015,
+          203.57850000000002
+        ],
+        "body_ms": {
+          "projection": [
+            203.18457000000015,
+            203.57850000000002
+          ],
+          "glu": [
+            0,
+            0
+          ],
+          "attention": [
+            40.60768999999999,
+            41.063289999999995
+          ],
+          "norm": [
+            10.679330000000006,
+            10.793260000000005
+          ],
+          "other": [
+            0.055670000000000004,
+            0.06026
+          ]
+        }
+      },
+      "prefill-t128": {
+        "wall_ms": [
+          93.11895,
+          94.077049
+        ],
+        "envelope_ms": [
+          92.90236,
+          93.84469
+        ],
+        "gate_ms": [
+          6.814630000000005,
+          7.904069999999996
+        ],
+        "gap_ms": [
+          1.3668700000000058,
+          1.6978200000000072
+        ],
+        "host_minus_envelope_ms": [
+          0.2165899999999965,
+          0.4855590000000092
+        ],
+        "projection_and_glu_ms": [
+          69.84417,
+          69.92430999999998
+        ],
+        "body_ms": {
+          "projection": [
+            68.82652,
+            68.93559999999998
+          ],
+          "glu": [
+            0.9887099999999998,
+            1.0176499999999997
+          ],
+          "attention": [
+            6.684950000000001,
+            7.0545100000000005
+          ],
+          "norm": [
+            7.6816499999999985,
+            7.6953200000000015
+          ],
+          "other": [
+            0.04672,
+            0.04849
+          ]
+        }
+      },
+      "prefill-t512": {
+        "wall_ms": [
+          158.114376,
+          158.493001
+        ],
+        "envelope_ms": [
+          157.81152,
+          158.1884
+        ],
+        "gate_ms": [
+          7.113989999999998,
+          7.381150000000007
+        ],
+        "gap_ms": [
+          1.3667900000000373,
+          1.4453100000000347
+        ],
+        "host_minus_envelope_ms": [
+          0.30285599999999135,
+          0.3058080000000132
+        ],
+        "projection_and_glu_ms": [
+          123.52214999999993,
+          123.86069999999994
+        ],
+        "body_ms": {
+          "projection": [
+            123.52214999999993,
+            123.86069999999994
+          ],
+          "glu": [
+            0,
+            0
+          ],
+          "attention": [
+            17.953210000000006,
+            18.1772
+          ],
+          "norm": [
+            7.485310000000002,
+            7.533440000000001
+          ],
+          "other": [
+            0.054419999999999996,
+            0.055540000000000006
+          ]
+        }
+      }
+    },
+    "objects": {
+      "b1_wpe5": {
+        "path": "/app/plow/build-gemma31/hsaco-occ4-b1-clean/interp_decode_gq.elf",
+        "sha256": "84296e1e397f6767364243d24e97f77804b001b40533cdae81d1b6ac2ea28ea1",
+        "resources": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 30776,
+          "max_flat_workgroup_size": 512,
+          "private_segment_fixed_size": 1404,
+          "sgpr_count": 106,
+          "sgpr_spill_count": 87,
+          "vgpr_count": 110,
+          "vgpr_spill_count": 0
+        }
+      },
+      "b4": {
+        "path": "/app/plow/build-gemma31/hsaco/interp_decode_gq.elf",
+        "sha256": "8008b9f79564f6bf99feb78a5679464e5628040ad555e4fc2ef3b6275169610f",
+        "resources": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 64568,
+          "max_flat_workgroup_size": 512,
+          "private_segment_fixed_size": 1472,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 87,
+          "vgpr_count": 256,
+          "vgpr_spill_count": 2
+        }
+      },
+      "prefill": {
+        "path": "/app/plow/build-gemma31/hsaco/interp_prefill_gq.elf",
+        "sha256": "7d065efe67f149b82da7bff5fbfbc2e4f4fe974d55a640a434d59caf56c2e884",
+        "resources": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 64560,
+          "max_flat_workgroup_size": 512,
+          "private_segment_fixed_size": 1360,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 23,
+          "vgpr_count": 256,
+          "vgpr_spill_count": 118
+        }
+      },
+      "mixed": {
+        "path": "/app/plow/build-gemma31/hsaco/interp_mixed_gq.elf",
+        "sha256": "b1deafe6490f3f57c18ba47a803785177a260884a7ba91d2f2dc952782bc86a5",
+        "resources": {
+          "agpr_count": 212,
+          "group_segment_fixed_size": 64544,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 1596,
+          "sgpr_count": 108,
+          "sgpr_spill_count": 23,
+          "vgpr_count": 468,
+          "vgpr_spill_count": 0
+        }
+      }
+    },
+    "packet_sha256": "59df5045781261d3c9aafe27804af667c95008a3a602775695d2ab68c0d45dc6",
+    "source_revision": "5feeb384ea521ee4bc40621f41f320744e31534f",
+    "private_host_patch": "/tmp/gemma31-profile.KZX6eT/crates/plowrt/src/exec/amd_mixed_step.rs",
+    "capture_test": "/tmp/gemma31-profile.KZX6eT/crates/plowrt/tests/hsa_mixed_step.rs::profile_native_packet_phases",
+    "configuration": {
+      "assets": "/app/plow/build-gemma31/decode-placed-assets",
+      "fusion": 1,
+      "l2_place_dispatch": 1,
+      "lowrung": "/app/plow/build-gemma31/hsaco-occ4-b1-clean:1",
+      "hardware": "MI300X",
+      "leased_gpu": 4
+    },
+    "artifact_directory": "/app/plow/build-gemma31/plow-profile/native",
+    "runs": [
+      {
+        "label": "decode-d1-ctx128-r0",
+        "wall_ms": 27.61942,
+        "envelope_ms": 27.45848,
+        "gate_ms": 0.7898899999999995,
+        "gap_ms": 1.4210854715202004e-14,
+        "host_minus_envelope_ms": 0.16094000000000008,
+        "body_ms": {
+          "other": 0.04342,
+          "norm": 1.6589699999999996,
+          "projection": 22.587409999999988,
+          "attention": 2.3787899999999995
+        },
+        "projection_and_glu_ms": 22.587409999999988,
+        "records": 94395,
+        "packets": 676
+      },
+      {
+        "label": "decode-d1-ctx128-r1",
+        "wall_ms": 27.625499,
+        "envelope_ms": 27.48196,
+        "gate_ms": 0.7880200000000005,
+        "gap_ms": 2.4868995751603507e-14,
+        "host_minus_envelope_ms": 0.14353900000000053,
+        "body_ms": {
+          "other": 0.036520000000000004,
+          "norm": 1.6385000000000005,
+          "projection": 22.664879999999975,
+          "attention": 2.354040000000001
+        },
+        "projection_and_glu_ms": 22.664879999999975,
+        "records": 94395,
+        "packets": 676
+      },
+      {
+        "label": "decode-d1-ctx128-r2",
+        "wall_ms": 27.614313,
+        "envelope_ms": 27.47432,
+        "gate_ms": 0.7891699999999999,
+        "gap_ms": 7.105427357601002e-15,
+        "host_minus_envelope_ms": 0.13999300000000048,
+        "body_ms": {
+          "other": 0.03676,
+          "norm": 1.6377900000000007,
+          "projection": 22.67579999999999,
+          "attention": 2.3347999999999995
+        },
+        "projection_and_glu_ms": 22.67579999999999,
+        "records": 94395,
+        "packets": 676
+      },
+      {
+        "label": "decode-d1-ctx4096-r0",
+        "wall_ms": 28.536109,
+        "envelope_ms": 28.40932,
+        "gate_ms": 0.8335999999999997,
+        "gap_ms": 0.0,
+        "host_minus_envelope_ms": 0.1267889999999987,
+        "body_ms": {
+          "other": 0.04111,
+          "norm": 1.74003,
+          "projection": 22.70128,
+          "attention": 3.0933
+        },
+        "projection_and_glu_ms": 22.70128,
+        "records": 94395,
+        "packets": 676
+      },
+      {
+        "label": "decode-d1-ctx4096-r1",
+        "wall_ms": 28.600735,
+        "envelope_ms": 28.44864,
+        "gate_ms": 0.8155700000000005,
+        "gap_ms": 1.0658141036401503e-14,
+        "host_minus_envelope_ms": 0.1520949999999992,
+        "body_ms": {
+          "other": 0.03977,
+          "norm": 1.7151100000000001,
+          "projection": 22.80667999999999,
+          "attention": 3.071509999999998
+        },
+        "projection_and_glu_ms": 22.80667999999999,
+        "records": 94395,
+        "packets": 676
+      },
+      {
+        "label": "decode-d1-ctx4096-r2",
+        "wall_ms": 28.32903,
+        "envelope_ms": 28.1768,
+        "gate_ms": 0.7950100000000001,
+        "gap_ms": -3.552713678800501e-15,
+        "host_minus_envelope_ms": 0.15222999999999942,
+        "body_ms": {
+          "other": 0.03651,
+          "norm": 1.6715099999999998,
+          "projection": 22.647660000000002,
+          "attention": 3.0261099999999996
+        },
+        "projection_and_glu_ms": 22.647660000000002,
+        "records": 94395,
+        "packets": 676
+      },
+      {
+        "label": "decode-d2-ctx128-r0",
+        "wall_ms": 34.528174,
+        "envelope_ms": 34.39459,
+        "gate_ms": 0.8602500000000007,
+        "gap_ms": -1.4210854715202004e-14,
+        "host_minus_envelope_ms": 0.13358399999999904,
+        "body_ms": {
+          "other": 0.08191,
+          "norm": 2.64345,
+          "projection": 27.003790000000013,
+          "attention": 3.8051899999999987
+        },
+        "projection_and_glu_ms": 27.003790000000013,
+        "records": 97221,
+        "packets": 676
+      },
+      {
+        "label": "decode-d2-ctx128-r1",
+        "wall_ms": 34.493783,
+        "envelope_ms": 34.35961,
+        "gate_ms": 0.8578099999999993,
+        "gap_ms": 7.105427357601002e-15,
+        "host_minus_envelope_ms": 0.134172999999997,
+        "body_ms": {
+          "other": 0.07818,
+          "norm": 2.6131000000000015,
+          "projection": 27.019249999999992,
+          "attention": 3.7912700000000017
+        },
+        "projection_and_glu_ms": 27.019249999999992,
+        "records": 97221,
+        "packets": 676
+      },
+      {
+        "label": "decode-d2-ctx128-r2",
+        "wall_ms": 34.557618,
+        "envelope_ms": 34.42043,
+        "gate_ms": 0.86541,
+        "gap_ms": 2.1316282072803006e-14,
+        "host_minus_envelope_ms": 0.13718799999999476,
+        "body_ms": {
+          "other": 0.08087,
+          "norm": 2.640179999999999,
+          "projection": 26.999339999999982,
+          "attention": 3.8346300000000006
+        },
+        "projection_and_glu_ms": 26.999339999999982,
+        "records": 97221,
+        "packets": 676
+      },
+      {
+        "label": "decode-d2-ctx4096-r0",
+        "wall_ms": 35.842165,
+        "envelope_ms": 35.696,
+        "gate_ms": 0.8538300000000008,
+        "gap_ms": 0.0,
+        "host_minus_envelope_ms": 0.14616500000000343,
+        "body_ms": {
+          "other": 0.08681,
+          "norm": 2.597390000000001,
+          "projection": 27.106229999999996,
+          "attention": 5.0517400000000015
+        },
+        "projection_and_glu_ms": 27.106229999999996,
+        "records": 97221,
+        "packets": 676
+      },
+      {
+        "label": "decode-d2-ctx4096-r1",
+        "wall_ms": 35.868084,
+        "envelope_ms": 35.72754,
+        "gate_ms": 0.8626499999999994,
+        "gap_ms": 0.0,
+        "host_minus_envelope_ms": 0.14054400000000555,
+        "body_ms": {
+          "other": 0.08288999999999999,
+          "norm": 2.6443300000000005,
+          "projection": 27.067689999999992,
+          "attention": 5.069980000000002
+        },
+        "projection_and_glu_ms": 27.067689999999992,
+        "records": 97221,
+        "packets": 676
+      },
+      {
+        "label": "decode-d2-ctx4096-r2",
+        "wall_ms": 35.86547,
+        "envelope_ms": 35.71866,
+        "gate_ms": 0.8515300000000005,
+        "gap_ms": -1.4210854715202004e-14,
+        "host_minus_envelope_ms": 0.1468100000000021,
+        "body_ms": {
+          "other": 0.07855999999999999,
+          "norm": 2.6157300000000014,
+          "projection": 27.098130000000012,
+          "attention": 5.07471
+        },
+        "projection_and_glu_ms": 27.098130000000012,
+        "records": 97221,
+        "packets": 676
+      },
+      {
+        "label": "decode-d4-ctx128-r0",
+        "wall_ms": 37.192992,
+        "envelope_ms": 37.05332,
+        "gate_ms": 1.03817,
+        "gap_ms": 1.4210854715202004e-14,
+        "host_minus_envelope_ms": 0.13967199999999735,
+        "body_ms": {
+          "other": 0.11502000000000001,
+          "norm": 2.8761999999999985,
+          "projection": 28.072219999999984,
+          "attention": 4.0753900000000005,
+          "glu": 0.8763199999999999
+        },
+        "projection_and_glu_ms": 28.948539999999984,
+        "records": 104133,
+        "packets": 896
+      },
+      {
+        "label": "decode-d4-ctx128-r1",
+        "wall_ms": 37.195185,
+        "envelope_ms": 37.05083,
+        "gate_ms": 1.0311400000000004,
+        "gap_ms": 1.4210854715202004e-14,
+        "host_minus_envelope_ms": 0.14435500000000445,
+        "body_ms": {
+          "other": 0.11821999999999999,
+          "norm": 2.8683000000000014,
+          "projection": 28.064769999999985,
+          "attention": 4.0790999999999995,
+          "glu": 0.8893000000000002
+        },
+        "projection_and_glu_ms": 28.954069999999984,
+        "records": 104133,
+        "packets": 896
+      },
+      {
+        "label": "decode-d4-ctx128-r2",
+        "wall_ms": 37.195576,
+        "envelope_ms": 37.05538,
+        "gate_ms": 1.0223800000000007,
+        "gap_ms": -3.552713678800501e-14,
+        "host_minus_envelope_ms": 0.1401960000000031,
+        "body_ms": {
+          "other": 0.12215999999999999,
+          "norm": 2.834830000000001,
+          "projection": 28.148120000000038,
+          "attention": 4.053919999999998,
+          "glu": 0.8739699999999999
+        },
+        "projection_and_glu_ms": 29.022090000000038,
+        "records": 104133,
+        "packets": 896
+      },
+      {
+        "label": "decode-d4-ctx4096-r0",
+        "wall_ms": 39.344784,
+        "envelope_ms": 39.19146,
+        "gate_ms": 1.0688299999999988,
+        "gap_ms": 7.105427357601002e-15,
+        "host_minus_envelope_ms": 0.1533239999999978,
+        "body_ms": {
+          "other": 0.11874,
+          "norm": 2.9902899999999986,
+          "projection": 27.792809999999996,
+          "attention": 6.29962,
+          "glu": 0.9211699999999998
+        },
+        "projection_and_glu_ms": 28.713979999999996,
+        "records": 104133,
+        "packets": 896
+      },
+      {
+        "label": "decode-d4-ctx4096-r1",
+        "wall_ms": 39.393848,
+        "envelope_ms": 39.24543,
+        "gate_ms": 1.0534000000000006,
+        "gap_ms": 7.105427357601002e-15,
+        "host_minus_envelope_ms": 0.1484179999999995,
+        "body_ms": {
+          "other": 0.12174,
+          "norm": 2.9527500000000013,
+          "projection": 28.000559999999986,
+          "attention": 6.222220000000003,
+          "glu": 0.89476
+        },
+        "projection_and_glu_ms": 28.895319999999987,
+        "records": 104133,
+        "packets": 896
+      },
+      {
+        "label": "decode-d4-ctx4096-r2",
+        "wall_ms": 39.396852,
+        "envelope_ms": 39.24757,
+        "gate_ms": 1.0452099999999986,
+        "gap_ms": 0.0,
+        "host_minus_envelope_ms": 0.14928199999999947,
+        "body_ms": {
+          "other": 0.12153,
+          "norm": 2.906329999999999,
+          "projection": 28.073210000000003,
+          "attention": 6.1987000000000005,
+          "glu": 0.9025900000000002
+        },
+        "projection_and_glu_ms": 28.975800000000003,
+        "records": 104133,
+        "packets": 896
+      },
+      {
+        "label": "mixed-t1024-d1-p3-r0",
+        "wall_ms": 399.066212,
+        "envelope_ms": 398.24657,
+        "gate_ms": 4.427740000000003,
+        "gap_ms": 1.7053025658242404e-13,
+        "host_minus_envelope_ms": 0.8196419999999875,
+        "body_ms": {
+          "other": 0.07959,
+          "norm": 23.68859999999999,
+          "projection": 333.70469999999983,
+          "attention": 36.34593999999999
+        },
+        "projection_and_glu_ms": 333.70469999999983,
+        "records": 308864,
+        "packets": 1016
+      },
+      {
+        "label": "mixed-t1024-d1-p3-r1",
+        "wall_ms": 398.448239,
+        "envelope_ms": 397.62952,
+        "gate_ms": 4.430779999999999,
+        "gap_ms": -5.684341886080802e-14,
+        "host_minus_envelope_ms": 0.8187189999999873,
+        "body_ms": {
+          "other": 0.08363,
+          "norm": 23.807669999999987,
+          "projection": 332.8512400000001,
+          "attention": 36.45620000000001
+        },
+        "projection_and_glu_ms": 332.8512400000001,
+        "records": 308864,
+        "packets": 1016
+      },
+      {
+        "label": "mixed-t1024-d1-p3-r2",
+        "wall_ms": 399.014836,
+        "envelope_ms": 398.19333,
+        "gate_ms": 4.440860000000001,
+        "gap_ms": -5.684341886080802e-14,
+        "host_minus_envelope_ms": 0.8215059999999994,
+        "body_ms": {
+          "other": 0.08541000000000001,
+          "norm": 23.72881000000001,
+          "projection": 333.56088000000005,
+          "attention": 36.37737000000001
+        },
+        "projection_and_glu_ms": 333.56088000000005,
+        "records": 308864,
+        "packets": 1016
+      },
+      {
+        "label": "mixed-t512-d1-p3-r0",
+        "wall_ms": 253.972414,
+        "envelope_ms": 253.01993,
+        "gate_ms": 4.27238,
+        "gap_ms": -8.526512829121202e-14,
+        "host_minus_envelope_ms": 0.9524839999999983,
+        "body_ms": {
+          "other": 0.07518,
+          "norm": 15.213000000000013,
+          "projection": 207.86897000000008,
+          "attention": 25.590399999999992
+        },
+        "projection_and_glu_ms": 207.86897000000008,
+        "records": 308864,
+        "packets": 1016
+      },
+      {
+        "label": "mixed-t512-d1-p3-r1",
+        "wall_ms": 252.085016,
+        "envelope_ms": 251.50869,
+        "gate_ms": 4.23511999999999,
+        "gap_ms": 0.0,
+        "host_minus_envelope_ms": 0.5763259999999946,
+        "body_ms": {
+          "other": 0.08024999999999999,
+          "norm": 14.979899999999994,
+          "projection": 206.89925000000002,
+          "attention": 25.31417
+        },
+        "projection_and_glu_ms": 206.89925000000002,
+        "records": 308864,
+        "packets": 1016
+      },
+      {
+        "label": "mixed-t512-d1-p3-r2",
+        "wall_ms": 252.16746,
+        "envelope_ms": 251.59793,
+        "gate_ms": 4.25891000000001,
+        "gap_ms": -8.526512829121202e-14,
+        "host_minus_envelope_ms": 0.5695300000000145,
+        "body_ms": {
+          "other": 0.07780999999999999,
+          "norm": 15.054779999999989,
+          "projection": 206.76952000000006,
+          "attention": 25.43691000000001
+        },
+        "projection_and_glu_ms": 206.76952000000006,
+        "records": 308864,
+        "packets": 1016
+      },
+      {
+        "label": "prefill-t1024-r0",
+        "wall_ms": 263.443623,
+        "envelope_ms": 262.98085,
+        "gate_ms": 6.719820000000009,
+        "gap_ms": 1.2417199999997877,
+        "host_minus_envelope_ms": 0.46277300000002697,
+        "body_ms": {
+          "other": 0.055670000000000004,
+          "norm": 10.715780000000008,
+          "projection": 203.18457000000015,
+          "attention": 41.063289999999995
+        },
+        "projection_and_glu_ms": 203.18457000000015,
+        "records": 238161,
+        "packets": 896
+      },
+      {
+        "label": "prefill-t1024-r1",
+        "wall_ms": 263.829238,
+        "envelope_ms": 263.36416,
+        "gate_ms": 7.225970000000006,
+        "gap_ms": 1.383620000000036,
+        "host_minus_envelope_ms": 0.4650779999999486,
+        "body_ms": {
+          "other": 0.06026,
+          "norm": 10.679330000000006,
+          "projection": 203.40729,
+          "attention": 40.60768999999999
+        },
+        "projection_and_glu_ms": 203.40729,
+        "records": 238161,
+        "packets": 896
+      },
+      {
+        "label": "prefill-t1024-r2",
+        "wall_ms": 264.017509,
+        "envelope_ms": 263.55562,
+        "gate_ms": 6.932830000000003,
+        "gap_ms": 1.2942999999999358,
+        "host_minus_envelope_ms": 0.46188900000004196,
+        "body_ms": {
+          "other": 0.0564,
+          "norm": 10.793260000000005,
+          "projection": 203.57850000000002,
+          "attention": 40.900330000000004
+        },
+        "projection_and_glu_ms": 203.57850000000002,
+        "records": 238161,
+        "packets": 896
+      },
+      {
+        "label": "prefill-t128-r0",
+        "wall_ms": 94.077049,
+        "envelope_ms": 93.59149,
+        "gate_ms": 7.590819999999999,
+        "gap_ms": 1.6978200000000072,
+        "host_minus_envelope_ms": 0.4855590000000092,
+        "body_ms": {
+          "other": 0.04849,
+          "norm": 7.683019999999998,
+          "projection": 68.82652,
+          "attention": 6.727169999999999,
+          "glu": 1.0176499999999997
+        },
+        "projection_and_glu_ms": 69.84417,
+        "records": 213809,
+        "packets": 1016
+      },
+      {
+        "label": "prefill-t128-r1",
+        "wall_ms": 93.11895,
+        "envelope_ms": 92.90236,
+        "gate_ms": 6.814630000000005,
+        "gap_ms": 1.3668700000000058,
+        "host_minus_envelope_ms": 0.2165899999999965,
+        "body_ms": {
+          "other": 0.04672,
+          "norm": 7.6953200000000015,
+          "projection": 68.93559999999998,
+          "attention": 7.0545100000000005,
+          "glu": 0.9887099999999998
+        },
+        "projection_and_glu_ms": 69.92430999999998,
+        "records": 213809,
+        "packets": 1016
+      },
+      {
+        "label": "prefill-t128-r2",
+        "wall_ms": 94.062147,
+        "envelope_ms": 93.84469,
+        "gate_ms": 7.904069999999996,
+        "gap_ms": 1.6240999999999985,
+        "host_minus_envelope_ms": 0.21745699999999601,
+        "body_ms": {
+          "other": 0.04724,
+          "norm": 7.6816499999999985,
+          "projection": 68.90324000000001,
+          "attention": 6.684950000000001,
+          "glu": 0.9994399999999997
+        },
+        "projection_and_glu_ms": 69.90268,
+        "records": 213809,
+        "packets": 1016
+      },
+      {
+        "label": "prefill-t512-r0",
+        "wall_ms": 158.114376,
+        "envelope_ms": 157.81152,
+        "gate_ms": 7.282750000000002,
+        "gap_ms": 1.422990000000084,
+        "host_minus_envelope_ms": 0.30285599999999135,
+        "body_ms": {
+          "other": 0.05467,
+          "norm": 7.533440000000001,
+          "projection": 123.52214999999993,
+          "attention": 17.995520000000003
+        },
+        "projection_and_glu_ms": 123.52214999999993,
+        "records": 238161,
+        "packets": 896
+      },
+      {
+        "label": "prefill-t512-r1",
+        "wall_ms": 158.122698,
+        "envelope_ms": 157.81689,
+        "gate_ms": 7.113989999999998,
+        "gap_ms": 1.3667900000000373,
+        "host_minus_envelope_ms": 0.3058080000000132,
+        "body_ms": {
+          "other": 0.054419999999999996,
+          "norm": 7.485310000000002,
+          "projection": 123.61917999999996,
+          "attention": 18.1772
+        },
+        "projection_and_glu_ms": 123.61917999999996,
+        "records": 238161,
+        "packets": 896
+      },
+      {
+        "label": "prefill-t512-r2",
+        "wall_ms": 158.493001,
+        "envelope_ms": 158.1884,
+        "gate_ms": 7.381150000000007,
+        "gap_ms": 1.4453100000000347,
+        "host_minus_envelope_ms": 0.304600999999991,
+        "body_ms": {
+          "other": 0.055540000000000006,
+          "norm": 7.49249,
+          "projection": 123.86069999999994,
+          "attention": 17.953210000000006
+        },
+        "projection_and_glu_ms": 123.86069999999994,
+        "records": 238161,
+        "packets": 896
+      }
+    ],
+    "method": "Existing k3_trace_report critical-envelope reduction, native40-byte records,100MHz ticks. Packet body includes publish/release; recorded gates exclude initial queue claim. Private debug host driver; shipping GPU objects. Host-minus-envelope includes GPU launch tail plus host synchronization/bookkeeping, not pure CPU compute. Mixed projection includes GEMV decode prefix and MFMA prefill suffix. All3 repetitions, no timings discarded. Separate medians need not sum exactly. No memory bandwidth/spill/occupancy mechanism proven.",
+    "related_artifacts": {
+      "timing.json": {
+        "path": "/app/plow/build-gemma31/plow-profile/native/timing.json",
+        "sha256": "ce3ff3c9ced6d5dc9d4d45fc0563aeedd8966bc94b2575cc34ffad9b1641c6d0"
+      },
+      "instructions.json": {
+        "path": "/app/plow/build-gemma31/plow-profile/native/instructions.json",
+        "sha256": "269919ddae79c8f8ebe12e9d22bf3508b7a7378e7ab89e09d473a8f7792176d6"
+      },
+      "top-shapes.json": {
+        "path": "/app/plow/build-gemma31/plow-profile/native/top-shapes.json",
+        "sha256": "fe14555c5679c64fb0f8fcd30b5ffb9ec00125603d93198fbc6835ca2aa53540"
+      },
+      "top-packets.json": {
+        "path": "/app/plow/build-gemma31/plow-profile/native/top-packets.json",
+        "sha256": "acd5f1965f889b9d44743f68a35d760af2bdfd42b915f33594e968759c57877c"
+      },
+      "reduce.py": {
+        "path": "/app/plow/build-gemma31/plow-profile/native/reduce.py",
+        "sha256": "5899c85e6d3ca94b5eccdc4966ff9bb4f7113efd362a0374ec499b51bf468418"
+      }
+    },
+    "limitations": [
+      "No hardware-counter proof of bandwidth, occupancy, or spill bottlenecks.",
+      "Ordinary one-span prefill and mixed three-span cases have different work layouts; their ratio is not a measured fusion penalty.",
+      "Prefill residual gap is unassigned timeline time, including segmented-launch gaps; it is not attributed to GPU arithmetic.",
+      "Native packet body includes publish/release overhead; initial queue claim is outside recorded gate.",
+      "Debug host driver and shipping GPU objects; timestamp envelope is validated against per-call Rust wall time."
+    ],
+    "source_summary_sha256": "64b1572a8d937d7abb959ca2cbf90626dbcb5a345f02a416b1cb33d986d345eb"
+  },
+  "plow_projection_shapes": [
+    {
+      "case": "decode-d1-ctx128",
+      "shape": "GEMV_GLU M1 N21504 K5376",
+      "count": 60,
+      "median_ms": 7.723259999999999,
+      "range_ms": [
+        7.721349999999999,
+        7.75686
+      ]
+    },
+    {
+      "case": "decode-d1-ctx128",
+      "shape": "GEMV M1 N5376 K21504",
+      "count": 60,
+      "median_ms": 5.88098,
+      "range_ms": [
+        5.85016,
+        5.890340000000002
+      ]
+    },
+    {
+      "case": "decode-d1-ctx128",
+      "shape": "GEMV_QKV M1 N16384 K5376",
+      "count": 50,
+      "median_ms": 3.258939999999999,
+      "range_ms": [
+        3.2525500000000007,
+        3.26706
+      ]
+    },
+    {
+      "case": "decode-d1-ctx128",
+      "shape": "GEMV M1 N5376 K8192",
+      "count": 50,
+      "median_ms": 2.9437,
+      "range_ms": [
+        2.928699999999999,
+        2.9465599999999994
+      ]
+    },
+    {
+      "case": "decode-d1-ctx128",
+      "shape": "GEMV M1 N262144 K5376",
+      "count": 1,
+      "median_ms": 1.07777,
+      "range_ms": [
+        1.07031,
+        1.0844
+      ]
+    },
+    {
+      "case": "decode-d1-ctx128",
+      "shape": "GEMV M1 N16384 K5376",
+      "count": 10,
+      "median_ms": 0.9686199999999998,
+      "range_ms": [
+        0.9636299999999999,
+        0.97042
+      ]
+    },
+    {
+      "case": "decode-d1-ctx128",
+      "shape": "GEMV M1 N5376 K16384",
+      "count": 10,
+      "median_ms": 0.7924599999999999,
+      "range_ms": [
+        0.7861500000000001,
+        0.7936399999999999
+      ]
+    },
+    {
+      "case": "decode-d1-ctx128",
+      "shape": "GEMV M1 N2048 K5376",
+      "count": 10,
+      "median_ms": 5e-05,
+      "range_ms": [
+        0.0,
+        0.00018
+      ]
+    },
+    {
+      "case": "decode-d1-ctx4096",
+      "shape": "GEMV_GLU M1 N21504 K5376",
+      "count": 60,
+      "median_ms": 7.75299,
+      "range_ms": [
+        7.722190000000001,
+        7.7588399999999975
+      ]
+    },
+    {
+      "case": "decode-d1-ctx4096",
+      "shape": "GEMV M1 N5376 K21504",
+      "count": 60,
+      "median_ms": 5.921799999999999,
+      "range_ms": [
+        5.879979999999999,
+        5.929670000000001
+      ]
+    },
+    {
+      "case": "decode-d1-ctx4096",
+      "shape": "GEMV_QKV M1 N16384 K5376",
+      "count": 50,
+      "median_ms": 3.2620900000000006,
+      "range_ms": [
+        3.2429499999999996,
+        3.26427
+      ]
+    },
+    {
+      "case": "decode-d1-ctx4096",
+      "shape": "GEMV M1 N5376 K8192",
+      "count": 50,
+      "median_ms": 2.9665200000000005,
+      "range_ms": [
+        2.928880000000002,
+        2.98636
+      ]
+    },
+    {
+      "case": "decode-d1-ctx4096",
+      "shape": "GEMV M1 N262144 K5376",
+      "count": 1,
+      "median_ms": 1.07612,
+      "range_ms": [
+        1.05413,
+        1.09406
+      ]
+    },
+    {
+      "case": "decode-d1-ctx4096",
+      "shape": "GEMV M1 N16384 K5376",
+      "count": 10,
+      "median_ms": 0.9739000000000001,
+      "range_ms": [
+        0.9717,
+        0.9783499999999999
+      ]
+    },
+    {
+      "case": "decode-d1-ctx4096",
+      "shape": "GEMV M1 N5376 K16384",
+      "count": 10,
+      "median_ms": 0.7965000000000001,
+      "range_ms": [
+        0.79351,
+        0.7997000000000001
+      ]
+    },
+    {
+      "case": "decode-d1-ctx4096",
+      "shape": "GEMV M1 N2048 K5376",
+      "count": 10,
+      "median_ms": 0.0003,
+      "range_ms": [
+        0.0,
+        0.00081
+      ]
+    },
+    {
+      "case": "decode-d2-ctx128",
+      "shape": "GEMV_GLU M2 N21504 K5376",
+      "count": 60,
+      "median_ms": 10.898300000000003,
+      "range_ms": [
+        10.896840000000003,
+        10.90591
+      ]
+    },
+    {
+      "case": "decode-d2-ctx128",
+      "shape": "GEMV M2 N5376 K21504",
+      "count": 60,
+      "median_ms": 6.07699,
+      "range_ms": [
+        6.0702799999999995,
+        6.080659999999999
+      ]
+    },
+    {
+      "case": "decode-d2-ctx128",
+      "shape": "GEMV_QKV M2 N16384 K5376",
+      "count": 50,
+      "median_ms": 4.2786,
+      "range_ms": [
+        4.27218,
+        4.2828100000000004
+      ]
+    },
+    {
+      "case": "decode-d2-ctx128",
+      "shape": "GEMV M2 N5376 K8192",
+      "count": 50,
+      "median_ms": 2.9399099999999994,
+      "range_ms": [
+        2.93444,
+        2.9427899999999996
+      ]
+    },
+    {
+      "case": "decode-d2-ctx128",
+      "shape": "GEMV M2 N16384 K5376",
+      "count": 10,
+      "median_ms": 0.99735,
+      "range_ms": [
+        0.99709,
+        0.9988199999999998
+      ]
+    },
+    {
+      "case": "decode-d2-ctx128",
+      "shape": "GEMV M2 N262144 K5376",
+      "count": 1,
+      "median_ms": 0.94616,
+      "range_ms": [
+        0.94371,
+        0.9487
+      ]
+    },
+    {
+      "case": "decode-d2-ctx128",
+      "shape": "GEMV M2 N5376 K16384",
+      "count": 10,
+      "median_ms": 0.86872,
+      "range_ms": [
+        0.86727,
+        0.87428
+      ]
+    },
+    {
+      "case": "decode-d2-ctx128",
+      "shape": "GEMV M2 N2048 K5376",
+      "count": 10,
+      "median_ms": 0.00026,
+      "range_ms": [
+        0.0,
+        0.00031
+      ]
+    },
+    {
+      "case": "decode-d2-ctx4096",
+      "shape": "GEMV_GLU M2 N21504 K5376",
+      "count": 60,
+      "median_ms": 10.951350000000003,
+      "range_ms": [
+        10.943379999999998,
+        10.973279999999999
+      ]
+    },
+    {
+      "case": "decode-d2-ctx4096",
+      "shape": "GEMV M2 N5376 K21504",
+      "count": 60,
+      "median_ms": 6.106940000000001,
+      "range_ms": [
+        6.082160000000001,
+        6.130779999999999
+      ]
+    },
+    {
+      "case": "decode-d2-ctx4096",
+      "shape": "GEMV_QKV M2 N16384 K5376",
+      "count": 50,
+      "median_ms": 4.3088999999999995,
+      "range_ms": [
+        4.292349999999999,
+        4.31067
+      ]
+    },
+    {
+      "case": "decode-d2-ctx4096",
+      "shape": "GEMV M2 N5376 K8192",
+      "count": 50,
+      "median_ms": 2.91254,
+      "range_ms": [
+        2.908980000000001,
+        2.9159000000000015
+      ]
+    },
+    {
+      "case": "decode-d2-ctx4096",
+      "shape": "GEMV M2 N16384 K5376",
+      "count": 10,
+      "median_ms": 0.99875,
+      "range_ms": [
+        0.9933,
+        1.00295
+      ]
+    },
+    {
+      "case": "decode-d2-ctx4096",
+      "shape": "GEMV M2 N262144 K5376",
+      "count": 1,
+      "median_ms": 0.9559,
+      "range_ms": [
+        0.92332,
+        0.96167
+      ]
+    },
+    {
+      "case": "decode-d2-ctx4096",
+      "shape": "GEMV M2 N5376 K16384",
+      "count": 10,
+      "median_ms": 0.8673099999999999,
+      "range_ms": [
+        0.85827,
+        0.8726400000000001
+      ]
+    },
+    {
+      "case": "decode-d2-ctx4096",
+      "shape": "GEMV M2 N2048 K5376",
+      "count": 10,
+      "median_ms": 0.0,
+      "range_ms": [
+        0.0,
+        0.00071
+      ]
+    },
+    {
+      "case": "decode-d4-ctx128",
+      "shape": "GEMV M4 N21504 K5376",
+      "count": 120,
+      "median_ms": 11.020380000000003,
+      "range_ms": [
+        11.015269999999996,
+        11.06447
+      ]
+    },
+    {
+      "case": "decode-d4-ctx128",
+      "shape": "GEMV M4 N5376 K21504",
+      "count": 60,
+      "median_ms": 6.45257,
+      "range_ms": [
+        6.427220000000001,
+        6.470960000000002
+      ]
+    },
+    {
+      "case": "decode-d4-ctx128",
+      "shape": "GEMV M4 N8192 K5376",
+      "count": 50,
+      "median_ms": 4.601700000000002,
+      "range_ms": [
+        4.595859999999999,
+        4.604239999999999
+      ]
+    },
+    {
+      "case": "decode-d4-ctx128",
+      "shape": "GEMV M4 N5376 K8192",
+      "count": 50,
+      "median_ms": 3.0944699999999994,
+      "range_ms": [
+        3.0858900000000005,
+        3.1059999999999994
+      ]
+    },
+    {
+      "case": "decode-d4-ctx128",
+      "shape": "GEMV M4 N16384 K5376",
+      "count": 10,
+      "median_ms": 1.00769,
+      "range_ms": [
+        1.0013,
+        1.0091299999999999
+      ]
+    },
+    {
+      "case": "decode-d4-ctx128",
+      "shape": "GEMV M4 N262144 K5376",
+      "count": 1,
+      "median_ms": 0.96402,
+      "range_ms": [
+        0.96292,
+        0.97241
+      ]
+    },
+    {
+      "case": "decode-d4-ctx128",
+      "shape": "GEMV M4 N5376 K16384",
+      "count": 10,
+      "median_ms": 0.9214699999999999,
+      "range_ms": [
+        0.91632,
+        0.92223
+      ]
+    },
+    {
+      "case": "decode-d4-ctx128",
+      "shape": "GEMV M4 N4096 K5376",
+      "count": 100,
+      "median_ms": 0.023100000000000002,
+      "range_ms": [
+        0.019629999999999998,
+        0.025230000000000006
+      ]
+    },
+    {
+      "case": "decode-d4-ctx128",
+      "shape": "GEMV M4 N2048 K5376",
+      "count": 10,
+      "median_ms": 0.00021,
+      "range_ms": [
+        0.00018,
+        0.00024
+      ]
+    },
+    {
+      "case": "decode-d4-ctx4096",
+      "shape": "GEMV M4 N21504 K5376",
+      "count": 120,
+      "median_ms": 10.947850000000006,
+      "range_ms": [
+        10.872570000000001,
+        11.01308
+      ]
+    },
+    {
+      "case": "decode-d4-ctx4096",
+      "shape": "GEMV M4 N5376 K21504",
+      "count": 60,
+      "median_ms": 6.433910000000001,
+      "range_ms": [
+        6.38228,
+        6.445329999999999
+      ]
+    },
+    {
+      "case": "decode-d4-ctx4096",
+      "shape": "GEMV M4 N8192 K5376",
+      "count": 50,
+      "median_ms": 4.60333,
+      "range_ms": [
+        4.578309999999999,
+        4.62152
+      ]
+    },
+    {
+      "case": "decode-d4-ctx4096",
+      "shape": "GEMV M4 N5376 K8192",
+      "count": 50,
+      "median_ms": 3.101940000000001,
+      "range_ms": [
+        3.0981300000000003,
+        3.10916
+      ]
+    },
+    {
+      "case": "decode-d4-ctx4096",
+      "shape": "GEMV M4 N16384 K5376",
+      "count": 10,
+      "median_ms": 1.0008299999999999,
+      "range_ms": [
+        0.9998900000000001,
+        1.00513
+      ]
+    },
+    {
+      "case": "decode-d4-ctx4096",
+      "shape": "GEMV M4 N262144 K5376",
+      "count": 1,
+      "median_ms": 0.95746,
+      "range_ms": [
+        0.9225,
+        0.97241
+      ]
+    },
+    {
+      "case": "decode-d4-ctx4096",
+      "shape": "GEMV M4 N5376 K16384",
+      "count": 10,
+      "median_ms": 0.9163,
+      "range_ms": [
+        0.9122599999999998,
+        0.91973
+      ]
+    },
+    {
+      "case": "decode-d4-ctx4096",
+      "shape": "GEMV M4 N4096 K5376",
+      "count": 100,
+      "median_ms": 0.01713,
+      "range_ms": [
+        0.01574,
+        0.017820000000000003
+      ]
+    },
+    {
+      "case": "decode-d4-ctx4096",
+      "shape": "GEMV M4 N2048 K5376",
+      "count": 10,
+      "median_ms": 0.0,
+      "range_ms": [
+        0.0,
+        0.00197
+      ]
+    },
+    {
+      "case": "mixed-t1024-d1-p3",
+      "shape": "GEMM_GLU M1024 N21504 K5376",
+      "count": 60,
+      "median_ms": 139.39666,
+      "range_ms": [
+        138.98198000000002,
+        139.53899
+      ]
+    },
+    {
+      "case": "mixed-t1024-d1-p3",
+      "shape": "GEMM M1024 N5376 K21504",
+      "count": 60,
+      "median_ms": 90.92247999999998,
+      "range_ms": [
+        90.87482999999996,
+        90.94457999999999
+      ]
+    },
+    {
+      "case": "mixed-t1024-d1-p3",
+      "shape": "GEMM M1024 N4096 K5376",
+      "count": 100,
+      "median_ms": 27.041669999999996,
+      "range_ms": [
+        27.010769999999994,
+        27.0524
+      ]
+    },
+    {
+      "case": "mixed-t1024-d1-p3",
+      "shape": "GEMM M1024 N5376 K8192",
+      "count": 50,
+      "median_ms": 26.94929999999999,
+      "range_ms": [
+        26.895850000000003,
+        26.993129999999997
+      ]
+    },
+    {
+      "case": "mixed-t1024-d1-p3",
+      "shape": "GEMM M1024 N8192 K5376",
+      "count": 50,
+      "median_ms": 26.60305,
+      "range_ms": [
+        26.56729,
+        26.666669999999993
+      ]
+    },
+    {
+      "case": "mixed-t1024-d1-p3",
+      "shape": "GEMM M1024 N5376 K16384",
+      "count": 10,
+      "median_ms": 10.74462,
+      "range_ms": [
+        10.66452,
+        10.752019999999998
+      ]
+    },
+    {
+      "case": "mixed-t1024-d1-p3",
+      "shape": "GEMM M1024 N16384 K5376",
+      "count": 10,
+      "median_ms": 9.151589999999999,
+      "range_ms": [
+        9.144699999999998,
+        9.18734
+      ]
+    },
+    {
+      "case": "mixed-t1024-d1-p3",
+      "shape": "GEMM M1024 N2048 K5376",
+      "count": 10,
+      "median_ms": 1.53654,
+      "range_ms": [
+        1.5207,
+        1.5508199999999999
+      ]
+    },
+    {
+      "case": "mixed-t1024-d1-p3",
+      "shape": "GEMM M3 N262144 K5376",
+      "count": 1,
+      "median_ms": 1.13614,
+      "range_ms": [
+        1.13459,
+        1.15359
+      ]
+    },
+    {
+      "case": "mixed-t512-d1-p3",
+      "shape": "GEMM_GLU M512 N21504 K5376",
+      "count": 60,
+      "median_ms": 79.35535,
+      "range_ms": [
+        79.30349999999999,
+        80.32893999999999
+      ]
+    },
+    {
+      "case": "mixed-t512-d1-p3",
+      "shape": "GEMM M512 N5376 K21504",
+      "count": 60,
+      "median_ms": 61.93939999999998,
+      "range_ms": [
+        61.82733,
+        62.24714
+      ]
+    },
+    {
+      "case": "mixed-t512-d1-p3",
+      "shape": "GEMM M512 N5376 K8192",
+      "count": 50,
+      "median_ms": 19.003860000000003,
+      "range_ms": [
+        18.94897999999999,
+        19.118940000000006
+      ]
+    },
+    {
+      "case": "mixed-t512-d1-p3",
+      "shape": "GEMM M512 N4096 K5376",
+      "count": 100,
+      "median_ms": 16.255739999999992,
+      "range_ms": [
+        16.164770000000004,
+        16.264699999999998
+      ]
+    },
+    {
+      "case": "mixed-t512-d1-p3",
+      "shape": "GEMM M512 N8192 K5376",
+      "count": 50,
+      "median_ms": 14.603139999999994,
+      "range_ms": [
+        14.56214,
+        14.609289999999998
+      ]
+    },
+    {
+      "case": "mixed-t512-d1-p3",
+      "shape": "GEMM M512 N5376 K16384",
+      "count": 10,
+      "median_ms": 7.51023,
+      "range_ms": [
+        7.46766,
+        7.5708400000000005
+      ]
+    },
+    {
+      "case": "mixed-t512-d1-p3",
+      "shape": "GEMM M512 N16384 K5376",
+      "count": 10,
+      "median_ms": 5.49416,
+      "range_ms": [
+        5.48437,
+        5.530609999999999
+      ]
+    },
+    {
+      "case": "mixed-t512-d1-p3",
+      "shape": "GEMM M512 N2048 K5376",
+      "count": 10,
+      "median_ms": 1.53151,
+      "range_ms": [
+        1.52261,
+        1.55816
+      ]
+    },
+    {
+      "case": "mixed-t512-d1-p3",
+      "shape": "GEMM M3 N262144 K5376",
+      "count": 1,
+      "median_ms": 1.0949,
+      "range_ms": [
+        1.06638,
+        1.17309
+      ]
+    },
+    {
+      "case": "prefill-t1024",
+      "shape": "GEMM_GLU M1024 N21504 K5376",
+      "count": 60,
+      "median_ms": 86.64666,
+      "range_ms": [
+        86.38648999999995,
+        86.75873000000003
+      ]
+    },
+    {
+      "case": "prefill-t1024",
+      "shape": "GEMM_WIDE M1024 N5376 K21504",
+      "count": 60,
+      "median_ms": 54.68872000000001,
+      "range_ms": [
+        54.67628,
+        54.90825
+      ]
+    },
+    {
+      "case": "prefill-t1024",
+      "shape": "GEMM_WIDE M1024 N8192 K5376",
+      "count": 50,
+      "median_ms": 24.878859999999996,
+      "range_ms": [
+        24.65202,
+        24.942870000000006
+      ]
+    },
+    {
+      "case": "prefill-t1024",
+      "shape": "GEMM_WIDE M1024 N5376 K8192",
+      "count": 50,
+      "median_ms": 16.44782,
+      "range_ms": [
+        16.38367,
+        16.463380000000004
+      ]
+    },
+    {
+      "case": "prefill-t1024",
+      "shape": "GEMM_WIDE M1024 N5376 K16384",
+      "count": 10,
+      "median_ms": 6.114719999999999,
+      "range_ms": [
+        6.10952,
+        6.1237699999999995
+      ]
+    },
+    {
+      "case": "prefill-t1024",
+      "shape": "GEMM_WIDE M1024 N16384 K5376",
+      "count": 10,
+      "median_ms": 5.21306,
+      "range_ms": [
+        5.15928,
+        5.270190000000001
+      ]
+    },
+    {
+      "case": "prefill-t1024",
+      "shape": "GEMM_MED M1024 N4096 K5376",
+      "count": 100,
+      "median_ms": 5.165220000000001,
+      "range_ms": [
+        5.133730000000002,
+        5.223130000000001
+      ]
+    },
+    {
+      "case": "prefill-t1024",
+      "shape": "GEMM_SMALL M1024 N2048 K5376",
+      "count": 10,
+      "median_ms": 3.66994,
+      "range_ms": [
+        3.64772,
+        3.6822299999999997
+      ]
+    },
+    {
+      "case": "prefill-t1024",
+      "shape": "GEMV M1 N262144 K5376",
+      "count": 1,
+      "median_ms": 0.60736,
+      "range_ms": [
+        0.60689,
+        0.60985
+      ]
+    },
+    {
+      "case": "prefill-t128",
+      "shape": "GEMM_SMALL M128 N5376 K21504",
+      "count": 60,
+      "median_ms": 26.285410000000002,
+      "range_ms": [
+        26.26235000000001,
+        26.288139999999995
+      ]
+    },
+    {
+      "case": "prefill-t128",
+      "shape": "GEMM_MED M128 N21504 K5376",
+      "count": 120,
+      "median_ms": 22.227809999999995,
+      "range_ms": [
+        22.154350000000004,
+        22.238980000000012
+      ]
+    },
+    {
+      "case": "prefill-t128",
+      "shape": "GEMM_SMALL M128 N5376 K8192",
+      "count": 50,
+      "median_ms": 7.80569,
+      "range_ms": [
+        7.788049999999998,
+        7.832989999999999
+      ]
+    },
+    {
+      "case": "prefill-t128",
+      "shape": "GEMM_SMALL M128 N8192 K5376",
+      "count": 50,
+      "median_ms": 7.1457200000000025,
+      "range_ms": [
+        7.14555,
+        7.175420000000002
+      ]
+    },
+    {
+      "case": "prefill-t128",
+      "shape": "GEMM_SMALL M128 N5376 K16384",
+      "count": 10,
+      "median_ms": 3.33541,
+      "range_ms": [
+        3.33217,
+        3.3453300000000006
+      ]
+    },
+    {
+      "case": "prefill-t128",
+      "shape": "GEMM_SMALL M128 N16384 K5376",
+      "count": 10,
+      "median_ms": 1.4938200000000001,
+      "range_ms": [
+        1.49199,
+        1.49713
+      ]
+    },
+    {
+      "case": "prefill-t128",
+      "shape": "GEMV M1 N262144 K5376",
+      "count": 1,
+      "median_ms": 0.6051,
+      "range_ms": [
+        0.60352,
+        0.60548
+      ]
+    },
+    {
+      "case": "prefill-t128",
+      "shape": "GEMM_SMALL M128 N4096 K5376",
+      "count": 100,
+      "median_ms": 0.0007999999999999999,
+      "range_ms": [
+        0.00072,
+        0.00268
+      ]
+    },
+    {
+      "case": "prefill-t128",
+      "shape": "GEMM_SMALL M128 N2048 K5376",
+      "count": 10,
+      "median_ms": 0.00015,
+      "range_ms": [
+        0.0,
+        0.0006
+      ]
+    },
+    {
+      "case": "prefill-t512",
+      "shape": "GEMM_GLU M512 N21504 K5376",
+      "count": 60,
+      "median_ms": 43.74219999999999,
+      "range_ms": [
+        43.67304,
+        43.93611000000001
+      ]
+    },
+    {
+      "case": "prefill-t512",
+      "shape": "GEMM_MED M512 N5376 K21504",
+      "count": 60,
+      "median_ms": 37.02254000000001,
+      "range_ms": [
+        37.01943000000001,
+        37.03940000000001
+      ]
+    },
+    {
+      "case": "prefill-t512",
+      "shape": "GEMM_MED M512 N8192 K5376",
+      "count": 50,
+      "median_ms": 14.018290000000002,
+      "range_ms": [
+        14.014899999999999,
+        14.085270000000001
+      ]
+    },
+    {
+      "case": "prefill-t512",
+      "shape": "GEMM_MED M512 N5376 K8192",
+      "count": 50,
+      "median_ms": 10.703610000000003,
+      "range_ms": [
+        10.68748,
+        10.705359999999997
+      ]
+    },
+    {
+      "case": "prefill-t512",
+      "shape": "GEMM_SMALL M512 N4096 K5376",
+      "count": 100,
+      "median_ms": 8.404709999999998,
+      "range_ms": [
+        8.4034,
+        8.443080000000004
+      ]
+    },
+    {
+      "case": "prefill-t512",
+      "shape": "GEMM_MED M512 N5376 K16384",
+      "count": 10,
+      "median_ms": 4.15306,
+      "range_ms": [
+        4.139270000000001,
+        4.15573
+      ]
+    },
+    {
+      "case": "prefill-t512",
+      "shape": "GEMM_WIDE M512 N16384 K5376",
+      "count": 10,
+      "median_ms": 2.9475200000000004,
+      "range_ms": [
+        2.9299099999999996,
+        2.96293
+      ]
+    },
+    {
+      "case": "prefill-t512",
+      "shape": "GEMM_SMALL M512 N2048 K5376",
+      "count": 10,
+      "median_ms": 1.9980400000000003,
+      "range_ms": [
+        1.99374,
+        2.00624
+      ]
+    },
+    {
+      "case": "prefill-t512",
+      "shape": "GEMV M1 N262144 K5376",
+      "count": 1,
+      "median_ms": 0.60547,
+      "range_ms": [
+        0.60412,
+        0.60718
+      ]
+    }
+  ],
+  "plow_scheduler": {
+    "schema": 1,
+    "provenance": {
+      "server_manifest": "/app/plow/build-gemma31/bench-serve/plow-server.json",
+      "server_manifest_sha256": "29a3c6c11fa924915fb812f8bf7bc25901cc5585f59434962a32d22f4919848f",
+      "logfile": "/tmp/gemma31-runtime-fusion-bench-serve.log",
+      "logfile_sha256": "044c9994861c5a1a3311fb0bcdafc2ed1eff16cf3993dcca524ad5156dfed000",
+      "matrix_log": "/tmp/gemma31-stock-bench-matrix.log",
+      "matrix_sha256": "cf6c8552c40e504335f4f7196197e1300eeb9d6c7c2573c3369834e731f845df",
+      "log_line_count": 18520,
+      "window_rule": "Directory UTC timestamp is CLI invocation start; exclusive end is next Plow CLI invocation, with final window capped at observed log EOF +1us. All36 windows account exactly for4 first-prefill outputs +508 decode row advances =512 benchmark output tokens.",
+      "attribution_limit": "Mux records do not carry request IDs. Exact token accounting, nonoverlapping client windows, and recorded one-cell-at-a-time execution policy support attribution. Private18928 cancellation exercise used a separate server/log and is excluded; no pre-benchmark token records appear here."
+    },
+    "count_units": {
+      "completed_requests": "HTTP requests, not device launches",
+      "ordinary_decode_token_advances": "One logged sampled output row; batched rows/deferred-read quanta are NOT GPU launch counts",
+      "mixed_launch_events": "One successful mixed_step dispatch debug event; decode_rows gives output-row advances in that dispatch",
+      "packed_prefill_events": "Successful host packed-prefill advancement events; not a complete device launch census",
+      "server_tail_after_last_prefill_s": "Last server decode-token log minus last prefill-token log; excludes initial prefill and is not hardware profiling"
+    },
+    "measured_c4": {
+      "cells": 15,
+      "mixed_decode_token_advances": 25,
+      "total_decode_token_advances": 7620,
+      "mixed_decode_percent": 0.32808398950131235,
+      "min_decode_after_last_prefill_percent": 97.04724409448819
+    },
+    "groups": [
+      {
+        "input_tokens": 128,
+        "concurrency": 1,
+        "measured_cells": 5,
+        "mixed_launch_events": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "mixed_decode_token_advances": 0,
+        "total_decode_token_advances": 2540,
+        "mixed_decode_fraction": 0.0,
+        "decode_advances_after_last_prefill_per_cell": [
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "packed_prefill_events_per_cell": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "median_ttft_ms": 94.67890599626116,
+        "median_tpot_ms": 27.57217742133277,
+        "median_server_tail_after_last_prefill_s": 3.508537,
+        "median_benchmark_duration_s": 14.388546072994359
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 4,
+        "measured_cells": 5,
+        "mixed_launch_events": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "mixed_decode_token_advances": 5,
+        "total_decode_token_advances": 2540,
+        "mixed_decode_fraction": 0.001968503937007874,
+        "decode_advances_after_last_prefill_per_cell": [
+          493,
+          495,
+          493,
+          493,
+          493
+        ],
+        "packed_prefill_events_per_cell": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "median_ttft_ms": 552.5473224988673,
+        "median_tpot_ms": 38.99212384263721,
+        "median_server_tail_after_last_prefill_s": 4.833478,
+        "median_benchmark_duration_s": 5.616750656045042,
+        "median_tail_to_median_benchmark_duration_ratio": 0.8605470130310944
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 1,
+        "measured_cells": 5,
+        "mixed_launch_events": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "mixed_decode_token_advances": 0,
+        "total_decode_token_advances": 2540,
+        "mixed_decode_fraction": 0.0,
+        "decode_advances_after_last_prefill_per_cell": [
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "packed_prefill_events_per_cell": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "median_ttft_ms": 339.6443459787406,
+        "median_tpot_ms": 28.94861320094169,
+        "median_server_tail_after_last_prefill_s": 3.712899,
+        "median_benchmark_duration_s": 16.070187681994867
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 4,
+        "measured_cells": 5,
+        "mixed_launch_events": [
+          2,
+          2,
+          2,
+          2,
+          2
+        ],
+        "mixed_decode_token_advances": 10,
+        "total_decode_token_advances": 2540,
+        "mixed_decode_fraction": 0.003937007874015748,
+        "decode_advances_after_last_prefill_per_cell": [
+          494,
+          494,
+          494,
+          494,
+          494
+        ],
+        "packed_prefill_events_per_cell": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "median_ttft_ms": 1757.0168285164982,
+        "median_tpot_ms": 40.531232445014965,
+        "median_server_tail_after_last_prefill_s": 4.99353,
+        "median_benchmark_duration_s": 7.0147129080141895,
+        "median_tail_to_median_benchmark_duration_ratio": 0.7118651989727159
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 1,
+        "measured_cells": 5,
+        "mixed_launch_events": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "mixed_decode_token_advances": 0,
+        "total_decode_token_advances": 2540,
+        "mixed_decode_fraction": 0.0,
+        "decode_advances_after_last_prefill_per_cell": [
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "packed_prefill_events_per_cell": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "median_ttft_ms": 1428.8239960151259,
+        "median_tpot_ms": 28.608203307114998,
+        "median_server_tail_after_last_prefill_s": 3.647351,
+        "median_benchmark_duration_s": 20.253461633983534
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 4,
+        "measured_cells": 5,
+        "mixed_launch_events": [
+          2,
+          2,
+          2,
+          2,
+          2
+        ],
+        "mixed_decode_token_advances": 10,
+        "total_decode_token_advances": 2540,
+        "mixed_decode_fraction": 0.003937007874015748,
+        "decode_advances_after_last_prefill_per_cell": [
+          494,
+          494,
+          494,
+          494,
+          494
+        ],
+        "packed_prefill_events_per_cell": [
+          12,
+          12,
+          12,
+          12,
+          12
+        ],
+        "median_ttft_ms": 5552.62900350499,
+        "median_tpot_ms": 41.432083275455135,
+        "median_server_tail_after_last_prefill_s": 5.065918,
+        "median_benchmark_duration_s": 10.90986857097596,
+        "median_tail_to_median_benchmark_duration_ratio": 0.4643427156837711
+      }
+    ],
+    "cells": [
+      {
+        "input_tokens": 128,
+        "concurrency": 1,
+        "repetition": "warmup",
+        "measured": false,
+        "matrix_line": 1,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c1-rwarmup-20260907T161937.535109Z/result.json",
+        "result_sha256": "9e95e9057d48d6e48f03bb7ba9c36110a734f5d9160c20fe8dfb864d4a539271",
+        "window_start_utc": "2026-09-07T16:19:37.535109Z",
+        "window_end_exclusive_utc": "2026-09-07T16:21:42.785311Z",
+        "first_log_line": 14,
+        "last_log_line": 527,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.474552,
+        "benchmark_duration_s": 14.309813517029397,
+        "request_start_spread_ms": 10740.646107995417,
+        "median_ttft_ms": 94.57984552136622,
+        "median_tpot_ms": 27.344431098381897
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 1,
+        "repetition": "1",
+        "measured": true,
+        "matrix_line": 4,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c1-r1-20260907T162142.785311Z/result.json",
+        "result_sha256": "0dc9637d6f51e373c6246af774bca79eec84ded73f532563a7bcbbfb69bfcdaf",
+        "window_start_utc": "2026-09-07T16:21:42.785311Z",
+        "window_end_exclusive_utc": "2026-09-07T16:22:10.057224Z",
+        "first_log_line": 528,
+        "last_log_line": 1039,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.490141,
+        "benchmark_duration_s": 14.32240567804547,
+        "request_start_spread_ms": 10737.597280007321,
+        "median_ttft_ms": 94.42066398332827,
+        "median_tpot_ms": 27.47311338202067
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 1,
+        "repetition": "2",
+        "measured": true,
+        "matrix_line": 6,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c1-r2-20260907T162210.057224Z/result.json",
+        "result_sha256": "33a9719054d44d46139507a0de795a5f5c3d582f6dbeef6f300fa0f799a6b9bb",
+        "window_start_utc": "2026-09-07T16:22:10.057224Z",
+        "window_end_exclusive_utc": "2026-09-07T16:22:37.976069Z",
+        "first_log_line": 1040,
+        "last_log_line": 1551,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.499649,
+        "benchmark_duration_s": 14.359166201029439,
+        "request_start_spread_ms": 10764.93126899004,
+        "median_ttft_ms": 94.6276479808148,
+        "median_tpot_ms": 27.533834704791936
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 1,
+        "repetition": "3",
+        "measured": true,
+        "matrix_line": 8,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c1-r3-20260907T162237.976069Z/result.json",
+        "result_sha256": "c09ff09a08201b15766c97400cd9021a3ffa519e8fae794a0cb52aba10fce168",
+        "window_start_utc": "2026-09-07T16:22:37.976069Z",
+        "window_end_exclusive_utc": "2026-09-07T16:23:05.520615Z",
+        "first_log_line": 1552,
+        "last_log_line": 2063,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.510525,
+        "benchmark_duration_s": 14.388546072994359,
+        "request_start_spread_ms": 10783.375794999301,
+        "median_ttft_ms": 94.68766799545847,
+        "median_tpot_ms": 27.57217742133277
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 1,
+        "repetition": "4",
+        "measured": true,
+        "matrix_line": 10,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c1-r4-20260907T162305.520615Z/result.json",
+        "result_sha256": "3a41946bf5d80eac10b9664232f2033fe2c9719b54c911dc85112623d9c840cd",
+        "window_start_utc": "2026-09-07T16:23:05.520615Z",
+        "window_end_exclusive_utc": "2026-09-07T16:23:32.759710Z",
+        "first_log_line": 2064,
+        "last_log_line": 2575,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.508537,
+        "benchmark_duration_s": 14.404804210003931,
+        "request_start_spread_ms": 10801.368100976106,
+        "median_ttft_ms": 94.89227450103499,
+        "median_tpot_ms": 27.61801309066854
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 1,
+        "repetition": "5",
+        "measured": true,
+        "matrix_line": 12,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c1-r5-20260907T162332.759710Z/result.json",
+        "result_sha256": "f7844d24dc5de80489e293a9bd3f1b530c3e7b0a28ae39cd5fe9637cee60c813",
+        "window_start_utc": "2026-09-07T16:23:32.759710Z",
+        "window_end_exclusive_utc": "2026-09-07T16:24:00.396460Z",
+        "first_log_line": 2576,
+        "last_log_line": 3087,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.511758,
+        "benchmark_duration_s": 14.412062311021145,
+        "request_start_spread_ms": 10804.914265987463,
+        "median_ttft_ms": 94.67890599626116,
+        "median_tpot_ms": 27.627184507886213
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 4,
+        "repetition": "warmup",
+        "measured": false,
+        "matrix_line": 14,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c4-rwarmup-20260907T162400.396460Z/result.json",
+        "result_sha256": "fde152d50f0db31a2e69b236ab47a2fb754efc9c65c7ab38526cf6d6cfc922fb",
+        "window_start_utc": "2026-09-07T16:24:00.396460Z",
+        "window_end_exclusive_utc": "2026-09-07T16:24:18.861999Z",
+        "first_log_line": 3088,
+        "last_log_line": 3600,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 507,
+        "mixed_decode_token_advances": 1,
+        "mixed_launch_events": [
+          {
+            "log_line": 3094,
+            "utc": "2026-09-07T16:24:13.238124Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 493,
+        "server_tail_after_last_prefill_s": 4.864209,
+        "benchmark_duration_s": 5.651189577009063,
+        "request_start_spread_ms": 0.5556190153583884,
+        "median_ttft_ms": 552.8596960066352,
+        "median_tpot_ms": 39.240905968289034
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 4,
+        "repetition": "1",
+        "measured": true,
+        "matrix_line": 16,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c4-r1-20260907T162418.861999Z/result.json",
+        "result_sha256": "bb4ff018482e928477b7c9476b09ad98f792dac70e257391a2c65a7148a56d26",
+        "window_start_utc": "2026-09-07T16:24:18.861999Z",
+        "window_end_exclusive_utc": "2026-09-07T16:24:38.142269Z",
+        "first_log_line": 3601,
+        "last_log_line": 4112,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 507,
+        "mixed_decode_token_advances": 1,
+        "mixed_launch_events": [
+          {
+            "log_line": 3606,
+            "utc": "2026-09-07T16:24:32.488649Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 493,
+        "server_tail_after_last_prefill_s": 4.860313,
+        "benchmark_duration_s": 5.6469489660230465,
+        "request_start_spread_ms": 0.5460449610836804,
+        "median_ttft_ms": 554.2268010030966,
+        "median_tpot_ms": 39.205203303062596
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 4,
+        "repetition": "2",
+        "measured": true,
+        "matrix_line": 18,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c4-r2-20260907T162438.142269Z/result.json",
+        "result_sha256": "c5f72596e1bee4ae04c32d8561a11c9587097283279cafe58c64357b2cd12fe7",
+        "window_start_utc": "2026-09-07T16:24:38.142269Z",
+        "window_end_exclusive_utc": "2026-09-07T16:24:56.948580Z",
+        "first_log_line": 4113,
+        "last_log_line": 4624,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 507,
+        "mixed_decode_token_advances": 1,
+        "mixed_launch_events": [
+          {
+            "log_line": 4116,
+            "utc": "2026-09-07T16:24:51.317464Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 495,
+        "server_tail_after_last_prefill_s": 4.838473,
+        "benchmark_duration_s": 5.569787151005585,
+        "request_start_spread_ms": 0.5218799924477935,
+        "median_ttft_ms": 498.39523050468415,
+        "median_tpot_ms": 39.036174421198666
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 4,
+        "repetition": "3",
+        "measured": true,
+        "matrix_line": 20,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c4-r3-20260907T162456.948580Z/result.json",
+        "result_sha256": "c887797bfb848db28753ef8b92c7b6568bc60425a5a2c9577d11f66a53294244",
+        "window_start_utc": "2026-09-07T16:24:56.948580Z",
+        "window_end_exclusive_utc": "2026-09-07T16:25:15.653248Z",
+        "first_log_line": 4625,
+        "last_log_line": 5136,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 507,
+        "mixed_decode_token_advances": 1,
+        "mixed_launch_events": [
+          {
+            "log_line": 4630,
+            "utc": "2026-09-07T16:25:09.930304Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 493,
+        "server_tail_after_last_prefill_s": 4.832329,
+        "benchmark_duration_s": 5.616750656045042,
+        "request_start_spread_ms": 0.5564609891735017,
+        "median_ttft_ms": 552.5473224988673,
+        "median_tpot_ms": 38.98021074009172
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 4,
+        "repetition": "4",
+        "measured": true,
+        "matrix_line": 22,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c4-r4-20260907T162515.653248Z/result.json",
+        "result_sha256": "56091d792c051e0a44e054c60d613445db681902f7f970d8e2dccca8f50806a2",
+        "window_start_utc": "2026-09-07T16:25:15.653248Z",
+        "window_end_exclusive_utc": "2026-09-07T16:25:34.578760Z",
+        "first_log_line": 5137,
+        "last_log_line": 5648,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 507,
+        "mixed_decode_token_advances": 1,
+        "mixed_launch_events": [
+          {
+            "log_line": 5142,
+            "utc": "2026-09-07T16:25:28.947428Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 493,
+        "server_tail_after_last_prefill_s": 4.830809,
+        "benchmark_duration_s": 5.615356753987726,
+        "request_start_spread_ms": 0.57616998674348,
+        "median_ttft_ms": 552.041687478777,
+        "median_tpot_ms": 38.97061889787666
+      },
+      {
+        "input_tokens": 128,
+        "concurrency": 4,
+        "repetition": "5",
+        "measured": true,
+        "matrix_line": 24,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c4-r5-20260907T162534.578760Z/result.json",
+        "result_sha256": "413bedd3fdae69a9d4f26578c5709130b07a32590820548881447b4a2c25dd44",
+        "window_start_utc": "2026-09-07T16:25:34.578760Z",
+        "window_end_exclusive_utc": "2026-09-07T16:25:54.482284Z",
+        "first_log_line": 5649,
+        "last_log_line": 6160,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 507,
+        "mixed_decode_token_advances": 1,
+        "mixed_launch_events": [
+          {
+            "log_line": 5654,
+            "utc": "2026-09-07T16:25:48.725960Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 493,
+        "server_tail_after_last_prefill_s": 4.833478,
+        "benchmark_duration_s": 5.619655632996,
+        "request_start_spread_ms": 0.7837910088710487,
+        "median_ttft_ms": 554.1848569991998,
+        "median_tpot_ms": 38.99212384263721
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 1,
+        "repetition": "warmup",
+        "measured": false,
+        "matrix_line": 26,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c1-rwarmup-20260907T162554.482284Z/result.json",
+        "result_sha256": "fb09e759f8c6df9a6448b6e4c898a4a1f31da6024fe2a88af8e3326d0e86aaba",
+        "window_start_utc": "2026-09-07T16:25:54.482284Z",
+        "window_end_exclusive_utc": "2026-09-07T16:26:22.944041Z",
+        "first_log_line": 6161,
+        "last_log_line": 6672,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.583094,
+        "benchmark_duration_s": 15.628082234004978,
+        "request_start_spread_ms": 11711.889365979005,
+        "median_ttft_ms": 330.6125375092961,
+        "median_tpot_ms": 28.15590238182138
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 1,
+        "repetition": "1",
+        "measured": true,
+        "matrix_line": 28,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c1-r1-20260907T162622.944041Z/result.json",
+        "result_sha256": "35d7de4aa143547041bfdd50a0efa9e20115ff3d0233b55c456fba62e076be0d",
+        "window_start_utc": "2026-09-07T16:26:22.944041Z",
+        "window_end_exclusive_utc": "2026-09-07T16:26:51.875964Z",
+        "first_log_line": 6673,
+        "last_log_line": 7184,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.598519,
+        "benchmark_duration_s": 15.689792607969139,
+        "request_start_spread_ms": 11757.923936005682,
+        "median_ttft_ms": 333.0032925005071,
+        "median_tpot_ms": 28.263622614157235
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 1,
+        "repetition": "2",
+        "measured": true,
+        "matrix_line": 30,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c1-r2-20260907T162651.875964Z/result.json",
+        "result_sha256": "9ad4d73270a23fd46755a45a96ee0ac65c640bf5dae6128a0dbd65ed3355f859",
+        "window_start_utc": "2026-09-07T16:26:51.875964Z",
+        "window_end_exclusive_utc": "2026-09-07T16:27:21.861794Z",
+        "first_log_line": 7185,
+        "last_log_line": 7696,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.639165,
+        "benchmark_duration_s": 15.81514701800188,
+        "request_start_spread_ms": 11840.827096020803,
+        "median_ttft_ms": 334.29287499166094,
+        "median_tpot_ms": 28.50138879125373
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 1,
+        "repetition": "3",
+        "measured": true,
+        "matrix_line": 32,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c1-r3-20260907T162721.861794Z/result.json",
+        "result_sha256": "8688a71d526cd73375176ebdff014f112b5a350d14ecb343bb056d2c2eccbe5f",
+        "window_start_utc": "2026-09-07T16:27:21.861794Z",
+        "window_end_exclusive_utc": "2026-09-07T16:27:51.640075Z",
+        "first_log_line": 7697,
+        "last_log_line": 8208,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.712899,
+        "benchmark_duration_s": 16.070187681994867,
+        "request_start_spread_ms": 12013.384430028964,
+        "median_ttft_ms": 339.6443459787406,
+        "median_tpot_ms": 28.94861320094169
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 1,
+        "repetition": "4",
+        "measured": true,
+        "matrix_line": 34,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c1-r4-20260907T162751.640075Z/result.json",
+        "result_sha256": "22d1c8afb7d8dcf12b149cdebfc4b25cdd42744cf187f2d366bcc789cfec2bd3",
+        "window_start_utc": "2026-09-07T16:27:51.640075Z",
+        "window_end_exclusive_utc": "2026-09-07T16:28:21.614938Z",
+        "first_log_line": 8209,
+        "last_log_line": 8720,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.832618,
+        "benchmark_duration_s": 16.584059769986197,
+        "request_start_spread_ms": 12396.702031022869,
+        "median_ttft_ms": 353.0820974847302,
+        "median_tpot_ms": 29.94971674033734
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 1,
+        "repetition": "5",
+        "measured": true,
+        "matrix_line": 36,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c1-r5-20260907T162821.614938Z/result.json",
+        "result_sha256": "15308706c87426239ec26bad97acec8a51882d13f53620a05639b755f578ef47",
+        "window_start_utc": "2026-09-07T16:28:21.614938Z",
+        "window_end_exclusive_utc": "2026-09-07T16:28:51.301917Z",
+        "first_log_line": 8721,
+        "last_log_line": 9232,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.829563,
+        "benchmark_duration_s": 16.740092673979234,
+        "request_start_spread_ms": 12555.184533004649,
+        "median_ttft_ms": 355.1257840299513,
+        "median_tpot_ms": 30.154912413316083
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 4,
+        "repetition": "warmup",
+        "measured": false,
+        "matrix_line": 38,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c4-rwarmup-20260907T162851.301917Z/result.json",
+        "result_sha256": "caa4444d705ee99c6c4c82d9f14096e90ffba3b51f2522245fb9b99c0a282353",
+        "window_start_utc": "2026-09-07T16:28:51.301917Z",
+        "window_end_exclusive_utc": "2026-09-07T16:29:12.017667Z",
+        "first_log_line": 9233,
+        "last_log_line": 9744,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 9236,
+            "utc": "2026-09-07T16:29:05.798375Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 9237,
+            "utc": "2026-09-07T16:29:06.056061Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 4.998294,
+        "benchmark_duration_s": 7.030505172966514,
+        "request_start_spread_ms": 0.6746969884261489,
+        "median_ttft_ms": 1764.4981695339084,
+        "median_tpot_ms": 40.70810498014335
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 4,
+        "repetition": "1",
+        "measured": true,
+        "matrix_line": 40,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c4-r1-20260907T162912.017667Z/result.json",
+        "result_sha256": "b3a5fd3979db9518675d7aa2610b9a20432759d39f72df2a6716208c4e5f0031",
+        "window_start_utc": "2026-09-07T16:29:12.017667Z",
+        "window_end_exclusive_utc": "2026-09-07T16:29:32.572037Z",
+        "first_log_line": 9745,
+        "last_log_line": 10256,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 9748,
+            "utc": "2026-09-07T16:29:26.408699Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 9749,
+            "utc": "2026-09-07T16:29:26.666429Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 4.998696,
+        "benchmark_duration_s": 7.03083072102163,
+        "request_start_spread_ms": 1.0563170071691275,
+        "median_ttft_ms": 1764.7873295063619,
+        "median_tpot_ms": 40.693546062808366
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 4,
+        "repetition": "2",
+        "measured": true,
+        "matrix_line": 42,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c4-r2-20260907T162932.572037Z/result.json",
+        "result_sha256": "443effc65ec6210fd27b5fe8a34e67f8913d1ee0f1a6688280e877cb889d2c2c",
+        "window_start_utc": "2026-09-07T16:29:32.572037Z",
+        "window_end_exclusive_utc": "2026-09-07T16:29:53.597982Z",
+        "first_log_line": 10257,
+        "last_log_line": 10768,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 10260,
+            "utc": "2026-09-07T16:29:47.423192Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 10261,
+            "utc": "2026-09-07T16:29:47.680417Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 4.977288,
+        "benchmark_duration_s": 7.001812978996895,
+        "request_start_spread_ms": 0.6281780079007149,
+        "median_ttft_ms": 1758.2727084809449,
+        "median_tpot_ms": 40.531232445014965
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 4,
+        "repetition": "3",
+        "measured": true,
+        "matrix_line": 44,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c4-r3-20260907T162953.597982Z/result.json",
+        "result_sha256": "ab0d2a3510c1b1abde0814a41b5853ccc52fda11dd561cc657373b2ab87ab7e3",
+        "window_start_utc": "2026-09-07T16:29:53.597982Z",
+        "window_end_exclusive_utc": "2026-09-07T16:30:13.829803Z",
+        "first_log_line": 10769,
+        "last_log_line": 11280,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 10772,
+            "utc": "2026-09-07T16:30:07.596636Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 10773,
+            "utc": "2026-09-07T16:30:07.854380Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 4.99353,
+        "benchmark_duration_s": 7.0147129080141895,
+        "request_start_spread_ms": 0.5101219867356122,
+        "median_ttft_ms": 1754.6889484801795,
+        "median_tpot_ms": 40.50201953546415
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 4,
+        "repetition": "4",
+        "measured": true,
+        "matrix_line": 46,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c4-r4-20260907T163013.829803Z/result.json",
+        "result_sha256": "4742a5696682be1e1a0ffb5dce520d1fe53e8517b73ae651484d9549ccfe5270",
+        "window_start_utc": "2026-09-07T16:30:13.829803Z",
+        "window_end_exclusive_utc": "2026-09-07T16:30:34.360934Z",
+        "first_log_line": 11281,
+        "last_log_line": 11792,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 11284,
+            "utc": "2026-09-07T16:30:28.134415Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 11285,
+            "utc": "2026-09-07T16:30:28.391498Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 5.014455,
+        "benchmark_duration_s": 7.036729866988026,
+        "request_start_spread_ms": 0.5951189668849111,
+        "median_ttft_ms": 1756.0509265167639,
+        "median_tpot_ms": 40.670686464446895
+      },
+      {
+        "input_tokens": 1024,
+        "concurrency": 4,
+        "repetition": "5",
+        "measured": true,
+        "matrix_line": 48,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p1024-c4-r5-20260907T163034.360934Z/result.json",
+        "result_sha256": "5b6a0746806d05d80b19faf421c090dd8e91dd4cf4b3c40fe1ca8fdf596643a2",
+        "window_start_utc": "2026-09-07T16:30:34.360934Z",
+        "window_end_exclusive_utc": "2026-09-07T16:30:55.324822Z",
+        "first_log_line": 11793,
+        "last_log_line": 12304,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 11796,
+            "utc": "2026-09-07T16:30:49.146335Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 11797,
+            "utc": "2026-09-07T16:30:49.404011Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 4.989658,
+        "benchmark_duration_s": 7.012451490969397,
+        "request_start_spread_ms": 0.5668760277330875,
+        "median_ttft_ms": 1757.0168285164982,
+        "median_tpot_ms": 40.47748937379701
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 1,
+        "repetition": "warmup",
+        "measured": false,
+        "matrix_line": 50,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c1-rwarmup-20260907T163055.324822Z/result.json",
+        "result_sha256": "47cf7102722abdcec83e05fde3a20a9b6afc71929dbcb5c672146524cf031321",
+        "window_start_utc": "2026-09-07T16:30:55.324822Z",
+        "window_end_exclusive_utc": "2026-09-07T16:31:28.827582Z",
+        "first_log_line": 12305,
+        "last_log_line": 12816,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.607178,
+        "benchmark_duration_s": 20.095135267998558,
+        "request_start_spread_ms": 15064.974595967215,
+        "median_ttft_ms": 1421.8549395154696,
+        "median_tpot_ms": 28.34813237028915
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 1,
+        "repetition": "1",
+        "measured": true,
+        "matrix_line": 52,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c1-r1-20260907T163128.827582Z/result.json",
+        "result_sha256": "c470afe6ae6c23c0478fcbb4cfe1ecc3f1fe6a649c2653af775e76c7b1808d89",
+        "window_start_utc": "2026-09-07T16:31:28.827582Z",
+        "window_end_exclusive_utc": "2026-09-07T16:32:02.782979Z",
+        "first_log_line": 12817,
+        "last_log_line": 13328,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.609576,
+        "benchmark_duration_s": 20.126725248002913,
+        "request_start_spread_ms": 15093.778875016142,
+        "median_ttft_ms": 1422.6689970237203,
+        "median_tpot_ms": 28.424724306971733
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 1,
+        "repetition": "2",
+        "measured": true,
+        "matrix_line": 54,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c1-r2-20260907T163202.782979Z/result.json",
+        "result_sha256": "8b1864d1609c12f4cf07e23789f587da80a832cb6db8bd18812044ea05bb8ae8",
+        "window_start_utc": "2026-09-07T16:32:02.782979Z",
+        "window_end_exclusive_utc": "2026-09-07T16:32:36.065498Z",
+        "first_log_line": 13329,
+        "last_log_line": 13840,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.625444,
+        "benchmark_duration_s": 20.177968090982176,
+        "request_start_spread_ms": 15125.872272998095,
+        "median_ttft_ms": 1426.6504910192452,
+        "median_tpot_ms": 28.48159254315001
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 1,
+        "repetition": "3",
+        "measured": true,
+        "matrix_line": 56,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c1-r3-20260907T163236.065498Z/result.json",
+        "result_sha256": "80be5dafcfeebda2c2d5632b0e15761266855b89daadd05952ab9804112fe76c",
+        "window_start_utc": "2026-09-07T16:32:36.065498Z",
+        "window_end_exclusive_utc": "2026-09-07T16:33:10.099384Z",
+        "first_log_line": 13841,
+        "last_log_line": 14352,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.647351,
+        "benchmark_duration_s": 20.253461633983534,
+        "request_start_spread_ms": 15173.731513961684,
+        "median_ttft_ms": 1428.8239960151259,
+        "median_tpot_ms": 28.608203307114998
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 1,
+        "repetition": "4",
+        "measured": true,
+        "matrix_line": 58,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c1-r4-20260907T163310.099384Z/result.json",
+        "result_sha256": "6192ac4bee014d1e87cba9839dcc5836c85c80242ee6e9937b55a35c9e747c61",
+        "window_start_utc": "2026-09-07T16:33:10.099384Z",
+        "window_end_exclusive_utc": "2026-09-07T16:33:43.699443Z",
+        "first_log_line": 14353,
+        "last_log_line": 14864,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.688269,
+        "benchmark_duration_s": 20.444031802995596,
+        "request_start_spread_ms": 15306.67701701168,
+        "median_ttft_ms": 1440.3390804945957,
+        "median_tpot_ms": 28.872721362171518
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 1,
+        "repetition": "5",
+        "measured": true,
+        "matrix_line": 60,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c1-r5-20260907T163343.699443Z/result.json",
+        "result_sha256": "f2ea5492dda910058f5d48488b9f198613b6c50c4843e2e685a5fd45c64d238c",
+        "window_start_utc": "2026-09-07T16:33:43.699443Z",
+        "window_end_exclusive_utc": "2026-09-07T16:34:17.696407Z",
+        "first_log_line": 14865,
+        "last_log_line": 15376,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 508,
+        "mixed_decode_token_advances": 0,
+        "mixed_launch_events": [],
+        "packed_prefill_events": 0,
+        "decode_advances_after_last_prefill": 127,
+        "server_tail_after_last_prefill_s": 3.829202,
+        "benchmark_duration_s": 20.938643654983025,
+        "request_start_spread_ms": 15619.813449971844,
+        "median_ttft_ms": 1468.0712865374517,
+        "median_tpot_ms": 29.60635444853367
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 4,
+        "repetition": "warmup",
+        "measured": false,
+        "matrix_line": 62,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c4-rwarmup-20260907T163417.696407Z/result.json",
+        "result_sha256": "3c891703bf25b91ee952ee23e2b42a7943675d380ed450eed4bb0f1770bb64ca",
+        "window_start_utc": "2026-09-07T16:34:17.696407Z",
+        "window_end_exclusive_utc": "2026-09-07T16:34:42.950233Z",
+        "first_log_line": 15377,
+        "last_log_line": 15900,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 15392,
+            "utc": "2026-09-07T16:34:36.675384Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 15393,
+            "utc": "2026-09-07T16:34:36.953213Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 12,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 5.097604,
+        "benchmark_duration_s": 10.968858269043267,
+        "request_start_spread_ms": 0.8022179827094078,
+        "median_ttft_ms": 5576.354393007932,
+        "median_tpot_ms": 41.694496055206976
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 4,
+        "repetition": "1",
+        "measured": true,
+        "matrix_line": 64,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c4-r1-20260907T163442.950233Z/result.json",
+        "result_sha256": "6ab3cb14874c08220034e6f871ba39b872338965fb6859d248e4526258e80e60",
+        "window_start_utc": "2026-09-07T16:34:42.950233Z",
+        "window_end_exclusive_utc": "2026-09-07T16:35:07.071166Z",
+        "first_log_line": 15901,
+        "last_log_line": 16424,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 15916,
+            "utc": "2026-09-07T16:35:00.842404Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 15917,
+            "utc": "2026-09-07T16:35:01.119816Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 12,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 5.066428,
+        "benchmark_duration_s": 10.926013880001847,
+        "request_start_spread_ms": 0.6342870183289051,
+        "median_ttft_ms": 5565.646016999381,
+        "median_tpot_ms": 41.44904014950537
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 4,
+        "repetition": "2",
+        "measured": true,
+        "matrix_line": 66,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c4-r2-20260907T163507.071166Z/result.json",
+        "result_sha256": "d9467a6f9566327df78de97be651f3a2902419df7a70a4e6fe8803585e8350a2",
+        "window_start_utc": "2026-09-07T16:35:07.071166Z",
+        "window_end_exclusive_utc": "2026-09-07T16:35:31.017076Z",
+        "first_log_line": 16425,
+        "last_log_line": 16948,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 16440,
+            "utc": "2026-09-07T16:35:24.680914Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 16441,
+            "utc": "2026-09-07T16:35:24.958791Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 12,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 5.072313,
+        "benchmark_duration_s": 10.921540711948182,
+        "request_start_spread_ms": 0.6744370330125093,
+        "median_ttft_ms": 5556.277581490576,
+        "median_tpot_ms": 41.48192096462172
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 4,
+        "repetition": "3",
+        "measured": true,
+        "matrix_line": 68,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c4-r3-20260907T163531.017076Z/result.json",
+        "result_sha256": "9833250b2566075448b3d3b78d38b4201e658791cc5b6c74741a1b54760e8ab3",
+        "window_start_utc": "2026-09-07T16:35:31.017076Z",
+        "window_end_exclusive_utc": "2026-09-07T16:35:55.732576Z",
+        "first_log_line": 16949,
+        "last_log_line": 17472,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 16964,
+            "utc": "2026-09-07T16:35:49.405962Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 16965,
+            "utc": "2026-09-07T16:35:49.683429Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 12,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 5.065918,
+        "benchmark_duration_s": 10.90986857097596,
+        "request_start_spread_ms": 0.7333349785767496,
+        "median_ttft_ms": 5551.09552302747,
+        "median_tpot_ms": 41.432083275455135
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 4,
+        "repetition": "4",
+        "measured": true,
+        "matrix_line": 70,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c4-r4-20260907T163555.732576Z/result.json",
+        "result_sha256": "b36213135dd1398461bd703412ea6b99386e1ad631b2a4f0d736c7d78c9d0ab9",
+        "window_start_utc": "2026-09-07T16:35:55.732576Z",
+        "window_end_exclusive_utc": "2026-09-07T16:36:20.898697Z",
+        "first_log_line": 17473,
+        "last_log_line": 17996,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 17488,
+            "utc": "2026-09-07T16:36:14.618499Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 17489,
+            "utc": "2026-09-07T16:36:14.895379Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 12,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 5.062945,
+        "benchmark_duration_s": 10.908374949998688,
+        "request_start_spread_ms": 0.8902170229703188,
+        "median_ttft_ms": 5552.62900350499,
+        "median_tpot_ms": 41.405288893756946
+      },
+      {
+        "input_tokens": 4096,
+        "concurrency": 4,
+        "repetition": "5",
+        "measured": true,
+        "matrix_line": 72,
+        "result_path": "/app/plow/build-gemma31/bench-serve/results/plow-p4096-c4-r5-20260907T163620.898697Z/result.json",
+        "result_sha256": "ca75cd344e0a71d86e78b226528220833abb55fd9f55d0a9508a885eb0e48da9",
+        "window_start_utc": "2026-09-07T16:36:20.898697Z",
+        "window_end_exclusive_utc": "2026-09-07T16:36:44.325063Z",
+        "first_log_line": 17997,
+        "last_log_line": 18520,
+        "completed_requests": 4,
+        "output_tokens": 512,
+        "prefill_first_token_outputs": 4,
+        "ordinary_decode_token_advances": 506,
+        "mixed_decode_token_advances": 2,
+        "mixed_launch_events": [
+          {
+            "log_line": 18012,
+            "utc": "2026-09-07T16:36:38.478869Z",
+            "decode_rows": 1,
+            "prefill_spans": 3,
+            "capacity": 1024
+          },
+          {
+            "log_line": 18013,
+            "utc": "2026-09-07T16:36:38.756030Z",
+            "decode_rows": 1,
+            "prefill_spans": 1,
+            "capacity": 512
+          }
+        ],
+        "packed_prefill_events": 12,
+        "decode_advances_after_last_prefill": 494,
+        "server_tail_after_last_prefill_s": 5.06396,
+        "benchmark_duration_s": 10.902939012972638,
+        "request_start_spread_ms": 0.6622879882343113,
+        "median_ttft_ms": 5546.4449794963,
+        "median_tpot_ms": 41.41195098444174
+      }
+    ],
+    "short_prefill_timeline": {
+      "case_result": "/app/plow/build-gemma31/bench-serve/results/plow-p128-c4-r1-20260907T162418.861999Z/result.json",
+      "request_ttft_ms": [
+        98.55712595162913,
+        476.75036103464663,
+        631.7032409715466,
+        785.801674996037
+      ],
+      "request_start_spread_ms": 0.5460449610836804,
+      "events": [
+        {
+          "log_line": 3601,
+          "utc": "2026-09-07T16:24:32.190086Z",
+          "ms_after_first_prefill_token": 0.0,
+          "event": "amd: prefill token token=140708 slot=0"
+        },
+        {
+          "log_line": 3602,
+          "utc": "2026-09-07T16:24:32.298864Z",
+          "ms_after_first_prefill_token": 108.778,
+          "event": "amd: token (deferred read) token=140708 slot=0"
+        },
+        {
+          "log_line": 3603,
+          "utc": "2026-09-07T16:24:32.298913Z",
+          "ms_after_first_prefill_token": 108.827,
+          "event": "amd: token (deferred read) token=140708 slot=0"
+        },
+        {
+          "log_line": 3604,
+          "utc": "2026-09-07T16:24:32.298919Z",
+          "ms_after_first_prefill_token": 108.833,
+          "event": "amd: token (deferred read) token=140708 slot=0"
+        },
+        {
+          "log_line": 3605,
+          "utc": "2026-09-07T16:24:32.298924Z",
+          "ms_after_first_prefill_token": 108.83800000000001,
+          "event": "amd: token (deferred read) token=140708 slot=0"
+        },
+        {
+          "log_line": 3606,
+          "utc": "2026-09-07T16:24:32.488649Z",
+          "ms_after_first_prefill_token": 298.56300000000005,
+          "event": "AMD mixed prefill/decode launch decode=1 prefill=3 rows=512"
+        },
+        {
+          "log_line": 3607,
+          "utc": "2026-09-07T16:24:32.568459Z",
+          "ms_after_first_prefill_token": 378.373,
+          "event": "amd: prefill token token=240017 slot=1"
+        },
+        {
+          "log_line": 3608,
+          "utc": "2026-09-07T16:24:32.642928Z",
+          "ms_after_first_prefill_token": 452.84200000000004,
+          "event": "amd: token (deferred read) token=140708 slot=0"
+        },
+        {
+          "log_line": 3609,
+          "utc": "2026-09-07T16:24:32.642971Z",
+          "ms_after_first_prefill_token": 452.885,
+          "event": "amd: token (deferred read) token=140708 slot=0"
+        },
+        {
+          "log_line": 3610,
+          "utc": "2026-09-07T16:24:32.642977Z",
+          "ms_after_first_prefill_token": 452.89099999999996,
+          "event": "amd: token (deferred read) token=24695 slot=1"
+        },
+        {
+          "log_line": 3611,
+          "utc": "2026-09-07T16:24:32.642984Z",
+          "ms_after_first_prefill_token": 452.898,
+          "event": "amd: token (deferred read) token=39569 slot=1"
+        },
+        {
+          "log_line": 3612,
+          "utc": "2026-09-07T16:24:32.723761Z",
+          "ms_after_first_prefill_token": 533.675,
+          "event": "amd: prefill token token=8858 slot=2"
+        },
+        {
+          "log_line": 3613,
+          "utc": "2026-09-07T16:24:32.798166Z",
+          "ms_after_first_prefill_token": 608.0799999999999,
+          "event": "amd: token (deferred read) token=140708 slot=0"
+        },
+        {
+          "log_line": 3614,
+          "utc": "2026-09-07T16:24:32.798206Z",
+          "ms_after_first_prefill_token": 608.12,
+          "event": "amd: token (deferred read) token=140708 slot=0"
+        },
+        {
+          "log_line": 3615,
+          "utc": "2026-09-07T16:24:32.798212Z",
+          "ms_after_first_prefill_token": 608.1260000000001,
+          "event": "amd: token (deferred read) token=240017 slot=1"
+        },
+        {
+          "log_line": 3616,
+          "utc": "2026-09-07T16:24:32.798219Z",
+          "ms_after_first_prefill_token": 608.133,
+          "event": "amd: token (deferred read) token=24695 slot=1"
+        },
+        {
+          "log_line": 3617,
+          "utc": "2026-09-07T16:24:32.798225Z",
+          "ms_after_first_prefill_token": 608.139,
+          "event": "amd: token (deferred read) token=8858 slot=2"
+        },
+        {
+          "log_line": 3618,
+          "utc": "2026-09-07T16:24:32.798231Z",
+          "ms_after_first_prefill_token": 608.1450000000001,
+          "event": "amd: token (deferred read) token=8858 slot=2"
+        },
+        {
+          "log_line": 3619,
+          "utc": "2026-09-07T16:24:32.877935Z",
+          "ms_after_first_prefill_token": 687.849,
+          "event": "amd: prefill token token=240017 slot=3"
+        }
+      ],
+      "interpretation": "Four fresh128-token requests cannot enter packed-prefill without initialized cursors. First ordinary prefill completes, then4 decode outputs for slot0 arrive before1 mixed dispatch processes prefixes of the other3 requests. Their final prompt tokens remain excluded from mixed and packed admission, so3 ordinary prefill completions follow serially, with deferred decode between them. Log intervals are not isolated GPU-kernel durations."
+    },
+    "source_evidence": [
+      {
+        "path": "crates/plowrt/src/serve/mux.rs",
+        "line": 2003,
+        "claim": "Mixed requires active decode plus eligible pending prefill"
+      },
+      {
+        "path": "crates/plowrt/src/serve/engine.rs",
+        "line": 573,
+        "claim": "Packed prefill rejects final chunk"
+      },
+      {
+        "path": "crates/plowrt/src/serve/engine.rs",
+        "line": 584,
+        "claim": "Mixed excludes final prompt token"
+      },
+      {
+        "path": "crates/plowrt/src/serve/engine.rs",
+        "line": 619,
+        "claim": "Partial mixed advance retains original program for remaining cursor span"
+      },
+      {
+        "path": "crates/plowrt/src/serve/engine.rs",
+        "line": 1429,
+        "claim": "Fresh requests lack packable cursor"
+      },
+      {
+        "path": "crates/plowrt/src/serve/mux.rs",
+        "line": 2252,
+        "claim": "One pending request gets isolated prefill fallback"
+      },
+      {
+        "path": "crates/plowrt/src/serve/mux.rs",
+        "line": 2330,
+        "claim": "Ordinary decode and deferred-read multistep follow prefill"
+      },
+      {
+        "path": "runtime/amd/interp.hip",
+        "line": 1848,
+        "claim": "Mixed GEMM executes GEMV prefix bands followed by separate GEMM suffix with same weight pointer"
+      },
+      {
+        "path": "runtime/amd/interp.hip",
+        "line": 1878,
+        "claim": "Mixed gate/up similarly executes separate GEMV_GLU and GEMM_GLU weight-load streams"
+      },
+      {
+        "path": "crates/plowrt/src/serve/engine.rs",
+        "line": 1712,
+        "claim": "Multistep loops over quantum and submits one full decode step each iteration, then reads token capture once; it does not merge autoregressive forwards into one matrix pass"
+      }
+    ],
+    "weight_reuse_limit": "Source proves separate prefix/suffix weight-load streams, not a joint GEMM sharing one staged weight tile. It does not quantify extra HBM bytes: cache reuse may absorb some rereads. No hardware traffic measurement was made in this read-only attribution."
+  },
+  "plow_hsa": {
+    "cases": [
+      {
+        "input": 128,
+        "concurrency": 1,
+        "rep": "warmup",
+        "start_ns": 281307177300255,
+        "end_ns": 281334913138685,
+        "api_count": 15780,
+        "apis": {
+          "hsa_signal_wait_scacquire": [
+            2832,
+            14316.758961000036
+          ],
+          "hsa_signal_create": [
+            2316,
+            1.5342089999999962
+          ],
+          "hsa_amd_memory_async_copy": [
+            2316,
+            62.64594900000015
+          ],
+          "hsa_signal_destroy": [
+            2316,
+            1.6377920000000155
+          ],
+          "hsa_queue_add_write_index_screlease": [
+            1500,
+            0.18649800000000194
+          ],
+          "hsa_queue_load_read_index_scacquire": [
+            1500,
+            0.2416590000000033
+          ],
+          "hsa_signal_add_screlease": [
+            1500,
+            0.39866899999999833
+          ],
+          "hsa_signal_store_screlease": [
+            1500,
+            0.1638590000000017
+          ]
+        },
+        "memory_copy_count": 2316,
+        "memory_copy_ms": 36.378791,
+        "result_path": "/app/plow/build-gemma31/plow-profile-hsa/results/control-p128-c1-rwarmup-20260907T164306.206051Z/result.json",
+        "benchmark_duration_ms": 14427.030610968359,
+        "wait_union_ms": 14316.758961,
+        "wait_fraction_of_benchmark_duration": 0.9923565941639769,
+        "nonwaiting_api_sum_ms": 66.808635,
+        "dispatch_count_including_helpers": 1500,
+        "mixed_launches_logged": 0,
+        "accounting": {
+          "completed": 4,
+          "total_input_tokens": 512,
+          "total_output_tokens": 512
+        }
+      },
+      {
+        "input": 4096,
+        "concurrency": 4,
+        "rep": "1",
+        "start_ns": 281334913503820,
+        "end_ns": 281359755473196,
+        "api_count": 14299,
+        "apis": {
+          "hsa_signal_wait_scacquire": [
+            1001,
+            10746.035294000007
+          ],
+          "hsa_signal_create": [
+            842,
+            0.6290130000000004
+          ],
+          "hsa_amd_memory_async_copy": [
+            842,
+            4.782588000000001
+          ],
+          "hsa_signal_destroy": [
+            842,
+            0.6186149999999988
+          ],
+          "hsa_queue_add_write_index_screlease": [
+            2687,
+            0.15640600000000204
+          ],
+          "hsa_queue_load_read_index_scacquire": [
+            2687,
+            0.18050499999999856
+          ],
+          "hsa_signal_add_screlease": [
+            2687,
+            0.20456199999999974
+          ],
+          "hsa_signal_store_screlease": [
+            2687,
+            0.13547900000000307
+          ],
+          "hsa_amd_memory_lock": [
+            12,
+            0.22177199999999997
+          ],
+          "hsa_amd_memory_unlock": [
+            12,
+            0.014030999999999997
+          ]
+        },
+        "memory_copy_count": 842,
+        "memory_copy_ms": 13.020504,
+        "result_path": "/app/plow/build-gemma31/plow-profile-hsa/results/control-p4096-c4-r1-20260907T164333.943198Z/result.json",
+        "benchmark_duration_ms": 10913.679223973304,
+        "wait_union_ms": 10746.035294,
+        "wait_fraction_of_benchmark_duration": 0.9846391004781364,
+        "nonwaiting_api_sum_ms": 6.942971,
+        "dispatch_count_including_helpers": 2687,
+        "mixed_launches_logged": 2,
+        "accounting": {
+          "completed": 4,
+          "total_input_tokens": 16384,
+          "total_output_tokens": 512
+        }
+      },
+      {
+        "input": 128,
+        "concurrency": 1,
+        "rep": "1",
+        "start_ns": 281359755912662,
+        "end_ns": 281388395118474,
+        "api_count": 15780,
+        "apis": {
+          "hsa_signal_wait_scacquire": [
+            2832,
+            14460.064504000007
+          ],
+          "hsa_signal_create": [
+            2316,
+            1.4997739999999904
+          ],
+          "hsa_amd_memory_async_copy": [
+            2316,
+            13.197741999999991
+          ],
+          "hsa_signal_destroy": [
+            2316,
+            1.680845000000014
+          ],
+          "hsa_queue_add_write_index_screlease": [
+            1500,
+            0.19628300000000226
+          ],
+          "hsa_queue_load_read_index_scacquire": [
+            1500,
+            0.2501780000000049
+          ],
+          "hsa_signal_add_screlease": [
+            1500,
+            0.406038999999998
+          ],
+          "hsa_signal_store_screlease": [
+            1500,
+            0.17939300000000158
+          ]
+        },
+        "memory_copy_count": 2316,
+        "memory_copy_ms": 36.324672,
+        "result_path": "/app/plow/build-gemma31/plow-profile-hsa/results/control-p128-c1-r1-20260907T164358.785853Z/result.json",
+        "benchmark_duration_ms": 14755.96228404902,
+        "wait_union_ms": 14460.064504,
+        "wait_fraction_of_benchmark_duration": 0.9799472393360018,
+        "nonwaiting_api_sum_ms": 17.410254,
+        "dispatch_count_including_helpers": 1500,
+        "mixed_launches_logged": 0,
+        "accounting": {
+          "completed": 4,
+          "total_input_tokens": 512,
+          "total_output_tokens": 512
+        }
+      }
+    ],
+    "method": "Successful unmodified production server under rocprofv3 --hsa-trace --memory-copy-trace. HSA events selected by monotonic full CLI windows; stock benchmark duration excludes CLI startup. Wait intervals are unioned, not summed. Waiting includes GPU completion and copies and is not pure GPU arithmetic. Other API time is a sum, not an exclusive host timeline. Dispatch count derives one hsa_signal_add_screlease per HsaBackend::dispatch and includes helper/segmented kernels. Mixed count derives successful server debug records.",
+    "limitations": [
+      "Kernel-trace mode stalls queue interposition with reused counting completion signals; its captures are invalid and excluded.",
+      "HSA-only trace cannot separately identify ordinary interpreter and helper kernel launches.",
+      "One measured cell per shape; native packet profiling supplies the three-repeat operator breakdown."
+    ],
+    "server_manifest": "/app/plow/build-gemma31/plow-profile-hsa/server.json",
+    "server_log": "/tmp/gemma31-hsa-baseline-serving.log",
+    "artifacts": {
+      "server.json": {
+        "path": "/app/plow/build-gemma31/plow-profile-hsa/server.json",
+        "sha256": "5a8d69f7f8d0ec916de6abbe9572a038f054e6945418665f9f17ba3e531c7893"
+      },
+      "client-windows.json": {
+        "path": "/app/plow/build-gemma31/plow-profile-hsa/client-windows.json",
+        "sha256": "d338a3440e8a9df435379e21c231b7e94cd6f1fcabbe64282092081778e1eec8"
+      },
+      "rocprof-serve/plow_hsa_api_trace.csv": {
+        "path": "/app/plow/build-gemma31/plow-profile-hsa/rocprof-serve/plow_hsa_api_trace.csv",
+        "sha256": "35d97cb2c58da3171278df76df540c2feb84f0d0646a747ef8b136c3146ff9f4"
+      },
+      "rocprof-serve/plow_memory_copy_trace.csv": {
+        "path": "/app/plow/build-gemma31/plow-profile-hsa/rocprof-serve/plow_memory_copy_trace.csv",
+        "sha256": "47e0776c7eff76fa534365af38eb4c2fde07bde6b674552c90796bd55d4ac7bf"
+      }
+    }
+  },
+  "vllm_provenance": {
+    "utc": "2026-09-07T16:51:35.918142+00:00",
+    "server_pid": 741588,
+    "engine_pid": 742041,
+    "base_url": "http://127.0.0.1:18931",
+    "gpu_index": 1,
+    "gpu_uuid": "0x6dbba48a71ce2d3e",
+    "gpu_model": "AMD Instinct MI300X",
+    "rocm_custom_op_binary": "/app/plow/.venv-vllm028/lib/python3.12/site-packages/vllm/_rocm_C.abi3.so",
+    "rocm_custom_op_sha256": "3dae22fc4d1f1eb33551b74511a210d6ac2777b8c24f6e2ddb2434b75eef8c5b",
+    "graph": "/root/.cache/vllm/torch_compile_cache/2d52869424/rank_0_0/backbone/computation_graph.py",
+    "graph_sha256": "7eec209168547961951c4e70cee596e2c2d07fce392996008ce50e3d99f82be5",
+    "profile_server_script_sha256": "9e99ba9c68d36dd2bf252717153f638d2b59c253edb26b6497ab6be1fb2b90b3",
+    "capture_script_sha256": "a80ec148d2a83c9b14a61d1aa8074195d794bf373dd737934f2a4e7f2438826f",
+    "summary_script_sha256": "ab0df6b6ff12c8db3f003e2a4f3f778d99fea43f5bd0cd669f1a77b3a6b825b2",
+    "official_kernel_source_url": "https://raw.githubusercontent.com/vllm-project/vllm/v0.28.0/csrc/rocm/skinny_gemms.cu",
+    "official_kernel_source_sha256": "013f14b570cd8f25e254bf47643ba2802ab7d5fdd2069adb111bc6ff560f6682",
+    "no_application_source_edits": true,
+    "clocks_pinned": false,
+    "capture_complete": true,
+    "accounting": {
+      "torch-p128-c1-capture-20260907T164117.414008Z": {
+        "valid": true,
+        "errors": {}
+      },
+      "torch-p4096-c4-capture-20260907T164501.695986Z": {
+        "valid": true,
+        "errors": {}
+      }
+    }
+  },
+  "vllm": {
+    "p128-c1": {
+      "trace": "/app/plow/build-gemma31/vllm-profile/torch/rank0.1788799301049816409.pt.trace.json.gz",
+      "trace_sha256": "44287e002c2ecdebe8c3e91069c8af56242a318a301bc8c772c33d74647f6317",
+      "raw_gpu_annotations": 512,
+      "unique_iteration_annotations": 512,
+      "annotation_merge_rule": "Same GPU device PID and External id across streams describes one iteration; merge its time extent and count requests once.",
+      "annotation_overlap_count": 0,
+      "phase_summary": {
+        "decode": {
+          "iterations": 508,
+          "median_span_us": 17116.9541015625,
+          "mean_span_us": 17139.287909079725,
+          "mean_kernel_work_us": 17125.978283464567,
+          "mean_kernel_union_us": 17118.98970380167,
+          "context_request_passes": 0,
+          "decode_request_passes": 508
+        },
+        "prefill": {
+          "iterations": 4,
+          "median_span_us": 68873.734375,
+          "mean_span_us": 69080.60961914062,
+          "mean_kernel_work_us": 30996.327250000002,
+          "mean_kernel_union_us": 30996.337890625,
+          "context_request_passes": 4,
+          "decode_request_passes": 0
+        }
+      },
+      "full_iteration_window_note": "GPU kernels from this backbone start to next backbone start, including LM head and sampling after backbone; first-to-last excludes HTTP idle following last kernel. Tiny next-iteration preparation may fall in preceding window. No cross-stream CPU flow attribution used.",
+      "full_phase_summary": {
+        "prefill": {
+          "iterations": 4,
+          "mean_kernel_work_us": 31657.95075,
+          "mean_kernel_union_us": 31657.960693359375,
+          "median_first_to_last_kernel_us": 69927.2451171875,
+          "mean_first_to_last_kernel_us": 70144.93676757812,
+          "mean_family_us": {
+            "copy_kernel": 32.17,
+            "other_or_unclassified": 754.40175,
+            "fused_rms_norm_and_neighbors": 966.89425,
+            "matrix_hipblaslt": 27341.37125,
+            "kv_cache_write": 277.94375,
+            "attention_and_reduce": 1031.79125,
+            "gelu_and_mul": 652.19425,
+            "matrix_vllm_rocm_skinny": 582.41825,
+            "sampling": 18.766000000000002
+          }
+        },
+        "decode": {
+          "iterations": 508,
+          "mean_kernel_work_us": 17783.753368110236,
+          "mean_kernel_union_us": 17776.458423043798,
+          "median_first_to_last_kernel_us": 17785.23046875,
+          "mean_first_to_last_kernel_us": 17808.342114065577,
+          "mean_family_us": {
+            "copy_kernel": 23.339555118110237,
+            "other_or_unclassified": 957.1787598425196,
+            "fused_rms_norm_and_neighbors": 1028.7877066929134,
+            "matrix_vllm_rocm_skinny": 13912.17678937008,
+            "kv_cache_write": 320.3097342519685,
+            "attention_and_reduce": 811.0931791338583,
+            "gelu_and_mul": 709.6407027559055,
+            "sampling": 21.22694094488189
+          }
+        }
+      },
+      "decode_by_actual_batch": {
+        "1": {
+          "iterations": 508,
+          "mean_kernel_work_us": 17783.753368110236,
+          "mean_first_to_last_kernel_us": 17808.342114065577,
+          "median_first_to_last_kernel_us": 17785.23046875,
+          "mean_family_us": {
+            "attention_and_reduce": 811.0931791338583,
+            "copy_kernel": 23.339555118110237,
+            "fused_rms_norm_and_neighbors": 1028.7877066929134,
+            "gelu_and_mul": 709.6407027559055,
+            "kv_cache_write": 320.3097342519685,
+            "matrix_vllm_rocm_skinny": 13912.176789370078,
+            "other_or_unclassified": 957.1787598425196,
+            "sampling": 21.22694094488189
+          }
+        }
+      },
+      "warning": "Torch ROCTracer duplicate-flow warning observed; phase assignment uses nonoverlapping GPU annotation timestamp intervals, not CPU flow IDs. CPU scopes are not GPU durations. Profiling perturbs timings."
+    },
+    "p4096-c4": {
+      "trace": "/app/plow/build-gemma31/vllm-profile/torch/rank0.1788799520235172252.pt.trace.json.gz",
+      "trace_sha256": "46a3d7bd5dcace67cf2be4a84a79eb03f96fbab5c8b6a062e0c2252fafa93a4a",
+      "raw_gpu_annotations": 130,
+      "unique_iteration_annotations": 129,
+      "annotation_merge_rule": "Same GPU device PID and External id across streams describes one iteration; merge its time extent and count requests once.",
+      "annotation_overlap_count": 0,
+      "phase_summary": {
+        "decode": {
+          "iterations": 127,
+          "median_span_us": 21278.2255859375,
+          "mean_span_us": 21269.736112819883,
+          "mean_kernel_work_us": 19936.908417322833,
+          "mean_kernel_union_us": 19930.251576341045,
+          "context_request_passes": 0,
+          "decode_request_passes": 507
+        },
+        "mixed": {
+          "iterations": 1,
+          "median_span_us": 1714533.26953125,
+          "mean_span_us": 1714533.26953125,
+          "mean_kernel_work_us": 1714416.317,
+          "mean_kernel_union_us": 1714410.8232421875,
+          "context_request_passes": 3,
+          "decode_request_passes": 1
+        },
+        "prefill": {
+          "iterations": 1,
+          "median_span_us": 585862.9697265625,
+          "mean_span_us": 585862.9697265625,
+          "mean_kernel_work_us": 582421.656,
+          "mean_kernel_union_us": 582421.4931640625,
+          "context_request_passes": 1,
+          "decode_request_passes": 0
+        }
+      },
+      "full_iteration_window_note": "GPU kernels from this backbone start to next backbone start, including LM head and sampling after backbone; first-to-last excludes HTTP idle following last kernel. Tiny next-iteration preparation may fall in preceding window. No cross-stream CPU flow attribution used.",
+      "full_phase_summary": {
+        "prefill": {
+          "iterations": 1,
+          "mean_kernel_work_us": 583312.573,
+          "mean_kernel_union_us": 583312.4111328125,
+          "median_first_to_last_kernel_us": 586761.58984375,
+          "mean_first_to_last_kernel_us": 586761.58984375,
+          "mean_family_us": {
+            "copy_kernel": 26.514,
+            "other_or_unclassified": 7226.325,
+            "fused_rms_norm_and_neighbors": 9511.222,
+            "matrix_hipblaslt": 404281.607,
+            "kv_cache_write": 2550.829,
+            "attention_and_reduce": 148342.035,
+            "gelu_and_mul": 10542.763,
+            "matrix_vllm_rocm_skinny": 812.652,
+            "sampling": 18.626
+          }
+        },
+        "mixed": {
+          "iterations": 1,
+          "mean_kernel_work_us": 1715333.552,
+          "mean_kernel_union_us": 1715327.8984375,
+          "median_first_to_last_kernel_us": 1715456.525390625,
+          "mean_first_to_last_kernel_us": 1715456.525390625,
+          "mean_family_us": {
+            "copy_kernel": 36.007,
+            "other_or_unclassified": 20480.592,
+            "fused_rms_norm_and_neighbors": 26184.749,
+            "matrix_hipblaslt": 1203817.821,
+            "kv_cache_write": 7043.655,
+            "attention_and_reduce": 425685.539,
+            "gelu_and_mul": 31228.634,
+            "matrix_vllm_rocm_skinny": 839.412,
+            "sampling": 17.143
+          }
+        },
+        "decode": {
+          "iterations": 127,
+          "mean_kernel_work_us": 20587.863637795275,
+          "mean_kernel_union_us": 20581.138410433072,
+          "median_first_to_last_kernel_us": 21981.783203125,
+          "mean_first_to_last_kernel_us": 21995.18643116388,
+          "mean_family_us": {
+            "copy_kernel": 21.783889763779527,
+            "other_or_unclassified": 949.4462440944882,
+            "fused_rms_norm_and_neighbors": 1126.4786141732282,
+            "matrix_vllm_rocm_skinny": 14296.866913385828,
+            "kv_cache_write": 317.6844724409449,
+            "attention_and_reduce": 3113.493874015748,
+            "gelu_and_mul": 739.56,
+            "sampling": 22.549629921259843
+          }
+        }
+      },
+      "decode_by_actual_batch": {
+        "3": {
+          "iterations": 1,
+          "mean_kernel_work_us": 14859.876,
+          "mean_first_to_last_kernel_us": 21752.6328125,
+          "median_first_to_last_kernel_us": 21752.6328125,
+          "mean_family_us": {
+            "attention_and_reduce": 2239.545,
+            "copy_kernel": 32.081,
+            "fused_rms_norm_and_neighbors": 806.542,
+            "gelu_and_mul": 527.704,
+            "kv_cache_write": 224.212,
+            "matrix_vllm_rocm_skinny": 10339.246,
+            "other_or_unclassified": 682.655,
+            "sampling": 7.891
+          }
+        },
+        "4": {
+          "iterations": 126,
+          "mean_kernel_work_us": 20633.323857142856,
+          "mean_first_to_last_kernel_us": 21997.111459883432,
+          "median_first_to_last_kernel_us": 21982.404296875,
+          "mean_family_us": {
+            "attention_and_reduce": 3120.4299761904763,
+            "copy_kernel": 21.702166666666667,
+            "fused_rms_norm_and_neighbors": 1129.0177936507937,
+            "gelu_and_mul": 741.2413968253968,
+            "kv_cache_write": 318.4263174603175,
+            "matrix_vllm_rocm_skinny": 14328.276603174603,
+            "other_or_unclassified": 951.563634920635,
+            "sampling": 22.665968253968256
+          }
+        }
+      },
+      "warning": "Torch ROCTracer duplicate-flow warning observed; phase assignment uses nonoverlapping GPU annotation timestamp intervals, not CPU flow IDs. CPU scopes are not GPU durations. Profiling perturbs timings."
+    }
+  },
+  "raw_plow_traces": [
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d1-ctx128-r0.bin",
+      "sha256": "ec7c565d6ede8ea2a5dbf98d83d6b54b15ce2489f50386adb772d0ec63b584d5",
+      "bytes": 3775800
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d1-ctx128-r1.bin",
+      "sha256": "8d2007e5bd977112b17b10df7746e8ebced6c9af5f48f552b1dcfd7506e68276",
+      "bytes": 3775800
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d1-ctx128-r2.bin",
+      "sha256": "ba7e342bb5e7124e49487ce6995c6df9d0c50a20faa5f84f3c8ae76a612fb633",
+      "bytes": 3775800
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d1-ctx4096-r0.bin",
+      "sha256": "017d7f783acd78a441d3148ce773c3fc8982097bdba4f89d90cc91cee25c10b3",
+      "bytes": 3775800
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d1-ctx4096-r1.bin",
+      "sha256": "6ec1e6b0078fc93cba5e3a798f18db73046a2826a4042874b60b7a504fdf0d68",
+      "bytes": 3775800
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d1-ctx4096-r2.bin",
+      "sha256": "cf6e0e14503ffa71a0359a23f95ca357810458d3aa9f47ece747e9ca093dbce4",
+      "bytes": 3775800
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d2-ctx128-r0.bin",
+      "sha256": "83f459e09ec9d0f6a4d50bc0d5eec9b2ec8a95eae55f6f658677b74a738786ce",
+      "bytes": 3888840
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d2-ctx128-r1.bin",
+      "sha256": "b86ffd777c0bd0e8d7607b82de0d62139d0a86eaf19896167d41a96a22b6cb69",
+      "bytes": 3888840
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d2-ctx128-r2.bin",
+      "sha256": "22fb511e7781bdd37a97c6e6b43e18c08529cda6757201eba369252ef2843b4f",
+      "bytes": 3888840
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d2-ctx4096-r0.bin",
+      "sha256": "e84eff8a29ab855b488de35a70edabd49e5ea0f0fe2073a75a142f530fdb1f19",
+      "bytes": 3888840
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d2-ctx4096-r1.bin",
+      "sha256": "ae2fa046a289433f71cede9bbc0aab3d8f8a595265cc277fe05a1ef8c1f83ecc",
+      "bytes": 3888840
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d2-ctx4096-r2.bin",
+      "sha256": "6ee8b5065a28c087a386eb13b1f4e7bc237adbb329c399a7de0791e3483e5457",
+      "bytes": 3888840
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d4-ctx128-r0.bin",
+      "sha256": "b73a74b8038afd502857c94f301e463106471369f19250804b642e632e3d0ddf",
+      "bytes": 4165320
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d4-ctx128-r1.bin",
+      "sha256": "828e2eb2fee65db88707d6ae198706f306fd67a53e714b18fa5b68dec8f94dc6",
+      "bytes": 4165320
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d4-ctx128-r2.bin",
+      "sha256": "d8c03b034ac9a922c1132777df2fe277eb7fc552ac3d0871369536766fa03f26",
+      "bytes": 4165320
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d4-ctx4096-r0.bin",
+      "sha256": "9eec734b8663fa9051b543737ccd68a8dd3e74fa6d68d29c296e4c9ef25f682a",
+      "bytes": 4165320
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d4-ctx4096-r1.bin",
+      "sha256": "a243b27e9d5e0e947920ebb586b403ab291b4719200a1802b53083178151bf13",
+      "bytes": 4165320
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/decode-d4-ctx4096-r2.bin",
+      "sha256": "8de55dd60778b5a114c9a66b0b094375e1938729a1826af18df756a0f355972d",
+      "bytes": 4165320
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/mixed-t1024-d1-p3-r0.bin",
+      "sha256": "8e172c1267aa25ac86ac3b17290c55c8432da1b0da0c71d45220b717ad0b39a1",
+      "bytes": 12354560
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/mixed-t1024-d1-p3-r1.bin",
+      "sha256": "0e467381146dfeeb0a40b79414d667ccb2153c2f45abe2da99ec2cd91f44e2df",
+      "bytes": 12354560
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/mixed-t1024-d1-p3-r2.bin",
+      "sha256": "52fb0e4ae8f7dd9859a0f25af4a905abc23a1f96c6f2ddbc02f04e0a0b1bd8d2",
+      "bytes": 12354560
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/mixed-t512-d1-p3-r0.bin",
+      "sha256": "aca364aefc31b414db8def7e10dd34baa9d765869829f9c2b8ce7eb42c309897",
+      "bytes": 12354560
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/mixed-t512-d1-p3-r1.bin",
+      "sha256": "22053d1ed8a38e0379b43159b7ecd5feea1a417ede71bfdf40922a4e000ca68c",
+      "bytes": 12354560
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/mixed-t512-d1-p3-r2.bin",
+      "sha256": "9dc4d79da27c238932a58a6e7210784396f0fa4cc60d98b80974fee6388cd62f",
+      "bytes": 12354560
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/prefill-t1024-r0.bin",
+      "sha256": "61bc388bb95ae12bfda9ddd6a37f4dce63017c9d0b801258f09f07b9e49e8afb",
+      "bytes": 9526440
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/prefill-t1024-r1.bin",
+      "sha256": "2f8dc5109065af387155593f45b830c70becc621a4c4d675962dc5b6ef62dc42",
+      "bytes": 9526440
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/prefill-t1024-r2.bin",
+      "sha256": "25f4c19d6d65efe86ea17785f4ad39c37bcc2a8e5c884522732cf26a73353ee6",
+      "bytes": 9526440
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/prefill-t128-r0.bin",
+      "sha256": "0393562dc56b685afcdf41094a3dabd9dff220b78d555d50ee1b68d6011580a3",
+      "bytes": 8552360
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/prefill-t128-r1.bin",
+      "sha256": "9024efce6c6c27f5171ff3dfc7539888f312bed8e3045a86f9d0e84d39c9abf1",
+      "bytes": 8552360
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/prefill-t128-r2.bin",
+      "sha256": "0b07f0e3a13ae734db067dd3d77e65aced3f8571fa2f30187c0c93095c284a1b",
+      "bytes": 8552360
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/prefill-t512-r0.bin",
+      "sha256": "dc8d86da243f871cf21e19e7194fb7a143f2096cb5d2d1a9a8114d79bd6455e4",
+      "bytes": 9526440
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/prefill-t512-r1.bin",
+      "sha256": "4ad1b5c64a845e484b5b9df98883cc1cc1873c0bdbd2718284f8ae3a354f0848",
+      "bytes": 9526440
+    },
+    {
+      "path": "/app/plow/build-gemma31/plow-profile/native/prefill-t512-r2.bin",
+      "sha256": "e81f7bed253e1e871f8b99e3ce042df114b98d6a0fb08d3aee7960806d7dc133",
+      "bytes": 9526440
+    }
+  ],
+  "limits": [
+    "Plow: median of three isolated shapes. vLLM: mean over serving iterations with growing context.",
+    "Projection plus activation groups Plow fused GLU and vLLM separate GELU together.",
+    "Native packet bodies include publish; gates are not all interpreter overhead. Prefill has unallocated envelope gaps.",
+    "Private host instrumentation uses shipping GPU objects and a dedicated mixed trace buffer.",
+    "Torch profiling perturbs prefill host timing. Full windows include head and sampling; small next-step preparation may enter the prior window.",
+    "Clocks/power unpinned, distinct exclusive GPU leases, shared host resources.",
+    "No hardware-counter proof of bandwidth saturation, cache misses, spill traffic or occupancy as the dominant physical cause.",
+    "BF16 only; current Plow FP8 decode is not equivalent to vLLM W8A8."
+  ]
+}

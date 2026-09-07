@@ -1,9 +1,54 @@
 # Gemma 4 31B: packed prefill on MI300X
 
-Qualified on 2026-09-07: one MI300X, TP1, BF16, batch ladder 1/2/4, prefill
-rungs 128/512/1024, context 8192. Packing remains opt-in. It improves throughput
-against the same chunked configuration on long concurrent prompts, but does not
-beat whole-prefill serving or vLLM in this measurement.
+Qualified on 2026-09-07: one MI300X, TP1, BF16, context 8192. Runtime fusion
+passed four-slot and eight-slot numerical and serving checks and remains opt-in.
+The current stock `vllm bench serve` comparison below still favors vLLM in every
+throughput, TTFT and TPOT cell.
+
+## Current runtime-fusion serving comparison
+
+These results use source `5feeb384`, the ordinary `decode-placed-assets`,
+runtime fusion enabled, packed 512-token prefill chunks, multistep 4, decode
+ladder 1/2/4, the WPE5 MM1 tier and decode L2 placement. Both servers use the
+same full checkpoint and tokenizer, BF16 weights/activations/KV, TP1, context
+8192, four maximum sequences, greedy sampling, ignored EOS and disabled prefix
+caching. vLLM is `0.28.0+rocm723`, with compilation/graphs enabled and its
+custom tanh-GELU operation verified in the generated graph.
+
+The unmodified installed `vllm bench serve` client measured both HTTP servers:
+four requests per run, 128 output tokens, one full-corpus warmup and five measured
+repetitions per cell/backend. All 72 runs passed request and actual token-usage
+accounting. Each value below is the median of five per-run metrics.
+
+| Input / concurrency | Plow tokens/s / TTFT ms / TPOT ms | vLLM tokens/s / TTFT ms / TPOT ms |
+|---|---:|---:|
+| 128 / 1 | 35.58 / 94.68 / 27.57 | 56.48 / 48.35 / 17.47 |
+| 128 / 4 | 91.16 / 552.55 / 38.99 | 195.91 / 114.38 / 19.67 |
+| 1024 / 1 | 31.86 / 339.64 / 28.95 | 52.41 / 149.99 / 18.05 |
+| 1024 / 4 | 72.99 / 1757.02 / 40.53 | 158.05 / 558.52 / 21.11 |
+| 4096 / 1 | 25.28 / 1428.82 / 28.61 | 42.30 / 606.85 / 19.04 |
+| 4096 / 4 | 46.93 / 5552.63 / 41.43 | 100.52 / 2332.10 / 21.74 |
+
+Both token budgets are nonbinding for this corpus: Plow's prefill-only interleave
+budget is disabled (`PLOW_PF_INTERLEAVE=0`), while vLLM's combined budget is
+16384 tokens. The engines retain their own chunking and scheduling algorithms.
+Paired clients run concurrently on separately leased MI300X GPUs; clocks and
+power are not pinned, and the host also runs other GPU workloads. These short
+closed-loop batches do not establish saturation throughput or tail SLOs.
+
+Exact paired completion text matches in all 20 measured requests per cell except
+1024/C1 (10/20) and 1024/C4 (16/20). Token counts remain identical. Cross-engine
+text equality is therefore not claimed; fusion's numerical qualification uses
+ordinary Plow with matched chunk boundaries separately. Stock ITL measures SSE
+event spacing: Plow delivers tokens in multistep bursts and emits an empty final
+choice, so its tiny median event interval is not per-token GPU decode latency.
+
+[Current measurements, manifests and raw-result hashes](gemma4-31b-mi300x-bench-serve-20260907.json).
+The full raw CLI results and fixed corpus are retained in
+`build-gemma31/bench-serve/stock-results.zip`. Earlier tables below describe
+different configurations and are historical comparisons.
+[GPU and scheduler trace analysis](gemma4-31b-mi300x-trace-20260907.md) locates
+the remaining projection/attention gap and serialized prefill completion.
 
 ## Build and run
 
@@ -124,6 +169,14 @@ isolation directions were bitwise exact. The tracked attention primitive has ten
 cases: corrected arithmetic passes and the old four-wave arithmetic fails.
 Runtime-only mux and HTTP checks passed with observed fused launches, including
 cancellation, output limits, slot reuse and context rejection/recovery.
+An additional 305.7-second serving exercise and near-context checks completed
+298 requests, including 284 exact comparisons with isolated greedy baselines,
+and 96 deliberate disconnects without errors or output/usage mismatches.
+Near-context cases reached exactly 8192 total tokens with output limits
+1/17/64/128; recovery and concurrent requests passed. Logs recorded 261 additional
+mixed launches during the exercise. Artifacts are in
+`build-gemma31/runtime-http-qualification/`. This is a bounded exercise, not a
+long-running production soak.
 
 The normal CMake mixed GQ object SHA256 is
 `b1deafe6490f3f57c18ba47a803785177a260884a7ba91d2f2dc952782bc86a5`.
