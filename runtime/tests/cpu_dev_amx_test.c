@@ -454,27 +454,78 @@ static void test_gemv_glu_fp8_amx(uint32_t M, uint32_t N, uint32_t K, uint32_t a
     free(x); free(Wg); free(Wu); free(gs); free(us); free(C); free(R);
 }
 
-static void test_gemv_mx4_amx(uint32_t M, uint32_t N, uint32_t K, int glu, uint32_t act, PlowCpuCtx* ctx) {
-    plow_bf16* x = malloc((size_t)M * K * 2);
+static void test_gemv_mx4_amx_r0(uint32_t M, uint32_t N, uint32_t K, int glu, uint32_t act,
+                                 uint32_t x_row0, PlowCpuCtx* ctx) {
+    plow_bf16* x = malloc((size_t)(M + x_row0) * K * 2);
     uint8_t *W = malloc((size_t)N * K / 2), *Wu = malloc((size_t)N * K / 2);
     uint8_t *S = malloc((size_t)N * K / 32), *Su = malloc((size_t)N * K / 32);
     plow_bf16 *C = calloc((size_t)M * N, 2), *R = calloc((size_t)M * N, 2);
-    fill_bf16(x, (size_t)M * K, 1.0f); fill_fp4(W, (size_t)N * K / 2); fill_fp4(Wu, (size_t)N * K / 2);
+    fill_bf16(x, (size_t)(M + x_row0) * K, 1.0f); fill_fp4(W, (size_t)N * K / 2); fill_fp4(Wu, (size_t)N * K / 2);
     fill_e8m0(S, (size_t)N * K / 32); fill_e8m0(Su, (size_t)N * K / 32);
     void* T[8] = {C, x, W, S, Su, Wu, NULL, NULL};
     PlowDevInst in = inst(glu ? PLOW_DOP_GEMV_GLU_MXFP4 : PLOW_DOP_GEMV_MXFP4);
     in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[3] = 3;
     if (glu) { in.t[4] = 4; in.t[5] = 5; in.i[5] = act; }
     in.i[0] = M; in.i[1] = N; in.i[2] = K;
+    /* op 92 has no x_row0 slot; only the plain GEMV twin carries it. */
+    if (!glu) in.i[4] = x_row0;
     kfn f = plow_cpu_kernel(in.op);
     T[0] = R; run_all(glu ? g_gemv_glu_mxfp4 : g_gemv_mxfp4, &in, 1, T, ctx);
     for (int k = 0; k < 3; k++) {
         T[0] = C; memset(C, 0, (size_t)M * N * 2);
         run_all(f, &in, NBLKS[k], T, ctx);
-        char what[96]; snprintf(what, sizeof what, "amx gemv_mxfp4%s M=%u N=%u K=%u nblk=%u", glu ? "_glu" : "", M, N, K, NBLKS[k]);
+        char what[110]; snprintf(what, sizeof what, "amx gemv_mxfp4%s M=%u N=%u K=%u r0=%u nblk=%u", glu ? "_glu" : "", M, N, K, x_row0, NBLKS[k]);
         compare(what, C, R, (size_t)M * N);
     }
     free(x); free(W); free(Wu); free(S); free(Su); free(C); free(R);
+}
+
+static void test_gemv_mx4_amx(uint32_t M, uint32_t N, uint32_t K, int glu, uint32_t act, PlowCpuCtx* ctx) {
+    test_gemv_mx4_amx_r0(M, N, K, glu, act, 0, ctx);
+}
+
+/* MXFP4 PREFILL GEMM family (93/96..99) and the fused gate|up GLU (113) against golden. Bias is
+ * exercised on the plain rungs (t7, CPU-tier only). */
+static void test_gemm_mx4_amx(uint16_t op, uint32_t M, uint32_t N, uint32_t K, int bias,
+                              uint32_t act, PlowCpuCtx* ctx) {
+    const int glu = op == PLOW_DOP_GEMM_GLU_MXFP4;
+    /* i4/i5 are the same spare slots the bf16 rungs carry (a prefill lm_head reads row T-1). */
+    const uint32_t a_row0 = (!glu && op == PLOW_DOP_GEMM_SMALL_MXFP4 && M > 8) ? 3 : 0;
+    const uint32_t c_row0 = (!glu && op == PLOW_DOP_GEMM_MED_MXFP4) ? 2 : 0;
+    plow_bf16* A = malloc((size_t)(M + a_row0) * K * 2);
+    uint8_t *W = malloc((size_t)N * K / 2), *Wu = malloc((size_t)N * K / 2);
+    uint8_t *S = malloc((size_t)N * K / 32), *Su = malloc((size_t)N * K / 32);
+    plow_bf16* b = bias ? malloc((size_t)N * 2) : NULL;
+    plow_bf16 *C = calloc((size_t)(M + c_row0) * N, 2), *R = calloc((size_t)(M + c_row0) * N, 2);
+    fill_bf16(A, (size_t)(M + a_row0) * K, 1.0f);
+    fill_fp4(W, (size_t)N * K / 2); fill_fp4(Wu, (size_t)N * K / 2);
+    fill_e8m0(S, (size_t)N * K / 32); fill_e8m0(Su, (size_t)N * K / 32);
+    if (b) fill_bf16(b, N, 0.5f);
+    void* T[8] = {C, A, W, S, Su, Wu, NULL, b};
+    PlowDevInst in = inst(op);
+    in.t[0] = 0; in.t[1] = 1; in.t[2] = 2; in.t[3] = 3;
+    if (glu) { in.t[4] = 4; in.t[5] = 5; in.i[5] = act; }
+    else if (b) in.t[7] = 7;
+    in.i[0] = M; in.i[1] = N; in.i[2] = K;
+    if (!glu) { in.i[4] = a_row0; in.i[5] = c_row0; }
+    kfn f = plow_cpu_kernel(op);
+    kfn g = glu ? g_gemm_glu_mxfp4
+                : op == PLOW_DOP_GEMM_MED_MXFP4   ? g_gemm_med_mxfp4
+                : op == PLOW_DOP_GEMM_SMALL_MXFP4 ? g_gemm_small_mxfp4
+                : op == PLOW_DOP_GEMM_WIDE_MXFP4  ? g_gemm_wide_mxfp4
+                : op == PLOW_DOP_GEMM_C5_MXFP4    ? g_gemm_c5_mxfp4
+                                                  : g_gemm_mxfp4;
+    CHECK(f != NULL && f != g, "op %u: AMX mxfp4 GEMM not registered", op);
+    T[0] = R; run_all(g, &in, 1, T, ctx);
+    for (int k = 0; k < 3; k++) {
+        T[0] = C; memset(C, 0, (size_t)(M + c_row0) * N * 2);
+        run_all(f, &in, NBLKS[k], T, ctx);
+        char what[110];
+        snprintf(what, sizeof what, "amx gemm_mxfp4 op=%u M=%u N=%u K=%u nblk=%u", op, M, N, K,
+                 NBLKS[k]);
+        compare(what, C, R, (size_t)(M + c_row0) * N);
+    }
+    free(A); free(W); free(Wu); free(S); free(Su); free(b); free(C); free(R);
 }
 
 int main(int argc, char** argv) {
@@ -528,6 +579,10 @@ int main(int argc, char** argv) {
         test_shape(ops[o], 16, 3840, 15360, &ctx);
         test_shape(ops[o], 37, 15360, 3840, &ctx); /* odd M, K-panel tail, N strips */
     }
+    /* Narrow N with many rows: wm_run splits these slices over M, not over N strips. */
+    test_shape(PLOW_DOP_GEMM, 1024, 512, 2880, &ctx);       /* kv_proj prefill */
+    test_shape(PLOW_DOP_GEMM_NORM, 544, 500, 2080, &ctx);   /* ragged M blocks, N and K tails */
+    test_shape(PLOW_DOP_GEMM_GLU, 1024, 320, 1024, &ctx);   /* two accumulators per strip */
     /* Odd geometry: N not a multiple of 32, M partial second tile. */
     test_shape(PLOW_DOP_GEMM_SMALL, 21, 100, 128, &ctx);
     test_shape(PLOW_DOP_GEMM_GLU, 21, 100, 128, &ctx);
@@ -548,6 +603,22 @@ int main(int argc, char** argv) {
     test_gemv_mx4_amx(5, 37, 1024, 0, 0, &ctx);
     test_gemv_mx4_amx(8, 300, 3840, 1, 0, &ctx);
     test_gemv_mx4_amx(6, 100, 2048, 1, 1, &ctx);
+    /* The prefill lm_head under PLOW_MX4_PREFILL: M=1 scoring the last of `t` staged rows. */
+    test_gemv_mx4_amx_r0(1, 4096, 2880, 0, 0, 127, &ctx);
+    {
+        const uint16_t mops[] = {PLOW_DOP_GEMM_MXFP4, PLOW_DOP_GEMM_MED_MXFP4,
+                                 PLOW_DOP_GEMM_SMALL_MXFP4, PLOW_DOP_GEMM_WIDE_MXFP4,
+                                 PLOW_DOP_GEMM_C5_MXFP4};
+        for (size_t o = 0; o < sizeof mops / sizeof mops[0]; o++) {
+            test_gemm_mx4_amx(mops[o], 128, 3840, 3840, 1, 0, &ctx);
+            test_gemm_mx4_amx(mops[o], 37, 500, 2048, 0, 0, &ctx); /* odd M, N tail, K panel tail */
+        }
+        test_gemm_mx4_amx(PLOW_DOP_GEMM_MXFP4, 512, 512, 2880, 1, 0, &ctx); /* narrow N, many rows */
+        test_gemm_mx4_amx(PLOW_DOP_GEMM_MXFP4, 5, 4096, 3840, 0, 0, &ctx);
+        test_gemm_mx4_amx(PLOW_DOP_GEMM_GLU_MXFP4, 128, 3840, 3840, 0, 0, &ctx);
+        test_gemm_mx4_amx(PLOW_DOP_GEMM_GLU_MXFP4, 21, 100, 128, 0, 1, &ctx);
+        test_gemm_mx4_amx(PLOW_DOP_GEMM_GLU_MXFP4, 512, 320, 1024, 0, 1, &ctx);
+    }
 
     free(ctx.scratch);
     printf(fails ? "cpu_dev_amx_test: %d FAILURES\n" : "cpu_dev_amx_test: all passed\n", fails);

@@ -87,11 +87,14 @@ impl Emitter<'_> {
             d.i[2] = k;
         })
     }
-    /// Decode-only MXFP4 twin of `proj`: `out[t, n] = src[t] . dequant(W4[n]) + bias[n]` (op 91, t7 bias).
+    /// MXFP4 twin of `proj`: `out[t, n] = src[t] . dequant(W4[n]) + bias[n]`. Decode takes the
+    /// GEMV (91), prefill the tiled GEMM (93); both carry the bias in t7 (CPU tiers). Prefill on
+    /// the fp4 weight is what lets the bf16 projections go undeclared — see `w4` below.
     fn proj_mx4(&mut self, out: u32, src: u32, w4: u32, s4: u32, bias: u32, n: u32, k: u32, dep: u32) -> u32 {
-        debug_assert!(!self.prefill && w4 != TENSOR_NONE);
+        debug_assert!(w4 != TENSOR_NONE);
+        let op = if self.prefill { DevOp::GemmMxfp4 } else { DevOp::GemvMxfp4 };
         let t = self.t;
-        self.b.emit(DevOp::GemvMxfp4, self.b.all(), &[dep], |d| {
+        self.b.emit(op, self.b.all(), &[dep], |d| {
             d.t[0] = out;
             d.t[1] = src;
             d.t[2] = w4;
@@ -149,18 +152,26 @@ impl Emitter<'_> {
         let (t, h, hd, heads, kvh) = (self.t, c.hidden, c.hd, c.heads, c.kvh);
         let (qd, kd) = (heads * hd, kvh * hd);
         let p = format!("{}layers.{l}", c.prefix);
-        let wq = self.w(&format!("{p}.self_attn.q_proj.weight"), qd as u64 * h as u64 * BF16);
+        // The bf16 projections are declared only when something still reads them: under
+        // PLOW_MXFP4 with prefill at fp4 nothing does, and declaring them would bind ~2.4 GB of
+        // dead weight (the coverage gate accepts the `mxfp4/` twin as covering the bf16 name).
+        let bf16w = !mx4_prefill_on();
+        let wp = |em: &mut Self, s: &str, sz: u64| -> u32 {
+            if bf16w { em.w(s, sz) } else { TENSOR_NONE }
+        };
+        let wq = wp(self, &format!("{p}.self_attn.q_proj.weight"), qd as u64 * h as u64 * BF16);
         let bq = self.w(&format!("{p}.self_attn.q_proj.bias"), qd as u64 * BF16);
-        let wk = self.w(&format!("{p}.self_attn.k_proj.weight"), kd as u64 * h as u64 * BF16);
+        let wk = wp(self, &format!("{p}.self_attn.k_proj.weight"), kd as u64 * h as u64 * BF16);
         let bk = self.w(&format!("{p}.self_attn.k_proj.bias"), kd as u64 * BF16);
-        let wv = self.w(&format!("{p}.self_attn.v_proj.weight"), kd as u64 * h as u64 * BF16);
+        let wv = wp(self, &format!("{p}.self_attn.v_proj.weight"), kd as u64 * h as u64 * BF16);
         let bv = self.w(&format!("{p}.self_attn.v_proj.bias"), kd as u64 * BF16);
-        let wo = self.w(&format!("{p}.self_attn.o_proj.weight"), h as u64 * qd as u64 * BF16);
+        let wo = wp(self, &format!("{p}.self_attn.o_proj.weight"), h as u64 * qd as u64 * BF16);
         let bo = self.w(&format!("{p}.self_attn.o_proj.bias"), h as u64 * BF16);
-        // PLOW_MXFP4: decode reads the dense projections from `mxfp4/<name>` twins (e2m1 + E8M0,
-        // quantize_mxfp4.py) through biased GEMV_MXFP4 (t7 = bias, CPU tiers); prefill keeps the bf16
-        // GEMMs, so the bf16 weights above stay bound.
-        let mx4 = emit_config::active().mxfp4 && !self.prefill;
+        // PLOW_MXFP4: q/k/v/o read the `mxfp4/<name>` twins (e2m1 + E8M0, quantize_mxfp4.py) —
+        // decode through biased GEMV_MXFP4, prefill through biased GEMM_MXFP4 (t7 = bias, CPU
+        // tiers). PLOW_MX4_PREFILL=0 keeps prefill on bf16, and then the bf16 weights above stay
+        // bound in BOTH forms; the default routes both phases at fp4 so they do not.
+        let mx4 = emit_config::active().mxfp4 && (!self.prefill || mx4_prefill_on());
         let w4 = |em: &mut Self, s: &str, out: u64, k: u64| -> (u32, u32) {
             if mx4 {
                 (
@@ -187,17 +198,17 @@ impl Emitter<'_> {
         // q/k/v projections. Decode fuses the three into one GEMV sweep (op 22) with the three
         // bias handles in i5/i6/i7; prefill is three biased GEMMs.
         let (hn, qg, kg, vg) = (self.hn, self.qg, self.kg, self.vg);
-        let (cq, ck, cv) = if self.prefill {
-            (
-                self.proj(qg, hn, wq, bq, qd, h, dep),
-                self.proj(kg, hn, wk, bk, kd, h, dep),
-                self.proj(vg, hn, wv, bv, kd, h, dep),
-            )
-        } else if mx4 {
+        let (cq, ck, cv) = if mx4 {
             (
                 self.proj_mx4(qg, hn, wq4, sq4, bq, qd, h, dep),
                 self.proj_mx4(kg, hn, wk4, sk4, bk, kd, h, dep),
                 self.proj_mx4(vg, hn, wv4, sv4, bv, kd, h, dep),
+            )
+        } else if self.prefill {
+            (
+                self.proj(qg, hn, wq, bq, qd, h, dep),
+                self.proj(kg, hn, wk, bk, kd, h, dep),
+                self.proj(vg, hn, wv, bv, kd, h, dep),
             )
         } else {
             let f = self.b.emit(DevOp::GemvQkv, self.b.all(), &[dep], |d| {
@@ -552,11 +563,14 @@ fn phase(
     } else {
         "lm_head.weight".to_string()
     };
-    let lm = em.w(&head, c.vocab as u64 * h as u64 * BF16);
+    let head_mx4 = emit_config::active().mxfp4 && (!prefill || mx4_prefill_on());
+    // Untied, so nothing else reads the bf16 head: once BOTH phases score through the fp4 twin it
+    // is 1.16 GB of dead weight, and the coverage gate takes `mxfp4/<head>` as covering it.
+    let lm = if head_mx4 { TENSOR_NONE } else { em.w(&head, c.vocab as u64 * h as u64 * BF16) };
     let (vocab, all) = (c.vocab, em.b.all());
-    let head_mx4 = emit_config::active().mxfp4 && !prefill;
     dep = if head_mx4 {
-        // PLOW_MXFP4 decode head: the 1.16 GB bf16 lm_head is ~1/4 of a GPT-OSS decode step's bytes.
+        // PLOW_MXFP4 head: the 1.16 GB bf16 lm_head is ~1/4 of a GPT-OSS decode step's bytes.
+        // Prefill scores the LAST prompt row only (i0=1, a_row0=t-1), decode every sequence row.
         let lm4 = em.w(&format!("mxfp4/{head}"), c.vocab as u64 * h as u64 / 2);
         let ls4 = em.w(&format!("mxfp4/{head}_scale"), c.vocab as u64 * h as u64 / 32);
         em.b.emit(DevOp::GemvMxfp4, all, &[dep], |d| {
@@ -564,9 +578,10 @@ fn phase(
             d.t[1] = hn;
             d.t[2] = lm4;
             d.t[3] = ls4;
-            d.i[0] = t;
+            d.i[0] = if prefill { 1 } else { t };
             d.i[1] = vocab;
             d.i[2] = h;
+            d.i[4] = if prefill { t - 1 } else { 0 };
         })
     } else {
         em.b.emit(DevOp::Gemv, all, &[dep], |d| {

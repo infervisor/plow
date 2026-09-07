@@ -10,6 +10,9 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_RESIDUAL] = g_residual;
     tab[PLOW_DOP_GLU] = g_glu;
     tab[PLOW_DOP_SOFTCAP] = g_softcap;
+    tab[PLOW_DOP_CAST_F32_BF16] = g_cast_f32_bf16;
+    tab[PLOW_DOP_ZERO_F32] = g_zero_f32;
+    tab[PLOW_DOP_GEMM_SPLITK] = g_gemm_splitk;
     tab[PLOW_DOP_EMBED] = g_embed;
     tab[PLOW_DOP_ARGMAX] = g_argmax;
     tab[PLOW_DOP_ARGMAX_FIN] = g_argmax_fin;
@@ -37,6 +40,12 @@ void plow_cpu_register_golden(plow_cpu_kernel_fn* tab) {
     tab[PLOW_DOP_ATTN_RES] = g_attn_res;
     tab[PLOW_DOP_GEMV_MXFP4] = g_gemv_mxfp4;
     tab[PLOW_DOP_GEMV_GLU_MXFP4] = g_gemv_glu_mxfp4;
+    tab[PLOW_DOP_GEMM_MXFP4] = g_gemm_mxfp4;
+    tab[PLOW_DOP_GEMM_MED_MXFP4] = g_gemm_med_mxfp4;
+    tab[PLOW_DOP_GEMM_SMALL_MXFP4] = g_gemm_small_mxfp4;
+    tab[PLOW_DOP_GEMM_WIDE_MXFP4] = g_gemm_wide_mxfp4;
+    tab[PLOW_DOP_GEMM_C5_MXFP4] = g_gemm_c5_mxfp4;
+    tab[PLOW_DOP_GEMM_GLU_MXFP4] = g_gemm_glu_mxfp4;
     tab[PLOW_DOP_MOE_GLU_MX] = g_moe_glu_mx;
     tab[PLOW_DOP_MOE_DOWN_MX] = g_moe_down_mx;
     tab[PLOW_DOP_MOE_GLU_MX_PF] = g_moe_glu_mx_pf;

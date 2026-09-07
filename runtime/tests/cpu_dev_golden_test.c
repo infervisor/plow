@@ -104,6 +104,46 @@ static void test_rmsnorm(PlowCpuCtx* ctx) {
     free(x); free(g); free(out);
 }
 
+/* The split-K triple (147 zero -> 148 accumulate f32 -> 149 narrow to bf16) must equal a plain
+ * GEMV of the same operands. On CPU the split factor S is ignored -- slices own whole outputs and
+ * reduce all of K -- so the result must also be identical for every S and every worker count. */
+static void test_splitk_triple(PlowCpuCtx* ctx) {
+    const uint32_t N = 64, K = 96;
+    for (uint32_t M = 1; M <= 4; M++) {
+        plow_bf16 *x = malloc(M * K * 2), *W = malloc(N * K * 2), *C = malloc(M * N * 2);
+        float* acc = malloc(M * N * sizeof(float));
+        fill_bf16(x, M * K, 1.0f);
+        fill_bf16(W, N * K, 0.5f);
+        void* T[4] = {acc, x, W, C};
+        for (int k = 0; k < 2; k++) {
+            for (uint32_t S = 1; S <= 4; S <<= 1) {
+                memset(C, 0xAA, M * N * 2);
+                memset(acc, 0xAA, M * N * sizeof(float));
+                PlowDevInst z = inst(PLOW_DOP_ZERO_F32);
+                z.t[0] = 0; z.i[0] = M; z.i[1] = N;
+                run_all(&z, NBLKS[k], T, ctx);
+                PlowDevInst g = inst(PLOW_DOP_GEMM_SPLITK);
+                g.t[0] = 0; g.t[1] = 1; g.t[2] = 2;
+                g.i[0] = M; g.i[1] = N; g.i[2] = K; g.i[3] = S;
+                run_all(&g, NBLKS[k], T, ctx);
+                PlowDevInst f = inst(PLOW_DOP_CAST_F32_BF16);
+                f.t[0] = 3; f.t[1] = 0; f.i[0] = M; f.i[1] = N;
+                run_all(&f, NBLKS[k], T, ctx);
+                for (uint32_t m = 0; m < M; m++)
+                    for (uint32_t n = 0; n < N; n++) {
+                        float want = 0.0f;
+                        for (uint32_t kk = 0; kk < K; kk++)
+                            want += plow_bf2f(x[m * K + kk]) * plow_bf2f(W[n * K + kk]);
+                        CHECK(close_bf(C[m * N + n], want),
+                              "splitk M=%u S=%u nblk=%u m=%u n=%u got %f want %f", M, S, NBLKS[k],
+                              m, n, plow_bf2f(C[m * N + n]), want);
+                    }
+            }
+        }
+        free(x); free(W); free(C); free(acc);
+    }
+}
+
 static void test_gemv(PlowCpuCtx* ctx) {
     const uint32_t N = 70, K = 96;
     for (uint32_t M = 1; M <= 4; M++) {
@@ -279,6 +319,7 @@ int main(void) {
     test_residual(&ctx);
     test_rmsnorm(&ctx);
     test_gemv(&ctx);
+    test_splitk_triple(&ctx);
     test_gemm(&ctx);
     test_glu(&ctx);
     test_flash_decode(&ctx);

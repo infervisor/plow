@@ -84,7 +84,7 @@ enum {
     /* t0=out t1=gate t2=up             i0=n i1=act(0=gelu_tanh,1=silu,3=swiglu_oai)  f0=alpha f1=limit
      * Gemma is GeGLU (gelu_tanh), not SwiGLU.
      *
-     * ACT CODES, shared by every GLU-family op (5, 19, 20, 45, 48, 85, 147, 149):
+     * ACT CODES, shared by every GLU-family op (5, 19, 20, 45, 48, 85, 150, 152):
      *   0 gelu_tanh(g)*u   1 silu(g)*u   2 situ (Kimi-K3, op 105 documents it)
      *   3 swiglu_oai (GPT-OSS). PAIR FORM A(g)*B(u), like situ it transforms the UP branch:
      *        A(g) = min(g, limit) * sigmoid(alpha * min(g, limit))
@@ -739,8 +739,9 @@ enum {
      * Layout: W packed 2 fp4/byte, row stride K/2 bytes, low nibble = even k. S one E8M0 byte per
      * 32-K block, row stride K/32 bytes. A lane's 16-byte load is exactly one 32-element block.
      * t0=C(bf16) t1=x(bf16) t2=W(fp4) t3=S(e8m0) t7=OPTIONAL bf16 [N] bias (CPU tiers; the GPU
-     * arms ignore it, so the emitter sets it only on CPU-targeted MXFP4 dense arms)   i0=M i1=N i2=K.
-     * See op_gemm.h d_gemv_mxfp4. */
+     * arms ignore it, so the emitter sets it only on CPU-targeted MXFP4 dense arms)   i0=M i1=N i2=K
+     * i4=x_row0 (rows of t1 to skip, as PLOW_DOP_GEMV; a prefill lm_head scores the LAST prompt
+     * row, so it is M=1 at i4=T-1). See op_gemm.h d_gemv_mxfp4. */
     PLOW_DOP_GEMV_MXFP4 = 91,
 
     /* MXFP4 DECODE fused gate|up GEMV+GLU (w4a16) — the mxfp4 twin of PLOW_DOP_GEMV_GLU_FP8. Gate
@@ -754,7 +755,9 @@ enum {
     /* MXFP4 (w4a16) PREFILL GEMM — bf16 activations x packed-2/byte fp4 weights with E8M0 scale
      * rows (K/32 bytes/row). Reuses the bf16 wide-K MFMA; only the weight fetch dequants fp4->bf16
      * with the MX scale folded exactly, so this is the fp4 weight-bandwidth win at M>1 without an
-     * activation-quant op. t0=C(bf16) t1=A(bf16) t2=W(fp4) t3=wscale(e8m0)  i0=M i1=N i2=K.
+     * activation-quant op. t0=C(bf16) t1=A(bf16) t2=W(fp4) t3=wscale(e8m0)
+     * t7=OPTIONAL bf16 [N] bias (CPU tiers, as on GEMV_MXFP4; the GPU arms ignore it)
+     * i0=M i1=N i2=K i4=a_row0 i5=c_row0 (same spare slots as PLOW_DOP_GEMM).
      * See op_gemm.h d_gemm_mxfp4. */
     PLOW_DOP_GEMM_MXFP4 = 93,
 

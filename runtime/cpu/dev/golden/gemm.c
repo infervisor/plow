@@ -233,3 +233,40 @@ G_K(g_gemv_argmax) {
     }
     part[slice] = best;
 }
+
+/* t0=dst(f32); i0*i1 = element count. Clears the split-K accumulator. */
+G_K(g_zero_f32) {
+    (void)ctx;
+    float* dst = PLOW_CPU_TEN(in, T, 0);
+    const uint64_t total = (uint64_t)in->i[0] * (uint64_t)in->i[1];
+    const uint32_t n = total > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)total;
+    uint32_t lo, hi;
+    g_range(n, slice, nblk, &lo, &hi);
+    for (uint32_t i = lo; i < hi; i++) dst[i] = 0.0f;
+}
+
+/* t0=C(f32)[M,N] t1=x(bf16)[M,K] t2=W(bf16)[N,K]; i0=M i1=N i2=K i3=S.
+ *
+ * S is the GPU's K-split factor: there, blocks own (output tile, k-chunk) pairs and accumulate
+ * into C atomically. On CPU we slice over OUTPUTS instead and reduce the whole of K in one pass,
+ * which computes each C element exactly once. That is the same value as summing the S partials,
+ * needs no atomics, and makes the result independent of the worker count. S is therefore ignored
+ * beyond validation. The preceding ZERO_F32 is redundant for us but harmless. */
+G_K(g_gemm_splitk) {
+    (void)ctx;
+    const uint32_t M = in->i[0], N = in->i[1], K = in->i[2];
+    float* C = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* W = PLOW_CPU_TEN(in, T, 2);
+    uint32_t n0, n1;
+    g_range(N, slice, nblk, &n0, &n1);
+    for (uint32_t m = 0; m < M; m++) {
+        const plow_bf16* xm = x + (size_t)m * K;
+        for (uint32_t n = n0; n < n1; n++) {
+            const plow_bf16* wn = W + (size_t)n * K;
+            float acc = 0.0f;
+            for (uint32_t k = 0; k < K; k++) acc += plow_bf2f(xm[k]) * plow_bf2f(wn[k]);
+            C[(size_t)m * N + n] = acc;
+        }
+    }
+}

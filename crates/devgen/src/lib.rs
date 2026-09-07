@@ -106,8 +106,8 @@ pub mod tune_demand;
 // ## Verified vendor-NEUTRAL (do not re-audit)
 //
 // * opcode-changing, but every op has an AMD arm: `PLOW_NO_FUSE_QKV`, `PLOW_FP8_HEAD`,
-//   `PLOW_FP8_KV`, `PLOW_FP8_KV_FULL`, `PLOW_MXFP4`, `PLOW_MLA_PREFILL`, `PLOW_MOE_PREFILL`,
-//   `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_ROUTER_OLD` (GLM arm), `GLM_GROUP`;
+//   `PLOW_MX4_HEAD`, `PLOW_FP8_KV`, `PLOW_FP8_KV_FULL`, `PLOW_MXFP4`, `PLOW_MLA_PREFILL`,
+//   `PLOW_MOE_PREFILL`, `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_ROUTER_OLD` (GLM arm), `GLM_GROUP`;
 // * tuning constants carried in an existing instruction field, read identically by both
 //   interpreters: `PLOW_NS_MUL`, `PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_GLM_GF`, `PLOW_MLA_NS`,
 //   `PLOW_MAX_CHUNK`, `PLOW_DECODE_BATCH`. (`PLOW_NS_FULL_ABS`'s comment cites an sm_120 part —
@@ -1538,6 +1538,11 @@ struct Tn {
     // labelled variant: vLLM fp8 keeps lm_head bf16, so report as its own row.
     head8: u32,
     head8s: u32,
+    // MXFP4 weight-only lm_head twin (PLOW_MX4_HEAD; default on under --mxfp4, tied models
+    // only). Same split as head8: the EMBED lookup keeps the bf16 table, only the head GEMV
+    // reads this one. Wins over head8 when both are asked for — 0.53 GB against 1.01 GB.
+    head4: u32,
+    head4s: u32,
     x: u32,
     // NRN-fold residual ping-pong twin of `x` (Gemma fp8 decode on AMD only; TENSOR_NONE
     // otherwise so every other blob stays byte-identical). NRN1 writes its residual here and
@@ -1823,7 +1828,7 @@ fn declare(
         } else {
             b.tensor("lm_head.weight", (c.vocab * c.hidden) as u64 * BF16)
         },
-        head8: if c.tied && emit_config::active().fp8_head {
+        head8: if c.tied && emit_config::active().fp8_head && !mx4_head_on() {
             b.tensor(
                 &format!("fp8/{}embed_tokens.weight", c.prefix),
                 (c.vocab * c.hidden) as u64,
@@ -1831,10 +1836,26 @@ fn declare(
         } else {
             TENSOR_NONE
         },
-        head8s: if c.tied && emit_config::active().fp8_head {
+        head8s: if c.tied && emit_config::active().fp8_head && !mx4_head_on() {
             b.tensor(
                 &format!("fp8/{}embed_tokens.weight_scale", c.prefix),
                 c.vocab as u64 * F32,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        head4: if c.tied && mx4_head_on() {
+            b.tensor(
+                &format!("mxfp4/{}embed_tokens.weight", c.prefix),
+                (c.vocab * c.hidden) as u64 / 2,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        head4s: if c.tied && mx4_head_on() {
+            b.tensor(
+                &format!("mxfp4/{}embed_tokens.weight_scale", c.prefix),
+                (c.vocab * c.hidden) as u64 / 32,
             )
         } else {
             TENSOR_NONE
@@ -2123,11 +2144,14 @@ fn declare(
         // (fused GemvQkv, bf16 GemmGlu/GemvGlu, bf16 proj arm) is under a `!fp8` guard.
         // MXFP4 dense twins (PLOW_MXFP4=1): `mxfp4/<name>` packed e2m1 (numel/2 bytes) +
         // `mxfp4/<name>_scale` E8M0 (numel/32 bytes) — quantize_mxfp4.py's layout, the GPT-OSS
-        // expert byte order. Decode reads them through ops 91/92; prefill keeps the bf16 weight, so
-        // `wproj` is NOT elided here (unlike fp8, where GEMM_FP8 consumes the twin).
+        // expert byte order. Decode reads them through ops 91/92 and, under PLOW_MX4_PREFILL,
+        // prefill reads them through ops 93/96..99/113 — at which point the bf16 projection is
+        // dead and is elided exactly as the fp8 axis elides it. With prefill left on bf16 BOTH
+        // encodings stay bound, which is how the fp4 twin came to outweigh the bf16 original.
         let mx4 = emit_config::active().mxfp4;
+        let mx4_pf = mx4_prefill_on();
         let wproj = |b: &mut Builder, s: &str, sz: u64| {
-            if fp8 || !in_block {
+            if fp8 || mx4_pf || !in_block {
                 TENSOR_NONE
             } else {
                 b.tensor(&format!("{prefix}layers.{l}.{s}"), sz)
@@ -2211,7 +2235,7 @@ fn declare(
             // always have a real v_proj. (fp8 mode elides the bf16 twin like the other projections.)
             wv: wopt(
                 b,
-                !keqv && !fp8,
+                !keqv && !fp8 && !mx4_pf,
                 "self_attn.v_proj.weight",
                 (kd * c.hidden) as u64 * BF16,
             ),
@@ -3156,8 +3180,11 @@ fn emit_phase(
     let decode = mode.decode_shape();
     let gemv_family = mode.gemv();
     // MXFP4 dense decode (PLOW_MXFP4=1): q/k/v/o/down through GemvMxfp4 (91), gate|up through
-    // GemvGluMxfp4 (92); prefill stays on the bf16 weight. Exclusive with the fp8 axis.
+    // GemvGluMxfp4 (92). Exclusive with the fp8 axis.
     let mx4 = emit_config::active().mxfp4;
+    // MXFP4 dense PREFILL: the tiled projections and the fused gate|up GLU take the fp4 rungs, so
+    // the bf16 twins are dead and `declare()` stops emitting them (see `wproj`).
+    let mx4_pf = mx4_prefill_on();
     // A decode LADDER makes every rung — the one-row rung included — address the KV cache per
     // sequence out of `pos[]`. See the two `i[6] = n_batch_kv` sites below for why.
     let seq_rows = emit_config::active().decode_ladder_on();
@@ -3316,6 +3343,26 @@ fn emit_phase(
             // packet), so a gamma here would be a silently dropped norm — refuse instead.
             assert_eq!(gamma, TENSOR_NONE, "mxfp4 GEMV cannot fold a norm (gamma) — emit it as a packet");
             return b.emit(DevOp::GemvMxfp4, gemv_wg_cap(cus), deps, |d| {
+                d.t[0] = out;
+                d.t[1] = a;
+                d.t[2] = w8;
+                d.t[3] = scale;
+                d.i[0] = m;
+                d.i[1] = nn;
+                d.i[2] = k;
+            });
+        }
+        // PREFILL at fp4 (`PLOW_MX4_PREFILL`): the same tile rungs one encoding over, w4a16 —
+        // bf16 activations against the e2m1 twin and its E8M0 scale rows. Without this arm the
+        // bf16 weight stays live for prefill alone and the blob carries both encodings.
+        if !gemv_family && mx4_pf {
+            assert!(
+                w8 != TENSOR_NONE && scale != TENSOR_NONE,
+                "mxfp4 prefill GEMM has no fp4 twin for this projection — the bf16 weight it \
+                 would fall back to is no longer declared"
+            );
+            let op = pick_tile(m, nn, k, n_cu, kernelcaps::QuantScheme::Mxfp4);
+            return b.emit(op, cus, deps, |d| {
                 d.t[0] = out;
                 d.t[1] = a;
                 d.t[2] = w8;
@@ -4752,7 +4799,26 @@ fn emit_phase(
                     d.i[3] = mu;
                 }
             })
-        } else if gemm_glu {
+        } else if mx4_pf && !gemv_family && glu_fusion_wins_mxfp4(t, inter_l, c.hidden, n_cu) {
+            // PREFILL fp4 GLU (op 113): gate|up as two e2m1 matrices with their own E8M0 scale
+            // rows, SwiGLU/GeGLU fused in the epilogue. Same slot map as the decode twin (92).
+            assert!(w.wg8 != TENSOR_NONE && w.sg != TENSOR_NONE, "mxfp4 prefill GLU has no fp4 twin");
+            b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_pf], |d| {
+                d.t[0] = n.fu;
+                d.t[1] = mlp_src;
+                d.t[2] = w.wg8;
+                d.t[5] = w.wu8;
+                d.t[3] = w.sg;
+                d.t[4] = w.su;
+                d.i[0] = t;
+                d.i[1] = inter_l;
+                d.i[2] = c.hidden;
+                d.i[5] = c.mlp_act;
+            })
+        } else if gemm_glu && !mx4_pf {
+            // Not under mx4_pf: the bf16 gate/up weights are no longer declared, so the shapes the
+            // fp4 GLU epilogue does not cover (op 113 is 256x256 only) must take the UNFUSED fp4
+            // pair below, not this arm with two TENSOR_NONE weights.
             // sm_90a TMA GLU ring: bf16 maps in i6/i7/i3.
             let tmg = tma_gemm.then(|| {
                 (
@@ -5416,12 +5482,17 @@ fn emit_phase(
     // The tied embedding LOOKUP stays bf16 (reads the original table); only the head GEMV
     // reads the fp8 twin. Own reporting row — vLLM's fp8 recipe keeps lm_head bf16.
     let fp8_head = decode && n.head8 != TENSOR_NONE;
+    // PLOW_MX4_HEAD: the same trade at w4 — 2.01 GB of bf16 tied head -> 0.53 GB of e2m1
+    // + E8M0 block scales. Decode only; the tied EMBED lookup still reads the bf16 table.
+    let mx4_head = decode && n.head4 != TENSOR_NONE;
     // E5 (rtx-19) PLOW_FUSE_ARGMAX: fuse the greedy-argmax epilogue (+ softcap) into the lm_head
     // GEMV, folding each block's owned vocab slice into an amax partial and dropping the SoftCap +
     // Argmax packets. Greedy B=1 decode on the bf16 head only (fp8 head keeps the classic path).
-    let fuse_am = fuse_argmax_on() && decode && gemv_family && !fp8_head && t == 1;
+    let fuse_am = fuse_argmax_on() && decode && gemv_family && !fp8_head && !mx4_head && t == 1;
     let lm_op = if fuse_am {
         DevOp::GemvArgmax
+    } else if mx4_head {
+        DevOp::GemvMxfp4
     } else if fp8_head {
         DevOp::GemvFp8
     } else {
@@ -5439,8 +5510,16 @@ fn emit_phase(
     let c_lm = b.emit(lm_op, all.clone(), &[c_f], |d| {
         d.t[0] = n.logits;
         d.t[1] = head_src;
-        d.t[2] = if fp8_head { n.head8 } else { head_w };
-        if fp8_head {
+        d.t[2] = if mx4_head {
+            n.head4
+        } else if fp8_head {
+            n.head8
+        } else {
+            head_w
+        };
+        if mx4_head {
+            d.t[3] = n.head4s;
+        } else if fp8_head {
             d.t[5] = n.head8s;
         }
         if fuse_am {
@@ -5565,6 +5644,36 @@ fn gemv_split() -> u32 {
 /// (`DevOp::GemvArgmax`), replacing the `SoftCap` + `Argmax` packets. Default off → byte-identical.
 fn fuse_argmax_on() -> bool {
     emit_config::active().fuse_argmax
+}
+
+/// MXFP4 tied lm_head (`PLOW_MX4_HEAD`). Default ON under `--mxfp4`: the mxfp4 twin already
+/// carries the head (`quantize_mxfp4.py` writes it for a tied checkpoint) and the bf16 head is
+/// the single largest tensor a decode step reads. Off by default on every other body, where the
+/// twin is produced by a different quantizer and would not have it. "1"/"0" forces either way.
+fn mx4_head_on() -> bool {
+    match emit_config::active().mx4_head.as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => emit_config::active().mxfp4,
+    }
+}
+
+/// MXFP4 dense PREFILL (`PLOW_MX4_PREFILL`). Default ON under `--mxfp4` on gfx950 and the CPU
+/// tier: with prefill on the fp4 rungs the bf16 projections are dead weight the blob no longer has
+/// to declare, which is the difference between an mxfp4 asset that is smaller than its bf16
+/// original and one that is larger. Off (or without `--mxfp4`) the emit is byte-identical.
+///
+/// Default OFF on sm_90a/sm_120a for the same reason `pf_gemv_head` defaults per target: the fp4
+/// prefill rungs (93/96..99, 113) exist in `runtime/amd/op_gemm.h` and in the CPU tier, and the
+/// NVIDIA interpreter would take `default: __trap()` on them. "1" forces it either way, so the
+/// NVIDIA arm can still be A/B'd once its kernels land.
+fn mx4_prefill_on() -> bool {
+    emit_config::active().mxfp4
+        && match emit_config::active().mx4_prefill.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => emit_is_amd(),
+        }
 }
 
 /// Argmax-partial slot count: when fused the lm_head runs on all `n_cu` blocks (one partial each),
@@ -7063,8 +7172,12 @@ fn emit_dense_gqa(
     );
     // WEIGHT AXIS, 4-bit (`PLOW_MXFP4=1`) on the dense family: decode q/k/v/o/down go through
     // GemvMxfp4 (91) and gate|up through GemvGluMxfp4 (92) on `mxfp4/<name>` e2m1 twins with one
-    // E8M0 scale per 32 K (`quantize_mxfp4.py`); prefill keeps the bf16 weight (no GemmMxfp4 arm
-    // yet — prefill is compute-bound, the win is decode bytes). The manifest derives
+    // E8M0 scale per 32 K (`quantize_mxfp4.py`); PREFILL takes the fp4 tile rungs (93/96..99) and
+    // the fused gate|up 113 unless `PLOW_MX4_PREFILL=0`, which is what lets the bf16 projections
+    // be elided. The point of it is MEMORY — Gemma-4-12B went from 34.7 GiB resident (more than
+    // its own bf16 build) to 14.3 — but on the CPU tier a dense prefill also streams the whole
+    // weight set once per chunk, so quartering it measured -26%..-33% TTFT at 128/512/1024 rather
+    // than the regression a purely compute-bound prefill would have shown. The manifest derives
     // `mxfp4_weights` from the emitted stream. Exclusive with the fp8 axis.
     assert!(
         !(ecfg.mxfp4 && fp8),

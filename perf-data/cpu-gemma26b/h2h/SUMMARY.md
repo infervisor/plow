@@ -154,3 +154,38 @@ term as GPT-OSS, and the thing prefill+decode fusion would remove.
 
 Single-stream cpu_bench after the fix: prefill 241.3 / 326.3 / 465.1 tok/s at 64 / 128 / 512 prompt
 tokens (was 128.8 / 171.1 / 201.5), decode p50 35.1-37.0 ms (unchanged).
+
+## After the MoE prefill epilogue and the flash-decode GQA fold (0d07dfa + 55f9e7f, 22:3x)
+
+Full 16 cells through `plowrt serve`, fresh prompts, 8 slots, against the FAIR 8-slot llama.cpp
+Q4_K_M baseline. vLLM is absent by necessity: its CPU backend has no 4-bit path for this checkpoint
+and its worker is OOM-killed at load even at 2048 context, so plow serves a model vLLM cannot host
+on this box at all. TTFT / TPOT mean ms; the last two columns are the previous plow run.
+
+| workload | conc | plow TTFT | Q4_K_M TTFT | plow TPOT | Q4_K_M TPOT | was TTFT | was TPOT |
+|---|---|---|---|---|---|---|---|
+| chat_short | 1 | **321** | 649 | **36** | 50 | 331 | 35 |
+| chat_short | 2 | **404** | 1226 | **60** | 80 | 487 | 58 |
+| chat_short | 4 | **739** | 2302 | **87** | 111 | 804 | 87 |
+| chat_short | 8 | **1842** | 4948 | **130** | 178 | 1705 | 125 |
+| chat_long | 1 | **1040** | 4187 | **38** | 52 | 1019 | 38 |
+| chat_long | 2 | **1339** | 7009 | **75** | 125 | 1335 | 68 |
+| chat_long | 4 | **1898** | 11944 | **110** | 237 | 1883 | 106 |
+| chat_long | 8 | **4470** | 34445 | **210** | 217 | 4538 | 191 |
+| code | 1 | **864** | 3858 | **38** | 52 | 919 | 38 |
+| code | 2 | **1560** | 7914 | **63** | 90 | 1851 | 69 |
+| code | 4 | **1934** | 15773 | **110** | 185 | 2892 | 128 |
+| code | 8 | **4409** | 32080 | **173** | 183 | 4184 | 167 |
+| summarize | 1 | **3192** | 11237 | **40** | 56 | 2806 | 40 |
+| summarize | 2 | **3215** | 23241 | 107 | 105 | 3396 | 97 |
+| summarize | 4 | **3756** | 47619 | 205 | 172 | 5905 | 191 |
+| summarize | 8 | **11770** | 92495 | 329 | 257 | 16562 | 389 |
+
+plow wins **all 16 TTFT cells and 13 of 16 TPOT, 29 of 32**, against 30 of 32 before. The one cell
+that moved against us is summarize TPOT at c=2 (107 vs 105), a 2% difference that is inside this
+box's run-to-run spread. TTFT improved materially where prefill dominates: summarize c=4 5905 -> 3756
+and code c=4 2892 -> 1934.
+
+The three remaining TPOT losses are all summarize, the 1100-token prompts, and they are the same
+prefill-interference term as GPT-OSS rather than kernel speed: decode waits behind other slots'
+prompts because prefill chunks and decode rows do not share a forward pass.

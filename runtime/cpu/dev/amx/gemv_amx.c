@@ -357,7 +357,7 @@ X_K(x_gemv_mxfp4) {
         return;
     }
     plow_bf16* C = PLOW_CPU_TEN(in, T, 0);
-    const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* x = (const plow_bf16*)PLOW_CPU_TEN(in, T, 1) + (size_t)in->i[4] * K;
     const uint8_t* W = PLOW_CPU_TEN(in, T, 2);
     const uint8_t* S = PLOW_CPU_TEN(in, T, 3);
     const plow_bf16* bias = PLOW_CPU_TEN(in, T, 7);

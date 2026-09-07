@@ -1,4 +1,4 @@
-/* golden/moe.c — GPT-OSS flat-tensor MXFP4 MoE, scalar reference (dev_isa.h ops 147-150).
+/* golden/moe.c — GPT-OSS flat-tensor MXFP4 MoE, scalar reference (dev_isa.h ops 150-153).
  *
  * Expert e of a [E][N][K/2] fp4 tensor starts at W + e*N*(K/2), scales at S + e*N*(K/32), bias at
  * b + e*N. Rows are dequantized on the fly (mxfp4_common.h plow_mxfp4_row_dot: f32 per 32-block,

@@ -18,6 +18,7 @@ V_K(v_gemv_argmax);
 V_K(v_residual);
 V_K(v_glu);
 V_K(v_softcap);
+V_K(v_cast_f32_bf16);
 V_K(v_embed);
 V_K(v_argmax);
 V_K(v_argmax_fin);
@@ -39,8 +40,8 @@ void v_register_attention(plow_cpu_kernel_fn* tab);
 V_K(v_gemv_mxfp4);
 V_K(v_moe_glu_mx);
 V_K(v_moe_down_mx);
-V_K(v_moe_glu_mx_b);  /* 147 at B >= 2: grouped by expert */
-V_K(v_moe_down_mx_b); /* 148 at B >= 2 */
+V_K(v_moe_glu_mx_b);  /* 150 at B >= 2: grouped by expert */
+V_K(v_moe_down_mx_b); /* 151 at B >= 2 */
 V_K(v_moe_glu_mx_pf);
 V_K(v_moe_down_mx_pf);
 void v_register_gptoss(plow_cpu_kernel_fn* tab);

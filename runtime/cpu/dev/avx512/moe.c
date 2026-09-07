@@ -1,4 +1,4 @@
-/* avx512/moe.c — GPT-OSS flat-tensor MXFP4 MoE, AVX-512 BF16 (dev_isa.h ops 147-150).
+/* avx512/moe.c — GPT-OSS flat-tensor MXFP4 MoE, AVX-512 BF16 (dev_isa.h ops 150-153).
  *
  * Same slice partition (golden/gptoss.h) and numerics as golden/moe.c. Inner loop is
  * mxfp4_common.h plow_mx_dot_rm: RB packed weight rows x M staged activation rows, 128 weights per
@@ -274,7 +274,7 @@ V_K(v_moe_down_mx_pf) {
     }
 }
 
-/* ---- Batched decode grouped by expert (147/148 at B >= 2) --------------------------------------
+/* ---- Batched decode grouped by expert (150/151 at B >= 2) --------------------------------------
  * The per-slot decode kernels stream + dequantize an expert once per SLOT, so a rung-8 step costs
  * ~8x rung 1. Here the B*k slots are sorted by expert and each selected expert's rows are
  * dequantized once for all its M <= 8 slots (a row never selects an expert twice, so M <= B).
@@ -349,7 +349,7 @@ static uint32_t mxb_stage(plow_bf16* XP, size_t ldx, uint32_t K, const plow_bf16
     return M;
 }
 
-/* 147 at B >= 2 (slot map as v_moe_glu_mx). */
+/* 150 at B >= 2 (slot map as v_moe_glu_mx). */
 V_K(v_moe_glu_mx_b) {
     const uint32_t k = in->i[0], I = in->i[1], K = in->i[2], E = in->i[3], layout = in->i[4];
     const uint32_t act = in->i[5], B = in->i[6] ? in->i[6] : 1u;
@@ -393,7 +393,7 @@ V_K(v_moe_glu_mx_b) {
     }
 }
 
-/* 148 at B >= 2 (slot map as v_moe_down_mx). */
+/* 151 at B >= 2 (slot map as v_moe_down_mx). */
 V_K(v_moe_down_mx_b) {
     const uint32_t k = in->i[0], H = in->i[1], I = in->i[2], E = in->i[3];
     const uint32_t B = in->i[6] ? in->i[6] : 1u;

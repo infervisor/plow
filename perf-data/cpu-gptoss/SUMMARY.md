@@ -239,3 +239,212 @@ off by default. Fresh-prompt results; TTFT / TPOT mean ms:
 
 The opt-in path improves default MXFP4 decode from 24-25 ms to 22-23 ms at c=1 and
 from 142-288 ms to 110-246 ms at c=8. Sampled outputs remained coherent in this campaign.
+
+## After the MoE prefill epilogue and the flash-decode GQA fold (0d07dfa + 55f9e7f, 22:2x)
+
+Two kernel changes since the physical-core table above, both bit-identical:
+
+* `0d07dfa` transposes the 32x32 accumulator in both MXFP4 MoE prefill kernels so each token's 32
+  outputs leave as one vector store instead of up to 1024 scattered 2-byte stores, and gates
+  `dot_block`'s weight prefetch at the call site. The prefetch was walking 16 weight rows ahead into a
+  dequantized strip already resident in L2, which was pure overhead on the MXFP4 path; that gating was
+  worth more than the transpose. Prefill at 512 tokens 455 -> 470 tok/s.
+* `55f9e7f` folds the GQA head groups onto one K/V pass in flash decode. With `gqa=8` the four head
+  groups behind each kv head were separate work items re-reading the same K and V rows, so the kernel
+  was loading 868 MB to consume 241 MB. It was never bandwidth-starved -- it ran at ~73 GB/s into the
+  cores, essentially at this box's roofline -- it was moving 4x the bytes it needed. FLASH_DECODE went
+  16.61 -> 7.91 ms/thread and the batch-8, 1100-context decode step 118.0 -> 105.3 ms.
+
+Fresh prompts, one server at a time, 8 slots. TTFT / TPOT mean ms; bold = best of the three.
+
+| workload | conc | plow TTFT | llama TTFT | vLLM TTFT | plow TPOT | llama TPOT | vLLM TPOT |
+|---|---|---|---|---|---|---|---|
+| chat_short | 1 | **325** | 748 | 637 | **23** | 41 | 71 |
+| chat_short | 2 | **388** | 1625 | 1220 | **46** | 65 | 95 |
+| chat_short | 4 | **727** | 3059 | 1657 | **76** | 104 | 103 |
+| chat_short | 8 | **1782** | 5260 | 2120 | **130** | 177 | 136 |
+| chat_long | 1 | **858** | 4823 | 1346 | **25** | 51 | 71 |
+| chat_long | 2 | **1294** | 9520 | 1962 | **53** | 81 | 80 |
+| chat_long | 4 | **1580** | 14432 | 2550 | **92** | 133 | 102 |
+| chat_long | 8 | **3692** | 35666 | 4591 | 182 | 215 | **137** |
+| code | 1 | **723** | 4212 | 1253 | **25** | 50 | 76 |
+| code | 2 | **1369** | 8780 | 2151 | **51** | 73 | 81 |
+| code | 4 | **1668** | 18762 | 2944 | **94** | 123 | 115 |
+| code | 8 | **3773** | 35120 | 4156 | 163 | 207 | **152** |
+| summarize | 1 | 2469 | 10693 | **1829** | **26** | 59 | 71 |
+| summarize | 2 | **2427** | 23777 | 3593 | **78** | 113 | 85 |
+| summarize | 4 | **3073** | 57888 | 6735 | 163 | 195 | **116** |
+| summarize | 8 | 10037 | 73138 | **7219** | 279 | 430 | **153** |
+
+plow wins **all 32 cells against llama.cpp** and **26 of 32 against vLLM**, up from 24: 14 of 16 TTFT
+and 12 of 16 TPOT. The two newly won cells are chat_short TPOT at c=8 (130 vs 136) and summarize TPOT
+at c=2 (78 vs 85). Every TTFT cell improved, several by a third (chat_long c=4 2468 -> 1580, summarize
+c=4 4838 -> 3073).
+
+The six remaining losses are the same structural item, not kernel speed. Decode is now at the memory
+wall: at batch 8 the MoE ops move 4.31 GB and 2.15 GB per step at 100 and 98 GB/s against a measured
+84-115 GB/s roofline, so there is no headroom left in them. `GEMV_MXFP4` is compute-bound rather than
+bandwidth-bound -- its busy time scales with batch while its weight bytes do not, fitting to ~3.4 ms
+fixed plus ~2.8 ms per batch row -- so the 25 GB/s figure it appears to run at is an artifact of
+dividing mostly-MAC time by constant bytes. What is left is that vLLM runs prefill chunks and decode
+rows in one forward, so a decoding request never queues behind another prompt.
+
+Two notes for later. Reducing decode further needs fewer bytes, not faster kernels, since MXFP4 is
+already 4-bit. And the `FA_GF=2` head pairing computes `hkv = h0 / gqa` for both heads of a pair,
+which is wrong for MHA (`gqa == 1`); no local checkpoint is MHA (Gemma-4 is gqa 2 and 4, GPT-OSS is 8)
+so it is latent, and the GQA fold guards itself to `ng=1` there.
+
+## Long-prompt prefill: the AMX GEMM had an L2 capacity knee (commit 6ad987a)
+
+Profiling at 512 vs 1024 tokens showed GEMM scaling 2.82x for 2x the tokens, where a dense GEMM
+should be linear. That anomaly is invisible at 512 tokens, which is why earlier profiles missed it,
+and it lands exactly at the prompt lengths where we lose cells to vLLM.
+
+It was not a bucket-ladder artifact: the T=128/512/1024 programs are the same shape (413 insts,
+6281 slices, 120 GEMM insts x 16 slices) and differ only in M. In an isolated harness the per-token
+cost is flat to M=512 then steps: 3.24 / 3.26 / 4.11 / 4.47 / 4.91 us/tok at M=256/512/768/1024/1536.
+
+**Cause.** `wm_run` sized its token chunk against the 8 MiB scratch only. The packed x panel is
+2 KiB/token, so x plus the fp32 partials crossed the 2 MiB private L2 between M=512 (1.5 MiB) and
+M=768 (2.25 MiB) -- exactly the knee. Decomposed with `PLOW_AMX_DEBUG`, the x-pack scaled linearly
+(0.554 -> 1.055 ms) while the TDP loop went 4.0x for 2x tokens (0.756 -> 2.998 ms): both tile
+operands had started coming from L3.
+
+**Fix.** Bound the token chunk so x + partials + the slice's W panel stay under 3/4 of L2, and split
+M evenly across chunks (a ragged tail otherwise paid a whole extra W pass for a few tokens). The
+extra W pass per chunk is an L3 hit -- one op's W is 23.6 MB against a 260 MB L3 -- far cheaper than
+the L2 miss it replaces. Budget swept on the real model: baseline / 2.0 / 1.5 / 1.25 MiB gave GEMM
+294.9 / 223.7 / 217.7 / 225.5 ms/thr.
+
+Verified here at 1024 tokens: GEMM 306.1 -> 245.1 ms/thr, prefill wall 1860.5 -> 1765.2 ms. Decode
+is unchanged (the decode program contains no GEMM op) and output is bit-identical, since chunking
+reorders no output tile's K accumulation. C suite 12/12, Rust suite green.
+
+### It does not close the summarize cell, and the arithmetic says why
+
+summarize TTFT at c=1 is the one lost cell with NO interference component, so it is pure prefill
+speed. After this fix we run 1024 tokens in 1765 ms = 580 tok/s, against vLLM's 1111 tokens in
+1829 ms = 607 tok/s. We are 4.7% slower on raw rate. Our prefill COMPUTE alone for that prompt
+(the 1024 bucket plus the 128 bucket) is about 1986 ms, already more than vLLM's entire 1829 ms
+TTFT, so no amount of serve-overhead removal can close this cell. It needs real prefill speed.
+
+Where the remaining time is at 1024 tokens: MoE 928 ms/thr (57%), FLASH_PREFILL 264 (16%),
+GEMM 245 (15%).
+
+### Attention on AMX: measured and rejected
+
+A roofline correction first: **VDPBF16PS is 1/cycle on this part, not 2.** Measured 105.3 GMAC/s per
+core; calibrating against vfmadd132ps (known 2/cycle) shows the core turbos to ~3.56 GHz. Assuming
+2/cycle at 2.3 GHz overstates the ceiling by 2x. Accounting for the shuffles PV actually issues
+(4 dpbf16 plus 2 vpunpck, which cost 44% by contending for port 5) gives a realistic ceiling of
+75.2 GMAC/s. FLASH_PREFILL achieves 42.6 GMAC/s at the real shape, i.e. **57% of that ceiling, not
+the 21% a naive roofline suggests.**
+
+* `FA_RB` sweep (2/4/6/8/12/16, bit-exact): 2 is 12% worse, 4 through 16 all within 2%. So it is not
+  latency-bound on the 4-row softmax chain and widening the register-resident state buys nothing.
+* `FA_BQ_TILE` sweep (128/64/32): 128 is best for causal layers. 64 helps the sliding-window layers
+  by 9%, but those are only ~4 ms/thr of 232, inside noise, and it costs 3% on causal. The apparent
+  2x window overcompute is not real: `v_pf_block` already skips fully-masked blocks, so true
+  overcompute is ~1.25x.
+* AMX is the only real lever (TDPBF16PS is 13.9x vdpbf16ps per core) but 43% of the kernel is
+  already non-MAC work -- online softmax, K^T build, masking, loads -- so even a free MAC unit caps
+  the win at ~2.3x on 15% of prefill, about 7% of wall, for a change that cannot be bit-exact (P
+  must be bf16 for the PV tile op) and that needs the 4-row softmax restructured to feed 16- or
+  32-row tiles. Not attempted.
+
+### Identified, not taken
+
+`pack_x_panel` runs once per SLICE, so all 16 slices pack the same full M x K activation. It is
+25-38% of q_proj/o_proj time, and for kv_proj (N=512, one 32-column strip per slice) the pack is
+~3x the strip's compute, which is why kv_proj gets 281 GFLOP/s/core against q_proj's 900. Splitting
+the slice over M rather than N whenever N < M makes the pack 1x instead of 16x. Bit-exact, worth
+about 1.2-1.5% of prefill wall.
+
+### Negative result: a wider prefill bucket does not help (2026-09-07, 04:3x)
+
+A 1111-token summarize prompt runs the 1024 bucket PLUS the 128 bucket. Fitting cost against
+chunk width (128 rows at 265 tok/s, 1024 rows at 1686.6 ms) gives a fixed ~311 ms per chunk --
+one full sweep of the weights -- plus 1.34 ms/row, so the second chunk appeared to be paying a
+whole extra sweep to process 87 real tokens.
+
+Partially-filled buckets do NOT compute their padding: `rebase_chunk_rows` rewrites the row-count
+fields from `t` down to `clen` when `clen < t` (`kvrow.rs`), so a wider bucket costs nothing extra
+in rows. That predicted ~311 ms back on the cell.
+
+The ladder is capped by `default_chunk(window)`, which pins GPT-OSS to 1024 because it has
+128-token sliding layers; `PLOW_MAX_CHUNK=2048` overrides it and emits a T=2048 bucket (verified
+in the program list). Measured through serve, summarize c=1 TTFT:
+
+| ladder | p50 | mean |
+|---|---|---|
+| 128/512/1024 (default) | 2122 | 2469 |
+| 128/512/1024/2048 | 2184 | 2507 |
+
+**No gain; if anything slightly worse.** The saved sweep is cancelled because the wider program is
+less efficient per row: the T=1024 program runs 607 tok/s where T=2048 runs 554, about 9% worse,
+and 1111 rows placed in the T=2048 program inherit that program's tiling. The two effects are the
+same size, so they cancel.
+
+Worth knowing for anyone tempted by the same idea: widening the ladder also doubles the sliding
+layers' KV ring, since it is `next_pow2(window + chunk - 1)` = 2048 -> 4096. So it costs memory
+for no throughput.
+
+#### Follow-up: the 1024 boundary is real, but widening the bucket is worse (confirmed)
+
+Crossing the top bucket costs a fixed extra pass, measured with `cpu_bench` on the default ladder:
+
+| prompt | TTFT | note |
+|---|---|---|
+| 1024 | 2045.6 ms | one chunk |
+| 1088 | 2503.0 ms | 1024 + 64: **+457 ms for 64 more tokens** |
+| 1111 | 2528.1 ms | 1024 + 87 |
+| 1152 | 2609.5 ms | 1024 + 128 |
+
+So the tail chunk really does pay a full weight sweep. But replacing the pair with a single wider
+pass costs MORE, not less. Interleaved A/B at 1111 tokens, 3 pairs:
+
+| | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| default (1024 + 87) | 2490.0 | 2491.9 | 2553.2 | **2491.9** |
+| single 2048 bucket | 2613.9 | 2607.1 | 2646.8 | **2613.9** |
+
+The 2048 program is enough worse per row that it more than gives back the saved sweep. With
+power-of-two programs and this cost structure, two chunks is already the cheaper option for a
+1111-token prompt, so there is no bucket-ladder win available here.
+
+Also worth recording: serve adds almost nothing. `cpu_bench` TTFT at 1111 tokens is 2446-2528 ms
+against serve's 2471, so the summarize c=1 gap to vLLM (1829 ms) is entirely prefill compute, not
+request handling. Closing it needs ~27% more prefill throughput. Worker idle at 1024 tokens is 15%
+of wall (busy mean 1514.8, min 1461.4, max 1620.5 against a 1780.3 ms wall), of which only the
+~106 ms mean-to-max spread is imbalance; the rest is dependency stalls on the critical path. That
+caps the remaining bit-exact headroom well below what the cell needs.
+
+#### MXFP4 dense prefill on GPT-OSS: a memory-for-latency trade, unlike the 12B (96ad1d5)
+
+Back-to-back serve A/B, same session, pre-96ad1d5 blob (bf16 dense prefill) against a re-emitted
+one (fp4 dense prefill), summarize c=1, two pairs:
+
+| | TTFT mean | RSS |
+|---|---|---|
+| bf16 dense prefill | 2604 / 2603 | 15.27 GiB |
+| fp4 dense prefill | 2705 / 2680 | 12.88 GiB |
+
+So on GPT-OSS the fp4 dense prefill costs about **3.4% TTFT to save 2.39 GiB**. That is the
+opposite balance from Gemma-4-12B, where the same change is -30% prefill AND -20.4 GiB, because
+the 12B is dense (prefill streams its whole 22 GiB weight set per chunk) while GPT-OSS is MoE and
+only q/k/v/o plus lm_head move inside a much larger expert read. `PLOW_MX4_PREFILL` is per-emit,
+so a GPT-OSS blob can be emitted with it off when TTFT matters more than 2.4 GB; the default stays
+on because the dense case is where it is dramatic. Decode is unaffected either way (25-26 ms).
+
+**Methodology warning, and it invalidated a reading of mine.** This box drifted **5.4% over nine
+hours**: the recorded 22:25 figure for summarize c=1 is 2469 ms, and the SAME blob re-measured at
+06:53 gives 2603. My first pass at this comparison used the recorded number as the baseline and
+concluded fp4 prefill had made everything worse; the controlled back-to-back A/B shows most of
+that was drift. Cross-session absolute comparisons on this box are unsafe below ~10%, even
+serve-to-serve with identical settings. Only interleaved or same-session pairs should be trusted.
+
+This does not change the contested cell: summarize TTFT at c=1 is 2603 (or 2693 with fp4 prefill)
+against vLLM's 1829, a ~42% gap either way. Note also that the vLLM GPT-OSS baseline is itself from
+an earlier session and was never re-verified here, unlike the Gemma-4-12B vLLM baseline which was;
+given the drift measured above that number carries the same uncertainty, though not nearly enough
+to close a 42% gap.
