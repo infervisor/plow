@@ -200,9 +200,34 @@ fn gpu_chat_prompt(bundle: Option<&crate::asset::ModelBundle>, messages: &[Messa
         harmony_chat_prompt(messages)
     } else if one("<|assistant|>") {
         glm_chat_prompt(messages)
+    } else if one("<|start_header_id|>") && one("<|eot_id|>") {
+        llama3_chat_prompt(messages)
     } else {
         gemma_chat_prompt(messages)
     }
+}
+
+/// Llama-3.x chat format (the checkpoint's `chat_template.jinja`, text-only, no tools):
+/// `<|begin_of_text|>`, one `<|start_header_id|>{role}<|end_header_id|>\n\n{text}<|eot_id|>`
+/// block per message, then the generation prompt for the assistant. The markers are single
+/// ids via `added_tokens` (128000, 128006, 128007, 128009); `<|eot_id|>` is in the stop set
+/// through `generation_config.json`.
+fn llama3_chat_prompt(messages: &[Message]) -> String {
+    let mut p = String::from("<|begin_of_text|>");
+    for m in messages {
+        let role = match m.role.as_str() {
+            "assistant" => "assistant",
+            "system" | "developer" => "system",
+            _ => "user",
+        };
+        p.push_str("<|start_header_id|>");
+        p.push_str(role);
+        p.push_str("<|end_header_id|>\n\n");
+        p.push_str(m.content.as_text().trim());
+        p.push_str("<|eot_id|>");
+    }
+    p.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    p
 }
 
 /// OpenAI harmony format (gpt-oss), text-only, no tools, reasoning DISABLED: one
