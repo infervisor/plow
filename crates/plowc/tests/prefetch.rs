@@ -26,6 +26,7 @@ fn prefetch_opts(out: PathBuf) -> Options {
         tuning_db: None,
         gpu: "H100 SXM5".into(),
         num_gpus: 1,
+        unit_shares: None,
         parallel: Parallel::Tp,
         batches: vec![1],
         seqs: vec![128],

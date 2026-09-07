@@ -50,7 +50,10 @@ fn heterogeneous() -> Soc<'static> {
                 cm: CostModel::new(h100_pcie(), DEFAULT_PAGE_BYTES),
             },
         ],
-        memory: MemoryModel { unified: true },
+        memory: MemoryModel {
+            unified: true,
+            shared_bw: None,
+        },
     }
 }
 

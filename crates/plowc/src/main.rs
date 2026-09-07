@@ -67,6 +67,12 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     num_gpus: usize,
 
+    /// Apple SoC unit shares, e.g. `gpu:0.7,cpu:0.3` or `gpu:1,ane:0` (rung 3 of the Apple
+    /// plan): the compiler's `Soc::heterogeneous` weights. Take them from a measurement
+    /// (`plowrt` example `apple_calibrate`); a zero share drops the unit.
+    #[arg(long)]
+    unit_shares: Option<String>,
+
     /// Parallel strategy across the GPUs.
     #[arg(long, value_enum, default_value_t = Parallel::Tp)]
     parallel: Parallel,
@@ -536,6 +542,35 @@ struct VizCli {
     /// Open the browser automatically after starting the server.
     #[arg(long, default_value_t = true)]
     open: bool,
+}
+
+/// `gpu:0.7,cpu:0.3,ane:0` -> unit weights; unknown unit names and non-numbers are errors.
+fn parse_unit_shares(spec: &str) -> Result<Vec<(costmodel::UnitKind, f64)>, String> {
+    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (name, w) = part
+            .split_once(':')
+            .ok_or_else(|| format!("--unit-shares: expected unit:weight, got {part:?}"))?;
+        let kind = match name.trim().to_ascii_lowercase().as_str() {
+            "gpu" => costmodel::UnitKind::Gpu,
+            "cpu" => costmodel::UnitKind::Cpu,
+            "ane" | "npu" => costmodel::UnitKind::Ane,
+            other => {
+                return Err(format!(
+                    "--unit-shares: unknown unit {other:?} (gpu|cpu|ane)"
+                ))
+            }
+        };
+        let w: f64 = w
+            .trim()
+            .parse()
+            .map_err(|e| format!("--unit-shares: weight for {name}: {e}"))?;
+        out.push((kind, w));
+    }
+    if out.is_empty() {
+        return Err("--unit-shares: no units".into());
+    }
+    Ok(out)
 }
 
 fn main() -> ExitCode {
@@ -1713,6 +1748,10 @@ fn run(cli: Cli) -> Result<Report, Box<dyn std::error::Error>> {
         gpu: cli.gpu,
         num_gpus: cli.num_gpus,
         parallel: cli.parallel,
+        unit_shares: match &cli.unit_shares {
+            None => None,
+            Some(spec) => Some(parse_unit_shares(spec)?),
+        },
         batches,
         seqs,
         phases: cli.phase.phases(),

@@ -158,6 +158,7 @@ fn options(out: PathBuf, gpu: &str) -> Options {
         tuning_db: None,
         gpu: gpu.into(),
         num_gpus: 1,
+        unit_shares: None,
         parallel: Parallel::Tp,
         batches: vec![1],
         seqs: vec![1],

@@ -124,6 +124,10 @@ pub struct Options {
     pub tuning_db: Option<std::path::PathBuf>,
     pub num_gpus: usize,
     pub parallel: Parallel,
+    /// Unified-memory unit shares `(kind, weight)` for an Apple SoC target (rung 3 of
+    /// plans/apple-silicon-backend.md): builds [`Soc::heterogeneous`] instead of a single GPU.
+    /// Weights come from a calibration (`plowrt` example `apple_calibrate`), never from rooflines.
+    pub unit_shares: Option<Vec<(costmodel::UnitKind, f64)>>,
     pub batches: Vec<i64>,
     pub seqs: Vec<i64>,
     pub phases: Vec<Phase>,
@@ -2578,6 +2582,16 @@ fn run_lean_verify(
 
 fn build_soc(spec: &'static hwspec::GpuSpec, opts: &Options) -> Result<Soc<'static>, PlowcError> {
     let page = opts.page_kib * 1024;
+    if let Some(shares) = &opts.unit_shares {
+        if spec.vendor != hwspec::Vendor::Apple {
+            return Err(PlowcError::Parallelism(format!(
+                "--unit-shares needs a unified-memory (Apple) target; {} is {:?}",
+                spec.name, spec.vendor
+            )));
+        }
+        let bus = spec.mem.bandwidth_for_bound().0 * 1e9;
+        return Ok(Soc::heterogeneous(spec, page, shares, Some(bus)));
+    }
     if opts.num_gpus <= 1 {
         return Ok(Soc::single(spec, page));
     }

@@ -30,8 +30,9 @@ struct Wait { uint id, threshold; };
 struct Params { uint seg, n_cu, spin_max, inst_lo, inst_hi; };  // entries with inst outside [lo, hi) are skipped
 
 constant ushort TNONE = 0xFFFFu;
-constant uint NT = 256;      // threads per threadgroup
-constant uint NSG = 8;       // simdgroups (G_WAVES)
+constant uint NT = 1024;     // threads per threadgroup: 32 simdgroups on one core
+constant uint NSG = 32;      // simdgroups
+constant uint WAVES = 8;     // G_WAVES: (token, head) items packed per workgroup by the emitter
 constant float NEG_INF = -3.0e38f;
 
 // ---- bf16 / e4m3 -------------------------------------------------------------------------------
@@ -390,12 +391,16 @@ void op_gemv_glu_fp8(const thread Inst& in, device const ulong* tab, uint slice,
 
 // ---- GEMM family (prefill) ------------------------------------------------------------------------
 // Output tiles of (BM, BN), linear tile id = slice + k*nblk (golden gemm_tiles order). Inside a tile:
-// 64x64 sub-tiles computed on `simdgroup_matrix<float, 8, 8>` — 8 simdgroups, each owning a 16x32
-// block (2x4 accumulators) — with K staged 32 at a time in threadgroup memory as f32 (A: 64x32
-// row-major [m][k], B: 64x32 [n][k], loaded transposed). Weights are bf16 or e4m3 (per-column
-// scale in the epilogue); the second weight stream (GLU) shares the machinery on 64x32 sub-tiles.
-constant uint GK = 32;
-constant uint TILE_FLOATS = 4096;   // one 64x64 f32 tile: A|B staging, then the accumulator dump
+// 64x64 sub-tiles on `simdgroup_matrix<float, 8, 8>` — 8 simdgroups, each a 16x32 block (2x4
+// accumulators). K is staged 16 at a time as f32 in threadgroup memory, DOUBLE-BUFFERED: every
+// thread owns one float4 of A and one of B per chunk, issues the next chunk's device loads before
+// the current chunk's matrix ops and stores them to the other buffer afterwards. One threadgroup
+// per core (the persistent grid) has nothing else to hide load latency behind, so this overlap is
+// where the prefill rate comes from. The epilogue dumps one 8x8 accumulator at a time through a
+// per-simdgroup scratch, so no full output tile is needed in threadgroup memory. Weights are bf16
+// or e4m3 (per-column scale in the epilogue); GLU shares the machinery on 64x32 sub-tiles.
+constant uint GK = 16;
+constant uint TILE_FLOATS = 4096;   // two (A 64x16 | B 64x16) chunk buffers
 struct GemmArgs {
     device const ushort* A;      // [M][K] bf16 (row m offset applied by caller)
     device const ushort* B16;    // [N][K] bf16, or
@@ -405,96 +410,94 @@ struct GemmArgs {
     uint K;
     uint M, N;                   // bounds for zero fill
 };
-// Stage A rows [m0, m0+64) x k-chunk into As[64][GK] and B rows [n0, n0+bn) into Bs[bn][GK].
-// Four consecutive k per thread per load (K % 4 == 0 for every model here; a ragged K falls
-// back to scalar loads), so a 64-row chunk is 8 vector loads per thread instead of 32 scalar ones.
-inline void stage_a(device const ushort* A, uint M, uint K, uint m0, uint k0, threadgroup float* As, uint lid) {
-    if ((K & 3u) == 0u) {
-        for (uint e = lid; e < 64u * (GK / 4u); e += NT) {
-            uint r = e / (GK / 4u), kk = (e % (GK / 4u)) * 4u;
-            uint m = m0 + r, k = k0 + kk;
-            float4 v = (m < M && k < K) ? bf4(*(device const ushort4*)(A + m * K + k)) : float4(0.0f);
-            *(threadgroup float4*)(As + r * GK + kk) = v;
-        }
-    } else {
-        for (uint e = lid; e < 64u * GK; e += NT) {
-            uint r = e / GK, kk = e % GK;
-            uint m = m0 + r, k = k0 + kk;
-            As[e] = (m < M && k < K) ? bf2f(A[m * K + k]) : 0.0f;
-        }
-    }
+// Thread `lid` owns A group (row lid/4, k-quad lid%4) of a 64x16 chunk.
+inline float4 load_a(device const ushort* A, uint M, uint K, uint m0, uint k0, uint lid) {
+    uint m = m0 + lid / 4u, k = k0 + (lid % 4u) * 4u;
+    if (m >= M || k >= K) return float4(0.0f);
+    if ((K & 3u) == 0u) return bf4(*(device const ushort4*)(A + m * K + k));
+    float4 v = 0.0f;
+    for (uint j = 0; j < 4u && k + j < K; j++) v[j] = bf2f(A[m * K + k + j]);
+    return v;
 }
-inline void stage_b(device const ushort* B16, device const uchar* B8, uint N, uint K, uint n0, uint bn, uint k0,
-                    threadgroup float* Bs, uint lid) {
-    if ((K & 3u) == 0u) {
-        for (uint e = lid; e < bn * (GK / 4u); e += NT) {
-            uint r = e / (GK / 4u), kk = (e % (GK / 4u)) * 4u;
-            uint n = n0 + r, k = k0 + kk;
-            float4 v = 0.0f;
-            if (n < N && k < K) v = B8 ? e4m3x4(*(device const uchar4*)(B8 + n * K + k)) : bf4(*(device const ushort4*)(B16 + n * K + k));
-            *(threadgroup float4*)(Bs + r * GK + kk) = v;
-        }
-    } else {
-        for (uint e = lid; e < bn * GK; e += NT) {
-            uint r = e / GK, kk = e % GK;
-            uint n = n0 + r, k = k0 + kk;
-            float b = 0.0f;
-            if (n < N && k < K) b = B8 ? e4m3(B8[n * K + k]) : bf2f(B16[n * K + k]);
-            Bs[e] = b;
-        }
-    }
+// Thread `t` (0..4*bn) owns B group (row t/4, k-quad t%4) of a bn x 16 chunk.
+inline float4 load_b(device const ushort* B16, device const uchar* B8, uint N, uint K, uint n0, uint k0, uint t) {
+    uint n = n0 + t / 4u, k = k0 + (t % 4u) * 4u;
+    if (n >= N || k >= K) return float4(0.0f);
+    if ((K & 3u) == 0u) return B8 ? e4m3x4(*(device const uchar4*)(B8 + n * K + k)) : bf4(*(device const ushort4*)(B16 + n * K + k));
+    float4 v = 0.0f;
+    for (uint j = 0; j < 4u && k + j < K; j++) v[j] = B8 ? e4m3(B8[n * K + k + j]) : bf2f(B16[n * K + k + j]);
+    return v;
 }
-inline void stage(thread const GemmArgs& g, uint m0, uint n0, uint bn, uint k0, threadgroup float* As,
-                  threadgroup float* Bs, uint lid) {
-    stage_a(g.A, g.M, g.K, m0, k0, As, lid);
-    stage_b(g.B16, g.B8, g.N, g.K, n0, bn, k0, Bs, lid);
-}
-// acc[2][4] (rows sg/2*16.., cols sg%2*32..) += A[m0..+64][k0..+32] . B[n0..+64][k0..+32]^T
+inline void put4(threadgroup float* buf, uint t, float4 v) { *(threadgroup float4*)(buf + (t / 4u) * GK + (t % 4u) * 4u) = v; }
+
+// acc[2] (rows sg/4*8.., cols sg%4*16..) += As[64][16] . Bs[64][16]^T   (32 simdgroups x 8x16)
 inline void mma_chunk(threadgroup const float* As, threadgroup const float* Bs, uint sg,
-                      thread simdgroup_float8x8 (&acc)[2][4]) {
-    uint r0 = (sg / 2u) * 16u, c0 = (sg % 2u) * 32u;
+                      thread simdgroup_float8x8 (&acc)[2]) {
+    uint r0 = (sg / 4u) * 8u, c0 = (sg % 4u) * 16u;
     for (uint kk = 0; kk < GK; kk += 8u) {
-        simdgroup_float8x8 a[2], b[4];
-        for (uint i = 0; i < 2; i++) simdgroup_load(a[i], As + (r0 + i * 8u) * GK + kk, GK);
-        for (uint j = 0; j < 4; j++) simdgroup_load(b[j], Bs + (c0 + j * 8u) * GK + kk, GK, ulong2(0, 0), true);
-        for (uint i = 0; i < 2; i++)
-            for (uint j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        simdgroup_float8x8 a, b[2];
+        simdgroup_load(a, As + r0 * GK + kk, GK);
+        for (uint j = 0; j < 2; j++) simdgroup_load(b[j], Bs + (c0 + j * 8u) * GK + kk, GK, ulong2(0, 0), true);
+        for (uint j = 0; j < 2; j++) simdgroup_multiply_accumulate(acc[j], a, b[j], acc[j]);
     }
+}
+// One 8x8 accumulator through the simdgroup's scratch: lane l handles elements 2l, 2l+1.
+inline void epilogue8x8(simdgroup_float8x8 acc, threadgroup float* scratch, uint lane, uint m_base, uint n_base,
+                        uint m1, uint n1, thread const GemmArgs& g, device ushort* C, uint ldc) {
+    simdgroup_store(acc, scratch, 8u);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = lane * 2u; e < lane * 2u + 2u; e++) {
+        uint m = m_base + e / 8u, n = n_base + e % 8u;
+        if (m < m1 && n < n1) {
+            float v = scratch[e];
+            if (g.B8) v *= g.wscale[n];
+            if (g.bias) v += bf2f(g.bias[n]);
+            C[m * ldc + n] = f2bf(v);
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 }
 inline void gemm_tile(thread const GemmArgs& g, device ushort* C, uint ldc, uint m0, uint m1, uint n0, uint n1,
-                      threadgroup float* tile, uint lid, uint sg) {
-    threadgroup float* As = tile;
-    threadgroup float* Bs = tile + 64u * GK;
+                      threadgroup float* tile, uint lid, uint sg, uint lane) {
+    const uint nchunk = (g.K + GK - 1) / GK;
+    // Staging ownership: threads 0..255 carry the A chunk (one float4 each), 256..511 the B chunk.
+    const bool a_side = lid < 256u, b_side = lid >= 256u && lid < 512u;
+    const uint bt = lid - 256u;
     for (uint mm = m0; mm < m1; mm += 64u)
         for (uint nn = n0; nn < n1; nn += 64u) {
-            simdgroup_float8x8 acc[2][4];
-            for (uint i = 0; i < 2; i++) for (uint j = 0; j < 4; j++) acc[i][j] = simdgroup_float8x8(0.0f);
-            for (uint k0 = 0; k0 < g.K; k0 += GK) {
-                stage(g, mm, nn, 64u, k0, As, Bs, lid);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                mma_chunk(As, Bs, sg, acc);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            // dump the 64x64 accumulator tile over the staging area, then the epilogue
-            uint r0 = (sg / 2u) * 16u, c0 = (sg % 2u) * 32u;
-            for (uint i = 0; i < 2; i++)
-                for (uint j = 0; j < 4; j++) simdgroup_store(acc[i][j], tile + (r0 + i * 8u) * 64u + c0 + j * 8u, 64u);
+            simdgroup_float8x8 acc[2];
+            for (uint j = 0; j < 2; j++) acc[j] = simdgroup_float8x8(0.0f);
+            float4 r = a_side ? load_a(g.A, g.M, g.K, mm, 0, lid)
+                     : (b_side ? load_b(g.B16, g.B8, g.N, g.K, nn, 0, bt) : float4(0.0f));
+            if (a_side) put4(tile, lid, r);
+            if (b_side) put4(tile + 1024u, bt, r);
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint e = lid; e < 64u * 64u; e += NT) {
-                uint m = mm + e / 64u, n = nn + e % 64u;
-                if (m >= m1 || n >= n1) continue;
-                float v = tile[e];
-                if (g.B8) v *= g.wscale[n];
-                if (g.bias) v += bf2f(g.bias[n]);
-                C[m * ldc + n] = f2bf(v);
+            for (uint c = 0; c < nchunk; c++) {
+                threadgroup float* cur = tile + (c & 1u) * 2048u;
+                threadgroup float* nxt = tile + ((c + 1u) & 1u) * 2048u;
+                bool more = c + 1u < nchunk;
+                if (more) {
+                    if (a_side) r = load_a(g.A, g.M, g.K, mm, (c + 1u) * GK, lid);
+                    if (b_side) r = load_b(g.B16, g.B8, g.N, g.K, nn, (c + 1u) * GK, bt);
+                }
+                mma_chunk(cur, cur + 1024u, sg, acc);
+                if (more) {
+                    if (a_side) put4(nxt, lid, r);
+                    if (b_side) put4(nxt + 1024u, bt, r);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
+            uint r0 = (sg / 4u) * 8u, c0 = (sg % 4u) * 16u;
+            threadgroup float* scratch = tile + sg * 64u;
+            for (uint j = 0; j < 2; j++)
+                epilogue8x8(acc[j], scratch, lane, mm + r0, nn + c0 + j * 8u, m1, n1, g, C, ldc);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 }
 // t0=C t1=A t2=B t7=bias?  i0=M i1=N i2=K i4=a_row0 i5=c_row0   (bf16)
 // t0=C t1=A t2=B(e4m3) t3=a_scale? t4=w_scale i0=M i1=N i2=K i4=a_row0 i5=c_row0 (fp8; a_scale -> poison)
 void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint BM, uint BN, bool fp8,
-             threadgroup float* tile, uint lid, uint sg) {
+             threadgroup float* tile, uint lid, uint sg, uint lane) {
     uint M = in.i[0], N = in.i[1], K = in.i[2];
     device ushort* C = ten<ushort>(tab, in, 0) + in.i[5] * N;
     GemmArgs g;
@@ -514,13 +517,14 @@ void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nb
                 C[(m0 + e / (n1 - n0)) * N + n0 + e % (n1 - n0)] = ushort(0x7fc1);
             continue;
         }
-        gemm_tile(g, C, N, m0, m1, n0, n1, tile, lid, sg);
+        gemm_tile(g, C, N, m0, m1, n0, n1, tile, lid, sg, lane);
     }
 }
 // GLU: t0=fu t1=A t2=Wg t5=Wu t6=bias_g? t7=bias_u? i5=act (bf16) / t3=a_scale? t4=g_scale t6=u_scale (fp8)
-// 64x32 sub-tiles: A 64x32 | Bg 32x32 | Bu 32x32 staging; 8 simdgroups x (8 rows x 32 cols) = 4+4 accumulators.
+// 64x32 sub-tiles: chunk buffer = A 64x16 | Bg 32x16 | Bu 32x16 (2048 floats), double-buffered;
+// simdgroup sg owns the 8x8 block (rows sg/4*8, cols sg%4*8): one gate + one up accumulator.
 void op_gemm_glu(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, bool fp8,
-                 threadgroup float* tile, uint lid, uint sg) {
+                 threadgroup float* tile, uint lid, uint sg, uint lane) {
     uint M = in.i[0], N = in.i[1], K = in.i[2], act = in.i[5];
     float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
     device ushort* C = ten<ushort>(tab, in, 0);
@@ -540,47 +544,63 @@ void op_gemm_glu(const thread Inst& in, device const ulong* tab, uint slice, uin
     }
     bool poison = fp8 && (ten<float>(tab, in, 3) != 0 || !gg.wscale || !gu.wscale);
     const uint BM = 256, BN = 128;
+    const uint nchunk = (K + GK - 1) / GK;
     uint tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN;
-    threadgroup float* As = tile;
-    threadgroup float* Bg = tile + 64u * GK;
-    threadgroup float* Bu = tile + 64u * GK + 32u * GK;
+    // Staging ownership: threads 0..255 A, 256..383 Bg, 384..511 Bu (32 rows x 4 quads each).
+    const bool a_side = lid < 256u, g_side = lid >= 256u && lid < 384u, u_side = lid >= 384u && lid < 512u;
+    const uint bt = lid >= 384u ? lid - 384u : lid - 256u;
     for (uint lin = slice; lin < tm * tn; lin += nblk) {
         uint m0 = (lin / tn) * BM, n0 = (lin % tn) * BN;
         uint m1 = min(m0 + BM, M), n1 = min(n0 + BN, N);
         for (uint mm = m0; mm < m1; mm += 64u)
             for (uint nn = n0; nn < n1; nn += 32u) {
-                simdgroup_float8x8 ag[4], au[4];
-                for (uint j = 0; j < 4; j++) { ag[j] = simdgroup_float8x8(0.0f); au[j] = simdgroup_float8x8(0.0f); }
+                simdgroup_float8x8 ag = simdgroup_float8x8(0.0f), au = simdgroup_float8x8(0.0f);
+                const uint r0 = (sg / 4u) * 8u, c0 = (sg % 4u) * 8u;
                 if (!poison) {
-                    for (uint k0 = 0; k0 < K; k0 += GK) {
-                        // A once, both weight streams
-                        stage(gg, mm, nn, 32u, k0, As, Bg, lid);
-                        stage_b(gu.B16, gu.B8, N, K, nn, 32u, k0, Bu, lid);
-                        threadgroup_barrier(mem_flags::mem_threadgroup);
-                        uint r0 = sg * 8u;
+                    float4 r = a_side ? load_a(gg.A, M, K, mm, 0, lid)
+                             : (g_side ? load_b(gg.B16, gg.B8, N, K, nn, 0, bt)
+                             : (u_side ? load_b(gu.B16, gu.B8, N, K, nn, 0, bt) : float4(0.0f)));
+                    if (a_side) put4(tile, lid, r);
+                    if (g_side) put4(tile + 1024u, bt, r);
+                    if (u_side) put4(tile + 1536u, bt, r);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint c = 0; c < nchunk; c++) {
+                        threadgroup float* cur = tile + (c & 1u) * 2048u;
+                        threadgroup float* nxt = tile + ((c + 1u) & 1u) * 2048u;
+                        bool more = c + 1u < nchunk;
+                        if (more) {
+                            if (a_side) r = load_a(gg.A, M, K, mm, (c + 1u) * GK, lid);
+                            if (g_side) r = load_b(gg.B16, gg.B8, N, K, nn, (c + 1u) * GK, bt);
+                            if (u_side) r = load_b(gu.B16, gu.B8, N, K, nn, (c + 1u) * GK, bt);
+                        }
+                        threadgroup const float* As = cur;
+                        threadgroup const float* Bg = cur + 1024u;
+                        threadgroup const float* Bu = cur + 1536u;
                         for (uint kk = 0; kk < GK; kk += 8u) {
                             simdgroup_float8x8 a, bg, bu;
                             simdgroup_load(a, As + r0 * GK + kk, GK);
-                            for (uint j = 0; j < 4; j++) {
-                                simdgroup_load(bg, Bg + (j * 8u) * GK + kk, GK, ulong2(0, 0), true);
-                                simdgroup_load(bu, Bu + (j * 8u) * GK + kk, GK, ulong2(0, 0), true);
-                                simdgroup_multiply_accumulate(ag[j], a, bg, ag[j]);
-                                simdgroup_multiply_accumulate(au[j], a, bu, au[j]);
-                            }
+                            simdgroup_load(bg, Bg + c0 * GK + kk, GK, ulong2(0, 0), true);
+                            simdgroup_load(bu, Bu + c0 * GK + kk, GK, ulong2(0, 0), true);
+                            simdgroup_multiply_accumulate(ag, a, bg, ag);
+                            simdgroup_multiply_accumulate(au, a, bu, au);
+                        }
+                        if (more) {
+                            if (a_side) put4(nxt, lid, r);
+                            if (g_side) put4(nxt + 1024u, bt, r);
+                            if (u_side) put4(nxt + 1536u, bt, r);
                         }
                         threadgroup_barrier(mem_flags::mem_threadgroup);
                     }
                 }
-                // dump: g -> tile[0..2048) as [64][32], u -> tile[2048..4096)
-                for (uint j = 0; j < 4; j++) {
-                    simdgroup_store(ag[j], tile + (sg * 8u) * 32u + j * 8u, 32u);
-                    simdgroup_store(au[j], tile + 2048u + (sg * 8u) * 32u + j * 8u, 32u);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint e = lid; e < 64u * 32u; e += NT) {
-                    uint m = mm + e / 32u, n = nn + e % 32u;
+                // epilogue: gate and up 8x8 blocks side by side in the simdgroup's scratch
+                threadgroup float* scratch = tile + sg * 128u;
+                simdgroup_store(ag, scratch, 8u);
+                simdgroup_store(au, scratch + 64u, 8u);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint e = lane * 2u; e < lane * 2u + 2u; e++) {
+                    uint m = mm + r0 + e / 8u, n = nn + c0 + e % 8u;
                     if (m >= m1 || n >= n1) continue;
-                    float g = tile[e], u = tile[2048u + e];
+                    float g = scratch[e], u = scratch[64u + e];
                     if (fp8) { g *= gg.wscale[n]; u *= gu.wscale[n]; }
                     if (gg.bias) g += bf2f(gg.bias[n]);
                     if (gu.bias) u += bf2f(gu.bias[n]);
@@ -713,9 +733,9 @@ void op_headnorm_rope(const thread Inst& in, device const ulong* tab, uint slice
     uint H2 = hd >> 1, total = ntok * nhead;
     if (hd > 512u || (hd & 63u)) return;   // lane mapping needs hd % 64 == 0 (every model here)
     uint per = hd / 32u;                    // elements per lane: i = lane + 32*j
-    for (uint w0 = slice * NSG; w0 < total; w0 += nblk * NSG) {
+    for (uint w0 = slice * WAVES; w0 < total; w0 += nblk * WAVES) {
         uint w = w0 + sg;
-        if (w >= total) continue;
+        if (sg >= WAVES || w >= total) continue;
         uint t = w / nhead, hh = w % nhead;
         uint position = pos ? uint(pos[t]) : out_row0 + t;
         device const ushort* xr = x + (t * nhead + hh) * hd;
@@ -998,18 +1018,18 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 4: op_residual(in, tab, slice, nblk, lid); return true;
         case 6: op_embed(in, tab, slice, nblk, lid); return true;
         case 7: op_softcap(in, tab, slice, nblk, lid); return true;
-        case 8: op_gemm(in, tab, slice, nblk, 256, 256, false, tile, lid, sg); return true;
-        case 14: op_gemm(in, tab, slice, nblk, 64, 128, false, tile, lid, sg); return true;
-        case 15: op_gemm(in, tab, slice, nblk, 128, 128, false, tile, lid, sg); return true;
-        case 94: op_gemm(in, tab, slice, nblk, 128, 256, false, tile, lid, sg); return true;
-        case 95: op_gemm(in, tab, slice, nblk, 192, 256, false, tile, lid, sg); return true;
-        case 33: op_gemm(in, tab, slice, nblk, 256, 256, true, tile, lid, sg); return true;
-        case 34: op_gemm(in, tab, slice, nblk, 128, 128, true, tile, lid, sg); return true;
-        case 35: op_gemm(in, tab, slice, nblk, 64, 128, true, tile, lid, sg); return true;
-        case 100: op_gemm(in, tab, slice, nblk, 128, 256, true, tile, lid, sg); return true;
-        case 101: op_gemm(in, tab, slice, nblk, 192, 256, true, tile, lid, sg); return true;
-        case 20: op_gemm_glu(in, tab, slice, nblk, false, tile, lid, sg); return true;
-        case 36: op_gemm_glu(in, tab, slice, nblk, true, tile, lid, sg); return true;
+        case 8: op_gemm(in, tab, slice, nblk, 256, 256, false, tile, lid, sg, lane); return true;
+        case 14: op_gemm(in, tab, slice, nblk, 64, 128, false, tile, lid, sg, lane); return true;
+        case 15: op_gemm(in, tab, slice, nblk, 128, 128, false, tile, lid, sg, lane); return true;
+        case 94: op_gemm(in, tab, slice, nblk, 128, 256, false, tile, lid, sg, lane); return true;
+        case 95: op_gemm(in, tab, slice, nblk, 192, 256, false, tile, lid, sg, lane); return true;
+        case 33: op_gemm(in, tab, slice, nblk, 256, 256, true, tile, lid, sg, lane); return true;
+        case 34: op_gemm(in, tab, slice, nblk, 128, 128, true, tile, lid, sg, lane); return true;
+        case 35: op_gemm(in, tab, slice, nblk, 64, 128, true, tile, lid, sg, lane); return true;
+        case 100: op_gemm(in, tab, slice, nblk, 128, 256, true, tile, lid, sg, lane); return true;
+        case 101: op_gemm(in, tab, slice, nblk, 192, 256, true, tile, lid, sg, lane); return true;
+        case 20: op_gemm_glu(in, tab, slice, nblk, false, tile, lid, sg, lane); return true;
+        case 36: op_gemm_glu(in, tab, slice, nblk, true, tile, lid, sg, lane); return true;
         case 10: op_gemv(in, tab, slice, nblk, sg, lane); return true;
         case 19: op_gemv_glu(in, tab, slice, nblk, sg, lane); return true;
         case 22: op_gemv_qkv(in, tab, slice, nblk, sg, lane); return true;

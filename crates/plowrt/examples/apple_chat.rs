@@ -83,6 +83,9 @@ fn main() {
     }
     println!("output: {:?}", tok.decode(&out));
     println!("tokens: {out:?}");
+    if let Some((ops, ms)) = eng.last_cpu {
+        println!("cpu share: {ops} decode ops split with the CPU, {ms:.2} ms of CPU-side time in the last step");
+    }
     if !step_ms.is_empty() {
         let mean = step_ms.iter().sum::<f64>() / step_ms.len() as f64;
         let min = step_ms.iter().cloned().fold(f64::INFINITY, f64::min);

@@ -37,7 +37,7 @@ use crate::exec::kvrow::{place_lm_head_row, rebase_chunk_rows};
 use crate::{Result, RuntimeError};
 
 const MSL: &str = include_str!("../../../../../runtime/apple/interp.metal");
-const THREADS: usize = 256;
+const THREADS: usize = 1024;
 const PAGE: usize = 16384;
 
 type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -82,6 +82,16 @@ struct ProgGpu {
     n_seg: u32,
 }
 
+/// A decode/prefill instruction whose column range is split between the GPU (the walk, on
+/// columns `[0, n_gpu)`) and the CPU worker threads (NEON kernels on `[n_gpu, N)`), joined at a
+/// segment boundary — rung 3's runtime half. `PLOW_CPU_SHARE=<pct>[:<n ops>]`.
+struct CpuSlot {
+    prog: usize,
+    inst: usize,
+    n_gpu: u32,
+    threads: usize,
+}
+
 pub struct MetalEngine {
     pub model: CpuModel,
     _device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -107,6 +117,9 @@ pub struct MetalEngine {
     ane: Vec<AneSlot>,
     /// `(ops run on the ANE, summed ANE ms)` for the last program run that used it.
     pub last_ane: Option<(usize, f64)>,
+    cpu_slots: Vec<CpuSlot>,
+    /// `(ops split with the CPU, summed CPU-side ms)` for the last program run that used it.
+    pub last_cpu: Option<(usize, f64)>,
 }
 
 // SAFETY: Metal and CoreML objects are thread-safe per Apple's documentation, and the serve
@@ -310,10 +323,13 @@ impl MetalEngine {
         );
         #[cfg(feature = "ane")]
         let ane = Self::ane_slots(&model)?;
+        let cpu_slots = Self::cpu_slots(&model)?;
         Ok(MetalEngine {
             #[cfg(feature = "ane")]
             ane,
             last_ane: None,
+            cpu_slots,
+            last_cpu: None,
             model,
             _device: device,
             queue,
@@ -335,6 +351,125 @@ impl MetalEngine {
 
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
+    }
+
+    /// `PLOW_CPU_SHARE=<pct>[:<n ops>]`: give the CPU `pct`% of the columns of the first n (default
+    /// all) GEMV-family instructions of the batch-1 decode program. The GPU walk stops after
+    /// each such instruction; the two halves run concurrently and join at the boundary.
+    fn cpu_slots(model: &CpuModel) -> Result<Vec<CpuSlot>> {
+        let Ok(spec) = std::env::var("PLOW_CPU_SHARE") else {
+            return Ok(Vec::new());
+        };
+        if spec.is_empty() || spec == "0" {
+            return Ok(Vec::new());
+        }
+        let (pct, limit) = match spec.split_once(':') {
+            Some((a, b)) => (
+                a.parse::<u32>()
+                    .map_err(|e| RuntimeError::Device(format!("PLOW_CPU_SHARE: {e}")))?,
+                b.parse::<usize>()
+                    .map_err(|e| RuntimeError::Device(format!("PLOW_CPU_SHARE: {e}")))?,
+            ),
+            None => (
+                spec.parse::<u32>()
+                    .map_err(|e| RuntimeError::Device(format!("PLOW_CPU_SHARE: {e}")))?,
+                usize::MAX,
+            ),
+        };
+        let threads = std::env::var("PLOW_CPU_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8usize)
+            .max(1);
+        let dp = model.decode_prog_for(1);
+        let mut out = Vec::new();
+        for (i, d) in model.blob.progs[dp].insts.iter().enumerate() {
+            if !matches!(d.op, 10 | 19 | 30 | 31) || out.len() >= limit {
+                continue;
+            }
+            // bf16 GEMV norm folds (rms/gamma) are per row, fine; a bias would need a column offset.
+            if d.op == 10 && d.t[7] != packet::dev::TENSOR_NONE16 {
+                continue;
+            }
+            let n = d.i[1];
+            let n_cpu = ((n * pct / 100) / 4) * 4;
+            if n_cpu == 0 || n_cpu >= n {
+                continue;
+            }
+            out.push(CpuSlot {
+                prog: dp,
+                inst: i,
+                n_gpu: n - n_cpu,
+                threads,
+            });
+        }
+        tracing::info!(ops = out.len(), pct, threads, "CPU share slots ready");
+        Ok(out)
+    }
+
+    /// Run the CPU half of slot `si` on `threads` worker threads: the same NEON kernel over the
+    /// instruction's tail columns, with the weight / scale / output tables offset by `n_gpu`.
+    fn run_cpu_slot(&self, si: usize) -> Result<()> {
+        let slot = &self.cpu_slots[si];
+        let mut d = self.progs[slot.prog].insts_host[slot.inst];
+        let n_gpu = slot.n_gpu as usize;
+        let k = d.i[2] as usize;
+        let n_cpu = d.i[1] as usize - n_gpu;
+        let n_tensors = self.model.names.len();
+        let mut table: Vec<*mut c_void> = (0..n_tensors)
+            .map(|h| self.host_ptr(h) as *mut c_void)
+            .collect();
+        let fp8 = d.op == 30 || d.op == 31;
+        let w_bytes = if fp8 { k } else { k * 2 };
+        let (w_slots, s_slots): (&[usize], &[usize]) = match d.op {
+            30 => (&[2], &[5]),
+            31 => (&[2, 5], &[3, 4]),
+            19 => (&[2, 5], &[6, 7]), // bf16 GLU biases are per column too
+            _ => (&[2], &[]),
+        };
+        let off = |table: &mut Vec<*mut c_void>, slot: usize, bytes: usize| {
+            let h = d.t[slot];
+            if h != packet::dev::TENSOR_NONE16 {
+                // SAFETY: an in-bounds column offset of the tensor.
+                table[h as usize] =
+                    unsafe { (table[h as usize] as *mut u8).add(bytes) } as *mut c_void;
+            }
+        };
+        for &w in w_slots {
+            off(&mut table, w, n_gpu * w_bytes);
+        }
+        for &sc in s_slots {
+            off(&mut table, sc, n_gpu * if d.op == 19 { 2 } else { 4 });
+        }
+        off(&mut table, 0, n_gpu * 2);
+        d.i[1] = n_cpu as u32;
+        let f = ffi::kernel(d.op)
+            .ok_or_else(|| RuntimeError::Device(format!("no CPU kernel for op {}", d.op)))?;
+        let scratch_bytes = ffi::scratch_bytes().max(64) as usize;
+        let table_ptr = table.as_ptr() as usize;
+        let threads = slot.threads;
+        std::thread::scope(|sc| {
+            for w in 0..threads {
+                sc.spawn(move || {
+                    let mut ctx = ffi::PlowCpuCtx::new(w as u32, 0);
+                    let mut scratch = vec![0u64; scratch_bytes / 8 + 8];
+                    ctx.scratch = scratch.as_mut_ptr() as *mut c_void;
+                    ctx.scratch_bytes = scratch_bytes as u32;
+                    let _ = ffi::thread_init(&mut ctx);
+                    // SAFETY: disjoint column slices of one op on tensors the GPU half does not write.
+                    unsafe {
+                        f(
+                            &d,
+                            w as u32,
+                            threads as u32,
+                            table_ptr as *const *mut c_void,
+                            &mut ctx,
+                        )
+                    };
+                });
+            }
+        });
+        Ok(())
     }
 
     /// `PLOW_ANE=1|<n>|all`: delegate the first n (or every) eligible GEMM of the 128-row
@@ -591,6 +726,44 @@ impl MetalEngine {
                 return self.check_fault(p);
             }
         }
+        let mine: Vec<usize> = (0..self.cpu_slots.len())
+            .filter(|&i| self.cpu_slots[i].prog == p)
+            .collect();
+        if !mine.is_empty() && !self.serial {
+            self.last_cpu = None;
+            let n = self.progs[p].insts_host.len() as u32;
+            let mut lo = 0u32;
+            let mut cpu_ms = 0.0;
+            for si in mine {
+                let (i, n_gpu) = (self.cpu_slots[si].inst as u32, self.cpu_slots[si].n_gpu);
+                // Producers of instruction i must be complete before the CPU half reads them:
+                // sync the walk up to i, then run the GPU's column share of i and the CPU's tail
+                // concurrently. Two boundaries per split op — the cost §2.2 pairs joins to avoid.
+                self.dispatch_range(p, lo, i)?;
+                let full_n = self.progs[p].insts_host[i as usize].i[1];
+                self.progs[p].insts_host[i as usize].i[1] = n_gpu;
+                let cb = self.commit_range(p, i, i + 1)?;
+                self.progs[p].insts_host[i as usize].i[1] = full_n;
+                let t = Instant::now();
+                self.run_cpu_slot(si)?;
+                cpu_ms += t.elapsed().as_secs_f64() * 1e3;
+                cb.waitUntilCompleted();
+                if cb.status() != MTLCommandBufferStatus::Completed {
+                    return Err(RuntimeError::Device(format!(
+                        "metal: program {p} command buffer status {:?}",
+                        cb.status()
+                    )));
+                }
+                lo = i + 1;
+                self.last_cpu = Some(match self.last_cpu {
+                    Some((c, _)) => (c + 1, cpu_ms),
+                    None => (1, cpu_ms),
+                });
+            }
+            self.dispatch_range(p, lo, n)?;
+            self.last_run_us = t0.elapsed().as_secs_f64() * 1e6;
+            return self.check_fault(p);
+        }
         self.dispatch_range(p, 0, u32::MAX)?;
         self.last_run_us = t0.elapsed().as_secs_f64() * 1e6;
         self.check_fault(p)
@@ -625,6 +798,38 @@ impl MetalEngine {
     /// One command buffer running every segment of program `p` restricted to instructions
     /// `[inst_lo, inst_hi)`; waits for completion.
     fn dispatch_range(&mut self, p: usize, inst_lo: u32, inst_hi: u32) -> Result<()> {
+        let cb = self.commit_range(p, inst_lo, inst_hi)?;
+        cb.waitUntilCompleted();
+        if cb.status() != MTLCommandBufferStatus::Completed {
+            let e = cb.error().map(|e| e.to_string()).unwrap_or_default();
+            return Err(RuntimeError::Device(format!(
+                "metal: program {p} command buffer status {:?}: {e}",
+                cb.status()
+            )));
+        }
+        Ok(())
+    }
+
+    /// As [`Self::dispatch_range`] but returns the committed command buffer without waiting, so
+    /// host-side work (a CPU column share) can overlap it.
+    fn commit_range(
+        &mut self,
+        p: usize,
+        inst_lo: u32,
+        inst_hi: u32,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        // The instruction table may have been patched since the last copy.
+        {
+            let pg = &self.progs[p];
+            // SAFETY: shared buffer sized at load for this table; no run in flight on it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pg.insts_host.as_ptr() as *const u8,
+                    pg.insts.contents().as_ptr() as *mut u8,
+                    std::mem::size_of_val(pg.insts_host.as_slice()),
+                );
+            }
+        }
         let pg = &self.progs[p];
         let n_cu = self.model.blob.n_cu as usize;
         let cb = self
@@ -724,15 +929,7 @@ impl MetalEngine {
             enc.endEncoding();
         }
         cb.commit();
-        cb.waitUntilCompleted();
-        if cb.status() != MTLCommandBufferStatus::Completed {
-            let e = cb.error().map(|e| e.to_string()).unwrap_or_default();
-            return Err(RuntimeError::Device(format!(
-                "metal: program {p} command buffer status {:?}: {e}",
-                cb.status()
-            )));
-        }
-        Ok(())
+        Ok(cb)
     }
 
     /// The compiled prefill buckets as `(program, rows)`.
@@ -839,6 +1036,12 @@ impl MetalEngine {
     /// The (patched) instructions of program `p`.
     pub fn insts_host(&self, p: usize) -> &[DevInst64] {
         &self.progs[p].insts_host
+    }
+
+    /// Mutable view for calibration experiments (a patched instruction is copied to the device
+    /// by the next `run_inst`/`run_prog`).
+    pub fn insts_host_mut(&mut self, p: usize) -> &mut [DevInst64] {
+        &mut self.progs[p].insts_host
     }
 
     /// Diagnostic: run ONE instruction of program `p` (all its slices) as its own dispatch.
