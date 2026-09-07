@@ -229,6 +229,41 @@ This parks the largest remaining decode lever: it would take ~2.7 GB/rank/token 
 stream, about −17% if decode were purely bandwidth-bound. The blob and the weight dir are both
 built and on disk, so the retry after a kernel fix is cheap.
 
+## 5f. No reference engine can serve GLM-5.3 on this host
+
+Both candidate references were taken as far as they go. Neither runs, and in both cases the
+blocker is GLM's DSA sparse-attention indexer meeting this host's toolchain.
+
+**vLLM 0.28.** With AITER the server loads (176.22 GiB/rank in 161.8 s), allocates 66,912
+tokens of KV cache, reports startup complete, and then the FIRST forward dies inside the
+indexer's own kernel:
+
+```
+aiter/ops/flydsl/kernels/fp8_mqa_logits.py
+  -> flydsl/compiler/jit_function.py:784 _run_pipeline
+  -> MLIRError: Failure while executing pass pipeline:
+     error: "-":2:3: lld invocation failed
+```
+
+reached from `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py`. The `lld` call is INSIDE
+flydsl's bundled MLIR, not a subprocess, so the PATH shims that fixed `rocminfo` and `gcc`
+cannot reach it; pointing `ROCM_PATH` at the complete `/opt/rocm-7.2.4` tree changed nothing.
+With AITER off vLLM refuses at startup — `Sparse attention indexer ROCm path is only supported
+on AITER` — because the indexer has no non-AITER ROCm kernel and no flag disables DSA.
+
+**SGLang 0.5.19.** The model is first-class (`GlmMoeDsaForCausalLM` in `models/glm4_moe.py`,
+registered with NextN/MTP handling) and its ROCm DSA branch is real: `_use_aiter` gated on
+`is_hip()`, routing through `aiter_paged_mqa_logits`, which lives in `aiter/ops/**triton**/`
+rather than `aiter/ops/flydsl/` — so SGLang would sidestep the exact JIT that kills vLLM. It
+still cannot run: `sglang` imports `sgl_kernel`, PyPI ships only a CUDA build of it
+(`cp310-abi3-linux_x86_64`, fails with `libnvrtc.so.12`), there is no `sgl-kernel-rocm`, and
+SGLang's ROCm kernels ship inside container images while this host has no container runtime
+(docker, podman, nerdctl, singularity, apptainer all absent).
+
+**Consequence.** The plow-vs-reference comparison is unavailable for GLM-5.3 on this host. That
+is a statement about ROCm DSA support in both engines, NOT a plow result, and no number in this
+document should be presented as beating either of them.
+
 ## 6. Open levers, in the order worth taking
 
 1. **Measured GEMM tiles** (§5 caveat 2). Cheapest, and it gates the ranking of everything else.
