@@ -42,8 +42,13 @@ for key, name, better in METRICS:
             if j is None or key not in j:
                 cells.append("—"); continue
             vals[l] = j[key]; cells.append(f"{j[key]:.2f}")
+        # Best PLOW arm of whatever arms are present, against the vLLM reference. Oriented so
+        # >1 always means plow loses, whichever direction the metric runs.
         ratio = "—"
-        if "plow" in vals and "vllm" in vals and vals["plow"]:
-            r = vals["vllm"] / vals["plow"] if better == "higher" else vals["plow"] / vals["vllm"]
-            ratio = f"{r:.2f}x"
+        parms = {k: v for k, v in vals.items() if k != "vllm"}
+        if parms and "vllm" in vals:
+            best = max(parms.values()) if better == "higher" else min(parms.values())
+            if best:
+                r = vals["vllm"] / best if better == "higher" else best / vals["vllm"]
+                ratio = f"{r:.2f}x"
         print(f"| {tp} | {inlen} | {conc} | " + " | ".join(cells) + f" | {ratio} |")
