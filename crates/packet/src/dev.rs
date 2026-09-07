@@ -169,9 +169,11 @@ pub enum DevOp {
     /// `crate::slots`' drift test; see that module for why the table is checked
     /// against these comments rather than generated from them.
     FlashPrefill = 11,
-    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32)` ·
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32) t6=decode_slot(i32)?` ·
     /// `i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window i5=nsplit i6=hd` ·
-    /// `f0=scale`.
+    /// `f0=scale`. For ordinary BF16, `decode_slot[b]` selects the physical KV slot for
+    /// compact row `b`; when absent, physical slot and compact row are identical. Packed
+    /// extension forms retain their extension-specific operands.
     FlashDecode = 12,
     /// `t0=O t1=Opart t2=mlpart t3=sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
     ///

@@ -155,6 +155,114 @@ fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
 }
 
 #[test]
+fn validates_hd64_half_split_attention_ladder() {
+    let mut blob = fixture();
+    for g in &mut blob.progs {
+        for d in &mut g.insts[..2] {
+            d.i[2] = 64;
+        }
+        g.insts[0].i[5] = packet::dev::ROPE_PAIR_HALF;
+        g.insts[2].i[6] = 64;
+        g.insts[3].i[3] = 64;
+    }
+    for t in &mut blob.tensors[3..5] {
+        t.bytes /= 4;
+    }
+    blob.tensors[5].bytes /= 4;
+    blob.tensors[7].bytes /= 4;
+    assert!(validate_decode_ladder(&blob).unwrap());
+    blob.progs[0].insts[0].i[5] = 0;
+    assert!(validate_decode_ladder(&blob).is_err());
+}
+
+fn append_flat_mxfp4_moe(blob: &mut DevBlob) {
+    for g in &mut blob.progs {
+        let rows = g.t;
+        let mut router = DevInst64 {
+            op: DevOp::MoeRouterTopkPf as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        router.i = [0, 32, 4, 2, rows, 0, 0, 0];
+        let mut glu = DevInst64 {
+            op: DevOp::MoeGluMx as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        glu.i = [4, 2880, 2880, 32, 0, 3, rows, 0];
+        let mut down = DevInst64 {
+            op: DevOp::MoeDownMx as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        down.i = [4, 2880, 2880, 32, 0, 0, rows, 0];
+        let mut combine = DevInst64 {
+            op: DevOp::MoeCombinePf as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        combine.i = [2880, 4, rows, 0, 0, 0, 0, 0];
+        for d in [router, glu, down, combine] {
+            let entry = StreamEnt {
+                inst: g.insts.len() as u32,
+                ..Default::default()
+            };
+            g.insts.push(d);
+            g.stream.push(entry);
+            g.gq_stream.push(entry);
+        }
+        g.stream_len[0] = g.stream.len() as u32;
+        g.gq_seg_ofs[1] = g.gq_stream.len() as u32;
+    }
+}
+
+#[test]
+fn validates_flat_mxfp4_moe_decode_ladder_rows() {
+    let mut blob = fixture();
+    append_flat_mxfp4_moe(&mut blob);
+    assert!(validate_decode_ladder(&blob).unwrap());
+    for (inst, field) in [(4, 4), (5, 6), (6, 6), (7, 2)] {
+        let mut invalid = fixture();
+        append_flat_mxfp4_moe(&mut invalid);
+        invalid.progs[1].insts[inst].i[field] = 1;
+        assert!(validate_decode_ladder(&invalid).is_err());
+    }
+}
+
+#[test]
+fn fine_gated_prefill_selects_segment_pair_from_packet_topology() {
+    let mut blob = fixture();
+    let mut prefill = blob.progs.remove(0);
+    prefill.t = 256;
+    prefill.stream[0].flags |= packet::dev::SE_FINE;
+    blob.progs.insert(0, prefill);
+    assert!(prefill_needs_segment_pair(&blob, None));
+    blob.progs[0].stream[0].flags &= !packet::dev::SE_FINE;
+    assert!(!prefill_needs_segment_pair(&blob, None));
+}
+
+#[test]
+#[ignore = "CPU-only actual packet check; set TEST_SEGMENTED_PREFILL_PACKET"]
+fn actual_seven_program_packet_selects_segment_pair() {
+    let path = std::env::var("TEST_SEGMENTED_PREFILL_PACKET").unwrap();
+    let blob = DevBlob::parse(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(blob.progs.len(), 7);
+    assert_eq!(blob.prefill_progs().len(), 3);
+    assert!(prefill_needs_segment_pair(&blob, None));
+}
+
+#[test]
+fn decode_ladder_accepts_runtime_input_capacity_beyond_widest_rung() {
+    let mut blob = fixture();
+    blob.tensors[1].bytes = 128 * 4;
+    assert!(validate_decode_ladder(&blob).unwrap());
+}
+
+#[test]
 fn unsupported_families_and_single_rung_keep_widest_execution() {
     let mut blob = fixture();
     for g in &mut blob.progs {

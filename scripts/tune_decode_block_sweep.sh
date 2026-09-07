@@ -44,11 +44,9 @@ CTX="1024,8192"
 ITERS=60
 WARMUP=10
 PF_ITERS=3
-# Rows of act.x uploaded per prefill pass. act.x is sized by the packet's largest
-# PREFILL BUCKET (8192 on a 12B block), not by max_ctx, so without this a ctx
-# above the bucket is rejected at upload and the block cannot be benched at all
-# above 8k. See the flag's comment in examples/block_run.rs.
-PF_CHUNK=8192
+# Rows of act.x uploaded per prefill pass. Zero derives the packet's largest
+# prefill bucket from build.json; --pf-chunk remains an explicit override.
+PF_CHUNK=0
 OUT=""
 WORK=/dev/shm/plowtune/block
 MEM_HEADROOM=6000     # MiB free the card must have; a block is small, but a
@@ -78,6 +76,7 @@ done
 [ -n "$ASSET" ] || { echo "--asset is required" >&2; exit 2; }
 [ -n "$OUT" ] || { echo "--out is required" >&2; exit 2; }
 [ -f "$ASSET/block.json" ] || { echo "no block.json in $ASSET" >&2; exit 2; }
+[ -f "$ASSET/build.json" ] || { echo "no build.json in $ASSET" >&2; exit 2; }
 
 BLOCK_RUN="$ROOT/target/release/examples/block_run"
 [ -x "$BLOCK_RUN" ] || { echo "no block_run at $BLOCK_RUN" >&2; exit 2; }
@@ -103,9 +102,29 @@ touch "$OUT"
 
 LAYER="$(sed -n 's/.*"layer": *\([0-9]*\).*/\1/p' "$ASSET/block.json" | head -1)"
 KVH="$(sed -n 's/.*"kv_heads": *\([0-9]*\).*/\1/p' "$ASSET/block.json" | head -1)"
+ARCH="$(python3 - "$ASSET/build.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("arch", "sm_120a"))
+PY
+)"
+if [ "$PF_CHUNK" -eq 0 ]; then
+  PF_CHUNK="$(python3 - "$ASSET/build.json" <<'PY'
+import json, sys
+buckets = json.load(open(sys.argv[1])).get("shapes", {}).get("prefill_buckets", [])
+print(max(buckets, default=0))
+PY
+)"
+  [ "$PF_CHUNK" -gt 0 ] || { echo "build.json has no prefill bucket" >&2; exit 2; }
+fi
+case "$ARCH" in
+  sm_90a)  BUILD_SH=build_sm90a_cubin.sh; CUBIN=interp_sm90a.cubin;;
+  sm_120a) BUILD_SH=build_sm120_cubin.sh; CUBIN=interp_sm120.cubin;;
+  *) echo "unsupported CUDA block architecture '$ARCH'" >&2; exit 2;;
+esac
 echo "asset  : $ASSET  (layer $LAYER, kv_heads $KVH)"
+echo "arch   : $ARCH  ($BUILD_SH)"
 echo "arms   : $ARMS"
-echo "grid   : batch[$BATCH] ctx[$CTX]  iters=$ITERS"
+echo "grid   : batch[$BATCH] ctx[$CTX]  iters=$ITERS pf_chunk=$PF_CHUNK"
 
 # Same cache discipline as tune_decode_sweep.sh: keyed by the SHA of the FULL
 # define string, so an arm that names nothing builds an object byte-identical to
@@ -115,24 +134,27 @@ build_arm() {   # $1 arm -> echoes cubin dir
   if [ "$arm" != "none" ]; then
     for one in ${arm//+/ }; do defs="$defs -D$one"; done
   fi
-  local key; key="$(printf '%s' "$defs" | sha256sum | cut -c1-16)"
+  local key; key="$(printf '%s\n%s' "$ARCH" "$defs" | sha256sum | cut -c1-16)"
   local dir="$WORK/cubin/$key"
-  if [ -f "$dir/interp_sm120.cubin" ]; then echo "$dir"; return 0; fi
+  if [ -f "$dir/.complete" ] && [ -f "$dir/$CUBIN" ]; then echo "$dir"; return 0; fi
   mkdir -p "$dir"; printf '%s\n' "$defs" > "$dir/defines"
   echo "  [build] $arm -> $key ($defs)" >&2
-  [ "$DRY" = "1" ] && { echo "$dir"; return 0; }
-  PLOW_ROOT="$ROOT" PLOW_EXTRA_DEFINES="$defs" \
-    "$ROOT/scripts/build_sm120_cubin.sh" "$dir/interp_sm120.cubin" \
+  [ "$DRY" = "1" ] && { : > "$dir/registers"; echo "$dir"; return 0; }
+  local tmp="$dir/${CUBIN%.cubin}.build.$$.cubin"
+  PLOW_ROOT="$ROOT" PLOW_EXTRA_DEFINES="$defs" PLOW_BUILD_DECODE_ONLY=1 \
+    "$ROOT/scripts/$BUILD_SH" "$tmp" \
     >"$WORK/log/build_$key.log" 2>&1 \
     || { echo "FATAL: build failed for $arm — see $WORK/log/build_$key.log" >&2; exit 1; }
   # Registers AND occupancy, recorded per object. Trap 2 in the header: an
   # optimum found at the block's occupancy is wrong at the model's, and the only
   # way to know is to look.
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin cuobjdump -res-usage \
-      "$dir/interp_sm120.cubin" 2>/dev/null \
-    | awk '/interp_sm12011PlowProgram/{f=1}
+      "$tmp" 2>/dev/null \
+    | awk -v stem="${CUBIN%.cubin}" '$0 ~ stem "11PlowProgram"{f=1}
            f && /REG:/ { for(i=1;i<=NF;i++) if($i ~ /^REG:/){sub("REG:","",$i); print $i; exit} }' \
     > "$dir/registers" || true
+  mv "$tmp" "$dir/$CUBIN"
+  touch "$dir/.complete"
   echo "$dir"
 }
 
@@ -143,8 +165,14 @@ for arm in $ARMS; do
   # changes between arms, which is the whole point — anything else varying would
   # make the ranking attribute a packet difference to a define.
   adir="$WORK/asset/$arm"; mkdir -p "$adir"
-  for f in block.json model.pkt weights.json tokenizer.json checkpoint sample_sm120.cubin interp_sm120_pf.cubin; do
+  for f in block.json model.pkt weights.json tokenizer.json checkpoint; do
     [ -e "$ASSET/$f" ] && ln -sfn "$(readlink -f "$ASSET/$f")" "$adir/$f"
+  done
+  # Decode sweeps must retain the packet-paired prefill and role objects. A
+  # general object rebuilt from the same source can reject segmented/fine-gated
+  # prefill metadata even though the decode object is valid.
+  for f in "$ASSET/${CUBIN%.cubin}"_*.cubin; do
+    [ -e "$f" ] && ln -sfn "$(readlink -f "$f")" "$adir/$(basename "$f")"
   done
   # GF_FULL IS A PAIR. The emitter sizes the full layers' nsplit from
   # `n_grp = heads / FA_GF_FULL`, so an arm that changes only the OBJECT define
@@ -166,8 +194,17 @@ for arm in $ARMS; do
         exit 1
       fi;;
   esac
-  ln -sfn "$cdir/interp_sm120.cubin" "$adir/interp_sm120.cubin"
-  [ -f "$cdir/interp_sm120_pf.cubin" ] && ln -sfn "$cdir/interp_sm120_pf.cubin" "$adir/interp_sm120_pf.cubin"
+  ln -sfn "$cdir/$CUBIN" "$adir/$CUBIN"
+  run_env=()
+  if [ -e "$adir/${CUBIN%.cubin}_pfseg.cubin" ] &&
+     [ -e "$adir/${CUBIN%.cubin}_pfgemm.cubin" ]; then
+    run_env+=(
+      "PLOW_PF_SEG_DIR=$adir"
+      "PLOW_PF_SEG_PURE=1"
+      "PLOW_PF_SEG_FA512=all"
+      "PLOW_PF_SEG_GRAPH=1"
+    )
+  fi
 
   echo "[arm] $arm  regs=$regs"
   [ "$DRY" = "1" ] && continue
@@ -189,7 +226,7 @@ for arm in $ARMS; do
   log="$WORK/log/run_${arm}.log"
   set +e
   "$ROOT/perf-data/tools/gpulease" "${LABEL}-${arm}" \
-    "$BLOCK_RUN" "$adir" bench --batch "$BATCH" --ctx "$CTX" \
+    env "${run_env[@]}" "$BLOCK_RUN" "$adir" bench --batch "$BATCH" --ctx "$CTX" \
       --iters "$ITERS" --warmup "$WARMUP" --prefill-iters "$PF_ITERS" \
       --pf-chunk "$PF_CHUNK" >"$log" 2>&1
   rc=$?

@@ -126,13 +126,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use packet::dev::{DevInst64, DevOp, DevProgram, PrefillSpan, PREFILL_SPAN_RESET_STATE, SE_XCTR};
+use packet::dev::{DevInst64, DevOp, DevProgram, PrefillSpan, SE_XCTR};
 use packet::devbuild::{lean_attn_res_f32mix_inst64, static_seg_ofs};
 use serde::Serialize;
 
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
+use crate::exec::amd_packed::validate_rows as validate_amd_packed_rows;
 use crate::exec::device_api::EngineDevice;
 use crate::exec::kvrow::{
     derive_kvrow, is_lm_head_matmul, kvrow_span, prefill_row_field, rebase_chunk_rows, RowField,
@@ -6853,81 +6854,11 @@ fn validate_packed_prefill(
     }
     let prog_u32 = u32::try_from(prog)
         .map_err(|_| RuntimeError::Device(format!("prefill program index {prog} exceeds u32")))?;
-    let mut row = 0u32;
-    for (i, span) in spans.iter().enumerate() {
-        if span.row0 != row || span.n_rows == 0 {
-            return Err(RuntimeError::Device(format!(
-                "packed prefill span {i} is not dense: row0={} n_rows={} expected row0={row}",
-                span.row0, span.n_rows
-            )));
-        }
-        if span.flags & !PREFILL_SPAN_RESET_STATE != 0 {
-            return Err(RuntimeError::Device(format!(
-                "packed prefill span {i} has unknown flags {:#x}",
-                span.flags
-            )));
-        }
-        let reset = span.flags & PREFILL_SPAN_RESET_STATE != 0;
-        if reset != (span.kv_row0 == 0) {
-            return Err(RuntimeError::Device(format!(
-                "packed prefill span {i} reset flag disagrees with kv_row0={}",
-                span.kv_row0
-            )));
-        }
-        let kv_end = span.kv_row0.checked_add(span.n_rows).ok_or_else(|| {
-            RuntimeError::Device(format!("packed prefill span {i} KV range overflows u32"))
-        })?;
-        if kv_end != span.kv_len {
-            return Err(RuntimeError::Device(format!(
-                "packed prefill span {i} has kv_row0+n_rows={kv_end}, kv_len={}",
-                span.kv_len
-            )));
-        }
-        if span.slot as usize >= batch
-            || span.state_slot as usize >= batch
-            || span.slot != span.state_slot
-        {
-            return Err(RuntimeError::Device(format!(
-                "packed prefill span {i} has incompatible KV/state slots {}/{} for batch {batch}",
-                span.slot, span.state_slot
-            )));
-        }
-        if span.program != prog_u32 {
-            return Err(RuntimeError::Device(format!(
-                "packed prefill span {i} names program {}, staged for {prog}",
-                span.program
-            )));
-        }
-        if spans[..i].iter().any(|prior| prior.slot == span.slot) {
-            return Err(RuntimeError::Device(format!(
-                "packed prefill slot {} appears in more than one span",
-                span.slot
-            )));
-        }
-        row = row
-            .checked_add(span.n_rows)
-            .ok_or_else(|| RuntimeError::Device("packed prefill row count overflows u32".into()))?;
-    }
-    if row > rung {
-        return Err(RuntimeError::Device(format!(
-            "packed prefill has {row} rows but program {prog} is compiled for {rung}"
-        )));
-    }
-    if parked.len() != rung as usize
-        || parked.iter().any(|&v| v > 1)
-        || parked[..row as usize].iter().any(|&v| v != 0)
-        || parked[row as usize..].iter().any(|&v| v == 0)
-    {
-        return Err(RuntimeError::Device(format!(
-            "packed prefill parked mask must have {rung} binary rows, active [0,{row})=0 and padding [{row},{rung})!=0 (got {})",
-            parked.len()
-        )));
-    }
-    let n_spans = u32::try_from(spans.len())
-        .map_err(|_| RuntimeError::Device("packed prefill span count exceeds u32".into()))?;
+    let rows = validate_amd_packed_rows(prog_u32, 0, rung, batch, spans, parked)
+        .map_err(|error| RuntimeError::Device(format!("packed prefill: {error}")))?;
     Ok(PackedPrefillBinding {
         prog,
-        n_spans,
+        n_spans: rows.n_spans,
         n_rows: rung,
     })
 }
@@ -13678,6 +13609,7 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 mod tests {
     use super::*;
     use crate::exec::kvrow::KDA_ROW_COUNT_OPS;
+    use packet::dev::PREFILL_SPAN_RESET_STATE;
 
     #[test]
     fn materialized_mla_flat_grid_covers_every_qblock_head_and_batch_once() {

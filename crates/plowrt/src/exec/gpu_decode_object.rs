@@ -490,23 +490,7 @@ mod tests {
         .is_err());
     }
     fn elf(sm: u32, entry: &str) -> Vec<u8> {
-        let mut e = vec![0u8; 217 + entry.len() + 1];
-        e[..6].copy_from_slice(b"\x7fELF\x02\x01");
-        e[0x30..0x34].copy_from_slice(&(sm << 8).to_le_bytes());
-        e[0x28..0x30].copy_from_slice(&64u64.to_le_bytes());
-        e[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
-        e[0x3c..0x3e].copy_from_slice(&2u16.to_le_bytes());
-        e[68..72].copy_from_slice(&2u32.to_le_bytes());
-        e[88..96].copy_from_slice(&192u64.to_le_bytes());
-        e[96..104].copy_from_slice(&24u64.to_le_bytes());
-        e[104..108].copy_from_slice(&1u32.to_le_bytes());
-        e[132..136].copy_from_slice(&3u32.to_le_bytes());
-        e[152..160].copy_from_slice(&216u64.to_le_bytes());
-        e[160..168].copy_from_slice(&((entry.len() + 2) as u64).to_le_bytes());
-        e[192..196].copy_from_slice(&1u32.to_le_bytes());
-        e[196] = 0x12;
-        e[217..217 + entry.len()].copy_from_slice(entry.as_bytes());
-        e
+        plow_asset::cubin::synthetic_elf(entry, &[], sm)
     }
     #[test]
     fn image_identity_isa_and_entry_are_checked_without_external_files() {

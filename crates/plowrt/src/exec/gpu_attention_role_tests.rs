@@ -88,6 +88,42 @@ fn metadata() -> serde_json::Value {
     },"programs":[{"index":0,"roles":[0,1,2,2,0]}]})
 }
 
+fn hd512_fixture() -> (DevProg, Vec<DevTensor>) {
+    let (mut program, mut tensors) = fixture(128, 1);
+    let work = 128_u64 * 24;
+    tensors[0].bytes = work * 512 * 4;
+    tensors[2].bytes = work * 512 * 2;
+    tensors[3].bytes = 4 * 65536 * 512 * 2;
+    tensors[4].bytes = 4 * 65536 * 512 * 2;
+    tensors[5].bytes = work * 512 * 2;
+    tensors.push(DevTensor {
+        name: "kv.map".into(),
+        bytes: 256,
+        init: None,
+    });
+    program.insts[2].i[6] = 512;
+    program.insts[2].t[7] = 6;
+    program.insts[3].i[3] = 512;
+    (program, tensors)
+}
+
+fn hd512_object() -> plow_asset::segment_roles::SegmentObject {
+    plow_asset::segment_roles::SegmentObject {
+        abi: plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32_ABI.into(),
+        file: "attention.cubin".into(),
+        sha256: Some("a".repeat(64)),
+        promote_k512: None,
+        attention: Some(plow_asset::segment_roles::AttentionCapability {
+            profile: "sm90a".into(),
+            dtype: "bf16".into(),
+            head_dim: 512,
+            query_tile: 64,
+            kv_tile: 32,
+            warps: 8,
+        }),
+    }
+}
+
 #[test]
 fn accepts_combined_roles_and_preserves_packet_split_counts() {
     for (rows, splits) in [(128, 3), (1024, 2), (4096, 1), (8192, 4)] {
@@ -223,7 +259,97 @@ fn rejects_missing_unused_and_mismatched_role_objects() {
 }
 
 #[test]
-#[ignore = "requires TEST_ATTENTION_ROLE_PACKET pointing to a role2 packet"]
+fn accepts_exact_hd512_wg32_contract_and_rejects_drift() {
+    let (program, tensors) = hd512_fixture();
+    assert_eq!(
+        packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).unwrap(),
+        [0, 0, 6, 0, 0]
+    );
+    let object = hd512_object();
+    check_attention_hd512_role(
+        "sm90a",
+        &object,
+        Some(1),
+        Some(256),
+        [Some(512), Some(64), Some(32), Some(8)],
+    )
+    .unwrap();
+    for geometry in [
+        [Some(256), Some(64), Some(32), Some(8)],
+        [Some(512), Some(32), Some(32), Some(8)],
+        [Some(512), Some(64), Some(16), Some(8)],
+        [Some(512), Some(64), Some(32), Some(4)],
+    ] {
+        assert!(
+            check_attention_hd512_role("sm90a", &object, Some(1), Some(256), geometry).is_err()
+        );
+    }
+    assert!(check_attention_hd512_role(
+        "sm120",
+        &object,
+        Some(1),
+        Some(256),
+        [Some(512), Some(64), Some(32), Some(8)]
+    )
+    .is_err());
+
+    for case in 0..4 {
+        let (mut program, mut tensors) = hd512_fixture();
+        match case {
+            0 => program.insts[2].op = DevOp::FlashPrefillFp8 as u16,
+            1 => program.insts[2].t[7] = TENSOR_NONE16,
+            2 => tensors[6].bytes = 128,
+            3 => {}
+            _ => unreachable!(),
+        }
+        let roles = if case == 3 {
+            [0, 0, 0, 6, 0]
+        } else {
+            [0, 0, 6, 0, 0]
+        };
+        assert!(packet_role_segments(&program, &roles, &tensors).is_err());
+    }
+}
+
+#[test]
+fn packet_role_overrides_only_its_legacy_prefill_segment() {
+    let (program, tensors) = hd512_fixture();
+    let roles = packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).unwrap();
+    let legacy_classes = [4, 8, 2, 4, 8];
+    let dispatch: Vec<_> = legacy_classes
+        .iter()
+        .enumerate()
+        .map(|(segment, &class)| (packet_role_index(&roles, segment), class))
+        .collect();
+    assert_eq!(
+        dispatch,
+        [(None, 4), (None, 8), (Some(5), 2), (None, 4), (None, 8),]
+    );
+}
+
+#[test]
+fn accepts_hd512_fused_output_and_rejects_unsafe_contracts() {
+    let (mut program, mut tensors) = hd512_fixture();
+    program.insts[2].t[5] = 5;
+    assert_eq!(
+        packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).unwrap(),
+        [0, 0, 6, 0, 0]
+    );
+
+    program.insts[2].t[5] = 2;
+    assert!(packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).is_err());
+
+    program.insts[2].t[5] = 5;
+    program.insts[2].i[7] = 2;
+    assert!(packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).is_err());
+
+    program.insts[2].i[7] = 1;
+    tensors[5].bytes -= 1;
+    assert!(packet_role_segments(&program, &[0, 0, 6, 0, 0], &tensors).is_err());
+}
+
+#[test]
+#[ignore = "requires TEST_ATTENTION_ROLE_PACKET pointing to an attention-role packet"]
 fn actual_packet_attention_roles() {
     let path = std::env::var("TEST_ATTENTION_ROLE_PACKET").expect("packet path");
     let raw = std::fs::read(path).unwrap();
@@ -236,7 +362,13 @@ fn actual_packet_attention_roles() {
         .programs
         .iter()
         .flat_map(|p| &p.roles)
-        .filter(|&&r| r == 2)
+        .filter(|&&role| {
+            matches!(
+                role,
+                plow_asset::segment_roles::PREFILL_ATTENTION
+                    | plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32
+            )
+        })
         .count();
     assert!(attention > 0);
     println!(

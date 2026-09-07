@@ -66,6 +66,7 @@ pub(super) fn load_fp8_m1_role(
     match loaded {
         Ok((function, smem)) => Ok(PacketRole {
             function,
+            grid,
             smem,
             block: 256,
             _module: module,

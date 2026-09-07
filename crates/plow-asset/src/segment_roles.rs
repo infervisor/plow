@@ -7,12 +7,22 @@ pub const PREFILL_ATTENTION: u8 = 2;
 pub const GEMV_CTA512: u8 = 3;
 pub const FP8_M1: u8 = 4;
 pub const CUBLASLT: u8 = 5;
-pub const MAX_ROLE: u8 = CUBLASLT;
+pub const PREFILL_ATTENTION_HD512_WG32: u8 = 6;
+pub const MXFP4_MOE: u8 = 7;
+pub const MAX_ROLE: u8 = MXFP4_MOE;
+
+pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
+pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
 
 pub fn requires_object(role: u8) -> bool {
     matches!(
         role,
-        FP8_PREFILL_GEMM | PREFILL_ATTENTION | GEMV_CTA512 | FP8_M1
+        FP8_PREFILL_GEMM
+            | PREFILL_ATTENTION
+            | GEMV_CTA512
+            | FP8_M1
+            | PREFILL_ATTENTION_HD512_WG32
+            | MXFP4_MOE
     )
 }
 
@@ -33,6 +43,18 @@ pub struct SegmentObject {
     pub sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promote_k512: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<AttentionCapability>,
+}
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionCapability {
+    pub profile: String,
+    pub dtype: String,
+    pub head_dim: u32,
+    pub query_tile: u32,
+    pub kv_tile: u32,
+    pub warps: u32,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,7 +106,33 @@ impl SegmentRoles {
                 FP8_PREFILL_GEMM => "fp8_gemm_tma128_v1",
                 PREFILL_ATTENTION => "attention_sm90_hd256_v1",
                 GEMV_CTA512 => "gemv_sm90_cta512_v1",
-                _ => crate::fp8_m1_role::ABI,
+                FP8_M1 => crate::fp8_m1_role::ABI,
+                PREFILL_ATTENTION_HD512_WG32 => PREFILL_ATTENTION_HD512_WG32_ABI,
+                MXFP4_MOE => MXFP4_MOE_ABI,
+                _ => return Err("invalid packet segment object role".into()),
+            };
+            let valid_hash = |hash: Option<&str>| {
+                hash.is_some_and(|s| {
+                    s.len() == 64
+                        && s.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+            };
+            let hd512_wg = AttentionCapability {
+                profile: "sm90a".into(),
+                dtype: "bf16".into(),
+                head_dim: 512,
+                query_tile: 64,
+                kv_tile: 32,
+                warps: 8,
+            };
+            let hd512_px4 = AttentionCapability {
+                profile: "sm90a".into(),
+                dtype: "bf16".into(),
+                head_dim: 512,
+                query_tile: 32,
+                kv_tile: 16,
+                warps: 8,
             };
             if object.abi != abi
                 || object.file.is_empty()
@@ -93,13 +141,23 @@ impl SegmentRoles {
                     .any(|c| !matches!(c, std::path::Component::Normal(_)))
                 || (id == FP8_M1
                     && (object.promote_k512.is_none_or(|v| v > 1)
-                        || object.sha256.as_ref().is_none_or(|s| {
-                            s.len() != 64
-                                || !s
-                                    .bytes()
-                                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                        })))
-                || (id != FP8_M1 && (object.sha256.is_some() || object.promote_k512.is_some()))
+                        || !valid_hash(object.sha256.as_deref())
+                        || object.attention.is_some()))
+                || (id == PREFILL_ATTENTION_HD512_WG32
+                    && (!valid_hash(object.sha256.as_deref())
+                        || object.promote_k512.is_some()
+                        || object
+                            .attention
+                            .as_ref()
+                            .is_none_or(|a| a != &hd512_wg && a != &hd512_px4)))
+                || (id == MXFP4_MOE
+                    && (!valid_hash(object.sha256.as_deref())
+                        || object.promote_k512.is_some()
+                        || object.attention.is_some()))
+                || (!matches!(id, FP8_M1 | PREFILL_ATTENTION_HD512_WG32 | MXFP4_MOE)
+                    && (object.sha256.is_some()
+                        || object.promote_k512.is_some()
+                        || object.attention.is_some()))
             {
                 return Err("invalid packet segment object".into());
             }
@@ -167,6 +225,49 @@ mod tests {
             br#"{"version":1,"objects":{},"programs":[{"index":0,"roles":[6]}]}"#.as_slice(),
         ] {
             assert!(SegmentRoles::from_bytes(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn hd512_attention_role_requires_exact_hash_and_capability() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"6":{{"abi":"attention_sm90_hd512_wg32_v1","file":"attention.cubin","sha256":"{}","attention":{{"profile":"sm90a","dtype":"bf16","head_dim":512,"query_tile":64,"kv_tile":32,"warps":8}}}}}},"programs":[{{"index":0,"roles":[0,6,6,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        SegmentRoles::from_bytes(
+            raw.replace(
+                "\"query_tile\":64,\"kv_tile\":32",
+                "\"query_tile\":32,\"kv_tile\":16",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        for bad in [
+            raw.replace(&"a".repeat(64), "bad"),
+            raw.replace("\"head_dim\":512", "\"head_dim\":256"),
+            raw.replace("\"query_tile\":64", "\"query_tile\":32"),
+            raw.replace("\"kv_tile\":32", "\"kv_tile\":16"),
+            raw.replace("\"warps\":8", "\"warps\":4"),
+            raw.replace("\"profile\":\"sm90a\"", "\"profile\":\"sm120\""),
+            raw.replace("\"dtype\":\"bf16\"", "\"dtype\":\"fp8\""),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn mxfp4_moe_role_requires_exact_hash() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"7":{{"abi":"mxfp4_moe_sm90_v1","file":"moe.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,7,7,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&format!(r#","sha256":"{}""#, "a".repeat(64)), ""),
+            raw.replace(&"a".repeat(64), "bad"),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
         }
     }
 }

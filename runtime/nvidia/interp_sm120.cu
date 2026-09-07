@@ -31,6 +31,14 @@
 #error "FP8 M1 role requires256 threads"
 #endif
 #include "dev_isa.h"
+#include "mixed_step.h"
+#if PLOW_MIXED_STEP
+#if PLOW_FP8_KV
+#error "mixed dense consumer supports BF16 direct KV only"
+#endif
+extern "C" __device__ unsigned plow_mixed_interpreter
+    = 1;
+#endif
 
 /* ---- OPTIONAL per-packet arm selection (plow_config.h) ---------------------------------
  * -DPLOW_CONFIG='"plow_config.h"' includes a header devgen generated FROM THE EMITTED
@@ -64,6 +72,10 @@
 /* 0 = a GENERAL object: built with every arm, pairs with any packet. */
 #define PLOW_PACKET_HASH 0ull
 #endif
+/* HD64 was introduced as a packet-specialized arm; general objects retain the old inventory. */
+#ifndef PLOW_HAS_FLASH_HD64
+#define PLOW_HAS_FLASH_HD64 0
+#endif
 /* Defaults for the arms gated below. `1` = compile it, which is the pre-existing behaviour. */
 #ifndef PLOW_HAS_GEMV_FP8
 #define PLOW_HAS_GEMV_FP8 1
@@ -82,6 +94,27 @@
 #endif
 #ifndef PLOW_HAS_MOE_EXPERT_GLU_GEMMA
 #define PLOW_HAS_MOE_EXPERT_GLU_GEMMA 1
+#endif
+
+/* Flat MXFP4 projections and experts are compiled only into a packet-specialized object. The
+ * general serving objects predate these opcodes; keeping the bodies out preserves their register
+ * and instruction-cache profile. `plow_config.h` derives every term from the selected object's
+ * opcode inventory and stamps the packet digest into the cubin. */
+#ifdef PLOW_CONFIG
+#define PLOW_NV_MXFP4_PROJ PLOW_HAS_GEMV_MXFP4
+#define PLOW_NV_MXFP4_MOE                                                                  \
+    (PLOW_HAS_MOE_GLU_MX || PLOW_HAS_MOE_DOWN_MX || PLOW_HAS_MOE_GLU_MX_PF ||              \
+     PLOW_HAS_MOE_DOWN_MX_PF)
+#define PLOW_NV_MOE_COMMON                                                                 \
+    (PLOW_HAS_MOE_ROUTER_TOPK_PF || PLOW_HAS_MOE_ALIGN_PF || PLOW_HAS_MOE_COMBINE_PF)
+#else
+#define PLOW_NV_MXFP4_PROJ 0
+#define PLOW_NV_MXFP4_MOE 0
+#define PLOW_NV_MOE_COMMON 0
+#define PLOW_PACKET_LINEAR_BIAS 0
+#define PLOW_PACKET_ROPE_HALF_HD64 0
+#define PLOW_PACKET_ATTENTION_SINKS 0
+#define PLOW_PACKET_GQA 1
 #endif
 /* The Gemma decode MoE family is all-or-nothing per model: a dense checkpoint emits none of
  * the router/expert/combine ops, a sparse one emits the whole family. Deriving the block gate
@@ -110,6 +143,9 @@
 #endif
 
 #include "op_attention.cuh" /* validated: d_flash_decode / d_flash_merge (harvested) */
+#if PLOW_PACKET_ATTENTION_SINKS && PLOW_NV_PACKED_REQUEST
+#error "attention sinks and packed-request FlashMerge currently share t3"
+#endif
 #if PLOW_NV_PACKED_REQUEST
 #define PLOW_PF_REQ_ARG , (const int*)TEN(3)
 #if !defined(PLOW_NV_HOPPER) || !PLOW_NV_HOPPER || !PLOW_NV_PREFILL || PLOW_FP8_KV
@@ -735,7 +771,15 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #define PLOW_NV_FA_ARENA                                                                     \
     (PLOW_NV_FA_ARENA1 > PLOW_NV_DSA_ARENA ? PLOW_NV_FA_ARENA1 : PLOW_NV_DSA_ARENA)
 #else
-#define PLOW_NV_FA_ARENA FA_DEC_SMEM_FLOATS(PLOW_NV_FA_HD, PLOW_NV_FA_GF)
+#define PLOW_NV_DEFAULT_FA_ARENA FA_DEC_SMEM_FLOATS(PLOW_NV_FA_HD, PLOW_NV_FA_GF)
+#if PLOW_HAS_FLASH_HD64
+#define PLOW_NV_HD64_FA_ARENA FA_DEC_SMEM_FLOATS(64, PLOW_PACKET_GQA)
+#define PLOW_NV_FA_ARENA                                                                    \
+    (PLOW_NV_DEFAULT_FA_ARENA > PLOW_NV_HD64_FA_ARENA ? PLOW_NV_DEFAULT_FA_ARENA            \
+                                                        : PLOW_NV_HD64_FA_ARENA)
+#else
+#define PLOW_NV_FA_ARENA PLOW_NV_DEFAULT_FA_ARENA
+#endif
 #endif
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_FP8_M1_XCACHE && !PLOW_NV_PREFILL
 #if PLOW_NV_FP8_M1_TMA
@@ -875,7 +919,11 @@ extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_hi) =
 #define TEN(k) (PLOW_T(k) == PLOW_TENSOR_NONE ? nullptr : T[PLOW_T(k)])
 
 __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T, unsigned slice,
-                                          unsigned nblk, float* arena) {
+                                          unsigned nblk, float* arena
+#if PLOW_MIXED_STEP
+                                          , const PlowProgram* mixed
+#endif
+                                          ) {
     const uint4 tv_ = *reinterpret_cast<const uint4*>(in->t);
     const unsigned tw_[4] = {tv_.x, tv_.y, tv_.z, tv_.w};
 #if PLOW_NV_FP8_M1_ROLE
@@ -1044,6 +1092,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_GEMM:
     case PLOW_DOP_GEMM_MED:
     case PLOW_DOP_GEMM_SMALL:
+#if defined(PLOW_NV_HOPPER) && PLOW_PACKET_LINEAR_BIAS
+        if (TEN(7)) {
+            d_gemm_bias((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                        (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(7),
+                        in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk,
+                        (__nv_bfloat16*)arena);
+            break;
+        }
+#endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_TMA_GEMM
         if (in->i[6] && in->i[7]) {
 #if PGM90_UNI_BN256
@@ -1261,7 +1318,54 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * t6 (NONE on every legacy bf16 packet; host-patched in PX-1 batched-prefill mode) is the
      * packed chunk's request table — see d_flash_prefill_mux. */
 #if !PLOW_NV_SEG_GEMM && !PLOW_NV_FATLITE /* lean GEMM + FATLITE objects never run flash */
+#if PLOW_MIXED_STEP
     case PLOW_DOP_FLASH_PREFILL:
+#if !PLOW_NV_FA_ONLY
+        if (in->i[6] == 128)
+            d_flash_prefill_mixed<128, 64, PLOW_NV_FA128_BKV>(
+                mixed, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
+                (__nv_bfloat16*)TEN(5), in->i[0], in->i[2], in->i[3], in->i[5], in->i[7],
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
+        else
+#endif
+#if PLOW_NV_GEMMA
+#if !PLOW_NV_FA_ONLY || PLOW_NV_FA_ONLY_HD256
+        if (in->i[6] == 256)
+            d_flash_prefill_mixed<256, 64, PLOW_NV_FA256_BKV>(
+                mixed, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
+                (__nv_bfloat16*)TEN(5), in->i[0], in->i[2], in->i[3], in->i[5], in->i[7],
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
+        else
+#endif
+        if (in->i[6] == 512)
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_FA512_WG
+            d_flash_prefill_mixed<512, 64, PLOW_NV_FA512_BKV>(
+#else
+            d_flash_prefill_mixed<512, 32, 16>(
+#endif
+                mixed, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
+                (__nv_bfloat16*)TEN(5), in->i[0], in->i[2], in->i[3], in->i[5], in->i[7],
+                in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena, TEN(7));
+        else
+            __trap();
+#else
+        __trap();
+#endif
+        break;
+#else
+    case PLOW_DOP_FLASH_PREFILL:
+#if PLOW_HAS_FLASH_HD64
+        if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64)
+            d_flash_prefill_mux<64, 64, 64>(
+                (const int*)TEN(6), (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
+                in->fj[2].u, in->fj[0].f, slice, nblk, arena);
+        else
+#endif
 #if !PLOW_NV_FA_ONLY /* lean hd512-only FA object does not carry the Qwen arm */
         if (in->i[6] == 128)
             d_flash_prefill_mux<128, 64, PLOW_NV_FA128_BKV>(
@@ -1307,6 +1411,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         __trap();
 #endif
         break;
+#endif
 
 #if PLOW_FP8_KV
     /* fp8-KV prefill READ: dequant the e4m3 cache (t3=K t4=V) ×per-row scale (t6=k_scale t7=v_scale)
@@ -1375,34 +1480,41 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
 #if !PLOW_NV_GEMM_ONLY && (!PLOW_NV_FA_ONLY || PLOW_NV_FA_ROPE)
     /* i2 selects the head-dim template; i5==1 selects the INTERLEAVED (GPT-J) rotate.
-     * Only hd=128 non-interleaved is instantiated in this build (Qwen3). Anything else
-     * traps rather than falling through to a wrong head dim.
+     * HD64 is selected by packet inventory independently of model-family build flags.
+     * Anything else traps rather than falling through to a wrong head dim.
      * T16 (PLOW_NV_FA_ROPE): also in the FA object — rope packets classed 2 merge the
      * [rope, flash, flash, merge] chain into ONE FA-class launch. */
     case PLOW_DOP_HEADNORM_ROPE:
-#if PLOW_NV_GEMMA
-        /* Gemma: head_dim is 256 (sliding) or 512 (full), both non-interleaved.
-         * PREFILL object only: t6 (NONE on legacy bf16 packets; host-patched in PX-1 batched
-         * mode on KV-write sites) is the per-row seq-slot map — see d_headnorm_rope. The decode
-         * object never passes it, keeping its SASS byte-identical. */
-#if PLOW_NV_PREFILL
+#if PLOW_MIXED_STEP
+#define PLOW_HNR_SLOT , (const int*)TEN(6), mixed
+#elif PLOW_NV_PREFILL
 #define PLOW_HNR_SLOT , (const int*)TEN(6)
 #else
 #define PLOW_HNR_SLOT
 #endif
-        /* GLM/Kimi MLA decoupled RoPE: hd=64 partial-rope slice is ALWAYS interleaved
-         * (GPT-J), i[5] ignored — GLM is the only hd=64 user, matching runtime/amd/
-         * interp.hip. GLM DSA indexer q_idx/k_idx: hd=128 interleaved (i[5]==1). Qwen
-         * GQA: hd=128 non-interleaved (i[5]==0) — required in the PREFILL object, which
-         * is a Gemma build and would otherwise trap Qwen buckets. Gemma full/sliding
-         * attention: hd=256/512 non-interleaved (i[5]==0). */
-        if (in->i[2] == 64)
+#if PLOW_HAS_HEADNORM_HD64
+        /* The packet flag selects explicit half-split pairing; other HD64 packets use the
+         * pre-existing interleaved pairing. Packet inventory keeps this template out of
+         * objects that do not carry an HD64 instruction. */
+        if (in->i[2] == 64 && in->i[5] == 2 && PLOW_PACKET_ROPE_HALF_HD64)
+            d_headnorm_rope<64, /*INTERLEAVE=*/false>(
+                (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
+                (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+        else if (in->i[2] == 64)
             d_headnorm_rope<64, /*INTERLEAVE=*/true>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                 in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
-        else if (in->i[2] == 128 && in->i[5] == 1)
+        else
+#endif
+#if PLOW_NV_GEMMA
+        /* GLM DSA indexer q_idx/k_idx: hd=128 interleaved (i[5]==1). Qwen GQA:
+         * hd=128 non-interleaved. Gemma full/sliding attention: hd=256/512
+         * non-interleaved. */
+        if (in->i[2] == 128 && in->i[5] == 1)
             d_headnorm_rope<128, /*INTERLEAVE=*/true>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
@@ -1426,25 +1538,17 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                 in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
-        else
-            __trap();
-#undef PLOW_HNR_SLOT
 #else
-#if PLOW_NV_PREFILL
-#define PLOW_HNR_SLOT , (const int*)TEN(6)
-#else
-#define PLOW_HNR_SLOT
-#endif
         if (in->i[2] == PLOW_NV_FA_HD && in->i[5] == 0)
             d_headnorm_rope<PLOW_NV_FA_HD>(
                 (__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
                 (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                 in->i[4], slice, nblk, in->i[6] PLOW_HNR_SLOT);
+#endif
         else
             __trap();
 #undef PLOW_HNR_SLOT
-#endif
         break;
 
 #if PLOW_FP8_KV
@@ -1533,7 +1637,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif /* PLOW_NV_PREFILL && PLOW_NV_PF_GEMV_HEAD */
 #endif /* !PLOW_NV_GEMM_ONLY (pointwise + lm_head GEMV) */
 
-#if !PLOW_NV_PREFILL
+#if !PLOW_NV_PREFILL || PLOW_MIXED_STEP
 #if defined(PLOW_NV_HOPPER) && defined(PLOW_NV_FP8_M1) && PLOW_NV_FP8_M1 && PLOW_NV_QUANT_FP8_VLLM
     case PLOW_DOP_QUANT_FP8:
         if (in->i[0] != 1) { __trap(); break; }
@@ -1608,6 +1712,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
+#if PLOW_PACKET_LINEAR_BIAS
+        if (TEN(7)) {
+            d_gemv_bias((__nv_bfloat16*)TEN(0),
+                        (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                        (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(7),
+                        in->i[0], in->i[1], in->i[2], slice, nblk);
+            break;
+        }
+#endif
         if (in->i[2] <= PLOW_NV_GEMV_STAGING_BYTES / 2u)
             d_gemv((__nv_bfloat16*)TEN(0),
                    (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
@@ -1645,11 +1758,31 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
+#if PLOW_PACKET_LINEAR_BIAS
+        if (in->i[5] && in->i[6] && in->i[7]) {
+            d_gemv_qkv_bias(
+                (__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3), (__nv_bfloat16*)TEN(5),
+                (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(6),
+                (const __nv_bfloat16*)T[in->i[5]], (const __nv_bfloat16*)T[in->i[6]],
+                (const __nv_bfloat16*)T[in->i[7]], in->i[0], in->i[1], in->i[3],
+                in->i[4], in->i[2], slice, nblk);
+            break;
+        }
+#endif
         d_gemv_qkv((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3), (__nv_bfloat16*)TEN(5),
                    (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
                    (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(6), in->i[0], in->i[1],
                    in->i[3], in->i[4], in->i[2], slice, nblk, (__nv_bfloat16*)arena);
         break;
+
+#if PLOW_NV_MXFP4_PROJ
+    case PLOW_DOP_GEMV_MXFP4:
+        d_gemv_mxfp4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                      (const uint8_t*)TEN(2), (const uint8_t*)TEN(3),
+                      (const __nv_bfloat16*)TEN(7), in->i[0], in->i[1], in->i[2], slice, nblk);
+        break;
+#endif
 
     case PLOW_DOP_GEMV_GLU:
         d_gemv_glu((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
@@ -1732,50 +1865,56 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #else
     case PLOW_DOP_FLASH_DECODE: {
         const unsigned gqa = in->i[1] / in->i[2];
+#define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
+    do {                                                                                       \
+        if (TEN(6))                                                                            \
+            d_flash_decode_slots<DD, GG>(                                                       \
+                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
+                (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
+                (const int*)TEN(6));                                                            \
+        else                                                                                   \
+            d_flash_decode<DD, GG>(                                                            \
+                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
+                (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u);              \
+    } while (0)
+#if PLOW_HAS_FLASH_HD64
+        if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64) {
+            if (gqa != PLOW_PACKET_GQA) { __trap(); break; }
+            PLOW_NV_FLASH_DECODE(64, PLOW_PACKET_GQA);
+        } else
+#endif
 #if PLOW_NV_GEMMA
         if (in->i[6] == 128) {
             if ((gqa % PLOW_NV_FA_GF) != 0) { __trap(); break; }
-            d_flash_decode<128, PLOW_NV_FA_GF>(
-                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                slice, nblk, arena, in->fj[1].u);
+            PLOW_NV_FLASH_DECODE(128, PLOW_NV_FA_GF);
         } else if (in->i[6] == 256) {
 #if PLOW_NV_FA_GF_HD256 != 2
             if (gqa % PLOW_NV_FA_GF_HD256 == 0) {
-                d_flash_decode<256, PLOW_NV_FA_GF_HD256>(
-                    (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-                    (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-                    in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                    slice, nblk, arena, in->fj[1].u);
+                PLOW_NV_FLASH_DECODE(256, PLOW_NV_FA_GF_HD256);
                 break;
             }
 #endif
             if ((gqa % 2u) != 0) { __trap(); break; }
-            d_flash_decode<256, 2>(
-                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                slice, nblk, arena, in->fj[1].u);
+            PLOW_NV_FLASH_DECODE(256, 2);
         } else if (in->i[6] == 512) {
             if ((gqa % PLOW_NV_FA_GF_FULL) != 0) { __trap(); break; }
-            d_flash_decode<512, PLOW_NV_FA_GF_FULL>(
-                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-                slice, nblk, arena, in->fj[1].u);
+            PLOW_NV_FLASH_DECODE(512, PLOW_NV_FA_GF_FULL);
         } else {
             __trap();
         }
 #else
-        if ((gqa % PLOW_NV_FA_GF) != 0) { __trap(); break; }
-        if (in->i[6] != PLOW_NV_FA_HD) { __trap(); break; }
-        d_flash_decode<PLOW_NV_FA_HD, PLOW_NV_FA_GF>(
-            (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
-            (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (const int*)TEN(5),
-            in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7],
-            slice, nblk, arena, in->fj[1].u);
+        if (in->i[6] == PLOW_NV_FA_HD) {
+            if ((gqa % PLOW_NV_FA_GF) != 0) { __trap(); break; }
+            PLOW_NV_FLASH_DECODE(PLOW_NV_FA_HD, PLOW_NV_FA_GF);
+        } else {
+            __trap();
+        }
 #endif
+#undef PLOW_NV_FLASH_DECODE
         break;
     }
 #endif /* PLOW_NV_LEAN_DECODE (FLASH_DECODE) */
@@ -1893,13 +2032,82 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif /* PLOW_NV_DSA */
 #endif /* PLOW_NV_GEMMA */
-#endif /* !PLOW_NV_PREFILL */
+#endif /* !PLOW_NV_PREFILL || PLOW_MIXED_STEP */
 
 #if !PLOW_NV_GEMM_ONLY
+#if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ROUTER_TOPK_PF
+    case PLOW_DOP_MOE_ROUTER_TOPK_PF:
+        if (TEN(2) || in->i[0] || in->i[6] > 1u || in->i[7]) { __trap(); break; }
+        d_moe_router_topk_pf_nv((unsigned char*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                                (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr,
+                                in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[4], slice,
+                                nblk, (float*)arena);
+        break;
+#endif
+#if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ALIGN_PF
+    case PLOW_DOP_MOE_ALIGN_PF:
+        if (in->i[3] || in->i[4]) { __trap(); break; }
+        d_moe_align_pf_nv((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
+                          (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                          slice);
+        break;
+#endif
+#if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_GLU_MX
+    case PLOW_DOP_MOE_GLU_MX:
+        d_moe_glu_mx((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                     (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
+                     (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
+                     in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6],
+                     in->fj[0].f, in->fj[1].f, slice, nblk);
+        break;
+#endif
+#if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX
+    case PLOW_DOP_MOE_DOWN_MX:
+        d_moe_down_mx((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                      (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
+                      (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
+                      in->i[1], in->i[2], in->i[3], in->i[6], slice, nblk);
+        break;
+#endif
+#if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_GLU_MX_PF
+    case PLOW_DOP_MOE_GLU_MX_PF:
+        d_moe_glu_mx_pf((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                        (const uint8_t*)TEN(2), (const uint8_t*)TEN(3), (const int*)TEN(4),
+                        (const unsigned*)TEN(5), (const __nv_bfloat16*)TEN(6), in->i[0],
+                        in->i[1], in->i[2], in->i[3], in->i[5], in->fj[0].f, in->fj[1].f,
+                        slice, nblk);
+        break;
+#endif
+#if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX_PF
+    case PLOW_DOP_MOE_DOWN_MX_PF:
+        d_moe_down_mx_pf((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                         (const uint8_t*)TEN(2), (const uint8_t*)TEN(3),
+                         (const int*)TEN(4), (const __nv_bfloat16*)TEN(5),
+                         (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0], in->i[1],
+                         in->i[2], slice, nblk);
+        break;
+#endif
+#if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_COMBINE_PF
+    case PLOW_DOP_MOE_COMBINE_PF:
+        if (in->i[3] || in->i[4] || in->i[7]) { __trap(); break; }
+        d_moe_combine_pf_nv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                            (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), in->i[0],
+                            in->i[1], in->i[2], slice, nblk);
+        break;
+#endif
+
     case PLOW_DOP_FLASH_MERGE:
 #if PLOW_NV_LEAN_DECODE
         __trap();
-#elif PLOW_NV_GEMMA
+#else
+#if PLOW_HAS_FLASH_HD64
+        if (in->i[3] == 64 && PLOW_HAS_FLASH_HD64 && PLOW_PACKET_ATTENTION_SINKS)
+            d_flash_merge<64, true>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
+                                    (const float*)TEN(2), in->i[0], in->i[1], in->i[2],
+                                    slice, nblk, nullptr, (const __nv_bfloat16*)TEN(3));
+        else
+#endif
+#if PLOW_NV_GEMMA
         if (in->i[3] == 128)
             d_flash_merge<128>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
@@ -1909,14 +2117,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         else if (in->i[3] == 512)
             d_flash_merge<512>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
                                (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk PLOW_PF_REQ_ARG);
+#else
+        if (in->i[3] == PLOW_NV_FA_HD)
+            d_flash_merge<PLOW_NV_FA_HD>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
+                                         (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice,
+                                         nblk PLOW_PF_REQ_ARG);
+#endif
         else
             __trap();
-#else
-        if (in->i[3] != PLOW_NV_FA_HD) { __trap(); break; }
-        d_flash_merge<PLOW_NV_FA_HD>((__nv_bfloat16*)TEN(0), (const float*)TEN(1),
-                                     (const float*)TEN(2), in->i[0], in->i[1], in->i[2], slice,
-                                     nblk PLOW_PF_REQ_ARG);
-#endif
+#endif /* PLOW_NV_LEAN_DECODE */
         break;
 
 #if PLOW_NV_GEMMA && !PLOW_NV_PREFILL && PLOW_HAS_MOE_GEMMA
@@ -2522,7 +2731,11 @@ __global__ __launch_bounds__(PLOW_NV_THREADS, PLOW_NV_MINBLK) void PLOW_SYM(inte
          * on the REAL 401-packet / 32493-entry decode program. Output is garbage. */
         (void)nblk_grid;
 #else
-        plow_exec(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena);
+        plow_exec(in, prog.tensors, e.slice, in->blocks ? in->blocks : nblk_grid, arena
+#if PLOW_MIXED_STEP
+                  , &prog
+#endif
+                  );
 #endif
 
         __syncthreads(); /* retire this block's stores before the release */

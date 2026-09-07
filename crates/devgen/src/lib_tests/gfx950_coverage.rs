@@ -568,6 +568,7 @@ fn dense_mxfp4_is_not_silently_bf16() {
         arch: "gfx950".into(),
         emit_cfg: None,
         whole_graph_fusions: WholeGraphFusionDecisions::default(),
+        mixed_step: None,
     };
     // The emit now runs to completion instead of refusing immediately, so PLOW_MXFP4 is live for
     // far longer; without the shared lock a concurrent emitter test in this binary sees it and

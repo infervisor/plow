@@ -142,7 +142,7 @@ const DOC: &[S] = &[
     S { op: DevOp::Gemm, t: &["C", "A", "B", "", "", "", "", "bias?"], i: &["M", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::Gemv, t: &["C", "x", "W", "rms?", "gamma?", "", "", "bias?"], i: &["M", "N", "K", "norm"], f: &["eps"], j: &[] },
     S { op: DevOp::FlashPrefill, t: &["Opart", "mlpart", "Q", "K", "V", "O_final"], i: &["n_q", "n_kv", "n_head", "n_kv_head", "q_pos0", "window", "hd", "nsplit"], f: &["scale"], j: &["kv_stride", "kv_mask"] },
-    S { op: DevOp::FlashDecode, t: &["Opart", "mlpart", "Q", "K", "V", "kv_len"], i: &["n_batch", "n_head", "n_kv_head", "kv_stride", "window", "nsplit", "hd"], f: &["scale"], j: &[] },
+    S { op: DevOp::FlashDecode, t: &["Opart", "mlpart", "Q", "K", "V", "kv_len", "decode_slot?"], i: &["n_batch", "n_head", "n_kv_head", "kv_stride", "window", "nsplit", "hd"], f: &["scale"], j: &[] },
     S { op: DevOp::FlashMerge, t: &["O", "Opart", "mlpart", "sinks?"], i: &["n_batch", "n_head", "nsplit", "hd"], f: &[], j: &[] },
     S { op: DevOp::NormResidual, t: &["out", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::AddNorm, t: &["out", "resid", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps"], j: &[] },

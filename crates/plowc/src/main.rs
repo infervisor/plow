@@ -10,7 +10,7 @@
 //! ("egglog fusion analysis … fusions_found=662") was read as a compiler pass
 //! reporting its work, and quoted as such.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -23,6 +23,25 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod fusion_coverage;
+
+fn parse_mixed_rows(value: &str) -> Result<devgen::MixedRows, String> {
+    let (total, decode) = value
+        .split_once(':')
+        .ok_or("expected TOTAL_ROWS:DECODE_ROWS")?;
+    let total_rows = total
+        .parse::<u32>()
+        .map_err(|_| "invalid total row count".to_string())?;
+    let decode_rows = decode
+        .parse::<u32>()
+        .map_err(|_| "invalid decode row count".to_string())?;
+    if decode_rows == 0 || decode_rows >= total_rows {
+        return Err("require 0 < DECODE_ROWS < TOTAL_ROWS".into());
+    }
+    Ok(devgen::MixedRows {
+        total_rows,
+        decode_rows,
+    })
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -158,6 +177,15 @@ struct Cli {
     /// `gemma4 --embed-hsaco`).
     #[arg(long)]
     embed_hsaco: Option<String>,
+
+    /// Emit an auxiliary dense mixed-step shape as TOTAL_ROWS:DECODE_ROWS.
+    /// May be repeated; requires --mixed-object.
+    #[arg(long, value_parser = parse_mixed_rows)]
+    mixed_rows: Vec<devgen::MixedRows>,
+
+    /// Mixed-step interpreter CUBIN or HSACO carrying plow_mixed_interpreter.
+    #[arg(long)]
+    mixed_object: Option<PathBuf>,
 
     /// Disable the Lean ORDERING CERTIFICATE (on by default). Affects only
     /// verification — `--lean-oracle` is a separate switch and keeps running.
@@ -550,12 +578,15 @@ fn main() -> ExitCode {
     // that was missing. Defaulting it here moves the decision to the only place that knows the
     // arch. `deny_uniseg` still wins downstream for targets that must read `seg` (AMD).
     // Opt out with PLOW_UNISEG=0.
-    if cli.arch.starts_with("sm_120") && std::env::var_os("PLOW_UNISEG").is_none() {
-        // The real gate is `packet::devbuild::Builder`'s own `std::env::var("PLOW_UNISEG")` read,
-        // not this struct field — set both so the emitted manifest and the diagnostic agree.
-        std::env::set_var("PLOW_UNISEG", "1");
-        cli.emit_cfg.uniseg = true;
-    }
+    cli.emit_cfg.uniseg = effective_uniseg(
+        &cli.arch,
+        cli.emit_cfg.uniseg,
+        cli.segmented,
+        std::env::var_os("PLOW_UNISEG").is_some(),
+    );
+    // Builder still consumes this legacy switch directly. Keep it synchronized
+    // with the parsed emit config until that input is carried in BuilderConfig.
+    std::env::set_var("PLOW_UNISEG", if cli.emit_cfg.uniseg { "1" } else { "0" });
     let cli = cli;
 
     // Log the parsed CLI arguments so every invocation is self-describing in logs.
@@ -1268,14 +1299,22 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             l2_layout,
             gpu: cli.gpu.clone(),
             arch: cli.arch.clone(),
-            emit_cfg: Some({
-                let mut cfg = cli.emit_cfg.clone();
-                if cli.segmented {
-                    cfg.uniseg = false;
-                }
-                cfg
-            }),
+            emit_cfg: Some(cli.emit_cfg.clone()),
             whole_graph_fusions,
+            mixed_step: if cli.mixed_rows.is_empty() && cli.mixed_object.is_none() {
+                None
+            } else {
+                if cli.mixed_rows.is_empty() {
+                    return Err("--mixed-object requires at least one --mixed-rows".into());
+                }
+                Some(devgen::MixedStepCompile {
+                    rows: cli.mixed_rows.clone(),
+                    object: cli
+                        .mixed_object
+                        .clone()
+                        .ok_or("--mixed-rows requires --mixed-object")?,
+                })
+            },
         },
         verify,
     );
@@ -1379,7 +1418,7 @@ fn build_cubin_from_manifest(
         return Err(format!(
             "--emit devblob+cubin needs a CUDA toolkit: {} not found. The packet and \
              {} were written successfully — build the object separately (see \
-             runtime/CMakeLists.txt, -DPLOW_SM120_CUBIN=ON) or use --emit devblob, \
+             runtime/CMakeLists.txt) or use --emit devblob, \
              which needs no toolkit.",
             nvcc.display(),
             mpath.display()
@@ -1396,19 +1435,13 @@ fn build_cubin_from_manifest(
     }
 
     // The manifest is arch-agnostic on purpose; picking the backend is this
-    // function's job. Only nvcc/sm_1xx is wired — hipcc → .hsaco (runtime/amd/)
-    // is the same shape and is deliberately left for a follow-up.
+    // function's job. hipcc → .hsaco (runtime/amd/) is the same shape and is
+    // deliberately left for a follow-up.
     let flags = man
         .get("backends")
         .and_then(|b| b.get("nvcc"))
         .ok_or_else(|| format!("{}: no nvcc backend section", mpath.display()))?;
-    if !arch.starts_with("sm_") {
-        return Err(format!(
-            "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
-             need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
-        )
-        .into());
-    }
+    let arch_option = cubin_arch_option(arch)?;
     let list = |k: &str| -> Vec<String> {
         flags
             .get(k)
@@ -1427,7 +1460,7 @@ fn build_cubin_from_manifest(
     // table appends verbatim. PLOW_NV_FA_GF_FULL has its own cache variable (it
     // must reach every decode-family object from one place — that was bug #2),
     // so route it there rather than into the raw-append bucket.
-    let mut args: Vec<String> = vec!["-DPLOW_SM120_CUBIN=ON".into()];
+    let mut args: Vec<String> = vec![arch_option.into()];
     if !req.iter().any(|d| d.starts_with("PLOW_NV_GEMMA")) {
         args.push("-DPLOW_CUBIN_GEMMA=OFF".into());
     }
@@ -1437,6 +1470,9 @@ fn build_cubin_from_manifest(
     if req.iter().any(|d| d.starts_with("PLOW_FP8_KV")) {
         args.push("-DPLOW_FP8_KV=ON".into());
         args.push("-DPLOW_SM120_CUBIN_FP8KV=ON".into());
+    }
+    if req.iter().any(|d| d.starts_with("PLOW_NV_PF_GEMV_HEAD")) {
+        args.push("-DPLOW_NV_PF_GEMV_HEAD=ON".into());
     }
     if segmented {
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
@@ -1454,6 +1490,15 @@ fn build_cubin_from_manifest(
     args.push(format!("-DPLOW_CUBIN_ARCH={arch}"));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
+    let config = pkt.with_file_name("plow_config.h");
+    if !config.is_file() {
+        return Err(format!(
+            "--emit devblob+cubin: packet config {} was not emitted",
+            config.display()
+        )
+        .into());
+    }
+    args.push(cubin_config_option(&config));
     let build_dir = out_dir.join(".cubin-build");
     let runtime_dir = repo_runtime_dir()?;
     args.push(format!("-DPLOW_CUBIN_DIR={}", out_dir.display()));
@@ -1479,6 +1524,35 @@ fn build_cubin_from_manifest(
     }
     info!(out = %out_dir.display(), "interpreter object built");
     Ok(())
+}
+
+fn effective_uniseg(arch: &str, configured: bool, segmented: bool, env_present: bool) -> bool {
+    if segmented {
+        false
+    } else if arch.starts_with("sm_120") && !env_present {
+        true
+    } else {
+        configured
+    }
+}
+
+fn cubin_config_option(config: &Path) -> String {
+    format!("-DPLOW_CUBIN_CONFIG={}", config.display())
+}
+
+fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
+    match arch {
+        "sm_90a" => Ok("-DPLOW_SM90A_CUBIN=ON"),
+        "sm_120a" => Ok("-DPLOW_SM120_CUBIN=ON"),
+        _ if !arch.starts_with("sm_") => Err(format!(
+            "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
+             need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
+        )),
+        _ => Err(format!(
+            "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
+             supported CUDA architectures are sm_90a and sm_120a."
+        )),
+    }
 }
 
 fn which_cmake() -> Option<PathBuf> {
@@ -2106,6 +2180,20 @@ mod cli_tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn mixed_rows_are_explicit_and_bounded() {
+        assert_eq!(
+            parse_mixed_rows("128:16").unwrap(),
+            devgen::MixedRows {
+                total_rows: 128,
+                decode_rows: 16,
+            }
+        );
+        assert!(parse_mixed_rows("16:16").is_err());
+        assert!(parse_mixed_rows("16:0").is_err());
+        assert!(parse_mixed_rows("16").is_err());
+    }
+
     fn parse(extra: &[&str]) -> Cli {
         let mut argv = vec!["plowc", "--hf-dir", "/tmp/x", "--emit", "devblob"];
         argv.extend_from_slice(extra);
@@ -2121,6 +2209,41 @@ mod cli_tests {
         )
         .unwrap_err();
         assert!(err.contains("FP8 lowering"));
+    }
+
+    #[test]
+    fn cubin_build_selects_the_interpreter_for_the_target_arch() {
+        assert_eq!(
+            cubin_arch_option("sm_90a").unwrap(),
+            "-DPLOW_SM90A_CUBIN=ON"
+        );
+        assert_eq!(
+            cubin_arch_option("sm_120a").unwrap(),
+            "-DPLOW_SM120_CUBIN=ON"
+        );
+        assert!(cubin_arch_option("sm_100a")
+            .unwrap_err()
+            .contains("no served interpreter"));
+        assert!(cubin_arch_option("gfx950")
+            .unwrap_err()
+            .contains("hipcc/.hsaco"));
+    }
+
+    #[test]
+    fn cubin_build_config_is_the_packet_sibling() {
+        let pkt = Path::new("/tmp/model-assets/model.pkt");
+        assert_eq!(
+            cubin_config_option(&pkt.with_file_name("plow_config.h")),
+            "-DPLOW_CUBIN_CONFIG=/tmp/model-assets/plow_config.h"
+        );
+    }
+
+    #[test]
+    fn uniseg_cli_state_reaches_the_legacy_builder_switch() {
+        assert!(effective_uniseg("sm_90a", true, false, false));
+        assert!(!effective_uniseg("sm_90a", true, true, false));
+        assert!(effective_uniseg("sm_120a", false, false, false));
+        assert!(!effective_uniseg("sm_120a", false, false, true));
     }
 
     /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be

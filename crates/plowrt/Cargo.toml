@@ -95,6 +95,7 @@ cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 
 [dev-dependencies]
+plow-asset = { workspace = true, features = ["test-util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

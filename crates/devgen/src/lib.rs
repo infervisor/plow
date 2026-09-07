@@ -48,6 +48,7 @@ use serde_json::Value;
 
 mod checkpoint;
 use checkpoint::{layer_scalars, validate_coverage};
+mod attention_prefill_role;
 mod block;
 use block::{parse_block, write_block_descriptor};
 mod config;
@@ -57,6 +58,7 @@ pub mod kda;
 use config::*;
 mod gptoss;
 mod ladder;
+pub mod mixed_step_emit;
 mod mla;
 mod qwen35;
 #[cfg(test)]
@@ -64,6 +66,7 @@ mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
 mod decode_objects;
 mod gemv_decode_role;
+mod mxfp4_moe_role;
 pub mod manifest;
 mod projection_rewrite;
 pub mod tune_demand;
@@ -1527,6 +1530,7 @@ struct Tn {
     ids: u32,
     pos: u32,
     kvlen: u32,
+    decode_slot: u32,
     cos_s: u32,
     sin_s: u32,
     cos_f: u32,
@@ -1711,6 +1715,8 @@ fn declare(
     block: std::ops::Range<usize>,
     nrn_fold: bool,
     merge_fold: bool,
+    mixed_total_rows: Option<u32>,
+    mixed_decode_rows: Option<u32>,
 ) -> Tn {
     // ACTIVATIONS ARE SIZED BY THE CHUNK, NOT THE CONTEXT.
     //
@@ -1770,6 +1776,9 @@ fn declare(
         (kvh_local(c.kvh_slide, tp, 0) * c.hd_slide).max(kvh_local(c.kvh_full, tp, 0) * c.hd_full);
     let hd_max = c.hd_slide.max(c.hd_full);
     let inter_sh = c.inter / tp;
+    let mixed_attention_rows = mixed_decode_rows
+        .map(|decode_rows| decode_rows * b.n_cu().div_ceil(c.heads).max(1))
+        .unwrap_or(0);
     // lm_head is REPLICATED under TP here, not vocab-sharded. ONE reason is left, and it is
     // specific to THIS emitter: Gemma TIES lm_head to embed_tokens, and the emitted lm_head Gemv
     // reads `emb` from offset 0 with no per-rank vocab offset, so a vocab shard would make every
@@ -1807,7 +1816,13 @@ fn declare(
         ids: b.tensor("in.ids", ctx as u64 * I32),
         pos: b.tensor("in.pos", ctx as u64 * I32),
         // BATCH>1 (serving pending #4): one KV length per sequence. dbatch==1 => I32, identical.
-        kvlen: b.tensor("in.kvlen", dbatch as u64 * I32),
+        kvlen: b.tensor(
+            "in.kvlen",
+            u64::from(mixed_total_rows.unwrap_or(dbatch).max(dbatch)) * I32,
+        ),
+        decode_slot: mixed_decode_rows
+            .map(|rows| b.tensor(plow_asset::mixed_step::DECODE_SLOT_TENSOR, u64::from(rows) * I32))
+            .unwrap_or(TENSOR_NONE),
         cos_s: b.tensor_gen("in.cos_slide", cs_s.byte_len(), cs_s),
         sin_s: b.tensor_gen("in.sin_slide", sn_s.byte_len(), sn_s),
         cos_f: b.tensor_gen("in.cos_full", cs_f.byte_len(), cs_f),
@@ -1870,14 +1885,18 @@ fn declare(
         opart: ac(
             b,
             "opart",
-            (rows.max(64) * (c.heads / tp) * ns_pre * hd_max).max((c.heads / tp) * 64 * hd_max)
+            (rows.max(64) * (c.heads / tp) * ns_pre * hd_max)
+                .max((c.heads / tp) * 64 * hd_max)
+                .max(mixed_attention_rows * (c.heads / tp) * hd_max)
                 as u64
                 * F32,
         ),
         mlpart: ac(
             b,
             "mlpart",
-            (rows.max(64) * (c.heads / tp) * ns_pre * 2).max((c.heads / tp) * 64 * 2) as u64 * F32,
+            (rows.max(64) * (c.heads / tp) * ns_pre * 2)
+                .max((c.heads / tp) * 64 * 2)
+                .max(mixed_attention_rows * (c.heads / tp) * 2) as u64 * F32,
         ),
         at: ac(b, "at", (rows * qd_max) as u64 * BF16),
         og: ac(b, "og", (rows * c.hidden) as u64 * BF16),
@@ -2435,7 +2454,7 @@ fn gemv_row_bucket(t: u32) -> u32 {
     p.min(GEMV_MAXM)
 }
 
-/// Rows a fused decode GEMV stages in LDS at once — the quantity the fusion gate must bound.
+/// Rows a fused AMD decode GEMV stages in LDS at once — the quantity the fusion gate must bound.
 ///
 /// # This is the §6g-WALK companion change, and without it the walk buys nothing
 ///
@@ -2468,6 +2487,23 @@ fn gemv_staged_rows(t: u32) -> u32 {
     } else {
         t
     }
+}
+
+/// Whether the fused QKV/GLU input representation fits the backend body.
+///
+/// AMD's fused bodies stage every active row in LDS and therefore need the arena bound above.
+/// NVIDIA's batched bodies use `gemv_walk` over global activation rows; only their separate M=1
+/// overload stages one row in shared memory. Applying the AMD bound to CUDA made Gemma-4-31B's
+/// B16 rung drop both fusions and invalidated the otherwise uniform decode-object ladder.
+fn gemv_fused_input_fits(amd: bool, t: u32, hidden: u32) -> bool {
+    let staged_rows = if amd {
+        gemv_staged_rows(t)
+    } else if t <= 1 {
+        t
+    } else {
+        return true;
+    };
+    staged_rows as u64 * hidden as u64 <= gm_lds_halves()
 }
 
 /// Largest prefill chunk. Mirrors `PLOW_MAX_CHUNK` in `dev_isa.h`.
@@ -3026,16 +3062,23 @@ enum Mode {
     /// caps at n_cu. **Requires prefill opcodes in the interpreter** — the sm_120 build traps on
     /// FlashPrefill(11)/GemmSmall(14)/GemmMed(15)/GemmGlu(20), so this mode is AMD-only today.
     DecodeTiled,
+    Mixed { decode_rows: u32 },
 }
 
 impl Mode {
     /// One query row, KV append + ring mask, decode's nsplit and one-shot all-reduce.
     fn decode_shape(self) -> bool {
-        self != Mode::Prefill
+        matches!(self, Mode::Decode | Mode::DecodeTiled)
     }
     /// The GEMV opcode family and every fusion that exists only to serve it, plus flash-decode.
     fn gemv(self) -> bool {
         self == Mode::Decode
+    }
+    fn mixed_decode_rows(self) -> Option<u32> {
+        match self {
+            Mode::Mixed { decode_rows } => Some(decode_rows),
+            _ => None,
+        }
     }
 }
 
@@ -3155,6 +3198,7 @@ fn emit_phase(
     // the `hn_dep` closure below already binds a `gemv: u32` parameter that would shadow it.)
     let decode = mode.decode_shape();
     let gemv_family = mode.gemv();
+    let mixed_decode_rows = mode.mixed_decode_rows();
     // MXFP4 dense decode (PLOW_MXFP4=1): q/k/v/o/down through GemvMxfp4 (91), gate|up through
     // GemvGluMxfp4 (92); prefill stays on the bf16 weight. Exclusive with the fp8 axis.
     let mx4 = emit_config::active().mxfp4;
@@ -3273,7 +3317,7 @@ fn emit_phase(
     // builder-local tensor_gen would die with the program (measured: n_tensor stayed at
     // the declare()-time count and every map decl vanished from the blob). run_verified
     // folds the registry into the Model after all programs are emitted.
-    let tma_gemm = emit_config::active().tma_gemm;
+    let tma_gemm = emit_config::active().tma_gemm && mixed_decode_rows.is_none();
     let tmap = |target: u32, rows: u32, k: u32| -> u32 {
         tmaps.borrow_mut().handle(target, rows, k, false)
     };
@@ -3468,7 +3512,9 @@ fn emit_phase(
     // norm" rationale addressed serialization, but the GH200 per-op trace showed the real
     // cost is the extra HBM round trip + packet per pair, which holds at any T (norms ~9%
     // of a 4k chunk). Opt-in until token-gated on hardware.
-    let gfuse = c.arch == Arch::Gemma4 && (gemv_family || emit_config::active().pf_gfuse);
+    let gfuse = c.arch == Arch::Gemma4
+        && mixed_decode_rows.is_none()
+        && (gemv_family || emit_config::active().pf_gfuse);
     // NRN2 -> q/k/v FOLD (Experiment N2, the item "norm fusion capped at 0.43 ms by t[8]"):
     // delete the END-OF-LAYER NormResidualNorm packet by computing it inside the NEXT layer's
     // q/k/v GemvFp8 staging (op 30 i3; gemv_nrn_lds in op_gemm.h — bit-exact replication of
@@ -3523,11 +3569,9 @@ fn emit_phase(
         // (q/k/v as three separate bf16 Gemv packets = +2 packets/layer, uneven CU fill). Tokens
         // are bit-identical (each output column is the same per-column dot). Off by default =>
         // byte-identical stream. Measures the marginal TPOT cost of a 2-gate/layer reduction.
-        // THE SAME LDS PRECONDITION `glu_fused` CHECKS. `gemv_qkv_rows` reads x
-        // only through `ld_lds8` — it has no global-read arm — and `op_gemm.h`
-        // says so: *"x is ALWAYS staged in LDS here: plowc emits this op only
-        // when M*K fits GM_LDS_HALVES."* That precondition was stated and never
-        // enforced for THIS op, only for `GemvGlu`.
+        // AMD has the same LDS precondition as `glu_fused`: its `gemv_qkv_rows` reads x only
+        // through LDS. CUDA's batched overload reads x from global memory through `gemv_walk`,
+        // so applying that constraint there changes ladder composition without protecting memory.
         //
         // MEASURED, Gemma-4-31B (hidden 5376), PLOW_DECODE_BATCH=16: the arena
         // holds 73728 halves, `M*K` is 16*5376 = 86016, and row `m` lives at
@@ -3540,9 +3584,7 @@ fn emit_phase(
             && !keqv
             && !fp8
             && !mx4
-            // `gemv_staged_rows`, not `t`: with `PLOW_GEMV_WALK` the staging moves inside the
-            // row loop and the bound stops depending on M. See §6g-WALK's companion change.
-            && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves()
+            && gemv_fused_input_fits(amd, t, c.hidden)
             && !emit_config::active().no_fuse_qkv;
         // FUSED Q|K|V, per-channel fp8 (DevOp::GemvQkvFp8, op 115) — the arm the comment above
         // called "opcode 26 deferred", landed but OFF BY DEFAULT, because it MEASURES SLOWER.
@@ -4137,7 +4179,7 @@ fn emit_phase(
                 d.t[3] = cs;
                 d.t[4] = sn;
                 d.t[5] = n.pos;
-                d.t[6] = n.kcs[l]; // fp8-KV per-row scale (NONE in bf16 mode)
+                d.t[6] = mixed_decode_rows.map_or(n.kcs[l], |_| n.decode_slot);
                 d.i[0] = t;
                 d.i[1] = kvh;
                 d.i[2] = hd;
@@ -4180,7 +4222,7 @@ fn emit_phase(
                 d.t[0] = n.vc[l];
                 d.t[1] = v_src;
                 d.t[5] = n.pos;
-                d.t[6] = n.vcs[l]; // fp8-KV per-row scale (NONE in bf16 mode)
+                d.t[6] = mixed_decode_rows.map_or(n.vcs[l], |_| n.decode_slot);
                 d.i[0] = t;
                 d.i[1] = kvh;
                 d.i[2] = hd;
@@ -4251,7 +4293,78 @@ fn emit_phase(
         // epilogue and the packet's own coarse completion signal covers the merge, so o_proj
         // just re-points its dep at the flash op with no threshold change.
         let fuse_merge = fuse_hnr && n.mrgc != TENSOR_NONE;
-        let c_fa = if fuse_hnr {
+        let mixed_attention = mixed_decode_rows.map(|decode_rows| {
+            let decode_ns = n_cu.div_ceil(c.heads).max(1);
+            let c_decode = b.emit(DevOp::FlashDecode, all.clone(), &[c_qn, c_kn, c_vn], |d| {
+                d.t[0] = n.opart;
+                d.t[1] = n.mlpart;
+                d.t[2] = n.q;
+                d.t[3] = n.kc[l];
+                d.t[4] = n.vc[l];
+                d.t[5] = n.kvlen;
+                d.t[6] = n.decode_slot;
+                d.i[0] = decode_rows;
+                d.i[1] = heads;
+                d.i[2] = kvh;
+                d.i[3] = kvr;
+                d.i[4] = win;
+                d.i[5] = decode_ns;
+                d.i[6] = hd;
+                d.i[7] = kvm;
+                d.f[0] = c.attn_scale;
+            });
+            let merge_cus: Vec<u32> = (0..(decode_rows * heads * flash_merge_dsplit())
+                .min(n_cu)
+                .max(1))
+                .collect();
+            let merge_map = flash_merge_map(
+                decode_rows * heads,
+                decode_ns,
+                1,
+                heads,
+                all.len() as u32,
+                merge_cus.len() as u32,
+            );
+            let c_decode_merge = b.emit_dep(
+                DevOp::FlashMerge,
+                merge_cus,
+                vec![Dep::Fine {
+                    producer: c_decode,
+                    map: merge_map,
+                }],
+                |d| {
+                    d.t[0] = n.at;
+                    d.t[1] = n.opart;
+                    d.t[2] = n.mlpart;
+                    d.i[0] = decode_rows;
+                    d.i[1] = heads;
+                    d.i[2] = decode_ns;
+                    d.i[3] = hd;
+                },
+            );
+            let c_prefill = b.emit(DevOp::FlashPrefill, all.clone(), &[c_qn, c_kn, c_vn], |d| {
+                d.t[0] = n.opart;
+                d.t[1] = n.mlpart;
+                d.t[2] = n.q;
+                d.t[3] = n.kc[l];
+                d.t[4] = n.vc[l];
+                d.t[5] = n.at;
+                d.i[0] = t;
+                d.i[1] = t;
+                d.i[2] = heads;
+                d.i[3] = kvh;
+                d.i[5] = win;
+                d.i[6] = hd;
+                d.i[7] = 1;
+                d.f[0] = c.attn_scale;
+                d.j[0] = kvr;
+                d.j[1] = kvm;
+            });
+            vec![c_decode_merge, c_prefill]
+        });
+        let c_fa = if mixed_attention.is_some() {
+            0
+        } else if fuse_hnr {
             // NRF fold packet: flash depends on the three RAW projections directly (the hnr
             // level is gone). Operands per the exec's unpacking map; kv_rows gets nothing —
             // the fold reads the write position from the kv_len TENSOR (qpos = len-1), so
@@ -4436,8 +4549,10 @@ fn emit_phase(
         // When fused, flash_prefill already wrote the normalized bf16 to n.at, so there is no
         // FlashMerge op and o_proj depends on the flash op directly. Coarse: n.at row r needs
         // every head of its q-tile, which is spread across the flash workgroups.
-        let attn_dep = if fused || fuse_merge {
-            c_fa
+        let attn_deps = if let Some(deps) = mixed_attention {
+            deps
+        } else if fused || fuse_merge {
+            vec![c_fa]
         } else {
             // L1: fold a D-chunk axis into the merge's work id so it can occupy more than
             // `t*heads` (= 32 at Gemma-31B decode) of 256 CUs. `flash_merge_map` and
@@ -4464,7 +4579,7 @@ fn emit_phase(
                 all.len() as u32,
                 mg_cus.len() as u32,
             );
-            b.emit_dep(
+            vec![b.emit_dep(
                 DevOp::FlashMerge,
                 mg_cus,
                 vec![Dep::Fine {
@@ -4472,7 +4587,7 @@ fn emit_phase(
                     map,
                 }],
                 fill,
-            )
+            )]
         };
 
         // o_proj is ROW-parallel: input = this rank's qd heads, output =
@@ -4481,7 +4596,11 @@ fn emit_phase(
         // partials into the replicated `og` that NormResidual consumes — all-reduce #1 of the layer.
         // proj() picks the fp8 (GemvFp8) arm on the decode fp8 path via the wo8/so operands.
         // w8a8: quant the (qd-width) attention output feeding o_proj.
-        let do_ = quant(b, n.xqo, n.aso, n.at, qd, attn_dep);
+        let o_deps = if w8a8 {
+            vec![quant(b, n.xqo, n.aso, n.at, qd, attn_deps[0])]
+        } else {
+            attn_deps
+        };
         let c_o = if tp > 1 {
             let c_op = proj(
                 b,
@@ -4497,7 +4616,7 @@ fn emit_phase(
                 qd,
                 TENSOR_NONE,
                 all.clone(),
-                &[do_],
+                &o_deps,
             );
             emit_xreduce(b, &mut xgate, decode, &xr_cus, c_op, n.og, xr_elems, tp, 0)
         } else {
@@ -4515,7 +4634,7 @@ fn emit_phase(
                 qd,
                 TENSOR_NONE,
                 all.clone(),
-                &[do_],
+                &o_deps,
             )
         };
         // FIRST RESIDUAL + PRE-MLP NORM — the biggest structural fork.
@@ -4623,10 +4742,8 @@ fn emit_phase(
         // gate-vs-up), so only when pick_tile would have chosen Gemm anyway.
         // gate/up are COLUMN-parallel (inter_l lanes on this rank); the GLU is elementwise on the
         // rank's own lanes, so no communication. `c_gl` is the dependency feeding down_proj.
-        // Same bound, same reason as `fuse_qkv` above: `gemv_glu_rows` also reads x only
-        // through LDS, and with the walk on it stages `min(MM, M)` rows, not M.
-        let glu_fused =
-            gemv_family && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves();
+        // Same backend-specific bound as `fuse_qkv` above.
+        let glu_fused = gemv_family && gemv_fused_input_fits(amd, t, c.hidden);
         let gemm_glu = !gemv_family && glu_fusion_wins(t, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
@@ -5398,20 +5515,27 @@ fn emit_phase(
     // A/B and the AMD escape hatch are both preserved, and an empty `--arch` (the golden tests)
     // keeps the old emission byte for byte.
     let pf_gemv_head = !decode
+        && mixed_decode_rows.is_none()
         && match emit_config::active().pf_gemv_head.as_deref() {
             Some("1") => true,
             Some("0") => false,
             _ => amd,
         };
+    let (lm_m, lm_row0) = if let Some(decode_rows) = mixed_decode_rows {
+        (decode_rows, 0)
+    } else if decode {
+        (t, 0)
+    } else {
+        (1, t - 1)
+    };
     let lm_op = if gemv_family || pf_gemv_head {
         DevOp::Gemv
     } else {
-        pick_tile(1, vocab_l, c.hidden, n_cu, kernelcaps::QuantScheme::None)
+        pick_tile(lm_m, vocab_l, c.hidden, n_cu, kernelcaps::QuantScheme::None)
     };
     // PREFILL takes only the LAST prompt row's logits (M=1, a_row0=t-1). DECODE takes ALL t rows,
     // one per sequence (M=t, a_row0=0) — batch>1 samples a token per sequence. Decode B=1 gives
     // (M=1, a_row0=0), identical to the old (1, t-1) since t==1 there.
-    let (lm_m, lm_row0) = if decode { (t, 0) } else { (1, t - 1) };
     // PLOW_FP8_HEAD: weight-only fp8 lm_head (GemvFp8, dequant-on-load, per-row scale).
     // The tied embedding LOOKUP stays bf16 (reads the original table); only the head GEMV
     // reads the fp8 twin. Own reporting row — vLLM's fp8 recipe keeps lm_head bf16.
@@ -5483,7 +5607,7 @@ fn emit_phase(
     // without the guard every prefill bucket emitted argmax over t "sequences", reading
     // t*vocab logits from the [dbatch][vocab] tensor (a 64 MiB OOB read at t=8192) and
     // clobbering ids[0..t]. Prefill is always single-sequence (lm_head M=1 → logits row 0).
-    let nb_argmax = if decode && t > 1 { t } else { 0 };
+    let nb_argmax = if lm_m > 1 { lm_m } else { 0 };
     // FUSED (fuse_am): GemvArgmax already wrote the `all.len()` partials — skip the Argmax packet
     // and fold that many. CLASSIC: the 64-block Argmax strides the full vocab, folding AMAX_BLOCKS.
     let (c_am, nparts) = if fuse_am {
@@ -5650,6 +5774,21 @@ pub struct EmitArgs {
     /// Fusion candidates derived from the complete operator graph. Empty for
     /// legacy/direct callers; no model name participates in these decisions.
     pub whole_graph_fusions: WholeGraphFusionDecisions,
+    /// Optional auxiliary dense mixed-step programs and their matching interpreter object.
+    /// Empty preserves the ordinary packet byte-for-byte.
+    pub mixed_step: Option<MixedStepCompile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MixedRows {
+    pub total_rows: u32,
+    pub decode_rows: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MixedStepCompile {
+    pub rows: Vec<MixedRows>,
+    pub object: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -5840,6 +5979,7 @@ impl EmitArgs {
             arch: String::new(),
             emit_cfg: None,
             whole_graph_fusions: WholeGraphFusionDecisions::default(),
+            mixed_step: None,
         }
     }
 }
@@ -5855,6 +5995,7 @@ trait DevblobEmitter {
     fn emit_prefill(&self, b: &mut Builder, t: u32);
     /// Emit the decode program into `b`; `kv_rows` collects the KV-write inst indices.
     fn emit_decode(&self, b: &mut Builder, dbatch: u32, dmode: Mode, kv_rows: &mut Vec<u32>);
+    fn emit_mixed(&self, b: &mut Builder, rows: MixedRows);
 }
 
 /// Dense GQA (Gemma / Llama / Qwen). Arch is DATA (`Cfg.arch` switches), so ONE
@@ -5949,6 +6090,8 @@ impl<'a> DenseGqaEmitter<'a> {
         dbatch: u32,
         moe_pf: bool,
         amd: bool,
+        mixed_total_rows: Option<u32>,
+        mixed_decode_rows: Option<u32>,
     ) -> (Self, Vec<packet::devbuild::TensorDecl>, Vec<GenTensor>) {
         let mut tb = Builder::new(n_cu);
         // NRN2 -> q/k/v fold (op 30 i3, gemv_nrn_lds): Gemma dense fp8 decode, AMD arm only.
@@ -5990,6 +6133,8 @@ impl<'a> DenseGqaEmitter<'a> {
             block.clone(),
             nrn_fold,
             merge_fold,
+            mixed_total_rows,
+            mixed_decode_rows,
         );
         let tensors = tb.tensors();
         let gen = tb.gen_tensors();
@@ -6077,6 +6222,30 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
             &self.tmaps,
         );
     }
+    fn emit_mixed(&self, b: &mut Builder, rows: MixedRows) {
+        let mut dummy = Vec::new();
+        emit_phase(
+            b,
+            self.c,
+            self.ls,
+            &self.tn,
+            rows.total_rows,
+            self.ctx,
+            Mode::Mixed {
+                decode_rows: rows.decode_rows,
+            },
+            self.n_cu,
+            &mut dummy,
+            self.fp8,
+            false,
+            self.fp8_kv,
+            self.fp8_kv_full,
+            self.block.clone(),
+            self.block_mode,
+            self.amd,
+            &self.tmaps,
+        );
+    }
 }
 
 /// Compile a checkpoint into a PLOWDEV device blob at `args.out`. This is the
@@ -6129,6 +6298,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         arch,
         emit_cfg: _emit_cfg,
         whole_graph_fusions,
+        mixed_step,
     } = args;
 
     // Resolve the unified emit config: either from the CLI (plowc path) or from env vars (legacy).
@@ -6440,6 +6610,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         gpu,
         arch,
         verify,
+        mixed_step,
     );
 }
 
@@ -6984,6 +7155,7 @@ fn emit_dense_gqa(
     gpu: String,
     arch: String,
     verify: Option<VerifyHook>,
+    mixed_step: Option<MixedStepCompile>,
 ) {
     // Empty --gpu ⇒ unknown target (0), not fnv("") — so the header stamp is 0
     // and unspecified-GPU blobs stay byte-stable (e.g. the golden test).
@@ -7210,6 +7382,38 @@ fn emit_dense_gqa(
     // slot `s`'s offset into the KV cache is `s * (kv_head*ring*hd)` — INVARIANT in B — so a
     // sequence keeps its slot while the program under it changes rung to rung.
     let dbatch: u32 = *rungs.last().expect("decode_rungs is non-empty");
+    let mixed_total_rows = mixed_step
+        .as_ref()
+        .and_then(|mixed| mixed.rows.iter().map(|rows| rows.total_rows).max());
+    let mixed_decode_rows = mixed_step
+        .as_ref()
+        .and_then(|mixed| mixed.rows.iter().map(|rows| rows.decode_rows).max());
+    if let Some(mixed) = &mixed_step {
+        assert!(
+            !mixed.rows.is_empty(),
+            "mixed step requires at least one row shape"
+        );
+        assert!(
+            !c.moe && !fp8 && !fp8_kv && c.tp == 1,
+            "mixed step currently requires dense TP1 BF16 weights and direct BF16 KV"
+        );
+        let mut shapes = std::collections::BTreeSet::new();
+        for &shape in &mixed.rows {
+            assert!(
+                shape.decode_rows > 0
+                    && shape.decode_rows < shape.total_rows
+                    && shape.total_rows <= arows
+                    && shape.decode_rows <= dbatch,
+                "invalid mixed rows total={} decode={} (activation rows={arows}, decode capacity={dbatch})",
+                shape.total_rows,
+                shape.decode_rows,
+            );
+            assert!(
+                shapes.insert((shape.total_rows, shape.decode_rows)),
+                "duplicate mixed row shape"
+            );
+        }
+    }
     // 26B-A4B MoE decode is BATCHED (B in 1..=32): the router family, the flat expert GLU/down
     // and the combine all carry a batch row count and index [B][k] routing slots. See the
     // work-item ordering note in runtime/nvidia/op_moe.cuh for the weight-reuse design.
@@ -7245,6 +7449,8 @@ fn emit_dense_gqa(
         dbatch,
         moe_pf,
         amd,
+        mixed_total_rows,
+        mixed_decode_rows,
     );
 
     let mut progs = Vec::new();
@@ -7356,6 +7562,17 @@ fn emit_dense_gqa(
         tlist.push(rb);
     }
 
+    let mut mixed_programs = Vec::new();
+    if let Some(mixed) = &mixed_step {
+        for &shape in &mixed.rows {
+            let mut builder = Builder::new(n_cu);
+            builder.adopt_tensors(tensors.clone());
+            builder.force_uniseg();
+            emitter.emit_mixed(&mut builder, shape);
+            mixed_programs.push(builder.finish());
+        }
+    }
+
     // Fold the GEN_TMAP_BF16 mint registry into the Model tables (see TmapMint: the
     // per-program Builders adopt clones, so the registry is the only durable record).
     // Empty (and byte-identical) unless PLOW_TMA_GEMM=1.
@@ -7385,6 +7602,104 @@ fn emit_dense_gqa(
             .unwrap_or_else(|error| panic!("decode projection tuning: {error}"));
     // Emit v6 with sections when --embed-cubin/--embed-hsaco given, else v5.
     let mut sections = Vec::new();
+    if let Some(mixed) = &mixed_step {
+        let object_bytes = std::fs::read(&mixed.object).unwrap_or_else(|error| {
+            panic!("mixed step object {}: {error}", mixed.object.display())
+        });
+        let kind = match plow_asset::cubin::elf_machine(&object_bytes) {
+            Some(190) => plow_asset::mixed_step::PayloadKind::Cubin,
+            Some(224) => plow_asset::mixed_step::PayloadKind::Hsaco,
+            _ => panic!("mixed step object must be a CUDA or AMDGPU ELF"),
+        };
+        assert_eq!(
+            kind == plow_asset::mixed_step::PayloadKind::Hsaco,
+            amd,
+            "mixed step object backend does not match the compile target"
+        );
+        let object_name = match kind {
+            plow_asset::mixed_step::PayloadKind::Cubin => "mixed.interp.cubin",
+            plow_asset::mixed_step::PayloadKind::Hsaco => "mixed.interp.hsaco",
+            plow_asset::mixed_step::PayloadKind::Programs => unreachable!(),
+        };
+        let aux = Model {
+            n_cu,
+            target: target_fp,
+            tensors: m.tensors.clone(),
+            progs: mixed_programs,
+            kv_row_insts: Vec::new(),
+            prog_t: mixed.rows.iter().map(|shape| shape.total_rows).collect(),
+            gen: m.gen.clone(),
+        };
+        plow_asset::program::with_model(&aux, |packet| {
+            let contracts: Vec<_> = packet
+                .tensors
+                .iter()
+                .map(|tensor| plow_asset::mixed_step::TensorContract {
+                    name: tensor.name,
+                    bytes: tensor.bytes,
+                    initialized: tensor.initialized,
+                })
+                .collect();
+            for (program, shape) in packet.programs.iter().zip(&mixed.rows) {
+                plow_asset::mixed_step::dense_consumer_contract(
+                    &plow_asset::aux_program::Program {
+                        rows: program.rows,
+                        n_counter: program.n_counter,
+                        insts: program.insts.to_vec(),
+                        stream: program.stream.to_vec(),
+                        stream_ofs: program.stream_ofs.to_vec(),
+                        stream_len: program.stream_len.to_vec(),
+                        waits: program.waits.to_vec(),
+                        succs: program.succs.to_vec(),
+                        gq_stream: program.gq_stream.to_vec(),
+                        gq_seg_ofs: program.gq_seg_ofs.to_vec(),
+                    },
+                    shape.decode_rows,
+                    &contracts,
+                )
+                .unwrap_or_else(|error| panic!("mixed dense consumer contract: {error}"));
+            }
+            let objects = [mixed_step_emit::ObjectSection {
+                section: object_name,
+                kind,
+                version: plow_asset::mixed_step::VERSION,
+                n_cu,
+                capability: plow_asset::mixed_step::OBJECT_CAPABILITY,
+                capability_version: plow_asset::mixed_step::VERSION,
+                bytes: &object_bytes,
+            }];
+            let object_indices = vec![vec![0usize]; mixed.rows.len()];
+            let variants: Vec<_> = mixed
+                .rows
+                .iter()
+                .zip(&object_indices)
+                .enumerate()
+                .map(|(index, (shape, objects))| mixed_step_emit::Variant {
+                    rows: shape.total_rows,
+                    decode_rows: shape.decode_rows,
+                    program_index: index as u32,
+                    object_indices: objects,
+                })
+                .collect();
+            mixed_step_emit::append(
+                &m,
+                &mut sections,
+                &mixed_step_emit::Spec {
+                    max_active_requests: dbatch,
+                    physical_slot_capacity: dbatch,
+                    programs: mixed_step_emit::ProgramSection {
+                        section: "mixed.programs",
+                        version: plow_asset::aux_program::VERSION,
+                        n_cu,
+                        programs: packet.programs,
+                    },
+                    objects: &objects,
+                    variants: &variants,
+                },
+            )
+            .unwrap_or_else(|error| panic!("mixed step packaging: {error}"));
+        });
+    }
     if ecfg.gemv_decode_role {
         assert!(
             !amd && arch == "sm_90a" && !fp8 && !c.moe && rungs == [1],
@@ -7569,6 +7884,13 @@ fn emit_dense_gqa(
         )
     }
     .unwrap_or_else(|error| panic!("decode objects: {error}"));
+    attention_prefill_role::apply_output_object(
+        &mut m,
+        &mut sections,
+        &arch,
+        std::path::Path::new(&out),
+    )
+    .unwrap_or_else(|error| panic!("prefill attention object: {error}"));
     let blob = if sections.is_empty() {
         m.to_blob()
     } else {

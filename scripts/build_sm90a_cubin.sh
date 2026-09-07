@@ -36,6 +36,8 @@
 #      <assets>/interp_sm90a_pf.cubin (PLOW_NV_CUBIN_PF overrides); absent, the
 #      serve path falls back to decode-only prompt consumption.
 # Both are verified to carry their kernel symbol.
+# `PLOW_BUILD_DECODE_ONLY=1` stops after the decode object; decode block sweeps
+# retain the packet-paired prefill objects and do not need to rebuild them.
 #
 # Runs with a clean environment: under `nix develop`, CPATH points nvcc's host
 # pass at nix glibc headers that conflict with the CUDA math headers.
@@ -56,6 +58,8 @@ esac
 # PLOW_ROOT lets a worktree build its OWN modified source instead of /root/plow.
 HERE="${PLOW_ROOT:-.}"
 SRC="$HERE/runtime/nvidia/interp_sm90a.cu"
+# PLOW_CUBIN_CONFIG points at devgen's packet-generated plow_config.h. The object inventory and
+# packet digest then come from the compiled packet; unset keeps the general-object recipe.
 # PLOW_NVCC selects the toolchain. It MUST NOT be newer than what the installed
 # driver accepts, or the cubin loads with CUDA_ERROR_INVALID_IMAGE at runtime
 # (e.g. a CUDA 13 cubin on a 570.x / CUDA 12.8 driver). Check `nvidia-smi`.
@@ -139,6 +143,23 @@ if [ "${PLOW_BUILD_FP8_M1_TMA:-0}" = "1" ]; then
   export PLOW_BUILD_TMA_GEMM=1
 fi
 
+DECODE_EXTRA="$EXTRA"
+PREFILL_EXTRA="$EXTRA"
+FLASH_EXTRA="$EXTRA"
+PACKET_GEOMETRY="-DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2"
+if [ -n "${PLOW_CUBIN_CONFIG:-}" ]; then
+  [ -f "$PLOW_CUBIN_CONFIG" ] || { echo "missing PLOW_CUBIN_CONFIG: $PLOW_CUBIN_CONFIG" >&2; exit 2; }
+  cfg_dir="$(dirname -- "$PLOW_CUBIN_CONFIG")"
+  cfg_name="$(basename -- "$PLOW_CUBIN_CONFIG")"
+  CONFIG_FLAGS="-I$cfg_dir -DPLOW_CONFIG=\"$cfg_name\""
+  DECODE_EXTRA="$DECODE_EXTRA $CONFIG_FLAGS -DPLOW_BUCKET_DECODE=1"
+  PREFILL_EXTRA="$PREFILL_EXTRA $CONFIG_FLAGS -DPLOW_BUCKET_DECODE=0"
+  FLASH_EXTRA="$FLASH_EXTRA $CONFIG_FLAGS -DPLOW_BUCKET_FLASH=1"
+  if grep -qx '#define PLOW_HAS_FLASH_HD64 1' "$PLOW_CUBIN_CONFIG"; then
+    PACKET_GEOMETRY="-DPLOW_NV_GEMMA=0"
+  fi
+fi
+
 
 # PLOW_BUILD_TMA_GEMM=1: opt-in TMA + warp-specialized prefill GEMM (op_gemm_sm90.cuh,
 # port of tma_ws_gemm_bf16.cu's ws_tma winner). Prefill object only — decode never
@@ -198,8 +219,8 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
   "${NVENV[@]}" \
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
-    -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 $FATLITE_GATE \
-    -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
+    -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 $PACKET_GEOMETRY $FATLITE_GATE \
+    -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $PREFILL_EXTRA $PF_EXTRA \
     -o "$OUT_PFSEG" "$SRC"
   "${NVENV[@]}" \
     cuobjdump -symbols "$OUT_PFSEG" | grep -q "_pfseg" || { echo "FATAL: _pfseg symbol missing" >&2; exit 1; }
@@ -260,8 +281,8 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
     -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPGM90_TMA_STAGES=3 \
-    -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 $GEMM_ONLY_GATE \
-    -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
+    $PACKET_GEOMETRY $GEMM_ONLY_GATE \
+    -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $PREFILL_EXTRA $PF_EXTRA \
     -o "$OUT_PFGEMM" "$SRC"
   "${NVENV[@]}" \
     cuobjdump -symbols "$OUT_PFGEMM" | grep -q "_pfgemm" || { echo "FATAL: _pfgemm symbol missing" >&2; exit 1; }
@@ -294,18 +315,27 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
       -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
       -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_FA_ONLY=1 $FA_WG \
       -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 \
-      -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
+      -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $FLASH_EXTRA $PF_EXTRA \
       -o "$OUT_PFFA" "$SRC"
     "${NVENV[@]}" \
       cuobjdump -symbols "$OUT_PFFA" | grep -q "_pffa" || { echo "FATAL: _pffa symbol missing" >&2; exit 1; }
     echo "built $OUT_PFFA ($(stat -c%s "$OUT_PFFA") B)"
+
+    OUT_PFATTN="${OUT%.cubin}_pfattn_hd512.cubin"
+    "${NVENV[@]}" \
+      "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
+      -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+      -o "$OUT_PFATTN" "$HERE/runtime/nvidia/interp_sm90a_pfattn_hd512.cu"
+    "${NVENV[@]}" \
+      cuobjdump -symbols "$OUT_PFATTN" | grep -q "plow_sm90a_pfattn_hd512" || { echo "FATAL: pfattn hd512 symbol missing" >&2; exit 1; }
+    echo "built $OUT_PFATTN ($(stat -c%s "$OUT_PFATTN") B)"
   fi
 fi
 
 "${NVENV[@]}" \
   "$NVCC" -arch=sm_90a -O3 -cubin \
   -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
-  -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA \
+  $PACKET_GEOMETRY -DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $DECODE_EXTRA \
   -o "$OUT" "$SRC"
 
 if ! "${NVENV[@]}" \
@@ -316,10 +346,30 @@ if ! "${NVENV[@]}" \
 fi
 echo "built $OUT ($(stat -c%s "$OUT") B), kernel $KSYM present"
 
+if [ -n "${PLOW_CUBIN_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_HAS_MOE_GLU_MX 1' "$PLOW_CUBIN_CONFIG" &&
+   grep -qx '#define PLOW_HAS_MOE_DOWN_MX 1' "$PLOW_CUBIN_CONFIG"; then
+  OUT_MXFP4_MOE="${OUT%.cubin}_mxfp4_moe.cubin"
+  "${NVENV[@]}" \
+    "$NVCC" -std=c++17 -arch=sm_90a -O3 -cubin \
+    -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+    -o "$OUT_MXFP4_MOE" "$HERE/runtime/nvidia/interp_sm90a_mxfp4_moe.cu"
+  "${NVENV[@]}" cuobjdump -symbols "$OUT_MXFP4_MOE" | \
+    grep -q plow_sm90a_mxfp4_moe || {
+      echo "FATAL: MXFP4 MoE role kernel missing in $OUT_MXFP4_MOE" >&2
+      exit 1
+    }
+  echo "built $OUT_MXFP4_MOE ($(stat -c%s "$OUT_MXFP4_MOE") B)"
+fi
+
+if [ "${PLOW_BUILD_DECODE_ONLY:-0}" = "1" ]; then
+  exit 0
+fi
+
 "${NVENV[@]}" \
   "$NVCC" -arch=sm_90a -O3 -cubin \
   -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
-  -DPLOW_NV_PREFILL=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
+  -DPLOW_NV_PREFILL=1 $PACKET_GEOMETRY -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $PREFILL_EXTRA $PF_EXTRA \
   -o "$OUT_PF" "$SRC"
 
 if ! "${NVENV[@]}" \
@@ -340,7 +390,7 @@ if [ "${PLOW_BUILD_FP8KV:-0}" = "1" ]; then
   "${NVENV[@]}" \
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
-    -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_EMBED_SMEM=1 -DPLOW_FP8_KV=1 $GEMMA_GATE $GEMV_RB $EXTRA \
+    -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_EMBED_SMEM=1 -DPLOW_FP8_KV=1 $GEMMA_GATE $GEMV_RB $DECODE_EXTRA \
     -o "$OUT_KV" "$SRC"
   "${NVENV[@]}" \
     cuobjdump -symbols "$OUT_KV" | grep -q "$KSYM" || { echo "FATAL: $KSYM missing in $OUT_KV" >&2; exit 1; }
@@ -363,7 +413,7 @@ if [ "${PLOW_BUILD_FP8KV:-0}" = "1" ]; then
   "${NVENV[@]}" \
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
-    -DPLOW_NV_PREFILL=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1 -DPLOW_FP8_KV=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
+    -DPLOW_NV_PREFILL=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1 -DPLOW_FP8_KV=1 $GEMMA_GATE $GEMV_RB $PREFILL_EXTRA $PF_EXTRA \
     $FA_PIPE_KV \
     -o "$OUT_PF_KV" "$SRC"
   "${NVENV[@]}" \

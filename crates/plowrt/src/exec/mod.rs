@@ -9,6 +9,8 @@
 /// (segmented dispatch, three kernels, per-phase scheduler, static LDS).
 #[cfg(feature = "hsa")]
 pub mod amd;
+#[cfg(feature = "hsa")]
+mod amd_packed;
 /// N [`amd::AmdEngine`] ranks stepped as one: the host half of the inline
 /// collective. Decode is launch-all-then-drain-all; prefill is per-segment,
 /// all-ranks, with a host barrier — see the module note for why the two differ.
@@ -32,6 +34,8 @@ pub mod indirection;
 // Prefill-chunk helpers are only exercised by an engine with a prefill path (AMD today).
 #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
 pub mod kvrow;
+pub mod mixed_packet;
+pub mod mixed_step_staging;
 pub mod oob;
 pub mod queue;
 /// Multi-GPU (tensor-parallel) device group: peer buffers, cross-GPU counters,
