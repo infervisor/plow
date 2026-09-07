@@ -1616,6 +1616,15 @@ struct Tn {
     // fold is enabled, so every other blob stays byte-identical.
     mrgc: u32,
     hn: u32,
+    // Gemma-4 E-series per-layer inputs (TENSOR_NONE elsewhere): the packed embedding table
+    // [vocab][L*P], the context projection [L*P][H] and its norm gamma [P]; activations
+    // `ple_raw` (token part), `ple_pp` (projection) and `ple` (combined) are [rows][L*P] bf16.
+    ple_tab: u32,
+    ple_proj: u32,
+    ple_norm: u32,
+    ple_raw: u32,
+    ple_pp: u32,
+    ple: u32,
     qg: u32,
     kg: u32,
     vg: u32,
@@ -1695,6 +1704,10 @@ struct LW {
     g_po: u32,
     qn: u32,
     kn: u32,
+    // E-series per-layer input block (op 154): gate [P][H], projection [H][P], post norm [H].
+    plg: u32,
+    plp: u32,
+    g_pl: u32,
     // Gemma-4 MoE (26B-A4B) per-layer weights + the loader-filled expert pointer table.
     // TENSOR_NONE on the dense 12B/31B path. rproj/rscale/rpes = router; g_pf1/g_pf2/g_pre2 = the
     // three extra sandwich norms. ewt = Persistent u64[E*2] {gate_up base, down base} per expert,
@@ -1933,6 +1946,45 @@ fn declare(
             TENSOR_NONE
         },
         hn: ac(b, "hn", (rows * c.hidden) as u64 * BF16),
+        ple_tab: if c.ple > 0 {
+            b.tensor(
+                &format!("{}embed_tokens_per_layer.weight", c.prefix),
+                (c.vocab as u64) * (c.layers * c.ple) as u64 * BF16,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        ple_proj: if c.ple > 0 {
+            b.tensor(
+                &format!("{}per_layer_model_projection.weight", c.prefix),
+                (c.layers * c.ple) as u64 * c.hidden as u64 * BF16,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        ple_norm: if c.ple > 0 {
+            b.tensor(
+                &format!("{}per_layer_projection_norm.weight", c.prefix),
+                c.ple as u64 * BF16,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        ple_raw: if c.ple > 0 {
+            ac(b, "ple_raw", (rows * c.layers * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple_pp: if c.ple > 0 {
+            ac(b, "ple_pp", (rows * c.layers * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
+        ple: if c.ple > 0 {
+            ac(b, "ple", (rows * c.layers * c.ple) as u64 * BF16)
+        } else {
+            TENSOR_NONE
+        },
         qg: ac(b, "qg", (rows * qd_max) as u64 * BF16),
         kg: ac(b, "kg", (rows * kd_max) as u64 * BF16),
         vg: ac(b, "vg", (rows * kd_max) as u64 * BF16),
@@ -2129,6 +2181,10 @@ fn declare(
         let fp8_kv = fp8_kv && (full || !fp8_kv_full);
         let hd = if full { c.hd_full } else { c.hd_slide };
         let kvh = if full { c.kvh_full } else { c.kvh_slide };
+        // KV sharing (E-series): this layer reads the KV cache of `kv_src` and owns no k/v
+        // projection, k norm or cache of its own.
+        let shared = c.kv_is_shared(l as usize);
+        let kv_src = c.kv_source(l as usize);
         // KV CACHE, HEAD-MAJOR [kv_head][ctx][hd] (see dev_isa.h "THE KV CACHE IS HEAD-MAJOR").
         // Exactly the layout HeadNormRope writes (op_norm.h d_headnorm_rope, out_stride = kvr)
         // and the layout FlashDecode reads with kv_stride — so the cache write is not a separate
@@ -2153,7 +2209,9 @@ fn declare(
         // ((b*n_kv_head+hkv)*kv_stride+row)*hd, so the per-batch stride is kv_head*ring*hd and the
         // tensor is dbatch* that. dbatch==1 => byte-identical to the single-sequence cache.
         let db = dbatch as u64;
-        t.kc.push(if in_block {
+        t.kc.push(if shared {
+            t.kc[kv_src]
+        } else if in_block {
             b.tensor(
                 &format!("kv.{l}.k"),
                 db * (kvr * kvh_local * hd) as u64 * kv_elt,
@@ -2161,7 +2219,9 @@ fn declare(
         } else {
             TENSOR_NONE
         });
-        t.vc.push(if in_block {
+        t.vc.push(if shared {
+            t.vc[kv_src]
+        } else if in_block {
             b.tensor(
                 &format!("kv.{l}.v"),
                 db * (kvr * kvh_local * hd) as u64 * kv_elt,
@@ -2169,7 +2229,9 @@ fn declare(
         } else {
             TENSOR_NONE
         });
-        t.kcs.push(if fp8_kv && in_block {
+        t.kcs.push(if shared {
+            t.kcs[kv_src]
+        } else if fp8_kv && in_block {
             b.tensor(
                 &format!("kv.{l}.k_scale"),
                 db * (kvr * kvh_local) as u64 * F32,
@@ -2177,7 +2239,9 @@ fn declare(
         } else {
             TENSOR_NONE
         });
-        t.vcs.push(if fp8_kv && in_block {
+        t.vcs.push(if shared {
+            t.vcs[kv_src]
+        } else if fp8_kv && in_block {
             b.tensor(
                 &format!("kv.{l}.v_scale"),
                 db * (kvr * kvh_local) as u64 * F32,
@@ -2301,12 +2365,16 @@ fn declare(
         };
         t.lw.push(LW {
             wq: wproj(b, "self_attn.q_proj.weight", (qd * c.hidden) as u64 * BF16),
-            wk: wproj(b, "self_attn.k_proj.weight", (kd * c.hidden) as u64 * BF16),
+            wk: if shared {
+                TENSOR_NONE
+            } else {
+                wproj(b, "self_attn.k_proj.weight", (kd * c.hidden) as u64 * BF16)
+            },
             // Gemma full layers have NO v_proj: V is the raw k_proj output (k_eq_v). Llama/Qwen
             // always have a real v_proj. (fp8 mode elides the bf16 twin like the other projections.)
             wv: wopt(
                 b,
-                !keqv && !fp8 && !mx4_pf,
+                !keqv && !fp8 && !mx4_pf && !shared,
                 "self_attn.v_proj.weight",
                 (kd * c.hidden) as u64 * BF16,
             ),
@@ -2326,8 +2394,12 @@ fn declare(
             // Dims use the TP-sharded shard extents (qd/kd/inter_sh); at tp==1 these equal the full
             // extents, so the single-GPU fp8 pkt is unaffected by the TP structure.
             wq8: w8(b, "self_attn.q_proj.weight", (qd * c.hidden) as u64),
-            wk8: w8(b, "self_attn.k_proj.weight", (kd * c.hidden) as u64),
-            wv8: if keqv {
+            wk8: if shared {
+                TENSOR_NONE
+            } else {
+                w8(b, "self_attn.k_proj.weight", (kd * c.hidden) as u64)
+            },
+            wv8: if keqv || shared {
                 TENSOR_NONE
             } else {
                 w8(b, "self_attn.v_proj.weight", (kd * c.hidden) as u64)
@@ -2342,13 +2414,17 @@ fn declare(
                 qd as u64,
                 (qd * c.hidden) as u64,
             ),
-            sk: sc(
-                b,
-                "self_attn.k_proj.weight",
-                kd as u64,
-                (kd * c.hidden) as u64,
-            ),
-            sv: if keqv {
+            sk: if shared {
+                TENSOR_NONE
+            } else {
+                sc(
+                    b,
+                    "self_attn.k_proj.weight",
+                    kd as u64,
+                    (kd * c.hidden) as u64,
+                )
+            },
+            sv: if keqv || shared {
                 TENSOR_NONE
             } else {
                 sc(
@@ -2405,9 +2481,27 @@ fn declare(
             ),
             kn: wopt(
                 b,
-                c.has_qk_norm,
+                c.has_qk_norm && !shared,
                 "self_attn.k_norm.weight",
                 hd as u64 * BF16,
+            ),
+            plg: wopt(
+                b,
+                c.ple > 0,
+                "per_layer_input_gate.weight",
+                (c.ple * c.hidden) as u64 * BF16,
+            ),
+            plp: wopt(
+                b,
+                c.ple > 0,
+                "per_layer_projection.weight",
+                (c.hidden * c.ple) as u64 * BF16,
+            ),
+            g_pl: wopt(
+                b,
+                c.ple > 0,
+                "post_per_layer_input_norm.weight",
+                c.hidden as u64 * BF16,
             ),
             // MoE (26B-A4B): router + FUSED 3D expert weights + the 3 extra sandwich norms. The
             // ewt pointer table is NOT a checkpoint tensor — it is a Persistent buffer the harness/
@@ -3400,6 +3494,59 @@ fn emit_phase(
             d.f[0] = escale;
         })
     };
+    // Gemma-4 E-series PER-LAYER INPUTS (dev_isa.h op 154), once per token for all layers:
+    // ple_raw = embed_per_layer[ids] * sqrt(P); ple_pp = x . Wproj^T (the 1/sqrt(H) is dropped:
+    // the RMSNorm that follows is scale-invariant); ple = (RMSNorm_P(ple_pp) * gamma + ple_raw) / sqrt(2).
+    // Every layer's block then reads its P-column slice of `ple`. Emitted before the hetero
+    // join so the CPU lane's rows see it.
+    let c_ple = if c.ple > 0 && !block_mode {
+        let lp = c.layers * c.ple;
+        let c_pe = b.emit(DevOp::Embed, rows.clone(), &[], |d| {
+            d.t[0] = n.ple_raw;
+            d.t[1] = n.ple_tab;
+            d.t[2] = n.ids;
+            d.i[0] = t;
+            d.i[1] = lp;
+            d.f[0] = (c.ple as f32).sqrt();
+        });
+        let fill = |d: &mut DevInst| {
+            d.t[0] = n.ple_pp;
+            d.t[1] = n.x;
+            d.t[2] = n.ple_proj;
+            d.i[0] = t;
+            d.i[1] = lp;
+            d.i[2] = c.hidden;
+        };
+        let c_pp = if gemv_family {
+            b.emit(DevOp::Gemv, gemv_wg_cap(all.clone()), &[dep], fill)
+        } else {
+            let op = pick_tile(t, lp, c.hidden, n_cu, kernelcaps::QuantScheme::None);
+            b.emit(op, all.clone(), &[dep], fill)
+        };
+        let nrows = t * c.layers;
+        let c_pn = b.emit(
+            DevOp::RmsNorm,
+            (0..nrows.min(n_cu).max(1)).collect(),
+            &[c_pp],
+            |d| {
+                d.t[0] = n.ple;
+                d.t[1] = n.ple_pp;
+                d.t[2] = n.ple_norm;
+                d.i[0] = nrows;
+                d.i[1] = c.ple;
+                d.f[0] = c.eps;
+            },
+        );
+        b.emit(DevOp::Residual, elem(t * lp), &[c_pn, c_pe], |d| {
+            d.t[0] = n.ple;
+            d.t[1] = n.ple;
+            d.t[2] = n.ple_raw;
+            d.i[0] = t * lp;
+            d.f[0] = std::f32::consts::FRAC_1_SQRT_2;
+        })
+    } else {
+        0
+    };
     if hj {
         b.host_join();
         join();
@@ -3663,6 +3810,7 @@ fn emit_phase(
     let fuse_nrn = gfuse
         && fp8
         && amd
+        && c.ple == 0
         && !block_mode
         && n.xr != TENSOR_NONE
         && (c.hidden & 7) == 0
@@ -3674,6 +3822,9 @@ fn emit_phase(
 
     for l in block.clone() {
         let full = c.is_full[l];
+        // KV sharing (E-series): no k/v projection, norm or cache write; attention reads the
+        // source layer's cache (`n.kc[l]` aliases it, see declare()).
+        let shared = c.kv_is_shared(l);
         // MIXED fp8-KV (PLOW_FP8_KV_FULL=1): per-layer effective flag — see declare(). Ops keyed
         // on it (HeadNormRope[Fp8], FlashDecode[Fp8], FlashPrefill[Fp8], the fp8-tuned nsplit
         // gates) all follow the LAYER's cache dtype.
@@ -3719,6 +3870,7 @@ fn emit_phase(
         // precondition with nothing checking it.
         let fuse_qkv = gemv_family
             && !keqv
+            && !shared
             && !fp8
             && !mx4
             // `gemv_staged_rows`, not `t`: with `PLOW_GEMV_WALK` the staging moves inside the
@@ -3744,6 +3896,7 @@ fn emit_phase(
         // the AMD side, so the gate lives here.
         let fuse_qkv_fp8 = gemv_family
             && !keqv
+            && !shared
             && fp8
             && amd
             && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves()
@@ -4040,7 +4193,9 @@ fn emit_phase(
             (c_q, c_k, c_v, v_src) = (fused, fused, fused, n.vg);
             let _ = qkv_g; // norm is a shared packet here, never folded into the fused GEMV
         } else {
-            let (cq, ck, cv) = if gemv_family {
+            let (cq, ck, cv) = if shared {
+                (all.clone(), Vec::new(), Vec::new())
+            } else if gemv_family {
                 split3(gemv_wg_n(n_cu), qd, kd, if keqv { 0 } else { kd })
             } else {
                 split3(
@@ -4111,7 +4266,9 @@ fn emit_phase(
                 )
             };
             rec(cqc);
-            let ckc = if let Some(f) = &nrn {
+            let ckc = if shared {
+                cqc
+            } else if let Some(f) = &nrn {
                 fold_proj(b, n.kg, w.wk8, w.sk, kd, ck, false, f)
             } else {
                 proj(
@@ -4131,8 +4288,12 @@ fn emit_phase(
                     &[dq],
                 )
             };
-            rec(ckc);
-            let (vsrc, cvc) = if keqv {
+            if !shared {
+                rec(ckc);
+            }
+            let (vsrc, cvc) = if shared {
+                (n.vg, cqc)
+            } else if keqv {
                 (n.kg, ckc) // k_eq_v: V is the RAW k_proj output
             } else if let Some(f) = &nrn {
                 (n.vg, fold_proj(b, n.vg, w.wv8, w.sv, kd, cv, false, f))
@@ -4157,7 +4318,7 @@ fn emit_phase(
                     ),
                 )
             };
-            if !keqv {
+            if !keqv && !shared {
                 rec(cvc);
             }
             (c_q, c_k, c_v, v_src) = (cqc, ckc, cvc, vsrc);
@@ -4283,6 +4444,7 @@ fn emit_phase(
         // (correct, token-identical, and the trade flips where fine deps do not exist — the
         // static scheduler, or a launch-per-op backend). Opt in with PLOW_FUSE_HNR=1.
         let fuse_hnr = gemv_family
+            && !shared
             && amd
             && t == 1
             && !fp8_kv
@@ -4331,7 +4493,7 @@ fn emit_phase(
         } else {
             DevOp::HeadNormRope
         };
-        let c_kn = if fuse_hnr {
+        let c_kn = if fuse_hnr || shared {
             0
         } else {
             b.emit_dep(hn_op, hn_set(1), hn_dep(c_k, nk, kvh), |d| {
@@ -4367,17 +4529,19 @@ fn emit_phase(
                 }
             })
         };
-        if decode && !fuse_hnr {
+        if decode && !fuse_hnr && !shared {
             kv_rows.push(c_kn);
         }
         // v_norm: WEIGHTLESS (gamma NONE) and NO RoPE (cos NONE).
         // On a full layer V comes from the RAW k_proj output, so its producer is c_k (nk wgs).
-        let vn_dep = if keqv {
+        let vn_dep = if shared {
+            Vec::new()
+        } else if keqv {
             hn_dep(c_v, nk, kvh)
         } else {
             hn_dep(c_v, nv, kvh)
         };
-        let c_vn = if fuse_hnr {
+        let c_vn = if fuse_hnr || shared {
             0
         } else {
             b.emit_dep(hn_op, hn_set(2), vn_dep, |d| {
@@ -4398,7 +4562,7 @@ fn emit_phase(
                 }
             })
         };
-        if decode && !fuse_hnr {
+        if decode && !fuse_hnr && !shared {
             kv_rows.push(c_vn);
         }
 
@@ -4407,6 +4571,9 @@ fn emit_phase(
         // PREVIOUS decode step (a previous launch), so within this program flash depends only on
         // the three headnorms' work for its own head — not on all of them.
         let fa_dep = || -> Vec<Dep> {
+            if shared {
+                return vec![Dep::Coarse(c_qn)];
+            }
             if !gemv_family {
                 return vec![Dep::Coarse(c_qn), Dep::Coarse(c_kn), Dep::Coarse(c_vn)];
             }
@@ -4602,7 +4769,12 @@ fn emit_phase(
             // k_eq_v just encodes the same base at both pair slots.
             let fa_tm = (tma_gemm && !fp8_kv && (hd == 256 || hd == 512) && !gemv_family)
                 .then(|| tmap_kv(n.kc[l], n.vc[l], kvr, hd, kvh));
-            b.emit(fa_op, all.clone(), &[c_qn, c_kn, c_vn], |d| {
+            let fa_deps: Vec<u32> = if shared {
+                vec![c_qn]
+            } else {
+                vec![c_qn, c_kn, c_vn]
+            };
+            b.emit(fa_op, all.clone(), &fa_deps, |d| {
                 d.t[0] = n.opart;
                 d.t[1] = n.mlpart;
                 d.t[2] = n.q;
@@ -5568,6 +5740,36 @@ fn emit_phase(
                 // layer folds into q+k only (no v proj exists).
                 nrn_pending = Some((ffn_out, w.g_po, next_gin, ls[l]));
                 c_d
+            } else if c.ple > 0 {
+                // E-series: the sandwich residual, then the per-layer input block carrying the
+                // layer scalar AND the next layer's input norm (t5/t6), so the packet count per
+                // layer stays at the fused pair's.
+                let cr = b.emit(DevOp::NormResidual, rows.clone(), &[c_d], |d| {
+                    d.t[0] = n.x;
+                    d.t[1] = n.x;
+                    d.t[2] = ffn_out;
+                    d.t[3] = w.g_po;
+                    d.i[0] = t;
+                    d.i[1] = c.hidden;
+                    d.f[0] = c.eps;
+                    d.f[1] = 1.0;
+                });
+                b.emit(DevOp::PerLayerInput, rows.clone(), &[cr, c_ple], |d| {
+                    d.t[0] = n.x;
+                    d.t[1] = w.plg;
+                    d.t[2] = w.plp;
+                    d.t[3] = w.g_pl;
+                    d.t[4] = n.ple;
+                    d.t[5] = n.hn;
+                    d.t[6] = next_gin;
+                    d.i[0] = t;
+                    d.i[1] = c.hidden;
+                    d.i[2] = c.ple;
+                    d.i[3] = l as u32 * c.ple;
+                    d.i[4] = c.layers * c.ple;
+                    d.f[0] = c.eps;
+                    d.f[1] = ls[l];
+                })
             } else {
                 b.emit(DevOp::NormResidualNorm, rows.clone(), &[c_d], |d| {
                     d.t[0] = n.hn;
@@ -5591,10 +5793,30 @@ fn emit_phase(
                 d.i[0] = tg;
                 d.i[1] = c.hidden;
                 d.f[0] = c.eps;
-                d.f[1] = ls[l];
+                // E-series: the layer scalar applies after the per-layer input block below.
+                d.f[1] = if c.ple > 0 { 1.0 } else { ls[l] };
             });
             rec(cr);
-            cr
+            if c.ple > 0 {
+                let cp = b.emit(DevOp::PerLayerInput, rows_g.clone(), &[cr, c_ple], |d| {
+                    d.t[0] = n.x;
+                    d.t[1] = w.plg;
+                    d.t[2] = w.plp;
+                    d.t[3] = w.g_pl;
+                    d.t[4] = n.ple;
+                    d.i[0] = tg;
+                    d.i[1] = c.hidden;
+                    d.i[2] = c.ple;
+                    d.i[3] = l as u32 * c.ple;
+                    d.i[4] = c.layers * c.ple;
+                    d.f[0] = c.eps;
+                    d.f[1] = ls[l];
+                });
+                rec(cp);
+                cp
+            } else {
+                cr
+            }
         } else {
             let cr = b.emit(DevOp::Residual, elem(tg * c.hidden), &[c_d], |d| {
                 d.t[0] = n.x;
@@ -7974,6 +8196,13 @@ fn emit_dense_gqa(
     // benchmarked by someone. PLOW_SKIP_COVERAGE=1 is the deliberate escape hatch for
     // partial/renamed checkpoints; it is loud because it re-arms the silent-wrong-model
     // failure mode this gate exists to prevent.
+    let kv_dead: Vec<String> = (0..c.layers as usize)
+        .filter(|&l| c.kv_is_shared(l))
+        .flat_map(|l| {
+            ["k_proj", "v_proj", "k_norm"]
+                .map(|w| format!("{}layers.{l}.self_attn.{w}.weight", c.prefix))
+        })
+        .collect();
     match validate_coverage(
         &dir,
         &c.prefix,
@@ -7982,7 +8211,10 @@ fn emit_dense_gqa(
         // The dense path declares every weight it reads; nothing reaches the device by a
         // name-pattern bind, a load-time fold or a host-side absorption, and nothing it
         // declares is synthesized before the bind, and no weight is conditionally covered.
-        &[],
+        // The one exception is ARCHITECTURAL: a KV-shared layer (Gemma-4 E-series) ships k/v
+        // projections and a k norm that no forward pass reads — HF lists them in
+        // `_keys_to_ignore_on_load_unexpected` — so those exact names are waived here.
+        &kv_dead.iter().map(String::as_str).collect::<Vec<_>>(),
         &[],
         &[],
     ) {

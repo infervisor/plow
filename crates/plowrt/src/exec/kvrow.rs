@@ -249,6 +249,7 @@ pub(crate) const PREFILL_ROW_FIELDS: &[(DevOp, RowField)] = &[
     (DevOp::GemmWideFp8, RowField::Rows(0)),
     (DevOp::GemmGluFp8, RowField::Rows(0)),
     (DevOp::GemmFp8Blk, RowField::Rows(0)),
+    (DevOp::PerLayerInput, RowField::Rows(0)),
     (DevOp::FlashMlaPrefill, RowField::Rows(4)),
     (DevOp::FlashMlaPrefillFp8, RowField::Rows(4)),
     (DevOp::MlaMergeFold, RowField::Rows(0)),

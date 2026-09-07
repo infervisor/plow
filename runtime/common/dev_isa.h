@@ -1315,6 +1315,17 @@ enum {
     PLOW_DOP_MOE_GLU_MX_PF = 152,
     PLOW_DOP_MOE_DOWN_MX_PF = 153,
 
+    /* Gemma-4 E-series PER-LAYER INPUT block, fused (one packet per layer, in place on x):
+     *   t0=x(bf16 [T][H], in/out) t1=Wg(bf16 [P][H]) t2=Wp(bf16 [H][P]) t3=gamma_post(bf16 [H])
+     *   t4=ple(bf16 [T][stride]) t5=hn_out?(bf16 [T][H]) t6=gamma_next?(bf16 [H])
+     *   i0=T i1=H i2=P i3=col0 i4=stride   f0=eps f1=layer_scalar
+     * per row t:  g = gelu_tanh(Wg . x[t]);  a = g * ple[t][col0 .. col0+P);  y = Wp . a;
+     *             x[t] = (x[t] + RMSNorm(y) * gamma_post) * layer_scalar;
+     *             hn[t] = RMSNorm(x[t]) * gamma_next          (only when t5 is bound)
+     * `ple` is the [T][layers*P] per-layer input table (Gemma4TextModel.project_per_layer_inputs,
+     * with the 1/sqrt(2) folded into Wp by the emitter); t5/t6 fold the NEXT layer's input norm. */
+    PLOW_DOP_PER_LAYER_INPUT = 154,
+
     PLOW_DOP__COUNT
 };
 

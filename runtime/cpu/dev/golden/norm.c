@@ -216,3 +216,62 @@ G_K(g_norm_residual_norm) {
         }
     }
 }
+
+/* Op 154 (dev_isa.h): Gemma-4 E-series per-layer input block, in place on x.
+ * t0=x t1=Wg[P][H] t2=Wp[H][P] t3=gamma_post[H] t4=ple[T][stride] t5=hn_out? t6=gamma_next?
+ * i0=T i1=H i2=P i3=col0 i4=stride  f0=eps f1=layer_scalar.
+ * bf16 rounding follows the HF module boundaries (gate out, act, product, projection out). */
+G_K(g_per_layer_input) {
+    plow_bf16* x = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* wg = PLOW_CPU_TEN(in, T, 1);
+    const plow_bf16* wp = PLOW_CPU_TEN(in, T, 2);
+    const plow_bf16* gamma = PLOW_CPU_TEN(in, T, 3);
+    const plow_bf16* ple = PLOW_CPU_TEN(in, T, 4);
+    plow_bf16* hn = PLOW_CPU_TEN(in, T, 5);
+    const plow_bf16* gnext = PLOW_CPU_TEN(in, T, 6);
+    const uint32_t rows = in->i[0], H = in->i[1], P = in->i[2], col0 = in->i[3], stride = in->i[4];
+    const float eps = in->fj[0].f, ls = in->fj[1].f;
+    if (P > 1024u || !ctx || !ctx->scratch || ctx->scratch_bytes < (size_t)(P + H) * sizeof(float)) {
+        for (uint32_t t = slice; t < rows; t += nblk) g_poison_row(x + (size_t)t * H, H);
+        return;
+    }
+    float* a = (float*)ctx->scratch;
+    float* y = a + P;
+    for (uint32_t t = slice; t < rows; t += nblk) {
+        plow_bf16* xr = x + (size_t)t * H;
+        const plow_bf16* pr = ple + (size_t)t * stride + col0;
+        for (uint32_t p = 0; p < P; p++) {
+            const plow_bf16* w = wg + (size_t)p * H;
+            float s = 0.0f;
+            for (uint32_t h = 0; h < H; h++) s += plow_bf2f(w[h]) * plow_bf2f(xr[h]);
+            const float g = plow_bf2f(plow_f2bf(g_gelu_tanh(plow_bf2f(plow_f2bf(s)))));
+            a[p] = plow_bf2f(plow_f2bf(g * plow_bf2f(pr[p])));
+        }
+        float ss = 0.0f;
+        for (uint32_t h = 0; h < H; h++) {
+            const plow_bf16* w = wp + (size_t)h * P;
+            float s = 0.0f;
+            for (uint32_t p = 0; p < P; p++) s += plow_bf2f(w[p]) * a[p];
+            y[h] = plow_bf2f(plow_f2bf(s));
+            ss += y[h] * y[h];
+        }
+        const float inv = g_rsqrt(ss / (float)H + eps);
+        float ss2 = 0.0f;
+        for (uint32_t h = 0; h < H; h++) {
+            const float g = gamma ? plow_bf2f(gamma[h]) : 1.0f;
+            const float n = plow_bf2f(plow_f2bf(y[h] * inv * g));
+            const float v = plow_bf2f(plow_f2bf(plow_bf2f(xr[h]) + n)) * ls;
+            xr[h] = plow_f2bf(v);
+            const float vb = plow_bf2f(xr[h]);
+            ss2 += vb * vb;
+        }
+        if (hn) {
+            const float inv2 = g_rsqrt(ss2 / (float)H + eps);
+            plow_bf16* o = hn + (size_t)t * H;
+            for (uint32_t h = 0; h < H; h++) {
+                const float g = gnext ? plow_bf2f(gnext[h]) : 1.0f;
+                o[h] = plow_f2bf(plow_bf2f(xr[h]) * inv2 * g);
+            }
+        }
+    }
+}

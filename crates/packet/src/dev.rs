@@ -1802,6 +1802,13 @@ pub enum DevOp {
     /// `t0=part(f32[T*k][H]) t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx(u32)
     /// t7=row_gate(f32)` · `i0=H i1=I i2=n_exp`.
     MoeDownMxPf = 153,
+    /// Gemma-4 E-series per-layer input block, fused and in place on `x`: `g = gelu_tanh(Wg . x)`,
+    /// `a = g * ple[t][col0..col0+P)`, `x = (x + RMSNorm(Wp . a) * gamma_post) * layer_scalar`, and
+    /// optionally the next layer's input norm `hn = RMSNorm(x) * gamma_next` (t5/t6). See
+    /// `dev_isa.h` op 154.
+    /// `t0=x t1=Wg t2=Wp t3=gamma_post t4=ple t5=hn_out? t6=gamma_next?` ·
+    /// `i0=T i1=H i2=P i3=col0 i4=stride` · `f0=eps f1=layer_scalar`.
+    PerLayerInput = 154,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -1971,6 +1978,7 @@ impl DevOp {
         DevOp::MoeDownMx,
         DevOp::MoeGluMxPf,
         DevOp::MoeDownMxPf,
+        DevOp::PerLayerInput,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -2145,6 +2153,7 @@ impl DevOp {
             DevOp::MoeDownMx => "PLOW_DOP_MOE_DOWN_MX",
             DevOp::MoeGluMxPf => "PLOW_DOP_MOE_GLU_MX_PF",
             DevOp::MoeDownMxPf => "PLOW_DOP_MOE_DOWN_MX_PF",
+            DevOp::PerLayerInput => "PLOW_DOP_PER_LAYER_INPUT",
         }
     }
 
@@ -2184,7 +2193,8 @@ impl DevOp {
     /// 147 -> 150 for `MoeGluMx` .. `MoeDownMxPf` (GPT-OSS flat MXFP4 MoE): main took
     /// 147-149 for `ZeroF32`/`GemmSplitK`/`CastF32Bf16` while this branch was out, the same
     /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
-    pub const COUNT: u16 = 154;
+    /// 154 -> 155 for `PerLayerInput = 154` (Gemma-4 E-series per-layer inputs).
+    pub const COUNT: u16 = 155;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

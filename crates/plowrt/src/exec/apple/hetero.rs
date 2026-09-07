@@ -343,6 +343,11 @@ fn cpu_rebase(
                 (2, row0 * hidden * 2),
             ]
         }
+        DevOp::PerLayerInput => {
+            let (h, stride) = (d.i[1] as usize, d.i[4] as usize);
+            o.i[0] = rows as u32;
+            vec![(0, row0 * h * 2), (4, row0 * stride * 2), (5, row0 * h * 2)]
+        }
         DevOp::Glu => {
             let inter = plan.inter as usize;
             o.i[0] = (rows * inter) as u32;

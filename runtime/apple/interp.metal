@@ -1044,6 +1044,71 @@ void op_flash_merge(const thread Inst& in, device const ulong* tab, uint slice, 
 
 // ---- dispatch ------------------------------------------------------------------------------------------
 // Returns false for an opcode this interpreter does not implement (the host reports the fault).
+// Op 154: Gemma-4 E-series per-layer input block, in place on x (dev_isa.h). One threadgroup per
+// row: 32 simdgroups compute the P gate dots (lanes strided over H), the products land in `tile`,
+// every thread then owns H/NT rows of the projection, and the two norms reduce through `red`.
+// Needs P + H <= TILE_FLOATS (E4B: 256 + 2560).
+void op_per_layer_input(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
+                        threadgroup float* tile, threadgroup float* red, uint lid, uint sg, uint lane) {
+    device ushort* x = ten<ushort>(tab, in, 0);
+    device const ushort* wg = ten<ushort>(tab, in, 1);
+    device const ushort* wp = ten<ushort>(tab, in, 2);
+    device const ushort* gamma = ten<ushort>(tab, in, 3);
+    device const ushort* ple = ten<ushort>(tab, in, 4);
+    device ushort* hn = ten<ushort>(tab, in, 5);
+    device const ushort* gnext = ten<ushort>(tab, in, 6);
+    uint rows = in.i[0], H = in.i[1], P = in.i[2], col0 = in.i[3], stride = in.i[4];
+    float eps = as_type<float>(in.fj[0]), ls = as_type<float>(in.fj[1]);
+    if (P + H > TILE_FLOATS) return;
+    threadgroup float* a = tile;
+    threadgroup float* y = tile + P;
+    for (uint t = slice; t < rows; t += nblk) {
+        device ushort* xr = x + ulong(t) * H;
+        device const ushort* pr = ple + ulong(t) * stride + col0;
+        for (uint p = sg; p < P; p += NSG) {
+            device const ushort* w = wg + ulong(p) * H;
+            float s = 0.0f;
+            for (uint h = lane; h < H; h += 32u) s += bf2f(w[h]) * bf2f(xr[h]);
+            s = simd_sum(s);
+            if (lane == 0) {
+                float g = rbf(gelu_tanhs(rbf(s)));
+                a[p] = rbf(g * bf2f(pr[p]));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float ss = 0.0f;
+        for (uint h = lid; h < H; h += NT) {
+            device const ushort* w = wp + ulong(h) * P;
+            float s = 0.0f;
+            for (uint p = 0; p < P; p++) s += bf2f(w[p]) * a[p];
+            s = rbf(s);
+            y[h] = s;
+            ss += s * s;
+        }
+        ss = tg_sum(ss, red, lid, sg, lane);
+        float inv = rsqrt(ss / float(H) + eps);
+        float ss2 = 0.0f;
+        for (uint h = lid; h < H; h += NT) {
+            float g = gamma ? bf2f(gamma[h]) : 1.0f;
+            float n = rbf(y[h] * inv * g);
+            ushort v = f2bf(rbf(bf2f(xr[h]) + n) * ls);
+            xr[h] = v;
+            float vb = bf2f(v);
+            ss2 += vb * vb;
+        }
+        ss2 = tg_sum(ss2, red, lid, sg, lane);
+        if (hn) {
+            float inv2 = rsqrt(ss2 / float(H) + eps);
+            device ushort* o = hn + ulong(t) * H;
+            for (uint h = lid; h < H; h += NT) {
+                float g = gnext ? bf2f(gnext[h]) : 1.0f;
+                o[h] = f2bf(bf2f(xr[h]) * inv2 * g);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nblk,
              threadgroup float* tile, threadgroup float* red, threadgroup ulong* keys,
              uint lid, uint sg, uint lane) {
@@ -1079,6 +1144,7 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 18: op_argmax_fin(in, tab, slice, lid); return true;
         case 21: op_add_norm(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 23: op_norm_residual_norm(in, tab, slice, nblk, red, lid, sg, lane); return true;
+        case 154: op_per_layer_input(in, tab, slice, nblk, tile, red, lid, sg, lane); return true;
         default: return false;
     }
 }

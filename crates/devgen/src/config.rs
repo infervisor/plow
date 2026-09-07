@@ -206,6 +206,29 @@ pub(crate) struct Cfg {
     pub(crate) n_exp: u32,     // 128 routed experts
     pub(crate) top_k: u32,     // 8 experts/token
     pub(crate) moe_inter: u32, // 704 per-expert intermediate
+    // Gemma-4 E-series (E2B/E4B): per-layer input embeddings (`hidden_size_per_layer_input`, 0 =
+    // none) and KV sharing (`num_kv_shared_layers` trailing layers reuse the KV of the last
+    // non-shared layer of their type; 0 = none). See `dev_isa.h` op 154.
+    pub(crate) ple: u32,
+    pub(crate) kv_shared: u32,
+}
+
+impl Cfg {
+    /// The layer whose KV cache layer `l` reads: itself, or (KV sharing) the last non-shared
+    /// layer of the same attention type.
+    pub(crate) fn kv_source(&self, l: usize) -> usize {
+        let first_shared = (self.layers - self.kv_shared) as usize;
+        if self.kv_shared == 0 || l < first_shared {
+            return l;
+        }
+        (0..first_shared)
+            .rev()
+            .find(|&s| self.is_full[s] == self.is_full[l])
+            .expect("a KV-shared layer needs an earlier layer of its type")
+    }
+    pub(crate) fn kv_is_shared(&self, l: usize) -> bool {
+        self.kv_source(l) != l
+    }
 }
 
 pub(crate) fn cfg_from(dir: &Path) -> Cfg {
@@ -276,7 +299,8 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         mlp_act: 0,
         has_qk_norm: true,
         has_v_norm: true,
-        k_eq_v: true,
+        // 12B/31B share k_proj as V on full layers; the E-series ships `attention_k_eq_v: false`.
+        k_eq_v: t["attention_k_eq_v"].as_bool().unwrap_or(true),
         tied: true,
         prefix: if flat {
             "model."
@@ -291,6 +315,8 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         n_exp: t["num_experts"].as_u64().unwrap_or(0) as u32,
         top_k: t["top_k_experts"].as_u64().unwrap_or(0) as u32,
         moe_inter: t["moe_intermediate_size"].as_u64().unwrap_or(0) as u32,
+        ple: t["hidden_size_per_layer_input"].as_u64().unwrap_or(0) as u32,
+        kv_shared: t["num_kv_shared_layers"].as_u64().unwrap_or(0) as u32,
     };
     if c.moe {
         crate::require_moe_topk(c.top_k, "gemma4 (enable_moe_block)");
@@ -370,6 +396,8 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
         n_exp: 0,
         top_k: 0,
         moe_inter: 0,
+        ple: 0,
+        kv_shared: 0,
     }
 }
 
