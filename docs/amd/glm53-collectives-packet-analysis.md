@@ -60,6 +60,33 @@ static census:
 The decode win is not the 0.6% of work; it is 78 fewer packet boundaries per token, on a chain
 where the GLM-5.2 campaign priced the boundary at ~2.13 us each.
 
+### And it measures — the folds are the best plow arm on this model
+
+Served end to end at TP4 on the same four cards, all arms minutes apart, 8 prompts per cell,
+128 output tokens. `tp4f` is the folded blob; `tp4m` is the same blob without the folds; `plow`
+is the original analytical-tile baseline.
+
+| cell | metric | plow | tp4m | **tp4f** | tp4f vs plow |
+|---|---|---:|---:|---:|---:|
+| 1024 / c1 | tok/s | 23.78 | 23.97 | **24.20** | +1.8% |
+| 1024 / c1 | TPOT ms | 38.70 | 38.59 | **38.21** | −1.3% |
+| 1024 / c4 | tok/s | 38.93 | 39.23 | **39.94** | +2.6% |
+| 1024 / c4 | TPOT ms | 95.06 | 94.75 | **93.62** | −1.5% |
+| 4096 / c1 | tok/s | 18.31 | 17.66 | **19.22** | **+5.0%** |
+| 4096 / c1 | TPOT ms | 47.02 | 49.84 | **43.69** | **−7.1%** |
+| 4096 / c4 | tok/s | 29.48 | 29.05 | **29.59** | +0.4% |
+| 4096 / c4 | TPOT ms | 122.23 | 123.65 | 122.24 | 0.0% |
+
+The folded arm is at least as good as the baseline in every cell and clearly better at 4096/c1.
+The win is on the DECODE axis, which is what the packet census predicted: the fold removes
+packet boundaries, and 78 of them per token is worth about 0.17 ms against a 38-47 ms TPOT
+before any second-order effect.
+
+**TTFT did not move** (383 -> 385, 1024 -> 1030, 1698 -> 1692). That is a real negative result
+about the prefill half: folding `Residual` into `XReduceTwoShot` removes 7.8% of CU-weighted
+prefill WORK and buys no TTFT, so prefill at these lengths is not CU-throughput bound. Do not
+spend more effort on prefill packet-count reduction on this evidence.
+
 **Not yet adopted.** `PLOW_GLM_XR_RES` is recorded byte-identical and `GLM_FUSE_XRN` requires
 `fuse_b1` + tp>1 (both hold here), but that record is GLM-5.2's. On GLM-5.3 these need the
 paired accuracy gate before the deltas above can be called wins.
