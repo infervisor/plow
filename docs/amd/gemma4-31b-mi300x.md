@@ -140,3 +140,68 @@ Current Plow FP8 prefill and decode use different activation precisions;
 decode retains BF16 activations. This hybrid must not be compared as equivalent
 to vLLM W8A8. Tensorwise versus per-token scales and AITER's FNUZ activation
 range also require an explicit matching profile before FP8 results qualify.
+
+## Matched BF16 rerun
+
+The rerun uses 128 output tokens, five repetitions and one full warmup per case.
+Both engines use the same checkpoint/tokenizer, BF16 weights/activations/KV,
+TP1, context 8192, maximum four sequences, disabled prefix caching and greedy
+sampling. vLLM uses a 2048-token batching budget and its custom tanh-GELU
+kernel; compilation and GPU graphs remain enabled. Plow uses a 2048-token
+prefill interleave budget, packed 512-row chunks and multistep 4. Those budget
+settings have different scheduler semantics, recorded in the result manifest.
+
+Plow's existing decode tier mechanism selects a dedicated MM1 object for one
+request and retains MM4 for batches. This improves solo throughput by 16–17%
+over the prior MM4-only object in the 128/1024-input experiment. All compared
+Plow trajectories matched through 128 output tokens, and the clean build passed
+HTTP parity, cancellation, output limits and slot-reuse checks.
+
+```bash
+PLOW_OCC4=1 PLOW_DECODE_BATCH=1 PLOW_ROWS_ONLY='=interp_decode' \
+  scripts/build_gfx942.sh "$PWD/build-gemma31/hsaco-occ4-b1-clean"
+
+# Set before the packed-serving command above:
+export PLOW_HSACO_LOWRUNG="$PWD/build-gemma31/hsaco-occ4-b1-clean:1"
+```
+
+Do not use OCC4 for the batched object: the build script rejects a known hang. The
+tested `PLOW_DEC_SQUEEZE` batched alternative regressed and was not promoted.
+
+Each cell is **output tokens/s / median TTFT ms / median TPOT ms**.
+
+| Input / concurrency | Plow packed + MM1 tier | vLLM 0.28 tanh |
+|---|---:|---:|
+| 128 / 1 | 31.50 / 95.53 / 31.24 | 55.69 / 51.55 / 17.69 |
+| 128 / 4 | 87.03 / 353.87 / 42.69 | 187.88 / 115.94 / 20.52 |
+| 1024 / 1 | 29.33 / 328.53 / 31.77 | 51.06 / 139.09 / 18.64 |
+| 1024 / 4 | 73.33 / 1182.51 / 44.84 | 153.32 / 451.41 / 22.68 |
+| 4096 / 1 | 23.35 / 1419.53 / 31.99 | 41.79 / 572.49 / 19.61 |
+| 4096 / 4 | 47.07 / 4933.37 / 45.99 | 98.11 / 1672.14 / 27.41 |
+
+vLLM remains faster in every measured case. These short closed-loop batches
+do not establish saturation throughput or tail SLOs. Clocks/power were not
+pinned; runs used separate single-MI300X leases. The manifest records the
+actual GPU visibility, object hashes, checkpoint hashes and runtime settings.
+
+[Measurements and manifests](gemma4-31b-mi300x-matched-bf16-20260907.json).
+
+The vLLM activation correction is:
+
+```bash
+--compilation-config '{"custom_ops":["none","+gelu_and_mul"]}'
+```
+
+The generated graph was checked for `_C.gelu_tanh_and_mul`; the startup warning
+alone cannot determine which implementation runs. The FP8 weight exporter now
+provides `--scale-mode vllm-channel`, with the reference per-channel scale floor
+and separate provenance metadata. This exports weights only; it does not
+enable W8A8 decode.
+
+The complete Gemma checkpoint was exported with this mode. Every row of all
+410 projection matrices was checked against vLLM's GPU `_fp8_channel_scale`
+and `_fp8_quant_per_channel`: zero byte mismatches and zero scale mismatches.
+The comparison masks FN negative zero, reinterprets FN bytes as FNUZ and
+doubles scales. Actual exporter tests also passed zero/tiny/midpoint inputs,
+existing-output refusal and nonfinite-source rejection. The export and its
+provenance live in `build-gemma31/fp8-ptpc-export`.

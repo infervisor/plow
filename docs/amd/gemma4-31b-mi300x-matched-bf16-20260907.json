@@ -1,0 +1,4724 @@
+{
+  "date": "2026-09-07",
+  "checkpoint_sha256": {
+    "model-00001-of-00002.safetensors": "eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa",
+    "model-00002-of-00002.safetensors": "018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10",
+    "config.json": "e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1",
+    "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+  },
+  "method": {
+    "inputs": [
+      128,
+      1024,
+      4096
+    ],
+    "output_tokens": 128,
+    "concurrency": [
+      1,
+      4
+    ],
+    "repetitions": 5,
+    "warmups_per_case": 1,
+    "ttft": "first nonempty text chunk",
+    "tpot": "(request end - first nonempty text)/(completion_tokens-1)",
+    "limitations": [
+      "Small closed-loop batches, not saturation load or tail SLO qualification.",
+      "Same2048 token budget value, different scheduling semantics.",
+      "Separate leased MI300X GPUs, clocks/power not pinned.",
+      "Stock vLLM AITER off; custom tanh GELU enabled with compilation and graphs."
+    ]
+  },
+  "manifests": {
+    "plow-qualified": {
+      "model": "google/gemma-4-31B-it",
+      "checkpoint_sha256": {
+        "model-00001-of-00002.safetensors": "eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa",
+        "model-00002-of-00002.safetensors": "018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10",
+        "config.json": "e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1",
+        "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+      },
+      "gpu_model": "AMD Instinct MI300X",
+      "gpu_count": 1,
+      "tensor_parallel_size": 1,
+      "weight_dtype": "bfloat16",
+      "activation_dtype": "bfloat16",
+      "kv_dtype": "bfloat16",
+      "max_context": 8192,
+      "max_sequences": 4,
+      "prefix_caching": false,
+      "temperature": 0,
+      "ignore_eos": true,
+      "add_special_tokens": false,
+      "activation_function": "gelu_pytorch_tanh",
+      "comparison_limitations": [
+        "Plow prefill interleave2048 and vLLM max_num_batched_tokens2048 have different scheduler semantics.",
+        "Plow flushes captured output once per multistep quantum; chunk gaps cannot establish per-token ITL.",
+        "Separate single-GPU leases; clock and power limits not pinned."
+      ],
+      "gpu_visibility": {
+        "ROCR_VISIBLE_DEVICES": "7"
+      },
+      "engine": "plow",
+      "compiler": "Nix ROCm7.14.0/HIP7.14.60850",
+      "prefill_chunk": 512,
+      "prefill_interleave": 2048,
+      "packed_prefill": true,
+      "multistep": 4,
+      "decode_rungs": [
+        1,
+        2,
+        4
+      ],
+      "artifact_sha256": {
+        "build-gemma31/qualified-assets/model.pkt": "587e1e2bbb666fce3cff3109eb13cb2916dca0e6882e5e7912aa68a4b9eddae1",
+        "build-gemma31/hsaco-occ4-b1-clean/interp_decode_gq.elf": "84296e1e397f6767364243d24e97f77804b001b40533cdae81d1b6ac2ea28ea1",
+        "build-gemma31/hsaco/interp_decode_gq.elf": "8008b9f79564f6bf99feb78a5679464e5628040ad555e4fc2ef3b6275169610f",
+        "build-gemma31/hsaco/interp_prefill_gq.elf": "7d065efe67f149b82da7bff5fbfbc2e4f4fe974d55a640a434d59caf56c2e884",
+        "build-gemma31/hsaco/interp_flash_gq.elf": "9d3c3949441ad7167b91d78b4ab80cc024c431092b92dc6a324dd103d8ba8e21"
+      }
+    },
+    "vllm-tanh": {
+      "model": "google/gemma-4-31B-it",
+      "checkpoint_sha256": {
+        "model-00001-of-00002.safetensors": "eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa",
+        "model-00002-of-00002.safetensors": "018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10",
+        "config.json": "e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1",
+        "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+      },
+      "gpu_model": "AMD Instinct MI300X",
+      "gpu_count": 1,
+      "tensor_parallel_size": 1,
+      "weight_dtype": "bfloat16",
+      "activation_dtype": "bfloat16",
+      "kv_dtype": "bfloat16",
+      "max_context": 8192,
+      "max_sequences": 4,
+      "prefix_caching": false,
+      "temperature": 0,
+      "ignore_eos": true,
+      "add_special_tokens": false,
+      "activation_function": "gelu_pytorch_tanh",
+      "comparison_limitations": [
+        "Plow prefill interleave2048 and vLLM max_num_batched_tokens2048 have different scheduler semantics.",
+        "Plow flushes captured output once per multistep quantum; chunk gaps cannot establish per-token ITL.",
+        "Separate single-GPU leases; clock and power limits not pinned."
+      ],
+      "gpu_visibility": {
+        "ROCR_VISIBLE_DEVICES": "6"
+      },
+      "engine": "vllm0.28.0+rocm723",
+      "torch": "2.12.0+git6bbd260",
+      "torch_build_hip": "7.2.53211",
+      "runtime_rocm": "/opt/rocm/core-7.14/lib",
+      "max_num_batched_tokens": 2048,
+      "aiter": false,
+      "compile_mode": 3,
+      "cudagraphs": true,
+      "custom_ops": [
+        "none",
+        "+gelu_and_mul",
+        "+sparse_attn_indexer"
+      ],
+      "attention_backend": "TRITON_ATTN"
+    }
+  },
+  "runs": {
+    "plow-qualified": {
+      "raw_sha256": "3786609906d616996cc8c2ea3f22681a837b44e7586558a574a5fe311128d5d2",
+      "measurements": [
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 4.053310272982344,
+          "output_tok_s": 31.579127029379908,
+          "request_s": 0.24671192991703053,
+          "ttft_ms": 94.97399895917624,
+          "latency_ms": {
+            "p50": 4053.001311956905,
+            "p95": 4053.001311956905,
+            "p99": 4053.001311956905
+          },
+          "tpot_ms": {
+            "p50": 31.1655693936829,
+            "p95": 31.1655693936829,
+            "p99": 31.1655693936829
+          },
+          "requests": [
+            {
+              "ttft_ms": 94.97399895917624,
+              "latency_ms": 4053.001311956905,
+              "tpot_ms": 31.1655693936829,
+              "text_chunk_gap_ms": {
+                "p50": 0.014791963621973991,
+                "p95": 125.19430249230936,
+                "p99": 125.42561389156617
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 4.056583579047583,
+          "output_tok_s": 31.553645452080694,
+          "request_s": 0.24651285509438042,
+          "ttft_ms": 95.07052297703922,
+          "latency_ms": {
+            "p50": 4056.3383929547854,
+            "p95": 4056.3383929547854,
+            "p99": 4056.3383929547854
+          },
+          "tpot_ms": {
+            "p50": 31.191085590375955,
+            "p95": 31.191085590375955,
+            "p99": 31.191085590375955
+          },
+          "requests": [
+            {
+              "ttft_ms": 95.07052297703922,
+              "latency_ms": 4056.3383929547854,
+              "tpot_ms": 31.191085590375955,
+              "text_chunk_gap_ms": {
+                "p50": 0.015443016309291124,
+                "p95": 125.28826615889557,
+                "p99": 125.55833732825704
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 4.063535385008436,
+          "output_tok_s": 31.499664177216037,
+          "request_s": 0.24609112638450029,
+          "ttft_ms": 95.52623302442953,
+          "latency_ms": {
+            "p50": 4063.276859000325,
+            "p95": 4063.276859000325,
+            "p99": 4063.276859000325
+          },
+          "tpot_ms": {
+            "p50": 31.24213091319603,
+            "p95": 31.24213091319603,
+            "p99": 31.24213091319603
+          },
+          "requests": [
+            {
+              "ttft_ms": 95.52623302442953,
+              "latency_ms": 4063.276859000325,
+              "tpot_ms": 31.24213091319603,
+              "text_chunk_gap_ms": {
+                "p50": 0.014911987818777561,
+                "p95": 125.53088548593223,
+                "p99": 125.7036289316602
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 3,
+          "elapsed_s": 4.073297704977449,
+          "output_tok_s": 31.424170112483502,
+          "request_s": 0.24550132900377736,
+          "ttft_ms": 97.7555499994196,
+          "latency_ms": {
+            "p50": 4073.033429973293,
+            "p95": 4073.033429973293,
+            "p99": 4073.033429973293
+          },
+          "tpot_ms": {
+            "p50": 31.301400629715538,
+            "p95": 31.301400629715538,
+            "p99": 31.301400629715538
+          },
+          "requests": [
+            {
+              "ttft_ms": 97.7555499994196,
+              "latency_ms": 4073.033429973293,
+              "tpot_ms": 31.301400629715538,
+              "text_chunk_gap_ms": {
+                "p50": 0.015212048310786486,
+                "p95": 125.72546980227344,
+                "p99": 125.82035734318197
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 4,
+          "elapsed_s": 4.078541101014707,
+          "output_tok_s": 31.38377101757162,
+          "request_s": 0.24518571107477827,
+          "ttft_ms": 97.89601998636499,
+          "latency_ms": {
+            "p50": 4078.3020540256985,
+            "p95": 4078.3020540256985,
+            "p99": 4078.3020540256985
+          },
+          "tpot_ms": {
+            "p50": 31.341779795585303,
+            "p95": 31.341779795585303,
+            "p99": 31.341779795585303
+          },
+          "requests": [
+            {
+              "ttft_ms": 97.89601998636499,
+              "latency_ms": 4078.3020540256985,
+              "tpot_ms": 31.341779795585303,
+              "text_chunk_gap_ms": {
+                "p50": 0.015464029274880886,
+                "p95": 125.76778108486906,
+                "p99": 125.84980134735815
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 0,
+          "elapsed_s": 5.874586452031508,
+          "output_tok_s": 87.15507111533677,
+          "request_s": 0.6808989930885685,
+          "ttft_ms": 354.783745482564,
+          "latency_ms": {
+            "p50": 5769.226231990615,
+            "p95": 5864.423579061986,
+            "p99": 5872.033829426509
+          },
+          "tpot_ms": {
+            "p50": 42.6334054055752,
+            "p95": 43.588524389696694,
+            "p99": 43.67201605265388
+          },
+          "requests": [
+            {
+              "ttft_ms": 442.2675549867563,
+              "latency_ms": 5810.517638979945,
+              "tpot_ms": 42.269685700733774,
+              "text_chunk_gap_ms": {
+                "p50": 42.30456001823768,
+                "p95": 83.29690670943819,
+                "p99": 84.02263027033769
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 96.51904500788078,
+              "latency_ms": 5645.515943993814,
+              "tpot_ms": 43.69288896839318,
+              "text_chunk_gap_ms": {
+                "p50": 42.13982401415706,
+                "p95": 83.33528690855019,
+                "p99": 175.55027200258337
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 267.29993597837165,
+              "latency_ms": 5727.9348250012845,
+              "tpot_ms": 42.99712511041664,
+              "text_chunk_gap_ms": {
+                "p50": 42.16583300149068,
+                "p95": 83.34899216424674,
+                "p99": 151.41093193320512
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 617.8078299853951,
+              "latency_ms": 5873.93639201764,
+              "tpot_ms": 41.38683907112004,
+              "text_chunk_gap_ms": {
+                "p50": 42.15194197604433,
+                "p95": 83.28812170657329,
+                "p99": 83.74538007308729
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 1,
+          "elapsed_s": 5.878107958007604,
+          "output_tok_s": 87.10285752790824,
+          "request_s": 0.6804910744367831,
+          "ttft_ms": 352.80667498591356,
+          "latency_ms": {
+            "p50": 5772.904226469109,
+            "p95": 5867.692241043551,
+            "p99": 5875.215671410551
+          },
+          "tpot_ms": {
+            "p50": 42.677933476245634,
+            "p95": 43.63003288969529,
+            "p99": 43.71275854636145
+          },
+          "requests": [
+            {
+              "ttft_ms": 95.00499500427395,
+              "latency_ms": 5649.151869991329,
+              "tpot_ms": 43.73343996052799,
+              "text_chunk_gap_ms": {
+                "p50": 42.21117001725361,
+                "p95": 83.59999430249445,
+                "p99": 175.35881074145436
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 264.811621978879,
+              "latency_ms": 5731.407176994253,
+              "tpot_ms": 43.04405948831003,
+              "text_chunk_gap_ms": {
+                "p50": 42.30839596129954,
+                "p95": 83.4727598412428,
+                "p99": 151.63839798769868
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 440.80172799294814,
+              "latency_ms": 5814.401275943965,
+              "tpot_ms": 42.311807464181236,
+              "text_chunk_gap_ms": {
+                "p50": 42.05053101759404,
+                "p95": 83.39570640819147,
+                "p99": 84.15860832552426
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 615.0411510025151,
+              "latency_ms": 5877.096529002301,
+              "tpot_ms": 41.43350691338414,
+              "text_chunk_gap_ms": {
+                "p50": 42.229978018440306,
+                "p95": 83.39017715770751,
+                "p99": 83.71743862750009
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 2,
+          "elapsed_s": 5.885440660989843,
+          "output_tok_s": 86.99433559727527,
+          "request_s": 0.679643246853713,
+          "ttft_ms": 352.93710499536246,
+          "latency_ms": {
+            "p50": 5780.094022018602,
+            "p95": 5874.990725092357,
+            "p99": 5882.523023457034
+          },
+          "tpot_ms": {
+            "p50": 42.73351903167905,
+            "p95": 43.675945801513755,
+            "p99": 43.75790346575182
+          },
+          "requests": [
+            {
+              "ttft_ms": 95.56729503674433,
+              "latency_ms": 5655.4231910267845,
+              "tpot_ms": 43.77839288181134,
+              "text_chunk_gap_ms": {
+                "p50": 42.525029042735696,
+                "p95": 83.90536898514256,
+                "p99": 174.9108810920734
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 265.4337310232222,
+              "latency_ms": 5738.551099027973,
+              "tpot_ms": 43.0954123464941,
+              "text_chunk_gap_ms": {
+                "p50": 42.40005201427266,
+                "p95": 83.96595157100819,
+                "p99": 151.097238536458
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 440.4404789675027,
+              "latency_ms": 5821.636945009232,
+              "tpot_ms": 42.37162571686401,
+              "text_chunk_gap_ms": {
+                "p50": 42.48772299615666,
+                "p95": 83.70407330803573,
+                "p99": 84.33230515685864
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 615.7768480479717,
+              "latency_ms": 5884.406098048203,
+              "tpot_ms": 41.48526968504119,
+              "text_chunk_gap_ms": {
+                "p50": 42.51506400760263,
+                "p95": 83.55577280162834,
+                "p99": 84.34168201871216
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 3,
+          "elapsed_s": 5.883117454010062,
+          "output_tok_s": 87.02868912654625,
+          "request_s": 0.6799116338011426,
+          "ttft_ms": 352.68621501745656,
+          "latency_ms": {
+            "p50": 5778.046366001945,
+            "p95": 5872.963446448557,
+            "p99": 5880.526633285917
+          },
+          "tpot_ms": {
+            "p50": 42.7193712675944,
+            "p95": 43.671741089522364,
+            "p99": 43.75449825900948
+          },
+          "requests": [
+            {
+              "ttft_ms": 94.69580295262858,
+              "latency_ms": 5654.144621978048,
+              "tpot_ms": 43.77518755138126,
+              "text_chunk_gap_ms": {
+                "p50": 42.098762991372496,
+                "p95": 83.5812739096582,
+                "p99": 175.5141036596615
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 440.53471903316677,
+              "latency_ms": 5819.390873017255,
+              "tpot_ms": 42.35319806286684,
+              "text_chunk_gap_ms": {
+                "p50": 42.12421097327024,
+                "p95": 83.50491401506588,
+                "p99": 83.79996667732485
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 264.83771100174636,
+              "latency_ms": 5736.701858986635,
+              "tpot_ms": 43.085544472321956,
+              "text_chunk_gap_ms": {
+                "p50": 42.13662899564952,
+                "p95": 83.64385652821511,
+                "p99": 151.7981876258268
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 615.5212969752029,
+              "latency_ms": 5882.417429995257,
+              "tpot_ms": 41.4716230946461,
+              "text_chunk_gap_ms": {
+                "p50": 42.151922010816634,
+                "p95": 83.44066578429192,
+                "p99": 83.64919457351789
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 4,
+          "elapsed_s": 5.889047865988687,
+          "output_tok_s": 86.94104915617672,
+          "request_s": 0.6792269465326306,
+          "ttft_ms": 354.579760984052,
+          "latency_ms": {
+            "p50": 5783.941979490919,
+            "p95": 5879.22565449262,
+            "p99": 5886.788960492704
+          },
+          "tpot_ms": {
+            "p50": 42.75088361029029,
+            "p95": 43.70615043435392,
+            "p99": 43.78950783814208
+          },
+          "requests": [
+            {
+              "ttft_ms": 442.6219739834778,
+              "latency_ms": 5825.652236992028,
+              "tpot_ms": 42.38606506305945,
+              "text_chunk_gap_ms": {
+                "p50": 42.23924200050533,
+                "p95": 83.54160611052066,
+                "p99": 83.82457698811777
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 96.07845696154982,
+              "latency_ms": 5659.992549975868,
+              "tpot_ms": 43.81034718908912,
+              "text_chunk_gap_ms": {
+                "p50": 42.58334601763636,
+                "p95": 83.62720631994307,
+                "p99": 175.41177200269885
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 618.0771319777705,
+              "latency_ms": 5888.679786992725,
+              "tpot_ms": 41.500808307204366,
+              "text_chunk_gap_ms": {
+                "p50": 42.21011803019792,
+                "p95": 83.4891451522708,
+                "p99": 83.74880251241848
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 266.53754798462614,
+              "latency_ms": 5742.2317219898105,
+              "tpot_ms": 43.115702157521135,
+              "text_chunk_gap_ms": {
+                "p50": 42.29698795825243,
+                "p95": 83.5859494865872,
+                "p99": 151.4348233782216
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "completion_tokens": 128,
+                "total_tokens": 256,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 4.357742969994433,
+          "output_tok_s": 29.373003612501613,
+          "request_s": 0.22947659072266885,
+          "ttft_ms": 328.39975698152557,
+          "latency_ms": {
+            "p50": 4357.407318952028,
+            "p95": 4357.407318952028,
+            "p99": 4357.407318952028
+          },
+          "tpot_ms": {
+            "p50": 31.72446899189372,
+            "p95": 31.72446899189372,
+            "p99": 31.72446899189372
+          },
+          "requests": [
+            {
+              "ttft_ms": 328.39975698152557,
+              "latency_ms": 4357.407318952028,
+              "tpot_ms": 31.72446899189372,
+              "text_chunk_gap_ms": {
+                "p50": 0.014782010111957788,
+                "p95": 126.96710678283125,
+                "p99": 127.03719501849264
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 4.359613693028223,
+          "output_tok_s": 29.360399570423905,
+          "request_s": 0.22937812164393676,
+          "ttft_ms": 328.1655869795941,
+          "latency_ms": {
+            "p50": 4359.35016797157,
+            "p95": 4359.35016797157,
+            "p99": 4359.35016797157
+          },
+          "tpot_ms": {
+            "p50": 31.741610873952567,
+            "p95": 31.741610873952567,
+            "p99": 31.741610873952567
+          },
+          "requests": [
+            {
+              "ttft_ms": 328.1655869795941,
+              "latency_ms": 4359.35016797157,
+              "tpot_ms": 31.741610873952567,
+              "text_chunk_gap_ms": {
+                "p50": 0.01573300687596202,
+                "p95": 127.03068937407807,
+                "p99": 127.14970951084979
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 4.363770226016641,
+          "output_tok_s": 29.332433508269666,
+          "request_s": 0.22915963678335677,
+          "ttft_ms": 328.60044698463753,
+          "latency_ms": {
+            "p50": 4363.513692980632,
+            "p95": 4363.513692980632,
+            "p99": 4363.513692980632
+          },
+          "tpot_ms": {
+            "p50": 31.770970440913345,
+            "p95": 31.770970440913345,
+            "p99": 31.770970440913345
+          },
+          "requests": [
+            {
+              "ttft_ms": 328.60044698463753,
+              "latency_ms": 4363.513692980632,
+              "tpot_ms": 31.770970440913345,
+              "text_chunk_gap_ms": {
+                "p50": 0.01505296677350998,
+                "p95": 127.1109540713951,
+                "p99": 127.99523934372701
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 3,
+          "elapsed_s": 4.365056175040081,
+          "output_tok_s": 29.323792150011602,
+          "request_s": 0.22909212617196564,
+          "ttft_ms": 328.67552898824215,
+          "latency_ms": {
+            "p50": 4364.554936997592,
+            "p95": 4364.554936997592,
+            "p99": 4364.554936997592
+          },
+          "tpot_ms": {
+            "p50": 31.778578015821655,
+            "p95": 31.778578015821655,
+            "p99": 31.778578015821655
+          },
+          "requests": [
+            {
+              "ttft_ms": 328.67552898824215,
+              "latency_ms": 4364.554936997592,
+              "tpot_ms": 31.778578015821655,
+              "text_chunk_gap_ms": {
+                "p50": 0.015142024494707584,
+                "p95": 127.1805829135701,
+                "p99": 127.94370879186317
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 4,
+          "elapsed_s": 4.364958549034782,
+          "output_tok_s": 29.324448001529017,
+          "request_s": 0.22909725001194545,
+          "ttft_ms": 328.52905098116025,
+          "latency_ms": {
+            "p50": 4364.7019769996405,
+            "p95": 4364.7019769996405,
+            "p99": 4364.7019769996405
+          },
+          "tpot_ms": {
+            "p50": 31.780889181247876,
+            "p95": 31.780889181247876,
+            "p99": 31.780889181247876
+          },
+          "requests": [
+            {
+              "ttft_ms": 328.52905098116025,
+              "latency_ms": 4364.7019769996405,
+              "tpot_ms": 31.780889181247876,
+              "text_chunk_gap_ms": {
+                "p50": 0.015072000678628683,
+                "p95": 127.13796579046175,
+                "p99": 127.96014759805985
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 0,
+          "elapsed_s": 6.979691072017886,
+          "output_tok_s": 73.35568218092733,
+          "request_s": 0.5730912670384948,
+          "ttft_ms": 1180.7404624996707,
+          "latency_ms": {
+            "p50": 6873.090916022193,
+            "p95": 6969.378332691849,
+            "p99": 6977.059290528414
+          },
+          "tpot_ms": {
+            "p50": 44.82165711435057,
+            "p95": 46.58779876744814,
+            "p99": 46.74440288430402
+          },
+          "requests": [
+            {
+              "ttft_ms": 1055.4382940172218,
+              "latency_ms": 6831.210284028202,
+              "tpot_ms": 45.478519606385674,
+              "text_chunk_gap_ms": {
+                "p50": 43.30198798561469,
+                "p95": 86.55865117907524,
+                "p99": 208.73198910849084
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 805.128114996478,
+              "latency_ms": 6746.639462013263,
+              "tpot_ms": 46.78355391351799,
+              "text_chunk_gap_ms": {
+                "p50": 43.29321504337713,
+                "p95": 86.49252693867311,
+                "p99": 250.74742493685335
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1556.9822989637032,
+              "latency_ms": 6978.979529987555,
+              "tpot_ms": 42.69289158286497,
+              "text_chunk_gap_ms": {
+                "p50": 43.17602998344228,
+                "p95": 86.44572730408981,
+                "p99": 86.68776923790574
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1306.0426309821196,
+              "latency_ms": 6914.971548016183,
+              "tpot_ms": 44.16479462231546,
+              "text_chunk_gap_ms": {
+                "p50": 43.45146199921146,
+                "p95": 86.46039544255473,
+                "p99": 87.74464232730678
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 1,
+          "elapsed_s": 6.987313740013633,
+          "output_tok_s": 73.27565628948,
+          "request_s": 0.5724660647615625,
+          "ttft_ms": 1182.8106374887284,
+          "latency_ms": {
+            "p50": 6880.923342017923,
+            "p95": 6977.306146270712,
+            "p99": 6985.011428474099
+          },
+          "tpot_ms": {
+            "p50": 44.86702916952122,
+            "p95": 46.63912553686693,
+            "p99": 46.79673158946836
+          },
+          "requests": [
+            {
+              "ttft_ms": 1057.7304550097324,
+              "latency_ms": 6839.119620039128,
+              "tpot_ms": 45.52274933094012,
+              "text_chunk_gap_ms": {
+                "p50": 43.298312986735255,
+                "p95": 86.5420536021702,
+                "p99": 208.2429836376096
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 806.1257840017788,
+              "latency_ms": 6754.314688034356,
+              "tpot_ms": 46.83613310261872,
+              "text_chunk_gap_ms": {
+                "p50": 43.29239402431995,
+                "p95": 86.56917969929054,
+                "p99": 251.4232685114257
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1307.8908199677244,
+              "latency_ms": 6922.727063996717,
+              "tpot_ms": 44.211309008102305,
+              "text_chunk_gap_ms": {
+                "p50": 43.43717003939673,
+                "p95": 86.55867689521983,
+                "p99": 86.59425937803462
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1559.4137180014513,
+              "latency_ms": 6986.937749024946,
+              "tpot_ms": 42.73640969309839,
+              "text_chunk_gap_ms": {
+                "p50": 43.58922701794654,
+                "p95": 86.49769109324552,
+                "p99": 86.6690881329123
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 2,
+          "elapsed_s": 6.985927371017169,
+          "output_tok_s": 73.29019796629399,
+          "request_s": 0.5725796716116718,
+          "ttft_ms": 1184.0326960082166,
+          "latency_ms": {
+            "p50": 6878.839887504,
+            "p95": 6975.7711892190855,
+            "p99": 6983.4684722160455
+          },
+          "tpot_ms": {
+            "p50": 44.841001507840815,
+            "p95": 46.611622397950114,
+            "p99": 46.769140605841336
+          },
+          "requests": [
+            {
+              "ttft_ms": 807.6453219982795,
+              "latency_ms": 6752.327382040676,
+              "tpot_ms": 46.808520157814144,
+              "text_chunk_gap_ms": {
+                "p50": 43.733943020924926,
+                "p95": 86.57247679657303,
+                "p99": 251.40200983150862
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1309.609675023239,
+              "latency_ms": 6921.248767990619,
+              "tpot_ms": 44.18613459029433,
+              "text_chunk_gap_ms": {
+                "p50": 43.741112982388586,
+                "p95": 86.52730751200579,
+                "p99": 86.71744329854846
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1058.455716993194,
+              "latency_ms": 6836.4310070173815,
+              "tpot_ms": 45.4958684253873,
+              "text_chunk_gap_ms": {
+                "p50": 43.71589596848935,
+                "p95": 86.5888254949823,
+                "p99": 208.26576364459385
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1560.4305859887972,
+              "latency_ms": 6985.3927929652855,
+              "tpot_ms": 42.71623785020857,
+              "text_chunk_gap_ms": {
+                "p50": 43.8109069946222,
+                "p95": 86.53828587266617,
+                "p99": 86.65426583494991
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 3,
+          "elapsed_s": 6.981966019026004,
+          "output_tok_s": 73.33178056220687,
+          "request_s": 0.5729045356422412,
+          "ttft_ms": 1183.0282974988222,
+          "latency_ms": {
+            "p50": 6875.074833020335,
+            "p95": 6971.818833349971,
+            "p99": 6979.510985867819
+          },
+          "tpot_ms": {
+            "p50": 44.81926405922451,
+            "p95": 46.586040168469886,
+            "p99": 46.74280061315485
+          },
+          "requests": [
+            {
+              "ttft_ms": 1308.6477000033483,
+              "latency_ms": 6917.332753015216,
+              "tpot_ms": 44.16287443316432,
+              "text_chunk_gap_ms": {
+                "p50": 44.37136399792507,
+                "p95": 86.2894324993249,
+                "p99": 86.78012674907222
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 807.4475169996731,
+              "latency_ms": 6748.760338989086,
+              "tpot_ms": 46.78199072432609,
+              "text_chunk_gap_ms": {
+                "p50": 44.47551997145638,
+                "p95": 86.44740058807656,
+                "p99": 250.71359412162565
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1057.4088949942961,
+              "latency_ms": 6832.816913025454,
+              "tpot_ms": 45.475653685284705,
+              "text_chunk_gap_ms": {
+                "p50": 44.25516998162493,
+                "p95": 86.47242420702241,
+                "p99": 208.14478744170543
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1559.384704043623,
+              "latency_ms": 6981.434023997281,
+              "tpot_ms": 42.69330173191857,
+              "text_chunk_gap_ms": {
+                "p50": 44.37380796298385,
+                "p95": 86.13341511809267,
+                "p99": 86.62319163791835
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 4,
+          "elapsed_s": 6.982489418995101,
+          "output_tok_s": 73.32628369004897,
+          "request_s": 0.5728615913285076,
+          "ttft_ms": 1184.2362450261135,
+          "latency_ms": {
+            "p50": 6876.9682540150825,
+            "p95": 6972.477819252526,
+            "p99": 6980.002969446359
+          },
+          "tpot_ms": {
+            "p50": 44.824661488102116,
+            "p95": 46.591048880125484,
+            "p99": 46.748091394771954
+          },
+          "requests": [
+            {
+              "ttft_ms": 1309.5010330434889,
+              "latency_ms": 6919.174672046211,
+              "tpot_ms": 44.17065857482458,
+              "text_chunk_gap_ms": {
+                "p50": 43.42530301073566,
+                "p95": 86.19117470225319,
+                "p99": 86.35460977675393
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1058.971457008738,
+              "latency_ms": 6834.761835983954,
+              "tpot_ms": 45.47866440137965,
+              "text_chunk_gap_ms": {
+                "p50": 43.3218979742378,
+                "p95": 86.21885471511632,
+                "p99": 207.86102341022257
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 808.452257013414,
+              "latency_ms": 6750.445963989478,
+              "tpot_ms": 46.78735202343357,
+              "text_chunk_gap_ms": {
+                "p50": 43.304421997163445,
+                "p95": 86.2350852927193,
+                "p99": 250.7831310236361
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1559.856719977688,
+              "latency_ms": 6981.884256994817,
+              "tpot_ms": 42.6931302127333,
+              "text_chunk_gap_ms": {
+                "p50": 43.44447102630511,
+                "p95": 86.2261674774345,
+                "p99": 86.31588209420443
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "completion_tokens": 128,
+                "total_tokens": 1152,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 5.489406099950429,
+          "output_tok_s": 23.317640864857108,
+          "request_s": 0.18216906925669615,
+          "ttft_ms": 1420.10928603122,
+          "latency_ms": {
+            "p50": 5488.970279053319,
+            "p95": 5488.970279053319,
+            "p99": 5488.970279053319
+          },
+          "tpot_ms": {
+            "p50": 32.03827553560708,
+            "p95": 32.03827553560708,
+            "p99": 32.03827553560708
+          },
+          "requests": [
+            {
+              "ttft_ms": 1420.10928603122,
+              "latency_ms": 5488.970279053319,
+              "tpot_ms": 32.03827553560708,
+              "text_chunk_gap_ms": {
+                "p50": 0.015622994396835566,
+                "p95": 128.2056494965218,
+                "p99": 128.31386991078034
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 5.480026821023785,
+          "output_tok_s": 23.357549913612814,
+          "request_s": 0.1824808587001001,
+          "ttft_ms": 1417.8360829828307,
+          "latency_ms": {
+            "p50": 5479.6174700022675,
+            "p95": 5479.6174700022675,
+            "p99": 5479.6174700022675
+          },
+          "tpot_ms": {
+            "p50": 31.982530606452258,
+            "p95": 31.982530606452258,
+            "p99": 31.982530606452258
+          },
+          "requests": [
+            {
+              "ttft_ms": 1417.8360829828307,
+              "latency_ms": 5479.6174700022675,
+              "tpot_ms": 31.982530606452258,
+              "text_chunk_gap_ms": {
+                "p50": 0.01459202030673623,
+                "p95": 128.0253145028837,
+                "p99": 128.07507103774697
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 5.483550479984842,
+          "output_tok_s": 23.3425406526674,
+          "request_s": 0.18236359884896405,
+          "ttft_ms": 1419.5259959669784,
+          "latency_ms": {
+            "p50": 5483.151644992176,
+            "p95": 5483.151644992176,
+            "p99": 5483.151644992176
+          },
+          "tpot_ms": {
+            "p50": 31.997052354529117,
+            "p95": 31.997052354529117,
+            "p99": 31.997052354529117
+          },
+          "requests": [
+            {
+              "ttft_ms": 1419.5259959669784,
+              "latency_ms": 5483.151644992176,
+              "tpot_ms": 31.997052354529117,
+              "text_chunk_gap_ms": {
+                "p50": 0.015193014405667782,
+                "p95": 128.1145511136856,
+                "p99": 128.21440506260842
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 3,
+          "elapsed_s": 5.482414905040059,
+          "output_tok_s": 23.347375603099255,
+          "request_s": 0.18240137189921293,
+          "ttft_ms": 1419.6392750018276,
+          "latency_ms": {
+            "p50": 5482.103981019463,
+            "p95": 5482.103981019463,
+            "p99": 5482.103981019463
+          },
+          "tpot_ms": {
+            "p50": 31.987911071005005,
+            "p95": 31.987911071005005,
+            "p99": 31.987911071005005
+          },
+          "requests": [
+            {
+              "ttft_ms": 1419.6392750018276,
+              "latency_ms": 5482.103981019463,
+              "tpot_ms": 31.987911071005005,
+              "text_chunk_gap_ms": {
+                "p50": 0.014682009350508451,
+                "p95": 128.04192798794247,
+                "p99": 128.19501768797636
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 4,
+          "elapsed_s": 5.480778832978103,
+          "output_tok_s": 23.35434504852084,
+          "request_s": 0.18245582069156907,
+          "ttft_ms": 1417.980479018297,
+          "latency_ms": {
+            "p50": 5480.507288011722,
+            "p95": 5480.507288011722,
+            "p99": 5480.507288011722
+          },
+          "tpot_ms": {
+            "p50": 31.98840007081437,
+            "p95": 31.98840007081437,
+            "p99": 31.98840007081437
+          },
+          "requests": [
+            {
+              "ttft_ms": 1417.980479018297,
+              "latency_ms": 5480.507288011722,
+              "tpot_ms": 31.98840007081437,
+              "text_chunk_gap_ms": {
+                "p50": 0.015522993635386229,
+                "p95": 127.97941758180968,
+                "p99": 128.08717314852402
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 0,
+          "elapsed_s": 10.868645645037759,
+          "output_tok_s": 47.10798536648963,
+          "request_s": 0.3680311356757002,
+          "ttft_ms": 4925.769786495948,
+          "latency_ms": {
+            "p50": 10760.844151489437,
+            "p95": 10858.308212587144,
+            "p99": 10866.017425756436
+          },
+          "tpot_ms": {
+            "p50": 45.94546744089361,
+            "p95": 47.95633670548527,
+            "p99": 48.13460456310977
+          },
+          "requests": [
+            {
+              "ttft_ms": 5063.6405239929445,
+              "latency_ms": 10803.701285971329,
+              "tpot_ms": 45.197328834475464,
+              "text_chunk_gap_ms": {
+                "p50": 44.6883569820784,
+                "p95": 88.1023605237715,
+                "p99": 88.46111926133744
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4787.899048998952,
+              "latency_ms": 10717.987017007545,
+              "tpot_ms": 46.693606047311754,
+              "text_chunk_gap_ms": {
+                "p50": 44.3871280294843,
+                "p95": 88.26315787155181,
+                "p99": 226.2399430549694
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4511.990324012004,
+              "latency_ms": 10630.745108006522,
+              "tpot_ms": 48.17917152751589,
+              "text_chunk_gap_ms": {
+                "p50": 44.37718301778659,
+                "p95": 88.30430979724042,
+                "p99": 275.3348675102461
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 5337.697204027791,
+              "latency_ms": 10867.944729048759,
+              "tpot_ms": 43.54525610252731,
+              "text_chunk_gap_ms": {
+                "p50": 44.54656597226858,
+                "p95": 87.96272370964289,
+                "p99": 88.43155037378892
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 1,
+          "elapsed_s": 10.87841824098723,
+          "output_tok_s": 47.065666042413106,
+          "request_s": 0.3677005159563524,
+          "ttft_ms": 4934.175161499297,
+          "latency_ms": {
+            "p50": 10770.61024249997,
+            "p95": 10868.14859888982,
+            "p99": 10875.894050966017
+          },
+          "tpot_ms": {
+            "p50": 45.956181740162776,
+            "p95": 47.966024352491495,
+            "p99": 48.14397712222092
+          },
+          "requests": [
+            {
+              "ttft_ms": 5072.016565012746,
+              "latency_ms": 10813.28498001676,
+              "tpot_ms": 45.20683791341744,
+              "text_chunk_gap_ms": {
+                "p50": 44.186968996655196,
+                "p95": 87.9063937754836,
+                "p99": 88.34720365703106
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4796.333757985849,
+              "latency_ms": 10727.93550498318,
+              "tpot_ms": 46.705525566908115,
+              "text_chunk_gap_ms": {
+                "p50": 44.26537599647418,
+                "p95": 87.92772752349265,
+                "p99": 226.54821885866016
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4521.15278999554,
+              "latency_ms": 10641.087884956505,
+              "tpot_ms": 48.18846531465327,
+              "text_chunk_gap_ms": {
+                "p50": 44.34391297399998,
+                "p95": 87.94500958174467,
+                "p99": 275.19561961409636
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 5346.724617003929,
+              "latency_ms": 10877.830413985066,
+              "tpot_ms": 43.552014149457776,
+              "text_chunk_gap_ms": {
+                "p50": 44.3063480197452,
+                "p95": 87.88116041687317,
+                "p99": 88.07560081011616
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 2,
+          "elapsed_s": 10.894912878982723,
+          "output_tok_s": 46.99440974766256,
+          "request_s": 0.36714382615361374,
+          "ttft_ms": 4936.798726499546,
+          "latency_ms": {
+            "p50": 10787.039272487164,
+            "p95": 10884.529971599113,
+            "p99": 10892.255487123039
+          },
+          "tpot_ms": {
+            "p50": 46.06488618887887,
+            "p95": 48.074328234074564,
+            "p99": 48.25214628918521
+          },
+          "requests": [
+            {
+              "ttft_ms": 5074.804004980251,
+              "latency_ms": 10829.807569971308,
+              "tpot_ms": 45.31498870071698,
+              "text_chunk_gap_ms": {
+                "p50": 44.88357895752415,
+                "p95": 88.0535650998354,
+                "p99": 88.52871046983637
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4798.793448018841,
+              "latency_ms": 10744.270975003019,
+              "tpot_ms": 46.814783677040765,
+              "text_chunk_gap_ms": {
+                "p50": 44.71278400160372,
+                "p95": 88.12150468002073,
+                "p99": 227.0498473872421
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4524.09544098191,
+              "latency_ms": 10657.763742958196,
+              "tpot_ms": 48.29660080296288,
+              "text_chunk_gap_ms": {
+                "p50": 44.891330995596945,
+                "p95": 88.23191329138353,
+                "p99": 275.5279257206712
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 5350.112963991705,
+              "latency_ms": 10894.18686600402,
+              "tpot_ms": 43.65412521269539,
+              "text_chunk_gap_ms": {
+                "p50": 44.82535197166726,
+                "p95": 88.06206700392067,
+                "p99": 88.45171930501238
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 3,
+          "elapsed_s": 10.898039947031066,
+          "output_tok_s": 46.98092523871536,
+          "request_s": 0.36703847842746373,
+          "ttft_ms": 4941.223996982444,
+          "latency_ms": {
+            "p50": 10790.26322448044,
+            "p95": 10887.676027411362,
+            "p99": 10895.39006949286
+          },
+          "tpot_ms": {
+            "p50": 46.0554269881732,
+            "p95": 48.07303701483876,
+            "p99": 48.25187353833898
+          },
+          "requests": [
+            {
+              "ttft_ms": 5079.35378595721,
+              "latency_ms": 10833.034896000754,
+              "tpot_ms": 45.304575669634204,
+              "text_chunk_gap_ms": {
+                "p50": 44.47595099918544,
+                "p95": 88.20327341672964,
+                "p99": 88.58332437230274
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4803.094208007678,
+              "latency_ms": 10747.491552960128,
+              "tpot_ms": 46.8062783067122,
+              "text_chunk_gap_ms": {
+                "p50": 44.16003898950294,
+                "p95": 88.20739851216786,
+                "p99": 226.94076765444964
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4527.819549024571,
+              "latency_ms": 10661.485548014753,
+              "tpot_ms": 48.29658266921403,
+              "text_chunk_gap_ms": {
+                "p50": 44.28564599948004,
+                "p95": 88.24038140010089,
+                "p99": 275.5828550411388
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 5354.227395029739,
+              "latency_ms": 10897.318580013234,
+              "tpot_ms": 43.64638728333461,
+              "text_chunk_gap_ms": {
+                "p50": 44.32213999098167,
+                "p95": 88.1654997880105,
+                "p99": 88.39431284926832
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "plow-packed512-mm1",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 4,
+          "elapsed_s": 10.877892154967412,
+          "output_tok_s": 47.06794227282297,
+          "request_s": 0.36771829900642944,
+          "ttft_ms": 4939.233034994686,
+          "latency_ms": {
+            "p50": 10770.22409500205,
+            "p95": 10867.512824662845,
+            "p99": 10875.220816945075
+          },
+          "tpot_ms": {
+            "p50": 45.913315433128844,
+            "p95": 47.92144720540675,
+            "p99": 48.09979128665071
+          },
+          "requests": [
+            {
+              "ttft_ms": 5076.520857983269,
+              "latency_ms": 10812.914545997046,
+              "tpot_ms": 45.168454236328955,
+              "text_chunk_gap_ms": {
+                "p50": 44.24299200763926,
+                "p95": 87.94473538873717,
+                "p99": 88.3854860207066
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4801.945212006103,
+              "latency_ms": 10727.533644007053,
+              "tpot_ms": 46.65817662992874,
+              "text_chunk_gap_ms": {
+                "p50": 44.34899101033807,
+                "p95": 87.99578189500608,
+                "p99": 226.08115480397734
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 5350.859118043445,
+              "latency_ms": 10877.147815015633,
+              "tpot_ms": 43.51408422812746,
+              "text_chunk_gap_ms": {
+                "p50": 44.42215996095911,
+                "p95": 87.90031668613665,
+                "p99": 88.31525413668714
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 4527.109711023513,
+              "latency_ms": 10641.445629007649,
+              "tpot_ms": 48.144377306961694,
+              "text_chunk_gap_ms": {
+                "p50": 44.512955006211996,
+                "p95": 88.14318800577894,
+                "p99": 274.6785964653827
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "completion_tokens": 128,
+                "total_tokens": 4224,
+                "prompt_tokens_details": {
+                  "cached_tokens": 0
+                }
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        }
+      ]
+    },
+    "vllm-tanh": {
+      "raw_sha256": "6f454b3ae4177d7605aecb48c1576d8fbd57a767afc22f2bafe5451964b3ab6e",
+      "measurements": [
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 2.296179553028196,
+          "output_tok_s": 55.74476953737956,
+          "request_s": 0.4355060120107778,
+          "ttft_ms": 52.114179998170584,
+          "latency_ms": {
+            "p50": 2295.6731560407206,
+            "p95": 2295.6731560407206,
+            "p99": 2295.6731560407206
+          },
+          "tpot_ms": {
+            "p50": 17.665818708996458,
+            "p95": 17.665818708996458,
+            "p99": 17.665818708996458
+          },
+          "requests": [
+            {
+              "ttft_ms": 52.114179998170584,
+              "latency_ms": 2295.6731560407206,
+              "tpot_ms": 17.665818708996458,
+              "text_chunk_gap_ms": {
+                "p50": 17.64088898198679,
+                "p95": 18.082416808465496,
+                "p99": 18.261445245007053
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 2.29829393903492,
+          "output_tok_s": 55.693485426737304,
+          "request_s": 0.4351053548963852,
+          "ttft_ms": 52.09383001783863,
+          "latency_ms": {
+            "p50": 2297.927831998095,
+            "p95": 2297.927831998095,
+            "p99": 2297.927831998095
+          },
+          "tpot_ms": {
+            "p50": 17.683732299057137,
+            "p95": 17.683732299057137,
+            "p99": 17.683732299057137
+          },
+          "requests": [
+            {
+              "ttft_ms": 52.09383001783863,
+              "latency_ms": 2297.927831998095,
+              "tpot_ms": 17.683732299057137,
+              "text_chunk_gap_ms": {
+                "p50": 17.658916010987014,
+                "p95": 18.221497791819274,
+                "p99": 18.320857839426026
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 2.29832796897972,
+          "output_tok_s": 55.69266080716152,
+          "request_s": 0.4350989125559494,
+          "ttft_ms": 51.46730499109253,
+          "latency_ms": {
+            "p50": 2297.9623330174945,
+            "p95": 2297.9623330174945,
+            "p99": 2297.9623330174945
+          },
+          "tpot_ms": {
+            "p50": 17.688937228554348,
+            "p95": 17.688937228554348,
+            "p99": 17.688937228554348
+          },
+          "requests": [
+            {
+              "ttft_ms": 51.46730499109253,
+              "latency_ms": 2297.9623330174945,
+              "tpot_ms": 17.688937228554348,
+              "text_chunk_gap_ms": {
+                "p50": 17.679355980362743,
+                "p95": 18.085034075193107,
+                "p99": 18.296692691510543
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 3,
+          "elapsed_s": 2.300147755013313,
+          "output_tok_s": 55.64859897413814,
+          "request_s": 0.4347546794854542,
+          "ttft_ms": 51.55263299820945,
+          "latency_ms": {
+            "p50": 2299.6772329788655,
+            "p95": 2299.6772329788655,
+            "p99": 2299.6772329788655
+          },
+          "tpot_ms": {
+            "p50": 17.70176850378469,
+            "p95": 17.70176850378469,
+            "p99": 17.70176850378469
+          },
+          "requests": [
+            {
+              "ttft_ms": 51.55263299820945,
+              "latency_ms": 2299.6772329788655,
+              "tpot_ms": 17.70176850378469,
+              "text_chunk_gap_ms": {
+                "p50": 17.67741300864145,
+                "p95": 18.093427998246625,
+                "p99": 18.378829010762274
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 4,
+          "elapsed_s": 2.3051779420347884,
+          "output_tok_s": 55.52716676050351,
+          "request_s": 0.4338059903164337,
+          "ttft_ms": 51.448657002765685,
+          "latency_ms": {
+            "p50": 2304.800237994641,
+            "p95": 2304.800237994641,
+            "p99": 2304.800237994641
+          },
+          "tpot_ms": {
+            "p50": 17.742925834581698,
+            "p95": 17.742925834581698,
+            "p99": 17.742925834581698
+          },
+          "requests": [
+            {
+              "ttft_ms": 51.448657002765685,
+              "latency_ms": 2304.800237994641,
+              "tpot_ms": 17.742925834581698,
+              "text_chunk_gap_ms": {
+                "p50": 17.717072973027825,
+                "p95": 18.240790319396183,
+                "p99": 18.386902005877346
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 0,
+          "elapsed_s": 2.7224433119990863,
+          "output_tok_s": 188.0663585329309,
+          "request_s": 1.4692684260385227,
+          "ttft_ms": 115.88422249769792,
+          "latency_ms": {
+            "p50": 2721.7000479868148,
+            "p95": 2722.0340983156348,
+            "p99": 2722.0599236368435
+          },
+          "tpot_ms": {
+            "p50": 20.51819675976931,
+            "p95": 20.51830684961421,
+            "p99": 20.518315990398616
+          },
+          "requests": [
+            {
+              "ttft_ms": 116.24963296344504,
+              "latency_ms": 2722.0663799671456,
+              "tpot_ms": 20.518242102391344,
+              "text_chunk_gap_ms": {
+                "p50": 20.520868012681603,
+                "p95": 21.011315536452457,
+                "p99": 21.104150973260403
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 116.04593897936866,
+              "latency_ms": 2721.8511689570732,
+              "tpot_ms": 20.51815141714728,
+              "text_chunk_gap_ms": {
+                "p50": 20.523001032415777,
+                "p95": 21.003795217256993,
+                "p99": 21.10972255235538
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 115.72250601602718,
+              "latency_ms": 2721.5489270165563,
+              "tpot_ms": 20.518318275594716,
+              "text_chunk_gap_ms": {
+                "p50": 20.53281501866877,
+                "p95": 21.008951804833487,
+                "p99": 21.096772069577128
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "2533d27e636070342db282337c287821c4d261233551518a7a10c0dafe5d9060",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 98.39152998756617,
+              "latency_ms": 2701.0233030305244,
+              "tpot_ms": 20.493163567267388,
+              "text_chunk_gap_ms": {
+                "p50": 20.51487797871232,
+                "p95": 21.00556381046772,
+                "p99": 21.090003115823492
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 1,
+          "elapsed_s": 2.7254437399678864,
+          "output_tok_s": 187.85931717894601,
+          "request_s": 1.4676509154605157,
+          "ttft_ms": 117.43863701121882,
+          "latency_ms": {
+            "p50": 2724.7450024588034,
+            "p95": 2724.965895464993,
+            "p99": 2724.9793567106826
+          },
+          "tpot_ms": {
+            "p50": 20.529516960455723,
+            "p95": 20.530523204471088,
+            "p99": 20.53056098083969
+          },
+          "requests": [
+            {
+              "ttft_ms": 117.71570099517703,
+              "latency_ms": 2724.870544974692,
+              "tpot_ms": 20.5287782990513,
+              "text_chunk_gap_ms": {
+                "p50": 20.47407696954906,
+                "p95": 21.067857486195862,
+                "p99": 21.18294585729018
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 117.64025804586709,
+              "latency_ms": 2724.982722022105,
+              "tpot_ms": 20.530255621860142,
+              "text_chunk_gap_ms": {
+                "p50": 20.460737985558808,
+                "p95": 21.055992611218244,
+                "p99": 21.157641004538164
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 99.83233996899799,
+              "latency_ms": 2704.272161005065,
+              "tpot_ms": 20.507400165638323,
+              "text_chunk_gap_ms": {
+                "p50": 20.47000202583149,
+                "p95": 21.069274767069146,
+                "p99": 21.157307551475242
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 117.23701597657055,
+              "latency_ms": 2724.6194599429145,
+              "tpot_ms": 20.53057042493184,
+              "text_chunk_gap_ms": {
+                "p50": 20.468598988372833,
+                "p95": 21.057174308225513,
+                "p99": 21.1750205012504
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 2,
+          "elapsed_s": 2.725200226996094,
+          "output_tok_s": 187.87610353473445,
+          "request_s": 1.467782058865113,
+          "ttft_ms": 115.54121098015457,
+          "latency_ms": {
+            "p50": 2724.4637229887303,
+            "p95": 2724.8336767341243,
+            "p99": 2724.884475377039
+          },
+          "tpot_ms": {
+            "p50": 20.542666626091325,
+            "p95": 20.542749991011622,
+            "p99": 20.542757267537564
+          },
+          "requests": [
+            {
+              "ttft_ms": 115.97447202075273,
+              "latency_ms": 2724.8971750377677,
+              "tpot_ms": 20.542698448952873,
+              "text_chunk_gap_ms": {
+                "p50": 20.55327600101009,
+                "p95": 21.08935560681857,
+                "p99": 21.336719817481935
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 97.9973409557715,
+              "latency_ms": 2704.0432099602185,
+              "tpot_ms": 20.520046212633442,
+              "text_chunk_gap_ms": {
+                "p50": 20.530170993879437,
+                "p95": 21.08855666592717,
+                "p99": 21.321213819319382
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 115.53897295380011,
+              "latency_ms": 2724.4535929639824,
+              "tpot_ms": 20.54263480322978,
+              "text_chunk_gap_ms": {
+                "p50": 20.546665997244418,
+                "p95": 21.085264312569052,
+                "p99": 21.335071767680347
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "2533d27e636070342db282337c287821c4d261233551518a7a10c0dafe5d9060",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 115.54344900650904,
+              "latency_ms": 2724.473853013478,
+              "tpot_ms": 20.542759086669047,
+              "text_chunk_gap_ms": {
+                "p50": 20.552214002236724,
+                "p95": 21.081942896125838,
+                "p99": 21.286147042410448
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 3,
+          "elapsed_s": 2.7216650110203773,
+          "output_tok_s": 188.12013893217758,
+          "request_s": 1.4696885854076374,
+          "ttft_ms": 115.93571997946128,
+          "latency_ms": {
+            "p50": 2720.7873460138217,
+            "p95": 2721.2623355851974,
+            "p99": 2721.3060279458296
+          },
+          "tpot_ms": {
+            "p50": 20.510286917519487,
+            "p95": 20.511828777889033,
+            "p99": 20.511914171607557
+          },
+          "requests": [
+            {
+              "ttft_ms": 116.39151501003653,
+              "latency_ms": 2721.3169510359876,
+              "tpot_ms": 20.51122390571615,
+              "text_chunk_gap_ms": {
+                "p50": 20.476962032262236,
+                "p95": 21.09559157397598,
+                "p99": 21.189262475818396
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 115.93703698599711,
+              "latency_ms": 2720.95284803072,
+              "tpot_ms": 20.511935520037188,
+              "text_chunk_gap_ms": {
+                "p50": 20.450621959753335,
+                "p95": 21.0684199759271,
+                "p99": 21.21594213647768
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 98.54151296894997,
+              "latency_ms": 2700.8317559957504,
+              "tpot_ms": 20.490474354541735,
+              "text_chunk_gap_ms": {
+                "p50": 20.483230997342616,
+                "p95": 21.099842782132328,
+                "p99": 21.183592131128535
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 115.93440297292545,
+              "latency_ms": 2720.6218439969234,
+              "tpot_ms": 20.50934992932282,
+              "text_chunk_gap_ms": {
+                "p50": 20.463060995098203,
+                "p95": 21.072380209807307,
+                "p99": 21.23547518160194
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 128,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 4,
+          "elapsed_s": 2.7279046030016616,
+          "output_tok_s": 187.68984789153498,
+          "request_s": 1.466326936652617,
+          "ttft_ms": 116.06821700115688,
+          "latency_ms": {
+            "p50": 2727.1902315260377,
+            "p95": 2727.536822052207,
+            "p99": 2727.5628300081007
+          },
+          "tpot_ms": {
+            "p50": 20.560015862400636,
+            "p95": 20.56006268507849,
+            "p99": 20.5600690724297
+          },
+          "requests": [
+            {
+              "ttft_ms": 116.44035700010136,
+              "latency_ms": 2727.569331997074,
+              "tpot_ms": 20.560070669267503,
+              "text_chunk_gap_ms": {
+                "p50": 20.550401008222252,
+                "p95": 21.138693805551156,
+                "p99": 21.212886796565726
+              },
+              "prompt_sha256": "a1e016cb2c0ea9314d90363a5fbde7b8f303ea16e78c54dd8e0416545b740d9f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 116.23038398101926,
+              "latency_ms": 2727.352599031292,
+              "tpot_ms": 20.56001744134073,
+              "text_chunk_gap_ms": {
+                "p50": 20.55353601463139,
+                "p95": 21.142672398127615,
+                "p99": 21.212304616346955
+              },
+              "prompt_sha256": "24c3ef470c8c247e33417545c934db17583ae558aeeb1a2bcf3fa39ae3394ebd",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 115.9060500212945,
+              "latency_ms": 2727.0278640207835,
+              "tpot_ms": 20.560014283460543,
+              "text_chunk_gap_ms": {
+                "p50": 20.556320960167795,
+                "p95": 21.133204095531255,
+                "p99": 21.20610545971431
+              },
+              "prompt_sha256": "5726c1347b8a76cd4f4b84456c94247e9d0d17e369a084ca885b8391e084f55f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "2533d27e636070342db282337c287821c4d261233551518a7a10c0dafe5d9060",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 98.8296139985323,
+              "latency_ms": 2706.887065025512,
+              "tpot_ms": 20.535885441157323,
+              "text_chunk_gap_ms": {
+                "p50": 20.551432971842587,
+                "p95": 21.127345802960917,
+                "p99": 21.206334210000932
+              },
+              "prompt_sha256": "9b55f52d3bfb1323ad5767ca00caeb0f278f40171424fdbbf56a61714498407f",
+              "usage": {
+                "prompt_tokens": 128,
+                "total_tokens": 256,
+                "completion_tokens": 128
+              },
+              "text_sha256": "1923b94e41bbdc964785f84661c1c956129ae756938c11d52beb4d76a4055447",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 2.508328886004165,
+          "output_tok_s": 51.02999080950163,
+          "request_s": 0.3986718031992315,
+          "ttft_ms": 139.089731965214,
+          "latency_ms": {
+            "p50": 2507.828879985027,
+            "p95": 2507.828879985027,
+            "p99": 2507.828879985027
+          },
+          "tpot_ms": {
+            "p50": 18.651489354486717,
+            "p95": 18.651489354486717,
+            "p99": 18.651489354486717
+          },
+          "requests": [
+            {
+              "ttft_ms": 139.089731965214,
+              "latency_ms": 2507.828879985027,
+              "tpot_ms": 18.651489354486717,
+              "text_chunk_gap_ms": {
+                "p50": 18.646240001544356,
+                "p95": 19.070752465631813,
+                "p99": 19.393195933662355
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 2.50536369998008,
+          "output_tok_s": 51.0903865977693,
+          "request_s": 0.3991436452950727,
+          "ttft_ms": 138.9715049881488,
+          "latency_ms": {
+            "p50": 2504.9327969900332,
+            "p95": 2504.9327969900332,
+            "p99": 2504.9327969900332
+          },
+          "tpot_ms": {
+            "p50": 18.629616472455783,
+            "p95": 18.629616472455783,
+            "p99": 18.629616472455783
+          },
+          "requests": [
+            {
+              "ttft_ms": 138.9715049881488,
+              "latency_ms": 2504.9327969900332,
+              "tpot_ms": 18.629616472455783,
+              "text_chunk_gap_ms": {
+                "p50": 18.625838973093778,
+                "p95": 19.09139709896408,
+                "p99": 19.29466275498271
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 2.5068731640349142,
+          "output_tok_s": 51.05962353275935,
+          "request_s": 0.39890330884968245,
+          "ttft_ms": 139.1108839889057,
+          "latency_ms": {
+            "p50": 2506.451524037402,
+            "p95": 2506.451524037402,
+            "p99": 2506.451524037402
+          },
+          "tpot_ms": {
+            "p50": 18.640477480696823,
+            "p95": 18.640477480696823,
+            "p99": 18.640477480696823
+          },
+          "requests": [
+            {
+              "ttft_ms": 139.1108839889057,
+              "latency_ms": 2506.451524037402,
+              "tpot_ms": 18.640477480696823,
+              "text_chunk_gap_ms": {
+                "p50": 18.59443198191002,
+                "p95": 19.16201938292943,
+                "p99": 19.303356702439487
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 3,
+          "elapsed_s": 2.5069192220107652,
+          "output_tok_s": 51.058685447923196,
+          "request_s": 0.39889598006189997,
+          "ttft_ms": 138.8349609915167,
+          "latency_ms": {
+            "p50": 2506.5369920339435,
+            "p95": 2506.5369920339435,
+            "p99": 2506.5369920339435
+          },
+          "tpot_ms": {
+            "p50": 18.64332307907423,
+            "p95": 18.64332307907423,
+            "p99": 18.64332307907423
+          },
+          "requests": [
+            {
+              "ttft_ms": 138.8349609915167,
+              "latency_ms": 2506.5369920339435,
+              "tpot_ms": 18.64332307907423,
+              "text_chunk_gap_ms": {
+                "p50": 18.6258289613761,
+                "p95": 19.10151107585989,
+                "p99": 19.272108661243692
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 4,
+          "elapsed_s": 2.506852633028757,
+          "output_tok_s": 51.06004170869492,
+          "request_s": 0.39890657584917905,
+          "ttft_ms": 140.1141210226342,
+          "latency_ms": {
+            "p50": 2506.3994060037658,
+            "p95": 2506.3994060037658,
+            "p99": 2506.3994060037658
+          },
+          "tpot_ms": {
+            "p50": 18.632167598276627,
+            "p95": 18.632167598276627,
+            "p99": 18.632167598276627
+          },
+          "requests": [
+            {
+              "ttft_ms": 140.1141210226342,
+              "latency_ms": 2506.3994060037658,
+              "tpot_ms": 18.632167598276627,
+              "text_chunk_gap_ms": {
+                "p50": 18.618428031913936,
+                "p95": 19.0667990304064,
+                "p99": 19.237640547798946
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 0,
+          "elapsed_s": 3.3345119050354697,
+          "output_tok_s": 153.54571061114677,
+          "request_s": 1.1995758641495842,
+          "ttft_ms": 450.59000197215937,
+          "latency_ms": {
+            "p50": 3323.834940470988,
+            "p95": 3333.966931721079,
+            "p99": 3333.993844719953
+          },
+          "tpot_ms": {
+            "p50": 22.624344161416467,
+            "p95": 24.559697538397025,
+            "p99": 24.766655419306925
+          },
+          "requests": [
+            {
+              "ttft_ms": 520.32288297778,
+              "latency_ms": 3334.0005729696713,
+              "tpot_ms": 22.154942440881033,
+              "text_chunk_gap_ms": {
+                "p50": 22.197398997377604,
+                "p95": 22.671459714183584,
+                "p99": 23.068437156034634
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 520.1921479892917,
+              "latency_ms": 3333.776297979057,
+              "tpot_ms": 22.154205905431223,
+              "text_chunk_gap_ms": {
+                "p50": 22.200164035893977,
+                "p95": 22.668434330262244,
+                "p99": 23.104589112335816
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 380.98785595502704,
+              "latency_ms": 3313.893582962919,
+              "tpot_ms": 23.093745881951904,
+              "text_chunk_gap_ms": {
+                "p50": 22.202936990652233,
+                "p95": 22.67529660020955,
+                "p99": 23.15399710321799
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 140.53061202866957,
+              "latency_ms": 3292.4667629995383,
+              "tpot_ms": 24.8183948895344,
+              "text_chunk_gap_ms": {
+                "p50": 22.220114013180137,
+                "p95": 22.677668498363346,
+                "p99": 108.73751527047656
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 1,
+          "elapsed_s": 3.3393202620209195,
+          "output_tok_s": 153.32461693570633,
+          "request_s": 1.1978485698102057,
+          "ttft_ms": 451.6606594843324,
+          "latency_ms": {
+            "p50": 3328.8949470152147,
+            "p95": 3338.6968049337156,
+            "p99": 3338.719908169005
+          },
+          "tpot_ms": {
+            "p50": 22.655388090794347,
+            "p95": 24.59316545264157,
+            "p99": 24.800640189585707
+          },
+          "requests": [
+            {
+              "ttft_ms": 141.32912398781627,
+              "latency_ms": 3297.5977509631775,
+              "tpot_ms": 24.85250887382174,
+              "text_chunk_gap_ms": {
+                "p50": 22.24025398027152,
+                "p95": 22.868243500124663,
+                "p99": 108.56108103995152
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 382.56553997052833,
+              "latency_ms": 3319.2567370133474,
+              "tpot_ms": 23.123552732620624,
+              "text_chunk_gap_ms": {
+                "p50": 22.20337901962921,
+                "p95": 22.846034000394866,
+                "p99": 23.098568802233785
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 521.1448890040629,
+              "latency_ms": 3338.7256839778274,
+              "tpot_ms": 22.185675550974523,
+              "text_chunk_gap_ms": {
+                "p50": 22.215606993995607,
+                "p95": 22.7724242140539,
+                "p99": 22.989530932391062
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 520.7557789981365,
+              "latency_ms": 3338.533157017082,
+              "tpot_ms": 22.187223448968073,
+              "text_chunk_gap_ms": {
+                "p50": 22.2100589890033,
+                "p95": 22.77818081784062,
+                "p99": 22.987126188818365
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 2,
+          "elapsed_s": 3.338658505002968,
+          "output_tok_s": 153.35500747763504,
+          "request_s": 1.1980859959190238,
+          "ttft_ms": 451.24653598759323,
+          "latency_ms": {
+            "p50": 3328.04082747316,
+            "p95": 3338.212198688416,
+            "p99": 3338.239671731135
+          },
+          "tpot_ms": {
+            "p50": 22.652520153508338,
+            "p95": 24.589448570416813,
+            "p99": 24.797016422715274
+          },
+          "requests": [
+            {
+              "ttft_ms": 520.6418089801446,
+              "latency_ms": 3338.2465399918146,
+              "tpot_ms": 22.185864023713936,
+              "text_chunk_gap_ms": {
+                "p50": 22.232833027374,
+                "p95": 22.74779421859421,
+                "p99": 23.208346487954255
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 520.5644029774703,
+              "latency_ms": 3338.0175979691558,
+              "tpot_ms": 22.184670826706185,
+              "text_chunk_gap_ms": {
+                "p50": 22.230489004869014,
+                "p95": 22.74467419483699,
+                "p99": 23.214001846499738
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 381.92866899771616,
+              "latency_ms": 3318.064056977164,
+              "tpot_ms": 23.11917628330274,
+              "text_chunk_gap_ms": {
+                "p50": 22.222997969947755,
+                "p95": 22.758550994331017,
+                "p99": 23.391393574420363
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 141.12793299136683,
+              "latency_ms": 3296.9392979866825,
+              "tpot_ms": 24.848908385789887,
+              "text_chunk_gap_ms": {
+                "p50": 22.23613701062277,
+                "p95": 22.77709020418115,
+                "p99": 108.39530802448222
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 3,
+          "elapsed_s": 3.3443924330058508,
+          "output_tok_s": 153.09208182241582,
+          "request_s": 1.1960318892376236,
+          "ttft_ms": 451.97545949486084,
+          "latency_ms": {
+            "p50": 3333.82273701136,
+            "p95": 3343.7967719248263,
+            "p99": 3343.8069559581345
+          },
+          "tpot_ms": {
+            "p50": 22.69171084658661,
+            "p95": 24.63387971559235,
+            "p99": 24.841762531927316
+          },
+          "requests": [
+            {
+              "ttft_ms": 141.71285700285807,
+              "latency_ms": 3303.2169779762626,
+              "tpot_ms": 24.89373323601106,
+              "text_chunk_gap_ms": {
+                "p50": 22.317078022751957,
+                "p95": 22.923503955826163,
+                "p99": 109.05468233395308
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 521.749451989308,
+              "latency_ms": 3343.8095019664615,
+              "tpot_ms": 22.220945275410656,
+              "text_chunk_gap_ms": {
+                "p50": 22.285832033958286,
+                "p95": 22.854660399025306,
+                "p99": 23.19828946259804
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 382.42603198159486,
+              "latency_ms": 3323.9208390004933,
+              "tpot_ms": 23.161376433219672,
+              "text_chunk_gap_ms": {
+                "p50": 22.290628985501826,
+                "p95": 22.88693619775586,
+                "p99": 23.31168433651328
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 521.5248870081268,
+              "latency_ms": 3343.7246350222267,
+              "tpot_ms": 22.222045259953543,
+              "text_chunk_gap_ms": {
+                "p50": 22.290248016361147,
+                "p95": 22.854752477724105,
+                "p99": 23.19387872586958
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 1024,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 4,
+          "elapsed_s": 3.3511093070264906,
+          "output_tok_s": 152.78522814115792,
+          "request_s": 1.1936345948527962,
+          "ttft_ms": 451.9999614858534,
+          "latency_ms": {
+            "p50": 3340.6871624756604,
+            "p95": 3350.519863740192,
+            "p99": 3350.5452167411568
+          },
+          "tpot_ms": {
+            "p50": 22.745568511730763,
+            "p95": 24.68142224705822,
+            "p99": 24.888329501217964
+          },
+          "requests": [
+            {
+              "ttft_ms": 382.62373697943985,
+              "latency_ms": 3331.0340449679643,
+              "tpot_ms": 23.215829196760033,
+              "text_chunk_gap_ms": {
+                "p50": 22.40493899444118,
+                "p95": 22.902793512912467,
+                "p99": 23.142524093855172
+              },
+              "prompt_sha256": "b90a108dee38144a70c057b581fb4d7510fc03e6a104c0bada967fb399d9381e",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 521.5891829575412,
+              "latency_ms": 3350.551554991398,
+              "tpot_ms": 22.275294267983124,
+              "text_chunk_gap_ms": {
+                "p50": 22.378480003681034,
+                "p95": 22.87942468537949,
+                "p99": 23.092105336254463
+              },
+              "prompt_sha256": "a129aa2663efa20adff3bbbde2067c98865715883aa6a4b1e887ae2dc34fd94c",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 521.376185992267,
+              "latency_ms": 3350.3402799833566,
+              "tpot_ms": 22.275307826701493,
+              "text_chunk_gap_ms": {
+                "p50": 22.387332981452346,
+                "p95": 22.865411994280294,
+                "p99": 23.089230488985777
+              },
+              "prompt_sha256": "291e50c59324ffbf3cf169fc8b157d93c7898d16df715b40785481661966aba9",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 141.25980000244454,
+              "latency_ms": 3308.646951976698,
+              "tpot_ms": 24.9400563147579,
+              "text_chunk_gap_ms": {
+                "p50": 22.41482399404049,
+                "p95": 22.93737680884078,
+                "p99": 108.87648858246334
+              },
+              "prompt_sha256": "5b3d0bbe654e0c3778460df1585e326e1c9fe6268cf4e8ac78e8c76a5c7916fa",
+              "usage": {
+                "prompt_tokens": 1024,
+                "total_tokens": 1152,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 0,
+          "elapsed_s": 3.062918081996031,
+          "output_tok_s": 41.79021331076064,
+          "request_s": 0.3264860414903175,
+          "ttft_ms": 571.1748690227978,
+          "latency_ms": {
+            "p50": 3062.3751310049556,
+            "p95": 3062.3751310049556,
+            "p99": 3062.3751310049556
+          },
+          "tpot_ms": {
+            "p50": 19.6157500943477,
+            "p95": 19.6157500943477,
+            "p99": 19.6157500943477
+          },
+          "requests": [
+            {
+              "ttft_ms": 571.1748690227978,
+              "latency_ms": 3062.3751310049556,
+              "tpot_ms": 19.6157500943477,
+              "text_chunk_gap_ms": {
+                "p50": 19.600022991653532,
+                "p95": 20.1963763742242,
+                "p99": 20.352894427487627
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 1,
+          "elapsed_s": 3.062599495984614,
+          "output_tok_s": 41.79456052540376,
+          "request_s": 0.3265200041047169,
+          "ttft_ms": 573.4136209939606,
+          "latency_ms": {
+            "p50": 3062.039159995038,
+            "p95": 3062.039159995038,
+            "p99": 3062.039159995038
+          },
+          "tpot_ms": {
+            "p50": 19.595476685047853,
+            "p95": 19.595476685047853,
+            "p99": 19.595476685047853
+          },
+          "requests": [
+            {
+              "ttft_ms": 573.4136209939606,
+              "latency_ms": 3062.039159995038,
+              "tpot_ms": 19.595476685047853,
+              "text_chunk_gap_ms": {
+                "p50": 19.583187997341156,
+                "p95": 20.07382881711237,
+                "p99": 20.432502737967297
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 2,
+          "elapsed_s": 3.0634547719964758,
+          "output_tok_s": 41.782892037469665,
+          "request_s": 0.32642884404273176,
+          "ttft_ms": 572.4918359774165,
+          "latency_ms": {
+            "p50": 3062.835427990649,
+            "p95": 3062.835427990649,
+            "p99": 3062.835427990649
+          },
+          "tpot_ms": {
+            "p50": 19.609004661521514,
+            "p95": 19.609004661521514,
+            "p99": 19.609004661521514
+          },
+          "requests": [
+            {
+              "ttft_ms": 572.4918359774165,
+              "latency_ms": 3062.835427990649,
+              "tpot_ms": 19.609004661521514,
+              "text_chunk_gap_ms": {
+                "p50": 19.601195002906024,
+                "p95": 20.21734931622632,
+                "p99": 20.472290203906596
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 3,
+          "elapsed_s": 3.0629497789777815,
+          "output_tok_s": 41.78978084411109,
+          "request_s": 0.3264826628446179,
+          "ttft_ms": 571.772511000745,
+          "latency_ms": {
+            "p50": 3062.506577000022,
+            "p95": 3062.506577000022,
+            "p99": 3062.506577000022
+          },
+          "tpot_ms": {
+            "p50": 19.612079259836825,
+            "p95": 19.612079259836825,
+            "p99": 19.612079259836825
+          },
+          "requests": [
+            {
+              "ttft_ms": 571.772511000745,
+              "latency_ms": 3062.506577000022,
+              "tpot_ms": 19.612079259836825,
+              "text_chunk_gap_ms": {
+                "p50": 19.612681993748993,
+                "p95": 20.098786713788286,
+                "p99": 20.47048106091097
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 1,
+          "repeat": 4,
+          "elapsed_s": 3.0671653199824505,
+          "output_tok_s": 41.732344574348666,
+          "request_s": 0.32603394198709895,
+          "ttft_ms": 572.4877089960501,
+          "latency_ms": {
+            "p50": 3066.6769010131247,
+            "p95": 3066.6769010131247,
+            "p99": 3066.6769010131247
+          },
+          "tpot_ms": {
+            "p50": 19.6392849765124,
+            "p95": 19.6392849765124,
+            "p99": 19.6392849765124
+          },
+          "requests": [
+            {
+              "ttft_ms": 572.4877089960501,
+              "latency_ms": 3066.6769010131247,
+              "tpot_ms": 19.6392849765124,
+              "text_chunk_gap_ms": {
+                "p50": 19.631319970358163,
+                "p95": 20.129955792799592,
+                "p99": 20.33974707359448
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 0,
+          "elapsed_s": 5.202096198045183,
+          "output_tok_s": 98.42186313132709,
+          "request_s": 0.7689208057134929,
+          "ttft_ms": 1668.6996380158234,
+          "latency_ms": {
+            "p50": 5140.615042502759,
+            "p95": 5195.237223766162,
+            "p99": 5199.975749572623
+          },
+          "tpot_ms": {
+            "p50": 27.33791657076327,
+            "p95": 34.37700567063032,
+            "p99": 35.08359242875979
+          },
+          "requests": [
+            {
+              "ttft_ms": 1948.087905999273,
+              "latency_ms": 5161.6726659704,
+              "tpot_ms": 25.303817007646668,
+              "text_chunk_gap_ms": {
+                "p50": 23.147667990997434,
+                "p95": 23.769378708675504,
+                "p99": 29.462533618789127
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1389.3113700323738,
+              "latency_ms": 5119.557419035118,
+              "tpot_ms": 29.372016133879875,
+              "text_chunk_gap_ms": {
+                "p50": 23.158463998697698,
+                "p95": 23.774632794084027,
+                "p99": 287.31083140359243
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 573.5635649762116,
+              "latency_ms": 5051.613932999317,
+              "tpot_ms": 35.26023911829216,
+              "text_chunk_gap_ms": {
+                "p50": 23.172515037003905,
+                "p95": 29.14445492206133,
+                "p99": 296.8014337704517
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 2275.975317985285,
+              "latency_ms": 5201.160381024238,
+              "tpot_ms": 23.032953252275217,
+              "text_chunk_gap_ms": {
+                "p50": 23.144413018599153,
+                "p95": 23.718903824919835,
+                "p99": 23.81303195725195
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 1,
+          "elapsed_s": 5.218781883013435,
+          "output_tok_s": 98.1071850629558,
+          "request_s": 0.7664623833043422,
+          "ttft_ms": 1675.773270020727,
+          "latency_ms": {
+            "p50": 5158.290478517301,
+            "p95": 5212.455622298876,
+            "p99": 5217.162726103561
+          },
+          "tpot_ms": {
+            "p50": 27.421395342492712,
+            "p95": 34.49916802885242,
+            "p99": 35.21075170316209
+          },
+          "requests": [
+            {
+              "ttft_ms": 2284.8312350106426,
+              "latency_ms": 5218.339502054732,
+              "tpot_ms": 23.098490291685746,
+              "text_chunk_gap_ms": {
+                "p50": 23.148979991674423,
+                "p95": 23.64414608455263,
+                "p99": 24.014675202779472
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1955.3447460057214,
+              "latency_ms": 5179.113637015689,
+              "tpot_ms": 25.38400701582652,
+              "text_chunk_gap_ms": {
+                "p50": 23.154308029916137,
+                "p95": 23.748591932235286,
+                "p99": 32.53819868899881
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1396.2017940357327,
+              "latency_ms": 5137.467320018914,
+              "tpot_ms": 29.458783669158905,
+              "text_chunk_gap_ms": {
+                "p50": 23.160858021583408,
+                "p95": 23.998228617710993,
+                "p99": 287.63775945873914
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 576.4972540200688,
+              "latency_ms": 5070.855501980986,
+              "tpot_ms": 35.38864762173951,
+              "text_chunk_gap_ms": {
+                "p50": 23.182259988971055,
+                "p95": 32.46111638727596,
+                "p99": 297.6267040276434
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 2,
+          "elapsed_s": 5.224411684030201,
+          "output_tok_s": 98.00146523005904,
+          "request_s": 0.7656364471098362,
+          "ttft_ms": 1673.7820735143032,
+          "latency_ms": {
+            "p50": 5163.661800994305,
+            "p95": 5217.630754731363,
+            "p99": 5222.283274129732
+          },
+          "tpot_ms": {
+            "p50": 27.479367932913398,
+            "p95": 34.53951154509651,
+            "p99": 35.24825469945011
+          },
+          "requests": [
+            {
+              "ttft_ms": 1953.8603909895755,
+              "latency_ms": 5184.675408992916,
+              "tpot_ms": 25.439488330734967,
+              "text_chunk_gap_ms": {
+                "p50": 23.24214903637767,
+                "p95": 23.929312580730766,
+                "p99": 29.832896790467164
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 575.2800769987516,
+              "latency_ms": 5074.3110189796425,
+              "tpot_ms": 35.42544048803851,
+              "text_chunk_gap_ms": {
+                "p50": 23.26117700431496,
+                "p95": 29.48817269061683,
+                "p99": 299.5740722876508
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 2286.757039022632,
+              "latency_ms": 5223.446403979324,
+              "tpot_ms": 23.123538306745605,
+              "text_chunk_gap_ms": {
+                "p50": 23.2418579980731,
+                "p95": 23.882624885300174,
+                "p99": 23.99621478980407
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1393.7037560390308,
+              "latency_ms": 5142.6481929956935,
+              "tpot_ms": 29.519247535091832,
+              "text_chunk_gap_ms": {
+                "p50": 23.24875898193568,
+                "p95": 23.966053634649143,
+                "p99": 288.02984612295387
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 3,
+          "elapsed_s": 5.208614406990819,
+          "output_tok_s": 98.29869519863318,
+          "request_s": 0.7679585562393217,
+          "ttft_ms": 1672.8508829837665,
+          "latency_ms": {
+            "p50": 5147.518527024658,
+            "p95": 5201.77576096321,
+            "p99": 5206.482209798996
+          },
+          "tpot_ms": {
+            "p50": 27.359587748353476,
+            "p95": 34.41009931651303,
+            "p99": 35.11764227621639
+          },
+          "requests": [
+            {
+              "ttft_ms": 1952.6918859919533,
+              "latency_ms": 5168.438415043056,
+              "tpot_ms": 25.320838811426004,
+              "text_chunk_gap_ms": {
+                "p50": 23.133436974603683,
+                "p95": 23.756494995905086,
+                "p99": 29.67064297758039
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 576.0465809726156,
+              "latency_ms": 5058.451639022678,
+              "tpot_ms": 35.29452801614222,
+              "text_chunk_gap_ms": {
+                "p50": 23.193276021629572,
+                "p95": 29.39298467827021,
+                "p99": 297.3464162473101
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 2281.4286669599824,
+              "latency_ms": 5207.658822007943,
+              "tpot_ms": 23.041182323212286,
+              "text_chunk_gap_ms": {
+                "p50": 23.113848001230508,
+                "p95": 23.734565381892025,
+                "p99": 23.983076501172036
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1393.0098799755797,
+              "latency_ms": 5126.598639006261,
+              "tpot_ms": 29.398336685280952,
+              "text_chunk_gap_ms": {
+                "p50": 23.153287009336054,
+                "p95": 23.793625371763483,
+                "p99": 287.66829136293364
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        },
+        {
+          "schema_version": 2,
+          "label": "vllm028-bf16-tanh",
+          "model": "gemma-4-31B-it",
+          "warmups_per_case": 1,
+          "input": 4096,
+          "output": 128,
+          "concurrency": 4,
+          "repeat": 4,
+          "elapsed_s": 5.227180406975094,
+          "output_tok_s": 97.94955600093553,
+          "request_s": 0.7652309062573088,
+          "ttft_ms": 1675.204561499413,
+          "latency_ms": {
+            "p50": 5166.596690978622,
+            "p95": 5220.325187811977,
+            "p99": 5225.009249576251
+          },
+          "tpot_ms": {
+            "p50": 27.49127661007251,
+            "p95": 34.55787591235602,
+            "p99": 35.266571856629994
+          },
+          "requests": [
+            {
+              "ttft_ms": 1394.7277839761227,
+              "latency_ms": 5146.04696497554,
+              "tpot_ms": 29.537946307082024,
+              "text_chunk_gap_ms": {
+                "p50": 23.28847802709788,
+                "p95": 23.89043349539861,
+                "p99": 288.54798356420343
+              },
+              "prompt_sha256": "aaa170216463c0b60c6f6ea09892af38abb59ebd00b3aa5150e7cb8814b66c80",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "5e25b0b7d6a3b22d41a517666caf86cac19fa87b801ee123e43a42d392f1dae2",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 575.9550239890814,
+              "latency_ms": 5077.31074601179,
+              "tpot_ms": 35.44374584269849,
+              "text_chunk_gap_ms": {
+                "p50": 23.29832297982648,
+                "p95": 29.823611408937666,
+                "p99": 297.48312543379143
+              },
+              "prompt_sha256": "70e5ed6985993f96427a761fce219f81c0a33d9b305b3f5995ec9c5118326180",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 1955.6813390227035,
+              "latency_ms": 5187.1464169817045,
+              "tpot_ms": 25.444606913063,
+              "text_chunk_gap_ms": {
+                "p50": 23.27732095727697,
+                "p95": 23.871566011803225,
+                "p99": 30.310559936333426
+              },
+              "prompt_sha256": "e921dd670f902e3dd48e1d30eaa839a864eaa57fa2912fbd4bee8ad7b3190ff9",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "fdf5e81dcbf94dc4c6315afce9f96d32ba78fae26f44e5f598cc54f3c01bca83",
+              "text_chunks": 128
+            },
+            {
+              "ttft_ms": 2284.33881001547,
+              "latency_ms": 5226.1802650173195,
+              "tpot_ms": 23.164105944896455,
+              "text_chunk_gap_ms": {
+                "p50": 23.26344099128619,
+                "p95": 23.851751070469618,
+                "p99": 23.969901526579633
+              },
+              "prompt_sha256": "01043efca04d6a5b77cb1b06c57f0660a0b14a8a4dfb9994202e034a693429f8",
+              "usage": {
+                "prompt_tokens": 4096,
+                "total_tokens": 4224,
+                "completion_tokens": 128
+              },
+              "text_sha256": "a2143532a043a77cec0672d98d16bc4fb9b5fd5c43aaf2d7ff0e35c64d188ced",
+              "text_chunks": 128
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "summary": {
+    "plow-qualified": [
+      {
+        "input": 128,
+        "concurrency": 1,
+        "output_tok_s": 31.499664177216037,
+        "ttft_ms": 95.52623302442953,
+        "tpot_ms": 31.24213091319603,
+        "latency_ms": 4063.276859000325
+      },
+      {
+        "input": 128,
+        "concurrency": 4,
+        "output_tok_s": 87.02868912654625,
+        "ttft_ms": 353.8702074729372,
+        "tpot_ms": 42.69159508673805,
+        "latency_ms": 5776.374680484878
+      },
+      {
+        "input": 1024,
+        "concurrency": 1,
+        "output_tok_s": 29.332433508269666,
+        "ttft_ms": 328.52905098116025,
+        "tpot_ms": 31.770970440913345,
+        "latency_ms": 4363.513692980632
+      },
+      {
+        "input": 1024,
+        "concurrency": 4,
+        "output_tok_s": 73.32628369004897,
+        "ttft_ms": 1182.5070439954288,
+        "tpot_ms": 44.84348134669351,
+        "latency_ms": 6877.045584027655
+      },
+      {
+        "input": 4096,
+        "concurrency": 1,
+        "output_tok_s": 23.347375603099255,
+        "ttft_ms": 1419.5259959669784,
+        "tpot_ms": 31.98840007081437,
+        "latency_ms": 5482.103981019463
+      },
+      {
+        "input": 4096,
+        "concurrency": 4,
+        "output_tok_s": 47.065666042413106,
+        "ttft_ms": 4933.367366000311,
+        "tpot_ms": 45.98658266532286,
+        "latency_ms": 10775.596419465728
+      }
+    ],
+    "vllm-tanh": [
+      {
+        "input": 128,
+        "concurrency": 1,
+        "output_tok_s": 55.69266080716152,
+        "ttft_ms": 51.55263299820945,
+        "tpot_ms": 17.688937228554348,
+        "latency_ms": 2297.9623330174945
+      },
+      {
+        "input": 128,
+        "concurrency": 4,
+        "output_tok_s": 187.87610353473445,
+        "ttft_ms": 115.93571997946128,
+        "tpot_ms": 20.52441225584237,
+        "latency_ms": 2721.9587744621094
+      },
+      {
+        "input": 1024,
+        "concurrency": 1,
+        "output_tok_s": 51.05962353275935,
+        "ttft_ms": 139.089731965214,
+        "tpot_ms": 18.640477480696823,
+        "latency_ms": 2506.451524037402
+      },
+      {
+        "input": 1024,
+        "concurrency": 4,
+        "output_tok_s": 153.32461693570633,
+        "ttft_ms": 451.4079424843658,
+        "tpot_ms": 22.6845268543267,
+        "latency_ms": 3332.4051714735106
+      },
+      {
+        "input": 4096,
+        "concurrency": 1,
+        "output_tok_s": 41.78978084411109,
+        "ttft_ms": 572.4877089960501,
+        "tpot_ms": 19.612079259836825,
+        "latency_ms": 3062.506577000022
+      },
+      {
+        "input": 4096,
+        "concurrency": 4,
+        "output_tok_s": 98.1071850629558,
+        "ttft_ms": 1672.144850017503,
+        "tpot_ms": 27.40831152347144,
+        "latency_ms": 5153.85981547297
+      }
+    ]
+  }
+}
