@@ -575,6 +575,11 @@ struct LayerSrc {
 unsafe impl Send for AneLanes {}
 
 #[cfg(feature = "ane")]
+/// `PLOW_ANE_W8=1`: ANE programs carry 8-bit linear-quantized weights (half the bytes).
+pub fn ane_w8() -> bool {
+    std::env::var("PLOW_ANE_W8").as_deref() == Ok("1")
+}
+
 fn e4m3_lut() -> [f32; 256] {
     let mut lut = [0f32; 256];
     for (b, v) in lut.iter_mut().enumerate() {
@@ -954,6 +959,7 @@ impl AneLanes {
             flex_outputs: false,
             range: false,
             out_range: std::env::var("PLOW_OUT_RANGE").is_ok(),
+            w8: ane_w8(),
             layers,
         }
     }
@@ -979,7 +985,7 @@ impl AneLanes {
     fn net(&mut self, lane: &AneLane, t: usize) -> Result<&mut crate::exec::ane::AneNet> {
         let key = (lane.kind.clone(), lane.layer, t);
         if !self.nets.contains_key(&key) {
-            let name = format!("v1-l{}-{}-t{t}", lane.layer, lane.kind);
+            let name = format!("v1-l{}-{}-t{t}{}", lane.layer, lane.kind, if ane_w8() { "-w8" } else { "" });
             let cached = crate::exec::ane::AneNet::cached(&self.dir, &name);
             let t0 = Instant::now();
             let io = self.io(lane);

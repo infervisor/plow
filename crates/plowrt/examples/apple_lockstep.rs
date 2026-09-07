@@ -90,12 +90,27 @@ fn main() {
             let mut by_op: std::collections::BTreeMap<u16, (usize, f64)> =
                 std::collections::BTreeMap::new();
             let t_all = std::time::Instant::now();
+            let mut each: Vec<(f64, usize)> = Vec::with_capacity(insts.len());
             for (i, d) in insts.iter().enumerate() {
                 let t = std::time::Instant::now();
                 gpu.run_inst(p, i).expect("run_inst");
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                each.push((ms, i));
                 let e = by_op.entry(d.op).or_default();
                 e.0 += 1;
-                e.1 += t.elapsed().as_secs_f64() * 1e3;
+                e.1 += ms;
+            }
+            each.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            println!("  slowest instructions:");
+            for &(ms, i) in each.iter().take(12) {
+                let d = &insts[i];
+                println!(
+                    "    #{i:<4} {:<24} {ms:>8.3} ms  i={:?} blocks={} t={:?}",
+                    DevOp::from_u16(d.op).map(|o| o.c_name()).unwrap_or("?"),
+                    &d.i[..6],
+                    d.blocks,
+                    &d.t[..4]
+                );
             }
             let total = t_all.elapsed().as_secs_f64() * 1e3;
             let mut rows: Vec<_> = by_op.into_iter().collect();

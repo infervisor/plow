@@ -495,8 +495,9 @@ fn apple_prefill_tile(m: u32, n: u32, n_cu: u32, quant: kernelcaps::QuantScheme)
         quant,
         kernelcaps::QuantScheme::W8A16 | kernelcaps::QuantScheme::W8A8
     );
+    let mx4 = matches!(quant, kernelcaps::QuantScheme::Mxfp4);
     assert!(
-        matches!(quant, kernelcaps::QuantScheme::None) || fp8,
+        matches!(quant, kernelcaps::QuantScheme::None) || fp8 || mx4,
         "Apple pick_tile: no prefill GEMM opcode for quant {quant:?}"
     );
     // Measured (v3 tiles, M4 Pro): 128x128 beats 256x256 at every shape (3.8 vs 2.9 TFLOPS at
@@ -504,9 +505,17 @@ fn apple_prefill_tile(m: u32, n: u32, n_cu: u32, quant: kernelcaps::QuantScheme)
     // projections where 128x128 leaves cores idle.
     let tiles = |bm: u32, bn: u32| m.div_ceil(bm) * n.div_ceil(bn);
     if tiles(128, 128) >= n_cu {
-        if fp8 { DevOp::GemmMedFp8 } else { DevOp::GemmMed }
+        if fp8 {
+            DevOp::GemmMedFp8
+        } else if mx4 {
+            DevOp::GemmMedMxfp4
+        } else {
+            DevOp::GemmMed
+        }
     } else if fp8 {
         DevOp::GemmSmallFp8
+    } else if mx4 {
+        DevOp::GemmSmallMxfp4
     } else {
         DevOp::GemmSmall
     }
@@ -6092,7 +6101,8 @@ fn mx4_prefill_on() -> bool {
         && match emit_config::active().mx4_prefill.as_deref() {
             Some("1") => true,
             Some("0") => false,
-            _ => emit_is_amd(),
+            // The Metal interpreter carries the fp4 prefill rungs (93/96/97/98, 113) too.
+            _ => emit_is_amd() || emit_is_apple(),
         }
 }
 

@@ -165,6 +165,7 @@ fn main() {
             flex_outputs: std::env::var("PLOW_FLEX_OUT").is_ok(),
             range: std::env::var("PLOW_RANGE").is_ok(),
             out_range: std::env::var("PLOW_OUT_RANGE").is_ok(),
+        w8: std::env::var("PLOW_ANE_W8").as_deref() == Ok("1"),
             layers,
         };
         let io = (spec.inputs.clone(), spec.outputs.clone());
@@ -216,6 +217,7 @@ pub fn enum_big() {
         flex_outputs: std::env::var("PLOW_FLEX_OUT").is_ok(),
         range: false,
         out_range: std::env::var("PLOW_OUT_RANGE").is_ok(),
+        w8: std::env::var("PLOW_ANE_W8").as_deref() == Ok("1"),
         layers: vec![Layer::InnerProduct {
             input: "x".into(),
             output: "y".into(),

@@ -188,6 +188,7 @@ fn main() {
                         flex_outputs: false,
                         range: false,
                         out_range: false,
+                        w8: plowrt::exec::apple::hetero::ane_w8(),
                         layers: vec![Layer::InnerProduct {
                             input: "x".into(),
                             output: "y".into(),
@@ -197,7 +198,7 @@ fn main() {
                         }],
                     };
                     let io = (spec.inputs.clone(), spec.outputs.clone());
-                    let net = AneNet::new(&ane_dir, &format!("ip-{nn}x{k}-t{ra}"), move || spec, io, MLComputeUnits::CPUAndNeuralEngine)
+                    let net = AneNet::new(&ane_dir, &format!("ip-{nn}x{k}-t{ra}{}", if plowrt::exec::apple::hetero::ane_w8() { "-w8" } else { "" }), move || spec, io, MLComputeUnits::CPUAndNeuralEngine)
                         .expect("ane program");
                     nets.insert((nn, k, ra), net);
                 }

@@ -402,7 +402,9 @@ void op_gemv_glu_fp8(const thread Inst& in, device const ulong* tab, uint slice,
 struct GemmArgs {
     device const ushort* A;      // [M][K] bf16 (row m offset applied by caller)
     device const ushort* B16;    // [N][K] bf16, or
-    device const uchar* B8;      //          e4m3
+    device const uchar* B8;      //          e4m3, or
+    device const uchar* B4;      //          e2m1 packed (row stride K/2) with
+    device const uchar* S8;      //          E8M0 scales (row stride ceil(K/32)), folded at staging
     device const float* wscale;  // [N] for B8
     device const ushort* bias;   // [N] bf16 or null
     uint K;
@@ -424,6 +426,121 @@ inline void epilogue8x8(simdgroup_float8x8 acc, threadgroup float* scratch, uint
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
 }
+// ---- MXFP4 (OCP e2m1 + one E8M0 scale per 32 K) ---------------------------------------------------
+// Row layout (dev_isa.h op 91): W[n] is K/2 bytes, low nibble = even k; S[n] is K/32 E8M0 bytes,
+// scale = bitcast(s << 23). A 32-block is accumulated in f32 and scaled once (the scale is a
+// power of two, so folding it into the bf16 operand — the GEMM staging path — is exact).
+constant float E2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                           -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+inline float e8m0f(uchar s) { return as_type<float>(uint(s) << 23); }
+// Byte -> (low nibble, high nibble) e2m1 pair: one lookup decodes two weights.
+// Four rows' 32-block dots against x[32], one block per lane per step (16 B of weights per row).
+inline float4 dot4_mx4(device const uchar* W, device const uchar* S, uint ldw, uint lds,
+                       device const ushort* x, uint K, uint lane) {
+    float4 acc = float4(0.0f);
+    uint nb = K / 32u;
+    for (uint b = lane; b < nb; b += 32u) {
+        device const ushort* xb = x + b * 32u;
+        float xv[32];
+        for (uint j = 0; j < 8u; j++) {
+            float4 v = bf4(*(device const ushort4*)(xb + 4u * j));
+            xv[4u * j] = v.x; xv[4u * j + 1u] = v.y; xv[4u * j + 2u] = v.z; xv[4u * j + 3u] = v.w;
+        }
+        for (uint r = 0; r < 4u; r++) {
+            device const uchar* wb = W + r * ldw + b * 16u;
+            float blk = 0.0f;
+            for (uint j = 0; j < 4u; j++) {
+                uchar4 c = *(device const uchar4*)(wb + 4u * j);
+                blk += E2M1[c.x & 15u] * xv[8u * j] + E2M1[c.x >> 4] * xv[8u * j + 1u]
+                     + E2M1[c.y & 15u] * xv[8u * j + 2u] + E2M1[c.y >> 4] * xv[8u * j + 3u]
+                     + E2M1[c.z & 15u] * xv[8u * j + 4u] + E2M1[c.z >> 4] * xv[8u * j + 5u]
+                     + E2M1[c.w & 15u] * xv[8u * j + 6u] + E2M1[c.w >> 4] * xv[8u * j + 7u];
+            }
+            acc[r] += blk * e8m0f(S[r * lds + b]);
+        }
+    }
+    // Partial last block (K % 32): lane 0, scalar.
+    if (lane == 0 && (K & 31u)) {
+        uint k0 = nb * 32u;
+        for (uint r = 0; r < 4u; r++) {
+            float blk = 0.0f;
+            for (uint k = k0; k < K; k++) {
+                uchar c = W[r * ldw + (k >> 1)];
+                blk += E2M1[(k & 1u) ? (c >> 4) : (c & 15u)] * bf2f(x[k]);
+            }
+            acc[r] += blk * e8m0f(S[r * lds + nb]);
+        }
+    }
+    return float4(simd_sum(acc.x), simd_sum(acc.y), simd_sum(acc.z), simd_sum(acc.w));
+}
+inline float dot_mx4(device const uchar* W, device const uchar* S, device const ushort* x, uint K, uint lane) {
+    float acc = 0.0f;
+    uint nb = K / 32u;
+    for (uint b = lane; b < nb; b += 32u) {
+        device const ushort* xb = x + b * 32u;
+        device const uchar* wb = W + b * 16u;
+        float blk = 0.0f;
+        for (uint j = 0; j < 4u; j++) {
+            uchar4 c = *(device const uchar4*)(wb + 4u * j);
+            float4 x0 = bf4(*(device const ushort4*)(xb + 8u * j)), x1 = bf4(*(device const ushort4*)(xb + 8u * j + 4u));
+            blk += E2M1[c.x & 15u] * x0.x + E2M1[c.x >> 4] * x0.y + E2M1[c.y & 15u] * x0.z + E2M1[c.y >> 4] * x0.w
+                 + E2M1[c.z & 15u] * x1.x + E2M1[c.z >> 4] * x1.y + E2M1[c.w & 15u] * x1.z + E2M1[c.w >> 4] * x1.w;
+        }
+        acc += blk * e8m0f(S[b]);
+    }
+    if (lane == 0 && (K & 31u)) {
+        float blk = 0.0f;
+        for (uint k = nb * 32u; k < K; k++) {
+            uchar c = W[k >> 1];
+            blk += E2M1[(k & 1u) ? (c >> 4) : (c & 15u)] * bf2f(x[k]);
+        }
+        acc += blk * e8m0f(S[nb]);
+    }
+    return simd_sum(acc);
+}
+// t0=C t1=x t2=W(fp4) t3=S(e8m0)  i0=M i1=N i2=K i4=x_row0  (bias t7 is a CPU-tier operand)
+void op_gemv_mxfp4(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
+    uint M = in.i[0], N = in.i[1], K = in.i[2];
+    device ushort* C = ten<ushort>(tab, in, 0);
+    device const ushort* x = ten<ushort>(tab, in, 1) + in.i[4] * K;
+    device const uchar* W = ten<uchar>(tab, in, 2);
+    device const uchar* S = ten<uchar>(tab, in, 3);
+    uint ldw = K / 2u, lds = (K + 31u) / 32u;
+    uint n0, n1;
+    range(N, slice, nblk, n0, n1);
+    for (uint m = 0; m < M; m++) {
+        uint n = n0 + sg * 4u;
+        for (; n + 4u <= n1; n += NSG * 4u) {
+            float4 a = dot4_mx4(W + n * ldw, S + n * lds, ldw, lds, x + m * K, K, lane);
+            if (lane == 0) { C[m * N + n] = f2bf(a.x); C[m * N + n + 1] = f2bf(a.y); C[m * N + n + 2] = f2bf(a.z); C[m * N + n + 3] = f2bf(a.w); }
+        }
+        for (; n < n1; n++) {
+            float acc = dot_mx4(W + n * ldw, S + n * lds, x + m * K, K, lane);
+            if (lane == 0) C[m * N + n] = f2bf(acc);
+        }
+    }
+}
+// t0=C t1=x t2=Wg(fp4) t5=Wu(fp4) t3=Sg t4=Su  i0=M i1=N i2=K i5=act
+void op_gemv_glu_mxfp4(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint sg, uint lane) {
+    uint M = in.i[0], N = in.i[1], K = in.i[2], act = in.i[5];
+    float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
+    device ushort* C = ten<ushort>(tab, in, 0);
+    device const ushort* x = ten<ushort>(tab, in, 1);
+    device const uchar* Wg = ten<uchar>(tab, in, 2);
+    device const uchar* Wu = ten<uchar>(tab, in, 5);
+    device const uchar* Sg = ten<uchar>(tab, in, 3);
+    device const uchar* Su = ten<uchar>(tab, in, 4);
+    uint ldw = K / 2u, lds = (K + 31u) / 32u;
+    uint n0, n1;
+    range(N, slice, nblk, n0, n1);
+    for (uint n = n0 + sg; n < n1; n += NSG)
+        for (uint m = 0; m < M; m++) {
+            float g = dot_mx4(Wg + n * ldw, Sg + n * lds, x + m * K, K, lane);
+            float u = dot_mx4(Wu + n * ldw, Su + n * lds, x + m * K, K, lane);
+            if (lane == 0) C[m * N + n] = f2bf(glu_pair(g, u, act, f0, f1));
+        }
+}
+
 // ---- v3 tiles: bf16 staging in 8x8 blocks, K chunks of 32, 128-wide sub-tiles ---------------------
 // One threadgroup per core (the persistent grid) cannot hide latency by occupancy, so the kernel
 // pipelines inside the threadgroup: the next chunk's device loads sit in registers while this
@@ -447,12 +564,29 @@ inline ushort4 load_a16(device const ushort* A, uint M, uint K, uint m, uint k) 
     for (uint j = 0; j < 4u && k + j < K; j++) v[j] = A[m * K + k + j];
     return v;
 }
-inline ushort4 load_b16(device const ushort* B16, device const uchar* B8, uint N, uint K, uint n, uint k) {
+inline ushort4 load_b16(thread const GemmArgs& g, uint n, uint k) {
+    const uint N = g.N, K = g.K;
     if (n >= N || k >= K) return ushort4(0);
+    if (g.B4) {
+        // Two packed bytes hold the k-quad; the block scale is a power of two, so the product is
+        // exact in bf16.
+        float s = e8m0f(g.S8[n * ((K + 31u) / 32u) + k / 32u]);
+        if ((K & 3u) == 0u) {
+            uchar2 pk = *(device const uchar2*)(g.B4 + n * (K / 2u) + k / 2u);
+            uint c = uint(pk.x) | (uint(pk.y) << 8);
+            return f4bf(float4(E2M1[c & 15u], E2M1[(c >> 4) & 15u], E2M1[(c >> 8) & 15u], E2M1[(c >> 12) & 15u]) * s);
+        }
+        ushort4 v = ushort4(0);
+        for (uint j = 0; j < 4u && k + j < K; j++) {
+            uchar c = g.B4[n * (K / 2u) + ((k + j) >> 1)];
+            v[j] = f2bf(E2M1[((k + j) & 1u) ? (c >> 4) : (c & 15u)] * s);
+        }
+        return v;
+    }
     if ((K & 3u) == 0u)
-        return B8 ? f4bf(e4m3x4(*(device const uchar4*)(B8 + n * K + k))) : *(device const ushort4*)(B16 + n * K + k);
+        return g.B8 ? f4bf(e4m3x4(*(device const uchar4*)(g.B8 + n * K + k))) : *(device const ushort4*)(g.B16 + n * K + k);
     ushort4 v = ushort4(0);
-    for (uint j = 0; j < 4u && k + j < K; j++) v[j] = B8 ? f2bf(e4m3(B8[n * K + k + j])) : B16[n * K + k + j];
+    for (uint j = 0; j < 4u && k + j < K; j++) v[j] = g.B8 ? f2bf(e4m3(g.B8[n * K + k + j])) : g.B16[n * K + k + j];
     return v;
 }
 // Fragments of step kb for a simdgroup at grid (sgr, sgc): RB A blocks, CB B blocks (transposed).
@@ -478,7 +612,7 @@ inline void gemm_sub(thread const GemmArgs& g, device ushort* C, uint ldc, uint 
     simdgroup_float8x8 acc[RB][CB];
     for (uint i = 0; i < RB; i++) for (uint j = 0; j < CB; j++) acc[i][j] = simdgroup_float8x8(0.0f);
     ushort4 ra = a_side ? load_a16(g.A, g.M, g.K, mm + ar, aq * 4u) : ushort4(0);
-    ushort4 rb = b_side ? load_b16(g.B16, g.B8, g.N, g.K, nn + br, bq * 4u) : ushort4(0);
+    ushort4 rb = b_side ? load_b16(g, nn + br, bq * 4u) : ushort4(0);
     if (a_side) stage_put(stage, ar, aq, ra);
     if (b_side) stage_put(stage + A_ELTS, br, bq, rb);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -489,7 +623,7 @@ inline void gemm_sub(thread const GemmArgs& g, device ushort* C, uint ldc, uint 
         if (more) {
             uint k0 = (c + 1u) * GK;
             if (a_side) ra = load_a16(g.A, g.M, g.K, mm + ar, k0 + aq * 4u);
-            if (b_side) rb = load_b16(g.B16, g.B8, g.N, g.K, nn + br, k0 + bq * 4u);
+            if (b_side) rb = load_b16(g, nn + br, k0 + bq * 4u);
         }
         threadgroup const bfloat* As = (threadgroup const bfloat*)cur;
         threadgroup const bfloat* Bs = As + A_ELTS;
@@ -558,8 +692,8 @@ inline void gemm_sub_glu(thread const GemmArgs& gg, thread const GemmArgs& gu, d
     simdgroup_float8x8 ag[RB][CB], au[RB][CB];
     for (uint i = 0; i < RB; i++) for (uint j = 0; j < CB; j++) { ag[i][j] = simdgroup_float8x8(0.0f); au[i][j] = simdgroup_float8x8(0.0f); }
     ushort4 ra = a_side ? load_a16(gg.A, M, K, mm + ar, aq * 4u) : ushort4(0);
-    ushort4 rg = h_side ? load_b16(gg.B16, gg.B8, N, K, nn + ar, aq * 4u) : ushort4(0);
-    ushort4 ru = h_side ? load_b16(gu.B16, gu.B8, N, K, nn + ar, aq * 4u) : ushort4(0);
+    ushort4 rg = h_side ? load_b16(gg, nn + ar, aq * 4u) : ushort4(0);
+    ushort4 ru = h_side ? load_b16(gu, nn + ar, aq * 4u) : ushort4(0);
     if (a_side) stage_put(stage, ar, aq, ra);
     if (h_side) { stage_put(stage + A_ELTS, ar, aq, rg); stage_put(stage + A_ELTS + H_ELTS, ar, aq, ru); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -571,8 +705,8 @@ inline void gemm_sub_glu(thread const GemmArgs& gg, thread const GemmArgs& gu, d
             uint k0 = (c + 1u) * GK;
             if (a_side) ra = load_a16(gg.A, M, K, mm + ar, k0 + aq * 4u);
             if (h_side) {
-                rg = load_b16(gg.B16, gg.B8, N, K, nn + ar, k0 + aq * 4u);
-                ru = load_b16(gu.B16, gu.B8, N, K, nn + ar, k0 + aq * 4u);
+                rg = load_b16(gg, nn + ar, k0 + aq * 4u);
+                ru = load_b16(gu, nn + ar, k0 + aq * 4u);
             }
         }
         threadgroup const bfloat* As = (threadgroup const bfloat*)cur;
@@ -643,18 +777,22 @@ inline void gemm_tile2_glu(thread const GemmArgs& gg, thread const GemmArgs& gu,
 }
 // t0=C t1=A t2=B t7=bias?  i0=M i1=N i2=K i4=a_row0 i5=c_row0   (bf16)
 // t0=C t1=A t2=B(e4m3) t3=a_scale? t4=w_scale i0=M i1=N i2=K i4=a_row0 i5=c_row0 (fp8; a_scale -> poison)
-void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint BM, uint BN, bool fp8,
+// enc: 0 = bf16 weights, 1 = e4m3 + per-channel f32 scale (t4), 2 = MXFP4 (t3 = E8M0 scales)
+void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint BM, uint BN, uint enc,
              threadgroup float* tile, uint lid, uint sg, uint lane) {
     uint M = in.i[0], N = in.i[1], K = in.i[2];
+    bool fp8 = enc == 1u, mx4 = enc == 2u;
     device ushort* C = ten<ushort>(tab, in, 0) + in.i[5] * N;
     GemmArgs g;
     g.A = ten<ushort>(tab, in, 1) + in.i[4] * K;
-    g.B16 = fp8 ? (device const ushort*)0 : ten<ushort>(tab, in, 2);
+    g.B16 = enc == 0u ? ten<ushort>(tab, in, 2) : (device const ushort*)0;
     g.B8 = fp8 ? ten<uchar>(tab, in, 2) : (device const uchar*)0;
+    g.B4 = mx4 ? ten<uchar>(tab, in, 2) : (device const uchar*)0;
+    g.S8 = mx4 ? ten<uchar>(tab, in, 3) : (device const uchar*)0;
     g.wscale = fp8 ? ten<float>(tab, in, 4) : (device const float*)0;
-    g.bias = fp8 ? (device const ushort*)0 : ten<ushort>(tab, in, 7);
+    g.bias = enc == 0u ? ten<ushort>(tab, in, 7) : (device const ushort*)0;
     g.K = K; g.M = M; g.N = N;
-    bool poison = fp8 && (ten<float>(tab, in, 3) != 0 || !g.wscale);
+    bool poison = (fp8 && (ten<float>(tab, in, 3) != 0 || !g.wscale)) || (mx4 && !g.S8);
     // The small tile op narrows to 64 columns only when 128-wide tiles would leave executors
     // idle (a 64-wide sub-tile halves the matrix work per simdgroup, so it must buy parallelism).
     if (BM == 64u && BN == 64u) {
@@ -676,26 +814,32 @@ void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nb
 // GLU: t0=fu t1=A t2=Wg t5=Wu t6=bias_g? t7=bias_u? i5=act (bf16) / t3=a_scale? t4=g_scale t6=u_scale (fp8)
 // 64x32 sub-tiles: chunk buffer = A 64x16 | Bg 32x16 | Bu 32x16 (2048 floats), double-buffered;
 // simdgroup sg owns the 8x8 block (rows sg/4*8, cols sg%4*8): one gate + one up accumulator.
-void op_gemm_glu(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, bool fp8,
+void op_gemm_glu(const thread Inst& in, device const ulong* tab, uint slice, uint nblk, uint enc,
                  threadgroup float* tile, uint lid, uint sg, uint lane) {
     uint M = in.i[0], N = in.i[1], K = in.i[2], act = in.i[5];
+    bool fp8 = enc == 1u, mx4 = enc == 2u;
     float f0 = as_type<float>(in.fj[0]), f1 = as_type<float>(in.fj[1]);
     device ushort* C = ten<ushort>(tab, in, 0);
     GemmArgs gg, gu;
     gg.A = gu.A = ten<ushort>(tab, in, 1);
     gg.K = gu.K = K; gg.M = gu.M = M; gg.N = gu.N = N;
+    gg.B16 = gu.B16 = (device const ushort*)0;
+    gg.B8 = gu.B8 = (device const uchar*)0;
+    gg.B4 = gu.B4 = (device const uchar*)0;
+    gg.S8 = gu.S8 = (device const uchar*)0;
+    gg.wscale = gu.wscale = (device const float*)0;
+    gg.bias = gu.bias = (device const ushort*)0;
     if (fp8) {
-        gg.B16 = gu.B16 = (device const ushort*)0;
         gg.B8 = ten<uchar>(tab, in, 2); gu.B8 = ten<uchar>(tab, in, 5);
         gg.wscale = ten<float>(tab, in, 4); gu.wscale = ten<float>(tab, in, 6);
-        gg.bias = gu.bias = (device const ushort*)0;
+    } else if (mx4) {
+        gg.B4 = ten<uchar>(tab, in, 2); gu.B4 = ten<uchar>(tab, in, 5);
+        gg.S8 = ten<uchar>(tab, in, 3); gu.S8 = ten<uchar>(tab, in, 4);
     } else {
-        gg.B8 = gu.B8 = (device const uchar*)0;
         gg.B16 = ten<ushort>(tab, in, 2); gu.B16 = ten<ushort>(tab, in, 5);
-        gg.wscale = gu.wscale = (device const float*)0;
         gg.bias = ten<ushort>(tab, in, 6); gu.bias = ten<ushort>(tab, in, 7);
     }
-    bool poison = fp8 && (ten<float>(tab, in, 3) != 0 || !gg.wscale || !gu.wscale);
+    bool poison = (fp8 && (ten<float>(tab, in, 3) != 0 || !gg.wscale || !gu.wscale)) || (mx4 && (!gg.S8 || !gu.S8));
     const uint BM = 256, BN = 128;
     uint tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN;
     for (uint lin = slice; lin < tm * tn; lin += nblk) {
@@ -1226,18 +1370,26 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 4: op_residual(in, tab, slice, nblk, lid); return true;
         case 6: op_embed(in, tab, slice, nblk, lid); return true;
         case 7: op_softcap(in, tab, slice, nblk, lid); return true;
-        case 8: op_gemm(in, tab, slice, nblk, 256, 256, false, tile, lid, sg, lane); return true;
-        case 14: op_gemm(in, tab, slice, nblk, 64, 64, false, tile, lid, sg, lane); return true;
-        case 15: op_gemm(in, tab, slice, nblk, 128, 128, false, tile, lid, sg, lane); return true;
-        case 94: op_gemm(in, tab, slice, nblk, 128, 256, false, tile, lid, sg, lane); return true;
-        case 95: op_gemm(in, tab, slice, nblk, 192, 256, false, tile, lid, sg, lane); return true;
-        case 33: op_gemm(in, tab, slice, nblk, 256, 256, true, tile, lid, sg, lane); return true;
-        case 34: op_gemm(in, tab, slice, nblk, 128, 128, true, tile, lid, sg, lane); return true;
-        case 35: op_gemm(in, tab, slice, nblk, 64, 64, true, tile, lid, sg, lane); return true;
+        case 8: op_gemm(in, tab, slice, nblk, 256, 256, 0u, tile, lid, sg, lane); return true;
+        case 14: op_gemm(in, tab, slice, nblk, 64, 64, 0u, tile, lid, sg, lane); return true;
+        case 15: op_gemm(in, tab, slice, nblk, 128, 128, 0u, tile, lid, sg, lane); return true;
+        case 94: op_gemm(in, tab, slice, nblk, 128, 256, 0u, tile, lid, sg, lane); return true;
+        case 95: op_gemm(in, tab, slice, nblk, 192, 256, 0u, tile, lid, sg, lane); return true;
+        case 33: op_gemm(in, tab, slice, nblk, 256, 256, 1u, tile, lid, sg, lane); return true;
+        case 34: op_gemm(in, tab, slice, nblk, 128, 128, 1u, tile, lid, sg, lane); return true;
+        case 35: op_gemm(in, tab, slice, nblk, 64, 64, 1u, tile, lid, sg, lane); return true;
+        // MXFP4 prefill rungs: the 256-row and wide rungs take the 128x128 geometry here.
+        case 93: op_gemm(in, tab, slice, nblk, 128, 128, 2u, tile, lid, sg, lane); return true;
+        case 96: op_gemm(in, tab, slice, nblk, 128, 128, 2u, tile, lid, sg, lane); return true;
+        case 97: op_gemm(in, tab, slice, nblk, 64, 64, 2u, tile, lid, sg, lane); return true;
+        case 98: op_gemm(in, tab, slice, nblk, 128, 128, 2u, tile, lid, sg, lane); return true;
+        case 113: op_gemm_glu(in, tab, slice, nblk, 2u, tile, lid, sg, lane); return true;
+        case 91: op_gemv_mxfp4(in, tab, slice, nblk, sg, lane); return true;
+        case 92: op_gemv_glu_mxfp4(in, tab, slice, nblk, sg, lane); return true;
         case 100: op_gemm(in, tab, slice, nblk, 128, 256, true, tile, lid, sg, lane); return true;
         case 101: op_gemm(in, tab, slice, nblk, 192, 256, true, tile, lid, sg, lane); return true;
-        case 20: op_gemm_glu(in, tab, slice, nblk, false, tile, lid, sg, lane); return true;
-        case 36: op_gemm_glu(in, tab, slice, nblk, true, tile, lid, sg, lane); return true;
+        case 20: op_gemm_glu(in, tab, slice, nblk, 0u, tile, lid, sg, lane); return true;
+        case 36: op_gemm_glu(in, tab, slice, nblk, 1u, tile, lid, sg, lane); return true;
         case 10: op_gemv(in, tab, slice, nblk, sg, lane); return true;
         case 19: op_gemv_glu(in, tab, slice, nblk, sg, lane); return true;
         case 22: op_gemv_qkv(in, tab, slice, nblk, sg, lane); return true;

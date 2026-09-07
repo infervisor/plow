@@ -57,6 +57,14 @@ fn f_str(out: &mut Vec<u8>, field: u32, s: &str) {
 fn f_msg(out: &mut Vec<u8>, field: u32, m: &[u8]) {
     f_bytes(out, field, m);
 }
+fn packed_f32(out: &mut Vec<u8>, field: u32, vals: &[f32]) {
+    let mut b = Vec::with_capacity(vals.len() * 4);
+    for v in vals {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    f_bytes(out, field, &b);
+}
+
 fn packed_i64(out: &mut Vec<u8>, field: u32, vals: &[i64]) {
     let mut p = Vec::new();
     for &v in vals {
@@ -325,6 +333,9 @@ pub struct NetSpec {
     pub range: bool,
     /// Outputs use a shape range even when the inputs are enumerated.
     pub out_range: bool,
+    /// Store InnerProduct weights as 8-bit linear-quantized rows (CoreML `rawValue` +
+    /// `quantization`, one scale/bias per output row) instead of fp16: half the program bytes.
+    pub w8: bool,
     pub layers: Vec<Layer>,
 }
 
@@ -396,12 +407,34 @@ pub fn net_mlmodel(spec: &NetSpec) -> Vec<u8> {
                 w_f16,
             } => {
                 assert_eq!(w_f16.len(), n * k);
-                let mut wbytes = Vec::with_capacity(n * k * 2);
-                for &h in w_f16 {
-                    wbytes.extend_from_slice(&h.to_le_bytes());
-                }
                 let mut wp = Vec::new();
-                f_bytes(&mut wp, 2, &wbytes);
+                if spec.w8 {
+                    // Symmetric per-row: value = q * scale + bias, q in [0, 255], bias = -127.5 scale.
+                    let mut q = Vec::with_capacity(n * k);
+                    let mut scale = Vec::with_capacity(*n);
+                    let mut bias = Vec::with_capacity(*n);
+                    for row in w_f16.chunks_exact(*k) {
+                        let amax = row.iter().map(|&h| half_to_f32(h).abs()).fold(0f32, f32::max);
+                        let s = if amax > 0.0 { amax / 127.5 } else { 1.0 };
+                        scale.push(s);
+                        bias.push(-127.5 * s);
+                        q.extend(row.iter().map(|&h| (half_to_f32(h) / s + 127.5).round().clamp(0.0, 255.0) as u8));
+                    }
+                    let mut lq = Vec::new();
+                    packed_f32(&mut lq, 1, &scale);
+                    packed_f32(&mut lq, 2, &bias);
+                    let mut qp = Vec::new();
+                    f_varint(&mut qp, 1, 8);
+                    f_msg(&mut qp, 101, &lq);
+                    f_bytes(&mut wp, 30, &q);
+                    f_msg(&mut wp, 40, &qp);
+                } else {
+                    let mut wbytes = Vec::with_capacity(n * k * 2);
+                    for &h in w_f16 {
+                        wbytes.extend_from_slice(&h.to_le_bytes());
+                    }
+                    f_bytes(&mut wp, 2, &wbytes);
+                }
                 let mut ip = Vec::new();
                 f_varint(&mut ip, 1, *k as u64);
                 f_varint(&mut ip, 2, *n as u64);
@@ -602,4 +635,30 @@ impl AneNet {
         self.last_ms = t0.elapsed().as_secs_f64() * 1e3;
         Ok(())
     }
+}
+
+/// fp16 -> f32 (subnormals and infinities included).
+pub fn half_to_f32(h: u16) -> f32 {
+    let s = ((h >> 15) & 1) as u32;
+    let e = ((h >> 10) & 0x1f) as i32;
+    let m = (h & 0x3ff) as u32;
+    let bits = if e == 0 {
+        if m == 0 {
+            s << 31
+        } else {
+            let mut e2 = -14i32;
+            let mut m2 = m;
+            while m2 & 0x400 == 0 {
+                m2 <<= 1;
+                e2 -= 1;
+            }
+            m2 &= 0x3ff;
+            (s << 31) | (((e2 + 127) as u32) << 23) | (m2 << 13)
+        }
+    } else if e == 0x1f {
+        (s << 31) | 0x7f80_0000 | (m << 13)
+    } else {
+        (s << 31) | (((e - 15 + 127) as u32) << 23) | (m << 13)
+    };
+    f32::from_bits(bits)
 }

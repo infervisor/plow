@@ -4,6 +4,7 @@
 //! against the CPU tier's kernel on the same operands.
 //!
 //! `cargo run --release --features ane --example metal_gemm_bench -- <model.pkt> <ckpt> [--reps 5] [--check] [--m 25,64,128,512]`
+//! GEMV opcodes (10/30/31/91/92) are included so the decode projections and the lm_head are timed too.
 //!
 //! Cells come from the blob itself (every distinct GEMM-family instruction shape of the prefill
 //! programs, at the requested M values), so the table is the model's real prefill mix.
@@ -24,12 +25,14 @@ fn main() {
     let mut reps = 5usize;
     let mut check = false;
     let mut all_tiles = false;
+    let mut cold = false;
     let mut ms_list: Vec<u32> = vec![25, 64, 128, 512];
     while let Some(a) = args.next() {
         match a.as_str() {
             "--reps" => reps = args.next().unwrap().parse().unwrap(),
             "--check" => check = true,
             "--all-tiles" => all_tiles = true,
+            "--cold" => cold = true,
             "--m" => ms_list = args.next().unwrap().split(',').map(|v| v.parse().unwrap()).collect(),
             other => panic!("unknown arg {other}"),
         }
@@ -40,22 +43,27 @@ fn main() {
     let base: Vec<*mut c_void> = (0..n).map(|h| gpu.host_ptr(h) as *mut c_void).collect();
 
     // Distinct GEMM-family instructions of the prefill programs, keyed by (op, N, K, operand handles).
-    let gemm_ops = [8u16, 14, 15, 20, 33, 34, 35, 36];
+    let gemm_ops = [8u16, 14, 15, 20, 33, 34, 35, 36, 93, 96, 97, 98, 113, 10, 30, 31, 91, 92];
     let mut cells: BTreeMap<(u16, u32, u32, [u16; 8]), (usize, usize)> = BTreeMap::new();
-    for p in 0..gpu.model.dec_ix {
+    // Prefill programs first, then decode (the GEMV forms and the decode-only lm_head).
+    for p in 0..gpu.model.blob.progs.len() {
         for (i, d) in gpu.insts_host(p).iter().enumerate() {
             if gemm_ops.contains(&d.op) {
                 cells.entry((d.op, d.i[1], d.i[2], d.t)).or_insert((p, i));
             }
         }
     }
-    // One representative per (op, N, K): the first layer's.
+    // One representative per (op, N, K): the first layer's. `--cold` rotates through every
+    // layer's instance across reps so the weights come from DRAM like in a real prefill, not
+    // from the cache the previous rep left warm.
     let mut seen = std::collections::HashSet::new();
     let mut plan: Vec<(DevInst64, usize, usize)> = Vec::new();
+    let mut alts: BTreeMap<(u16, u32, u32), Vec<(usize, usize)>> = BTreeMap::new();
     for ((op, nn, k, _), (p, i)) in &cells {
         if seen.insert((*op, *nn, *k)) {
             plan.push((gpu.insts_host(*p)[*i], *p, *i));
         }
+        alts.entry((*op, *nn, *k)).or_default().push((*p, *i));
     }
     // Random A operand (bf16 in [-1, 1]) so the check is not on zeros.
     let mut rng = 0x9E3779B9u32;
@@ -82,8 +90,8 @@ fn main() {
         if check { "; checking against the CPU kernel" } else { "" }
     );
     println!(
-        "{:<22} {:>5} {:>6} {:>5} {:>9} {:>8} {:>8}  {}",
-        "op", "M", "N", "K", "ms", "GFLOPS", "GB/s(W)", "check"
+        "{:<22} {:>4} {:>5} {:>6} {:>5} {:>9} {:>8} {:>8}  {}",
+        "op", "blk", "M", "N", "K", "ms", "GFLOPS", "GB/s(W)", "check"
     );
     let mut ctx = PlowCpuCtx::new(0, 0);
     let scratch_bytes = ffi::scratch_bytes().max(64) as usize;
@@ -131,6 +139,7 @@ fn main() {
             .flat_map(|&(d, p, i)| {
                 let alts: &[u16] = match d.op {
                     33 | 34 | 35 => &[33, 34, 35],
+                    93 | 96 | 97 | 98 => &[93, 96, 97],
                     8 | 14 | 15 => &[8, 15, 14],
                     _ => &[],
                 };
@@ -147,8 +156,9 @@ fn main() {
     for (d0, p, i) in plan {
         let name = DevOp::from_u16(d0.op).map(|o| o.c_name()).unwrap_or("?");
         let (nn, k) = (d0.i[1], d0.i[2]);
-        let fp8 = matches!(d0.op, 33 | 34 | 35 | 36);
-        let glu = matches!(d0.op, 20 | 36);
+        let fp8 = matches!(d0.op, 33 | 34 | 35 | 36 | 30 | 31);
+        let mx4 = matches!(d0.op, 93 | 96 | 97 | 98 | 113 | 91 | 92);
+        let glu = matches!(d0.op, 20 | 36 | 113 | 31 | 92);
         // Rows the operands can hold (the lm_head writes a 1-row logits tensor).
         let cap = (gpu.tensor_bytes(d0.t[0] as usize).len() as u32 / (nn * 2))
             .min(gpu.tensor_bytes(d0.t[1] as usize).len() as u32 / (k * 2));
@@ -172,14 +182,28 @@ fn main() {
             d.blocks = 16;
             gpu.insts_host_mut(p)[i] = d;
             let mut best = f64::INFINITY;
-            for _ in 0..reps {
+            let layers = alts.get(&(d0.op, d0.i[1], d0.i[2])).cloned().unwrap_or_default();
+            for r in 0..reps {
+                let (p2, i2) = if cold && !layers.is_empty() { layers[r % layers.len()] } else { (p, i) };
+                let saved = gpu.insts_host(p2)[i2];
+                let mut d2 = saved;
+                d2.i = d.i;
+                d2.blocks = d.blocks;
+                gpu.insts_host_mut(p2)[i2] = d2;
                 let t = Instant::now();
-                gpu.run_inst(p, i).expect("run_inst");
+                gpu.run_inst(p2, i2).expect("run_inst");
                 best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                gpu.insts_host_mut(p2)[i2] = saved;
+                if (p2, i2) == (p, i) {
+                    gpu.insts_host_mut(p)[i] = d;
+                }
             }
             total_ms += best;
             let flops = 2.0 * m as f64 * nn as f64 * k as f64 * if glu { 2.0 } else { 1.0 };
-            let wbytes = nn as f64 * k as f64 * if fp8 { 1.0 } else { 2.0 } * if glu { 2.0 } else { 1.0 };
+            let wbytes = nn as f64
+                * k as f64
+                * if fp8 { 1.0 } else if mx4 { 0.5 + 1.0 / 32.0 } else { 2.0 }
+                * if glu { 2.0 } else { 1.0 };
             let mut verdict = String::new();
             if check {
                 // CPU kernel with its output redirected to a scratch copy, then compare row block [0, m).
@@ -216,8 +240,9 @@ fn main() {
                 };
             }
             println!(
-                "{:<22} {:>5} {:>6} {:>5} {:>9.3} {:>8.0} {:>8.0}  {}",
+                "{:<22} {:>4} {:>5} {:>6} {:>5} {:>9.3} {:>8.0} {:>8.0}  {}",
                 name.trim_start_matches("PLOW_DOP_"),
+                d0.blocks,
                 m,
                 nn,
                 k,
