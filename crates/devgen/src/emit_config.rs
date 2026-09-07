@@ -93,6 +93,21 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_FP8_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fp8_head: bool,
 
+    /// MXFP4 tied embed/lm_head, decode only. "1"/"0" to force; DEFAULT ON under --mxfp4,
+    /// off otherwise. The tied EMBED lookup keeps the bf16 table (one row per token); only the
+    /// head GEMV reads the twin, so 2.01 GB of bf16 becomes 0.53 GB on Gemma-4-12B. Requires
+    /// `mxfp4/<embed>` + `_scale` in the weight twin — `quantize_mxfp4.py` writes those for a
+    /// tied checkpoint, and a stale twin fails loudly at load with the missing tensor name.
+    /// Wins over --fp8-head when both are on.
+    ///
+    /// "1" on an otherwise-fp8 body (measured: 132 -> 121 ms/token, Gemma-4-12B decode at c=1)
+    /// makes `precision.weight_enc` report `mxfp4`: the manifest derives that axis from the
+    /// instruction stream, and one GemvMxfp4 arm IS present. That is the capability fact object
+    /// selection needs — the arm must be compiled in — so it is left alone rather than
+    /// special-cased into a per-opcode judgement.
+    #[arg(long, env = "PLOW_MX4_HEAD")]
+    pub mx4_head: Option<String>,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Scheduling / segmentation
     // ──────────────────────────────────────────────────────────────────────────
@@ -789,6 +804,7 @@ impl EmitConfig {
             fp8_kv: env_bool("PLOW_FP8_KV") || env_bool("PLOW_KV_FP8"),
             fp8_kv_full: env_bool("PLOW_FP8_KV_FULL"),
             fp8_head: env_bool("PLOW_FP8_HEAD"),
+            mx4_head: env_str("PLOW_MX4_HEAD"),
             uniseg: env_bool("PLOW_UNISEG"),
             emit_packed_prefill: env_bool("PLOW_EMIT_PACKED_PREFILL"),
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on

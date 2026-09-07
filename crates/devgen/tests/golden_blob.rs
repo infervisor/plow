@@ -714,3 +714,36 @@ fn w8a8_is_emitted_where_it_exists_and_refused_where_it_does_not() {
         "MLA must refuse PLOW_W8A8 rather than silently emit w8a16"
     );
 }
+
+/// `PLOW_MX4_HEAD` splits a TIED embedding: the `Embed` lookup keeps the bf16 table (one 7.7 KB
+/// row per token — its bandwidth is irrelevant) while the decode lm_head GEMV reads an MXFP4
+/// twin. Three parties must agree on the twin's spelling — this emitter, `quantize_mxfp4.py`,
+/// and the runtime's checkpoint index — so the keys are pinned here, together with the property
+/// that makes the split legal: the bf16 table is STILL declared.
+#[test]
+fn a_mxfp4_tied_head_keeps_the_bf16_embedding_table() {
+    let _g = emit_guard();
+    let dir = tempdir("mx4_head_gemma");
+    write_gemma_config(&dir);
+    let plain = emit(&dir, 512, 128, 1);
+    let quantized = {
+        let _e = EnvScope::set(&[("PLOW_MX4_HEAD", "1")]);
+        emit(&dir, 512, 128, 1)
+    };
+    let has = |b: &[u8], n: &str| {
+        b.windows(n.len()).any(|w| w == n.as_bytes())
+    };
+    assert!(
+        has(&quantized, "mxfp4/model.embed_tokens.weight_scale"),
+        "the E8M0 block scales are `<weight name>_scale`, the same suffix rule as the fp8 twins"
+    );
+    assert!(has(&quantized, "mxfp4/model.embed_tokens.weight"));
+    assert!(
+        has(&quantized, "model.embed_tokens.weight"),
+        "the tie means EMBED still reads the bf16 table; dropping it would break the lookup"
+    );
+    assert!(
+        !has(&plain, "mxfp4/"),
+        "unset must leave the blob exactly as it was"
+    );
+}

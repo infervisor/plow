@@ -106,8 +106,8 @@ pub mod tune_demand;
 // ## Verified vendor-NEUTRAL (do not re-audit)
 //
 // * opcode-changing, but every op has an AMD arm: `PLOW_NO_FUSE_QKV`, `PLOW_FP8_HEAD`,
-//   `PLOW_FP8_KV`, `PLOW_FP8_KV_FULL`, `PLOW_MXFP4`, `PLOW_MLA_PREFILL`, `PLOW_MOE_PREFILL`,
-//   `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_ROUTER_OLD` (GLM arm), `GLM_GROUP`;
+//   `PLOW_MX4_HEAD`, `PLOW_FP8_KV`, `PLOW_FP8_KV_FULL`, `PLOW_MXFP4`, `PLOW_MLA_PREFILL`,
+//   `PLOW_MOE_PREFILL`, `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_ROUTER_OLD` (GLM arm), `GLM_GROUP`;
 // * tuning constants carried in an existing instruction field, read identically by both
 //   interpreters: `PLOW_NS_MUL`, `PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_GLM_GF`, `PLOW_MLA_NS`,
 //   `PLOW_MAX_CHUNK`, `PLOW_DECODE_BATCH`. (`PLOW_NS_FULL_ABS`'s comment cites an sm_120 part —
@@ -1538,6 +1538,11 @@ struct Tn {
     // labelled variant: vLLM fp8 keeps lm_head bf16, so report as its own row.
     head8: u32,
     head8s: u32,
+    // MXFP4 weight-only lm_head twin (PLOW_MX4_HEAD; default on under --mxfp4, tied models
+    // only). Same split as head8: the EMBED lookup keeps the bf16 table, only the head GEMV
+    // reads this one. Wins over head8 when both are asked for — 0.53 GB against 1.01 GB.
+    head4: u32,
+    head4s: u32,
     x: u32,
     // NRN-fold residual ping-pong twin of `x` (Gemma fp8 decode on AMD only; TENSOR_NONE
     // otherwise so every other blob stays byte-identical). NRN1 writes its residual here and
@@ -1823,7 +1828,7 @@ fn declare(
         } else {
             b.tensor("lm_head.weight", (c.vocab * c.hidden) as u64 * BF16)
         },
-        head8: if c.tied && emit_config::active().fp8_head {
+        head8: if c.tied && emit_config::active().fp8_head && !mx4_head_on() {
             b.tensor(
                 &format!("fp8/{}embed_tokens.weight", c.prefix),
                 (c.vocab * c.hidden) as u64,
@@ -1831,10 +1836,26 @@ fn declare(
         } else {
             TENSOR_NONE
         },
-        head8s: if c.tied && emit_config::active().fp8_head {
+        head8s: if c.tied && emit_config::active().fp8_head && !mx4_head_on() {
             b.tensor(
                 &format!("fp8/{}embed_tokens.weight_scale", c.prefix),
                 c.vocab as u64 * F32,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        head4: if c.tied && mx4_head_on() {
+            b.tensor(
+                &format!("mxfp4/{}embed_tokens.weight", c.prefix),
+                (c.vocab * c.hidden) as u64 / 2,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        head4s: if c.tied && mx4_head_on() {
+            b.tensor(
+                &format!("mxfp4/{}embed_tokens.weight_scale", c.prefix),
+                (c.vocab * c.hidden) as u64 / 32,
             )
         } else {
             TENSOR_NONE
@@ -5416,12 +5437,17 @@ fn emit_phase(
     // The tied embedding LOOKUP stays bf16 (reads the original table); only the head GEMV
     // reads the fp8 twin. Own reporting row — vLLM's fp8 recipe keeps lm_head bf16.
     let fp8_head = decode && n.head8 != TENSOR_NONE;
+    // PLOW_MX4_HEAD: the same trade at w4 — 2.01 GB of bf16 tied head -> 0.53 GB of e2m1
+    // + E8M0 block scales. Decode only; the tied EMBED lookup still reads the bf16 table.
+    let mx4_head = decode && n.head4 != TENSOR_NONE;
     // E5 (rtx-19) PLOW_FUSE_ARGMAX: fuse the greedy-argmax epilogue (+ softcap) into the lm_head
     // GEMV, folding each block's owned vocab slice into an amax partial and dropping the SoftCap +
     // Argmax packets. Greedy B=1 decode on the bf16 head only (fp8 head keeps the classic path).
-    let fuse_am = fuse_argmax_on() && decode && gemv_family && !fp8_head && t == 1;
+    let fuse_am = fuse_argmax_on() && decode && gemv_family && !fp8_head && !mx4_head && t == 1;
     let lm_op = if fuse_am {
         DevOp::GemvArgmax
+    } else if mx4_head {
+        DevOp::GemvMxfp4
     } else if fp8_head {
         DevOp::GemvFp8
     } else {
@@ -5439,8 +5465,16 @@ fn emit_phase(
     let c_lm = b.emit(lm_op, all.clone(), &[c_f], |d| {
         d.t[0] = n.logits;
         d.t[1] = head_src;
-        d.t[2] = if fp8_head { n.head8 } else { head_w };
-        if fp8_head {
+        d.t[2] = if mx4_head {
+            n.head4
+        } else if fp8_head {
+            n.head8
+        } else {
+            head_w
+        };
+        if mx4_head {
+            d.t[3] = n.head4s;
+        } else if fp8_head {
             d.t[5] = n.head8s;
         }
         if fuse_am {
@@ -5565,6 +5599,18 @@ fn gemv_split() -> u32 {
 /// (`DevOp::GemvArgmax`), replacing the `SoftCap` + `Argmax` packets. Default off → byte-identical.
 fn fuse_argmax_on() -> bool {
     emit_config::active().fuse_argmax
+}
+
+/// MXFP4 tied lm_head (`PLOW_MX4_HEAD`). Default ON under `--mxfp4`: the mxfp4 twin already
+/// carries the head (`quantize_mxfp4.py` writes it for a tied checkpoint) and the bf16 head is
+/// the single largest tensor a decode step reads. Off by default on every other body, where the
+/// twin is produced by a different quantizer and would not have it. "1"/"0" forces either way.
+fn mx4_head_on() -> bool {
+    match emit_config::active().mx4_head.as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => emit_config::active().mxfp4,
+    }
 }
 
 /// Argmax-partial slot count: when fused the lm_head runs on all `n_cu` blocks (one partial each),

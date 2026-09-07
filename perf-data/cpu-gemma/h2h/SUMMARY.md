@@ -71,6 +71,12 @@ pipeline fill and drain across the 48 layer boundaries. Closing it would give ~1
 margin; the byte counts cap it there, since our fp8 weights are 12.0 GB against Q8_0's 12.75 GB.
 MXFP4 is the data type where the margin is real, and it is also our fastest configuration.
 
+**Superseded for the quantized twins (`../mx4-lm-head.md`).** The tie above was not the roofline it
+looks like: 2.01 GB of the 13 GB is the bf16 tied `lm_head`, which was in neither twin. Quantizing
+that one tensor to MXFP4 for the decode GEMV — the bf16 table stays bound for the embedding lookup —
+takes fp8 to **121 ms (1.10x vs Q8_0)** and MXFP4 to **76 ms (1.59x vs Q4_K_M)**, both medians of 3.
+On by default under `--mxfp4`, `--mx4-head 1` on the fp8 body. bf16 is unchanged.
+
 ### vLLM re-run with the current methodology (13:5x)
 
 The vLLM figures above came from the original run, which predated `--fresh-prompts`. Re-run with the
