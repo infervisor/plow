@@ -576,15 +576,23 @@ impl SegmentRoleValidation for SegmentRoles {
             .collect();
         value.validate(&blob.progs, &indices, &blob.tensors)?;
         for program in &value.programs {
-            for (seg, &role) in program.roles.iter().enumerate() {
-                if role == plow_asset::segment_roles::FP8_M1 {
+            let fp8_pcs: Vec<_> = program
+                .roles
+                .iter()
+                .enumerate()
+                .filter(|(_, role)| **role == plow_asset::segment_roles::FP8_M1)
+                .map(|(seg, _)| {
                     let g = &blob.progs[program.index];
-                    let pc = g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize;
-                    blob.with_packet_view(|p| {
-                        plow_asset::fp8_m1_role::validate(p, program.index, pc)
-                    })
-                    .map_err(RuntimeError::Rejected)?;
-                }
+                    g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize
+                })
+                .collect();
+            if !fp8_pcs.is_empty() {
+                blob.with_packet_view(|p| {
+                    plow_asset::fp8_m1_role::validate_all(p, program.index, &fp8_pcs)
+                })
+                .map_err(RuntimeError::Rejected)?;
+            }
+            for (seg, &role) in program.roles.iter().enumerate() {
                 if role == plow_asset::segment_roles::PREFILL_ATTENTION_HD512_WG32 {
                     let g = &blob.progs[program.index];
                     let pc = g.gq_stream[g.gq_seg_ofs[seg] as usize].inst as usize;
