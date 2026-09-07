@@ -8,14 +8,21 @@ pub const GEMV_CTA512: u8 = 3;
 pub const FP8_M1: u8 = 4;
 pub const CUBLASLT: u8 = 5;
 pub const PREFILL_ATTENTION_HD512_WG32: u8 = 6;
-pub const MAX_ROLE: u8 = PREFILL_ATTENTION_HD512_WG32;
+pub const MXFP4_MOE: u8 = 7;
+pub const MAX_ROLE: u8 = MXFP4_MOE;
 
 pub const PREFILL_ATTENTION_HD512_WG32_ABI: &str = "attention_sm90_hd512_wg32_v1";
+pub const MXFP4_MOE_ABI: &str = "mxfp4_moe_sm90_v1";
 
 pub fn requires_object(role: u8) -> bool {
     matches!(
         role,
-        FP8_PREFILL_GEMM | PREFILL_ATTENTION | GEMV_CTA512 | FP8_M1 | PREFILL_ATTENTION_HD512_WG32
+        FP8_PREFILL_GEMM
+            | PREFILL_ATTENTION
+            | GEMV_CTA512
+            | FP8_M1
+            | PREFILL_ATTENTION_HD512_WG32
+            | MXFP4_MOE
     )
 }
 
@@ -101,6 +108,7 @@ impl SegmentRoles {
                 GEMV_CTA512 => "gemv_sm90_cta512_v1",
                 FP8_M1 => crate::fp8_m1_role::ABI,
                 PREFILL_ATTENTION_HD512_WG32 => PREFILL_ATTENTION_HD512_WG32_ABI,
+                MXFP4_MOE => MXFP4_MOE_ABI,
                 _ => return Err("invalid packet segment object role".into()),
             };
             let valid_hash = |hash: Option<&str>| {
@@ -142,7 +150,11 @@ impl SegmentRoles {
                             .attention
                             .as_ref()
                             .is_none_or(|a| a != &hd512_wg && a != &hd512_px4)))
-                || (!matches!(id, FP8_M1 | PREFILL_ATTENTION_HD512_WG32)
+                || (id == MXFP4_MOE
+                    && (!valid_hash(object.sha256.as_deref())
+                        || object.promote_k512.is_some()
+                        || object.attention.is_some()))
+                || (!matches!(id, FP8_M1 | PREFILL_ATTENTION_HD512_WG32 | MXFP4_MOE)
                     && (object.sha256.is_some()
                         || object.promote_k512.is_some()
                         || object.attention.is_some()))
@@ -239,6 +251,21 @@ mod tests {
             raw.replace("\"warps\":8", "\"warps\":4"),
             raw.replace("\"profile\":\"sm90a\"", "\"profile\":\"sm120\""),
             raw.replace("\"dtype\":\"bf16\"", "\"dtype\":\"fp8\""),
+        ] {
+            assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn mxfp4_moe_role_requires_exact_hash() {
+        let raw = format!(
+            r#"{{"version":1,"objects":{{"7":{{"abi":"mxfp4_moe_sm90_v1","file":"moe.cubin","sha256":"{}"}}}},"programs":[{{"index":0,"roles":[0,7,7,0]}}]}}"#,
+            "a".repeat(64)
+        );
+        SegmentRoles::from_bytes(raw.as_bytes()).unwrap();
+        for bad in [
+            raw.replace(&format!(r#","sha256":"{}""#, "a".repeat(64)), ""),
+            raw.replace(&"a".repeat(64), "bad"),
         ] {
             assert!(SegmentRoles::from_bytes(bad.as_bytes()).is_err());
         }
