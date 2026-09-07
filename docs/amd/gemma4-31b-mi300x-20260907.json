@@ -1,0 +1,2554 @@
+{
+  "date": "2026-09-07",
+  "branch": "perf/gemma31-native-next",
+  "head": "95ed05a39c9d1ea90bce5f6325de11c1ba3e412f",
+  "working_diff_sha256": "2ccd91f05da067ca8032d84deb7933b27d9054143ade5d8591f4572aa78f3c2a",
+  "model": "google/gemma-4-31B-it",
+  "gpu": "1 x AMD Instinct MI300X per server, gpulease",
+  "dtype": "BF16",
+  "tp": 1,
+  "batch": 4,
+  "max_ctx": 8192,
+  "prefill_rungs": [
+    128,
+    512,
+    1024
+  ],
+  "decode_rungs": [
+    1,
+    2,
+    4
+  ],
+  "compiler": "Nix ROCm 7.14.0, HIP 7.14.60850, clang 23",
+  "vllm": {
+    "version": "0.28.0",
+    "wheel_index": "https://wheels.vllm.ai/rocm/0.28.0/rocm723",
+    "torch": "2.12.0+git6bbd260",
+    "torch_hip": "7.2.53211",
+    "runtime_libraries": "/opt/rocm/core-7.14/lib",
+    "flags": [
+      "--dtype bfloat16",
+      "--tensor-parallel-size 1",
+      "--max-model-len 8192",
+      "--max-num-seqs 4",
+      "--no-enable-prefix-caching",
+      "--language-model-only"
+    ]
+  },
+  "method": "scripts/bench_packed_serve.py; four 128/8 warmups; two repetitions per cell; 64 output tokens; deterministic text fixtures; prefix caching off; end-to-end aggregate output throughput; TTFT is first nonempty streamed text. Independent servers use separate GPU leases. Small comparison, not a saturation or soak test.",
+  "checks": [
+    "482 CPU/CUDA/HSA library tests passed, 11 ignored",
+    "8 API integration tests passed",
+    "3 full Gemma GPU parity cases passed",
+    "HTTP concurrent ragged requests, limits 1/3/7/17, prefill/decode cancellation, slot reuse and oversized context rejection passed for chunks 128 and 512",
+    "Both Plow modes and vLLM answered Paris for the capital-of-France chat smoke",
+    "Debug mux log confirmed two-request packed prefill launches",
+    "gfx942 build register/LDS and instruction audits passed"
+  ],
+  "runs": {
+    "control": [
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 2.4577249229769222,
+        "output_tok_s": 26.04034300245445,
+        "ttft_ms": 97.2554559702985,
+        "requests": [
+          {
+            "ttft_ms": 97.2554559702985,
+            "latency_ms": 2457.3508859612048,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 2.466209127975162,
+        "output_tok_s": 25.950759517521565,
+        "ttft_ms": 97.35644597094506,
+        "requests": [
+          {
+            "ttft_ms": 97.35644597094506,
+            "latency_ms": 2465.902369993273,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 3.1203842000104487,
+        "output_tok_s": 82.04117941602921,
+        "ttft_ms": 290.9680400043726,
+        "requests": [
+          {
+            "ttft_ms": 224.6775120147504,
+            "latency_ms": 3036.9810329866596,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 357.2585679939948,
+            "latency_ms": 3078.891764045693,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 95.80168599495664,
+            "latency_ms": 2995.7492150133476,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 490.4789589927532,
+            "latency_ms": 3119.411799008958,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 3.119730714999605,
+        "output_tok_s": 82.05836445086653,
+        "ttft_ms": 291.0899514972698,
+        "requests": [
+          {
+            "ttft_ms": 490.7534300000407,
+            "latency_ms": 3118.7096610083245,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 357.1852780296467,
+            "latency_ms": 3078.166431048885,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 224.99462496489286,
+            "latency_ms": 3036.3873569876887,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 95.14143998967484,
+            "latency_ms": 2994.4169869995676,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 2.6096699059708044,
+        "output_tok_s": 24.524174438142904,
+        "ttft_ms": 264.30559501750395,
+        "requests": [
+          {
+            "ttft_ms": 264.30559501750395,
+            "latency_ms": 2609.3382100225426,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 2.604914206021931,
+        "output_tok_s": 24.568947358054057,
+        "ttft_ms": 263.8943009660579,
+        "requests": [
+          {
+            "ttft_ms": 263.8943009660579,
+            "latency_ms": 2604.5936580048874,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 3.861823755025398,
+        "output_tok_s": 66.28992316567185,
+        "ttft_ms": 710.1492660003714,
+        "requests": [
+          {
+            "ttft_ms": 1163.334816985298,
+            "latency_ms": 3861.482164997142,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 560.1208150037564,
+            "latency_ms": 3777.8391590109095,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 860.1777169969864,
+            "latency_ms": 3819.6801859885454,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 262.5022929860279,
+            "latency_ms": 3735.6854649842717,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 3.8636369819869287,
+        "output_tok_s": 66.2588129251078,
+        "ttft_ms": 712.0380754640792,
+        "requests": [
+          {
+            "ttft_ms": 862.4597729649395,
+            "latency_ms": 3822.0280800014734,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1164.9972989689559,
+            "latency_ms": 3863.205326953903,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 263.45561601920053,
+            "latency_ms": 3737.0632520178333,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 561.6163779632188,
+            "latency_ms": 3779.5443839859217,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 3.513432002044283,
+        "output_tok_s": 18.21580721151334,
+        "ttft_ms": 1147.7454170235433,
+        "requests": [
+          {
+            "ttft_ms": 1147.7454170235433,
+            "latency_ms": 3513.042241043877,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 3.518324284988921,
+        "output_tok_s": 18.19047785704652,
+        "ttft_ms": 1148.6681340029463,
+        "requests": [
+          {
+            "ttft_ms": 1148.6681340029463,
+            "latency_ms": 3517.8364970488474,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 7.465802018006798,
+        "output_tok_s": 34.289685071014816,
+        "ttft_ms": 2920.0614995206706,
+        "requests": [
+          {
+            "ttft_ms": 2329.2803310323507,
+            "latency_ms": 7379.719460033812,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 4696.62378000794,
+            "latency_ms": 7464.934853021987,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1149.084104981739,
+            "latency_ms": 7336.67800197145,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 3510.8426680089906,
+            "latency_ms": 7422.006183012854,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-control",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 7.474467393010855,
+        "output_tok_s": 34.24993200711234,
+        "ttft_ms": 2923.019634501543,
+        "requests": [
+          {
+            "ttft_ms": 3515.505467017647,
+            "latency_ms": 7432.355922006536,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 4701.947988010943,
+            "latency_ms": 7473.512928001583,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1150.2401100005955,
+            "latency_ms": 7345.789642015006,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 2330.533801985439,
+            "latency_ms": 7388.581428036559,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "chunked512": [
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 2.4115264769643545,
+        "output_tok_s": 26.539206851489197,
+        "ttft_ms": 96.32819303078577,
+        "requests": [
+          {
+            "ttft_ms": 96.32819303078577,
+            "latency_ms": 2411.166478996165,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 2.3438309420016594,
+        "output_tok_s": 27.305723656563405,
+        "ttft_ms": 94.47441500378773,
+        "requests": [
+          {
+            "ttft_ms": 94.47441500378773,
+            "latency_ms": 2343.5152400052175,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 3.1603881820337847,
+        "output_tok_s": 81.00270765955653,
+        "ttft_ms": 340.2993669733405,
+        "requests": [
+          {
+            "ttft_ms": 93.89955800725147,
+            "latency_ms": 2917.7831020206213,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 597.026753006503,
+            "latency_ms": 3159.5199370058253,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 424.16690598474815,
+            "latency_ms": 3078.6019249935634,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 256.43182796193287,
+            "latency_ms": 2997.6677499944344,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 3.161900289996993,
+        "output_tok_s": 80.9639699296917,
+        "ttft_ms": 341.05905651813373,
+        "requests": [
+          {
+            "ttft_ms": 597.1853890223429,
+            "latency_ms": 3161.477829038631,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 425.0102450023405,
+            "latency_ms": 3080.783231998794,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 93.47953996621072,
+            "latency_ms": 2918.422706949059,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 257.10786803392693,
+            "latency_ms": 2999.615487991832,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 2.591101346013602,
+        "output_tok_s": 24.69992155978913,
+        "ttft_ms": 324.4667809922248,
+        "requests": [
+          {
+            "ttft_ms": 324.4667809922248,
+            "latency_ms": 2590.7083399943076,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 2.591221795999445,
+        "output_tok_s": 24.69877341214434,
+        "ttft_ms": 323.05822701891884,
+        "requests": [
+          {
+            "ttft_ms": 323.05822701891884,
+            "latency_ms": 2590.7576830359176,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 4.3694148259819485,
+        "output_tok_s": 58.58908119177458,
+        "ttft_ms": 1027.7358335151803,
+        "requests": [
+          {
+            "ttft_ms": 322.2488390165381,
+            "latency_ms": 3881.6146799945273,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 789.3355790292844,
+            "latency_ms": 4045.5602500005625,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1266.1360880010761,
+            "latency_ms": 4208.37412198307,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1749.5435180026107,
+            "latency_ms": 4368.510556989349,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 4.378048243001103,
+        "output_tok_s": 58.473544783169146,
+        "ttft_ms": 1030.484886985505,
+        "requests": [
+          {
+            "ttft_ms": 1752.561493020039,
+            "latency_ms": 4377.214498992544,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 791.5237650158815,
+            "latency_ms": 4053.770015016198,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 323.4525860170834,
+            "latency_ms": 3889.7156009916216,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1269.4460089551285,
+            "latency_ms": 4217.179284954909,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 3.6783889689831994,
+        "output_tok_s": 17.398921250487337,
+        "ttft_ms": 1394.5342890219763,
+        "requests": [
+          {
+            "ttft_ms": 1394.5342890219763,
+            "latency_ms": 3677.985986985732,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 3.6857970060082152,
+        "output_tok_s": 17.36395137759178,
+        "ttft_ms": 1396.5638289810158,
+        "requests": [
+          {
+            "ttft_ms": 1396.5638289810158,
+            "latency_ms": 3685.4048810200766,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 10.11974153999472,
+        "output_tok_s": 25.29708876340863,
+        "ttft_ms": 4418.593903508736,
+        "requests": [
+          {
+            "ttft_ms": 3397.546523017809,
+            "latency_ms": 8810.202747990843,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 7499.773006013129,
+            "latency_ms": 10118.977400008589,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1393.6861839611083,
+            "latency_ms": 8141.036867978983,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 5439.641283999663,
+            "latency_ms": 9471.767281997018,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-chunked512",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 10.137862128030974,
+        "output_tok_s": 25.251872314594358,
+        "ttft_ms": 4427.683781017549,
+        "requests": [
+          {
+            "ttft_ms": 7513.5368799674325,
+            "latency_ms": 10137.453446979634,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 3404.6002220129594,
+            "latency_ms": 8827.092868974432,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 5450.767340022139,
+            "latency_ms": 9490.416477026884,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1397.3491810029373,
+            "latency_ms": 8156.810212007258,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "packed128": [
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 2.3802360640256666,
+        "output_tok_s": 26.888089365286532,
+        "ttft_ms": 96.88020602334291,
+        "requests": [
+          {
+            "ttft_ms": 96.88020602334291,
+            "latency_ms": 2379.8799029900692,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 2.3841213440173306,
+        "output_tok_s": 26.84427122830824,
+        "ttft_ms": 96.18055098690093,
+        "requests": [
+          {
+            "ttft_ms": 96.18055098690093,
+            "latency_ms": 2383.9063629857264,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 3.2027436310308985,
+        "output_tok_s": 79.93146798253058,
+        "ttft_ms": 349.3916504958179,
+        "requests": [
+          {
+            "ttft_ms": 436.6236490313895,
+            "latency_ms": 3129.4912950252183,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 609.9049290060066,
+            "latency_ms": 3202.122652961407,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 262.15965196024626,
+            "latency_ms": 3046.597637992818,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 93.78667699638754,
+            "latency_ms": 2964.473969012033,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 3.286545864015352,
+        "output_tok_s": 77.89332952963294,
+        "ttft_ms": 426.52768752304837,
+        "requests": [
+          {
+            "ttft_ms": 339.85225501237437,
+            "latency_ms": 3130.6694429949857,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 513.2031200337224,
+            "latency_ms": 3212.8841470112093,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 93.46338495379314,
+            "latency_ms": 2965.5732209794223,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 686.9551540003158,
+            "latency_ms": 3286.126958031673,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 3.0633751319837756,
+        "output_tok_s": 20.891989143541483,
+        "ttft_ms": 765.4769660439342,
+        "requests": [
+          {
+            "ttft_ms": 765.4769660439342,
+            "latency_ms": 3063.0315390299074,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 3.063484204991255,
+        "output_tok_s": 20.891245300278182,
+        "ttft_ms": 765.5134800006635,
+        "requests": [
+          {
+            "ttft_ms": 765.5134800006635,
+            "latency_ms": 3063.2445469964296,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 5.377439659961965,
+        "output_tok_s": 47.6062989429826,
+        "ttft_ms": 2442.4525014765095,
+        "requests": [
+          {
+            "ttft_ms": 2351.7268679570407,
+            "latency_ms": 5219.792726973537,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 2169.6280449978076,
+            "latency_ms": 5136.2107720342465,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 2714.684162987396,
+            "latency_ms": 5376.84825703036,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 2533.1781349959783,
+            "latency_ms": 5303.011580021121,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 5.3915158419986255,
+        "output_tok_s": 47.482008307537725,
+        "ttft_ms": 2445.4423989809584,
+        "requests": [
+          {
+            "ttft_ms": 2354.4965419569053,
+            "latency_ms": 5233.333078969736,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 2536.3882560050115,
+            "latency_ms": 5317.181280988734,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 2173.191444016993,
+            "latency_ms": 5149.737754021771,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 2718.6100719845854,
+            "latency_ms": 5391.154132026713,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 5.512262483011,
+        "output_tok_s": 11.61047758470327,
+        "ttft_ms": 3187.190964992624,
+        "requests": [
+          {
+            "ttft_ms": 3187.190964992624,
+            "latency_ms": 5511.949325969908,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 5.518346605007537,
+        "output_tok_s": 11.597676728374438,
+        "ttft_ms": 3189.2094779759645,
+        "requests": [
+          {
+            "ttft_ms": 3189.2094779759645,
+            "latency_ms": 5518.026578007266,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 12.75842222594656,
+        "output_tok_s": 20.065176983982994,
+        "ttft_ms": 9744.60095402901,
+        "requests": [
+          {
+            "ttft_ms": 9461.529126041569,
+            "latency_ms": 12512.452090042643,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 9838.83646101458,
+            "latency_ms": 12682.693133014254,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 9650.365447043441,
+            "latency_ms": 12597.87136799423,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 10028.013591014314,
+            "latency_ms": 12757.87977600703,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed128",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 12.780617977958173,
+        "output_tok_s": 20.030330336256437,
+        "ttft_ms": 9761.195254483027,
+        "requests": [
+          {
+            "ttft_ms": 9856.042334984522,
+            "latency_ms": 12705.71840298362,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 9477.342390979175,
+            "latency_ms": 12533.972845005337,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 9666.348173981532,
+            "latency_ms": 12620.298744994216,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 10044.790313986596,
+            "latency_ms": 12779.99541797908,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "packed512": [
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 2.392713539011311,
+        "output_tok_s": 26.74787389151705,
+        "ttft_ms": 96.02470800746232,
+        "requests": [
+          {
+            "ttft_ms": 96.02470800746232,
+            "latency_ms": 2392.403797013685,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 2.3942251970293,
+        "output_tok_s": 26.730985907010645,
+        "ttft_ms": 95.64775601029396,
+        "requests": [
+          {
+            "ttft_ms": 95.64775601029396,
+            "latency_ms": 2393.874101981055,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 3.308759462030139,
+        "output_tok_s": 77.37038697969521,
+        "ttft_ms": 430.1178375026211,
+        "requests": [
+          {
+            "ttft_ms": 342.26686001056805,
+            "latency_ms": 3151.3687819824554,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 517.9688149946742,
+            "latency_ms": 3234.0883999713697,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 95.24743800284341,
+            "latency_ms": 2985.725923033897,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 693.9434260129929,
+            "latency_ms": 3308.2150000263937,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 3.236991203040816,
+        "output_tok_s": 79.08578798716373,
+        "ttft_ms": 352.33791801147163,
+        "requests": [
+          {
+            "ttft_ms": 440.1558010140434,
+            "latency_ms": 3162.885923986323,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 94.64161400683224,
+            "latency_ms": 2995.803125028033,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 264.52003500889987,
+            "latency_ms": 3079.1515419841744,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 614.1559149837121,
+            "latency_ms": 3235.93627801165,
+            "usage": {
+              "prompt_tokens": 128,
+              "completion_tokens": 64,
+              "total_tokens": 192,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 2.6534697769675404,
+        "output_tok_s": 24.119362713503747,
+        "ttft_ms": 327.84742600051686,
+        "requests": [
+          {
+            "ttft_ms": 327.84742600051686,
+            "latency_ms": 2653.1013270141557,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 2.6509005809784867,
+        "output_tok_s": 24.142738682556196,
+        "ttft_ms": 326.3065950013697,
+        "requests": [
+          {
+            "ttft_ms": 326.3065950013697,
+            "latency_ms": 2650.5110699799843,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 4.236614294000901,
+        "output_tok_s": 60.42560928015071,
+        "ttft_ms": 1176.148178987205,
+        "requests": [
+          {
+            "ttft_ms": 1301.043618004769,
+            "latency_ms": 4161.520748981275,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1051.252739969641,
+            "latency_ms": 4077.0193729549646,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1549.6253620367497,
+            "latency_ms": 4235.491508035921,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 801.9695990369655,
+            "latency_ms": 3992.3166439984925,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 4.248677861003671,
+        "output_tok_s": 60.254038638628344,
+        "ttft_ms": 1176.8599020142574,
+        "requests": [
+          {
+            "ttft_ms": 1051.7603179905564,
+            "latency_ms": 4088.796261989046,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1301.9594860379584,
+            "latency_ms": 4172.993655025493,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 1552.9617730062455,
+            "latency_ms": 4248.358584998641,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 801.9391630077735,
+            "latency_ms": 4003.7851939559914,
+            "usage": {
+              "prompt_tokens": 1024,
+              "completion_tokens": 64,
+              "total_tokens": 1088,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 3.7644376839743927,
+        "output_tok_s": 17.00121116958709,
+        "ttft_ms": 1412.6257699681446,
+        "requests": [
+          {
+            "ttft_ms": 1412.6257699681446,
+            "latency_ms": 3764.0634659910575,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 3.769795762025751,
+        "output_tok_s": 16.97704704448199,
+        "ttft_ms": 1413.398313045036,
+        "requests": [
+          {
+            "ttft_ms": 1413.398313045036,
+            "latency_ms": 3769.4011740386486,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 8.069119132997002,
+        "output_tok_s": 31.725891733726012,
+        "ttft_ms": 4901.497539482079,
+        "requests": [
+          {
+            "ttft_ms": 5038.806733966339,
+            "latency_ms": 7993.231783970259,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 5312.591910012998,
+            "latency_ms": 8067.7638099878095,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 4490.094598964788,
+            "latency_ms": 7820.714983972721,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 4764.1883449978195,
+            "latency_ms": 7907.146482961252,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      },
+      {
+        "label": "plow-packed512",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 8.081593153998256,
+        "output_tok_s": 31.67692249805319,
+        "ttft_ms": 4908.125028479844,
+        "requests": [
+          {
+            "ttft_ms": 4770.089273981284,
+            "latency_ms": 7918.573460017797,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 5046.160782978404,
+            "latency_ms": 8005.435501981992,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 4496.75411102362,
+            "latency_ms": 7832.870399986859,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          },
+          {
+            "ttft_ms": 5320.688485982828,
+            "latency_ms": 8080.619609972928,
+            "usage": {
+              "prompt_tokens": 4096,
+              "completion_tokens": 64,
+              "total_tokens": 4160,
+              "prompt_tokens_details": {
+                "cached_tokens": 0
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "vllm028": [
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 1.1445154449902475,
+        "output_tok_s": 55.91886092943494,
+        "ttft_ms": 49.16651197709143,
+        "requests": [
+          {
+            "ttft_ms": 49.16651197709143,
+            "latency_ms": 1144.2785109975375,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 1.1450532379676588,
+        "output_tok_s": 55.8925977220001,
+        "ttft_ms": 48.53804403683171,
+        "requests": [
+          {
+            "ttft_ms": 48.53804403683171,
+            "latency_ms": 1144.7403610218316,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 1.3522472810000181,
+        "output_tok_s": 189.3144867783961,
+        "ttft_ms": 110.557551990496,
+        "requests": [
+          {
+            "ttft_ms": 111.0751440282911,
+            "latency_ms": 1351.880283036735,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 110.85112998262048,
+            "latency_ms": 1351.7401639837772,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 110.26397399837151,
+            "latency_ms": 1351.1595680029131,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 90.64368600957096,
+            "latency_ms": 1332.1853650268167,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 128,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 1.3536679319804534,
+        "output_tok_s": 189.11580451304994,
+        "ttft_ms": 109.67825399711728,
+        "requests": [
+          {
+            "ttft_ms": 90.97300801659003,
+            "latency_ms": 1333.5973619832657,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 109.76064199348912,
+            "latency_ms": 1353.171450959053,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 109.61093899095431,
+            "latency_ms": 1353.0236799851991,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 109.74556900328025,
+            "latency_ms": 1353.1495269853622,
+            "usage": {
+              "prompt_tokens": 128,
+              "total_tokens": 192,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 1.2842628289945424,
+        "output_tok_s": 49.83403595828278,
+        "ttft_ms": 137.5931380316615,
+        "requests": [
+          {
+            "ttft_ms": 137.5931380316615,
+            "latency_ms": 1283.9740180061199,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 1.268322114017792,
+        "output_tok_s": 50.46036751441693,
+        "ttft_ms": 137.3584289685823,
+        "requests": [
+          {
+            "ttft_ms": 137.3584289685823,
+            "latency_ms": 1267.9897479829378,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 1.850911449000705,
+        "output_tok_s": 138.3102363639345,
+        "ttft_ms": 513.8027000066359,
+        "requests": [
+          {
+            "ttft_ms": 514.4396559917368,
+            "latency_ms": 1850.5933139822446,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 514.0103049925528,
+            "latency_ms": 1850.1810079906136,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 138.57571501284838,
+            "latency_ms": 1829.0805410360917,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 513.5950950207189,
+            "latency_ms": 1849.8344909748994,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 1024,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 1.850411122024525,
+        "output_tok_s": 138.34763364365847,
+        "ttft_ms": 514.3777534831315,
+        "requests": [
+          {
+            "ttft_ms": 514.7419369895943,
+            "latency_ms": 1850.1123660244048,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 514.4989140098915,
+            "latency_ms": 1849.8965429607779,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 138.20781599497423,
+            "latency_ms": 1828.6827169940807,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 514.2565929563716,
+            "latency_ms": 1849.7169059701264,
+            "usage": {
+              "prompt_tokens": 1024,
+              "total_tokens": 1088,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 0,
+        "elapsed_s": 1.751200538012199,
+        "output_tok_s": 36.54635697670975,
+        "ttft_ms": 555.0028360448778,
+        "requests": [
+          {
+            "ttft_ms": 555.0028360448778,
+            "latency_ms": 1750.8424240513705,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 1,
+        "repeat": 1,
+        "elapsed_s": 1.7528581430087797,
+        "output_tok_s": 36.5117966078784,
+        "ttft_ms": 554.8765769926831,
+        "requests": [
+          {
+            "ttft_ms": 554.8765769926831,
+            "latency_ms": 1752.495541004464,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 0,
+        "elapsed_s": 3.517152405984234,
+        "output_tok_s": 72.78615494865409,
+        "ttft_ms": 2141.2120274908375,
+        "requests": [
+          {
+            "ttft_ms": 2140.999970957637,
+            "latency_ms": 3515.9154899884015,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 555.6602270225994,
+            "latency_ms": 3494.314044015482,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 2141.424084024038,
+            "latency_ms": 3516.23989403015,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 2141.9675450306386,
+            "latency_ms": 3516.8726880219765,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      },
+      {
+        "label": "vllm028-rocm",
+        "model": "gemma-4-31B-it",
+        "input": 4096,
+        "output": 64,
+        "concurrency": 4,
+        "repeat": 1,
+        "elapsed_s": 3.521976408024784,
+        "output_tok_s": 72.68646076580946,
+        "ttft_ms": 2138.736311957473,
+        "requests": [
+          {
+            "ttft_ms": 556.6934400121681,
+            "latency_ms": 3499.893283995334,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 2138.9049839926884,
+            "latency_ms": 3521.2370739900507,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 2138.8304329593666,
+            "latency_ms": 3521.3392059667967,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          },
+          {
+            "ttft_ms": 2138.6421909555793,
+            "latency_ms": 3521.1390869808383,
+            "usage": {
+              "prompt_tokens": 4096,
+              "total_tokens": 4160,
+              "completion_tokens": 64
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "comparison_limitations": [
+    "Indicative historical runs; vLLM batching budget16384 vsPlow prefill interleave2048.",
+    "vLLM compiled native GELU used erf approximation; Plow uses tanh. Superseded as a matched reference by explicit +gelu_and_mul runs."
+  ]
+}

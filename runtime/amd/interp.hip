@@ -181,6 +181,9 @@ extern "C" __device__ unsigned plow_packet_hash_hi =
 #endif
 
 extern "C" __device__ unsigned plow_packed_prefill_abi_1 = 1;
+#if PLOW_PACKED_PREFILL_DENSE_CONSUMERS
+extern "C" __device__ unsigned plow_packed_prefill_dense_consumers_1 = 1;
+#endif
 #if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS && PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS && \
     (PLOW_MLA_PREFILL || PLOW_MLA_PF_V2_ARM)
 extern "C" __device__ unsigned plow_packed_prefill_mla_consumers_1 = 1;
@@ -957,32 +960,48 @@ __device__ __forceinline__ CStream as_konst(const PlowStreamEnt* p) {
  * head dims, so the switch is closed. */
 __device__ __forceinline__ void exec_flash_prefill(CInst in, CTens T, unsigned slice,
                                                    unsigned nblk, bf16* lds
-#if PLOW_MIXED_STEP
+#if PLOW_MIXED_STEP || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
                                                    , const PlowProgram* mixed
 #endif
                                                    ) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     const unsigned hd = in->i[6];
+#if PLOW_MIXED_STEP || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
 #if PLOW_MIXED_STEP
+#define PLOW_DENSE_SPAN plow_mixed_prefill_span
+#else
+#define PLOW_DENSE_SPAN plow_packed_prefill_span
+#endif
 #define PLOW_AMD_FLASH_PREFILL(HD)                                                         \
     do {                                                                                  \
-        if (!plow_mixed_step_enabled(mixed) || in->i[0] != mixed->n_prefill_rows ||       \
-            in->i[7] != 1u || !TEN(5))                                                    \
-            __builtin_trap();                                                             \
         for (unsigned si = 0; si < mixed->n_prefill_spans; ++si) {                       \
-            const PlowPrefillSpan* span = plow_mixed_prefill_span(mixed, si);             \
+            const PlowPrefillSpan* span = PLOW_DENSE_SPAN(mixed, si);             \
             const size_t qoff = (size_t)span->row0 * in->i[2] * (HD);                     \
             const size_t kvoff = (size_t)span->slot * in->i[3] * in->fj[1].u * (HD);      \
-            d_flash_prefill<HD>((float*)TEN(0) + qoff,                                    \
-                                (float*)TEN(1) + (size_t)span->row0 * in->i[2] * 2u,      \
-                                (bf16*)TEN(5) + qoff, (const bf16*)TEN(2) + qoff,          \
+            d_flash_prefill<HD>((float*)TEN(0) + qoff * in->i[7],                                    \
+                                (float*)TEN(1) + (size_t)span->row0 * in->i[2] * in->i[7] * 2u,      \
+                                TEN(5) ? (bf16*)TEN(5) + qoff : nullptr, (const bf16*)TEN(2) + qoff,          \
                                 (const bf16*)TEN(3) + kvoff, (const bf16*)TEN(4) + kvoff, \
                                 span->n_rows, span->kv_len, in->i[2], in->i[3],           \
                                 span->kv_row0, in->i[5], in->fj[0].f, in->fj[1].u,        \
-                                in->fj[2].u, 1u, slice, nblk, lds);                        \
+                                in->fj[2].u, in->i[7], slice, nblk, lds);                        \
             __syncthreads();                                                              \
         }                                                                                 \
     } while (0)
+#endif
+#if PLOW_MIXED_STEP
+    if (!plow_mixed_step_enabled(mixed) || in->i[0] != mixed->n_prefill_rows ||
+        in->i[7] != 1u || !TEN(5)) __builtin_trap();
+#elif PLOW_PACKED_PREFILL_DENSE_CONSUMERS
+    if (plow_packed_prefill_enabled(mixed)) {
+        if (hd == 128) PLOW_AMD_FLASH_PREFILL(128);
+#ifndef PLOW_FLASH_HD128
+        else if (hd == 256) PLOW_AMD_FLASH_PREFILL(256);
+        else if (hd == 512) PLOW_AMD_FLASH_PREFILL(512);
+#endif
+        else __builtin_trap();
+        return;
+    }
 #endif
     /* THREE build shapes for the flash op, chosen at compile time:
      *
@@ -1036,7 +1055,8 @@ __device__ __forceinline__ void exec_flash_prefill(CInst in, CTens T, unsigned s
                              in->fj[2].u, in->i[7], slice, nblk, lds);
 #endif
 #endif /* PLOW_FLASH_HD128 */
-#if PLOW_MIXED_STEP
+#if PLOW_MIXED_STEP || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
+#undef PLOW_DENSE_SPAN
 #undef PLOW_AMD_FLASH_PREFILL
 #endif
 #undef TEN
@@ -2139,7 +2159,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
     CInst in = plow_scalar_ptr(in_v);
     CTens T = plow_scalar_ptr(T_v);
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
 #define PLOW_PACKED_NORM_ARGS , prog_meta, in->i[7]
 #else
 #define PLOW_PACKED_NORM_ARGS
@@ -2164,7 +2184,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
     if (in->op == PLOW_DOP_FLASH_PREFILL_FP8) exec_flash_prefill_fp8(in, T, slice, nblk, sm->fa);
 #else
     if (in->op == PLOW_DOP_FLASH_PREFILL) exec_flash_prefill(in, T, slice, nblk, sm->fa
-#if PLOW_MIXED_STEP
+#if PLOW_MIXED_STEP || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
                                                             , prog_meta
 #endif
                                                             );
@@ -3311,7 +3331,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_PREFILL
         case PLOW_DOP_FLASH_PREFILL:
             exec_flash_prefill(in, T, slice, nblk, sm->fa
-#if PLOW_MIXED_STEP
+#if PLOW_MIXED_STEP || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
                                , prog_meta
 #endif
                                );

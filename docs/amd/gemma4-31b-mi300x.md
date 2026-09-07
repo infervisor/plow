@@ -1,0 +1,142 @@
+# Gemma 4 31B: packed prefill on MI300X
+
+Qualified on 2026-09-07: one MI300X, TP1, BF16, batch ladder 1/2/4, prefill
+rungs 128/512/1024, context 8192. Packing remains opt-in. It improves throughput
+against the same chunked configuration on long concurrent prompts, but does not
+beat whole-prefill serving or vLLM in this measurement.
+
+## Build and run
+
+Use `nix develop` for every command. Build the compiler/runtime with
+`cargo build --release -p plowc -p plowrt --features plowrt/hsa` and build
+`lean-plow` with `lake build` from its directory. Compile from the **complete
+checkpoint**: configuration-only emission substitutes identity `layer_scalar`
+values and must never be used for numerical validation or serving.
+
+The tested checkpoint is `build-gemma31/checkpoint`. The qualified assets are
+`build-gemma31/qualified-assets`; the earlier `build-gemma31/assets` directory
+contains structural assets and is unsuitable for serving.
+
+```bash
+PLOW_VERIFY_BIN="$PWD/lean-plow/.lake/build/bin/plow_verify" \
+PLOW_L2_PLACE=0 PLOW_AMD=1 PLOW_DECODE_BATCH=4 PLOW_DECODE_BATCH_LADDER=1,2,4 \
+  target/release/plowc --hf-dir "$PWD/build-gemma31/checkpoint" \
+  --gpu MI300X --arch gfx942 --num-gpus 1 --max-ctx 8192 \
+  --out "$PWD/build-gemma31/qualified-assets"
+
+PLOW_DECODE_BATCH=4 scripts/build_gfx942.sh "$PWD/build-gemma31/hsaco"
+
+perf-data/tools/gpulease -n 1 gemma31-packed \
+  env PLOW_HSACO="$PWD/build-gemma31/hsaco" \
+  PLOW_PF_BATCH=1 PLOW_PF_CHUNK=512 PLOW_MULTISTEP=4 \
+  target/release/plowrt serve --assets "$PWD/build-gemma31/qualified-assets" --port 8000
+```
+
+The asset directory must link `checkpoint` to the full checkpoint, `tokenizer.json`
+to its tokenizer, and `hsaco` to the built objects. `/v1/models` reports the asset's
+network name; the qualification bundle uses `gemma-4-31B-it`. A fresh emission
+from a directory named `checkpoint` uses that basename instead.
+
+Use `gpulease` for every GPU process, including tests. It must detect all eight
+GPUs on this host. The current Nix SMI setup needs its Python environment first
+in PATH (`/nix/store/3i4w73bg0ak00b1rx6p3n6ks1sjfpykc-python3-3.13.13-env/bin`).
+The project compiler is the Nix ROCm 7.14.0 toolchain enforced by the build script.
+
+## Runtime contract
+
+- Initialized middle chunks can share a larger compiled prefill rung. Initial
+  admission, final sampling and prefix snapshot boundaries remain isolated.
+- Dense BF16 attention uses each request's KV slot and position, including ring
+  wraparound and split attention partials. Parked rows do not write request state.
+- Every routed kernel object must advertise
+  `plow_packed_prefill_dense_consumers_1`. Unsupported operator families and legacy
+  L2-domain packets fall back to isolated scheduling; explicit staging rejects them.
+- Cursor frontiers commit after successful execution. Binding cleanup runs on
+  success and failure. Multistep admission rejects inactive and duplicate slots
+  and clamps the quantum to every active context's remaining capacity.
+- Deferred decoding captures each token on device and reads once per quantum.
+  Per-token drains and counter checks remain enabled.
+- AMD and NVIDIA share context-budget calculation. Single-GPU AMD and TP reuse
+  host cursor scheduling. AMD packed and mixed dense attention share span dispatch.
+  Intel support here is the CPU backend; no Intel GPU backend was added.
+
+## Verification
+
+482 combined CPU/CUDA/HSA library tests and eight API integration tests passed.
+Three full-model GPU cases compare packed prefill and two four-token decode
+quanta with isolated greedy execution: short padded packs, unequal positions
+crossing ring boundaries, and a full 1024-row pack. Rejected members, duplicate
+feeds, sparse slots and slot reuse are covered.
+
+```bash
+perf-data/tools/gpulease -n 1 gemma31-parity \
+  env PLOW_GPU_TEST=1 PLOW_GPU_ASSETS="$PWD/build-gemma31/qualified-assets" \
+  cargo test -p plowrt --features hsa --test hsa_multistep -- --test-threads=1
+
+python3 scripts/verify_packed_serve.py \
+  --control http://127.0.0.1:18911 --candidate http://127.0.0.1:18913 \
+  --model gemma-4-31B-it --max-ctx 8192
+```
+
+The HTTP test passed for both 128- and 512-token chunks: concurrent ragged
+requests, exact output limits 1/3/7/17, cancellation during prefill and decode,
+recovery, and oversized-context rejection. Debug mux logs confirmed actual
+packed launches. Both Plow configurations and vLLM answered `Paris` in the chat
+smoke test. GPU execution was validated on MI300X only; CUDA/CPU validation was
+through host tests. This is functional qualification, not a long-running soak.
+An earlier separate VMM pool test failed on its mutable-environment assumption
+with the immutable runtime configuration; that unchanged test is outside this
+qualification, which uses the default non-VMM AMD KV path.
+
+## Comparison
+
+Each cell is **aggregate output tokens/s / median TTFT in milliseconds**.
+64 output tokens, concurrency 1 or 4, two repetitions after warmup. Text fixtures
+and usage checks are identical; prefix caching is disabled. These historical
+runs used four short warmup requests and two repetitions. The current benchmark
+defaults to a full warmup per case and five repetitions.
+Whole prefill uses `PLOW_PF_NO_CHUNK=1`, packing off and multistep 1. Chunked
+configurations use multistep 4. `Chunk 512` disables packing; `Packed 512` enables
+it with the same chunk size. Results are indicative, not a fully matched
+scheduler comparison: vLLM used its 16384-token batching budget while Plow used
+a 2048-token prefill interleave budget. Its compiled native GELU also used the
+erf approximation; Plow uses the checkpoint's tanh approximation. They do not
+establish an apples-to-apples performance win or a load limit.
+
+| Input / concurrency | Whole prefill | Chunk 512 | Packed 512 | Packed 128 | vLLM 0.28 |
+|---|---:|---:|---:|---:|---:|
+| 128 / 1 | 26.0 / 97 | 26.9 / 95 | 26.7 / 96 | 26.9 / 97 | 55.9 / 49 |
+| 128 / 4 | 82.0 / 291 | 81.0 / 341 | 78.2 / 391 | 78.9 / 388 | 189.2 / 110 |
+| 1024 / 1 | 24.5 / 264 | 24.7 / 324 | 24.1 / 327 | 20.9 / 765 | 50.1 / 137 |
+| 1024 / 4 | 66.3 / 711 | 58.5 / 1029 | 60.3 / 1177 | 47.5 / 2444 | 138.3 / 514 |
+| 4096 / 1 | 18.2 / 1148 | 17.4 / 1396 | 17.0 / 1413 | 11.6 / 3188 | 36.5 / 555 |
+| 4096 / 4 | 34.3 / 2922 | 25.3 / 4423 | 31.7 / 4905 | 20.0 / 9753 | 72.7 / 2140 |
+
+At 4096 input tokens and four requests, packing improves matched chunked
+throughput by 25% (25.3 → 31.7 tokens/s), with median TTFT increasing from 4.42s
+to 4.91s. Whole prefill reaches 34.3 tokens/s and vLLM reaches 72.7 tokens/s.
+Use 512-token chunks when enabling this path; the tested 128-token setting adds
+substantial overhead. Packing is not enabled by default.
+
+vLLM is the official 0.28.0 ROCm wheel from
+`https://wheels.vllm.ai/rocm/0.28.0/rocm723`, with PyTorch
+`2.12.0+git6bbd260` (build HIP `7.2.53211`). It runs with system-built ROCm
+`/opt/rocm/core-7.14/lib`; loading the Nix ROCm libraries into that wheel crashed
+PyTorch during import. Its Python uses Nix glibc, and its host C-extension
+compiler wrapper clears `LD_LIBRARY_PATH` before invoking system GCC. Plow's
+HIP kernels were built with the Nix 7.14 compiler throughout.
+
+[Raw measurements and provenance](gemma4-31b-mi300x-20260907.json).
+
+For new comparisons, pass `--manifest FILE` to `scripts/bench_packed_serve.py`.
+Record checkpoint and tokenizer hashes, weight/activation/KV precision, TP,
+GPU identity, toolchain, maximum context and sequences, token budgets, prefix
+caching and backend flags. Use the same input/output/concurrency matrix and
+warmups. The runner verifies exact token counts and records prompt hashes,
+request latency, TPOT and text delivery timestamps. Text chunk gaps are not
+token ITL: decoding and transport can combine multiple tokens in one chunk.
+
+Current Plow FP8 prefill and decode use different activation precisions;
+decode retains BF16 activations. This hybrid must not be compared as equivalent
+to vLLM W8A8. Tensorwise versus per-token scales and AITER's FNUZ activation
+range also require an explicit matching profile before FP8 results qualify.

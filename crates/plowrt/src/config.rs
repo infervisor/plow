@@ -273,7 +273,7 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub upload_direct: bool,
 
-    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD TP packs only
+    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
     /// exact-capability programs; unsupported programs retain fair isolated scheduling.
     #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_batch: bool,

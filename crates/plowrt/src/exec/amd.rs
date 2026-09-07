@@ -5252,6 +5252,47 @@ fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) 
     seen && covered
 }
 
+fn check_packed_dense_program(insts: &[DevInst64]) -> Result<()> {
+    for d in insts {
+        let op = DevOp::from_u16(d.op);
+        if !matches!(
+            op,
+            Some(
+                DevOp::Embed
+                    | DevOp::RmsNorm
+                    | DevOp::HeadNormRope
+                    | DevOp::Gemv
+                    | DevOp::Gemm
+                    | DevOp::FlashPrefill
+                    | DevOp::FlashMerge
+                    | DevOp::Glu
+                    | DevOp::Residual
+                    | DevOp::Argmax
+                    | DevOp::ArgmaxFin
+                    | DevOp::SoftCap
+                    | DevOp::RowRms
+                    | DevOp::GemmNorm
+                    | DevOp::GemmSmall
+                    | DevOp::GemmMed
+                    | DevOp::GemmWide
+                    | DevOp::GemmGlu
+                    | DevOp::NormResidual
+            )
+        ) {
+            return Err(RuntimeError::Device(format!(
+                "packed dense prefill does not support {op:?}"
+            )));
+        }
+        if (d.op == DevOp::FlashPrefill as u16
+            && (d.i[7] == 0 || !matches!(d.i[6], 128 | 256 | 512)))
+            || (d.op == DevOp::RmsNorm as u16 && d.i[2] != 0)
+        {
+            return Err(RuntimeError::Device("packed dense prefill requires direct BF16 attention and row-local RMS normalization".into()));
+        }
+    }
+    Ok(())
+}
+
 fn packed_mla_compatible(prog: &DevProg) -> bool {
     !prog.insts.iter().any(|d| {
         d.op == DevOp::FlashGatherPrefill as u16
@@ -7071,6 +7112,8 @@ impl CounterBankState {
 struct AmdProg {
     t: u32,
     packed_prefill_only: bool,
+    packed_dense: bool,
+    packed_dense_error: Option<String>,
     packed_needs_mla: bool,
     packed_mla_compatible: bool,
     packed_mla_segmented: bool,
@@ -7255,6 +7298,7 @@ pub struct AmdEngine {
     k_packed_mla_flash: Option<HsaKernel>,
     k_packed_kda: Option<HsaKernel>,
     k_xr_attnres: Option<HsaKernel>,
+    packed_prefill_dense: bool,
     packed_prefill_prefill_abi: bool,
     sched_prefill: Sched,
     sched_decode: Sched,
@@ -7989,6 +8033,8 @@ impl AmdEngine {
             .hsaco_lowrung
             .clone()
             .filter(|d| !d.is_empty());
+        let mut dense_prefill_object = false;
+        let mut dense_flash_object = false;
         type LK = (HsaKernel, bool);
         let mut load_one_in = |phase: Phase,
                                sched: Sched,
@@ -8056,6 +8102,12 @@ impl AmdEngine {
             }
             check_gate_hier_object(&syms, &path, phase, sched)?;
             let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
+            let dense = syms.contains(&"plow_packed_prefill_dense_consumers_1");
+            match phase {
+                Phase::Prefill => dense_prefill_object = dense,
+                Phase::Flash => dense_flash_object = dense,
+                _ => {}
+            }
             if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
                 check_prefill_object(&syms, &path, req)?;
             }
@@ -10321,6 +10373,10 @@ impl AmdEngine {
             progs.push(AmdProg {
                 t: p.t,
                 packed_prefill_only: p.packed_prefill_only,
+                packed_dense_error: check_packed_dense_program(&p.insts)
+                    .err()
+                    .map(|e| e.to_string()),
+                packed_dense: p.insts.iter().any(|d| d.op == DevOp::FlashPrefill as u16),
                 packed_needs_mla: p.insts.iter().any(|d| {
                     d.op == DevOp::RmsNorm as u16
                         || d.op == DevOp::HeadNormRope as u16
@@ -10763,6 +10819,7 @@ impl AmdEngine {
             k_packed_mla_flash,
             k_packed_kda,
             k_xr_attnres,
+            packed_prefill_dense: dense_prefill_object && (k_flash.is_none() || dense_flash_object),
             packed_prefill_prefill_abi,
             sched_prefill,
             sched_decode,
@@ -10920,7 +10977,17 @@ impl AmdEngine {
                     .into(),
             ));
         }
-        if program.packed_needs_mla {
+        if program.packed_dense {
+            if !self.packed_prefill_dense {
+                return Err(RuntimeError::Device(
+                    "packed dense prefill requires plow_packed_prefill_dense_consumers_1 in every routed object".into(),
+                ));
+            }
+            if let Some(error) = &program.packed_dense_error {
+                return Err(RuntimeError::Device(error.clone()));
+            }
+        }
+        if program.packed_needs_mla && !program.packed_dense {
             if !program.packed_mla_compatible {
                 return Err(RuntimeError::Device(
                     "packed-prefill MLA does not support NoPE or gathered/per-query selector packets"
@@ -10980,6 +11047,14 @@ impl AmdEngine {
     /// needed by the packed route.
     pub fn packed_prefill_prog_capable(&self, prog: usize) -> bool {
         self.packed_prefill_prog_for(prog).is_some()
+    }
+
+    pub(crate) fn prefill_rungs(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        self.progs[..self.dec_lo]
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.packed_prefill_only)
+            .map(|(index, p)| (index, p.t))
     }
 
     /// Validate and upload one ragged packed-prefill descriptor. The binding is program-exact:
@@ -11312,7 +11387,7 @@ impl AmdEngine {
             }
         }
         match packed_segment_route(
-            active,
+            active && !self.progs[p].packed_dense,
             self.progs[p].packed_seg_family[seg],
             self.k_packed_mla_norm.is_some(),
             self.k_packed_mla_flash.is_some(),
@@ -11819,7 +11894,7 @@ impl AmdEngine {
         }
         let family = self.progs[p].packed_seg_family[seg];
         let route = packed_segment_route(
-            active,
+            active && !self.progs[p].packed_dense,
             family,
             self.k_packed_mla_norm.is_some(),
             self.k_packed_mla_flash.is_some(),
@@ -12210,6 +12285,15 @@ impl AmdEngine {
     /// before it returns, so dispatch N-1 (which dirtied `stale`) has retired
     /// before dispatch N is even staged.
     pub fn run(&mut self, p: usize, k: HsaKernel) -> Result<()> {
+        self.run_with_capture(p, k, None)
+    }
+
+    fn run_with_capture(
+        &mut self,
+        p: usize,
+        k: HsaKernel,
+        capture: Option<(usize, usize)>,
+    ) -> Result<()> {
         use crate::obs::dstep;
         if requires_segmented_decode(&self.progs[p].decode_routes) {
             if !ctr_dbuf() {
@@ -12227,6 +12311,9 @@ impl AmdEngine {
                 let cur = self.progs[p].bank.current();
                 dstep::timed(&dstep::REARM, || self.rearm_bank(p, 1 - cur))?;
                 self.progs[p].bank.select_rearmed_inactive();
+            }
+            if let Some((step, quantum)) = capture {
+                self.enqueue_token_capture(step, quantum, self.progs[p].t as usize)?;
             }
             dstep::timed(&dstep::DRAIN, || self.drain())?;
             self.seg_drain_us += t0.elapsed().as_secs_f64() * 1e6;
@@ -12252,6 +12339,9 @@ impl AmdEngine {
             let cur = self.progs[p].bank.current();
             dstep::timed(&dstep::REARM, || self.rearm_bank(p, 1 - cur))?;
             self.progs[p].bank.select_rearmed_inactive();
+        }
+        if let Some((step, quantum)) = capture {
+            self.enqueue_token_capture(step, quantum, self.progs[p].t as usize)?;
         }
         // The drain is where an async kernel trap surfaces — capture the
         // dispatch shape at the site before propagating.
@@ -12474,7 +12564,7 @@ impl AmdEngine {
             c0,
             clen,
             self.progs[prog].t,
-            self.ragged_bucket(prog),
+            bucket.or_else(|| self.ragged_bucket(prog)),
         );
         rebase_kda_key_factor_routes(&mut self.progs[prog].prefill_routes, clen);
         // The same `rows`/`kv_len` pair [`AmdEngine::prefill_prepare`] uploads to `in.kvlen`.
@@ -12665,9 +12755,7 @@ impl AmdEngine {
                 self.kv_slot
             )));
         }
-        let rung = self
-            .prefill_prog_t(prog)
-            .ok_or_else(|| RuntimeError::Device(format!("program {prog} is not a prefill rung")))?;
+        let rung = self.check_packed_prefill_program(prog)?;
         let rows = validate_packed_prompt_slices(rung, spans, prompt_slices)?;
         self.stage_packed_prefill(prog, spans, parked)?;
 
@@ -12739,6 +12827,55 @@ impl AmdEngine {
             )
         });
         plan_chunks_capped(&buckets, n_prompt, max_bucket)
+    }
+
+    pub(crate) fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+        let rows = if self.ragged_bucket(step.prog).is_some() {
+            step.clen
+        } else {
+            self.progs[step.prog].t
+        };
+        if step.c0 as usize + rows as usize > self.max_ctx {
+            return Err(RuntimeError::Rejected(format!(
+                "prefill chunk at {} writes {rows} rows past max_ctx {}",
+                step.c0, self.max_ctx
+            )));
+        }
+        self.vmm_ensure(self.kv_slot, step.c0 + rows)?;
+        self.prefill_prepare(prompt, step)?;
+        self.run_segmented(step.prog)
+    }
+
+    pub(crate) fn prefill_packed_chunk(
+        &mut self,
+        spans: &[PrefillSpan],
+        prompts: &[&[u32]],
+        parked: &[u32],
+    ) -> Result<()> {
+        self.clear_packed_prefill();
+        let result = (|| {
+            let first = spans.first().ok_or_else(|| {
+                RuntimeError::Rejected("packed prefill requires at least one span".into())
+            })?;
+            if spans.iter().any(|s| s.program != first.program) {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill spans do not share one compiled program".into(),
+                ));
+            }
+            let prog = self
+                .packed_prefill_prog_for(first.program as usize)
+                .ok_or_else(|| {
+                    RuntimeError::Rejected("prefill program has no packed topology".into())
+                })?;
+            let mut routed = spans.to_vec();
+            for span in &mut routed {
+                span.program = prog as u32;
+            }
+            self.packed_prefill_prepare(prog, &routed, prompts, parked)?;
+            self.run_segmented(prog)
+        })();
+        self.clear_packed_prefill();
+        result
     }
 
     /// Prefill `prompt`, leaving the KV cache populated for `[0, prompt.len())`
@@ -13295,6 +13432,39 @@ impl AmdEngine {
         kvlen: &[u32],
         dp: usize,
     ) -> Result<Vec<u32>> {
+        self.run_decode_batched_at(pos, kvlen, dp, None)?;
+        let rows = (self.progs[dp].t as usize).min(self.batch);
+        let mut ids = self.read_sampled_batched(rows)?;
+        ids.resize(self.batch, 0);
+        Ok(ids)
+    }
+
+    pub(crate) fn decode_batched_deferred_at(
+        &mut self,
+        pos: &[u32],
+        kvlen: &[u32],
+        dp: usize,
+        step: usize,
+        quantum: usize,
+    ) -> Result<()> {
+        if !self.deferred_token_capture_available()
+            || step >= quantum
+            || quantum > DEFERRED_TOKEN_MAX_STEPS
+        {
+            return Err(RuntimeError::Rejected(
+                "invalid deferred decode quantum".into(),
+            ));
+        }
+        self.run_decode_batched_at(pos, kvlen, dp, Some((step, quantum)))
+    }
+
+    fn run_decode_batched_at(
+        &mut self,
+        pos: &[u32],
+        kvlen: &[u32],
+        dp: usize,
+        capture: Option<(usize, usize)>,
+    ) -> Result<()> {
         let b = self.batch;
         if pos.len() != b || kvlen.len() != b {
             return Err(RuntimeError::Device(format!(
@@ -13330,14 +13500,7 @@ impl AmdEngine {
 
         self.decode_prepare_batched(pos, kvlen)?;
 
-        self.run(dp, self.decode_kernel_for(dp))?;
-
-        // Only the rung's own rows sampled a token this step. The returned vector stays
-        // `batch` long — every caller indexes it BY SLOT — with the uncovered tail zeroed
-        // rather than carrying a stale id that would read as a real token.
-        let rows = (self.progs[dp].t as usize).min(b);
-        let mut ids = self.read_sampled_batched(rows)?;
-        ids.resize(b, 0);
+        self.run_with_capture(dp, self.decode_kernel_for(dp), capture)?;
 
         // Hand the pre-mapper the new frontier so the next block is mapped
         // BEFORE a step needs it. Never blocks; `vmm_ensure` above is the
@@ -13347,7 +13510,7 @@ impl AmdEngine {
                 v.advise(i, p + 1);
             }
         }
-        Ok(ids)
+        Ok(())
     }
 
     /// The `b` tokens the DEVICE sampled into `in.ids`, one per sequence slot.
@@ -14805,6 +14968,38 @@ mod tests {
             gq_stream: Vec::new(),
             gq_seg_ofs: Vec::new(),
             l2_domains: 0,
+        }
+    }
+
+    #[test]
+    fn packed_dense_contract_accepts_split_attention_and_refuses_other_state() {
+        let mut p = segmented_prog(
+            &[
+                DevOp::RmsNorm,
+                DevOp::GemmWide,
+                DevOp::HeadNormRope,
+                DevOp::FlashPrefill,
+                DevOp::FlashMerge,
+            ],
+            &[0, 0, 0, 1, 2],
+        );
+        p.insts[3].i[6] = 512;
+        p.insts[3].i[7] = 4;
+        p.insts[3].t[5] = packet::dev::TENSOR_NONE16;
+        assert!(super::check_packed_dense_program(&p.insts).is_ok());
+        p.insts[3].i[6] = 64;
+        assert!(super::check_packed_dense_program(&p.insts).is_err());
+        p.insts[3].i[6] = 512;
+        p.insts[0].i[2] = 1;
+        assert!(super::check_packed_dense_program(&p.insts).is_err());
+        p.insts[0].i[2] = 0;
+        for op in [
+            DevOp::FlashPrefillFp8,
+            DevOp::FlashMlaPrefill,
+            DevOp::KdaStateStep,
+        ] {
+            p.insts[3].op = op as u16;
+            assert!(super::check_packed_dense_program(&p.insts).is_err());
         }
     }
 
