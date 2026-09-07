@@ -1,5 +1,5 @@
 use crate::{live_kv, program::Packet};
-use packet::dev::{DevOp, TENSOR_NONE16};
+use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -13,6 +13,23 @@ fn need(ok: bool, text: &str) -> Result<()> {
     } else {
         Err(format!("packed prefill: {text}"))
     }
+}
+
+fn downstream_merge(insts: &[DevInst64], pc: usize) -> Result<&DevInst64> {
+    let d = &insts[pc];
+    // Layer scratch is reused after its merge has consumed the partials.
+    let mut merges = insts[pc + 1..]
+        .iter()
+        .take_while(|m| {
+            !(m.op == DevOp::FlashPrefill as u16
+                && m.t[..2].iter().any(|h| d.t[..2].contains(h)))
+        })
+        .filter(|m| m.op == DevOp::FlashMerge as u16 && m.t[1] == d.t[0] && m.t[2] == d.t[1]);
+    let merge = merges
+        .next()
+        .ok_or("packed prefill: missing downstream merge")?;
+    need(merges.next().is_none(), "one downstream merge required")?;
+    Ok(merge)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,21 +199,7 @@ impl Manifest {
                     if d.t[5] == TENSOR_NONE16 {
                         extent(d.t[0], product(&[g.rows, d.i[2], d.i[6], d.i[7]], 4)?)?;
                         extent(d.t[1], product(&[g.rows, d.i[2], d.i[7]], 8)?)?;
-                        let merges: Vec<_> = g
-                            .insts
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, m)| {
-                                m.op == DevOp::FlashMerge as u16
-                                    && m.t[1] == d.t[0]
-                                    && m.t[2] == d.t[1]
-                            })
-                            .collect();
-                        need(
-                            merges.len() == 1 && merges[0].0 > pc,
-                            "one downstream merge required",
-                        )?;
-                        let merge = merges[0].1;
+                        let merge = downstream_merge(g.insts, pc)?;
                         need(
                             merge.i[..4] == [g.rows, d.i[2], d.i[7], d.i[6]],
                             "merge geometry",
@@ -335,6 +338,26 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layer_scratch_reuse_requires_a_merge_before_overwrite() {
+        let mut flash = DevInst64 {
+            op: DevOp::FlashPrefill as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [TENSOR_NONE16; 8],
+            i: [0; 8],
+        };
+        flash.t[..2].copy_from_slice(&[0, 1]);
+        let mut merge = flash;
+        merge.op = DevOp::FlashMerge as u16;
+        merge.t[..3].copy_from_slice(&[2, 0, 1]);
+        let chain = [flash, merge, flash, merge];
+        assert!(downstream_merge(&chain, 0).is_ok());
+        assert!(downstream_merge(&chain, 2).is_ok());
+        assert!(downstream_merge(&[flash, flash, merge], 0).is_err());
+        assert!(downstream_merge(&[merge, flash], 1).is_err());
+        assert!(downstream_merge(&[flash, merge, merge], 0).is_err());
+    }
     #[test]
     fn ragged_physical_slots_and_padding() {
         let mut f = vec![0; 16];

@@ -785,6 +785,12 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
+    pub(crate) fn nv_live_kv_enabled(&self, packed_prefill: bool, full_cache: bool) -> bool {
+        self.nv_vmm_live()
+            || (packed_prefill && full_cache && !self.nv_vmm_prefix() && !self.nv.prefix_cache)
+    }
+
+    #[cfg(feature = "cuda")]
     pub(crate) fn nv_vmm_live_rings(&self) -> bool {
         select_compat(
             self.nv.vmm_live_rings,
