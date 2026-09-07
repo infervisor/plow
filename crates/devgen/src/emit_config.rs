@@ -747,6 +747,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_UNISEG_MAX_T")]
     pub uniseg_max_t: Option<u32>,
 
+    /// Heterogeneous prefill row split on a unified-memory SoC: `ane=<pct>[,cpu=<pct>]` of every
+    /// prefill bucket's rows go to the Neural Engine / CPU lanes (see `hetero.rs`).
+    #[arg(long, env = "PLOW_ROW_SPLIT")]
+    pub row_split: Option<String>,
+
     /// Narrow GLM dispatch to the workgroups that own work. DEFAULT ON (`=0` for the
     /// A/B control arm); the emitted arithmetic is unchanged either way.
     #[arg(long, env = "PLOW_GLM_WGFIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -978,6 +983,9 @@ impl EmitConfig {
             qwen_prefill: std::env::var("PLOW_QWEN_PREFILL").ok(),
             pf_gfuse: env_bool("PLOW_PF_GFUSE"),
             uniseg_max_t: env_u32("PLOW_UNISEG_MAX_T"),
+            row_split: std::env::var("PLOW_ROW_SPLIT")
+                .ok()
+                .filter(|s| !s.is_empty()),
             glm_wgfit: env_opt_out("PLOW_GLM_WGFIT"),
             tunedb: std::env::var("PLOW_TUNEDB").ok(), // preserves "" for "disable tuning"
             tune_dump: env_bool("PLOW_TUNE_DUMP"),

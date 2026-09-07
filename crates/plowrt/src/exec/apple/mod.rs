@@ -36,6 +36,8 @@ use crate::exec::cpu::ffi::{self, Isa};
 use crate::exec::kvrow::{place_lm_head_row, rebase_chunk_rows};
 use crate::{Result, RuntimeError};
 
+pub mod hetero;
+
 const MSL: &str = include_str!("../../../../../runtime/apple/interp.metal");
 const THREADS: usize = 1024;
 const PAGE: usize = 16384;
@@ -120,6 +122,8 @@ pub struct MetalEngine {
     cpu_slots: Vec<CpuSlot>,
     /// `(ops split with the CPU, summed CPU-side ms)` for the last program run that used it.
     pub last_cpu: Option<(usize, f64)>,
+    /// Compiler-planned heterogeneous prefill (`hetero.json` beside the blob).
+    pub hetero: Option<hetero::Hetero>,
 }
 
 // SAFETY: Metal and CoreML objects are thread-safe per Apple's documentation, and the serve
@@ -324,12 +328,20 @@ impl MetalEngine {
         #[cfg(feature = "ane")]
         let ane = Self::ane_slots(&model)?;
         let cpu_slots = Self::cpu_slots(&model)?;
+        let hetero = hetero::Hetero::load(&model, blob)?;
+        if hetero.is_some() && serial {
+            return Err(RuntimeError::Device(
+                "metal: a heterogeneous blob needs the persistent walk (unset PLOW_METAL_SERIAL)"
+                    .into(),
+            ));
+        }
         Ok(MetalEngine {
             #[cfg(feature = "ane")]
             ane,
             last_ane: None,
             cpu_slots,
             last_cpu: None,
+            hetero,
             model,
             _device: device,
             queue,
@@ -704,6 +716,15 @@ impl MetalEngine {
             );
             std::ptr::write_bytes(self.fault.contents().as_ptr() as *mut u8, 0, 64);
         }
+        if self
+            .hetero
+            .as_ref()
+            .is_some_and(|h| h.prog_plan(p).is_some())
+        {
+            self.run_prog_hetero(p)?;
+            self.last_run_us = t0.elapsed().as_secs_f64() * 1e6;
+            return self.check_fault(p);
+        }
         #[cfg(feature = "ane")]
         {
             let mine: Vec<usize> = (0..self.ane.len())
@@ -769,6 +790,55 @@ impl MetalEngine {
         self.check_fault(p)
     }
 
+    /// The three-lane segment loop (`hetero.rs`): per host segment, the GPU's command buffer
+    /// runs asynchronously while the CPU pool and the ANE take their row blocks; the join is
+    /// waiting for all three.
+    fn run_prog_hetero(&mut self, p: usize) -> Result<()> {
+        let n_seg = self.progs[p].n_seg;
+        let plan = self.hetero.as_ref().unwrap().prog_plan(p).unwrap().clone();
+        if plan.segments.iter().any(|s| s.seg >= n_seg) {
+            return Err(RuntimeError::Device(format!(
+                "hetero: program {p} plan names segment past the blob's {n_seg}"
+            )));
+        }
+        let n = self.model.names.len();
+        let table: Vec<*mut u8> = (0..n).map(|h| self.host_ptr(h)).collect();
+        let mut si = 0usize;
+        for seg in 0..n_seg {
+            let cb = self.commit(p, 0, u32::MAX, seg, seg + 1)?;
+            let sp = plan.segments.get(si).filter(|s| s.seg == seg);
+            let mut started = false;
+            if let Some(sp) = sp {
+                si += 1;
+                let insts = std::mem::take(&mut self.progs[p].insts_host);
+                let het = self.hetero.as_mut().unwrap();
+                let r = het.run_lanes(p, sp, &insts, &table);
+                self.progs[p].insts_host = insts;
+                started = r?;
+                if started {
+                    self.hetero.as_mut().unwrap().wait_cpu();
+                }
+            }
+            let t = Instant::now();
+            cb.waitUntilCompleted();
+            if let Some(h) = self.hetero.as_mut() {
+                h.stats.segs += 1;
+                if sp.is_some() {
+                    h.stats.gpu_wait_ms += t.elapsed().as_secs_f64() * 1e3;
+                }
+            }
+            let _ = started;
+            if cb.status() != MTLCommandBufferStatus::Completed {
+                let e = cb.error().map(|e| e.to_string()).unwrap_or_default();
+                return Err(RuntimeError::Device(format!(
+                    "metal: program {p} segment {seg} command buffer status {:?}: {e}",
+                    cb.status()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Read the fault word left by the kernels of program `p`'s last command buffer.
     fn check_fault(&self, p: usize) -> Result<()> {
         // SAFETY: 64-byte shared buffer written by the kernel before completion.
@@ -817,6 +887,20 @@ impl MetalEngine {
         p: usize,
         inst_lo: u32,
         inst_hi: u32,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let n_seg = self.progs[p].n_seg;
+        self.commit(p, inst_lo, inst_hi, 0, n_seg)
+    }
+
+    /// One command buffer over segments `[seg_lo, seg_hi)` of program `p` restricted to
+    /// instructions `[inst_lo, inst_hi)`; committed, not waited.
+    fn commit(
+        &mut self,
+        p: usize,
+        inst_lo: u32,
+        inst_hi: u32,
+        seg_lo: u32,
+        seg_hi: u32,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         // The instruction table may have been patched since the last copy.
         {
@@ -878,7 +962,11 @@ impl MetalEngine {
                 enc.endEncoding();
             }
         }
-        for seg in 0..(if self.serial { 0 } else { pg.n_seg }) {
+        for seg in (if self.serial { 0 } else { seg_lo })..(if self.serial {
+            0
+        } else {
+            seg_hi.min(pg.n_seg)
+        }) {
             let enc = cb
                 .computeCommandEncoder()
                 .ok_or_else(|| RuntimeError::Device("metal: no encoder".into()))?;
@@ -993,6 +1081,9 @@ impl MetalEngine {
         let pg = &mut self.progs[ch.prog];
         pg.insts_host.copy_from_slice(&pristine);
         rebase_chunk_rows(&mut pg.insts_host, &names, ch.c0, ch.clen, t, Some(t));
+        if let Some(h) = self.hetero.as_mut() {
+            h.prepare_chunk(ch.prog, &mut pg.insts_host, &pristine, ch.clen);
+        }
         if place_lm_head_row(&mut pg.insts_host, logits, ch.clen - 1).is_none() && logits.is_some()
         {
             tracing::warn!(

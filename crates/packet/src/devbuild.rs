@@ -219,6 +219,9 @@ struct LocalityCensus {
 struct Op {
     inst: DevInst,
     isolated: bool,
+    /// Host-join epoch (see [`Builder::host_join`]); a change between consecutive ops opens a
+    /// new segment regardless of wave class or `PLOW_UNISEG`.
+    join: u32,
     cus: Vec<u32>,
     deps: Vec<Dep>,
     counter: u32,   // the coarse counter this op bumps
@@ -323,6 +326,8 @@ pub struct Builder {
     uniseg_denied: bool,
     /// See [`Builder::force_uniseg`].
     uniseg_forced: bool,
+    /// See [`Builder::host_join`].
+    cur_join: u32,
     /// See [`Builder::set_gq_order_asap`]. Default on; `PLOW_GQ_ORDER=emit` restores emit order.
     gq_order_asap: bool,
     /// See [`Builder::set_gq_order_seg`]. Default on; `PLOW_GQ_ORDER=asap` keeps program-wide
@@ -561,6 +566,7 @@ impl Builder {
             place_l2: None,
             uniseg_denied: false,
             uniseg_forced: false,
+            cur_join: 0,
             gq_order_asap: std::env::var("PLOW_GQ_ORDER").ok().as_deref() != Some("emit"),
             gq_order_seg: !matches!(
                 std::env::var("PLOW_GQ_ORDER").ok().as_deref(),
@@ -881,6 +887,15 @@ impl Builder {
         self.emit_dep(op, cus, d, f)
     }
 
+    /// Start a new host segment before the next op: a join point where work outside the
+    /// device stream (another compute unit on a unified-memory SoC) must have completed before
+    /// the ops after it run. Applies under `PLOW_UNISEG` too — it is a host boundary, not a
+    /// wave class. Counters are unchanged: the runtime bumps nothing, the segment launch order
+    /// is the fence.
+    pub fn host_join(&mut self) {
+        self.cur_join += 1;
+    }
+
     /// Preserve an operation as its own segment without dropping dependency edges.
     pub fn isolate(&mut self, counter: u32) {
         self.ops[counter as usize].isolated = true;
@@ -936,6 +951,7 @@ impl Builder {
         self.ops.push(Op {
             inst,
             isolated: false,
+            join: self.cur_join,
             cus,
             deps,
             counter,
@@ -2237,7 +2253,8 @@ impl Builder {
                     || self.ops[i].inst.op == DevOp::QwenGdnPrefill as u16
                     || self.ops[i - 1].inst.op == DevOp::QwenGdnPrefill as u16
                     || self.ops[i].isolated
-                    || self.ops[i - 1].isolated)
+                    || self.ops[i - 1].isolated
+                    || self.ops[i].join != self.ops[i - 1].join)
             {
                 cur_seg += 1;
             }
@@ -5713,5 +5730,40 @@ mod isolated_segment_tests {
         }
         assert_eq!(isolated.gq_seg_ofs.len(), 4);
         assert!(plain.gq_stream.iter().all(|e| e.seg == 0));
+    }
+}
+
+#[cfg(test)]
+mod host_join_tests {
+    use super::*;
+
+    /// A host join opens a new segment even under forced uniseg, without touching counters.
+    #[test]
+    fn host_join_segments_under_uniseg() {
+        let build = |join: bool| -> Program {
+            let mut b = Builder::new(4);
+            b.force_uniseg();
+            let mut prior = None;
+            for i in 0..4 {
+                if join && (i == 1 || i == 3) {
+                    b.host_join();
+                }
+                let deps: Vec<_> = prior.into_iter().collect();
+                prior = Some(b.emit(DevOp::Nop, b.all(), &deps, |_| {}));
+            }
+            b.finish()
+        };
+        let plain = build(false);
+        let joined = build(true);
+        assert_eq!(plain.waits, joined.waits);
+        assert_eq!(plain.succs, joined.succs);
+        assert!(plain.stream.iter().all(|e| e.seg == 0));
+        for (ix, expected) in [0u16, 1, 1, 2].into_iter().enumerate() {
+            assert!(joined
+                .stream
+                .iter()
+                .filter(|e| e.inst == ix as u32)
+                .all(|e| e.seg == expected));
+        }
     }
 }

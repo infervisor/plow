@@ -602,6 +602,49 @@ fn main() -> ExitCode {
         std::env::set_var("PLOW_UNISEG", "1");
         cli.emit_cfg.uniseg = true;
     }
+    // `--unit-shares` on an Apple target is the heterogeneous prefill ROW split (devgen `hetero.rs`):
+    // the ANE/CPU shares become row percentages of every prefill bucket. `--row-split` wins if given.
+    if cli.arch == "metal3" && cli.emit_cfg.row_split.is_none() {
+        if let Some(spec) = cli.unit_shares.as_deref() {
+            let shares = match parse_unit_shares(spec) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let total: f64 = shares.iter().map(|(_, w)| w).sum();
+            let pct = |kind: costmodel::UnitKind| -> u32 {
+                shares
+                    .iter()
+                    .filter(|(k, _)| *k == kind)
+                    .map(|(_, w)| (w / total.max(1e-9) * 100.0).round() as u32)
+                    .sum()
+            };
+            let (ane, cpu) = (pct(costmodel::UnitKind::Ane), pct(costmodel::UnitKind::Cpu));
+            if ane + cpu > 0 {
+                let spec = format!("ane={ane},cpu={cpu}");
+                std::env::set_var("PLOW_ROW_SPLIT", &spec);
+                cli.emit_cfg.row_split = Some(spec);
+            }
+        } else if let Some(spec) = hwspec::registry::lookup(&cli.gpu) {
+            // No split named: take the measured one (`apple_prefill_calibrate`) if this part has
+            // a record. Absent record = GPU-only, exactly as before.
+            let slug = spec.name.to_lowercase().replace(' ', "-");
+            let path = std::path::PathBuf::from(format!("tuning/apple-{slug}-prefill.json"));
+            if let Ok(bytes) = std::fs::read(&path) {
+                let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let ane = doc["chosen"]["ane_pct"].as_u64().unwrap_or(0);
+                let cpu = doc["chosen"]["cpu_pct"].as_u64().unwrap_or(0);
+                if ane + cpu > 0 {
+                    let rs = format!("ane={ane},cpu={cpu}");
+                    tracing::info!(record = %path.display(), split = %rs, "apple: calibrated prefill row split");
+                    std::env::set_var("PLOW_ROW_SPLIT", &rs);
+                    cli.emit_cfg.row_split = Some(rs);
+                }
+            }
+        }
+    }
     let cli = cli;
 
     // Log the parsed CLI arguments so every invocation is self-describing in logs.

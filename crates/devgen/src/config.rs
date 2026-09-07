@@ -8,7 +8,7 @@ use serde_json::Value;
 
 /// Which checkpoint architecture we are compiling (tensor naming, norm topology,
 /// activation, attention geometry, RoPE differ per arch).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Arch {
     Gemma4,
     Llama,

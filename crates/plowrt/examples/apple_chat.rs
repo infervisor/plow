@@ -25,10 +25,12 @@ fn main() {
         .expect("usage: apple_chat <model.pkt> <checkpoint-dir>")
         .into();
     let mut n_tokens = 16usize;
+    let mut pf_reps = 0usize;
     let mut prompt = String::from("The capital of France is");
     while let Some(a) = args.next() {
         match a.as_str() {
             "--tokens" => n_tokens = args.next().unwrap().parse().unwrap(),
+            "--pf-reps" => pf_reps = args.next().unwrap().parse().unwrap(),
             "--prompt" => prompt = args.next().unwrap(),
             "--chat" => {
                 let q = args.next().unwrap();
@@ -70,6 +72,36 @@ fn main() {
     );
     if let Some((ops, ms)) = eng.last_ane {
         println!("ane: {ops} prefill GEMMs ran on the Neural Engine, {ms:.1} ms of ANE time");
+    }
+    let print_hetero = |eng: &MetalEngine| {
+        if let Some(h) = &eng.hetero {
+            let s = h.stats;
+            println!(
+                "hetero: {} segments; ane {} programs {:.1} ms; cpu {} ops {:.1} ms; gpu-wait after lanes {:.1} ms (plan ane {}% cpu {}%)",
+                s.segs, s.ane_runs, s.ane_ms, s.cpu_ops, s.cpu_ms, s.gpu_wait_ms, h.plan.ane_pct, h.plan.cpu_pct
+            );
+        }
+    };
+    print_hetero(&eng);
+    if pf_reps > 0 {
+        let mut ms = Vec::with_capacity(pf_reps);
+        for _ in 0..pf_reps {
+            if let Some(h) = eng.hetero.as_mut() {
+                h.reset_stats();
+            }
+            let t = Instant::now();
+            let f = eng.prefill(&ids).expect("prefill");
+            ms.push(t.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(f, first, "prefill is not deterministic");
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "prefill x{pf_reps}: min {:.1} ms, median {:.1} ms, max {:.1} ms",
+            ms[0],
+            ms[ms.len() / 2],
+            ms[ms.len() - 1]
+        );
+        print_hetero(&eng);
     }
     let mut out = vec![first];
     let mut pos = ids.len() as u32;

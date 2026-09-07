@@ -1,0 +1,36 @@
+{
+  "schema": "apple-prefill-split-v1",
+  "gpu": "Apple M4 Pro",
+  "model": "Llama-3.2-3B-Instruct",
+  "prompt_tokens": 128,
+  "rule": "whole-prefill median; split = argmin if it beats gpu-only by > 5% with the same first token, else 0",
+  "gpu_only_ms": 419.12037499999997,
+  "cells": [
+    {
+      "ane_pct": 0,
+      "cpu_pct": 0,
+      "prefill_ms_median": 419.12037499999997,
+      "prefill_ms_min": 418.724417,
+      "ane_ms": 0.0,
+      "cpu_ms": 0.0,
+      "gpu_wait_ms": 0.0,
+      "first_token": 1105,
+      "same_first_token": true
+    },
+    {
+      "ane_pct": 50,
+      "cpu_pct": 0,
+      "prefill_ms_median": 268.81925,
+      "prefill_ms_min": 268.353791,
+      "ane_ms": 170.780165,
+      "cpu_ms": 0.0,
+      "gpu_wait_ms": 5.472334999999999,
+      "first_token": 1105,
+      "same_first_token": true
+    }
+  ],
+  "chosen": {
+    "ane_pct": 50,
+    "cpu_pct": 0
+  }
+}

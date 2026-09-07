@@ -52,6 +52,7 @@ mod block;
 use block::{parse_block, write_block_descriptor};
 mod config;
 pub mod emit_config;
+pub mod hetero;
 pub mod k3;
 pub mod kda;
 use config::*;
@@ -3220,6 +3221,8 @@ fn emit_phase(
     amd: bool,
     // Shared GEN_TMAP_BF16 mint registry (see TmapMint). Inert unless PLOW_TMA_GEMM=1.
     tmaps: &std::cell::RefCell<TmapMint>,
+    // Heterogeneous prefill lane collector (Apple SoC row split); `None` for decode.
+    hetero: Option<&std::cell::RefCell<hetero::ProgCollector>>,
 ) {
     // The two axes the old `decode` bool used to carry at once. Every former use site below is
     // now one or the other: `decode` for shape, `gemv_family` for kernel family. (Not `gemv` —
@@ -3293,6 +3296,25 @@ fn emit_phase(
     // recorded above d_norm_residual_norm in runtime/amd/op_norm.h. Read that before widening
     // this. At decode batch B the row axis already gives it B workgroups for free.
     let elem = |n: u32| -> Vec<u32> { (0..n.div_ceil(512 * 8).max(1).min(n_cu)).collect() };
+    // HETEROGENEOUS PREFILL ROW SPLIT (hetero.rs). The GPU packet keeps rows [0, tg) of every
+    // projection/norm/residual; the ANE/CPU lanes take the rest concurrently, joined by host
+    // segments (`Builder::host_join`). Dense, single-GPU, bf16-activation prefill only.
+    let split = hetero
+        .and_then(|_| hetero::RowSplit::from_env())
+        .filter(|_| !gemv_family && tp == 1 && !c.moe && !block_mode && !w8a8 && !mx4);
+    let tg = split.map_or(t, |s| s.rows(t).0);
+    let rows_g: Vec<u32> = (0..tg.min(n_cu).max(1)).collect();
+    let hj = split.is_some();
+    let rec = |ctr: u32| {
+        if hj {
+            hetero.unwrap().borrow_mut().split_op(ctr);
+        }
+    };
+    let join = || {
+        if hj {
+            hetero.unwrap().borrow_mut().flush();
+        }
+    };
     let ns = if gemv_family {
         n_cu.div_ceil(heads).max(1)
     } else {
@@ -3320,6 +3342,10 @@ fn emit_phase(
             d.f[0] = escale;
         })
     };
+    if hj {
+        b.host_join();
+        join();
+    }
 
     // In decode, every projection is a GEMV (M=1): a 32x32 matrix core would run with 1 of
     // 32 M-lanes live, and the step is bandwidth-bound on the 57 GiB of weights anyway.
@@ -3890,7 +3916,7 @@ fn emit_phase(
             } else {
                 &[dep]
             };
-            b.emit(DevOp::RmsNorm, rows.clone(), nd, |d| {
+            let cn = b.emit(DevOp::RmsNorm, rows_g.clone(), nd, |d| {
                 d.t[0] = n.hn;
                 d.t[1] = n.x;
                 d.t[2] = w.g_in;
@@ -3898,10 +3924,12 @@ fn emit_phase(
                     d.t[3] = n.xqh; // fused w8a8 activation quant (T11): xq out
                     d.t[4] = n.ash; //   + per-row a_scale out
                 }
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = c.hidden;
                 d.f[0] = c.eps;
-            })
+            });
+            rec(cn);
+            cn
         };
         let (qkv_src, qkv_g) = (n.hn, TENSOR_NONE);
 
@@ -3959,9 +3987,9 @@ fn emit_phase(
             } else {
                 split3(
                     n_cu,
-                    tiles(t, qd),
-                    tiles(t, kd),
-                    if keqv { 0 } else { tiles(t, kd) },
+                    tiles(tg, qd),
+                    tiles(tg, kd),
+                    if keqv { 0 } else { tiles(tg, kd) },
                 )
             };
             (nq, nk, nv) = (cq.len() as u32, ck.len() as u32, cv.len() as u32);
@@ -4016,7 +4044,7 @@ fn emit_phase(
                     w.sq,
                     n.xqh,
                     n.ash,
-                    t,
+                    tg,
                     qd,
                     c.hidden,
                     qkv_g,
@@ -4024,6 +4052,7 @@ fn emit_phase(
                     &[dq],
                 )
             };
+            rec(cqc);
             let ckc = if let Some(f) = &nrn {
                 fold_proj(b, n.kg, w.wk8, w.sk, kd, ck, false, f)
             } else {
@@ -4036,7 +4065,7 @@ fn emit_phase(
                     w.sk,
                     n.xqh,
                     n.ash,
-                    t,
+                    tg,
                     kd,
                     c.hidden,
                     qkv_g,
@@ -4044,6 +4073,7 @@ fn emit_phase(
                     &[dq],
                 )
             };
+            rec(ckc);
             let (vsrc, cvc) = if keqv {
                 (n.kg, ckc) // k_eq_v: V is the RAW k_proj output
             } else if let Some(f) = &nrn {
@@ -4060,7 +4090,7 @@ fn emit_phase(
                         w.sv,
                         n.xqh,
                         n.ash,
-                        t,
+                        tg,
                         kd,
                         c.hidden,
                         qkv_g,
@@ -4069,7 +4099,26 @@ fn emit_phase(
                     ),
                 )
             };
+            if !keqv {
+                rec(cvc);
+            }
             (c_q, c_k, c_v, v_src) = (cqc, ckc, cvc, vsrc);
+        }
+        // J1: every unit's q/k/v rows are in place before RoPE / the KV append / attention.
+        if hj {
+            let mut h = hetero.unwrap().borrow_mut();
+            h.ane = match h.ane.take() {
+                Some(prev) => Some(hetero::AneLane {
+                    kind: "mid".into(),
+                    layer: prev.layer,
+                }),
+                None => Some(hetero::AneLane {
+                    kind: "pre".into(),
+                    layer: l as u32,
+                }),
+            };
+            h.flush();
+            b.host_join();
         }
 
         // headnorm+RoPE for q; and for k/v the store goes STRAIGHT INTO THE KV CACHE at
@@ -4578,6 +4627,11 @@ fn emit_phase(
         // partials into the replicated `og` that NormResidual consumes — all-reduce #1 of the layer.
         // proj() picks the fp8 (GemvFp8) arm on the decode fp8 path via the wo8/so operands.
         // w8a8: quant the (qd-width) attention output feeding o_proj.
+        // J2: attention over all rows is complete; the post-attention part is row-split again.
+        if hj {
+            join();
+            b.host_join();
+        }
         let do_ = quant(b, n.xqo, n.aso, n.at, qd, attn_dep);
         let c_o = if tp > 1 {
             let c_op = proj(
@@ -4598,7 +4652,7 @@ fn emit_phase(
             );
             emit_xreduce(b, &mut xgate, decode, &xr_cus, c_op, n.og, xr_elems, tp, 0)
         } else {
-            proj(
+            let co = proj(
                 b,
                 n.og,
                 n.at,
@@ -4607,13 +4661,21 @@ fn emit_phase(
                 w.so,
                 n.xqo,
                 n.aso,
-                t,
+                tg,
                 c.hidden,
                 qd,
                 TENSOR_NONE,
                 all.clone(),
                 &[do_],
-            )
+            );
+            rec(co);
+            if hj {
+                hetero.unwrap().borrow_mut().ane = Some(hetero::AneLane {
+                    kind: "post".into(),
+                    layer: l as u32,
+                });
+            }
+            co
         };
         // FIRST RESIDUAL + PRE-MLP NORM — the biggest structural fork.
         //   Gemma SANDWICH: x = x + post_attn_norm(o); then hn = pre_feedforward_norm(x).
@@ -4664,27 +4726,28 @@ fn emit_phase(
             })
         } else {
             let c_r1 = if gemma {
-                b.emit(DevOp::NormResidual, rows.clone(), &[c_o], |d| {
+                b.emit(DevOp::NormResidual, rows_g.clone(), &[c_o], |d| {
                     d.t[0] = n.x;
                     d.t[1] = n.x;
                     d.t[2] = n.og;
                     d.t[3] = w.g_pa;
-                    d.i[0] = t;
+                    d.i[0] = tg;
                     d.i[1] = c.hidden;
                     d.f[0] = c.eps;
                     d.f[1] = 1.0;
                 })
             } else {
-                b.emit(DevOp::Residual, elem(t * c.hidden), &[c_o], |d| {
+                b.emit(DevOp::Residual, elem(tg * c.hidden), &[c_o], |d| {
                     d.t[0] = n.x;
                     d.t[1] = n.x;
                     d.t[2] = n.og;
-                    d.i[0] = t * c.hidden;
+                    d.i[0] = tg * c.hidden;
                     d.f[0] = 1.0;
                 })
             };
+            rec(c_r1);
             let pre_mlp_norm = if gemma { w.g_pf } else { w.g_pa };
-            b.emit(DevOp::RmsNorm, rows.clone(), &[c_r1], |d| {
+            let cpf = b.emit(DevOp::RmsNorm, rows_g.clone(), &[c_r1], |d| {
                 d.t[0] = n.hn;
                 d.t[1] = n.x;
                 d.t[2] = pre_mlp_norm;
@@ -4692,10 +4755,12 @@ fn emit_phase(
                     d.t[3] = n.xqh; // fused w8a8 activation quant (T11) — see the pre-qkv site
                     d.t[4] = n.ash;
                 }
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = c.hidden;
                 d.f[0] = c.eps;
-            })
+            });
+            rec(cpf);
+            cpf
         };
         let (mlp_src, mlp_g) = (n.hn, TENSOR_NONE);
         // GATE|UP AS ONE GEMV WITH A FUSED GLU EPILOGUE -- the fusion every BLAS ships.
@@ -4724,7 +4789,7 @@ fn emit_phase(
         // through LDS, and with the walk on it stages `min(MM, M)` rows, not M.
         let glu_fused =
             gemv_family && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= gm_lds_halves();
-        let gemm_glu = !gemv_family && glu_fusion_wins(t, inter_l, c.hidden, n_cu);
+        let gemm_glu = !gemv_family && glu_fusion_wins(tg, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
         // (returns c_pf) off the w8a8 path, so glu_fused/bf16 arms below keep their c_pf dep.
@@ -4832,7 +4897,7 @@ fn emit_phase(
                     tmap8(w.wu8, inter_l, c.hidden),
                 )
             });
-            b.emit(DevOp::GemmGluFp8, all.clone(), &[dmlp], |d| {
+            let cg = b.emit(DevOp::GemmGluFp8, all.clone(), &[dmlp], |d| {
                 d.t[0] = n.fu;
                 d.t[2] = w.wg8;
                 d.t[5] = w.wu8;
@@ -4844,7 +4909,7 @@ fn emit_phase(
                 } else {
                     d.t[1] = mlp_src;
                 }
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = inter_l;
                 d.i[2] = c.hidden;
                 d.i[5] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU (Llama/Qwen)
@@ -4853,7 +4918,9 @@ fn emit_phase(
                     d.i[7] = mg;
                     d.i[3] = mu;
                 }
-            })
+            });
+            rec(cg);
+            cg
         } else if mx4_pf && !gemv_family && glu_fusion_wins_mxfp4(t, inter_l, c.hidden, n_cu) {
             // PREFILL fp4 GLU (op 113): gate|up as two e2m1 matrices with their own E8M0 scale
             // rows, SwiGLU/GeGLU fused in the epilogue. Same slot map as the decode twin (92).
@@ -4882,12 +4949,12 @@ fn emit_phase(
                     tmap(w.wu, inter_l, c.hidden),
                 )
             });
-            b.emit(DevOp::GemmGlu, all.clone(), &[c_pf], |d| {
+            let cg = b.emit(DevOp::GemmGlu, all.clone(), &[c_pf], |d| {
                 d.t[0] = n.fu;
                 d.t[1] = mlp_src;
                 d.t[2] = w.wg;
                 d.t[5] = w.wu;
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = inter_l;
                 d.i[2] = c.hidden;
                 d.i[5] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU (Llama/Qwen)
@@ -4896,13 +4963,15 @@ fn emit_phase(
                     d.i[7] = mg;
                     d.i[3] = mu;
                 }
-            })
+            });
+            rec(cg);
+            cg
         } else {
             // gate and up: same argument as q/k/v -- independent, so disjoint CU sets.
             let (cg, cu) = if gemv_family {
                 split2(n_cu, 1, 1)
             } else {
-                split2(n_cu, tiles(t, inter_l), tiles(t, inter_l))
+                split2(n_cu, tiles(tg, inter_l), tiles(tg, inter_l))
             };
             let c_g = proj(
                 b,
@@ -4913,13 +4982,14 @@ fn emit_phase(
                 w.sg,
                 n.xqh,
                 n.ash,
-                t,
+                tg,
                 inter_l,
                 c.hidden,
                 mlp_g,
                 cg,
                 &[dmlp],
             );
+            rec(c_g);
             let c_u = proj(
                 b,
                 n.ut,
@@ -4929,13 +4999,14 @@ fn emit_phase(
                 w.su,
                 n.xqh,
                 n.ash,
-                t,
+                tg,
                 inter_l,
                 c.hidden,
                 mlp_g,
                 cu,
                 &[dmlp],
             );
+            rec(c_u);
             if qnorm_fuse {
                 // T11 GLU-INTO-QUANT: one row-owning packet computes fu = act(g)*u AND its
                 // fp8 quant (QuantFp8 t3/t4/i2 — see d_quant_fp8), deleting the elementwise
@@ -4952,13 +5023,15 @@ fn emit_phase(
                     d.i[2] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU
                 })
             } else {
-                b.emit(DevOp::Glu, elem(t * inter_l), &[c_g, c_u], |d| {
+                let cgl = b.emit(DevOp::Glu, elem(tg * inter_l), &[c_g, c_u], |d| {
                     d.t[0] = n.fu;
                     d.t[1] = n.gt;
                     d.t[2] = n.ut;
-                    d.i[0] = t * inter_l;
+                    d.i[0] = tg * inter_l;
                     d.i[1] = c.mlp_act; // 0 GeGLU (Gemma), 1 SwiGLU
-                })
+                });
+                rec(cgl);
+                cgl
             }
         };
         // down_proj is ROW-parallel (input = inter_l lanes) → a PARTIAL H-vector. Under TP it
@@ -4993,7 +5066,7 @@ fn emit_phase(
                 b, &mut xgate, decode, &xr_cus, c_dp, n.dg, xr_elems, tp, slot_b,
             )
         } else {
-            proj(
+            let cd = proj(
                 b,
                 n.dg,
                 n.fu,
@@ -5002,13 +5075,15 @@ fn emit_phase(
                 w.sd,
                 n.xqi,
                 n.asi,
-                t,
+                tg,
                 c.hidden,
                 inter_l,
                 TENSOR_NONE,
                 all.clone(),
                 &[dfu],
-            )
+            );
+            rec(cd);
+            cd
         };
         // ===== Gemma-4 26B-A4B MoE branch (decode, B=1) =====
         // The dense MLP above produced `n.dg`. The MoE block adds a routed-expert branch and sums
@@ -5450,25 +5525,34 @@ fn emit_phase(
                 })
             }
         } else if gemma {
-            b.emit(DevOp::NormResidual, rows.clone(), &[c_d], |d| {
+            let cr = b.emit(DevOp::NormResidual, rows_g.clone(), &[c_d], |d| {
                 d.t[0] = n.x;
                 d.t[1] = n.x;
                 d.t[2] = ffn_out;
                 d.t[3] = w.g_po;
-                d.i[0] = t;
+                d.i[0] = tg;
                 d.i[1] = c.hidden;
                 d.f[0] = c.eps;
                 d.f[1] = ls[l];
-            })
+            });
+            rec(cr);
+            cr
         } else {
-            b.emit(DevOp::Residual, elem(t * c.hidden), &[c_d], |d| {
+            let cr = b.emit(DevOp::Residual, elem(tg * c.hidden), &[c_d], |d| {
                 d.t[0] = n.x;
                 d.t[1] = n.x;
                 d.t[2] = ffn_out;
-                d.i[0] = t * c.hidden;
+                d.i[0] = tg * c.hidden;
                 d.f[0] = 1.0;
-            })
+            });
+            rec(cr);
+            cr
         };
+    }
+    // J3: the residual stream is complete on every unit before the final norm reads it.
+    if hj && !block_mode {
+        join();
+        b.host_join();
     }
 
     // BLOCK MODE: stop here. `act.x` (n.x) — the post-FFN residual the loop's
@@ -6090,6 +6174,9 @@ struct DenseGqaEmitter<'a> {
     amd: bool,
     /// See [`TmapMint`]. RefCell: `emit_prefill`/`emit_decode` take `&self`.
     tmaps: std::cell::RefCell<TmapMint>,
+    /// Heterogeneous prefill (see `hetero.rs`): armed per program by `emit_dense_gqa`, drained after.
+    hetero_on: std::cell::Cell<bool>,
+    hetero: std::cell::RefCell<hetero::ProgCollector>,
 }
 
 impl<'a> DenseGqaEmitter<'a> {
@@ -6174,6 +6261,8 @@ impl<'a> DenseGqaEmitter<'a> {
                 base: tensors.len() as u32,
                 ..Default::default()
             }),
+            hetero_on: std::cell::Cell::new(false),
+            hetero: std::cell::RefCell::new(hetero::ProgCollector::default()),
         };
         (e, tensors, gen)
     }
@@ -6193,6 +6282,68 @@ impl<'a> DenseGqaEmitter<'a> {
             gens.push(g);
         }
         (decls, gens)
+    }
+
+    /// The `hetero.json` sidecar (see `hetero.rs`): activation/weight tensor NAMES so the runtime
+    /// binds by name, plus the per-program lane plans collected during `emit_prefill`.
+    fn hetero_plan(
+        &self,
+        programs: Vec<hetero::ProgPlan>,
+        tensors: &[packet::devbuild::TensorDecl],
+        fp8: bool,
+    ) -> hetero::HeteroPlan {
+        let name = |h: u32| tensors[h as usize].name.clone();
+        let opt = |h: u32| (h != TENSOR_NONE).then(|| name(h));
+        let n = &self.tn;
+        let c = self.c;
+        let split = hetero::RowSplit::from_env().unwrap_or_default();
+        hetero::HeteroPlan {
+            schema: "plow-hetero-v1".into(),
+            arch: format!("{:?}", c.arch).to_ascii_lowercase(),
+            hidden: c.hidden,
+            inter: c.inter,
+            qd: c.heads * c.hd_full,
+            kd: c.kvh_full * c.hd_full,
+            eps: c.eps,
+            mlp_act: c.mlp_act,
+            fp8,
+            ane_pct: split.ane_pct,
+            cpu_pct: split.cpu_pct,
+            tensors: hetero::ActTensors {
+                x: name(n.x),
+                hn: name(n.hn),
+                qg: name(n.qg),
+                kg: name(n.kg),
+                vg: name(n.vg),
+                at: name(n.at),
+                og: name(n.og),
+                fu: name(n.fu),
+                dg: name(n.dg),
+            },
+            layers: n
+                .lw
+                .iter()
+                .map(|w| hetero::LayerWeights {
+                    g_in: name(w.g_in),
+                    g_pa: name(w.g_pa),
+                    wq: name(if fp8 { w.wq8 } else { w.wq }),
+                    wk: name(if fp8 { w.wk8 } else { w.wk }),
+                    wv: name(if fp8 { w.wv8 } else { w.wv }),
+                    wo: name(if fp8 { w.wo8 } else { w.wo }),
+                    wg: name(if fp8 { w.wg8 } else { w.wg }),
+                    wu: name(if fp8 { w.wu8 } else { w.wu }),
+                    wd: name(if fp8 { w.wd8 } else { w.wd }),
+                    sq: opt(w.sq),
+                    sk: opt(w.sk),
+                    sv: opt(w.sv),
+                    so: opt(w.so),
+                    sg: opt(w.sg),
+                    su: opt(w.su),
+                    sd: opt(w.sd),
+                })
+                .collect(),
+            programs,
+        }
     }
 }
 
@@ -6217,6 +6368,7 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
             self.block_mode,
             self.amd,
             &self.tmaps,
+            self.hetero_on.get().then_some(&self.hetero),
         );
     }
     fn emit_decode(&self, b: &mut Builder, dbatch: u32, dmode: Mode, kv_rows: &mut Vec<u32>) {
@@ -6239,6 +6391,7 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
             self.block_mode,
             self.amd,
             &self.tmaps,
+            None,
         );
     }
 }
@@ -7417,6 +7570,7 @@ fn emit_dense_gqa(
 
     let mut progs = Vec::new();
     let mut tlist = Vec::new();
+    let mut hetero_progs: Vec<hetero::ProgPlan> = Vec::new();
     for &t in &buckets {
         if c.moe && !moe_pf {
             break;
@@ -7463,7 +7617,22 @@ fn emit_dense_gqa(
                 b.force_uniseg();
             }
         }
+        let split = hetero::RowSplit::from_env();
+        emitter.hetero_on.set(split.is_some());
         emitter.emit_prefill(&mut b, t);
+        emitter.hetero_on.set(false);
+        let coll = std::mem::take(&mut *emitter.hetero.borrow_mut());
+        if !coll.segments.is_empty() {
+            let (rows_gpu, rows_ane, rows_cpu) = split.unwrap().rows(t);
+            hetero_progs.push(hetero::ProgPlan {
+                prog: progs.len() as u32,
+                t,
+                rows_gpu,
+                rows_ane,
+                rows_cpu,
+                segments: coll.segments,
+            });
+        }
         progs.push(b.finish());
         tlist.push(t);
     }
@@ -7786,6 +7955,19 @@ fn emit_dense_gqa(
     // is unchanged.
     if !arch.is_empty() {
         let man = manifest::build(&m, &arch, &lean);
+        if !hetero_progs.is_empty() {
+            let plan = emitter.hetero_plan(std::mem::take(&mut hetero_progs), &m.tensors, fp8);
+            let hpath = std::path::Path::new(&out).with_file_name("hetero.json");
+            std::fs::write(&hpath, serde_json::to_vec_pretty(&plan).unwrap())
+                .unwrap_or_else(|e| panic!("{}: hetero plan not written: {e}", hpath.display()));
+            eprintln!(
+                "  heterogeneous prefill plan -> {} (ane {}%, cpu {}%, {} programs)",
+                hpath.display(),
+                plan.ane_pct,
+                plan.cpu_pct,
+                plan.programs.len()
+            );
+        }
         let mpath = std::path::Path::new(&out).with_file_name("build.json");
         let cpath = std::path::Path::new(&out).with_file_name("plow_config.h");
         manifest::write_config_header(&cpath, &man)
