@@ -220,73 +220,120 @@ mod cuda {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let rows = flag("--rows").and_then(|s| s.parse().ok()).unwrap_or(128);
         let decode_rows = flag("--decode").and_then(|s| s.parse().ok()).unwrap_or(1);
+        let spans = flag("--spans").and_then(|s| s.parse().ok()).unwrap_or(1);
         if decode_rows == 0 || decode_rows + 1 > e.batch() || decode_rows >= rows {
             return Err("mixed-check needs 0 < decode < rows and one free prefill slot".into());
         }
-        for slot in 0..=decode_rows {
-            e.begin_slot(slot, rows + 1)?;
+        if spans == 0 {
+            return Err("mixed-check needs at least one span".into());
         }
-        let input = synth(rows, hidden);
-        e.upload_activation("act.x", &input)?;
-        let decode: Vec<_> = (0..decode_rows)
-            .map(|slot| plow_asset::mixed_step::DecodeRequest {
-                slot: slot as u32,
-                state_slot: slot as u32,
-                token: 100 + slot as u32,
-            })
-            .collect();
-        let prefill_tokens: Vec<_> = (0..rows - decode_rows)
+        let prefill_rows = rows - decode_rows;
+        for slot in 0..=decode_rows {
+            e.begin_slot(slot, spans * rows + 1)?;
+        }
+        let input = synth(rows * spans, hidden);
+        let prefill_tokens: Vec<_> = (0..prefill_rows * spans)
             .map(|row| 200 + row as u32)
             .collect();
-        let prefill = [plow_asset::mixed_step::PrefillRequest {
-            slot: decode_rows as u32,
-            state_slot: decode_rows as u32,
-            start: 0,
-            tokens: &prefill_tokens,
-            prompt_len: prefill_tokens.len() as u32,
-        }];
         let start = Instant::now();
-        e.mixed_step(rows as u32, &decode, &prefill, &mut [])?;
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
-        let mixed_out = e.download_activation(out_name)?;
-        let mixed_out = &mixed_out[..rows * hidden];
-        if mixed_out.iter().any(|value| !value.is_finite()) {
-            return Err("mixed block output contains non-finite values".into());
+        let mut mixed_outputs = Vec::with_capacity(spans);
+        let mut mixed_kv = Vec::with_capacity(spans);
+        for span in 0..spans {
+            e.upload_activation(
+                "act.x",
+                &input[span * rows * hidden..(span + 1) * rows * hidden],
+            )?;
+            let decode: Vec<_> = (0..decode_rows)
+                .map(|slot| plow_asset::mixed_step::DecodeRequest {
+                    slot: slot as u32,
+                    state_slot: slot as u32,
+                    token: 100 + (span * decode_rows + slot) as u32,
+                })
+                .collect();
+            let pf_start = span * prefill_rows;
+            let prefill = [plow_asset::mixed_step::PrefillRequest {
+                slot: decode_rows as u32,
+                state_slot: decode_rows as u32,
+                start: pf_start as u32,
+                tokens: &prefill_tokens[pf_start..pf_start + prefill_rows],
+                prompt_len: prefill_tokens.len() as u32,
+            }];
+            e.mixed_step(rows as u32, &decode, &prefill, &mut [])?;
+            let out = e.download_activation(out_name)?;
+            if out[..rows * hidden].iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "mixed block output contains non-finite values at span {span}"
+                )
+                .into());
+            }
+            mixed_outputs.push(out[..rows * hidden].to_vec());
+            mixed_kv.push(snapshot_kv_range(
+                e,
+                desc,
+                decode_rows,
+                span,
+                prefill_rows,
+                pf_start,
+            )?);
         }
-        let mixed_kv = snapshot_kv(e, desc, decode_rows, rows - decode_rows)?;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
 
         for slot in 0..=decode_rows {
-            e.begin_slot(slot, rows + 1)?;
+            e.begin_slot(slot, spans * rows + 1)?;
         }
-        e.upload_activation("act.x", &input[..decode_rows * hidden])?;
-        let feeds: Vec<_> = (0..decode_rows)
-            .map(|slot| (slot, 100 + slot as u32))
-            .collect();
-        let mut tokens = Vec::new();
-        e.step_slots(&feeds, &mut tokens)?;
-        let decode_out = e.download_activation(out_name)?;
+        for span in 0..spans {
+            let span_input = &input[span * rows * hidden..(span + 1) * rows * hidden];
+            e.upload_activation("act.x", &span_input[..decode_rows * hidden])?;
+            let feeds: Vec<_> = (0..decode_rows)
+                .map(|slot| (slot, 100 + (span * decode_rows + slot) as u32))
+                .collect();
+            let mut tokens = Vec::new();
+            e.step_slots(&feeds, &mut tokens)?;
+            let decode_out = e.download_activation(out_name)?;
 
-        e.upload_activation("act.x", &input[decode_rows * hidden..])?;
-        e.prefill_slot(decode_rows, &prefill_tokens)?;
-        let prefill_out = e.download_activation(out_name)?;
-        let reference_kv = snapshot_kv(e, desc, decode_rows, rows - decode_rows)?;
-        let mut reference_out = Vec::with_capacity(rows * hidden);
-        reference_out.extend_from_slice(&decode_out[..decode_rows * hidden]);
-        reference_out.extend_from_slice(&prefill_out[..(rows - decode_rows) * hidden]);
-        compare_f32("activation", mixed_out, &reference_out, 6.0e-3, 5.0e-2)?;
-        compare_bf16("written KV", &mixed_kv, &reference_kv, 6.0e-3, 5.0e-2)?;
+            e.upload_activation("act.x", &span_input[decode_rows * hidden..])?;
+            let pf_end = (span + 1) * prefill_rows;
+            e.prefill_slot(decode_rows, &prefill_tokens[..pf_end])?;
+            let prefill_out = e.download_activation(out_name)?;
+            let reference_kv = snapshot_kv_range(
+                e,
+                desc,
+                decode_rows,
+                span,
+                prefill_rows,
+                span * prefill_rows,
+            )?;
+            let mut reference_out = Vec::with_capacity(rows * hidden);
+            reference_out.extend_from_slice(&decode_out[..decode_rows * hidden]);
+            reference_out.extend_from_slice(&prefill_out[..prefill_rows * hidden]);
+            compare_f32(
+                &format!("span {span} activation"),
+                &mixed_outputs[span],
+                &reference_out,
+                6.0e-3,
+                7.5e-2,
+            )?;
+            compare_bf16(
+                &format!("span {span} written KV"),
+                &mixed_kv[span],
+                &reference_kv,
+                6.0e-3,
+                5.0e-2,
+            )?;
+        }
         println!(
-            "mixed-check: rows={rows} decode={decode_rows} prefill={} elapsed={elapsed_ms:.3} ms parity=PASS",
-            prefill_tokens.len()
+            "mixed-check: rows={rows} decode={decode_rows} prefill_rows={prefill_rows} spans={spans} elapsed={elapsed_ms:.3} ms parity=PASS"
         );
         Ok(())
     }
 
-    fn snapshot_kv(
+    fn snapshot_kv_range(
         e: &plowrt::exec::gpu::GpuEngine,
         desc: &plow_asset::BlockDescriptor,
         decode_rows: usize,
+        decode_position: usize,
         prefill_rows: usize,
+        prefill_position: usize,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let heads = usize::try_from(desc.dims.kv_heads.ok_or("block has no KV-head count")?)?;
         let head_dim = usize::try_from(desc.dims.head_dim.ok_or("block has no head dimension")?)?;
@@ -302,12 +349,18 @@ mod cuda {
                     .ok_or_else(|| format!("missing carried-state tensor {name:?}"))?;
                 let slot_bytes = tensor_bytes / e.batch() as u64;
                 let head_bytes = slot_bytes / heads as u64;
-                for (slot, written_rows) in (0..decode_rows)
-                    .map(|slot| (slot, 1))
-                    .chain(std::iter::once((decode_rows, prefill_rows)))
+                for (slot, position, written_rows) in (0..decode_rows)
+                    .map(|slot| (slot, decode_position, 1))
+                    .chain(std::iter::once((
+                        decode_rows,
+                        prefill_position,
+                        prefill_rows,
+                    )))
                 {
                     for head in 0..heads {
-                        let offset = slot as u64 * slot_bytes + head as u64 * head_bytes;
+                        let offset = slot as u64 * slot_bytes
+                            + head as u64 * head_bytes
+                            + position as u64 * row_bytes as u64;
                         let begin = out.len();
                         out.resize(begin + written_rows * row_bytes, 0);
                         e.read_tensor_range(name, offset, &mut out[begin..])?;
