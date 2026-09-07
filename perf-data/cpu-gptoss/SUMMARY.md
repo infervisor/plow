@@ -388,3 +388,33 @@ same size, so they cancel.
 Worth knowing for anyone tempted by the same idea: widening the ladder also doubles the sliding
 layers' KV ring, since it is `next_pow2(window + chunk - 1)` = 2048 -> 4096. So it costs memory
 for no throughput.
+
+#### Follow-up: the 1024 boundary is real, but widening the bucket is worse (confirmed)
+
+Crossing the top bucket costs a fixed extra pass, measured with `cpu_bench` on the default ladder:
+
+| prompt | TTFT | note |
+|---|---|---|
+| 1024 | 2045.6 ms | one chunk |
+| 1088 | 2503.0 ms | 1024 + 64: **+457 ms for 64 more tokens** |
+| 1111 | 2528.1 ms | 1024 + 87 |
+| 1152 | 2609.5 ms | 1024 + 128 |
+
+So the tail chunk really does pay a full weight sweep. But replacing the pair with a single wider
+pass costs MORE, not less. Interleaved A/B at 1111 tokens, 3 pairs:
+
+| | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| default (1024 + 87) | 2490.0 | 2491.9 | 2553.2 | **2491.9** |
+| single 2048 bucket | 2613.9 | 2607.1 | 2646.8 | **2613.9** |
+
+The 2048 program is enough worse per row that it more than gives back the saved sweep. With
+power-of-two programs and this cost structure, two chunks is already the cheaper option for a
+1111-token prompt, so there is no bucket-ladder win available here.
+
+Also worth recording: serve adds almost nothing. `cpu_bench` TTFT at 1111 tokens is 2446-2528 ms
+against serve's 2471, so the summarize c=1 gap to vLLM (1829 ms) is entirely prefill compute, not
+request handling. Closing it needs ~27% more prefill throughput. Worker idle at 1024 tokens is 15%
+of wall (busy mean 1514.8, min 1461.4, max 1620.5 against a 1780.3 ms wall), of which only the
+~106 ms mean-to-max spread is imbalance; the rest is dependency stalls on the critical path. That
+caps the remaining bit-exact headroom well below what the cell needs.
