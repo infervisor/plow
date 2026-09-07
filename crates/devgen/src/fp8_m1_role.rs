@@ -34,10 +34,7 @@ pub fn apply(
         return Err("invalid FP8 M1 role selection".into());
     }
     plow_asset::program::with_model(model, |p| {
-        for &pc in &sel.pcs {
-            plow_asset::fp8_m1_role::validate(p, sel.program, pc)?;
-        }
-        Ok::<_, String>(())
+        plow_asset::fp8_m1_role::validate_all(p, sel.program, &sel.pcs)
     })?;
     let p = &model.progs[sel.program];
     if p.hier_base != 0
