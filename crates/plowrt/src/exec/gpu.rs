@@ -146,6 +146,101 @@ fn read_cubin_candidate(path: &Path) -> Option<Vec<u8>> {
     cubin::is_elf64_le(&image).then_some(image)
 }
 
+fn interp_candidate(
+    image: &[u8],
+    profile: &InterpreterProfile,
+    want_sm: u32,
+    role: Role,
+) -> std::result::Result<String, String> {
+    let Some(info) = cubin::inspect(image) else {
+        return Err("not an ELF cubin".into());
+    };
+    if cubin::global_u32(image, plow_asset::mixed_step::OBJECT_CAPABILITY).is_some() {
+        return Err("mixed-step auxiliary object is not an ordinary interpreter".into());
+    }
+    if info.sm != want_sm {
+        return Err(format!("built for sm_{}, device is sm_{want_sm}", info.sm));
+    }
+    match info.interp_entry(role) {
+        Some(sym) => Ok(sym.to_string()),
+        None if info.entries.is_empty() => Ok(profile.symbol(role).to_string()),
+        None => Err(format!(
+            "no {} entry — has {}",
+            role.as_str(),
+            cubin::describe(image)
+        )),
+    }
+}
+
+fn embedded_interp_image(
+    blob: &DevBlob,
+    raw: &[u8],
+    profile: &InterpreterProfile,
+    want_sm: u32,
+    role: Role,
+    rejected: &mut Vec<String>,
+) -> Option<InterpImage> {
+    for s in blob
+        .sections
+        .iter()
+        .filter(|s| s.kind == packet::devbuild::SECT_CUBIN)
+    {
+        let Some(data) = raw.get(s.offset..s.offset + s.size) else {
+            continue;
+        };
+        match interp_candidate(data, profile, want_sm, role) {
+            Ok(entry) => {
+                return Some(InterpImage {
+                    image: data.to_vec(),
+                    entry,
+                    source: format!("embedded section '{}'", s.name),
+                })
+            }
+            Err(why) => rejected.push(format!("embedded '{}': {why}", s.name)),
+        }
+    }
+    None
+}
+
+fn filesystem_interp_image(
+    assets_dir: &Path,
+    profile: &InterpreterProfile,
+    want_sm: u32,
+    role: Role,
+    rejected: &mut Vec<String>,
+) -> Option<InterpImage> {
+    let mut paths = vec![assets_dir.join(profile.file(role))];
+    if let Ok(rd) = std::fs::read_dir(assets_dir) {
+        let mut rest: Vec<std::path::PathBuf> = rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p != &paths[0])
+            .collect();
+        rest.sort();
+        paths.extend(rest);
+    }
+    for path in paths {
+        let Some(image) = read_cubin_candidate(&path) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        match interp_candidate(&image, profile, want_sm, role) {
+            Ok(entry) => {
+                return Some(InterpImage {
+                    image,
+                    entry,
+                    source: name,
+                })
+            }
+            Err(why) => rejected.push(format!("{name}: {why}")),
+        }
+    }
+    None
+}
+
 /// Find the interpreter object for `role` BY CONTENT.
 ///
 /// A cubin names its own SM (`e_flags`) and its own entry points (`.symtab`),
@@ -179,23 +274,7 @@ fn resolve_interp_image(
     // `None` from `inspect` means unparseable, not "no entry" — a hand-built
     // object with a stripped symbol table still loads under the profile's
     // expected symbol, which is what the pre-discovery loader always did.
-    let judge = |image: &[u8]| -> std::result::Result<String, String> {
-        let Some(info) = cubin::inspect(image) else {
-            return Err("not an ELF cubin".into());
-        };
-        if info.sm != want_sm {
-            return Err(format!("built for sm_{}, device is sm_{want_sm}", info.sm));
-        }
-        match info.interp_entry(role) {
-            Some(sym) => Ok(sym.to_string()),
-            None if info.entries.is_empty() => Ok(profile.symbol(role).to_string()),
-            None => Err(format!(
-                "no {} entry — has {}",
-                role.as_str(),
-                cubin::describe(image)
-            )),
-        }
-    };
+    let judge = |image: &[u8]| interp_candidate(image, profile, want_sm, role);
 
     // 1. Operator override: forced, and loud when wrong. The CLI flag is read
     // as well as the env var — declaring `--nv-cubin` and then consulting only
@@ -228,56 +307,22 @@ fn resolve_interp_image(
     // 2. Embedded sections. The section NAME is not load-bearing: `plowc
     //    --embed-cubin` labels every image `interp_sm120` regardless of the arch
     //    it just compiled, so only the content can decide.
-    for s in blob
-        .sections
-        .iter()
-        .filter(|s| s.kind == packet::devbuild::SECT_CUBIN)
+    if let Some(image) =
+        embedded_interp_image(blob, raw, profile, want_sm, role, &mut rejected)
     {
-        let Some(data) = raw.get(s.offset..s.offset + s.size) else {
-            continue;
-        };
-        match judge(data) {
-            Ok(entry) => {
-                return Ok(Some(InterpImage {
-                    image: data.to_vec(),
-                    entry,
-                    source: format!("embedded section '{}'", s.name),
-                }))
-            }
-            Err(why) => rejected.push(format!("embedded '{}': {why}", s.name)),
-        }
+        return Ok(Some(image));
     }
 
     // 3. The assets dir — the profile's expected name first, then everything
     //    else that looks like a cubin, so a misnamed bundle still serves.
-    let mut paths = vec![assets_dir.join(profile.file(role))];
-    if let Ok(rd) = std::fs::read_dir(assets_dir) {
-        let mut rest: Vec<std::path::PathBuf> = rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p != &paths[0])
-            .collect();
-        rest.sort();
-        paths.extend(rest);
-    }
-    for path in paths {
-        let Some(image) = read_cubin_candidate(&path) else {
-            continue;
-        };
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        match judge(&image) {
-            Ok(entry) => {
-                return Ok(Some(InterpImage {
-                    image,
-                    entry,
-                    source: name,
-                }))
-            }
-            Err(why) => rejected.push(format!("{name}: {why}")),
-        }
+    if let Some(image) = filesystem_interp_image(
+        assets_dir,
+        profile,
+        want_sm,
+        role,
+        &mut rejected,
+    ) {
+        return Ok(Some(image));
     }
 
     if !rejected.is_empty() {
@@ -7932,6 +7977,20 @@ mod slab_tests {
 mod profile_tests {
     use super::*;
 
+    fn prefill_images() -> (InterpreterProfile, Vec<u8>, Vec<u8>) {
+        let profile = interpreter_profile((9, 0)).unwrap();
+        let ordinary = plow_asset::cubin::synthetic_elf(profile.prefill_symbol, &[], 90);
+        let mixed = plow_asset::cubin::synthetic_elf(
+            profile.prefill_symbol,
+            &[(
+                plow_asset::mixed_step::OBJECT_CAPABILITY,
+                plow_asset::mixed_step::VERSION,
+            )],
+            90,
+        );
+        (profile, ordinary, mixed)
+    }
+
     #[test]
     fn selects_native_hopper_for_h100_and_h200() {
         let p = interpreter_profile((9, 0)).unwrap();
@@ -7947,6 +8006,83 @@ mod profile_tests {
         assert_eq!(p.prefill_symbol, "_Z15interp_sm120_pf11PlowProgram");
         assert!(interpreter_profile((8, 9)).is_none());
         assert!(interpreter_profile((10, 0)).is_none());
+    }
+
+    #[test]
+    fn auxiliary_mixed_object_cannot_win_ordinary_prefill_discovery() {
+        let (profile, ordinary, mixed) = prefill_images();
+        assert_eq!(
+            interp_candidate(&ordinary, &profile, 90, Role::Prefill).unwrap(),
+            profile.prefill_symbol
+        );
+        assert!(interp_candidate(&mixed, &profile, 90, Role::Prefill)
+            .unwrap_err()
+            .contains("mixed-step auxiliary object"));
+    }
+
+    #[test]
+    fn embedded_mixed_object_is_skipped_for_ordinary_prefill() {
+        use crate::asset::devblob::DevSection;
+
+        let (profile, ordinary, mixed) = prefill_images();
+        let mut raw = mixed.clone();
+        raw.extend_from_slice(&ordinary);
+        let blob = DevBlob {
+            n_cu: 0,
+            flags: 0,
+            target: 0,
+            tensors: Vec::new(),
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            progs: Vec::new(),
+            sections: vec![
+                DevSection {
+                    kind: packet::devbuild::SECT_CUBIN,
+                    name: "mixed".into(),
+                    offset: 0,
+                    size: mixed.len(),
+                },
+                DevSection {
+                    kind: packet::devbuild::SECT_CUBIN,
+                    name: "ordinary".into(),
+                    offset: mixed.len(),
+                    size: ordinary.len(),
+                },
+            ],
+            gen: Vec::new(),
+            tp: None,
+        };
+        let mut rejected = Vec::new();
+        let selected =
+            embedded_interp_image(&blob, &raw, &profile, 90, Role::Prefill, &mut rejected)
+                .unwrap();
+        assert_eq!(selected.image, ordinary);
+        assert_eq!(selected.source, "embedded section 'ordinary'");
+        assert!(rejected[0].contains("mixed-step auxiliary object"));
+    }
+
+    #[test]
+    fn filesystem_mixed_object_is_skipped_for_ordinary_prefill() {
+        let (profile, ordinary, mixed) = prefill_images();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "plow-interp-discovery-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join(profile.prefill_file), mixed).unwrap();
+        std::fs::write(dir.join("ordinary.cubin"), &ordinary).unwrap();
+
+        let mut rejected = Vec::new();
+        let selected =
+            filesystem_interp_image(&dir, &profile, 90, Role::Prefill, &mut rejected).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(selected.image, ordinary);
+        assert_eq!(selected.source, "ordinary.cubin");
+        assert!(rejected[0].contains("mixed-step auxiliary object"));
     }
 }
 
