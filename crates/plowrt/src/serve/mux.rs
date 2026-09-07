@@ -1328,14 +1328,6 @@ fn run_one_tick(
                         if slot.step != 0 || slot.respond.is_closed() {
                             continue;
                         }
-                        let available = slot
-                            .prompt_ids
-                            .len()
-                            .saturating_sub(1)
-                            .saturating_sub(slot.pf_pos);
-                        if available == 0 {
-                            continue;
-                        }
                         if slot.pf_pos == 0 {
                             let reserve = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
                             if let Err(err) = e.begin_slot(i, reserve) {
@@ -1353,8 +1345,36 @@ fn run_one_tick(
                                 }
                                 continue;
                             }
+                            let attached = {
+                                let request = slots[i].as_ref().expect("checked Some");
+                                e.attach_prompt(i, &request.prompt_ids)
+                            };
+                            match attached {
+                                Ok(frontier) => {
+                                    let request = slots[i].as_mut().expect("checked Some");
+                                    request.pf_pos = frontier;
+                                    request.cached_tokens = e.attached_rows(i) as usize;
+                                }
+                                Err(err) => {
+                                    note_fault(&mut tick_fault, &err);
+                                    if let Some(taken) = slots[i].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken.respond.try_send(StreamChunk::Err(err));
+                                    }
+                                    continue;
+                                }
+                            }
                         }
-                        let start = slots[i].as_ref().expect("checked Some").pf_pos;
+                        let request = slots[i].as_ref().expect("checked Some");
+                        let start = request.pf_pos;
+                        let available = request
+                            .prompt_ids
+                            .len()
+                            .saturating_sub(1)
+                            .saturating_sub(start);
+                        if available == 0 {
+                            continue;
+                        }
                         let take = available.min(remaining).min(pf_chunk_rows());
                         pack.push((i, start, take));
                         remaining -= take;

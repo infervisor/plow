@@ -4723,11 +4723,9 @@ impl GpuEngine {
         self.vmm_attached.get(b).copied().unwrap_or(0)
     }
 
-    /// Prefix-cache attach for the DECODE-ONLY prompt path (no prefill
-    /// object): consult the cache once for a fresh slot and return the row
-    /// the caller should resume feeding from — the attached rows' KV is
-    /// already mapped, so only the tail goes through per-token decode steps.
-    /// A no-op (returns 0) with VMM off or on a warm slot.
+    /// Prefix-cache attach for a fresh slot. The attached rows' KV is already
+    /// mapped, so decode-only and mixed-prefill callers feed only the tail. A
+    /// no-op (returns 0) with VMM off or on a warm slot.
     pub fn attach_prompt(&mut self, b: usize, prompt: &[u32]) -> Result<usize> {
         if self.pos[b] == 0 && self.vmm_prefix_enabled() {
             self.vmm_attach(b, prompt)?;
