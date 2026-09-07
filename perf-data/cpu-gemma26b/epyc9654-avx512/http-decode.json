@@ -1,0 +1,72 @@
+{
+  "model": "gemma-4-26b-a4b-it-cpu",
+  "concurrency": 4,
+  "seconds": 16.225248168979306,
+  "output_tokens_per_second": 31.55575770969602,
+  "results": [
+    {
+      "prompt": "Explain how a refrigerator transfers heat. Use about 150 words.",
+      "text": "A refrigerator transfers heat through a continuous cycle involving a chemical refrigerant that changes states between liquid and gas. This process relies on the principle that substances absorb heat when they evaporate and release heat when they condense.\n\nThe cycle begins with the **evaporator coils** located inside the fridge. As the cold, liquid refrigerant flows through these coils, it absorbs heat from the food and air inside, causing the refrigerant to evaporate into a gas. This gas is then sucked into a **compressor**, which squeezes the molecules together, significantly increasing the gas's pressure and temperature.\n\nThe hot, high-pressure gas travels to the **cond",
+      "seconds": 15.868841613002587,
+      "ttft_seconds": 0.3842183320084587,
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 28,
+        "completion_tokens": 128,
+        "total_tokens": 156,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "mean_post_first_token_ms": 121.9261675668829
+    },
+    {
+      "prompt": "Explain why the sky appears blue. Use about 150 words.",
+      "text": "The sky appears blue due to a phenomenon called **Rayleigh scattering**. As sunlight reaches Earth's atmosphere, it strikes molecules of nitrogen and oxygen, causing the light to scatter in all directions.\n\nSunlight is composed of a spectrum of colors, each traveling in waves of different lengths. Red light travels in long, lazy waves, while blue and violet light travel in much shorter, smaller waves. Because blue light waves are shorter, they strike the gas molecules in the atmosphere more frequently and scatter much more efficiently than the longer red waves.\n\nWhile violet light actually scatters even more than blue, our eyes are significantly more sensitive to blue",
+      "seconds": 15.994269280985463,
+      "ttft_seconds": 0.8348199349711649,
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 28,
+        "completion_tokens": 128,
+        "total_tokens": 156,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "mean_post_first_token_ms": 119.36574288200235
+    },
+    {
+      "prompt": "Explain how a bicycle stays balanced while moving. Use about 150 words.",
+      "text": "A bicycle stays balanced through a combination of physics principles, primarily **gyroscopic effects**, **caster effects**, and **steering geometry**.\n\nWhile many believe the spinning wheels act like gyroscopes to keep the bike upright, this effect is actually quite weak at low speeds. The true secret lies in the bike's design, specifically the \"trail\" created by the front fork angle. This geometry creates a self-correcting mechanism similar to a shopping cart wheel. If the bike begins to lean to one side, the front wheel naturally turns into the direction of the lean. This steering adjustment moves the contact patch of the tires back under the",
+      "seconds": 16.115603259007912,
+      "ttft_seconds": 1.3235881910077296,
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 30,
+        "completion_tokens": 128,
+        "total_tokens": 158,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "mean_post_first_token_ms": 116.47255959055262
+    },
+    {
+      "prompt": "Explain how plants turn sunlight into stored energy. Use about 150 words.",
+      "text": "Plants transform sunlight into stored energy through a biological process called **photosynthesis**. This complex transformation occurs primarily within the leaves, inside specialized organelles known as **chloroplasts**.\n\nThe process begins when a green pigment called **chlorophyll** absorbs light energy from the sun. Using this energy, the plant takes in water from its roots and carbon dioxide from the air. Through a series of chemical reactions, the plant breaks these molecules apart and rearranges them to create **glucose**, a simple sugar.\n\nThis glucose serves as the plant's primary fuel source, providing the energy needed for growth, reproduction, and repair. Any excess glucose is",
+      "seconds": 16.221925379009917,
+      "ttft_seconds": 1.837585526984185,
+      "finish_reason": "length",
+      "usage": {
+        "prompt_tokens": 30,
+        "completion_tokens": 128,
+        "total_tokens": 158,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "mean_post_first_token_ms": 113.26251851988766
+    }
+  ]
+}

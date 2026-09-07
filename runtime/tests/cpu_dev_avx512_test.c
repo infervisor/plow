@@ -278,8 +278,9 @@ static void test_embed(uint32_t ntok, uint32_t hidden) {
 static void test_argmax(uint32_t n, uint32_t B) {
     plow_bf16* x = rand_bf16((size_t)B * n, 20.0f);
     /* Force a few exact ties and negative-heavy rows to exercise the key order. */
-    x[7] = x[3];
+    x[7] = x[3] = plow_f2bf(100.0f);
     for (uint32_t i = 0; i < n; i++) x[(size_t)(B - 1) * n + i] = plow_f2bf(-fabsf(plow_bf2f(x[(size_t)(B - 1) * n + i])) - 1.0f);
+    x[(size_t)(B - 1) * n + 3] = x[(size_t)(B - 1) * n + 7] = plow_f2bf(-0.0f);
     uint64_t *part = calloc(B * 16, 8), *rpart = calloc(B * 16, 8);
     int32_t ids[4], rids[4];
     void* T[2] = {part, x};
@@ -563,6 +564,31 @@ static void bench_stream(void) {
  * is linked (plowrt build.rs) — a whole-archive link or a non-weak hook is the durable fix. */
 plow_cpu_kernel_fn volatile g_force_avx512_member = v_gemv;
 
+static void test_attn_res(uint32_t H, uint32_t nb, int norm, int push) {
+    const uint32_t rows = 5, cap = 17;
+    plow_bf16* prefix = rand_bf16(rows * H, 0.5f), *ring = rand_bf16(rows * cap * H, 0.5f);
+    plow_bf16* ring0 = malloc(rows * cap * H * 2), *ring_ref = malloc(rows * cap * H * 2);
+    plow_bf16* src = rand_bf16(rows * H, 0.5f), *gamma = rand_bf16(H, 1.0f);
+    plow_bf16* out = zeros_bf16(rows * H), *ref = zeros_bf16(rows * H);
+    float* weight = malloc(H * sizeof(float));
+    for (uint32_t i = 0; i < H; i++) weight[i] = frand() * 0.125f;
+    memcpy(ring0, ring, rows * cap * H * 2);
+    void* T[] = {out, prefix, ring, weight, push ? src : NULL, norm ? gamma : NULL};
+    PlowDevInst in = inst(PLOW_DOP_ATTN_RES);
+    for (uint32_t i = 0; i < 6; i++) in.t[i] = i;
+    in.i[0] = rows; in.i[1] = H; in.i[2] = nb; in.i[4] = cap; in.fj[0].f = 1e-6f;
+    for (uint32_t blocks = 1; blocks < 8; blocks += 3) {
+        memcpy(ring, ring0, rows * cap * H * 2);
+        run_all(g_attn_res, &in, blocks, T);
+        memcpy(ref, out, rows * H * 2); memcpy(ring_ref, ring, rows * cap * H * 2);
+        memcpy(ring, ring0, rows * cap * H * 2); memset(out, 0, rows * H * 2);
+        run_all(plow_cpu_kernel(in.op), &in, blocks, T);
+        cmp_bf16("attn_res", out, ref, rows * H);
+        CHECK(memcmp(ring, ring_ref, rows * cap * H * 2) == 0, "attn_res push");
+    }
+    free(prefix); free(ring); free(ring0); free(ring_ref); free(src); free(gamma); free(out); free(ref); free(weight);
+}
+
 int main(int argc, char** argv) {
     const int tier = plow_cpu_init(PLOW_CPU_ISA_AVX512);
     if (tier < PLOW_CPU_ISA_AVX512) {
@@ -574,6 +600,14 @@ int main(int argc, char** argv) {
     g_ctx.scratch = aligned_alloc(64, g_ctx.scratch_bytes);
     plow_cpu_thread_init(&g_ctx);
     if (argc > 1 && strcmp(argv[1], "--bench") == 0) { bench(); return 0; }
+
+    CHECK(plow_cpu_tier_of(PLOW_DOP_ATTN_RES) == PLOW_CPU_ISA_AVX512, "attn_res tier");
+    for (uint32_t nb = 0; nb <= 16; nb += 8)
+        for (int norm = 0; norm < 2; norm++)
+            for (int push = 0; push < 2; push++) {
+                test_attn_res(17, nb, norm, push);
+                test_attn_res(259, nb, norm, push);
+            }
 
     const uint32_t Ks[2] = {3840, 3872};
     for (int ki = 0; ki < 2; ki++) {

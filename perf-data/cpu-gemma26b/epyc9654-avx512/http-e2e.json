@@ -1,0 +1,117 @@
+{
+  "model": "gemma-4-26b-a4b-it-cpu",
+  "results": [
+    {
+      "case": "single",
+      "answer": "Paris",
+      "seconds": 0.434,
+      "first_content_seconds": null,
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 2,
+        "total_tokens": 27,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "case": "stream",
+      "answer": "Berlin",
+      "seconds": 0.428,
+      "first_content_seconds": 0.35870962403714657,
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 2,
+        "total_tokens": 27,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "case": "concurrent-Italy",
+      "answer": "Rome",
+      "seconds": 0.428,
+      "first_content_seconds": null,
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 2,
+        "total_tokens": 27,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "case": "concurrent-Japan",
+      "answer": "Tokyo",
+      "seconds": 0.851,
+      "first_content_seconds": null,
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 2,
+        "total_tokens": 27,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "case": "concurrent-Spain",
+      "answer": "Madrid",
+      "seconds": 1.853,
+      "first_content_seconds": null,
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 2,
+        "total_tokens": 27,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "case": "concurrent-Canada",
+      "answer": "Ottawa",
+      "seconds": 1.361,
+      "first_content_seconds": null,
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 2,
+        "total_tokens": 27,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "case": "multi-chunk-prefill",
+      "answer": "Paris",
+      "seconds": 4.094,
+      "first_content_seconds": null,
+      "usage": {
+        "prompt_tokens": 932,
+        "completion_tokens": 2,
+        "total_tokens": 934,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    },
+    {
+      "case": "reuse-after-disconnect",
+      "answer": "4",
+      "seconds": 0.486,
+      "first_content_seconds": null,
+      "usage": {
+        "prompt_tokens": 24,
+        "completion_tokens": 2,
+        "total_tokens": 26,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      }
+    }
+  ]
+}

@@ -70,11 +70,6 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
         v
     }
 
-    /// Whether the C compiler accepts `flag` (probed with an empty TU).
-    fn accepts(base: &cc::Build, flag: &str) -> bool {
-        base.is_flag_supported(flag).unwrap_or(false)
-    }
-
     fn base(root: &Path) -> cc::Build {
         let mut b = cc::Build::new();
         b.include(root.join("runtime/common"))
@@ -119,7 +114,9 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
         if plain.is_empty() && avx.is_empty() && amx.is_empty() {
             std::fs::write(&stub, STUB).unwrap();
             plain_srcs.push(stub);
-            println!("cargo:warning=runtime/cpu/dev has no kernel sources yet; linking the no-op stub");
+            println!(
+                "cargo:warning=runtime/cpu/dev has no kernel sources yet; linking the no-op stub"
+            );
         }
         let probe = out.join("cpu_dev_abi_probe.c");
         std::fs::write(&probe, ABI_PROBE).unwrap();
@@ -140,9 +137,6 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
             ] {
                 b.flag(f);
             }
-            if accepts(&b, "-mavx512fp16") {
-                b.flag("-mavx512fp16");
-            }
             b.files(&avx);
             objects.extend(b.compile_intermediates());
         }
@@ -159,9 +153,6 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
                 "-mamx-int8",
             ] {
                 b.flag(f);
-            }
-            if accepts(&b, "-mavx512fp16") {
-                b.flag("-mavx512fp16");
             }
             b.files(&amx);
             objects.extend(b.compile_intermediates());
@@ -182,6 +173,5 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
         println!("cargo:rustc-link-lib=static=plow_cpu_dev");
         // libm for the golden kernels' expf/tanhf/etc.
         println!("cargo:rustc-link-lib=m");
-
     }
 }

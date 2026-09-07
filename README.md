@@ -209,6 +209,9 @@ jq -r .network "$ASSETS/weights.json"
 Streaming: `"stream": true`. Also `/healthz`, `/metrics`. Multiple
 `--assets DIR` register more models.
 
+For CPU-only builds, AVX-512 coverage, and NUMA placement, see
+[CPU execution](docs/runtime/cpu.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Please follow the

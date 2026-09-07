@@ -164,7 +164,8 @@ pub struct CpuRuntimeConfig {
     )]
     pub threads: u32,
 
-    /// NUMA placement: `auto` (all nodes), `off`, or a node list (`0,1`).
+    /// NUMA: auto interleaves large tensors across allowed nodes (best effort);
+    /// off keeps OS memory policy; a node list (0,1) requires successful placement.
     #[arg(
         long = "cpu-numa",
         env = "PLOW_CPU_NUMA",

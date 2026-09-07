@@ -65,3 +65,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Type-check
         run: cargo check --workspace --all-targets
+      - name: CPU runtime
+        run: cargo test -p plowrt --no-default-features --features cpu
+      - name: CPU kernel oracles
+        run: |
+          cmake -S runtime -B build-cpu -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-cpu --parallel 2
+          ctest --test-dir build-cpu -R cpu_dev --output-on-failure --parallel 2

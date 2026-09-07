@@ -60,7 +60,7 @@ fn live_slot_lifecycle_with_gaps() {
     let tok = plowrt::text::tokenizer::load_tokenizer(&ckpt);
     let prompt = |q: &str| {
         tok.encode_with_special_tokens(
-            &format!("<bos><start_of_turn>user\n{q}<end_of_turn>\n<start_of_turn>model\n"),
+            &format!("<bos><|turn>user\n{q}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
             true,
         )
     };
@@ -97,7 +97,7 @@ fn live_slot_lifecycle_with_gaps() {
 
     // Decode a few greedy tokens on slot 2 and check the answer is sane (Rome, possibly
     // wrapped in Gemma-4 thinking tokens).
-    let mut ids = vec![t2];
+    let mut ids = vec![t2, o3[2].1, o4[1].1, _o5[2].1];
     let mut last = _o6[0].1;
     for _ in 0..8 {
         ids.push(last);

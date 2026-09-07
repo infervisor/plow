@@ -360,6 +360,9 @@ V_K(v_gemv_argmax) {
  * satisfies the symbol. Called by plow_cpu_init after the golden registrar when cpuid
  * reports AVX-512 F/BW/VL/BF16. */
 void plow_cpu_register_avx512(plow_cpu_kernel_fn* tab) {
+    v_register_gemm(tab);
+    v_register_gemm_quant(tab);
+    tab[PLOW_DOP_ATTN_RES] = v_attn_res;
     tab[PLOW_DOP_RESIDUAL] = v_residual;
     tab[PLOW_DOP_GLU] = v_glu;
     tab[PLOW_DOP_SOFTCAP] = v_softcap;

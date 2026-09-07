@@ -2392,6 +2392,8 @@ async fn bringup_runtime(
     let vendor = backend.vendor();
     if vendor.is_some() {
         tracing::info!(class = ?backend.class(), vendor = ?vendor, "backend ready — GPU accelerated");
+    } else if cfg!(feature = "cpu") {
+        tracing::info!("CPU execution selected; native engine enabled for device blobs");
     } else {
         tracing::warn!("╔══════════════════════════════════════════════════════════════════╗");
         tracing::warn!("║  WARNING: No GPU backend available — falling back to CPU!       ║");
@@ -2410,6 +2412,11 @@ async fn bringup_runtime(
         let target_vendor = hwspec::registry::lookup(&target).map(|s| s.vendor);
         if target_vendor.is_some() && target_vendor == vendor {
             tracing::info!(dir = %dir.display(), %target, "loaded model bundle");
+        } else if cfg!(feature = "cpu")
+            && vendor.is_none()
+            && plowrt::asset::devblob::DevBlob::find_in_dir(dir)?.is_some()
+        {
+            tracing::info!(dir = %dir.display(), %target, "loaded model bundle for CPU engine");
         } else {
             tracing::warn!(
                 dir = %dir.display(), %target,

@@ -26,9 +26,9 @@ pub struct Topology {
 /// Which NUMA nodes the pool spreads over (`--cpu-numa`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NumaMode {
-    /// Every online node, one queue/arena policy per node.
+    /// Every allowed node, with interleaved large model allocations.
     Auto,
-    /// Ignore topology: one node, no pinning by node.
+    /// Use all allowed CPUs without changing memory placement.
     Off,
     /// Restrict to these nodes.
     Nodes(Vec<u32>),
@@ -41,9 +41,24 @@ impl std::str::FromStr for NumaMode {
             "auto" | "" => Ok(NumaMode::Auto),
             "off" | "none" => Ok(NumaMode::Off),
             list => {
+                if list.split(',').any(|part| {
+                    let mut ends = part.trim().split('-');
+                    let a = ends.next().unwrap_or("").parse::<u32>();
+                    let b = ends.next().map(str::parse::<u32>);
+                    ends.next().is_some()
+                        || match (a, b) {
+                            (Ok(a), Some(Ok(b))) => a > b || b - a > 4096,
+                            (Ok(_), None) => false,
+                            _ => true,
+                        }
+                }) {
+                    return Err(format!("invalid NUMA node list: {s:?}"));
+                }
                 let nodes = parse_cpulist(list);
                 if nodes.is_empty() {
-                    return Err(format!("--cpu-numa: expected auto|off|<node list>, got {s:?}"));
+                    return Err(format!(
+                        "--cpu-numa: expected auto|off|<node list>, got {s:?}"
+                    ));
                 }
                 Ok(NumaMode::Nodes(nodes))
             }
@@ -96,12 +111,13 @@ impl Topology {
         };
         let mut cores: Vec<Core> = Vec::new();
         for &cpu in &online {
-            let sib = siblings
+            let mut sib = siblings
                 .iter()
                 .find(|(c, _)| *c == cpu)
                 .map(|(_, l)| parse_cpulist(l))
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| vec![cpu]);
+            sib.retain(|c| online.binary_search(c).is_ok());
             let rep = *sib.iter().min().unwrap_or(&cpu);
             if rep != cpu || cores.iter().any(|c| c.cpu == rep) {
                 continue;
@@ -112,10 +128,7 @@ impl Topology {
                 siblings: sib,
             });
         }
-        let mut nodes: Vec<u32> = node_cpulists.iter().map(|(n, _)| *n).collect();
-        if nodes.is_empty() {
-            nodes.push(0);
-        }
+        let mut nodes: Vec<u32> = cores.iter().map(|c| c.node).collect();
         nodes.sort_unstable();
         nodes.dedup();
         Topology { cores, nodes }
@@ -124,7 +137,22 @@ impl Topology {
     /// Read the live sysfs tree; fall back to `available_parallelism` on node 0.
     pub fn detect() -> Topology {
         let root = Path::new("/sys/devices/system");
-        let online = std::fs::read_to_string(root.join("cpu/online")).unwrap_or_default();
+        let mut online = std::fs::read_to_string(root.join("cpu/online")).unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        if let Ok(status) = std::fs::read_to_string("/proc/thread-self/status") {
+            if let Some(allowed) = status
+                .lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            {
+                let allowed = parse_cpulist(allowed);
+                online = parse_cpulist(&online)
+                    .into_iter()
+                    .filter(|c| allowed.binary_search(c).is_ok())
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+            }
+        }
         if online.trim().is_empty() {
             return Topology::fallback();
         }
@@ -141,7 +169,10 @@ impl Topology {
             for e in rd.flatten() {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
-                if let Some(n) = name.strip_prefix("node").and_then(|n| n.parse::<u32>().ok()) {
+                if let Some(n) = name
+                    .strip_prefix("node")
+                    .and_then(|n| n.parse::<u32>().ok())
+                {
                     if let Ok(l) = std::fs::read_to_string(e.path().join("cpulist")) {
                         if !l.trim().is_empty() {
                             node_text.push((n, l));
@@ -180,17 +211,43 @@ impl Topology {
         self.cores.len()
     }
 
+    pub fn worker_cpus(&self, nodes: &[u32]) -> Vec<(u32, u32)> {
+        let groups: Vec<Vec<&Core>> = nodes
+            .iter()
+            .map(|&n| self.cores_on_node(n).collect())
+            .collect();
+        let ranks = self
+            .cores
+            .iter()
+            .map(|c| c.siblings.len())
+            .max()
+            .unwrap_or(0);
+        let width = groups.iter().map(Vec::len).max().unwrap_or(0);
+        let mut cpus = Vec::new();
+        for rank in 0..ranks {
+            for i in 0..width {
+                for cores in &groups {
+                    if let Some(c) = cores.get(i) {
+                        if let Some(&cpu) = c.siblings.get(rank) {
+                            cpus.push((cpu, c.node));
+                        }
+                    }
+                }
+            }
+        }
+        cpus
+    }
+
     /// Cores on `node`, ascending.
     pub fn cores_on_node(&self, node: u32) -> impl Iterator<Item = &Core> {
         self.cores.iter().filter(move |c| c.node == node)
     }
 
-    /// The node set a [`NumaMode`] selects, in ascending order (never empty:
-    /// `Off` collapses to `[0]`, `Nodes` keeps only nodes that exist).
+    /// The node set used for worker placement. Validate explicit nodes before loading.
     pub fn select_nodes(&self, mode: &NumaMode) -> Vec<u32> {
         match mode {
             NumaMode::Auto => self.nodes.clone(),
-            NumaMode::Off => vec![self.nodes.first().copied().unwrap_or(0)],
+            NumaMode::Off => self.nodes.clone(),
             NumaMode::Nodes(list) => {
                 let v: Vec<u32> = list
                     .iter()
@@ -231,15 +288,72 @@ mod tests {
         assert_eq!(t.cores[1].cpu, 1);
         assert_eq!(t.cores[1].node, 1);
         assert_eq!(t.nodes, vec![0, 1]);
-        assert_eq!(t.select_nodes(&NumaMode::Off), vec![0]);
+        assert_eq!(t.select_nodes(&NumaMode::Off), vec![0, 1]);
         assert_eq!(t.select_nodes(&NumaMode::Nodes(vec![7, 1])), vec![1]);
+    }
+
+    #[test]
+    fn restricted_siblings_keep_allowed_representative() {
+        let t = Topology::from_sysfs_text(
+            "2-3",
+            &[(2, "0,2"), (3, "1,3")],
+            &[(0, "0,2"), (1, "1,3"), (2, "4-5")],
+        );
+        assert_eq!(
+            t.cores.iter().map(|c| c.cpu).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(t.cores[0].siblings, vec![2]);
+        assert_eq!(t.nodes, vec![0, 1]);
+    }
+
+    #[test]
+    fn placement_spreads_cores_before_smt() {
+        let t = Topology::from_sysfs_text(
+            "0-5",
+            &[
+                (0, "0,3"),
+                (1, "1,4"),
+                (2, "2,5"),
+                (3, "0,3"),
+                (4, "1,4"),
+                (5, "2,5"),
+            ],
+            &[(0, "0-1,3-4"), (1, "2,5")],
+        );
+        assert_eq!(
+            t.worker_cpus(&t.nodes),
+            vec![(0, 0), (2, 1), (1, 0), (3, 0), (5, 1), (4, 0)]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn detected_cpus_respect_thread_affinity() {
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let allowed = parse_cpulist(
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+                .unwrap(),
+        );
+        let t = Topology::detect();
+        let cpus = t.worker_cpus(&t.nodes);
+        assert!(!cpus.is_empty());
+        assert!(cpus.iter().all(|(c, _)| allowed.contains(c)));
+        assert_eq!(cpus.len(), allowed.len());
     }
 
     #[test]
     fn numa_mode_parses() {
         assert_eq!("auto".parse::<NumaMode>().unwrap(), NumaMode::Auto);
         assert_eq!("off".parse::<NumaMode>().unwrap(), NumaMode::Off);
-        assert_eq!("0,2".parse::<NumaMode>().unwrap(), NumaMode::Nodes(vec![0, 2]));
-        assert!("bogus".parse::<NumaMode>().is_err());
+        assert_eq!(
+            "0,2".parse::<NumaMode>().unwrap(),
+            NumaMode::Nodes(vec![0, 2])
+        );
+        for bad in ["bogus", "0,bogus", "3-1", "0,", "-1", "0-4294967295"] {
+            assert!(bad.parse::<NumaMode>().is_err(), "{bad}");
+        }
     }
 }

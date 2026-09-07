@@ -10,6 +10,8 @@
     void name(const PlowDevInst* in, uint32_t slice, uint32_t nblk, void* const* T, PlowCpuCtx* ctx)
 
 /* gemv.c */
+void v_register_gemm(plow_cpu_kernel_fn* tab);
+void v_register_gemm_quant(plow_cpu_kernel_fn* tab);
 V_K(v_gemv);
 V_K(v_gemv_glu);
 V_K(v_gemv_qkv);
@@ -35,6 +37,7 @@ V_K(v_headnorm_rope);
 V_K(v_flash_prefill);
 V_K(v_flash_decode);
 V_K(v_flash_merge);
+V_K(v_attn_res);
 void v_register_attention(plow_cpu_kernel_fn* tab);
 /* gptoss.c / moe.c */
 V_K(v_gemv_mxfp4);
@@ -203,15 +206,12 @@ static inline __m512i v_amax_key(__m512i b) {
 
 /* Reduce per-lane (key, index) bests to golden's packed u64 max. */
 static inline uint64_t v_amax_fold(__m512i keys, __m512i idx, uint64_t best) {
-    uint32_t k[16], ix[16];
-    _mm512_storeu_si512(k, keys);
-    _mm512_storeu_si512(ix, idx);
-    for (int l = 0; l < 16; l++) {
-        if (k[l] == 0u) continue; /* lane never saw an element */
-        const uint64_t p = ((uint64_t)k[l] << 32) | (uint64_t)(~ix[l]);
-        best = p > best ? p : best;
-    }
-    return best;
+    const uint32_t key = _mm512_reduce_max_epu32(keys);
+    if (key == 0u) return best;
+    const __mmask16 winners = _mm512_cmpeq_epi32_mask(keys, _mm512_set1_epi32((int)key));
+    const uint32_t index = _mm512_mask_reduce_min_epu32(winners, idx);
+    const uint64_t packed = ((uint64_t)key << 32) | (uint64_t)(~index);
+    return packed > best ? packed : best;
 }
 
 /* --- MoE selection key / top-k (golden route.c f32_key + moe_gemma.c gm_topk_tail) ------- */

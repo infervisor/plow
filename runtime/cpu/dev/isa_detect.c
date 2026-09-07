@@ -39,16 +39,18 @@ static int detect_isa(void) {
     if (!osxsave) return PLOW_CPU_ISA_SCALAR;
     const uint64_t xcr0 = xgetbv0();
     /* AVX-512 state: opmask (5), ZMM_Hi256 (6), Hi16_ZMM (7). */
-    if ((xcr0 & 0xE0u) != 0xE0u) return PLOW_CPU_ISA_SCALAR;
+    if ((xcr0 & 0xE6u) != 0xE6u) return PLOW_CPU_ISA_SCALAR;
     if (__get_cpuid_max(0, NULL) < 7) return PLOW_CPU_ISA_SCALAR;
     __cpuid_count(7, 0, a, b, c, d);
     const int f = (b >> 16) & 1, bw = (b >> 30) & 1, vl = (b >> 31) & 1;
     const int amx_bf16 = (d >> 22) & 1, amx_tile = (d >> 24) & 1;
+    const int vnni = (c >> 11) & 1, amx_int8 = (d >> 25) & 1;
+    if (a < 1) return PLOW_CPU_ISA_SCALAR;
     uint32_t a1, b1, c1, d1;
     __cpuid_count(7, 1, a1, b1, c1, d1);
     const int bf16 = (a1 >> 5) & 1;
-    if (!(f && bw && vl && bf16)) return PLOW_CPU_ISA_SCALAR;
-    if (!(amx_tile && amx_bf16)) return PLOW_CPU_ISA_AVX512;
+    if (!(f && bw && vl && bf16 && vnni)) return PLOW_CPU_ISA_SCALAR;
+    if (!(amx_tile && amx_bf16 && amx_int8)) return PLOW_CPU_ISA_AVX512;
 #if defined(__linux__)
     if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) != 0)
         return PLOW_CPU_ISA_AVX512;
@@ -93,6 +95,7 @@ int plow_cpu_init(int isa_cap) {
         plow_cpu_kernel_fn golden[PLOW_CPU_DOP_TABLE];
         memset(golden, 0, sizeof(golden));
         plow_cpu_register_golden(golden);
+        plow_cpu_register_golden_fp8(golden);
         for (const char* p = pin; *p;) {
             char* end;
             long op = strtol(p, &end, 10);
