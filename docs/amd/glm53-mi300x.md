@@ -181,6 +181,54 @@ variable with a SHELL BUILTIN — coreutils `env -u` is itself a system binary a
 `undefined symbol: __tunable_is_initialized`. `build-glm53/rocm-shim/bin/{rocminfo,vllm-cc}`.
 With those, vLLM 0.28 loads GLM-5.3 at TP4: 176.22 GiB/rank in 161.8 s.
 
+## 5d. All plow TP4 arms, same four cards, minutes apart
+
+| cell | metric | plow (analytical) | tp4m (measured tiles) | **tp4f (+ collective folds)** |
+|---|---|---:|---:|---:|
+| 1024 / c1 | tok/s | 23.78 | 23.97 | **24.20** |
+| 1024 / c1 | TTFT ms | 383 | 388 | 385 |
+| 1024 / c1 | TPOT ms | 38.70 | 38.59 | **38.21** |
+| 1024 / c4 | tok/s | 38.93 | 39.23 | **39.94** |
+| 1024 / c4 | TTFT ms | 840 | 844 | **835** |
+| 1024 / c4 | TPOT ms | 95.06 | 94.75 | **93.62** |
+| 4096 / c1 | tok/s | 18.31 | 17.66 | **19.22** |
+| 4096 / c1 | TTFT ms | 1024 | 1042 | 1030 |
+| 4096 / c1 | TPOT ms | 47.02 | 49.84 | **43.69** |
+| 4096 / c4 | tok/s | 29.48 | 29.05 | **29.59** |
+| 4096 / c4 | TTFT ms | 1698 | 1782 | **1692** |
+| 4096 / c4 | TPOT ms | 122.23 | 123.65 | 122.24 |
+
+**Measured tiles are a NULL on this model.** Every cell is inside this box's noise and the sign
+is not even consistent. The recipe ranks the tile campaign as lever #1, but that ranking was
+written when the store was stale and the prize was UNKNOWN. It is consistent with the GLM-5.2
+sweep's own note that "every GLM-5.2 narrow shape agrees" with the analytical model — the
+campaign CONFIRMS the model on GLM shapes rather than correcting it. Its value is that TTFT can
+now be REPORTED as measured-tile, not that it is faster. Do not re-run it expecting a win.
+
+**The collective folds are the only lever that paid** — see
+`glm53-collectives-packet-analysis.md`. Best arm in every cell, and clearly better at 4096/c1.
+
+## 5e. GLM_LINEAR_FP8 HANGS on GLM-5.3 / gfx942
+
+The fourth arm (`tp4q`: `GLM_LINEAR_FP8=1` against the `GLM-5.3-plow-q` weight dir, which keeps
+`o_proj` and the shared expert in their checkpoint block-fp8 form) loads and passes the
+coherence smoke, then hangs on the first benchmark cell: the server log stops at
+`decode ladder rung rung=1 occupied=1` and never advances, the four leased GPUs sit at 100%
+utilization producing no tokens, and the process burns 2685 s of CPU over 39 minutes. That is
+the persistent-megakernel spin. Torn down with TERM, never `-9` — the recipe records that a
+`-9` leaves the megakernel resident and wedges the box.
+
+The prep is exonerated: it republishes the checkpoint's own fp8 bytes and `[128,128]` scale
+grids VERBATIM (10.69 GB in 9 s, no requant), and the blob binds the right names —
+`plowrt disasm build-glm53/tp4q --program 1` shows `o_proj` served by `GemvFp8Blk` at `b=304`
+with its scale grid, 303 fp8 bindings in the decode program. The suspect is the decode-side
+`GemvFp8Blk` arm at these shapes. Diagnosing it needs a single-layer block harness, not a
+full-model serve.
+
+This parks the largest remaining decode lever: it would take ~2.7 GB/rank/token off a 16.0 GB
+stream, about −17% if decode were purely bandwidth-bound. The blob and the weight dir are both
+built and on disk, so the retry after a kernel fix is cheap.
+
 ## 6. Open levers, in the order worth taking
 
 1. **Measured GEMM tiles** (§5 caveat 2). Cheapest, and it gates the ranking of everything else.
