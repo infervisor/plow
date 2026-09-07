@@ -1300,13 +1300,16 @@ fn run_one_tick(
             // A mixed packet variant executes existing decode rows and a
             // prefix of waiting prefill rows in one compiler-emitted program.
             // Keep each prompt's last token for the ordinary decode path so
-            // it can produce that request's first output token.
+            // it can produce that request's first output token. Admit only a
+            // cold prefill span until repeated mixed-span parity is qualified.
             if !feeds.is_empty() && did_prefill {
                 let available_prefill: usize = slots
                     .iter()
                     .take(cap)
                     .filter_map(|slot| slot.as_ref())
-                    .filter(|slot| slot.step == 0 && !slot.respond.is_closed())
+                    .filter(|slot| {
+                        slot.step == 0 && slot.pf_pos == 0 && !slot.respond.is_closed()
+                    })
                     .map(|slot| {
                         slot.prompt_ids
                             .len()
@@ -1325,7 +1328,7 @@ fn run_one_tick(
                         let Some(slot) = slots[i].as_ref() else {
                             continue;
                         };
-                        if slot.step != 0 || slot.respond.is_closed() {
+                        if slot.step != 0 || slot.pf_pos != 0 || slot.respond.is_closed() {
                             continue;
                         }
                         if slot.pf_pos == 0 {
@@ -1366,6 +1369,9 @@ fn run_one_tick(
                             }
                         }
                         let request = slots[i].as_ref().expect("checked Some");
+                        if request.pf_pos != 0 {
+                            continue;
+                        }
                         let start = request.pf_pos;
                         let available = request
                             .prompt_ids
@@ -1415,6 +1421,14 @@ fn run_one_tick(
                         drop(prefill);
                         match mixed {
                             Ok(()) => {
+                                tracing::debug!(
+                                    decode = feeds.len(),
+                                    prefill = pack.len(),
+                                    prefill_rows =
+                                        pack.iter().map(|&(_, _, len)| len).sum::<usize>(),
+                                    rows,
+                                    "gpu: mixed prefill/decode launch"
+                                );
                                 for &(slot, start, len) in &pack {
                                     slots[slot].as_mut().expect("packed slot is Some").pf_pos =
                                         start + len;
