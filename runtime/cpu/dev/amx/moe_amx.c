@@ -259,7 +259,7 @@ X_K(x_moe_group_down_gemma_pf) {
     }
 }
 
-/* ---- GPT-OSS flat MXFP4 experts (149 GLU, 150 down): A tiles dequantized per K step ---------- */
+/* ---- GPT-OSS flat MXFP4 experts (152 GLU, 153 down): A tiles dequantized per K step ---------- */
 
 extern plow_mx_vlut plow_v_mx_lut; /* avx512/gptoss.c */
 
@@ -645,7 +645,7 @@ X_K(x_moe_down_mx_pf_i8) {
     }
 }
 
-/* 149: t0=fu_g t1=xn2 t2=W_gu t3=S_gu t4=meta t5=row_token t6=bias_gu?  i0=I i1=K i2=E i3=layout
+/* 152: t0=fu_g t1=xn2 t2=W_gu t3=S_gu t4=meta t5=row_token t6=bias_gu?  i0=I i1=K i2=E i3=layout
  * i5=act f0/f1. layout 0: gate row 2n / up row 2n+1 (stride 2 rows); 1: gate n / up I+n. */
 X_K(x_moe_glu_mx_pf) {
     if (moe_i8()) { x_moe_glu_mx_pf_i8(in, slice, nblk, T, ctx); return; }
@@ -737,7 +737,7 @@ X_K(x_moe_glu_mx_pf) {
     }
 }
 
-/* 150: t0=part t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx t7=row_gate  i0=H i1=I i2=E. */
+/* 153: t0=part t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx t7=row_gate  i0=H i1=I i2=E. */
 X_K(x_moe_down_mx_pf) {
     if (moe_i8()) { x_moe_down_mx_pf_i8(in, slice, nblk, T, ctx); return; }
     const uint32_t H = in->i[0], I = in->i[1], E = in->i[2];

@@ -84,7 +84,7 @@ enum {
     /* t0=out t1=gate t2=up             i0=n i1=act(0=gelu_tanh,1=silu,3=swiglu_oai)  f0=alpha f1=limit
      * Gemma is GeGLU (gelu_tanh), not SwiGLU.
      *
-     * ACT CODES, shared by every GLU-family op (5, 19, 20, 45, 48, 85, 147, 149):
+     * ACT CODES, shared by every GLU-family op (5, 19, 20, 45, 48, 85, 150, 152):
      *   0 gelu_tanh(g)*u   1 silu(g)*u   2 situ (Kimi-K3, op 105 documents it)
      *   3 swiglu_oai (GPT-OSS). PAIR FORM A(g)*B(u), like situ it transforms the UP branch:
      *        A(g) = min(g, limit) * sigmoid(alpha * min(g, limit))
