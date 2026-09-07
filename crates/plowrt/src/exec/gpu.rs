@@ -5584,23 +5584,19 @@ impl GpuEngine {
         let Some(ms) = self.multistep.as_ref() else {
             return Err(RuntimeError::Rejected("multi-step not enabled".into()));
         };
-        let (mut k, f_adv) = (ms.quantum.min(requested), ms.f_advance);
-        if feeds.is_empty() || k == 0 {
+        let f_adv = ms.f_advance;
+        let k = crate::sched::multistep::decode_quantum(
+            feeds.iter().map(|&(slot, _)| slot),
+            &self.pos,
+            self.max_ctx,
+            requested,
+            ms.quantum,
+        )
+        .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
+        if k == 0 {
             return Ok(k);
         }
         let bsz = self.batch;
-        for &(b, _) in feeds {
-            if b >= bsz {
-                return Err(RuntimeError::Rejected(format!("slot {b} out of range")));
-            }
-            if self.pos[b] as usize >= self.max_ctx {
-                return Err(RuntimeError::Rejected(format!(
-                    "context exhausted at {} (compiled max {})",
-                    self.pos[b], self.max_ctx
-                )));
-            }
-            k = k.min(self.max_ctx - self.pos[b] as usize);
-        }
         let rung = self.select_decode(feeds.iter().map(|&(slot, _)| slot))?;
         let launch_rows = self.selected_decode(rung).map_or(bsz, |r| r.rows);
         // VMM: map every row this quantum will write. Fed rows need the full

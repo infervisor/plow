@@ -87,7 +87,7 @@ CDNA3_TILE_4W="-DGM_BM=64 -DGM_BN=128${GM_DBUF:+ -DGM_DBUF=$GM_DBUF}"
 # Folding them in is only affordable because both halves are free at the cliff
 # (measured, and re-checked by the table this script prints).
 AX_GMOE="-DPLOW_MOE_GEMMA=1 -DPLOW_MOE_GEMMA_PF=1"
-AX_PREFILL="-DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_GMOE"
+AX_PREFILL="-DPLOW_PACKED_PREFILL_DENSE_CONSUMERS=1 -DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_GMOE"
 # PLOW_GEMV_MM is next_pow2(PLOW_DECODE_BATCH) CLAMPED TO 16, not the batch itself. The GEMV
 # ladder instantiates MM in {1,2,4,8,16} and one instantiation with a runtime M serves every
 # M <= MM, so the bucket is a CEILING. Passing the raw batch through was a bug in this script:
@@ -171,7 +171,7 @@ fi
 # symbol is REJECTED, and the rejection is an `info!` degrade ("no flash object
 # -- flash segments run on the 8-wave interpreter"), not an error. See the note
 # on AX_GMOE above for why that degrade is not benign.
-AX_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 $CDNA3_TILE_4W $AX_GMOE"
+AX_FLASH="-DPLOW_PACKED_PREFILL_DENSE_CONSUMERS=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 $CDNA3_TILE_4W $AX_GMOE"
 # V2 MLA prefill arm (d_flash_mla_prefill_v2): the full-column-wave layout that needs this
 # object's 512-register budget. Marker `plow_mla_pf_v2_arm_1`; the host routes FlashMlaPrefill
 # segments here only under PLOW_MLA_PF_V2=1, so carrying the arm costs Gemma nothing.
@@ -340,8 +340,10 @@ fi
 # the decode program's segments are then gated by two different protocols and the run deadlocks.
 # The measurement above was taken with the flag on the DECODE object alone, so that is where it
 # goes. Do not widen this without re-running the hang test.
+AX_DECODE_GQ=""
 if [ "${PLOW_L2HIER:-1}" = 1 ]; then
-  AX_DECODE="$AX_DECODE -DPLOW_L2_PLACE_DISPATCH=1 -DPLOW_GATE_HIER=1"
+  AX_DECODE="$AX_DECODE -DPLOW_L2_PLACE_DISPATCH=1"
+  AX_DECODE_GQ="-DPLOW_GATE_HIER=1"
 fi
 
 # OPT-IN (PLOW_GLM_GF8=1): compile the GF=8 MLA flash-decode arm so PLOW_GLM_GF=4-vs-8
@@ -867,13 +869,17 @@ ROWS=(
   "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4 $AX_FP8KV"
 )
 
-# PLOW_ROWS_ONLY=<substring>: build only the rows whose stem matches — for iterating on
+# PLOW_ROWS_ONLY=<substring> (or =<exact-stem>): build only matching rows — for iterating on
 # ONE object family (e.g. interp_flash) without paying the full 28-object build. The
 # resulting dir is PARTIAL; copy it over a full set before serving from it.
 if [ -n "${PLOW_ROWS_ONLY:-}" ]; then
   FILTERED=()
   for row in "${ROWS[@]}"; do
-    case "${row%%|*}" in *"${PLOW_ROWS_ONLY}"*) FILTERED+=("$row");; esac
+    if [[ "$PLOW_ROWS_ONLY" == =* ]]; then
+      if [ "${row%%|*}" = "${PLOW_ROWS_ONLY#=}" ]; then FILTERED+=("$row"); fi
+    else
+      case "${row%%|*}" in *"${PLOW_ROWS_ONLY}"*) FILTERED+=("$row");; esac
+    fi
   done
   # A mistyped filter matching NOTHING must refuse, not print "ready (0 objects)" — that state
   # has already invalidated performance work once (see LESSONS).
@@ -907,7 +913,10 @@ export -f one; export HIPCC ARCH R INC BUN
 # (gq_seg_ofs), not by this build, and plowrt opens the twin by literal name.
 printf '%s\n' "${ROWS[@]}" | while IFS='|' read -r stem axes; do
   echo "$stem|$axes"
-  echo "${stem}_gq|$axes $AX_GQ"
+  case "$stem" in
+    interp_decode*) echo "${stem}_gq|$axes $AX_GQ $AX_DECODE_GQ" ;;
+    *) echo "${stem}_gq|$axes $AX_GQ" ;;
+  esac
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s a <<< "{}"; one "$s" $a'
 
 # test_kernels.elf -- the golden __device__ wrappers, which call the SAME op_*.h bodies the
