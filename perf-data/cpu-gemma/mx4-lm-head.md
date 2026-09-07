@@ -147,3 +147,29 @@ bf16 originals for the prefill GEMM and the mxfp4 decode twins. That is not from
 is the same duplicate-weight problem already logged for GPT-OSS: implementing the `GEMM_MXFP4` family
 (present in the ISA, no CPU kernel at any tier) would let prefill read MXFP4 directly and drop the
 bf16 copies.
+
+### vLLM baseline re-confirmed in-session (2026-09-07, 01:1x-01:3x)
+
+The vLLM figures used above came from an earlier session. Re-run here with identical settings
+(`vllm serve --dtype bfloat16 --max-model-len 4096 --max-num-seqs 8`, fresh prompts, 8 requests,
+64 max tokens) so the comparison is same-session rather than inherited. TPOT mean ms:
+
+| workload | conc | vLLM TTFT | vLLM TPOT |
+|---|---|---|---|
+| chat_short | 1 | 642 | 450 |
+| chat_short | 2 | 1219 | 446 |
+| chat_long | 1 | 2073 | 448 |
+| chat_long | 2 | 2724 | 474 |
+
+That reproduces the recorded 460-544 range at its low end, so the margins below are if anything
+conservative. vLLM's CPU backend has no fp8 and no MXFP4 path, so this single bf16 row is the
+comparison for every plow data type -- there is no vLLM fp8 or MXFP4 number to beat because vLLM
+cannot produce one on CPU.
+
+Against plow at c=1, both measured as means in this session:
+
+| plow data type | plow | vLLM bf16 | margin |
+|---|---|---|---|
+| bf16 | 233 | 450 | 1.93x |
+| fp8 + MXFP4 head | 127 | 450 | 3.54x |
+| MXFP4 + MXFP4 head | 81 | 450 | 5.56x |
