@@ -79,3 +79,46 @@ kernels.
 * **Always `--fresh-prompts`.** Prefix caches inflate a server's c>=2 TTFT several-fold.
 * **Single prefill measurements vary ~10% on this box.** Repeat three times.
 * **Re-emit every blob after an opcode renumber.** A merge silently gave three opcodes two meanings.
+
+## MXFP4 dense prefill: a 4-bit blob no longer carries bf16 too (commit 96ad1d5)
+
+A quantized blob used to declare BOTH the bf16 originals and the quantized twins, because decode
+went through `GEMV_MXFP4` while prefill used the plain bf16 `GEMM`. The `GEMM_MXFP4` family existed
+in `dev_isa.h` with no CPU kernel at any tier, so the emitter had no choice. Consequence: the
+Gemma-4-12B MXFP4 build was **larger than its own bf16 build**.
+
+Implementing the family (golden + AMX, all six opcodes, riding the existing pack-free `wm_run`
+driver with `dequant_strip` hoisted into `mxfp4_common.h`) lets the emitter drop the duplicates.
+
+Verified here, independently of the implementing agent:
+
+| Gemma-4-12B | resident set | 512-token prefill |
+|---|---|---|
+| plain bf16 | 28.46 GiB | - |
+| MXFP4, bf16 prefill (before) | 34.69 GiB | 3457.8 ms, 148 tok/s |
+| MXFP4, fp4 prefill (after) | **14.26 GiB** | **2413.1 ms, 212 tok/s** |
+
+Resident set measured on the serving process (`ps -o rss=`), matching the agent's figure exactly.
+Prefill is an interleaved A/B over two blobs emitted from the same command differing only in
+`PLOW_MX4_PREFILL`, 3 pairs, all three consistent: 3438.7/3457.8/3467.4 against
+2449.4/2405.4/2413.1. **-30% prefill time and -20.4 GiB.**
+
+**My prior expectation was wrong, and the reason is worth keeping.** I predicted a memory win and
+no speed win, reasoning that the GEMM reads ~1.27 GB per forward (~12 ms at this box's bandwidth)
+against ~220 ms of busy time, so it is compute-bound and MXFP4 only adds dequant work. That
+reasoning was right for GPT-OSS, where only q/k/v/o move and they are a small slice of a much
+larger MoE read -- it measured flat there, -0.2%/-1.2%/+0.1%. It was wrong for a DENSE model: a
+dense CPU prefill streams the entire weight set once per chunk, and the 12B's whole set is 22 GiB,
+so quartering it dwarfs the unpack cost. Check whether the model is dense or sparse before
+applying a bandwidth argument to its prefill.
+
+GPT-OSS still gains the memory: 15.34 -> 12.94 GiB, and the -2.40 GiB matches its tensor table
+exactly (97 tensors, 2.265 GiB: 24x4 projections plus lm_head).
+
+Not bit-exact, since prefill now uses quantized weights. On the 12B, divergence from plain bf16
+goes 49/160 greedy tokens (the existing fp4-decode error) to 67/160, and essentially all of the
+increase is one prompt moving its first difference from index 30 to 13; two of five prompts stay
+token-identical to the old fp4 blob. `PLOW_MX4_PREFILL=0` is a byte-identical opt-out at emit time.
+Default is gated on the AMD/CPU target, off for sm_90a/sm_120a where the kernels do not exist.
+
+C suite 12/12, Rust and devgen suites green.
