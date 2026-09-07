@@ -16,8 +16,8 @@ use crate::exec::cpu::control::{
     Cmd, ControlRing, Feedback, CMD_BARRIER, CMD_CANCEL, CMD_RESET_SLOT, CMD_RUN, CMD_STOP,
 };
 use crate::exec::cpu::interp::{
-    run_gq, run_static, wait_until, Exec, GqState, LoadedProgram, Parker, RunShared,
-    StaticState, WorkerCtx,
+    run_gq, run_static, wait_until, Exec, GqState, LoadedProgram, Parker, RunShared, StaticState,
+    WorkerCtx,
 };
 use crate::exec::cpu::topology::{NumaMode, Topology};
 
@@ -43,10 +43,16 @@ struct Shared {
 /// first `active` workers. Used both at spawn (for the pool's own bookkeeping) and per program, so
 /// prefill and decode can run on different widths without respawning threads.
 pub fn cu_map(n_cu: u32, per_node: &[Vec<u32>], nodes: usize, active: usize) -> Vec<Vec<u32>> {
-    let mut out: Vec<Vec<u32>> = vec![Vec::new(); per_node.iter().map(Vec::len).sum::<usize>().max(active)];
+    let mut out: Vec<Vec<u32>> =
+        vec![Vec::new(); per_node.iter().map(Vec::len).sum::<usize>().max(active)];
     let live: Vec<Vec<u32>> = per_node
         .iter()
-        .map(|ws| ws.iter().copied().filter(|&w| (w as usize) < active).collect())
+        .map(|ws| {
+            ws.iter()
+                .copied()
+                .filter(|&w| (w as usize) < active)
+                .collect()
+        })
         .collect();
     for cu in 0..n_cu {
         let np = (cu as usize) % nodes.max(1);
@@ -127,7 +133,11 @@ impl WorkerPool {
                     let cpu = if rank == 0 {
                         Some(c.cpu)
                     } else {
-                        c.siblings.iter().copied().filter(|&x| x != c.cpu).nth(rank - 1)
+                        c.siblings
+                            .iter()
+                            .copied()
+                            .filter(|&x| x != c.cpu)
+                            .nth(rank - 1)
                     };
                     if let Some(cpu) = cpu {
                         cpus.push((cpu, n));
@@ -138,7 +148,11 @@ impl WorkerPool {
         if cpus.is_empty() {
             cpus.push((0, nodes[0]));
         }
-        let threads = if threads == 0 { cpus.len() } else { threads.max(1) };
+        let threads = if threads == 0 {
+            cpus.len()
+        } else {
+            threads.max(1)
+        };
         // Round-robin over logical cpus when oversubscribed.
         let placement: Vec<(u32, u32)> = (0..threads).map(|k| cpus[k % cpus.len()]).collect();
         let node_pos = |n: u32| nodes.iter().position(|&x| x == n).unwrap_or(0) as u32;

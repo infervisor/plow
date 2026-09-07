@@ -119,7 +119,9 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
         if plain.is_empty() && avx.is_empty() && amx.is_empty() {
             std::fs::write(&stub, STUB).unwrap();
             plain_srcs.push(stub);
-            println!("cargo:warning=runtime/cpu/dev has no kernel sources yet; linking the no-op stub");
+            println!(
+                "cargo:warning=runtime/cpu/dev has no kernel sources yet; linking the no-op stub"
+            );
         }
         let probe = out.join("cpu_dev_abi_probe.c");
         std::fs::write(&probe, ABI_PROBE).unwrap();
@@ -182,6 +184,5 @@ int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
         println!("cargo:rustc-link-lib=static=plow_cpu_dev");
         // libm for the golden kernels' expf/tanhf/etc.
         println!("cargo:rustc-link-lib=m");
-
     }
 }

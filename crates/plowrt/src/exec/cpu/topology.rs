@@ -43,7 +43,9 @@ impl std::str::FromStr for NumaMode {
             list => {
                 let nodes = parse_cpulist(list);
                 if nodes.is_empty() {
-                    return Err(format!("--cpu-numa: expected auto|off|<node list>, got {s:?}"));
+                    return Err(format!(
+                        "--cpu-numa: expected auto|off|<node list>, got {s:?}"
+                    ));
                 }
                 Ok(NumaMode::Nodes(nodes))
             }
@@ -141,7 +143,10 @@ impl Topology {
             for e in rd.flatten() {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
-                if let Some(n) = name.strip_prefix("node").and_then(|n| n.parse::<u32>().ok()) {
+                if let Some(n) = name
+                    .strip_prefix("node")
+                    .and_then(|n| n.parse::<u32>().ok())
+                {
                     if let Ok(l) = std::fs::read_to_string(e.path().join("cpulist")) {
                         if !l.trim().is_empty() {
                             node_text.push((n, l));
@@ -239,7 +244,10 @@ mod tests {
     fn numa_mode_parses() {
         assert_eq!("auto".parse::<NumaMode>().unwrap(), NumaMode::Auto);
         assert_eq!("off".parse::<NumaMode>().unwrap(), NumaMode::Off);
-        assert_eq!("0,2".parse::<NumaMode>().unwrap(), NumaMode::Nodes(vec![0, 2]));
+        assert_eq!(
+            "0,2".parse::<NumaMode>().unwrap(),
+            NumaMode::Nodes(vec![0, 2])
+        );
         assert!("bogus".parse::<NumaMode>().is_err());
     }
 }

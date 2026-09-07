@@ -254,7 +254,16 @@ mod tests {
     fn names_operands_from_the_slot_table() {
         let mut d = inst(DevOp::Gemm);
         // Unused slots carry the builder's TENSOR_NONE, not 0: t7 is Gemm's optional bias.
-        d.t = [3, 4, 5, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE];
+        d.t = [
+            3,
+            4,
+            5,
+            TENSOR_NONE,
+            TENSOR_NONE,
+            TENSOR_NONE,
+            TENSOR_NONE,
+            TENSOR_NONE,
+        ];
         d.i = [1, 6144, 2048, 0, 0, 0, 0, 0];
         let names = ["w0", "w1", "w2", "act.hn", "act.x", "blk.q.w"];
         let out = disasm(7, &d.pack(), &names);

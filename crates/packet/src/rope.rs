@@ -328,7 +328,14 @@ impl GenTensor {
                 beta_slow,
                 orig,
                 truncate,
-            } => (ROPE_SCALE_YARN, factor, beta_fast, beta_slow, orig, truncate as u32),
+            } => (
+                ROPE_SCALE_YARN,
+                factor,
+                beta_fast,
+                beta_slow,
+                orig,
+                truncate as u32,
+            ),
         };
         let base = GenTensor {
             tensor: 0,
@@ -495,7 +502,10 @@ mod tests {
         // The recipe round-trips through the wire fields (low/high carry the betas, aux the flag).
         let (cos, sin) = rope_tables(64, 64, 150_000.0, 1.0, scale);
         let [gc, gs] = GenTensor::rope_pair(64, 64, 150_000.0, 1.0, scale);
-        assert_eq!((gc.scale, gc.aux, gc.low, gc.high), (ROPE_SCALE_YARN, 0, 32.0, 1.0));
+        assert_eq!(
+            (gc.scale, gc.aux, gc.low, gc.high),
+            (ROPE_SCALE_YARN, 0, 32.0, 1.0)
+        );
         assert_eq!(gc.generate().unwrap(), cos);
         assert_eq!(gs.generate().unwrap(), sin);
         // Position 0 is cos = mscale, sin = 0 on every pair: the factor is on the table, not on q.
