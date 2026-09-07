@@ -195,6 +195,31 @@ impl ChatTemplate {
                 _ => Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod)),
             }
         });
+        // THE CURRENT DATE, which templates stamp into the system prompt.
+        // `transformers` exposes it as `datetime.now().strftime(fmt)`, so this
+        // is local time, not UTC. Three families here need it and each fails
+        // differently without it: gpt-oss calls it UNGUARDED, so the render
+        // dies with "undefined is not callable" and the server 400s on every
+        // request; Llama-3.2 guards it and falls back to a hardcoded
+        // "26 Jul 2024"; Muse-Glimmer guards it and drops its "Current date:"
+        // line. The two guarded ones are worse than the loud one — the model is
+        // told the wrong day and nothing anywhere says so.
+        env.add_function("strftime_now", |format: String| -> Result<String, minijinja::Error> {
+            // Parsed rather than formatted straight through: chrono's `Display`
+            // errors on an unknown specifier, and `to_string()` on that panics
+            // — inside a request handler.
+            let parsed = chrono::format::StrftimeItems::new(&format)
+                .parse()
+                .map_err(|e| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        format!("strftime_now({format:?}): {e}"),
+                    )
+                })?;
+            Ok(chrono::Local::now()
+                .format_with_items(parsed.iter())
+                .to_string())
+        });
         // `tojson` under a different spelling, used by tool-calling templates.
         env.add_filter("tojson", |v: Value| -> Result<String, minijinja::Error> {
             serde_json::to_string(&v)
@@ -321,6 +346,40 @@ mod tests {
         let (turns, items) = out.split_once('|').expect("both halves rendered");
         assert_eq!(turns, "user=dflt;bot=dflt;");
         assert!(items.contains("[role]") && items.contains("[content]"), "{items}");
+    }
+
+    /// `strftime_now` stamps the current date into the system prompt. gpt-oss
+    /// calls it UNGUARDED (`chat_template.jinja:202`), so without it the render
+    /// dies with "undefined is not callable" and the server answers 400 to
+    /// every request; Llama-3.2 and Muse-Glimmer guard it with `is defined` and
+    /// quietly serve a stale (`26 Jul 2024`) or missing date instead.
+    #[test]
+    fn strftime_now_stamps_the_current_date() {
+        let d = std::env::temp_dir().join("plow-template-strftime-test");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("chat_template.jinja"),
+            "{{ strftime_now('%Y-%m-%d') }}|{{ strftime_now('%d %b %Y') }}",
+        )
+        .unwrap();
+        let t = ChatTemplate::load(&d).expect("template compiles");
+        let now = chrono::Local::now();
+        assert_eq!(
+            t.render(&[]).expect("renders"),
+            format!("{}|{}", now.format("%Y-%m-%d"), now.format("%d %b %Y"))
+        );
+    }
+
+    /// An unknown specifier must be a render error, not a panic: chrono's
+    /// `Display` reports it by failing to format, and `to_string()` on that
+    /// panics — which here would be a panic inside a request handler.
+    #[test]
+    fn a_bad_strftime_format_is_an_error_not_a_panic() {
+        let d = std::env::temp_dir().join("plow-template-strftime-bad-test");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("chat_template.jinja"), "{{ strftime_now('%Q') }}").unwrap();
+        let t = ChatTemplate::load(&d).expect("template compiles");
+        assert!(t.render(&[]).is_err());
     }
 
     /// The REAL Gemma-4 template, which is the one `.get()` was blocking.

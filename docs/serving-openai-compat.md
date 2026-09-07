@@ -47,6 +47,23 @@ those families. `get`/`items`/`keys`/`values` are now handled by the same unknow
 callback, with `get` returning Python's `None` for a missing key so the `a.get(x) or a.get(y)`
 idiom stays falsy.
 
+**And they call `strftime_now`, which is worse when it is *guarded*.** Templates stamp the
+current date into the system prompt with `strftime_now(fmt)` — `datetime.now().strftime(fmt)`
+on the `transformers` side, so local time, not UTC. Three families need it and each broke
+differently without it:
+
+| family | how the template calls it | what plowrt did |
+|---|---|---|
+| gpt-oss | unguarded, `chat_template.jinja:202` | render died, `undefined is not callable` → **400 on every request** |
+| Llama-3.2 | `{% if strftime_now is defined %}` … `{% else %}"26 Jul 2024"` | rendered, telling the model **`Today Date: 26 Jul 2024`** |
+| Muse-Glimmer | `{%- elif strftime_now is defined -%}` | rendered, **dropping the `Current date:` line** |
+
+The two guarded ones are the dangerous pair: no error anywhere, and the model is simply told
+the wrong day. It is now an env function backed by `chrono::Local`, with an unknown specifier
+returned as a render error rather than the panic `to_string()` on a failed chrono `Display`
+would raise inside a request handler. Llama-3.1 and Llama-3.3 were unaffected — their templates
+hardcode the date string instead of calling out for it.
+
 Rendering is verified against a Jinja env configured the way `transformers` configures it
 (`ImmutableSandboxedEnvironment`, `trim_blocks`, `lstrip_blocks`, `loopcontrols`,
 `raise_exception`, `tojson`), over six conversation shapes — user-only, system+user,
@@ -63,6 +80,21 @@ multi-turn, `developer` role, a tool result, and a null-content assistant turn.
 | `google/gemma-4-26B-A4B-it` (`gemma4`) | `chat_template.jinja` | 6/6 byte-identical |
 | Kimi-K2.5 (`kimi_k25`) | `chat_template.jinja` | 6/6 byte-identical |
 | Kimi-K3 | ships none | built-in `k3_chat_prompt` |
+| `openai/gpt-oss-20b` (`gpt_oss`) | `chat_template.jinja` | 5/5 byte-identical¹ |
+| Llama-3.1, Llama-3.2, Llama-3.3 (`llama`) | `.jinja` / `tokenizer_config.json` | 6/6 byte-identical each |
+| `meta-models/Muse-Glimmer-30B` (`muse_glimmer`) | `chat_template.jinja` | 6/6 byte-identical |
+
+¹ gpt-oss's sixth shape — a `tool` message with no preceding assistant tool call — is refused by
+the template's own `raise_exception` on both sides, which the server answers as a 400 carrying
+the template's message. That is the designed path, not a divergence.
+
+Template support is not serving support. `gpt_oss` and `llama` compile (`devgen`'s `gptoss.rs`
+emitter and the dense-GQA path respectively; `llama` also has an `nn-graph` builder), and both
+load a stock `tokenizer.json` through the `tokenizers` crate with no per-family fix-up — only
+Qwen2 needs one. `muse_glimmer` is **refused by the compiler** (`nn-graph`'s config parser
+rejects it, and `devgen` has no arm), so its template rendering correctly is moot until an
+emitter exists. Likewise `kimi_k25` — the two Kimi-K2.5 checkpoints on this host hit the
+`other =>` arm and cannot be built, and Gemma-4-26B-A4B is refused as MoE.
 
 **Reasoning is split from the answer.** With thinking left open the raw generation is
 `<trace></think><answer>`, and `</think>` is `special: false` in GLM's added tokens, so
