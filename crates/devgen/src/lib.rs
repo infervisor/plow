@@ -3265,6 +3265,9 @@ fn emit_phase(
     let elem = |n: u32| -> Vec<u32> { (0..n.div_ceil(512 * 8).max(1).min(n_cu)).collect() };
     let ns = if gemv_family {
         n_cu.div_ceil(heads).max(1)
+    } else if emit_config::active().packed_prefill_on() {
+        // Request packing must not change the softmax reduction with the bucket.
+        1
     } else {
         n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
             .max(1)
@@ -6294,6 +6297,7 @@ fn apply_production_defaults(
         && tp == 1
     {
         cfg.decode_ladder = Some("1,2,4,8,16".into());
+        cfg.decode_ladder_default = true;
     }
     cfg.packed_prefill_default = capabilities.dense_packet_contracts
         && arch == "sm_90a"
@@ -7409,11 +7413,11 @@ fn emit_dense_gqa(
     // so B=32 only fits at a reduced ctx. Raising it further needs no kernel work.
     // The rung ladder, ASCENDING. `[decode_batch]` when PLOW_DECODE_BATCH_LADDER is unset,
     // so `dbatch` below is the value it always was and the emit is byte-identical.
-    let rungs: Vec<u32> = ecfg.decode_rungs();
+    let mut rungs: Vec<u32> = ecfg.decode_rungs();
     // Every per-slot resource is sized at the WIDEST rung, and that is the whole design:
     // slot `s`'s offset into the KV cache is `s * (kv_head*ring*hd)` — INVARIANT in B — so a
     // sequence keeps its slot while the program under it changes rung to rung.
-    let dbatch: u32 = *rungs.last().expect("decode_rungs is non-empty");
+    let mut dbatch: u32 = *rungs.last().expect("decode_rungs is non-empty");
     let mixed_total_rows = mixed_step
         .as_ref()
         .and_then(|mixed| mixed.rows.iter().map(|rows| rows.total_rows).max());
@@ -7466,24 +7470,42 @@ fn emit_dense_gqa(
     // Phase 1: the DenseGqaEmitter owns the dense
     // tensor declaration (declare) and the emit_phase call sites. Byte-identical —
     // `new` forwards to the same `declare`, `emit_*` to the same `emit_phase`.
-    let (emitter, tensors, gen) = DenseGqaEmitter::new(
-        &c,
-        &ls,
-        n_cu,
-        ctx,
-        fp8,
-        w8a8,
-        fp8_kv,
-        fp8_kv_full,
-        block.clone(),
-        block_mode,
-        ns_pre,
-        dbatch,
-        moe_pf,
-        amd,
-        mixed_total_rows,
-        mixed_decode_rows,
-    );
+    let declare = |dbatch| {
+        DenseGqaEmitter::new(
+            &c,
+            &ls,
+            n_cu,
+            ctx,
+            fp8,
+            w8a8,
+            fp8_kv,
+            fp8_kv_full,
+            block.clone(),
+            block_mode,
+            ns_pre,
+            dbatch,
+            moe_pf,
+            amd,
+            mixed_total_rows,
+            mixed_decode_rows,
+        )
+    };
+    let (mut emitter, mut tensors, mut gen) = declare(dbatch);
+    if ecfg.decode_ladder_default && mixed_step.is_none() {
+        if let Some(target) = hwspec::registry::lookup(&gpu) {
+            let budget = target.mem.capacity.0.saturating_sub(2 << 30);
+            loop {
+                let resident: u64 = tensors.iter().map(|t| t.bytes).sum();
+                if resident <= budget || rungs.len() == 1 {
+                    break;
+                }
+                rungs.pop();
+                dbatch = *rungs.last().unwrap();
+                (emitter, tensors, gen) = declare(dbatch);
+            }
+            eprintln!("  default decode ladder after full-context memory sizing: {rungs:?}");
+        }
+    }
 
     let mut progs = Vec::new();
     let mut tlist = Vec::new();

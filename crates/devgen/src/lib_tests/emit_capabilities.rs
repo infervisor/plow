@@ -43,6 +43,7 @@ fn production_defaults_are_capability_and_target_driven() {
     let mut cfg = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
     apply_production_defaults(&mut cfg, emit_capabilities("gemma4"), "sm_90a", 1);
     assert_eq!(cfg.decode_rungs(), [1, 2, 4, 8, 16]);
+    assert!(cfg.decode_ladder_default);
     assert!(cfg.packed_prefill_on());
 
     let mut disabled = EmitArgsForTest::try_parse_from([
@@ -59,6 +60,7 @@ fn production_defaults_are_capability_and_target_driven() {
         1,
     );
     assert_eq!(disabled.decode_rungs(), [1]);
+    assert!(!disabled.decode_ladder_default);
     assert!(!disabled.packed_prefill_on());
 
     let mut unsupported = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;

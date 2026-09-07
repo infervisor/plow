@@ -2851,12 +2851,13 @@ impl GpuEngine {
         let vmm = {
             let run = || {
                 let config = RuntimeConfig::get();
-                let packet_live = packed_prefill.is_some()
-                    && live_kv_manifest.as_ref().is_some_and(|manifest| {
+                let live = config.nv_live_kv_enabled(
+                    packed_prefill.is_some(),
+                    live_kv_manifest.as_ref().is_some_and(|manifest| {
                         manifest.caches.iter().any(|cache| cache.window == 0)
-                    });
-                let live = config.nv_vmm_live() || packet_live;
-                if packet_live && !config.nv_vmm_live() {
+                    }),
+                );
+                if live && !config.nv_vmm_live() {
                     tracing::info!("live KV allocation enabled by packet metadata");
                 }
                 let rings = config.nv_vmm_live_rings();

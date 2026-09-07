@@ -196,6 +196,28 @@ impl VmmGeometry {
         })
     }
 
+    pub(crate) fn block_bytes(&self, gran: u64, block_hint: u64) -> Result<u64> {
+        let row_bytes = self.row_bytes();
+        let head_span = self.max_ctx as u64 * row_bytes;
+        if gran == 0 || row_bytes == 0 || head_span < gran || head_span % gran != 0 {
+            return Err(RuntimeError::Device(format!(
+                "vmm: head window {head_span} B not a multiple of granularity {gran}"
+            )));
+        }
+        let block_bytes = block_hint.clamp(gran, head_span);
+        if !block_bytes.is_power_of_two()
+            || head_span % block_bytes != 0
+            || block_bytes % gran != 0
+            || block_bytes % row_bytes != 0
+        {
+            return Err(RuntimeError::Device(format!(
+                "vmm: block {block_bytes} B must be a pow2 multiple of granularity \
+                 {gran} and row {row_bytes}, dividing the head window {head_span}"
+            )));
+        }
+        Ok(block_bytes)
+    }
+
     /// Expected byte size of one full-layer `kv.{l}.k`/`.v` tensor — the
     /// validation gate against the blob's declared sizes.
     pub fn full_tensor_bytes(&self) -> u64 {
@@ -687,22 +709,7 @@ impl VmmKv {
         let gran = ops.granularity()?;
         let row_bytes = geo.row_bytes();
         let head_span = geo.max_ctx as u64 * row_bytes;
-        if head_span % gran != 0 {
-            return Err(RuntimeError::Device(format!(
-                "vmm: head window {head_span} B not a multiple of granularity {gran}"
-            )));
-        }
-        let block_bytes = block_hint.clamp(gran, head_span);
-        if !block_bytes.is_power_of_two()
-            || head_span % block_bytes != 0
-            || block_bytes % gran != 0
-            || block_bytes % row_bytes != 0
-        {
-            return Err(RuntimeError::Device(format!(
-                "vmm: block {block_bytes} B must be a pow2 multiple of granularity \
-                 {gran} and row {row_bytes}, dividing the head window {head_span}"
-            )));
-        }
+        let block_bytes = geo.block_bytes(gran, block_hint)?;
         let block_rows = (block_bytes / row_bytes) as u32;
         let bph = (head_span / block_bytes) as u32;
 

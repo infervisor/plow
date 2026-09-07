@@ -140,6 +140,9 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-batch-ladder", env = "PLOW_DECODE_BATCH_LADDER")]
     pub decode_ladder: Option<String>,
 
+    #[arg(skip)]
+    pub decode_ladder_default: bool,
+
     /// Bind prebuilt CUDA objects in the output directory to complete decode programs.
     #[arg(long = "emit-decode-objects")]
     pub decode_objects: Option<std::path::PathBuf>,
@@ -800,6 +803,7 @@ impl EmitConfig {
             decode_grouped_moe_segments: env_bool_opt("PLOW_SEG_DECODE_GROUPED_MOE"),
             decode_batch: env_u32("PLOW_DECODE_BATCH").unwrap_or(1),
             decode_ladder: env_str("PLOW_DECODE_BATCH_LADDER"),
+            decode_ladder_default: false,
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
