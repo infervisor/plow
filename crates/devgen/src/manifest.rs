@@ -1863,6 +1863,11 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",
         if moe_prefill_ep_required { 1 } else { 0 }
     ));
+    let prefill_gemv_head = prefill_ops.contains("Gemv");
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_PF_GEMV_HEAD {0}\n#ifndef PLOW_NV_PF_GEMV_HEAD\n#define PLOW_NV_PF_GEMV_HEAD {0}\n#endif\n",
+        if prefill_gemv_head { 1 } else { 0 }
+    ));
     for (key, macro_name) in [
         ("moe_stage1_body", "PLOW_OBJECT_MOE_STAGE1_BODY"),
         ("moe_stage2_body", "PLOW_OBJECT_MOE_STAGE2_BODY"),
@@ -2360,6 +2365,15 @@ mod tests {
         let man = build(&m, "sm_120a");
         let req = man["backends"]["nvcc"]["requires"].as_array().unwrap();
         assert!(req.iter().any(|v| v == "PLOW_NV_PF_GEMV_HEAD=1"));
+        let header = config_header(&man);
+        assert!(header.contains(
+            "#define PLOW_PACKET_REQUIRES_PF_GEMV_HEAD 1\n#ifndef PLOW_NV_PF_GEMV_HEAD\n#define PLOW_NV_PF_GEMV_HEAD 1\n#endif\n"
+        ));
+
+        let ordinary = config_header(&build(&model(), "sm_120a"));
+        assert!(ordinary.contains(
+            "#define PLOW_PACKET_REQUIRES_PF_GEMV_HEAD 0\n#ifndef PLOW_NV_PF_GEMV_HEAD\n#define PLOW_NV_PF_GEMV_HEAD 0\n#endif\n"
+        ));
     }
 
     /// The pairing hash must move when the compiled arm set moves, and must NOT
