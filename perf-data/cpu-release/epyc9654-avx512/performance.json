@@ -1,0 +1,452 @@
+[
+  {
+    "profile": "12b-bf16-24-node0",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-12b/assets/model.pkt",
+      "/workspace/models/gemma-4-12B-it-cpu",
+      "--threads",
+      "24",
+      "--numa",
+      "0",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/12b-bf16-24-node0.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": null,
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 24,
+        "isa": "Avx512",
+        "ttft_ms": 1210.26,
+        "tpot_ms": 253.929,
+        "tpot_p50_ms": 248.24
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 24,
+        "isa": "Avx512",
+        "ttft_ms": 12867.75,
+        "tpot_ms": 251.609,
+        "tpot_p50_ms": 248.746
+      }
+    ]
+  },
+  {
+    "profile": "12b-bf16-24-all",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-12b/assets/model.pkt",
+      "/workspace/models/gemma-4-12B-it-cpu",
+      "--threads",
+      "24",
+      "--numa",
+      "auto",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/12b-bf16-24-all.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": null,
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 24,
+        "isa": "Avx512",
+        "ttft_ms": 778.51,
+        "tpot_ms": 96.077,
+        "tpot_p50_ms": 93.509
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 24,
+        "isa": "Avx512",
+        "ttft_ms": 10226.26,
+        "tpot_ms": 95.015,
+        "tpot_p50_ms": 94.264
+      }
+    ]
+  },
+  {
+    "profile": "12b-bf16-96",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-12b/assets/model.pkt",
+      "/workspace/models/gemma-4-12B-it-cpu",
+      "--threads",
+      "96",
+      "--numa",
+      "auto",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/12b-bf16-96.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": null,
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 594.0,
+        "tpot_ms": 86.015,
+        "tpot_p50_ms": 86.001
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 5732.76,
+        "tpot_ms": 87.163,
+        "tpot_p50_ms": 87.221
+      }
+    ]
+  },
+  {
+    "profile": "12b-bf16-192",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-12b-192/assets/model.pkt",
+      "/workspace/models/gemma-4-12B-it-cpu",
+      "--threads",
+      "192",
+      "--numa",
+      "auto",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/12b-bf16-192.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": null,
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 192,
+        "isa": "Avx512",
+        "ttft_ms": 1001.26,
+        "tpot_ms": 90.812,
+        "tpot_p50_ms": 88.243
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 192,
+        "isa": "Avx512",
+        "ttft_ms": 5198.0,
+        "tpot_ms": 88.421,
+        "tpot_p50_ms": 88.491
+      }
+    ]
+  },
+  {
+    "profile": "12b-fp8-96",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-12b-fp8/assets/model.pkt",
+      "/workspace/models/gemma-4-12B-it-cpu",
+      "--threads",
+      "96",
+      "--numa",
+      "auto",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/12b-fp8-96.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": "/workspace/models/gemma-4-12B-it-fp8-cpu",
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 1014.23,
+        "tpot_ms": 76.476,
+        "tpot_p50_ms": 76.999
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 5573.25,
+        "tpot_ms": 73.429,
+        "tpot_p50_ms": 71.088
+      }
+    ]
+  },
+  {
+    "profile": "12b-w8a8-96",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-12b-w8a8/assets/model.pkt",
+      "/workspace/models/gemma-4-12B-it-cpu",
+      "--threads",
+      "96",
+      "--numa",
+      "auto",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/12b-w8a8-96.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": "/workspace/models/gemma-4-12B-it-fp8-cpu",
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 793.49,
+        "tpot_ms": 49.82,
+        "tpot_p50_ms": 49.804
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 8509.91,
+        "tpot_ms": 52.994,
+        "tpot_p50_ms": 50.696
+      }
+    ]
+  },
+  {
+    "profile": "26b-bf16-96",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-e2e/assets/model.pkt",
+      "/workspace/models/gemma-4-26B-A4B-it-cpu",
+      "--threads",
+      "96",
+      "--numa",
+      "auto",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/26b-bf16-96.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": null,
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 304.74,
+        "tpot_ms": 37.608,
+        "tpot_p50_ms": 37.742
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 2079.75,
+        "tpot_ms": 37.992,
+        "tpot_p50_ms": 38.003
+      }
+    ]
+  },
+  {
+    "profile": "26b-fp8-96",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-26b-fp8/assets/model.pkt",
+      "/workspace/models/gemma-4-26B-A4B-it-cpu",
+      "--threads",
+      "96",
+      "--numa",
+      "auto",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/26b-fp8-96.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": "/workspace/models/gemma-4-26B-A4B-it-fp8-cpu",
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 800.25,
+        "tpot_ms": 27.304,
+        "tpot_p50_ms": 25.235
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 96,
+        "isa": "Avx512",
+        "ttft_ms": 13396.0,
+        "tpot_ms": 25.922,
+        "tpot_p50_ms": 25.996
+      }
+    ]
+  },
+  {
+    "profile": "12b-bf16-24-all-repeat",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-12b/assets/model.pkt",
+      "/workspace/models/gemma-4-12B-it-cpu",
+      "--threads",
+      "24",
+      "--numa",
+      "auto",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/12b-bf16-24-all-repeat.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": null,
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 24,
+        "isa": "Avx512",
+        "ttft_ms": 777.0,
+        "tpot_ms": 105.195,
+        "tpot_p50_ms": 105.253
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 24,
+        "isa": "Avx512",
+        "ttft_ms": 10300.0,
+        "tpot_ms": 108.937,
+        "tpot_p50_ms": 106.507
+      }
+    ]
+  },
+  {
+    "profile": "12b-bf16-24-node0-repeat",
+    "command": [
+      "/app/plow/.worktrees/cpu-production-avx512/target/release/examples/cpu_bench",
+      "/app/plow/.worktrees/cpu-production-avx512/build-cpu-12b/assets/model.pkt",
+      "/workspace/models/gemma-4-12B-it-cpu",
+      "--threads",
+      "24",
+      "--numa",
+      "0",
+      "--isa",
+      "avx512",
+      "--prompt-lens",
+      "32,512",
+      "--decode",
+      "32",
+      "--json",
+      "/tmp/cpu-release-perf-final/12b-bf16-24-node0-repeat.json"
+    ],
+    "huge_pages": false,
+    "fp8_dir": null,
+    "exit_code": 0,
+    "results": [
+      {
+        "prompt_len": 32,
+        "decode": 32,
+        "batch": 1,
+        "threads": 24,
+        "isa": "Avx512",
+        "ttft_ms": 1265.51,
+        "tpot_ms": 252.944,
+        "tpot_p50_ms": 247.505
+      },
+      {
+        "prompt_len": 512,
+        "decode": 32,
+        "batch": 1,
+        "threads": 24,
+        "isa": "Avx512",
+        "ttft_ms": 12825.74,
+        "tpot_ms": 254.389,
+        "tpot_p50_ms": 249.991
+      }
+    ]
+  }
+]

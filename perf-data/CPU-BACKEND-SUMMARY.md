@@ -1,5 +1,10 @@
 # plow CPU backend vs llama.cpp and vLLM — consolidated results
 
+For the 2026-09-07 AMD EPYC 9654 CPU release campaign, see the
+[AVX-512/FP8/NUMA report](cpu-release/epyc9654-avx512/README.md). It includes real
+12B/26B networks, scalar/quantized answer checks, and 24/96/192-core measurements.
+The historical Intel HTTP comparisons below use a different host and methodology.
+
 Box: Sapphire Rapids, 8 cores / 16 threads, 58 GB, AVX-512 + AMX. All figures are **through the
 OpenAI API** (`plowrt serve`, `llama-server`, `vllm serve`), `tools/bench-api/bench.py` with
 `--fresh-prompts`, 8 requests per cell, 64 max tokens, one server at a time on a quiet box, matched

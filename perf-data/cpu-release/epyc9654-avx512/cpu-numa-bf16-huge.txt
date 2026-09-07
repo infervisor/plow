@@ -1,0 +1,4 @@
+engine: isa=Avx512 threads=96 n_cu=96 weights=22.18 GiB max_ctx=2048 batch=4 rungs=[1, 2, 4]
+prompt=   32 batch=1  TTFT     807.7 ms (   39.6 tok/s)  step mean   190.2 ms p50   183.3 ms ( 5.26 tok/s/seq,   5.26 tok/s aggregate, 125.2 GB/s weights)  text=" river flows quietly past the old mill.The quick brown fox"
+prompt=  512 batch=1  TTFT    5972.3 ms (   85.7 tok/s)  step mean   183.2 ms p50   182.5 ms ( 5.46 tok/s/seq,   5.46 tok/s aggregate, 130.0 GB/s weights)  text=" river flows stylist.\nthought\nIt looks like your"
+wrote /tmp/cpu-numa-bf16-huge.json

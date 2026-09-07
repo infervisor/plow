@@ -131,7 +131,14 @@ node and measured 3.33 output tokens/s serially or 11.34 tokens/s at concurrency
 four. See the [12B report](../../perf-data/cpu-gemma/epyc9654-avx512/README.md)
 for first-token latency, prefill measurements, and the limits of this comparison.
 
-Production certification still requires full-network scalar/quantized quality
-comparisons, extended context/soak tests, and NUMA scaling measurements. The
-original gitignored CPU plans were absent; their outstanding items cannot be
+The [release experiment report](../../perf-data/cpu-release/epyc9654-avx512/README.md)
+adds BF16/W8A16/W8A8 answer comparisons, near-capacity context checks, a 256-request
+26B FP8 soak, and repeated NUMA measurements at fixed worker count. At 24 workers,
+distributed placement reduced 12B decode latency by 2.3–2.6x versus node 0. The
+report includes 96/192-core comparisons and the FP8 prefill/decode tradeoff.
+
+These are bounded local checks. Broader quality evaluation, long-duration load,
+and other CPU hosts remain production-qualification work. Repository-wide
+formatting and a parallel compiler-test failure also prevent a clean merge gate.
+The original gitignored CPU plans were absent; their outstanding items cannot be
 declared closed from this checkout.

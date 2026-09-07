@@ -1,0 +1,146 @@
+[
+  {
+    "profile": "12b-bf16-scalar",
+    "large_tensor_resident_pages_by_node": {
+      "0": 324325,
+      "1": 1279561,
+      "2": 845257,
+      "3": 820745,
+      "4": 919903,
+      "5": 835039,
+      "6": 817472,
+      "7": 697474
+    },
+    "page_bytes": 4096,
+    "before": {
+      "VmRSS": "26472024 kB",
+      "VmHWM": "49718140 kB",
+      "Threads": "482"
+    },
+    "after": {
+      "VmRSS": "27259260 kB",
+      "VmHWM": "49718140 kB",
+      "Threads": "482"
+    }
+  },
+  {
+    "profile": "12b-fp8-scalar",
+    "large_tensor_resident_pages_by_node": {
+      "0": 336610,
+      "1": 633054,
+      "2": 484832,
+      "3": 484832,
+      "4": 484832,
+      "5": 484832,
+      "6": 484832,
+      "7": 484832
+    },
+    "page_bytes": 4096,
+    "before": {
+      "VmRSS": "15827544 kB",
+      "VmHWM": "28447612 kB",
+      "Threads": "482"
+    },
+    "after": {
+      "VmRSS": "16614784 kB",
+      "VmHWM": "28447612 kB",
+      "Threads": "482"
+    }
+  },
+  {
+    "profile": "26b-bf16",
+    "large_tensor_resident_pages_by_node": {
+      "0": 308892,
+      "1": 3623810,
+      "2": 1654113,
+      "3": 1029624,
+      "4": 1887807,
+      "5": 2399983,
+      "6": 1403813,
+      "7": 513222
+    },
+    "page_bytes": 4096,
+    "before": {
+      "VmRSS": "51598304 kB",
+      "VmHWM": "100873088 kB",
+      "Threads": "482"
+    },
+    "after": {
+      "VmRSS": "52394572 kB",
+      "VmHWM": "100873088 kB",
+      "Threads": "482"
+    }
+  },
+  {
+    "profile": "26b-bf16-scalar",
+    "large_tensor_resident_pages_by_node": {
+      "0": 314121,
+      "1": 3228117,
+      "2": 1602658,
+      "3": 1265736,
+      "4": 1839195,
+      "5": 2402660,
+      "6": 1602658,
+      "7": 566119
+    },
+    "page_bytes": 4096,
+    "before": {
+      "VmRSS": "51597916 kB",
+      "VmHWM": "100873088 kB",
+      "Threads": "482"
+    },
+    "after": {
+      "VmRSS": "52385188 kB",
+      "VmHWM": "100873088 kB",
+      "Threads": "482"
+    }
+  },
+  {
+    "profile": "12b-w8a8",
+    "large_tensor_resident_pages_by_node": {
+      "0": 294212,
+      "1": 676348,
+      "2": 485280,
+      "3": 485280,
+      "4": 525576,
+      "5": 485280,
+      "6": 485280,
+      "7": 444984
+    },
+    "page_bytes": 4096,
+    "before": {
+      "VmRSS": "15842204 kB",
+      "VmHWM": "28462976 kB",
+      "Threads": "482"
+    },
+    "after": {
+      "VmRSS": "16638016 kB",
+      "VmHWM": "28462976 kB",
+      "Threads": "482"
+    }
+  },
+  {
+    "profile": "26b-fp8",
+    "large_tensor_resident_pages_by_node": {
+      "0": 1017567,
+      "1": 1017567,
+      "2": 1017567,
+      "3": 1017569,
+      "4": 81747,
+      "5": 1983682,
+      "6": 604675,
+      "7": 98338
+    },
+    "page_bytes": 4096,
+    "before": {
+      "VmRSS": "27668092 kB",
+      "VmHWM": "53103488 kB",
+      "Threads": "482"
+    },
+    "after": {
+      "VmRSS": "28462736 kB",
+      "VmHWM": "53103488 kB",
+      "Threads": "482"
+    }
+  }
+]
