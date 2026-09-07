@@ -360,6 +360,47 @@ the 21% a naive roofline suggests.**
 the slice over M rather than N whenever N < M makes the pack 1x instead of 16x. Bit-exact, worth
 about 1.2-1.5% of prefill wall.
 
+### The summarize cell is NOT out of bit-exact reach — the earlier claim conflated two headrooms
+
+Recorded above: worker idle "caps the remaining bit-exact headroom well below what the cell needs."
+That was about **load imbalance**, and it was read as if it bounded **all** headroom. A fresh
+per-op profile on current code (1024 tokens, `--threads 16`, `prof1024.sh`) says otherwise.
+
+| op | busy/thr | share of 1491.8 ms mean busy |
+|---|---|---|
+| `MOE_GLU_MX_PF` | 614.2 | 41% |
+| `MOE_DOWN_MX_PF` | 335.1 | 22% |
+| `FLASH_PREFILL` | 248.1 | 17% |
+| `GEMM` | 235.0 | 16% |
+
+MoE is 949 ms/thr, confirming the 928 on record. Its efficiency, from measured busy time against
+exact MAC counts (1024 tok x 24 layers x top-4 x 3 mats x 2880^2 = 2.446e12 MACs, GLU 2/3, DOWN 1/3):
+
+| op | MACs | thread-seconds | per thread | per physical core | vs 1464 GMAC/s achievable TMUL |
+|---|---|---|---|---|---|
+| GLU | 1.631e12 | 9.827 | 166 GMAC/s | 332 GMAC/s | **22.7%** |
+| DOWN | 0.815e12 | 5.361 | 152 GMAC/s | 304 GMAC/s | **20.8%** |
+
+(1464 GMAC/s is this file's own calibration: TDPBF16PS at 13.9x the measured 105.3 GMAC/s
+vdpbf16ps. Per-core doubles the per-thread figure because 16 workers share 8 physical cores.)
+
+Two independent levers, either of which covers the 18.3% the cell needs:
+
+1. **Kernel efficiency.** The MoE prefill dot runs at ~21-23% of the achievable TMUL rate. Not a
+   bandwidth wall: expert weights are 398 MB/layer at MXFP4, 9.55 GB per 1024-token chunk, ~95 ms
+   at this box's ~100 GB/s, against 949 ms of MoE time. Not dequant either — that profiled at ~19%.
+2. **Scheduling.** Wall is 2024.5 ms against 1491.8 ms mean busy, i.e. **26% idle** (higher than
+   the 15% on record, which was at a narrower worker width — SMT contention shows up here). Even
+   perfect balance floors at max-busy 1587.5 ms, a 21.5% cut on its own; the remaining ~437 ms is
+   dependency stalls on the packet DAG, not imbalance.
+
+Closing the cell needs MoE prefill roughly 44% faster (928 -> 519 ms saves the 409 ms that takes
+2238 to 1829), or the equivalent from scheduling. Both are bit-exact-able in principle: making the
+same dot faster and packing workers better changes no accumulation order.
+
+This does not mean it is easy — 21% to 32% of a TMUL ceiling on a gathered, block-quantized MoE is
+real work. It means the cell should not be recorded as unreachable.
+
 ### INT8 MoE prefill closes 9% of the summarize cell, not the 11.2% needed (2026-09-07, 09:5x)
 
 `PLOW_MOE_INT8=1` is the one already-built lever never measured against this cell through serve.
@@ -445,7 +486,7 @@ power-of-two programs and this cost structure, two chunks is already the cheaper
 
 Also worth recording: serve adds almost nothing. `cpu_bench` TTFT at 1111 tokens is 2446-2528 ms
 against serve's 2471, so the summarize c=1 gap to vLLM (1829 ms) is entirely prefill compute, not
-request handling. Closing it needs ~18% more prefill throughput — the earlier "~27%" here was
+request handling. Closing it needs ~18% more prefill throughput, which a fresh profile says is available (see "not out of bit-exact reach" below) — the earlier "~27%" here was
 computed against a 2603 ms reading that was a p50, and against a since-improved baseline; the
 paired means on 2026-09-07 are 2238 ms bit-exact and 2034 ms with `PLOW_MOE_INT8=1`, so the gap to
 vLLM's 1829 ms is 18.3% bit-exact and 11.2% with int8. Worker idle at 1024 tokens is 15%
