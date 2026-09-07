@@ -48,3 +48,6 @@ plow_profile.sqlite
 assets-run/
 target-glm53/
 target-glm53-check/
+venv-sglang/
+.venv-sglang/
+sglang-pkgs/
