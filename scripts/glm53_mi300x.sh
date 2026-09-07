@@ -105,6 +105,10 @@ bench)
   ;;
 
 # ---------------------------------------------------------------- vLLM 0.28 reference (own lease)
+# ROCM_PATH/ROCM_HOME are load-bearing above TP1 and only above TP1: each multiproc worker
+# re-derives the ROCm version at init_device and reads <root>/.info/version. /opt/rocm has no
+# .info directory on this box, so every TP4 worker died with "RuntimeError: ROCm version file
+# not found" while the TP1 Gemma runs never noticed. /opt/rocm/core-7.14/.info/version is 7.14.0.
 # GPU_MEM_UTIL matters at TP4 and only there: the raw checkpoint is 703.7 GiB, so a TP4 rank
 # holds 175.9 GiB = 188.9 GB of a 206.1 GB card. vLLM's default 0.9 budget is 185.5 GB — LESS
 # than the weights — so TP4 refuses before it reaches the KV cache. TP8 (94.4 GB/rank) is fine
@@ -115,6 +119,8 @@ vllm)
   tp="${2:?tp}"; port="${3:?port}"
   exec env GPU_LEASE_TIMEOUT="${GPU_LEASE_TIMEOUT:-7200}" "$LEASE" -n "$tp" "vllm028-glm53-tp$tp" \
     env VLLM_ROCM_LIB=/opt/rocm/core-7.14/lib HF_HUB_OFFLINE=1 \
+        ROCM_PATH="${VLLM_ROCM_ROOT:-/opt/rocm/core-7.14}" \
+        ROCM_HOME="${VLLM_ROCM_ROOT:-/opt/rocm/core-7.14}" \
         VLLM_ROCM_USE_AITER="${VLLM_ROCM_USE_AITER:-1}" \
     "$WT/build-gemma31/vllm-python" -m vllm.entrypoints.openai.api_server \
       --model "$RAW" --served-model-name glm-5.3 --tensor-parallel-size "$tp" \
