@@ -258,8 +258,23 @@ fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
 fn decode_feed_extent(feeds: &[(usize, u32)]) -> Option<usize> {
     feeds.iter().map(|&(slot, _)| slot + 1).max()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DecodeProgress {
+    extent: usize,
+    steps: std::num::NonZeroUsize,
+}
+
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
+fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgress> {
+    Some(DecodeProgress {
+        extent: decode_feed_extent(feeds)?,
+        steps: std::num::NonZeroUsize::new(steps)?,
+    })
 }
 
 impl ModelMux {
@@ -895,22 +910,23 @@ pub fn spawn(
                     tokens_produced,
                     did_prefill,
                     tick_fault,
-                    fed_extent,
+                    decode_progress,
                 )) => {
                     // Decode-service EWMA: prefill ticks are excluded — see
                     // `service_sample`. Updating on them poisons the admission
                     // predictor and sheds live decode streams.
-                    if let Some(sample) = service_sample(ms, did_prefill) {
+                    let sample = service_sample(ms, did_prefill);
+                    if let Some(sample) = sample {
                         load.service_ms.update(sample);
-                        if let (Some(controller), Some(extent)) =
-                            (rung_controller.as_mut(), fed_extent)
-                        {
-                            let rung = controller.covering(extent);
-                            metrics
-                                .decode_rung_actual
-                                .store(controller.width(rung) as u64, Ordering::Relaxed);
-                            controller.observe_decode(rung, sample);
-                        }
+                    }
+                    if let (Some(controller), Some(progress), Some(sample)) =
+                        (rung_controller.as_mut(), decode_progress, sample)
+                    {
+                        let rung = controller.covering(progress.extent);
+                        metrics
+                            .decode_rung_actual
+                            .store(controller.width(rung) as u64, Ordering::Relaxed);
+                        controller.observe_decode(rung, sample, progress.steps);
                     } else if rung_controller.is_some() {
                         metrics.decode_rung_actual.store(0, Ordering::Relaxed);
                     }
@@ -1219,9 +1235,9 @@ fn run_one_tick(
     // First device fault seen this tick — the dispatcher's EngineHealth
     // signal. Always `None` on the CPU reference path.
     Option<crate::DeviceErrorInfo>,
-    // Highest physical slot fed to decode, plus one. Empty decode ticks do
-    // not produce a rung sample.
-    Option<usize>,
+    // Only successful decode contributes a rung sample. Steps count device
+    // execution, including tokens discarded after a stop within the quantum.
+    Option<DecodeProgress>,
 ) {
     let bucket = key.and_then(|k| bundle.bucket(k));
     let mut tokens_this_tick = 0usize;
@@ -1488,15 +1504,7 @@ fn run_one_tick(
                             }
                         }
                         obs.host.slot_tokens = toks;
-                        return (
-                            slots,
-                            bufs,
-                            obs,
-                            tokens_this_tick,
-                            true,
-                            tick_fault,
-                            decode_feed_extent(&feeds),
-                        );
+                        return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
                     }
                 }
             }
@@ -1658,7 +1666,7 @@ fn run_one_tick(
 
             let pack_prefill_ns = pack_t.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
             let pack_had_feeds = !feeds.is_empty();
-            let fed_extent = decode_feed_extent(&feeds);
+            let mut decode_progress = None;
             let dec_t = packlog::on().then(Instant::now);
 
             // One batched decode launch for every slot already past prefill. The
@@ -1695,6 +1703,7 @@ fn run_one_tick(
                     );
                     match e.multi_step_at_most(&feeds, requested, &mut toks) {
                         Ok(k) => {
+                            decode_progress = completed_decode(&feeds, k);
                             for (ri, &(i, _)) in feeds.iter().enumerate() {
                                 for s in 0..k {
                                     if slots[i].is_none() {
@@ -1752,7 +1761,7 @@ fn run_one_tick(
                         tokens_this_tick,
                         did_prefill,
                         tick_fault,
-                        fed_extent,
+                        decode_progress,
                     );
                 }
                 // Device sampling (plan stage 4): when the engine has a sampler,
@@ -1779,6 +1788,7 @@ fn run_one_tick(
                 let step_res = e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks);
                 match step_res {
                     Ok(()) => {
+                        decode_progress = completed_decode(&feeds, 1);
                         for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
                             let slot_opt = &mut slots[i];
                             let Some(slot) = slot_opt.as_mut() else {
@@ -1872,7 +1882,7 @@ fn run_one_tick(
                 tokens_this_tick,
                 did_prefill,
                 tick_fault,
-                fed_extent,
+                decode_progress,
             );
         }
 
@@ -2195,7 +2205,7 @@ fn run_one_tick(
                     Some((i, *s.out_ids.last()?))
                 })
                 .collect();
-            let fed_extent = decode_feed_extent(&feeds);
+            let mut decode_progress = None;
             if feeds.is_empty() {
                 return (
                     slots,
@@ -2250,7 +2260,7 @@ fn run_one_tick(
                                 e.release(i);
                             }
                         }
-                        Ok(())
+                        Ok(quantum)
                     })
             } else {
                 e.step_batch(&feeds).map(|out| {
@@ -2273,12 +2283,13 @@ fn run_one_tick(
                             e.release(i);
                         }
                     }
+                    1
                 })
             };
             obs.host.slot_tokens = deferred;
             match step_result {
-                Ok(out) => {
-                    let _ = out;
+                Ok(quantum) => {
+                    decode_progress = completed_decode(&feeds, quantum);
                 }
                 Err(err) => {
                     // The batched launch failed — every fed slot loses.
@@ -2314,7 +2325,7 @@ fn run_one_tick(
                 tokens_this_tick,
                 did_prefill,
                 tick_fault,
-                fed_extent,
+                decode_progress,
             );
         }
 
@@ -3264,6 +3275,16 @@ mod tests {
 
         assert_eq!(controller.width(controller.covering(extent)), 1);
         assert_eq!(decode_feed_extent(&[]), None);
+    }
+
+    #[test]
+    fn decode_progress_uses_completed_steps_and_physical_extent() {
+        let feeds = [(0, 7), (3, 9)];
+        let progress = completed_decode(&feeds, 2).unwrap();
+        assert_eq!(progress.extent, 4);
+        assert_eq!(progress.steps.get(), 2);
+        assert_eq!(completed_decode(&feeds, 0), None);
+        assert_eq!(completed_decode(&[], 4), None);
     }
 
     #[cfg(feature = "cuda")]
