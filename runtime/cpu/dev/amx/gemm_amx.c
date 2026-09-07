@@ -451,14 +451,16 @@ static void tile_amx(const gemm_args* g, uint32_t m0, uint32_t m1, uint32_t n0, 
  * epilogue transposes the 32x32 fp32 block back (four ILS steps) and then runs the existing bf16 /
  * bias / GLU rows.
  *
- * Blocking mirrors the strip driver above with the roles swapped: K is paneled (WM_KP) so the x
- * panel of ALL tokens (M x 1 KiB, 512 KiB at M=512) stays L2-resident and a strip's W panel (32
- * rows x 1 KiB) stays L1-resident across the token blocks; fp32 partials per (strip, token block)
- * live in scratch between panels. Measured single-thread here: x tiles from L3 (the strip-outer,
- * full-K order) would cap the K loop at ~40% of the TMUL, both operands from L2 run at ~94%.
+ * Blocking mirrors the strip driver above with the roles swapped: K is paneled (WM_KP) and the
+ * tokens are chunked (WM_L2_BUDGET) so the chunk's x panel (2 KiB per token) stays L2-resident and
+ * a strip's W panel (32 rows x 2 KiB) stays L1-resident across the token blocks; fp32 partials per
+ * (strip, token block) live in scratch between panels. Measured single-thread here: x tiles from
+ * L3 (the strip-outer, full-K order) would cap the K loop at ~40% of the TMUL, both operands from
+ * L2 run at ~94%.
  * The next strip's W panel is software-prefetched (T1) at ~2 lines per K step so its first token
  * block does not stall on DRAM. Slices own contiguous 32-row weight strips. */
 #define WM_KP 1024u
+#define WM_L2_BUDGET (1536u << 10) /* token-chunk cache budget: 3/4 of the 2 MiB L2 of every AMX part */
 #define WM_TB_BYTES (WM_KP * 64u) /* one token block's x tiles over a panel: 16 kb x 2 tiles */
 #define WM_CB_OFF 0u              /* ping-pong x {gate, up} C^T landing, 4 KiB each */
 #define WM_CT_OFF (WM_CB_OFF + 4u * 4096u) /* same, transposed [m][n] */
@@ -596,10 +598,25 @@ static int wm_run(const gemm_args* g, uint32_t slice, uint32_t nblk, PlowCpuCtx*
     float* cb = (float*)(sc + WM_CT_OFF);
     uint8_t* wt = sc + WM_WT_OFF;
     uint8_t* xp = sc + WM_XP_OFF;
-    /* Token chunk: x panel (ntb x 32 KiB) + partials (nstrip x ntb x nacc x 4 KiB) must fit. */
+    /* Token chunk: x panel (ntb x 64 KiB) + partials (nstrip x ntb x nacc x 4 KiB) must fit. */
     const size_t per_tb = (size_t)WM_TB_BYTES + (size_t)nstrip * nacc * 4096u;
-    const uint32_t ntb_max = (uint32_t)((ctx->scratch_bytes - WM_XP_OFF) / per_tb);
+    uint32_t ntb_max = (uint32_t)((ctx->scratch_bytes - WM_XP_OFF) / per_tb);
     if (!ntb_max) return 0;
+    {   /* ...and must stay under L2 alongside the slice's W panel, which every token block of
+         * the chunk re-reads: past that the K loop stalls on L3 and per-token cost jumps ~40%.
+         * Chunking instead re-reads W once more per chunk, out of L3 (one op's W is far under
+         * the 260 MiB L3), which is the far cheaper miss. */
+        const size_t wpanel = (size_t)nstrip * nacc * 32u * WM_KP * 2u;
+        const uint32_t ntb_l2 = wpanel + per_tb <= WM_L2_BUDGET
+                                    ? (uint32_t)((WM_L2_BUDGET - wpanel) / per_tb)
+                                    : 1u;
+        if (ntb_l2 < ntb_max) ntb_max = ntb_l2;
+        /* Even chunks: every chunk costs one pass over the slice's W, so a ragged tail would pay
+         * a full pass for a handful of tokens. */
+        const uint32_t ntb_all = (g->M + 31u) / 32u;
+        if (ntb_max < ntb_all) ntb_max = (ntb_all + (ntb_all + ntb_max - 1u) / ntb_max - 1u) /
+                                         ((ntb_all + ntb_max - 1u) / ntb_max);
+    }
     memset(wt, 0, 2048u);
     const uint32_t npanel = (g->K + WM_KP - 1u) / WM_KP;
     for (uint32_t m0 = 0; m0 < g->M; m0 += ntb_max * 32u) {
