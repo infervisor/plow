@@ -103,11 +103,35 @@ Same profile: wall **2024.5 ms** against **1491.8 ms** mean busy. Worker min 137
 * Note this 26% is at 16 workers on 8 physical cores. The 15% on record was at a narrower width —
   SMT contention shows up here, and TMUL is shared per physical core.
 
+### MEASURED 2026-09-07 11:0x — width is worth -18.5%, bit-exact
+
+The 8-vs-16 worker experiment has now been run, and it is the largest bit-exact result on the
+table. All rows below have a `tokens:` line identical to baseline:
+
+| variant | threads | prefill wall | GLU ms/thr | DOWN ms/thr | delta |
+|---|---|---|---|---|---|
+| baseline | 16 | 2024.5 | 614.21 | 335.08 | — |
+| v2 (asm) | 16 | 1953.0 | 594.46 | 332.97 | -3.5% |
+| v3 (asm) | 16 | 1912.4 | 585.25 | 325.99 | -5.5% |
+| **v2t8** | **8** | **1650.0** | **566.10** | **310.32** | **-18.5%** |
+
+Scaled to the served cell: 2238 x 1650/2024.5 = **~1824 ms against vLLM's 1829**. So width alone
+plausibly flips summarize c=1, with **no numeric change at all** — where the asm restructuring is
+worth only 3.5-5.5%. This inverts the priority in §1: the kernel pass is the bonus, width is the
+lever.
+
+Two caveats before believing it: that is a profile wall, not a measured TTFT, and the run set
+`threads=8` for the **whole engine**. A global change would regress batch-1 dense decode, which
+wants logical CPUs. The correct shape is per-phase width.
+
 Work items, in order of expected value:
 
-1. **Per-phase worker width.** Task #15 landed per-*model* width (physical for MoE, logical for
-   dense) but per-phase needs idle workers to stop polling first. MoE prefill at 8 vs 16 workers is
-   a direct experiment: the two MoE ops are 63% of busy time and share one TMUL per core.
+1. **Per-phase worker width — now P0.** Task #15 landed per-*model* width (physical for MoE,
+   logical for dense) but per-phase needs idle workers to stop polling first; check whether that
+   blocker is still real. Needed: a proper width sweep (8/10/12/16, bit-exact, wall + per-op
+   busy/thr — only 8 and 16 exist so far), confirmation that the win is SMT contention on the
+   shared TMUL rather than scheduling overhead (worker idle was 26% at 16 threads; what is it at
+   8?), and proof the decode step does not regress at the chosen width.
 2. **Attack the ~437 ms of dependency stalls.** Look at whether MoE prefill serialises behind
    `MOE_ROUTER_TOPK_PF` / `MOE_ALIGN_PF` (0.63 and 0.03 ms/thr busy, but spans of ~1932 ms — they
    sit on the critical path across the whole prefill). Check per-CU static stream assignment.
