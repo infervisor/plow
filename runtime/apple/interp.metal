@@ -983,8 +983,7 @@ void op_flash_decode(const thread Inst& in, device const ulong* tab, uint slice,
                 uint my_lo = lo + sg * chunk, my_hi = min(my_lo + chunk, hi);
                 float m = NEG_INF, l = 0.0f, acc[16];
                 for (uint j = 0; j < 16; j++) acc[j] = 0.0f;
-                if (my_lo < my_hi)
-                    attend_rows(q, kbase, vbase, D, kv_mask, scale, my_lo, my_hi, qpos, window, false, lane, acc, m, l);
+                attend_rows(q, kbase, vbase, D, kv_mask, scale, my_lo, my_hi, qpos, window, false, lane, acc, m, l);
                 threadgroup float* part = tile + sg * stride;
                 if (lane == 0) { part[0] = m; part[1] = l; }
                 for (uint j = 0; j < per; j++) part[2u + lane + 32u * j] = acc[j];
@@ -1059,31 +1058,41 @@ void op_per_layer_input(const thread Inst& in, device const ulong* tab, uint sli
     device const ushort* gnext = ten<ushort>(tab, in, 6);
     uint rows = in.i[0], H = in.i[1], P = in.i[2], col0 = in.i[3], stride = in.i[4];
     float eps = as_type<float>(in.fj[0]), ls = as_type<float>(in.fj[1]);
-    if (P + H > TILE_FLOATS) return;
     threadgroup float* a = tile;
     threadgroup float* y = tile + P;
     for (uint t = slice; t < rows; t += nblk) {
         device ushort* xr = x + ulong(t) * H;
+        if (P + H > TILE_FLOATS || (P & 7u)) {
+            // Same failure as the golden: a poisoned row, never a silent skip.
+            for (uint h = lid; h < H; h += NT) xr[h] = 0x7FC0;
+            continue;
+        }
         device const ushort* pr = ple + ulong(t) * stride + col0;
+        // Gate: one simdgroup per output p, lanes over H (the GEMV family's dot).
         for (uint p = sg; p < P; p += NSG) {
-            device const ushort* w = wg + ulong(p) * H;
-            float s = 0.0f;
-            for (uint h = lane; h < H; h += 32u) s += bf2f(w[h]) * bf2f(xr[h]);
-            s = simd_sum(s);
+            float s = dot_bf16(wg + ulong(p) * H, xr, H, lane); // simd-reduced inside
             if (lane == 0) {
                 float g = rbf(gelu_tanhs(rbf(s)));
                 a[p] = rbf(g * bf2f(pr[p]));
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Projection: one simdgroup per output h, lanes over P in 8-wide coalesced loads.
         float ss = 0.0f;
-        for (uint h = lid; h < H; h += NT) {
+        for (uint h = sg; h < H; h += NSG) {
             device const ushort* w = wp + ulong(h) * P;
             float s = 0.0f;
-            for (uint p = 0; p < P; p++) s += bf2f(w[p]) * a[p];
-            s = rbf(s);
-            y[h] = s;
-            ss += s * s;
+            for (uint p = lane * 8u; p + 8u <= P; p += 256u) {
+                float4 w0 = bf4(*(device const ushort4*)(w + p)), w1 = bf4(*(device const ushort4*)(w + p + 4));
+                s += dot(w0, float4(a[p], a[p + 1], a[p + 2], a[p + 3]))
+                   + dot(w1, float4(a[p + 4], a[p + 5], a[p + 6], a[p + 7]));
+            }
+            s = simd_sum(s);
+            if (lane == 0) {
+                s = rbf(s);
+                y[h] = s;
+                ss += s * s;
+            }
         }
         ss = tg_sum(ss, red, lid, sg, lane);
         float inv = rsqrt(ss / float(H) + eps);

@@ -2183,8 +2183,8 @@ fn declare(
         let kvh = if full { c.kvh_full } else { c.kvh_slide };
         // KV sharing (E-series): this layer reads the KV cache of `kv_src` and owns no k/v
         // projection, k norm or cache of its own.
-        let shared = c.kv_is_shared(l as usize);
         let kv_src = c.kv_source(l as usize);
+        let shared = kv_src != l as usize;
         // KV CACHE, HEAD-MAJOR [kv_head][ctx][hd] (see dev_isa.h "THE KV CACHE IS HEAD-MAJOR").
         // Exactly the layout HeadNormRope writes (op_norm.h d_headnorm_rope, out_stride = kvr)
         // and the layout FlashDecode reads with kv_stride — so the cache write is not a separate
@@ -3453,7 +3453,10 @@ fn emit_phase(
     // segments (`Builder::host_join`). Dense, single-GPU, bf16-activation prefill only.
     let split = hetero
         .and_then(|_| hetero::RowSplit::from_env())
-        .filter(|_| !gemv_family && tp == 1 && !c.moe && !block_mode && !w8a8 && !mx4);
+        // E-series (per-layer inputs, KV sharing) is not in the ANE lane's layer graph yet.
+        .filter(|_| {
+            !gemv_family && tp == 1 && !c.moe && !block_mode && !w8a8 && !mx4 && c.ple == 0 && c.kv_shared == 0
+        });
     let tg = split.map_or(t, |s| s.rows(t).0);
     let rows_g: Vec<u32> = (0..tg.min(n_cu).max(1)).collect();
     let hj = split.is_some();
@@ -3499,7 +3502,12 @@ fn emit_phase(
     // the RMSNorm that follows is scale-invariant); ple = (RMSNorm_P(ple_pp) * gamma + ple_raw) / sqrt(2).
     // Every layer's block then reads its P-column slice of `ple`. Emitted before the hetero
     // join so the CPU lane's rows see it.
-    let c_ple = if c.ple > 0 && !block_mode {
+    assert!(
+        !(block_mode && (c.ple > 0 || c.kv_shared > 0)),
+        "block mode uploads act.x only: a per-layer-input or KV-shared model has no per-layer inputs \
+         or source caches inside one block"
+    );
+    let c_ple = if c.ple > 0 {
         let lp = c.layers * c.ple;
         let c_pe = b.emit(DevOp::Embed, rows.clone(), &[], |d| {
             d.t[0] = n.ple_raw;
@@ -3507,7 +3515,8 @@ fn emit_phase(
             d.t[2] = n.ids;
             d.i[0] = t;
             d.i[1] = lp;
-            d.f[0] = (c.ple as f32).sqrt();
+            // HF casts the scale to the weight dtype (bf16) before multiplying.
+            d.f[0] = crate::config::bf16_round((c.ple as f32).sqrt());
         });
         let fill = |d: &mut DevInst| {
             d.t[0] = n.ple_pp;
@@ -5700,6 +5709,27 @@ fn emit_phase(
         // SECOND RESIDUAL.
         //   Gemma: x = (x + post_ffn_norm(d)) * layer_scalar — the learned scalar folds in.
         //   Llama/Qwen: x = x + d (plain).
+        // E-series per-layer input block (op 154) after the sandwich residual; `hn_out`/`gnext`
+        // fold the next layer's input norm in (decode), TENSOR_NONE leaves it to a RmsNorm packet.
+        let ple_block =
+            |b: &mut Builder, cus: Vec<u32>, nrows: u32, dep: u32, hn_out: u32, gnext: u32| -> u32 {
+                b.emit(DevOp::PerLayerInput, cus, &[dep, c_ple], |d| {
+                    d.t[0] = n.x;
+                    d.t[1] = w.plg;
+                    d.t[2] = w.plp;
+                    d.t[3] = w.g_pl;
+                    d.t[4] = n.ple;
+                    d.t[5] = hn_out;
+                    d.t[6] = gnext;
+                    d.i[0] = nrows;
+                    d.i[1] = c.hidden;
+                    d.i[2] = c.ple;
+                    d.i[3] = l as u32 * c.ple;
+                    d.i[4] = c.layers * c.ple;
+                    d.f[0] = c.eps;
+                    d.f[1] = ls[l];
+                })
+            };
         dep = if let Some(ct) = moe_fused_tail {
             // op72 already produced the new residual (n.x) AND the next input norm (n.hn).
             ct
@@ -5754,22 +5784,7 @@ fn emit_phase(
                     d.f[0] = c.eps;
                     d.f[1] = 1.0;
                 });
-                b.emit(DevOp::PerLayerInput, rows.clone(), &[cr, c_ple], |d| {
-                    d.t[0] = n.x;
-                    d.t[1] = w.plg;
-                    d.t[2] = w.plp;
-                    d.t[3] = w.g_pl;
-                    d.t[4] = n.ple;
-                    d.t[5] = n.hn;
-                    d.t[6] = next_gin;
-                    d.i[0] = t;
-                    d.i[1] = c.hidden;
-                    d.i[2] = c.ple;
-                    d.i[3] = l as u32 * c.ple;
-                    d.i[4] = c.layers * c.ple;
-                    d.f[0] = c.eps;
-                    d.f[1] = ls[l];
-                })
+                ple_block(b, rows.clone(), t, cr, n.hn, next_gin)
             } else {
                 b.emit(DevOp::NormResidualNorm, rows.clone(), &[c_d], |d| {
                     d.t[0] = n.hn;
@@ -5798,20 +5813,7 @@ fn emit_phase(
             });
             rec(cr);
             if c.ple > 0 {
-                let cp = b.emit(DevOp::PerLayerInput, rows_g.clone(), &[cr, c_ple], |d| {
-                    d.t[0] = n.x;
-                    d.t[1] = w.plg;
-                    d.t[2] = w.plp;
-                    d.t[3] = w.g_pl;
-                    d.t[4] = n.ple;
-                    d.i[0] = tg;
-                    d.i[1] = c.hidden;
-                    d.i[2] = c.ple;
-                    d.i[3] = l as u32 * c.ple;
-                    d.i[4] = c.layers * c.ple;
-                    d.f[0] = c.eps;
-                    d.f[1] = ls[l];
-                });
+                let cp = ple_block(b, rows_g.clone(), tg, cr, TENSOR_NONE, TENSOR_NONE);
                 rec(cp);
                 cp
             } else {
@@ -8232,6 +8234,7 @@ fn emit_dense_gqa(
     check_fp8_a_scale_bound(&m, &arch, &gpu);
     check_gfx950_opcode_coverage(&m, amd);
     check_nvidia_opcode_coverage(&m, amd);
+    check_apple_only_opcodes(&m, arch == "metal3");
     check_group_routing_supported(&m, amd, &arch);
     warn_arch_gpu_vendor_mismatch(&arch, &gpu);
 
@@ -8404,3 +8407,27 @@ mod chunk_default_tests;
 mod emit_capabilities_tests;
 
 pub mod fp8_m1_role;
+
+/// Opcodes only the Metal interpreter (and the CPU golden tier) implement. Refused at emit for
+/// any other GPU target, so an E-series blob cannot reach a CUDA/HIP interpreter's
+/// `default: __trap()`.
+fn check_apple_only_opcodes(m: &Model, apple: bool) {
+    if apple {
+        return;
+    }
+    const APPLE_ONLY: [DevOp; 1] = [DevOp::PerLayerInput];
+    let bad: Vec<&'static str> = APPLE_ONLY
+        .iter()
+        .filter(|op| {
+            m.progs
+                .iter()
+                .any(|p| p.insts.iter().any(|i| i.op == **op as u16))
+        })
+        .map(|op| op.c_name())
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "this packet carries opcode(s) only the Apple (metal3) interpreter implements: {bad:?}; \
+         emit with --gpu <apple part> or a CPU target"
+    );
+}

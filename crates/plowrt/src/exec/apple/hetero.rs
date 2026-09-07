@@ -270,7 +270,7 @@ impl Hetero {
                     let mut done: Vec<usize> = Vec::with_capacity(offs.len());
                     for (slot, bytes) in offs {
                         let h = d.t[slot] as usize;
-                        if !done.contains(&h) {
+                        if h != packet::dev::TENSOR_NONE16 as usize && !done.contains(&h) {
                             tab[h] += bytes;
                             done.push(h);
                         }

@@ -3,6 +3,17 @@
 //!
 //! `cargo run --release --features metal --example apple_chat -- <model.pkt> <checkpoint-dir> [--tokens N] [--prompt "..."] [--chat "..."]`
 
+/// Decode step-time window printed every `WINDOW` steps (the per-context growth is visible).
+const WINDOW: usize = 100;
+
+/// `(mean, min, max)` of a step-time window in ms.
+fn stats(w: &[f64]) -> (f64, f64, f64) {
+    let mean = w.iter().sum::<f64>() / w.len() as f64;
+    let min = w.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = w.iter().cloned().fold(0.0, f64::max);
+    (mean, min, max)
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() {
     use plowrt::exec::apple::MetalEngine;
@@ -110,15 +121,12 @@ fn main() {
         let t = Instant::now();
         let next = eng.decode_step(pos, pos + 1).expect("decode");
         step_ms.push(t.elapsed().as_secs_f64() * 1e3);
-        if step_ms.len() % 100 == 0 {
-            let w = &step_ms[step_ms.len() - 100..];
+        if step_ms.len() % WINDOW == 0 {
+            let (mean, min, max) = stats(&step_ms[step_ms.len() - WINDOW..]);
             println!(
-                "  steps {}..{}: mean {:.1} ms/tok, min {:.1}, max {:.1}",
-                step_ms.len() - 100,
-                step_ms.len(),
-                w.iter().sum::<f64>() / 100.0,
-                w.iter().cloned().fold(f64::INFINITY, f64::min),
-                w.iter().cloned().fold(0.0, f64::max)
+                "  steps {}..{}: mean {mean:.1} ms/tok, min {min:.1}, max {max:.1}",
+                step_ms.len() - WINDOW,
+                step_ms.len()
             );
         }
         out.push(next);
@@ -130,8 +138,7 @@ fn main() {
         println!("cpu share: {ops} decode ops split with the CPU, {ms:.2} ms of CPU-side time in the last step");
     }
     if !step_ms.is_empty() {
-        let mean = step_ms.iter().sum::<f64>() / step_ms.len() as f64;
-        let min = step_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+        let (mean, min, _) = stats(&step_ms);
         println!(
             "decode: {} steps, mean {mean:.1} ms/tok ({:.2} tok/s), min {min:.1} ms",
             step_ms.len(),

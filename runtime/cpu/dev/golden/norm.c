@@ -256,17 +256,13 @@ G_K(g_per_layer_input) {
             ss += y[h] * y[h];
         }
         const float inv = g_rsqrt(ss / (float)H + eps);
-        float ss2 = 0.0f;
         for (uint32_t h = 0; h < H; h++) {
             const float g = gamma ? plow_bf2f(gamma[h]) : 1.0f;
             const float n = plow_bf2f(plow_f2bf(y[h] * inv * g));
-            const float v = plow_bf2f(plow_f2bf(plow_bf2f(xr[h]) + n)) * ls;
-            xr[h] = plow_f2bf(v);
-            const float vb = plow_bf2f(xr[h]);
-            ss2 += vb * vb;
+            xr[h] = plow_f2bf(plow_bf2f(plow_f2bf(plow_bf2f(xr[h]) + n)) * ls);
         }
         if (hn) {
-            const float inv2 = g_rsqrt(ss2 / (float)H + eps);
+            const float inv2 = g_rsqrt(row_ss(xr, H) / (float)H + eps);
             plow_bf16* o = hn + (size_t)t * H;
             for (uint32_t h = 0; h < H; h++) {
                 const float g = gnext ? plow_bf2f(gnext[h]) : 1.0f;

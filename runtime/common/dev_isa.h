@@ -1323,7 +1323,8 @@ enum {
      *             x[t] = (x[t] + RMSNorm(y) * gamma_post) * layer_scalar;
      *             hn[t] = RMSNorm(x[t]) * gamma_next          (only when t5 is bound)
      * `ple` is the [T][layers*P] per-layer input table (Gemma4TextModel.project_per_layer_inputs,
-     * with the 1/sqrt(2) folded into Wp by the emitter); t5/t6 fold the NEXT layer's input norm. */
+     * whose 1/sqrt(2) the emitter already applied when it combined the table); Wp is the checkpoint
+     * weight verbatim. t5/t6 fold the NEXT layer's input norm. */
     PLOW_DOP_PER_LAYER_INPUT = 154,
 
     PLOW_DOP__COUNT

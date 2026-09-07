@@ -1804,7 +1804,9 @@ pub enum DevOp {
     MoeDownMxPf = 153,
     /// Gemma-4 E-series per-layer input block, fused and in place on `x`: `g = gelu_tanh(Wg . x)`,
     /// `a = g * ple[t][col0..col0+P)`, `x = (x + RMSNorm(Wp . a) * gamma_post) * layer_scalar`, and
-    /// optionally the next layer's input norm `hn = RMSNorm(x) * gamma_next` (t5/t6). See
+    /// optionally the next layer's input norm `hn = RMSNorm(x) * gamma_next` (t5/t6). `ple` is
+    /// the combined per-layer input table, already carrying HF's 1/sqrt(2) (the emitter applies it
+    /// on the Residual that forms the table); `Wp` is the checkpoint weight verbatim. See
     /// `dev_isa.h` op 154.
     /// `t0=x t1=Wg t2=Wp t3=gamma_post t4=ple t5=hn_out? t6=gamma_next?` ·
     /// `i0=T i1=H i2=P i3=col0 i4=stride` · `f0=eps f1=layer_scalar`.

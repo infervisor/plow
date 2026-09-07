@@ -321,6 +321,15 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
     if c.moe {
         crate::require_moe_topk(c.top_k, "gemma4 (enable_moe_block)");
     }
+    assert!(
+        c.kv_shared < c.layers,
+        "gemma4: num_kv_shared_layers {} must be below num_hidden_layers {}",
+        c.kv_shared,
+        c.layers
+    );
+    for l in 0..c.layers as usize {
+        let _ = c.kv_source(l); // every shared layer must have an earlier layer of its type
+    }
     c
 }
 

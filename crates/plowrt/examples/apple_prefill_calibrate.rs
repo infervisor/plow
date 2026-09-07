@@ -180,7 +180,11 @@ fn main() {
         "cells": cells,
         "chosen": {"ane_pct": chosen.0, "cpu_pct": chosen.1},
     });
-    let path = PathBuf::from(format!("tuning/apple-{slug}-prefill.json"));
+    let model_slug = ckpt
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| "model".into());
+    let path = PathBuf::from(format!("tuning/apple-{slug}-{model_slug}-prefill.json"));
     std::fs::create_dir_all(path.parent().unwrap()).ok();
     std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).expect("write");
     println!("wrote {}", path.display());
