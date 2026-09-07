@@ -465,22 +465,22 @@ inline void frag_load(threadgroup const bfloat* As, threadgroup const bfloat* Bs
 // One SM x 128 sub-tile at (mm, nn). Simdgroups form an RS x CS grid (RS*CS == 32), each owning
 // RB x CB 8x8 accumulators. Thread lid stages A group (row lid/8, k-quad lid%8) and B group
 // (same indexing over the 128 B rows) of every chunk: two ushort4 device loads per chunk.
-template <uint SM, uint RB, uint CB>
+template <uint SM, uint SN, uint RB, uint CB>
 inline void gemm_sub(thread const GemmArgs& g, device ushort* C, uint ldc, uint mm, uint nn, uint m1, uint n1,
                      threadgroup ushort* stage, uint lid, uint sg, uint lane) {
     constexpr uint RS = SM / (8u * RB), CS = NSG / RS;
-    constexpr uint A_ELTS = SM * GK, STAGE = (SM + SN2) * GK;
+    constexpr uint A_ELTS = SM * GK, STAGE = (SM + SN) * GK;
     constexpr uint QK = GK / 4u;                   // k-quads per row
     const uint nchunk = (g.K + GK - 1u) / GK;
-    const bool a_side = lid < SM * QK;
+    const bool a_side = lid < SM * QK, b_side = lid < SN * QK;
     const uint ar = lid / QK, aq = lid % QK, br = lid / QK, bq = lid % QK;
     const uint sgr = sg / CS, sgc = sg % CS;
     simdgroup_float8x8 acc[RB][CB];
     for (uint i = 0; i < RB; i++) for (uint j = 0; j < CB; j++) acc[i][j] = simdgroup_float8x8(0.0f);
     ushort4 ra = a_side ? load_a16(g.A, g.M, g.K, mm + ar, aq * 4u) : ushort4(0);
-    ushort4 rb = load_b16(g.B16, g.B8, g.N, g.K, nn + br, bq * 4u);
+    ushort4 rb = b_side ? load_b16(g.B16, g.B8, g.N, g.K, nn + br, bq * 4u) : ushort4(0);
     if (a_side) stage_put(stage, ar, aq, ra);
-    stage_put(stage + A_ELTS, br, bq, rb);
+    if (b_side) stage_put(stage + A_ELTS, br, bq, rb);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint c = 0; c < nchunk; c++) {
         threadgroup ushort* cur = stage + (c & 1u) * STAGE;
@@ -489,7 +489,7 @@ inline void gemm_sub(thread const GemmArgs& g, device ushort* C, uint ldc, uint 
         if (more) {
             uint k0 = (c + 1u) * GK;
             if (a_side) ra = load_a16(g.A, g.M, g.K, mm + ar, k0 + aq * 4u);
-            rb = load_b16(g.B16, g.B8, g.N, g.K, nn + br, k0 + bq * 4u);
+            if (b_side) rb = load_b16(g.B16, g.B8, g.N, g.K, nn + br, k0 + bq * 4u);
         }
         threadgroup const bfloat* As = (threadgroup const bfloat*)cur;
         threadgroup const bfloat* Bs = As + A_ELTS;
@@ -505,7 +505,7 @@ inline void gemm_sub(thread const GemmArgs& g, device ushort* C, uint ldc, uint 
         }
         if (more) {
             if (a_side) stage_put(nxt, ar, aq, ra);
-            stage_put(nxt + A_ELTS, br, bq, rb);
+            if (b_side) stage_put(nxt + A_ELTS, br, bq, rb);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -515,17 +515,27 @@ inline void gemm_sub(thread const GemmArgs& g, device ushort* C, uint ldc, uint 
             epilogue8x8(acc[i][j], scratch, lane, mm + (sgr * RB + i) * 8u, nn + (sgc * CB + j) * 8u, m1, n1, g, C, ldc);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
-// Sub-tile rows follow the remaining M: 128 (16x32 blocks), 64 (8x32) or 32 (8x16).
+// Sub-tile rows follow the remaining M: 128 (16x32 blocks), 64 (8x32) or 32 (8x16); 64-wide
+// tiles (BN = 64: the narrow projections, where 128-wide tiles would leave cores idle) halve
+// the block columns.
 inline void gemm_tile2(thread const GemmArgs& g, device ushort* C, uint ldc, uint m0, uint m1, uint n0, uint n1,
-                       threadgroup float* tile, uint lid, uint sg, uint lane) {
+                       uint bn, threadgroup float* tile, uint lid, uint sg, uint lane) {
     threadgroup ushort* stage = (threadgroup ushort*)tile;
     for (uint mm = m0; mm < m1;) {
         uint rem = m1 - mm;
         uint sm = rem > 64u ? 128u : (rem > 32u ? 64u : 32u);
-        for (uint nn = n0; nn < n1; nn += SN2) {
-            if (sm == 128u) gemm_sub<128, 2, 4>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
-            else if (sm == 64u) gemm_sub<64, 1, 4>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
-            else gemm_sub<32, 1, 2>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+        if (bn >= SN2) {
+            for (uint nn = n0; nn < n1; nn += SN2) {
+                if (sm == 128u) gemm_sub<128, SN2, 2, 4>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+                else if (sm == 64u) gemm_sub<64, SN2, 1, 4>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+                else gemm_sub<32, SN2, 1, 2>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+            }
+        } else {
+            for (uint nn = n0; nn < n1; nn += 64u) {
+                if (sm == 128u) gemm_sub<128, 64, 2, 2>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+                else if (sm == 64u) gemm_sub<64, 64, 1, 2>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+                else gemm_sub<32, 64, 1, 1>(g, C, ldc, mm, nn, m1, n1, stage, lid, sg, lane);
+            }
         }
         mm += sm;
     }
@@ -645,6 +655,12 @@ void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nb
     g.bias = fp8 ? (device const ushort*)0 : ten<ushort>(tab, in, 7);
     g.K = K; g.M = M; g.N = N;
     bool poison = fp8 && (ten<float>(tab, in, 3) != 0 || !g.wscale);
+    // The small tile op narrows to 64 columns only when 128-wide tiles would leave executors
+    // idle (a 64-wide sub-tile halves the matrix work per simdgroup, so it must buy parallelism).
+    if (BM == 64u && BN == 64u) {
+        uint tm64 = (M + 63u) / 64u, tn128 = (N + 127u) / 128u;
+        if (tm64 * tn128 >= nblk) BN = 128u;
+    }
     uint tm = (M + BM - 1) / BM, tn = (N + BN - 1) / BN;
     for (uint lin = slice; lin < tm * tn; lin += nblk) {
         uint m0 = (lin / tn) * BM, n0 = (lin % tn) * BN;
@@ -654,7 +670,7 @@ void op_gemm(const thread Inst& in, device const ulong* tab, uint slice, uint nb
                 C[(m0 + e / (n1 - n0)) * N + n0 + e % (n1 - n0)] = ushort(0x7fc1);
             continue;
         }
-        gemm_tile2(g, C, N, m0, m1, n0, n1, tile, lid, sg, lane);
+        gemm_tile2(g, C, N, m0, m1, n0, n1, BN, tile, lid, sg, lane);
     }
 }
 // GLU: t0=fu t1=A t2=Wg t5=Wu t6=bias_g? t7=bias_u? i5=act (bf16) / t3=a_scale? t4=g_scale t6=u_scale (fp8)
@@ -1211,13 +1227,13 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 6: op_embed(in, tab, slice, nblk, lid); return true;
         case 7: op_softcap(in, tab, slice, nblk, lid); return true;
         case 8: op_gemm(in, tab, slice, nblk, 256, 256, false, tile, lid, sg, lane); return true;
-        case 14: op_gemm(in, tab, slice, nblk, 64, 128, false, tile, lid, sg, lane); return true;
+        case 14: op_gemm(in, tab, slice, nblk, 64, 64, false, tile, lid, sg, lane); return true;
         case 15: op_gemm(in, tab, slice, nblk, 128, 128, false, tile, lid, sg, lane); return true;
         case 94: op_gemm(in, tab, slice, nblk, 128, 256, false, tile, lid, sg, lane); return true;
         case 95: op_gemm(in, tab, slice, nblk, 192, 256, false, tile, lid, sg, lane); return true;
         case 33: op_gemm(in, tab, slice, nblk, 256, 256, true, tile, lid, sg, lane); return true;
         case 34: op_gemm(in, tab, slice, nblk, 128, 128, true, tile, lid, sg, lane); return true;
-        case 35: op_gemm(in, tab, slice, nblk, 64, 128, true, tile, lid, sg, lane); return true;
+        case 35: op_gemm(in, tab, slice, nblk, 64, 64, true, tile, lid, sg, lane); return true;
         case 100: op_gemm(in, tab, slice, nblk, 128, 256, true, tile, lid, sg, lane); return true;
         case 101: op_gemm(in, tab, slice, nblk, 192, 256, true, tile, lid, sg, lane); return true;
         case 20: op_gemm_glu(in, tab, slice, nblk, false, tile, lid, sg, lane); return true;

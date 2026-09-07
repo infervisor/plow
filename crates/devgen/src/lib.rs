@@ -500,7 +500,8 @@ fn apple_prefill_tile(m: u32, n: u32, n_cu: u32, quant: kernelcaps::QuantScheme)
         "Apple pick_tile: no prefill GEMM opcode for quant {quant:?}"
     );
     // Measured (v3 tiles, M4 Pro): 128x128 beats 256x256 at every shape (3.8 vs 2.9 TFLOPS at
-    // 512x3072x3072) and 64x128 wins only where 128x128 leaves cores idle.
+    // 512x3072x3072); the 64x64 small tile (Metal geometry of GemmSmall) is for the narrow
+    // projections where 128x128 leaves cores idle.
     let tiles = |bm: u32, bn: u32| m.div_ceil(bm) * n.div_ceil(bn);
     if tiles(128, 128) >= n_cu {
         if fp8 { DevOp::GemmMedFp8 } else { DevOp::GemmMed }

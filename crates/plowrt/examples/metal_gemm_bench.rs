@@ -162,8 +162,10 @@ fn main() {
             }
             for &kk in &ks {
             let k = kk;
+            let nn = std::env::var("PLOW_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(nn);
             let mut d = d0;
             d.i[0] = m;
+            d.i[1] = nn;
             d.i[2] = k;
             d.i[4] = 0;
             d.i[5] = 0;
