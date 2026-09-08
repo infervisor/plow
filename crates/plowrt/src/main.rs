@@ -2513,7 +2513,7 @@ async fn bringup_runtime(
     }
     let execset = Arc::new(ExecutorSet::bringup(backend)?);
 
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     for dir in &assets {
         let slug = registry.load(dir, None)?;
         let target = registry.get(&slug)?.manifest.gpu.clone();
@@ -2577,7 +2577,7 @@ async fn bringup_runtime(
     #[cfg(feature = "cuda")]
     if let Some(cuda) = &cuda {
         let mut models: Vec<(String, PathBuf, PathBuf)> = Vec::new();
-        let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+        let slugs: Vec<String> = state.registry.slugs();
         for slug in slugs {
             let bundle = state.registry.get(&slug)?;
             if plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)?.is_none() {
@@ -2620,7 +2620,7 @@ async fn bringup_runtime(
     // the packet.
     #[cfg(feature = "hsa")]
     if vendor == Some(hwspec::Vendor::Amd) {
-        let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+        let slugs: Vec<String> = state.registry.slugs();
         for slug in slugs {
             let bundle = state.registry.get(&slug)?;
             let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
@@ -2667,7 +2667,7 @@ async fn bringup_runtime(
     // interpreter. Same tokenizer refusal as the GPU paths.
     #[cfg(feature = "cpu")]
     if vendor.is_none() {
-        let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+        let slugs: Vec<String> = state.registry.slugs();
         for slug in slugs {
             let bundle = state.registry.get(&slug)?;
             let Some(blob) = plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)? else {
@@ -2716,7 +2716,7 @@ async fn bringup_runtime(
     // Each dispatcher owns a Sender clone via AppState::mux(slug). Managed
     // (GPU) models are skipped — their dispatcher lifecycle belongs to the
     // manager (spawned on load, drained+removed on evict).
-    let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+    let slugs: Vec<String> = state.registry.slugs();
     for slug in slugs {
         if managed_slugs.contains(&slug) {
             continue;
@@ -2773,11 +2773,7 @@ async fn bench(
     plowrt::serve::bench::validate_request_layout(&input, warmup_requests, requests)?;
     validate_token_audit_options(token_audit, &input, warmup_requests, requests, output_len)?;
     let state = bringup_runtime(vec![assets], executors, false, mux_cfg).await?;
-    let models = state
-        .registry
-        .slugs()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let models = state.registry.slugs();
     let [model] = models.as_slice() else {
         return Err(format!("bench requires exactly one model, loaded {}", models.len()).into());
     };

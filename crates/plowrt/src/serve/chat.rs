@@ -68,6 +68,14 @@ pub async fn chat_completions(
                         Json(serde_json::json!({"error": e.to_string()})),
                     )
                         .into_response(),
+                    // No `retry-after`: retrying cannot help. The model is
+                    // resident-capable but an operator took it down, and only
+                    // an explicit load brings it back.
+                    EnsureError::Unloaded => (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response(),
                     EnsureError::Load(err) => (
                         status_for(&err),
                         Json(serde_json::json!({"error": err.to_string()})),

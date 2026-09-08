@@ -329,9 +329,39 @@ pub struct AppState {
     /// at startup when any bundle is GPU-managed; `None` on CPU-only serves.
     #[cfg(feature = "cuda")]
     manager: std::sync::OnceLock<Arc<manager::ModelManager>>,
+    /// Operator-set residency overrides, slug → state. Absent = [`Residency::Auto`].
+    /// Only the control plane writes here; the manager and the request path read it.
+    residency: RwLock<FxHashMap<String, Residency>>,
     /// When set, each run records a timeline dumpable at `GET /trace`.
     record_trace: bool,
     trace: Mutex<Timeline>,
+}
+
+/// Operator-visible residency state of a registered slug.
+///
+/// This exists because residency is otherwise purely demand-driven: an
+/// operator's unload would be undone by the very next request (which calls
+/// `ensure_resident`) or by the speculative preloader. `Unloaded` is the state
+/// that makes an explicit unload stick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Residency {
+    /// Registered; the manager loads and evicts it on demand.
+    #[default]
+    Auto,
+    /// An unload is in flight. Handlers refuse new work for this slug BEFORE
+    /// the mux is removed, so a request cannot slip into the window between
+    /// `remove_mux` and the dispatcher's exit and be dropped without a terminal.
+    Unloading,
+    /// Explicitly unloaded. `ensure_resident` refuses and the preloader skips
+    /// it until an explicit load returns it to `Auto`.
+    Unloaded,
+}
+
+impl Residency {
+    /// Whether new requests for this slug may be admitted.
+    pub fn admits(self) -> bool {
+        matches!(self, Residency::Auto)
+    }
 }
 
 impl AppState {
@@ -352,6 +382,7 @@ impl AppState {
             vmm_stats: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
             manager: std::sync::OnceLock::new(),
+            residency: RwLock::new(FxHashMap::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
         }
@@ -405,6 +436,24 @@ impl AppState {
     #[cfg(feature = "cuda")]
     pub fn manager(&self) -> Option<&Arc<manager::ModelManager>> {
         self.manager.get()
+    }
+
+    /// Residency state of `slug` (defaults to [`Residency::Auto`]).
+    pub fn residency(&self, slug: &str) -> Residency {
+        self.residency.read().get(slug).copied().unwrap_or_default()
+    }
+
+    /// Set the residency state of `slug`. `Auto` clears the override.
+    pub fn set_residency(&self, slug: &str, state: Residency) {
+        let mut map = self.residency.write();
+        match state {
+            Residency::Auto => {
+                map.remove(slug);
+            }
+            _ => {
+                map.insert(slug.to_string(), state);
+            }
+        }
     }
 
     /// Register a dispatcher for a model slug. Called once at startup.

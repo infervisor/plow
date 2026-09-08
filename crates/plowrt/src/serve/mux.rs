@@ -4009,6 +4009,8 @@ mod tests {
                 cached_tokens: 0,
                 kv: None,
                 arrived: Instant::now(),
+                stop_tail: String::new(),
+                stop_pending: String::new(),
             }),
             rx,
         )

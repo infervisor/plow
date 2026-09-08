@@ -53,7 +53,7 @@ fn used(be: &CudaBackend) -> u64 {
 
 /// Registry + execset + AppState over one CUDA backend, models A then B.
 fn build_state(be: &Arc<CudaBackend>) -> (Arc<AppState>, String, String) {
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let slug_a = registry.load(assets_a(), None).expect("load A");
     let slug_b = registry.load(assets_b(), None).expect("load B");
     assert_ne!(
@@ -322,7 +322,7 @@ async fn long_prefill_does_not_shed_decode_streams() {
         std::env::var("PLOW_MM_ASSETS_C").unwrap_or_else(|_| "/root/gpu-assets-b4/b4".into()),
     );
     let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
-    let mut registry = Registry::new();
+    let registry = Registry::new();
     let slug = registry.load(&assets, None).expect("load C");
     let backend: Arc<dyn Backend> = Arc::clone(&be) as Arc<dyn Backend>;
     let execset = Arc::new(ExecutorSet::bringup(backend).expect("execset"));

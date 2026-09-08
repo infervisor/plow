@@ -107,6 +107,12 @@ pub async fn completions(
                         Json(serde_json::json!({"error": e.to_string()})),
                     )
                         .into_response(),
+                    // No `retry-after`: only an explicit load brings it back.
+                    EnsureError::Unloaded => (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response(),
                     EnsureError::Load(err) => (
                         status_for(&err),
                         Json(serde_json::json!({"error": err.to_string()})),

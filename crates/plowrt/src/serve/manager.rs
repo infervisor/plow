@@ -15,12 +15,31 @@
 //! dir and cached — the planner self-calibrates.
 //!
 //! **Cross-model execution.** Resident models keep their per-model dispatchers
-//! (one `ModelMux` each); GPU execution serializes naturally: every engine
-//! shares ONE `CudaBackend` (one context) and launches cooperatively on the
-//! NULL stream, so kernels from different models are stream-ordered — a tick's
-//! launch can never interleave with another model's launch, and each engine
-//! synchronizes under its own mutex before reading results. No global launch
-//! lock is needed.
+//! (one `ModelMux` each), each with its own `EngineThread`, so two ticks do run
+//! concurrently on two OS threads against the one shared `CUcontext`.
+//!
+//! This paragraph used to claim they were ordered by the NULL stream. They are
+//! not: `GpuEngine` owns a private stream created `CU_STREAM_NON_BLOCKING`
+//! (`exec/gpu.rs`, `device/cuda.rs` — "work here never implicitly orders
+//! against the legacy default stream"), and every serving launch goes to it.
+//! Nothing at the driver level orders one model's launch against another's.
+//!
+//! It is nonetheless safe, for a different reason: **every mutable device
+//! buffer is per-engine** — instruction stream, tensor tables, counter block,
+//! GQ cursor, pinned staging, kernarg, graph caches, the cuBLASLt handle and
+//! its workspace, and the VMM KV slab. Each engine even loads its OWN
+//! `CUmodule` (the backend allocates a fresh id per load and never dedups by
+//! image), so the `__device__` trace globals are per-engine too. Addresses are
+//! driver-assigned (`cuMemAddressReserve` with a null hint) and the blob binds
+//! tensors by handle, never by absolute pointer, so two resident models cannot
+//! alias by construction. No lock is needed for MEMORY safety.
+//!
+//! What co-residency does cost is throughput, not correctness: the interpreter
+//! grid is `occupancy × sm_count`, i.e. the whole device, and a cooperative
+//! launch is all-blocks-co-resident-or-fail. A second model's grid is therefore
+//! admitted only once the first VACATES — which is why segment boundaries are
+//! the switch points, and why a long unsegmented prefill blocks a co-tenant for
+//! its full duration.
 //!
 //! **Admission.** Resident models shed on their own KV pools / slot tables as
 //! before. A non-resident model's request first passes [`ModelManager::
@@ -36,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
 use crate::asset::devblob::DevBlob;
@@ -164,6 +183,7 @@ impl BlobPlan {
 }
 
 /// One registered (not necessarily resident) model.
+#[derive(Clone)]
 struct Managed {
     slug: String,
     dir: PathBuf,
@@ -184,12 +204,41 @@ pub struct SwitchReport {
     pub vram_used: u64,
 }
 
+/// How an eviction ends the victim's in-flight generations.
+#[derive(Clone, Copy, Debug)]
+enum Stop {
+    /// Let live slots run to completion, bounded by `PLOW_DRAIN_TIMEOUT_MS`
+    /// when it is set. The S1 switch path.
+    Graceful,
+    /// Stop at the next tick top and flush what each slot produced. The
+    /// control-plane unload path.
+    Now,
+}
+
+/// What one control-plane unload did.
+#[derive(Clone, Debug, Default)]
+pub struct UnloadReport {
+    pub slug: String,
+    /// Time spent stopping and flushing in-flight generations.
+    pub stop_ms: f64,
+    /// Time spent dropping the engine.
+    pub unload_ms: f64,
+    /// Bytes released from the slab chunk pool by the trim.
+    pub pool_trimmed: u64,
+    /// Device free-memory delta across the whole operation.
+    pub freed: u64,
+}
+
 /// Why `ensure_resident` refused.
 #[derive(Debug)]
 pub enum EnsureError {
     /// Even after evicting every other resident model the target cannot fit.
     /// Shed with 503 + Retry-After.
     WontFit { need: u64, free: u64 },
+    /// The operator unloaded this model (or is unloading it). Demand loading is
+    /// deliberately NOT attempted — otherwise the next request would silently
+    /// undo the unload. Cleared by an explicit load.
+    Unloaded,
     /// The engine load (or drain plumbing) failed.
     Load(RuntimeError),
 }
@@ -203,6 +252,10 @@ impl std::fmt::Display for EnsureError {
                 need >> 20,
                 free >> 20
             ),
+            EnsureError::Unloaded => write!(
+                f,
+                "model was unloaded by the operator — load it again to serve it"
+            ),
             EnsureError::Load(e) => write!(f, "model load failed: {e}"),
         }
     }
@@ -215,7 +268,10 @@ pub struct ModelManager {
     state: Weak<AppState>,
     be: Arc<CudaBackend>,
     mux_cfg: MuxConfig,
-    models: Vec<Managed>,
+    /// Registered models. Behind a lock because the control plane registers
+    /// new assets dirs while the server is live; cloned out of the lock at every
+    /// use, since every caller then awaits a load.
+    models: RwLock<Vec<Managed>>,
     /// Serializes switches. Resident-model requests never take it.
     switch: tokio::sync::Mutex<()>,
     /// slug → last request time (LRU eviction order).
@@ -273,7 +329,7 @@ impl ModelManager {
             state: Arc::downgrade(state),
             be,
             mux_cfg,
-            models: managed,
+            models: RwLock::new(managed),
             switch: tokio::sync::Mutex::new(()),
             last_use: Mutex::new(FxHashMap::default()),
             overhead: Mutex::new(FxHashMap::default()),
@@ -284,18 +340,53 @@ impl ModelManager {
 
     /// Whether `slug` is under manager control (has a blob plan).
     pub fn manages(&self, slug: &str) -> bool {
-        self.models.iter().any(|m| m.slug == slug)
+        self.models.read().iter().any(|m| m.slug == slug)
+    }
+
+    /// Clone `slug`'s record out from under the lock. Every caller goes on to
+    /// await a load, and the lock must not be held across an await.
+    fn managed(&self, slug: &str) -> Option<Managed> {
+        self.models.read().iter().find(|m| m.slug == slug).cloned()
+    }
+
+    /// Register a model the process was not started with, so a later `load`
+    /// can bring it up. Parses the blob plan up front (the same startup-only
+    /// file read `new` does) so a bad bundle is refused here rather than
+    /// halfway through a load. Idempotent for an already-registered slug.
+    pub fn register(&self, slug: &str, dir: PathBuf, ckpt: PathBuf) -> Result<()> {
+        if self.manages(slug) {
+            return Ok(());
+        }
+        let plan = BlobPlan::from_dir_with_granularity(&dir, Some(self.be.granularity()?))?;
+        tracing::info!(
+            %slug,
+            dir = %dir.display(),
+            total_gib = gib(plan.tensor_total()),
+            "planner: model registered at runtime"
+        );
+        self.models.write().push(Managed {
+            slug: slug.to_string(),
+            dir,
+            ckpt,
+            plan,
+        });
+        Ok(())
+    }
+
+    /// Every registered slug, in registration order.
+    pub fn slugs(&self) -> Vec<String> {
+        self.models.read().iter().map(|m| m.slug.clone()).collect()
     }
 
     /// The parsed plan for `slug` (tests / capacity reporting).
     pub fn plan(&self, slug: &str) -> Option<BlobPlan> {
-        self.models.iter().find(|m| m.slug == slug).map(|m| m.plan)
+        self.models.read().iter().find(|m| m.slug == slug).map(|m| m.plan)
     }
 
     /// Planner requirement for `slug`: tensor total + (measured|default)
     /// overhead. `None` for unmanaged slugs.
     pub fn required(&self, slug: &str) -> Option<u64> {
-        let m = self.models.iter().find(|m| m.slug == slug)?;
+        let m = self.managed(slug)?;
         let ovh = self
             .overhead
             .lock()
@@ -339,7 +430,7 @@ impl ModelManager {
     /// fit (no eviction — earlier models win). At least one model must load.
     pub async fn load_initial(&self) -> Result<()> {
         let mut loaded = 0usize;
-        for m in &self.models {
+        for m in self.models.read().clone() {
             let need = self.required(&m.slug).expect("managed") + RESERVE;
             let free = self.free_vram()?;
             if free < need {
@@ -351,12 +442,12 @@ impl ModelManager {
                 );
                 continue;
             }
-            self.load_model(m)
+            self.load_model(&m)
                 .await
                 .map_err(|e| RuntimeError::Msg(format!("{}: {e}", m.slug)))?;
             loaded += 1;
         }
-        if loaded == 0 && !self.models.is_empty() {
+        if loaded == 0 && !self.models.read().is_empty() {
             return Err(RuntimeError::Msg(
                 "planner: no model fits the VRAM budget at startup".into(),
             ));
@@ -380,17 +471,19 @@ impl ModelManager {
             self.touch(slug);
             return Ok(());
         }
+        // An explicitly unloaded model must STAY unloaded: demand-loading here
+        // is exactly how an operator's unload would be undone by the next
+        // request to arrive.
+        if !self.state()?.residency(slug).admits() {
+            return Err(EnsureError::Unloaded);
+        }
 
         let _g = self.switch.lock().await;
         if self.is_resident(slug) {
             self.touch(slug);
             return Ok(());
         }
-        let m = self
-            .models
-            .iter()
-            .find(|m| m.slug == slug)
-            .expect("managed");
+        let m = self.managed(slug).expect("managed");
         let need = self.required(slug).expect("managed") + RESERVE;
         let mut report = SwitchReport {
             target: slug.to_string(),
@@ -423,6 +516,7 @@ impl ModelManager {
             }
             let victims: Vec<String> = self
                 .models
+                .read()
                 .iter()
                 .filter(|v| v.slug != slug && self.is_resident(&v.slug))
                 .map(|v| v.slug.clone())
@@ -439,12 +533,12 @@ impl ModelManager {
                     free: free + credit,
                 });
             };
-            let (drain_ms, unload_ms) = self.evict(&victim).await?;
+            let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
             report.evicted.push((victim, drain_ms, unload_ms));
         }
 
         let t0 = Instant::now();
-        self.load_model(m).await?;
+        self.load_model(&m).await?;
         report.load_ms = ms(t0);
         let (free, total) = self.be.mem_info().map_err(EnsureError::Load)?;
         report.vram_used = total - free;
@@ -459,6 +553,129 @@ impl ModelManager {
         self.touch(slug);
         self.maybe_preload();
         Ok(())
+    }
+
+    /// Control-plane unload: stop and flush this model's in-flight work, then
+    /// release its device memory. Every other model keeps serving.
+    ///
+    /// Three deliberate differences from a switch eviction:
+    ///
+    /// * the slug is marked `Unloading` **before** the mux is removed, so a
+    ///   request cannot land in the window between removal and the dispatcher's
+    ///   exit — where it would be dropped with no terminal chunk;
+    /// * in-flight generations are stopped, not drained. A graceful drain is
+    ///   `O(max_tokens × service_ms)` and an admin call must not hang on it;
+    /// * the slab chunk pool is trimmed to zero. A switch keeps an evicted
+    ///   model's physical chunks pooled on purpose (that is what makes the next
+    ///   switch µs-class), but an operator who unloads a model and sees
+    ///   `nvidia-smi` unchanged will reasonably call it broken.
+    ///
+    /// Ends in `Residency::Unloaded`, which is what stops the next request (or
+    /// the speculative preloader) from silently loading it again.
+    pub async fn unload(&self, slug: &str) -> std::result::Result<UnloadReport, EnsureError> {
+        if !self.manages(slug) {
+            return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
+        }
+        let state = self.state()?;
+        let _g = self.switch.lock().await;
+
+        // Before `remove_mux`, not after: this is what closes the late-submit
+        // window rather than merely narrowing it.
+        state.set_residency(slug, crate::serve::Residency::Unloading);
+
+        let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
+        let (stop_ms, unload_ms) = self.evict(slug, Stop::Now).await?;
+        let pool_trimmed = VmmOps::pool_trim(&*self.be, 0);
+        let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
+
+        state.set_residency(slug, crate::serve::Residency::Unloaded);
+        self.last_use.lock().remove(slug);
+
+        let report = UnloadReport {
+            slug: slug.to_string(),
+            stop_ms,
+            unload_ms,
+            pool_trimmed,
+            freed: free_after.saturating_sub(free_before),
+        };
+        tracing::info!(
+            %slug,
+            stop_ms = report.stop_ms,
+            unload_ms = report.unload_ms,
+            pool_trimmed_mib = report.pool_trimmed >> 20,
+            freed_gib = gib(report.freed),
+            "model unloaded"
+        );
+        Ok(report)
+    }
+
+    /// Control-plane load: make `slug` resident now and clear any operator
+    /// unload. Returns the load wall time in ms (`0.0` when already resident).
+    ///
+    /// `evict_lru` is off by default on purpose — an admin load must not
+    /// silently take down someone else's model. Without it a model that does
+    /// not fit is refused with [`EnsureError::WontFit`] carrying the shortfall.
+    pub async fn load(
+        self: &Arc<Self>,
+        slug: &str,
+        evict_lru: bool,
+    ) -> std::result::Result<f64, EnsureError> {
+        if !self.manages(slug) {
+            return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
+        }
+        let state = self.state()?;
+        let was = state.residency(slug);
+        // `ensure_resident` and the fit path below both refuse a pinned slug,
+        // so the pin has to come off first — and go back on if the load fails,
+        // or a failed load would quietly re-arm demand loading.
+        state.set_residency(slug, crate::serve::Residency::Auto);
+
+        let result = self.load_inner(slug, evict_lru).await;
+        if result.is_err() {
+            state.set_residency(slug, was);
+        }
+        result
+    }
+
+    async fn load_inner(
+        self: &Arc<Self>,
+        slug: &str,
+        evict_lru: bool,
+    ) -> std::result::Result<f64, EnsureError> {
+        if self.is_resident(slug) {
+            self.touch(slug);
+            return Ok(0.0);
+        }
+        if evict_lru {
+            let t0 = Instant::now();
+            self.ensure_resident(slug).await?;
+            return Ok(ms(t0));
+        }
+
+        let _g = self.switch.lock().await;
+        if self.is_resident(slug) {
+            self.touch(slug);
+            return Ok(0.0);
+        }
+        let m = self.managed(slug).expect("managed");
+        let need = self.required(slug).expect("managed") + RESERVE;
+        // Same accounting as the switch path: chunks the incoming slab cannot
+        // consume have to be real free memory before the load.
+        VmmOps::pool_trim(&*self.be, m.plan.slab_reusable());
+        let free = self.free_vram().map_err(EnsureError::Load)?;
+        let credit = VmmOps::pool_bytes(&*self.be);
+        if free + credit < need {
+            return Err(EnsureError::WontFit {
+                need,
+                free: free + credit,
+            });
+        }
+        let t0 = Instant::now();
+        self.load_model(&m).await?;
+        self.touch(slug);
+        let load_ms = ms(t0);
+        tracing::info!(%slug, load_ms, "model loaded");
+        Ok(load_ms)
     }
 
     /// After a switch: if spare VRAM fits the hottest non-resident model
@@ -481,14 +698,10 @@ impl ModelManager {
             let Some(slug) = mgr.preload_candidate() else {
                 return;
             };
-            let m = mgr
-                .models
-                .iter()
-                .find(|m| m.slug == slug)
-                .expect("candidate is managed");
+            let m = mgr.managed(&slug).expect("candidate is managed");
             VmmOps::pool_trim(&*mgr.be, m.plan.slab_reusable());
             let t0 = Instant::now();
-            match mgr.load_model(m).await {
+            match mgr.load_model(&m).await {
                 Ok(()) => {
                     tracing::info!(%slug, load_ms = ms(t0), "planner: speculative preload complete")
                 }
@@ -502,10 +715,14 @@ impl ModelManager {
     fn preload_candidate(&self) -> Option<String> {
         let free = self.free_vram().ok()?;
         let pool = VmmOps::pool_bytes(&*self.be);
+        let state = self.state.upgrade()?;
         let last_use = self.last_use.lock();
         self.models
+            .read()
             .iter()
             .filter(|m| !self.is_resident(&m.slug))
+            // Never speculatively reload what an operator unloaded.
+            .filter(|m| state.residency(&m.slug).admits())
             .filter(|m| {
                 let credit = pool.min(m.plan.slab_reusable());
                 self.required(&m.slug).expect("managed") + RESERVE <= free + credit
@@ -524,23 +741,29 @@ impl ModelManager {
     /// preempted (`ModelMux::preempt` — streams close with
     /// `finish_reason: "preempted"` and the tokens produced so far), bounding
     /// the switch's drain phase. `0` preempts immediately.
-    async fn evict(&self, slug: &str) -> std::result::Result<(f64, f64), EnsureError> {
+    async fn evict(&self, slug: &str, stop: Stop) -> std::result::Result<(f64, f64), EnsureError> {
         let state = self.state()?;
         let t0 = Instant::now();
         if let Some(mux) = state.remove_mux(slug) {
-            match drain_timeout_ms() {
-                None => mux.drain().await,
-                Some(ms) => {
-                    let deadline = std::time::Duration::from_millis(ms);
-                    if tokio::time::timeout(deadline, mux.drain()).await.is_err() {
-                        tracing::info!(
-                            %slug,
-                            timeout_ms = ms,
-                            "drain deadline passed — preempting live generations"
-                        );
-                        mux.preempt().await;
+            match stop {
+                // Control-plane unload: an admin call must not block on
+                // `max_tokens`. Live generations stop at the next tick top and
+                // close with what they produced.
+                Stop::Now => mux.preempt().await,
+                Stop::Graceful => match drain_timeout_ms() {
+                    None => mux.drain().await,
+                    Some(ms) => {
+                        let deadline = std::time::Duration::from_millis(ms);
+                        if tokio::time::timeout(deadline, mux.drain()).await.is_err() {
+                            tracing::info!(
+                                %slug,
+                                timeout_ms = ms,
+                                "drain deadline passed — preempting live generations"
+                            );
+                            mux.preempt().await;
+                        }
                     }
-                }
+                },
             }
         }
         let drain_ms = ms(t0);
