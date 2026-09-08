@@ -496,9 +496,7 @@ impl AmdEngine {
         // difference has two candidate causes at once, the packing and the bucket. Pinning the
         // bucket holds the packing fixed and moves only the reduction order, which is what
         // separates them. Unset in every measured configuration.
-        let pinned = std::env::var("PLOW_TOKEN_BATCH_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok());
+        let pinned = crate::config::RuntimeConfig::get().amd.token_batch_rows;
         step.programs
             .iter()
             .filter(|p| pinned.is_none_or(|rows| p.rows == rows))

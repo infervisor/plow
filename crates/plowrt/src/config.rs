@@ -637,6 +637,27 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-launch-rows", env = "PLOW_LAUNCH_ROWS", global = true)]
     pub launch_rows: Option<u32>,
 
+    /// Unified token batch: restrict bucket selection to one compiled row count.
+    ///
+    /// An ATTRIBUTION knob, not a tuning one. The route is confined to buckets with
+    /// `nsplit == 1`, so for a given prompt it may run a different rung from the ordinary
+    /// route — which means a differing greedy token has two candidate causes at once, the
+    /// packing and the reduction order. Pinning the rung holds the packing fixed and moves
+    /// only the second.
+    #[arg(long = "amd-token-batch-rows", env = "PLOW_TOKEN_BATCH_ROWS", global = true)]
+    pub token_batch_rows: Option<u32>,
+
+    /// Unified token batch: admit a step with only ONE participant.
+    ///
+    /// Off by default. A prompt admitted alone runs a `nsplit == 1` rung far wider than the one
+    /// the ordinary route would pick for it, and there is nothing to pack it with — measured on
+    /// Gemma-4 31B at concurrency 1, -3.5% throughput and -35% TTFT at 512 input, -10.5% and
+    /// -48.8% at 2048. The ordinary route already samples a completing prompt's last row in its
+    /// own prefill program with no extra pass, so there is nothing to win there either. Kept as
+    /// a flag so the policy stays falsifiable.
+    #[arg(long = "amd-token-batch-solo", env = "PLOW_TOKEN_BATCH_SOLO", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub token_batch_solo: bool,
+
     /// RAGGED-M prefill: cover a prompt in the FEWEST launches and run the last
     /// chunk at its real row count instead of its padded bucket width.
     ///
