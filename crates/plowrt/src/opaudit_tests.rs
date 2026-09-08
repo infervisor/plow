@@ -360,7 +360,7 @@ fn mixed_step_v1_packs_only_class_a_and_class_b_plus_two_hand_converted_c() {
     for spec in &synth.programs {
         let audit = audit_program(&prog(spec.decode_rows, &spec.program.insts));
         // Printed under `--nocapture`: this is the table the fusion verdict in
-        // docs/arch/17-operator-row-identity-classes.md quotes.
+        // docs/arch/17-unified-token-batch.md (Part III) quotes.
         for row in &audit.ops {
             eprintln!(
                 "v1 decode_rows={} {:>3} {:<16} x{:<4} {} {:<12} {}",

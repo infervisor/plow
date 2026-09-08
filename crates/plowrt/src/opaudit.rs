@@ -34,7 +34,7 @@
 //! opcodes are classified from `runtime/amd/interp.hip` instead, because the
 //! ISA's spec for them is absent or stale; each says so in its `note`, and the
 //! one with no spec anywhere is reported unclassified. See
-//! `docs/arch/17-operator-row-identity-classes.md`.
+//! `docs/arch/17-unified-token-batch.md (Part III)`.
 
 use std::collections::BTreeMap;
 

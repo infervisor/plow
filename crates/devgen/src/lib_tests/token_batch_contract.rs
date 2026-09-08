@@ -1,6 +1,6 @@
 //! The dense-GQA emit preconditions the unified token-batch route depends on.
 //!
-//! `plans/unified-token-batch.md` §8 Phase 2 / `docs/arch/17-unified-token-batch-dense-gqa.md`.
+//! `plans/unified-token-batch.md` §8 Phase 2 / `docs/arch/17-unified-token-batch.md (Part II)`.
 //! The AMD route schedules `FlashPrefill` as one flat work list over every span's query tiles.
 //! That schedule is bit-identical to an isolated per-request run only while a span boundary
 //! cannot move the KV partition, which holds exactly at `nsplit == 1`; `runtime/amd/interp.hip`

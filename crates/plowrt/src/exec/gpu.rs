@@ -3755,7 +3755,7 @@ impl GpuEngine {
         // closes on `<|close|>` — ran past its own turn boundary on NVIDIA
         // while stopping correctly on the other two backends.
         let mut stop_ids = crate::asset::checkpoint::read_eos_ids(checkpoint_dir);
-        stop_ids.extend(crate::asset::checkpoint::chat_stop_ids(checkpoint_dir));
+        stop_ids.extend(crate::asset::checkpoint::chat_stop_ids(checkpoint_dir, &stop_ids));
         stop_ids.sort_unstable();
         stop_ids.dedup();
         if let Some(tm) = load_tim.as_mut() {

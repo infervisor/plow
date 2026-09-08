@@ -408,7 +408,7 @@ enum Cmd {
     ///
     /// Static and offline, like `disasm`: the blob is a file. The four classes
     /// are §3 of `plans/unified-token-batch.md`, reproduced in
-    /// `docs/arch/17-operator-row-identity-classes.md`.
+    /// `docs/arch/17-unified-token-batch.md (Part III)`.
     ///
     /// An opcode with no classification is class C and is REFUSED, because on
     /// AMD the interpreter's dispatch `default:` writes nothing and does not

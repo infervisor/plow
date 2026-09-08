@@ -67,6 +67,16 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: CPU runtime
         run: cargo test -p plowrt --no-default-features --features cpu
+      # The feature set the README's quickstart tells people to build, and the
+      # only step that compiles the CUDA and HSA backends at all. `cargo check
+      # --workspace --all-targets` above runs on DEFAULT features (`default =
+      # []`), so every `#[cfg(feature = "cuda")]` and `#[cfg(feature = "hsa")]`
+      # line is invisible to it — which is how a `chat_stop_ids` call in
+      # `exec/gpu.rs` sat one argument short of its own signature until someone
+      # tried the documented build. Neither driver is linked (both are
+      # `dlopen`ed), so this needs no CUDA or ROCm on the runner.
+      - name: GPU backends type-check (README quickstart feature set)
+        run: cargo check -p plowrt --all-targets --features cuda,hsa
       - name: CPU kernel oracles
         run: |
           cmake -S runtime -B build-cpu -DCMAKE_BUILD_TYPE=Release

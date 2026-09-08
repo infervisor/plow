@@ -123,6 +123,13 @@ http-body-util = "0.1"
 name = "h2d_bench"
 required-features = ["cuda"]
 
+# Reads the cu -> L2-domain recovery and the placement decision out of
+# `exec::cpu::engine` rather than copying them, so it needs that engine
+# compiled. Undeclared, it broke `--features hsa` builds of the workspace.
+[[example]]
+name = "l2_probe"
+required-features = ["cpu"]
+
 [[example]]
 name = "reload_bench"
 required-features = ["cuda"]

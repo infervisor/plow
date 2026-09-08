@@ -1467,6 +1467,57 @@ pub fn active() -> &'static EmitConfig {
 
 #[cfg(test)]
 mod tests {
+    /// [`crate::manifest::UNRECORDED_ENV`] names every emit-affecting env var read outside `EmitConfig`.
+    ///
+    /// Read out of the SOURCE, not maintained by hand, because the failure mode is silent: a new
+    /// `env::var("PLOW_...")` in the packet builder changes emitted bytes and, unlisted, leaves
+    /// `build.json` claiming a replay that does not reproduce. Diagnostics-only reads (`*_DUMP`,
+    /// `*_REPORT`, `*_QUIET`, `PLOW_ROOT`) are excluded by name — they do not move bytes.
+    #[test]
+    fn unrecorded_env_list_is_complete() {
+        let root = kernelcaps::source_root();
+        let mut found: Vec<String> = Vec::new();
+        for rel in ["crates/packet/src/devbuild.rs"] {
+            let Ok(src) = std::fs::read_to_string(root.join(rel)) else {
+                eprintln!("skipped: {rel} not readable from {}", root.display());
+                return;
+            };
+            // The name must follow the call's OPEN PAREN, not merely appear near it. A
+            // 200-byte window instead swept up `PLOW_UNISEG` from a doc comment three lines
+            // below an unrelated `env::var` and reported a knob that is a declared field.
+            for (i, _) in src.match_indices("env::var") {
+                let rest = &src[i + "env::var".len()..];
+                let rest = rest.strip_prefix("_os").unwrap_or(rest);
+                let Some(rest) = rest.strip_prefix('(') else {
+                    continue;
+                };
+                let rest = rest.trim_start();
+                let Some(rest) = rest.strip_prefix('"') else {
+                    continue;
+                };
+                let Some(end) = rest.find('"') else { continue };
+                let name = &rest[..end];
+                if name.starts_with("PLOW_") {
+                    found.push(name.to_string());
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        let diagnostic = |k: &str| {
+            k.ends_with("_DUMP") || k.ends_with("_REPORT") || k.ends_with("_QUIET") || k == "PLOW_ROOT"
+        };
+        let missing: Vec<&String> = found
+            .iter()
+            .filter(|k| !diagnostic(k) && !crate::manifest::UNRECORDED_ENV.contains(&k.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these emit-affecting env vars are read outside EmitConfig but not listed in \
+             UNRECORDED_ENV, so build.json will not record them: {missing:?}"
+        );
+    }
+
     use super::EmitConfig;
     use clap::Parser;
 

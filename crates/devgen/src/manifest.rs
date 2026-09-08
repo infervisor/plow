@@ -876,6 +876,44 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
 /// build, and a replay that froze today's defaults would silently opt out of every such
 /// promotion. Production defaults are omitted for the same reason — they are derived from arch
 /// and capabilities, so a replay reproduces them by re-deriving them.
+/// Emit-affecting env vars read OUTSIDE [`crate::emit_config::EmitConfig`], so `build.json` can
+/// at least say they were set.
+///
+/// These are read straight from the environment in `packet::devbuild`, where there is no field to
+/// carry a value, a source and a default — several were fields once and were deliberately deleted
+/// (see `every_field_has_a_reader`'s message). So they cannot appear in `replay`. A replay from
+/// that section reproduces the blob byte-for-byte EXCEPT where one of these was set, which is a
+/// silent difference and was measured as one: `PLOW_MLA_PF_V2` on a GLM-5.3 TP4 replay.
+///
+/// Naming them is not a fix — promoting a read to a field is — but it turns "the replay does not
+/// match and nobody knows why" into "the replay does not match and here is the variable".
+///
+/// `emit_config::tests::unrecorded_env_list_is_complete` keeps this honest against the source.
+pub(crate) const UNRECORDED_ENV: &[&str] = &[
+    "PLOW_BLOCK",
+    // BOTH a field and a raw read, which is the worst case rather than a duplicate entry.
+    // `EmitConfig` declares `uniseg`, so `build.json` records a value for it under `knobs` — but
+    // `packet::devbuild`, where `uniseg` is computed, consults the ENVIRONMENT rather than the
+    // field. Set the field programmatically without the variable and the
+    // packet ignores it; the manifest still reports the field. Listing it here means the manifest
+    // carries what the builder actually saw alongside what the field claimed.
+    "PLOW_UNISEG",
+    "PLOW_CHAIN_BYPASS",
+    "PLOW_FINE_FORCE",
+    "PLOW_FUSE_XR_ATTNRES",
+    "PLOW_GQ_ORDER",
+    "PLOW_MLA_PF_V2",
+    "PLOW_MOE_DECODE_STANDALONE",
+    "PLOW_PHASE_OBJECTS",
+    "PLOW_SEG_CLASS_SLICE",
+    "PLOW_SEG_FA512",
+    "PLOW_SEG_PER_OP",
+    "PLOW_SEG_PURE_GEMM",
+    "PLOW_SEG_SLICE_ALL",
+    "PLOW_SEG_V2",
+    "PLOW_XR_WAVE_RS",
+];
+
 fn emit_config_section() -> Value {
     let knobs = crate::emit_config::knobs_or_env();
     let mut replay: BTreeMap<String, Value> = BTreeMap::new();
@@ -898,9 +936,16 @@ fn emit_config_section() -> Value {
         // section reproduces the blob byte-for-byte except for `PLOW_MLA_PF_V2`, which is read
         // in `crates/packet/src/devbuild.rs` and is not a field. Promoting such a read to a
         // field is what makes it recordable; nothing here can record what it cannot see.
-        "covers": "knobs declared by EmitConfig; env vars read outside it are not recorded",
+        "covers": "knobs declared by EmitConfig; env vars read outside it are named under \
+                   `unrecorded_env`, which reports their value but cannot describe them",
         "knob_count": knobs.len(),
         "replay": replay,
+        // The gap the note above describes, made VISIBLE rather than merely admitted. Only vars
+        // actually present are listed, so an ordinary build emits `{}`.
+        "unrecorded_env": UNRECORDED_ENV
+            .iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), json!(v))))
+            .collect::<Map<_, _>>(),
         "knobs": knobs.iter().map(|k| json!({
             "id": k.id,
             "env": k.env,

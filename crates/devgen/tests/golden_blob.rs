@@ -965,9 +965,18 @@ fn the_occupancy_floor_is_configurable() {
         }
         let man: serde_json::Value =
             serde_json::from_slice(&std::fs::read(td.join("build.json")).unwrap()).unwrap();
+        // OCCUPANCY findings only. `PLOW_AUDIT_OCC_FLOOR` governs one of the audit's two
+        // kinds, and counting both made this test a hostage to the other: the gfx942
+        // production decode ladder (`1,2,4,8`) makes a narrow rung run on a wider compiled
+        // GEMV object, which is a real `gemv_ceiling` finding and has nothing to do with the
+        // floor under test. It is silenced by `PLOW_AUDIT_GEMV_WASTE_MAX`, a different knob.
         man["dispatch_audit"]["findings"]
             .as_array()
-            .map(Vec::len)
+            .map(|f| {
+                f.iter()
+                    .filter(|r| r["kind"].as_str() == Some("occupancy"))
+                    .count()
+            })
             .unwrap_or(0)
     };
     // A floor of 0 admits everything; the section still exists, it simply has nothing to say.

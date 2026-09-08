@@ -2475,7 +2475,7 @@ const Q_TILE_ROWS: u32 = 8 * 32;
 ///
 /// Extracted from `emit_phase` so the unified token-batch route's precondition is a TEST rather
 /// than a device trap. That route (`plans/unified-token-batch.md` §8 Phase 2,
-/// `docs/arch/17-unified-token-batch-dense-gqa.md`) schedules attention as one flat work list
+/// `docs/arch/17-unified-token-batch.md (Part II)`) schedules attention as one flat work list
 /// over every span's query tiles, and that schedule is bit-identical to an isolated per-request
 /// run only while the KV partition does not move with a span boundary — i.e. only at
 /// `nsplit == 1`. `runtime/amd/interp.hip` traps a `FlashPrefill` packet with `i7 != 1` rather
