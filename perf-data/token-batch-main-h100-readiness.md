@@ -189,9 +189,29 @@ sequences and 2048 batched prefill tokens. Results below are medians across the 
 | 16384 | 134.6 ms | 15.35 ms | 3119 ms | 267 |
 
 One request at 16K/C64 reported zero cached tokens; its latency remains included.
-This full-grid screen and Plow's smaller regression screens have different suffix indices
-and cache histories. They locate the performance gap; final comparisons require matched
-full-grid Plow runs. Raw results, all 30 summary cells and provenance are in
+The subsequent Plow full-grid run completed all 90 waves / 1875 measured requests,
+with all prompt hashes matched to vLLM and zero cache misses. It uses the default rebuilt
+Hopper W8A8 prefill object, explicit prefix caching with a 4096 MiB cap and `--multistep 1`.
+No CPU builds overlapped either FP8 full-grid run. All six fresh natural-text completions
+also match Plow's preceding runtime exactly. Cache retained after the grid: 3935 MiB.
+
+| Input tokens | C1 TTFT, Plow / vLLM | C64 TTFT, Plow / vLLM | C64 output tokens/s, Plow / vLLM |
+|---|---:|---:|---:|
+| 1024 | 139.1 / 24.0 ms | 12.85 / 0.38 s | 76.29 / 1567.88 |
+| 2048 | 137.9 / 26.9 ms | 13.23 / 0.45 s | 74.35 / 1215.56 |
+| 4096 | 295.0 / 40.8 ms | 18.35 / 0.78 s | 54.28 / 873.03 |
+| 8192 | 341.6 / 67.7 ms | 20.14 / 1.49 s | 49.56 / 543.73 |
+| 16384 | 720.9 / 134.6 ms | 33.04 / 3.16 s | 30.65 / 267.17 |
+
+This comparison pools request latency percentiles across three measured waves; throughput
+is the median wave throughput. The preceding vLLM-only table uses medians of wave summaries.
+[All 30 cells, including latency and chunk-gap tails](gemma31-h100-fp8-cached-comparison.csv)
+are available as CSV. Plow loses throughput in every cell. At 16K/C64 it has lower pooled
+TPOT (111.86 vs 133.28 ms), but much longer queueing and end-to-end latency. The physical
+Plow capacity is four slots; vLLM permits 64 active sequences. No all-metrics win is established.
+Raw paired results and provenance: `plow-fp8-occ1-full.jsonl`,
+`matched-fp8-cached-comparison.json`, and `matched-fp8-cached-provenance.json`.
+The vLLM-only results, all 30 summary cells and provenance remain in
 `vllm-fp8-cached-screen.jsonl`, `vllm-fp8-cached-screen-summary.json` and
 `vllm-fp8-screen-provenance.json`.
 
