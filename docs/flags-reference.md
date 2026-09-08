@@ -832,7 +832,7 @@ capped at 256, and need not match any thread count.
 | `PLOW_VMM_LIVE=1` / `--vmm-live` | packet-selected for packed prefill with full-attention KV | Grow packet-described full-attention KV backing with the live frontier, without prefix reuse. Explicit enable remains available for legacy packets. Multistep maps the selected rung's full write frontier. Model admission counts startup backing and the retained block pool; virtual context capacity is not charged as resident memory. |
 | `PLOW_VMM_LIVE_RINGS=1` / `--vmm-live-rings` | off | Retain sliding-ring backing on first use. Requires live KV. Sub-granularity logical slots share aligned physical mappings while preserving the packet's logical batch stride. |
 | `PLOW_VMM_BLOCK_MIB=M` | 2 | VMM sharing block size. 2 MiB ≈ 4096 tokens at hd256 bf16. Raise (e.g. 64) for 128k-dedup work. |
-| `PLOW_VMM_CACHE_MIB=M` | 4096 | Soft cap on retained VMM prefix blocks plus boundary snapshots; active pins can temporarily exceed it. `0` uses OOM-driven eviction only. Disable reuse with `PLOW_VMM_PREFIX=0`. |
+| `PLOW_VMM_CACHE_MIB=M` | 4096 | Soft cap on retained VMM prefix blocks plus boundary snapshots; active pins and one recently reused snapshot can temporarily exceed it while radix leases are held. OOM reclamation can still evict that snapshot. `0` uses OOM-driven eviction only. Disable reuse with `PLOW_VMM_PREFIX=0`. |
 | `PLOW_VMM_KV=1` | off | **AMD** — VMM-backed KV on ROCr (`hsa_amd_vmem_*`); warns and falls back if the platform can't support it. |
 | `PLOW_PREFIX_CACHE=1` | off | enable the TP-only prefix cache. |
 | `PLOW_NV_SCHED=1` | **on** | global-queue interpreter scheduler; the static per-block-stream path is the build-time A/B. |

@@ -1263,7 +1263,7 @@ impl VmmKv {
                 match s.ops.alloc(snap_bytes) {
                     Ok(va) => break va,
                     Err(error) if matches!(&error, RuntimeError::Oom(_)) => {
-                        if !evict_one(s, &mut inner) { return Err(error); }
+                        if !evict_one(s, &mut inner, false) { return Err(error); }
                     }
                     Err(error) => return Err(error),
                 }
@@ -1446,7 +1446,7 @@ fn create_block(s: &Shared, inner: &mut Inner) -> Result<u32> {
                 if e.is_fatal() {
                     return Err(e);
                 }
-                if !evict_one(s, inner) {
+                if !evict_one(s, inner, false) {
                     return Err(RuntimeError::Oom(format!("vmm kv block: {e}")));
                 }
             }
@@ -1470,7 +1470,7 @@ fn install_block(inner: &mut Inner, block: Block) -> u32 {
 
 fn trim_cache(s: &Shared, inner: &mut Inner) {
     while s.cache_cap > 0 && inner.stats.cache_bytes > s.cache_cap {
-        if !evict_one(s, inner) {
+        if !evict_one(s, inner, true) {
             break;
         }
     }
@@ -1502,26 +1502,32 @@ fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
 
 /// Evict the LRU zero-ref radix leaf, dereferencing its blocks and freeing
 /// its boundary snapshot. `false` when nothing is evictable.
-fn evict_one(s: &Shared, inner: &mut Inner) -> bool {
+fn evict_one(s: &Shared, inner: &mut Inner, preserve_hot: bool) -> bool {
     let Some(key) = inner.cache.evict_lru() else {
         // A radix lease protects shared KV, but snapshots are only needed while
-        // restoring an attachment. Reused snapshots get a second chance.
-        let (node, snap) = loop {
-            let Some((node, index)) = inner.published.iter()
+        // restoring an attachment. Protect the most recently reused snapshot
+        // against unique-tail bursts; the rest remain LRU so new prefixes fit.
+        let protected = inner.published.values().flatten()
+            .filter(|snap| snap.users == 0 && snap.referenced)
+            .max_by_key(|snap| snap.last_used)
+            .map(|snap| snap.va);
+        let Some((node, index)) = inner.published.iter()
                 .flat_map(|(&node, snaps)| snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap)))
                 .filter(|(_, _, snap)| snap.users == 0)
-                .min_by_key(|(_, _, snap)| snap.last_used)
+                .min_by_key(|(_, _, snap)| (
+                    Some(snap.va) == protected,
+                    snap.last_used,
+                ))
                 .map(|(node, index, _)| (node, index))
-            else { return false };
-            let snapshots = inner.published.get_mut(&node).unwrap();
-            if snapshots[index].referenced {
-                snapshots[index].referenced = false;
-                inner.snapshot_tick += 1;
-                snapshots[index].last_used = inner.snapshot_tick;
-            } else {
-                break (node, snapshots.swap_remove(index));
-            }
-        };
+        else { return false };
+        // Active radix leases can exceed the soft budget. Keep their hot
+        // snapshot until retirement, but allow OOM reclamation to remove it.
+        if preserve_hot && inner.stats.cache_blocks > 0
+            && Some(inner.published[&node][index].va) == protected
+        {
+            return false;
+        }
+        let snap = inner.published.get_mut(&node).unwrap().swap_remove(index);
         if inner.published[&node].is_empty() { inner.published.remove(&node); }
         free_snapshot(s, inner, snap);
         return true;
@@ -2595,7 +2601,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_budget_trims_after_the_inflight_snapshot_releases() {
+    fn cache_budget_trims_after_active_radix_leases_release() {
         let ops = Arc::new(MockVmm::default());
         let p = pool_with_cap(ops.clone(), 448);
         let a = prompt(17);
@@ -2610,9 +2616,12 @@ mod tests {
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
 
         p.finish_attach(1);
+        assert_eq!(p.stats().cache_bytes, 576);
+        assert_eq!(p.stats().snapshot_bytes, 192);
+        p.begin_seq(0);
         assert!(p.stats().cache_bytes <= 448);
-        assert_eq!(p.stats().snapshot_bytes, 0);
-        assert_eq!(ops.frees.load(Ordering::SeqCst), 2);
+        assert_eq!(p.stats().snapshot_bytes, 192);
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2631,7 +2640,7 @@ mod tests {
         p.release_prefix(1);
         {
             let mut inner = p.shared.inner.lock();
-            while evict_one(&p.shared, &mut inner) {}
+            while evict_one(&p.shared, &mut inner, false) {}
         }
         assert_eq!(p.stats().snapshot_bytes, 0);
         assert_eq!(p.stats().cache_bytes, 0);
@@ -2726,7 +2735,7 @@ mod tests {
     }
 
     #[test]
-    fn reused_short_prefix_gets_a_second_chance_against_unique_tails() {
+    fn reused_short_prefix_survives_a_burst_of_unique_tails() {
         let ops = Arc::new(MockVmm::default());
         let p = pool_with_cap(ops, 96);
         let publish = |first| {
@@ -2743,6 +2752,9 @@ mod tests {
         p.finish_attach(1);
         p.begin_seq(1);
         let b = publish(20);
+        for first in 100..116 {
+            publish(first);
+        }
         let c = publish(30);
         assert_eq!(p.try_attach(1, &a).unwrap().unwrap().snap_va, hit.snap_va);
         p.begin_seq(1);
@@ -2750,7 +2762,106 @@ mod tests {
         p.begin_seq(1);
         assert_eq!(p.try_attach(1, &c).unwrap().unwrap().rows, 6);
         assert!(p.stats().cache_bytes <= 96);
+        assert_eq!(p.stats().snapshots_evicted, 17);
+    }
+
+    #[test]
+    fn reused_snapshots_leave_room_for_a_new_prefix() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool_with_cap(ops, 96);
+        for first in [10, 20, 30] {
+            let mut tokens = prompt(7);
+            tokens[0] = first;
+            p.begin_seq(0);
+            p.try_attach(0, &tokens).unwrap();
+            p.ensure_rows(0, 7).unwrap();
+            p.publish_at(0, &tokens, 6, 48, |_| Ok(())).unwrap();
+            p.begin_seq(1);
+            assert_eq!(p.try_attach(1, &tokens).unwrap().unwrap().rows, 6);
+            p.finish_attach(1);
+        }
+        p.begin_seq(1);
+        let mut oldest = prompt(7);
+        oldest[0] = 10;
+        assert!(p.try_attach(1, &oldest).unwrap().is_none());
+        assert_eq!(p.stats().cache_bytes, 96);
         assert_eq!(p.stats().snapshots_evicted, 1);
+    }
+
+    #[test]
+    fn new_long_prompt_snapshot_survives_its_output_tail() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool_with_cap(ops, 400);
+        for first in [10, 20] {
+            let mut tokens = prompt(7);
+            tokens[0] = first;
+            p.begin_seq(0);
+            p.try_attach(0, &tokens).unwrap();
+            p.ensure_rows(0, 7).unwrap();
+            p.publish_at(0, &tokens, 6, 48, |_| Ok(())).unwrap();
+            p.begin_seq(1);
+            p.try_attach(1, &tokens).unwrap().unwrap();
+            p.finish_attach(1);
+        }
+        let tokens = prompt(18);
+        p.begin_seq(0);
+        p.try_attach(0, &tokens).unwrap();
+        p.ensure_rows(0, 18).unwrap();
+        p.publish_at(0, &tokens, 16, 48, |_| Ok(())).unwrap();
+        p.publish_at(0, &tokens, 17, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.begin_seq(1);
+        assert_eq!(p.try_attach(1, &tokens[..17]).unwrap().unwrap().rows, 16);
+        assert_eq!(p.stats().cache_bytes, 400);
+        assert_eq!(p.stats().snapshots_evicted, 1);
+    }
+
+    #[test]
+    fn active_radix_leases_do_not_flush_the_hot_snapshot_at_the_soft_cap() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool_with_cap(ops, 176);
+        let short = prompt(7);
+        p.try_attach(0, &short).unwrap();
+        p.ensure_rows(0, 7).unwrap();
+        p.publish_at(0, &short, 6, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.try_attach(1, &short).unwrap().unwrap();
+        p.finish_attach(1);
+        p.begin_seq(1);
+        let long = prompt(17);
+        p.try_attach(0, &long).unwrap().unwrap();
+        p.finish_attach(0);
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_at(0, &long, 16, 48, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().cache_bytes, 304);
+        assert_eq!(p.try_attach(1, &short).unwrap().unwrap().rows, 6);
+        p.finish_attach(1);
+        p.begin_seq(1);
+        p.begin_seq(0);
+        assert!(p.stats().cache_bytes <= 176);
+    }
+
+    #[test]
+    fn oom_reclamation_can_evict_the_last_reused_snapshot() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool_with_cap(ops, 176);
+        let tokens = prompt(7);
+        p.try_attach(0, &tokens).unwrap();
+        p.ensure_rows(0, 7).unwrap();
+        p.publish_at(0, &tokens, 6, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        p.try_attach(1, &tokens).unwrap().unwrap();
+        p.finish_attach(1);
+        p.begin_seq(1);
+        let long = prompt(17);
+        p.try_attach(0, &long).unwrap().unwrap();
+        p.finish_attach(0);
+        p.ensure_rows(0, 17).unwrap();
+        p.publish_at(0, &long, 16, 48, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().cache_bytes, 304);
+        let mut inner = p.shared.inner.lock();
+        assert!(evict_one(&p.shared, &mut inner, false));
+        assert_eq!(inner.stats.snapshot_bytes, 0);
     }
 
     #[test]

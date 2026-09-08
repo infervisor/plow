@@ -14,7 +14,7 @@ rollback. This is capability-gated selection, not production qualification of ev
 | Failed AMD kernel lookup | Module now owned by the cleanup guard before lookup. |
 | Startup observability | `armed` and `ready` are separate; `fires=false` until a successful device dispatch. |
 | Post-dispatch validation | Invalid token IDs or failed frontier commit are device errors; no ordinary-path retry. |
-| Host verification | CUDA + HSA library suite: 588 passed, 14 ignored, zero failures. |
+| Host verification | CUDA + HSA library suite: 592 passed, 14 ignored, zero failures. |
 | Shared contract and CPU integration | 18 asset-contract tests, 5 C/Rust resolver checks and 4 compact-tail tests passed. |
 | H100 default/fallback smoke | FP8 server starts with `token_batch=true`, explicitly reports CUDA executor unavailable, and generates through ordinary execution. |
 | AMD device correctness/performance | Not tested on this host. |
@@ -113,7 +113,7 @@ Extending the workload to 2K exposed eviction of the primed 1920-token prefix at
 4 and 16. Snapshots attached to radix nodes were protected for the entire KV lease, even
 after restoration, forcing eviction of the hot short-prefix snapshot. Snapshots now become
 evictable after restoration finishes; radix references still protect the shared KV blocks.
-Second-chance eviction considers all unpinned snapshots when no radix leaf can be reclaimed.
+That second-chance policy considered all unpinned snapshots when no radix leaf was reclaimable.
 The 2K replay reuses 1920 tokens in all 85 measured requests through concurrency 64.
 The 8K replay likewise reuses 7776 tokens in all 85 measured requests. Retained cache
 after both workloads is 3327.5 MiB against the 4096 MiB cap. At concurrency 64,
@@ -329,3 +329,45 @@ the candidate while the highest slot continues decoding against a non-retired re
 122 FP8 batch-16 and 78 BF16 batch-8 snapshots are bit-exact. BF16 batch-8 API serving and
 pressure qualification remain pending. Raw failure and corrected results are
 `plow-fp8-b16-c1024-*`, `plow-fp8-b16-reclaim-*`, and `prefix-reclaim-qualification.json`.
+
+## Prefix eviction under batch-16 bursts
+
+The batch-16 timing run stopped after 47 complete waves and 821 requests because the
+shared prefix was repeatedly evicted. It recorded 728 cache misses, starting at 1K/C8.
+All completed prompt hashes match the earlier batch-4 grid. These incomplete results are
+preserved as `plow-fp8-b16-full.*` and `plow-fp8-b16-failed-summary.json`; they do not form
+a full performance comparison.
+
+When no radix leaf is reclaimable, eviction now protects the most recently reused
+unpinned snapshot and selects other snapshots by LRU. This keeps one shared prefix
+through bursts of unique tails while allowing a new workload to replace older entries.
+Active radix leases may temporarily retain that snapshot above the soft budget; releasing
+leases trims the cache again, and OOM reclamation can still remove the snapshot. Snapshot
+pins and radix leases retain their existing lifetime rules. A first candidate
+that protected multiple historical reused snapshots failed natural 16K warm reuse and
+was rejected; its binary, patch and results remain under `prefix-scan*` and
+`plow-fp8-b16-scan-*` in the campaign directory.
+
+The expanded unique-tail regression fails with the prior second-chance policy. The
+revised policy passes that test, new-prefix admission, a new long prompt competing with
+its output tail, active-lease budget pressure, OOM eviction of the protected snapshot,
+and the full 592-test host suite. Before the active-lease exemption, H100 retained all
+192 measured burst prefixes through 8K, but the first 16K wave lost all 16 prefixes.
+It completed with cold fallback; debugger attachment was attempted during diagnosis,
+so that wave is excluded from performance claims.
+The final policy retains all 240 measured batch-16 prefixes across 1K/2K/4K/8K/16K,
+with three waves at each length. All 208 prompts also completed by the previous candidate
+have identical hashes and output text, including the 16K cold-to-cached comparison.
+All 12 natural outputs and six warm cache counts pass. Sixteen distinct cold 16K requests,
+16 exact isolated replays, short recovery, and all three API lifecycle checks pass.
+Retained cache returns to 3310 MiB under the 4096 MiB budget. Raw results and hashes are
+`plow-fp8-b16-scan3-*` and `prefix-scan3-qualification.json`.
+
+These bursts use a subset seed sequence and are not prompt-matched to the full vLLM grid;
+they support cache regression claims only. No CPU build overlaps their timing. A separate
+packed-prefill prototype was built during functional pressure checks, whose durations are
+not used for performance claims. The prototype is not included in this change.
+
+BF16 batch 8 starts at 71.48 GiB with automatic prefix reuse. Its 12 natural cold/warm
+outputs match the prior batch-4 baseline and all six warm cache counts pass. Eight-way
+16K pressure, isolated replay and API lifecycle qualification are still running.
