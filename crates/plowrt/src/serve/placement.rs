@@ -249,6 +249,28 @@ pub fn assign(
     })
 }
 
+/// Parse `--pin slug@ordinal` entries into a slug -> ordinal map.
+///
+/// Rejected rather than ignored: a pin that does not parse is an operator
+/// saying where a model goes, and silently placing it somewhere else is the
+/// one outcome that must not happen.
+pub fn parse_pins(pins: &[String]) -> Result<Vec<(String, u32)>, String> {
+    let mut out = Vec::with_capacity(pins.len());
+    for pin in pins {
+        let (slug, ord) = pin
+            .rsplit_once('@')
+            .ok_or_else(|| format!("--pin {pin:?} is not slug@ordinal"))?;
+        if slug.is_empty() {
+            return Err(format!("--pin {pin:?} names no model"));
+        }
+        let ord: u32 = ord
+            .parse()
+            .map_err(|_| format!("--pin {pin:?}: {ord:?} is not a device ordinal"))?;
+        out.push((slug.to_string(), ord));
+    }
+    Ok(out)
+}
+
 /// The maximum TP degree across models — the grouping width (see [`plan_groups`]).
 pub fn grouping_width(models: &[ModelSpec], visible: usize) -> Result<u32, PlacementError> {
     let width = models.iter().map(|m| m.tp.max(1)).max().unwrap_or(1);
@@ -431,6 +453,27 @@ mod tests {
                 visible: 2
             })
         );
+    }
+
+    #[test]
+    fn pins_parse_and_bad_ones_are_refused() {
+        let pins = vec!["a@0".to_string(), "b@3".to_string()];
+        assert_eq!(
+            parse_pins(&pins).unwrap(),
+            vec![("a".to_string(), 0), ("b".to_string(), 3)]
+        );
+        // A slug may itself contain '@' (an org-qualified name), so the SPLIT
+        // is from the right.
+        assert_eq!(
+            parse_pins(&["org@v1/model@2".to_string()]).unwrap(),
+            vec![("org@v1/model".to_string(), 2)]
+        );
+        for bad in ["a", "a@", "@2", "a@x", ""] {
+            assert!(
+                parse_pins(&[bad.to_string()]).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
     }
 
     #[test]

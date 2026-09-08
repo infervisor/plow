@@ -2645,6 +2645,24 @@ async fn bringup_runtime(
                 });
             }
 
+            // `--pin slug@ordinal`. A pin naming a model this server does not
+            // serve is an error: it is almost always a typo, and honouring the
+            // rest of the pins while dropping that one places a model somewhere
+            // the operator did not ask for.
+            for (slug, ordinal) in placement::parse_pins(&RuntimeConfig::get().pin)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+            {
+                match specs.iter_mut().find(|s| s.slug == slug) {
+                    Some(spec) => spec.device = Some(ordinal),
+                    None => {
+                        return Err(format!(
+                            "--pin {slug}@{ordinal} names a model this server does not serve"
+                        )
+                        .into())
+                    }
+                }
+            }
+
             // Visible ordinals. Device 0 is already open; the rest are found by
             // opening them, because the driver device-count call is not bound
             // here and an ordinal that will not open is one we could not have

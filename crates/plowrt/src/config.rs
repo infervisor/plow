@@ -116,6 +116,12 @@ pub struct RuntimeConfig {
     )]
     pub place: String,
 
+    /// Pin a model to a device: `--pin slug@2`, repeatable. The ordinal is the
+    /// first device of the group the model must occupy. Required for every
+    /// model under `--place explicit`; an override elsewhere.
+    #[arg(long = "pin", env = "PLOW_PIN", value_delimiter = ',', global = true)]
+    pub pin: Vec<String>,
+
     /// How co-resident models take a shared GPU: `free` (private streams, the
     /// driver admits whoever is ready — fastest, and the default) or `rr`
     /// (round-robin turns, which bounds starvation and makes the interleaving
