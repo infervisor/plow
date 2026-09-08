@@ -201,6 +201,16 @@ extern "C" __device__ unsigned plow_packet_hash_hi =
 #endif
 
 extern "C" __device__ unsigned plow_packed_prefill_abi_1 = 1;
+/* The unified token batch. Two SEPARATE claims, deliberately not one symbol:
+ *   plow_token_batch_abi_1   the object was compiled against the PlowProgram that carries
+ *                            `token_batch`, so its kernarg block has the right shape.
+ *   plow_row_gather_1        PLOW_DOP_ROW_GATHER has a real dispatch arm.
+ * The first says the route is ARMED, the second that a terminal segment CAN FIRE, and only the
+ * second licenses a measurement of one. Neither claims any descriptor-aware MATH arm — those
+ * are their own markers, because an object that parses the descriptor and then runs a
+ * packet-scalar kernel is exactly the silent wrong answer the contract exists to prevent. */
+extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
+extern "C" __device__ unsigned plow_row_gather_1 = 1;
 #if PLOW_PACKED_PREFILL_DENSE_CONSUMERS
 extern "C" __device__ unsigned plow_packed_prefill_dense_consumers_1 = 1;
 #endif
@@ -3042,6 +3052,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     in->fj[0].f, slice, nblk);
             break;
 #endif
+        /* Terminal row selection for the unified token batch. Always dispatched: the arm is
+         * a bounds-checked copy with no resource cost worth pruning, and a pruned arm here is
+         * indistinguishable at runtime from a gather that silently wrote nothing. */
+        case PLOW_DOP_ROW_GATHER:
+            d_row_gather((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned*)TEN(2), in->i[0],
+                         in->i[1], in->i[2], slice, nblk);
+            break;
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_SOFTCAP
         case PLOW_DOP_SOFTCAP:
 #if PLOW_MIXED_STEP

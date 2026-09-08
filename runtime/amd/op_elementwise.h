@@ -208,6 +208,44 @@ __device__ void d_embed(bf16* __restrict__ out, const bf16* __restrict__ table,
     }
 }
 
+/* Compact hidden-row gather — the unified token batch's terminal row selection.
+ *
+ * out[s][h] = x[rows[s]][h], for s in [0, S), over H features.
+ *
+ * NOT d_embed. That gathers EMBEDDING-TABLE rows by token id and scales by sqrt(hidden); this
+ * gathers rows of a hidden activation by PACKED ROW INDEX and copies them verbatim, because the
+ * final RMSNorm that follows must see exactly the bytes the body wrote.
+ *
+ * `rows[s] >= live` TRAPS. A clamped index is not a degraded answer: it is another request's
+ * hidden row, and the token it produces is fluent and wrong. This interpreter's dispatch
+ * `default:` already writes nothing and does not trap, so every check that CAN be explicit
+ * here should be. */
+__device__ __attribute__((noinline)) void d_row_gather(bf16* __restrict__ out,
+                             const bf16* __restrict__ x,
+                             const unsigned* __restrict__ rows, unsigned n_sample,
+                             unsigned hidden, unsigned live, unsigned slice, unsigned nblk) {
+    /* The geometry check lives HERE, not at the dispatch site. plow_exec is the per-packet
+     * dispatcher and its register pressure is the object's spill budget: hoisting three
+     * immediate compares into the switch arm cost 72 scratch ops in plow_exec alone
+     * (153 -> 225 on interp_prefill), for checks that are free inside an already-outlined
+     * body. */
+    if (!n_sample || !hidden || !live) __builtin_trap();
+    const auto* xg = as_glob(x);
+    auto* og = as_glob(out);
+    for (unsigned s = slice; s < n_sample; s += nblk) {
+        const unsigned src_row = rows[s];
+        if (src_row >= live) __builtin_trap();
+        const size_t src = (size_t)src_row * hidden, dst = (size_t)s * hidden;
+        if ((hidden & 7u) == 0) {
+            for (unsigned i = threadIdx.x * 8; i < hidden; i += PLOW_THREADS * 8)
+                st_glob8(og + dst + i, ld_glob8(xg + src + i));
+        } else {
+            for (unsigned i = threadIdx.x; i < hidden; i += PLOW_THREADS)
+                st_act1(&out[dst + i], x[src + i]);
+        }
+    }
+}
+
 /* Greedy argmax over the logit row, as an unsigned MAX over a packed key.
  *
  *   [63:32] an order-preserving u32 image of the bf16 value

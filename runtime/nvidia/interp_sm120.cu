@@ -40,6 +40,13 @@ extern "C" __device__ unsigned plow_mixed_interpreter
     = 1;
 #endif
 
+/* The unified token batch, as two SEPARATE claims (see interp.hip for why one symbol will not
+ * do): the ABI marker says the object was compiled against the PlowProgram carrying
+ * `token_batch`; the gather marker says PLOW_DOP_ROW_GATHER has a real dispatch arm. Armed and
+ * can-fire are different claims, and only the second licenses a measurement. */
+extern "C" __device__ unsigned plow_token_batch_abi_1 = 1;
+extern "C" __device__ unsigned plow_row_gather_1 = 1;
+
 /* ---- OPTIONAL per-packet arm selection (plow_config.h) ---------------------------------
  * -DPLOW_CONFIG='"plow_config.h"' includes a header devgen generated FROM THE EMITTED
  * INSTRUCTION STREAM of one packet (crates/devgen/src/manifest.rs). It carries a presence
@@ -1595,6 +1602,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_EMBED:
         d_embed((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const int*)TEN(2),
                 in->i[0], in->i[1], in->fj[0].f, slice, nblk);
+        break;
+
+    /* Terminal row selection for the unified token batch. One arm serves BOTH NVIDIA images:
+     * interp_sm90a.cu is a wrapper TU that renames the public symbols and then includes this
+     * file, so there is no second switch to keep in step. */
+    case PLOW_DOP_ROW_GATHER:
+        if (!in->i[0] || !in->i[1] || !in->i[2]) { __trap(); break; }
+        d_row_gather((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                     (const unsigned*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
         break;
 
     case PLOW_DOP_RESIDUAL:

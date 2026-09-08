@@ -38,6 +38,35 @@ static __device__ void d_embed(__nv_bfloat16* __restrict__ out, const __nv_bfloa
     }
 }
 
+/* Compact hidden-row gather — the unified token batch's terminal row selection.
+ *
+ * out[s][h] = x[rows[s]][h], for s in [0, S), over H features.
+ *
+ * NOT d_embed above: that gathers EMBEDDING-TABLE rows by token id and scales by sqrt(hidden).
+ * This gathers rows of a hidden activation by PACKED ROW INDEX and copies them verbatim,
+ * because the final RMSNorm that follows must see exactly the bytes the body wrote.
+ *
+ * `rows[s] >= live` traps. A clamped index selects another request's hidden row, and the token
+ * it produces is fluent and wrong. */
+static __device__ void d_row_gather(__nv_bfloat16* __restrict__ out,
+                                    const __nv_bfloat16* __restrict__ x,
+                                    const unsigned* __restrict__ rows, unsigned n_sample,
+                                    unsigned hidden, unsigned live, unsigned slice,
+                                    unsigned nblk) {
+    for (unsigned s = slice; s < n_sample; s += nblk) {
+        const unsigned src_row = rows[s];
+        if (src_row >= live) { asm volatile("trap;"); return; }
+        const size_t src = (size_t)src_row * hidden, dst = (size_t)s * hidden;
+        if ((hidden & 7u) == 0) {
+            for (unsigned i = threadIdx.x * 8; i < hidden; i += PLOW_NV_THREADS * 8)
+                st_glob8(out + dst + i, ld_glob8(x + src + i));
+        } else {
+            for (unsigned i = threadIdx.x; i < hidden; i += PLOW_NV_THREADS)
+                out[dst + i] = x[src + i];
+        }
+    }
+}
+
 /* out = (a + b) * scale. Prefill-only on Qwen (decode fuses this into ADD_NORM).
  * i0=n is the FLAT element count (t*hidden), not a row count. */
 static __device__ void d_residual(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ a,

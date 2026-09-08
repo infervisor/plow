@@ -378,7 +378,10 @@ fn plan_inner(
             // one does NOT make it a decode span, and an intermediate chunk contributes zero
             // to S.
             Phase::Prefill => {
-                require(end <= request.prompt_len, "prefill span overruns the prompt")?;
+                require(
+                    end <= request.prompt_len,
+                    "prefill span overruns the prompt",
+                )?;
                 end == request.prompt_len
             }
         };
@@ -585,14 +588,16 @@ pub fn validate(b: &HostBatch<'_>) -> std::result::Result<(), Refusal> {
     check(b)?;
     let mut next = 0u32;
     for span in b.spans {
-        let end = span
-            .row0
-            .checked_add(span.n_rows)
-            .ok_or(Refusal::Cover)?;
+        let end = span.row0.checked_add(span.n_rows).ok_or(Refusal::Cover)?;
         if span.n_rows == 0 || end > b.real_rows || span.row0 != next {
             return Err(Refusal::Cover);
         }
-        if span.kv_len != span.kv_row0.checked_add(span.n_rows).ok_or(Refusal::KvLen)? {
+        if span.kv_len
+            != span
+                .kv_row0
+                .checked_add(span.n_rows)
+                .ok_or(Refusal::KvLen)?
+        {
             return Err(Refusal::KvLen);
         }
         for j in 0..span.n_rows {
@@ -785,7 +790,11 @@ pub struct CapabilityRefusal {
 
 impl std::fmt::Display for CapabilityRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "token batch refused: {} — {}", self.capability, self.detail)
+        write!(
+            f,
+            "token batch refused: {} — {}",
+            self.capability, self.detail
+        )
     }
 }
 
@@ -900,11 +909,7 @@ impl Capabilities {
                 ),
             });
         }
-        let prefill_spans = plan
-            .phases
-            .iter()
-            .filter(|p| **p == Phase::Prefill)
-            .count() as u32;
+        let prefill_spans = plan.phases.iter().filter(|p| **p == Phase::Prefill).count() as u32;
         if prefill_spans > self.max_prefill_spans {
             return Err(CapabilityRefusal {
                 capability: format!("{}.d_class_prefill_spans", self.target),

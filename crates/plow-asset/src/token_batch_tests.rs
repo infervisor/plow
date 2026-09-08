@@ -76,7 +76,12 @@ fn the_section_six_example_produces_its_exact_row_and_sample_maps() {
     assert_eq!(
         plan.pending
             .iter()
-            .map(|p| (p.slot, p.expected_frontier, p.new_frontier, p.completes_prompt))
+            .map(|p| (
+                p.slot,
+                p.expected_frontier,
+                p.new_frontier,
+                p.completes_prompt
+            ))
             .collect::<Vec<_>>(),
         vec![
             (0, 100, 101, true),
@@ -105,7 +110,11 @@ fn decode_counts_zero_through_four_keep_a_dense_cover() {
         let plan = plan(&requests, &frontiers, &generations, 16, 4096, 0).unwrap();
         assert_eq!(plan.real_rows as usize, d + 3);
         assert_eq!(plan.spans.len(), d + 1);
-        assert_eq!(plan.sample_rows as usize, d + 1, "every decode plus the prompt");
+        assert_eq!(
+            plan.sample_rows as usize,
+            d + 1,
+            "every decode plus the prompt"
+        );
         // Decode spans first, in caller order, then prefill.
         for i in 0..d {
             assert_eq!(plan.spans[i].row0, i as u32);
@@ -124,7 +133,15 @@ fn decode_counts_zero_through_four_keep_a_dense_cover() {
 fn a_one_token_prompt_is_one_span_with_one_sample_row() {
     static ONE: [u32; 1] = [42];
     let (frontiers, generations) = tables(&[0]);
-    let plan = plan(&[prefill(1, 0, 1, &ONE)], &frontiers, &generations, 8, 4096, 0).unwrap();
+    let plan = plan(
+        &[prefill(1, 0, 1, &ONE)],
+        &frontiers,
+        &generations,
+        8,
+        4096,
+        0,
+    )
+    .unwrap();
     assert_eq!((plan.real_rows, plan.sample_rows), (1, 1));
     assert_eq!(plan.phases, vec![Phase::Prefill]);
     assert_eq!(plan.sample_input_rows, vec![0]);
@@ -138,7 +155,15 @@ fn a_one_token_prompt_is_one_span_with_one_sample_row() {
 fn a_final_chunk_of_length_one_is_prefill_and_samples() {
     static ONE: [u32; 1] = [42];
     let (frontiers, generations) = tables(&[99]);
-    let plan = plan(&[prefill(1, 0, 100, &ONE)], &frontiers, &generations, 8, 4096, 0).unwrap();
+    let plan = plan(
+        &[prefill(1, 0, 100, &ONE)],
+        &frontiers,
+        &generations,
+        8,
+        4096,
+        0,
+    )
+    .unwrap();
     assert_eq!(plan.phases, vec![Phase::Prefill]);
     assert_eq!(plan.sample_rows, 1);
     assert_eq!(plan.positions[0], 99);
@@ -202,7 +227,15 @@ fn ragged_positions_come_from_each_span_not_the_row_index() {
 fn padding_is_inert_and_owned_by_nobody() {
     static ONE: [u32; 1] = [42];
     let (frontiers, generations) = tables(&[7]);
-    let plan = plan(&[decode(1, 0, 7, &ONE)], &frontiers, &generations, 8, 4096, 0).unwrap();
+    let plan = plan(
+        &[decode(1, 0, 7, &ONE)],
+        &frontiers,
+        &generations,
+        8,
+        4096,
+        0,
+    )
+    .unwrap();
     assert_eq!((plan.real_rows, plan.row_capacity), (1, 8));
     assert_eq!(&plan.active, &[1, 0, 0, 0, 0, 0, 0, 0]);
     assert!(plan.input_ids[1..].iter().all(|&t| t == 0));
@@ -220,9 +253,25 @@ fn padding_is_inert_and_owned_by_nobody() {
 fn a_span_past_the_context_limit_is_refused() {
     static CHUNK: [u32; 4] = [1, 2, 3, 4];
     let (frontiers, generations) = tables(&[125]);
-    let err = plan(&[prefill(1, 0, 200, &CHUNK)], &frontiers, &generations, 8, 128, 0).unwrap_err();
+    let err = plan(
+        &[prefill(1, 0, 200, &CHUNK)],
+        &frontiers,
+        &generations,
+        8,
+        128,
+        0,
+    )
+    .unwrap_err();
     assert!(err.contains("context limit"), "{err}");
-    assert!(plan(&[prefill(1, 0, 200, &CHUNK)], &frontiers, &generations, 8, 129, 0).is_ok());
+    assert!(plan(
+        &[prefill(1, 0, 200, &CHUNK)],
+        &frontiers,
+        &generations,
+        8,
+        129,
+        0
+    )
+    .is_ok());
 }
 
 /// Ownership: a span must start at its slot's committed frontier and carry the generation the
@@ -239,7 +288,15 @@ fn invalid_ownership_is_refused_at_plan_time() {
     assert!(err.contains("generation"), "{err}");
 
     // A decode row before the prompt end is a request that has not finished prefilling.
-    let err = plan(&[decode(1, 0, 64, &ONE)], &frontiers, &generations, 8, 4096, 0).unwrap_err();
+    let err = plan(
+        &[decode(1, 0, 64, &ONE)],
+        &frontiers,
+        &generations,
+        8,
+        4096,
+        0,
+    )
+    .unwrap_err();
     assert!(err.contains("decode span"), "{err}");
 
     // Two spans on one physical slot would both start at its frontier and both advance it.
@@ -256,7 +313,15 @@ fn invalid_ownership_is_refused_at_plan_time() {
 
     // A prefill span that overruns its own prompt.
     static FIVE: [u32; 5] = [1, 2, 3, 4, 5];
-    let err = plan(&[prefill(1, 1, 12, &FIVE)], &frontiers, &generations, 8, 4096, 0).unwrap_err();
+    let err = plan(
+        &[prefill(1, 1, 12, &FIVE)],
+        &frontiers,
+        &generations,
+        8,
+        4096,
+        0,
+    )
+    .unwrap_err();
     assert!(err.contains("overruns"), "{err}");
 }
 
@@ -352,17 +417,11 @@ fn malformed_tables_are_refused_by_the_named_invariant() {
         Err(Refusal::Cover)
     );
     // Short cover: spans stop before M.
-    assert_eq!(
-        run(good(vec![span(0, 2, 0)], 4)),
-        Err(Refusal::Cover)
-    );
+    assert_eq!(run(good(vec![span(0, 2, 0)], 4)), Err(Refusal::Cover));
     // Position mismatch.
     let (spans, mut positions, active, m) = good(vec![span(0, 2, 0), span(2, 2, 10)], 4);
     positions[3] = 99;
-    assert_eq!(
-        run((spans, positions, active, m)),
-        Err(Refusal::Position)
-    );
+    assert_eq!(run((spans, positions, active, m)), Err(Refusal::Position));
     // A live mask bit past M: the filler and the planner disagree about who owns the row.
     let (spans, positions, mut active, m) = good(vec![span(0, 4, 0)], 4);
     active[5] = 1;
@@ -447,7 +506,10 @@ fn refusals_name_the_capability() {
     let mut wrong = caps(vec![gemm], vec![]);
     wrong.descriptor_version = TOKEN_BATCH_VERSION + 1;
     assert_eq!(
-        wrong.refuse_program([gemm].into_iter()).unwrap_err().capability,
+        wrong
+            .refuse_program([gemm].into_iter())
+            .unwrap_err()
+            .capability,
         format!("gfx942.{OBJECT_CAPABILITY}"),
     );
 
@@ -472,7 +534,15 @@ fn plan_capacities_and_the_d_class_limit_are_refused_not_truncated() {
     };
     let (frontiers, generations) = tables(&[0, 0, 5]);
 
-    let one_span = plan(&[prefill(1, 0, 2, &TWO)], &frontiers, &generations, 8, 64, 0).unwrap();
+    let one_span = plan(
+        &[prefill(1, 0, 2, &TWO)],
+        &frontiers,
+        &generations,
+        8,
+        64,
+        0,
+    )
+    .unwrap();
     assert!(caps.refuse_plan(&one_span).is_ok());
 
     // Two INTERMEDIATE chunks, so S = 0 and only the D-class limit can fire. Isolating it
@@ -508,7 +578,15 @@ fn plan_capacities_and_the_d_class_limit_are_refused_not_truncated() {
         "S=2 exceeds the compiled sample capacity, and that is what should be named",
     );
 
-    let wide = plan(&[prefill(1, 0, 2, &TWO)], &frontiers, &generations, 16, 64, 0).unwrap();
+    let wide = plan(
+        &[prefill(1, 0, 2, &TWO)],
+        &frontiers,
+        &generations,
+        16,
+        64,
+        0,
+    )
+    .unwrap();
     assert_eq!(
         caps.refuse_plan(&wide).unwrap_err().capability,
         "cpu.row_capacity"
@@ -549,4 +627,67 @@ fn the_descriptor_requires_addresses_that_match_its_counts() {
     assert_eq!(intermediate.sample_rows, 0);
     assert!(descriptor(&intermediate, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000).is_err());
     assert!(descriptor(&intermediate, 0x1000, 0x2000, 0x3000, 0x4000, 0).is_ok());
+}
+
+/// A program in this contract is explicitly BODY or OUTPUT, and the declared role is checked
+/// against what the program actually contains rather than trusted. The discriminator is the
+/// row gather: an output segment begins with exactly one, a body has none.
+#[test]
+fn program_roles_are_derived_from_the_instruction_stream() {
+    let inst = |op: DevOp| packet::dev::DevInst64 {
+        op: op as u16,
+        blocks: 1,
+        ..Default::default()
+    };
+    let program = |insts: Vec<packet::dev::DevInst64>| aux_program::Program {
+        rows: 8,
+        n_counter: 1,
+        insts,
+        stream: Vec::new(),
+        stream_ofs: Vec::new(),
+        stream_len: Vec::new(),
+        waits: Vec::new(),
+        succs: Vec::new(),
+        gq_stream: Vec::new(),
+        gq_seg_ofs: Vec::new(),
+    };
+
+    // A body: packed rows through the layers, no selection.
+    assert_eq!(
+        role_of(&program(vec![
+            inst(DevOp::Embed),
+            inst(DevOp::RmsNorm),
+            inst(DevOp::Gemm)
+        ]))
+        .unwrap(),
+        ProgramRole::Body,
+    );
+
+    // The terminal segment: gather, then the model's existing tail.
+    assert_eq!(
+        role_of(&program(vec![
+            inst(DevOp::RowGather),
+            inst(DevOp::RmsNorm),
+            inst(DevOp::Gemm),
+            inst(DevOp::Argmax),
+            inst(DevOp::ArgmaxFin),
+        ]))
+        .unwrap(),
+        ProgramRole::Output,
+    );
+
+    // A gather that is NOT first means the row selection happened after some tail stage — the
+    // "earlier alias" wrong-model bug, where the head reads a tensor the final residual has
+    // not finished writing.
+    let err = role_of(&program(vec![inst(DevOp::RmsNorm), inst(DevOp::RowGather)])).unwrap_err();
+    assert!(err.contains("first instruction"), "{err}");
+
+    // Two gathers is two row selections in one segment: which one owns the sample list is
+    // undefined, so it is refused rather than resolved by position.
+    let err = role_of(&program(vec![
+        inst(DevOp::RowGather),
+        inst(DevOp::RowGather),
+    ]))
+    .unwrap_err();
+    assert!(err.contains("more than one"), "{err}");
 }

@@ -219,7 +219,10 @@ fn rust_and_c_agree_on_the_device_isa() {
             offset_of!(TokenBatch, row_capacity),
         ),
         ("TokenBatch.real_rows", offset_of!(TokenBatch, real_rows)),
-        ("TokenBatch.sample_rows", offset_of!(TokenBatch, sample_rows)),
+        (
+            "TokenBatch.sample_rows",
+            offset_of!(TokenBatch, sample_rows),
+        ),
         ("TokenBatch.n_spans", offset_of!(TokenBatch, n_spans)),
         ("TokenBatch.flags", offset_of!(TokenBatch, flags)),
         ("TokenBatch.spans", offset_of!(TokenBatch, spans)),

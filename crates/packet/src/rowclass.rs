@@ -119,12 +119,25 @@ pub fn class_of(op: DevOp) -> RowClass {
         | MoeCombine | MoeCombinePf | MoeGroupGluPf | MoeGroupDownPf | MoeExpertGluFp8Blk
         | MoeExpertDownFp8Blk | MoeGroupGluFp8Blk | MoeGroupDownFp8Blk | MoeGluMx | MoeDownMx
         | MoeGluMxPf | MoeDownMxPf => RowClass::A,
-        MoeRouterGemma | MoeRouterGemmaScore | MoeRouterGemmaScoreFast | MoeRouterGemmaTopk
-        | MoeRouterGemmaPf | MoeAlignGemmaPf | MoeExpertGluGemma | MoeExpertDownGemma
-        | MoeExpertGluGemmaFp8 | MoeExpertDownGemmaFp8 | MoeExpertGluNormGemma
-        | MoeCombineGemma | MoeCombineNormGemma | MoeCombineResidNormGemma
-        | MoeGroupGluGemmaPf | MoeGroupDownGemmaPf | MoeCombineNormGemmaPf
-        | MoeGroupGluGemmaPfW8a8 | MoeGroupDownGemmaPfW8a8 => RowClass::A,
+        MoeRouterGemma
+        | MoeRouterGemmaScore
+        | MoeRouterGemmaScoreFast
+        | MoeRouterGemmaTopk
+        | MoeRouterGemmaPf
+        | MoeAlignGemmaPf
+        | MoeExpertGluGemma
+        | MoeExpertDownGemma
+        | MoeExpertGluGemmaFp8
+        | MoeExpertDownGemmaFp8
+        | MoeExpertGluNormGemma
+        | MoeCombineGemma
+        | MoeCombineNormGemma
+        | MoeCombineResidNormGemma
+        | MoeGroupGluGemmaPf
+        | MoeGroupDownGemmaPf
+        | MoeCombineNormGemmaPf
+        | MoeGroupGluGemmaPfW8a8
+        | MoeGroupDownGemmaPfW8a8 => RowClass::A,
         // Attention epilogues: per (row, head) folds of partials. No position, no coupling —
         // including GPT-OSS's sink logit, which is one unscaled value per HEAD with no value
         // row, so it composes with packing unchanged.
