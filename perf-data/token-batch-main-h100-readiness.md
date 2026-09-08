@@ -14,7 +14,7 @@ rollback. This is capability-gated selection, not production qualification of ev
 | Failed AMD kernel lookup | Module now owned by the cleanup guard before lookup. |
 | Startup observability | `armed` and `ready` are separate; `fires=false` until a successful device dispatch. |
 | Post-dispatch validation | Invalid token IDs or failed frontier commit are device errors; no ordinary-path retry. |
-| Host verification | CUDA + HSA library suite: 582 passed, 14 ignored, zero failures. |
+| Host verification | CUDA + HSA library suite: 584 passed, 14 ignored, zero failures. |
 | Shared contract and CPU integration | 18 asset-contract tests, 5 C/Rust resolver checks and 4 compact-tail tests passed. |
 | H100 default/fallback smoke | FP8 server starts with `token_batch=true`, explicitly reports CUDA executor unavailable, and generates through ordinary execution. |
 | AMD device correctness/performance | Not tested on this host. |
@@ -109,6 +109,21 @@ one warmup wave and one measured wave per cell. Neither establishes a performanc
 BF16 API checks also pass ragged request parity, exact limits, slot reuse, prefill/decode
 disconnects, context rejection and recovery; retained cache remains within the cap afterward.
 
+Extending the workload to 2K exposed eviction of the primed 1920-token prefix at concurrency
+4 and 16. Snapshots attached to radix nodes were protected for the entire KV lease, even
+after restoration, forcing eviction of the hot short-prefix snapshot. Snapshots now become
+evictable after restoration finishes; radix references still protect the shared KV blocks.
+Second-chance eviction considers all unpinned snapshots when no radix leaf can be reclaimed.
+The 2K replay reuses 1920 tokens in all 85 measured requests through concurrency 64.
+The physical decode capacity is still 4. In the single-wave concurrency-4 screen, TTFT
+changed from 9.92 s with cache misses to 1.07 s with hits. This is regression evidence.
+
+FP8 narrow dispatch now admits the channel-scaled `GemvFp8` and `GemvGluFp8` projections
+while retaining the existing KV geometry and cross-rung shape checks. The actual Gemma
+packet qualifies at widths 1/2/4. On H100, 50 full-logit snapshots match widest-only execution
+bit for bit across prefill, sparse-slot decoding and slot reuse. HTTP performance measurements
+for the narrower FP8 route are still pending.
+
 Raw artifacts: `/opt/dlami/nvme/tmp/gemma31-glm53-h100-20260908/`.
 Host test log: `/tmp/plow-token-batch-readiness-tests-final.log`.
 Final lifecycle test log: `/tmp/plow-prefix-retire-tests.log`.
@@ -120,5 +135,7 @@ Current GPU artifacts: `plow-fp8-stream-*`; source and executable hashes are in
 BF16 artifacts: `plow-bf16-prefix-plan-*`, with hashes in
 `plow-bf16-prefix-plan-provenance.json`. Planner host checks:
 `/tmp/plow-prefix-plan-library-tests.log` (582 passed, 14 ignored).
+Latest host and FP8 device checks: `/tmp/plow-cache-rung-library-tests.log` (584 passed,
+14 ignored) and `/tmp/plow-fp8-rung-gpu.log`. Queue artifacts: `plow-bf16-cache-rung-*`.
 CPU integration log: `/tmp/plow-token-batch-cpu-integration-tests.log`.
 The compact-tail fixture needed the new optional worker-pinning argument before it could run.

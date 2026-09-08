@@ -155,6 +155,46 @@ fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
 }
 
 #[test]
+fn validates_channel_fp8_rows_and_preserves_projection_and_kv_checks() {
+    for op in [DevOp::GemvFp8, DevOp::GemvGluFp8] {
+        let mut blob = fixture();
+        for (name, bytes) in [("x", 256), ("wg", 128), ("sg", 64), ("wu", 128), ("su", 64)] {
+            blob.tensors.push(DevTensor { name: name.into(), bytes, init: None });
+        }
+        for g in &mut blob.progs {
+            let mut d = DevInst64 {
+                op: op as u16,
+                blocks: 1,
+                t: [TENSOR_NONE16; 8],
+                ..Default::default()
+            };
+            d.t[..3].copy_from_slice(&[7, 8, 9]);
+            if op == DevOp::GemvFp8 {
+                d.t[5] = 10;
+            } else {
+                d.t[3..6].copy_from_slice(&[10, 12, 11]);
+            }
+            d.i[..3].copy_from_slice(&[g.t, 16, 8]);
+            let entry = StreamEnt { inst: g.insts.len() as u32, ..Default::default() };
+            g.insts.push(d);
+            g.stream.push(entry);
+            g.gq_stream.push(entry);
+            g.stream_len[0] += 1;
+            g.gq_seg_ofs[1] += 1;
+        }
+        assert!(validate_decode_ladder(&blob).unwrap());
+        blob.progs[0].insts[4].i[0] = 2;
+        assert!(validate_decode_ladder(&blob).is_err());
+        blob.progs[0].insts[4].i[0] = 1;
+        blob.progs[0].insts[4].t[5] = 12;
+        assert!(!validate_decode_ladder(&blob).unwrap());
+        blob.progs[0].insts[4].t[5] = if op == DevOp::GemvFp8 { 10 } else { 11 };
+        blob.progs[0].insts[0].i[6] = 0;
+        assert!(validate_decode_ladder(&blob).is_err());
+    }
+}
+
+#[test]
 fn validates_hd64_half_split_attention_ladder() {
     let mut blob = fixture();
     for g in &mut blob.progs {

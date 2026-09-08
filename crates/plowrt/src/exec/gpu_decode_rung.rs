@@ -149,8 +149,10 @@ pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
                     | DevOp::Gemm
                     | DevOp::GemmNorm
                     | DevOp::Gemv
+                    | DevOp::GemvFp8
                     | DevOp::GemvQkv
                     | DevOp::GemvGlu
+                    | DevOp::GemvGluFp8
                     | DevOp::GemmGlu
                     | DevOp::NormResidual
                     | DevOp::NormResidualNorm

@@ -1488,24 +1488,25 @@ fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
 /// its boundary snapshot. `false` when nothing is evictable.
 fn evict_one(s: &Shared, inner: &mut Inner) -> bool {
     let Some(key) = inner.cache.evict_lru() else {
-        // Whole-block snapshots follow their radix leases. Short prefixes have no
-        // radix node; give a reused snapshot one second chance against one-off tails.
-        let Some(snapshots) = inner.published.get_mut(&None) else { return false };
-        let snap = loop {
-            let Some(index) = snapshots.iter().enumerate()
-                .filter(|(_, snap)| snap.users == 0)
-                .min_by_key(|(_, snap)| snap.last_used)
-                .map(|(i, _)| i)
+        // A radix lease protects shared KV, but snapshots are only needed while
+        // restoring an attachment. Reused snapshots get a second chance.
+        let (node, snap) = loop {
+            let Some((node, index)) = inner.published.iter()
+                .flat_map(|(&node, snaps)| snaps.iter().enumerate().map(move |(i, snap)| (node, i, snap)))
+                .filter(|(_, _, snap)| snap.users == 0)
+                .min_by_key(|(_, _, snap)| snap.last_used)
+                .map(|(node, index, _)| (node, index))
             else { return false };
+            let snapshots = inner.published.get_mut(&node).unwrap();
             if snapshots[index].referenced {
                 snapshots[index].referenced = false;
                 inner.snapshot_tick += 1;
                 snapshots[index].last_used = inner.snapshot_tick;
             } else {
-                break snapshots.swap_remove(index);
+                break (node, snapshots.swap_remove(index));
             }
         };
-        if snapshots.is_empty() { inner.published.remove(&None); }
+        if inner.published[&node].is_empty() { inner.published.remove(&node); }
         free_snapshot(s, inner, snap);
         return true;
     };
@@ -2541,28 +2542,30 @@ mod tests {
     }
 
     #[test]
-    fn cache_budget_trims_after_the_last_borrower_releases() {
+    fn cache_budget_trims_after_the_inflight_snapshot_releases() {
         let ops = Arc::new(MockVmm::default());
-        let p = pool_with_cap(ops.clone(), 128);
+        let p = pool_with_cap(ops.clone(), 448);
         let a = prompt(17);
         p.try_attach(0, &a).unwrap();
         p.ensure_rows(0, 17).unwrap();
         p.publish(0, &a, 192, |_| Ok(())).unwrap();
         p.try_attach(1, &a).unwrap().expect("shared prefix");
-        p.begin_seq(0);
-        assert_eq!(p.stats().cache_bytes, 448);
-        assert_eq!(ops.frees.load(Ordering::SeqCst), 0);
-
-        p.begin_seq(1);
-        assert!(p.stats().cache_bytes <= 128);
-        assert_eq!(p.stats().snapshot_bytes, 0);
+        p.ensure_rows(0, 25).unwrap();
+        p.publish(0, &prompt(25), 64, |_| Ok(())).unwrap();
+        assert_eq!(p.stats().cache_bytes, 576);
+        assert_eq!(p.stats().snapshot_bytes, 192);
         assert_eq!(ops.frees.load(Ordering::SeqCst), 1);
+
+        p.finish_attach(1);
+        assert!(p.stats().cache_bytes <= 448);
+        assert_eq!(p.stats().snapshot_bytes, 0);
+        assert_eq!(ops.frees.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn idle_slot_releases_cache_holds_without_unmapping_writable_kv() {
         let ops = Arc::new(MockVmm::default());
-        let p = pool_with_cap(ops.clone(), 128);
+        let p = pool_with_cap(ops.clone(), 448);
         let tokens = prompt(17);
         p.try_attach(0, &tokens).unwrap();
         p.ensure_rows(0, 17).unwrap();
@@ -2573,8 +2576,12 @@ mod tests {
         p.release_prefix(0);
         assert_eq!(p.stats().snapshot_bytes, 192);
         p.release_prefix(1);
+        {
+            let mut inner = p.shared.inner.lock();
+            while evict_one(&p.shared, &mut inner) {}
+        }
         assert_eq!(p.stats().snapshot_bytes, 0);
-        assert!(p.stats().cache_bytes <= 128);
+        assert_eq!(p.stats().cache_bytes, 0);
         assert_eq!(p.mapped_rows(0), mapped);
         assert!(p.stats().blocks_live > 0);
         assert_eq!(ops.releases.load(Ordering::SeqCst), 0);
@@ -2625,19 +2632,44 @@ mod tests {
         p.publish_at(0, &tokens, 16, 64, |_| Ok(())).unwrap();
         p.publish_at(0, &tokens, 21, 96, |_| Ok(())).unwrap();
         p.begin_seq(0);
+        assert_eq!(p.try_attach(0, &tokens[..21]).unwrap().unwrap().rows, 16);
         let hit = p.try_attach(1, &tokens).unwrap().unwrap();
         assert_eq!(hit.rows, 21);
         assert_eq!(p.mapped_rows(1), 16);
-        assert_eq!(p.stats().blocks_shared_mapped, 4);
+        assert_eq!(p.stats().blocks_shared_mapped, 8);
         ops.fail_creates.store(1, Ordering::SeqCst);
         assert!(p.ensure_rows(1, 22).is_err());
         p.ensure_rows(1, 22).unwrap();
         assert_eq!(p.mapped_rows(1), 24);
         p.finish_attach(1);
         p.begin_seq(1);
+        p.begin_seq(0);
         let mut changed = tokens.clone();
         changed[20] ^= 1;
         assert_eq!(p.try_attach(1, &changed).unwrap().unwrap().rows, 16);
+    }
+
+    #[test]
+    fn hot_short_snapshot_survives_publishers_holding_full_blocks() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool_with_cap(ops, 192);
+        let prime = prompt(7);
+        p.try_attach(0, &prime).unwrap();
+        p.ensure_rows(0, 7).unwrap();
+        p.publish_at(0, &prime, 6, 48, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+        let request = prompt(9);
+        assert_eq!(p.try_attach(1, &request).unwrap().unwrap().rows, 6);
+        p.ensure_rows(1, 9).unwrap();
+        p.finish_attach(1);
+        p.publish_at(1, &request, 8, 48, |_| Ok(())).unwrap();
+
+        assert_eq!(p.stats().cache_bytes, 176);
+        assert_eq!(p.stats().snapshot_bytes, 48);
+        assert_eq!(p.stats().snapshots_evicted, 1);
+        let mut next = request;
+        next[6] ^= 1;
+        assert_eq!(p.try_attach(0, &next).unwrap().unwrap().rows, 6);
     }
 
     #[test]
