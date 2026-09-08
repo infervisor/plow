@@ -20,6 +20,71 @@ physical cores for MoE; logical CPUs for dense decode. An explicit count overrid
 that choice. Each loaded model owns a pool; budget threads across concurrently
 served models. A CPU-only build does not probe or link CUDA/HSA drivers.
 
+## Compiling a bundle
+
+There is no CPU emit target. `plowc` always compiles for a *device* target and the
+CPU backend interprets the resulting packet, so the interpreter-object step of the
+GPU quickstart is skipped entirely — a CPU bundle is `model.pkt`, its manifest, and
+a tokenizer, with no cubin or hsaco.
+
+```sh
+CKPT=/path/to/gemma-4-12B-it
+target/release/plowc --hf-dir "$CKPT" \
+  --gpu rtx6000pro --n-cu 96 --max-ctx 2048 \
+  --batch 1,4 --seq 128,512 --out /path/to/bundle
+```
+
+Pick an **NVIDIA** target. A gfx942/gfx950 packet carries AMD-specific fusion the
+CPU kernels do not implement and is rejected at load, typically as a KV-row site
+past the decode program's instruction count. `rtx6000pro` is what the bundles in
+`perf-data/cpu-*` were built with; the `--gpu` default is `h100`.
+
+`--n-cu` is the packet's count of *virtual* executors, not a thread count. Kernels
+take "the `slice`-th of `nblk` shares", and the worker pool maps whatever thread
+count it has onto those executors: a worker owns several when threads are fewer,
+and tail workers own none when threads are more. **One bundle therefore serves any
+core count**, and `--cpu-threads` is free to differ from `--n-cu` — 96 executors on
+192 threads is a normal configuration. Compile once at a width that divides the
+largest machine you intend to serve; the emitter caps `--n-cu` at 256, because the
+per-domain slice count is a nine-bit field. Leaving it at `0` takes the `--gpu`
+spec's SM/CU count, which is why an explicit value is usually the better choice
+for CPU.
+
+Emit-time choices the CPU loader constrains:
+
+| choice | why |
+| --- | --- |
+| `--qnorm-fuse` (default off) | leave it off for W8A8; CPU loading rejects that RMSNorm fusion |
+| `--max-ctx` | sizes the KV cache, which is host RAM here — the 2048 above is a bench setting, not a serving one |
+| `--batch` / `--seq` | the compiled prefill buckets and decode rungs; a bundle with no grouped-prefill program prefills one token at a time |
+| MXFP4 | `--gpu` must be a target that permits it at emit; the twin is supplied at run time with `--cpu-mxfp4-dir` |
+
+## Flags
+
+Every CPU runtime knob is a `--cpu-*` flag with a `PLOW_CPU_*` environment twin;
+the CLI wins over the environment. `plowrt serve --help` prints them under the
+"CPU runtime" heading.
+
+| flag | env | default | effect |
+| --- | --- | --- | --- |
+| `--cpu-threads N` | `PLOW_CPU_THREADS` | `0` | Persistent workers. `0` selects the model-dependent width: physical cores for MoE, logical CPUs for dense decode. Need not equal `--n-cu`. |
+| `--cpu-numa MODE` | `PLOW_CPU_NUMA` | `auto` | `auto` interleaves large tensors across the allowed nodes (best effort); `off` keeps the OS policy, including an external `numactl`; a list such as `0,1` requires successful placement and rejects unavailable nodes. |
+| `--cpu-isa TIER` | `PLOW_CPU_ISA` | `auto` | Kernel tier ceiling: `scalar`, `avx512`, `amx`. For A/B, and for hosts without AMX. Never activates above what cpuid and OS state permit. |
+| `--cpu-huge-pages=B` | `PLOW_CPU_HUGE_PAGES` | unset | Override transparent-huge-page *advice*: by default ordinary pages for interleaved tensors, huge-page advice for single-node or OS placement. Changes advice, not the system THP setting. |
+| `--cpu-spin-us N` | `PLOW_CPU_SPIN_US` | `2000` | Spin budget (µs) before a blocked worker yields and parks. Decode packets are 100–500 µs apart; parking on every gap measured **+17% TPOT** at 50 µs versus 1000. |
+| `--cpu-prefill-chunk N` | `PLOW_CPU_PF_CHUNK` | `0` | Largest prefill chunk (rows) one tick may run while other slots decode; `0` = whole prompt. Measured **negative** at concurrency ≥ 4, so it stays off. |
+| `--cpu-mxfp4-dir DIR` | `PLOW_MXFP4_DIR` | unset | Directory holding the MXFP4 weight twin (`mxfp4/<name>` plus `_scale` rows, from `perf-data/tools/quantize_mxfp4.py`). |
+| `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | The fp8 weight twin. Runtime-wide rather than CPU-specific, but this is how a CPU bundle gets W8A16/W8A8 weights. |
+| `--cpu-global-queue=B` | `PLOW_CPU_GQ` | `false` | Take the blob's op-major global work queue, windowed per segment and locality domain, instead of static per-cu streams. **Measured ~2x slower** on the EPYC 9654; kept for A/B where the static partition is a poor fit. |
+| `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | `false` | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **Measured 1.5x slower** and never faster — see the [placement report](../../perf-data/cpu-numa-placement/epyc9654-avx512/README.md). Inert on a blob carrying no domains, and the balance guard declines a losing plan even when this is on. |
+
+The last two default to off because they were measured worse, not because they are
+unfinished. Both are safe to flip for an A/B on a different host; neither changes
+what is computed.
+
+`--executors` (not CPU-specific) sizes the reference interpreter. Each loaded model
+owns its own worker pool, so budget threads across concurrently served models.
+
 ## ISA coverage
 
 The x86-64 scalar code stays at the baseline ISA. Runtime detection checks OS
