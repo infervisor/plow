@@ -104,7 +104,7 @@ a regression check, not comprehensive model-quality qualification.
 | 16384 | 15552 | 2341 ms | 5842 ms |
 
 BF16 also retains 3917.5 MiB after its six-cell screen. Its decode ladder selects among
-1/2/4 rows; the FP8 ladder still falls back to width 4. Both screens use 32 output tokens,
+1/2/4 rows; FP8 used width 4 in these earlier screens. Both screens use 32 output tokens,
 one warmup wave and one measured wave per cell. Neither establishes a performance win.
 BF16 API checks also pass ragged request parity, exact limits, slot reuse, prefill/decode
 disconnects, context rejection and recovery; retained cache remains within the cap afterward.
@@ -115,14 +115,32 @@ after restoration, forcing eviction of the hot short-prefix snapshot. Snapshots 
 evictable after restoration finishes; radix references still protect the shared KV blocks.
 Second-chance eviction considers all unpinned snapshots when no radix leaf can be reclaimed.
 The 2K replay reuses 1920 tokens in all 85 measured requests through concurrency 64.
+The 8K replay likewise reuses 7776 tokens in all 85 measured requests. Retained cache
+after both workloads is 3327.5 MiB against the 4096 MiB cap. At concurrency 64,
+2K/8K median TTFT is 25.54/50.79 s and throughput is 39.10/20.03 output tokens/s.
 The physical decode capacity is still 4. In the single-wave concurrency-4 screen, TTFT
 changed from 9.92 s with cache misses to 1.07 s with hits. This is regression evidence.
 
 FP8 narrow dispatch now admits the channel-scaled `GemvFp8` and `GemvGluFp8` projections
 while retaining the existing KV geometry and cross-rung shape checks. The actual Gemma
 packet qualifies at widths 1/2/4. On H100, 50 full-logit snapshots match widest-only execution
-bit for bit across prefill, sparse-slot decoding and slot reuse. HTTP performance measurements
-for the narrower FP8 route are still pending.
+bit for bit across prefill, sparse-slot decoding and slot reuse. All 12 natural-text cold/warm
+requests and all 15 measured cached preflight completions match the preceding FP8 runtime.
+
+| FP8 input tokens | Concurrency-1 TPOT, width 4 | TPOT, narrow dispatch | Cached tokens |
+|---|---:|---:|---:|
+| 1024 | 35.61 ms | 20.93 ms | 960 |
+| 4096 | 35.94 ms | 21.21 ms | 3872 |
+| 16384 | 37.00 ms | 22.29 ms | 15552 |
+
+Concurrency-4 performance is essentially unchanged because it still uses width 4.
+These are single-wave regression screens. Retained cache is 3935 MiB after the new screen.
+The new FP8 runtime also passes ragged request parity, output limits, slot reuse,
+prefill/decode disconnects, context rejection and recovery. Raw results and executable
+hashes are in `plow-fp8-cache-rung-*` and `plow-fp8-cache-rung-provenance.json`.
+Default multi-step decoding delivers text in bursts of four chunks; chunk-gap tails and
+cached TTFT remain performance targets. No full-matrix win or production-ready default
+prefix selection is established.
 
 Raw artifacts: `/opt/dlami/nvme/tmp/gemma31-glm53-h100-20260908/`.
 Host test log: `/tmp/plow-token-batch-readiness-tests-final.log`.
