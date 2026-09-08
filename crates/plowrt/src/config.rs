@@ -670,6 +670,19 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-token-batch-solo", env = "PLOW_TOKEN_BATCH_SOLO", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub token_batch_solo: bool,
 
+    /// Unified token batch: keep the WIDE dense-GEMM rungs plowc chose per shape.
+    ///
+    /// The token-batch object is the mixed object's shape, and at four waves the fused-GLU
+    /// epilogue's `SN == 2` pins `GM_BN` to 128 — so its plain `Gemm` body is one tile for every
+    /// projection. The synthesizer collapses `GemmWide` (128x256) and `GemmC5` (192x256) onto
+    /// `Gemm`, which throws away the per-shape choice plowc measured. With this on the two wide
+    /// opcodes survive synthesis; they are separate instantiations already compiled into the
+    /// object, and only the token-batch route may ask for them (the mixed route splits every
+    /// projection into a decode GEMV band and a prefill GEMM band, which the wide arms have no
+    /// form of).
+    #[arg(long = "amd-token-batch-wide-tiles", env = "PLOW_TOKEN_BATCH_WIDE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub token_batch_wide_tiles: bool,
+
     /// RAGGED-M prefill: cover a prompt in the FEWEST launches and run the last
     /// chunk at its real row count instead of its padded bucket width.
     ///

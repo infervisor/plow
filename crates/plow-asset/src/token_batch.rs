@@ -849,6 +849,12 @@ impl Capabilities {
                 DevOp::NormResidual as u16,
                 DevOp::SoftCap as u16,
                 DevOp::Gemm as u16,
+                // The wide dense rungs. Class A like `Gemm` — no position, no cross-row
+                // coupling — and their arms take live M from the descriptor exactly as
+                // `Gemm`'s does. The object says so with `plow_token_batch_wide_gemm_1`,
+                // which the loader requires before the synthesizer is allowed to keep them.
+                DevOp::GemmWide as u16,
+                DevOp::GemmC5 as u16,
                 DevOp::GemmGlu as u16,
                 DevOp::HeadNormRope as u16,
                 DevOp::FlashPrefill as u16,

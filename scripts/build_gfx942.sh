@@ -1048,7 +1048,23 @@ ROWS=(
   # matmul over the combined M and its per-span attention loop with a flat query-tile schedule.
   # A separate row, not a define on the one above: the two routes are different dispatch and
   # `interp_mixed` stays byte-for-byte the qualified object it is today.
-  "interp_tokbatch|-DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=64 -DGM_BN=128 -DFA_DC=256 -DFA_DBUF=1"
+  # GM_BM=256, NOT the mixed row's 64, and it is the single biggest thing measured about this
+  # route. `mixed_program::synthesize` rewrites every GEMM opcode -- `GemmWide` and `GemmC5`
+  # included -- onto plain `Gemm`, so this object's ONE compiled tile runs every dense
+  # projection of a prefill chunk. At 64x128 that is the slowest rung in op_gemm.h's own
+  # inventory: 332-458 TF/s against 192x256's 1033-1236 on exactly the Gemma-31B shapes
+  # (see the tile-inventory table above GM_WD_BM). BN stays 128 because the fused-GLU
+  # epilogue's `SN == 2` pins it there at four waves; BM is free, and 256x128 is 2x the
+  # arithmetic intensity of 64x128 for NOTHING: 64/192/256 all measure 446 vgpr / 190 agpr /
+  # 64,544 B LDS / 0 spill on this row, because the arena is already sized at `GM_C5_*` (see
+  # PLOW_GM_ARENA under PLOW_MIXED_STEP) and the wave grid is 2x2 either way. The object was
+  # paying for a 192x256 arena and running 64x128 inside it.
+  # Serving delta on Gemma-4 31B at concurrency 8, token batch against the ordinary route:
+  # 7168 input -18.4% -> -1.8%, 4096 -17.8% -> -4.5%, 2048 -12.4% -> -2.4% output tokens/s;
+  # at concurrency 1 with `--amd-token-batch-solo` (no packing at all, so the prefill chunk
+  # alone) 7168 goes -24.8% -> -6.5% and its TTFT +64.8% -> +13.0%.
+  # `TB_GM_BM`/`TB_GM_BN` stay overridable so the A/B that found this is one env away.
+  "interp_tokbatch|-DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=${TB_GM_BM:-256} -DGM_BN=${TB_GM_BN:-128} -DFA_DC=256 -DFA_DBUF=1"
   "interp_prefill_fp8|$AX_PREFILL $AX_FP8"
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"

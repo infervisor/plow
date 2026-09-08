@@ -527,12 +527,15 @@ What it is **not** yet, and why the default stays scoped:
 * **One (backend, family) pair, one arch, one blob.** gfx942, Gemma-4 31B, BF16, TP1, batch 8. TP
   returns `None`; no MoE, MLA, DSA, recurrent or FP8 family has been near this route. FP8 was
   asked for and is not measured here.
-* **The long-prompt regression is unexplained.** It is not the rung width — §6.3's cap experiment
-  refutes that directly — and it is not the split-K, since capping `nsplit` moves the route by
-  less than 1.1%. Both packed routes lose at ≥2048, so it is a property of packing prefill with
-  decode at long context rather than of this route; the token batch simply loses more of it above
-  2048. Finding the cause is the next work item and it is worth more than anything else on this
-  list, because it is the difference between a short-prompt feature and a general one.
+* **The long-prompt regression is unexplained.** ~~It is not the rung width — §6.3's cap
+  experiment refutes that directly — and it is not the split-K, since capping `nsplit` moves the
+  route by less than 1.1%. Both packed routes lose at ≥2048, so it is a property of packing
+  prefill with decode at long context rather than of this route; the token batch simply loses more
+  of it above 2048.~~ **ANSWERED in §9, and this bullet is kept only so the reasoning that led
+  there is legible.** It was not a property of packing: the synthesizer collapsed `GemmWide` and
+  `GemmC5` onto plain `Gemm`, and `interp_tokbatch` compiled plain `Gemm` at the 64x128 tile. One
+  build constant takes the ≥2048 loss from 11–24% to 3–14%; §9 has the attribution, the grid and
+  the identity re-gate.
 * **The terminal segment is still not emitted.** `S` is capped by the synthesized program's
   `dcap = min(batch - 1, T - 1)` = 7, and the campaign shows the route running *at* that ceiling
   (`decode=6 prefill=1`, `decode=3 prefill=4 completed=4`). A compact `RowGather` tail with its
@@ -545,6 +548,171 @@ One finding that belongs to nobody on this list: **capping `nsplit` to 1 is a sm
 for the ORDINARY route** — +0.1 to +3.2% throughput and +0.2 to +11.1% TTFT, rising with input
 length — while doing nothing measurable for the token batch. That is a separate question from
 this route and should be pursued as one.
+
+---
+
+## 9. The long-prompt regression, found and largely removed
+
+§7 left this as "the next work item and it is worth more than anything else on this list". It was
+one line of the build and one line of the synthesizer, and both were about the **dense GEMM tile**.
+
+### 9.1 Two hypotheses, refuted first
+
+**"The terminal one-row span costs a full 128-row `FlashPrefill` q-tile."** `plan_into` under
+`SpanCover::PrefixFree` does emit a span with `n_rows: 1, kv_row0: L-1, kv_len: L` for a
+completing prompt, and `d_flash_prefill`'s TB arm does bill
+`ceil(n_rows / FA_QT) * n_head * nsplit` with `FA_QT = 128`. It is still wrong, twice over:
+
+* **In the source.** `runtime/amd/interp.hip` partitions the span table between the two attention
+  operators. `exec_flash_decode`'s arm takes `plow_tb_span_range(tbv, 0, plow_tb_decode_spans(tbv))`
+  and `exec_flash_prefill`'s takes the complement, where `plow_tb_decode_spans` is *the leading run
+  of `n_rows == 1` spans*. The terminal row is inside that run — that is what
+  `validate_token_batch_rows` pins — so it is served by **FlashDecode**, one work item per
+  head-group per split, not by a q-tile. No 128x row ever exists.
+* **In the numbers already recorded.** Fusion has no terminal split at all (it replays the token
+  through `split_terminal_prefill`) and loses the *same* 14–18% at ≥2048 in §5.2. And with
+  `--amd-token-batch-solo` the route loses 10.7 / 16.8 / 23.8% at 2048 / 4096 / 7168 at
+  **concurrency 1**, where there is one prompt, no decode row, and nothing packed with anything.
+  A cost that appears with no packing is not a cost of packing.
+
+**"It is the rung width / the KV split."** Already refuted in §6.3 and not revisited.
+
+### 9.2 The cause
+
+`exec/mixed_program.rs` ended its GEMM arm with `inst.op = DevOp::Gemm as u16` — collapsing
+`GemmSmall`, `GemmMed`, **`GemmWide` (128x256)** and **`GemmC5` (192x256)** onto plain `Gemm`. And
+`scripts/build_gfx942.sh` compiled `interp_tokbatch`'s plain `Gemm` at `-DGM_BM=64 -DGM_BN=128`.
+
+So **every dense projection of every prefill chunk on this route ran the 64x128 tile** — the
+slowest rung in `op_gemm.h`'s own inventory, measured in that file at **332–458 TF/s against
+192x256's 1033–1236 on exactly the Gemma-31B shapes** (`g31b gate/up N21504 K5376 M2048`:
+332 vs 1033). The ordinary route emits the rung plowc chose per shape and runs it in
+`interp_prefill`.
+
+That predicts, and it is what §5 measured: a cost proportional to the dense-GEMM share of the
+step, hence **invisible at 128 input and −25% at 7168**; **shared with fusion**, which is the same
+object shape; and **paid at concurrency 1 by the token batch alone**, because fusion needs a decode
+row to fire and this route does not.
+
+`GM_BN` cannot move: at four waves `GM_WN` is 2 and the fused-GLU epilogue's
+`static_assert(!GLU || SN == 2)` pins `BN` to 128. `GM_BM` is free, and **raising it is free**:
+64, 192 and 256 all compile to 446 vgpr / 190 agpr / 64,544 B LDS / 0 spill, because
+`PLOW_GM_ARENA` under `PLOW_MIXED_STEP` is *already* sized at `GM_C5_*` (192x256x64) —
+"the mixed object's small default tile does not bound the other GEMM opcodes". The object was
+paying for a 192x256 arena and running 64x128 inside it.
+
+### 9.3 The attribution measurement
+
+Four arms, four leased MI300X, served simultaneously; `--amd-token-batch-solo` so the route fires
+on a **solo prompt** and the cell contains no packing, no decode interleave and no terminal span
+beside a decode row. 64 output tokens, 3 repeats after 1 warmup, medians.
+
+**Output tokens/s**
+
+| in | c | ordinary | tb `GM_BM=64` | tb `192` | tb `256` |
+|---:|---:|---:|---:|---:|---:|
+| 2048 | 1 | 33.12 | 29.59 (−10.7%) | 30.86 (−6.8%) | 31.33 (**−5.4%**) |
+| 4096 | 1 | 27.56 | 22.72 (−17.6%) | 24.20 (−12.2%) | 25.56 (**−7.3%**) |
+| 7168 | 1 | 21.03 | 15.82 (−24.8%) | 18.46 (−12.2%) | 19.66 (**−6.5%**) |
+
+**TTFT ms** — 7168: 1537 ordinary, 2533 at `GM_BM=64` (+64.8%), 1904 at 192, **1737 at 256
+(+13.0%)**. **TPOT p50** moves by at most 3.7% across all four arms at every length: decode is
+untouched, which is what says the whole thing is a prefill cost.
+
+One tile constant recovers **73% of the throughput loss and 80% of the TTFT loss** at 7168.
+
+### 9.4 The grid, with the tile fixed
+
+Same protocol as §5, two rounds with the arm→GPU assignment rotated between them; the
+two-participant admission rule on, so concurrency 1 does not fire. `tb-before` is `GM_BM=64`,
+`tb-after` is `GM_BM=256`. Round 2 (rotated) shown; round 1 agrees within the round spread.
+
+**Output tokens/s**
+
+| in | c | ordinary | fusion | tb-before | tb-after | tb-after vs ordinary | tb-after vs fusion |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 1 | 40.78 | 39.83 | 41.08 | 41.16 | **+0.9%** | +3.3% |
+| 128 | 4 | 87.01 | 90.88 | 97.43 | 94.41 | **+8.5%** | +3.9% |
+| 128 | 8 | 92.99 | 105.42 | 108.00 | 109.63 | **+17.9%** | +4.0% |
+| 512 | 1 | 38.05 | 37.09 | 38.16 | 38.42 | **+1.0%** | +3.6% |
+| 512 | 4 | 78.47 | 77.34 | 83.18 | 85.95 | **+9.5%** | +11.1% |
+| 512 | 8 | 83.04 | 84.73 | 89.27 | 93.12 | **+12.1%** | +9.9% |
+| 2048 | 1 | 32.12 | 31.18 | 31.97 | 32.50 | **+1.2%** | +4.2% |
+| 2048 | 4 | 58.00 | 48.49 | 48.76 | 55.13 | **−5.0%** | +13.7% |
+| 2048 | 8 | 60.02 | 49.01 | 51.70 | 58.15 | **−3.1%** | +18.6% |
+| 4096 | 1 | 26.94 | 26.06 | 26.66 | 27.16 | **+0.8%** | +4.2% |
+| 4096 | 4 | 39.49 | 32.24 | 29.55 | 35.43 | **−10.3%** | +9.9% |
+| 4096 | 8 | 39.24 | 31.51 | 31.25 | 36.79 | **−6.2%** | +16.8% |
+| 7168 | 1 | 20.63 | 20.10 | 20.45 | 20.75 | **+0.6%** | +3.2% |
+| 7168 | 4 | 24.96 | 20.72 | 17.90 | 21.56 | **−13.6%** | +4.1% |
+| 7168 | 8 | 24.08 | 19.95 | 18.81 | 22.27 | **−7.5%** | +11.6% |
+
+**TTFT ms**
+
+| in | c | ordinary | fusion | tb-before | tb-after |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 4 | 352 | 424 | 222 | **221** |
+| 128 | 8 | 658 | 622 | 493 | **465** |
+| 512 | 8 | 991 | 1043 | 1302 | **823** |
+| 2048 | 8 | 2283 | 3227 | 3201 | **2609** |
+| 4096 | 8 | 4616 | 6264 | 6990 | **5430** |
+| 7168 | 4 | 4661 | 5853 | 7637 | **6073** |
+| 7168 | 8 | 8901 | 11344 | 13448 | **10725** |
+
+**TPOT p50** never regresses against `tb-before` or fusion at any long cell: 7168/8 is 179.1 ms
+against fusion's 210.1 and `tb-before`'s 202.7 (ordinary 166.9). **No throughput here is bought
+with per-token latency** — at ≥2048 the token batch is the *best* TPOT of the two packed arms, and
+at ≤512 it is the best of all three.
+
+**Identity survives the tile.** Reduction order inside the GEMM changed, so this was re-gated:
+eight DISTINCT pseudo-random 2048-word prompts, packed at concurrency 4 and 8 against the same
+prompts run one at a time on the same server — **packed == isolated 16/16**.
+
+### 9.5 What is left, and the second half of the fix
+
+`tb-after` is now better than fusion in **every** cell and better than the ordinary route at every
+length up to 512 and at every concurrency-1 cell; it still loses 3–14% to the ordinary route at
+≥2048 with concurrency ≥ 4. The remaining gap has the same shape as the one just closed: `BN` is
+still 128 where the ordinary route runs 256.
+
+The second half is therefore to stop collapsing the opcode at all, and it is implemented behind
+`--amd-token-batch-wide-tiles` (`PLOW_TOKEN_BATCH_WIDE`), **off by default**:
+
+* `exec_gemm_wide` / `exec_gemm_c5` take live `M` from `PLOW_RUNTIME_ROWS`, the same split
+  `exec_gemm` already makes — without it a wide packet on this route would run the compiled
+  bucket width over rows nobody wrote.
+* The object says so with a new marker, `plow_token_batch_wide_gemm_1`, which the loader requires
+  before the synthesizer is allowed to keep the opcode; `Capabilities::amd_dense_gqa` gains the two
+  opcodes as class A. An object built before this change refuses the knob instead of writing
+  nothing, which is the failure mode the audit exists for.
+* Only the token-batch route asks for it. The mixed route splits every projection into a decode
+  GEMV band and a prefill GEMM band, and the wide arms have no band split.
+
+Measured (same protocol, four arms simultaneously, `hsaco` identical across the two token-batch
+arms so only the knob differs):
+
+| in | c | ordinary | fusion | tb-after | tb-after **+wide** | wide vs tb-after |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 4 | 57.85 | 48.97 | 54.27 (−6.2%) | 56.25 (**−2.8%**) | +3.6% |
+| 2048 | 8 | 60.11 | 49.31 | 57.52 (−4.3%) | 59.74 (**−0.6%**) | +3.9% |
+| 4096 | 4 | 39.23 | 32.17 | 34.75 (−11.4%) | 35.39 (**−9.8%**) | +1.8% |
+| 4096 | 8 | 38.87 | 31.50 | 35.97 (−7.5%) | 36.72 (**−5.5%**) | +2.1% |
+| 7168 | 4 | 24.85 | 20.68 | 21.10 (−15.1%) | 21.57 (**−13.2%**) | +2.2% |
+| 7168 | 8 | 23.93 | 19.95 | 22.28 (−6.9%) | 22.73 (**−5.0%**) | +2.0% |
+
+A further **+1.8 to +3.9% in every cell**, largest at 2048 where `GemmWide` is the rung plowc
+actually chose. It is consistent and it is small beside the tile constant, which is why it ships as
+a knob and the tile ships as the default. Re-gating identity under it, and reaching `GemmC5`'s
+192x256 — which the arena already holds — are the remaining work.
+
+The cross-GPU noise floor for this protocol was measured in the same session and is **≤1%**: the
+round that ran the wide arm before the capability was declared had it silently fall back to the
+ordinary route, so two of its four arms were the same configuration on different cards; they
+differed by +0.2 to +1.0% across all six cells.
+
+**§7's fourth bullet is now answered and should be read as history.** The long-prompt regression
+was neither a property of packing nor of this route: it was one compiled GEMM tile, shared by both
+packed routes, and it is now 3–14% instead of 11–24%.
 
 ---
 
@@ -572,8 +740,10 @@ Knobs this work added, all opt-in and all through `RuntimeConfig`:
 | flag | env | what |
 |---|---|---|
 | `--token-batch` | `PLOW_TOKEN_BATCH` | arm the route (mutually exclusive with `--fusion`) |
-| `--amd-token-batch-solo` | `PLOW_TOKEN_BATCH_SOLO` | admit a step with one participant; §5.3 is why it is off |
+| `--amd-token-batch-solo` | `PLOW_TOKEN_BATCH_SOLO` | admit a step with one participant; §5.3 is why it is off, and §9.3 is why it is kept |
 | `--amd-token-batch-rows` | `PLOW_TOKEN_BATCH_ROWS` | pin the prefill rung, for attribution (§3) |
+| `--amd-token-batch-wide-tiles` | `PLOW_TOKEN_BATCH_WIDE` | keep `GemmWide`/`GemmC5` through synthesis (§9.5) |
+| — | `TB_GM_BM` / `TB_GM_BN` | `scripts/build_gfx942.sh`: the token-batch object's GEMM tile, for the A/B in §9.3 |
 
 The identity and attribution corpora are `ident.py` / `attrib.sh` in this campaign's scratch;
 they differ from `bench_packed_serve.py` in one way that matters — **every request gets a

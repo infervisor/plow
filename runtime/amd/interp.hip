@@ -50,6 +50,9 @@ extern "C" __device__ unsigned plow_mixed_block = 256;
  *   plow_token_batch_dense_gqa_1    the dense-GQA operator set is present and armed
  *   plow_token_batch_combined_m_1   projections run at combined M (no phase band)
  *   plow_token_batch_span_attn_1    FlashPrefill/FlashDecode read their bounds from spans
+ *   plow_token_batch_wide_gemm_1    GEMM_WIDE/GEMM_C5 take their M from the descriptor too,
+ *                                   so the synthesizer may keep the rung plowc chose instead
+ *                                   of collapsing every projection onto GEMM's one tile
  * "Armed" is not "fires": a step only fires the route when it is launched with a descriptor
  * carrying more than one span, and that is logged separately by the host. */
 #ifndef PLOW_TOKEN_BATCH
@@ -63,6 +66,7 @@ extern "C" __device__ unsigned plow_token_batch_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_dense_gqa_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_combined_m_1 = 1;
 extern "C" __device__ unsigned plow_token_batch_span_attn_1 = 1;
+extern "C" __device__ unsigned plow_token_batch_wide_gemm_1 = 1;
 #endif
 
 #ifdef PLOW_CONFIG
@@ -2106,11 +2110,22 @@ __device__ __forceinline__ void exec_gemm_med(CInst in, CTens T,
                (const bf16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
+/* `rows` is the LIVE row count, the same split `exec_gemm` already makes: `PLOW_RUNTIME_ROWS` is
+ * the identity on every object whose packet M is its M, and the token batch's combined live M on
+ * the one whose packet M is a compiled CAPACITY. Without it a wide-tile packet on that route
+ * would run the bucket width and read rows no one wrote.
+ *
+ * LDS is already paid for: `PLOW_GM_ARENA` under `PLOW_MIXED_STEP` is sized at `GM_C5_*`
+ * (192x256x64) precisely because "the mixed object's small default tile does not bound the other
+ * GEMM opcodes", so both wide rungs stage inside the arena the object already allocates. */
 __device__ __forceinline__ void exec_gemm_wide(CInst in, CTens T,
-                                               unsigned slice, unsigned nblk, bf16* lds) {
+                                               unsigned slice, unsigned nblk, bf16* lds,
+                                               unsigned rows = 0) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    const unsigned m_ = rows ? rows : in->i[0];
+    if (!m_) return;
 #if PLOW_CDNA4
-    const unsigned M = in->i[0], N = in->i[1];
+    const unsigned M = m_, N = in->i[1];
     if (in->i[7] == PLOW_GEMM_WIDE_C8_TAG && (M % GM_C8_BM) == 0 && (N % GM_C8_BN) == 0 &&
         (M / GM_C8_BM) * (N / GM_C8_BN) == nblk) {
         d_gemm_c8((bf16*)TEN(0) + (size_t)in->i[5] * N,
@@ -2121,16 +2136,19 @@ __device__ __forceinline__ void exec_gemm_wide(CInst in, CTens T,
     {
     d_gemm_wide((bf16*)TEN(0) + (size_t)in->i[5] * in->i[1],
            (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
-                (const bf16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+                (const bf16*)TEN(2), m_, in->i[1], in->i[2], slice, nblk, lds);
     }
 #undef TEN
 }
 __device__ __forceinline__ void exec_gemm_c5(CInst in, CTens T,
-                                             unsigned slice, unsigned nblk, bf16* lds) {
+                                             unsigned slice, unsigned nblk, bf16* lds,
+                                             unsigned rows = 0) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    const unsigned m_ = rows ? rows : in->i[0];
+    if (!m_) return;
     d_gemm_c5((bf16*)TEN(0) + (size_t)in->i[5] * in->i[1],
            (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
-              (const bf16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+              (const bf16*)TEN(2), m_, in->i[1], in->i[2], slice, nblk, lds);
 #undef TEN
 }
 __device__ __forceinline__ void exec_gemm(CInst in, CTens T,
@@ -3819,12 +3837,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * spill 2 -- byte-for-byte the budget before they were added. */
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_WIDE
         case PLOW_DOP_GEMM_WIDE:
-            exec_gemm_wide(in, T, slice, nblk, sm->gm);
+            exec_gemm_wide(in, T, slice, nblk, sm->gm, PLOW_RUNTIME_ROWS(in->i[0]));
             break;
 #endif
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMM_C5
         case PLOW_DOP_GEMM_C5:
-            exec_gemm_c5(in, T, slice, nblk, sm->gm);
+            exec_gemm_c5(in, T, slice, nblk, sm->gm, PLOW_RUNTIME_ROWS(in->i[0]));
             break;
 #endif
         /* DENSE block-fp8 (w8a16), the T-row twin of GEMV_FP8_BLK. Its accumulator is 32 registers

@@ -120,7 +120,9 @@ impl MixedAmdStep {
         batch: usize,
         route: StepRoute,
     ) -> Result<Self> {
-        let mut synthesized = crate::exec::mixed_program::synthesize(blob, batch)?;
+        let wide_tiles = route == StepRoute::TokenBatch
+            && crate::config::RuntimeConfig::get().amd.token_batch_wide_tiles;
+        let mut synthesized = crate::exec::mixed_program::synthesize(blob, batch, wide_tiles)?;
         if route == StepRoute::TokenBatch {
             // The route is qualified at `nsplit == 1` with a fused flash epilogue, and
             // `runtime/amd/interp.hip`'s token-batch FlashPrefill arm TRAPS on anything else:
@@ -173,6 +175,15 @@ impl MixedAmdStep {
                 "plow_token_batch_span_attn_1",
             ],
         };
+        // The wide rungs are a SEPARATE claim about the object, so they need a separate marker:
+        // an object built before `exec_gemm_wide`/`exec_gemm_c5` learned to read live M would
+        // run the compiled bucket width over rows nobody wrote, and AMD's dispatch would not
+        // say so. Only asked for when the knob is on, so an old object still serves the route.
+        let markers: Vec<&str> = markers
+            .iter()
+            .copied()
+            .chain(wide_tiles.then_some("plow_token_batch_wide_gemm_1"))
+            .collect();
         for marker in markers {
             if elf_symbol_u32(&object, marker) != Some(1) {
                 return Err(RuntimeError::Rejected(format!(
@@ -428,6 +439,8 @@ fn validate_program(program: &plow_asset::aux_program::Program) -> Result<()> {
                     | DevOp::RmsNorm
                     | DevOp::HeadNormRope
                     | DevOp::Gemm
+                    | DevOp::GemmWide
+                    | DevOp::GemmC5
                     | DevOp::GemmGlu
                     | DevOp::FlashDecode
                     | DevOp::FlashPrefill

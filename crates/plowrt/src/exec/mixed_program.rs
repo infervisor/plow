@@ -152,7 +152,16 @@ fn decode_attention(program: &DevProg) -> Result<BTreeMap<(u16, u16), (DevInst64
     Ok(result)
 }
 
-pub(crate) fn synthesize(blob: &DevBlob, physical_batch: usize) -> Result<SynthesizedMixed> {
+/// `wide_tiles`: keep `GemmWide`/`GemmC5` — the 128x256 and 192x256 rungs plowc CHOSE per shape
+/// — instead of collapsing them onto `Gemm`, whose body in the mixed/token-batch object is the
+/// 64x128 tile the GLU epilogue's `SN == 2` pins BN for at four waves. Only the token-batch
+/// route asks for this: the mixed route splits every projection into a decode GEMV band and a
+/// prefill GEMM band, and the wide arms have no band split.
+pub(crate) fn synthesize(
+    blob: &DevBlob,
+    physical_batch: usize,
+    wide_tiles: bool,
+) -> Result<SynthesizedMixed> {
     if blob.tp.is_some()
         || physical_batch < 2
         || physical_batch > u32::MAX as usize
@@ -425,14 +434,23 @@ pub(crate) fn synthesize(blob: &DevBlob, physical_batch: usize) -> Result<Synthe
                     if inst.i[3] != 0 || inst.i[5] != 0 {
                         return Err(reject("folded/banded GEMM unsupported"));
                     }
-                    if inst.i[0] == 1 && inst.i[4] == source.t - 1 {
+                    let decode_row = inst.i[0] == 1 && inst.i[4] == source.t - 1;
+                    if decode_row {
                         inst.i[0] = dcap;
                         inst.i[4] = 0;
                         reserve(blob, &mut specs, inst.t[0], bytes(&[dcap, inst.i[1], 2])?)?;
                     } else if inst.i[0] != source.t || inst.i[4] != 0 {
                         return Err(reject("GEMM row role mismatch"));
                     }
-                    inst.op = DevOp::Gemm as u16;
+                    // The wide rungs are kept only on a FULL-ROW projection. A row that was a
+                    // one-row GEMV in the source is `dcap` rows here, which is what the small
+                    // tile and the GEMV cap in `exec_gemm` are for.
+                    let keep = wide_tiles
+                        && !decode_row
+                        && matches!(code, DevOp::GemmWide | DevOp::GemmC5);
+                    if !keep {
+                        inst.op = DevOp::Gemm as u16;
+                    }
                 }
                 DevOp::SoftCap => {
                     inst.i[0] = inst.i[0]

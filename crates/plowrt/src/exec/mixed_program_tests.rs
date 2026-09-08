@@ -84,7 +84,7 @@ fn sandwich_norm_assets_synthesize_identical_mixed_programs() {
         let raw = std::fs::read(root.join(format!("{mode}-assets/model.pkt"))).unwrap();
         let blob = DevBlob::parse_l2(&raw, true).unwrap();
         let batch = blob.decode_progs().last().unwrap().t as usize;
-        results.push(synthesize(&blob, batch).unwrap());
+        results.push(synthesize(&blob, batch, false).unwrap());
     }
     let [off, on] = results.as_slice() else {
         unreachable!()
@@ -136,7 +136,7 @@ fn ordinary_asset_synthesis() {
     let kvlen = tensor(&blob, "in.kvlen").unwrap() as usize;
     let batch = (blob.tensors[kvlen].bytes / 4) as usize;
     {
-        let mixed = synthesize(&blob, batch).unwrap();
+        let mixed = synthesize(&blob, batch, false).unwrap();
         assert_eq!(
             mixed
                 .programs
@@ -179,13 +179,13 @@ fn ordinary_asset_synthesis() {
             mixed.tensors.len()
         );
     }
-    assert!(synthesize(&blob, 1).is_err());
-    assert!(synthesize(&blob, batch + 1).is_err());
+    assert!(synthesize(&blob, 1, false).is_err());
+    assert!(synthesize(&blob, batch + 1, false).is_err());
     if batch > 2 {
-        assert!(synthesize(&blob, batch - 1).is_err());
+        assert!(synthesize(&blob, batch - 1, false).is_err());
     }
     blob.tensors[kvlen].bytes += 4;
-    assert!(synthesize(&blob, batch).is_err());
+    assert!(synthesize(&blob, batch, false).is_err());
     blob.tensors[kvlen].bytes -= 4;
     let k = blob
         .progs
@@ -196,7 +196,7 @@ fn ordinary_asset_synthesis() {
         .t[3] as usize;
     let size = blob.tensors[k].bytes;
     blob.tensors[k].bytes = 2;
-    assert!(synthesize(&blob, batch).is_err());
+    assert!(synthesize(&blob, batch, false).is_err());
     blob.tensors[k].bytes = size;
     let prefill = blob
         .progs
@@ -205,7 +205,7 @@ fn ordinary_asset_synthesis() {
         .unwrap();
     let first = prefill.insts[0].op;
     prefill.insts[0].op = u16::MAX;
-    assert!(synthesize(&blob, batch).is_err());
+    assert!(synthesize(&blob, batch, false).is_err());
     let prefill = blob
         .progs
         .iter_mut()
@@ -218,5 +218,5 @@ fn ordinary_asset_synthesis() {
         .find(|i| i.op == DevOp::FlashPrefill as u16)
         .unwrap();
     flash.i[6] = 128;
-    assert!(synthesize(&blob, batch).is_err());
+    assert!(synthesize(&blob, batch, false).is_err());
 }

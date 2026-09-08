@@ -353,7 +353,7 @@ fn mixed_step_v1_packs_only_class_a_and_class_b_plus_two_hand_converted_c() {
         return;
     };
     let blob = crate::asset::devblob::DevBlob::parse_l2(&buf, true).unwrap();
-    let synth = crate::exec::mixed_program::synthesize(&blob, 4).expect("v1 synthesis");
+    let synth = crate::exec::mixed_program::synthesize(&blob, 4, false).expect("v1 synthesis");
     assert!(!synth.programs.is_empty());
 
     let mut seen: std::collections::BTreeSet<&'static str> = Default::default();
