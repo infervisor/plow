@@ -86,7 +86,32 @@ def _k27(tp: int, m: int = 4096):
     ]
 
 
-MODELS = {"gemma12b": _gemma12b, "glm53": _glm53, "k27": _k27}
+def _dsv4(tp: int, m: int = 4096):
+    # DeepSeek-V4-Flash (deepseek_v4). plow cannot serve this yet — these shapes bound what
+    # it could reach on this part, they do not describe a running model. Geometry from the
+    # shipped config.json: hidden 4096, 43 layers, 64 heads at head_dim 512 with
+    # num_key_value_heads=1 (the DK=512 DR=0 MLA), q_lora_rank 1024, 256 experts top-6 at
+    # moe_intermediate_size 2048, and a GROUPED output LoRA (o_groups 8 x o_lora_rank 1024)
+    # that has no analogue in the other two models — it is priced here as its two factors.
+    h, heads, hd = 4096, 64, 512
+    q_lora, rope = 1024, 64
+    o_groups, o_lora = 8, 1024
+    hdl = heads // tp
+    return [
+        (m, q_lora, h, "q_a_proj"),
+        (m, hdl * hd, q_lora, "q_b_proj"),
+        # kv is num_key_value_heads=1: one head's worth, NOT sharded by tp.
+        (m, hd + rope, h, "kv_a_proj"),
+        # Grouped output LoRA: down into the per-group rank, then back out to hidden.
+        (m, o_groups * o_lora // tp, hdl * hd, "o_lora_down"),
+        (m, h, o_groups * o_lora // tp, "o_lora_up"),
+        # 256 experts top-6 -> a smaller routed share per expert than GLM's top-8.
+        (max(1, m * 6 // 256), 2 * 2048, h, "expert gate/up"),
+        (max(1, m * 6 // 256), h, 2048, "expert down"),
+    ]
+
+
+MODELS = {"gemma12b": _gemma12b, "glm53": _glm53, "k27": _k27, "dsv4": _dsv4}
 
 
 def fp8_dtype():

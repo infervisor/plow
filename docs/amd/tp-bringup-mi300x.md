@@ -4,10 +4,13 @@ Bringup status, base numbers and roofline for the three checkpoints in
 `/workspace/models`, measured on one 8x MI300X host on 2026-09-08 from
 `main` @ `8d98edcb`.
 
-**Headline:** GLM-5.3 serves in production at TP8 and is qualified here.
-Kimi-K2.7-Code and DeepSeek-V4-Flash **cannot serve**: each is blocked on a
-named, reproducible emitter gate, recorded below. No performance number is
-reported for a model that does not serve.
+**Headline:** GLM-5.3 serves in production at TP8 and is qualified here, with
+end-to-end base numbers. Kimi-K2.7-Code now **emits and disassembles a single
+block** at TP8 — the trace is in §5 — but cannot serve. DeepSeek-V4-Flash
+cannot emit at all. For the two that do not serve, what is reported is what was
+actually measured: the hardware ceiling at their own per-rank shapes, which
+bounds them on this part. No end-to-end serving number is invented for a model
+that does not serve.
 
 ---
 
@@ -49,7 +52,7 @@ campaign-specific runner"):
 Two boundary extensions were needed and made:
 
 * `bringup_ceiling.py` took its shapes from a hardcoded Gemma-12B list. It is
-  now `--model {gemma12b,glm53,k27} --tp N --rows M`, with per-rank sharding
+  now `--model {gemma12b,glm53,k27,dsv4} --tp N --rows M`, with per-rank sharding
   applied on the correct dimension per projection (column-parallel shards `N`,
   row-parallel shards `K`). `--model gemma12b` reproduces the original list at
   `tp=1`, so numbers already published against it still stand.
@@ -65,7 +68,7 @@ reading code.
 | model | `model_type` | emit path | state |
 |---|---|---|---|
 | GLM-5.3-FP8 | `glm_moe_dsa` | `glm_main`, full model | **serves** (§3) |
-| Kimi-K2.7-Code | `kimi_k25` → text `kimi_k2` | `kimi_emit_block`, single block only | blocked (§5) |
+| Kimi-K2.7-Code | `kimi_k25` → text `kimi_k2` | `kimi_emit_block`, single block only | **block emits** (§5); cannot serve |
 | DeepSeek-V4-Flash | `deepseek_v4` | none | blocked (§6) |
 
 ## 3. GLM-5.3 — production configuration
@@ -216,26 +219,101 @@ emitted as an UNSCALED RoPE at theta 50000 — correct-looking tables, wrong
 long-context behaviour.
 ```
 
+**YaRN is now wired** (`RopeScale::YarnDeepSeek`, `ROPE_SCALE_YARN_DS`). It was not
+a matter of passing the existing `RopeScale::Yarn`: HF's generic YaRN and the
+DeepSeek family disagree about the attention factor, and taking the generic one
+would have been a quieter version of the bug the gate was catching.
+
+| | table factor (cos/sin) | softmax fold |
+|---|---|---|
+| HF generic YaRN | `0.1*ln(f)+1` = **1.4159** at f=64 | none |
+| DeepSeek family | `mscale(f,mscale) / mscale(f,mscale_all_dim)` = **1.0** | `mscale(f,mscale_all_dim)^2` = 2.0047 |
+
+K2.7 ships `mscale = mscale_all_dim = 1.0`, so the table ratio is exactly 1.0 —
+a 41.6% error had the generic formula been reused — while the `0.1*ln(f)+1`
+term reappears squared in `softmax_scale`. The frequency interpolation is
+identical between the two and is shared rather than restated, so they cannot
+drift. Only the `mscale == mscale_all_dim` case is representable and the
+emitter refuses the unequal one: an unequal pair needs a per-table attention
+factor the ABI-locked 72-byte `GenTensor` has no room for.
+
+### Single-block trace, TP8
+
+`plowc --hf-dir /workspace/models/kimi_k27_code --emit devblob --gpu MI300X
+--arch gfx942 --num-gpus 8 --block 3` now emits:
+`kimi_mla_moe --block 3..4: bf16 block, 1 layer(s), 36 decode ops, ctx=4096 tp=8`.
+
+`plowrt disasm` on it confirms the geometry is the model's and not a default:
+`n_head=8` (64/8), `n_exp=384`, `k=8`, `I_moe=256` (2048/8), `H=7168`, the MLA
+absorb path bound to `derived.{q_absorb,kv_a_latent,k_rope,q_rope,v_absorb}`,
+and one `MoeExpertGlu`/`MoeExpertDown` pair per top-k slot — 8, not 384.
+
+The trace also independently validates the RoPE work above. `FlashMlaDecode`
+carries `scale=0.14467962`, and
+
+```
+qk_head_dim^-0.5 * mscale(64, 1.0)^2 = 192^-0.5 * 1.4158883^2
+                                     = 0.07216878 * 2.00473  = 0.14467962
+```
+
+which is the emitted constant exactly. Had the table/softmax split been taken
+the other way round, this number would have been 0.07216878.
+
+Op inventory for the 36-op decode block (dispatch width `b` in CUs):
+
+| ops | count | width |
+|---|---:|---:|
+| `RmsNorm` | 3 | 1 |
+| `GemvQkv` | 2 | 302 / 288 |
+| `HeadNormRope` | 2 | 1 |
+| `FlashMlaDecode` + `MlaMergeFold` | 2 | 64 / 304 |
+| `Gemv` (o_proj, router, shared down) | 3 | 304 |
+| `MoeExpertGlu` + `MoeExpertDown` | 16 | 38 |
+| `XReduce` / `MoeCombine` | 3 | 14 |
+| `Residual` / `GemvGlu` / `MoeRouterTopk` | 5 | 1–304 |
+
+The 16 expert dispatches at **b=38** are the structural finding: 8 top-k slots
+issued as 16 separate dispatches, each occupying 38 of 304 CUs (12.5%). That is
+the decode-side twin of §4's `GemmSmall` occupancy result, and it is the reason
+K2.7's expert shapes measure as badly as they do below.
+
+### Measured ceiling at K2.7's own shapes
+
+`bringup_ceiling.py --model k27 --tp 8`, per-rank, M=4096 (`e4m3fnuz`):
+
+| projection | M | N | K | fp8 TF/s | bf16 TF/s |
+|---|---:|---:|---:|---:|---:|
+| q_a_proj | 4096 | 1536 | 7168 | 842.4 | 508.1 |
+| q_b_proj | 4096 | 1536 | 1536 | 650.1 | 435.7 |
+| kv_a_proj | 4096 | 576 | 7168 | 744.1 | 468.5 |
+| kv_b_proj | 4096 | 2048 | 512 | 401.2 | 334.8 |
+| o_proj | 4096 | 7168 | 1024 | 679.4 | 544.1 |
+| expert gate/up | 85 | 4096 | 7168 | 234.8 | 146.7 |
+| expert down | 85 | 7168 | 2048 | 115.4 | 110.6 |
+
+K2.7 routes top-8 of **384** experts, so a 4096-row chunk gives each expert 85
+rows against GLM-5.3's 128 at top-8 of 256. The expert GEMMs land at 115–235
+TF/s versus GLM's 160–304 on the same part — the wider expert table makes the
+per-expert GEMM smaller, and smaller is worse here. Any K2.7 prefill design on
+gfx942 is bounded by this before a single plow kernel is written.
+
 **Remaining gates, in order:**
 
-1. **YaRN in the MLA RoPE tables.** `crates/devgen/src/mla.rs` passes
-   `RopeScale::None` to `GenTensor::rope_pair`, which already *supports*
-   `RopeScale::Yarn`. Wiring it is small, but K2.7 ships
-   `mscale: 1.0, mscale_all_dim: 1.0` and `RopeScale::Yarn` has no `mscale`
-   field — `crates/devgen/src/config.rs:104` explicitly refuses those keys as
-   "not representable in the RoPE table recipe (GenTensor is ABI-locked)".
-   DeepSeek's YaRN attention factor is
-   `mscale(f, mscale) / mscale(f, mscale_all_dim)`, which is 1.0 when the two
-   are equal, whereas `RopeScale::mscale()` returns `0.1*ln(f)+1 = 1.416` at
-   `factor=64`. **These disagree, and the difference is a silent long-context
-   correctness bug, not a tuning choice.** It was deliberately not guessed at
-   here. Resolve the attention-factor definition first, then wire it.
-2. **Full-model Kimi device emit.** Even with RoPE resolved, `crates/devgen/src/lib.rs`
-   supports only `--block <l>[..<r>]` for this family; the `glm_main` analogue
-   is an unimplemented milestone. Single-block traces are reachable after gate
-   1; a served model is not.
-3. **Tokenizer.** The checkpoint ships `tiktoken.model` + `tokenization_kimi.py`,
-   not `tokenizer.json`, so the bundle's tokenizer link has no source file.
+1. ~~YaRN in the MLA RoPE tables.~~ **Done** — see above.
+2. **Full-model Kimi device emit.** `crates/devgen/src/lib.rs` supports only
+   `--block <l>[..<r>]` for this family; the `glm_main` analogue is an
+   unimplemented milestone. Single-block traces are reachable today (above); a
+   served model is not.
+3. **Expert precision.** The checkpoint is compressed-tensors w4a16 at
+   `group_size 32`, and the block above emits the **bf16** arm, so `amd-block`
+   cannot bind these weights for a measured block latency. A w4-group-32 expert
+   arm is the gate between "the block emits and disassembles" and "the block
+   runs on hardware with its own weights". `plowrt amd-probe` would execute it
+   with zero-filled weights, but that path documents itself as "never a
+   model-quality or performance result" and is not reported as one here.
+4. **Tokenizer.** The checkpoint ships `tiktoken.model` +
+   `tokenization_kimi.py`, not `tokenizer.json`, so the bundle's tokenizer link
+   has no source file.
 
 ## 6. DeepSeek-V4-Flash — blocked, no serving path
 
@@ -256,6 +334,33 @@ clamped SwiGLU. What blocks serving is the **emitter**, not the kernels:
 * w4a8 routed experts: `MoeGluMx`/`MoeDownMx` already read the fp4 expert
   weights byte-identically, but those arms are w4a16 and the reference is w4a8
   (fp8 e4m3 activations, per-128-K power-of-2 scale).
+
+### Measured ceiling at DSV4's own shapes
+
+plow cannot serve this model, so this is a bound on what it could reach here,
+not a measurement of it. `bringup_ceiling.py --model dsv4 --tp 8`, per-rank,
+M=4096 (`e4m3fnuz`), geometry from the shipped `config.json` (hidden 4096, 64
+heads at head_dim 512 with `num_key_value_heads=1`, `q_lora_rank` 1024, 256
+experts top-6, and the grouped output LoRA `o_groups=8 x o_lora_rank=1024`
+priced as its two factors):
+
+| projection | M | N | K | fp8 TF/s | bf16 TF/s |
+|---|---:|---:|---:|---:|---:|
+| q_a_proj | 4096 | 1024 | 4096 | 671.1 | 436.8 |
+| q_b_proj | 4096 | 4096 | 1024 | 733.2 | 521.0 |
+| kv_a_proj | 4096 | 576 | 4096 | 640.1 | 424.1 |
+| o_lora_down | 4096 | 1024 | 4096 | 736.6 | 496.0 |
+| o_lora_up | 4096 | 4096 | 1024 | 713.1 | 522.8 |
+| expert gate/up | 96 | 4096 | 4096 | 157.4 | 131.6 |
+| expert down | 96 | 4096 | 2048 | **59.2** | **101.1** |
+
+`expert down` is the one row in this whole campaign where **fp8 is slower than
+bf16** — 59.2 against 101.1 TF/s. At M=96 the per-tile scale handling costs more
+than the narrower operand saves, so the w4a8 expert arm DSV4 needs (§6) should
+not be assumed to pay for itself at decode-shaped M on this part; it has to be
+measured against a bf16 arm rather than adopted because the weights are narrow.
+The grouped output LoRA, by contrast, prices well (713–737 TF/s) — it is two
+ordinary GEMMs and is not where this model will be slow.
 
 DSpark (3 MTP blocks) is optional — the shipped `generate.py` never calls
 `forward_spec`, so a first bringup is bit-exact without it.

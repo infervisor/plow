@@ -378,9 +378,12 @@ impl DevBlob {
                 }
                 if r.generate().is_none() {
                     return Err(RuntimeError::Device(format!(
-                        "devblob: gen recipe for `{}` has unknown kind {} — this blob \
-                         needs a newer plowrt",
-                        tensors[r.tensor as usize].name, r.kind
+                        "devblob: gen recipe for `{}` is unreadable — kind {}, scale {} \
+                         — this blob needs a newer plowrt. `generate()` refuses on an unknown \
+                         KIND or an unknown SCALE; both are printed because naming only the \
+                         kind sent a reader looking at the wrong field when it was the scale \
+                         (a DeepSeek-family YaRN blob read by a pre-ROPE_SCALE_YARN_DS runtime).",
+                        tensors[r.tensor as usize].name, r.kind, r.scale
                     )));
                 }
             }
