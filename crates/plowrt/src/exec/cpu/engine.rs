@@ -1134,7 +1134,12 @@ pub fn cu_domains(progs: &[DevProg], n_cu: u32) -> Option<(Vec<u32>, u32)> {
         domains = p.l2_domains;
         for (cu, slot) in dom.iter_mut().enumerate() {
             let start = p.stream_ofs[cu] as usize;
-            for e in &p.stream[start..start + p.stream_len[cu] as usize] {
+            // Slicing directly would panic on a blob that never went through `validate_cpu_blob`,
+            // which a caller outside the engine (the l2_probe example) does not run.
+            let entries = start
+                .checked_add(p.stream_len[cu] as usize)
+                .and_then(|end| p.stream.get(start..end))?;
+            for e in entries {
                 let d = ((e.flags & SE_DOMAIN_MASK) >> SE_DOMAIN_SHIFT) as u32;
                 if d >= domains {
                     return None;
@@ -1207,6 +1212,11 @@ pub fn node_plan(
     work: &[Vec<u64>],
 ) -> Option<Vec<u32>> {
     if nodes < 2 || (domains as usize) < nodes || !(domains as usize).is_multiple_of(nodes) {
+        return None;
+    }
+    // No work to judge means nothing establishes the plan is safe; `all()` on an empty slice is
+    // vacuously true, which would turn "unknown" into "approved".
+    if work.is_empty() {
         return None;
     }
     let per = domains as usize / nodes;
@@ -1396,6 +1406,26 @@ mod placement_tests {
         // Sanity that this shape is otherwise acceptable, so the rejection is the imbalance.
         let flat = vec![vec![1u64; 4]];
         assert!(node_plan(&dom, domains, 2, &flat).is_some());
+    }
+
+    /// No work rows means nothing established the plan is safe. `all()` over an empty slice is
+    /// vacuously true, so this has to be rejected explicitly or "unknown" reads as "approved".
+    #[test]
+    fn node_plan_declines_with_no_work_to_judge() {
+        let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
+        assert!(node_plan(&dom, domains, 8, &[]).is_none());
+    }
+
+    /// `cu_domains` is `pub` and the probe calls it on a blob that never saw `validate_cpu_blob`,
+    /// so a stream window past the end has to decline rather than panic.
+    #[test]
+    fn cu_domains_declines_a_stream_window_past_the_end() {
+        let mut p = prog(8, 2, |cu| cu / 4);
+        p.stream_len[3] = 9_999;
+        assert!(cu_domains(&[p], 8).is_none());
+        let mut q = prog(8, 2, |cu| cu / 4);
+        q.stream_ofs[5] = u32::MAX;
+        assert!(cu_domains(&[q], 8).is_none());
     }
 
     /// `cu_work` keeps one row per program rather than collapsing them.

@@ -71,13 +71,66 @@ After the guard landed, both settings take the round-robin and become one popula
 (TTFT 6361–8666 ms, step 1100–1520 ms across four runs straddling both flags), which
 is the ±20% noise band this bench actually has at 192 threads.
 
+## Can a change rescue it? No — balance was not the whole cause
+
+The obvious objection to the above is that the losses are load imbalance, not the idea, so
+fix the imbalance and the idea should pay. It does not.
+
+`n_cu = 132` does not divide by the 18 SMs per partition, which left domain 7 with 6 cus
+instead of 18. Recompiling at `--n-cu 144` removes exactly that:
+
+| | n_cu=132 | n_cu=144 |
+| --- | ---: | ---: |
+| emitter skew, prefill | 66.8–75.5% | **0.3%** |
+| placed vs round-robin peak, T=512 | 14131 vs 13328 (6.0% worse) | 14131 vs 14111 (**0.14% worse**) |
+| placed vs round-robin peak, T=1 decode | 7377 vs 5676 (30% worse) | 7377 vs 5977 (23% worse) |
+
+Prefill is now balanced to 0.14%, which makes it a fair test of locality alone. Forcing the
+guard open (a temporary local patch, not a shipped flag) and A/B-ing at prompt 512, 192
+threads:
+
+| rep | placed TTFT ms | RR TTFT ms | placed step ms | RR step ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 18250.0 | 15286.5 | 1161.0 | 1136.7 |
+| 2 | 18582.7 | 15042.0 | 1094.6 | 1121.4 |
+| 3 | 18999.7 | 14786.8 | 1138.8 | 1151.0 |
+| **mean** | **18610.8** | **15038.4** | **1131.5** | **1136.4** |
+
+**Prefill is still 1.24x slower with the balance objection removed.** Decode became neutral
+(1.00x), which is consistent: at `n_cu = 144` no node is left mostly idle, so the earlier
+1.50x decode loss was the 6-cu node, and what remains in prefill is not imbalance at all.
+
+The reason total balance does not rescue it is that **per-node work balance is not per-op
+concurrency**. Ops do not all span the full width — in the T=512 program `PLOW_DOP_GEMM` is
+291 instructions averaging 89.6 of 144 slices:
+
+```
+     8 PLOW_DOP_GEMM      insts=291   slices=26064     # 89.6 slices per instruction
+     7 PLOW_DOP_SOFTCAP   insts=1     slices=64
+    18 PLOW_DOP_ARGMAX_FIN insts=1    slices=1
+```
+
+A contiguous domain map confines a k-slice op to `ceil(k / 18)` nodes, so a 90-slice GEMM
+runs on 5 of 8 nodes and the other 3 idle through it; the round-robin spreads the same 90
+slices over all 8. Summed over a program those totals even out — hence the 0.14% — while
+every barrier still waits on a narrower machine. No domain-to-node assignment can fix that,
+because the narrowing is in the domain map's contiguity in cu index, not in the assignment.
+
+Nor is there locality to win it back. Model tensors of at least 256 KiB are `mbind`
+interleaved across every node, so a weight read is ~1/8 local wherever the reading thread
+sits — placement cannot change it. Making the idea pay would need the weights placed per
+node to match, which is NUMA tensor parallelism and a different design (see the note at the
+end of the runtime doc).
+
 ## What was NOT measured
 
-* A blob whose domains are balanced. Under the AMD round-robin map the plan reduces
-  to `cu % nodes` exactly when the domain count equals the node count, so an 8-XCD
-  blob on this 8-node host is the identical mapping and cannot show a difference; a
-  node count other than 8 would be needed, and a gfx950 blob does not load on the CPU
-  backend (`KV-row site 689 exceeds decode program 6's 676 instructions`).
+* A blob under the AMD round-robin domain map. It reduces to `cu % nodes` exactly when
+  the domain count equals the node count, so an 8-XCD blob on this 8-node host is the
+  identical mapping and cannot show a difference; a node count other than 8 would be
+  needed, and a gfx950 blob does not load on the CPU backend (`KV-row site 689 exceeds
+  decode program 6's 676 instructions`). Note the round-robin map would also spread each
+  op across nodes, which is the property the blocked map lacks — so it is the shape most
+  likely to come out neutral, not the shape most likely to win.
 * The global-queue path (`PLOW_CPU_GQ=1`), which is itself off by default.
 * Any host that is not this one.
 

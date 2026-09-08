@@ -86,18 +86,26 @@ locality domains instead is implemented behind `--cpu-l2-place` and is **off**,
 because it measured 1.5x slower and never faster; see the
 [placement report](../../perf-data/cpu-numa-placement/epyc9654-avx512/README.md).
 
-The reason is worth keeping, because the idea is superficially attractive. An L2
-domain says which slices share a *GPU* cache. It does not say which weights they
-touch, and CPU model tensors are interleaved across every node regardless — so
-grouping by domain creates no memory locality on this engine. It does destroy the
-round-robin's load balance, because nothing makes domains equal in cost: under the
-blocked map (`cu / sms_per_partition`) the low-numbered cus carry every narrowly
-sliced op, so one node inherits a third of the packet. On an H100-mapped
-Gemma-4-31B that is a 3.0-4.1x work spread across nodes against round-robin's
-1.04-1.12x.
+The reason is worth keeping, because the idea is superficially attractive and the
+obvious rescue does not work. An L2 domain says which slices share a *GPU* cache.
+It does not say which weights they touch, and CPU model tensors are `mbind`
+interleaved across every node regardless — a weight read is ~1/8 local wherever
+the reading thread sits, so grouping by domain creates no memory locality here.
 
-The mechanism is kept, tested, and A/B-able because it costs nothing when off and
-a host with balanced domains has not been measured. When it is on, `node_plan`
+What it does cost is concurrency. A contiguous domain map confines a k-slice op to
+`ceil(k / sms_per_partition)` nodes, and ops are not all full width: in one
+Gemma-4-31B prefill program `GEMM` is 291 instructions averaging 89.6 of 144
+slices, so those run on 5 of 8 nodes while the round-robin spreads them over all
+8. Summed per node the two look balanced — 0.14% apart on that blob — while every
+barrier still waits on a narrower machine, and placement measured 1.24x slower
+anyway. Balancing the domains does not rescue it, because the narrowing is in the
+map's contiguity, not in how domains are assigned to nodes.
+
+The mechanism is kept, tested, and A/B-able because it costs nothing when off, not
+because a win is expected: balanced domains were measured and still lost. What has
+not been tried is the AMD round-robin domain map, which spreads each op across
+nodes rather than narrowing it, and so is the shape most likely to come out
+neutral. When placement is on, `node_plan`
 still declines any plan that would leave a node busier than the round-robin
 would in ANY ONE PROGRAM, which is what rejects the case above. The per-program
 test is the load-bearing part: programs are alternatives — a prefill bucket or
