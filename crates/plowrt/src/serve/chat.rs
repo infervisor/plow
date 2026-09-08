@@ -856,7 +856,7 @@ fn sse_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{k3_chat_prompt, request_id, Message};
+    use super::{gemma_chat_prompt, k3_chat_prompt, request_id, Message};
 
     #[test]
     fn request_ids_are_unique() {
@@ -869,6 +869,63 @@ mod tests {
             content: Some(crate::serve::openai::Content::Text(text.into())),
             reasoning_content: None,
         }
+    }
+
+    /// The Gemma-4 built-in builder AGREES with the checkpoint's own template,
+    /// byte for byte, on a text-only conversation.
+    ///
+    /// This is the reassuring half of [`gemma_chat_prompt`]'s "text-only
+    /// subset" caveat, and it is worth pinning because the caveat reads as
+    /// alarming without it: the fallback is not an approximation of the plain
+    /// chat case, it is exact there. What the template carries and the builder
+    /// does not is tool calling, multimodal parts and thinking-content
+    /// ordering — none of which a text-only request reaches.
+    ///
+    /// So a checkpoint whose `chat_template.jinja` went unlinked still served
+    /// ordinary chat correctly. Linking it matters for the other three.
+    ///
+    /// Skips where the checkpoint is absent, like the GLM test below.
+    #[test]
+    fn the_gemma_builder_matches_the_checkpoint_template_on_text() {
+        let dir = std::path::Path::new("/app/plow/build-gemma31/checkpoint");
+        if !dir.join("chat_template.jinja").exists() {
+            eprintln!("skipped: no Gemma-4 checkpoint on this host");
+            return;
+        }
+        let t = crate::serve::template::ChatTemplate::load(dir).expect("template compiles");
+        for convo in [
+            vec![("system", "You are helpful."), ("user", "Hi there")],
+            vec![("user", "one"), ("assistant", "two"), ("user", "three")],
+        ] {
+            let built = gemma_chat_prompt(
+                &convo
+                    .iter()
+                    .map(|&(r, c)| msg(r, c))
+                    .collect::<Vec<_>>(),
+            );
+            let rendered = t
+                .render(
+                    &convo
+                        .iter()
+                        .map(|&(r, c)| serde_json::json!({"role": r, "content": c}))
+                        .collect::<Vec<_>>(),
+                )
+                .expect("renders");
+            assert_eq!(built, rendered, "convo {convo:?}");
+        }
+    }
+
+    /// The exact Gemma-4 generation prompt, so a template or builder change has
+    /// to restate it. Note `<|turn>`/`<turn|>` and the open `<|channel>thought`
+    /// — NOT Gemma-3's `<start_of_turn>`/`<end_of_turn>`.
+    #[test]
+    fn the_gemma_generation_prompt_is_pinned() {
+        assert_eq!(
+            gemma_chat_prompt(&[msg("system", "You are helpful."), msg("user", "Hi there")]),
+            "<bos><|turn>system\nYou are helpful.<turn|>\n\
+             <|turn>user\nHi there<turn|>\n\
+             <|turn>model\n<|channel>thought\n<channel|>"
+        );
     }
 
     /// PINNED AGAINST THE CHECKPOINT'S OWN TEMPLATE, rendered with jinja2 from
