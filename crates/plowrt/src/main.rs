@@ -436,7 +436,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let filter_str = format!("{filter}");
-    if matches!(&cli.cmd, Cmd::Bench { .. }) {
+    // `op-audit --format json` writes a document to stdout; the startup banner
+    // would land inside it. Same reason `bench` logs to stderr.
+    if matches!(&cli.cmd, Cmd::Bench { .. } | Cmd::OpAudit { .. }) {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
