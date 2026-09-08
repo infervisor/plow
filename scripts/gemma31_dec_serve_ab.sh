@@ -14,6 +14,7 @@ OBJ="${PLOW_OBJ_DIR:-/app/plow/build-gemma31/hsaco-tiered}"
 BIN="${PLOW_BIN_DIR:-/app/plow/build-gemma31/residue/target/release}"
 PORT0="${PORT0:-20100}"
 INPUTS="${INPUTS:-128 512 2048 8192}"
+CONC="${CONC:-1 4}"
 mkdir -p "$OUT"
 
 serve_up() { # $1 assetsdir  $2 port  $3 logfile
@@ -41,7 +42,7 @@ run_arm() { # $1 label  $2 assetsdir  $3 port  $4 round
   serve_up "$2" "$3" "$OUT/serve_$1_r$4.log" || return 1
   python3 "$ROOT/scripts/bench_packed_serve.py" --url "http://127.0.0.1:$3" \
     --out "$OUT/bench_$1_r$4.json" --label "$1-r$4" \
-    --inputs $INPUTS --outputs 64 --concurrency 1 4 \
+    --inputs $INPUTS --outputs 64 --concurrency $CONC \
     --repeats 3 --warmups 1 > "$OUT/bench_$1_r$4.txt" 2>&1
   rc=$?
   serve_down

@@ -11,6 +11,11 @@ ASSETS="${1:?assets}"; PORT="${2:?port}"; OBJ="${3:?objdir}"; BIN="${4:?bindir}"
 export LD_LIBRARY_PATH="${ROCM_PATH:?nix develop did not set ROCM_PATH}/lib:${LD_LIBRARY_PATH:-}"
 export PLOW_HSACO="$OBJ"
 export PLOW_MLA_PF_V2=1
+# NOT REQUIRED ON AMD, and kept only so an operator copying this line onto the CUDA path gets
+# the same behaviour. `AmdEngine::load` accepts an L2-placed blob unconditionally and then
+# checks each code object for `plow_l2_place_dispatch_1`, which is a stronger guard than this
+# assertion: verified by serving `PLOWDEV\x0b` with the variable unset and reading
+# "L2 hierarchical gate: FIRING" out of the log.
 export PLOW_L2_PLACE_DISPATCH=1
 # BATCH-WIDTH-MATCHED DECODE TIERS, picked up automatically. `scripts/build_gfx942.sh` with
 # PLOW_DECODE_TIERS=1,2 writes `$OBJ/lowrung1` and `$OBJ/lowrung2`: the same decode rows compiled

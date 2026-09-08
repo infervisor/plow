@@ -472,15 +472,30 @@ if [ "${PLOW_GLM_FUSE_QNORM:-1}" = 1 ]; then
   AX_DECODE="$AX_DECODE -DPLOW_GLM_FUSE_QNORM=1"
 fi
 
-# OPT-IN (PLOW_L2HIER_PF=1): the same pair on the PREFILL objects, for blobs whose
-# prefill program is PLACED (GLM: uni-segment prefill, one object per program run, so
-# the mixed-protocol deadlock above cannot arise -- that hang needed one placed
-# program's segments split across objects with and without the define). On an
-# UNPLACED blob the define is inert (GATE_HIER's runtime precondition is
-# l2_domains != 0). Still: re-run the hang test (amd-bench --prompt at 2-4k completes
-# in normal wall time) before trusting any build that widens this.
+# OPT-IN (PLOW_L2HIER_PF=1): L2-DOMAIN DISPATCH ON THE PREFILL ROWS, for blobs emitted with
+# PLOW_L2_PLACE_PREFILL=1 (which is NOT the AMD default -- see crates/devgen/src/lib.rs).
+# Without this the prefill objects lack the axis and plowrt refuses a prefill-placed blob. The
+# FLASH rows already carry it unconditionally (AX_FLASH above), which is why Gemma's split
+# prefill program only needs this one knob.
+#
+# PLACEMENT ONLY, and that is a hard limit rather than caution. This block used to add
+# `-DPLOW_GATE_HIER=1` as well, and an object built that way DOES NOT COMPILE: the guard at the
+# top of interp.hip is
+#     #if PLOW_GATE_HIER && (!PLOW_BUCKET_DECODE || !PLOW_GLOBAL_QUEUE || !PLOW_L2_PLACE_DISPATCH)
+#     #error "PLOW_GATE_HIER requires a decode global-queue object with L2-domain dispatch"
+# and AX_PREFILL carries -DPLOW_BUCKET_DECODE=0. Verified by compiling the row by hand: one
+# error, no object. plowrt's `check_gate_hier_object` refuses the same pairing a second time at
+# load. So the two-level gate is DECODE-ONLY by construction, and the hierarchy half of
+# "PLOW_L2HIER_PF" was never buildable; what remains here is the placement half.
+#
+# MEASURED AND NOT DEFAULTED. With these objects a prefill-placed Gemma-4-31B blob (dense, whose
+# prefill program spans the prefill AND flash objects -- the shape recorded above as hanging
+# amd-bench) runs to completion in normal wall time and moves TTFT -1.4/-2.1/-6.2% at 128/2048/8192
+# tokens solo, with one reproducible +3.2% at 2048/conc-4 and decode untouched. Left opt-in for
+# blast radius, not for the number: it makes every prefill object in a tree incompatible with a
+# default emit. docs/amd/gemma4-31b-mi300x.md has the table.
 if [ "${PLOW_L2HIER_PF:-0}" = 1 ]; then
-  AX_PREFILL="$AX_PREFILL -DPLOW_L2_PLACE_DISPATCH=1 -DPLOW_GATE_HIER=1"
+  AX_PREFILL="$AX_PREFILL -DPLOW_L2_PLACE_DISPATCH=1"
 fi
 
 # OPT-IN (PLOW_MLA_PF_QK1=1): MLA prefill computes QK^T + softmax on ONE wave per M-tile
