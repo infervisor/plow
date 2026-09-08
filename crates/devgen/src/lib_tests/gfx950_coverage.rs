@@ -302,6 +302,16 @@ const GFX950_UNEMITTED: &[(&str, &str)] = &[
           (mla.rs:1595 states the substitution). The arm stays for the unfused A/B.",
     ),
     (
+        "PLOW_DOP_ROW_GATHER",
+        "Terminal row selection for the unified token batch (docs/arch/17-unified-token-batch.md). \
+          The ISA, the ABI, the planner and the arms landed once for every backend; the emitter \
+          that builds a body/output segment pair is Phase 2, per (family, backend) pair. Until \
+          then nothing routes it, and `token_batch::Capabilities::can_run_output` is what stops a \
+          tail being claimed as reachable — the arm's presence is `plow_row_gather_1`, which says \
+          the route CAN FIRE, not that anything fires it. Not a precision arm: it traps on an \
+          out-of-range row rather than gathering the wrong one.",
+    ),
+    (
         "PLOW_DOP_ROWRMS",
         "Precomputed row-RMS feeding GemmNorm's norm=1 mode (op_gemm.h:1086). Every emitter uses \
           the fused norm path, which needs no separate RMS packet.",
