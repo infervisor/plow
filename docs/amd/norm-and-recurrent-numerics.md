@@ -2,15 +2,17 @@
 
 Findings **F5** and **F6** of `plans/gpu-kernel-static-audit-20260908.md`, measured. Both were
 static-analysis findings about *reachable* numerical failure; this is what the hardware and the
-shipped checkpoints actually do. F5 is below; F6 lands with its own change.
+shipped checkpoints actually do.
 
-**F5 in one line.** It needs no arithmetic change: the shipped bodies run 16-17 orders of magnitude
-below the overflow point on both checkpoints, the audit's cancellation example is computed
-*exactly* by the code the compiler emits, and the remedy costs 13-32%.
+**Outcome in one line each.** F5 needs no arithmetic change: the shipped bodies run 16-17 orders of
+magnitude below the overflow point on both checkpoints, the audit's cancellation example is
+computed *exactly* by the code the compiler emits, and the remedy costs 13-32%. F6 needed one: the
+KDA softplus lost its whole tail, the loss compounds over a recurrence rather than perturbing one
+output, and the fix is +14 instructions in `d_kda_gate`.
 
 Everything below is on MI300X / gfx942, ROCm 7.14 from the flake, blobs
 `build-glm53/tp4-long` (GLM-5.3 TP4, 93 layers) and `build-gemma31/assets-final-plain`
-(Gemma-4 31B).
+(Gemma-4 31B). No KDA checkpoint exists on this box — see §2.1.
 
 ---
 ## 1. F5 — normalization range and conditioning
@@ -164,6 +166,141 @@ that can prove it on demand.
   simulation says is unreachable at `feat = 128`, and it would move every object's hash. If a wider
   LayerNorm shape ever ships, revisit both this and the two-pass together.
 
+---
+
+## 2. F6 — the recurrent softplus
+
+`runtime/amd/op_kda.h:111`, the `PLOW_KDA_GATE_SOFTPLUS` (unbounded) branch:
+
+```
+g[t,h,d] = -exp(A_log[h]) * softplus(g_raw[t,h,d] + dt_bias[h,d])       (log2 units, prefix-summed)
+```
+
+`softplus` was `__logf(1.0f + __expf(x))`, matching `[fla]`'s `tl.log(1 + tl.exp(x))`.
+
+### 2.1 What breaks, and why it is not an ordinary rounding difference
+
+FP32 has 24 significant bits, so `1.0f + e` rounds to **exactly 1.0f** for every `e < 2^-25`, i.e.
+for every `x <= -16.6355`. The expression then returns exactly zero, the derived per-step decay is
+`exp(-A*0) = 1`, and the gate stops forgetting. Just *above* the cliff the same expression is wrong
+the other way: `1 + e` quantizes to `1 + 2^-23`, so the per-step decay is **2x too large**.
+
+| x | true softplus | `__logf(1+__expf(x))` | rel err |
+|---:|---:|---:|---:|
+| -20 | 2.06115e-09 | **0** | 1.0 |
+| -17 | 4.13994e-08 | **0** | 1.0 |
+| -16.6355 | 5.96047e-08 | **0** | 1.0 |
+| -16 | 1.12535e-07 | 1.19209e-07 | 5.93e-2 |
+| -12 | 6.14419e-06 | 6.19886e-06 | 8.90e-3 |
+| -10 | 4.53989e-05 | 4.54177e-05 | 4.14e-4 |
+
+Over a persistent recurrence that is a missing operation repeated per token, not a perturbed
+output. At the checkpoint-maximum `A = exp(A_log) = 11.776` (`docs/kimi-k3-kda.md` §3.1), the
+fraction of state a channel should still hold:
+
+| s | 8 192 steps | 131 072 steps | 1 048 576 steps (K3 `max_position_embeddings`) |
+|---:|---|---|---|
+| -17 | 0.99601 vs **1.00000** | 0.93810 vs **1.00000** | 0.59977 vs **1.00000** |
+| -18 | 0.99853 vs **1.00000** | 0.97677 vs **1.00000** | 0.82856 vs **1.00000** |
+| -20 | 0.99980 vs **1.00000** | 0.99682 vs **1.00000** | 0.97487 vs **1.00000** |
+| -25 | 0.99999 vs **1.00000** | 0.99998 vs **1.00000** | 0.99983 vs **1.00000** |
+
+**Scope, stated plainly.** The only KDA checkpoint that exists — Kimi-K3 — sets
+`gate_lower_bound = -5.0`, and `crates/devgen/src/kda.rs` selects the gate mode from
+`gate_lower_bound.is_some()`, so K3 takes `PLOW_KDA_GATE_LOWER_BOUND` and never calls this
+function. The softplus branch serves a checkpoint without that field (Kimi-Linear-era `fla`
+defaults). **No such checkpoint is on this box, and there is no K3 snapshot here either**, so the
+`s <= -17` region is a contract, not a sampled observation: reaching it needs
+`g_raw <= -9.1` given the measured `dt_bias >= -7.894`, and `g_raw` is an unmeasured projection
+output.
+
+### 2.2 Compatibility versus stability
+
+Bit-compatibility with `[fla]` was **already not on the table**: this body calls `__logf`/`__expf`,
+the fast intrinsics, where Triton's `tl.log`/`tl.exp` are the precise libdevice calls. The middle
+region does not match `[fla]` bit-for-bit today and never did. What the guard preserves is the
+*formula*, and the change preserves it too.
+
+Against that: the sibling recurrent gate in this tree already made the opposite call and wrote down
+why. `op_qwen_gdn.h:36`: *"TRANSCENDENTALS ARE THE PRECISE ONES. `expf`/`log1pf`, not `__expf` —
+these bodies are memory bound, the gate feeds a multiplicative recurrence over a PERSISTENT state
+where a relative error compounds across steps."* Same structure, same argument, opposite choice —
+and KDA is the one whose formulation loses the tail entirely.
+
+**Decision: take the stable branch.**
+
+```c
+if (x > 20.0f) return x;                       // [fla]'s guard, unchanged
+const float e = __expf(x);
+return x < -8.0f ? e * (1.0f - 0.5f * e)       // log(1+e) = e - e^2/2 + O(e^3)
+                 : __logf(1.0f + e);           // [fla]'s expression, unchanged
+```
+
+`-8` is where the two are equal: below it the series' relative error is `e^2/3 <= 2^-24`, above it
+the `1 + e` form is better, and at the switch point the series is already the closer of the two, so
+the join has no step of its own. `PLOW_KDA_SOFTPLUS_FLA_COMPAT=1` restores the previous expression
+exactly.
+
+**Not** `log1pf(expf(x))`: correct in the tail too, and §2.4 prices it.
+
+### 2.3 Oracle
+
+`runtime/tests/kda_step_cdna3_test.hip` gates the BT64 chunk gate prefix against an f64 host
+reference. Its existing case draws `dt_bias` from the K3-measured `[-7,-1]`, which cannot see this:
+the accumulated prefix error stays under 7e-5 either way. A **tail case** was added at
+`dt_bias in [-26,-20]` with its own bar; the bar follows the build, because the compat form cannot
+pass a tight one by construction.
+
+```
+                                    FLA_COMPAT=1        FLA_COMPAT=0 (shipped)
+chunk gate bounded    (K3's path)   1.859e-05           1.859e-05        unchanged
+chunk gate softplus   (K3 range)    6.822e-05           6.999e-05        bar 2e-4, both pass
+chunk gate softplus tail            2.833e-06           9.326e-13        3.0e6 x closer
+```
+
+Everything else in the file — BC16/BT64 intra, the W/U transform, the 4-chunk carry, prefill and
+batched-decode state walks, the gated norm, the packed spans — is unchanged and PASSes in both.
+
+The file also did not **build** on gfx942 before this: `k_intra_cached` asks for 114,688 B of LDS
+against the part's 65,536 B limit, and the compiler refuses it, which made the only f64 oracle for
+the KDA gate unusable on the arch its filename names. It is now compiled only where it fits and the
+host skips the arm when the symbol is absent. (Its `KDA3_BENCH` timing path still assumes the arm;
+that is a CDNA4 bench and was left alone.)
+
+### 2.4 Cost
+
+`scripts/kx.sh kda_gate --isa` — three formulations, three code objects, one source, with a device
+**f64** reference so the error column is distance from the mathematics rather than from the
+incumbent. The output is `exp2(accumulated log2 gate)`, i.e. the retained-state fraction, so max
+error is directly "state kept that should have decayed".
+
+| arm | ISA total | VALU | SALU | max err, 64 steps | max err, 8192 steps |
+|---|---:|---:|---:|---:|---:|
+| `fla` `__logf(1+__expf(x))` | 141 | 80 | 56 | 4.447e-05 | **5.644e-03** |
+| `branch` (shipped now) | 203 | 83 | 115 | 4.888e-06 | **9.030e-06** |
+| `log1pf(expf(x))` (`qwen_softplus`) | 525 | 191 | 329 | 2.384e-07 | 3.874e-06 |
+
+The `fla` error grows 127 x from 64 to 8192 steps — it is a drift, linear in sequence length. The
+branch's grows 1.85 x: ordinary rounding. At 8192 steps the branch is **625 x** closer to the
+mathematics; `log1pf` buys a further 2.3 x for 2.6 x the instructions.
+
+Timing (model grid, ratios >1 = faster than `fla`): branch 0.822 / 0.806, `log1pf` 0.294 / 0.270.
+That 20% is on a probe whose entire body is the softplus. In the real op it is **+14 instructions
+in `d_kda_gate` (538 -> 552, +2.6%)** and +10 in `d_kda_state_step_g`, +56 across all of
+`interp_decode_k3.elf` (150 707 -> 150 763, +0.037%), with no VGPR, LDS, occupancy or spill change
+— `asm_audit.py --contract` passes unchanged over all 45 objects.
+
+### 2.5 What did NOT land
+
+The nested `exp(A_log) * softplus(s)` is still a product of two separately-rounded FP32
+intermediates, so extreme finite parameters — the audit's `A_log = 100, s = -100`, whose
+mathematical product is ~1 — still overflow or underflow one factor. The measured K3 range is
+`exp(A_log) in [0.471, 11.776]`, i.e. `A_log in [-0.75, 2.47]`. The contract the body now asserts
+in its header is `|A_log| <= 80` with the product finite, not the general case; closing it means
+the audit's 190-instruction nested precise gate, for parameters no checkpoint ships.
+
+---
+
 ## Reproducing
 
 ```sh
@@ -174,9 +311,20 @@ PLOW_DUMP_ACT="act.x:/tmp/x,act.xmid:/tmp/xmid,act.xnext:/tmp/xnext" \
 # the all-layer tripwire
 PLOW_DECODE_BATCH=4 PLOW_NORM_RANGE_CHECK=1 PLOW_NORM_SS_MAX=1e12f \
   scripts/build_gfx942.sh <objdir>
-# body-level cost, seconds, 1 GPU
-scripts/kx.sh norm_ss --isa
+# body-level costs and errors, seconds each, 1 GPU
+scripts/kx.sh norm_ss  --isa
+scripts/kx.sh kda_gate --isa
+# F6 oracle, both formulations
+hipcc --offload-arch=gfx942 -O3 -w -DKDA3_DEVICE [-DPLOW_KDA_SOFTPLUS_FLA_COMPAT=1] --genco \
+      runtime/tests/kda_step_cdna3_test.hip -o /tmp/kda3.co -Iruntime/amd -Iruntime/common
+g++  -O2 -w -std=c++17 -x c++ -D__HIP_PLATFORM_AMD__=1 [-DPLOW_KDA_SOFTPLUS_FLA_COMPAT=1] \
+     -I/opt/rocm-7.2.4/include runtime/tests/kda_step_cdna3_test.hip -o /tmp/kda3 \
+     -L/opt/rocm-7.2.4/lib -lamdhip64
+perf-data/tools/gpulease -n 1 kda3 /tmp/kda3 /tmp/kda3.co
 ```
+
+The host half needs the SYSTEM `g++` and `/opt/rocm-7.2.4`, the way `scripts/kx.sh` builds its
+driver: the flake's `clang++` links a libstdc++ that wants a newer glibc than this image has.
 
 `PLOW_DUMP_ACT` used to be honoured only on the TP path, so every single-GPU model on this box —
 Gemma-4 among them — dumped nothing and the caller got an empty range report rather than an error.
@@ -184,12 +332,24 @@ Both `amd-bench` closures honour it now.
 
 ## Blast radius
 
-Full 45-object gfx942 build at `PLOW_DECODE_BATCH=4`, disassembled with `llvm-objdump` and
+Full 45-object gfx942 builds at `PLOW_DECODE_BATCH=4`, disassembled with `llvm-objdump` and
 compared instruction-for-instruction against a build from the unmodified tree:
-**all 45 ISA-identical, 0 differing.** `rn_ss` is an identity when `PLOW_NORM_RANGE_CHECK=0`, and
-that is the check rather than the claim. `asm_audit.py --contract` PASSes unchanged over all 45,
-so `scripts/obj_baseline_gfx942.json` is untouched — no `--bless`.
 
-Greedy token streams therefore cannot move, and do not: base objects vs changed objects, 3 prompts
-x 3 contexts x 64 tokens, full id streams compared — Gemma-4 31B 9/9 identical (128 / 1024 / 8192),
-GLM-5.3 TP4 9/9 identical (128 / 2048 / 8192, all four ranks token-identical each step).
+| tree | ISA-identical | differing |
+|---|---:|---|
+| F5 only (`PLOW_KDA_SOFTPLUS_FLA_COMPAT=1`) | **45 / 45** | none |
+| F5 + F6 | 31 / 45 | 14, every one a `*_k3*` object |
+
+`rn_ss` is an identity when `PLOW_NORM_RANGE_CHECK=0`, and the first row is the check rather than
+the claim. `asm_audit.py --contract` PASSes unchanged over all 45 in both, so
+`scripts/obj_baseline_gfx942.json` is untouched — no `--bless`.
+
+**GLM-5.3 TP4 loads `interp_prefill_fp8_mla_moe_gq` / `interp_decode_gq`; Gemma-4 31B loads
+`interp_prefill_gq` / `interp_decode_gq`. All of those are in the ISA-identical set** — neither
+model's served arithmetic can move. Greedy token streams, base objects vs changed objects, full id
+streams compared:
+
+| model | contexts | cells | result |
+|---|---|---|---|
+| Gemma-4 31B | 128 / 1024 / 8192, 3 prompts, 64 tokens | 9 | 9/9 identical |
+| GLM-5.3 TP4 | 128 / 2048 / 8192, 3 prompts, 64 tokens | 9 | 9/9 identical, all 4 ranks token-identical each step |

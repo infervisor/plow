@@ -924,6 +924,22 @@ output accumulator — two multiplies per *token*, off the inner loop entirely. 
 per-layer (or per-head) scalar would move the dequant out of the staging loop the way both
 references do, at the cost of the accuracy that produced 4/9 character-identical completions.
 
+## Numerical contracts of the norm family and the recurrent gates
+
+`docs/amd/norm-and-recurrent-numerics.md` — measured answers to findings F5 and F6 of
+`plans/gpu-kernel-static-audit-20260908.md`, on gfx942:
+
+* every `op_norm.h` reduction runs at `max|x| < sqrt(FLT_MAX/feat)`; the shipped checkpoints stay
+  16-17 orders below it (GLM-5.3 max 1080, Gemma-4 max 55). No arithmetic change: the scale-safe
+  two-pass costs +15.8% of the norm budget per token, and `PLOW_NORM_RANGE_CHECK=1` (default off,
+  no instruction in a shipped object) can assert the contract on demand.
+* `d_layernorm_bias`'s `msq - mean*mean` compiles to ONE `v_fma_f32` on gfx942, so the audit's
+  cancellation example is computed exactly rather than to 0.787%.
+* `kda_softplus` lost its whole tail (`log(1 + exp(x))` is exactly 0 for `x <= -16.6355`, so the
+  gate stops forgetting). Fixed with a series branch below -8: 625 x closer to an f64 oracle over
+  8192 steps for +14 instructions in `d_kda_gate`. `PLOW_KDA_SOFTPLUS_FLA_COMPAT=1` restores the
+  `[fla]` expression.
+
 ## Follow-ups this work leaves open
 
 1. **The gfx942 tile store is now stale.** Any edit reachable from `interp.hip` re-keys

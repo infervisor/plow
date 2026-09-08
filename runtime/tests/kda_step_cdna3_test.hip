@@ -111,6 +111,12 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_intra_full(KArgs
         (const float*)a->gprefix, (const float*)a->o, (const uint2*)a->chunks, a->n_chunks,
         a->T, a->H, a->D, a->scale, blockIdx.x, gridDim.x, mat);
 }
+/* 114,688 B of LDS: a CDNA4 kernel. gfx942 caps a workgroup at 65,536 and the COMPILER refuses
+ * it, which made this whole file -- the only f64 oracle for the KDA gate -- unbuildable on the
+ * arch its name claims. Compiled only where it fits; the host skips the arm when the symbol is
+ * absent.                                                                    [pre-existing] */
+#define KDA3_HAS_INTRA_CACHED (PLOW_LDS_MAX_BYTES >= 114688)
+#if KDA3_HAS_INTRA_CACHED
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, 1) void k_intra_cached(KArgs* a) {
     __shared__ __align__(16) bf16 scratch[57344];
     d_kda_chunk_intra_bt64_cached(
@@ -118,6 +124,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 1) void k_intra_cached(KAr
         (const float*)a->gprefix, (const float*)a->o, (const uint2*)a->chunks, a->n_chunks,
         a->T, a->H, a->D, a->scale, blockIdx.x, gridDim.x, scratch);
 }
+#endif
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_wu(KArgs* a) {
     d_kda_chunk_wu_bt64(
         (bf16*)a->w, (bf16*)a->u, KDA_CHUNK_QPRE ? (bf16*)a->q : nullptr,
@@ -194,6 +201,11 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry_packed(KAr
 
 typedef unsigned short bf16;
 enum { PLOW_KDA_GATE_SOFTPLUS = 0, PLOW_KDA_GATE_LOWER_BOUND = 1 };
+/* Mirrors op_kda.h's default. The host half does not include the header, and the tail bar below
+ * follows the DEVICE build, so this define must be passed to BOTH compiles or not at all. */
+#ifndef PLOW_KDA_SOFTPLUS_FLA_COMPAT
+#define PLOW_KDA_SOFTPLUS_FLA_COMPAT 0
+#endif
 static float b2f(bf16 b) { unsigned u = (unsigned)b << 16; float f; memcpy(&f, &u, 4); return f; }
 static bf16 f2b(float f) {
     unsigned u; memcpy(&u, &f, 4);
@@ -277,7 +289,9 @@ int main(int argc, char** argv) {
     HC(hipModuleGetFunction(&fprepare, M, "k_prepare"));
     HC(hipModuleGetFunction(&fintra, M, "k_intra"));
     HC(hipModuleGetFunction(&fintra_full, M, "k_intra_full"));
-    HC(hipModuleGetFunction(&fintra_cached, M, "k_intra_cached"));
+    /* Absent on a 64 KiB-LDS part; every use below is guarded on the null handle. */
+    if (hipModuleGetFunction(&fintra_cached, M, "k_intra_cached") != hipSuccess)
+        fintra_cached = nullptr;
     HC(hipModuleGetFunction(&fwu, M, "k_wu"));
     HC(hipModuleGetFunction(&fcarry, M, "k_carry"));
     HC(hipModuleGetFunction(&fprepare_packed, M, "k_prepare_packed"));
@@ -288,7 +302,14 @@ int main(int argc, char** argv) {
     const unsigned H = 96, D = 128, GRID = 37;
     srand(1337);
 
-    auto run_prefix = [&](unsigned mode) -> double {
+    /* `dt_lo`/`dt_hi` bound the learned bias, and with it `s = g_raw + dt_bias` -- the argument
+     * softplus sees. The default [-7,-1] is the K3-measured range (docs/kimi-k3-kda.md 3.1). The
+     * TAIL case drives it to [-26,-20], where `log(1.0f + expf(s))` ABSORBS: fp32's `1.0f +` is
+     * exactly 1 for every s <= -16.6355, the gate comes out exactly ZERO, and the recurrence stops
+     * forgetting. Nothing in the default case can see that -- its accumulated prefix error stays
+     * under 3e-6 either way -- so the tail case carries its own, tight bar.    [F6, gpu-audit] */
+    auto run_prefix = [&](unsigned mode, float dt_lo = -7.f, float dt_hi = -1.f,
+                          double bar_g = 2e-4, const char* tag = "") -> double {
         const unsigned PT = 139, PH = 3, PD = 128;
         std::vector<uint2> chunks{make_uint2(0, 64), make_uint2(64, 1), make_uint2(65, 7),
                                   make_uint2(72, 64), make_uint2(136, 3)};
@@ -297,7 +318,7 @@ int main(int argc, char** argv) {
         for (auto& x : graw) x = f2b(((float)rand() / RAND_MAX - .5f) * 4.f);
         for (auto& x : braw) x = f2b(((float)rand() / RAND_MAX - .5f) * 4.f);
         for (auto& x : alog) x = logf(.5f + (float)rand() / RAND_MAX * 11.5f);
-        for (auto& x : dtb) x = -7.f + (float)rand() / RAND_MAX * 6.f;
+        for (auto& x : dtb) x = dt_lo + (float)rand() / RAND_MAX * (dt_hi - dt_lo);
 
         std::vector<double> gref(graw.size()), bref(braw.size());
         const double rcp_ln2 = 1.4426950408889634074;
@@ -359,9 +380,10 @@ int main(int argc, char** argv) {
         double max_g = 0.0, max_b = 0.0;
         for (size_t i = 0; i < gout.size(); i++) max_g = fmax(max_g, fabs(gout[i] - gref[i]));
         for (size_t i = 0; i < bout.size(); i++) max_b = fmax(max_b, fabs(bout[i] - bref[i]));
-        printf("  chunk gate %-7s max abs %.3e (bar 2e-4) beta %.3e (bar 2e-6)\n",
-               mode == PLOW_KDA_GATE_LOWER_BOUND ? "bounded" : "softplus", max_g, max_b);
-        return fmax(max_g / 2e-4, max_b / 2e-6);
+        printf("  chunk gate %-7s%-6s max abs %.3e (bar %.0e) beta %.3e (bar 2e-6)\n",
+               mode == PLOW_KDA_GATE_LOWER_BOUND ? "bounded" : "softplus", tag, max_g, bar_g,
+               max_b);
+        return fmax(max_g / bar_g, max_b / 2e-6);
     };
 
     auto run_intra = [&]() -> double {
@@ -526,29 +548,34 @@ int main(int argc, char** argv) {
         printf("  chunk intra BT64 qk max abs %.3e (bar 5e-5) inv %.3e (bar 3e-4)\n",
                qk64_max, inv64_max);
 
-        HC(hipMemset(d_qk64, 0, qk64_ref.size() * sizeof(float)));
-        HC(hipMemset(d_inv64, 0, inv64_ref.size() * sizeof(float)));
-        HC(hipModuleLaunchKernel(fintra_cached, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0,
-                                 args, nullptr));
-        HC(hipDeviceSynchronize());
-        std::vector<float> qk_cached(qk64_ref.size()), inv_cached(inv64_ref.size());
-        HC(hipMemcpy(qk_cached.data(), d_qk64, qk_cached.size() * sizeof(float),
-                     hipMemcpyDeviceToHost));
-        HC(hipMemcpy(inv_cached.data(), d_inv64, inv_cached.size() * sizeof(float),
-                     hipMemcpyDeviceToHost));
-        size_t qk_exact_bad = 0, inv_exact_bad = 0;
         double qk_cached_max = 0.0, inv_cached_max = 0.0;
-        for (size_t i = 0; i < qk_cached.size(); ++i) {
-            qk_exact_bad += qk_cached[i] != qk64[i];
-            qk_cached_max = fmax(qk_cached_max, fabs(qk_cached[i] - qk64_ref[i]));
+        if (fintra_cached) {
+            HC(hipMemset(d_qk64, 0, qk64_ref.size() * sizeof(float)));
+            HC(hipMemset(d_inv64, 0, inv64_ref.size() * sizeof(float)));
+            HC(hipModuleLaunchKernel(fintra_cached, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0,
+                                     args, nullptr));
+            HC(hipDeviceSynchronize());
+            std::vector<float> qk_cached(qk64_ref.size()), inv_cached(inv64_ref.size());
+            HC(hipMemcpy(qk_cached.data(), d_qk64, qk_cached.size() * sizeof(float),
+                         hipMemcpyDeviceToHost));
+            HC(hipMemcpy(inv_cached.data(), d_inv64, inv_cached.size() * sizeof(float),
+                         hipMemcpyDeviceToHost));
+            size_t qk_exact_bad = 0, inv_exact_bad = 0;
+            for (size_t i = 0; i < qk_cached.size(); ++i) {
+                qk_exact_bad += qk_cached[i] != qk64[i];
+                qk_cached_max = fmax(qk_cached_max, fabs(qk_cached[i] - qk64_ref[i]));
+            }
+            for (size_t i = 0; i < inv_cached.size(); ++i) {
+                inv_exact_bad += inv_cached[i] != inv64[i];
+                inv_cached_max = fmax(inv_cached_max, fabs(inv_cached[i] - inv64_ref[i]));
+            }
+            printf("  chunk intra cached qk max abs %.3e exact_bad %zu/%zu inv max abs %.3e exact_bad %zu/%zu\n",
+                   qk_cached_max, qk_exact_bad, qk_cached.size(), inv_cached_max, inv_exact_bad,
+                   inv_cached.size());
+        } else {
+            printf("  chunk intra cached SKIPPED (a 114,688 B LDS kernel; this part caps a "
+                   "workgroup at 65,536)\n");
         }
-        for (size_t i = 0; i < inv_cached.size(); ++i) {
-            inv_exact_bad += inv_cached[i] != inv64[i];
-            inv_cached_max = fmax(inv_cached_max, fabs(inv_cached[i] - inv64_ref[i]));
-        }
-        printf("  chunk intra cached qk max abs %.3e exact_bad %zu/%zu inv max abs %.3e exact_bad %zu/%zu\n",
-               qk_cached_max, qk_exact_bad, qk_cached.size(), inv_cached_max, inv_exact_bad,
-               inv_cached.size());
 
         const unsigned IV = 32;
         std::vector<bf16> value((size_t)IT * IH * IV);
@@ -640,6 +667,11 @@ int main(int argc, char** argv) {
     double worst = 0;
     worst = fmax(worst, run_prefix(PLOW_KDA_GATE_LOWER_BOUND));
     worst = fmax(worst, run_prefix(PLOW_KDA_GATE_SOFTPLUS));
+    /* THE TAIL. `PLOW_KDA_SOFTPLUS_FLA_COMPAT=1` restores [fla]'s `log(1 + exp(x))` and CANNOT
+     * pass 1e-7 here -- that build knowingly returns exactly zero for the whole region, and the
+     * accumulated prefix is then ~2e-6 away from the f64 reference. The bar follows the build. */
+    worst = fmax(worst, run_prefix(PLOW_KDA_GATE_SOFTPLUS, -26.f, -20.f,
+                                   PLOW_KDA_SOFTPLUS_FLA_COMPAT ? 1e-5 : 1e-7, " tail"));
     worst = fmax(worst, run_intra());
 
     if (getenv("KDA3_BENCH")) {
