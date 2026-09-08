@@ -1457,6 +1457,13 @@ struct RecurrentState {
     tensors: Vec<(usize, u64)>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackedAdmission {
+    Pending,
+    Waiting(u64),
+    Ready,
+}
+
 fn recurrent_state_layout(
     tensors: &[crate::asset::devblob::DevTensor],
     batch: usize,
@@ -1654,6 +1661,8 @@ pub struct GpuEngine {
     /// attach (0 = cold). Feeds per-request `usage.cached_tokens`.
     vmm_attached: Vec<u32>,
     vmm_active: Vec<bool>,
+    packed_admission: Vec<PackedAdmission>,
+    kv_admission_epoch: u64,
     /// Per-slot token ids whose KV rows the slot currently holds (prompt,
     /// then every decode-fed token) — `seq_tokens[b].len() == pos[b]` when
     /// consistent. Lets `begin_slot` publish the finished sequence's
@@ -2601,12 +2610,19 @@ impl GpuEngine {
                 )
             });
         let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
+        let packed_prefix = prefix_requested && config.nv.pf_batch;
+        if packed_prefix && (prefix_layout.is_none() || packed_prefill_metadata.is_none()) {
+            return Err(RuntimeError::Rejected(
+                "packed prefix reuse requires compiled packed-prefill metadata and a valid VMM layout"
+                    .into(),
+            ));
+        }
         tracing::info!(
             requested = ?config.nv_vmm_prefix(),
             selected = prefix_layout.is_some(),
             "VMM prefix cache selection"
         );
-        let packed_prefill = if prefix_requested || config.nv.prefix_cache {
+        let packed_prefill = if (prefix_requested && !packed_prefix) || config.nv.prefix_cache {
             if packed_prefill_metadata.is_some() {
                 tracing::info!("packed prefill disabled because prefix reuse is active");
             }
@@ -4067,14 +4083,14 @@ impl GpuEngine {
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
                 if packed_prefill.is_some() {
-                    if vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
+                    if (vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse()) && !packed_prefix)
                         || recurrent.is_some()
                         || prefill.iter().any(|b| b.fp8_kv)
                         || prefill.iter().any(|b| {
                             b.seg_class.len() < 2 || b.qwen_segments.iter().any(Option::is_some)
                         })
                     {
-                        return Err(RuntimeError::Rejected("packed requests require complete direct-KV segmented chains without prefix reuse".into()));
+                        return Err(RuntimeError::Rejected("packed requests require complete direct-KV segmented chains and a compatible prefix layout".into()));
                     }
                     Some(PfBatch {
                         d_slot,
@@ -4295,6 +4311,8 @@ impl GpuEngine {
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
             vmm_active: vec![false; batch],
+            packed_admission: vec![PackedAdmission::Pending; batch],
+            kv_admission_epoch: 0,
             seq_tokens: vec![Vec::new(); batch],
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
@@ -5120,6 +5138,7 @@ impl GpuEngine {
                 self.max_ctx
             )));
         }
+        self.reset_packed_admission(b);
         if let Some(state) = &self.recurrent {
             for &(index, stride) in &state.tensors {
                 self.be.memset_d8_async(
@@ -5152,6 +5171,7 @@ impl GpuEngine {
     }
 
     pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
+        self.reset_packed_admission(b);
         if !self.vmm_active[b] {
             return;
         }
@@ -5164,6 +5184,78 @@ impl GpuEngine {
         self.vmm.as_ref().unwrap().kv.begin_seq(b);
         self.seq_tokens[b].clear();
         self.vmm_active[b] = false;
+    }
+
+    fn reset_packed_admission(&mut self, b: usize) {
+        if self.packed_admission[b] == PackedAdmission::Ready {
+            self.kv_admission_epoch = self.kv_admission_epoch.wrapping_add(1);
+        }
+        self.packed_admission[b] = PackedAdmission::Pending;
+    }
+
+    pub(crate) fn packed_slot_ready(&self, b: usize) -> bool {
+        self.packed_admission[b] == PackedAdmission::Ready
+    }
+
+    pub(crate) fn admit_packed_slot(
+        &mut self,
+        b: usize,
+        prompt: &[u32],
+        total: usize,
+    ) -> Result<Option<usize>> {
+        match self.packed_admission.get(b) {
+            Some(PackedAdmission::Ready) => return Ok(Some(self.pos[b] as usize)),
+            Some(PackedAdmission::Waiting(epoch)) if *epoch == self.kv_admission_epoch => {
+                return Ok(None);
+            }
+            Some(PackedAdmission::Pending)
+                if self.packed_admission.iter().any(|state| {
+                    matches!(state, PackedAdmission::Waiting(epoch) if *epoch != self.kv_admission_epoch)
+                }) =>
+            {
+                // Retry older waiters before a new arrival takes released pages.
+                return Ok(None);
+            }
+            None => return Err(RuntimeError::Rejected(format!("slot {b} out of range"))),
+            _ => {}
+        }
+        let started = (|| {
+            self.begin_slot(b, total)?;
+            let frontier = self.attach_prompt(b, prompt)?;
+            if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
+                // Wider decode rungs write idle rows too. Reserve those before
+                // one request can consume their remaining physical pages.
+                for slot in 0..self.batch {
+                    v.kv.ensure_rows(slot, 1)?;
+                }
+                let margin = (v.kv.block_rows() as usize).max(self.pf_max_rows());
+                let rows = total.saturating_add(margin).min(self.max_ctx);
+                v.kv.ensure_rows(b, rows as u32)?;
+            }
+            Ok(frontier)
+        })();
+        match started {
+            Ok(frontier) => {
+                self.packed_admission[b] = PackedAdmission::Ready;
+                Ok(Some(frontier))
+            }
+            Err(error) => {
+                self.retire_slot(b, false);
+                let oom = matches!(error, RuntimeError::Oom(_)) || error.device_code() == Some(2);
+                if self.vmm_prefix_enabled()
+                    && oom
+                    && !error.is_fatal()
+                    && self.packed_admission.contains(&PackedAdmission::Ready)
+                {
+                    self.vmm.as_ref().unwrap().kv.ensure_rows(b, 1)?;
+                    self.packed_admission[b] = PackedAdmission::Waiting(self.kv_admission_epoch);
+                    tracing::info!(slot = b, total, "gpu: packed KV admission waiting");
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     /// Publish slot `b`'s current sequence up to its last 32-token boundary —
@@ -7497,6 +7589,12 @@ impl GpuEngine {
         }
         for r in reqs {
             self.pos[r.slot] = (r.c0 + r.len) as u32;
+            if self.vmm_prefix_enabled() && r.c0 + r.len + 1 == r.prompt.len() {
+                let end = r.c0 + r.len;
+                self.seq_tokens[r.slot].clear();
+                self.seq_tokens[r.slot].extend_from_slice(&r.prompt[..end]);
+                self.vmm_tail_publish(r.slot);
+            }
         }
         Ok(())
     }
@@ -7892,6 +7990,56 @@ mod attention_role_tests;
 #[cfg(test)]
 mod prefill_patch_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires packed-prefix assets whose full-context slots exceed available HBM"]
+    fn packed_admission_retries_after_retirement_and_preserves_waiter_priority() {
+        let assets = PathBuf::from(std::env::var("PACKED_ADMISSION_TEST_ASSETS").unwrap());
+        let be = Arc::new(CudaBackend::new(0).unwrap());
+        let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).unwrap();
+        assert!(e.pf_batch_enabled() && e.vmm_prefix_enabled() && e.batch >= 3);
+        let total = e.max_ctx;
+        let mut ready = Vec::new();
+        let mut waiting = Vec::new();
+        for slot in 0..e.batch {
+            if e.admit_packed_slot(slot, &[1, 2], total).unwrap().is_some() {
+                ready.push(slot);
+            } else {
+                waiting.push(slot);
+            }
+        }
+        assert!(!ready.is_empty() && !waiting.is_empty());
+        let epoch = e.kv_admission_epoch;
+        let created = e.vmm.as_ref().unwrap().kv.stats().blocks_created;
+        for _ in 0..16 {
+            for &slot in &waiting {
+                assert!(e.admit_packed_slot(slot, &[1, 2], total).unwrap().is_none());
+            }
+        }
+        assert_eq!(e.kv_admission_epoch, epoch);
+        assert_eq!(e.vmm.as_ref().unwrap().kv.stats().blocks_created, created);
+        let freed = ready[0];
+        e.retire_slot(freed, false);
+        assert!(e.admit_packed_slot(freed, &[1, 2], total).unwrap().is_none());
+        assert!(
+            e.admit_packed_slot(waiting[0], &[1, 2], total)
+                .unwrap()
+                .is_some()
+        );
+
+        // Cancel admitted and waiting requests, then execute a one-token prompt
+        // in the highest slot to exercise every inactive-row mapping backstop.
+        for slot in 0..e.batch {
+            e.retire_slot(slot, false);
+        }
+        let slot = e.batch - 1;
+        assert_eq!(e.admit_packed_slot(slot, &[1], 2).unwrap(), Some(0));
+        let mut tokens = Vec::new();
+        e.step_slots(&[(slot, 1)], &mut tokens).unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert!((tokens[0] as usize) < e.vocab);
+        eprintln!("PASS packed admission: {} admitted, {} waiting, retirement, priority, cancellation, widest-rung recovery", ready.len(), waiting.len());
+    }
 
     #[test]
     fn packed_runtime_tables_are_excluded_from_both_weight_consumers() {

@@ -1550,7 +1550,7 @@ fn run_one_tick(
                         }
                         continue;
                     }
-                    if s.pf_pos + 1 != n {
+                    if !e.packed_slot_ready(i) || s.pf_pos + 1 != n {
                         continue; // still mid-prefill
                     }
                     if s.respond.is_closed() {
@@ -1558,18 +1558,6 @@ fn run_one_tick(
                             release_kv(&arena, taken.kv);
                         }
                         continue;
-                    }
-                    // A 1-token prompt never enters the batched pass — its slot is
-                    // ready at pf_pos 0 but still needs its sequence begun.
-                    if n == 1 && s.pf_pos == 0 {
-                        if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
-                            note_fault(&mut tick_fault, &err);
-                            if let Some(taken) = slots[i].take() {
-                                release_kv(&arena, taken.kv);
-                                let _ = taken.respond.try_send(StreamChunk::Err(err));
-                            }
-                            continue;
-                        }
                     }
                     let last = *slots[i]
                         .as_ref()
@@ -3266,36 +3254,64 @@ fn gpu_prefill_batched_pass(
     // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows();
     loop {
-        // Minimal-padding budget: cap this pack at the largest bucket the
-        // waiting rows can FILL (else the smallest covering bucket), so a
-        // cold 4.5k-row pack runs [4096, tail] instead of an 8192 at ~45% pad.
+        for (i, slot) in slots.iter_mut().enumerate().take(cap) {
+            let Some(request) = slot.as_mut().filter(|s| s.step == 0) else {
+                continue;
+            };
+            if request.respond.is_closed() {
+                if let Some(taken) = slot.take() {
+                    release_kv(arena, taken.kv);
+                }
+                e.retire_slot(i, false);
+                continue;
+            }
+            if request.prompt_ids.is_empty() {
+                continue;
+            }
+            match e.admit_packed_slot(
+                i,
+                &request.prompt_ids,
+                request.prompt_ids.len() + request.gen.max_tokens.max(1),
+            ) {
+                Ok(Some(frontier)) => {
+                    request.pf_pos = frontier;
+                    request.cached_tokens = e.attached_rows(i) as usize;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        slot = i,
+                        error = %err,
+                        error_code = ?err.device_code(),
+                        fatal = err.is_fatal(),
+                        "gpu: packed KV admission failed"
+                    );
+                    note_fault(&mut tick_fault, &err);
+                    if let Some(taken) = slot.take() {
+                        release_kv(arena, taken.kv);
+                        let _ = taken.respond.try_send(StreamChunk::Err(err));
+                    }
+                }
+            }
+        }
+        // Count only admitted rows so waiting requests cannot enlarge a pack.
         let avail: usize = slots
             .iter()
+            .enumerate()
             .take(cap)
-            .filter_map(|s| s.as_ref())
-            .filter(|s| s.step == 0 && !s.respond.is_closed())
+            .filter(|(i, _)| e.packed_slot_ready(*i))
+            .filter_map(|(_, s)| s.as_ref())
+            .filter(|s| s.step == 0)
             .map(|s| (s.prompt_ids.len().max(1) - 1).saturating_sub(s.pf_pos))
             .sum();
         if avail == 0 {
             return tick_fault;
         }
         let per_launch = e.pf_pack_budget(avail.min(per_launch)).min(per_launch);
-        // Form one fair, rotating pack. The packet bucket supplies the row
-        // budget; request-local positions remain absolute in every span.
-        for slot in slots.iter_mut().take(cap) {
-            if slot
-                .as_ref()
-                .is_some_and(|request| request.step == 0 && request.respond.is_closed())
-            {
-                if let Some(taken) = slot.take() {
-                    release_kv(arena, taken.kv);
-                }
-            }
-        }
         let candidates = slots.iter().enumerate().take(cap).filter_map(|(i, slot)| {
             let s = slot.as_ref()?;
             let n = s.prompt_ids.len();
-            if s.step != 0 || n == 0 || s.pf_pos + 1 >= n {
+            if !e.packed_slot_ready(i) || s.step != 0 || n == 0 || s.pf_pos + 1 >= n {
                 return None;
             }
             let remaining = (n - 1 - s.pf_pos).min(chunk_cap);
@@ -3321,32 +3337,11 @@ fn gpu_prefill_batched_pass(
             crate::sched::prefill::SpanPolicy::FairSplit,
             |_| u32::try_from(per_launch).ok(),
         );
-        let mut pack = Vec::with_capacity(admission.spans().len());
-        for span in admission.spans().iter().copied() {
-            let i = span.slot as usize;
-            let c0 = span.kv_row0 as usize;
-            let len = span.n_rows as usize;
-            if c0 == 0 {
-                let s = slots[i].as_ref().expect("admitted slot is Some");
-                let n = s.prompt_ids.len();
-                if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
-                    tracing::warn!(
-                        slot = i,
-                        error = %err,
-                        error_code = ?err.device_code(),
-                        fatal = err.is_fatal(),
-                        "gpu: pf-batch begin failed"
-                    );
-                    note_fault(&mut tick_fault, &err);
-                    if let Some(taken) = slots[i].take() {
-                        release_kv(arena, taken.kv);
-                        let _ = taken.respond.try_send(StreamChunk::Err(err));
-                    }
-                    continue;
-                }
-            }
-            pack.push((i, c0, len));
-        }
+        let pack: Vec<_> = admission
+            .spans()
+            .iter()
+            .map(|span| (span.slot as usize, span.kv_row0 as usize, span.n_rows as usize))
+            .collect();
         if pack.is_empty() {
             return tick_fault;
         }
@@ -3395,10 +3390,13 @@ fn gpu_prefill_batched_pass(
         }
         // Cold path: stop as soon as any request is ready so its first token
         // fires this tick; the rest continue next tick (with decoders live).
-        let any_ready = slots.iter().take(cap).any(|s| {
+        let any_ready = slots.iter().enumerate().take(cap).any(|(i, s)| {
             s.as_ref()
                 .map(|s| {
-                    s.step == 0 && !s.prompt_ids.is_empty() && s.pf_pos + 1 == s.prompt_ids.len()
+                    e.packed_slot_ready(i)
+                        && s.step == 0
+                        && !s.prompt_ids.is_empty()
+                        && s.pf_pos + 1 == s.prompt_ids.len()
                 })
                 .unwrap_or(false)
         });

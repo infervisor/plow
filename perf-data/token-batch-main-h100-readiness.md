@@ -14,7 +14,7 @@ rollback. This is capability-gated selection, not production qualification of ev
 | Failed AMD kernel lookup | Module now owned by the cleanup guard before lookup. |
 | Startup observability | `armed` and `ready` are separate; `fires=false` until a successful device dispatch. |
 | Post-dispatch validation | Invalid token IDs or failed frontier commit are device errors; no ordinary-path retry. |
-| Host verification | CUDA + HSA library suite: 592 passed, 14 ignored, zero failures. |
+| Host verification | CUDA + HSA library suite: 592 passed, 15 ignored, zero failures. |
 | Shared contract and CPU integration | 18 asset-contract tests, 5 C/Rust resolver checks and 4 compact-tail tests passed. |
 | H100 default/fallback smoke | FP8 server starts with `token_batch=true`, explicitly reports CUDA executor unavailable, and generates through ordinary execution. |
 | AMD device correctness/performance | Not tested on this host. |
@@ -376,10 +376,10 @@ lifecycle checks pass. Retained cache returns to 4030 MiB. Results are
 `prefix-scan3-qualification.json`. This qualifies serving and memory behavior at batch 8;
 the fresh matched BF16 performance grid remains outstanding.
 
-## Packed-prefix prototype: rejected pending admission and terminal-row fixes
+## Packed-prefix prototype: numerical diagnosis and failed pressure test
 
-The explicit BF16 batch-8 packed-prefix prototype is not enabled by default or included
-in the runtime changes on this branch. It packs up to eight requests per launch. All
+The initial explicit BF16 batch-8 packed-prefix prototype failed qualification.
+It packs up to eight requests per launch. All
 39 preflight prompts and expected cache counts match ordinary execution, but one output
 differs. Natural cold/warm outputs agree within the prototype; only 8 of 12 match the
 ordinary baseline. Cold 16K pressure completes two requests before six decode streams
@@ -415,3 +415,36 @@ Cases contain `messages`, `prompt_tokens`, and `steps`. Run `ordinary` first, th
 its output directory to `split`, `packed`, or `packed-tail`. Use prefix reuse and disable
 multistep; packed modes also require compatible packed-prefix runtime support and assets.
 The rejected prototype's patch is preserved externally as `packed-prefix2-source.patch`.
+
+## Explicit packed-prefix KV admission
+
+The explicit CUDA combination `--pf-batch=true --vmm-prefix=true` now requires compatible
+packed-prefill metadata, direct-KV segmented programs, and a valid prefix layout. Before
+packing, each request attaches its cached prefix and reserves physical full-KV backing
+for its prompt, output budget, and prefetch/padding margin. Idle rows needed by wider
+decode rungs are also backed. Allocation OOM before launch rolls back that request and
+queues it while admitted requests finish. Waiters retry only after retirement releases
+an admission; existing waiters get priority over fresh arrivals. Cancellation retires
+both admitted and waiting requests.
+
+On H100, the batch-8 cold 16K workload now completes all eight requests, all eight exact
+isolated replays, and short recovery. The preceding candidate completed only two requests
+before six decode streams failed OOM. All 12 natural outputs match that preceding
+candidate and all six warm cache counts pass. API ragged parity, limits, reuse,
+prefill/decode cancellation, context rejection and recovery pass. An additional API test
+observes KV admission waiting under eight requests with 16000-token output budgets,
+cancels all streams, and recovers with an exact one-token-prompt completion.
+
+The new device test fills HBM with full-context reservations: three requests admit and
+five wait. Sixteen retry rounds create no new KV blocks. Retirement admits an older
+waiter before a new arrival. Cancelling all slots still permits decode in the highest
+slot, exercising every idle-row mapping. The device test passes in addition to the
+592-test host suite; it remains ignored in ordinary host runs.
+
+This combination remains experimental and off by default. It still uses decode for the
+last prompt token, with the numerical differences documented above. Compact terminal
+output, matched performance qualification, FP8 packed assets, and the CUDA unified
+token-batch executor remain outstanding. Admission validation is not a vLLM win claim.
+Functional pressure durations include a CPU diagnostic build and are not performance
+evidence. Raw proof and hashes are `plow-bf16-b8-packed-admission2-*`,
+`packed-admission2-gpu-test.log`, and `packed-admission2-qualification.json`.
