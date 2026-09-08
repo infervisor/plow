@@ -1487,8 +1487,9 @@ struct GlmLW {
     dst: u32,
     // DSA lightning indexer (TENSOR_NONE except on 'full' layers with the DSA gate on).
     // DECLARED bf16, which is what plow's indexer ops read. A block-fp8 checkpoint stores both
-    // as F8_E4M3 with a `weight_scale_inv` grid (verified on GLM-5.3-FP8), and plow has no
-    // upcast for them — the emit refuses that combination where `iwqb` is bound below.
+    // as F8_E4M3 with a `weight_scale_inv` grid (verified on GLM-5.3-FP8); the LOADER upcasts
+    // them at bind (`plowrt::asset::dsa_indexer`), so the bf16 declaration below holds for
+    // either checkpoint and nothing here needs to know which one it is.
     iwqb: u32, // indexer.wq_b.weight [HI*DI, QL]
     iwk: u32,  // indexer.wk.weight [DI, H] (the reference computes this projection in bf16)
     iknw: u32, // indexer.k_norm.weight [DI] bf16
@@ -2492,29 +2493,30 @@ pub(crate) fn declare_glm_rows_batched(
             } else {
                 TENSOR_NONE
             },
-            // DSA indexer q/k weights: PLAIN BF16, not fp8 — no shipped GLM-5.3-Flash checkpoint
-            // carries a `.weight_scale_inv` for either (confirmed against the real checkpoint),
-            // matching the reference's own policy of always computing these two projections in
-            // BF16 regardless of the model's block-fp8 `quantization_config`
-            // (`nvidia/attention.py`'s `wk_weights_proj` is built with `quant_config=None`
-            // unconditionally, and even loads a checkpoint's fp8 `wk` upcast to bf16). Neither has
-            // a `.weight_scale_inv` to declare.
+            // DSA indexer q/k weights: DECLARED bf16 whatever the checkpoint holds, matching the
+            // reference's own policy of computing these two projections in BF16 regardless of the
+            // model's block-fp8 `quantization_config` (`nvidia/attention.py`'s `wk_weights_proj`
+            // is built with `quant_config=None` unconditionally, and dequantises a checkpoint's
+            // fp8 `wk` into it at load). GLM-5.3-Flash carries no `.weight_scale_inv` for either
+            // and binds straight through; GLM-5.3-FP8 carries one for BOTH and is upcast at bind
+            // (`plowrt::asset::dsa_indexer`). No scale grid is declared on this side in either
+            // case — nothing downstream of the bind reads one.
             // k_norm weight/bias + weights_proj are bf16 too. REPLICATED across TP ranks (the
             // indexer is tiny and its idx is head-shared). Only bound on 'full' layers with the
             // DSA gate on.
             iwqb: if full {
-                // NOTE: the bf16 byte count below is a CLAIM ABOUT THE CHECKPOINT, and on a
-                // block-fp8 GLM it is false. GLM-5.3-FP8 stores `indexer.wq_b.weight` as
-                // F8_E4M3 [4096,2048] with a [32,16] `weight_scale_inv`, and `indexer.wk.weight`
-                // as F8_E4M3 [128,6144] with [1,48]. The reference upcasts both at load — its
-                // own comment says "FP8 wk weights are upcasted to BF16 during loading to
-                // maintain fusion" — and plow does not, so plowrt rejects such a blob on a size
-                // mismatch (8388608 B present against 16777216 B declared) AFTER uploading the
-                // whole model. Missing capability: `dsa_indexer_fp8_upcast`. It cannot be
-                // refused here: the emit does not read checkpoint headers, and the MoE encoding
-                // is not a proxy for the indexer's dtype — these emits are legitimate whenever
-                // the indexer really is bf16 on disk. The check belongs where the weights are
-                // resolved.
+                // The bf16 byte count below is a CLAIM ABOUT THE CHECKPOINT, and on a
+                // block-fp8 GLM it is false on disk: GLM-5.3-FP8 stores `indexer.wq_b.weight`
+                // as F8_E4M3 [4096,2048] with a [32,16] `weight_scale_inv`, and
+                // `indexer.wk.weight` as F8_E4M3 [128,6144] with [1,48]. It is still the RIGHT
+                // declaration — plow's indexer ops read bf16 and the reference computes both
+                // projections in bf16 whatever the checkpoint holds ("FP8 wk weights are
+                // upcasted to BF16 during loading to maintain fusion") — so the claim is made
+                // true at bind rather than weakened here: `plowrt::asset::dsa_indexer`
+                // dequantises the two by their scale grid, and refuses before the upload if it
+                // cannot. That is where it belongs, and not here: the emit does not read
+                // checkpoint headers, and the MoE encoding is not a proxy for the indexer's
+                // dtype — these emits are legitimate whenever the indexer really is bf16.
                 t(
                     b,
                     "self_attn.indexer.wq_b.weight",
@@ -3707,7 +3709,8 @@ fn emit_glm_dsa_decode_select(
     );
     // The DSA lightning indexer has NO MXFP4 path: plow reads `wq_b`/`wk`/`weights_proj` as bf16
     // and none of the three ops takes an encoding. (A block-fp8 checkpoint does quantize wq_b and
-    // wk on disk; that combination is refused where `GlmLW::iwqb` is bound.) Under MXFP4 the indexer
+    // wk on disk; the loader dequantises both into the declared bf16 -- `plowrt::asset::dsa_indexer`.)
+    // Under MXFP4 the indexer
     // would therefore be a bf16 island inside an otherwise fp4 packet — and worse, the
     // `weights_proj` GEMV would go through the encoding-aware helper and reach GEMV_MXFP4 with a
     // NULL E8M0 scale. Refuse the combination rather than emit either. GLM-5.2 is the only arch with

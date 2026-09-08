@@ -7033,6 +7033,74 @@ fn fold_res_score(c: &crate::asset::checkpoint::Checkpoint, name: &str) -> Optio
     Some(Ok(out))
 }
 
+/// Resolve every checkpoint weight the blob declares, BEFORE anything is uploaded.
+///
+/// The load path used to answer "is this weight in the checkpoint, and does it bind to the
+/// declared byte count?" one tensor at a time inside the upload loop, so the answer arrived
+/// after every earlier tensor had already been DMA'd. On a 181 GiB/rank GLM-5.3 that is
+/// minutes of upload on four ranks before a refusal that was decidable from the safetensors
+/// index at t=0. This is that decision, taken once, up front.
+///
+/// It reads NO payload: `tensor_ex` returns a subrange of an mmap without touching it, and
+/// `slice_for` only measures. The `n_gpu > 1` row-parallel skip is `touched`'s guard for the
+/// same reason it has one — a row gather is the single arm that copies, and doing it twice
+/// would cost more than the check is worth. Those tensors keep the old late failure; every
+/// other class now fails at t=0.
+///
+/// The three rules below are the upload loop's own, not a second opinion about them:
+/// `is_checkpoint_weight` as the gate, `fp8/` routing to the twin checkpoint, and the
+/// two-spelling lookup. Getting any of them wrong here would refuse a load that works.
+fn preflight_weights(
+    blob: &DevBlob,
+    ckpt: Option<&crate::asset::checkpoint::Checkpoint>,
+    fp8_ckpt: Option<&crate::asset::checkpoint::Checkpoint>,
+    rank: u32,
+    n_gpu: u32,
+) -> Result<()> {
+    for td in &blob.tensors {
+        if !packet::names::is_checkpoint_weight(&td.name) {
+            continue;
+        }
+        let is_fp8 = td.name.starts_with("fp8/");
+        let Some(c) = (if is_fp8 { fp8_ckpt } else { ckpt }) else {
+            // No checkpoint at all is not this function's error: the loop reports the
+            // missing `PLOW_FP8_DIR`, and a checkpoint-less bind is a legal packet-only load.
+            continue;
+        };
+        let stripped = td.name.strip_prefix("fp8/").unwrap_or(&td.name);
+        // DERIVED, and in no checkpoint by design — `fold_res_score` builds it from a norm
+        // and a proj. Without this exemption a Kimi-K3 load reports 186 false MISSING
+        // WEIGHTs before it starts.
+        if stripped.ends_with("_res_score.weight") {
+            continue;
+        }
+        let Some((src, shape)) = c.tensor_ex(&td.name).or_else(|| c.tensor_ex(stripped)) else {
+            return Err(RuntimeError::Device(format!(
+                "MISSING WEIGHT: {} (tried that name and the `fp8/`-stripped form{}) \
+                 — refused before the upload, not after it",
+                td.name,
+                if is_fp8 { " in PLOW_FP8_DIR" } else { "" }
+            )));
+        };
+        // The DSA indexer's two projections are declared bf16 and may be block-fp8 on disk;
+        // `plan` is the only thing that can tell a bindable one from a refusable one, and it
+        // must be asked BEFORE `slice_for`, which would reject the fp8 byte count outright.
+        if let Some(plan) = crate::asset::dsa_indexer::plan(c, stripped, td.bytes) {
+            plan?;
+            continue;
+        }
+        // A row-parallel gather is the one arm that allocates. Skipped for exactly the
+        // shapes `touched` skips it for; everything else is measured here.
+        let row = n_gpu > 1
+            && shape.len() == 2
+            && crate::asset::shard::shard_of(stripped) == crate::asset::shard::Shard::Row;
+        if !row {
+            crate::asset::shard::slice_for(stripped, src, shape, td.bytes, rank, n_gpu)?;
+        }
+    }
+    Ok(())
+}
+
 /// A `kv.`-namespace tensor that CARRIES STATE ACROSS TOKENS rather than being
 /// appended to — the KDA recurrent state, its three conv windows, and the AttnRes
 /// snapshot ring.
@@ -10104,6 +10172,22 @@ impl AmdEngine {
             .filter(|td| !is_peer_slot(&td.name) && !is_band_view(&td.name) && !is_vmm(&td.name))
             .map(|td| slab_pad(slab_need(td.bytes)))
             .sum();
+
+        // ---- EVERY checkpoint weight is RESOLVED before a byte is uploaded
+        //
+        // Weight resolution used to happen only inside the upload loop, tensor by tensor, so
+        // a name the checkpoint does not have — or a dtype the loader cannot bind — was
+        // discovered when the cursor reached it. On GLM-5.3 that was ~200 GiB of DMA before
+        // `MISSING WEIGHT` or a `slice_for` byte-count error, per rank, on four ranks. This
+        // pass answers the same questions from the safetensors index alone: no page is
+        // faulted, no payload is read, and the whole walk is a hash lookup per tensor.
+        //
+        // It must mirror the loop's resolution EXACTLY or it fails loads that work: same
+        // `is_checkpoint_weight` gate, same `fp8/` -> `fp8_ckpt` routing, same two-spelling
+        // lookup, and the same exemption for the derived `_res_score.weight` (in no
+        // checkpoint by design — `fold_res_score`).
+        preflight_weights(&blob, ckpt.as_deref(), fp8_ckpt.as_ref(), rank, n_gpu)?;
+
         let t_slab = Instant::now();
         let weight_slab = if slab_bytes == 0 || !crate::asset::checkpoint::weight_slab_enabled() {
             WeightSlab::PerTensor
@@ -10355,24 +10439,62 @@ impl AmdEngine {
                                 if is_fp8 { " in PLOW_FP8_DIR" } else { "" }
                             ))
                         })?;
-                    // At n_gpu == 1 this borrows the whole mmap range and the
-                    // size check inside is the old `SIZE MISMATCH`. Above 1 it
-                    // is the rank's shard — classified by the CHECKPOINT name
-                    // (`stripped`), so an fp8 twin shards exactly like its bf16
-                    // counterpart instead of falling through as replicated.
-                    if do_prefault {
-                        if let Some(s) = touched(c, stripped, td.bytes, rank, n_gpu) {
-                            prefault(s, &prof);
+                    // THE DSA LIGHTNING INDEXER'S TWO PROJECTIONS: block-fp8 on
+                    // disk, bf16 in the blob. Resolved before `slice_for` for the
+                    // same reason the fold above is resolved before the ordinary
+                    // lookup — handed an fp8 byte count against a bf16
+                    // declaration, `slice_for` refuses a checkpoint that is
+                    // perfectly bindable, and it refuses it 200 GiB in. See
+                    // `asset::dsa_indexer`: a shim for two named tensors, not a
+                    // dtype-coercion layer. `preflight_weights` has already taken
+                    // this decision at t=0, so the `?` here cannot fire.
+                    let upcast = match crate::asset::dsa_indexer::plan(c, stripped, td.bytes) {
+                        Some(p) => {
+                            let t = Instant::now();
+                            let bf16 = p?.dequantise();
+                            LoadProf::add(&prof.gather_ns, t);
+                            bf16
                         }
+                        None => None,
+                    };
+                    if let Some(bf16) = upcast {
+                        if bf16.len() as u64 != td.bytes {
+                            return Err(RuntimeError::Device(format!(
+                                "{}: upcast produced {} B, blob declares {}",
+                                td.name,
+                                bf16.len(),
+                                td.bytes
+                            )));
+                        }
+                        // `scrub = false`, and it MATTERS. `is_fp8_e4m3(resolved)`
+                        // is TRUE for the source name, and pushing dequantised
+                        // BF16 through the 0x80 scrub would zero the high byte of
+                        // every bf16 that happens to be a small negative — a
+                        // silent corruption of the tensor that picks which KV rows
+                        // attention sees, and one that still answers fluently.
+                        push(&mut ring, &bf16, false)?;
+                        wbytes += td.bytes;
+                        nweights += 1;
+                    } else {
+                        // At n_gpu == 1 this borrows the whole mmap range and the
+                        // size check inside is the old `SIZE MISMATCH`. Above 1 it
+                        // is the rank's shard — classified by the CHECKPOINT name
+                        // (`stripped`), so an fp8 twin shards exactly like its bf16
+                        // counterpart instead of falling through as replicated.
+                        if do_prefault {
+                            if let Some(s) = touched(c, stripped, td.bytes, rank, n_gpu) {
+                                prefault(s, &prof);
+                            }
+                        }
+                        let t = Instant::now();
+                        let slice = crate::asset::shard::slice_for(
+                            stripped, src, shape, td.bytes, rank, n_gpu,
+                        )?;
+                        LoadProf::add(&prof.gather_ns, t);
+                        push(&mut ring, &slice, c.is_fp8_e4m3(resolved))?;
+                        wbytes += td.bytes;
+                        nweights += 1;
                     }
-                    let t = Instant::now();
-                    let slice = crate::asset::shard::slice_for(
-                        stripped, src, shape, td.bytes, rank, n_gpu,
-                    )?;
-                    LoadProf::add(&prof.gather_ns, t);
-                    push(&mut ring, &slice, c.is_fp8_e4m3(resolved))?;
-                    wbytes += td.bytes;
-                    nweights += 1;
                 } else if td.name.starts_with("fp8/") {
                     return Err(RuntimeError::Device(format!(
                         "packet declares fp8 weights ({}) but PLOW_FP8_DIR is not set",

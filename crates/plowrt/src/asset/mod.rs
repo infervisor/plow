@@ -26,6 +26,10 @@ mod bucket;
 #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
 pub(crate) mod checkpoint;
 pub mod devblob;
+/// The DSA lightning indexer's fp8 -> bf16 upcast. Gated with `checkpoint` for the same
+/// reason `shard` is: it is a rule about how a checkpoint tensor becomes a bound one.
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+pub mod dsa_indexer;
 /// Megatron weight sharding. Gated with `checkpoint` — it is the rule for which
 /// slice of a checkpoint tensor a rank binds, and useless without one.
 #[cfg(any(feature = "cuda", feature = "hsa"))]
