@@ -101,10 +101,14 @@ impl BlobPlan {
     /// once (header + tensor decls; the init section ride-along is the cost of
     /// the shared parser — startup-only, never on the request path).
     pub fn from_dir(dir: &Path) -> Result<BlobPlan> {
-        Self::from_dir_with_granularity(dir, None)
+        Self::from_dir_with_granularity(dir, None, None)
     }
 
-    fn from_dir_with_granularity(dir: &Path, granularity: Option<u64>) -> Result<BlobPlan> {
+    fn from_dir_with_granularity(
+        dir: &Path,
+        granularity: Option<u64>,
+        checkpoint: Option<&Path>,
+    ) -> Result<BlobPlan> {
         let pkt = DevBlob::find_in_dir(dir)?
             .ok_or_else(|| RuntimeError::Device(format!("no PLOWDEV blob in {}", dir.display())))?;
         let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
@@ -157,6 +161,21 @@ impl BlobPlan {
                     RuntimeError::Rejected("live KV plan tensor classification".into())
                 })? + resident
                     + crate::memory::vmm::kv_pool_cap();
+            } else if config.nv_vmm_prefix() {
+                if let Some(layout) = checkpoint
+                    .and_then(|path| crate::exec::gpu::GpuEngine::vmm_prefix_layout(&blob, path))
+                {
+                    let geo = &layout.geo;
+                    let block = geo
+                        .block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)?;
+                    let tracks = geo.full_layers.len() as u64 * 2;
+                    let virtual_bytes = geo.full_tensor_bytes() * tracks;
+                    let resident = block * u64::from(geo.batch) * u64::from(geo.kvh_full) * tracks;
+                    plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
+                        RuntimeError::Rejected("prefix KV plan tensor classification".into())
+                    })? + resident
+                        + crate::memory::vmm::kv_pool_cap();
+                }
             }
         }
         Ok(plan)
@@ -243,7 +262,8 @@ impl ModelManager {
     ) -> Result<ModelManager> {
         let mut managed = Vec::with_capacity(models.len());
         for (slug, dir, ckpt) in models {
-            let plan = BlobPlan::from_dir_with_granularity(&dir, Some(be.granularity()?))?;
+            let plan =
+                BlobPlan::from_dir_with_granularity(&dir, Some(be.granularity()?), Some(&ckpt))?;
             tracing::info!(
                 %slug,
                 weights_gib = gib(plan.weights_bytes),

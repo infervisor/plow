@@ -83,8 +83,31 @@ The same FP8 server passes isolated-versus-concurrent ragged request parity, exa
 limits, slot reuse, disconnects during prefill and decode, context rejection, and recovery.
 Retained cache remains under the cap after these checks.
 The 1K concurrency-1 TTFT still exceeds the earlier vLLM BF16 screen's 33.1 ms.
-BF16 cache serving, the full concurrency matrix, and production qualification remain pending.
-Prefix caching remains opt-in.
+The full concurrency matrix and production qualification remain pending. Prefix caching
+remains opt-in.
+
+BF16 startup initially failed because the planner counted all 10 GiB of virtual full-KV
+as resident. Planning now uses the same validated prefix layout as runtime bringup and
+counts initial mapped blocks plus the block pool. Planned tensor memory changed from
+80.45 to 71.57 GiB; the successful H100 load measured 71.13 GiB.
+
+BF16 passes all six cold/warm natural-text pairs and eight concurrent natural-text requests,
+including a four-request batch mixing 1K and 16K inputs. Cached and concurrent completions
+match isolated cold output exactly. Four of six cold completions match vLLM BF16 exactly;
+the remaining two first diverge at re-tokenized positions 43 and 22. This small corpus is
+a regression check, not comprehensive model-quality qualification.
+
+| BF16 input tokens | Cached tokens, concurrency 1 and 4 | TTFT at concurrency 1 | TTFT at concurrency 4 |
+|---|---:|---:|---:|
+| 1024 | 960 | 445 ms | 1053 ms |
+| 4096 | 3872 | 1156 ms | 2891 ms |
+| 16384 | 15552 | 2341 ms | 5842 ms |
+
+BF16 also retains 3917.5 MiB after its six-cell screen. Its decode ladder selects among
+1/2/4 rows; the FP8 ladder still falls back to width 4. Both screens use 32 output tokens,
+one warmup wave and one measured wave per cell. Neither establishes a performance win.
+BF16 API checks also pass ragged request parity, exact limits, slot reuse, prefill/decode
+disconnects, context rejection and recovery; retained cache remains within the cap afterward.
 
 Raw artifacts: `/opt/dlami/nvme/tmp/gemma31-glm53-h100-20260908/`.
 Host test log: `/tmp/plow-token-batch-readiness-tests-final.log`.
@@ -94,5 +117,8 @@ Stream-ordering verification: `/tmp/plow-subblock-stream-library-tests.log` and
 `/tmp/plow-subblock-stream-cuda-test.log`.
 Current GPU artifacts: `plow-fp8-stream-*`; source and executable hashes are in
 `plow-fp8-stream-provenance.json` under the raw-artifact directory.
+BF16 artifacts: `plow-bf16-prefix-plan-*`, with hashes in
+`plow-bf16-prefix-plan-provenance.json`. Planner host checks:
+`/tmp/plow-prefix-plan-library-tests.log` (582 passed, 14 ignored).
 CPU integration log: `/tmp/plow-token-batch-cpu-integration-tests.log`.
 The compact-tail fixture needed the new optional worker-pinning argument before it could run.

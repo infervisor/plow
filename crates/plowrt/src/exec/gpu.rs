@@ -413,6 +413,15 @@ const STAGE: usize = 64 << 20;
 /// the launch loudly (never silent), so a stale value here cannot corrupt.
 const SMEM_PF: u32 = 21312 * 4;
 
+pub(crate) struct VmmPrefixLayout {
+    pub(crate) geo: crate::memory::vmm::VmmGeometry,
+    slide: Vec<(usize, usize, u64)>,
+    slide_scale: Vec<(usize, usize)>,
+    full_scale: Vec<(usize, usize)>,
+    ring: u64,
+    snap_row_bytes: u64,
+}
+
 /// VMM live allocation or prefix-sharing state: the pool
 /// backing every FULL layer's `kv.{l}.k/v` tensor with per-sequence VA
 /// windows. Live mode can retain demand-mapped whole-slot rings; prefix
@@ -4437,19 +4446,10 @@ impl GpuEngine {
         self.vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
     }
 
-    /// Bring up VMM prefix sharing when `--vmm-prefix` / `PLOW_VMM_PREFIX=1`
-    /// and the model's KV geometry (from the checkpoint's `config.json`)
-    /// validates against the blob's declared tensor sizes. Any mismatch logs
-    /// and falls back to the cudaMalloc path — never fails the load.
-    fn vmm_bringup(
-        be: &Arc<CudaBackend>,
+    pub(crate) fn vmm_prefix_layout(
         blob: &DevBlob,
         checkpoint_dir: &Path,
-    ) -> Option<VmmServe> {
-        let on = crate::config::RuntimeConfig::get().nv_vmm_prefix();
-        if !on {
-            return None;
-        }
+    ) -> Option<VmmPrefixLayout> {
         let batch = blob.decode_prog().ok()?.t;
         let max_ctx = blob
             .tensors
@@ -4570,6 +4570,38 @@ impl GpuEngine {
             } else {
                 0
             };
+
+        Some(VmmPrefixLayout {
+            geo,
+            slide,
+            slide_scale,
+            full_scale,
+            ring,
+            snap_row_bytes,
+        })
+    }
+
+    /// Bring up VMM prefix sharing when `--vmm-prefix` / `PLOW_VMM_PREFIX=1`
+    /// and the model's KV geometry (from the checkpoint's `config.json`)
+    /// validates against the blob's declared tensor sizes. Any mismatch logs
+    /// and falls back to the cudaMalloc path — never fails the load.
+    fn vmm_bringup(
+        be: &Arc<CudaBackend>,
+        blob: &DevBlob,
+        checkpoint_dir: &Path,
+    ) -> Option<VmmServe> {
+        let on = crate::config::RuntimeConfig::get().nv_vmm_prefix();
+        if !on {
+            return None;
+        }
+        let VmmPrefixLayout {
+            geo,
+            slide,
+            slide_scale,
+            full_scale,
+            ring,
+            snap_row_bytes,
+        } = Self::vmm_prefix_layout(blob, checkpoint_dir)?;
 
         // Default sharing block = the driver granularity (2 MiB measured):
         // the finest match unit VMM can map, e.g. 4096 tokens at hd256 bf16 —
