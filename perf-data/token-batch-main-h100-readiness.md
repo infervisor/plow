@@ -327,7 +327,7 @@ limits, slot reuse, prefill/decode disconnects, context rejection and recovery p
 Host tests: 588 passed, 14 ignored. The full-logit GPU gate now retires lower slots only in
 the candidate while the highest slot continues decoding against a non-retired reference:
 122 FP8 batch-16 and 78 BF16 batch-8 snapshots are bit-exact. BF16 batch-8 API serving and
-pressure qualification remain pending. Raw failure and corrected results are
+pressure qualification were pending at that stage; the results below complete them. Raw failure and corrected results are
 `plow-fp8-b16-c1024-*`, `plow-fp8-b16-reclaim-*`, and `prefix-reclaim-qualification.json`.
 
 ## Prefix eviction under batch-16 bursts
@@ -369,5 +369,9 @@ packed-prefill prototype was built during functional pressure checks, whose dura
 not used for performance claims. The prototype is not included in this change.
 
 BF16 batch 8 starts at 71.48 GiB with automatic prefix reuse. Its 12 natural cold/warm
-outputs match the prior batch-4 baseline and all six warm cache counts pass. Eight-way
-16K pressure, isolated replay and API lifecycle qualification are still running.
+outputs match the prior batch-4 baseline and all six warm cache counts pass. All eight
+distinct cold 16K requests, eight exact isolated replays, short recovery, and three API
+lifecycle checks pass. Retained cache returns to 4030 MiB. Results are
+`plow-bf16-b8-scan3-*`, with hashes in the `bf16_batch8` section of
+`prefix-scan3-qualification.json`. This qualifies serving and memory behavior at batch 8;
+the fresh matched BF16 performance grid remains outstanding.
