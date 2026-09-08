@@ -633,6 +633,11 @@ if(PLOW_ROCM)
         PROPERTIES LABELS "gpu;gfx942" RUN_SERIAL TRUE)
     add_test(NAME kda_state_resident_gfx942_oracle
         COMMAND kda_state_resident_gfx942_test ${KDA_STATE_RESIDENT_ELF})
+    # Registered now that the file also carries the packed-row identity gate: it is the
+    # acceptance evidence for the unified token batch's class-B recurrent decode path, so it
+    # has to be reachable by `ctest -L gfx942` rather than only by hand.
+    add_test(NAME qwen_gdn_gfx942_oracle
+        COMMAND qwen_gdn_gfx942_test ${QWEN_GDN_ELF})
     add_test(NAME kda_journal_gfx942_oracle
         COMMAND kda_journal_gfx942_test ${KDA_JOURNAL_ELF})
     add_test(NAME k3_dspark_mla_gfx942_oracle
@@ -643,6 +648,7 @@ if(PLOW_ROCM)
         COMMAND moe_prefill_w4a16_bridge_gfx942_test ${MOE_W4A16_ELF})
     set_tests_properties(
         kda_state_resident_gfx942_oracle
+        qwen_gdn_gfx942_oracle
         kda_journal_gfx942_oracle
         k3_dspark_mla_gfx942_oracle
         moe_prefill_a8w4_gfx942_oracle

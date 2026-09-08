@@ -92,6 +92,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_gate_prep(QArgs*
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <utility>
 #include <vector>
 
 #ifndef QGDN_THREADS
@@ -155,6 +156,40 @@ static void score(const char* nm, Err e, double rms_bar, double max_bar) {
     printf("  %-22s rms rel %.3e (bar %.0e)   max rel %.3e (bar %.0e)%s\n", nm, e.rms, rms_bar,
            e.mx, max_bar, (e.rms < rms_bar && e.mx < max_bar) ? "" : "   <-- FAIL");
     worst = fmax(worst, fmax(e.rms / rms_bar, e.mx / max_bar));
+}
+
+/* ---- the packed-row identity gate (see the block comment above its section in main) ----
+ * A separate verdict from `worst` because it is a different KIND of claim: `score` measures
+ * arithmetic against f64 and passes on a tolerance, this measures ADDRESSING and passes only on
+ * bit-identity. A body that mixed two requests' rows would sail through a 4e-3 bar. */
+static int ident_fail = 0;
+#define HX(x)                                                                                      \
+    do {                                                                                           \
+        hipError_t e_ = (x);                                                                       \
+        if (e_) { printf("hip err %s @%d\n", hipGetErrorString(e_), __LINE__); exit(1); }           \
+    } while (0)
+
+static std::vector<unsigned char> dl(unsigned long long p, size_t bytes) {
+    std::vector<unsigned char> v(bytes);
+    HX(hipMemcpy(v.data(), (void*)(size_t)p, bytes, hipMemcpyDeviceToHost));
+    return v;
+}
+
+/* `pack` vs `iso` must be byte-equal everywhere; every byte range in `pad` -- the slots no live
+ * row ever owned -- must still hold what `pristine` holds there. */
+static void ident(const char* nm, const std::vector<unsigned char>& pack,
+                  const std::vector<unsigned char>& iso,
+                  const std::vector<unsigned char>& pristine,
+                  const std::vector<std::pair<size_t, size_t>>& pad) {
+    bool same = pack.size() == iso.size() && pack.size() == pristine.size();
+    if (same) same = memcmp(pack.data(), iso.data(), pack.size()) == 0;
+    bool frozen = true;
+    for (size_t i = 0; i < pad.size(); i++)
+        frozen &= memcmp(pack.data() + pad[i].first, pristine.data() + pad[i].first,
+                         pad[i].second) == 0;
+    printf("  %-26s packed==isolated %-3s   padding frozen %-3s%s\n", nm, same ? "YES" : "no",
+           frozen ? "YES" : "no", (same && frozen) ? "" : "   <-- FAIL");
+    if (!same || !frozen) ident_fail = 1;
 }
 
 int main(int argc, char** argv) {
@@ -559,7 +594,292 @@ int main(int argc, char** argv) {
         score("gate_prep beta", cmp_f32(gb, bref), 1e-12, 1e-12); /* bf16-rounded: exact */
     }
 
-    printf("%s (worst %.3f)\n", worst < 1.0 ? "PASS" : "FAIL", worst);
-    return worst >= 1.0;
+    /* ============================================================================================
+     * PACKED-ROW IDENTITY — plans/unified-token-batch.md §5.4 and the §9 "Recurrent" gate row.
+     *
+     * Everything above scores one body against f64 at one fixed batch. That cannot see the
+     * property a unified token batch actually needs, which is about ADDRESSING, not arithmetic: a
+     * decode row belonging to request r must produce the SAME BYTES whether it is submitted alone
+     * or packed beside rows of other requests behind the ISA's `active[]` mask. §9 asks for
+     * bit-identity and bit-identity is what is checked here — a 4e-3 rms bar would pass a body
+     * that leaked one request's row into another's.
+     *
+     * The schedule is two rounds over six slots with the mask changing between them:
+     *
+     *     slot     0  1  2  3  4  5
+     *     round 0  .  A  A  .  A  .
+     *     round 1  A  .  A  A  .  .
+     *
+     * so slot 2 carries its state across both rounds, slots 1 and 4 have their state FROZEN by a
+     * park after using it, slots 0 and 3 resume from a state left a whole round stale (state-slot
+     * reuse), and slot 5 is padding that is never live and whose output must still hold the
+     * poison it was filled with. The isolated arm does not SUBMIT a parked row at all — that is
+     * what "isolated per-request execution" means — so a body that writes through a zero mask
+     * fails against it rather than being compared with itself.
+     *
+     * Both arms start from the same uploaded state/history bytes and the comparison is `memcmp`.
+     * The two stateful bodies (136's history, 137's f32 state) run the whole two-round schedule;
+     * the five stateless ones need only round 0, since a second round of the same input is the
+     * same launch.
+     * ========================================================================================== */
+    printf("packed-row identity (6 slots, mask {0,1,1,0,1,0} then {1,0,1,1,0,0}):\n");
+    {
+        const unsigned PB = 6;
+        std::vector<int> m0{0, 1, 1, 0, 1, 0}, m1{1, 0, 1, 1, 0, 0};
+        const unsigned long long dm[2] = {UP(m0, int), UP(m1, int)};
+        const std::vector<int>* mh[2] = {&m0, &m1};
+        const unsigned PAD = 5; /* the slot no round ever makes live */
+
+        a.eps = 1e-6f;
+        a.scale = (float)(1.0 / sqrt((double)DK));
+
+        /* ---- op 136: conv + the shifting history ---- */
+        {
+            const size_t rowc = CHANNELS, rowh = (size_t)CHANNELS * (WIDTH - 1);
+            std::vector<bf16> in((size_t)PB * rowc), w((size_t)CHANNELS * WIDTH),
+                h0((size_t)PB * rowh);
+            for (auto& x : in) x = f2b((float)(rnd() * 2.0));
+            for (auto& x : w) x = f2b((float)(rnd() * 1.0));
+            for (auto& x : h0) x = f2b((float)(rnd() * 2.0));
+            const unsigned long long din = UP(in, bf16), dw = UP(w, bf16);
+            const unsigned long long hp = UP(h0, bf16), hi = UP(h0, bf16);
+            const unsigned long long op = OUT((size_t)PB * rowc, bf16);
+            const unsigned long long oi = OUT((size_t)PB * rowc, bf16);
+            HX(hipMemset((void*)(size_t)op, 0xa5, (size_t)PB * rowc * 2));
+            HX(hipMemset((void*)(size_t)oi, 0xa5, (size_t)PB * rowc * 2));
+            a.weight = dw; a.channels = CHANNELS; a.width = WIDTH;
+            for (unsigned r = 0; r < 2; r++) {
+                a.batch = PB; a.active = dm[r]; a.in = din; a.history = hp; a.out = op;
+                if (sync(f_conv)) return 1;
+            }
+            for (unsigned r = 0; r < 2; r++)
+                for (unsigned s = 0; s < PB; s++) {
+                    if (!(*mh[r])[s]) continue;
+                    a.batch = 1;
+                    a.active = dm[r] + (unsigned long long)s * sizeof(int);
+                    a.in = din + (unsigned long long)s * rowc * 2;
+                    a.history = hi + (unsigned long long)s * rowh * 2;
+                    a.out = oi + (unsigned long long)s * rowc * 2;
+                    if (sync(f_conv)) return 1;
+                }
+            ident("gdn_conv out", dl(op, (size_t)PB * rowc * 2), dl(oi, (size_t)PB * rowc * 2),
+                  std::vector<unsigned char>((size_t)PB * rowc * 2, 0xa5),
+                  {{(size_t)PAD * rowc * 2, rowc * 2}});
+            std::vector<unsigned char> hpz((const unsigned char*)h0.data(),
+                                           (const unsigned char*)h0.data() + h0.size() * 2);
+            ident("gdn_conv history", dl(hp, h0.size() * 2), dl(hi, h0.size() * 2), hpz,
+                  {{(size_t)PAD * rowh * 2, rowh * 2}});
+        }
+
+        /* ---- op 137: the recurrence and its f32 state ---- */
+        {
+            const size_t rq = CHANNELS, rab = HV, rst = (size_t)HV * DV * DK, ro = (size_t)HV * DV;
+            std::vector<bf16> qkv((size_t)PB * rq), av((size_t)PB * rab), bv((size_t)PB * rab),
+                alog(HV), dtb(HV);
+            for (auto& x : qkv) x = f2b((float)(rnd() * 2.0));
+            for (auto& x : av) x = f2b((float)(rnd() * 4.0));
+            for (auto& x : bv) x = f2b((float)(rnd() * 4.0));
+            for (auto& x : alog) x = f2b(logf(0.5f + (float)(rnd() + 0.5) * 11.5f));
+            for (auto& x : dtb) x = f2b((float)(-7.0 + (rnd() + 0.5) * 6.0));
+            std::vector<float> S0((size_t)PB * rst);
+            for (auto& x : S0) x = (float)(rnd() * 0.5);
+            const unsigned long long dq = UP(qkv, bf16), da = UP(av, bf16), db = UP(bv, bf16);
+            const unsigned long long dal = UP(alog, bf16), ddt = UP(dtb, bf16);
+            const unsigned long long sp = UP(S0, float), si = UP(S0, float);
+            const unsigned long long op = OUT((size_t)PB * ro, bf16);
+            const unsigned long long oi = OUT((size_t)PB * ro, bf16);
+            HX(hipMemset((void*)(size_t)op, 0xa5, (size_t)PB * ro * 2));
+            HX(hipMemset((void*)(size_t)oi, 0xa5, (size_t)PB * ro * 2));
+            a.a_log = dal; a.dt_bias = ddt; a.alog_f32 = 0;
+            a.hk = HK; a.hv = HV; a.kdim = DK; a.vdim = DV;
+            for (unsigned r = 0; r < 2; r++) {
+                a.batch = PB; a.active = dm[r];
+                a.qkv = dq; a.a = da; a.b = db; a.state = sp; a.out = op;
+                if (sync(f_step)) return 1;
+            }
+            for (unsigned r = 0; r < 2; r++)
+                for (unsigned s = 0; s < PB; s++) {
+                    if (!(*mh[r])[s]) continue;
+                    a.batch = 1;
+                    a.active = dm[r] + (unsigned long long)s * sizeof(int);
+                    a.qkv = dq + (unsigned long long)s * rq * 2;
+                    a.a = da + (unsigned long long)s * rab * 2;
+                    a.b = db + (unsigned long long)s * rab * 2;
+                    a.state = si + (unsigned long long)s * rst * 4;
+                    a.out = oi + (unsigned long long)s * ro * 2;
+                    if (sync(f_step)) return 1;
+                }
+            ident("gdn_step out", dl(op, (size_t)PB * ro * 2), dl(oi, (size_t)PB * ro * 2),
+                  std::vector<unsigned char>((size_t)PB * ro * 2, 0xa5),
+                  {{(size_t)PAD * ro * 2, ro * 2}});
+            std::vector<unsigned char> s0z((const unsigned char*)S0.data(),
+                                           (const unsigned char*)S0.data() + S0.size() * 4);
+            ident("gdn_step state", dl(sp, S0.size() * 4), dl(si, S0.size() * 4), s0z,
+                  {{(size_t)PAD * rst * 4, rst * 4}});
+        }
+
+        /* ---- ops 138-141: stateless masked bodies, round 0 only ---- */
+        {
+            const size_t row = (size_t)HV * DV;
+            std::vector<bf16> core((size_t)PB * row), z((size_t)PB * row), g(DV);
+            for (auto& x : core) x = f2b((float)(rnd() * 2.0));
+            for (auto& x : z) x = f2b((float)(rnd() * 4.0));
+            for (auto& x : g) x = f2b((float)(0.5 + rnd() + 0.5));
+            const unsigned long long dc = UP(core, bf16), dz = UP(z, bf16), dg = UP(g, bf16);
+            const unsigned long long op = OUT((size_t)PB * row, bf16);
+            const unsigned long long oi = OUT((size_t)PB * row, bf16);
+            HX(hipMemset((void*)(size_t)op, 0xa5, (size_t)PB * row * 2));
+            HX(hipMemset((void*)(size_t)oi, 0xa5, (size_t)PB * row * 2));
+            a.gamma = dg; a.heads = HV; a.dim = DV;
+            a.batch = PB; a.active = dm[0]; a.core = dc; a.z = dz; a.out = op;
+            if (sync(f_gnorm)) return 1;
+            for (unsigned s = 0; s < PB; s++) {
+                if (!m0[s]) continue;
+                a.batch = 1;
+                a.active = dm[0] + (unsigned long long)s * sizeof(int);
+                a.core = dc + (unsigned long long)s * row * 2;
+                a.z = dz + (unsigned long long)s * row * 2;
+                a.out = oi + (unsigned long long)s * row * 2;
+                if (sync(f_gnorm)) return 1;
+            }
+            std::vector<std::pair<size_t, size_t>> pad{
+                {0, row * 2}, {(size_t)3 * row * 2, row * 2}, {(size_t)PAD * row * 2, row * 2}};
+            ident("gated_norm", dl(op, (size_t)PB * row * 2), dl(oi, (size_t)PB * row * 2),
+                  std::vector<unsigned char>((size_t)PB * row * 2, 0xa5), pad);
+        }
+        {
+            const size_t src = (size_t)HV * 2 * DV, row = (size_t)HV * DV;
+            std::vector<bf16> packed((size_t)PB * src);
+            for (auto& x : packed) x = f2b((float)(rnd() * 2.0));
+            const unsigned long long dp = UP(packed, bf16);
+            const unsigned long long qp = OUT((size_t)PB * row, bf16);
+            const unsigned long long qi = OUT((size_t)PB * row, bf16);
+            const unsigned long long gp = OUT((size_t)PB * row, bf16);
+            const unsigned long long gi = OUT((size_t)PB * row, bf16);
+            for (unsigned long long b : {qp, qi, gp, gi})
+                HX(hipMemset((void*)(size_t)b, 0xa5, (size_t)PB * row * 2));
+            a.heads = HV; a.dim = DV;
+            a.batch = PB; a.active = dm[0]; a.packed = dp; a.q = qp; a.gate = gp;
+            if (sync(f_split)) return 1;
+            for (unsigned s = 0; s < PB; s++) {
+                if (!m0[s]) continue;
+                a.batch = 1;
+                a.active = dm[0] + (unsigned long long)s * sizeof(int);
+                a.packed = dp + (unsigned long long)s * src * 2;
+                a.q = qi + (unsigned long long)s * row * 2;
+                a.gate = gi + (unsigned long long)s * row * 2;
+                if (sync(f_split)) return 1;
+            }
+            std::vector<std::pair<size_t, size_t>> pad{
+                {0, row * 2}, {(size_t)3 * row * 2, row * 2}, {(size_t)PAD * row * 2, row * 2}};
+            const std::vector<unsigned char> poison((size_t)PB * row * 2, 0xa5);
+            ident("q_gate_split q", dl(qp, poison.size()), dl(qi, poison.size()), poison, pad);
+            ident("q_gate_split gate", dl(gp, poison.size()), dl(gi, poison.size()), poison, pad);
+        }
+        {
+            const size_t row = (size_t)HV * DV;
+            std::vector<bf16> in((size_t)PB * row), gate((size_t)PB * row);
+            for (auto& x : in) x = f2b((float)(rnd() * 2.0));
+            for (auto& x : gate) x = f2b((float)(rnd() * 4.0));
+            const unsigned long long di = UP(in, bf16), dg = UP(gate, bf16);
+            const unsigned long long op = OUT((size_t)PB * row, bf16);
+            const unsigned long long oi = OUT((size_t)PB * row, bf16);
+            HX(hipMemset((void*)(size_t)op, 0xa5, (size_t)PB * row * 2));
+            HX(hipMemset((void*)(size_t)oi, 0xa5, (size_t)PB * row * 2));
+            a.cols = (unsigned)row;
+            a.batch = PB; a.active = dm[0]; a.in = di; a.gate = dg; a.out = op;
+            if (sync(f_sgate)) return 1;
+            for (unsigned s = 0; s < PB; s++) {
+                if (!m0[s]) continue;
+                a.batch = 1;
+                a.active = dm[0] + (unsigned long long)s * sizeof(int);
+                a.in = di + (unsigned long long)s * row * 2;
+                a.gate = dg + (unsigned long long)s * row * 2;
+                a.out = oi + (unsigned long long)s * row * 2;
+                if (sync(f_sgate)) return 1;
+            }
+            std::vector<std::pair<size_t, size_t>> pad{
+                {0, row * 2}, {(size_t)3 * row * 2, row * 2}, {(size_t)PAD * row * 2, row * 2}};
+            const std::vector<unsigned char> poison((size_t)PB * row * 2, 0xa5);
+            ident("sigmoid_gate", dl(op, poison.size()), dl(oi, poison.size()), poison, pad);
+        }
+        {
+            const unsigned DIM = 2048;
+            std::vector<bf16> in((size_t)PB * DIM), g(DIM);
+            for (auto& x : in) x = f2b((float)(rnd() * 2.0));
+            for (auto& x : g) x = f2b((float)(rnd() * 0.5));
+            const unsigned long long di = UP(in, bf16), dg = UP(g, bf16);
+            const unsigned long long op = OUT((size_t)PB * DIM, bf16);
+            const unsigned long long oi = OUT((size_t)PB * DIM, bf16);
+            HX(hipMemset((void*)(size_t)op, 0xa5, (size_t)PB * DIM * 2));
+            HX(hipMemset((void*)(size_t)oi, 0xa5, (size_t)PB * DIM * 2));
+            a.gamma = dg; a.dim = DIM; a.offset = 1.0f;
+            a.batch = PB; a.active = dm[0]; a.in = di; a.out = op;
+            if (sync(f_rms)) return 1;
+            for (unsigned s = 0; s < PB; s++) {
+                if (!m0[s]) continue;
+                a.batch = 1;
+                a.active = dm[0] + (unsigned long long)s * sizeof(int);
+                a.in = di + (unsigned long long)s * DIM * 2;
+                a.out = oi + (unsigned long long)s * DIM * 2;
+                if (sync(f_rms)) return 1;
+            }
+            std::vector<std::pair<size_t, size_t>> pad{
+                {0, (size_t)DIM * 2}, {(size_t)3 * DIM * 2, (size_t)DIM * 2},
+                {(size_t)PAD * DIM * 2, (size_t)DIM * 2}};
+            const std::vector<unsigned char> poison((size_t)PB * DIM * 2, 0xa5);
+            ident("qwen_rmsnorm", dl(op, poison.size()), dl(oi, poison.size()), poison, pad);
+        }
+
+        /* ---- op 142: per-head norm + RoPE, both the flat and the KV-ring scatter forms. The
+         * ring form is the interesting one under packing: it writes at `positions[slot]` inside
+         * the slot's own ring, so a body that derived the destination from a packed row index
+         * instead of the slot would land in another request's KV. ---- */
+        for (unsigned ring = 0; ring < 2; ring++) {
+            const unsigned HEADS = 8, CTX = ring ? 64u : 0u;
+            const size_t rin = (size_t)HEADS * HD;
+            const size_t rout = ring ? (size_t)HEADS * CTX * HD : rin;
+            std::vector<bf16> in((size_t)PB * rin), g(HD);
+            std::vector<float> cs((size_t)64 * (ROT / 2)), sn(cs.size());
+            /* deliberately unordered and NOT a function of the slot index */
+            std::vector<int> pos{5, 3, 17, 40, 2, 61};
+            for (auto& x : in) x = f2b((float)(rnd() * 2.0));
+            for (auto& x : g) x = f2b((float)(rnd() * 0.5));
+            for (size_t i = 0; i < cs.size(); i++) {
+                const double th = (double)i * 0.017 + 0.3;
+                cs[i] = (float)cos(th); sn[i] = (float)sin(th);
+            }
+            const unsigned long long di = UP(in, bf16), dg = UP(g, bf16);
+            const unsigned long long dcs = UP(cs, float), dsn = UP(sn, float), dpo = UP(pos, int);
+            const unsigned long long op = OUT((size_t)PB * rout, bf16);
+            const unsigned long long oi = OUT((size_t)PB * rout, bf16);
+            HX(hipMemset((void*)(size_t)op, 0xa5, (size_t)PB * rout * 2));
+            HX(hipMemset((void*)(size_t)oi, 0xa5, (size_t)PB * rout * 2));
+            a.gamma = dg; a.cos = dcs; a.sin = dsn;
+            a.heads = HEADS; a.dim = HD; a.rotary = ROT; a.context = CTX;
+            a.normalize = 1; a.offset = 1.0f; a.prefill = 0;
+            a.batch = PB; a.active = dm[0]; a.in = di; a.positions = dpo; a.out = op;
+            if (sync(f_hnr)) return 1;
+            for (unsigned s = 0; s < PB; s++) {
+                if (!m0[s]) continue;
+                a.batch = 1;
+                a.active = dm[0] + (unsigned long long)s * sizeof(int);
+                a.in = di + (unsigned long long)s * rin * 2;
+                a.positions = dpo + (unsigned long long)s * sizeof(int);
+                a.out = oi + (unsigned long long)s * rout * 2;
+                if (sync(f_hnr)) return 1;
+            }
+            std::vector<std::pair<size_t, size_t>> pad{
+                {0, rout * 2}, {(size_t)3 * rout * 2, rout * 2}, {(size_t)PAD * rout * 2, rout * 2}};
+            const std::vector<unsigned char> poison((size_t)PB * rout * 2, 0xa5);
+            ident(ring ? "headnorm_rope ring" : "headnorm_rope flat", dl(op, poison.size()),
+                  dl(oi, poison.size()), poison, pad);
+        }
+        a.rotary = 0; a.context = 0;
+    }
+
+    printf("%s (worst %.3f%s)\n", (worst < 1.0 && !ident_fail) ? "PASS" : "FAIL", worst,
+           ident_fail ? ", packed-row identity FAILED" : "");
+    return worst >= 1.0 || ident_fail;
 }
 #endif
