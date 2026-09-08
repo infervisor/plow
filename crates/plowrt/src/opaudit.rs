@@ -554,6 +554,15 @@ pub fn classify(op: DevOp) -> OpClass {
             d("documented dense single-sequence; the chunked scan is deliberately absent")
         }
 
+        // ---- the token batch's own row selector ---------------------------
+        // `t2=rows` is the explicit per-output-row source table, so each output row's
+        // identity is READ, never derived from a base. That is class B by definition, and
+        // it is the shape the descriptor exists to fill: `sample_input_rows` IS this table.
+        // Note this arm was added because the exhaustive match refused to compile once the
+        // opcode landed — which is the mechanism that keeps "unclassified is refused" from
+        // decaying into "unclassified is absent".
+        DevOp::RowGather => b("t2=rows[S], the explicit source row per output row"),
+
         // ---- unclassifiable ---------------------------------------------
         DevOp::Mamba2Scan => unclassified(
             "op 90 has no doc comment in packet::dev and no entry in packet::slots \

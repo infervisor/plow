@@ -295,7 +295,11 @@ fn an_unknown_wire_opcode_is_reported_and_refused() {
 fn the_table_and_the_text_renderers_cover_every_opcode() {
     let rows = table();
     let text = table_text(&rows);
-    assert!(text.starts_with("154 opcodes\n"), "{}", &text[..40]);
+    // Derived from the ISA, not typed: the count moves whenever an opcode lands, and a
+    // hard-coded literal here turns "the audit covers the ISA" into "the audit covered the
+    // ISA on the day this was written". RowGather (154) is what caught it.
+    let want = format!("{} opcodes\n", DevOp::ALL.len());
+    assert!(text.starts_with(&want), "{}", &text[..40]);
     for &op in DevOp::ALL {
         assert!(
             text.contains(op_name(op)),
