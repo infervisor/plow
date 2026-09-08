@@ -1,5 +1,6 @@
 /* Pointwise ops: op_elementwise.h ported 1:1 (f32 math, bf16 round on store). */
 #include "golden.h"
+#include <stdlib.h> /* abort() — a mis-planned row index is not a recoverable condition */
 
 /* t0=out t1=a t2=b t3=pre?  i0=n  f0=scale.  out = (a + b) * scale, or with pre:
  * out = (pre + bf16(a + b)) * scale — the inner sum is rounded like the packet it replaced. */
@@ -56,6 +57,30 @@ G_K(g_embed) {
         const plow_bf16* src = table + (size_t)ids[t] * hidden;
         plow_bf16* dst = out + (size_t)t * hidden;
         for (uint32_t i = 0; i < hidden; i++) dst[i] = plow_f2bf(plow_bf2f(src[i]) * scale);
+    }
+}
+
+/* t0=out(bf16[S][H]) t1=x(bf16[M][H]) t2=rows(u32[S])  i0=S i1=H i2=M.
+ * out[s][h] = x[rows[s]][h] — the terminal segment's compact hidden-row selection.
+ *
+ * NOT g_embed: that gathers EMBEDDING-TABLE rows by token id. This gathers hidden rows by
+ * packed row index, and the bound is the batch's live M rather than the vocabulary.
+ *
+ * An out-of-range index ABORTS rather than clamping. A clamped index is not a degraded
+ * answer, it is another request's hidden row, and the resulting token reads as fluent output.
+ * The CPU tier is the oracle every other backend is compared against, so it must not be the
+ * one tier that silently tolerates a mis-planned batch. */
+G_K(g_row_gather) {
+    (void)ctx;
+    plow_bf16* out = PLOW_CPU_TEN(in, T, 0);
+    const plow_bf16* x = PLOW_CPU_TEN(in, T, 1);
+    const uint32_t* rows = PLOW_CPU_TEN(in, T, 2);
+    const uint32_t S = in->i[0], H = in->i[1], M = in->i[2];
+    if (!out || !x || !rows) abort();
+    for (uint32_t s = slice; s < S; s += nblk) {
+        const uint32_t src = rows[s];
+        if (src >= M) abort();
+        memcpy(out + (size_t)s * H, x + (size_t)src * H, (size_t)H * sizeof(plow_bf16));
     }
 }
 

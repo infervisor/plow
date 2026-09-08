@@ -13,7 +13,7 @@
 
 use std::ffi::c_void;
 
-pub use packet::dev::DevInst64;
+pub use packet::dev::{DevInst64, TokenBatch};
 
 use crate::{Result, RuntimeError};
 
@@ -100,6 +100,103 @@ extern "C" {
     ) -> i32;
     fn plow_cpu_prepack_bf16_b_bytes(n: u32, k: u32) -> usize;
     fn plow_cpu_prepack_bf16_b(dst: *mut c_void, src: *const c_void, n: u32, k: u32) -> i32;
+    fn plow_token_batch_validate_host(tb: *const TokenBatch) -> i32;
+    fn plow_token_row_host(tb: *const TokenBatch, row: u32, out: *mut TokenRowFlat) -> i32;
+    fn plow_token_sample_row_host(tb: *const TokenBatch, s: u32, out: *mut u32) -> i32;
+    fn plow_token_batch_descriptor_version() -> u32;
+}
+
+/// Mirror of `PlowTokenRowFlat` (`runtime/cpu/dev/cpu_dev.h`): one resolved packed row, with
+/// the span reported as an INDEX because the device struct's span POINTER does not survive the
+/// FFI boundary. `span == SPAN_NONE` is a padding row, which is also the only case where
+/// `active == 0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct TokenRowFlat {
+    pub span: u32,
+    pub local_row: u32,
+    pub slot: u32,
+    pub state_slot: u32,
+    pub position: u32,
+    pub active: u32,
+}
+
+impl TokenRowFlat {
+    /// `PLOW_TB_SPAN_NONE`: this row is padding and belongs to no span.
+    pub const SPAN_NONE: u32 = u32::MAX;
+}
+
+/// `PLOW_TB_*` refusal codes from `runtime/common/token_batch.h`. Each names ONE invariant,
+/// because a refusal that does not say what it refused is indistinguishable from a crash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenBatchRefusal(pub i32);
+
+impl std::fmt::Display for TokenBatchRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            -1 => "descriptor or a required array is null",
+            -2 => "descriptor version this build does not implement",
+            -3 => "reserved flags set",
+            -4 => "real_rows exceeds row_capacity, or capacity is zero",
+            -5 => "span count disagrees with the live row count",
+            -6 => "spans do not cover [0, M) exactly (gap, overlap or zero length)",
+            -7 => "positions[] disagrees with the span's arithmetic",
+            -8 => "park mask disagrees with the span cover",
+            -9 => "kv_len != kv_row0 + n_rows",
+            -10 => "a sample index is not a live row",
+            -11 => "row index outside row_capacity",
+            _ => "unknown token-batch refusal",
+        })
+    }
+}
+
+/// Validate a token-batch descriptor through the SHARED resolver source, before any launch.
+///
+/// # Safety
+/// `tb`'s pointer fields must be valid HOST pointers for the extents its counts declare. This
+/// is the host twin: on a device the same header traps instead of returning.
+pub unsafe fn token_batch_validate(tb: &TokenBatch) -> std::result::Result<(), TokenBatchRefusal> {
+    match plow_token_batch_validate_host(tb) {
+        0 => Ok(()),
+        rc => Err(TokenBatchRefusal(rc)),
+    }
+}
+
+/// Resolve one packed row through the shared resolver.
+///
+/// # Safety
+/// As [`token_batch_validate`].
+pub unsafe fn token_row(
+    tb: &TokenBatch,
+    row: u32,
+) -> std::result::Result<TokenRowFlat, TokenBatchRefusal> {
+    let mut out = TokenRowFlat::default();
+    match plow_token_row_host(tb, row, &mut out) {
+        0 => Ok(out),
+        rc => Err(TokenBatchRefusal(rc)),
+    }
+}
+
+/// The `s`-th selected hidden row, as an index into the body's rows.
+///
+/// # Safety
+/// As [`token_batch_validate`].
+pub unsafe fn token_sample_row(
+    tb: &TokenBatch,
+    s: u32,
+) -> std::result::Result<u32, TokenBatchRefusal> {
+    let mut out = 0u32;
+    match plow_token_sample_row_host(tb, s, &mut out) {
+        0 => Ok(out),
+        rc => Err(TokenBatchRefusal(rc)),
+    }
+}
+
+/// `PLOW_TOKEN_BATCH_VERSION` this library was compiled against. Compared against
+/// [`packet::dev::TOKEN_BATCH_VERSION`] so a half-rebuilt tree fails loudly.
+pub fn token_batch_descriptor_version() -> u32 {
+    // SAFETY: plain FFI, no pointers.
+    unsafe { plow_token_batch_descriptor_version() }
 }
 
 /// Process-wide init (cpuid, AMX permission, dispatch table). Idempotent.
@@ -292,6 +389,10 @@ pub mod abi {
         pub fn plow_cpu_abi_isa_avx512() -> i32;
         pub fn plow_cpu_abi_isa_amx() -> i32;
         pub fn plow_cpu_abi_dop_table() -> i32;
+        pub fn plow_cpu_abi_sizeof_token_row() -> usize;
+        pub fn plow_cpu_abi_sizeof_token_batch() -> usize;
+        pub fn plow_cpu_abi_offsetof_token_row_active() -> usize;
+        pub fn plow_cpu_abi_tb_span_none() -> i32;
     }
 }
 

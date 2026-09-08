@@ -3626,6 +3626,7 @@ impl GpuEngine {
             prefill_parked: 0,
             n_prefill_spans: 0,
             n_prefill_rows: 0,
+            token_batch: 0,
         };
 
         let decode_rungs = if select_decode_rungs && !cublaslt_enabled {
@@ -6256,6 +6257,7 @@ impl GpuEngine {
                 prefill_parked: 0,
                 n_prefill_spans: 0,
                 n_prefill_rows: 0,
+                token_batch: 0,
             };
 
             // Precompute the per-chunk patch sites (harness inner loop): KV-write

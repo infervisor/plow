@@ -11924,6 +11924,9 @@ impl AmdEngine {
             prefill_parked,
             n_prefill_spans,
             n_prefill_rows,
+            // Unified token batch: this engine does not build one yet, and NULL is the
+            // documented "every existing path, bit for bit" value.
+            token_batch: 0,
         }
     }
 

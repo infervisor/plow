@@ -16,6 +16,7 @@ G_K(g_residual);
 G_K(g_glu);
 G_K(g_softcap);
 G_K(g_cast_f32_bf16);
+G_K(g_row_gather);
 G_K(g_embed);
 G_K(g_argmax);
 G_K(g_argmax_fin);

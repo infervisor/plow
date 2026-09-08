@@ -518,6 +518,7 @@ fn upload_program(
         prefill_parked: parked_base,
         n_prefill_spans: 0,
         n_prefill_rows: program.rows,
+        token_batch: 0,
     };
     Ok((
         kernarg,

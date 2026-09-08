@@ -36,6 +36,7 @@ pub mod moe;
 pub mod moe_ep;
 pub mod names;
 pub mod rope;
+pub mod rowclass;
 pub mod slots;
 
 use core::mem::size_of;

@@ -1317,6 +1317,21 @@ enum {
     PLOW_DOP_MOE_GLU_MX_PF = 152,
     PLOW_DOP_MOE_DOWN_MX_PF = 153,
 
+    /* Compact hidden-row gather — the first stage of the unified token batch's terminal
+     * segment (docs/arch/17-unified-token-batch.md §6.2).
+     *   t0=out(bf16 [S][H]) t1=x(bf16 [M][H]) t2=rows(u32 [S])
+     *   i0=S (sample rows) i1=H (features) i2=M (live source rows)
+     *   out[s][h] = x[rows[s]][h]
+     *
+     * NOT PLOW_DOP_EMBED. Embed gathers rows of the EMBEDDING TABLE by token id; this gathers
+     * rows of a hidden activation by packed row index, and the two have different operand
+     * element types and different bounds. There is no existing generic hidden-row gather.
+     *
+     * `rows[s] >= M` is a mis-planned batch, not a runtime condition: every backend traps
+     * rather than reading out of bounds, because a silently clamped index selects another
+     * request's hidden row and the wrong next token is indistinguishable from a good one. */
+    PLOW_DOP_ROW_GATHER = 154,
+
     PLOW_DOP__COUNT
 };
 
@@ -1496,6 +1511,47 @@ typedef struct {
     uint32_t program;    /* compiled prefill program/rung */
 } PlowPrefillSpan;
 
+/* ===== UNIFIED TOKEN BATCH (docs/arch/17-unified-token-batch.md) =============================
+ *
+ * One packed activation matrix per step holding every scheduled input token — decode rows and
+ * prefill rows, from any number of requests — plus the compact list of hidden rows whose
+ * next-token distributions the step owes.
+ *
+ * Three counts, everywhere, backend- and model-independent. A backend may CAP them; nothing may
+ * redefine them:
+ *   row_capacity  compiled/padded allocation capacity (the launched T)
+ *   real_rows     M — scheduled input tokens this step
+ *   sample_rows   S — hidden rows whose next-token distributions are needed. MAY BE ZERO, and
+ *                 zero means "no output segment" — NOT the legacy `n_batch == 0 means one row`.
+ *
+ * SPANS. `PlowPrefillSpan` is reused verbatim, including `state_slot` (the D-class recurrent
+ * families need it) and `program`. What changes is coverage: the spans cover exactly [0, M)
+ * with NO decode prefix — every row belongs to a span, decode spans included. Padding rows
+ * [M, row_capacity) belong to no span and carry active == 0.
+ *
+ * ACTIVE. `active[row] != 0` means the row is live, following the ISA's existing per-row
+ * `active[B]` convention (ops 136-145). This is the OPPOSITE polarity to the packed-prefill
+ * `prefill_parked` mask above, which is 1 for parked. They are different fields of different
+ * descriptors and are never both consulted for one row; the polarity is stated here because
+ * getting it backwards writes KV for padding rows and does not trap. */
+#define PLOW_TOKEN_BATCH_VERSION 1u
+
+typedef struct {
+    uint32_t version;      /* PLOW_TOKEN_BATCH_VERSION; a consumer refuses anything else */
+    uint32_t row_capacity; /* compiled/padded allocation capacity (launched T) */
+    uint32_t real_rows;    /* M: live rows, dense in [0, M) */
+    uint32_t sample_rows;  /* S: selected hidden rows; 0 = no output segment */
+    uint32_t n_spans;      /* R: spans covering exactly [0, M) */
+    uint32_t flags;        /* reserved; must be 0 in version 1 */
+    uint32_t _pad0;        /* explicit: this struct is memcpy'd to the device */
+    uint32_t _pad1;
+    const PlowPrefillSpan* spans;      /* [n_spans], monotone row0, dense cover of [0, M) */
+    const uint32_t*        input_ids;  /* [row_capacity] token ids; padding reads 0 */
+    const uint32_t*        positions;  /* [row_capacity] absolute position within the request */
+    const uint32_t*        active;     /* [row_capacity] 1 = live row, 0 = padding */
+    const uint32_t*        sample_rows_idx; /* [sample_rows] indices into the body's hidden rows */
+} PlowTokenBatch;
+
 /* Everything the interpreter needs; passed once as the kernel's args. */
 typedef struct {
     const PlowDevInst*   insts;
@@ -1602,6 +1658,15 @@ typedef struct {
     const uint32_t*        prefill_parked;
     uint32_t               n_prefill_spans;
     uint32_t               n_prefill_rows;
+    /* Unified token batch (PlowTokenBatch above). NULL retains every existing path bit for bit;
+     * ordinary execution supplies NULL and is a required test case on every backend.
+     *
+     * Appended after `n_prefill_rows`, which already ends on an 8-byte boundary, so every
+     * existing field keeps its offset and the ABI-lock test sees only the size grow,
+     * 168 -> 176. That growth is the point: `AmdEngine::load` derives its kernarg-segment
+     * check from `size_of::<DevProgram>()`, so an object built before this field is REFUSED
+     * BY NAME rather than loading and reading its grid dimensions off by eight bytes. */
+    const PlowTokenBatch*  token_batch;
 } PlowProgram;
 
 /* Tagged one-shot XReduce region (PLOW_XR_TAGGED decode objects, op_collective.h): four slots
@@ -1756,6 +1821,8 @@ PLOW_SASSERT(sizeof(PlowTraceRec) == 40, "PlowTraceRec size");
  * grid dimension as a device pointer and every static-scheduler prefill died with
  * "Memory access fault ... Reason: Unknown". The C harnesses pass `sizeof(pr)` and
  * were never affected. Bumping this assert is not enough; grep the hosts. */
-PLOW_SASSERT(sizeof(PlowProgram) == 168, "PlowProgram packed-prefill ABI size");
+PLOW_SASSERT(sizeof(PlowProgram) == 176, "PlowProgram token-batch ABI size");
+PLOW_SASSERT(sizeof(PlowTokenBatch) == 72, "PlowTokenBatch size");
+PLOW_SASSERT(__builtin_offsetof(PlowTokenBatch, spans) == 32, "PlowTokenBatch has no padding gap");
 
 #endif /* PLOW_DEV_ISA_H */
