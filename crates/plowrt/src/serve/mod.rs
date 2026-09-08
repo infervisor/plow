@@ -14,6 +14,7 @@ pub mod engine;
 pub mod manager;
 pub mod models;
 pub mod mux;
+pub mod placement;
 pub mod openai;
 pub mod stream;
 pub mod template;
