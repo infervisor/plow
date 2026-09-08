@@ -2157,10 +2157,29 @@ The concurrency-1 rows are the more interesting signal: fusion should be inert
 there, because the mixed step needs at least one decode and one prefill row to
 have anything to fuse. They lose 2.9-5.5% of throughput and 0.7-2.4 ms of TPOT
 consistently across four prompt lengths, which says **loading the mixed step
-costs something even on the ticks that never use it** — the object is a
-different `interp_mixed_gq.elf` build with its own tile and wave choices
-(`GM_BM=64 GM_BN=128`, 4 waves), so a fused-capable server is running a
-different decode body all the time.
+costs something even on the ticks that never use it**.
+
+> **Correction (2026-09-08).** The mechanism named here — "the object is a
+> different `interp_mixed_gq.elf` build with its own tile and wave choices
+> (`GM_BM=64 GM_BN=128`, 4 waves), so a fused-capable server is running a
+> different decode body all the time" — is not supported by the code. The
+> measurement stands; the attribution does not. `RuntimeConfig::fusion` has
+> exactly one consumer (`exec/amd.rs:11215`); `object_name` (`exec/amd.rs:3187`)
+> does not take fusion as an input; `GM_BM`/`GM_BN`/`PLOW_WG_WAVES` are `-D`
+> defines of the asset build that no Rust code reads; and the mixed object is a
+> separate HSA module with its own kernel symbol, launched from exactly one site
+> (`amd_mixed_step.rs:433`) that requires both a decode and a prefill row and so
+> cannot run at concurrency 1. What arming fusion *does* change on every request
+> is the prefill schedule: `serve/engine.rs:1318` calls `split_terminal_prefill`
+> whenever the mixed step is armed, peeling each prompt's last row into
+> `finish_prefill_batch`, which replays that token through an ordinary
+> decode-shaped pass — one extra full model launch per request, on the TTFT
+> critical path, fired or not. That accounts for order 1% at these prompt
+> lengths, not obviously all of 2.9-5.5%; the standing allocations and the second
+> resident executable are the other candidates. The experiment that would settle
+> the remainder is to arm fusion with the `split_terminal_prefill` call disabled
+> and re-run the concurrency-1 cell. See
+> [operator row-identity classes §7.2](../arch/17-operator-row-identity-classes.md#72-is-v1s-concurrency-1-cost-explained-by-the-object-swap).
 
 **Therefore fusion should not be defaulted on as it stands.** The shape of the
 result — a real win in one corner, a real loss in the rest, and a fixed cost on
