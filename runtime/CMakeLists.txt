@@ -651,6 +651,11 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(GET _f 2 _a1)
             list(GET _f 3 _a2)
             set(_defs ${_cubin_base} ${${_vdefs_var}} ${${_a1}})
+            if(_varch STREQUAL "sm_90a" AND PLOW_CUBIN_GEMMA AND PLOW_NV_W8A8
+               AND _a1 STREQUAL "_ax_seg_gemm")
+                # The 128-register cap spills the fused FP8 GEMM accumulators on Hopper.
+                list(APPEND _defs -DPLOW_NV_SEG_OCC1=1)
+            endif()
             if(_a2)
                 list(APPEND _defs ${${_a2}})
             endif()

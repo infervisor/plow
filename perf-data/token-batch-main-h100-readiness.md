@@ -142,6 +142,66 @@ Default multi-step decoding delivers text in bursts of four chunks; chunk-gap ta
 cached TTFT remain performance targets. No full-matrix win or production-ready default
 prefix selection is established.
 
+Prefill profiling attributes most warm TTFT to the GEMM-class segments: 282.5 ms at
+1K and 1680.6 ms at 16K. The ordinary Hopper W8A8 segmented GEMM object capped registers
+at 128, with a 1784-byte stack frame. Building it with `PLOW_NV_SEG_OCC1=1` permits 255
+registers and reduces the stack to 488 bytes (928 spill-store / 1068 spill-load bytes
+reported by ptxas). It runs 132 resident blocks instead of 264. Spills remain.
+
+CMake now selects this register budget for ordinary Hopper Gemma W8A8 segmented prefill.
+Other architecture/precision and packed-prefill build axes retain their existing defaults.
+`PLOW_EXTRA_DEFINES=-DPLOW_NV_SEG_OCC1=0` restores the prior budget. Existing assets must
+be rebuilt to use the change.
+
+The focused object passes 50 bit-exact full-logit snapshots against the old widest-only
+baseline, including the smallest prefill bucket, sparse slots and reuse. All 12 natural
+cold/warm requests and all 15 measured preflight completions also remain exact.
+
+| FP8 input tokens | Prior C1 TTFT | New C1 TTFT | Prior C4 TTFT | New C4 TTFT |
+|---|---:|---:|---:|---:|
+| 1024 | 353 ms | 150 ms | 859 ms | 310 ms |
+| 4096 | 986 ms | 305 ms | 2443 ms | 721 ms |
+| 16384 | 2079 ms | 719 ms | 5153 ms | 1767 ms |
+
+These single-wave screens follow identical natural quality requests. The new screen also
+uses `--multistep 1`; C1 TPOT remains about 21.0–22.4 ms, with regular chunk delivery.
+Separate event-instrumented single-step controls isolate the prefill effect: sending all
+segments to the existing high-register object changes C1 TTFT 344/984/2075 ms to
+141/301/721 ms, preserving all three measured completions. This diagnostic is not a new
+serving default. The focused object also passes API ragged parity, limits, slot reuse,
+cancellation, context rejection and recovery.
+
+Artifacts: `plow-fp8-prefill-{profile,fat-profile}*`, `build-fp8-occ1.{json,log}`,
+`fp8-occ1-gpu-logits.log`, `plow-fp8-occ1-*`, and `occ1-default-build.log`.
+
+Fresh vLLM 0.28.0 FP8 screening completed 90 waves / 1875 measured requests on the idle
+H100, without overlapping builds. It uses the same per-channel FP8 weight bytes, BF16 KV,
+95% primed shared input, 32 output tokens, one warmup and three measured waves per cell.
+vLLM uses FP8 decode activations; Plow uses BF16 decode activations. vLLM permits 64 active
+sequences and 2048 batched prefill tokens. Results below are medians across the three waves.
+
+| Input tokens | vLLM C1 TTFT | vLLM C1 TPOT | vLLM C64 TTFT | vLLM C64 output tokens/s |
+|---|---:|---:|---:|---:|
+| 1024 | 24.0 ms | 15.16 ms | 323 ms | 1568 |
+| 2048 | 26.9 ms | 15.17 ms | 434 ms | 1216 |
+| 4096 | 40.8 ms | 15.18 ms | 827 ms | 873 |
+| 8192 | 67.7 ms | 15.25 ms | 1485 ms | 544 |
+| 16384 | 134.6 ms | 15.35 ms | 3119 ms | 267 |
+
+One request at 16K/C64 reported zero cached tokens; its latency remains included.
+This full-grid screen and Plow's smaller regression screens have different suffix indices
+and cache histories. They locate the performance gap; final comparisons require matched
+full-grid Plow runs. Raw results, all 30 summary cells and provenance are in
+`vllm-fp8-cached-screen.jsonl`, `vllm-fp8-cached-screen-summary.json` and
+`vllm-fp8-screen-provenance.json`.
+
+None of the six matching natural prompts produces identical 64-token text between vLLM
+FP8 and Plow FP8. Median first divergence after re-tokenization is 13.5/15/8 at 1K/4K/16K.
+Cache reuse and narrow dispatch preserve Plow's own output exactly. Different activation
+precision is a known difference, not a proven explanation for every divergence. This
+small prose corpus does not establish equivalent model quality. Comparison artifact:
+`plow-vllm-fp8-quality-comparison.json`.
+
 Raw artifacts: `/opt/dlami/nvme/tmp/gemma31-glm53-h100-20260908/`.
 Host test log: `/tmp/plow-token-batch-readiness-tests-final.log`.
 Final lifecycle test log: `/tmp/plow-prefix-retire-tests.log`.
