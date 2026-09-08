@@ -115,6 +115,43 @@ pub trait SeqEngine {
             "mixed step unavailable".into(),
         ))
     }
+
+    // ---- unified token batch (`plans/unified-token-batch.md` §7) ----------------------------
+    //
+    // Deliberately NOT hung off the mixed-step surface. The two routes select different
+    // buckets (the token batch needs `nsplit == 1`), admit different work (it does not need a
+    // decode row, and it may complete a prompt in the same step) and commit differently, so a
+    // mux arm that reused `mixed_step_rows` would silently admit a plan the other route cannot
+    // execute. Every default declines, so no other backend changes.
+
+    /// Row capacity of the bucket that would carry `leading_rows` sampled rows — decode
+    /// requests plus prompts completing this step — and `prefill_rows` body rows. `None` when
+    /// this engine has no token-batch route or no bucket fits.
+    fn token_batch_rows(&self, _leading_rows: usize, _prefill_rows: usize) -> Option<u32> {
+        None
+    }
+    /// Rows of `slot`'s prompt this route may take next. Unlike `mixed_prefill_rows` this does
+    /// NOT hold the prompt's last token back: consuming it is the point.
+    fn token_batch_prefill_rows(&self, _slot: usize, _prompt: &[u32], _max_rows: u32) -> u32 {
+        0
+    }
+    fn token_batch_prefill_fits(&self, _slot: usize, _prefill_capacity: u32) -> bool {
+        false
+    }
+    /// Run one token batch. `output` receives one id per leading row: the `feeds` in order,
+    /// then the members whose prompt completes in this step, in order. Returns how many of
+    /// those trailing ids belong to completed prompts.
+    fn token_batch_step(
+        &mut self,
+        _rows: u32,
+        _feeds: &[(usize, u32)],
+        _members: &[(usize, &[u32], u32)],
+        _output: &mut Vec<u32>,
+    ) -> crate::Result<Vec<usize>> {
+        Err(crate::RuntimeError::Rejected(
+            "token batch unavailable".into(),
+        ))
+    }
     fn step_batch(&mut self, feeds: &[(usize, u32)]) -> crate::Result<Vec<(usize, u32)>>;
 }
 
@@ -617,6 +654,24 @@ mod amd_serve {
         }
         step.clen
             .min(prompt_rows.saturating_sub(1).saturating_sub(cur.frontier))
+            .min(max_rows)
+    }
+
+    /// Rows the unified token batch may take from `cur`.
+    ///
+    /// The only difference from [`mixed_cursor_rows`] is the missing `- 1`: mixed step v1 holds
+    /// the prompt's final token back so `finish_prefill_batch` can replay it through a
+    /// decode-shaped pass. This route consumes it in the same step and samples its hidden row
+    /// there, which is what removes that pass (`plans/unified-token-batch.md` §1, §6.5).
+    fn token_batch_cursor_rows(cur: &PfCursor, prompt_rows: u32, max_rows: u32) -> u32 {
+        let Some(step) = cur.steps.get(cur.next) else {
+            return 0;
+        };
+        if cur.snap_after == Some(cur.next) || step.c0 != cur.frontier {
+            return 0;
+        }
+        step.clen
+            .min(prompt_rows.saturating_sub(cur.frontier))
             .min(max_rows)
     }
 
@@ -1548,6 +1603,161 @@ mod amd_serve {
                 commit_mixed_prefill(self.pf[slot].as_mut().expect("staged mixed cursor"), take);
             }
             Ok(())
+        }
+
+        pub fn token_batch_rows(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
+            if !self.chunk_prefill || self.decode_only || self.prefix_cache {
+                return None;
+            }
+            match &self.ranks {
+                Ranks::One(e) => e.token_batch_rows(leading_rows, prefill_rows),
+                Ranks::Tp(_) => None,
+            }
+        }
+
+        pub fn token_batch_prefill_rows(&self, slot: usize, prompt: &[u32], max_rows: u32) -> u32 {
+            if slot >= self.batch || self.live[slot] || prompt.len() > self.max_ctx {
+                return 0;
+            }
+            let cap = max_rows.min(self.prefill_chunk_rows);
+            match &self.pf[slot] {
+                Some(cur) => token_batch_cursor_rows(cur, prompt.len() as u32, cap),
+                None => (prompt.len() as u32).min(cap),
+            }
+        }
+
+        pub fn token_batch_prefill_fits(&self, slot: usize, prefill_capacity: u32) -> bool {
+            self.mixed_prefill_fits(slot, prefill_capacity)
+        }
+
+        /// One unified token-batch step.
+        ///
+        /// Returns the slots whose prompt completed here, in the order their sampled ids
+        /// follow the decode feeds in `output`. Delivery is by logical request, never by row
+        /// number: packed rows, physical slots and compact output rows are three different
+        /// numberings.
+        pub fn token_batch_step(
+            &mut self,
+            rows: u32,
+            feeds: &[(usize, u32)],
+            members: &[(usize, &[u32], u32)],
+            output: &mut Vec<u32>,
+        ) -> Result<Vec<usize>> {
+            use plow_asset::mixed_step::{DecodeRequest, PrefillRequest};
+            if !self.chunk_prefill
+                || self.decode_only
+                || self.prefix_cache
+                || !matches!(self.ranks, Ranks::One(_))
+                || members.is_empty()
+            {
+                return Err(RuntimeError::Rejected("invalid AMD token batch".into()));
+            }
+            for (index, &(slot, _)) in feeds.iter().enumerate() {
+                self.check_slot(slot)?;
+                if !self.live[slot]
+                    || self.pf[slot].is_some()
+                    || self.pos[slot] as usize >= self.max_ctx
+                    || feeds[..index].iter().any(|&(prior, _)| prior == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "invalid token-batch decode slot {slot}"
+                    )));
+                }
+            }
+            for (index, &(slot, prompt, take)) in members.iter().enumerate() {
+                self.check_slot(slot)?;
+                if take == 0
+                    || !self.token_batch_prefill_fits(slot, rows.saturating_sub(feeds.len() as u32))
+                    || take > self.token_batch_prefill_rows(slot, prompt, u32::MAX)
+                    || feeds.iter().any(|&(prior, _)| prior == slot)
+                    || members[..index].iter().any(|&(prior, _, _)| prior == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "invalid token-batch prefill slot {slot}"
+                    )));
+                }
+            }
+            // Cursor setup may choose a shorter first chunk than admission estimated.
+            let mut completed = Vec::with_capacity(members.len());
+            for &(slot, prompt, take) in members {
+                self.prepare_prefill_cursor(slot, prompt, self.prefill_chunk_rows)?;
+                let take = self.token_batch_prefill_rows(slot, prompt, take);
+                if take == 0 {
+                    return Err(RuntimeError::Rejected(format!(
+                        "token-batch prefill slot {slot} reached a boundary"
+                    )));
+                }
+                completed.push((slot, take));
+            }
+            for slot in 0..self.batch {
+                self.pos_stage[slot] = self.pf[slot]
+                    .as_ref()
+                    .map_or(self.pos[slot], |cursor| cursor.frontier);
+            }
+            let decode: Vec<_> = feeds
+                .iter()
+                .map(|&(slot, token)| DecodeRequest {
+                    slot: slot as u32,
+                    state_slot: slot as u32,
+                    token,
+                })
+                .collect();
+            let prefill: Vec<_> = members
+                .iter()
+                .zip(&completed)
+                .map(|(&(slot, prompt, _), &(_, take))| {
+                    let start = self.pos_stage[slot];
+                    PrefillRequest {
+                        slot: slot as u32,
+                        state_slot: slot as u32,
+                        start,
+                        tokens: &prompt[start as usize..(start + take) as usize],
+                        prompt_len: prompt.len() as u32,
+                    }
+                })
+                .collect();
+            // Which members finish their prompt here, in span order. That is exactly the set
+            // whose hidden rows the step samples, and it is decided from the plan the device
+            // will see, not from a phase tag.
+            let finishing: Vec<usize> = prefill
+                .iter()
+                .filter(|r| r.start + r.tokens.len() as u32 == r.prompt_len)
+                .map(|r| r.slot as usize)
+                .collect();
+            let leading = feeds.len() + finishing.len();
+            let live: u32 = completed.iter().map(|&(_, take)| take).sum::<u32>()
+                + feeds.len() as u32;
+            if leading == 0 || live > rows {
+                return Err(RuntimeError::Rejected(format!(
+                    "token batch admits {live} rows and {leading} sampled rows against a \
+                     {rows}-row bucket"
+                )));
+            }
+            output.clear();
+            output.resize(leading, 0);
+            let Ranks::One(e) = &mut self.ranks else {
+                unreachable!()
+            };
+            e.token_batch_step(rows, &decode, &prefill, &mut self.pos_stage, output)?;
+            for &(slot, _) in feeds {
+                self.pos[slot] = self.pos_stage[slot];
+            }
+            for (slot, take) in completed {
+                if finishing.contains(&slot) {
+                    // The prompt is consumed and its first generated token is in `output`.
+                    // Retire the cursor and make the slot live, exactly as the terminal-prefill
+                    // path did — except that no second transformer pass produced the token.
+                    self.pf[slot] = None;
+                    self.pos[slot] = self.pos_stage[slot];
+                    self.live[slot] = true;
+                } else {
+                    commit_mixed_prefill(
+                        self.pf[slot].as_mut().expect("staged token-batch cursor"),
+                        take,
+                    );
+                }
+            }
+            Ok(finishing)
         }
 
         /// Rows completed by a request whose chunked prefill is still active.
@@ -2648,6 +2858,24 @@ impl SeqEngine for AmdServe {
         output: &mut [u32],
     ) -> crate::Result<()> {
         AmdServe::mixed_step(self, rows, feeds, members, output)
+    }
+    fn token_batch_rows(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
+        AmdServe::token_batch_rows(self, leading_rows, prefill_rows)
+    }
+    fn token_batch_prefill_rows(&self, slot: usize, prompt: &[u32], max_rows: u32) -> u32 {
+        AmdServe::token_batch_prefill_rows(self, slot, prompt, max_rows)
+    }
+    fn token_batch_prefill_fits(&self, slot: usize, prefill_capacity: u32) -> bool {
+        AmdServe::token_batch_prefill_fits(self, slot, prefill_capacity)
+    }
+    fn token_batch_step(
+        &mut self,
+        rows: u32,
+        feeds: &[(usize, u32)],
+        members: &[(usize, &[u32], u32)],
+        output: &mut Vec<u32>,
+    ) -> crate::Result<Vec<usize>> {
+        AmdServe::token_batch_step(self, rows, feeds, members, output)
     }
     fn step_batch(&mut self, feeds: &[(usize, u32)]) -> crate::Result<Vec<(usize, u32)>> {
         AmdServe::step_batch(self, feeds)

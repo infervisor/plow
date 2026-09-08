@@ -7621,6 +7621,11 @@ mod amd_token_batch;
 /// The AMD serving engine.
 pub struct AmdEngine {
     mixed_step: Option<amd_mixed_step::MixedAmdStep>,
+    /// The unified token-batch route. A SECOND instance of the same type on a different code
+    /// object: `interp_tokbatch_gq.elf`, spans covering `[0, M)`, no decode prefix. Never
+    /// loaded beside `mixed_step` — they are alternatives for one (backend, family) pair, and
+    /// a build that armed both would double the resident executables to measure neither.
+    token_batch_step: Option<amd_mixed_step::MixedAmdStep>,
     be: Arc<HsaBackend>,
     arch: String,
     n_cu: u32,
@@ -11355,25 +11360,16 @@ impl AmdEngine {
         // The refusal is by CAPABILITY NAME, never a fallback: AMD's dispatch `default:` writes
         // nothing and does not trap, so serving a token-batch packet against an object without
         // the arms is a silent wrong answer, not a slow path.
-        {
-            let cap =
-                amd_token_batch::probe_token_batch(hsaco_dir, &arch, |p| std::fs::read(p), elf_symbol_u32);
-            // The plan side cannot fire yet and says exactly why rather than going quiet: the
-            // shared planner still emits a decode BAND ahead of the span table, so the
-            // descriptor does not cover [0, M). `admit_token_batch` is what a caller consults
-            // once that lands; here it is asked about the shape the planner actually produces,
-            // so the line tells the truth about this build rather than about the plan.
-            let fires = amd_token_batch::admit_token_batch(
-                u32::try_from(batch.saturating_sub(1)).unwrap_or(u32::MAX),
-                1,
-                true,
-            );
-            amd_token_batch::log_route_once(&cap, fires);
-        }
-
         let mixed_step = if crate::config::RuntimeConfig::get().fusion && tp.is_none() && batch > 1
         {
-            match amd_mixed_step::MixedAmdStep::load(&be, &blob, &devp, hsaco_dir, batch) {
+            match amd_mixed_step::MixedAmdStep::load(
+                &be,
+                &blob,
+                &devp,
+                hsaco_dir,
+                batch,
+                amd_mixed_step::StepRoute::Mixed,
+            ) {
                 Ok(mixed) => {
                     tracing::info!("runtime prefill/decode fusion enabled");
                     Some(mixed)
@@ -11386,8 +11382,59 @@ impl AmdEngine {
         } else {
             None
         };
+        // UNIFIED TOKEN BATCH. Loaded on the same terms as fusion and never beside it: the two
+        // are alternatives for the (gfx942, dense-GQA) pair. A refusal here is by capability
+        // name and leaves the ordinary route in place; it never falls back to a token-batch
+        // packet on an object without the arms, because AMD's dispatch `default:` writes
+        // nothing and does not trap.
+        let token_batch_step = if crate::config::RuntimeConfig::get().token_batch
+            && !crate::config::RuntimeConfig::get().fusion
+            && tp.is_none()
+            && batch > 1
+        {
+            match amd_mixed_step::MixedAmdStep::load(
+                &be,
+                &blob,
+                &devp,
+                hsaco_dir,
+                batch,
+                amd_mixed_step::StepRoute::TokenBatch,
+            ) {
+                Ok(step) => Some(step),
+                Err(error) => {
+                    tracing::warn!(%error, "token-batch route unavailable; using ordinary execution");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // ARMED IS NOT FIRES, logged as two fields of one line. An object carrying the arms is
+        // armed; a step that ran with a descriptor covering more than one request has fired.
+        // Three campaigns on this branch measured "no effect" from something that never fired,
+        // which is why the two claims are never collapsed into one `enabled`.
+        {
+            let cap = amd_token_batch::probe_token_batch(
+                hsaco_dir,
+                &arch,
+                |p| std::fs::read(p),
+                elf_symbol_u32,
+            );
+            // The planner now emits spans covering [0, M) with no decode band, so the shape
+            // question is settled; what is left is whether THIS blob has a bucket the route
+            // can execute and whether the route was asked for at all.
+            let fires = if token_batch_step.is_some() {
+                amd_token_batch::admit_token_batch(0, 1, true)
+            } else if !crate::config::RuntimeConfig::get().token_batch {
+                Err(amd_token_batch::TokenBatchRefusal::NotRequested)
+            } else {
+                Err(amd_token_batch::TokenBatchRefusal::NoLegalBucket)
+            };
+            amd_token_batch::log_route_once(&cap, fires);
+        }
         let engine = AmdEngine {
             mixed_step,
+            token_batch_step,
             be,
             arch,
             n_cu: blob.n_cu,

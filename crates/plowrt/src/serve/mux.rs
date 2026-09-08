@@ -2115,6 +2115,185 @@ fn run_one_tick(
                 }
                 return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
             }
+            // ---------------------------------------------------------------------------
+            // UNIFIED TOKEN BATCH (plans/unified-token-batch.md §7).
+            //
+            // Placed ahead of the mixed arm and never active beside it — the engine loads one
+            // route or the other. Two things differ from the mixed arm, and both are the point
+            // of the route:
+            //
+            //  * It does NOT require a decode row. A step of one completing prompt is legal,
+            //    which is what lets a prompt's first generated token come out of the launch
+            //    that consumed the prompt instead of a second, decode-shaped pass.
+            //  * A member may consume its prompt to the end. `token_batch_prefill_rows` does
+            //    not hold the last token back, and the sampled ids for prompts that finish
+            //    here follow the decode feeds in `output`.
+            if !no_interleave && !nv.pf_defer_decode && e.token_batch_rows(1, 1).is_some() {
+                let feeds: Vec<(usize, u32)> = slots
+                    .iter()
+                    .enumerate()
+                    .take(b)
+                    .filter_map(|(i, slot)| {
+                        let slot = slot.as_ref()?;
+                        (slot.step > 0).then(|| (i, *slot.out_ids.last().expect("decode output")))
+                    })
+                    .collect();
+                let candidates: Vec<(usize, Instant, u32)> = slots
+                    .iter()
+                    .enumerate()
+                    .take(b)
+                    .filter_map(|(i, slot)| {
+                        let slot = slot.as_ref()?;
+                        if slot.step != 0 || slot.respond.is_closed() {
+                            return None;
+                        }
+                        let rows = e.token_batch_prefill_rows(i, &slot.prompt_ids, tick_max);
+                        (rows > 0).then_some((i, slot.arrived, rows))
+                    })
+                    .collect();
+                // `leading` bounds the selection stage and is not known until the pack is
+                // formed, so try the widest pack first and shrink. Assuming every member
+                // completes over-counts `leading`, which under-counts the prefill capacity —
+                // the safe direction: a plan that fits the assumed bucket also fits the real
+                // one.
+                let mut chosen: Option<(u32, Vec<(usize, u32)>)> = None;
+                for take in (1..=candidates.len()).rev() {
+                    let leading = feeds.len() + take;
+                    let want: u32 = candidates[..take]
+                        .iter()
+                        .fold(0u32, |sum, c| sum.saturating_add(c.2))
+                        .min(tick_max);
+                    let Some(rows) = e.token_batch_rows(leading, want as usize) else {
+                        continue;
+                    };
+                    let capacity = rows.saturating_sub(leading as u32).min(tick_max);
+                    let list: Vec<_> = candidates[..take]
+                        .iter()
+                        .copied()
+                        .filter(|&(slot, _, _)| e.token_batch_prefill_fits(slot, capacity))
+                        .collect();
+                    if list.len() != take {
+                        continue;
+                    }
+                    let pack =
+                        amd_mixed_prefill_pack(list, capacity, nv.pf_batch, e.prefill_turn(), b);
+                    if pack.len() == take {
+                        chosen = Some((rows, pack));
+                        break;
+                    }
+                }
+                if let Some((rows, pack)) = chosen {
+                    let mut tokens = std::mem::take(&mut obs.host.slot_tokens);
+                    let started = Instant::now();
+                    let mut finished: Vec<usize> = Vec::new();
+                    let mut result = {
+                        let members: Vec<_> = pack
+                            .iter()
+                            .map(|&(slot, take)| {
+                                (
+                                    slot,
+                                    slots[slot]
+                                        .as_ref()
+                                        .expect("token-batch member")
+                                        .prompt_ids
+                                        .as_slice(),
+                                    take,
+                                )
+                            })
+                            .collect();
+                        e.token_batch_step(rows, &feeds, &members, &mut tokens)
+                            .map(|done| finished = done)
+                    };
+                    crate::obs::ttft::PREFILL.add(started.elapsed().as_nanos() as u64);
+                    if result.is_ok() {
+                        // Members that did NOT finish keep a cursor; the ones that did have
+                        // consumed their whole prompt.
+                        let pending: Vec<usize> = pack
+                            .iter()
+                            .map(|&(slot, _)| slot)
+                            .filter(|slot| !finished.contains(slot))
+                            .collect();
+                        match amd_packed_frontier_updates(pending, |slot| e.prefill_frontier(slot))
+                        {
+                            Ok(updates) => {
+                                for (slot, frontier) in updates {
+                                    slots[slot].as_mut().expect("token-batch member").pf_pos =
+                                        frontier;
+                                }
+                            }
+                            Err(slot) => {
+                                result = Err(crate::RuntimeError::Device(format!(
+                                    "token-batch prefill slot {slot} lost its cursor after dispatch"
+                                )))
+                            }
+                        }
+                    }
+                    if let Some(&(slot, _)) = pack.last() {
+                        e.advance_prefill_turn(slot);
+                    }
+                    match result {
+                        Ok(()) => {
+                            tracing::debug!(
+                                rows,
+                                decode = feeds.len(),
+                                prefill = pack.len(),
+                                completed = finished.len(),
+                                "AMD token batch"
+                            );
+                            // Delivery is by LOGICAL REQUEST, in sample order: the decode
+                            // feeds first, then the prompts that completed here.
+                            let owners: Vec<usize> = feeds
+                                .iter()
+                                .map(|&(slot, _)| slot)
+                                .chain(finished.iter().copied())
+                                .collect();
+                            for (index, &slot) in owners.iter().enumerate() {
+                                if index >= finished.len() + feeds.len() {
+                                    break;
+                                }
+                                if index >= feeds.len() {
+                                    if let Some(s) = slots[slot].as_mut() {
+                                        if s.step == 0 {
+                                            s.pf_pos = s.prompt_ids.len();
+                                        }
+                                    }
+                                }
+                                handle_produced_token(
+                                    &mut slots[slot],
+                                    &arena,
+                                    bundle,
+                                    tokens[index],
+                                    1,
+                                    &mut tokens_this_tick,
+                                    Some(stop.as_slice()),
+                                );
+                                if slots[slot].is_none() {
+                                    e.release(slot);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            note_fault(&mut tick_fault, &err);
+                            let msg = err.to_string();
+                            for i in feeds
+                                .iter()
+                                .map(|&(slot, _)| slot)
+                                .chain(pack.iter().map(|&(slot, _)| slot))
+                            {
+                                if let Some(taken) = slots[i].take() {
+                                    release_kv(&arena, taken.kv);
+                                    let _ = taken
+                                        .respond
+                                        .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                }
+                                e.release(i);
+                            }
+                        }
+                    }
+                    obs.host.slot_tokens = tokens;
+                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
+                }
+            }
             if has_decode
                 && !no_interleave
                 && !nv.pf_defer_decode

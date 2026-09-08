@@ -76,16 +76,41 @@ impl MixedStepStaging {
         max_ctx: u32,
         auxiliary_program: u32,
     ) -> Result<&'a Plan, StageError> {
-        if self.pending {
-            return Err(StageError::PendingPlan);
-        }
-        mixed_step::plan_into(
+        self.stage_cover(
             decode,
             prefill,
             frontiers,
             rows,
             max_ctx,
             auxiliary_program,
+            mixed_step::SpanCover::DecodeBand,
+        )
+    }
+
+    /// Stage under an explicit span contract. `SpanCover::PrefixFree` is the unified token
+    /// batch's: spans cover exactly `[0, M)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_cover<'a>(
+        &'a mut self,
+        decode: &[DecodeRequest],
+        prefill: &[PrefillRequest<'_>],
+        frontiers: &[u32],
+        rows: u32,
+        max_ctx: u32,
+        auxiliary_program: u32,
+        cover: mixed_step::SpanCover,
+    ) -> Result<&'a Plan, StageError> {
+        if self.pending {
+            return Err(StageError::PendingPlan);
+        }
+        mixed_step::plan_into_cover(
+            decode,
+            prefill,
+            frontiers,
+            rows,
+            max_ctx,
+            auxiliary_program,
+            cover,
             &mut self.plan,
         )
         .map_err(StageError::Plan)?;
@@ -117,18 +142,15 @@ impl MixedStepStaging {
             return Err(StageError::NoPendingPlan);
         }
 
-        for row in self.plan.rows.iter().take(self.plan.decode_rows as usize) {
-            check_frontier(frontiers, row.slot, row.position)?;
+        // Per REQUEST, not per span: under `SpanCover::PrefixFree` a completing prompt owns
+        // two spans on one slot, so a per-span check would compare the terminal span's
+        // `kv_row0` against a frontier that belongs to the body span. Every frontier is
+        // checked before any is changed, so a refusal leaves host state exactly as it was.
+        for commit in &self.plan.commits {
+            check_frontier(frontiers, commit.slot, commit.expect)?;
         }
-        for span in &self.plan.prefill_spans {
-            check_frontier(frontiers, span.slot, span.kv_row0)?;
-        }
-
-        for row in self.plan.rows.iter().take(self.plan.decode_rows as usize) {
-            frontiers[row.slot as usize] = row.kv_len;
-        }
-        for span in &self.plan.prefill_spans {
-            frontiers[span.slot as usize] = span.kv_len;
+        for commit in &self.plan.commits {
+            frontiers[commit.slot as usize] = commit.after;
         }
         self.pending = false;
         Ok(())

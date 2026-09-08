@@ -455,6 +455,8 @@ fn buffers(rows: usize, spans: usize, parked: usize, mapped: usize) -> Plan {
         prefill_spans: Vec::with_capacity(spans),
         parked: Vec::with_capacity(parked),
         mapped_ends: Vec::with_capacity(mapped),
+        cover: SpanCover::DecodeBand,
+        commits: Vec::with_capacity(mapped),
     }
 }
 

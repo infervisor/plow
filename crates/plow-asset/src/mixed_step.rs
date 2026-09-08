@@ -63,6 +63,54 @@ pub struct PrefillRequest<'a> {
     pub prompt_len: u32,
 }
 
+/// How the plan's [`PrefillSpan`] table covers the packed rows.
+///
+/// The two are different contracts over one span array, and mixing them is the drift
+/// `plans/unified-token-batch.md` §4.3 exists to stop: `runtime/common/mixed_step.h` TRAPS
+/// unless `spans[0].row0 != 0`, and `runtime/amd/token_batch.h` traps unless the spans cover
+/// `[0, M)` from zero. A consumer must be told which one it is looking at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpanCover {
+    /// Mixed step v1. Rows `[0, decode_rows)` are a decode BAND that belongs to no span, and
+    /// the spans cover `[decode_rows, real_rows)`.
+    #[default]
+    DecodeBand,
+    /// Unified token batch (§4.3: "there is no decode prefix. Every row belongs to a span,
+    /// decode spans included"). The spans cover exactly `[0, real_rows)`.
+    ///
+    /// Two things follow that the decode band cannot express:
+    ///
+    /// * A decode request is a span of length one. The converse is NOT true — a final prefill
+    ///   chunk can also have length one — so length never decides a span's phase here either;
+    ///   what the leading run of length-one spans decides is only which attention kernel
+    ///   covers a span, which is the one thing §4.1 explicitly permits.
+    /// * A prefill span that COMPLETES its prompt is split: its final token leads the batch as
+    ///   a length-one span and the rest follows as an ordinary span, both in the same step and
+    ///   both on the same physical slot. The whole prompt's KV is written by the step's single
+    ///   RoPE/cache stage before any attention reads it, so the terminal row attends over its
+    ///   own complete prompt. That is what lets one launch produce the prompt's first generated
+    ///   token, and it is why this route does not need AMD's
+    ///   `split_terminal_prefill`/`finish_prefill_batch` replay of that token through a second,
+    ///   decode-shaped transformer pass (§1, §6.5).
+    PrefixFree,
+}
+
+/// One request's KV frontier transition, checked and applied as a unit after the device
+/// succeeds.
+///
+/// It is per REQUEST, not per span: under [`SpanCover::PrefixFree`] a completing prompt owns
+/// two spans on one slot, and committing per span would compare the terminal span's `kv_row0`
+/// against a frontier that belongs to the body span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Commit {
+    pub slot: u32,
+    /// The frontier this plan was built against. Re-checked before anything is mutated.
+    pub expect: u32,
+    /// The frontier after the step's rows are consumed as INPUT. A sampled token advances
+    /// nothing until it is fed back.
+    pub after: u32,
+}
+
 /// Backend-neutral host plan for one combined dispatch.
 ///
 /// Decode rows occupy `[0, decode_rows)`. The canonical [`PrefillSpan`] values
@@ -82,6 +130,10 @@ pub struct Plan {
     /// Largest mapped KV end per active physical slot, including bounded
     /// parked padding for adapters whose fixed-width kernels still address it.
     pub mapped_ends: Vec<(u32, u32)>,
+    /// Which contract [`Plan::prefill_spans`] follows.
+    pub cover: SpanCover,
+    /// One entry per admitted request, in row order.
+    pub commits: Vec<Commit>,
 }
 
 impl Plan {
@@ -99,6 +151,8 @@ impl Plan {
             prefill_spans: Vec::with_capacity(prefill_capacity),
             parked: Vec::with_capacity(row_capacity),
             mapped_ends: Vec::with_capacity(active_capacity),
+            cover: SpanCover::DecodeBand,
+            commits: Vec::with_capacity(active_capacity),
         }
     }
 
@@ -110,11 +164,17 @@ impl Plan {
         self.prefill_spans.clear();
         self.parked.clear();
         self.mapped_ends.clear();
+        self.cover = SpanCover::DecodeBand;
+        self.commits.clear();
     }
 }
 
 /// Build a mixed plan in caller-owned storage. With sufficient capacities, the
 /// successful path performs no heap allocation and never grows an output vector.
+///
+/// This is mixed step v1's shape — a decode band ahead of the spans — and is kept verbatim
+/// because it is the only route that serves today. [`plan_into_cover`] is the same planner
+/// with the span contract chosen explicitly.
 pub fn plan_into(
     decode: &[DecodeRequest],
     prefill: &[PrefillRequest<'_>],
@@ -124,7 +184,37 @@ pub fn plan_into(
     auxiliary_program: u32,
     out: &mut Plan,
 ) -> Result<()> {
+    plan_into_cover(
+        decode,
+        prefill,
+        frontiers,
+        rows,
+        max_ctx,
+        auxiliary_program,
+        SpanCover::DecodeBand,
+        out,
+    )
+}
+
+/// Build a plan under an explicit [`SpanCover`].
+///
+/// `SpanCover::PrefixFree` is the unified token batch's contract: spans cover exactly
+/// `[0, real_rows)`, decode requests become spans of length one, and a prefill request that
+/// completes its prompt contributes its final token as a leading length-one span so the step
+/// can sample it without a second pass.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_into_cover(
+    decode: &[DecodeRequest],
+    prefill: &[PrefillRequest<'_>],
+    frontiers: &[u32],
+    rows: u32,
+    max_ctx: u32,
+    auxiliary_program: u32,
+    cover: SpanCover,
+    out: &mut Plan,
+) -> Result<()> {
     out.clear();
+    out.cover = cover;
     let result = plan_into_inner(
         decode,
         prefill,
@@ -132,6 +222,7 @@ pub fn plan_into(
         rows,
         max_ctx,
         auxiliary_program,
+        cover,
         out,
     );
     if result.is_err() {
@@ -140,6 +231,7 @@ pub fn plan_into(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_into_inner(
     decode: &[DecodeRequest],
     prefill: &[PrefillRequest<'_>],
@@ -147,6 +239,7 @@ fn plan_into_inner(
     rows: u32,
     max_ctx: u32,
     auxiliary_program: u32,
+    cover: SpanCover,
     out: &mut Plan,
 ) -> Result<()> {
     require(
@@ -163,11 +256,24 @@ fn plan_into_inner(
         .len()
         .checked_add(prefill.len())
         .ok_or("mixed step: active request overflow")?;
+    // PrefixFree turns every decode request into a span and can split a completing prompt
+    // into two, so the span table is bounded by `decode + 2 * prefill`, not by `prefill`.
+    let prefix_free = cover == SpanCover::PrefixFree;
+    let span_capacity = if prefix_free {
+        decode
+            .len()
+            .checked_add(prefill.len().checked_mul(2).ok_or("mixed step: span count")?)
+            .ok_or("mixed step: span count")?
+    } else {
+        prefill.len()
+    };
+    let leading_capacity = if prefix_free { active } else { decode.len() };
     require(
         out.rows.capacity() >= capacity
-            && out.prefill_spans.capacity() >= prefill.len()
-            && out.decode_slots.capacity() >= decode.len()
+            && out.prefill_spans.capacity() >= span_capacity
+            && out.decode_slots.capacity() >= leading_capacity
             && out.parked.capacity() >= capacity
+            && out.commits.capacity() >= active
             && out.mapped_ends.capacity() >= active,
         "output buffer capacity",
     )?;
@@ -204,7 +310,70 @@ fn plan_into_inner(
         });
         out.decode_slots
             .push(i32::try_from(request.slot).map_err(|_| "mixed step: physical slot overflow")?);
+        if prefix_free {
+            out.prefill_spans.push(PrefillSpan {
+                row0: u32::try_from(index).map_err(|_| "mixed step: decode row offset")?,
+                n_rows: 1,
+                slot: request.slot,
+                flags: u32::from(position == 0) * PREFILL_SPAN_RESET_STATE,
+                kv_row0: position,
+                kv_len,
+                state_slot: request.state_slot,
+                program: auxiliary_program,
+            });
+        }
+        out.commits.push(Commit {
+            slot: request.slot,
+            expect: position,
+            after: kv_len,
+        });
         out.mapped_ends.push((request.slot, kv_len));
+    }
+
+    // The terminal rows of prompts that COMPLETE in this step. They lead the batch beside the
+    // decode rows because the selection stage samples the leading rows, and because a one-row
+    // span at frontier p attends over [0, p+1) with its query at p under either attention
+    // kernel — so a completing prompt's first generated token is produced by the same launch
+    // that consumed the prompt, with no replay through a decode-shaped pass.
+    if prefix_free {
+        for request in prefill {
+            let n_rows =
+                u32::try_from(request.tokens.len()).map_err(|_| "mixed step: prefill row count")?;
+            let end = request
+                .start
+                .checked_add(n_rows)
+                .ok_or("mixed step: prefill extent overflow")?;
+            if n_rows == 0 || end != request.prompt_len {
+                continue;
+            }
+            let position = end - 1;
+            require(
+                end <= max_ctx && out.rows.len() < capacity,
+                "terminal prefill extent",
+            )?;
+            out.prefill_spans.push(PrefillSpan {
+                row0: u32::try_from(out.rows.len())
+                    .map_err(|_| "mixed step: terminal row offset")?,
+                n_rows: 1,
+                slot: request.slot,
+                flags: u32::from(position == 0) * PREFILL_SPAN_RESET_STATE,
+                kv_row0: position,
+                kv_len: end,
+                state_slot: request.state_slot,
+                program: auxiliary_program,
+            });
+            out.rows.push(Row {
+                token: request.tokens[request.tokens.len() - 1],
+                slot: request.slot,
+                state_slot: request.state_slot,
+                position,
+                kv_len: end,
+                phase: RowPhase::Decode,
+            });
+            out.decode_slots.push(
+                i32::try_from(request.slot).map_err(|_| "mixed step: physical slot overflow")?,
+            );
+        }
     }
     let decode_rows = u32::try_from(out.rows.len()).map_err(|_| "mixed step: decode rows")?;
 
@@ -242,28 +411,46 @@ fn plan_into_inner(
                 && out.rows.len().saturating_add(request.tokens.len()) <= capacity,
             "prefill frontier or extent",
         )?;
-        let row0 = u32::try_from(out.rows.len()).map_err(|_| "mixed step: prefill row offset")?;
-        out.prefill_spans.push(PrefillSpan {
-            row0,
-            n_rows,
-            slot: request.slot,
-            flags: u32::from(request.start == 0) * PREFILL_SPAN_RESET_STATE,
-            kv_row0: request.start,
-            kv_len: end,
-            state_slot: request.state_slot,
-            program: auxiliary_program,
-        });
-        for (offset, &token) in request.tokens.iter().enumerate() {
-            let position = request.start + offset as u32;
-            out.rows.push(Row {
-                token,
+        // Under PrefixFree a completing prompt's last token has already been placed as a
+        // leading length-one span, so the body span is the rest — possibly empty, when the
+        // whole remaining prompt was one token.
+        let completes = prefix_free && end == request.prompt_len;
+        let body = if completes {
+            &request.tokens[..request.tokens.len() - 1]
+        } else {
+            request.tokens
+        };
+        if !body.is_empty() {
+            let row0 =
+                u32::try_from(out.rows.len()).map_err(|_| "mixed step: prefill row offset")?;
+            let body_rows = u32::try_from(body.len()).map_err(|_| "mixed step: body row count")?;
+            out.prefill_spans.push(PrefillSpan {
+                row0,
+                n_rows: body_rows,
                 slot: request.slot,
+                flags: u32::from(request.start == 0) * PREFILL_SPAN_RESET_STATE,
+                kv_row0: request.start,
+                kv_len: request.start + body_rows,
                 state_slot: request.state_slot,
-                position,
-                kv_len: position + 1,
-                phase: RowPhase::Prefill,
+                program: auxiliary_program,
             });
+            for (offset, &token) in body.iter().enumerate() {
+                let position = request.start + offset as u32;
+                out.rows.push(Row {
+                    token,
+                    slot: request.slot,
+                    state_slot: request.state_slot,
+                    position,
+                    kv_len: position + 1,
+                    phase: RowPhase::Prefill,
+                });
+            }
         }
+        out.commits.push(Commit {
+            slot: request.slot,
+            expect: request.start,
+            after: end,
+        });
         out.mapped_ends.push((request.slot, end));
     }
 

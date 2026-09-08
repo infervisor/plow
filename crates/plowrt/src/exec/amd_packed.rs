@@ -92,6 +92,147 @@ pub(super) fn recurrent_span_limit(ops: impl IntoIterator<Item = u16>) -> Result
     Ok(limit)
 }
 
+/// Validate a UNIFIED TOKEN BATCH row layout: the host twin of `plow_tb_view`'s predicates
+/// in `runtime/amd/token_batch.h`, run before anything reaches a device.
+///
+/// It differs from [`validate_rows`] in exactly the two ways the contract does
+/// (`plans/unified-token-batch.md` §4.3, §4.4):
+///
+/// * **There is no decode prefix.** The spans cover exactly `[0, real_rows)` from zero.
+/// * **A completing prompt owns two spans on one slot** — its terminal token as a leading
+///   length-one span, its body as an ordinary span — so "one slot, one span" is replaced by
+///   the stronger statement that the pair must be contiguous in KV: the terminal span starts
+///   exactly where the body span ends.
+///
+/// The device traps on a violation and AMD's dispatch `default:` neither writes nor traps, so
+/// the point of doing it here is to refuse by name instead of trapping a wavefront.
+pub(super) fn validate_token_batch_rows(
+    program: u32,
+    row_capacity: u32,
+    slot_capacity: usize,
+    leading: usize,
+    spans: &[PrefillSpan],
+    parked: &[u32],
+) -> Result<PackedRows, String> {
+    if spans.is_empty() {
+        return Err("token batch has no spans; the descriptor must cover [0, M)".into());
+    }
+    // `plow_tb_decode_spans` defines the attention partition — and, through
+    // `PLOW_SAMPLE_ROWS`, the selection stage's row count — as the LEADING RUN of length-one
+    // spans. The host decides which rows it will deliver; if the device would count a
+    // different number the two disagree about who owns a sampled id, so the disagreement is
+    // refused here rather than discovered as an off-by-one token.
+    //
+    // The case that reaches this is a body span of length one directly behind the leading run,
+    // which happens when a two-token prompt is completed in one step. Refusing leaves it to
+    // the ordinary route, which is a scheduling limit and not a wrong answer.
+    let device_leading = spans.iter().take_while(|s| s.n_rows == 1).count();
+    if device_leading != leading {
+        return Err(format!(
+            "token batch would sample {device_leading} leading row(s) but the host planned \
+             {leading}: a body span of length one sits directly behind the leading run"
+        ));
+    }
+    let mut row = 0u32;
+    for (index, span) in spans.iter().enumerate() {
+        if span.row0 != row || span.n_rows == 0 {
+            return Err(format!(
+                "token-batch span {index} is not dense: row0={} n_rows={} expected row0={row}",
+                span.row0, span.n_rows
+            ));
+        }
+        if span.flags & !PREFILL_SPAN_RESET_STATE != 0 {
+            return Err(format!(
+                "token-batch span {index} has unknown flags {:#x}",
+                span.flags
+            ));
+        }
+        if (span.flags & PREFILL_SPAN_RESET_STATE != 0) != (span.kv_row0 == 0) {
+            return Err(format!(
+                "token-batch span {index} reset flag disagrees with kv_row0={}",
+                span.kv_row0
+            ));
+        }
+        let kv_end = span
+            .kv_row0
+            .checked_add(span.n_rows)
+            .ok_or_else(|| format!("token-batch span {index} KV range overflows u32"))?;
+        if kv_end != span.kv_len {
+            return Err(format!(
+                "token-batch span {index} has kv_row0+n_rows={kv_end}, kv_len={}",
+                span.kv_len
+            ));
+        }
+        if span.slot as usize >= slot_capacity
+            || span.state_slot as usize >= slot_capacity
+            || span.slot != span.state_slot
+        {
+            return Err(format!(
+                "token-batch span {index} has incompatible KV/state slots {}/{} for capacity \
+                 {slot_capacity}",
+                span.slot, span.state_slot
+            ));
+        }
+        if span.program != program {
+            return Err(format!(
+                "token-batch span {index} names program {}, staged for {program}",
+                span.program
+            ));
+        }
+        let siblings: Vec<&PrefillSpan> = spans[..index]
+            .iter()
+            .filter(|prior| prior.slot == span.slot)
+            .collect();
+        match siblings.as_slice() {
+            [] => {}
+            // The terminal/body pair. The terminal span leads, so the earlier one is it, and
+            // this one must resume exactly where the terminal token does NOT overlap: the body
+            // ends where the terminal begins.
+            [terminal] => {
+                if terminal.n_rows != 1 || terminal.kv_row0 != kv_end {
+                    return Err(format!(
+                        "token-batch slot {} owns two spans that are not a terminal/body pair: \
+                         terminal kv[{}, {}) body kv[{}, {})",
+                        span.slot, terminal.kv_row0, terminal.kv_len, span.kv_row0, kv_end
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "token-batch slot {} appears in more than two spans",
+                    span.slot
+                ))
+            }
+        }
+        row = row
+            .checked_add(span.n_rows)
+            .ok_or_else(|| "token-batch row count overflows u32".to_string())?;
+    }
+    if row > row_capacity {
+        return Err(format!(
+            "token-batch rows end at {row}, past row capacity {row_capacity}"
+        ));
+    }
+    if parked.len() != row_capacity as usize
+        || parked.iter().any(|&value| value > 1)
+        || parked[..row as usize].iter().any(|&value| value != 0)
+        || parked[row as usize..].iter().any(|&value| value == 0)
+    {
+        return Err(format!(
+            "token-batch parked mask must have {row_capacity} binary rows, active [0,{row})=0 \
+             and padding [{row},{row_capacity})!=0 (got {})",
+            parked.len()
+        ));
+    }
+    Ok(PackedRows {
+        n_spans: spans
+            .len()
+            .try_into()
+            .map_err(|_| "token-batch span count exceeds u32".to_string())?,
+        real_rows: row,
+    })
+}
+
 /// Validate the row layout shared by AMD packed prefill and a future mixed-step adapter.
 /// `row_base` reserves leading active rows, such as compact decode rows; prefill spans cover
 /// the dense range immediately after them and the remaining rows are parked padding.

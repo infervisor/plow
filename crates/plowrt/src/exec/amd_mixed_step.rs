@@ -1,6 +1,51 @@
 use super::*;
 use crate::exec::mixed_step_staging::{fill_words, HostLayout, MixedStepStaging, SPAN_WORDS};
-use plow_asset::mixed_step::{DecodeRequest, PrefillRequest};
+use plow_asset::mixed_step::{DecodeRequest, PrefillRequest, SpanCover};
+
+/// Which packed route an instance of [`MixedAmdStep`] is.
+///
+/// The two share a synthesized program, a host staging layout and a launch. They differ in the
+/// code object, the kernel symbol, the span contract on the wire, and which prefill buckets
+/// they can execute — so they are one type with a route rather than two copies of five hundred
+/// lines that would drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StepRoute {
+    /// Mixed step v1 (`PLOW_FUSION`): a decode band ahead of the spans, `interp_mixed_gq.elf`.
+    Mixed,
+    /// The unified token batch (`plans/unified-token-batch.md`): spans cover `[0, M)`,
+    /// `interp_tokbatch_gq.elf`.
+    TokenBatch,
+}
+
+impl StepRoute {
+    fn object(self) -> &'static str {
+        match self {
+            StepRoute::Mixed => "interp_mixed_gq.elf",
+            StepRoute::TokenBatch => super::amd_token_batch::TOKEN_BATCH_OBJECT,
+        }
+    }
+
+    fn kernel(self, arch: &str) -> String {
+        match self {
+            StepRoute::Mixed => format!("plow_interp_mixed_{arch}_gq"),
+            StepRoute::TokenBatch => super::amd_token_batch::token_batch_kernel_symbol(arch),
+        }
+    }
+
+    fn cover(self) -> SpanCover {
+        match self {
+            StepRoute::Mixed => SpanCover::DecodeBand,
+            StepRoute::TokenBatch => SpanCover::PrefixFree,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            StepRoute::Mixed => "fusion",
+            StepRoute::TokenBatch => "token batch",
+        }
+    }
+}
 
 struct MixedProgram {
     rows: u32,
@@ -16,6 +61,7 @@ struct MixedProgram {
 }
 
 pub(super) struct MixedAmdStep {
+    pub(super) route: StepRoute,
     programs: Vec<MixedProgram>,
     staging: MixedStepStaging,
     layout: HostLayout,
@@ -72,21 +118,66 @@ impl MixedAmdStep {
         devp: &[DeviceMem],
         hsaco_dir: &Path,
         batch: usize,
+        route: StepRoute,
     ) -> Result<Self> {
-        let synthesized = crate::exec::mixed_program::synthesize(blob, batch)?;
-        let path = hsaco_dir.join("interp_mixed_gq.elf");
+        let mut synthesized = crate::exec::mixed_program::synthesize(blob, batch)?;
+        if route == StepRoute::TokenBatch {
+            // The route is qualified at `nsplit == 1` with a fused flash epilogue, and
+            // `runtime/amd/interp.hip`'s token-batch FlashPrefill arm TRAPS on anything else:
+            // when the KV partition moves with a span boundary the merge is no longer
+            // associative, and `exec_mixed_prefill_merge` still resolves rows through
+            // `plow_mixed_prefill_span`, which requires the decode prefix this contract
+            // removes. Drop those buckets here rather than admit a plan that would trap —
+            // a refused bucket is a scheduling limit, a trapped wavefront is an outage.
+            synthesized.programs.retain(|spec| {
+                spec.program
+                    .insts
+                    .iter()
+                    .filter(|i| i.op == DevOp::FlashPrefill as u16)
+                    .all(|i| i.i[7] == 1 && i.t[5] != packet::dev::TENSOR_NONE16)
+            });
+            if synthesized.programs.is_empty() {
+                return Err(RuntimeError::Rejected(
+                    "capability `token_batch_unsplit_attention`: no prefill bucket in this blob \
+                     has nsplit=1 with a fused flash epilogue"
+                        .into(),
+                ));
+            }
+        }
+        let path = hsaco_dir.join(route.object());
         let object = std::fs::read(&path).map_err(|error| {
-            RuntimeError::Rejected(format!("fusion object {}: {error}", path.display()))
+            RuntimeError::Rejected(format!(
+                "{} object {}: {error}",
+                route.label(),
+                path.display()
+            ))
         })?;
-        for marker in [
-            "plow_mixed_dynamic_rows_1",
-            "plow_mixed_step_bf16_1",
-            "plow_mixed_gemm_glu_1",
-            "plow_mixed_prefill_split_1",
-        ] {
+        let markers: &[&str] = match route {
+            StepRoute::Mixed => &[
+                "plow_mixed_dynamic_rows_1",
+                "plow_mixed_step_bf16_1",
+                "plow_mixed_gemm_glu_1",
+                "plow_mixed_prefill_split_1",
+            ],
+            // The token-batch object is built ON the mixed object's shape, so it must answer
+            // for that contract too; the four `plow_token_batch_*` names are what say the
+            // descriptor-aware arms are actually present rather than merely compiled around.
+            StepRoute::TokenBatch => &[
+                "plow_mixed_dynamic_rows_1",
+                "plow_mixed_step_bf16_1",
+                "plow_mixed_gemm_glu_1",
+                "plow_mixed_prefill_split_1",
+                "plow_token_batch_1",
+                "plow_token_batch_dense_gqa_1",
+                "plow_token_batch_combined_m_1",
+                "plow_token_batch_span_attn_1",
+            ],
+        };
+        for marker in markers {
             if elf_symbol_u32(&object, marker) != Some(1) {
                 return Err(RuntimeError::Rejected(format!(
-                    "fusion object lacks {marker}"
+                    "{} object lacks {marker}",
+                    route.label()
                 )));
             }
         }
@@ -98,7 +189,7 @@ impl MixedAmdStep {
             ));
         }
         let module = EngineDevice::module_load(&**be, &object)?;
-        let symbol = format!("plow_interp_mixed_{}_gq", EngineDevice::arch(&**be));
+        let symbol = route.kernel(&EngineDevice::arch(&**be).to_string());
         let kernel = EngineDevice::get_function(&**be, &module, &symbol)?;
         let abi = std::mem::size_of::<DevProgram>() as u32;
         // From here to the `Ok(Self { .. })` below the module is loaded and owned by nobody,
@@ -128,10 +219,18 @@ impl MixedAmdStep {
             .max()
             .unwrap_or(0) as usize;
         if rows == 0 || decode == 0 {
-            return Err(RuntimeError::Rejected(
-                "packet has no supported fusion buckets".into(),
-            ));
+            return Err(RuntimeError::Rejected(format!(
+                "packet has no supported {} buckets",
+                route.label()
+            )));
         }
+        // PrefixFree turns each decode request into a span and splits a completing prompt into
+        // two, so the span table is bounded by `2 * batch` rather than by `batch`.
+        let span_capacity = if route == StepRoute::TokenBatch {
+            batch * 2
+        } else {
+            batch
+        };
         let count = synthesized
             .tensors
             .iter()
@@ -184,9 +283,17 @@ impl MixedAmdStep {
         EngineDevice::upload(&**be, &table, 0, as_bytes(&addresses))?;
         let tensor_table = table.base;
         buffers.push(table);
-        let layout = HostLayout::new(rows, decode, batch)?;
+        // Under PrefixFree the leading sampled rows are decode rows PLUS the terminal row of
+        // every prompt completing this step, so the compact decode-slot image is `batch` long,
+        // not `decode` (= batch - 1) long.
+        let leading = if route == StepRoute::TokenBatch {
+            batch
+        } else {
+            decode
+        };
+        let layout = HostLayout::new(rows, leading, span_capacity)?;
         let host = be.host_alloc_pinned(layout.words() * 4)?;
-        let span_bytes = batch * std::mem::size_of::<PrefillSpan>();
+        let span_bytes = span_capacity * std::mem::size_of::<PrefillSpan>();
         let metadata = EngineDevice::alloc(&**be, (span_bytes + rows * 4) as u64)?;
         let parked_base = metadata.base + span_bytes as u64;
         let mut programs = Vec::with_capacity(synthesized.programs.len());
@@ -234,6 +341,28 @@ impl MixedAmdStep {
                 ));
             }
             vocab = Some(count);
+            // THE OPERATOR AUDIT, as a load-time gate rather than a habit
+            // (`plans/unified-token-batch.md` §3). Every opcode this program contains is
+            // classified; anything class C without a declared conversion, class D, or with no
+            // descriptor-aware arm is refused BY NAME. An opcode this build cannot name is
+            // treated as C, because C is the class that gets refused.
+            if route == StepRoute::TokenBatch {
+                let caps = plow_asset::token_batch::Capabilities::amd_dense_gqa(
+                    EngineDevice::arch(&**be).to_string(),
+                    program.rows,
+                    spec.decode_rows,
+                );
+                let audit = caps
+                    .refuse_program(program.insts.iter().map(|i| i.op))
+                    .map_err(|refusal| RuntimeError::Rejected(refusal.to_string()))?;
+                tracing::debug!(
+                    rows = program.rows,
+                    sample_capacity = spec.decode_rows,
+                    opcodes = audit.len(),
+                    converted = audit.iter().filter(|e| e.converted).count(),
+                    "token batch: operator audit admits every opcode in this bucket"
+                );
+            }
             let (arg, counter_bytes, tables) =
                 upload_program(be, program, tensor_table, metadata.base, parked_base)?;
             programs.push(MixedProgram {
@@ -256,8 +385,9 @@ impl MixedAmdStep {
             be.host_alloc_pinned(programs.iter().map(|p| p.counter_bytes).max().unwrap_or(4))?;
         zero.as_mut_slice().fill(0);
         Ok(Self {
+            route,
             programs,
-            staging: MixedStepStaging::with_capacity(rows, batch, batch),
+            staging: MixedStepStaging::with_capacity(rows, span_capacity, batch),
             layout,
             host,
             zero,
@@ -318,13 +448,49 @@ fn validate_program(program: &plow_asset::aux_program::Program) -> Result<()> {
 }
 
 impl AmdEngine {
+    fn step_slot(&mut self, route: StepRoute) -> &mut Option<MixedAmdStep> {
+        match route {
+            StepRoute::Mixed => &mut self.mixed_step,
+            StepRoute::TokenBatch => &mut self.token_batch_step,
+        }
+    }
+
+    fn step_ref(&self, route: StepRoute) -> Option<&MixedAmdStep> {
+        match route {
+            StepRoute::Mixed => self.mixed_step.as_ref(),
+            StepRoute::TokenBatch => self.token_batch_step.as_ref(),
+        }
+    }
+
     pub fn mixed_step_rows(&self, decode_rows: usize, prefill_rows: usize) -> Option<u32> {
-        if decode_rows == 0 || prefill_rows == 0 {
+        self.packed_step_rows(StepRoute::Mixed, decode_rows, prefill_rows)
+    }
+
+    /// Row capacity of the token-batch bucket that would carry `leading_rows` sampled rows
+    /// (decode requests plus prompts completing this step) and `prefill_rows` body rows.
+    ///
+    /// `leading_rows == 0` is refused, not treated as one: `S = 0` means no output segment,
+    /// and the legacy `n_batch == 0 means one row` convention would deliver a token to a
+    /// request that asked for none.
+    pub fn token_batch_rows(&self, leading_rows: usize, prefill_rows: usize) -> Option<u32> {
+        self.packed_step_rows(StepRoute::TokenBatch, leading_rows, prefill_rows)
+    }
+
+    fn packed_step_rows(
+        &self,
+        route: StepRoute,
+        decode_rows: usize,
+        prefill_rows: usize,
+    ) -> Option<u32> {
+        // v1 needs BOTH sides: with no prefill it is an ordinary decode step, and with no
+        // decode its selection stage has nothing to read. The token batch needs only a
+        // non-empty selection: a step of one completing prompt and nothing else is legal and
+        // is exactly the concurrency-1 case v1 has to pay a second pass for.
+        if decode_rows == 0 || (route == StepRoute::Mixed && prefill_rows == 0) {
             return None;
         }
-        let mixed = self.mixed_step.as_ref()?;
-        mixed
-            .programs
+        let step = self.step_ref(route)?;
+        step.programs
             .iter()
             .filter(|p| {
                 p.samples && decode_rows <= p.decode_rows as usize && p.rows as usize > decode_rows
@@ -347,56 +513,125 @@ impl AmdEngine {
         frontiers: &mut [u32],
         output: &mut [u32],
     ) -> Result<()> {
-        let mut mixed = self
-            .mixed_step
-            .take()
-            .ok_or_else(|| RuntimeError::Rejected("packet has no AMD mixed-step program".into()))?;
+        self.packed_step(StepRoute::Mixed, rows, decode, prefill, frontiers, output)
+    }
+
+    /// One unified token-batch step. `output` receives one sampled id per LEADING row, in
+    /// plan order: the decode requests first, then the prompts that complete in this step.
+    pub fn token_batch_step(
+        &mut self,
+        rows: u32,
+        decode: &[DecodeRequest],
+        prefill: &[PrefillRequest<'_>],
+        frontiers: &mut [u32],
+        output: &mut [u32],
+    ) -> Result<()> {
+        self.packed_step(
+            StepRoute::TokenBatch,
+            rows,
+            decode,
+            prefill,
+            frontiers,
+            output,
+        )
+    }
+
+    fn packed_step(
+        &mut self,
+        route: StepRoute,
+        rows: u32,
+        decode: &[DecodeRequest],
+        prefill: &[PrefillRequest<'_>],
+        frontiers: &mut [u32],
+        output: &mut [u32],
+    ) -> Result<()> {
+        let token_batch = route == StepRoute::TokenBatch;
+        // Sampled rows: decode requests, plus the terminal row of every prompt this step
+        // completes. On the mixed route the second group does not exist — its terminal tokens
+        // are replayed through a separate decode-shaped pass instead.
+        let leading = decode.len()
+            + if token_batch {
+                prefill
+                    .iter()
+                    .filter(|r| {
+                        !r.tokens.is_empty()
+                            && r.start.saturating_add(r.tokens.len() as u32) == r.prompt_len
+                    })
+                    .count()
+            } else {
+                0
+            };
+        let mut mixed = self.step_slot(route).take().ok_or_else(|| {
+            RuntimeError::Rejected(format!("packet has no AMD {} program", route.label()))
+        })?;
         let result = (|| -> Result<()> {
             if self.packed_prefill.is_some()
-                || decode.is_empty()
-                || prefill.is_empty()
+                || leading == 0
+                || (!token_batch && (decode.is_empty() || prefill.is_empty()))
                 || frontiers.len() != self.batch
-                || output.len() != decode.len()
-                || decode.len().saturating_add(prefill.len()) > mixed.layout.spans
+                || output.len() != leading
+                || decode.len().saturating_add(prefill.len()) > self.batch
             {
-                return Err(RuntimeError::Rejected(
-                    "mixed AMD request state mismatch".into(),
-                ));
+                return Err(RuntimeError::Rejected(format!(
+                    "{} AMD request state mismatch",
+                    route.label()
+                )));
             }
             let program = mixed
                 .programs
                 .iter()
-                .find(|p| p.rows == rows && p.samples && decode.len() <= p.decode_rows as usize)
+                .find(|p| p.rows == rows && p.samples && leading <= p.decode_rows as usize)
                 .ok_or_else(|| {
                     RuntimeError::Rejected(format!(
-                        "mixed AMD missing sampled variant {rows}:{}",
-                        decode.len()
+                        "{} AMD missing sampled variant {rows}:{leading}",
+                        route.label()
                     ))
                 })?;
             let plan = mixed
                 .staging
-                .stage(
+                .stage_cover(
                     decode,
                     prefill,
                     frontiers,
                     rows,
                     self.max_ctx as u32,
                     program.program_index,
+                    route.cover(),
                 )
                 .map_err(|e| RuntimeError::Rejected(e.to_string()))?;
-            crate::exec::amd_packed::validate_rows(
-                program.program_index,
-                plan.decode_rows,
-                rows,
-                self.batch,
-                &plan.prefill_spans,
-                &plan.parked,
-            )
-            .map_err(RuntimeError::Rejected)?;
+            if plan.decode_rows as usize != leading || plan.prefill_spans.len() > mixed.layout.spans
+            {
+                return Err(RuntimeError::Rejected(format!(
+                    "{} AMD plan shape mismatch",
+                    route.label()
+                )));
+            }
+            if token_batch {
+                crate::exec::amd_packed::validate_token_batch_rows(
+                    program.program_index,
+                    rows,
+                    self.batch,
+                    leading,
+                    &plan.prefill_spans,
+                    &plan.parked,
+                )
+                .map_err(RuntimeError::Rejected)?;
+            } else {
+                crate::exec::amd_packed::validate_rows(
+                    program.program_index,
+                    plan.decode_rows,
+                    rows,
+                    self.batch,
+                    &plan.prefill_spans,
+                    &plan.parked,
+                )
+                .map_err(RuntimeError::Rejected)?;
+            }
             if plan.rows.iter().any(|row| row.token >= mixed.vocab) {
-                return Err(RuntimeError::Rejected(
-                    "mixed AMD token outside vocabulary".into(),
-                ));
+                return Err(RuntimeError::Rejected(format!(
+                    "{} AMD token outside vocabulary",
+                    route.label()
+                )));
             }
             for &(slot, end) in &plan.mapped_ends {
                 self.vmm_ensure(slot as usize, end)?;
@@ -416,17 +651,18 @@ impl AmdEngine {
             let slice = |range: &std::ops::Range<usize>, words: usize| -> &[u8] {
                 &mixed.host.as_slice()[range.start * 4..(range.start + words) * 4]
             };
+            let n_spans = plan.prefill_spans.len();
             let uploads: [(u64, &[u8]); 7] = [
                 (mixed.ids_base, slice(&mixed.layout.ids, rows as usize)),
                 (mixed.pos_base, slice(&mixed.layout.pos, rows as usize)),
                 (mixed.kvlen_base, slice(&mixed.layout.kvlen, rows as usize)),
                 (
                     program.decode_slot,
-                    slice(&mixed.layout.decode_slot, decode.len()),
+                    slice(&mixed.layout.decode_slot, leading),
                 ),
                 (
                     mixed.metadata.base,
-                    slice(&mixed.layout.prefill_spans, prefill.len() * SPAN_WORDS),
+                    slice(&mixed.layout.prefill_spans, n_spans * SPAN_WORDS),
                 ),
                 (mixed.parked_base, slice(&mixed.layout.parked, rows as usize)),
                 (
@@ -436,7 +672,7 @@ impl AmdEngine {
             ];
             self.be.memcpy_htod_pinned_batch(&uploads)?;
             let mut arg = program.arg;
-            arg.n_prefill_spans = prefill.len() as u32;
+            arg.n_prefill_spans = n_spans as u32;
             let started = Instant::now();
             self.be.launch(
                 program.kernel,
@@ -450,11 +686,10 @@ impl AmdEngine {
             self.seg_drain_us += started.elapsed().as_secs_f64() * 1e6;
             let start = mixed.layout.ids.start * 4;
             self.be.memcpy_dtoh_pinned(
-                &mut mixed.host.as_mut_slice()[start..start + decode.len() * 4],
+                &mut mixed.host.as_mut_slice()[start..start + leading * 4],
                 mixed.ids_base,
             )?;
-            let tokens =
-                bytemuck::cast_slice(&mixed.host.as_slice()[start..start + decode.len() * 4]);
+            let tokens = bytemuck::cast_slice(&mixed.host.as_slice()[start..start + leading * 4]);
             mixed
                 .staging
                 .finish_after_device_success(frontiers, tokens, output)
@@ -464,7 +699,7 @@ impl AmdEngine {
             let _ = self.drain();
             mixed.staging.discard();
         }
-        self.mixed_step = Some(mixed);
+        *self.step_slot(route) = Some(mixed);
         result
     }
 }

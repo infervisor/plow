@@ -67,6 +67,12 @@ pub struct RuntimeConfig {
     #[arg(long = "fusion", env = "PLOW_FUSION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub fusion: bool,
 
+    /// Serve every scheduled token of a step from one unified token batch
+    /// (`plans/unified-token-batch.md`). Opt-in per (backend, family) pair until that pair is
+    /// measured; mutually exclusive with `--fusion`, which is the route it replaces.
+    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub token_batch: bool,
+
     /// Override whether freed slabs remain in the process reuse pool.
     #[arg(long = "rt-slab-keep", env = "PLOW_SLAB_KEEP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub slab_keep: Option<bool>,

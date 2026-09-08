@@ -815,6 +815,52 @@ impl AuditEntry {
 }
 
 impl Capabilities {
+    /// What `interp_tokbatch_<arch>_gq.elf` declares for the dense-GQA family.
+    ///
+    /// `converted_c` is the load-bearing half and it has TWO entries, not the one
+    /// `plans/unified-token-batch.md` §8's Phase 2 bullet names:
+    ///
+    /// * **`FlashPrefill`** — `i4 = q_pos0` plus the causal and sliding-window bounds built on
+    ///   it. Converted by `d_flash_prefill`'s `TB` arm, which resolves each work item to its
+    ///   span and takes `n_q`, `n_kv`, `q_pos0` and the Q/O/K/V bases from it; the packet's
+    ///   copies are passed as literal zero and are not read.
+    /// * **`HeadNormRope`** — the dense path's KV cache write. There is no separate write
+    ///   opcode: `i3 = out_row0` is a packet scalar host-patched per chunk, and every row's
+    ///   write address is `out_row0 + t`, which under packing puts one request's K/V into
+    ///   another request's cache. Converted in `runtime/amd/op_norm.h`, which takes the row's
+    ///   slot and absolute KV position (ring mask included) from the descriptor.
+    ///
+    /// A route that converted only the first would be a silent wrong answer, because a missing
+    /// arm on AMD writes nothing and does not trap.
+    ///
+    /// `RowGather` is deliberately absent from `descriptor_aware`: the object has the arm, but
+    /// this route emits no terminal segment, so [`Self::can_run_output`] must keep saying no.
+    pub fn amd_dense_gqa(target: impl Into<String>, row_capacity: u32, sample_capacity: u32) -> Self {
+        Capabilities {
+            target: target.into(),
+            descriptor_version: TOKEN_BATCH_VERSION,
+            row_capacity,
+            sample_capacity,
+            // No D-class operator exists in a dense-GQA program.
+            max_prefill_spans: u32::MAX,
+            descriptor_aware: vec![
+                DevOp::Embed as u16,
+                DevOp::RmsNorm as u16,
+                DevOp::NormResidual as u16,
+                DevOp::SoftCap as u16,
+                DevOp::Gemm as u16,
+                DevOp::GemmGlu as u16,
+                DevOp::HeadNormRope as u16,
+                DevOp::FlashPrefill as u16,
+                DevOp::FlashDecode as u16,
+                DevOp::FlashMerge as u16,
+                DevOp::Argmax as u16,
+                DevOp::ArgmaxFin as u16,
+            ],
+            converted_c: vec![DevOp::FlashPrefill as u16, DevOp::HeadNormRope as u16],
+        }
+    }
+
     fn names(&self, op: u16) -> String {
         DevOp::from_u16(op).map_or_else(
             || format!("{}.opcode_{op}", self.target),

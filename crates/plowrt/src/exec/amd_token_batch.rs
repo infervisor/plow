@@ -62,6 +62,12 @@ pub(super) enum TokenBatchRefusal {
     /// The program has no fused flash epilogue, so FlashPrefill would need a separate merge
     /// whose row map this route does not yet define.
     NoFusedEpilogue,
+    /// The route was not asked for. Distinct from every other variant: nothing is wrong, and
+    /// reporting it as a capability failure would make an opt-in read like a defect.
+    NotRequested,
+    /// The object is armed but this blob has no prefill bucket the route can execute — every
+    /// one splits its attention over KV.
+    NoLegalBucket,
 }
 
 impl std::fmt::Display for TokenBatchRefusal {
@@ -95,6 +101,17 @@ impl std::fmt::Display for TokenBatchRefusal {
                 f,
                 "capability `token_batch_fused_epilogue`: FlashPrefill has no O_final operand; \
                  the split-merge row map is not defined on this route"
+            ),
+            Self::NotRequested => write!(
+                f,
+                "not requested: the route is opt-in per (backend, family) pair until that pair \
+                 is measured — pass --token-batch or PLOW_TOKEN_BATCH=1"
+            ),
+            Self::NoLegalBucket => write!(
+                f,
+                "capability `token_batch_unsplit_attention`: no prefill bucket in this blob has \
+                 nsplit=1 with a fused flash epilogue, and a split packet moves the KV \
+                 partition with the span boundary"
             ),
         }
     }
