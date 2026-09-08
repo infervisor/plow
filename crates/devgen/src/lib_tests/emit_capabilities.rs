@@ -63,6 +63,17 @@ fn production_defaults_are_capability_and_target_driven() {
     assert_eq!(unsupported.decode_rungs(), [1]);
     assert!(!unsupported.packed_prefill_on());
 
+    // gfx942 STOPS AT 8. The 16 rung is not merely unmeasured there — selecting it costs
+    // throughput (GEMV_MAXM=16 with the fused bodies' LDS staging overflowing at t=16, so the
+    // emitter drops fuse_qkv and glu_fused: 202.3 -> 142.4 tok/s). Pin the width so a later
+    // "make the ladders match" tidy-up has to argue with this instead of silently adding it.
+    let mut amd = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
+    apply_production_defaults(&mut amd, emit_capabilities("gemma4"), "gfx942", 1);
+    assert_eq!(amd.decode_rungs(), [1, 2, 4, 8]);
+    assert!(amd.decode_ladder_default);
+    // Packed prefill stays sm_90a-only; the decode ladder moving does not move it.
+    assert!(!amd.packed_prefill_on());
+
     let mut other_target = EmitArgsForTest::try_parse_from(["test"]).unwrap().emit;
     apply_production_defaults(&mut other_target, emit_capabilities("gemma4"), "gfx950", 1);
     assert_eq!(other_target.decode_rungs(), [1]);
