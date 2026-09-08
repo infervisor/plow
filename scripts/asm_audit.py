@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
-"""asm_audit.py — assert what the compiler ACTUALLY emitted, per arch.
+"""asm_audit.py — the static performance contract for a built code object.
 
-The register-cliff check in build_gfx950.sh / build_gfx942.sh catches a kernel
-that will not launch. It does not catch the failure that costs the most: a kernel that
-compiles, launches, produces correct numbers, and is 4x slow because the
-backend picked the narrow MFMA, widened an fp4 operand to bf16, or spilled the
-accumulator to scratch. On a box with no GPU that failure is invisible.
+The register-cliff check in build_gfx950.sh / build_gfx942.sh catches a kernel that will not
+launch. It does not catch the failure that costs the most: a kernel that compiles, launches,
+produces correct numbers, and is slow — because the backend picked the narrow MFMA, because a
+`-D` never reached the compiler, because the accumulator went to scratch, or because a
+dispatch arm was never instantiated at all. On a box with no GPU every one of those is
+invisible. So: disassemble the code object and assert on what is actually in it.
 
-So: disassemble the code object and assert on the instruction stream.
+Two contracts, one disassembly pass:
+
+    --expect <expectations.json>   INSTRUCTION SELECTION, per kernel. Which MFMA a body must
+                                   use, which it must not, which convert proves an operand
+                                   was not silently widened. Documented below.
+    --contract <baseline.json>     THE PERFORMANCE CONTRACT, per object. Six classes, each
+                                   from a defect that cost real performance on this branch
+                                   and was found by hand. Documented under CONTRACT below.
 
 Usage
-    asm_audit.py <object.elf|object.co> [...]            # report
-    asm_audit.py --expect expectations.json <object...>  # report + assert
+    asm_audit.py <object.elf|object.co> [...]                    # report
+    asm_audit.py --expect expectations.json <object...>          # + instruction selection
+    asm_audit.py --contract baseline.json --defines d.json <object...>
+    asm_audit.py --contract baseline.json --defines d.json --bless <object...>
 
 `--expect` takes a two-level map, object-substring -> kernel-substring -> checks,
 plus a mandatory top-level `_arch`:
@@ -44,189 +54,62 @@ different set of arms. A check is one of:
     scratch_max     maximum spill instruction count
     forbid          list of instruction-name substrings that must NOT appear
 
-Exit status is nonzero if any assertion fails, so it drops straight into a
-build script or CI.
+CONTRACT
+--------
+`--contract` runs six checks. Four REFUSE, two REPORT — the split follows the emit-side
+twin's rule (`crates/devgen/src/dispatch_audit.rs`): a check refuses when the object is
+WRONG, and reports when the object is a deliberate trade whose number is worth watching.
+`PLOW_AUDIT_STRICT=1` promotes the reports to refusals, exactly as it does there.
+
+  1 macro    FAIL. Every geometry `-D` the build passed must appear in the object as a
+             `plow_geom_<MACRO>` marker carrying the value that COMPILED. `op_gemm.h`
+             declared five per-rung GEMM knobs as bare `#define`s while build_gfx942.sh
+             documented them as reachable through its `GM_AX` raw-`-D` hatch; a bare
+             `#define` after a command-line `-D` is a redefinition the header wins, the
+             recipe compiles `-w`, and every A/B ever run through that hatch measured an
+             UNCHANGED OBJECT — including a published "GM_SM_BK=128 is a flat null" row that
+             is worth -15.2% TTFT at 128 tokens now that the guards are there. Also checks
+             the roster: a knob `#ifndef`-guarded in the marked headers with no
+             PLOW_GEOM_MARK line in geom_contract.h is a failure, so the guard cannot rot.
+  2 spill    FAIL. Spill counted from `scratch_load_*`/`scratch_store_*`, never from
+             `.vgpr_spill_count` — candidates in this tree have reported 0 there and issued
+             119 scratch_load_dword anyway. A kernel whose note says 0 while its ISA
+             disagrees is a failure on its own; the per-object budget is the baseline.
+  3 permute  REPORT. `__shfl_xor` lowers to `ds_bpermute` on gfx9, an LDS-crossbar op. One
+             dense flash-prefill KV tile was 1651 instructions, 160 ds_bpermute and 163
+             s_waitcnt against 64 MFMA; DPP + one ds_swizzle took the permutes to 64 and was
+             worth -3.5% TTFT. Bodies whose permute count is disproportionate to their MFMA
+             count are named, with their s_waitcnt density, which was the co-signal.
+  4 lds16    REPORT. 2-byte LDS reads. The MLA prefill PV transpose issues 256 ds_read_u16
+             per lane per KV tile against 68 MFMA — the largest item in that loop, and a
+             deliberate trade documented in op_attention.h. Reported, never failed.
+  5 arms     FAIL. Every head-dim arm the object must serve must be present as a template
+             instantiation. `hd=64` had NO arm in prefill, decode or either merge and no
+             `else`, so GPT-OSS attention silently wrote nothing — on AMD a missing arm does
+             not trap.
+  6 budget   FAIL. VGPR/AGPR/LDS/occupancy against a committed per-object budget. This
+             replaces the hand-maintained resource table in build_gfx942.sh's header
+             comment, which was already stale: it claimed interp_prefill spill 6 against a
+             measured 126.
+
+The baseline (`scripts/obj_baseline_gfx942.json`) is COMMITTED, so a regression is a line in
+a `git diff` and not a number in a log nobody reads. `--bless` rewrites it. A baseline row is
+only compared when the object's `-D` axes match the ones the baseline recorded: a
+`PLOW_OCC4=1` or `PLOW_DECODE_BATCH=4` build is a different object and is checked by the
+rules that need no baseline, not against numbers describing a different compile.
+
+Exit status is nonzero if any assertion fails, so it drops straight into a build script.
 """
 
 import json
 import os
 import re
-import subprocess
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
-# Spill traffic on CDNA is scratch_load/scratch_store. Deliberately NOT matching
-# buffer_* here: the GEMV weight streams are raw buffer loads by design
-# (buf_ld_fp8 -> buffer_load_dwordx4 ... offen), and counting those as spills
-# reported 36 spills for a kernel the compiler says spills nothing.
-SPILL = re.compile(r"^\s*scratch_(load|store)")
-SYMBOL = re.compile(r"^([0-9a-f]{16})\s+<(.+)>:\s*$")
-# llvm-objdump prints "\tv_mfma_f32_32x32x64_f8f6f4 v[0:15], ... cbsz:4 blgp:4 // encoding"
-INSN = re.compile(r"^\s*([a-z][a-z0-9_]*)\s")
-MODIFIER = re.compile(r"\b(cbsz|blgp|abid|op_sel|op_sel_hi|neg|neg_hi):")
-
-# Instruction families we care about, in report order. Anything unmatched is
-# lumped into "other" — the point is the shape of the kernel, not a full ISA
-# taxonomy.
-FAMILIES = [
-    ("mfma", lambda m: m.startswith("v_mfma") or m.startswith("v_smfmac")),
-    ("cvt_scale", lambda m: m.startswith("v_cvt_scalef32")),
-    ("cvt", lambda m: m.startswith("v_cvt") ),
-    ("ds_read", lambda m: m.startswith("ds_read")),
-    ("ds_write", lambda m: m.startswith("ds_write")),
-    ("global", lambda m: m.startswith("global_") or m.startswith("flat_")),
-    ("buffer", lambda m: m.startswith("buffer_")),
-    ("scratch", lambda m: m.startswith("scratch_")),
-    ("barrier", lambda m: m == "s_barrier" or m.startswith("s_barrier")),
-    ("waitcnt", lambda m: m.startswith("s_waitcnt")),
-    ("valu", lambda m: m.startswith("v_")),
-    ("salu", lambda m: m.startswith("s_")),
-]
-
-
-def tool(name):
-    """Locate a ROCm LLVM tool without pinning a ROCm version."""
-    root = os.environ.get("ROCM_PATH", "/opt/rocm")
-    for cand in (f"{root}/llvm/bin/{name}", f"{root}/lib/llvm/bin/{name}", name):
-        if os.path.isfile(cand) or subprocess.run(
-            ["which", cand], capture_output=True
-        ).returncode == 0:
-            return cand
-    sys.exit(f"asm_audit: cannot find {name} (set ROCM_PATH)")
-
-
-ELF_ARCH = re.compile(r"\b(gfx\d+[a-z]*)\b")
-
-
-def elf_arch(path):
-    """The arch the object was BUILT for, out of its own ELF header.
-
-    Read rather than passed in: the objects carry it (`Flags: 0x54c, gfx942,
-    xnack, sramecc`), and a `--mcpu` the caller supplies is a second opinion
-    about a fact the file already states. That mattered here — this script had
-    `--mcpu=gfx950` hardcoded, which the disassembler happened to override from
-    the ELF, so the wrong-arch audit produced a correct disassembly checked
-    against an inverted contract.
-    """
-    out = subprocess.run(
-        [tool("llvm-readelf"), "-h", path], capture_output=True, text=True
-    )
-    if out.returncode != 0:
-        sys.exit(f"asm_audit: readelf failed on {path}:\n{out.stderr}")
-    for line in out.stdout.splitlines():
-        if line.strip().startswith("Flags:"):
-            m = ELF_ARCH.search(line)
-            if m:
-                return m.group(1)
-    sys.exit(f"asm_audit: {path} declares no gfx target in its ELF flags")
-
-
-def disassemble(path, arch):
-    out = subprocess.run(
-        [tool("llvm-objdump"), "-d", f"--mcpu={arch}", path],
-        capture_output=True, text=True,
-    )
-    if out.returncode != 0:
-        sys.exit(f"asm_audit: objdump failed on {path}:\n{out.stderr}")
-    return out.stdout
-
-
-class Kernel:
-    def __init__(self, name):
-        self.name = name
-        self.fam = Counter()
-        self.insn = Counter()     # every mnemonic, for `require_min`
-        self.mfma = Counter()
-        self.fmt = Counter()      # (cbsz, blgp) pairs seen on MFMAs
-        self.fmt_on = {}          # mnemonic -> Counter of its own (cbsz, blgp) pairs
-        self.spill = 0
-        self.total = 0
-        # --- pipeline quality (see burst/stalled below) ---
-        self.burst = 0            # longest back-to-back MFMA run
-        self._run = 0
-        self.stalled = 0          # MFMAs immediately preceded by a wait
-        self._pending_wait = False
-
-    def feed(self, mnemonic):
-        """Track MFMA clustering as instructions stream past.
-
-        These two numbers are the closest thing to a pipeline-quality reading
-        that a disassembly can give, and they are what separates a CK
-        Intrawave-style deep-prefetch loop from a naive one:
-
-        `burst`   — longest run of consecutive MFMAs. A loop that stages its
-                    operands far enough ahead issues MFMAs back to back; one
-                    that reads LDS just in time cannot, because every MFMA is
-                    separated by the ds_read feeding the next. op_gemm.h
-                    identifies that LDS-read -> MFMA dependency chain as the
-                    measured wall, so `burst` is the metric that moves when the
-                    chain is actually broken.
-        `stalled` — MFMAs issued immediately after an s_waitcnt, i.e. the
-                    operand was not ready and the wave blocked. Ideally 0: the
-                    prefetch should have landed several iterations earlier.
-
-        Neither is a cycle count and neither replaces a GPU. They are ordinal:
-        strictly better on both, at equal MFMA count, is a strictly better
-        pipeline, and that is enough to iterate on a box with no hardware.
-        """
-        is_mfma = mnemonic.startswith("v_mfma") or mnemonic.startswith("v_smfmac")
-        if is_mfma:
-            self._run += 1
-            self.burst = max(self.burst, self._run)
-            if self._pending_wait:
-                self.stalled += 1
-        elif mnemonic.startswith("s_nop") or mnemonic.startswith("s_setprio"):
-            pass          # scheduling padding, does not break a burst
-        else:
-            self._run = 0
-        # A wait "arms" only the next instruction.
-        self._pending_wait = mnemonic.startswith("s_waitcnt") if not is_mfma else False
-
-    @property
-    def density(self):
-        """MFMA per 100 instructions — the crude 'is this MFMA-bound' signal."""
-        return 100.0 * self.fam["mfma"] / self.total if self.total else 0.0
-
-
-def parse(text):
-    kernels, cur = [], None
-    for line in text.splitlines():
-        m = SYMBOL.match(line)
-        if m:
-            cur = Kernel(m.group(2))
-            kernels.append(cur)
-            continue
-        if cur is None:
-            continue
-        # Strip the trailing "// encoding" comment so it cannot be mistaken for
-        # an operand modifier.
-        code = line.split("//")[0]
-        i = INSN.match(code)
-        if not i:
-            continue
-        mn = i.group(1)
-        cur.total += 1
-        cur.insn[mn] += 1
-        cur.feed(mn)
-        if SPILL.match(code):
-            cur.spill += 1
-        for fam, pred in FAMILIES:
-            if pred(mn):
-                cur.fam[fam] += 1
-                break
-        else:
-            cur.fam["other"] += 1
-        if mn.startswith("v_mfma") or mn.startswith("v_smfmac"):
-            cur.mfma[mn] += 1
-            # Unspecified modifiers default to 0 in the AMDGPU asm printer.
-            cbsz = re.search(r"\bcbsz:(\d+)", code)
-            blgp = re.search(r"\bblgp:(\d+)", code)
-            pair = (int(cbsz.group(1)) if cbsz else 0,
-                    int(blgp.group(1)) if blgp else 0)
-            cur.fmt[pair] += 1
-            cur.fmt_on.setdefault(mn, Counter())[pair] += 1
-    return [k for k in kernels if k.total]
-
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import plow_isa as isa  # noqa: E402
 
 FMT_NAME = {0: "e4m3", 1: "e5m2", 2: "fp6", 3: "bf6", 4: "fp4"}
 
@@ -249,7 +132,7 @@ def report(path, kernels):
                 if (cbsz, blgp) != (0, 0) or any("f8f6f4" in m for m in k.mfma):
                     print(f"      {n:6d}  A={FMT_NAME.get(cbsz, cbsz)} "
                           f"B={FMT_NAME.get(blgp, blgp)}")
-        mix = "  ".join(f"{f}={k.fam[f]}" for f, _ in FAMILIES
+        mix = "  ".join(f"{f}={k.fam[f]}" for f, _ in isa.FAMILIES
                         if k.fam[f] and f != "mfma")
         if mix:
             print(f"    {mix}")
@@ -339,12 +222,387 @@ def check(kernels, expect):
     return fails
 
 
+# ------------------------------------------------------------------ the contract
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORKERS = int(os.environ.get("PLOW_AUDIT_JOBS", "8"))
+
+# Class 1. The headers whose `#ifndef`-guarded knobs geom_contract.h must mark, and the
+# namespaces that count as geometry. Both are asserted against the source, so a knob added
+# to one of these headers without a marker fails the build rather than silently opting out.
+GEOM_HEADERS = ["amd_arch.h", "op_attention.h", "op_moe.h", "op_gemm.h"]
+GEOM_NS = re.compile(r"^(GM|FA|GV|MPF)_[A-Z0-9_]*$")
+# The numeric PLOW_ knobs build_gfx942.sh passes as raw `-D`. `PLOW_*` at large is a
+# capability axis (PLOW_FP8, PLOW_K3) whose presence is already checked by the marker
+# symbols in interp.hip and by plowrt's arm checks; these three are GEOMETRY wearing a
+# PLOW_ name, and a `-D` that failed to reach them is as invisible as one for GM_BM.
+GEOM_EXTRA = {"PLOW_WG_WAVES", "PLOW_WPE", "PLOW_GEMV_MM"}
+GEOM_PREFIX = "plow_geom_"
+
+# Class 5. Head dims interp.hip dispatches, and the ONE flash family whose instantiations
+# survive inlining in every object built here (44/44 measured), so the check is a rule and
+# not a baseline diff: `d_flash_prefill<128>` is inlined into plow_exec in every 8-wave
+# prefill object, and `d_flash_prefill<128,true>`/`<256,true>` in interp_flash_fp8kv.
+#
+# d_flash_merge is ALSO the family that the emit-side coverage check goes blind on:
+# manifest.rs reads the head dim from i[6] for every flash op but FlashMerge carries it in
+# i[3], "the exact template family a dispatch bug has already been found in once".
+HD_REQUIRED = [128, 256, 512]
+# hd=64 is GPT-OSS. The arms are `#if !PLOW_FP8_KV` (no fp8-KV model has a 64-wide head, and
+# the extra instantiation outlines K3's hot MLA prefill body out of the interpreter), so an
+# fp8kv object legitimately has none.
+HD_GPTOSS = 64
+ARM_SYM = re.compile(r"^_Z\d+(d_flash_[a-z_0-9]*)I(.+?)Ev")
+ARM_HD = re.compile(r"^Li(\d+)E")
+
+# Class 3. A body is named when it issues at least PERMUTE_PER_MFMA LDS permutes per MFMA and
+# at least PERMUTE_FLOOR of them.
+#
+# 2.0 and 64 are both read off the case that paid: the pre-fix d_flash_prefill<256> KV tile
+# issued 160 ds_bpermute against 64 MFMA (2.5) and the DPP + single-ds_swizzle form issues 64
+# ds_swizzle and ZERO permutes, so the threshold sits between the two forms of the same body
+# and is not a taste. A softmax that spends one wave reduce per MFMA (1.0) is doing ordinary
+# work; at 2.0 the crossbar is the loop. The floor of 64 is one permute per lane-quarter per
+# wave and keeps the small norm/argmax helpers, whose reduce IS the kernel, out of the report.
+PERMUTE_PER_MFMA = 2.0
+PERMUTE_FLOOR = 64
+
+# Class 4. From the MLA prefill PV transpose, which is the body this check exists to keep
+# visible: the MFMA B-fragment for PV contracts over kv, the minor axis of the [kv][d] slab,
+# so the transpose is paid as "8 strided ds_read_u16 per output tile, 256 per KV tile"
+# (op_attention.h, PLOW_MLA_PF_SV). The compiled d_flash_mla_prefill_v2<512,64,false,true>
+# body shows exactly that: 256 2-byte reads against 136 MFMA, 1.88x.
+#
+# So the floor is ONE KV TILE'S WORTH, 256, and the ratio sits below the 1.88 that body shows
+# and above the ~1.0 of a loop that stages its operands b128-wide. The dense flash arms, at
+# 128 reads against 64 MFMA, are deliberately under the floor -- their transpose is half the
+# width and is not the item this reports. Reported, never failed: op_attention.h documents the
+# trade and the alternative (a transposed V store) costs LDS the 64 KiB budget does not have.
+LDS16_PER_MFMA = 1.5
+LDS16_FLOOR = 256
+
+
+def defines_of(axes):
+    """{MACRO: value} for the `-D` flags in one row's axis string. `-DX` alone is 1."""
+    got = {}
+    for tok in axes.split():
+        if not tok.startswith("-D"):
+            continue
+        body = tok[2:]
+        name, _, val = body.partition("=")
+        got[name] = val if val else "1"
+    return got
+
+
+def geom_roster():
+    """The knobs the headers declare, and the ones geom_contract.h marks."""
+    declared = set()
+    for h in GEOM_HEADERS:
+        with open(os.path.join(REPO, "runtime/amd", h)) as f:
+            for line in f:
+                m = re.match(r"^#ifndef ([A-Z0-9_]+)\s*$", line)
+                if m and GEOM_NS.match(m.group(1)):
+                    declared.add(m.group(1))
+    marked = set()
+    with open(os.path.join(REPO, "runtime/amd/geom_contract.h")) as f:
+        for line in f:
+            m = re.match(r"^PLOW_GEOM_MARK\(([A-Z0-9_]+)\)", line)
+            if m:
+                marked.add(m.group(1))
+    return declared, marked
+
+
+def arms_of(syms):
+    """{template family: sorted head dims} over the d_flash_* instantiations in an object."""
+    got = {}
+    for _, name in syms:
+        m = ARM_SYM.match(name)
+        if not m:
+            continue
+        hd = ARM_HD.match(m.group(2))
+        if hd:
+            got.setdefault(m.group(1), set()).add(int(hd.group(1)))
+    return {k: sorted(v) for k, v in sorted(got.items())}
+
+
+class ObjectFacts:
+    """Everything the contract reads out of one object, gathered in one pass."""
+
+    def __init__(self, path, kernels):
+        self.path = path
+        self.arch = isa.elf_arch(path)
+        self.stem = os.path.basename(path).rsplit(".", 1)[0]
+        self.syms = kernels
+        self.notes = isa.notes(path)
+        self.table = isa.symbols(path)
+        self.globals = isa.globals_u32(path)
+        self.geom = {k[len(GEOM_PREFIX):]: v for k, v in self.globals.items()
+                     if k.startswith(GEOM_PREFIX)}
+        self.arms = arms_of(self.table)
+        # The kernel the object exists for. Its note carries the resource numbers the cliff
+        # check prints; the OUTLINED bodies (plow_exec, d_gemm_glu, d_flash_prefill<D>) carry
+        # NO note at all, which is why their spill is invisible to `.vgpr_spill_count`.
+        main = max(self.notes.values(), key=lambda r: r.get("vgpr_count", 0), default={})
+        self.vgpr = main.get("vgpr_count", 0)
+        self.agpr = main.get("agpr_count", 0)
+        self.lds = main.get("group_segment_fixed_size", 0)
+        self.meta_spill = main.get("vgpr_spill_count", 0)
+        self.waves = self.geom.get("PLOW_WG_WAVES", 0) or (
+            main.get("max_flat_workgroup_size", 256) // 64)
+        self.occ = isa.occupancy(self.vgpr, self.lds, self.waves, self.arch)
+        self.isa_spill = sum(s.spill for s in kernels)
+        # Scratch traffic in symbols that have no kernel note. `.vgpr_spill_count` cannot see
+        # any of it, by construction.
+        self.unmetered = sum(s.spill for s in kernels if s.name not in self.notes)
+        # Kernels whose note claims no spill while their ISA shows scratch traffic. The
+        # baseline carries the known ones so a NEW one refuses; see class 2.
+        self.meta_lies = {s.name: s.spill for s in kernels
+                          if s.spill and s.name in self.notes
+                          and not self.notes[s.name].get("vgpr_spill_count")}
+        self.bpermute = sum(s.fam["bpermute"] for s in kernels)
+        self.narrow_ds = sum(s.narrow_ds for s in kernels)
+
+    def row(self, defines):
+        """The committed baseline row for this object."""
+        return {
+            "defines": defines,
+            "vgpr": self.vgpr, "agpr": self.agpr, "lds": self.lds, "occ": self.occ,
+            "meta_spill": self.meta_spill,
+            "isa_spill": self.isa_spill, "unmetered_spill": self.unmetered,
+            "meta_lies": self.meta_lies,
+            "bpermute": self.bpermute, "lds16": self.narrow_ds,
+            "arms": self.arms,
+        }
+
+
+def contract(facts, baseline, defines, strict):
+    """Run the six checks over one object. -> (failures, advisories)."""
+    fails, notes = [], []
+    o = facts.stem
+    want = baseline.get("objects", {}).get(o)
+    profiles = baseline.get("geom_profiles", {})
+
+    # --- 1. every geometry -D must appear in the object, carrying the value that compiled.
+    for name, val in sorted(defines.items()):
+        if not (GEOM_NS.match(name) or name in GEOM_EXTRA):
+            continue
+        if name not in facts.geom:
+            fails.append(
+                f"{o}: -D{name}={val} was passed but the object carries no "
+                f"{GEOM_PREFIX}{name} marker — add PLOW_GEOM_MARK({name}) to "
+                f"runtime/amd/geom_contract.h, or the -D cannot be shown to have taken")
+            continue
+        try:
+            iv = int(val, 0)
+        except ValueError:
+            continue          # a non-numeric -D is not a geometry value
+        if facts.geom[name] != iv:
+            fails.append(
+                f"{o}: -D{name}={iv} did NOT take — the object compiled {name}="
+                f"{facts.geom[name]} (a bare #define in the header wins over the command "
+                f"line, and the recipe compiles -w)")
+
+    # --- 6. resource budget, and the geometry the object actually compiled.
+    if want:
+        if want.get("defines") != defines:
+            notes.append(f"{o}: built with different axes than the baseline records; "
+                         f"resource and arm budgets not compared")
+            want = None
+    if want:
+        for field, got in (("vgpr", facts.vgpr), ("agpr", facts.agpr),
+                           ("lds", facts.lds), ("occ", facts.occ)):
+            if want.get(field) != got:
+                fails.append(f"{o}: {field} {got} != budget {want.get(field)} "
+                             f"(re-bless with --bless if this is intended)")
+        prof = profiles.get(want.get("geom"), {})
+        for knob, val in sorted(prof.items()):
+            if facts.geom.get(knob) != val:
+                fails.append(f"{o}: compiled {knob}={facts.geom.get(knob)}, "
+                             f"baseline {val}")
+        for knob in sorted(set(facts.geom) - set(prof)):
+            fails.append(f"{o}: compiled {knob}={facts.geom[knob]}, absent from the baseline "
+                         f"geometry profile")
+
+    # --- 2. spill, from the ISA, against the note and against the budget.
+    known = (want or {}).get("meta_lies", {})
+    for name, n in sorted(facts.meta_lies.items()):
+        msg = (f"{name} issues {n} scratch op(s) while its note reports vgpr_spill_count 0 "
+               f"— the metadata is wrong, trust the ISA")
+        if not want:
+            notes.append(f"{o}: {msg}")
+        elif n > known.get(name, -1):
+            fails.append(f"{o}: {msg} (baseline records {known.get(name, 'none')})")
+    for name in sorted(set(known) - set(facts.meta_lies)):
+        notes.append(f"{o}: {name} no longer under-reports its spill — re-bless")
+    if want:
+        if facts.isa_spill > want.get("isa_spill", 0):
+            fails.append(f"{o}: {facts.isa_spill} scratch ops > budget "
+                         f"{want.get('isa_spill')}")
+        elif facts.isa_spill < want.get("isa_spill", 0):
+            notes.append(f"{o}: {facts.isa_spill} scratch ops, below the budget of "
+                         f"{want.get('isa_spill')} — re-bless to hold the improvement")
+
+    # --- 5. every head-dim arm the object must serve is instantiated.
+    need = list(HD_REQUIRED)
+    if defines.get("PLOW_FP8_KV") != "1":
+        need.append(HD_GPTOSS)
+    if "d_flash_merge" in facts.arms:
+        missing = [h for h in need if h not in facts.arms["d_flash_merge"]]
+        if missing:
+            fails.append(
+                f"{o}: d_flash_merge has no arm for head_dim {missing} — on AMD a missing "
+                f"arm does not trap, the dispatch falls through and WRITES NOTHING")
+        extra = [h for h in facts.arms["d_flash_merge"] if h not in need]
+        if extra:
+            fails.append(f"{o}: d_flash_merge instantiates head_dim {extra}, which this "
+                         f"object's axes say it must not serve")
+    else:
+        notes.append(f"{o}: carries no d_flash_merge instantiation (the flash bucket runs "
+                     f"class-4 segments and merges elsewhere); its head-dim arms are held by "
+                     f"the baseline arm set, not by the coverage rule")
+    if want and facts.arms != want.get("arms"):
+        fails.append(f"{o}: flash arm set {facts.arms} != baseline {want.get('arms')}")
+
+    # --- 3. LDS-crossbar-bound reductions (report).
+    for s in facts.syms:
+        m, b = s.fam["mfma"], s.fam["bpermute"]
+        if m and b >= PERMUTE_FLOOR and b >= PERMUTE_PER_MFMA * m:
+            notes.append(
+                f"{o}: {s.name[:52]} issues {b} LDS permute(s) against {m} MFMA "
+                f"({b / m:.1f}x), s_waitcnt {s.fam['waitcnt']} ({s.wait_density:.1f}/100), "
+                f"{s.fam['swizzle']} ds_swizzle")
+
+    # --- 4. 2-byte LDS read density (report).
+    for s in facts.syms:
+        m, n = s.fam["mfma"], s.narrow_ds
+        if m and n >= LDS16_FLOOR and n >= LDS16_PER_MFMA * m:
+            notes.append(
+                f"{o}: {s.name[:52]} issues {n} 2-byte ds_read against {m} MFMA "
+                f"({n / m:.1f}x)")
+
+    if strict:
+        fails += [f"(strict) {n}" for n in notes]
+        notes = []
+    return fails, notes
+
+
+def run_contract(objects, baseline_path, defines_path, bless, strict):
+    with open(baseline_path) as f:
+        baseline = json.load(f)
+    defines_map = {}
+    if defines_path:
+        with open(defines_path) as f:
+            defines_map = {k: defines_of(v) for k, v in json.load(f).items()}
+
+    fails, notes = [], []
+
+    # The roster check is source-side and runs once: it is what stops the marker set from
+    # rotting as knobs are added.
+    declared, marked = geom_roster()
+    for knob in sorted(declared - marked):
+        fails.append(f"geom_contract.h: {knob} is a tunable in runtime/amd but has no "
+                     f"PLOW_GEOM_MARK line, so a -D{knob} could not be shown to have taken")
+    for knob in sorted(marked - declared - GEOM_EXTRA):
+        # The reverse direction, and it is a REFUSAL rather than a note: a marked knob that no
+        # header `#ifndef`-guards any more is a knob whose bare `#define` now silently beats the
+        # command line. That is the GM_SM_BK defect itself, catchable without anyone passing a
+        # -D at all.
+        fails.append(f"geom_contract.h: marks {knob}, but no header #ifndef-guards it any "
+                     f"more — a -D{knob} would be silently overridden by the header")
+
+    # The arch guard the `--expect` half already has: gfx942 and gfx950 are different LDS
+    # budgets, different occupancy arithmetic and a different geometry profile, so a baseline
+    # blessed on one describes nothing about the other.
+    want_arch = baseline.get("_arch")
+    for path, _ in objects:
+        got = isa.elf_arch(path)
+        if want_arch and got != want_arch:
+            print(f"FAIL  {os.path.basename(path)}: built for {got}, but "
+                  f"{os.path.basename(baseline_path)} is the {want_arch} contract")
+            return 1
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        all_facts = list(pool.map(lambda pk: ObjectFacts(*pk), objects))
+
+    rows, profiles = {}, {}
+    print("\n   object                              vgpr agpr    lds occ  meta   ISA  unmet "
+          "bperm  lds16")
+    for facts in all_facts:
+        defines = defines_map.get(facts.stem, {})
+        print(f"   {facts.stem:<34}{facts.vgpr:>6}{facts.agpr:>5}{facts.lds:>7}"
+              f"{facts.occ:>4}{facts.meta_spill:>6}{facts.isa_spill:>6}"
+              f"{facts.unmetered:>7}{facts.bpermute:>6}{facts.narrow_ds:>7}")
+        if bless:
+            rows[facts.stem] = facts.row(defines)
+            profiles[facts.stem] = facts.geom
+            continue
+        if not defines_map:
+            notes.append(f"{facts.stem}: no --defines entry; the geometry -D contract "
+                         f"(class 1) cannot run on this object")
+        f, n = contract(facts, baseline, defines, strict)
+        fails += f
+        notes += n
+
+    if bless:
+        # Geometry is identical across most rows, so the profiles are shared and named in
+        # first-appearance order over the sorted object list: one knob moving is then one
+        # changed line in the diff, not forty.
+        seen, named = {}, {}
+        for stem in sorted(rows):
+            key = json.dumps(profiles[stem], sort_keys=True)
+            if key not in seen:
+                seen[key] = f"p{len(seen)}"
+                named[seen[key]] = profiles[stem]
+            rows[stem]["geom"] = seen[key]
+        with open(baseline_path) as f:
+            old = json.load(f)
+        old["geom_profiles"] = named
+        old["objects"] = {k: rows[k] for k in sorted(rows)}
+        with open(baseline_path, "w") as f:
+            json.dump(old, f, indent=1, sort_keys=False)
+            f.write("\n")
+        print(f"\nBLESSED  {len(rows)} object(s), {len(named)} geometry profile(s) "
+              f"-> {os.path.relpath(baseline_path, REPO)}")
+        return 0
+
+    # Identical advisories across objects collapse to one line: the same three flash-prefill
+    # bodies are outlined into thirty objects, and thirty copies of one finding is a wall of
+    # text nobody reads rather than a report.
+    grouped = {}
+    for n in notes:
+        obj, _, msg = n.partition(": ")
+        grouped.setdefault(msg, []).append(obj)
+    for msg, objs in grouped.items():
+        where = objs[0] if len(objs) == 1 else f"{objs[0]} +{len(objs) - 1} more"
+        print(f"NOTE  [{where}] {msg}")
+    if fails:
+        for f in fails:
+            print(f"FAIL  {f}")
+        return 1
+    print(f"PASS  contract held over {len(objects)} object(s)"
+          f"{' (strict)' if strict else ''}")
+    return 0
+
+
 def main(argv):
-    expect, paths = None, []
+    expect, contract_path, defines_path, paths = None, None, None, []
+    bless = False
+    strict = os.environ.get("PLOW_AUDIT_STRICT", "0") not in ("0", "", "false")
+    quiet = False
     it = iter(argv)
     for a in it:
         if a == "--expect":
             expect = json.load(open(next(it)))
+        elif a == "--contract":
+            contract_path = next(it)
+        elif a == "--defines":
+            defines_path = next(it)
+        elif a == "--bless":
+            bless = True
+        elif a == "--strict":
+            strict = True
+        elif a == "--quiet":
+            quiet = True        # the contract table only; skip the per-kernel dump
         else:
             paths.append(a)
     if not paths:
@@ -354,11 +612,17 @@ def main(argv):
     if expect is not None and not want_arch:
         sys.exit("asm_audit: the expectation file must declare a top-level \"_arch\"")
 
+    # One disassembly for both contracts, and one thread per object: the whole cost here is
+    # llvm-objdump and llvm-readelf subprocesses, which release the GIL. 45 objects serially is
+    # 31 s, which is where a build-time check starts getting skipped.
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        arches = list(pool.map(isa.elf_arch, paths))
+        parsed = list(zip(paths, pool.map(isa.counts, paths, arches)))
+
     fails, checked = [], 0
-    for p in paths:
-        arch = elf_arch(p)
-        kernels = parse(disassemble(p, arch))
-        report(p, kernels)
+    for (p, kernels), arch in zip(parsed, arches):
+        if not quiet:
+            report(p, kernels)
         if not expect:
             continue
         if arch != want_arch:
@@ -376,14 +640,18 @@ def main(argv):
             checked += 1
             fails += [f"{base}: {f}" for f in check(kernels, expect[keys[0]])]
 
+    rc = 0
     if expect:
         print()
         if fails:
             for f in fails:
                 print(f"FAIL  {f}")
-            return 1
-        print(f"PASS  all {want_arch} assertions held over {checked} audited object(s)")
-    return 0
+            rc = 1
+        else:
+            print(f"PASS  all {want_arch} assertions held over {checked} audited object(s)")
+    if contract_path:
+        rc |= run_contract(parsed, contract_path, defines_path, bless, strict)
+    return rc
 
 
 if __name__ == "__main__":

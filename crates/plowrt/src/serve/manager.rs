@@ -58,14 +58,14 @@ const DEFAULT_OVERHEAD: u64 = 512 << 20;
 pub struct BlobPlan {
     /// Checkpoint weights (`model.*`, `fp8/*`).
     pub weights_bytes: u64,
-    /// KV arena at the compiled context (`kv.*`).
+    /// KV bytes (`kv.*`): compiled extent, or resident startup bytes in a live device plan.
     pub kv_bytes: u64,
     /// Activations, IO, MoE tables — every other blob tensor.
     pub other_bytes: u64,
 }
 
 impl BlobPlan {
-    /// Sum of every device tensor the engine will allocate.
+    /// Sum of the planned tensor bytes.
     pub fn tensor_total(&self) -> u64 {
         self.weights_bytes + self.kv_bytes + self.other_bytes
     }
@@ -101,6 +101,10 @@ impl BlobPlan {
     /// once (header + tensor decls; the init section ride-along is the cost of
     /// the shared parser — startup-only, never on the request path).
     pub fn from_dir(dir: &Path) -> Result<BlobPlan> {
+        Self::from_dir_with_granularity(dir, None)
+    }
+
+    fn from_dir_with_granularity(dir: &Path, granularity: Option<u64>) -> Result<BlobPlan> {
         let pkt = DevBlob::find_in_dir(dir)?
             .ok_or_else(|| RuntimeError::Device(format!("no PLOWDEV blob in {}", dir.display())))?;
         let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
@@ -119,6 +123,41 @@ impl BlobPlan {
         };
         for t in &blob.tensors {
             plan.add(&t.name, t.bytes);
+        }
+        if let Some(granularity) = granularity {
+            let config = crate::config::RuntimeConfig::get();
+            let manifest = crate::memory::vmm::LiveKvLayout::manifest(&blob, &raw)?;
+            let packed = blob
+                .reserved_metadata(&raw, plow_asset::packed_prefill::SECTION)?
+                .is_some();
+            let full = manifest
+                .as_ref()
+                .is_some_and(|m| m.caches.iter().any(|c| c.window == 0));
+            if config.nv_live_kv_enabled(packed, full) {
+                let layout = match manifest.as_ref() {
+                    Some(m) => crate::memory::vmm::LiveKvLayout::from_manifest(&blob, m)?,
+                    None => crate::memory::vmm::LiveKvLayout::from_blob(&blob)?,
+                };
+                let virtual_bytes: u64 = layout
+                    .full_tensors
+                    .iter()
+                    .flatten()
+                    .map(|&id| blob.tensors[id].bytes)
+                    .sum();
+                let geo = &layout.geometry;
+                let block =
+                    geo.block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)?;
+                // Load maps row zero for every slot, including idle decode lanes.
+                let resident = block
+                    * u64::from(geo.batch)
+                    * u64::from(geo.kvh_full)
+                    * layout.full_tensors.len() as u64
+                    * 2;
+                plan.kv_bytes = plan.kv_bytes.checked_sub(virtual_bytes).ok_or_else(|| {
+                    RuntimeError::Rejected("live KV plan tensor classification".into())
+                })? + resident
+                    + crate::memory::vmm::kv_pool_cap();
+            }
         }
         Ok(plan)
     }
@@ -204,7 +243,7 @@ impl ModelManager {
     ) -> Result<ModelManager> {
         let mut managed = Vec::with_capacity(models.len());
         for (slug, dir, ckpt) in models {
-            let plan = BlobPlan::from_dir(&dir)?;
+            let plan = BlobPlan::from_dir_with_granularity(&dir, Some(be.granularity()?))?;
             tracing::info!(
                 %slug,
                 weights_gib = gib(plan.weights_bytes),

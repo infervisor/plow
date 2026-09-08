@@ -164,6 +164,19 @@ fn k3_cfg_from(v: &Value) -> K3Cfg {
             .unwrap_or_else(|| panic!("kimi_k3: text_config missing required field {k:?}"))
     };
     let layers = g("num_hidden_layers");
+    // NO `require_mla_geometry` HERE, deliberately, and this is the one place in the family that
+    // does not get the check. K3's unit tests are built on FAITHFUL MINIATURES — `k3_json` is a
+    // 6-layer model at hidden 256 / kv_lora 32 / v_head 16, and `kimi_tests.rs` hand-builds a
+    // `K3Cfg` at kv_lora 64 — with dozens of derived shape assertions scaled to match. Those
+    // miniatures describe models the kernels could not serve, which is FINE because they are
+    // never served: they exist to test layer maps, gap reports and tensor naming. Asserting the
+    // real geometry here would refuse the whole K3 test suite, and rewriting the fixtures to
+    // 512-wide would destroy the property that makes them useful.
+    //
+    // The exposure this leaves is narrow and stated rather than hidden: a FUTURE model on the K3
+    // schema at a latent width other than 512 would emit unrefused. Kimi-K3 itself is pinned at
+    // `kv_lora_rank: 512` by the real-config test below, and `cfg_glm` — which is what
+    // GLM-5.2/5.3, DeepSeek-V2/V3 and Kimi-K2.7 all parse through — does carry the check.
     let attn = k3_attn_map(t, layers);
 
     let lac = &t["linear_attn_config"];
@@ -1231,7 +1244,7 @@ fn k3_build_model(
 
     let mut decode = Vec::with_capacity(rungs.len());
     let packed_prefill_topology =
-        crate::emit_is_amd() && crate::emit_config::active().emit_packed_prefill;
+        crate::emit_is_amd() && crate::emit_config::active().packed_prefill_on();
     let mut prefill = Vec::with_capacity(pf.len() * (1 + usize::from(packed_prefill_topology)));
     for (i, &t) in decode_build_order.iter().enumerate() {
         let fallback_ns = k3_nsplit_fallback(ctx);

@@ -977,6 +977,102 @@ fn phase(
     }
 }
 
+/// Set once `run` below emits for an AMD target: the AMD tile inventory, an AMD manifest, and
+/// an AMD interpreter object in place of the paired CUDA one. This is the DECODE gate.
+const AMD_QWEN_EMIT: bool = false;
+
+/// Set once a HIP chunked Gated DeltaNet prefill kernel and its `plowrt` adapter exist.
+/// PREFILL only — a decode-only blob emits `QwenGdnStep` and never reaches this.
+const AMD_GDN_PREFILL: bool = false;
+
+/// The Qwen3.5-specific opcodes. Derived from `DevOp::ALL` by `PLOW_DOP_QWEN_*` spelling rather
+/// than listed, so a new Qwen op joins the coverage question the moment it is defined.
+fn qwen_opcodes() -> Vec<DevOp> {
+    DevOp::ALL
+        .iter()
+        .copied()
+        .filter(|o| o.c_name().starts_with("PLOW_DOP_QWEN_"))
+        .collect()
+}
+
+/// The Qwen opcodes `runtime/amd/interp.hip` has no arm for.
+///
+/// Reads the same `GFX950_DISPATCHED` list `check_gfx950_opcode_coverage` reads, which a drift
+/// test keeps equal to the `case` labels actually present in `interp.hip`. So this shrinks by
+/// itself as arms land: implement the arm, add its spelling to the list, and the refusal below
+/// stops naming it.
+pub(crate) fn qwen_amd_missing_arms() -> Vec<&'static str> {
+    qwen_opcodes()
+        .into_iter()
+        .map(|o| o.c_name())
+        .filter(|c| !GFX950_DISPATCHED.contains(c))
+        .collect()
+}
+
+/// Refuse a Qwen3.5 emit for a target that cannot run the packet it would produce.
+///
+/// WHY A REFUSAL AND NOT A BEST EFFORT. AMD's dispatch `default:` is `/* PLOW_DOP_NOP */` — it
+/// writes NOTHING and does not trap — so an AMD packet carrying an op with no arm would RUN to
+/// completion over untouched output buffers and serve fluent nonsense. That is what
+/// `check_gfx950_opcode_coverage` catches generically; this is the same question asked early,
+/// before the emitter has done any work, with each gap named so its size is legible instead of
+/// being an arch string mismatch.
+///
+/// THE THREE GAPS ARE NOT THE SAME SHAPE, and the order matters to whoever picks this up:
+///
+///   1. The interpreter arms. CLOSED — `runtime/amd/op_qwen_gdn.h` implements all ten, and
+///      `qwen_amd_missing_arms` reads the live `GFX950_DISPATCHED` so this reopens by itself if
+///      one is ever dropped.
+///   2. The EMITTER. `run` below is NVIDIA-shaped throughout: it pins the NVIDIA tile inventory
+///      (`EmitAmdGuard::set(false)`), builds the manifest for `sm_90a`, and asserts an external
+///      paired CUDA interpreter. Porting that is what a decode-only AMD blob actually needs, and
+///      it is the SHORTEST path to a working AMD Qwen3.5 — see (3).
+///   3. `PLOW_DOP_QWEN_GDN_PREFILL`. Only a PREFILL program emits it (the `self.prefill` branch in
+///      `Emitter::gdn`); a decode-only model — which is what `model()` builds whenever
+///      `PLOW_QWEN_PREFILL` is unset, and how Kimi-K3 spent its whole AMD bring-up — carries
+///      `QwenGdnStep` instead and needs nothing from this gap. So (3) does NOT block (2). It is
+///      also not an interpreter arm on EITHER backend: sm_90a dispatches it host-side into a
+///      generated CuTe kernel (`runtime/nvidia/gdn_prefill.cpp`, `plow_gdn_run`) from
+///      `crates/plowrt/src/exec/gpu.rs`, so AMD needs a chunked HIP body AND an adapter.
+fn refuse_unimplemented_target(arch: &str, gpu: &str) {
+    if !target_is_amd(arch, gpu) {
+        return;
+    }
+    let mut gaps: Vec<String> = Vec::new();
+    let missing = qwen_amd_missing_arms();
+    if !missing.is_empty() {
+        gaps.push(format!(
+            "`qwen35_gdn_amd`: runtime/amd/interp.hip has no arm for {missing:?}. Implement them \
+             and add their `PLOW_DOP_*` spellings to `GFX950_DISPATCHED`"
+        ));
+    }
+    if !AMD_QWEN_EMIT {
+        gaps.push(
+            "`qwen35_amd_emit`: this emitter is NVIDIA-shaped — it pins the NVIDIA tile inventory \
+             (`EmitAmdGuard::set(false)`), builds the manifest for sm_90a, and asserts an external \
+             paired CUDA interpreter. The ten Gated DeltaNet arms exist and are oracle-checked \
+             (docs/amd/qwen35-gdn-mi300x.md); nothing routes a packet to them yet. A DECODE-ONLY \
+             blob needs only this gap closed"
+                .to_string(),
+        );
+    }
+    if !AMD_GDN_PREFILL {
+        gaps.push(
+            "`qwen35_gdn_prefill_amd`: PREFILL additionally needs \
+             `PLOW_DOP_QWEN_GDN_PREFILL`, a HOST-side chunked Gated DeltaNet dispatch rather than \
+             an interpreter arm — sm_90a calls the generated CuTe kernel in \
+             runtime/nvidia/gdn_prefill.cpp via `plow_gdn_run`, and there is no HIP equivalent or \
+             AMD adapter. Decode does not emit this op and is not blocked on it"
+                .to_string(),
+        );
+    }
+    assert!(
+        gaps.is_empty(),
+        "qwen3_5 cannot be emitted for {arch}. Missing capability:\n  - {}",
+        gaps.join("\n  - ")
+    );
+}
+
 pub(super) fn run(
     dir: &Path,
     ctx: u32,
@@ -989,6 +1085,7 @@ pub(super) fn run(
     gpu: &str,
     verify: Option<&VerifyHook>,
 ) {
+    refuse_unimplemented_target(arch, gpu);
     assert_eq!(
         arch, "sm_90a",
         "qwen3_5 native CUDA path currently requires sm_90a"
@@ -1058,6 +1155,7 @@ pub(super) fn run(
     }
     let lean = apply_verify_gate(&m, verify);
     let man = manifest::build(&m, arch, &lean);
+    crate::report_dispatch_audit(&man);
     let out = Path::new(out);
     let mut sections = Vec::new();
     if let Some(section) = segment_roles(&m) {
@@ -1161,6 +1259,79 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AMD gate is a REFUSAL, not a filter: every Qwen opcode is still missing an arm, so an
+    /// AMD target must not reach the emitter at all. Reads the live arm list, so the day an arm
+    /// lands this test's expectation moves with it rather than pinning a stale gap.
+    #[test]
+    fn amd_targets_are_refused_by_name() {
+        let missing = qwen_amd_missing_arms();
+        let all: Vec<&str> = qwen_opcodes().into_iter().map(|o| o.c_name()).collect();
+        assert!(!all.is_empty(), "no PLOW_DOP_QWEN_* opcodes found at all");
+        assert!(
+            missing.iter().all(|c| all.contains(c)),
+            "missing-arm list must be a subset of the Qwen opcodes"
+        );
+        for (arch, gpu) in [("gfx942", ""), ("gfx950", ""), ("", "MI300X")] {
+            let err = std::panic::catch_unwind(|| refuse_unimplemented_target(arch, gpu))
+                .expect_err("an AMD target must be refused while arms are missing");
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()).unwrap());
+            assert!(
+                msg.contains("Missing capability:"),
+                "the refusal must name the capability: {msg}"
+            );
+            for c in &missing {
+                assert!(msg.contains(c), "the refusal must name {c}: {msg}");
+            }
+            assert!(
+                AMD_QWEN_EMIT || msg.contains("qwen35_amd_emit"),
+                "the emitter gap must be named while it stands: {msg}"
+            );
+            assert!(
+                AMD_GDN_PREFILL || msg.contains("qwen35_gdn_prefill_amd"),
+                "the host-side prefill gap must be named while it stands: {msg}"
+            );
+        }
+        // sm_90a is the path that works; it must pass this gate untouched.
+        refuse_unimplemented_target("sm_90a", "H100");
+    }
+
+    /// The refusal claims a DECODE-only blob needs nothing from `qwen35_gdn_prefill_amd`, and that
+    /// claim is what tells the next person to port the emitter rather than the CuTe kernel. Pin it
+    /// against the emitter, not against a reading of it.
+    #[test]
+    fn a_decode_only_model_emits_no_prefill_op() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let c = Config::parse(&fixture());
+        let m = model(&c, 32768, 132, 0, false, 1);
+        let decode_ops: std::collections::BTreeSet<u16> =
+            m.progs.iter().flat_map(|p| p.insts.iter()).map(|d| d.op).collect();
+        assert!(
+            decode_ops.contains(&(DevOp::QwenGdnStep as u16)),
+            "a decode model must carry the step op"
+        );
+        assert!(
+            !decode_ops.contains(&(DevOp::QwenGdnPrefill as u16)),
+            "a decode-only model must not carry the host-dispatched prefill op"
+        );
+        // ... and every op it does carry must already have an AMD arm, or the claim is false.
+        let unarmed: Vec<&str> = decode_ops
+            .iter()
+            .filter_map(|&op| DevOp::ALL.iter().copied().find(|o| *o as u16 == op))
+            .map(|o| o.c_name())
+            .filter(|c| !GFX950_DISPATCHED.contains(c))
+            .collect();
+        assert!(
+            unarmed.is_empty(),
+            "a decode-only Qwen packet still carries {unarmed:?} with no AMD arm — the \
+             `qwen35_amd_emit` refusal claims this set is empty"
+        );
+    }
+
     #[test]
     fn decode_balanced_splits_reject_gf6_and_preserve_prefill() {
         let _env = crate::test_env::env_guard();

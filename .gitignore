@@ -46,6 +46,14 @@ plow_profile.sqlite
 
 # plowc/plowrt emitted serve-asset bundles for this campaign (model.pkt, weights.json, cubins)
 assets-run/
+target-glm53/
+target-glm53-check/
+venv-sglang/
+.venv-sglang/
+sglang-pkgs/
 
 # Performance measurements are summarized in Markdown.
 /perf-data/**/*.json
+
+# Sibling checkouts used for cross-branch comparison
+.worktrees/

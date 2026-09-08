@@ -258,8 +258,23 @@ fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
 fn decode_feed_extent(feeds: &[(usize, u32)]) -> Option<usize> {
     feeds.iter().map(|&(slot, _)| slot + 1).max()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DecodeProgress {
+    extent: usize,
+    steps: std::num::NonZeroUsize,
+}
+
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu", test))]
+fn completed_decode(feeds: &[(usize, u32)], steps: usize) -> Option<DecodeProgress> {
+    Some(DecodeProgress {
+        extent: decode_feed_extent(feeds)?,
+        steps: std::num::NonZeroUsize::new(steps)?,
+    })
 }
 
 impl ModelMux {
@@ -337,6 +352,14 @@ struct Slot {
     /// the gfx950 arm does.
     #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
     arrived: Instant,
+    /// Tail of the text streamed so far, for OpenAI `stop` matching. Only the
+    /// last `max(stop)` bytes are kept — a stop sequence can straddle token
+    /// boundaries, so matching per-delta would miss it, and keeping the whole
+    /// answer to scan it would be O(n^2) over a long generation.
+    stop_tail: String,
+    /// Bytes withheld from the client because they are a proper prefix of a stop string and
+    /// the rest of it may still be generated. Released once a later token proves otherwise.
+    stop_pending: String,
 }
 
 /// Buffers reused across ticks for one bucket. Reallocated only when the live
@@ -895,22 +918,23 @@ pub fn spawn(
                     tokens_produced,
                     did_prefill,
                     tick_fault,
-                    fed_extent,
+                    decode_progress,
                 )) => {
                     // Decode-service EWMA: prefill ticks are excluded — see
                     // `service_sample`. Updating on them poisons the admission
                     // predictor and sheds live decode streams.
-                    if let Some(sample) = service_sample(ms, did_prefill) {
+                    let sample = service_sample(ms, did_prefill);
+                    if let Some(sample) = sample {
                         load.service_ms.update(sample);
-                        if let (Some(controller), Some(extent)) =
-                            (rung_controller.as_mut(), fed_extent)
-                        {
-                            let rung = controller.covering(extent);
-                            metrics
-                                .decode_rung_actual
-                                .store(controller.width(rung) as u64, Ordering::Relaxed);
-                            controller.observe_decode(rung, sample);
-                        }
+                    }
+                    if let (Some(controller), Some(progress), Some(sample)) =
+                        (rung_controller.as_mut(), decode_progress, sample)
+                    {
+                        let rung = controller.covering(progress.extent);
+                        metrics
+                            .decode_rung_actual
+                            .store(controller.width(rung) as u64, Ordering::Relaxed);
+                        controller.observe_decode(rung, sample, progress.steps);
                     } else if rung_controller.is_some() {
                         metrics.decode_rung_actual.store(0, Ordering::Relaxed);
                     }
@@ -1088,6 +1112,8 @@ fn admit_into(
         out_ids: Vec::new(),
         gen: job.gen,
         arrived: job.arrived,
+            stop_tail: String::new(),
+            stop_pending: String::new(),
         respond: job.respond,
         prefix_offset: 0,
         read_offset: 0,
@@ -1190,7 +1216,9 @@ fn live_kv_rows(slots: &[Option<Slot>]) -> impl Iterator<Item = SlotHandle> + '_
 ///
 /// **Batched path.** When the bucket carries `TOKEN_SAMPLE_BATCH` the mux
 /// packs every live slot's logits into a `B×vocab` tile, sets per-row
-/// params/rng, and fires the bucket **once** via `AppState::step_batch`. The
+/// params/rng, and fires the bucket **once** via `AppState::step_batch`. A GPU
+/// packet may instead cover those decode rows and waiting prefill rows in one
+/// mixed launch. The
 /// produced tokens land in `obs.host.slot_tokens[row]`. This is the phase-3
 /// "one bucket walk per tick" path.
 ///
@@ -1217,9 +1245,9 @@ fn run_one_tick(
     // First device fault seen this tick — the dispatcher's EngineHealth
     // signal. Always `None` on the CPU reference path.
     Option<crate::DeviceErrorInfo>,
-    // Highest physical slot fed to decode, plus one. Empty decode ticks do
-    // not produce a rung sample.
-    Option<usize>,
+    // Only successful decode contributes a rung sample. Steps count device
+    // execution, including tokens discarded after a stop within the quantum.
+    Option<DecodeProgress>,
 ) {
     let bucket = key.and_then(|k| bundle.bucket(k));
     let mut tokens_this_tick = 0usize;
@@ -1231,8 +1259,9 @@ fn run_one_tick(
     // its stand-in logits are bypassed entirely. The engine drives B
     // independent sequence slots (the compiled PLOW_DECODE_BATCH; the slot
     // table is sized to it at spawn, so mux slot i IS engine slot i). Per
-    // tick: prefill each new arrival into its own KV slot (sequential), then
-    // ONE batched decode launch advances every already-running slot.
+    // tick: a packet-declared mixed variant combines live decode and waiting
+    // prefill rows when available; otherwise prefill runs before one batched
+    // decode launch.
     #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     if let Some(eng) = state.gpu_engine(bundle.network()) {
         let mut guard = eng.lock();
@@ -1292,6 +1321,202 @@ fn run_one_tick(
             let defer_decode = pf_defer_decode();
             if defer_decode && did_prefill {
                 feeds.clear();
+            }
+
+            // A mixed packet variant executes existing decode rows and a
+            // prefix of waiting prefill rows in one compiler-emitted program.
+            // Keep each prompt's last token for the ordinary decode path so
+            // it can produce that request's first output token. Admit only a
+            // cold prefill span until repeated mixed-span parity is qualified.
+            if !feeds.is_empty() && did_prefill {
+                let available_prefill: usize = slots
+                    .iter()
+                    .take(cap)
+                    .filter_map(|slot| slot.as_ref())
+                    .filter(|slot| slot.step == 0 && slot.pf_pos == 0 && !slot.respond.is_closed())
+                    .map(|slot| {
+                        slot.prompt_ids
+                            .len()
+                            .saturating_sub(1)
+                            .saturating_sub(slot.pf_pos)
+                    })
+                    .sum();
+                if let Some(rows) = e.mixed_step_rows(feeds.len(), available_prefill) {
+                    let prefill_capacity = rows as usize - feeds.len();
+                    let mut pack = Vec::<(usize, usize, usize)>::new();
+                    let mut remaining = prefill_capacity;
+                    for i in 0..slots.len().min(cap) {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let Some(slot) = slots[i].as_ref() else {
+                            continue;
+                        };
+                        if slot.step != 0 || slot.pf_pos != 0 || slot.respond.is_closed() {
+                            continue;
+                        }
+                        if slot.pf_pos == 0 {
+                            let reserve = slot.prompt_ids.len() + slot.gen.max_tokens.max(1);
+                            if let Err(err) = e.begin_slot(i, reserve) {
+                                tracing::warn!(
+                                    slot = i,
+                                    error = %err,
+                                    error_code = ?err.device_code(),
+                                    fatal = err.is_fatal(),
+                                    "gpu: mixed-step begin failed"
+                                );
+                                note_fault(&mut tick_fault, &err);
+                                if let Some(taken) = slots[i].take() {
+                                    release_kv(&arena, taken.kv);
+                                    let _ = taken.respond.try_send(StreamChunk::Err(err));
+                                }
+                                continue;
+                            }
+                            let attached = {
+                                let request = slots[i].as_ref().expect("checked Some");
+                                e.attach_prompt(i, &request.prompt_ids)
+                            };
+                            match attached {
+                                Ok(frontier) => {
+                                    let request = slots[i].as_mut().expect("checked Some");
+                                    request.pf_pos = frontier;
+                                    request.cached_tokens = e.attached_rows(i) as usize;
+                                }
+                                Err(err) => {
+                                    note_fault(&mut tick_fault, &err);
+                                    if let Some(taken) = slots[i].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken.respond.try_send(StreamChunk::Err(err));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        let request = slots[i].as_ref().expect("checked Some");
+                        if request.pf_pos != 0 {
+                            continue;
+                        }
+                        let start = request.pf_pos;
+                        let available = request
+                            .prompt_ids
+                            .len()
+                            .saturating_sub(1)
+                            .saturating_sub(start);
+                        if available == 0 {
+                            continue;
+                        }
+                        let take = available.min(remaining).min(pf_chunk_rows());
+                        pack.push((i, start, take));
+                        remaining -= take;
+                    }
+                    if pack.last().is_some_and(|&(_, start, len)| {
+                        start
+                            .checked_add(len)
+                            .and_then(|end| end.checked_add(remaining))
+                            .is_none_or(|end| end > e.max_ctx())
+                    }) {
+                        pack.clear();
+                    }
+                    if !pack.is_empty() {
+                        let decode: Vec<_> = feeds
+                            .iter()
+                            .map(|&(slot, token)| plow_asset::mixed_step::DecodeRequest {
+                                slot: slot as u32,
+                                state_slot: slot as u32,
+                                token,
+                            })
+                            .collect();
+                        let prefill: Vec<_> = pack
+                            .iter()
+                            .map(|&(slot, start, len)| {
+                                let request = slots[slot].as_ref().expect("packed slot is Some");
+                                plow_asset::mixed_step::PrefillRequest {
+                                    slot: slot as u32,
+                                    state_slot: slot as u32,
+                                    start: start as u32,
+                                    tokens: &request.prompt_ids[start..start + len],
+                                    prompt_len: request.prompt_ids.len() as u32,
+                                }
+                            })
+                            .collect();
+                        let mut toks = std::mem::take(&mut obs.host.slot_tokens);
+                        toks.resize(feeds.len(), 0);
+                        let mixed = e.mixed_step(rows, &decode, &prefill, &mut toks);
+                        drop(prefill);
+                        match mixed {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    decode = feeds.len(),
+                                    prefill = pack.len(),
+                                    prefill_rows =
+                                        pack.iter().map(|&(_, _, len)| len).sum::<usize>(),
+                                    rows,
+                                    "gpu: mixed prefill/decode launch"
+                                );
+                                for &(slot, start, len) in &pack {
+                                    slots[slot].as_mut().expect("packed slot is Some").pf_pos =
+                                        start + len;
+                                }
+                                for (row, &(slot, _)) in feeds.iter().enumerate() {
+                                    let slot_opt = &mut slots[slot];
+                                    let Some(request) = slot_opt.as_mut() else {
+                                        continue;
+                                    };
+                                    match gpu_finish_token(&mut *e, row, request, toks[row]) {
+                                        Ok(token) => handle_produced_token(
+                                            slot_opt,
+                                            &arena,
+                                            bundle,
+                                            token,
+                                            1,
+                                            &mut tokens_this_tick,
+                                            Some(stop.as_slice()),
+                                        ),
+                                        Err(err) => {
+                                            note_fault(&mut tick_fault, &err);
+                                            if let Some(taken) = slot_opt.take() {
+                                                release_kv(&arena, taken.kv);
+                                                let _ =
+                                                    taken.respond.try_send(StreamChunk::Err(err));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    error_code = ?err.device_code(),
+                                    fatal = err.is_fatal(),
+                                    decode = feeds.len(),
+                                    prefill = pack.len(),
+                                    rows,
+                                    "gpu: mixed-step launch failed"
+                                );
+                                note_fault(&mut tick_fault, &err);
+                                let msg = err.to_string();
+                                for &(slot, _) in &feeds {
+                                    if let Some(taken) = slots[slot].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken
+                                            .respond
+                                            .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                    }
+                                }
+                                for &(slot, _, _) in &pack {
+                                    if let Some(taken) = slots[slot].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken
+                                            .respond
+                                            .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                    }
+                                }
+                            }
+                        }
+                        obs.host.slot_tokens = toks;
+                        return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
+                    }
+                }
             }
 
             let pack_t = packlog::on().then(Instant::now);
@@ -1451,7 +1676,7 @@ fn run_one_tick(
 
             let pack_prefill_ns = pack_t.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
             let pack_had_feeds = !feeds.is_empty();
-            let fed_extent = decode_feed_extent(&feeds);
+            let mut decode_progress = None;
             let dec_t = packlog::on().then(Instant::now);
 
             // One batched decode launch for every slot already past prefill. The
@@ -1460,22 +1685,35 @@ fn run_one_tick(
             if !feeds.is_empty() {
                 let mut toks = std::mem::take(&mut obs.host.slot_tokens);
                 // Bounded device multi-step (plan stage 5): when enabled and EVERY
-                // fed row is greedy (temp==0; the device advance uses the argmax
+                // fed row uses unmodified greedy logits (the device advance uses the argmax
                 // token), run a K-token quantum with one host sync and stream up to
                 // K tokens per row, stopping a row as soon as handle_produced_token
-                // frees it (mid-quantum EOS / max_tokens — the extra device tokens
-                // past the stop are discarded, bounded by K). Any stochastic row
+                // frees it (mid-quantum EOS — extra device tokens past the stop
+                // are discarded). Remaining output budgets cap K. Any sampling adjustment
                 // falls through to the per-token path below.
-                let use_multi = e.multistep_quantum().is_some()
+                let use_multi = steps > 1
+                    && e.multistep_quantum().is_some()
                     && feeds.iter().all(|&(i, _)| {
                         slots[i]
                             .as_ref()
-                            .map(|s| s.gen.params.temperature <= 0.0)
+                            .map(|s| gpu_argmax_eligible(&s.gen.params))
                             .unwrap_or(true)
                     });
                 if use_multi {
-                    match e.multi_step(&feeds, &mut toks) {
+                    let remaining = feeds
+                        .iter()
+                        .filter_map(|&(i, _)| slots[i].as_ref())
+                        .map(|slot| slot.gen.max_tokens.max(1).saturating_sub(slot.step))
+                        .min()
+                        .unwrap_or(1);
+                    let requested = multistep_requested(
+                        remaining,
+                        steps as usize,
+                        e.multistep_quantum().unwrap_or(1),
+                    );
+                    match e.multi_step_at_most(&feeds, requested, &mut toks) {
                         Ok(k) => {
+                            decode_progress = completed_decode(&feeds, k);
                             for (ri, &(i, _)) in feeds.iter().enumerate() {
                                 for s in 0..k {
                                     if slots[i].is_none() {
@@ -1533,7 +1771,7 @@ fn run_one_tick(
                         tokens_this_tick,
                         did_prefill,
                         tick_fault,
-                        fed_extent,
+                        decode_progress,
                     );
                 }
                 // Device sampling (plan stage 4): when the engine has a sampler,
@@ -1560,6 +1798,7 @@ fn run_one_tick(
                 let step_res = e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks);
                 match step_res {
                     Ok(()) => {
+                        decode_progress = completed_decode(&feeds, 1);
                         for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
                             let slot_opt = &mut slots[i];
                             let Some(slot) = slot_opt.as_mut() else {
@@ -1653,7 +1892,7 @@ fn run_one_tick(
                 tokens_this_tick,
                 did_prefill,
                 tick_fault,
-                fed_extent,
+                decode_progress,
             );
         }
 
@@ -1661,10 +1900,9 @@ fn run_one_tick(
         // them. Mux slot `i` IS engine slot `i`, so no owner map is needed —
         // the engine's slot table and this one are the same indices.
         //
-        // A tick is EITHER one prefill (the prefill program is single-sequence
-        // and holds the whole device, so at most one per tick) followed by one
-        // batched decode step across every live slot. The two phases interleave
-        // by tick but never overlap on the device because they share scratch.
+        // A packet-bound mixed program can advance prefill and decode together.
+        // Otherwise, a tick runs one isolated/packed prefill submission followed
+        // by bounded decode. Those separate programs share scratch and run sequentially.
         //
         // Irrefutable in an hsa-only build (the enum then has one variant) and
         // refutable alongside `cuda` — the same arm has to compile as both.
@@ -1752,8 +1990,8 @@ fn run_one_tick(
             //     (`seed_ids` + `decode_prepare_batched` on one side,
             //     `prefill_prepare` on the other) before it reads them.
             //
-            // Prefill and decode remain sequential inside the tick because they
-            // share input/activation buffers. The parked-row mask prevents a
+            // The separate prefill/decode fallback runs sequentially because it
+            // shares input/activation buffers. The parked-row mask prevents a
             // mid-prefill KDA state from advancing during the decode dispatch.
             //
             // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
@@ -1761,15 +1999,254 @@ fn run_one_tick(
             let mut did_prefill = false;
             let nv = &crate::config::RuntimeConfig::get().nv;
             let no_interleave = nv.pf_no_interleave;
-            let has_decode = slots[..b.min(slots.len())]
+            let decode_rows = slots[..b.min(slots.len())]
                 .iter()
-                .any(|s| s.as_ref().is_some_and(|s| s.step > 0));
+                .filter(|slot| slot.as_ref().is_some_and(|slot| slot.step > 0))
+                .count();
+            let has_decode = decode_rows > 0;
             let tick_max = amd_prefill_tick_cap(
                 has_decode,
                 no_interleave,
                 nv.pf_defer_decode,
                 nv.pf_interleave,
             );
+            if nv.pf_batch
+                && slots[..b.min(slots.len())]
+                    .iter()
+                    .flatten()
+                    .filter(|slot| slot.step == 0)
+                    .take(2)
+                    .count()
+                    == 2
+            {
+                for (i, slot_opt) in slots.iter_mut().enumerate().take(b) {
+                    let Some(slot) = slot_opt.as_ref().filter(|slot| slot.step == 0) else {
+                        continue;
+                    };
+                    if let Err(err) = e.prepare_packed_prefill_slot(i, &slot.prompt_ids, tick_max) {
+                        note_fault(&mut tick_fault, &err);
+                        if let Some(taken) = slot_opt.take() {
+                            release_kv(&arena, taken.kv);
+                            let _ = taken.respond.try_send(StreamChunk::Err(err));
+                        }
+                        e.release(i);
+                    }
+                }
+            }
+            let terminal: Vec<_> = slots
+                .iter()
+                .enumerate()
+                .take(b)
+                .filter_map(|(i, slot)| {
+                    let slot = slot.as_ref()?;
+                    (slot.step == 0 && e.terminal_prefill_ready(i, &slot.prompt_ids)).then_some(i)
+                })
+                .collect();
+            if !terminal.is_empty() {
+                let feeds: Vec<_> = slots
+                    .iter()
+                    .enumerate()
+                    .take(b)
+                    .filter_map(|(i, slot)| {
+                        if no_interleave || nv.pf_defer_decode {
+                            return None;
+                        }
+                        let slot = slot.as_ref()?;
+                        slot.out_ids.last().map(|&token| (i, token))
+                    })
+                    .collect();
+                let result = {
+                    let members: Vec<_> = terminal
+                        .iter()
+                        .map(|&i| {
+                            (
+                                i,
+                                slots[i]
+                                    .as_ref()
+                                    .expect("terminal slot")
+                                    .prompt_ids
+                                    .as_slice(),
+                            )
+                        })
+                        .collect();
+                    e.finish_prefill_batch(&feeds, &members)
+                };
+                match result {
+                    Ok(output) => {
+                        e.advance_prefill_turn(*terminal.last().expect("terminal slots"));
+                        tracing::debug!(
+                            prefill = terminal.len(),
+                            decode = feeds.len(),
+                            "AMD batched prefill completion"
+                        );
+                        for (i, token) in output {
+                            if let Some(slot) = slots[i].as_mut() {
+                                if slot.step == 0 {
+                                    slot.pf_pos = slot.prompt_ids.len();
+                                }
+                            }
+                            handle_produced_token(
+                                &mut slots[i],
+                                &arena,
+                                bundle,
+                                token,
+                                1,
+                                &mut tokens_this_tick,
+                                Some(stop.as_slice()),
+                            );
+                            if slots[i].is_none() {
+                                e.release(i);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        note_fault(&mut tick_fault, &err);
+                        let msg = err.to_string();
+                        for i in terminal.into_iter().chain(feeds.iter().map(|&(i, _)| i)) {
+                            if let Some(taken) = slots[i].take() {
+                                release_kv(&arena, taken.kv);
+                                let _ = taken
+                                    .respond
+                                    .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                            }
+                            e.release(i);
+                        }
+                    }
+                }
+                return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
+            }
+            if has_decode
+                && !no_interleave
+                && !nv.pf_defer_decode
+                && e.mixed_step_rows(decode_rows, 1).is_some()
+            {
+                let mut candidates: Vec<_> = slots
+                    .iter()
+                    .enumerate()
+                    .take(b)
+                    .filter_map(|(i, slot)| {
+                        let slot = slot.as_ref()?;
+                        if slot.step != 0 || slot.respond.is_closed() {
+                            return None;
+                        }
+                        let rows = e.mixed_prefill_rows(i, &slot.prompt_ids, tick_max);
+                        (rows > 0).then_some((i, slot.arrived, rows))
+                    })
+                    .collect();
+                let available = candidates
+                    .iter()
+                    .fold(0u32, |sum, candidate| sum.saturating_add(candidate.2))
+                    .min(tick_max);
+                if let Some(rows) = e.mixed_step_rows(decode_rows, available as usize) {
+                    let prefill_capacity = rows.saturating_sub(decode_rows as u32);
+                    candidates.retain(|&(slot, _, _)| e.mixed_prefill_fits(slot, prefill_capacity));
+                    let capacity = prefill_capacity.min(tick_max);
+                    let pack = amd_mixed_prefill_pack(
+                        candidates,
+                        capacity,
+                        nv.pf_batch,
+                        e.prefill_turn(),
+                        b,
+                    );
+                    if !pack.is_empty() {
+                        let feeds: Vec<_> = slots
+                            .iter()
+                            .enumerate()
+                            .take(b)
+                            .filter_map(|(i, slot)| {
+                                let slot = slot.as_ref()?;
+                                (slot.step > 0)
+                                    .then(|| (i, *slot.out_ids.last().expect("decode output")))
+                            })
+                            .collect();
+                        let mut tokens = std::mem::take(&mut obs.host.slot_tokens);
+                        tokens.resize(feeds.len(), 0);
+                        let started = Instant::now();
+                        let mut result = {
+                            let members: Vec<_> = pack
+                                .iter()
+                                .map(|&(slot, take)| {
+                                    (
+                                        slot,
+                                        slots[slot]
+                                            .as_ref()
+                                            .expect("mixed member")
+                                            .prompt_ids
+                                            .as_slice(),
+                                        take,
+                                    )
+                                })
+                                .collect();
+                            e.mixed_step(rows, &feeds, &members, &mut tokens)
+                        };
+                        crate::obs::ttft::PREFILL.add(started.elapsed().as_nanos() as u64);
+                        if result.is_ok() {
+                            match amd_packed_frontier_updates(
+                                pack.iter().map(|&(slot, _)| slot),
+                                |slot| e.prefill_frontier(slot),
+                            ) {
+                                Ok(updates) => {
+                                    for (slot, frontier) in updates {
+                                        slots[slot].as_mut().expect("mixed member").pf_pos =
+                                            frontier;
+                                    }
+                                }
+                                Err(slot) => {
+                                    result = Err(crate::RuntimeError::Device(format!(
+                                        "mixed prefill slot {slot} lost its cursor after dispatch"
+                                    )))
+                                }
+                            }
+                        }
+                        e.advance_prefill_turn(pack.last().expect("mixed pack").0);
+                        match result {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    decode = feeds.len(),
+                                    prefill = pack.len(),
+                                    rows,
+                                    "AMD mixed prefill/decode launch"
+                                );
+                                for (row, &(slot, _)) in feeds.iter().enumerate() {
+                                    handle_produced_token(
+                                        &mut slots[slot],
+                                        &arena,
+                                        bundle,
+                                        tokens[row],
+                                        1,
+                                        &mut tokens_this_tick,
+                                        Some(stop.as_slice()),
+                                    );
+                                    if slots[slot].is_none() {
+                                        e.release(slot);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, error_code = ?err.device_code(), fatal = err.is_fatal(), "AMD mixed prefill/decode failed");
+                                note_fault(&mut tick_fault, &err);
+                                let msg = err.to_string();
+                                for slot in feeds
+                                    .iter()
+                                    .map(|&(slot, _)| slot)
+                                    .chain(pack.iter().map(|&(slot, _)| slot))
+                                {
+                                    if let Some(taken) = slots[slot].take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken
+                                            .respond
+                                            .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                    }
+                                    e.release(slot);
+                                }
+                            }
+                        }
+                        obs.host.slot_tokens = tokens;
+                        // Mixed latency includes prefill and must not train decode-rung service estimates.
+                        return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
+                    }
+                }
+            }
             let isolated = amd_prefill_pick(
                 (0..b.min(slots.len())).filter_map(|i| {
                     let slot = slots[i].as_ref()?;
@@ -1842,6 +2319,19 @@ fn run_one_tick(
                     e.advance_prefill_turn(packed.last().expect("pack has members").slot as usize);
                     match result {
                         Ok(()) => {
+                            // ONE info line the first time it actually fires. "Armed" (the
+                            // load-time line in exec/amd.rs) and "firing" are different
+                            // claims, and only the second one is evidence that a measured
+                            // delta belongs to this feature. Everything after that stays at
+                            // debug so the steady state is quiet.
+                            static FIRED: std::sync::Once = std::sync::Once::new();
+                            FIRED.call_once(|| {
+                                tracing::info!(
+                                    spans = packed.len(),
+                                    program = packed[0].program,
+                                    "AMD packed prefill fired"
+                                )
+                            });
                             tracing::debug!(spans = packed.len(), "AMD packed prefill advanced")
                         }
                         Err(err) => {
@@ -1890,13 +2380,8 @@ fn run_one_tick(
                 if nv.pf_batch {
                     e.advance_prefill_turn(i);
                 }
-                // §DISAGG phase-0. The AMD tick is EITHER a prefill OR a decode
-                // (this arm returns before the decode launch below), so unlike
-                // the CUDA arm there is no fused launch and `mixed_decode_ns`
-                // is ZERO BY CONSTRUCTION. What disaggregation can recover here
-                // is therefore the WHOLE prefill tick, during which every live
-                // decode stream is stalled — so `prefill_ns / (prefill_ns +
-                // decode_ns)` is the ceiling, not the mixed ratio.
+                // AMD prefill and decode share scratch and run sequentially.
+                // This interval measures isolated prefill, not mixed-kernel overlap.
                 let pk_t = packlog::on().then(Instant::now);
                 let slot_ref = slots[i].as_ref().expect("found above");
                 // §TTFT: everything between `mux.submit` and this line — the
@@ -1969,6 +2454,16 @@ fn run_one_tick(
                 }
             }
 
+            if did_prefill
+                && slots.iter().enumerate().take(b).any(|(i, slot)| {
+                    slot.as_ref().is_some_and(|slot| {
+                        slot.step == 0 && e.terminal_prefill_ready(i, &slot.prompt_ids)
+                    })
+                })
+            {
+                return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
+            }
+
             // Decode: every live slot feeds the token it last produced.
             let feeds: Vec<(usize, u32)> = (0..b.min(slots.len()))
                 .filter_map(|i| {
@@ -1976,7 +2471,7 @@ fn run_one_tick(
                     Some((i, *s.out_ids.last()?))
                 })
                 .collect();
-            let fed_extent = decode_feed_extent(&feeds);
+            let mut decode_progress = None;
             if feeds.is_empty() {
                 return (
                     slots,
@@ -2000,10 +2495,10 @@ fn run_one_tick(
                 .map(|slot| slot.gen.max_tokens.saturating_sub(slot.out_ids.len()))
                 .min()
                 .unwrap_or(1);
-            let requested = amd_multistep_requested(
+            let requested = multistep_requested(
                 remaining,
                 steps as usize,
-                crate::config::RuntimeConfig::get().nv.multistep,
+                crate::config::RuntimeConfig::get().nv.multistep as usize,
             );
             let multi = e.multistep_quantum(&feeds, requested);
             let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
@@ -2031,7 +2526,7 @@ fn run_one_tick(
                                 e.release(i);
                             }
                         }
-                        Ok(())
+                        Ok(quantum)
                     })
             } else {
                 e.step_batch(&feeds).map(|out| {
@@ -2054,12 +2549,13 @@ fn run_one_tick(
                             e.release(i);
                         }
                     }
+                    1
                 })
             };
             obs.host.slot_tokens = deferred;
             match step_result {
-                Ok(out) => {
-                    let _ = out;
+                Ok(quantum) => {
+                    decode_progress = completed_decode(&feeds, quantum);
                 }
                 Err(err) => {
                     // The batched launch failed — every fed slot loses.
@@ -2095,7 +2591,7 @@ fn run_one_tick(
                 tokens_this_tick,
                 did_prefill,
                 tick_fault,
-                fed_extent,
+                decode_progress,
             );
         }
 
@@ -2238,7 +2734,12 @@ fn run_one_tick(
                     // logits. Matches the fallback in generate_with_bucket.
                     obs.host.tokens.clear();
                     obs.host.rng01 =
-                        crate::serve::seeded_unit(&slot.prompt_ids, &slot.out_ids, slot.step);
+                        crate::serve::seeded_unit_with(
+                            &slot.prompt_ids,
+                            &slot.out_ids,
+                            slot.step,
+                            slot.gen.seed,
+                        );
                     crate::serve::reference_logits(
                         &slot.prompt_ids,
                         &slot.out_ids,
@@ -2371,11 +2872,9 @@ fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
     enabled && prefill_remains
 }
 
-#[cfg(any(feature = "hsa", feature = "cpu"))]
-fn amd_multistep_requested(remaining: usize, scheduler_steps: usize, configured: u32) -> usize {
-    remaining
-        .min(scheduler_steps)
-        .min(configured.max(1) as usize)
+#[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+fn multistep_requested(remaining: usize, scheduler_steps: usize, configured: usize) -> usize {
+    remaining.min(scheduler_steps).min(configured.max(1))
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
@@ -2399,6 +2898,39 @@ fn amd_prefill_pick(
         .map(|(slot, _)| slot)
 }
 
+#[cfg(any(feature = "hsa", feature = "cpu"))]
+fn amd_mixed_prefill_pack(
+    mut candidates: Vec<(usize, Instant, u32)>,
+    mut budget: u32,
+    fair: bool,
+    start: usize,
+    cap: usize,
+) -> Vec<(usize, u32)> {
+    let mut selected = Vec::new();
+    while budget > 0 {
+        let Some(slot) = amd_prefill_pick(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.2 > 0)
+                .map(|&(slot, arrived, _)| (slot, arrived)),
+            fair,
+            start,
+            cap,
+        ) else {
+            break;
+        };
+        let index = candidates
+            .iter()
+            .position(|candidate| candidate.0 == slot)
+            .expect("selected candidate");
+        let (_, _, rows) = candidates.remove(index);
+        let take = rows.min(budget);
+        selected.push((slot, take));
+        budget -= take;
+    }
+    selected
+}
+
 /// Form one ragged AMD prefill pack from already-planned request spans.
 ///
 /// All members use the first selected span's compiled program. Rows are packed
@@ -2412,41 +2944,16 @@ fn amd_prefill_pack(
     cap: usize,
     program_rows: impl Fn(u32) -> Option<u32>,
 ) -> Vec<packet::dev::PrefillSpan> {
-    if row_budget == 0 {
-        return Vec::new();
-    }
-    let cap = cap.max(1);
-    let mut candidates: Vec<_> = candidates
-        .into_iter()
-        .filter(|s| {
-            s.n_rows != 0
-                && s.n_rows <= row_budget
-                && s.slot < cap as u32
-                && s.state_slot == s.slot
-                && s.kv_row0.checked_add(s.n_rows) == Some(s.kv_len)
-        })
-        .collect();
-    candidates.sort_unstable_by_key(|s| ((s.slot as usize + cap - start % cap) % cap, s.slot));
-    let Some(program) = candidates.first().map(|s| s.program) else {
-        return Vec::new();
-    };
-    let Some(row_budget) = program_rows(program).map(|rows| rows.min(row_budget)) else {
-        return Vec::new();
-    };
-    let mut rows = 0u32;
-    let mut out = Vec::new();
-    for mut span in candidates.into_iter().filter(|s| s.program == program) {
-        let Some(next) = rows.checked_add(span.n_rows) else {
-            break;
-        };
-        if next > row_budget {
-            continue;
-        }
-        span.row0 = rows;
-        rows = next;
-        out.push(span);
-    }
-    out
+    crate::sched::prefill::admit(
+        candidates,
+        row_budget,
+        start,
+        cap,
+        crate::sched::prefill::SpanPolicy::Whole,
+        program_rows,
+    )
+    .spans()
+    .to_vec()
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
@@ -2511,10 +3018,8 @@ fn gpu_prefill_batched_pass(
     } else {
         pf_interleave_rows().min(budget_max)
     };
-    // RTX-12: per-request slice cap. With `chunk_cap < per_launch`, the first
-    // big prompt no longer consumes the whole budget, so the slot-order pack
-    // loop below hands the remaining budget to the next waiting request(s) —
-    // P1 single-slice-per-request co-packing (R ≈ per_launch / chunk_cap).
+    // Bound each candidate before fair sharing. Short requests return unused
+    // rows to later candidates in the same launch.
     let chunk_cap = pf_chunk_rows();
     loop {
         // Minimal-padding budget: cap this pack at the largest bucket the
@@ -2531,28 +3036,55 @@ fn gpu_prefill_batched_pass(
             return tick_fault;
         }
         let per_launch = e.pf_pack_budget(avail.min(per_launch)).min(per_launch);
-        // Assemble one pack: (slot, c0, len) per waiting request, in slot order.
-        let mut pack: Vec<(usize, usize, usize)> = Vec::new();
-        let mut budget = per_launch;
-        for i in 0..slots.len().min(cap) {
-            if budget == 0 {
-                break;
-            }
-            let Some(s) = slots[i].as_ref() else { continue };
-            if s.step != 0 {
-                continue;
-            }
-            let n = s.prompt_ids.len();
-            if n == 0 || s.pf_pos + 1 >= n {
-                continue; // empty / ready — handled by the feed collection
-            }
-            if s.respond.is_closed() {
-                if let Some(taken) = slots[i].take() {
+        // Form one fair, rotating pack. The packet bucket supplies the row
+        // budget; request-local positions remain absolute in every span.
+        for slot in slots.iter_mut().take(cap) {
+            if slot
+                .as_ref()
+                .is_some_and(|request| request.step == 0 && request.respond.is_closed())
+            {
+                if let Some(taken) = slot.take() {
                     release_kv(arena, taken.kv);
                 }
-                continue;
             }
-            if s.pf_pos == 0 {
+        }
+        let candidates = slots.iter().enumerate().take(cap).filter_map(|(i, slot)| {
+            let s = slot.as_ref()?;
+            let n = s.prompt_ids.len();
+            if s.step != 0 || n == 0 || s.pf_pos + 1 >= n {
+                return None;
+            }
+            let remaining = (n - 1 - s.pf_pos).min(chunk_cap);
+            let n_rows = u32::try_from(remaining).ok()?;
+            let slot = u32::try_from(i).ok()?;
+            let kv_row0 = u32::try_from(s.pf_pos).ok()?;
+            Some(packet::dev::PrefillSpan {
+                row0: 0,
+                n_rows,
+                slot,
+                flags: 0,
+                kv_row0,
+                kv_len: kv_row0 + n_rows,
+                state_slot: slot,
+                program: 0,
+            })
+        });
+        let admission = crate::sched::prefill::admit(
+            candidates,
+            u32::try_from(per_launch).unwrap_or(u32::MAX),
+            e.prefill_turn(),
+            cap.min(slots.len()),
+            crate::sched::prefill::SpanPolicy::FairSplit,
+            |_| u32::try_from(per_launch).ok(),
+        );
+        let mut pack = Vec::with_capacity(admission.spans().len());
+        for span in admission.spans().iter().copied() {
+            let i = span.slot as usize;
+            let c0 = span.kv_row0 as usize;
+            let len = span.n_rows as usize;
+            if c0 == 0 {
+                let s = slots[i].as_ref().expect("admitted slot is Some");
+                let n = s.prompt_ids.len();
                 if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
                     tracing::warn!(
                         slot = i,
@@ -2569,10 +3101,7 @@ fn gpu_prefill_batched_pass(
                     continue;
                 }
             }
-            let s = slots[i].as_ref().expect("checked Some");
-            let take = (n - 1 - s.pf_pos).min(budget).min(chunk_cap);
-            pack.push((i, s.pf_pos, take));
-            budget -= take;
+            pack.push((i, c0, len));
         }
         if pack.is_empty() {
             return tick_fault;
@@ -2593,6 +3122,7 @@ fn gpu_prefill_batched_pass(
                 for &(i, c0, len) in &pack {
                     slots[i].as_mut().expect("packed slot is Some").pf_pos = c0 + len;
                 }
+                e.advance_prefill_turn(pack.last().expect("pack is non-empty").0);
             }
             Err(err) => {
                 // The shared launch failed — every packed request loses.
@@ -2720,9 +3250,8 @@ fn dev_sample_spec(slot: &Slot) -> Option<crate::exec::gpu::DevSample> {
     })
 }
 
-/// Turn a slot's device-argmax token into the slot's produced token: greedy
-/// passes it through untouched; `temperature > 0` downloads logits row `row`
-/// and reuses the host sampler with penalties.
+/// Unmodified greedy requests keep the device argmax. Sampling adjustments
+/// download logits row `row` and use the host sampler.
 #[cfg(feature = "cuda")]
 fn gpu_finish_token(
     e: &mut crate::exec::gpu::GpuEngine,
@@ -2730,7 +3259,7 @@ fn gpu_finish_token(
     slot: &mut Slot,
     argmax_tok: u32,
 ) -> Result<u32> {
-    if slot.gen.params.temperature > 0.0 {
+    if !gpu_argmax_eligible(&slot.gen.params) {
         let mut logits = e.take_logits_buf();
         logits.clear();
         e.logits_row(row, &mut logits)?;
@@ -2741,6 +3270,11 @@ fn gpu_finish_token(
         return Ok(tok);
     }
     Ok(argmax_tok)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_argmax_eligible(params: &crate::text::sample::SamplingParams) -> bool {
+    params.temperature <= 0.0 && params.repetition_penalty == 1.0 && params.logit_bias.is_empty()
 }
 
 /// Incremental detokenize over a bounded window (TGI scheme): decode only
@@ -2826,6 +3360,77 @@ fn handle_produced_token(
             Some(ids) => ids.contains(&token),
             None => token % 256 == u32::from(b'\n'),
         };
+
+    // OPENAI `stop` STRINGS. The request field was not parsed at all before, so
+    // a client that relied on `stop` to end a step — every LangChain ReAct or
+    // structured-output chain does — got an over-generated answer it then
+    // mis-parsed. Matched on the streamed TEXT, not on ids, because a stop
+    // sequence need not be a token and can straddle a token boundary.
+    //
+    // `ignore_eos` suppresses this too: a benchmark that asks for exactly
+    // `--random-output-len` tokens must not be cut short by an accidental match.
+    let mut stop_str_cut: Option<usize> = None;
+    if !slot.gen.ignore_eos && !slot.gen.stop.is_empty() && !delta.is_empty() {
+        let keep = slot
+            .gen
+            .stop
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let base = slot.stop_tail.len();
+        slot.stop_tail.push_str(&delta);
+        stop_str_cut = earliest_stop_cut(&slot.stop_tail, base, delta.len(), &slot.gen.stop);
+        if stop_str_cut.is_none() && slot.stop_tail.len() > keep {
+            let cut = slot.stop_tail.len() - keep;
+            let cut = (0..=cut)
+                .rev()
+                .find(|&c| slot.stop_tail.is_char_boundary(c))
+                .unwrap_or(0);
+            slot.stop_tail.drain(..cut);
+        }
+    }
+    // WITHHOLD A TRAILING STOP PREFIX. Matching alone is not enough: the tail of THIS delta
+    // may be the start of a stop string whose remainder has not been generated yet, and once
+    // those bytes are sent they cannot be recalled. With stop "STOP", deltas "abcST" then
+    // "OPdef" matched correctly on the second — but the first had already emitted "abcST",
+    // so the client saw the stop string's own prefix in its answer. Hold back the longest
+    // suffix of the accumulated text that is a proper prefix of some stop string, and release
+    // it on a later token once it is known not to begin a match.
+    let mut delta = delta;
+    if stop_str_cut.is_none()
+        && !slot.gen.ignore_eos
+        && !slot.gen.stop.is_empty()
+        && !delta.is_empty()
+    {
+        let held = stop_prefix_held(&slot.stop_tail, &slot.gen.stop, delta.len());
+        if held > 0 {
+            let keep_to = (0..=delta.len() - held)
+                .rev()
+                .find(|&c| delta.is_char_boundary(c))
+                .unwrap_or(0);
+            slot.stop_pending.insert_str(0, &delta[keep_to..]);
+            delta.truncate(keep_to);
+        }
+    }
+    if !slot.stop_pending.is_empty() && (stop_str_cut.is_some() || !delta.is_empty()) {
+        // The held bytes did not begin a match after all: they belong in front of whatever
+        // this token contributes.
+        let mut released = std::mem::take(&mut slot.stop_pending);
+        released.push_str(&delta);
+        delta = released;
+    }
+    let (delta, stop_string) = match stop_str_cut {
+        Some(cut) => {
+            let cut = (0..=cut)
+                .rev()
+                .find(|&c| delta.is_char_boundary(c))
+                .unwrap_or(0);
+            (delta[..cut].to_string(), true)
+        }
+        None => (delta, false),
+    };
     if !stop_token
         && slot
             .respond
@@ -2841,8 +3446,8 @@ fn handle_produced_token(
         return;
     }
     let stop_max = slot.step >= slot.gen.max_tokens.max(1);
-    if stop_token || stop_max {
-        let reason = if stop_max && !stop_token {
+    if stop_token || stop_max || stop_string {
+        let reason = if stop_max && !stop_token && !stop_string {
             FinishReason::Length
         } else {
             FinishReason::Stop
@@ -2862,8 +3467,88 @@ fn handle_produced_token(
     }
 }
 
+/// Byte offset within THIS delta at which output must stop, or `None` for no match.
+///
+/// `stop` is a SET, not a priority order: the cut is the earliest match in the text, over every
+/// pattern. Scanning in list order and breaking on the first pattern that matched anywhere
+/// returned text past an earlier stop — with `["BB", "A"]` over "xxAyyBB", "xxAyy" instead of
+/// "xx". `base` is the accumulated tail's length before this delta was appended.
+fn earliest_stop_cut(tail: &str, base: usize, delta_len: usize, stops: &[String]) -> Option<usize> {
+    stops
+        .iter()
+        .filter_map(|pat| tail.find(pat.as_str()))
+        .map(|i| i.saturating_sub(base).min(delta_len))
+        .min()
+}
+
+/// Trailing bytes of this delta that must be withheld because they are a proper prefix of some
+/// stop string whose remainder may still be generated.
+///
+/// Matching alone is not enough. Sent bytes cannot be recalled, so with stop "STOP" the deltas
+/// "abcST" then "OPdef" match correctly on the second while the first has already emitted the
+/// stop string's own prefix. Returns the longest such suffix, capped at this delta's length —
+/// a prefix reaching back into earlier deltas was already sent and is not recoverable here.
+fn stop_prefix_held(tail: &str, stops: &[String], delta_len: usize) -> usize {
+    stops
+        .iter()
+        .filter_map(|pat| {
+            (1..pat.len())
+                .rev()
+                .find(|&n| pat.is_char_boundary(n) && tail.ends_with(&pat[..n]))
+        })
+        .max()
+        .unwrap_or(0)
+        .min(delta_len)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The reported defect: a stop string split across two deltas leaked its own prefix.
+    ///
+    /// With stop "STOP" and deltas "abcST" then "OPdef", the match is only findable on the
+    /// second — by which time "abcST" has been sent. `stop_prefix_held` is what withholds the
+    /// "ST" so the client sees "abc".
+    #[test]
+    fn a_stop_string_split_across_deltas_does_not_leak_its_prefix() {
+        let stops = vec!["STOP".to_string()];
+        // First delta: no match yet, but "ST" is a live prefix and must be held back.
+        assert_eq!(super::earliest_stop_cut("abcST", 0, 5, &stops), None);
+        assert_eq!(super::stop_prefix_held("abcST", &stops, 5), 2);
+        // Second delta completes it: nothing of "OPdef" survives.
+        assert_eq!(super::earliest_stop_cut("abcSTOPdef", 5, 5, &stops), Some(0));
+    }
+
+    /// A held prefix that turns out not to begin a match is released, not dropped.
+    #[test]
+    fn a_prefix_that_does_not_complete_is_released() {
+        let stops = vec!["STOP".to_string()];
+        assert_eq!(super::stop_prefix_held("abcST", &stops, 5), 2);
+        // "STx" is no longer a prefix of "STOP", so nothing is withheld and the earlier
+        // "ST" is released ahead of this delta by the caller.
+        assert_eq!(super::stop_prefix_held("abcSTx", &stops, 1), 0);
+        assert_eq!(super::earliest_stop_cut("abcSTx", 5, 1, &stops), None);
+    }
+
+    /// `stop` is a set: the cut is the earliest match in the TEXT, not the first pattern listed.
+    #[test]
+    fn multiple_stops_cut_at_the_earliest_match_not_the_first_listed() {
+        let stops = vec!["BB".to_string(), "A".to_string()];
+        // "A" at 2 precedes "BB" at 5; list order would have returned 5.
+        assert_eq!(super::earliest_stop_cut("xxAyyBB", 0, 7, &stops), Some(2));
+    }
+
+    /// Longest live prefix wins when several stops share a lead, and a stop already fully
+    /// matched withholds nothing (the cut handles it).
+    #[test]
+    fn the_longest_live_prefix_is_the_one_withheld() {
+        let stops = vec!["END".to_string(), "ENDING".to_string()];
+        assert_eq!(super::stop_prefix_held("textEN", &stops, 6), 2);
+        // Capped at the delta: bytes from earlier deltas are already sent.
+        assert_eq!(super::stop_prefix_held("textEN", &stops, 1), 1);
+        // No stop and no prefix.
+        assert_eq!(super::stop_prefix_held("plain", &stops, 5), 0);
+    }
+
     use super::*;
     use crate::exec::indirection::slots as ind_slots;
     use crate::serve::RunObserver;
@@ -2886,12 +3571,19 @@ mod tests {
         assert!(deferred_token(&ring, 2, 0, 3).is_err());
     }
 
-    #[cfg(feature = "hsa")]
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
     #[test]
-    fn amd_multistep_honors_the_runtime_cap() {
-        assert_eq!(amd_multistep_requested(16, 8, 4), 4);
-        assert_eq!(amd_multistep_requested(16, 8, 1), 1);
-        assert_eq!(amd_multistep_requested(3, 8, 4), 3);
+    fn multistep_honors_scheduler_runtime_and_output_caps() {
+        for (batch, expected) in [(1, 4), (4, 2), (16, 1)] {
+            let steps = MultiStep::for_batch(batch).steps as usize;
+            assert_eq!(multistep_requested(16, steps, 8), expected);
+        }
+        assert_eq!(multistep_requested(16, 1, 8), 1);
+        assert_eq!(multistep_requested(16, 8, 4), 4);
+        assert_eq!(multistep_requested(16, 8, 1), 1);
+        assert_eq!(multistep_requested(16, 8, 0), 1);
+        assert_eq!(multistep_requested(3, 8, 4), 3);
+        assert_eq!(multistep_requested(0, 8, 4), 0);
     }
 
     #[test]
@@ -3040,6 +3732,16 @@ mod tests {
         assert_eq!(decode_feed_extent(&[]), None);
     }
 
+    #[test]
+    fn decode_progress_uses_completed_steps_and_physical_extent() {
+        let feeds = [(0, 7), (3, 9)];
+        let progress = completed_decode(&feeds, 2).unwrap();
+        assert_eq!(progress.extent, 4);
+        assert_eq!(progress.steps.get(), 2);
+        assert_eq!(completed_decode(&feeds, 0), None);
+        assert_eq!(completed_decode(&[], 4), None);
+    }
+
     #[cfg(feature = "cuda")]
     fn prefill_test_bundle(name: &str) -> ModelBundle {
         let dir =
@@ -3075,6 +3777,20 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_argmax_requires_unmodified_greedy_logits() {
+        let mut params = crate::text::sample::SamplingParams::default();
+        assert!(!gpu_argmax_eligible(&params));
+        params.temperature = 0.0;
+        assert!(gpu_argmax_eligible(&params));
+        params.repetition_penalty = 1.1;
+        assert!(!gpu_argmax_eligible(&params));
+        params.repetition_penalty = 1.0;
+        params.logit_bias.push((1, 10.0));
+        assert!(!gpu_argmax_eligible(&params));
     }
 
     #[cfg(feature = "cuda")]
@@ -3147,7 +3863,27 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "hsa")]
+    #[cfg(any(feature = "hsa", feature = "cpu"))]
+    #[test]
+    fn amd_mixed_admission_obeys_rotation_age_and_total_prefill_budget() {
+        let now = Instant::now();
+        let candidates = vec![
+            (0, now, 512),
+            (2, now - std::time::Duration::from_secs(1), 512),
+            (3, now, 0),
+        ];
+        assert_eq!(
+            amd_mixed_prefill_pack(candidates.clone(), 700, true, 1, 4),
+            [(2, 512), (0, 188)]
+        );
+        assert_eq!(
+            amd_mixed_prefill_pack(candidates.clone(), 127, false, 0, 4),
+            [(2, 127)]
+        );
+        assert!(amd_mixed_prefill_pack(candidates, 0, true, 0, 4).is_empty());
+    }
+
+    #[cfg(any(feature = "hsa", feature = "cpu"))]
     #[test]
     fn amd_prefill_scheduler_controls_are_bounded() {
         assert_eq!(amd_prefill_tick_cap(false, false, false, 2048), u32::MAX);

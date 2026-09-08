@@ -2620,4 +2620,234 @@ static __device__ void d_moe_group_down_gemma_pf_w8a8(
 #endif /* PLOW_NV_HOPPER fork */
 #endif /* PGM_BM */
 
+#if PLOW_NV_MXFP4_MOE
+/* Generic flat-tensor MXFP4 MoE. These opcodes carry contiguous expert tensors rather than the
+ * host-built pointer tables used by the older MoE families. Hopper expands e2m1 in registers;
+ * every dot retains the packet reference's per-32-element scale/accumulation order. */
+__device__ __forceinline__ float plow_mxfp4_row_dot_nv(
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ s,
+    const bf16* __restrict__ x, unsigned K) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned nb = (K + 31u) >> 5;
+    float acc = 0.0f;
+    for (unsigned b = 0; b < nb; b++) {
+        const unsigned k = (b << 5) + lane;
+        const uint8_t p = k < K ? w[k >> 1] : 0u;
+        const unsigned q = (k & 1u) ? p >> 4 : p & 15u;
+        const float part = k < K ? plow_mxfp4_e2m1(q) * __bfloat162float(x[k]) : 0.0f;
+        acc += plow_warp_sum(part) * plow_mxfp4_scale(s[b]);
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float plow_swiglu_oai(float g, float u, float alpha, float limit) {
+    g = fminf(g, limit);
+    u = fmaxf(-limit, fminf(u, limit));
+    return g * (1.0f / (1.0f + __expf(-alpha * g))) * (u + 1.0f);
+}
+
+static __device__ void d_moe_glu_mx(
+    bf16* __restrict__ fu, const bf16* __restrict__ x, const unsigned char* __restrict__ table,
+    const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
+    const bf16* __restrict__ bias, unsigned ksel, unsigned I, unsigned K, unsigned E,
+    unsigned layout, unsigned act, unsigned B, float alpha, float limit,
+    unsigned slice, unsigned nblk) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned nwarp = blockDim.x >> 5;
+    const unsigned total = (B ? B : 1u) * ksel * I;
+    const unsigned per = (total + nblk - 1u) / nblk;
+    const unsigned lo = slice * per, hi = min(lo + per, total);
+    const size_t ldw = (K + 1u) >> 1, lds = (K + 31u) >> 5, N2 = 2u * I;
+    for (unsigned idx = lo + warp; idx < hi; idx += nwarp) {
+        const unsigned slot = idx / I, n = idx - slot * I;
+        const unsigned eid = *(const unsigned*)(table + (size_t)slot * 8u);
+        if (eid >= E) continue;
+        const bf16* xr = x + (size_t)(slot / ksel) * K;
+        const unsigned rg = layout ? n : 2u * n;
+        const unsigned ru = layout ? I + n : 2u * n + 1u;
+        const uint8_t* We = W + (size_t)eid * N2 * ldw;
+        const uint8_t* Se = S + (size_t)eid * N2 * lds;
+        float g = plow_mxfp4_row_dot_nv(We + (size_t)rg * ldw, Se + (size_t)rg * lds, xr, K);
+        float u = plow_mxfp4_row_dot_nv(We + (size_t)ru * ldw, Se + (size_t)ru * lds, xr, K);
+        if (bias) {
+            g += __bfloat162float(bias[(size_t)eid * N2 + rg]);
+            u += __bfloat162float(bias[(size_t)eid * N2 + ru]);
+        }
+        if ((threadIdx.x & 31u) == 0) {
+            float v = act == 3u ? plow_swiglu_oai(g, u, alpha, limit)
+                                : (act == 1u ? act_silu(g) : act_gelu_tanh(g)) * u;
+            fu[(size_t)slot * I + n] = __float2bfloat16(v);
+        }
+    }
+}
+
+static __device__ void d_moe_down_mx(
+    float* __restrict__ part, const bf16* __restrict__ fu,
+    const unsigned char* __restrict__ table, const uint8_t* __restrict__ W,
+    const uint8_t* __restrict__ S, const bf16* __restrict__ bias,
+    unsigned ksel, unsigned H, unsigned I, unsigned E, unsigned B,
+    unsigned slice, unsigned nblk) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned nwarp = blockDim.x >> 5;
+    const unsigned total = (B ? B : 1u) * ksel * H;
+    const unsigned per = (total + nblk - 1u) / nblk;
+    const unsigned lo = slice * per, hi = min(lo + per, total);
+    const size_t ldw = (I + 1u) >> 1, lds = (I + 31u) >> 5;
+    for (unsigned idx = lo + warp; idx < hi; idx += nwarp) {
+        const unsigned slot = idx / H, h = idx - slot * H;
+        const unsigned eid = *(const unsigned*)(table + (size_t)slot * 8u);
+        float v = 0.0f;
+        if (eid < E) {
+            const uint8_t* wr = W + ((size_t)eid * H + h) * ldw;
+            const uint8_t* sr = S + ((size_t)eid * H + h) * lds;
+            v = plow_mxfp4_row_dot_nv(wr, sr, fu + (size_t)slot * I, I);
+            if (bias) v += __bfloat162float(bias[(size_t)eid * H + h]);
+            v *= *(const float*)(table + (size_t)slot * 8u + 4u);
+        }
+        if ((threadIdx.x & 31u) == 0) part[(size_t)slot * H + h] = v;
+    }
+}
+
+#endif
+#if PLOW_NV_MOE_COMMON
+/* The common router/align/combine chain. GPT-OSS uses flat softmax top-k with no selection bias;
+ * the optional f32 bias and generic sigmoid/norm flags remain supported by the packet contract. */
+static __device__ void d_moe_router_topk_pf_nv(
+    unsigned char* table, const bf16* logit, const float* bias, unsigned E, unsigned ksel,
+    unsigned flags, float route_scale, unsigned T, unsigned slice, unsigned nblk, float* score) {
+    if (ksel > 16u || E == 0u) { if (threadIdx.x == 0) __trap(); return; }
+    for (unsigned tok = slice; tok < (T ? T : 1u); tok += nblk) {
+        if (threadIdx.x == 0) {
+            const bf16* lr = logit + (size_t)tok * E;
+            if (flags & 1u) {
+                for (unsigned e = 0; e < E; e++) score[e] = 1.0f / (1.0f + __expf(-__bfloat162float(lr[e])));
+            } else {
+                float mx = -INFINITY, sum = 0.0f;
+                for (unsigned e = 0; e < E; e++) mx = fmaxf(mx, __bfloat162float(lr[e]));
+                for (unsigned e = 0; e < E; e++) { score[e] = __expf(__bfloat162float(lr[e]) - mx); sum += score[e]; }
+                for (unsigned e = 0; e < E; e++) score[e] /= sum;
+            }
+            float sum = 0.0f;
+            for (unsigned j = 0; j < ksel; j++) {
+                unsigned best = 0;
+                float bv = -INFINITY;
+                for (unsigned e = 0; e < E; e++) {
+                    const float v = score[e] + (bias ? bias[e] : 0.0f);
+                    if (v > bv) { bv = v; best = e; }
+                }
+                *(unsigned*)(table + ((size_t)tok * ksel + j) * 8u) = best;
+                *(float*)(table + ((size_t)tok * ksel + j) * 8u + 4u) = score[best];
+                sum += score[best];
+                score[best] = -INFINITY;
+            }
+            for (unsigned j = 0; j < ksel; j++) {
+                float* gate = (float*)(table + ((size_t)tok * ksel + j) * 8u + 4u);
+                if ((flags & 2u) && sum != 0.0f) *gate /= sum;
+                *gate *= route_scale;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+static __device__ void d_moe_align_pf_nv(
+    int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
+    float* row_gate, unsigned T, unsigned E, unsigned ksel, unsigned slice) {
+    if (slice != 0u) return;
+    if (threadIdx.x == 0) {
+        int* rowoff = meta;
+        int* cnt = meta + E;
+        int* tilep = meta + 2u * E;
+        for (unsigned e = 0; e < E; e++) cnt[e] = 0;
+        for (unsigned s = 0; s < T * ksel; s++) {
+            const unsigned eid = table ? *(const unsigned*)(table + (size_t)s * 8u) : 0u;
+            if (eid < E) cnt[eid]++;
+        }
+        unsigned off = 0, tiles = 0;
+        for (unsigned e = 0; e < E; e++) {
+            rowoff[e] = (int)off; tilep[e] = (int)tiles;
+            const unsigned nt = ((unsigned)cnt[e] + 63u) / 64u;
+            off += nt * 64u; tiles += nt;
+        }
+        tilep[E] = (int)tiles;
+        for (unsigned r = 0; r < off; r++) { row_token[r] = PLOW_EXPERT_UNUSED; row_partidx[r] = PLOW_EXPERT_UNUSED; row_gate[r] = 0.0f; }
+        for (unsigned s = 0; s < T * ksel; s++) {
+            const unsigned eid = table ? *(const unsigned*)(table + (size_t)s * 8u) : 0u;
+            if (eid >= E) continue;
+            const unsigned at = (unsigned)rowoff[eid]++;
+            row_token[at] = s / ksel; row_partidx[at] = s;
+            row_gate[at] = table ? *(const float*)(table + (size_t)s * 8u + 4u) : 1.0f;
+        }
+        for (unsigned e = 0; e < E; e++) rowoff[e] -= cnt[e];
+    }
+}
+
+#endif
+#if PLOW_NV_MXFP4_MOE
+static __device__ void d_moe_glu_mx_pf(
+    bf16* fu, const bf16* x, const uint8_t* W, const uint8_t* S, const int* meta,
+    const unsigned* row_token, const bf16* bias, unsigned I, unsigned K, unsigned E,
+    unsigned layout, unsigned act, float alpha, float limit, unsigned slice, unsigned nblk) {
+    const unsigned warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
+    const unsigned total = E * I, per = (total + nblk - 1u) / nblk;
+    const unsigned lo = slice * per, hi = min(lo + per, total);
+    const size_t ldw = (K + 1u) >> 1, lds = (K + 31u) >> 5, N2 = 2u * I;
+    for (unsigned idx = lo + warp; idx < hi; idx += nwarp) {
+        const unsigned e = idx / I, n = idx - e * I;
+        const unsigned rg = layout ? n : 2u * n, ru = layout ? I + n : 2u * n + 1u;
+        const uint8_t* We = W + (size_t)e * N2 * ldw;
+        const uint8_t* Se = S + (size_t)e * N2 * lds;
+        for (unsigned r = (unsigned)meta[e]; r < (unsigned)(meta[e] + meta[E + e]); r++) {
+            const unsigned tok = row_token[r];
+            if (tok == PLOW_EXPERT_UNUSED) continue;
+            float g = plow_mxfp4_row_dot_nv(We + (size_t)rg * ldw, Se + (size_t)rg * lds, x + (size_t)tok * K, K);
+            float u = plow_mxfp4_row_dot_nv(We + (size_t)ru * ldw, Se + (size_t)ru * lds, x + (size_t)tok * K, K);
+            if (bias) { g += __bfloat162float(bias[(size_t)e * N2 + rg]); u += __bfloat162float(bias[(size_t)e * N2 + ru]); }
+            if ((threadIdx.x & 31u) == 0) fu[(size_t)r * I + n] = __float2bfloat16(
+                act == 3u ? plow_swiglu_oai(g, u, alpha, limit)
+                          : (act == 1u ? act_silu(g) : act_gelu_tanh(g)) * u);
+        }
+    }
+}
+
+static __device__ void d_moe_down_mx_pf(
+    float* part, const bf16* fu, const uint8_t* W, const uint8_t* S, const int* meta,
+    const bf16* bias, const unsigned* row_partidx, const float* row_gate,
+    unsigned H, unsigned I, unsigned E, unsigned slice, unsigned nblk) {
+    const unsigned warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
+    const unsigned total = E * H, per = (total + nblk - 1u) / nblk;
+    const unsigned lo = slice * per, hi = min(lo + per, total);
+    const size_t ldw = (I + 1u) >> 1, lds = (I + 31u) >> 5;
+    for (unsigned idx = lo + warp; idx < hi; idx += nwarp) {
+        const unsigned e = idx / H, h = idx - e * H;
+        for (unsigned r = (unsigned)meta[e]; r < (unsigned)(meta[e] + meta[E + e]); r++) {
+            const unsigned pidx = row_partidx[r];
+            if (pidx == PLOW_EXPERT_UNUSED) continue;
+            float v = plow_mxfp4_row_dot_nv(W + ((size_t)e * H + h) * ldw,
+                                             S + ((size_t)e * H + h) * lds,
+                                             fu + (size_t)r * I, I);
+            if (bias) v += __bfloat162float(bias[(size_t)e * H + h]);
+            if ((threadIdx.x & 31u) == 0) part[(size_t)pidx * H + h] = row_gate[r] * v;
+        }
+    }
+}
+
+#endif
+#if PLOW_NV_MOE_COMMON
+static __device__ void d_moe_combine_pf_nv(
+    bf16* out, const bf16* residual, const bf16* shared, const float* part,
+    unsigned H, unsigned ksel, unsigned T, unsigned slice, unsigned nblk) {
+    const size_t total = (size_t)(T ? T : 1u) * H;
+    for (size_t i = (size_t)slice * blockDim.x + threadIdx.x; i < total;
+         i += (size_t)nblk * blockDim.x) {
+        const unsigned tok = (unsigned)(i / H), h = (unsigned)(i - (size_t)tok * H);
+        float v = residual ? __bfloat162float(residual[i]) : 0.0f;
+        if (shared) v += __bfloat162float(shared[i]);
+        const float* p = part + (size_t)tok * ksel * H;
+        for (unsigned j = 0; j < ksel; j++) v += p[(size_t)j * H + h];
+        out[i] = __float2bfloat16(v);
+    }
+}
+#endif
+
 #endif /* PLOW_NV_OP_MOE_CUH */

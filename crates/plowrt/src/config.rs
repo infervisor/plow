@@ -63,6 +63,10 @@ pub struct RuntimeConfig {
     #[arg(long = "rt-weight-slab", env = "PLOW_WEIGHT_SLAB", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_slab: bool,
 
+    /// Pack prefill and decode into a shared GPU launch when supported.
+    #[arg(long = "fusion", env = "PLOW_FUSION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub fusion: bool,
+
     /// Override whether freed slabs remain in the process reuse pool.
     #[arg(long = "rt-slab-keep", env = "PLOW_SLAB_KEEP", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub slab_keep: Option<bool>,
@@ -273,7 +277,7 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub upload_direct: bool,
 
-    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD TP packs only
+    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD packs only
     /// exact-capability programs; unsupported programs retain fair isolated scheduling.
     #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_batch: bool,
@@ -477,8 +481,16 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-state-clear-device", env = "PLOW_STATE_CLEAR_DEVICE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub state_clear_device: bool,
 
-    /// Load exact-capability packed-prefill operator-family objects. Mux co-packing additionally
-    /// requires --pf-batch, a TP engine, and a compatibly segmented packet.
+    /// Load the exact-capability MLA and KDA packed-prefill operator-family objects.
+    ///
+    /// This flag does NOT gate dense/GQA co-packing, which needs no family object: the dense
+    /// consumers are compiled into the ordinary prefill and flash objects
+    /// (`PLOW_PACKED_PREFILL_DENSE_CONSUMERS=1` in `scripts/build_gfx942.sh`) and route through
+    /// the same interpreter. Dense co-packing needs only `--pf-batch`, two concurrent prefills,
+    /// and — the binding constraint in practice — a prefill chunk small enough that at least two
+    /// of them fit in one compiled prefill rung. It works at TP1 and under TP alike; the TP
+    /// engine has its own all-rank `prefill_packed_chunk`. See
+    /// `docs/amd/gemma4-31b-mi300x.md`, "Dense packed prefill is unreachable at chunk 8192".
     #[arg(long = "amd-packed-prefill-route", env = "PLOW_PACKED_PREFILL_ROUTE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_prefill_route: bool,
 
@@ -642,6 +654,24 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-ragged-chunk", env = "PLOW_RAGGED_CHUNK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ragged_chunk: bool,
 
+    /// Track the MLA decode's KV-split count from the LIVE `kv_len` instead of
+    /// the `max_ctx` the emitter baked it from.
+    ///
+    /// `devgen::mla::glm_nsplit` sizes `nsplit` for the top of the range a blob
+    /// serves, so one blob runs ONE split count at every context — a 32768-max-ctx
+    /// server blob runs `ns=64` at live 1024 where the measured chain optimum is
+    /// 16. The kernel takes `nsplit` as a runtime argument, so this patches the
+    /// flash's and the merge's `i[4]` per step (in practice a handful of times per
+    /// generation — the live value is a step function of `kv_len`) and changes no
+    /// dispatch, buffer or counter. See `exec::kvrow::mla_live_nsplit`.
+    ///
+    /// Opt-in: a different partition reassociates the online-softmax merge, so
+    /// this is a numerics-visible policy change and not a free win. It is inert on
+    /// any packet that is not a plain dense MLA decode (the DSA gather arm splits
+    /// over selected rows, not the KV window).
+    #[arg(long = "mla-ns-live", env = "PLOW_MLA_NS_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mla_ns_live: bool,
+
     /// hsaco directory override. Default: <assets>/hsaco.
     ///
     /// The clap **id** and **long** are both `rt-hsaco`, not `hsaco`. A
@@ -782,6 +812,12 @@ impl RuntimeConfig {
             Self::env_bool("PLOW_VMM_LIVE"),
             !Self::is_initialized(),
         )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn nv_live_kv_enabled(&self, packed_prefill: bool, full_cache: bool) -> bool {
+        self.nv_vmm_live()
+            || (packed_prefill && full_cache && !self.nv_vmm_prefix() && !self.nv.prefix_cache)
     }
 
     #[cfg(feature = "cuda")]
@@ -930,6 +966,29 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fusion_is_an_opt_in_runtime_flag() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "fusion")
+            .unwrap();
+        assert_eq!(arg.get_default_values(), ["false"]);
+        for (flag, enabled) in [("--fusion", true), ("--fusion=false", false)] {
+            let matches = command
+                .clone()
+                .try_get_matches_from(["test", flag])
+                .unwrap();
+            assert_eq!(
+                super::RuntimeConfig::from_arg_matches(&matches)
+                    .unwrap()
+                    .fusion,
+                enabled
+            );
+        }
+    }
+
+    #[test]
     fn compatibility_overrides_apply_only_without_initialized_cli() {
         assert_eq!(super::select_compat(true, Some(false), false), true);
         assert_eq!(super::select_compat(true, Some(false), true), false);
@@ -1011,6 +1070,52 @@ mod tests {
             .expect("explicit TP prefill segment-major rollback");
         let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
         assert!(!config.tp_prefill_segment_major);
+    }
+
+    #[test]
+    fn packed_prefill_route_stays_opt_in_and_pf_batch_does_not_imply_it() {
+        use clap::{Args, FromArgMatches};
+
+        // THE DEFAULT IS FALSE AND THIS TEST IS WHY IT SHOULD STAY THAT WAY. The route is one
+        // of THREE independent things a co-packed MLA prefill needs, and the other two are
+        // build-time: family objects from a `PLOW_PACKED_PREFILL_CONSUMERS=1` gfx942 build, and
+        // a blob emitted `PLOW_EMIT_PACKED_PREFILL=1` so its norm/MLA segments are family-pure.
+        // Defaulting the runtime half on would arm a warning on every ordinary AMD serve
+        // (`report_packed_prefill_route`) and buy nothing, because neither build-time half is a
+        // default. Flip this only together with those.
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "packed_prefill_route")
+            .expect("packed-prefill route argument");
+        assert_eq!(arg.get_default_values(), ["false"]);
+
+        let matches = command
+            .clone()
+            .try_get_matches_from(["test", "--amd-packed-prefill-route=true"])
+            .expect("explicit packed-prefill route opt-in");
+        assert!(
+            super::AmdRuntimeConfig::from_arg_matches(&matches)
+                .expect("AMD config")
+                .packed_prefill_route
+        );
+
+        // The KDA family object is a SEPARATE axis and defaults ON: it doubles as the
+        // spill-isolation object for ordinary KDA prefill segments, which needs no packing.
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "kda_family_route")
+            .expect("KDA family route argument");
+        assert_eq!(arg.get_default_values(), ["true"]);
+
+        // `--pf-batch` is the mux half and lives on the other config struct; it is off by
+        // default too, so neither flag alone can start a co-packed dispatch.
+        let nv = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = nv
+            .get_arguments()
+            .find(|arg| arg.get_id() == "pf_batch")
+            .expect("pf-batch argument");
+        assert_eq!(arg.get_default_values(), ["false"]);
     }
 
     #[test]

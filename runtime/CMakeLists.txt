@@ -479,6 +479,7 @@ option(PLOW_SM120_CUBIN "Emit the sm_120a .cubin artifacts `plowrt serve` loads"
 option(PLOW_SM90A_CUBIN "Emit the sm_90a .cubin artifacts `plowrt serve` loads" OFF)
 option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants (all enabled arches)" OFF)
 option(PLOW_SM120_CUBIN_SEG "Also emit the _pfseg (fat) and _pfgemm (lean occ-2) segmented prefill cubins" OFF)
+option(PLOW_CUBIN_PACKED_PREFILL "Emit ordinary and packet-request ABI segmented prefill pairs" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -532,6 +533,10 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     endif()
     # The generated header rides the BASE, so a specialised build cannot reach one
     # object and miss its sibling — the same property the axes below give the flags.
+    file(GLOB_RECURSE _cubin_headers CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/*.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/*.cuh"
+        "${CMAKE_CURRENT_SOURCE_DIR}/common/*.h")
     if(PLOW_CUBIN_CONFIG)
         get_filename_component(_cfg_dir "${PLOW_CUBIN_CONFIG}" DIRECTORY)
         get_filename_component(_cfg_name "${PLOW_CUBIN_CONFIG}" NAME)
@@ -541,19 +546,28 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
 
     # AXIS 1 — decode vs prefill. Decode carries the full-attn GF instantiation;
     # prefill carries the tiled-GEMM + FLASH_PREFILL arms.
-    set(_ax_decode -DPLOW_NV_FA_GF_FULL=${PLOW_NV_FA_GF_FULL})
+    set(_ax_decode -DPLOW_BUCKET_DECODE=1 -DPLOW_NV_FA_GF_FULL=${PLOW_NV_FA_GF_FULL})
     # PLOW_NV_PREFILL=1 on both Gemma (hd256/512) and non-Gemma (hd128-only)
     # prefill objects. The GEMMA define comes from _cubin_base when
     # PLOW_CUBIN_GEMMA is ON; the hd128 prefill object gets PREFILL alone.
-    set(_ax_prefill -DPLOW_NV_PREFILL=1)
+    set(_ax_prefill -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1)
     if(PLOW_NV_TRACE_PF)
         list(APPEND _ax_prefill -DPLOW_NV_TRACE=1)
     endif()
     # Segmented prefill axes (PLOW_SM120_CUBIN_SEG). The fat object carries all
     # arms at occ-1; the lean GEMM object compiles out flash arms and caps at
     # __maxnreg__(128) for occ-2 (2 blocks/SM).
-    set(_ax_seg_fat -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1)
-    set(_ax_seg_gemm -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1)
+    set(_ax_seg_fat -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1)
+    set(_ax_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1)
+    set(_ax_packed_seg_fat -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_PACKED_REQUEST=1)
+    set(_ax_packed_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPLOW_NV_PACKED_REQUEST=1)
+    if(PLOW_NV_PF_GEMV_HEAD)
+        list(APPEND _ax_prefill -DPLOW_NV_PF_GEMV_HEAD=1)
+        list(APPEND _ax_seg_fat -DPLOW_NV_PF_GEMV_HEAD=1)
+        list(APPEND _ax_seg_gemm -DPLOW_NV_PF_GEMV_HEAD=1)
+        list(APPEND _ax_packed_seg_fat -DPLOW_NV_PF_GEMV_HEAD=1)
+        list(APPEND _ax_packed_seg_gemm -DPLOW_NV_PF_GEMV_HEAD=1)
+    endif()
     # AXIS 2 — bf16 KV vs fp8 (e4m3) KV. On the PREFILL side fp8-KV also fixes the
     # staging arm, and it comes from the OPTION, never a literal: FLASH_PREFILL_FP8
     # dequants at the smem stage (cp.async cannot convert fp8 inline), so PIPE=0 is
@@ -611,7 +625,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
                 "${_vstem}_fp8kv|${_ksym_dec}|_ax_decode|_ax_fp8kv"
                 "${_vstem}_pf_fp8kv|${_ksym_pf}|_ax_prefill|_ax_fp8kv_pf")
         endif()
-        if(PLOW_SM120_CUBIN_SEG)
+        if(PLOW_SM120_CUBIN_SEG OR PLOW_CUBIN_PACKED_PREFILL)
             string(LENGTH "${_vstem}_pfseg" _len_pfseg)
             string(LENGTH "${_vstem}_pfgemm" _len_pfgemm)
             set(_ksym_pfseg "_Z${_len_pfseg}${_vstem}_pfseg11PlowProgram")
@@ -619,6 +633,15 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
             list(APPEND _cubin_rows
                 "${_vstem}_pfseg|${_ksym_pfseg}|_ax_seg_fat|"
                 "${_vstem}_pfgemm|${_ksym_pfgemm}|_ax_seg_gemm|")
+        endif()
+        if(PLOW_CUBIN_PACKED_PREFILL)
+            string(LENGTH "${_vstem}_pfpackedseg" _len_pfpackedseg)
+            string(LENGTH "${_vstem}_pfpackedgemm" _len_pfpackedgemm)
+            set(_ksym_pfpackedseg "_Z${_len_pfpackedseg}${_vstem}_pfpackedseg11PlowProgram")
+            set(_ksym_pfpackedgemm "_Z${_len_pfpackedgemm}${_vstem}_pfpackedgemm11PlowProgram")
+            list(APPEND _cubin_rows
+                "${_vstem}_pfpackedseg|${_ksym_pfpackedseg}|_ax_packed_seg_fat|"
+                "${_vstem}_pfpackedgemm|${_ksym_pfpackedgemm}|_ax_packed_seg_gemm|")
         endif()
 
         foreach(_row ${_cubin_rows})
@@ -636,7 +659,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
                 COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_out}" "${_sym}" required
                         -arch=${_varch} -O3 -cubin ${_cubin_inc}
                         ${_defs} ${_cubin_extra} "${_vsrc}"
-                DEPENDS "${_vsrc}" "${_cubin_run}"
+                DEPENDS "${_vsrc}" "${_cubin_run}" ${PLOW_CUBIN_CONFIG} ${_cubin_headers}
                 COMMENT "nvcc ${_stem}.cubin (${_defs})"
                 VERBATIM)
             list(APPEND _cubin_outs "${_out}")
@@ -647,7 +670,7 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # defines, so it is not a row in the table above. A failure here is non-fatal:
     # serving falls back to host sampling (hence `optional`).
     set(_smp_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/sample_sm120.cu")
-    if(PLOW_SM120_CUBIN AND EXISTS "${_smp_src}")
+    if((PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN) AND EXISTS "${_smp_src}")
         set(_smp_out "${PLOW_CUBIN_DIR}/sample_sm120.cubin")
         add_custom_command(OUTPUT "${_smp_out}"
             COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_smp_out}" plow_sample optional
@@ -1321,6 +1344,13 @@ if(PLOW_GFX950_HSACO)
         "interp_prefill|${_hs_kpf}|_hs_ax_prefill|_hs_ax_none|256|2"
         "interp_decode|${_hs_kdec}|_hs_ax_decode|_hs_ax_none|256|2"
         "interp_flash|${_hs_kfl}|_hs_ax_flash|_hs_ax_none|512|1")
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+        set(_hs_ax_mixed -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0
+            -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=64 -DGM_BN=128
+            -DFA_DC=256 -DFA_DBUF=1)
+        list(APPEND _hs_rows
+            "interp_mixed|plow_interp_mixed_gfx942|_hs_ax_mixed|_hs_ax_none|512|1")
+    endif()
     if(PLOW_HSACO_FP8)
         # MIXED-PRECISION OBJECTS, and the names do not say so. `interp_*_fp8` carries the fp8
         # arms IN ADDITION TO the bf16 ones, and the fp8 arms themselves are not one precision:
@@ -1473,6 +1503,11 @@ if(PLOW_GFX950_HSACO)
             set(_sfx "")
             set(_gq "")
             set(_row_kind_extra "")
+            set(_row_extra ${_hs_extra})
+            if(_a1 STREQUAL "_hs_ax_mixed")
+                # Runtime-built schedules require the universal qualified object.
+                set(_row_extra "")
+            endif()
             if(_kind STREQUAL "gq")
                 # Both the filename and the kernel symbol take the suffix, and
                 # gemma4_chat.c resolves both by name.
@@ -1488,7 +1523,7 @@ if(PLOW_GFX950_HSACO)
                 COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
                         "${PLOW_HSACO_ARCH}" "${_out}" "${_sym}${_sfx}" ${_maxreg} ${_minocc}
                         ${_hs_inc} ${_hs_arch_def} ${${_a1}} ${${_a2}} ${_gq}
-                        ${_row_kind_extra} ${_hs_extra} "${_hs_src}"
+                        ${_row_kind_extra} ${_row_extra} "${_hs_src}"
                 DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
                 COMMENT "hipcc ${_stem}${_sfx}.elf"
                 VERBATIM)

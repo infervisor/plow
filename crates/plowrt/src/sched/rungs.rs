@@ -1,6 +1,6 @@
 //! Decode-rung admission policy.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use super::admission::Ewma;
 
@@ -48,6 +48,7 @@ pub struct RungLoad {
 #[derive(Clone, Copy, Debug)]
 struct RungStat {
     service_ms: Ewma,
+    step_ms: Ewma,
     samples: u64,
 }
 
@@ -55,6 +56,7 @@ impl Default for RungStat {
     fn default() -> Self {
         Self {
             service_ms: Ewma::new(0.2),
+            step_ms: Ewma::new(0.2),
             samples: 0,
         }
     }
@@ -152,11 +154,14 @@ impl RungController {
         self.rungs.width(self.target)
     }
 
-    pub fn observe_decode(&mut self, rung: usize, service_ms: f64) {
-        if service_ms <= 0.0 || rung >= self.stats.len() {
+    pub fn observe_decode(&mut self, rung: usize, service_ms: f64, steps: NonZeroUsize) {
+        if !service_ms.is_finite() || service_ms <= 0.0 || rung >= self.stats.len() {
             return;
         }
         self.stats[rung].service_ms.update(service_ms);
+        self.stats[rung]
+            .step_ms
+            .update(service_ms / steps.get() as f64);
         self.stats[rung].samples = self.stats[rung].samples.saturating_add(1);
     }
 
@@ -223,8 +228,16 @@ impl RungController {
     }
 
     fn service_ms(&self, rung: usize) -> f64 {
+        self.estimate_ms(rung, |stat| stat.service_ms.get())
+    }
+
+    fn step_ms(&self, rung: usize) -> f64 {
+        self.estimate_ms(rung, |stat| stat.step_ms.get())
+    }
+
+    fn estimate_ms(&self, rung: usize, value: impl Fn(&RungStat) -> f64) -> f64 {
         if self.stats[rung].samples > 0 {
-            return self.stats[rung].service_ms.get();
+            return value(&self.stats[rung]);
         }
         (0..rung)
             .rev()
@@ -233,19 +246,18 @@ impl RungController {
             // width. Reusing the narrow latency unchanged overstates wider
             // capacity and can admit a burst on evidence it does not have.
             .map(|i| {
-                self.stats[i].service_ms.get() * self.rungs.width(rung) as f64
-                    / self.rungs.width(i) as f64
+                value(&self.stats[i]) * self.rungs.width(rung) as f64 / self.rungs.width(i) as f64
             })
             .unwrap_or(0.0)
     }
 
     fn utilization(&self, rung: usize, load: RungLoad) -> f64 {
-        let service_ms = self.service_ms(rung);
-        if service_ms <= 0.0 {
+        let step_ms = self.step_ms(rung);
+        if step_ms <= 0.0 {
             return 0.0;
         }
         let demand_tps = load.arrival_rps.max(0.0) * load.mean_output_tokens.max(1.0);
-        let capacity_tps = self.rungs.width(rung) as f64 * 1000.0 / service_ms;
+        let capacity_tps = self.rungs.width(rung) as f64 * 1000.0 / step_ms;
         demand_tps / capacity_tps
     }
 
@@ -331,7 +343,7 @@ mod tests {
     #[test]
     fn service_and_slo_are_keyed_by_actual_rung() {
         let mut c = controller(&[1, 4, 16]);
-        c.observe_decode(0, 40.0);
+        c.observe_decode(0, 40.0, NonZeroUsize::MIN);
         let mut l = load(1, 3);
         l.oldest_wait_ms = 300.0;
         let d = c.decide(l);
@@ -344,12 +356,70 @@ mod tests {
     #[test]
     fn unseen_wider_rung_uses_conservative_width_scaled_service() {
         let mut c = controller(&[1, 4, 16]);
-        c.observe_decode(0, 2.5);
+        c.observe_decode(0, 2.5, NonZeroUsize::MIN);
         let b1 = c.service_ms(0);
         assert!(b1 > 0.0);
         assert_eq!(c.service_ms(1), b1 * 4.0);
         assert_eq!(c.service_ms(2), b1 * 16.0);
-        c.observe_decode(1, 6.0);
+        c.observe_decode(1, 6.0, NonZeroUsize::MIN);
         assert_eq!(c.service_ms(2), c.service_ms(1) * 4.0);
+    }
+
+    #[test]
+    fn quantum_length_does_not_inflate_utilization_or_widen_admission() {
+        let mut single = controller(&[1, 4, 16]);
+        let mut multi = controller(&[1, 4, 16]);
+        let mut unnormalized = controller(&[1, 4, 16]);
+        for _ in 0..32 {
+            single.observe_decode(0, 10.0, NonZeroUsize::MIN);
+            multi.observe_decode(0, 40.0, NonZeroUsize::new(4).unwrap());
+            unnormalized.observe_decode(0, 40.0, NonZeroUsize::MIN);
+        }
+        let demand = RungLoad {
+            arrival_rps: 1.0,
+            mean_output_tokens: 50.0,
+            ..load(1, 0)
+        };
+        assert_eq!(single.utilization(0, demand), multi.utilization(0, demand));
+        assert_eq!(single.decide(demand).reason, RungReason::Hold);
+        assert_eq!(multi.decide(demand).reason, RungReason::Hold);
+        assert_eq!(unnormalized.decide(demand).reason, RungReason::Utilization);
+    }
+
+    #[test]
+    fn waiting_uses_the_whole_quantum_even_when_capacity_uses_steps() {
+        let mut c = controller(&[1, 4, 16]);
+        c.observe_decode(0, 40.0, NonZeroUsize::new(4).unwrap());
+        let demand = RungLoad {
+            oldest_wait_ms: 20.0,
+            ..load(1, 2)
+        };
+        assert_eq!(c.projected_wait_ms(0, demand), 20.0 + 2.0 * c.service_ms(0));
+        assert!(c.projected_wait_ms(0, demand) > 20.0 + 2.0 * c.step_ms(0));
+        assert_eq!(c.step_ms(1), c.step_ms(0) * 4.0);
+        assert_eq!(c.service_ms(1), c.service_ms(0) * 4.0);
+    }
+
+    #[test]
+    fn variable_completed_quanta_keep_a_per_step_average() {
+        let mut single = controller(&[1, 4]);
+        let mut variable = controller(&[1, 4]);
+        for steps in [4, 4, 2, 1, 3, 1] {
+            single.observe_decode(0, 10.0, NonZeroUsize::MIN);
+            variable.observe_decode(0, 10.0 * steps as f64, NonZeroUsize::new(steps).unwrap());
+        }
+        assert_eq!(single.step_ms(0), variable.step_ms(0));
+        assert!(variable.service_ms(0) > variable.step_ms(0));
+    }
+
+    #[test]
+    fn invalid_timing_does_not_poison_either_estimate() {
+        let mut c = controller(&[1, 4]);
+        for sample in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            c.observe_decode(0, sample, NonZeroUsize::MIN);
+        }
+        assert_eq!(c.stats[0].samples, 0);
+        assert_eq!(c.service_ms(0), 0.0);
+        assert_eq!(c.step_ms(0), 0.0);
     }
 }

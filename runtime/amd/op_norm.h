@@ -22,6 +22,45 @@
 
 #include "amd_common.h"
 #include "packed_prefill.h"
+#include "mixed_step.h"
+
+#if PLOW_MIXED_STEP && PLOW_WAVES == 4
+constexpr unsigned rn_groups = 2;
+#else
+constexpr unsigned rn_groups = 1;
+#endif
+constexpr unsigned rn_threads = PLOW_THREADS * rn_groups;
+constexpr unsigned rn_vecs = RN_VEC * rn_groups;
+
+__device__ __forceinline__ unsigned rn_index(unsigned c) {
+    return (threadIdx.x + (c % RN_VEC) * rn_threads +
+            (c / RN_VEC) * PLOW_THREADS) * 8;
+}
+
+__device__ __forceinline__ float rn_sumsq(const bf16v8* v, float* part) {
+    // Mixed workgroups reproduce the ordinary 512-thread element and reduction order.
+#pragma unroll
+    for (unsigned group = 0; group < rn_groups; ++group) {
+        float ss = 0.0f;
+#pragma unroll
+        for (unsigned c = 0; c < RN_VEC; ++c)
+#pragma unroll
+            for (unsigned j = 0; j < 8; ++j) {
+                const float f = bf2f(v[group * RN_VEC + c][j]);
+                ss += f * f;
+            }
+        if constexpr (rn_groups == 1) return block_sum(ss, part);
+        ss = wave_sum(ss);
+        if ((threadIdx.x & 63) == 0)
+            part[(threadIdx.x >> 6) + group * PLOW_WAVES] = ss;
+    }
+    __syncthreads();
+    float sum = 0.0f;
+#pragma unroll
+    for (unsigned wave = 0; wave < rn_threads / 64; ++wave) sum += part[wave];
+    __syncthreads();
+    return sum;
+}
 
 /* RN_REG / RN_VEC moved to amd_common.h: op_gemm.h's fused-norm GEMV (`norm == 2`,
  * `gemv_norm_lds`) must reduce with the SAME per-thread element map as `d_rmsnorm` below to
@@ -68,19 +107,19 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                           float eps, unsigned out_row0, unsigned slice, unsigned nblk, float* part,
                           unsigned char* __restrict__ xq = nullptr,
                           float* __restrict__ ascale = nullptr
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
                           ,
                           const PlowProgram* packed = nullptr,
                           unsigned packed_slot_stride = 0
 #endif
                           ) {
     /* feat % 8 == 0 is what lets the row be read 16 bytes at a time; Gemma's 5376 is. */
-    const bool fits = (feat <= RN_REG * PLOW_THREADS) && ((feat & 7u) == 0);
+    const bool fits = (feat <= RN_REG * rn_threads) && ((feat & 7u) == 0);
     const auto* xg = as_glob(x);
     const auto* gg = as_glob(gamma);
     auto* og = as_glob(out);
     for (unsigned row = slice; row < rows; row += nblk) {
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
         const PlowPackedRow prow = plow_packed_prefill_row(packed, row);
         if (!prow.active) continue;
 #endif
@@ -88,7 +127,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
         /* out_row0 offsets the OUTPUT row only (input stays at `base`): GLM's decode step norms the
          * current token (row 0 of x) into the latent KV cache at row = out_row0 (the sequence pos),
          * patched per step. Default 0 => in-place, every existing RMSNORM bit-identical. */
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
         const size_t out_row = packed_slot_stride
                                    ? plow_packed_prefill_cache_row(prow, packed_slot_stride,
                                                                   out_row0 + row)
@@ -100,10 +139,10 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
         if (fits) {
             /* PRODUCE: the row AND its weight, in one burst. Both are issued before anything
              * is waited on, so they cost ONE round trip between them, not one each. */
-            bf16v8 v[RN_VEC], w[RN_VEC];
+            bf16v8 v[rn_vecs], w[rn_vecs];
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++) {
-                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
                 v[c] = bf16v8_zero();
                 w[c] = bf16v8_zero();
                 if (i < feat) {
@@ -112,18 +151,10 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                 }
             }
             /* CONSUME: reduce, scale, store. No HBM read from here on. */
-            float ss = 0.0f;
+            const float inv = rsqrtf(rn_sumsq(v, part) / (float)feat + eps);
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++)
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const float f = bf2f(v[c][j]);
-                    ss += f * f;
-                }
-            const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
-#pragma unroll
-            for (int c = 0; c < RN_VEC; c++) {
-                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
                 if (i < feat) {
                     bf16v8 o;
 #pragma unroll
@@ -144,8 +175,8 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
             if (xq) {
                 float amax = 0.0f;
 #pragma unroll
-                for (int c = 0; c < RN_VEC; c++) {
-                    const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+                for (int c = 0; c < rn_vecs; c++) {
+                    const unsigned i = rn_index(c);
                     if (i < feat)
 #pragma unroll
                         for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bf2f(v[c][j])));
@@ -156,8 +187,8 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                 auto* const xqg = as_glob(xq);
                 if (threadIdx.x == 0) st_act<float>(&as_glob(ascale)[row], as);
 #pragma unroll
-                for (int c = 0; c < RN_VEC; c++) {
-                    const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+                for (int c = 0; c < rn_vecs; c++) {
+                    const unsigned i = rn_index(c);
                     if (i < feat) {
 #pragma unroll
                         for (int j = 0; j < 8; j += 2) {
@@ -348,12 +379,18 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
                                 float eps, unsigned out_row0, unsigned out_stride, unsigned kv_mask,
                                 unsigned skip_norm, unsigned slice,
                                 unsigned nblk, unsigned n_batch_kv = 0
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_MIXED_STEP
+                                , const PlowProgram* mixed = nullptr,
+                                const int* decode_slots = nullptr
+#elif PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
                                 ,
                                 const PlowProgram* packed = nullptr,
                                 unsigned packed_slot_stride = 0
 #endif
                                 ) {
+#if PLOW_PACKED_PREFILL_DENSE_CONSUMERS
+    if (!packed_slot_stride) packed_slot_stride = out_stride;
+#endif
     constexpr unsigned hd = HD;
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave_in_blk = threadIdx.x >> 6; /* PLOW_WAVES per workgroup */
@@ -373,7 +410,16 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
 
     for (unsigned w = slice * PLOW_WAVES + wave_in_blk; w < total; w += nblk * PLOW_WAVES) {
         const unsigned t = w / nhead, hh = w % nhead;
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_MIXED_STEP
+        PlowMixedRow mrow = {nullptr, 0u, 0u, 0u, 0u};
+        if (out_stride && mixed) {
+            mrow = plow_mixed_row(mixed, decode_slots, pos, t);
+            if (!mrow.active) continue;
+        }
+        const unsigned position = out_stride && mixed
+                                      ? mrow.position
+                                      : (pg ? (unsigned)pg[t] : out_row0 + t);
+#elif PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
         const PlowPackedRow prow = plow_packed_prefill_row(packed, t);
         if (!prow.active) continue;
         const unsigned position =
@@ -397,7 +443,12 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
          * legacy formula gets right. n_batch_kv == 0 keeps the legacy path byte-identical, so
          * every prefill packet and B=1 decode are unchanged. */
         const size_t obase =
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_MIXED_STEP
+            out_stride && mixed
+                ? (((size_t)mrow.slot * nhead + hh) * out_stride +
+                   (position & kv_mask)) * hd
+                :
+#elif PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
             packed_slot_stride && prow.span
                 ? (((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
                    (position & kv_mask)) * hd
@@ -482,7 +533,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
                                     float eps, unsigned out_row0, unsigned out_stride,
                                     unsigned kv_mask, unsigned skip_norm, unsigned slice,
                                     unsigned nblk, unsigned n_batch_kv = 0
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
                                     ,
                                     const PlowProgram* packed = nullptr,
                                     unsigned packed_slot_stride = 0
@@ -504,7 +555,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
 
     for (unsigned w = slice * PLOW_WAVES + wave_in_blk; w < total; w += nblk * PLOW_WAVES) {
         const unsigned t = w / nhead, hh = w % nhead;
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
         const PlowPackedRow prow = plow_packed_prefill_row(packed, t);
         if (!prow.active) continue;
         const unsigned position =
@@ -517,7 +568,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
          * its own pos[t] (see the bf16 twin above). The per-row `scale` array shares this row,
          * so both follow the same formula. */
         const size_t row =
-#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
                            packed_slot_stride && prow.span
                                ? ((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
                                      (position & kv_mask)
@@ -585,7 +636,7 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
                                 const bf16* __restrict__ b, const bf16* __restrict__ gamma,
                                 unsigned rows, unsigned feat, float eps, float scale,
                                 unsigned slice, unsigned nblk, float* part) {
-    const bool fits = (feat <= RN_REG * PLOW_THREADS) && ((feat & 7u) == 0);
+    const bool fits = (feat <= RN_REG * rn_threads) && ((feat & 7u) == 0);
     const auto* ag = as_glob(a);
     const auto* bg = as_glob(b);
     const auto* gg = as_glob(gamma);
@@ -596,10 +647,10 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
             /* PRODUCE: all THREE operands -- the sublayer output b, the residual a, and the
              * weight -- issued together. This op used to fetch a and gamma only AFTER the
              * barrier, which is why it cost 3.2 us against rmsnorm's 2.8: two round trips. */
-            bf16v8 v[RN_VEC], av[RN_VEC], w[RN_VEC];
+            bf16v8 v[rn_vecs], av[rn_vecs], w[rn_vecs];
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++) {
-                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
                 v[c] = bf16v8_zero();
                 av[c] = bf16v8_zero();
                 w[c] = bf16v8_zero();
@@ -610,18 +661,10 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
                 }
             }
             /* CONSUME. */
-            float ss = 0.0f;
+            const float inv = rsqrtf(rn_sumsq(v, part) / (float)feat + eps);
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++)
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const float f = bf2f(v[c][j]);
-                    ss += f * f;
-                }
-            const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
-#pragma unroll
-            for (int c = 0; c < RN_VEC; c++) {
-                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            for (int c = 0; c < rn_vecs; c++) {
+                const unsigned i = rn_index(c);
                 if (i < feat) {
                     bf16v8 o;
 #pragma unroll

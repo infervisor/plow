@@ -51,17 +51,9 @@ pub struct DevProg {
     pub gq_seg_ofs: Vec<u32>,
     /// L2-domain placement (`PLOW_L2_PLACE`): domains per ordered segment, or `0`.
     ///
-    /// RECOVERED, not read: the blob header carries one `F_L2DOM` flag and one domain count for
-    /// the whole blob (`reserved[2]`), but placement is decided per PROGRAM — `Builder::finish`
-    /// declines it for a multi-wave-class program, so a blob can hold a placed decode program
-    /// beside an unplaced, segmented prefill one. A program is placed iff the blob says placement
-    /// happened and its window count is a valid domain multiple. Legacy blobs have exactly
-    /// one window per domain; current blobs retain ordered segments independently.
-    ///
-    /// That test is exact rather than a heuristic, and the reason is a parity argument worth
-    /// stating: a wave-class window count is `2*layers + 1`, which is always ODD, while a domain
-    /// count is a hardware L2 partition count, which is a power of two and so always EVEN. The
-    /// two ranges cannot collide.
+    /// The header's domain count is shared, but placement is per program. Current placed
+    /// programs have one queue window per ordered segment and domain; unplaced programs
+    /// have one per ordered segment. Legacy placed programs have one per domain.
     pub l2_domains: u32,
 }
 
@@ -283,14 +275,19 @@ impl DevBlob {
                 let n_stream = progs[p].stream.len();
                 progs[p].gq_stream = take(buf, &mut off, n_stream, "gq_stream")?;
                 progs[p].gq_seg_ofs = take(buf, &mut off, n_seg + 1, "gq_seg_ofs")?;
-                // Which of these programs is L2-PLACED. See `DevProg::l2_domains` for why the
-                // window count identifies it exactly.
                 let l2_dom = hdr.reserved[2] as u32;
                 let combined = hdr.flags & packet::devbuild::PLOW_BLOB_F_L2SEG != 0;
+                let ordered_segments = progs[p]
+                    .gq_stream
+                    .iter()
+                    .map(|entry| entry.seg as usize + 1)
+                    .max()
+                    .unwrap_or(0);
                 if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
                     && l2_dom != 0
                     && ((!combined && n_seg == l2_dom as usize)
-                        || (combined && n_seg % l2_dom as usize == 0))
+                        || (combined
+                            && ordered_segments.checked_mul(l2_dom as usize) == Some(n_seg)))
                 {
                     progs[p].l2_domains = l2_dom;
                 }
@@ -1040,6 +1037,29 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("gen recipe targets tensor 99"), "got: {err}");
+    }
+
+    #[test]
+    fn mixed_placement_preserves_unplaced_segment_windows() {
+        let mut model = tiny_model();
+        let prefill = &mut model.progs[0];
+        for entry in prefill.stream.iter_mut().chain(&mut prefill.gq_stream) {
+            entry.seg = entry.inst as u16;
+        }
+        prefill.gq_seg_ofs = vec![0, 2, 4];
+
+        let decode = &mut model.progs[1];
+        decode.l2_domains = 2;
+        decode.l2_sms = 1;
+        for entry in &mut decode.stream {
+            entry.flags = (entry.slice as u16) << packet::dev::SE_DOMAIN_SHIFT;
+        }
+        decode.gq_stream = decode.stream.clone();
+        decode.gq_seg_ofs = vec![0, 2, 4];
+
+        let parsed = DevBlob::parse_l2(&model.to_blob(), true).unwrap();
+        assert_eq!(parsed.progs[0].l2_domains, 0);
+        assert_eq!(parsed.progs[1].l2_domains, 2);
     }
 
     #[test]

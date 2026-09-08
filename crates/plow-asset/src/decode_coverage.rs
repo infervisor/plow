@@ -1,4 +1,4 @@
-use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
+use packet::dev::{DevInst64, DevOp, ROPE_PAIR_HALF, TENSOR_NONE16};
 
 pub const SYMBOLS: [&str; 6] = [
     "plow_decode_bf16_abi",
@@ -105,11 +105,16 @@ impl DenseBf16 {
             }
             DevOp::Glu => i[0] > 0 && i[1] <= 1,
             DevOp::HeadNormRope => {
-                batch(i[0]) && i[1] > 0 && matches!(i[2], 256 | 512) && i[5] == 0
+                batch(i[0])
+                    && i[1] > 0
+                    && matches!((i[2], i[5]), (64, 0 | ROPE_PAIR_HALF) | (256 | 512, 0))
             }
             DevOp::FlashDecode => {
                 let gqa = i[1].checked_div(i[2]).unwrap_or(0);
                 let gf = match i[6] {
+                    // HD64 is emitted only in a packet-paired object. Its manifest-derived
+                    // specialization instantiates the packet's exact GQA group.
+                    64 => gqa,
                     256 if gqa % self.0[1] == 0 => self.0[1],
                     256 => 2,
                     512 => self.0[2],
@@ -124,7 +129,48 @@ impl DenseBf16 {
                     && i[3] > 0
                     && i[5] > 0
             }
-            DevOp::FlashMerge => batch(i[0]) && i[1] > 0 && i[2] > 0 && matches!(i[3], 256 | 512),
+            DevOp::FlashMerge => {
+                batch(i[0]) && i[1] > 0 && i[2] > 0 && matches!(i[3], 64 | 256 | 512)
+            }
+            DevOp::MoeRouterTopkPf => {
+                i[0] == 0
+                    && i[1] > 0
+                    && i[2] > 0
+                    && i[2] <= i[1].min(16)
+                    && i[3] & !7 == 0
+                    && batch(i[4])
+                    && i[6] <= 1
+                    && i[7] == 0
+                    && d.t[2] == TENSOR_NONE16
+                    && f32::from_bits(d.fj[0]).is_finite()
+            }
+            DevOp::MoeGluMx => {
+                i[0] > 0
+                    && i[0] <= 16
+                    && i[1] > 0
+                    && i[2] > 0
+                    && i[3] > 0
+                    && i[4] <= 1
+                    && matches!(i[5], 0 | 1 | 3)
+                    && batch(i[6])
+                    && (i[5] != 3
+                        || (f32::from_bits(d.fj[0]).is_finite()
+                            && f32::from_bits(d.fj[1]).is_finite()
+                            && f32::from_bits(d.fj[0]) > 0.0
+                            && f32::from_bits(d.fj[1]) > 0.0))
+            }
+            DevOp::MoeDownMx => {
+                i[0] > 0 && i[0] <= 16 && i[1] > 0 && i[2] > 0 && i[3] > 0 && batch(i[6])
+            }
+            DevOp::MoeCombinePf => {
+                i[0] > 0
+                    && i[1] > 0
+                    && i[1] <= 16
+                    && batch(i[2])
+                    && i[3] == 0
+                    && i[4] == 0
+                    && i[7] == 0
+            }
             DevOp::Argmax | DevOp::ArgmaxFin => i[0] > 0 && batch(i[1].max(1)),
             _ => false,
         };
@@ -219,7 +265,7 @@ mod tests {
             d.op = op as u16;
             assert!(c.instruction(&d, 4).is_err());
         }
-        for hd in [64, 128, 1024] {
+        for hd in [128, 1024] {
             let mut d = d;
             d.i[6] = hd;
             assert!(c.instruction(&d, 4).is_err());
@@ -236,6 +282,46 @@ mod tests {
         assert!(c.instruction(&d, 4).is_ok());
         d.i[1] = 16;
         assert!(c.instruction(&d, 4).is_ok()); // Compiled GF2 fallback.
+    }
+    #[test]
+    fn accepts_packet_paired_hd64_attention_and_rope_modes() {
+        let c = caps();
+        let mut d = flash();
+        d.i = [4, 64, 8, 1024, 128, 2, 64, 1023];
+        assert!(c.instruction(&d, 4).is_ok());
+        d.op = DevOp::FlashMerge as u16;
+        d.i = [4, 64, 2, 64, 0, 0, 0, 0];
+        assert!(c.instruction(&d, 4).is_ok());
+        d.op = DevOp::HeadNormRope as u16;
+        d.i = [4, 64, 64, 0, 1, ROPE_PAIR_HALF, 4, 0];
+        assert!(c.instruction(&d, 4).is_ok());
+        d.i[5] = 0;
+        assert!(c.instruction(&d, 4).is_ok());
+    }
+    #[test]
+    fn accepts_flat_mxfp4_moe_decode_chain_and_rejects_bad_rows() {
+        let c = caps();
+        let mut d = DevInst64 {
+            op: DevOp::MoeRouterTopkPf as u16,
+            blocks: 1,
+            t: [TENSOR_NONE16; 8],
+            ..Default::default()
+        };
+        d.i = [0, 32, 4, 2, 4, 0, 0, 0];
+        d.fj[0] = 1.0f32.to_bits();
+        c.instruction(&d, 4).unwrap();
+        d.op = DevOp::MoeGluMx as u16;
+        d.i = [4, 2880, 2880, 32, 0, 3, 4, 0];
+        d.fj[..2].copy_from_slice(&[1.702f32.to_bits(), 7.0f32.to_bits()]);
+        c.instruction(&d, 4).unwrap();
+        d.op = DevOp::MoeDownMx as u16;
+        d.i = [4, 2880, 2880, 32, 0, 0, 4, 0];
+        c.instruction(&d, 4).unwrap();
+        d.op = DevOp::MoeCombinePf as u16;
+        d.i = [2880, 4, 4, 0, 0, 0, 0, 0];
+        c.instruction(&d, 4).unwrap();
+        d.i[2] = 5;
+        assert!(c.instruction(&d, 4).is_err());
     }
     #[test]
     fn rejects_fused_quant_and_undersized_m1_staging() {

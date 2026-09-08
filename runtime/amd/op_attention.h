@@ -147,9 +147,38 @@
  * divergence between waves is safe. BIT-IDENTICAL by construction: the skipped path is
  * exactly the corr == 1.0f path (and the m == -inf virgin state has l == 0 and
  * o == 0, which the skip leaves untouched — the same values the corr = 0 full path
- * writes). Default OFF until measured. */
+ * writes).
+ *
+ * MEASURED AND A LOSS, on top of PLOW_WAVE_RED_DPP + FA_FASTMASK, Gemma-4 31B cold-prefill
+ * TTFT on MI300X: 128 tok 92.58 -> 94.30 ms, 1024 tok 258.67 -> 264.73, 4096 tok
+ * 1116.03 -> 1151.07, and the object gains 22 B of scratch. The vote itself is free now (see
+ * the lane-level form at the call site), so what is left is the skip's own cost against a skip
+ * that almost never fires: a wave owns 32 query rows, and the chance that NOT ONE of their
+ * running maxima moves across a 32-column tile is small. Default OFF. */
 #ifndef FA_LAZY_RESCALE
 #define FA_LAZY_RESCALE 0
+#endif
+
+/* INTERIOR-TILE MASK SKIP (prefill, NKT==1 arm). See the [FA_FASTMASK] note at the mask block:
+ * one wave-uniform test replaces the per-element causal/window/bounds mask on every KV tile that
+ * lies wholly inside the valid region. Bit-identical; costs one branch and a copy of the
+ * 16-element scale loop, and it FREES registers (d_flash_prefill<256> 419 -> 377 VGPR,
+ * <512> scratch 47 -> 10 B). Worth -0.4/-0.7/-1.5% of Gemma-4 31B cold-prefill TTFT at
+ * 128/1024/4096 tokens on its own. build_gfx942.sh turns it on by default for the flash object;
+ * OFF here so an object that does not pass the flag keeps the old body. */
+#ifndef FA_FASTMASK
+#define FA_FASTMASK 0
+#endif
+
+/* Head-major prefill work order (see the [FA_HEAD_MAJOR] note at the work loop).
+ *
+ * MEASURED AND A SMALL LOSS: on top of PLOW_WAVE_RED_DPP + FA_FASTMASK, Gemma-4 31B
+ * cold-prefill TTFT on MI300X moves 1024 tok 258.67 -> 260.03 ms and 4096 tok
+ * 1116.03 -> 1119.70. It narrows the live KV window per XCD from all 16 sliding KV heads
+ * (16 MiB against a 4 MiB L2) to about seven and buys nothing — this kernel is not waiting on
+ * the KV re-stream. Kept as the arm that says so. Default OFF. */
+#ifndef FA_HEAD_MAJOR
+#define FA_HEAD_MAJOR 0
 #endif
 
 /* Output-dim chunk. The O accumulator is DC/32 f32x16 = 4*DC AccVGPRs per lane;
@@ -275,9 +304,23 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     const unsigned gqa = n_head / n_kv_head;
 
     for (unsigned w = slice; w < n_work; w += nblk) {
+#if FA_HEAD_MAJOR
+        /* [FA_HEAD_MAJOR] KV-window locality. The shipped order is split-fastest, then head,
+         * then q-tile, so the ~nblk work items running at any instant span EVERY head — for a
+         * Gemma sliding layer at chunk 1024 that is all 16 KV heads, a 16 MiB window against
+         * one XCD's 4 MiB L2. Making the head the SLOWEST axis narrows the live window to
+         * ceil(nblk / (q_tiles*nsplit)) heads instead. Pure re-indexing of the same bijection:
+         * every (qt, h, sp) is still visited exactly once, so it cannot change any output. */
+        const unsigned per_head = q_tiles * nsplit;
+        const unsigned h = w / per_head;
+        const unsigned rem = w - h * per_head;
+        const unsigned qt = rem / nsplit;
+        const unsigned sp = rem - qt * nsplit;
+#else
         const unsigned sp = w % nsplit;
         const unsigned h = (w / nsplit) % n_head;
         const unsigned qt = w / (nsplit * n_head);
+#endif
         const unsigned hkv = h / gqa;
         const unsigned q_base = qt * PLOW_WAVES * FA_BQ; /* first row of this q-tile */
         const unsigned my_q0 = q_base + wave * FA_BQ; /* first row of THIS wave     */
@@ -377,8 +420,12 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
              * The window-skip `continue` is dropped -- my_lo already starts at the window and the
              * per-element softmax mask excludes any out-of-window rows. */
             constexpr int KPT = BKV * D / PLOW_THREADS / 8;
-            constexpr int VL = (DV == D) ? FA_DC : DCH;
-            constexpr int VPT = BKV * VL / PLOW_THREADS / 8;
+            /* The V slab is DCH wide, NOT FA_DC: DCH = min(FA_DC, DV), so a head narrower than
+             * the register-budget chunk (D=128 Llama/Qwen, D=64 GPT-OSS) has DCH < FA_DC and an
+             * FA_DC-wide walk both reads past the end of each V row and writes past the end of
+             * Vsm (32 x (DCH+FA_PAD) halves) into Psm. Identical to FA_DC for every D >= FA_DC,
+             * i.e. for both shipped Gemma arms. */
+            constexpr int VPT = BKV * DCH / PLOW_THREADS / 8;
             bf16v8 nk[KPT], nv[VPT];
     /* FP8 KV IN THE PREFETCH PATH. This branch had none, and it is the only path the 4-wave
      * flash object takes (it is the object built -DFA_DBUF=1). `ld_glob8` on a `const bf16*`
@@ -420,13 +467,13 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     }                                                                                            \
     _Pragma("unroll") for (int it = 0; it < VPT; it++) {                                         \
         const unsigned e = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                            \
-        const unsigned kv = (KVB) + e / VL;                                                      \
+        const unsigned kv = (KVB) + e / DCH;                                                     \
         if constexpr (FP8KV) {                                                                    \
             static_assert(DV == D, "rectangular fp8 flash is not implemented");                  \
-            if (kv < n_kv) FA_DB_FP8(nv[it], V, v_scale, d_off + e % FA_DC) else nv[it] = bf16v8_zero(); \
+            if (kv < n_kv) FA_DB_FP8(nv[it], V, v_scale, d_off + e % DCH) else nv[it] = bf16v8_zero(); \
         } else {                                                                                  \
         if constexpr (DV == D)                                                                    \
-            nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + e % FA_DC) \
+            nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + e % DCH) \
                                  : bf16v8_zero();                                                 \
         else                                                                                      \
             nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * DV + d_off + e % DCH) \
@@ -444,7 +491,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 #pragma unroll
                 for (int it = 0; it < VPT; it++) {
                     const unsigned e = threadIdx.x * 8 + it * (PLOW_THREADS * 8);
-                    __builtin_memcpy(&Vsm[(e / FA_DC) * VSTRIDE + e % FA_DC], &nv[it], 16);
+                    __builtin_memcpy(&Vsm[(e / DCH) * VSTRIDE + e % DCH], &nv[it], 16);
                 }
                 if (kv0 + BKV < my_hi) FA_DB_LOAD(kv0 + BKV); /* prefetch next; loads fly during compute */
                 __syncthreads(); /* Ksm/Vsm visible */
@@ -537,6 +584,27 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                      * must stop at 32 lanes — a full 64-lane reduce folds two rows
                      * together and silently corrupts the softmax. */
                     float p[16];
+#if FA_FASTMASK
+                    /* INTERIOR TILE. Every term of `valid` below is monotone in the row and the
+                     * column, so testing it once at the two extremes decides it for the whole
+                     * 32x32 tile: the mask then collapses to the scale. It is worth a branch —
+                     * the per-element form is ~4 compares, 3 ands and a select on each of 16
+                     * accumulator rows, ~250 of the ~1600 instructions a KV tile costs, and the
+                     * causal triangle means most tiles of a large q-tile are interior.
+                     *
+                     * Every operand is wave-uniform (`my_q0` is this wave's own first row and
+                     * `kv0` is the workgroup's loop variable), so this is a scalar branch, not
+                     * lane divergence. BIT-IDENTICAL: the taken path is exactly the all-valid
+                     * path of the masked form. */
+                    const bool full_tile =
+                        (my_q0 + FA_BQ <= n_q) && (kv0 + BKV <= n_kv) &&
+                        (kv0 + BKV - 1 <= q_pos0 + my_q0) &&
+                        (!window || (q_pos0 + my_q0 + FA_BQ - 1) - kv0 < window);
+                    if (full_tile) {
+#pragma unroll
+                        for (int i = 0; i < 16; i++) p[i] = s[i] * FA_SCALE(scale);
+                    } else
+#endif
 #pragma unroll
                     for (int i = 0; i < 16; i++) {
                         const unsigned qi = my_q0 + mfma_acc_m(lane, i);
@@ -551,12 +619,16 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
 #if FA_LAZY_RESCALE
                     /* [FA_LAZY_RESCALE] see the knob note: skip corr/rescale when no lane's
                      * running max moved this tile — the skipped block is exactly corr == 1.
-                     * No rm[] array: the vote recomputes half_wave_max and the full path
-                     * repeats it, so nothing new stays live across the branch (a held
-                     * rm[16] tripled the flash object's scratch spill, 217 -> 620 B). */
+                     * No rm[] array: nothing new stays live across the branch (a held rm[16]
+                     * tripled the flash object's scratch spill, 217 -> 620 B). */
+                    /* The vote needs no reduction at all. `m_st[i]` is half-wave uniform (it is
+                     * only ever assigned a half-wave max), so `half_wave_max(p[i]) > m_st[i]`
+                     * holds exactly when SOME lane of that half-wave has `p[i] > m_st[i]` — and
+                     * the ballot is over the whole wave either way. 16 compares replace 16
+                     * 32-lane reductions. */
                     bool upd = false;
 #pragma unroll
-                    for (int i = 0; i < 16; i++) upd |= half_wave_max(p[i]) > m_st[i];
+                    for (int i = 0; i < 16; i++) upd |= p[i] > m_st[i];
                     if (__ballot(upd) == 0ull) {
 #pragma unroll
                         for (int i = 0; i < 16; i++) {
@@ -749,12 +821,11 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
              * non-null O_final so the golden wrappers (which pass null and validate the
              * partial+merge path even at nsplit==1) still exercise the old path.
              *
-             * Compiled into the standalone flash object (PLOW_BUCKET_FLASH, Gemma) AND into the
-             * D=128 inline path (PLOW_FLASH_HD128, Llama/Qwen): both actually RUN flash and so
-             * both need the fused write. It is kept OUT of the 8-wave Gemma prefill interpreter
+             * Compiled into flash, inline HD128, and mixed objects, which all execute this
+             * final-output path. It is kept OUT of the 8-wave Gemma prefill interpreter
              * (neither macro) where the D=256/512 arms are compiled-but-never-run: adding the
              * fused write there pushes it 258 > 256 over the cliff for no benefit. */
-#if defined(PLOW_BUCKET_FLASH) || defined(PLOW_FLASH_HD128)
+#if defined(PLOW_BUCKET_FLASH) || defined(PLOW_FLASH_HD128) || PLOW_MIXED_STEP
             if (nsplit == 1 && O_final != nullptr) {
                 const unsigned qd = n_head * DV; /* row stride of n.at */
 #pragma unroll
@@ -828,6 +899,12 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
  *   mlpart[b][h][split][2]  f32   (running max, running sum)
  * ------------------------------------------------------------------------- */
 #define FA_DEC_TILE PLOW_THREADS /* KV rows per pass: one per thread */
+#if PLOW_MIXED_STEP && PLOW_WAVES == 4
+/* Preserve the ordinary 512-thread softmax and V accumulation order. */
+#define FA_DEC_GROUPS 2
+#else
+#define FA_DEC_GROUPS 1
+#endif
 /* Interleave the K-phase row->wave map instead of blocking it. Default OFF (byte-identical);
  * see the note at the map itself for why it matters when a split is shorter than the tile. */
 #ifndef FA_DEC_ILV
@@ -934,7 +1011,8 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
  * g), so all GF of them happen concurrently and the tile still costs 3 barriers, not 3*GF.
  * ------------------------------------------------------------------------- */
 #define FA_DEC_LDS_FLOATS(D, GF) \
-    ((GF) * FA_DEC_TILE + 2 * PLOW_WAVES + (GF) * ((D) / 2) + FA_DEC_NG(D) * (D))
+    ((GF) * FA_DEC_TILE * FA_DEC_GROUPS + 2 * PLOW_WAVES + (GF) * ((D) / 2) + \
+     FA_DEC_GROUPS * FA_DEC_NG(D) * (D))
 
 /* V rows in flight. A fused row feeds GF accumulators, so there is 8x more arithmetic per load
  * to hide its latency with — and 8 accumulators of 8 floats is already 64 VGPRs. Trade depth for
@@ -1066,7 +1144,7 @@ __device__ __forceinline__ float fa_merge_ml(const float* __restrict__ ml, unsig
 #endif /* FA_MERGE_UNROLL4 */
 }
 
-template <int D, int GF, bool FP8KV = false, bool NRF = false>
+template <int D, int GF, bool FP8KV = false, bool NRF = false, bool SLOTMAP = false>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                const bf16* __restrict__ Q, const bf16* __restrict__ K,
                                const bf16* __restrict__ V, const int* __restrict__ kv_len,
@@ -1082,21 +1160,23 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                const float* __restrict__ nrf_cos = nullptr,
                                const float* __restrict__ nrf_sin = nullptr, float nrf_eps = 0.0f,
                                unsigned nrf_skip = 0, unsigned* mrg_ctr = nullptr,
-                               bf16* o_final = nullptr) {
+                               bf16* o_final = nullptr,
+                               const int* __restrict__ decode_slot = nullptr) {
     /* A work item carries GF CONSECUTIVE query heads. They share a KV head as long as GF divides
      * GQA — which is the only thing this kernel needs, and is weaker than GF == GQA. On Gemma the
      * two coincide (hd 256 -> GQA 2 -> GF 2; hd 512 -> GQA 8 -> GF 8), but a true-MQA model has
      * GQA = n_head, and then this simply forms n_head/GF groups per KV head and still reads each
      * row once per group. Indexing by head-group rather than by kv_head is what makes that work;
      * the earlier form silently computed only the first GF heads of each KV head. */
+    constexpr unsigned DTILE = FA_DEC_TILE * FA_DEC_GROUPS;
     const unsigned gqa = n_head / n_kv_head;
     const unsigned n_grp = n_head / GF; /* head-groups; == n_kv_head when GF == gqa */
     const unsigned n_work = n_batch * n_grp * nsplit;
     const unsigned tid = threadIdx.x;
     const unsigned wave = tid >> 6, lane = tid & 63;
 
-    float* Ssm = lds;                                   /* [GF][FA_DEC_TILE] scores        */
-    float* hmax = lds + GF * FA_DEC_TILE;               /* [PLOW_WAVES] per-head tile max   */
+    float* Ssm = lds;                                   /* [GF][DTILE] scores        */
+    float* hmax = lds + GF * DTILE;               /* [PLOW_WAVES] per-head tile max   */
     float* hsum = hmax + PLOW_WAVES;                    /* [PLOW_WAVES] per-head tile sum   */
     bf16* qsm = (bf16*)(hsum + PLOW_WAVES);             /* [GF][D] query rows, staged once  */
     float* osm = (float*)(qsm + GF * D);                /* [NG][D] O, per row-group         */
@@ -1105,6 +1185,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         const unsigned sp = w % nsplit;
         const unsigned hg = (w / nsplit) % n_grp;
         const unsigned b = w / (nsplit * n_grp);
+        unsigned slot = b;
+        if constexpr (SLOTMAP) {
+            const int physical = decode_slot[b];
+            if (physical < 0) __builtin_trap();
+            slot = (unsigned)physical;
+        }
         const unsigned h0 = hg * GF;   /* the GF consecutive query heads this item carries */
         const unsigned hkv = h0 / gqa; /* they all share this KV head (GF divides gqa) */
 
@@ -1131,15 +1217,16 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         /* HEAD-MAJOR: this head's rows are CONTIGUOUS. See dev_isa.h -- token-major put
          * n_kv_head*D of stride between consecutive rows of one head (8 KB around 512 bytes of
          * payload at Gemma-31B), so a workgroup spanned 512 KB to read 256 KB. */
-        const auto* kbase = as_glob(K) + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
-        const auto* vbase = as_glob(V) + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
+        const size_t kv_batch = slot;
+        const auto* kbase = as_glob(K) + (kv_batch * n_kv_head + hkv) * kv_stride * D;
+        const auto* vbase = as_glob(V) + (kv_batch * n_kv_head + hkv) * kv_stride * D;
         /* FP8 KV: the cache is uint8[...] (1 byte/elem) with a PER-ROW f32 scale, head-major like
          * the bf16 cache. These bases are byte pointers (byte offset == element index) and the
          * per-(kv_head) scale slice; both unused on the bf16 instantiation. */
-        const unsigned char* kb8 = (const unsigned char*)K + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
-        const unsigned char* vb8 = (const unsigned char*)V + ((size_t)b * n_kv_head + hkv) * kv_stride * D;
-        const float* ksc = k_scale + ((size_t)b * n_kv_head + hkv) * kv_stride;
-        const float* vsc = v_scale + ((size_t)b * n_kv_head + hkv) * kv_stride;
+        const unsigned char* kb8 = (const unsigned char*)K + (kv_batch * n_kv_head + hkv) * kv_stride * D;
+        const unsigned char* vb8 = (const unsigned char*)V + (kv_batch * n_kv_head + hkv) * kv_stride * D;
+        const float* ksc = k_scale + (kv_batch * n_kv_head + hkv) * kv_stride;
+        const float* vsc = v_scale + (kv_batch * n_kv_head + hkv) * kv_stride;
 
         /* All GF query rows into LDS, once.
          *
@@ -1203,8 +1290,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             }
             /* Phase 2 (the ONE owning item): current-token K and V rows -> the cache. */
             if (qpos >= lo && qpos < hi) {
-                const size_t slot =
-                    (((size_t)b * n_kv_head + hkv) * kv_stride + (qpos & kv_mask)) * D;
+                const size_t cache_off =
+                    ((kv_batch * n_kv_head + hkv) * kv_stride + (qpos & kv_mask)) * D;
                 if (wave == 0) { /* K: norm(gamma_k) + RoPE, exactly hnr's k arm */
                     const auto* xg = as_glob(nrf_kg) + ((size_t)b * n_kv_head + hkv) * D;
                     const auto* gg = as_glob(nrf_gk);
@@ -1233,7 +1320,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                         r[e] = (e < EH) ? (v[e] * c - v[e + EH] * s) : (v[e] * c + v[e - EH] * s);
                     }
 #pragma unroll
-                    for (unsigned e = 0; e < E; e++) st_act1(&og[slot + lane + e * 64], f2bf(r[e]));
+                    for (unsigned e = 0; e < E; e++) st_act1(&og[cache_off + lane + e * 64], f2bf(r[e]));
                 } else if (wave == 1) { /* V: weightless RMS (Gemma norms V), no RoPE, no gamma */
                     const auto* xg = as_glob(nrf_vg) + ((size_t)b * n_kv_head + hkv) * D;
                     auto* og = as_glob((bf16*)V);
@@ -1248,7 +1335,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                         inv = rsqrtf(wave_sum(ss) / (float)D + nrf_eps);
                     }
 #pragma unroll
-                    for (unsigned e = 0; e < E; e++) st_act1(&og[slot + lane + e * 64], f2bf(v[e] * inv));
+                    for (unsigned e = 0; e < E; e++) st_act1(&og[cache_off + lane + e * 64], f2bf(v[e] * inv));
                 }
                 /* Drain the stores (s_waitcnt, NO cache ops) before the barrier. An agent-scope
                  * fence here was the first attempt and it cost +0.6 ms/token: its buffer_inv is
@@ -1284,22 +1371,24 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
          * (m, l, corr) is block-wide and unaffected: it is computed from Ssm by all threads, as
          * before, and `corr` rescales every group's partial identically. */
         constexpr unsigned NDT = FA_DEC_NDT(D); /* threads covering one row  */
-        constexpr unsigned NG = FA_DEC_NG(D);   /* row-groups                */
+        constexpr unsigned NG = FA_DEC_NG(D) * FA_DEC_GROUPS;   /* row-groups                */
         const unsigned dbase = (tid % NDT) * 8;
         const unsigned grp = tid / NDT;
-        float oacc[GF][8];
+        float oacc[FA_DEC_GROUPS][GF][8];
+#pragma unroll
+        for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
 #pragma unroll
         for (int g = 0; g < GF; g++)
 #pragma unroll
-            for (int u = 0; u < 8; u++) oacc[g][u] = 0.0f;
+            for (int u = 0; u < 8; u++) oacc[vg][g][u] = 0.0f;
 
         /* ABLATION (FA_ABL=2): retire the WHOLE kv loop -- K phase, softmax and V. What is left
          * is the packet's own cost (gate, dispatch, Q staging, epilogue), which separates "this
          * kernel is slow" from "this packet is expensive". Probe only. */
 #if FA_ABL >= 2
-        for (unsigned kv0 = lo; kv0 < lo; kv0 += FA_DEC_TILE) { /* ablation: loop never runs */
+        for (unsigned kv0 = lo; kv0 < lo; kv0 += DTILE) { /* ablation: loop never runs */
 #else
-        for (unsigned kv0 = lo; kv0 < hi; kv0 += FA_DEC_TILE) {
+        for (unsigned kv0 = lo; kv0 < hi; kv0 += DTILE) {
 #endif
             /* SCORES.  EIGHT LANES PER K ROW.                            [K-PHASE-KL8]
              *
@@ -1331,7 +1420,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
              * all GF query rows out of LDS, so the row still crosses HBM once, not GQA times. */
             constexpr unsigned KL = FA_DEC_KL;              /* lanes per K row              */
             constexpr unsigned KR = 64 / KL;                /* K rows per wave-pass         */
-            constexpr unsigned KRW = FA_DEC_TILE / PLOW_WAVES; /* rows a wave owns per tile */
+            constexpr unsigned KRW = DTILE / PLOW_WAVES; /* rows a wave owns per tile */
             constexpr unsigned KPASS = KRW / KR;            /* passes to cover them         */
             constexpr unsigned KSTEP = KL * 8;              /* elems a pass advances        */
             const unsigned ksub = lane % KL, krl = lane / KL;
@@ -1339,14 +1428,14 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
             for (unsigned p = 0; p < KPASS; p++) {
                 /* ROW->WAVE MAP. The default BLOCKS the tile: wave w owns rows [w*KRW,(w+1)*KRW),
                  * which is exactly right when the tile is full. It is pathological when it is not.
-                 * A split covers `per = ceil(span/nsplit)` rows of a FA_DEC_TILE(=512)-row tile,
+                 * A split covers `per = ceil(span/nsplit)` rows of a DTILE(=512)-row tile,
                  * and at Gemma-4's 1024-token sliding window with nsplit=38 that is 27 -- so every
                  * live row lands in wave 0's block and SEVEN OF EIGHT WAVES DO NOTHING. Measured
                  * 233 GB/s against the 4030 GB/s this same load map reaches on a full tile.
                  *
                  * FA_DEC_ILV INTERLEAVES instead: pass p covers rows [p*W*KR,(p+1)*W*KR) spread
                  * across all waves, so the first `per` rows occupy ceil(per/KR) waves rather than
-                 * one. Same bijection onto [0,FA_DEC_TILE) -- every Ssm slot is still written
+                 * one. Same bijection onto [0,DTILE) -- every Ssm slot is still written
                  * exactly once, which is what the block-wide max and the `Ssm[g*TILE+rl]` store
                  * below require -- and a pass is now CONTIGUOUS in kv (rows p*64..p*64+63) where
                  * the blocked map strided it by KRW across waves. */
@@ -1354,7 +1443,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                  * optimisation looks free. Under FA_DEC_ILV pass p covers [kv0+p*W*KR, ...) for the
                  * whole workgroup, so `if (kv0 + p*W*KR >= hi) break` would retire 7 of 8 passes at
                  * per=27 -- but a retired pass never writes its Ssm slots, and the softmax max
-                 * below is `for (i = lane; i < FA_DEC_TILE; i += 64) fmaxf(mx, Ssm[...])`, i.e.
+                 * below is `for (i = lane; i < DTILE; i += 64) fmaxf(mx, Ssm[...])`, i.e.
                  * UNBOUNDED over the tile. The skipped slots would hold the previous tile's scores
                  * and poison the block-wide max. Retiring them needs the -inf fill hoisted out of
                  * the pass loop first; until then the predicate below is what keeps them correct. */
@@ -1410,24 +1499,24 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 }
                 if (ksub == 0) {
 #pragma unroll
-                    for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + rl] = s0[g];
+                    for (int g = 0; g < GF; g++) Ssm[g * DTILE + rl] = s0[g];
                 }
             }
             /* This thread's OWN row's scores, for the pe below: it computed partials for KPASS
              * other rows, not for row `tid`. One LDS read per head after the barrier, which the
              * softmax needs anyway. */
-            float s[GF];
+            float s[FA_DEC_GROUPS][GF];
 
-#if FA_DEC_VPIPE
+#if FA_DEC_VPIPE && FA_DEC_GROUPS == 1
             /* PIPELINE: the KV loop is single-tile per split at the shipped nsplit=16 (span/16 ==
-             * FA_DEC_TILE at 8k), so there is no "next tile" to double-buffer. The one overlap the
+             * DTILE at 8k), so there is no "next tile" to double-buffer. The one overlap the
              * compiler cannot take is the V stream: a __syncthreads() is a hard scheduling barrier,
              * so V loads are pinned AFTER the whole softmax reduction (5 barriers, waves >= GF idle,
              * HBM drained). Issue this thread's FIRST V-group loads HERE -- their addresses do not
              * depend on the softmax result, only the multiply does -- so the HBM read of V flies
              * DURING the reduction instead of after it. Costs VU bf16v8 held across softmax. */
             constexpr int VU_ = FA_DEC_VPIPE; /* prefetch depth (rows/thread) held over softmax */
-            const unsigned rmax_pf = (hi - kv0 < FA_DEC_TILE) ? (hi - kv0) : FA_DEC_TILE;
+            const unsigned rmax_pf = (hi - kv0 < DTILE) ? (hi - kv0) : DTILE;
             /* vpipe_ok: the whole first VU_-group is in range (a full 512-row tile, i.e. long
              * context). Only then does the peel below consume vpre. NOTE: the load MUST stay a
              * branchless predicated load -- wrapping it in `if (vpipe_ok)` makes the allocator spill
@@ -1450,7 +1539,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #endif
             __syncthreads();
 #pragma unroll
-            for (int g = 0; g < GF; g++) s[g] = Ssm[g * FA_DEC_TILE + tid];
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
+#pragma unroll
+            for (int g = 0; g < GF; g++) s[vg][g] = Ssm[g * DTILE + tid + vg * PLOW_THREADS];
 
             /* BOUND THE SOFTMAX REDUCTIONS BY THE LIVE ROW COUNT (FA_DEC_LIVE).
              *
@@ -1462,14 +1553,14 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
              * -inf fill itself must STAY -- the `s[g]` read below and the V phase rely on it -- so
              * this bounds the READS only. Same quantity `rmax_pf` already computes for VPIPE. */
             const unsigned live_ =
-                ((hi - kv0) < (unsigned)FA_DEC_TILE) ? (hi - kv0) : (unsigned)FA_DEC_TILE;
-            const unsigned red_n = FA_DEC_LIVE ? live_ : (unsigned)FA_DEC_TILE;
+                ((hi - kv0) < (unsigned)DTILE) ? (hi - kv0) : (unsigned)DTILE;
+            const unsigned red_n = FA_DEC_LIVE ? live_ : (unsigned)DTILE;
             /* GF softmax reductions, ONE PER WAVE, so they all run concurrently: the tile still
              * costs 3 barriers, not 3*GF. (There are PLOW_WAVES=8 waves and GF <= 8.) */
             if (wave < GF) {
                 float mx = FA_NEG_INF;
                 for (unsigned i = lane; i < red_n; i += 64)
-                    mx = fmaxf(mx, Ssm[wave * FA_DEC_TILE + i]);
+                    mx = fmaxf(mx, Ssm[wave * DTILE + i]);
 #pragma unroll
                 for (int off = 32; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 64));
                 if (lane == 0) hmax[wave] = mx;
@@ -1482,21 +1573,25 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 mnew[g] = fmaxf(m_st[g], hmax[g]);
                 corr[g] = (m_st[g] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[g] - mnew[g]);
             }
-            float pe[GF];
+            float pe[FA_DEC_GROUPS][GF];
+#pragma unroll
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
 #pragma unroll
             for (int g = 0; g < GF; g++)
-                pe[g] = (mnew[g] == FA_NEG_INF || s[g] == FA_NEG_INF)
+                pe[vg][g] = (mnew[g] == FA_NEG_INF || s[vg][g] == FA_NEG_INF)
                             ? 0.0f
-                            : FA_EXP(s[g] - mnew[g]);
+                            : FA_EXP(s[vg][g] - mnew[g]);
             __syncthreads();
 #pragma unroll
-            for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + tid] = pe[g];
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
+#pragma unroll
+            for (int g = 0; g < GF; g++) Ssm[g * DTILE + tid + vg * PLOW_THREADS] = pe[vg][g];
             __syncthreads();
 
             if (wave < GF) {
                 float sm = 0.0f;
                 for (unsigned i = lane; i < red_n; i += 64)   /* see FA_DEC_LIVE above */
-                    sm += Ssm[wave * FA_DEC_TILE + i];
+                    sm += Ssm[wave * DTILE + i];
                 sm = wave_sum(sm);
                 if (lane == 0) hsum[wave] = sm;
             }
@@ -1514,9 +1609,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
              * `if (pw != 0)` is gone too: it made every V load conditional, so the compiler
              * could not batch them at all. Multiplying by an exact zero costs one FMA. */
 #pragma unroll
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
+#pragma unroll
             for (int g = 0; g < GF; g++)
 #pragma unroll
-                for (int u = 0; u < 8; u++) oacc[g][u] *= corr[g];
+                for (int u = 0; u < 8; u++) oacc[vg][g][u] *= corr[g];
 
             /* The other half of the fusion: the V row is loaded ONCE and accumulated into all GF
              * outputs. Same bytes off HBM, GF times the arithmetic — which is also why the unroll
@@ -1528,10 +1625,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #if FA_ABL
             const unsigned rmax = 0u; /* ablation: retires every V loop below */
 #else
-            const unsigned rmax = (hi - kv0 < FA_DEC_TILE) ? (hi - kv0) : FA_DEC_TILE;
+            const unsigned rmax = (hi - kv0 < DTILE) ? (hi - kv0) : DTILE;
 #endif
-            unsigned r = grp;
-#if FA_DEC_VPIPE
+#pragma unroll
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg) {
+                unsigned r = grp + vg * FA_DEC_NG(D);
+#if FA_DEC_VPIPE && FA_DEC_GROUPS == 1
             /* First VU-group was PREFETCHED over the softmax barriers (vpre). Consume it here
              * instead of re-loading; the loads already flew during the reduction. Only when the
              * whole first group was in range (vpipe_ok) -- otherwise fall through to the loops
@@ -1541,9 +1640,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 for (int c = 0; c < FA_DEC_VPIPE; c++) {
 #pragma unroll
                     for (int g = 0; g < GF; g++) {
-                        const float pw = Ssm[g * FA_DEC_TILE + r + (unsigned)c * NG];
+                        const float pw = Ssm[g * DTILE + r + (unsigned)c * NG];
 #pragma unroll
-                        for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(vpre[c][u]);
+                        for (int u = 0; u < 8; u++) oacc[vg][g][u] += pw * bf2f(vpre[c][u]);
                     }
                 }
                 r += FA_DEC_VPIPE * NG;
@@ -1569,9 +1668,9 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 for (int c = 0; c < VU; c++) {
 #pragma unroll
                     for (int g = 0; g < GF; g++) {
-                        const float pw = Ssm[g * FA_DEC_TILE + r + (unsigned)c * NG] * vsf[c];
+                        const float pw = Ssm[g * DTILE + r + (unsigned)c * NG] * vsf[c];
 #pragma unroll
-                        for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(vv[c][u]);
+                        for (int u = 0; u < 8; u++) oacc[vg][g][u] += pw * bf2f(vv[c][u]);
                     }
                 }
             }
@@ -1588,10 +1687,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 }
 #pragma unroll
                 for (int g = 0; g < GF; g++) {
-                    const float pw = Ssm[g * FA_DEC_TILE + r] * vsf;
+                    const float pw = Ssm[g * DTILE + r] * vsf;
 #pragma unroll
-                    for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(v[u]);
+                    for (int u = 0; u < 8; u++) oacc[vg][g][u] += pw * bf2f(v[u]);
                 }
+            }
             }
             __syncthreads();
         }
@@ -1609,7 +1709,10 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         for (int g = 0; g < GF; g++) {
             __syncthreads();
 #pragma unroll
-            for (int u = 0; u < 8; u++) osm[grp * D + dbase + u] = oacc[g][u];
+            for (unsigned vg = 0; vg < FA_DEC_GROUPS; ++vg)
+#pragma unroll
+            for (int u = 0; u < 8; u++)
+                osm[(grp + vg * FA_DEC_NG(D)) * D + dbase + u] = oacc[vg][g][u];
             __syncthreads();
 
             const unsigned h = h0 + (unsigned)g;
@@ -1700,6 +1803,18 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
     }
 }
 
+template <int D, int GF>
+__device__ __noinline__ void d_flash_decode_slots(
+    float* Opart, float* mlpart, const bf16* Q, const bf16* K, const bf16* V,
+    const int* kv_len, unsigned n_batch, unsigned n_head, unsigned n_kv_head,
+    unsigned kv_stride, unsigned window, float scale, unsigned nsplit, unsigned kv_mask,
+    unsigned slice, unsigned nblk, float* lds, const int* decode_slot) {
+    d_flash_decode<D, GF, false, false, true>(
+        Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
+        nsplit, kv_mask, slice, nblk, lds, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, 0.0f, 0, nullptr, nullptr, decode_slot);
+}
+
 /* Combine the split partials: standard online-softmax merge.
  *
  * WORK DECOMPOSITION IS (batch, head, d-chunk), and the d-chunk axis is DERIVED FROM `nblk`, not
@@ -1759,16 +1874,35 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
  * intentional Q-hoist), and the token is unchanged within noise (pre-change 17.472 vs dsplit=1
  * 17.275 median, n=9 interleaved, sd 0.35 / 0.62). Do not change the default. */
 
+/* `sinks_` = dev_isa.h op 13 t3, bf16[n_head] (nullptr = none). GPT-OSS `self_attn.sinks`: one
+ * extra logit per head that joins the softmax denominator and contributes no value row. The fold
+ * point is HERE and only here — see the [ISA] note at PLOW_DOP_FLASH_MERGE.
+ *
+ * FA_SCALE, because the sink is a RAW logit and (m, l) are in whatever base FA_EXP uses. With
+ * FA_USE_EXP2 the flash bodies fold log2(e) into the score scale, so the partials are log2-domain
+ * and the sink must be lifted into it too; FA_SCALE is the identity when FA_USE_EXP2 is off. This
+ * is the one place a raw logit enters the merge, so it is the one place that conversion belongs.
+ *
+ * The accumulator keeps `gm` as its base and only `inv` carries the sink, which is what makes the
+ * fold free on the D loop: with gm' = max(gm, sink),
+ *   O = (sum_s O_s e^(m_s-gm)) * e^(gm-gm') / gl',  gl' = gl e^(gm-gm') + e^(sink-gm')
+ * so `inv = rescale / gl'` with rescale = e^(gm-gm'). Written this way rather than as the
+ * algebraically equal `acc / (gl + e^(sink-gm))` because a sink far above every split's max
+ * overflows that form's denominator, and the sink CAN dominate: an empty split set leaves
+ * gm = FA_NEG_INF, where this form gives rescale = 0, gl' = 1, O = 0 — all mass on the sink, no
+ * value row, which is the right answer rather than a NaN. */
 template <int D>
 __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ Opart_,
                               const float* __restrict__ mlpart_, unsigned n_batch,
-                              unsigned n_head, unsigned nsplit, unsigned slice, unsigned nblk) {
+                              unsigned n_head, unsigned nsplit, unsigned slice, unsigned nblk,
+                              const bf16* __restrict__ sinks_ = nullptr) {
     /* All three came out of the tensor table, so all three were generic: the Opart reads were
      * flat_load_dword and the O writes flat_store_short. Nothing about the ACCESS was wrong --
      * they are coalesced -- they were just on the slow path. */
     auto* const O = as_glob(O_);
     const auto* const Opart = as_glob(Opart_);
     const auto* const mlpart = as_glob(mlpart_);
+    const auto* const sinks = sinks_ ? as_glob(sinks_) : nullptr;
     const unsigned n_bh = n_batch * n_head;
     /* MUST match flash_merge_map() in crates/devgen/src/lib.rs. A mismatch is a silent wrong
      * token, not an error: the fine dep would gate a workgroup on the wrong flash slices. */
@@ -1783,9 +1917,21 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
         const auto* ml = mlpart + (size_t)(b * n_head + h) * nsplit * 2;
 
         float gm;
-        const float gl = fa_merge_ml(ml, nsplit, gm);
+        float gl = fa_merge_ml(ml, nsplit, gm);
+        /* rescale stays exactly 1.0f without sinks, and 1.0f is an exact multiplicand, so the
+         * no-sink arithmetic below is bit-for-bit the pre-sinks merge. */
+        float rescale = 1.0f;
+        if (sinks) {
+            const float sink = FA_SCALE(bf2f(sinks[h]));
+            if (sink > gm) {
+                rescale = FA_EXP(gm - sink);
+                gl = gl * rescale + 1.0f;
+            } else {
+                gl += FA_EXP(sink - gm);
+            }
+        }
         /* v_rcp_f32 -- see the note at d_flash_prefill's epilogue. */
-        const float inv = (gl > 0.0f) ? FA_RECIP(gl) : 0.0f;
+        const float inv = (gl > 0.0f) ? rescale * FA_RECIP(gl) : 0.0f;
 
         /* FOUR SPLITS IN FLIGHT, and no `continue`.                   [MERGE-UNROLL4]
          *
@@ -3134,7 +3280,47 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
  * FlashMlaPrefill segments there per-program when PLOW_MLA_PF_V2=1 and the bucket is big
  * enough to fill the machine at BQ=64 (exec/amd.rs derive_segments).
  * ========================================================================================== */
+/* KV rows per staged slab. A BUILD AXIS now, not a bare constant, because it is the one
+ * tiling knob the V2 kernel has and the inner-loop ablation says the term it moves is the
+ * biggest one. Priced at T=32000, TP4, by the PLOW_MLA_PF2_ABL probes against a 12094 ms
+ * baseline TTFT: softmax 3662 ms (30.3%), QK MFMA 2255 ms (18.6%), PV 2164 ms (17.9%),
+ * K-slab global loads 1482 ms (12.2%). The softmax bookkeeping — running max/sum and the
+ * 512-wide accumulator rescale — is charged PER (query, KV tile), so a deeper slab pays it
+ * proportionally fewer times for the same KV.
+ *
+ * LDS is the binding constraint, not registers: KSLAB = BKV*KSTR + 3*SWZ halves plus the
+ * 4*RW*BKV P strips, so 32 -> 41,568 B, 48 -> 62,304 B, 64 -> 83,040 B. 64 DOES NOT FIT the
+ * 64 KiB budget; 48 is the deepest slab that does, and 48 = 3*16 keeps the MFMA contraction
+ * a multiple of 16.
+ *
+ * NOTE the dense flash reached the OPPOSITE conclusion at D<=128 (FA_BKV_D128: BKV64 was
+ * -30%), but that kernel is register-bound with a 128-wide D and this one is LDS-bound with
+ * a 576-wide D — the two are not the same experiment. */
+#ifndef FA_MLA_PF2_BKV
 #define FA_MLA_PF2_BKV 32
+#endif
+/* BKV IS THE MFMA CONTRACTION LENGTH OF THE PV PASS, so it must be a multiple of 16. A
+ * non-multiple COMPILES AND RUNS and is simply WRONG. Measured: BKV=40 at T=32000 cut TTFT
+ * 12153 -> 10903 ms (-10.3%), which read as a win until the character-identity gate came back
+ * DIFFERENT — the answer called the prompt garbled and the thinking block vanished. It was
+ * fast because it was dropping KV rows in the ragged tail. Fail the build instead.
+ *
+ * That leaves 32 as the only usable depth here: 48 is the next legal step and needs 62,304 B
+ * against a flash arena of ~58 KB, so it does not fit. Deeper requires shrinking KSTR, i.e.
+ * splitting the 576-wide D — a restructure, not a constant. */
+static_assert(FA_MLA_PF2_BKV % 16 == 0,
+              "FA_MLA_PF2_BKV must be a multiple of the 16-wide MFMA contraction; a "
+              "non-multiple silently drops KV rows in the tail");
+/* AND IT MUST BE 32, which the %16 rule alone does not say. The score tile is FIXED at two
+ * 16-wide MFMA n-subtiles — `sacc[2]`/`srope[2]`, the `kv0 + nt*16 + fr` column map, the
+ * `Pw[fr*BKV + kg*8]` A-fragment and the `kg*8 + j` V rows all walk exactly 32 KV columns
+ * per pass. A slab deeper than 32 is STAGED and then NEVER SCORED past row 31, which is the
+ * whole of the BKV=40 result (-10.3% TTFT, wrong answers): it was not a ragged-tail bug, it
+ * was 8 of every 40 KV rows silently deleted. Going deeper is a THIRD change on top of the
+ * LDS one — more score subtiles and a wider P strip — not a constant. */
+static_assert(FA_MLA_PF2_BKV == 32,
+              "the V2 score tile walks exactly 32 KV columns per pass (sacc[2] x 16); a "
+              "deeper slab stages rows that are never scored");
 #define FA_MLA_PF2_PAD 8
 /* Ablation probes (build axis PLOW_MLA_PF2_ABL, WRONG OUTPUT, never a serve asset):
  * 1 = no K-slab global loads (zeros staged), 2 = no QK MFMA, 3 = no softmax math
@@ -3158,7 +3344,117 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
  * unconditional path (the identity-skip argument fails somewhere subtle) AND SLOWER
  * (spill 248 -> 293; the divergent per-row branch costs more scheduling room than the
  * skipped multiplies are worth at occ 1). Do not re-try as a branch; a rescale saving
- * here must come from a deferred-rescale restructure, not a guard. */
+ * here must come from a deferred-rescale restructure, not a guard.  FA_MLA_PF2_DEFER
+ * below is that restructure. */
+
+/* ------------------------------------------------------------------------------------
+ * FA_MLA_PF2_DEFER — DEFERRED-FRAME online softmax. DEFAULT ON for CDNA3.
+ *
+ * The shipped online softmax charges, per (query row, KV tile): a quarter-wave max
+ * reduce (4 shuffles), a quarter-wave sum reduce (4 shuffles), a corr exp, and
+ * `oacc[t][i] *= corr` over ALL NT=32 output tiles. That last term is 128 v_mul per
+ * lane per tile — the single largest piece of the 30.3% of TTFT the ABL=3 probe
+ * attributes to the softmax at T=32k — and it is paid whether or not the running max
+ * actually moved. A GUARD around it (FA_LAZY_RESCALE's wave vote) was tried here twice
+ * and rejected; see the note above.
+ *
+ * This is the restructure that note asks for. The accumulator does not track the
+ * running max at all: it lives in a FRAME `f`, an upper bound on the row's scores, and
+ * accumulates `sum_j exp2(s_j - f) V_j` directly. The flash identity is
+ * `O_n = exp2(-m_n) * sum_j exp2(s_j) V_j`, so ANY per-row constant works as the
+ * exponent origin as long as (m, l, O) are reported in the same one — which they are:
+ * the epilogue writes `m := f` and `l := sum exp2(s_j - f)`, exactly the pair
+ * d_flash_merge / d_mla_merge_fold already consume. Nothing downstream changes.
+ *
+ * The frame is only re-taken when a lane's score would exceed it, i.e. when p would
+ * grow past 1. On a re-take the new frame is `ceil(rmax) + FA_MLA_PF2_FRAME`, so:
+ *
+ *   - p <= 2^-FA_MLA_PF2_FRAME ALWAYS, and l/oacc can never overflow. This is a
+ *     stronger bound than the running-max form gives (there p == 1 is reachable).
+ *   - the margin makes the NEXT re-take need a score FA_MLA_PF2_FRAME log2-units above
+ *     the current row max, so re-takes are record-breaks by a factor of 256, not by any
+ *     amount. Over a causal walk the count is O(log) in the tile count, single digits
+ *     against ~1000 tiles at T=32k, and the 128-mul rescale rides on that instead of on
+ *     every tile.
+ *   - both frames are INTEGERS, so `corr = exp2(f_old - f_new)` is an exact power of two
+ *     and a re-take is lossless — unlike the shipped form, where every rescale multiplies
+ *     the whole accumulator by a rounded corr.
+ *   - the uniform 2^-FA_MLA_PF2_FRAME on P costs no precision: P is stored bf16, and
+ *     scaling a bf16 by a power of two only moves its exponent.
+ *
+ * The l-reduce also leaves the loop: each lane sums its OWN kv columns in the frame and
+ * the quarter-wave reduce happens ONCE, in the epilogue. Valid because within a frame
+ * there is no per-tile rescale to interleave, and a re-take scales the partial by the
+ * same quarter-wave-uniform corr. Reassociates the f32 sum (FA_MERGE_UNROLL4's class).
+ *
+ * Per tile per lane this deletes, from the unconditional path, 128 v_mul, 16 max
+ * shuffles, 16 sum shuffles and 4 corr exp (4 rows x 4 quarter-wave steps each), and
+ * adds 4 v_max, 4 v_cmp and 4 ballot branches.
+ *
+ * MASKED LANES. `FA_MLA_PF2_MASKED` is the score a masked element carries, and it is
+ * DELIBERATELY more negative than the FA_NEG_INF a virgin frame holds: their difference
+ * (-4e37) underflows exp2 to a clean 0, so the hot path needs no `m == -inf` select at
+ * all. It also keeps a row that never saw a live score — a dead ns-split, a ragged tail
+ * row, a fully-windowed-out row — from ever taking a frame: `masked > FA_NEG_INF` is
+ * false, and if a sibling row in the same wave forces the branch, `ceil(-3.4e38) + M`
+ * is still -3.4e38 and `fmaxf` returns FA_NEG_INF unchanged. Those rows therefore still
+ * report (m = FA_NEG_INF, l = 0, O = 0), the triple the merge weighs at zero.
+ *
+ * NOT BIT-IDENTICAL, and that is the honest cost: the exp arguments move by the frame
+ * offset, so a greedy continuation of a long prompt eventually diverges on a near-tie and
+ * a character-identity gate CANNOT pass here by construction — unlike PLOW_MLA_PF_SV or
+ * PLOW_MLA_FOLD_TB, which are exact. The gate is the numerics class instead: mla_test's
+ * normalized error against the decode oracle stays in the shipped body's band on every
+ * shape (and the fp8 arm is unmoved), and long-context needle retrieval and coherence hold
+ * at 8k and 32k. Both are recorded in docs/amd/glm53-longctx-and-throughput.md.
+ *
+ * CDNA3 ONLY BY DEFAULT, the same policy FA_FAST_RCP and FA_MERGE_UNROLL4 state above: this
+ * is measured and content-gated on gfx942 (docs/amd/glm53-longctx-and-throughput.md) and
+ * there is no gfx950 in this machine to re-run its goldens on, so that target keeps the
+ * running-max form until someone with the hardware measures it. Force either way with the
+ * FA_MLA_PF2_DEFER build axis in scripts/build_gfx942.sh. */
+#ifndef FA_MLA_PF2_DEFER
+#define FA_MLA_PF2_DEFER (!PLOW_CDNA4)
+#endif
+/* Log2-units of headroom the re-taken frame keeps above the row max. Bigger = rarer
+ * re-takes and a smaller p; the only cost is dynamic range, and exp2 does not underflow
+ * until (max - s) exceeds 126 - FA_MLA_PF2_FRAME. Must be a non-negative INTEGER so the
+ * frame stays integral and corr stays an exact power of two. */
+#ifndef FA_MLA_PF2_FRAME
+#define FA_MLA_PF2_FRAME 8
+#endif
+static_assert(FA_MLA_PF2_FRAME >= 0 && FA_MLA_PF2_FRAME <= 64,
+              "FA_MLA_PF2_FRAME is log2 headroom over the row max: negative would let p "
+              "exceed 1 between re-takes, and past ~64 the low tail underflows exp2");
+/* Strictly below FA_NEG_INF, so (masked - FA_NEG_INF) underflows exp2 to 0. */
+#define FA_MLA_PF2_MASKED (-3.4e38f)
+static_assert(FA_MLA_PF2_MASKED < FA_NEG_INF,
+              "the masked score must sit below the virgin frame or a row that never saw "
+              "a live score would exponentiate its mask to 1");
+
+/* NaN-FREE f32 -> bf16 for the P strip. The shared f2bf carries a NaN/Inf guard that gfx942
+ * lowers to an exec-mask save/branch/restore around the rounding — cheap once, but this
+ * kernel converts 8 P elements per KV tile per lane and at occupancy 1 that pair is fully
+ * exposed. Under FA_MLA_PF2_DEFER the guard is PROVABLY DEAD: the frame is an upper bound on
+ * the row's scores, so `p = exp2(sv - f)` lies in [0, 1] (and in [0, cs] once the fp8 arm's
+ * finite positive dequant scale is applied) — never NaN, never Inf, never negative. So this
+ * is f2bf's RNE half alone, VALUE-IDENTICAL over the domain that reaches it. It is NOT a
+ * general f2bf replacement, and the branchless-f2bf-everywhere experiment that amd_common.h
+ * refutes is a different change: that one kept the guard as a select and paid its arithmetic
+ * on every conversion in the program. Opt out with FA_MLA_PF2_FASTBF=0. */
+#ifndef FA_MLA_PF2_FASTBF
+#define FA_MLA_PF2_FASTBF 1
+#endif
+__device__ __forceinline__ bf16 mla_pf2_f2bf(float f) {
+#if FA_MLA_PF2_FASTBF
+    unsigned u;
+    __builtin_memcpy(&u, &f, 4);
+    u += 0x7fffu + ((u >> 16) & 1u); /* round to nearest even */
+    return (bf16)(u >> 16);
+#else
+    return f2bf(f);
+#endif
+}
 
 /* ------------------------------------------------------------------------------------
  * PLOW_MLA_PF_SV — the V-STAGE arm. OPT-IN, default OFF, BIT-IDENTICAL (it moves LDS
@@ -3257,6 +3553,20 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
     constexpr int NKT = D / 32;            /* QK k-tiles (32-deep shim)          */
     constexpr int NT = DK / 16;            /* output n-tiles                     */
     static_assert(D % 32 == 0 && DK % 16 == 0, "MLA dims must tile");
+    /* DR IS GENERAL, INCLUDING ZERO. The body never needed a rope half to exist: the k-tiles
+     * of the latent and the rope are the same 32-deep MFMA shim and (outside the FP8 arm,
+     * where the two halves carry different dequant scales and must stay separate) they all
+     * accumulate into the same `sacc`. What blocked DR == 0 was three `e / DR` divisions in
+     * the K-staging — dead at zero, since their bound is `BKV * DR`, but still compiled, and
+     * division by a compile-time zero is UB the backend may render as a trap. They are
+     * `if constexpr`-guarded above rather than left to the dead-code pass.
+     *
+     * So `<512, 0>` (NoPE MLA: Kimi-K3's geometry without its identity rope table, DeepSeek-V4)
+     * instantiates from this one body with no separate arm, no second schedule and a smaller
+     * LDS slab. Anything else that is a multiple of the shim will too; only 0 and 64 are
+     * oracle-qualified, which is what devgen's `require_mla_geometry` refuses on. */
+    static_assert(DR == 0 || DR % 32 == 0,
+                  "DR must be zero or a multiple of the 32-deep MFMA k-tile shim");
 
     /* Halves the staged slab occupies: BKV rows of KSTR, plus the 3*FA_MLA_PF2_SWZ of
      * block-swizzle slack PLOW_MLA_PF_SV adds (0 when the arm is off). */
@@ -3371,9 +3681,17 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
             for (int kt = 0; kt < NKT; kt++) {
                 const unsigned c = (unsigned)kt * 32 + kg * 8;
                 bf16v8 v = bf16v8_zero();
-                if (live)
-                    v = (c < (unsigned)DK) ? ld_glob8(&Qabs[qrow * DK + c])
-                                           : ld_glob8(&Qrope[qrow * DR + (c - DK)]);
+                /* DR == 0 (NoPE): D == DK, so `c` never reaches the rope half and the second
+                 * arm is unreachable — but it is still COMPILED, and `qrow * 0 + (c - DK)`
+                 * underflows into a wild global address. `if constexpr` deletes it instead of
+                 * relying on it never running. */
+                if (live) {
+                    if constexpr (DR > 0)
+                        v = (c < (unsigned)DK) ? ld_glob8(&Qabs[qrow * DK + c])
+                                               : ld_glob8(&Qrope[qrow * DR + (c - DK)]);
+                    else
+                        v = ld_glob8(&Qabs[qrow * DK + c]);
+                }
                 __builtin_memcpy(&qa[kt], &v, 16);
             }
         }
@@ -3389,13 +3707,22 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
         }
 
 #if PLOW_MLA_PF2_DBUF
-        /* This thread's 9 slab fragments (8 latent + 1 rope; the loops below cover the
+        /* This thread's slab fragments (NLDF latent + NRDF rope; the loops below cover the
          * slab EXACTLY at 256 threads * 8 halves): loaded for tile n+1 while tile n
-         * computes, committed to LDS at the next fence. */
-        bf16v8 rl[9];
+         * computes, committed to LDS at the next fence. 8 + 1 at (DK,DR)=(512,64); the
+         * DR=0 arm has no rope strip at all, so NRDF is 0 and rl carries the latent alone.
+         * Both counts are exact divisions or the static_asserts below fail the build --
+         * a partial fragment would leave slab halves uninitialized under DBUF. */
+        constexpr int NLDF = BKV * DK / (int)(WG * 8);
+        constexpr int NRDF = (DR > 0) ? (BKV * DR / (int)(WG * 8)) : 0;
+        static_assert(NLDF * (int)(WG * 8) == BKV * DK,
+                      "the latent slab must divide evenly into 256-thread x 8-half fragments");
+        static_assert(DR == 0 || NRDF * (int)(WG * 8) == BKV * DR,
+                      "the rope slab must divide evenly into 256-thread x 8-half fragments");
+        bf16v8 rl[NLDF + NRDF];
         auto ld_slab = [&](unsigned base) {
 #pragma unroll
-            for (int it = 0; it < 8; it++) {
+            for (int it = 0; it < NLDF; it++) {
                 const unsigned e = tid * 8 + (unsigned)it * (WG * 8);
                 const unsigned r = e / DK, c = e % DK;
                 bf16v8 v = bf16v8_zero();
@@ -3423,7 +3750,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
 #endif
                 rl[it] = v;
             }
-            {
+            if constexpr (DR > 0) {
                 const unsigned e = tid * 8;
                 const unsigned r = e / DR, c = e % DR;
                 bf16v8 v = bf16v8_zero();
@@ -3455,7 +3782,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     }
                 }
 #endif
-                rl[8] = v;
+                rl[NLDF] = v;
             }
         };
         ld_slab(walk_lo); /* prologue: tile 0's loads in flight before the first fence */
@@ -3483,13 +3810,13 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
              * a tile entirely below win_lo, and walk_lo already floors to win_lo's tile,
              * so no reachable tile is ever skipped (GLM MLA runs window=0 besides). */
 #pragma unroll
-            for (int it = 0; it < 8; it++) {
+            for (int it = 0; it < NLDF; it++) {
                 const unsigned e = tid * 8 + (unsigned)it * (WG * 8);
                 __builtin_memcpy(&Ksm[krow(e / DK) + e % DK], &rl[it], 16);
             }
-            {
+            if constexpr (DR > 0) {
                 const unsigned e = tid * 8;
-                __builtin_memcpy(&Ksm[krow(e / DR) + DK + e % DR], &rl[8], 16);
+                __builtin_memcpy(&Ksm[krow(e / DR) + DK + e % DR], &rl[NLDF], 16);
             }
             __syncthreads(); /* slab visible to every wave */
             if (kv0 + BKV < walk_end)
@@ -3521,6 +3848,9 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                 }
                 __builtin_memcpy(&Ksm[krow(r) + c], &v, 16);
             }
+            /* The DR=0 arm has no rope strip: `if constexpr` because `e / DR` would be a
+             * constant division by zero even though the loop body is unreachable. */
+            if constexpr (DR > 0)
             for (unsigned e = tid * 8; e < (unsigned)(BKV * DR); e += WG * 8) {
                 const unsigned r = e / DR, c = e % DR;
                 bf16v8 v = bf16v8_zero();
@@ -3634,7 +3964,9 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
             /* ---- mask + per-wave online softmax. Row m = kg*4+i lives in the 16 lanes of
              * this k-group (one kv column each per n-tile), so the row reductions are
              * quarter-wave shuffles. No wave shares a row with any other wave. ---- */
-            float pe[2][4];
+#if !FA_MLA_PF2_DEFER || PLOW_MLA_PF2_ABL == 3
+            float pe[2][4]; /* the frame arm writes its P strip inline and needs no buffer */
+#endif
 #if PLOW_MLA_PF2_ABL == 3
             /* no softmax math: unit P, no shuffles/exp, no corr rescale */
 #pragma unroll
@@ -3643,6 +3975,83 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                 pe[1][i] = 1.0f;
                 m_st[i] = 0.0f;
                 l_st[i] += 2.0f * 16.0f;
+            }
+#elif FA_MLA_PF2_DEFER
+            /* ---- DEFERRED-FRAME form (see the FA_MLA_PF2_DEFER note). m_st[i] is the
+             * exponent FRAME, not the running max; oacc/l_st live in it and are rescaled
+             * only on a re-take. Row-at-a-time, exactly like the shipped form below, so
+             * only `sv[2]` is live at a time — a variant that hoisted all four rows'
+             * scores across one shared vote spilled the fp8-KV arm (12 B). ---- */
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned row_i = my_r0 + kg * 4 + (unsigned)i; /* GATHER (q,h) row */
+                const unsigned qi = GATHER ? q_base + (row_i >> 3) : my_q0 + kg * 4 + i;
+                const unsigned qg = q_pos0 + qi;
+                float sv[2];
+                float csv[2] = {1.0f, 1.0f}; /* FP8 only: this lane's two kv dequant scales */
+#pragma unroll
+                for (int nt = 0; nt < 2; nt++) {
+                    const unsigned kvg = kv0 + nt * 16 + fr;
+                    bool valid;
+                    if constexpr (GATHER) {
+                        const unsigned ql = qi - q_base; /* pack-local query, bit 0..QP-1 */
+                        valid = (qi < n_tok) && (kvg < ucount) &&
+                                (((Msm[nt * 16 + fr] >> ql) & 1ull) != 0ull);
+                    } else {
+                        valid = (qi < n_tok) && (kvg < kv_end) && (kvg <= qg) &&
+                                (!window || (qg - kvg) < window);
+                    }
+                    float score = sacc[nt][i];
+                    if constexpr (FP8) {
+                        const unsigned row = kvg & kv_mask;
+                        const float cs = csc[row];
+                        const float rs = krot_fp8 ? rsc[row] : 1.0f;
+                        score = score * cs + srope[nt][i] * rs;
+                        csv[nt] = cs;
+                    }
+                    sv[nt] = valid ? score * FA_SCALE(scale) : FA_MLA_PF2_MASKED;
+                }
+                /* The vote is on the LANE-LOCAL max — no shuffle. A lane under the frame
+                 * cannot push another lane over it, so the OR over the wave is exact, and
+                 * the branch is wave-uniform so the reduce inside is fully populated. The
+                 * four k-groups share this branch: a group whose row did not move takes
+                 * corr == exp2(0) == 1 and is untouched. */
+                if (__ballot(fmaxf(sv[0], sv[1]) > m_st[i]) != 0ull) {
+                    float rmax = fmaxf(sv[0], sv[1]);
+#pragma unroll
+                    for (int d = 1; d < 16; d <<= 1)
+                        rmax = fmaxf(rmax, __shfl_xor(rmax, d, PLOW_WAVE));
+                    const float fnew =
+                        fmaxf(m_st[i], __builtin_ceilf(rmax) + (float)FA_MLA_PF2_FRAME);
+                    const float corr = (m_st[i] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[i] - fnew);
+                    m_st[i] = fnew;
+                    l_st[i] *= corr;
+#pragma unroll
+                    for (int t = 0; t < NT; t++) oacc[t][i] *= corr;
+                }
+                const float f = m_st[i];
+                float p0 = FA_EXP(sv[0] - f);
+                float p1 = FA_EXP(sv[1] - f);
+#if PLOW_MLA_PF2_ABL != 4
+                /* P is written HERE rather than in the shared strip loop below, because the
+                 * frame makes `l` sensitive to the bf16 rounding the PV MFMA sees. With a
+                 * running max the dominant p is EXACTLY 1.0, so rounding P to bf16 while
+                 * summing f32 into l cancels out of O/l; against a frame the dominant p is a
+                 * general value and that mismatch lands on the output at bf16's 2^-9 (measured
+                 * against the decode oracle: 3e-4 -> 3e-3 before this, 3e-4 after). Convert
+                 * once and let l sum the SAME value. The fp8 arm keeps its existing split —
+                 * O carries the per-kv dequant scale on P, l does not — and reuses the scale
+                 * the score already loaded. */
+                const bf16 b0 = mla_pf2_f2bf(FP8 ? p0 * csv[0] : p0);
+                const bf16 b1 = mla_pf2_f2bf(FP8 ? p1 * csv[1] : p1);
+                Pw[(kg * 4 + (unsigned)i) * BKV + fr] = b0;
+                Pw[(kg * 4 + (unsigned)i) * BKV + 16 + fr] = b1;
+                if constexpr (!FP8) {
+                    p0 = bf2f(b0);
+                    p1 = bf2f(b1);
+                }
+#endif
+                l_st[i] += p0 + p1; /* per-lane partial; reduced once in the epilogue */
             }
 #else
 #pragma unroll
@@ -3697,8 +4106,10 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
 #endif /* PLOW_MLA_PF2_ABL == 3 */
 
 #if PLOW_MLA_PF2_ABL != 4
+#if !FA_MLA_PF2_DEFER || PLOW_MLA_PF2_ABL == 3
             /* ---- P through this wave's PRIVATE strip: same-wave ds_write -> ds_read is
-             * hardware-ordered (lgkmcnt), no barrier. ---- */
+             * hardware-ordered (lgkmcnt), no barrier. (FA_MLA_PF2_DEFER writes the strip
+             * inside the softmax loop instead — see the note there.) ---- */
 #pragma unroll
             for (int nt = 0; nt < 2; nt++)
 #pragma unroll
@@ -3708,6 +4119,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                         p *= csc[(kv0 + (unsigned)nt * 16 + fr) & kv_mask];
                     Pw[(kg * 4 + i) * BKV + (unsigned)nt * 16 + fr] = f2bf(p);
                 }
+#endif
 
             /* ---- O += P·V, V = the latent columns of the SAME slab ---- */
             bf16x8 pf;
@@ -3779,6 +4191,19 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
          * FA_RECIP to match the merge's v_rcp path (numerics gate class, not bit-exact —
          * the fused weight reassociated anyway). Dense arm only; the emitter refuses
          * ofold+GATHER and ofold+fp8kv. */
+#if FA_MLA_PF2_DEFER
+        /* The frame form kept `l` as a PER-LANE partial over this lane's own kv columns
+         * (no per-tile rescale can interleave inside a frame, and a re-take scales the
+         * partial by the same quarter-wave-uniform corr), so the row sum is one reduce
+         * for the whole walk instead of one per KV tile. Hoisted above the epilogue's
+         * `continue`: the 16 lanes of a quarter-wave share `qi`, but keeping the shuffles
+         * out of that branch keeps them unconditionally wave-populated. */
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+#pragma unroll
+            for (int d = 1; d < 16; d <<= 1) l_st[i] += __shfl_xor(l_st[i], d, PLOW_WAVE);
+        }
+#endif
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const unsigned row_i = my_r0 + kg * 4 + (unsigned)i;
@@ -4372,14 +4797,32 @@ __device__ void d_index_score_mfma(float* __restrict__ Score, const bf16* __rest
  * — confirmed by precedent, not guessed: `d_dsa_pool_expand` already computes this exact
  * "how many COMPLETE pools" quantity as `pool_len = seq_len / pool_size` (same floor
  * division), already hardware-verified. */
-template <int DI>
+/* `FAKEQ` — DeepSeek-V4's indexer numerics.  [DSV4-IDX]
+ *
+ * GLM-5.3 stores its indexer q and k as REAL fp8 with one power-of-two scale per vector, so the
+ * dot is over e4m3 bytes and the two scales multiply back in afterwards. V4 FAKE-quantizes
+ * instead: `fp4_act_quant(..., inplace=True)` (model.py:422, and `rotate=True` in the indexer's
+ * compressor at model.py:404) quantizes to e2m1 with a per-32 e8m0 scale and multiplies STRAIGHT
+ * BACK, storing the round-tripped value in bf16 (kernel.py:156-167). So by the time the score
+ * kernel sees them there is nothing left to dequantize: the operands are bf16 values that happen
+ * to carry e2m1 magnitudes, the block scales are already folded in, and there is no per-vector
+ * scale at all. That makes this arm SIMPLER than the fp8 one, not harder -- it drops both
+ * dequants and both scale multiplies. `Qscale`/`Kscale` are unread and may be null.
+ *
+ * The einsum's bf16 output round trip (`d = bf2f(f2bf(d))`) is kept: model.py:427's einsum has
+ * bf16 inputs and a bf16 result, and the ReLU and the head-weighted sum see that rounded value.
+ *
+ * `index_heads` is already a RUNTIME value here, so V4's 64 heads against GLM's 32 need nothing
+ * -- the 32-head hard assert lives on the MFMA paths (d_index_score_mfma, d_index_score_pf_row),
+ * whose A-tile M axis is the head axis, not on this scalar body. */
+template <int DI, bool FAKEQ = false>
 __device__ void d_index_score_kpool(float* __restrict__ Score, const uint8_t* __restrict__ Qfp8,
                                     const float* __restrict__ Qscale, const uint8_t* __restrict__ Kfp8,
                                     const float* __restrict__ Kscale, const float* __restrict__ W,
                                     const int* __restrict__ kv_len, unsigned n_batch,
                                     unsigned index_heads, unsigned pool_stride, unsigned pool_size,
                                     bool prefill, float scale, unsigned slice, unsigned nblk,
-                                    uint8_t* qlds /* index_heads*DI u8 */) {
+                                    uint8_t* qlds /* index_heads*DI u8, or *2 under FAKEQ */) {
     auto* const Sc = as_glob(Score);
     const auto* const Qg = as_glob(Qfp8);
     const auto* const Qs = as_glob(Qscale);
@@ -4392,23 +4835,37 @@ __device__ void d_index_score_kpool(float* __restrict__ Score, const uint8_t* __
         const unsigned token_len = prefill ? (unsigned)(kv_len[0] - (int)n_batch + (int)b + 1)
                                            : (unsigned)kv_len[b];
         const unsigned len = token_len / pool_size;
-        for (unsigned i = tid; i < HI * (unsigned)DI; i += PLOW_THREADS)
-            qlds[i] = Qg[(size_t)b * HI * DI + i];
+        /* FAKEQ stages bf16 halves through the same u8 arena; the caller sizes it *2. */
+        const bf16* qb = (const bf16*)qlds;
+        if constexpr (FAKEQ) {
+            const bf16* Qb = (const bf16*)Qfp8;
+            for (unsigned i = tid; i < HI * (unsigned)DI; i += PLOW_THREADS)
+                ((bf16*)qlds)[i] = as_glob(Qb)[(size_t)b * HI * DI + i];
+        } else {
+            for (unsigned i = tid; i < HI * (unsigned)DI; i += PLOW_THREADS)
+                qlds[i] = Qg[(size_t)b * HI * DI + i];
+        }
         __syncthreads();
         const auto* wb = Wg + (size_t)b * HI;
-        const auto* qs = Qs + (size_t)b * HI;
+        const auto* qs = FAKEQ ? nullptr : (Qs + (size_t)b * HI);
         for (unsigned p = slice * PLOW_THREADS + tid; p < len; p += nblk * PLOW_THREADS) {
             const size_t kbatch = prefill ? 0u : (size_t)b * pool_stride;
             const auto* kp = Kg + (kbatch + p) * DI;
-            const float ks = Ks[kbatch + p];
+            const bf16* kb = as_glob((const bf16*)Kfp8) + (kbatch + p) * DI;
+            const float ks = FAKEQ ? 1.0f : Ks[kbatch + p];
             float s = 0.0f;
             for (unsigned h = 0; h < HI; h++) {
-                const uint8_t* qh = qlds + (size_t)h * DI;
                 float d = 0.0f;
-                for (int i = 0; i < DI; i++) d += dequant_fp8(qh[i]) * dequant_fp8(kp[i]);
+                if constexpr (FAKEQ) {
+                    const bf16* qh = qb + (size_t)h * DI;
+                    for (int i = 0; i < DI; i++) d += bf2f(qh[i]) * bf2f(kb[i]);
+                } else {
+                    const uint8_t* qh = qlds + (size_t)h * DI;
+                    for (int i = 0; i < DI; i++) d += dequant_fp8(qh[i]) * dequant_fp8(kp[i]);
+                }
                 d = bf2f(f2bf(d));      /* the einsum's bf16-dtype output — see header */
                 d *= ks; /* k_scale, folded pre-relu (see header: relu commutes with it) */
-                s += wb[h] * qs[h] * (d > 0.0f ? d : 0.0f);
+                s += wb[h] * (FAKEQ ? 1.0f : qs[h]) * (d > 0.0f ? d : 0.0f);
             }
             Sc[(size_t)b * pool_stride + p] = s * scale;
         }
@@ -4794,9 +5251,23 @@ __device__ void d_index_score_pf_row(float* __restrict__ Score, const bf16* __re
                                      unsigned kv_stride, float scale, unsigned slice,
                                      unsigned nblk, bf16* ktile /* TILE_N * KSTRIDE */) {
     static_assert(DI % 16 == 0, "DI must be a whole number of MFMA k-steps");
-    static_assert(HIc == 32, "MFMA subtile assumes index_n_heads == 32");
+    /* The 32x32 MFMA's M axis IS the index heads, so a head count that is not a multiple of 32
+     * either wastes A-tile rows or reads off the end of a query row. DeepSeek-V4 has 64 index
+     * heads against GLM-5.3's 32 (index_n_heads, config.json), and the score is a PLAIN SUM
+     * over heads -- sum_h w[h] * relu(q_h . k) -- so a second head group is exactly a second
+     * 32-row tile whose `part` adds into the first. Nothing about the arithmetic changes; the
+     * epilogue reduce, the causal bound and the scale are shared.
+     *
+     * NOT generalized below 32: HIc = 16 or 8 (V4 at TP4/TP8 with the indexer SHARDED) would
+     * leave half or three quarters of the A tile idle. The roofline's recommendation there is
+     * to REPLICATE the indexer instead and keep a full tile
+     * (docs/amd/deepseek-v4-attention-roofline.md 6.3), which this assert enforces rather than
+     * silently accepting a 4x-wasteful tile.  [DSV4-IDX] */
+    static_assert(HIc % 32 == 0, "the 32x32 MFMA A-tile is 32 index heads; HIc must be a "
+                                 "multiple of it (replicate a sharded indexer instead)");
     static_assert(IDXPF_SPAN % TILE_N == 0, "span must end on a slab boundary");
     static_assert(TILE_N % 32u == 0, "slab is walked in 32-key MFMA subtiles");
+    constexpr int HG = HIc / 32; /* head groups: one 32-row A tile each */
     constexpr int NK = DI / MFMA_K;
     constexpr int KSTRIDE = DI + FA_PAD;
     constexpr unsigned NW = PLOW_THREADS / 64u;
@@ -4830,19 +5301,22 @@ __device__ void d_index_score_pf_row(float* __restrict__ Score, const bf16* __re
         const bool live = t < n_tok;
         const unsigned row_end = live ? (q_pos0 + t + 1u) : 0u;
         /* A-fragments + this row's lane-local head weights: loaded ONCE for the whole span. */
-        bf16x8 qf[NK];
-        float wv[16];
+        bf16x8 qf[HG][NK];
+        float wv[HG][16];
         if (live) {
 #pragma unroll
-            for (int ks = 0; ks < NK; ks++) {
-                const unsigned d0 = mfma_frag_k(lane, ks * MFMA_K);
-                qf[ks] = __builtin_bit_cast(bf16x8,
-                                            ld_glob8(&Qg[((size_t)t * HIc + frow) * DI + d0]));
-            }
+            for (int g = 0; g < HG; g++) {
 #pragma unroll
-            for (int i = 0; i < 16; i++) {
-                const unsigned h = mbase + ((unsigned)i % 4u) + 8u * ((unsigned)i / 4u);
-                wv[i] = bf2f(Wg[(size_t)t * HIc + h]);
+                for (int ks = 0; ks < NK; ks++) {
+                    const unsigned d0 = mfma_frag_k(lane, ks * MFMA_K);
+                    qf[g][ks] = __builtin_bit_cast(
+                        bf16x8, ld_glob8(&Qg[((size_t)t * HIc + g * 32u + frow) * DI + d0]));
+                }
+#pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    const unsigned h = mbase + ((unsigned)i % 4u) + 8u * ((unsigned)i / 4u);
+                    wv[g][i] = bf2f(Wg[(size_t)t * HIc + g * 32u + h]);
+                }
             }
         }
         for (unsigned b = s_lo; b < s_hi; b += TILE_N) {
@@ -4859,19 +5333,22 @@ __device__ void d_index_score_pf_row(float* __restrict__ Score, const bf16* __re
             for (unsigned st = 0; st < TILE_N; st += 32u) {
                 const unsigned pos0 = b + st;
                 if (pos0 >= row_end) break; /* causal: this row is done inside this slab */
-                f32x16 acc = (f32x16)(0.0f);
-#pragma unroll
-                for (int ks = 0; ks < NK; ks++) {
-                    const unsigned d0 = mfma_frag_k(lane, ks * MFMA_K);
-                    const bf16x8 kf =
-                        __builtin_bit_cast(bf16x8, ld_lds8(&ktile[(st + frow) * KSTRIDE + d0]));
-                    acc = plow_mfma_bf16_32x32(qf[ks], kf, acc);
-                }
                 float part = 0.0f;
 #pragma unroll
-                for (int i = 0; i < 16; i++) {
-                    const float d = acc[i];
-                    part += wv[i] * (d > 0.0f ? d : 0.0f);
+                for (int g = 0; g < HG; g++) {
+                    f32x16 acc = (f32x16)(0.0f);
+#pragma unroll
+                    for (int ks = 0; ks < NK; ks++) {
+                        const unsigned d0 = mfma_frag_k(lane, ks * MFMA_K);
+                        const bf16x8 kf = __builtin_bit_cast(
+                            bf16x8, ld_lds8(&ktile[(st + frow) * KSTRIDE + d0]));
+                        acc = plow_mfma_bf16_32x32(qf[g][ks], kf, acc);
+                    }
+#pragma unroll
+                    for (int i = 0; i < 16; i++) {
+                        const float d = acc[i];
+                        part += wv[g][i] * (d > 0.0f ? d : 0.0f);
+                    }
                 }
                 part += __shfl_xor(part, 32, PLOW_WAVE);
                 if (lane < 32u) {

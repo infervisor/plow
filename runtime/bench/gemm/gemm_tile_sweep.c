@@ -64,11 +64,15 @@ static double now(void) {
 
 /* Keep in sync with test_kernels.hip's GEMM_VARIANT list. Symbol lookup failing is the
  * signal that a variant is not compiled, so an entry costs nothing when absent. */
-static const struct { const char* sym; unsigned bm, bn; } TILES[] = {
-    {"gemm_c0", 256, 256}, {"gemm_c1", 256, 128}, {"gemm_c2", 128, 256},
-    {"gemm_c3", 128, 128}, {"gemm_c4", 64, 128},  {"gemm_c5", 192, 256},
-    {"gemm_c6", 320, 128}, {"gemm_c7", 384, 128}, {"gemm_c8", 128, 384},
-    {"gemm_c9", 192, 128}, {"gemm_c10", 64, 256}, {"gemm_c11", 256, 384},
+static const struct { const char* sym; unsigned bm, bn, bk; } TILES[] = {
+    {"gemm_c0", 256, 256, 64}, {"gemm_c1", 256, 128, 64}, {"gemm_c2", 128, 256, 64},
+    {"gemm_c3", 128, 128, 64}, {"gemm_c4", 64, 128, 64},  {"gemm_c5", 192, 256, 64},
+    {"gemm_c6", 320, 128, 64}, {"gemm_c7", 384, 128, 64}, {"gemm_c8", 128, 384, 64},
+    {"gemm_c9", 192, 128, 64}, {"gemm_c10", 64, 256, 64}, {"gemm_c11", 256, 384, 64},
+    /* The experimental rungs test_kernels.hip offers: narrower BN (4 waves only) and deeper
+     * BK. Absent from an object that could not compile them, and skipped silently there. */
+    {"gemm_e0", 64, 64, 64},   {"gemm_e1", 64, 64, 128},  {"gemm_e2", 64, 128, 128},
+    {"gemm_e3", 128, 64, 64},  {"gemm_e4", 64, 192, 64},  {"gemm_e5", 128, 128, 128},
 };
 #define NTILES ((int)(sizeof TILES / sizeof TILES[0]))
 
@@ -84,6 +88,15 @@ static const struct { const char* sym; unsigned bm, bn; } MXTILES[] = {
 };
 #define NMXTILES ((int)(sizeof MXTILES / sizeof MXTILES[0]))
 
+/* The W8A8 (fp8 weights AND fp8 activations) ladder: the same five selectable rungs
+ * `tunedb::RUNGS` maps to `Gemm*Fp8`, and nothing else. Same reasoning as MXTILES — a
+ * calibration-only tile has no fp8 dispatch arm, so a row for it can only be discarded. */
+static const struct { const char* sym; unsigned bm, bn; } F8TILES[] = {
+    {"gemm_fp8_c0", 256, 256}, {"gemm_fp8_c2", 128, 256}, {"gemm_fp8_c3", 128, 128},
+    {"gemm_fp8_c4", 64, 128},  {"gemm_fp8_c5", 192, 256},
+};
+#define NF8TILES ((int)(sizeof F8TILES / sizeof F8TILES[0]))
+
 /* OCP e2m1: three magnitude bits on the ladder 0,0.5,1,1.5,2,3,4,6 and a sign bit. This is the
  * HOST-side twin of `amd_common.h`'s `fp4_to_bf16v8`, and it is exact — every code is a small
  * dyadic rational and the E8M0 scale is a power of two — so the f64 reference below is an exact
@@ -95,9 +108,28 @@ static const double FP4[16] = {0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
  * is host code with no reason to be clever. */
 static double e8m0(unsigned char b) { return ldexp(1.0, (int)b - 127); }
 
+/* OCP e4m3 (FN: no infinities, one NaN code per sign) byte -> value, bias 7.
+ *
+ * The value is exact in f64 — every code is a dyadic rational — so the oracle below is the same
+ * reference the bf16 and mxfp4 ladders use, not an approximation. This is the OCP reading, NOT
+ * the e4m3FNUZ one CDNA3's matrix core applies: `OCP(b) == 2*FNUZ(b)` for every byte but 0x80,
+ * and `d_gemm_fp8_t`'s epilogue multiplies by PLOW_FP8_MMA_FIX (2*2 on gfx942) precisely to
+ * undo that on both operands. Generating no 0x80 keeps the identity total. */
+static double e4m3(unsigned char b) {
+    const int man = b & 7, exp = (b >> 3) & 15;
+    const double sign = (b & 0x80u) ? -1.0 : 1.0;
+    if (exp == 0) return sign * ldexp((double)man, -9);
+    return sign * ldexp(1.0 + man / 8.0, exp - 7);
+}
+static int e4m3_finite(unsigned char b) {
+    /* exp==15 && man==7 is the FN NaN code; 0x80 is OCP -0 and FNUZ NaN, and the runtime
+     * loader scrubs it out of every weight it uploads, so the sweep must not generate it. */
+    return b != 0x80u && (b & 0x7fu) != 0x7fu;
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <M> <N> <K> [label] [quant: None|Mxfp4]\n", argv[0]);
+        fprintf(stderr, "usage: %s <M> <N> <K> [label] [quant: None|Mxfp4|W8A8]\n", argv[0]);
         return 2;
     }
     const unsigned M = (unsigned)atoi(argv[1]), N = (unsigned)atoi(argv[2]),
@@ -105,8 +137,18 @@ int main(int argc, char** argv) {
     const char* label = argc > 4 ? argv[4] : "shape";
     const char* quant = argc > 5 ? argv[5] : "None";
     const int mx = strcmp(quant, "Mxfp4") == 0;
-    if (!mx && strcmp(quant, "None") != 0) {
-        fprintf(stderr, "unknown quant %s (want None or Mxfp4)\n", quant);
+    const int f8 = strcmp(quant, "W8A8") == 0;
+    if (!mx && !f8 && strcmp(quant, "None") != 0) {
+        fprintf(stderr, "unknown quant %s (want None, Mxfp4 or W8A8)\n", quant);
+        return 2;
+    }
+    /* REFUSED rather than measured wrong, same as the mxfp4 guard below. `d_gemm_fp8_t` stages a
+     * FBK=128 K-tile with no K predicate, so a K that is not a multiple of 128 reads past the
+     * row. Every prefill K plow emits for a dense model is a multiple of 128. */
+    if (f8 && K % 128u) {
+        fprintf(stderr, "w8a8 needs K %% 128 == 0 (K=%u): d_gemm_fp8_t's K-tile is 128 and "
+                        "its operand fetch is unpredicated\n",
+                K);
         return 2;
     }
     /* REFUSED rather than measured wrong. `d_gemm_t<WFP4>` static_asserts KEXACT, its weight
@@ -125,7 +167,17 @@ int main(int argc, char** argv) {
     char nm[64];
     uint32_t cus = 0, lds = 0;
     plow_hsa_device_info(H, 0, nm, &cus, &lds);
-    const unsigned NCU = cus, THREADS = 512;
+    /* THREADS is the OBJECT's wave grid, not a constant: `d_gemm_t` static_asserts
+     * THREADS == PLOW_THREADS, so a test_kernels.elf built with -DPLOW_WG_WAVES=4 must be
+     * launched at 256 and launching it at 512 is INVALID_ISA, not a slowdown. Defaults to the
+     * shipping 8-wave geometry, so every prior run reproduces unchanged. */
+    const char* wenv = getenv("PLOW_TILE_WAVES");
+    const unsigned WAVES = wenv ? (unsigned)atoi(wenv) : 8u;
+    if (WAVES != 4 && WAVES != 8) {
+        fprintf(stderr, "PLOW_TILE_WAVES must be 4 or 8 (got %u)\n", WAVES);
+        return 2;
+    }
+    const unsigned NCU = cus, THREADS = WAVES * 64;
 
     FILE* f = fopen("test_kernels.elf", "rb");
     if (!f) { perror("test_kernels.elf"); return 1; }
@@ -144,19 +196,45 @@ int main(int argc, char** argv) {
     /* mxfp4 weights are packed 2/byte with one E8M0 byte per 32 K — a QUARTER and a
      * thirty-second of the bf16 stream. That ratio is the whole reason the rung exists. */
     const size_t nW = nB / 2, nS = (size_t)N * (K / 32);
-    bf16* hA = plow_hsa_alloc_host(H, nA * 2);
-    bf16* hB = mx ? NULL : plow_hsa_alloc_host(H, nB * 2);
-    unsigned char* hW = mx ? plow_hsa_alloc_host(H, nW) : NULL;
+    /* w8a8 quantizes BOTH operands: one byte per element on each side, plus an f32 scale row
+     * per A row and per B output channel — the exact operand shape `d_gemm_fp8_t` binds. */
+    bf16* hA = f8 ? NULL : plow_hsa_alloc_host(H, nA * 2);
+    unsigned char* hAq = f8 ? plow_hsa_alloc_host(H, nA) : NULL;
+    float* hAs = f8 ? plow_hsa_alloc_host(H, M * sizeof(float)) : NULL;
+    bf16* hB = (mx || f8) ? NULL : plow_hsa_alloc_host(H, nB * 2);
+    unsigned char* hW = mx ? plow_hsa_alloc_host(H, nW) : (f8 ? plow_hsa_alloc_host(H, nB) : NULL);
     unsigned char* hS = mx ? plow_hsa_alloc_host(H, nS) : NULL;
+    float* hWs = f8 ? plow_hsa_alloc_host(H, N * sizeof(float)) : NULL;
     bf16* hC = plow_hsa_alloc_host(H, nC * 2);
-    bf16* hC2 = mx ? NULL : malloc(nC * sizeof(*hC2));
+    bf16* hC2 = (mx || f8) ? NULL : malloc(nC * sizeof(*hC2));
     int have_c2 = 0;
-    if (!hA || (!mx && (!hB || !hC2)) || (mx && (!hW || !hS)) || !hC) {
+    if ((!f8 && !hA) || (!mx && !f8 && (!hB || !hC2)) || (mx && (!hW || !hS)) ||
+        (f8 && (!hAq || !hAs || !hW || !hWs)) || !hC) {
         fprintf(stderr, "host allocation failed\n");
         return 1;
     }
     srand(5);
-    for (size_t i = 0; i < nA; i++) hA[i] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
+    if (f8) {
+        /* Only FINITE, non-0x80 codes, and only the low half of the exponent range: the f32
+         * accumulator then sees the same magnitudes the bf16 ladder produces, so a TF/s number
+         * from either arm is comparable. Both operand streams are drawn the same way. */
+        for (size_t i = 0; i < nA; i++) {
+            unsigned char b;
+            do { b = (unsigned char)((rand() & 0x80) | (rand() % 0x40)); } while (!e4m3_finite(b));
+            hAq[i] = b;
+        }
+        for (size_t i = 0; i < nB; i++) {
+            unsigned char b;
+            do { b = (unsigned char)((rand() & 0x80) | (rand() % 0x40)); } while (!e4m3_finite(b));
+            hW[i] = b;
+        }
+        /* VARIED, not pinned at 1.0, for the same reason the mxfp4 block scales are: a kernel
+         * that dropped either scale fetch must fail the spot-check rather than pass it. */
+        for (unsigned i = 0; i < M; i++) hAs[i] = 0.0625f * (1.0f + (float)(i % 3));
+        for (unsigned i = 0; i < N; i++) hWs[i] = 0.03125f * (1.0f + (float)(i % 5));
+    } else {
+        for (size_t i = 0; i < nA; i++) hA[i] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
+    }
     if (mx) {
         for (size_t i = 0; i < nW; i++) hW[i] = (unsigned char)(rand() & 0xff);
         /* Scales 2^-4..2^-2, VARIED per block rather than pinned at 2^0. A constant scale would
@@ -164,19 +242,28 @@ int main(int argc, char** argv) {
          * one thing about this path that is new. Varying it keeps |w| <= 1.5, in the same range
          * as the bf16 operand, so the f32 accumulator sees the same magnitudes either way. */
         for (size_t i = 0; i < nS; i++) hS[i] = (unsigned char)(127 - 4 + (int)(i % 3));
-    } else {
+    } else if (!f8) {
         for (size_t i = 0; i < nB; i++) hB[i] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
     }
-    void* dA = plow_hsa_alloc(H, 0, nA * 2);
-    void* dB = plow_hsa_alloc(H, 0, mx ? nW : nB * 2);
+    void* dA = plow_hsa_alloc(H, 0, f8 ? nA : nA * 2);
+    void* dB = plow_hsa_alloc(H, 0, mx ? nW : (f8 ? nB : nB * 2));
     void* dS = mx ? plow_hsa_alloc(H, 0, nS) : NULL;
+    void* dAs = f8 ? plow_hsa_alloc(H, 0, M * sizeof(float)) : NULL;
+    void* dWs = f8 ? plow_hsa_alloc(H, 0, N * sizeof(float)) : NULL;
     void* dC = plow_hsa_alloc(H, 0, nC * 2);
-    plow_hsa_copy_h2d(H, 0, dA, hA, nA * 2);
-    if (mx) {
-        plow_hsa_copy_h2d(H, 0, dB, hW, nW);
-        plow_hsa_copy_h2d(H, 0, dS, hS, nS);
+    if (f8) {
+        plow_hsa_copy_h2d(H, 0, dA, hAq, nA);
+        plow_hsa_copy_h2d(H, 0, dB, hW, nB);
+        plow_hsa_copy_h2d(H, 0, dAs, hAs, M * sizeof(float));
+        plow_hsa_copy_h2d(H, 0, dWs, hWs, N * sizeof(float));
     } else {
-        plow_hsa_copy_h2d(H, 0, dB, hB, nB * 2);
+        plow_hsa_copy_h2d(H, 0, dA, hA, nA * 2);
+        if (mx) {
+            plow_hsa_copy_h2d(H, 0, dB, hW, nW);
+            plow_hsa_copy_h2d(H, 0, dS, hS, nS);
+        } else {
+            plow_hsa_copy_h2d(H, 0, dB, hB, nB * 2);
+        }
     }
     struct __attribute__((packed)) {
         void* c; const void* a; const void* b; unsigned m, n, kk;
@@ -186,31 +273,38 @@ int main(int argc, char** argv) {
     struct __attribute__((packed)) {
         void* c; const void* a; const void* b; const void* s; unsigned m, n, kk;
     } mxargs = {dC, dA, dB, dS, M, N, K};
-    const void* kargs = mx ? (const void*)&mxargs : (const void*)&args;
-    const size_t kargs_sz = mx ? sizeof mxargs : sizeof args;
+    /* w8a8 takes BOTH scale rows, activation first: `d_gemm_fp8_t(C, A, B, ascale, wscale, ...)`. */
+    struct __attribute__((packed)) {
+        void* c; const void* a; const void* b; const void* as; const void* ws;
+        unsigned m, n, kk;
+    } f8args = {dC, dA, dB, dAs, dWs, M, N, K};
+    const void* kargs = mx ? (const void*)&mxargs : (f8 ? (const void*)&f8args : (const void*)&args);
+    const size_t kargs_sz = mx ? sizeof mxargs : (f8 ? sizeof f8args : sizeof args);
 
     /* The weight stream is the memory-bound floor for these shapes: at M=128 the B operand
      * dominates and A/C are noise, so B bytes / 6200 GB/s is the achievable wall time. */
     const double flops = 2.0 * (double)M * N * K;
-    const double wbytes = mx ? (double)(nW + nS) : 2.0 * (double)N * K;
+    const double wbytes = mx ? (double)(nW + nS)
+                             : (f8 ? (double)nB + 4.0 * (double)N : 2.0 * (double)N * K);
     const double mem_floor_ms = wbytes / (HBM_GBPS * 1e9) * 1e3;
-    printf("%s  %u CUs\n", nm, NCU);
+    printf("%s  %u CUs  %u waves/wg\n", nm, NCU, WAVES);
     printf("%s  M=%u N=%u K=%u   %.1f MFLOP  weights %.2f MB  HBM floor %.4f ms "
            "(= %.1f TF/s equiv, %.1f%% of MFMA peak)\n\n",
            label, M, N, K, flops / 1e6, wbytes / 1e6, mem_floor_ms,
            flops / (mem_floor_ms * 1e-3) / 1e12,
            100.0 * flops / (mem_floor_ms * 1e-3) / 1e12 / PEAK_TFLOPS);
-    printf("  %-10s %-10s %6s %6s   %9s %9s %7s %7s\n", "tile", "BMxBN", "tiles", "fill",
+    printf("  %-10s %-14s %6s %6s   %9s %9s %7s %7s\n", "tile", "BMxBNxBK", "tiles", "fill",
            "ms", "TF/s", "%peak", "%hbm");
 
     const char* jsonl = getenv("PLOW_GEMM_JSONL");
     FILE* jf = jsonl ? fopen(jsonl, "a") : NULL;
 
-    const int ntiles = mx ? NMXTILES : NTILES;
+    const int ntiles = mx ? NMXTILES : (f8 ? NF8TILES : NTILES);
     for (int t = 0; t < ntiles; t++) {
-        const char* sym = mx ? MXTILES[t].sym : TILES[t].sym;
-        const unsigned tbm = mx ? MXTILES[t].bm : TILES[t].bm;
-        const unsigned tbn = mx ? MXTILES[t].bn : TILES[t].bn;
+        const char* sym = mx ? MXTILES[t].sym : (f8 ? F8TILES[t].sym : TILES[t].sym);
+        const unsigned tbm = mx ? MXTILES[t].bm : (f8 ? F8TILES[t].bm : TILES[t].bm);
+        const unsigned tbn = mx ? MXTILES[t].bn : (f8 ? F8TILES[t].bn : TILES[t].bn);
+        const unsigned tbk = (mx || f8) ? 64u : TILES[t].bk;
         plow_hsa_kernel k;
         if (plow_hsa_get_kernel(H, 0, sym, &k) != 0) continue;
         /* A NaN sentinel makes incomplete tile coverage fail instead of inheriting a prior result. */
@@ -247,39 +341,48 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < nC; i++) {
             if (!isfinite(bf2f(hC[i]))) { bad++; break; }
         }
-        if (!mx && strcmp(sym, "gemm_c2") == 0) {
+        if (!mx && !f8 && strcmp(sym, "gemm_c2") == 0) {
             memcpy(hC2, hC, nC * sizeof(*hC2));
             have_c2 = 1;
-        } else if (!mx && strcmp(sym, "gemm_c8") == 0) {
+        } else if (!mx && !f8 && strcmp(sym, "gemm_c8") == 0) {
             if (!have_c2 || memcmp(hC2, hC, nC * sizeof(*hC2)) != 0) bad++;
         }
         for (int s = 0; s < 24; s++) {
             unsigned m = (unsigned)(rand() % (int)M), nn = (unsigned)(rand() % (int)N);
             double acc = 0;
             for (unsigned kk = 0; kk < K; kk++) {
-                /* The SAME oracle either way — an f64 dot product over the values the kernel
-                 * consumed — which is what lets one `GEMM_ORACLE` string key both ladders. For
-                 * mxfp4 the B element is reconstructed from its nibble and block scale; both
-                 * are exact, so this is the reference and not an estimate of it. */
-                double b;
+                /* The SAME oracle in all three ladders — an f64 dot product over the values the
+                 * kernel consumed — which is what lets one `GEMM_ORACLE` string key them. For
+                 * mxfp4 the B element is reconstructed from its nibble and block scale, for
+                 * w8a8 both elements from their e4m3 codes; all are exact, so this is the
+                 * reference and not an estimate of it. */
+                double a, b;
                 if (mx) {
                     const size_t e = (size_t)nn * K + kk;
                     const unsigned char byte = hW[e >> 1];
                     const unsigned nib = (kk & 1u) ? (byte >> 4) : (byte & 0xfu);
                     b = FP4[nib] * e8m0(hS[(size_t)nn * (K / 32) + (kk >> 5)]);
+                    a = (double)bf2f(hA[(size_t)m * K + kk]);
+                } else if (f8) {
+                    b = e4m3(hW[(size_t)nn * K + kk]);
+                    a = e4m3(hAq[(size_t)m * K + kk]);
                 } else {
                     b = bf2f(hB[(size_t)nn * K + kk]);
+                    a = (double)bf2f(hA[(size_t)m * K + kk]);
                 }
-                acc += (double)bf2f(hA[(size_t)m * K + kk]) * b;
+                acc += a * b;
             }
+            /* The per-row and per-channel scales are applied ONCE, in the kernel's epilogue,
+             * so the oracle applies them the same way rather than inside the K loop. */
+            if (f8) acc *= (double)hAs[m] * (double)hWs[nn];
             const double g = bf2f(hC[(size_t)m * N + nn]);
             if (fabs(g - acc) / (fabs(acc) + 1e-3) > 0.03) bad++;
         }
 
         const unsigned ntile = ((M + tbm - 1) / tbm) * ((N + tbn - 1) / tbn);
-        char bxb[16];
-        snprintf(bxb, sizeof bxb, "%ux%u", tbm, tbn);
-        printf("  %-10s %-10s %6u %5.1f%%   %9.4f %9.1f %6.1f%% %6.1f%%  %s\n", sym,
+        char bxb[24];
+        snprintf(bxb, sizeof bxb, "%ux%ux%u", tbm, tbn, tbk);
+        printf("  %-10s %-14s %6u %5.1f%%   %9.4f %9.1f %6.1f%% %6.1f%%  %s\n", sym,
                bxb, ntile, 100.0 * (ntile < NCU ? ntile : NCU) / NCU, dt * 1e3, tf,
                100.0 * tf / PEAK_TFLOPS, 100.0 * mem_floor_ms / (dt * 1e3),
                bad ? "MISMATCH!" : "ok");
@@ -291,7 +394,7 @@ int main(int argc, char** argv) {
             fprintf(jf,
                     "{\"m\":%u,\"n\":%u,\"k\":%u,\"quant\":\"%s\",\"tile\":\"%ux%ux%u\","
                     "\"sym\":\"%s\",\"correct\":%s,\"samples_ns\":[",
-                    M, N, K, quant, tbm, tbn, 64u, sym, bad ? "false" : "true");
+                    M, N, K, quant, tbm, tbn, tbk, sym, bad ? "false" : "true");
             for (int g = 0; g < groups; g++)
                 fprintf(jf, "%s%.1f", g ? "," : "", sample_ns[g]);
             fprintf(jf, "]}\n");
@@ -301,6 +404,8 @@ int main(int argc, char** argv) {
     plow_hsa_free(H, dA);
     plow_hsa_free(H, dB);
     if (dS) plow_hsa_free(H, dS);
+    if (dAs) plow_hsa_free(H, dAs);
+    if (dWs) plow_hsa_free(H, dWs);
     plow_hsa_free(H, dC);
     free(hC2);
     return 0;

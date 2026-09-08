@@ -355,7 +355,12 @@ pub struct StaticState {
 impl StaticState {
     pub fn new(idx: usize, cus: Vec<u32>) -> StaticState {
         let heads = vec![(0, 0); cus.len()];
-        StaticState { spawn_cus: cus.clone(), cus, heads, idx }
+        StaticState {
+            spawn_cus: cus.clone(),
+            cus,
+            heads,
+            idx,
+        }
     }
 
     fn reset(&mut self, prog: &LoadedProgram, seg: u32) {
@@ -539,7 +544,11 @@ pub fn run_gq(
         let ok = wait_until(
             parker,
             sh.spin_us,
-            || pending.iter().any(|&i| sh.gates_open(&gq.stream[i as usize])),
+            || {
+                pending
+                    .iter()
+                    .any(|&i| sh.gates_open(&gq.stream[i as usize]))
+            },
             || sh.cancelled(),
         );
         if !ok {

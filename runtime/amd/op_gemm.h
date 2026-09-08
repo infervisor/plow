@@ -1087,12 +1087,62 @@ PLOW_GM_MXFP4_TILE(d_gemm_mxfp4, GM_BM, GM_BN, GM_BK)
  * cluster pairs to trade while the register-staged global prefetch (GM_FETCH at the top of the
  * tile) loses half the MFMA it had to land behind. On a 64 KiB part the long single-buffered
  * k-tile is worth more than the overlap. Do not re-try this without a way to keep BK=64. */
+/* DEEPENING BK IS THE OPPOSITE TRADE FROM HALVING IT, AND ON CDNA3 IT PAYS EVERYWHERE.
+ *
+ * The note above rejects BK=32 because a shorter k-tile buys a second LDS buffer at the cost of
+ * MFMA to land the prefetch behind. BK=128 spends the SAME currency the other way: the stage
+ * grows to 52,224 B (still inside the 64 KiB arena and inside this object's 64,512 B GEMM
+ * union, so no other rung and no occupancy moves), the k-tile count HALVES, and each global
+ * fetch has twice the MFMA to hide under. Measured with `gemm_tile_sweep` on a leased MI300X,
+ * whole-GPU wall time in ms, 64x128 at BK=64 -> BK=128 (2026-09-08):
+ *
+ *              M=128            M=512            M=2048           M=8192
+ *   q_proj     .0954 -> .0699   .1840 -> .1435   .6571 -> .4855   2.528 -> 1.868
+ *   k/v_proj   .0952 -> .0665   .0979 -> .0844   .3565 -> .2717   1.306 -> 0.958
+ *   o_proj 8k  .1182 -> .0943   .2419 -> .2055   .5894 -> .5084   2.234 -> 1.845
+ *   o_proj 16k .2319 -> .1697   .4784 -> .3962   1.233 -> 0.996   5.381 -> 3.982
+ *   gate/up    .1855 -> .1417   .4478 -> .3461   1.803 -> 1.389   7.074 -> 5.445
+ *   down_proj  .3385 -> .2173   .6713 -> .5210   1.992 -> 1.467   7.189 -> 5.413
+ *
+ * 1.10x to 1.56x, no shape and no M where it loses, and the sweep's 24-sample f64 oracle passes
+ * on every cell. It is ARITHMETIC-PRESERVING: BK only sets where the k-tile barriers fall. The
+ * mainloop still walks k strictly ascending in MFMA_K steps and each output element is still
+ * accumulated by one workgroup over the full K in that order, so the f32 accumulator sees the
+ * same adds in the same sequence.
+ *
+ * CDNA3 ONLY, because that is where it is measured. CDNA4 runs this ladder DOUBLE-buffered
+ * (GM_DBUF=2) with 160 KiB of LDS -- a different regime, and 64x128 at BK=128 doubled there is
+ * 104,448 B. Leave gfx950 on the rung it was tuned at.
+ *
+ * AND THEY ARE `#ifndef`-GUARDED NOW, WHICH THEY WERE NOT. `build_gfx942.sh` documents GM_SM_BK
+ * and GM_MD_* as reachable through its `GM_AX` raw-`-D` escape hatch. They were not: a bare
+ * `#define` in a header that the command line has already defined is a REDEFINITION, the header
+ * wins (last definition), and the recipe compiles with `-w` so the warning is invisible. Every
+ * A/B ever run through GM_AX against these five macros measured an unchanged object -- including
+ * the "GM_SM_BK=128 is a flat null" row in docs/amd/gemma4-31b-mi300x.md, which is why the same
+ * change reads as 1.1-1.6x here. */
+#ifndef GM_SM_BM
 #define GM_SM_BM 64
+#endif
+#ifndef GM_SM_BN
 #define GM_SM_BN 128
+#endif
+#ifndef GM_SM_BK
+#if PLOW_CDNA4
 #define GM_SM_BK 64
+#else
+#define GM_SM_BK 128
+#endif
+#endif
+#ifndef GM_MD_BM
 #define GM_MD_BM 128
+#endif
+#ifndef GM_MD_BN
 #define GM_MD_BN 128
+#endif
+#ifndef GM_MD_BK
 #define GM_MD_BK 64
+#endif
 /* THE TWO MISSING RUNGS (tile-inventory campaign, measured 2026-07-27, runtime/ubench/
  * gemm_tile_sweep.c, whole GPU, 20 reps after a 50-launch clock warm-up, leased card).
  *
@@ -1266,16 +1316,17 @@ __device__ void d_gemm_fp8_blk(bf16* C, const bf16* A, const unsigned char* W,
  * d_gemv_glu: three packets (gemm, gemm, glu) collapse to one, gt/ut never reach HBM, and
  * the GLU's own global gate goes with them. Same tile, same registers, same MFMA count --
  * see the wave->column remap in d_gemm_t. */
-/* The GLU epilogue's wave->column map needs SN==2, i.e. the 8-wave grid. A 4-wave build (the
- * segmented-dispatch flash code object) omits it; plowc keeps gate/up as the tiled GEMM triple. */
-#if PLOW_WAVES == 8
+/* SN==2 holds for the ordinary 8-wave tile and the mixed 4-wave 64x128 tile. */
+#if PLOW_WAVES == 8 || PLOW_MIXED_STEP
 __device__ void d_gemm_glu(bf16* C, const bf16* A, const bf16* Bg, const bf16* Bu, unsigned M,
                            unsigned N, unsigned K, unsigned act, unsigned slice, unsigned nblk,
                            bf16* lds) {
     d_gemm_t<GM_BM, GM_BN, GM_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, true>(
         C, A, Bg, nullptr, nullptr, M, N, K, slice, nblk, lds, Bu, act);
 }
+#endif
 
+#if PLOW_WAVES == 8
 /* MXFP4 (w4a16) GEMM over gate|up in ONE pass -- the fp4 twin of d_gemm_glu, and the arm whose
  * absence made the SHARED-EXPERT PREFILL the one place an mxfp4 packet paid for its encoding in
  * HBM TRAFFIC rather than only in a different weight fetch. Without it the pair unfuses into two
@@ -2340,6 +2391,41 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
 #ifndef GV_RS_MAXNCH
 #define GV_RS_MAXNCH 8
 #endif
+/* THE SAME R-SPLIT, FOR THE OPPOSITE REASON, ON THE MM=4 DECODE BUCKET.
+ *
+ * The MM==1 arm above takes the split when the ROW is short (`nchunk < GV_RS_MAXNCH`), because
+ * there the unroll is capped by the row. At MM=4 the cap is the REGISTER BUDGET instead:
+ * `GV_UNROLL_M4` is 6 against MM=1's 11, and raising it does not merely fail to pay, it spills
+ * (UN=8 and UN=11 measure 0.17-0.58x on every Gemma-4 31B decode shape, with 119
+ * `scratch_load_dword` in the UN=8 body). R columns per wave-step buy the same in-flight loads
+ * that the unroll cannot, at R accumulators rather than R x UN of them.
+ *
+ * STAGED SHAPES ONLY, and the sign flips cleanly on that line -- which is why the predicate is
+ * `staged` and not a shape heuristic. Measured (runtime/bench/amd/gemma31_gemv_decode_bench.*,
+ * MM=4 / M=4, base = the shipping UN=6 body, two independent runs, A/A control 0.994-1.026):
+ *
+ *   STAGED (M*K <= GM_LDS_HALVES)          UNSTAGED (x re-read from global per column)
+ *     gate/up  21504x5376   1.052x           o_proj    5376x8192    0.750x
+ *     q_proj    8192x5376   1.051x           o_full    5376x16384   0.795x
+ *     kv_proj   4096x5376   1.029x           down      5376x21504   0.823x
+ *     lm_head 262144x5376   1.108x
+ *
+ * Weighted by the T=4 program's own instance counts that is -0.96 ms of a 27.29 ms per-token
+ * plain-GEMV projection total. BIT-EXACT: the R-split moves only which wave takes which column
+ * (checked elementwise on device by the bench against the shipping body, 0 mismatches).
+ *
+ * MM==4 EXACTLY. MM=2's staged set includes o_proj (K=8192 fits LDS at two rows but not at four)
+ * and the split loses on q/kv there, so the bucket that would need a shape predicate does not get
+ * the arm at all. */
+#ifndef GV_RS_WIDE
+#define GV_RS_WIDE (!PLOW_CDNA4)
+#endif
+#ifndef GV_RS_WIDE_R
+#define GV_RS_WIDE_R 2
+#endif
+#ifndef GV_RS_WIDE_UN
+#define GV_RS_WIDE_UN 6
+#endif
 template <int MM, bool XLDS, int UN, int R>
 __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* __restrict__ x_,
                                             const bf16* __restrict__ W_, unsigned M, unsigned N,
@@ -2398,10 +2484,14 @@ __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* _
         }
 }
 
-/* FULL R-GROUPS ONLY, then the leftover columns one at a time. The tail runs at UN = GV_UNROLL so
- * it is the SAME instantiation shape the single-column arm already carries — the R-split therefore
- * costs the object exactly TWO new bodies, not four. */
-template <int MM, bool XLDS, int UN, int R>
+/* FULL R-GROUPS ONLY, then the leftover columns one at a time. The tail runs at the SAME unroll
+ * the single-column arm for this bucket already carries, so the R-split costs the object exactly
+ * TWO new bodies, not four. `gv_unroll_for(MM)` (passed as TUN) and not GV_UNROLL: at MM=1
+ * they are the same 11,
+ * but at MM=4 a GV_UNROLL tail is the `UN=11` instantiation the unroll table already rejects —
+ * measured 4x SLOWER than UN=6 on gate/up at this bucket, because 11 x 4 rows of live weight
+ * vectors spills to scratch (119 scratch_load_dword in the standalone body). */
+template <int MM, bool XLDS, int UN, int R, int TUN>
 __device__ __forceinline__ void gemv_rows_rs(bf16* __restrict__ C, const bf16* __restrict__ x,
                                              const bf16* __restrict__ W, unsigned M, unsigned N,
                                              unsigned K, unsigned slice, unsigned nblk,
@@ -2415,7 +2505,7 @@ __device__ __forceinline__ void gemv_rows_rs(bf16* __restrict__ C, const bf16* _
     for (; n + (unsigned)(R - 1) * PLOW_WAVES < gv_n1; n += PLOW_WAVES * (unsigned)R)
         gemv_rows_r<MM, XLDS, UN, R>(C, x, W, M, N, K, n, lane, lds);
     for (; n < gv_n1; n += PLOW_WAVES)
-        gemv_rows_r<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
+        gemv_rows_r<MM, XLDS, TUN, 1>(C, x, W, M, N, K, n, lane, lds);
 }
 
 /* Guarded so the prefill build digest (`kernelcaps::build::preprocessed_digest`, the tune
@@ -2666,6 +2756,222 @@ __device__ __forceinline__ void gemv_rows_mfma(bf16* __restrict__ C_, const bf16
             if (mfma_acc_m(lane, (unsigned)i) == frow) d = acc[i];
         const float t = wave_sum(d);
         if (lane == 0) st_act1(&C[n], f2bf(t));
+    }
+}
+
+/* ------------- BATCHED DECODE ON THE MATRIX CORE (4x4x4 bf16) --------------------------------
+ *
+ * THE DEFECT THIS ADDRESSES, and it only exists at M > 1. `gemv_rows` spends ~24 VALU ops per
+ * 16 bytes of weight PER ACTIVATION ROW: gfx942 has no `v_dot2c_f32_bf16`, so `plow_dot2_bf16`
+ * emulates it with shifts + FMAs. The weight BYTE stream is independent of the batch width but
+ * that VALU work is not, so at batch 4 the arithmetic is 4x while the bytes are 1x, and the
+ * body crosses from memory-bound to issue-bound. Measured on the shipped object, Gemma-4 31B
+ * BF16 TP1 decode: plow streams weights at 839 GB/s where vLLM 0.28 streams them at 2111 GB/s
+ * against a 4112 GB/s measured HBM read ceiling.
+ *
+ * Per CU, per KB of weight, at M=4:
+ *   memory  1024 B / 6.4 B per CU-cycle  = 160 CU-cycles   (4112 GB/s over 304 CUs at 2.1 GHz)
+ *   VALU    4 rows x 24 ops x 4 cycles   =  96 CU-cycles    -- 60% busy BEFORE loads/LDS/loop
+ *   MFMA    4 rows x 2 mfma x 8 cycles   =  16 CU-cycles    -- 10% busy
+ *
+ * THE MAPPING is vLLM v0.28's `wvSplitK_hf_sml_` (csrc/rocm/skinny_gemms.cu, Apache-2.0), and
+ * the reason it is that shape and not "32 output rows in the MFMA's M" is BYTES PER INSTRUCTION.
+ * `v_mfma_f32_4x4x4bf16_1k` is 16 INDEPENDENT 4x4x4 blocks: block b = lane/4, and within a block
+ * lane l supplies A row / B column l%4. Give BOTH operands the SAME per-lane 4-half k-window and
+ * the accumulator's DIAGONAL D[i][i] holds this lane's dot4; the off-diagonal is junk that is
+ * never read. That costs 3/4 of the matrix, and it does not matter:
+ *
+ *   instruction              weight halves retired per wave   cycles   bytes/cycle
+ *   v_mfma_f32_4x4x4bf16_1k                256 (2 per 16 B)        8            64
+ *   v_mfma_f32_32x32x8bf16_1k              256                    32            16
+ *   v_mfma_f32_16x16x16bf16_1k             256                    16            32
+ *
+ * The 4x4 arm is the only one that keeps the SHIPPED memory pattern -- one wave owns one output
+ * row, its 64 lanes read 1024 CONTIGUOUS bytes of that row through one buffer descriptor -- while
+ * still retiring 16 B of weight per lane per two instructions. A 32x32 arm with 32 OUTPUT rows in
+ * A's M would use the full matrix but would read 32 rows at a K*2 stride, which is a different
+ * (and worse) memory pattern, and would break the per-row column ownership every decode consumer
+ * depends on. `gemv_rows_mfma` above is the M=1 32x32 diagonal arm and it LOSES by 1.6%.
+ *
+ * WHAT THIS COSTS, AND WHY IT IS OFF BY DEFAULT. It REDEFINES plow's decode reference arithmetic.
+ * `gemv_rows` reduces a column as a per-lane chain of `dot8(w, x, 0.0f)` -- four nested
+ * `fma(a,b, fma(...))` pairs -- followed by a 6-step xor-butterfly `wave_sum`. Every MFMA on this
+ * part reduces >= 4 products in hardware order inside ONE instruction, so NO MFMA arrangement can
+ * reproduce that nesting. The epilogue tree changes too (DPP shift-left diagonal gather, then
+ * shl4/shl8/shr15/BCAST15/BCAST31, result in lane 63, vs the xor butterfly's lane 0). Bit
+ * identity is impossible by construction; see docs/amd/gemma4-31b-mi300x.md for the measured
+ * price. That is a model-owner decision, so GV_MFMA4 defaults to 0.
+ *
+ * WHAT IT DOES NOT CHANGE. Per-row values are INDEPENDENT OF THE BATCH WIDTH: `acc[m][y]` sees
+ * only row m's activations and column n+y's weights, in increasing k order, through the same
+ * instruction sequence for every m. Neither MM, nor UN, nor YT reassociates a row -- they move
+ * only which wave takes which column and how many loads are in flight -- so a sequence decoded
+ * alone and the same sequence inside a ragged batch produce bit-identical logits.
+ *
+ * The workgroup's column interval [gv_n0, gv_n1) is unchanged, so PLOW_FINE's gemv->headnorm
+ * dependency map is unaffected, exactly as for `gemv_rows_rs`. ------------------------------- */
+#ifndef GV_MFMA4
+#define GV_MFMA4 0
+#endif
+
+typedef bf16_t gv_bf16x4 __attribute__((ext_vector_type(4)));
+union gv_mfma4_frag {
+    bf16v8 raw;
+    gv_bf16x4 h4[2];
+};
+static_assert(sizeof(gv_mfma4_frag) == 16, "the MFMA fragment must be one 16-byte load");
+
+/* Gather the 4x4 block diagonals into lane 63 and reduce the wave, verbatim from vLLM v0.28's
+ * `wvSplitK_hf_sml_` MFMA epilogue. `row_shl:n` moves lane l+n's value to lane l, so the first
+ * four terms leave the block diagonal in the lanes with l%4 == 0; shl4/shl8 fold the four blocks
+ * of a 16-lane row into its lane 0, shr15 parks that in lane 15, and the two ROW_BCASTs are the
+ * ordinary wave64 tail. bound_ctrl=1 so the lanes that shift in from outside contribute 0. */
+__device__ __forceinline__ float gv_mfma4_reduce(f32x4 v) {
+    float a = v[0];
+    a += __builtin_amdgcn_mov_dpp(v[1], 0x101, 0xf, 0xf, 1); /* row_shl:1 */
+    a += __builtin_amdgcn_mov_dpp(v[2], 0x102, 0xf, 0xf, 1); /* row_shl:2 */
+    a += __builtin_amdgcn_mov_dpp(v[3], 0x103, 0xf, 0xf, 1); /* row_shl:3 */
+    a += __builtin_amdgcn_mov_dpp(a, 0x104, 0xf, 0xf, 1);    /* row_shl:4 */
+    a += __builtin_amdgcn_mov_dpp(a, 0x108, 0xf, 0xf, 1);    /* row_shl:8 */
+    a = __builtin_amdgcn_mov_dpp(a, 0x11f, 0xf, 0xf, 1);     /* row_shr:15 */
+    a += __builtin_amdgcn_mov_dpp(a, 0x142, 0xf, 0xf, 1);    /* ROW_BCAST15 */
+    a += __builtin_amdgcn_mov_dpp(a, 0x143, 0xf, 0xf, 1);    /* ROW_BCAST31 */
+    return a;
+}
+
+/* THE MEASURED TILE PER BUCKET (gemma31_mfma_decode_bench, gfx942, 41 reps, palindromic, A/A
+ * 0.990-1.040; per-token ms over the T=4 instance counts, VALU base -> MFMA best):
+ *
+ *   MM=1  15.373 -> 14.602 (1.05x)   -- NOT TAKEN: see the MM >= 2 guard in d_gemv_t
+ *   MM=2  19.007 -> 15.039 (1.26x)   UN=11 YT=1   104 VGPR
+ *   MM=4  27.832 -> 16.388 (1.70x)   best standalone tile UN=6 YT=2, 194 VGPR (base 237);
+ *                                    the DEFAULT is UN=2 YT=4 (16.859, 146 VGPR) -- see below
+ *   MM=8  61.599 -> 41.844 (1.47x)   UN=3  YT=2   114 VGPR
+ *
+ * THE MM=4 DEFAULT IS NOT THE STANDALONE WINNER, AND THAT IS MEASURED. In the megakernel the
+ * ranking is a different one -- `plowrt amd-bench --batched`, ragged batch of 4 (1024/128/4096/
+ * 1024 prompt tokens), 64 dispatches, reproducible to 0.15%, against a 36.67 ms VALU control:
+ *
+ *   tile      standalone ms/token    megakernel batch-4 tpot
+ *   UN=2 YT=4        16.859                30.32 ms   <- the default
+ *   UN=3 YT=3        16.970                30.42
+ *   UN=4 YT=3        16.699                30.52
+ *   UN=6 YT=2        16.388 (best)         32.41
+ *   UN=2 YT=2        19.182                32.58
+ *   UN=11 YT=1       17.860                35.22
+ *
+ * YT, not UN, is what the megakernel responds to: a 9% standalone SPREAD maps to a 16% spread
+ * in the model, and it is ordered by YT. YT buys in-flight weight loads with COLUMNS and divides
+ * the LDS activation traffic per weight byte by YT, because the activation fragment is loaded
+ * once per (chunk, row) and reused across all YT columns. Depth (UN) buys the same in-flight
+ * loads with REGISTERS, and inside a 256-VGPR interpreter whose other arms are live there are
+ * none to spend -- which is exactly why the standalone ranking inverts.
+ *
+ * MM=2's tile is the STANDALONE winner and is NOT measured in the megakernel: the `lowrung2`
+ * object only ever sees 2-row packets, which a concurrency-4 workload barely emits. If it ever
+ * matters, re-run the probe above against `lowrung2` before trusting UN=11/YT=1 there. */
+#ifndef GV_MFMA4_UN_M2
+#define GV_MFMA4_UN_M2 11
+#endif
+#ifndef GV_MFMA4_YT_M2
+#define GV_MFMA4_YT_M2 1
+#endif
+#ifndef GV_MFMA4_UN_M4
+#define GV_MFMA4_UN_M4 2
+#endif
+#ifndef GV_MFMA4_YT_M4
+#define GV_MFMA4_YT_M4 4
+#endif
+#ifndef GV_MFMA4_UN_M8
+#define GV_MFMA4_UN_M8 3
+#endif
+#ifndef GV_MFMA4_YT_M8
+#define GV_MFMA4_YT_M8 2
+#endif
+__device__ __host__ constexpr int gv_mfma4_un(int mm) {
+    return mm >= 8 ? GV_MFMA4_UN_M8 : (mm >= 4 ? GV_MFMA4_UN_M4 : GV_MFMA4_UN_M2);
+}
+__device__ __host__ constexpr int gv_mfma4_yt(int mm) {
+    return mm >= 8 ? GV_MFMA4_YT_M8 : (mm >= 4 ? GV_MFMA4_YT_M4 : GV_MFMA4_YT_M2);
+}
+
+/* MM rows x YT output columns per wave-step, UN weight chunks in flight per column. */
+template <int MM, bool XLDS, int UN, int YT>
+__device__ __forceinline__ void gemv_rows_mfma4(bf16* __restrict__ C_, const bf16* __restrict__ x_,
+                                                const bf16* __restrict__ W_, unsigned M,
+                                                unsigned N, unsigned K, unsigned slice,
+                                                unsigned nblk, const bf16* lds) {
+    static_assert(MM >= 1 && YT >= 1 && UN >= 1, "degenerate MFMA decode tile");
+    /* 4 accumulator floats per (row, column) against a decode object already near 256 VGPRs. */
+    static_assert(MM * YT * 4 <= 64, "MFMA decode accumulator would dominate the register file");
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned step = PLOW_WAVE * 8;
+    const unsigned nchunk = (K + step - 1) / step;
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned gv_n0 = slice * gv_per;
+    const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+
+    auto* const C = as_glob(C_);
+    const auto* const x = as_glob(x_);
+    const auto* const W = as_glob(W_);
+    auto xv8 = [&](unsigned m, unsigned kk) -> bf16v8 {
+        const size_t xo = (size_t)m * K + kk;
+        if constexpr (XLDS)
+            return ld_lds8(lds + xo);
+        else
+            return ld_glob8(x + xo);
+    };
+
+    for (unsigned n = gv_n0 + wave * (unsigned)YT; n < gv_n1; n += PLOW_WAVES * (unsigned)YT) {
+        /* A ragged tail re-reads the last live column rather than branching: the extra columns
+         * are computed and never stored, and the descriptor keeps the loads in bounds. */
+        __amdgpu_buffer_rsrc_t wr[YT];
+#pragma unroll
+        for (int y = 0; y < YT; y++) {
+            const unsigned ny = (n + (unsigned)y < gv_n1) ? (n + (unsigned)y) : n;
+            wr[y] = PLOW_GV_RSRC(W + (size_t)ny * K, K);
+        }
+        f32x4 acc[MM][YT];
+#pragma unroll
+        for (int m = 0; m < MM; m++)
+#pragma unroll
+            for (int y = 0; y < YT; y++) acc[m][y] = (f32x4)(0.0f);
+
+        for (unsigned c = 0; c < nchunk; c += UN) {
+            gv_mfma4_frag wv[YT][UN];
+            /* Issue every load before touching any of them; the descriptor returns zero past
+             * the row, so no chunk needs a predicate. */
+#pragma unroll
+            for (int y = 0; y < YT; y++)
+#pragma unroll
+                for (int u = 0; u < UN; u++)
+                    wv[y][u].raw = buf_ld8(wr[y], ((c + (unsigned)u) * step + lane * 8) * 2u);
+#pragma unroll
+            for (int u = 0; u < UN; u++) {
+                const unsigned k = (c + (unsigned)u) * step + lane * 8;
+                const unsigned kx = (k < K) ? k : 0u; /* wv is 0 there; keep 0*NaN out of it */
+#pragma unroll
+                for (int m = 0; m < MM; m++) {
+                    gv_mfma4_frag av;
+                    av.raw = xv8(((unsigned)m < M) ? (unsigned)m : 0u, kx);
+#pragma unroll
+                    for (int y = 0; y < YT; y++)
+#pragma unroll
+                        for (int q = 0; q < 2; q++)
+                            acc[m][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
+                                av.h4[q], wv[y][u].h4[q], acc[m][y], 0, 0, 0);
+                }
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < MM; m++)
+#pragma unroll
+            for (int y = 0; y < YT; y++) {
+                const float t = gv_mfma4_reduce(acc[m][y]);
+                if (lane == 63 && (unsigned)m < M && n + (unsigned)y < gv_n1)
+                    st_act1(&C[(size_t)m * N + n + (unsigned)y], f2bf(t));
+            }
     }
 }
 
@@ -4289,6 +4595,17 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
         if (norm == 1)
             gemv_rows<MM, true, true, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
         else {
+#if GV_MFMA4
+            /* THE BATCHED MATRIX-CORE ARM. MM >= 2 EXACTLY, and the bound is the point: at MM=1
+             * the body is already memory-bound (1.05x measured) and the shipped VALU arithmetic
+             * is bit-identical to every golden in the tree, so a concurrency-1 tier must keep
+             * it. Turning GV_MFMA4 on therefore cannot perturb a batch-1 sequence. */
+            if constexpr (MM >= 2) {
+                gemv_rows_mfma4<MM, true, gv_mfma4_un(MM), gv_mfma4_yt(MM)>(C, x, W, M, N, K,
+                                                                            slice, nblk, lds);
+                return;
+            }
+#endif
 #if GV_DMA
             /* The arena is [ x | ring ]. x is M*K halves and 16-B aligned (K is a multiple of
              * 64 for every Gemma projection), so the ring behind it is too — which ds_read_b128
@@ -4352,7 +4669,20 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
                 if ((K + PLOW_WAVE * 8 - 1) / (PLOW_WAVE * 8) >= (unsigned)GV_RS_MAXNCH)
                     gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
                 else
-                    gemv_rows_rs<MM, true, GV_RS_UN, GV_RS_R>(C, x, W, M, N, K, slice, nblk, lds);
+                    gemv_rows_rs<MM, true, GV_RS_UN, GV_RS_R, GV_UNROLL>(C, x, W, M, N, K, slice,
+                                                                        nblk, lds);
+            } else if constexpr (GV_RS_WIDE && MM == 4) {
+                /* THE WIDE BUCKET TAKES THE R-SPLIT ON THE STAGED ARM, and `staged` is the whole
+                 * predicate: reaching this line already means `M*K <= GM_LDS_HALVES`. See
+                 * GV_RS_WIDE.
+                 *
+                 * The split buys in-flight loads with COLUMNS, never with DEPTH: asking for a
+                 * deeper unroll than the single-column body already budgets is what spills this
+                 * bucket (UN=8 measures 0.17-0.58x), so the arm must not reintroduce it. */
+                static_assert(GV_RS_WIDE_UN <= gv_unroll_for(MM),
+                              "the wide R-split must not deepen the bucket's unroll");
+                gemv_rows_rs<MM, true, GV_RS_WIDE_UN, GV_RS_WIDE_R, gv_unroll_for(MM)>(
+                    C, x, W, M, N, K, slice, nblk, lds);
             } else
                 gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
 #endif
@@ -4362,8 +4692,19 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
          * 0 above and this is mode 1 or nothing. */
         if (norm == 1)
             gemv_rows<MM, false, true, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
-        else
+        else {
+#if GV_MFMA4
+            /* o_proj (M*K = 32768 at M=4) and down (86016) miss the 32256-half staging budget and
+             * carry a third of the decode weight bytes, so the unstaged path must take the arm
+             * too or most of the win is left behind. */
+            if constexpr (MM >= 2) {
+                gemv_rows_mfma4<MM, false, gv_mfma4_un(MM), gv_mfma4_yt(MM)>(C, x, W, M, N, K,
+                                                                             slice, nblk, lds);
+                return;
+            }
+#endif
             gemv_rows<MM, false, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
+        }
     }
 }
 

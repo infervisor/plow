@@ -55,8 +55,25 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
                                 const bf16* __restrict__ residual, const float* __restrict__ hc_scale,
                                 const float* __restrict__ hc_base, unsigned T, unsigned n,
                                 unsigned hidden, unsigned sinkhorn_repeat, float rms_eps,
-                                float hc_eps, unsigned slice, unsigned nblk, float* part) {
-    const unsigned n3 = 2 * n + n * n;
+                                float hc_eps, unsigned slice, unsigned nblk, float* part,
+                                bool head_only = false) {
+    /* HEAD_ONLY — DeepSeek-V4's LEARNED GATED n -> 1 tower exit (`hc_head`,
+     * model.py:709-717), which is this op's `layer_input` half and nothing else:
+     *
+     *     pre[c] = sigmoid(mixes[c] * inv * hc_scale[0] + hc_base[c]) + hc_eps
+     *     y[d]   = SUM_c pre[c] * residual[c][d]
+     *
+     * -- term for term what reduction 2 below already computes. The differences are entirely
+     * in the SHAPE of the inputs: the head's projection is `hc_head_fn[n, n*hidden]`, so
+     * `mixes` is n wide rather than 2n+n^2, `hc_head_scale` is [1] and broadcasts, and there
+     * is no Sinkhorn, no `post` and no `comb` to produce. Reading `mrow[n..n3)` would read off
+     * the end of a head `mixes` row, so the flag skips the whole lane-0 block and leaves
+     * post_mix/comb_mix untouched (the emitter passes TENSOR_NONE for both).
+     *
+     * NOT op 122 mode 2. Mode 2's arithmetic mean is the right function for V4's OTHER n -> 1
+     * contraction -- the plain `h.mean(dim=2)` DSpark target taps at model.py:920 -- and the
+     * WRONG one here; the tower exit is gated and learned. Both survive.  [DSV4-MHC] */
+    const unsigned n3 = head_only ? n : (2 * n + n * n);
     const unsigned nh = n * hidden;
     __shared__ float logits[24]; /* n fixed at 4 — see the file header */
     __shared__ float comb_lds[16];
@@ -82,6 +99,8 @@ __device__ void d_hyperconn_pre(float* __restrict__ post_mix, float* __restrict_
                 const float v = (mrow[j] * inv) * hc_scale[0] + hc_base[j];
                 logits[j] = 1.0f / (1.0f + expf(-v)) + hc_eps;
             }
+        }
+        if (threadIdx.x == 0 && !head_only) {
             /* post_mix -> output directly, scaled by the compile-time post-mult constant. */
             for (unsigned j = 0; j < n; j++) {
                 const float v = (mrow[n + j] * inv) * hc_scale[1] + hc_base[n + j];

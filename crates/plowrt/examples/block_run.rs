@@ -8,6 +8,8 @@
 //!   block_run <asset-dir> bench --batch 1,2,4,8 --ctx 128,512,1024,4096
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
 //!                              [--pf-chunk N]
+//!   block_run <asset-dir> mixed-check --rows 128 --decode 1
+//!   block_run <asset-dir> packed-check
 //!
 //! `check` feeds a hidden-state into `act.x` (an .npy or a seeded synthetic),
 //! launches one prefill bucket, reads `act.x` back, and prints shape / min /
@@ -151,11 +153,11 @@ mod cuda {
         let mut args = std::env::args().skip(1);
         let asset = PathBuf::from(
             args.next()
-                .ok_or("usage: block_run <asset-dir> <check|bench> [flags]")?,
+                .ok_or("usage: block_run <asset-dir> <check|bench|mixed-check> [flags]")?,
         );
         let verb = args
             .next()
-            .ok_or("usage: block_run <asset-dir> <check|bench> [flags]")?;
+            .ok_or("usage: block_run <asset-dir> <check|bench|mixed-check> [flags]")?;
         let rest: Vec<String> = args.collect();
         let flag = |name: &str| -> Option<String> {
             rest.iter()
@@ -205,8 +207,338 @@ mod cuda {
                 }
                 bench(&mut e, hidden, &flag)
             }
-            other => Err(format!("unknown verb {other:?} (check|bench)").into()),
+            "mixed-check" => mixed_check(&mut e, &desc, hidden, &out_name, &flag),
+            "packed-check" => packed_check(&mut e, &desc, hidden, &out_name),
+            other => Err(format!("unknown verb {other:?} (check|bench|mixed-check)").into()),
         }
+    }
+
+    fn packed_check(
+        e: &mut plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        hidden: usize,
+        out_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use plowrt::exec::gpu::PfBatchReq;
+
+        let slots = [3usize, 15];
+        let starts = [31usize, 95];
+        let rows = [33usize, 31];
+        if !e.pf_batch_enabled()
+            || e.batch() <= slots[1]
+            || e.max_ctx() < starts[1] + rows[1]
+            || e.pf_max_rows() < rows.iter().sum()
+        {
+            return Err("packed-check asset lacks B16 packed-prefill capacity".into());
+        }
+        let prompts: Vec<Vec<u32>> = starts
+            .iter()
+            .zip(rows)
+            .enumerate()
+            .map(|(request, (&start, rows))| {
+                (0..start + rows + 1)
+                    .map(|position| 100 + ((position * 17 + request * 101) % 1000) as u32)
+                    .collect()
+            })
+            .collect();
+        let inputs = synth(rows.iter().sum(), hidden);
+
+        let prepare = |e: &mut plowrt::exec::gpu::GpuEngine| {
+            for request in 0..slots.len() {
+                e.begin_slot(slots[request], prompts[request].len() + 1)?;
+                e.upload_activation("act.x", &synth(starts[request], hidden))?;
+                e.prefill_batched(&[PfBatchReq {
+                    slot: slots[request],
+                    prompt: &prompts[request],
+                    c0: 0,
+                    len: starts[request],
+                }])?;
+            }
+            Ok::<_, plowrt::RuntimeError>(())
+        };
+
+        prepare(e)?;
+        let mut reference = Vec::new();
+        let mut row0 = 0;
+        for request in 0..slots.len() {
+            let row1 = row0 + rows[request];
+            e.upload_activation("act.x", &inputs[row0 * hidden..row1 * hidden])?;
+            e.prefill_batched(&[PfBatchReq {
+                slot: slots[request],
+                prompt: &prompts[request],
+                c0: starts[request],
+                len: rows[request],
+            }])?;
+            reference.push(e.download_activation(out_name)?[..rows[request] * hidden].to_vec());
+            row0 = row1;
+        }
+        let ranges: Vec<_> = (0..slots.len())
+            .map(|request| (slots[request], starts[request], rows[request]))
+            .collect();
+        let reference_kv = snapshot_kv_requests(e, desc, &ranges)?;
+
+        prepare(e)?;
+        e.upload_activation("act.x", &inputs)?;
+        let requests: Vec<_> = (0..slots.len())
+            .map(|request| PfBatchReq {
+                slot: slots[request],
+                prompt: &prompts[request],
+                c0: starts[request],
+                len: rows[request],
+            })
+            .collect();
+        e.prefill_batched(&requests)?;
+        let packed = e.download_activation(out_name)?;
+        let mut row0 = 0;
+        for (request, expected) in reference.iter().enumerate() {
+            let row1 = row0 + rows[request];
+            compare_f32(
+                &format!("packed request {request} activation"),
+                &packed[row0 * hidden..row1 * hidden],
+                expected,
+                6.0e-3,
+                7.5e-2,
+            )?;
+            row0 = row1;
+        }
+        compare_bf16(
+            "packed sparse-slot KV",
+            &snapshot_kv_requests(e, desc, &ranges)?,
+            &reference_kv,
+            6.0e-3,
+            5.0e-2,
+        )?;
+        println!(
+            "packed-check: sparse slots 3/15, absolute starts 31/95, ragged rows 33/31 parity=PASS"
+        );
+        Ok(())
+    }
+
+    fn mixed_check(
+        e: &mut plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        hidden: usize,
+        out_name: &str,
+        flag: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rows = flag("--rows").and_then(|s| s.parse().ok()).unwrap_or(128);
+        let decode_rows = flag("--decode").and_then(|s| s.parse().ok()).unwrap_or(1);
+        let spans = flag("--spans").and_then(|s| s.parse().ok()).unwrap_or(1);
+        if decode_rows == 0 || decode_rows + 1 > e.batch() || decode_rows >= rows {
+            return Err("mixed-check needs 0 < decode < rows and one free prefill slot".into());
+        }
+        if spans == 0 {
+            return Err("mixed-check needs at least one span".into());
+        }
+        let prefill_rows = rows - decode_rows;
+        for slot in 0..=decode_rows {
+            e.begin_slot(slot, spans * rows + 1)?;
+        }
+        let input = synth(rows * spans, hidden);
+        let prefill_tokens: Vec<_> = (0..prefill_rows * spans)
+            .map(|row| 200 + row as u32)
+            .collect();
+        let start = Instant::now();
+        let mut mixed_outputs = Vec::with_capacity(spans);
+        let mut mixed_kv = Vec::with_capacity(spans);
+        for span in 0..spans {
+            e.upload_activation(
+                "act.x",
+                &input[span * rows * hidden..(span + 1) * rows * hidden],
+            )?;
+            let decode: Vec<_> = (0..decode_rows)
+                .map(|slot| plow_asset::mixed_step::DecodeRequest {
+                    slot: slot as u32,
+                    state_slot: slot as u32,
+                    token: 100 + (span * decode_rows + slot) as u32,
+                })
+                .collect();
+            let pf_start = span * prefill_rows;
+            let prefill = [plow_asset::mixed_step::PrefillRequest {
+                slot: decode_rows as u32,
+                state_slot: decode_rows as u32,
+                start: pf_start as u32,
+                tokens: &prefill_tokens[pf_start..pf_start + prefill_rows],
+                prompt_len: prefill_tokens.len() as u32,
+            }];
+            e.mixed_step(rows as u32, &decode, &prefill, &mut [])?;
+            let out = e.download_activation(out_name)?;
+            if out[..rows * hidden].iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "mixed block output contains non-finite values at span {span}"
+                )
+                .into());
+            }
+            mixed_outputs.push(out[..rows * hidden].to_vec());
+            mixed_kv.push(snapshot_kv_range(
+                e,
+                desc,
+                decode_rows,
+                span,
+                prefill_rows,
+                pf_start,
+            )?);
+        }
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
+
+        for slot in 0..=decode_rows {
+            e.begin_slot(slot, spans * rows + 1)?;
+        }
+        for span in 0..spans {
+            let span_input = &input[span * rows * hidden..(span + 1) * rows * hidden];
+            e.upload_activation("act.x", &span_input[..decode_rows * hidden])?;
+            let feeds: Vec<_> = (0..decode_rows)
+                .map(|slot| (slot, 100 + (span * decode_rows + slot) as u32))
+                .collect();
+            let mut tokens = Vec::new();
+            e.step_slots(&feeds, &mut tokens)?;
+            let decode_out = e.download_activation(out_name)?;
+
+            e.upload_activation("act.x", &span_input[decode_rows * hidden..])?;
+            let pf_end = (span + 1) * prefill_rows;
+            e.prefill_slot(decode_rows, &prefill_tokens[..pf_end])?;
+            let prefill_out = e.download_activation(out_name)?;
+            let reference_kv = snapshot_kv_range(
+                e,
+                desc,
+                decode_rows,
+                span,
+                prefill_rows,
+                span * prefill_rows,
+            )?;
+            let mut reference_out = Vec::with_capacity(rows * hidden);
+            reference_out.extend_from_slice(&decode_out[..decode_rows * hidden]);
+            reference_out.extend_from_slice(&prefill_out[..prefill_rows * hidden]);
+            compare_f32(
+                &format!("span {span} activation"),
+                &mixed_outputs[span],
+                &reference_out,
+                6.0e-3,
+                7.5e-2,
+            )?;
+            compare_bf16(
+                &format!("span {span} written KV"),
+                &mixed_kv[span],
+                &reference_kv,
+                6.0e-3,
+                5.0e-2,
+            )?;
+        }
+        println!(
+            "mixed-check: rows={rows} decode={decode_rows} prefill_rows={prefill_rows} spans={spans} elapsed={elapsed_ms:.3} ms parity=PASS"
+        );
+        Ok(())
+    }
+
+    fn snapshot_kv_range(
+        e: &plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        decode_rows: usize,
+        decode_position: usize,
+        prefill_rows: usize,
+        prefill_position: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let ranges: Vec<_> = (0..decode_rows)
+            .map(|slot| (slot, decode_position, 1))
+            .chain(std::iter::once((
+                decode_rows,
+                prefill_position,
+                prefill_rows,
+            )))
+            .collect();
+        snapshot_kv_requests(e, desc, &ranges)
+    }
+
+    fn snapshot_kv_requests(
+        e: &plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        ranges: &[(usize, usize, usize)],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let heads = usize::try_from(desc.dims.kv_heads.ok_or("block has no KV-head count")?)?;
+        let head_dim = usize::try_from(desc.dims.head_dim.ok_or("block has no head dimension")?)?;
+        let row_bytes = head_dim.checked_mul(2).ok_or("KV row size overflow")?;
+        let mut out = Vec::new();
+        for state in &desc.carried_state {
+            if state.role != "kv" {
+                continue;
+            }
+            for name in &state.tensors {
+                let tensor_bytes = e
+                    .tensor_bytes(name)
+                    .ok_or_else(|| format!("missing carried-state tensor {name:?}"))?;
+                let slot_bytes = tensor_bytes / e.batch() as u64;
+                let head_bytes = slot_bytes / heads as u64;
+                for &(slot, position, written_rows) in ranges {
+                    for head in 0..heads {
+                        let offset = slot as u64 * slot_bytes
+                            + head as u64 * head_bytes
+                            + position as u64 * row_bytes as u64;
+                        let begin = out.len();
+                        out.resize(begin + written_rows * row_bytes, 0);
+                        e.read_tensor_range(name, offset, &mut out[begin..])?;
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err("block descriptor has no KV carried state".into());
+        }
+        Ok(out)
+    }
+
+    fn compare_f32(
+        what: &str,
+        got: &[f32],
+        reference: &[f32],
+        rel_l2_limit: f64,
+        abs_limit: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if got.len() != reference.len() {
+            return Err(format!("{what}: length {} != {}", got.len(), reference.len()).into());
+        }
+        let mut err2 = 0.0;
+        let mut ref2 = 0.0;
+        let mut max_abs = 0.0f64;
+        let mut max_ref = 0.0f64;
+        for (&a, &b) in got.iter().zip(reference) {
+            let delta = (a as f64 - b as f64).abs();
+            err2 += delta * delta;
+            ref2 += (b as f64) * (b as f64);
+            max_abs = max_abs.max(delta);
+            max_ref = max_ref.max((b as f64).abs());
+        }
+        let rel_l2 = (err2 / ref2.max(f64::MIN_POSITIVE)).sqrt();
+        let scaled_abs_limit = abs_limit + rel_l2_limit * max_ref;
+        println!("  {what}: rel_l2={rel_l2:.3e} max_abs={max_abs:.3e} max_ref={max_ref:.3e}");
+        if rel_l2 > rel_l2_limit || max_abs > scaled_abs_limit {
+            return Err(format!(
+                "{what} parity failed: rel_l2 {rel_l2:.3e} > {rel_l2_limit:.3e} or max_abs {max_abs:.3e} > {scaled_abs_limit:.3e}"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn compare_bf16(
+        what: &str,
+        got: &[u8],
+        reference: &[u8],
+        rel_l2_limit: f64,
+        abs_limit: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let decode = |bytes: &[u8]| {
+            bytes
+                .chunks_exact(2)
+                .map(|x| f32::from_bits(u32::from(u16::from_le_bytes([x[0], x[1]])) << 16))
+                .collect::<Vec<_>>()
+        };
+        compare_f32(
+            what,
+            &decode(got),
+            &decode(reference),
+            rel_l2_limit,
+            abs_limit,
+        )
     }
 
     fn check(

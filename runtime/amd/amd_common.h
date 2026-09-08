@@ -1141,19 +1141,84 @@ __device__ __forceinline__ float wave_sum(float v) {
     return v;
 }
 
+/* DPP/SWIZZLE HALF-WAVE REDUCTIONS. `__shfl_xor` has ONE lowering on gfx9 —
+ * `ds_bpermute_b32`, an LDS crossbar op — so each butterfly step is an LDS round trip with its
+ * own `s_waitcnt lgkmcnt`. Measured in the shipped 4-wave flash object, ONE KV tile of
+ * `d_flash_prefill<256>` is 1651 instructions of which 160 are ds_bpermute (16 accumulator rows
+ * x 5 steps x {max, sum}) and 163 are s_waitcnt: at 1 wave/SIMD there is no co-resident wave to
+ * hide any of that latency, and it is the largest single term in the softmax.
+ *
+ * DPP is a VALU operand modifier — no LDS, no waitcnt — and covers the xor-1/2/4/8 steps:
+ *   quad_perm[1,0,3,2] = lane^1, quad_perm[2,3,0,1] = lane^2, and once a quad (resp. octet)
+ *   holds a single value, ROW_HALF_MIRROR (lane^7) acts as lane^4 and ROW_MIRROR (lane^15) acts
+ *   as lane^8. Only the final xor-16 crosses a DPP row, and `ds_swizzle_b32` in bit-mask mode
+ *   does it in one LDS op with no address register.
+ *
+ * ORDER IS LOAD-BEARING FOR THE SUM AND FREE FOR THE MAX. f32 addition is not associative, so
+ * `half_wave_sum` keeps the original 16,8,4,2,1 tree exactly — xor-16/8/4 stay LDS (swizzle),
+ * only the last two steps become DPP. `fmaxf` is associative and commutative and exact, so
+ * `half_wave_max` runs ascending 1,2,4,8,16 and needs just one LDS op. Both are therefore
+ * BIT-IDENTICAL to the shfl form: 160 ds_bpermute per tile become 16 + 48 = 64 ds_swizzle.
+ *
+ * BOUND_CTRL:0 (a DPP source in an inactive lane reads as zero) rather than an identity `old`,
+ * which costs a materializing v_mov per step. Every call site reduces with a FULL wave — the K3
+ * ones sit under `if (wave == 0)` and give their out-of-range lanes the identity explicitly —
+ * and the ds_bpermute form reads undefined data from an inactive lane anyway, so neither form
+ * is defined for a partially-active reduction. */
+#ifndef PLOW_WAVE_RED_DPP
+#define PLOW_WAVE_RED_DPP 0
+#endif
+#if PLOW_WAVE_RED_DPP
+#define PLOW_DPP_XOR1 0xb1 /* quad_perm [1,0,3,2] */
+#define PLOW_DPP_XOR2 0x4e /* quad_perm [2,3,0,1] */
+#define PLOW_DPP_XOR4 0x141 /* row_half_mirror (lane^7; == lane^4 once quads are uniform)  */
+#define PLOW_DPP_XOR8 0x140 /* row_mirror      (lane^15; == lane^8 once octets are uniform) */
+/* ds_swizzle bit-mask mode, per group of 32 lanes: src = ((lane & and) | or) ^ xor. */
+#define PLOW_SWZ_XOR(x) ((((x) & 31) << 10) | 31)
+
+/* CTRL/PAT are template parameters: both builtins take a compile-time immediate. */
+template <int CTRL>
+__device__ __forceinline__ float plow_dpp_f32(float v, float ident) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(__float_as_int(ident), __float_as_int(v),
+                                                      CTRL, 0xf, 0xf, true));
+}
+template <int PAT>
+__device__ __forceinline__ float plow_swz_f32(float v) {
+    return __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), PAT));
+}
+#endif
+
 /* Reduce across the 32 lanes of a HALF-wave. The MFMA 32x32 accumulator layout
  * puts one output row entirely inside one half-wave (lanes 0-31 or 32-63), so a
  * row-wise softmax reduction must stop at 32 — going to 64 would fold two
  * different rows together. */
 __device__ __forceinline__ float half_wave_max(float v) {
+#if PLOW_WAVE_RED_DPP
+    v = fmaxf(v, plow_dpp_f32<PLOW_DPP_XOR1>(v, -INFINITY));
+    v = fmaxf(v, plow_dpp_f32<PLOW_DPP_XOR2>(v, -INFINITY));
+    v = fmaxf(v, plow_dpp_f32<PLOW_DPP_XOR4>(v, -INFINITY));
+    v = fmaxf(v, plow_dpp_f32<PLOW_DPP_XOR8>(v, -INFINITY));
+    v = fmaxf(v, plow_swz_f32<PLOW_SWZ_XOR(16)>(v));
+    return v;
+#else
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off, PLOW_WAVE));
     return v;
+#endif
 }
 __device__ __forceinline__ float half_wave_sum(float v) {
+#if PLOW_WAVE_RED_DPP
+    v += plow_swz_f32<PLOW_SWZ_XOR(16)>(v);
+    v += plow_swz_f32<PLOW_SWZ_XOR(8)>(v);
+    v += plow_swz_f32<PLOW_SWZ_XOR(4)>(v);
+    v += plow_dpp_f32<PLOW_DPP_XOR2>(v, 0.0f);
+    v += plow_dpp_f32<PLOW_DPP_XOR1>(v, 0.0f);
+    return v;
+#else
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, PLOW_WAVE);
     return v;
+#endif
 }
 
 /* ONE spelling of the logistic for the whole K3 family. `situ`'s gate branch and the MLA OUTPUT

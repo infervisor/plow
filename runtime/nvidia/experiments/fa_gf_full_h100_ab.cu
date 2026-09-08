@@ -527,7 +527,13 @@ __global__ void attention_prefill(AttentionArgs a) {
 template<int HD, int GF>
 static int attention_run(AttentionArgs a, cudaStream_t stream) {
     if (a.i[0] == 0) {
-        attention_decode<HD,GF><<<132,256,FA_DEC_SMEM_FLOATS(HD,GF)*4,stream>>>(a);
+        constexpr unsigned bytes = FA_DEC_SMEM_FLOATS(HD,GF)*4;
+        static const cudaError_t configured = bytes > 48 * 1024
+            ? cudaFuncSetAttribute(attention_decode<HD,GF>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize, bytes)
+            : cudaSuccess;
+        if (configured != cudaSuccess) return (int)configured;
+        attention_decode<HD,GF><<<132,256,bytes,stream>>>(a);
         cudaError_t rc = cudaGetLastError();
         if (rc != cudaSuccess) return (int)rc;
         attention_merge<HD><<<132,256,0,stream>>>(a);

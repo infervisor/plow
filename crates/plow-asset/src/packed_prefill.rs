@@ -1,10 +1,11 @@
 use crate::{live_kv, program::Packet};
-use packet::dev::{DevOp, TENSOR_NONE16};
+use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const SECTION: &str = "packed_prefill";
 pub const CAPABILITY: &str = "plow_pf_request_abi";
+pub const CAPABILITY_VALUE: u32 = 2;
 type Result<T> = std::result::Result<T, String>;
 fn need(ok: bool, text: &str) -> Result<()> {
     if ok {
@@ -12,6 +13,22 @@ fn need(ok: bool, text: &str) -> Result<()> {
     } else {
         Err(format!("packed prefill: {text}"))
     }
+}
+
+fn downstream_merge(insts: &[DevInst64], pc: usize) -> Result<&DevInst64> {
+    let d = &insts[pc];
+    // Layer scratch is reused after its merge has consumed the partials.
+    let mut merges = insts[pc + 1..]
+        .iter()
+        .take_while(|m| {
+            !(m.op == DevOp::FlashPrefill as u16 && m.t[..2].iter().any(|h| d.t[..2].contains(h)))
+        })
+        .filter(|m| m.op == DevOp::FlashMerge as u16 && m.t[1] == d.t[0] && m.t[2] == d.t[1]);
+    let merge = merges
+        .next()
+        .ok_or("packed prefill: missing downstream merge")?;
+    need(merges.next().is_none(), "one downstream merge required")?;
+    Ok(merge)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -91,7 +108,46 @@ impl Manifest {
             originals == live.maps.iter().map(|m| m.handle as u16).collect(),
             "descriptor table coverage",
         )?;
+        need(
+            !p.programs.iter().flat_map(|g| g.insts).any(|d| {
+                matches!(
+                    DevOp::from_u16(d.op),
+                    Some(DevOp::HeadNormRopeFp8 | DevOp::FlashPrefillFp8 | DevOp::FlashDecodeFp8)
+                )
+            }),
+            "FP8 KV is unsupported",
+        )?;
+        need(
+            !p.programs.iter().flat_map(|g| g.insts).any(|d| {
+                matches!(
+                    DevOp::from_u16(d.op),
+                    Some(
+                        DevOp::KdaConv
+                            | DevOp::KdaGate
+                            | DevOp::KdaStateStep
+                            | DevOp::KdaGatedNorm
+                            | DevOp::KdaConv3
+                            | DevOp::KdaStateStepG
+                            | DevOp::KdaConvStateStepG
+                            | DevOp::KdaChunkPrepare
+                            | DevOp::KdaChunkIntra
+                            | DevOp::KdaChunkWu
+                            | DevOp::KdaChunkCarry
+                            | DevOp::KdaDecodeFused
+                            | DevOp::QwenGdnConv
+                            | DevOp::QwenGdnStep
+                            | DevOp::QwenGdnConvPrefill
+                            | DevOp::QwenGdnQkvPrep
+                            | DevOp::QwenGdnGatePrep
+                            | DevOp::QwenGdnPrefill
+                    )
+                )
+            }),
+            "recurrent state is unsupported",
+        )?;
         for (pi, g) in p.programs.iter().enumerate() {
+            let mut flash_sites = 0usize;
+            let mut slot_writers = 0usize;
             if pi < p.prefill_count {
                 need(
                     self.programs[pi] == live_kv::program_digest(g),
@@ -115,6 +171,7 @@ impl Manifest {
                 }
                 let op = DevOp::from_u16(d.op).ok_or("packed opcode")?;
                 if op == DevOp::FlashPrefill {
+                    flash_sites += 1;
                     need(
                         matches!(d.i[6], 256 | 512) && d.i[7] > 0 && d.t[6] == TENSOR_NONE16,
                         "BF16 attention contract",
@@ -141,21 +198,7 @@ impl Manifest {
                     if d.t[5] == TENSOR_NONE16 {
                         extent(d.t[0], product(&[g.rows, d.i[2], d.i[6], d.i[7]], 4)?)?;
                         extent(d.t[1], product(&[g.rows, d.i[2], d.i[7]], 8)?)?;
-                        let merges: Vec<_> = g
-                            .insts
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, m)| {
-                                m.op == DevOp::FlashMerge as u16
-                                    && m.t[1] == d.t[0]
-                                    && m.t[2] == d.t[1]
-                            })
-                            .collect();
-                        need(
-                            merges.len() == 1 && merges[0].0 > pc,
-                            "one downstream merge required",
-                        )?;
-                        let merge = merges[0].1;
+                        let merge = downstream_merge(g.insts, pc)?;
                         need(
                             merge.i[..4] == [g.rows, d.i[2], d.i[7], d.i[6]],
                             "merge geometry",
@@ -196,13 +239,20 @@ impl Manifest {
                 }
                 if op == DevOp::HeadNormRope {
                     need(d.t[6] == TENSOR_NONE16, "existing slot map")?;
+                    slot_writers += usize::from(d.fj[1] != 0);
                 }
                 if op == DevOp::FlashMerge {
                     need(
-                        d.t[3..].iter().all(|&h| h == TENSOR_NONE16),
-                        "merge optional operands",
+                        d.t[4..].iter().all(|&h| h == TENSOR_NONE16),
+                        "merge request operand",
                     )?;
                 }
+            }
+            if pi < p.prefill_count {
+                need(
+                    flash_sites > 0 && slot_writers > 0,
+                    "request-aware attention and KV writer required",
+                )?;
             }
         }
         Ok(())
@@ -266,24 +316,47 @@ pub fn plan(
         out.mapped_ends.push((r.slot, end as u32));
         total = next;
     }
-    let last = requests.last().unwrap();
-    let end = last.start + last.len;
-    let padded = end
-        .checked_add(bucket - total)
-        .ok_or("packed padding overflow")?;
-    need(
-        padded <= max_ctx,
-        "padding exceeds physical context; clamping forbidden",
-    )?;
+    let padding = bucket - total;
+    let (padding_index, padding_request, padded) = requests
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, request)| {
+            let end = request.start.checked_add(request.len)?;
+            let padded = end.checked_add(padding)?;
+            (padded <= max_ctx).then_some((index, request, padded))
+        })
+        .ok_or("packed prefill: padding exceeds every request's physical context")?;
+    let end = padding_request.start + padding_request.len;
     out.slots
-        .extend(std::iter::repeat_n(last.slot as i32, bucket - total));
+        .extend(std::iter::repeat_n(padding_request.slot as i32, padding));
     out.positions.extend((end..padded).map(|x| x as i32));
-    out.mapped_ends.last_mut().unwrap().1 = padded as u32;
+    out.mapped_ends[padding_index].1 = padded as u32;
     Ok(out)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layer_scratch_reuse_requires_a_merge_before_overwrite() {
+        let mut flash = DevInst64 {
+            op: DevOp::FlashPrefill as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [TENSOR_NONE16; 8],
+            i: [0; 8],
+        };
+        flash.t[..2].copy_from_slice(&[0, 1]);
+        let mut merge = flash;
+        merge.op = DevOp::FlashMerge as u16;
+        merge.t[..3].copy_from_slice(&[2, 0, 1]);
+        let chain = [flash, merge, flash, merge];
+        assert!(downstream_merge(&chain, 0).is_ok());
+        assert!(downstream_merge(&chain, 2).is_ok());
+        assert!(downstream_merge(&[flash, flash, merge], 0).is_err());
+        assert!(downstream_merge(&[merge, flash], 1).is_err());
+        assert!(downstream_merge(&[flash, merge, merge], 0).is_err());
+    }
     #[test]
     fn ragged_physical_slots_and_padding() {
         let mut f = vec![0; 16];
@@ -346,6 +419,34 @@ mod tests {
             ..r
         };
         assert!(plan(&[tail], &[7], 2, 8).is_err());
+    }
+    #[test]
+    fn padding_uses_a_request_with_remaining_context_capacity() {
+        let frontiers = [2, 7];
+        let p = plan(
+            &[
+                Request {
+                    slot: 0,
+                    start: 2,
+                    len: 2,
+                    prompt: 8,
+                },
+                Request {
+                    slot: 1,
+                    start: 7,
+                    len: 1,
+                    prompt: 8,
+                },
+            ],
+            &frontiers,
+            4,
+            8,
+        )
+        .unwrap();
+        assert_eq!(p.table, [2, 0, 2, 0, 4, 2, 1, 1, 8]);
+        assert_eq!(p.slots, [0, 0, 1, 0]);
+        assert_eq!(p.positions, [2, 3, 7, 4]);
+        assert_eq!(p.mapped_ends, [(0, 5), (1, 8)]);
     }
     #[test]
     fn real_partial_rows_and_padding_have_disjoint_ownership() {

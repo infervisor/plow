@@ -122,3 +122,55 @@ fn a_legacy_rope_scaling_object_is_refused() {
         "rope_scaling": { "type": "linear", "factor": 4.0 },
     }));
 }
+
+/// `require_mla_geometry` refuses every MLA shape no kernel in this tree is instantiated for.
+///
+/// The failure it exists to prevent is the worst class in the emitter, because it is not a
+/// missing arm — which on AMD merely writes nothing — but a PRESENT arm reading a shape it was
+/// not built for: every MLA dispatch site hardcodes `<512, ...>`, so a `kv_lora_rank` of 384
+/// would emit correctly-shaped tensors and have the kernel read 512 elements out of each
+/// 384-wide latent row, past the end of the cache.
+#[test]
+fn an_unsupported_mla_geometry_is_refused_at_the_config_parse() {
+    let bad = |dk: u32, dr: u32, vd: u32| -> String {
+        let e = std::panic::catch_unwind(move || super::require_mla_geometry(dk, dr, vd, "probe"))
+            .expect_err("must refuse");
+        e.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default()
+    };
+
+    // The two geometries that ARE instantiated, both of which must pass.
+    super::require_mla_geometry(512, 64, 128, "deepseek/glm/k2.7");
+    super::require_mla_geometry(512, 0, 256, "nope");
+
+    // A latent width no kernel is built for. The message must name the value, the constant, and
+    // WHY it is not a config knob — an operator who reads only "unsupported" will try to make it
+    // supported by editing the config.
+    let m = bad(384, 64, 128);
+    assert!(m.contains("384") && m.contains("512"), "names both widths: {m}");
+    assert!(m.contains("TEMPLATE ARGUMENT"), "says why it is fixed: {m}");
+    assert!(m.contains("op_attention.h"), "names the fix site: {m}");
+
+    // An uninstantiated rope width. Distinguished from the DK case on purpose: DR is general in
+    // the body (the zero-rope arm made it so), so this refusal says "not qualified", not
+    // "impossible", and points at the coverage that would qualify it.
+    let m = bad(512, 96, 128);
+    assert!(m.contains("96"), "names the value: {m}");
+    assert!(m.contains("mla_gfx950_test.c"), "names the coverage to add: {m}");
+
+    // A v_head_dim that makes the fold's fast map unreachable in every arm. Correct output, 7.7x
+    // slower, and completely silent about it — which is why it is refused rather than tolerated.
+    for vd in [0u32, 2, 130] {
+        let m = bad(512, 64, vd);
+        assert!(
+            m.contains("PLOW_MLA_FOLD_VEC"),
+            "v_head_dim={vd} must name the constant it violates: {m}"
+        );
+    }
+    // ...and the multiples of 4 that surround them are accepted.
+    for vd in [4u32, 128, 132, 256] {
+        super::require_mla_geometry(512, 64, vd, "probe");
+    }
+}

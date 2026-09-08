@@ -268,6 +268,7 @@ const EMITTER_SRC: &[&str] = &[
     "kda.rs",
     "k3.rs",
     "mla/kimi_k3.rs",
+    "qwen35.rs",
 ];
 
 /// Arms gfx950 dispatches that NOTHING emits, each with why that is deliberate.
@@ -581,7 +582,10 @@ fn dense_mxfp4_is_not_silently_bf16() {
     let raw = std::fs::read(&out).expect("emitted packet");
     let mxfp4 = [DevOp::GemvMxfp4 as u16, DevOp::GemvGluMxfp4 as u16]
         .iter()
-        .any(|op| raw.windows(2).any(|w| u16::from_le_bytes([w[0], w[1]]) == *op));
+        .any(|op| {
+            raw.windows(2)
+                .any(|w| u16::from_le_bytes([w[0], w[1]]) == *op)
+        });
     assert!(
         mxfp4,
         "PLOW_MXFP4=1 emitted a packet with no MXFP4 opcode. It is byte-identical to the bf16 one \

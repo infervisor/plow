@@ -155,6 +155,36 @@ GEMM_VARIANT(gemm_c3, 128, 128, 64)
 GEMM_VARIANT(gemm_c4, 64, 128, 64)  /* the small tile: for shapes that cannot fill 256 CUs */
 #endif
 
+/* The wave-grid legality `d_gemm_t` static_asserts (op_gemm.h:463), lifted out so a rung can be
+ * OFFERED to both wave counts and compiled only where it is legal. BN=64 exists only at 4 waves
+ * (GM_WN=2); at 8 waves GM_WN=4 pins BN to a multiple of 128. */
+#define GM_TILE_LEGAL(BM, BN) ((BM) % (GM_WM * 32) == 0 && (BN) % (GM_WN * 32) == 0)
+
+/* EXPERIMENTAL RUNGS. Bench-only: no opcode, no `tunedb` rung, no emit path. They exist so
+ * `gemm_tile_sweep` can price the two escapes the M=128 occupancy wall leaves — a narrower BN
+ * (only reachable at 4 waves) and a deeper BK — against the shipping ladder on the same shapes
+ * and the same clock, before either is built into the interpreter. `gemm_tile_sweep`'s TILES
+ * table carries the matching entries; a symbol that is illegal or does not fit is simply absent
+ * and the sweep skips it. */
+#if GM_TILE_FITS(64, 64, 64) && GM_TILE_LEGAL(64, 64)
+GEMM_VARIANT(gemm_e0, 64, 64, 64)
+#endif
+#if GM_TILE_FITS(64, 64, 128) && GM_TILE_LEGAL(64, 64)
+GEMM_VARIANT(gemm_e1, 64, 64, 128)
+#endif
+#if GM_TILE_FITS(64, 128, 128) && GM_TILE_LEGAL(64, 128)
+GEMM_VARIANT(gemm_e2, 64, 128, 128)
+#endif
+#if GM_TILE_FITS(128, 64, 64) && GM_TILE_LEGAL(128, 64)
+GEMM_VARIANT(gemm_e3, 128, 64, 64)
+#endif
+#if GM_TILE_FITS(64, 192, 64) && GM_TILE_LEGAL(64, 192)
+GEMM_VARIANT(gemm_e4, 64, 192, 64)
+#endif
+#if GM_TILE_FITS(128, 128, 128) && GM_TILE_LEGAL(128, 128)
+GEMM_VARIANT(gemm_e5, 128, 128, 128)
+#endif
+
 /* FP8 (w8a8) GEMM variants — same tile family, fp8 operands, dequant epilogue. LDS is bytes, so
  * the tile fits in HALF the halves the bf16 arena reserves (rounded up to a whole bf16 count). */
 #define GEMM_FP8_VARIANT(NAME, BM, BN, BK)                                          \
@@ -167,6 +197,9 @@ GEMM_VARIANT(gemm_c4, 64, 128, 64)  /* the small tile: for shapes that cannot fi
     }
 #if GM_TILE_FITS(256, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c0, 256, 256, 64)
+#endif
+#if GM_TILE_FITS(128, 256, 64)
+GEMM_FP8_VARIANT(gemm_fp8_c2, 128, 256, 64) /* GemmWideFp8: the fifth selectable fp8 rung */
 #endif
 #if GM_TILE_FITS(128, 128, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c3, 128, 128, 64)
@@ -788,6 +821,53 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
     d_flash_merge<128>(O, Opart, mlpart, n_batch, n_head, nsplit, blockIdx.x, gridDim.x);
 }
 
+/* D=64 (GPT-OSS). The arms the interpreter gained with the hd=64 dispatch hole; wrappers so the
+ * golden harness can reach them at all — without these the only proof they work was that the
+ * blob stopped writing zeros. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_flash_prefill_64(
+    float* Opart, float* mlpart, const bf16* Q, const bf16* K, const bf16* V, unsigned n_q,
+    unsigned n_kv, unsigned n_head, unsigned n_kv_head, unsigned q_pos0, unsigned window,
+    float scale, unsigned nsplit) {
+    __shared__ bf16 lds[FA_LDS_HALVES(64)];
+    d_flash_prefill<64>(Opart, mlpart, /*O_final=*/nullptr, Q, K, V, n_q, n_kv, n_head, n_kv_head,
+                        q_pos0, window, scale, n_kv, PLOW_KV_MASK_NONE, nsplit, blockIdx.x,
+                        gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, FA_DEC_WPEU) void gemma_flash_decode_64(
+    float* Opart, float* mlpart, const bf16* Q, const bf16* K, const bf16* V, const int* kv_len,
+    unsigned n_batch, unsigned n_head, unsigned n_kv_head, unsigned kv_stride, unsigned window,
+    float scale, unsigned nsplit) {
+    __shared__ float lds[FA_DEC_LDS_FLOATS(64, PLOW_FA_GF(64))];
+    d_flash_decode<64, PLOW_FA_GF(64)>(Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head,
+                                       kv_stride, window, scale, nsplit, PLOW_KV_MASK_NONE,
+                                       blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_flash_merge_64(
+    bf16* O, const float* Opart, const float* mlpart, unsigned n_batch, unsigned n_head,
+    unsigned nsplit) {
+    d_flash_merge<64>(O, Opart, mlpart, n_batch, n_head, nsplit, blockIdx.x, gridDim.x);
+}
+
+/* ATTENTION-SINK merges (dev_isa.h op 13 t3). Separate symbols rather than a trailing `sinks`
+ * argument on the wrappers above, because the existing harnesses (attention_gfx950_test,
+ * decode_bench_gfx942) build their kernarg struct by hand and a widened signature would read
+ * past their packet silently instead of failing to link. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void gemma_flash_merge_64_sinks(bf16* O, const float* Opart, const float* mlpart,
+                                const bf16* sinks, unsigned n_batch, unsigned n_head,
+                                unsigned nsplit) {
+    d_flash_merge<64>(O, Opart, mlpart, n_batch, n_head, nsplit, blockIdx.x, gridDim.x, sinks);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void gemma_flash_merge_128_sinks(bf16* O, const float* Opart, const float* mlpart,
+                                 const bf16* sinks, unsigned n_batch, unsigned n_head,
+                                 unsigned nsplit) {
+    d_flash_merge<128>(O, Opart, mlpart, n_batch, n_head, nsplit, blockIdx.x, gridDim.x, sinks);
+}
+
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_flash_prefill_256(
     float* Opart, float* mlpart, const bf16* Q, const bf16* K, const bf16* V, unsigned n_q,
     unsigned n_kv, unsigned n_head, unsigned n_kv_head, unsigned q_pos0, unsigned window,
@@ -923,6 +1003,57 @@ void mla_flash_prefill_mfma_fp8_512(float* Opart, float* mlpart, const bf16* Qab
 }
 #endif
 
+/* The V2 (full-column-wave) MLA prefill on the BF16 latent — the arm GLM/DeepSeek serve.
+ * The fp8 wrapper below covers the same body only on the fp8-latent template arm. Dense,
+ * ns=1, no ofold, so the harness can normalize its (Opart, l) against the decode oracle. */
+extern "C" __global__ __launch_bounds__(256, 1)
+void mla_flash_prefill_v2_512(float* Opart, float* mlpart, const bf16* Qabs,
+                              const bf16* Qrope, const bf16* Ckv, const bf16* Krope,
+                              const int* kv_len, unsigned n_batch, unsigned n_tok,
+                              unsigned n_head, unsigned kv_stride, unsigned window,
+                              float scale) {
+    __shared__ bf16 lds[FA_MLA_PF2_LDS_BYTES(512, 64) / 2];
+    d_flash_mla_prefill_v2<512, 64, false, false>(
+        Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_tok, n_head, kv_stride,
+        window, scale, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds);
+}
+
+/* The ZERO-ROPE (NoPE) V2 prefill — `d_flash_mla_prefill_v2<512, 0>`.
+ *
+ * Same body, DR=0: no Qrope/Krope operand at all (they are not merely zero, they are absent —
+ * the harness passes NULL, so a staging path that still read them would fault rather than
+ * quietly load zeros and pass). The slab is DK wide instead of DK+DR, which is why this needs
+ * its own LDS array rather than reusing the roped one's size.
+ *
+ * The harness runs this against a fixture case whose rope tables are identically zero, so the
+ * f64/CPU golden for that case IS the NoPE golden, and additionally memcmps it against the
+ * <512,64> body on the same case — where the rope k-tiles contribute exactly +0.0 and must
+ * therefore not move a single bit. That pair is what pins the `if constexpr (DR > 0)` guards. */
+extern "C" __global__ __launch_bounds__(256, 1)
+void mla_flash_prefill_v2_nope_512(float* Opart, float* mlpart, const bf16* Qabs,
+                                   const bf16* Ckv, const int* kv_len, unsigned n_batch,
+                                   unsigned n_tok, unsigned n_head, unsigned kv_stride,
+                                   unsigned window, float scale) {
+    __shared__ bf16 lds[FA_MLA_PF2_LDS_BYTES(512, 0) / 2];
+    d_flash_mla_prefill_v2<512, 0, false, false>(
+        Opart, mlpart, Qabs, nullptr, Ckv, nullptr, kv_len, n_batch, n_tok, n_head,
+        kv_stride, window, scale, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds);
+}
+
+/* Same body on the GATHER arm: the per-64-query-tile union walk op 119 builds. DeepSeek-V4's
+ * CSA layers select 128 window + <=512 compressed rows per query out of one cache. */
+extern "C" __global__ __launch_bounds__(256, 1)
+void mla_flash_prefill_v2_nope_gather_512(float* Opart, float* mlpart, const bf16* Qabs,
+                                          const bf16* Ckv, const int* kv_len,
+                                          const unsigned char* uni, unsigned cap,
+                                          unsigned n_batch, unsigned n_tok, unsigned n_head,
+                                          unsigned kv_stride, float scale) {
+    __shared__ bf16 lds[(FA_MLA_PF2_LDS_BYTES(512, 0) + 256) / 2];
+    d_flash_mla_prefill_v2<512, 0, /*GATHER=*/true, false>(
+        Opart, mlpart, Qabs, nullptr, Ckv, nullptr, kv_len, n_batch, n_tok, n_head,
+        kv_stride, 0u, scale, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds, uni, cap);
+}
+
 extern "C" __global__ __launch_bounds__(256, 1)
 void mla_flash_prefill_v2_fp8_512(float* Opart, float* mlpart, const bf16* Qabs,
                                   const bf16* Qrope, const bf16* Ckv, const bf16* Krope,
@@ -997,6 +1128,19 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_m
     __shared__ float olds[512 + PLOW_WAVES * 32];
     d_mla_merge_fold<512, 32>(O, Opart, mlpart, Wuv, n_batch, n_head, V, nsplit, blockIdx.x,
                               gridDim.x, olds);
+}
+
+/* The third dispatched tile. `exec_mla_merge_fold` routes V in [128, 256) here (Kimi-K3's
+ * v_head_dim=128 at TP1 / batch>=2) and, since the V<128 arm landed, sends every V that is a
+ * nonzero multiple of PLOW_MLA_FOLD_VT below 128 to the VT=32 wrapper above. Both of those
+ * routings were untested: the fold had a BENCH (runtime/tests/decode_bench_gfx942.c) and no
+ * oracle at all, which is how the 7.7x scalar fallback survived unnoticed. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_merge_fold_512_v128(
+    bf16* O, const float* Opart, const float* mlpart, const bf16* Wuv, unsigned n_batch,
+    unsigned n_head, unsigned V, unsigned nsplit) {
+    __shared__ float olds[512 + PLOW_WAVES * 128];
+    d_mla_merge_fold<512, 128>(O, Opart, mlpart, Wuv, n_batch, n_head, V, nsplit, blockIdx.x,
+                               gridDim.x, olds);
 }
 
 /* DSA lightning-indexer score (DI=index_head_dim=128). score[t] = sum_h w[h]*ReLU(q[h].k[t]). */

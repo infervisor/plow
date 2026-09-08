@@ -32,6 +32,10 @@
 #include <cstring>
 #include <vector>
 
+#ifndef PLOW_PACKET_LINEAR_BIAS
+#define PLOW_PACKET_LINEAR_BIAS 1
+#endif
+
 #include "sm120_common.cuh"   /* pulls op_attention.cuh (flash + bf16v8/reductions) */
 #include "op_norm.cuh"
 #include "op_elementwise.cuh"
@@ -157,7 +161,8 @@ __global__ void k_flash_merge(bf16* O, const float* Opart, const float* mlpart,
     d_flash_merge<D>(O, Opart, mlpart, nb, nh, nsplit, blockIdx.x, gridDim.x);
 }
 template <int D, int GF>
-static void test_flash(const char* label, unsigned nh, unsigned nkv, unsigned len) {
+static void test_flash(const char* label, unsigned nh, unsigned nkv, unsigned len,
+                       unsigned window = 0) {
     seed(0x2000u + D + nh*13 + len);
     const unsigned nb=1, nsplit=4, kvs=len;
     const float scale = 1.0f/sqrtf((float)D);
@@ -172,10 +177,13 @@ static void test_flash(const char* label, unsigned nh, unsigned nkv, unsigned le
         const unsigned hkv=h/gqa;
         std::vector<float> s(len); float mx=-INFINITY;
         for (unsigned r=0;r<len;r++){
+            if (window && len - 1 - r >= window) { s[r] = -INFINITY; continue; }
             double dot=0; for (unsigned d=0;d<D;d++) dot += (double)Q[(size_t)h*D+d]*K[((size_t)hkv*kvs+r)*D+d];
             s[r]=(float)dot*scale; if (s[r]>mx) mx=s[r];
         }
-        float sum=0; for (unsigned r=0;r<len;r++){ s[r]=expf(s[r]-mx); sum+=s[r]; }
+        float sum=0; for (unsigned r=0;r<len;r++){
+            s[r] = s[r] == -INFINITY ? 0.0f : expf(s[r]-mx); sum+=s[r];
+        }
         for (unsigned d=0;d<D;d++){ double a=0;
             for (unsigned r=0;r<len;r++) a += (s[r]/sum)*V[((size_t)hkv*kvs+r)*D+d];
             Oref[(size_t)h*D+d]=(float)a; }
@@ -185,12 +193,50 @@ static void test_flash(const char* label, unsigned nh, unsigned nkv, unsigned le
     bf16* dO=dev_bf((size_t)nb*nh*D);
     const unsigned n_work = nb*(nh/GF)*nsplit;
     const size_t smem = (size_t)FA_DEC_SMEM_FLOATS(D,GF)*sizeof(float);
-    k_flash_decode<D,GF><<<n_work,256,smem>>>(dOp,dMl,dQ,dK,dV,dL,nb,nh,nkv,kvs,0/*full*/,scale,nsplit);
+    k_flash_decode<D,GF><<<n_work,256,smem>>>(dOp,dMl,dQ,dK,dV,dL,nb,nh,nkv,kvs,window,scale,nsplit);
     CK(cudaDeviceSynchronize());
     k_flash_merge<D><<<nb*nh,256>>>(dO,dOp,dMl,nb,nh,nsplit);
     CK(cudaDeviceSynchronize());
     report(label, Oref, from_dev(dO,(size_t)nb*nh*D), true);
     cudaFree(dQ);cudaFree(dK);cudaFree(dV);cudaFree(dL);cudaFree(dOp);cudaFree(dMl);cudaFree(dO);
+}
+
+template <int D>
+__global__ void k_flash_merge_sink(bf16* O, const float* Opart, const float* mlpart,
+                                   const bf16* sinks, unsigned nb, unsigned nh,
+                                   unsigned nsplit) {
+    d_flash_merge<D, true>(O, Opart, mlpart, nb, nh, nsplit, blockIdx.x, gridDim.x,
+                           nullptr, sinks);
+}
+template <int D>
+static void test_flash_merge_sink(const char* label, unsigned nh, unsigned nsplit) {
+    seed(0x2800u + D + nh + nsplit);
+    std::vector<float> op = gen_bf16((size_t)nh*nsplit*D, 0.5f);
+    std::vector<float> ml((size_t)nh*nsplit*2), sinks = gen_bf16(nh, 2.0f);
+    for (unsigned h=0; h<nh; h++) for (unsigned s=0; s<nsplit; s++) {
+        ml[((size_t)h*nsplit+s)*2] = rnd()*2.0f;
+        ml[((size_t)h*nsplit+s)*2+1] = 0.25f + fabsf(rnd());
+    }
+    std::vector<float> ref((size_t)nh*D);
+    for (unsigned h=0; h<nh; h++) {
+        float sink = sinks[h] * 1.4426950408889634f;
+        float gm = sink;
+        for (unsigned s=0; s<nsplit; s++) gm=fmaxf(gm,ml[((size_t)h*nsplit+s)*2]);
+        float den=exp2f(sink-gm);
+        for (unsigned s=0; s<nsplit; s++)
+            den += ml[((size_t)h*nsplit+s)*2+1]*exp2f(ml[((size_t)h*nsplit+s)*2]-gm);
+        for (unsigned d=0; d<D; d++) {
+            float num=0;
+            for (unsigned s=0; s<nsplit; s++)
+                num += op[((size_t)h*nsplit+s)*D+d]*exp2f(ml[((size_t)h*nsplit+s)*2]-gm);
+            ref[(size_t)h*D+d]=bf16_rt(num/den);
+        }
+    }
+    float *dop=to_dev_f(op), *dml=to_dev_f(ml); bf16 *ds=to_dev(sinks), *dout=dev_bf((size_t)nh*D);
+    k_flash_merge_sink<D><<<nh,256>>>(dout,dop,dml,ds,1,nh,nsplit);
+    CK(cudaDeviceSynchronize());
+    report(label,ref,from_dev(dout,(size_t)nh*D),true,1e-3);
+    cudaFree(dop);cudaFree(dml);cudaFree(ds);cudaFree(dout);
 }
 
 /* ==================== NORM_RESIDUAL_NORM / NORM_RESIDUAL ================== */
@@ -265,6 +311,70 @@ __global__ void k_gemm(bf16* C, const bf16* A, const bf16* B, unsigned m, unsign
                        unsigned a_row0) {
     extern __shared__ bf16 smg[];
     d_gemm(C, A, B, m, n, k, a_row0, blockIdx.x, gridDim.x, smg);
+}
+#if defined(PLOW_NV_HOPPER) && PLOW_PACKET_LINEAR_BIAS
+__global__ void k_gemm_bias(bf16* C, const bf16* A, const bf16* B, const bf16* bias,
+                            unsigned m, unsigned n, unsigned k) {
+    extern __shared__ bf16 smg[];
+    d_gemm_bias(C,A,B,bias,m,n,k,0,blockIdx.x,gridDim.x,smg);
+}
+#endif
+__global__ void k_gemv_bias(bf16* C, const bf16* A, const bf16* B, const bf16* bias,
+                            unsigned m, unsigned n, unsigned k) {
+    d_gemv_bias(C,A,B,bias,m,n,k,blockIdx.x,gridDim.x);
+}
+__global__ void k_gemv_qkv_bias(bf16* cq, bf16* ck, bf16* cv, const bf16* x,
+                                const bf16* wq, const bf16* wk, const bf16* wv,
+                                const bf16* bq, const bf16* bk, const bf16* bv,
+                                unsigned nq, unsigned nk, unsigned nv, unsigned k) {
+    d_gemv_qkv_bias(cq,ck,cv,x,wq,wk,wv,bq,bk,bv,1,nq,nk,nv,k,blockIdx.x,gridDim.x);
+}
+static void test_linear_bias(const char* label, unsigned m, unsigned n, unsigned k,
+                             bool prefill) {
+    seed(0x5300u + m+n+k);
+    std::vector<float> A=gen_bf16((size_t)m*k,1.0f), B=gen_bf16((size_t)n*k,1.0f);
+    std::vector<float> bias=gen_bf16(n,0.5f), ref((size_t)m*n);
+    for(unsigned i=0;i<m;i++) for(unsigned j=0;j<n;j++) { double acc=0;
+        for(unsigned kk=0;kk<k;kk++) acc+=(double)A[(size_t)i*k+kk]*B[(size_t)j*k+kk];
+        ref[(size_t)i*n+j]=bf16_rt((float)acc+bias[j]);
+    }
+    bf16 *da=to_dev(A),*db=to_dev(B),*dx=to_dev(bias),*dc=dev_bf((size_t)m*n);
+    if(prefill) {
+#if defined(PLOW_NV_HOPPER) && PLOW_PACKET_LINEAR_BIAS
+        size_t smem=(size_t)PGM_ARENA_BF16*sizeof(bf16);
+        CK(cudaFuncSetAttribute(k_gemm_bias,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)smem));
+        k_gemm_bias<<<188,256,smem>>>(dc,da,db,dx,m,n,k);
+#else
+        printf("  %-40s SKIP (requires Hopper)\n",label);
+#endif
+    } else k_gemv_bias<<<64,256>>>(dc,da,db,dx,m,n,k);
+    CK(cudaDeviceSynchronize());
+    report(label,ref,from_dev(dc,(size_t)m*n),true);
+    cudaFree(da);cudaFree(db);cudaFree(dx);cudaFree(dc);
+}
+static void test_qkv_bias(const char* label) {
+    constexpr unsigned K=256,NQ=128,NK=64,NV=64;
+    seed(0x5380u);
+    std::vector<float> x=gen_bf16(K,1.0f), wq=gen_bf16((size_t)NQ*K,1.0f),
+        wk=gen_bf16((size_t)NK*K,1.0f), wv=gen_bf16((size_t)NV*K,1.0f),
+        bq=gen_bf16(NQ,.5f),bk=gen_bf16(NK,.5f),bv=gen_bf16(NV,.5f);
+    auto ref=[&](const std::vector<float>& w,const std::vector<float>& b,unsigned n) {
+        std::vector<float> o(n); for(unsigned i=0;i<n;i++){ double a=0;
+            for(unsigned k=0;k<K;k++) a+=(double)x[k]*w[(size_t)i*K+k];
+            o[i]=bf16_rt((float)a+b[i]); } return o;
+    };
+    auto rq=ref(wq,bq,NQ),rk=ref(wk,bk,NK),rv=ref(wv,bv,NV);
+    bf16 *dx=to_dev(x),*dwq=to_dev(wq),*dwk=to_dev(wk),*dwv=to_dev(wv),
+         *dbq=to_dev(bq),*dbk=to_dev(bk),*dbv=to_dev(bv),
+         *dq=dev_bf(NQ),*dk=dev_bf(NK),*dv=dev_bf(NV);
+    k_gemv_qkv_bias<<<64,256>>>(dq,dk,dv,dx,dwq,dwk,dwv,dbq,dbk,dbv,NQ,NK,NV,K);
+    CK(cudaDeviceSynchronize());
+    std::vector<float> all=rq, got=from_dev(dq,NQ); all.insert(all.end(),rk.begin(),rk.end());
+    all.insert(all.end(),rv.begin(),rv.end()); auto gk=from_dev(dk,NK),gv=from_dev(dv,NV);
+    got.insert(got.end(),gk.begin(),gk.end());got.insert(got.end(),gv.begin(),gv.end());
+    report(label,all,got,true);
+    cudaFree(dx);cudaFree(dwq);cudaFree(dwk);cudaFree(dwv);cudaFree(dbq);cudaFree(dbk);
+    cudaFree(dbv);cudaFree(dq);cudaFree(dk);cudaFree(dv);
 }
 __global__ void k_gemm_glu(bf16* C, const bf16* A, const bf16* Wg, const bf16* Wu, unsigned m,
                            unsigned n, unsigned k, unsigned act) {
@@ -1538,11 +1648,15 @@ int main() {
            "flash/headnorm/norm ops MUST fail ***\n");
 #endif
     printf("\n== headnorm+rope ==\n");
+    test_headnorm_rope<64>("headnorm_rope hd64 t3 h8", 3, 8);
     test_headnorm_rope<128>("headnorm_rope hd128 t3 h8", 3, 8);
     test_headnorm_rope<256>("headnorm_rope hd256 t3 h4", 3, 4);
     test_headnorm_rope<512>("headnorm_rope hd512 t3 h4", 3, 4);
 
     printf("\n== flash decode+merge ==\n");
+    test_flash<64,8>("flash hd64 GF8 h64 kv8 len40", 64, 8, 40);
+    test_flash<64,8>("flash hd64 GF8 h64 kv8 len300 win128", 64, 8, 300, 128);
+    test_flash_merge_sink<64>("flash merge hd64 sinks h64 ns4", 64, 4);
     test_flash<128,4>("flash hd128 GF4 h8 kv2 len40", 8, 2, 40);
     test_flash<256,2>("flash hd256 GF2 h4 kv2 len40", 4, 2, 40);
     test_flash<512,2>("flash hd512 GF2 h4 kv1 len40", 4, 1, 40);
@@ -1562,6 +1676,9 @@ int main() {
     test_softcap("softcap n=262144 cap=30", 262144, 30.0f);
 
     printf("\n== prefill tiled GEMM (m16n8k16) ==\n");
+    test_linear_bias("gemv+bias m1 n128 k256",1,128,256,false);
+    test_qkv_bias("gemv qkv+bias nq128 nk64 nv64 k256");
+    test_linear_bias("gemm+bias m64 n128 k256",64,128,256,true);
     test_gemm("gemm m64 n256 k3840 (q_proj-ish)", 64, 256, 3840, 0);
     test_gemm("gemm m200 n512 k3840 (M-ragged)", 200, 512, 3840, 0);
     test_gemm("gemm m1 n300 k3840 a_row0=63 (lm_head-ish)", 1, 300, 3840, 63);
@@ -1571,6 +1688,8 @@ int main() {
     test_gemm_glu("gemm_glu m64 n256 k3840 silu", 64, 256, 3840, 1);
 
     printf("\n== flash prefill mma.sync QK^T (fused ns=1) ==\n");
+    test_flash_prefill<64,64,64>("flash_pre hd64 h64 kv8 len128 full",64,8,128,128,0,0,1,0.125f);
+    test_flash_prefill<64,64,64>("flash_pre hd64 h64 kv8 len300 win128",64,8,300,300,0,128,1,0.125f);
     /* args: nh, nkv, seq_q, seq_kv, q_pos0, window, nsplit */
     /* Qwen hd128 production tile, including the BKV64 two-cols-per-lane softmax path. */
     test_flash_prefill<128,64,64>("flash_pre hd128 h4 kv2 len128 causal fused (BKV64)", 4, 2, 128, 128, 0, 0, 1);

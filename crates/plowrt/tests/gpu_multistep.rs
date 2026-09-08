@@ -104,6 +104,110 @@ fn multi_step_matches_single_step_greedy() {
         &single[..single.len().min(8)]
     );
 
+    let block = std::fs::read(assets.join("block.json"))
+        .ok()
+        .map(|bytes| serde_json::from_slice::<plow_asset::BlockDescriptor>(&bytes).unwrap());
+    let mut sparse = vec![0];
+    for slot in [3, 15] {
+        if slot < e.batch() {
+            sparse.push(slot);
+        }
+    }
+    sparse.reverse();
+    for (prompt_len, requested) in [(32, 3), (32, 1), (e.max_ctx() - 4, K)] {
+        let steps = requested.min(e.max_ctx() - prompt_len);
+        let run = |e: &mut GpuEngine, multi: bool| {
+            for slot in 0..e.batch() {
+                e.begin_slot(slot, e.max_ctx()).unwrap();
+            }
+            let mut feeds = Vec::new();
+            for &slot in &sparse {
+                if let Some(block) = &block {
+                    let input: Vec<_> = (0..e.tensor_bytes("act.x").unwrap() as usize / 2)
+                        .map(|i| ((i * 13 + slot * 17) % 251) as f32 / 251.0 - 0.5)
+                        .collect();
+                    e.upload_activation("act.x", &input).unwrap();
+                    assert!(block.hidden > 0);
+                }
+                let prompt: Vec<_> = (0..prompt_len)
+                    .map(|i| 100 + ((i + slot * 17) % 1000) as u32)
+                    .collect();
+                feeds.push((slot, e.prefill_slot(slot, &prompt).unwrap()));
+            }
+            let mut tokens = Vec::new();
+            if multi {
+                assert_eq!(
+                    e.multi_step_at_most(&feeds, requested, &mut tokens)
+                        .unwrap(),
+                    steps
+                );
+            } else {
+                tokens.resize(feeds.len() * steps, 0);
+                let mut one = Vec::new();
+                for step in 0..steps {
+                    e.step_slots(&feeds, &mut one).unwrap();
+                    for (row, feed) in feeds.iter_mut().enumerate() {
+                        tokens[row * steps + step] = one[row];
+                        feed.1 = one[row];
+                    }
+                }
+            }
+            for &slot in &sparse {
+                assert_eq!(e.attach_prompt(slot, &[]).unwrap(), prompt_len + steps);
+            }
+            let mut state = Vec::new();
+            if let Some(block) = &block {
+                let row_bytes = block.hidden as usize * 2;
+                for &slot in &sparse {
+                    let mut bytes = vec![0; row_bytes];
+                    e.read_tensor_range("act.x", (slot * row_bytes) as u64, &mut bytes)
+                        .unwrap();
+                    assert!(bytes.chunks_exact(2).all(|x| {
+                        f32::from_bits(u32::from(u16::from_le_bytes([x[0], x[1]])) << 16)
+                            .is_finite()
+                    }));
+                    state.extend(bytes);
+                }
+                let heads = block.dims.kv_heads.unwrap() as usize;
+                let kv_row_bytes = block.dims.head_dim.unwrap() as usize * 2;
+                for carried in &block.carried_state {
+                    assert_eq!(carried.role, "kv", "requires a direct-KV block");
+                    for name in &carried.tensors {
+                        let slot_bytes = e.tensor_bytes(name).unwrap() as usize / e.batch();
+                        let head_bytes = slot_bytes / heads;
+                        let live_bytes = ((prompt_len + steps) * kv_row_bytes).min(head_bytes);
+                        for &slot in &sparse {
+                            for head in 0..heads {
+                                let offset = (slot * slot_bytes + head * head_bytes) as u64;
+                                let mut bytes = vec![0; live_bytes];
+                                e.read_tensor_range(name, offset, &mut bytes).unwrap();
+                                state.extend(bytes);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for &slot in &sparse {
+                    let mut logits = Vec::new();
+                    e.logits_row(slot, &mut logits).unwrap();
+                    assert!(logits.iter().all(|v| v.is_finite()));
+                    state.extend(logits.iter().flat_map(|v| v.to_le_bytes()));
+                }
+            }
+            (tokens, state)
+        };
+        let expected = run(&mut e, false);
+        let actual = run(&mut e, true);
+        assert_eq!(actual.0, expected.0, "sparse token ring");
+        assert_eq!(actual.1.len(), expected.1.len(), "state extent");
+        assert_eq!(
+            actual.1.iter().zip(&expected.1).position(|(a, b)| a != b),
+            None,
+            "first state mismatch: sparse {sparse:?}, prompt={prompt_len}, steps={steps}"
+        );
+        eprintln!("multistep tail exact: slots={sparse:?}, prompt={prompt_len}, requested={requested}, steps={steps}");
+    }
+
     std::env::remove_var("PLOW_MULTISTEP");
     std::env::remove_var("PLOW_NV_CUBIN_SAMPLE");
 }
