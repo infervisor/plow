@@ -23,7 +23,12 @@ struct Op {
 /// (threshold = its block count); slices are dealt round-robin over `n_cu`.
 /// `gq_domains > 0` also emits an op-major global-queue stream split across
 /// that many domain windows per segment.
-fn build(ops: &[Op], n_cu: u32, n_seg: u32, gq_domains: u32) -> (LoadedProgram, Vec<packet::Counter>) {
+fn build(
+    ops: &[Op],
+    n_cu: u32,
+    n_seg: u32,
+    gq_domains: u32,
+) -> (LoadedProgram, Vec<packet::Counter>) {
     let mut insts = Vec::new();
     let mut waits = Vec::new();
     let mut succs = Vec::new();
@@ -193,20 +198,39 @@ fn pool(threads: usize, n_cu: u32, exec: Arc<dyn Exec>) -> WorkerPool {
     WorkerPool::spawn(&topo, threads, &NumaMode::Off, 20, n_cu, None, exec)
 }
 
-fn run_once(p: &WorkerPool, prog: &Arc<LoadedProgram>, pool: &Arc<CounterPool>, seg: u32, rec: &Recorder) {
+fn run_once(
+    p: &WorkerPool,
+    prog: &Arc<LoadedProgram>,
+    pool: &Arc<CounterPool>,
+    seg: u32,
+    rec: &Recorder,
+) {
     pool.reset_all();
-    rec.base.store(prog.insts.as_ptr() as usize, Ordering::Release);
+    rec.base
+        .store(prog.insts.as_ptr() as usize, Ordering::Release);
     let gen = p.run(prog, seg, pool);
     assert_eq!(p.wait_done(gen), None, "fault");
 }
 
 /// fan-out: op0 (1 slice) → op1..op4 (4 slices each) → op5 (1 slice) waits on all.
 fn fan_ops() -> Vec<Op> {
-    let mut ops = vec![Op { blocks: 1, deps: vec![], seg: 0 }];
+    let mut ops = vec![Op {
+        blocks: 1,
+        deps: vec![],
+        seg: 0,
+    }];
     for _ in 0..4 {
-        ops.push(Op { blocks: 4, deps: vec![0], seg: 0 });
+        ops.push(Op {
+            blocks: 4,
+            deps: vec![0],
+            seg: 0,
+        });
     }
-    ops.push(Op { blocks: 1, deps: vec![1, 2, 3, 4], seg: 0 });
+    ops.push(Op {
+        blocks: 1,
+        deps: vec![1, 2, 3, 4],
+        seg: 0,
+    });
     ops
 }
 
@@ -216,10 +240,26 @@ fn diamond_ops() -> Vec<Op> {
     let mut prev: Option<usize> = None;
     for _ in 0..8 {
         let a = ops.len();
-        ops.push(Op { blocks: 6, deps: prev.into_iter().collect(), seg: 0 });
-        ops.push(Op { blocks: 6, deps: vec![a], seg: 0 });
-        ops.push(Op { blocks: 6, deps: vec![a], seg: 0 });
-        ops.push(Op { blocks: 6, deps: vec![a + 1, a + 2], seg: 0 });
+        ops.push(Op {
+            blocks: 6,
+            deps: prev.into_iter().collect(),
+            seg: 0,
+        });
+        ops.push(Op {
+            blocks: 6,
+            deps: vec![a],
+            seg: 0,
+        });
+        ops.push(Op {
+            blocks: 6,
+            deps: vec![a],
+            seg: 0,
+        });
+        ops.push(Op {
+            blocks: 6,
+            deps: vec![a + 1, a + 2],
+            seg: 0,
+        });
         prev = Some(a + 3);
     }
     ops
@@ -243,7 +283,11 @@ fn static_mode_orders_dependencies_on_every_thread_count() {
                 run_once(&p, &prog, &ctr, 0, &rec);
                 assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
             }
-            assert_eq!(rec.violations.load(Ordering::Relaxed), 0, "threads={threads}");
+            assert_eq!(
+                rec.violations.load(Ordering::Relaxed),
+                0,
+                "threads={threads}"
+            );
         }
     }
 }
@@ -265,6 +309,48 @@ fn threads_fewer_than_cus_does_not_deadlock() {
     assert_eq!(rec.violations.load(Ordering::Relaxed), 0);
 }
 
+/// Records which OS thread served each run. `ThreadId`s are unique for the lifetime of a thread,
+/// so an identical set across many runs is direct evidence the pool never respawned one.
+#[derive(Default)]
+struct Threads(std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>);
+
+impl Exec for Threads {
+    fn exec(&self, _inst: &DevInst64, _slice: u32, _nblk: u32, _w: &WorkerCtx) {
+        self.0.lock().unwrap().insert(std::thread::current().id());
+    }
+}
+
+/// Workers are PERSISTENT: spawned once and returned to the control loop, never re-created per
+/// run. `p.threads()` only counts join handles, which cannot change, so this checks the identity
+/// of the threads that actually ran the work — the same set, every run, for every width.
+#[test]
+fn the_same_os_threads_serve_every_run() {
+    let ops = fan_ops();
+    let (prog, ctrs) = build(&ops, 8, 1, 0);
+    let prog = Arc::new(prog);
+    let ctr = Arc::new(CounterPool::from_counters(&ctrs));
+    for threads in [1usize, 4, 8] {
+        let rec = Arc::new(Threads::default());
+        let p = pool(threads, 8, rec.clone());
+        let mut first: Option<std::collections::HashSet<_>> = None;
+        for i in 0..200 {
+            rec.0.lock().unwrap().clear();
+            let gen = p.run(&prog, 0, &ctr);
+            assert_eq!(p.wait_done(gen), None, "fault on run {i}");
+            ctr.reset_all();
+            let seen = rec.0.lock().unwrap().clone();
+            assert!(!seen.is_empty(), "run {i} executed nothing");
+            match &first {
+                None => first = Some(seen),
+                Some(f) => assert_eq!(&seen, f, "run {i} ran on a different thread set"),
+            }
+        }
+        // Every worker that ever ran is one of the pool's own, and no more than the pool has.
+        assert!(first.unwrap().len() <= threads);
+        assert_eq!(p.threads(), threads);
+    }
+}
+
 /// A locality plan moves WHERE a cu runs, never WHAT runs: every slice still executes exactly
 /// once and no dependency inverts, at any thread count. The plans are supplied directly so the
 /// check does not depend on how many NUMA nodes the test host happens to have — an out-of-range
@@ -276,9 +362,9 @@ fn a_locality_plan_changes_placement_but_not_execution() {
     let prog = Arc::new(prog);
     let ctr = Arc::new(CounterPool::from_counters(&ctrs));
     let plans: [(Vec<u32>, u32); 3] = [
-        (vec![0; 16], 2),                             // every cu onto one node
-        ((0..16).map(|cu| cu % 2).collect(), 2),      // interleaved groups
-        ((0..16).map(|cu| cu / 2).collect(), 8),      // blocked, more groups than nodes
+        (vec![0; 16], 2),                        // every cu onto one node
+        ((0..16).map(|cu| cu % 2).collect(), 2), // interleaved groups
+        ((0..16).map(|cu| cu / 2).collect(), 8), // blocked, more groups than nodes
     ];
     for (plan, domains) in plans {
         for threads in [1usize, 3, 16] {
@@ -298,7 +384,11 @@ fn a_locality_plan_changes_placement_but_not_execution() {
                 run_once(&p, &prog, &ctr, 0, &rec);
                 assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
             }
-            assert_eq!(rec.violations.load(Ordering::Relaxed), 0, "threads={threads}");
+            assert_eq!(
+                rec.violations.load(Ordering::Relaxed),
+                0,
+                "threads={threads}"
+            );
         }
     }
 }
@@ -318,7 +408,11 @@ fn global_queue_two_domains_orders_dependencies() {
             run_once(&p, &prog, &ctr, 0, &rec);
             assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
         }
-        assert_eq!(rec.violations.load(Ordering::Relaxed), 0, "threads={threads}");
+        assert_eq!(
+            rec.violations.load(Ordering::Relaxed),
+            0,
+            "threads={threads}"
+        );
     }
 }
 
@@ -326,10 +420,26 @@ fn global_queue_two_domains_orders_dependencies() {
 fn segments_run_one_at_a_time_with_seg_filter() {
     // seg 0: op0 → op1 ; seg 1: op2 (depends on op1) → op3.
     let ops = vec![
-        Op { blocks: 4, deps: vec![], seg: 0 },
-        Op { blocks: 4, deps: vec![0], seg: 0 },
-        Op { blocks: 4, deps: vec![1], seg: 1 },
-        Op { blocks: 4, deps: vec![2], seg: 1 },
+        Op {
+            blocks: 4,
+            deps: vec![],
+            seg: 0,
+        },
+        Op {
+            blocks: 4,
+            deps: vec![0],
+            seg: 0,
+        },
+        Op {
+            blocks: 4,
+            deps: vec![1],
+            seg: 1,
+        },
+        Op {
+            blocks: 4,
+            deps: vec![2],
+            seg: 1,
+        },
     ];
     let (prog, ctrs) = build(&ops, 8, 2, 0);
     let prog = Arc::new(prog);
@@ -338,7 +448,8 @@ fn segments_run_one_at_a_time_with_seg_filter() {
     let p = pool(4, 8, rec.clone());
     rec.reset();
     ctr.reset_all();
-    rec.base.store(prog.insts.as_ptr() as usize, Ordering::Release);
+    rec.base
+        .store(prog.insts.as_ptr() as usize, Ordering::Release);
     let g = p.run(&prog, 0, &ctr);
     assert_eq!(p.wait_done(g), None);
     assert_eq!(rec.count.load(Ordering::Relaxed), 8, "only seg 0 ran");
@@ -353,7 +464,11 @@ fn segments_run_one_at_a_time_with_seg_filter() {
 fn cancel_returns_pool_to_idle_and_next_run_completes() {
     // A long serial chain with a slow mock: cancel early, then run fully.
     let ops: Vec<Op> = (0..64)
-        .map(|k| Op { blocks: 1, deps: if k == 0 { vec![] } else { vec![k - 1] }, seg: 0 })
+        .map(|k| Op {
+            blocks: 1,
+            deps: if k == 0 { vec![] } else { vec![k - 1] },
+            seg: 0,
+        })
         .collect();
     let (prog, ctrs) = build(&ops, 4, 1, 0);
     let prog = Arc::new(prog);
@@ -362,13 +477,17 @@ fn cancel_returns_pool_to_idle_and_next_run_completes() {
     let p = pool(4, 4, rec.clone());
     rec.reset();
     ctr.reset_all();
-    rec.base.store(prog.insts.as_ptr() as usize, Ordering::Release);
+    rec.base
+        .store(prog.insts.as_ptr() as usize, Ordering::Release);
     let g = p.run(&prog, 0, &ctr);
     std::thread::sleep(Duration::from_millis(5));
     p.cancel(g);
     assert_eq!(p.wait_done(g), None);
     let partial = rec.count.load(Ordering::Relaxed);
-    assert!(partial < 64, "cancel should stop the chain early, ran {partial}");
+    assert!(
+        partial < 64,
+        "cancel should stop the chain early, ran {partial}"
+    );
     // Pool is idle and reusable.
     rec.reset();
     run_once(&p, &prog, &ctr, 0, &rec);
@@ -387,7 +506,8 @@ fn drop_cancels_an_inflight_run() {
     let prog = Arc::new(prog);
     let ctr = Arc::new(CounterPool::from_counters(&ctrs));
     let rec = Arc::new(Recorder::new(&ops, Duration::ZERO));
-    rec.base.store(prog.insts.as_ptr() as usize, Ordering::Release);
+    rec.base
+        .store(prog.insts.as_ptr() as usize, Ordering::Release);
     let p = pool(1, 1, rec);
     p.run(&prog, 0, &ctr);
 
@@ -408,7 +528,13 @@ fn reset_slot_zeroes_through_workers() {
     let mut buf = vec![0xFFu8; 1 << 20];
     let mut buf2 = vec![0xAAu8; 12345];
     unsafe {
-        p.reset_slot(3, &[(buf.as_mut_ptr(), buf.len()), (buf2.as_mut_ptr(), buf2.len())]);
+        p.reset_slot(
+            3,
+            &[
+                (buf.as_mut_ptr(), buf.len()),
+                (buf2.as_mut_ptr(), buf2.len()),
+            ],
+        );
     }
     assert!(buf.iter().all(|&b| b == 0));
     assert!(buf2.iter().all(|&b| b == 0));
@@ -426,7 +552,11 @@ fn pool_persists_across_many_runs() {
     for i in 0..1000 {
         rec.reset();
         run_once(&p, &prog, &ctr, 0, &rec);
-        assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops), "run {i}");
+        assert_eq!(
+            rec.count.load(Ordering::Relaxed),
+            total_slices(&ops),
+            "run {i}"
+        );
         // Every worker reported done ⇒ every thread is still alive.
         assert_eq!(p.feedback().done.load(Ordering::Acquire), 8);
     }
@@ -438,11 +568,23 @@ fn pool_persists_across_many_runs() {
 fn topology_fixture_and_detect() {
     let t = Topology::from_sysfs_text(
         "0-7",
-        &[(0, "0,4"), (1, "1,5"), (2, "2,6"), (3, "3,7"), (4, "0,4"), (5, "1,5"), (6, "2,6"), (7, "3,7")],
+        &[
+            (0, "0,4"),
+            (1, "1,5"),
+            (2, "2,6"),
+            (3, "3,7"),
+            (4, "0,4"),
+            (5, "1,5"),
+            (6, "2,6"),
+            (7, "3,7"),
+        ],
         &[(0, "0-1,4-5"), (1, "2-3,6-7")],
     );
     assert_eq!(t.physical_cores(), 4);
-    assert_eq!(t.cores_on_node(1).map(|c| c.cpu).collect::<Vec<_>>(), vec![2, 3]);
+    assert_eq!(
+        t.cores_on_node(1).map(|c| c.cpu).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
     let live = Topology::detect();
     assert!(live.physical_cores() >= 1);
     assert!(!live.nodes.is_empty());

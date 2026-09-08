@@ -1164,6 +1164,38 @@ pub fn cu_domains(progs: &[DevProg], n_cu: u32) -> Option<(Vec<u32>, u32)> {
     Some((dom, domains))
 }
 
+/// Workers to spawn: the width the topology and model want, but never more than the packet has
+/// executors.
+///
+/// `cu_map` deals cus `0..n_cu` over the pool, so a worker past `n_cu` owns nothing in EVERY
+/// program. It cannot be rescued by any later narrowing: it wakes on each run, finds an empty
+/// stream, returns to the control ring, and spins `--cpu-spin-us` before parking — on the cores the
+/// working set needs. This is NOT the per-program narrowing that measured worse (see the note at
+/// the call site); those workers were idle for one program and busy for another, while these are
+/// unusable for the whole model, so there is no width tradeoff to lose.
+///
+/// Measured on Gemma-4-31B dense, `n_cu = 144`, 8-node EPYC 9654, means of 3 (TTFT / decode step):
+///
+/// | workers | TTFT | decode step |
+/// |---|---|---|
+/// | 384 (all logical, the old default) | 20.50 s | 3459 ms |
+/// | 192 (all physical) | 16.24 s | 1196 ms |
+/// | 144 (`n_cu`) | 14.08 s | 415 ms |
+///
+/// The decode penalty tracks the idle count — 240 idle is 8.3x, 48 idle is 2.9x, 0 is baseline.
+///
+/// The global queue is exempt: there every worker claims from the shared window, so workers past
+/// `n_cu` do useful work rather than idling. An explicit `--cpu-threads` is always honoured.
+fn worker_width(explicit: usize, want: usize, n_cu: u32, gq: bool) -> usize {
+    if explicit != 0 {
+        return explicit;
+    }
+    if gq {
+        return want.max(1);
+    }
+    want.min(n_cu as usize).max(1)
+}
+
 /// Stream entries each cu runs, ONE VECTOR PER PROGRAM — the work unit the static walk executes.
 ///
 /// Kept per program rather than summed because programs are ALTERNATIVES: a prefill bucket or the
@@ -1428,6 +1460,30 @@ mod placement_tests {
         assert!(cu_domains(&[q], 8).is_none());
     }
 
+    /// A worker past `n_cu` owns nothing in any program and only costs its spin, so the auto width
+    /// is capped. Measured 8.3x on decode; the explicit override and the global queue are exempt.
+    #[test]
+    fn worker_width_never_exceeds_the_packet() {
+        assert_eq!(worker_width(0, 384, 144, false), 144, "capped at n_cu");
+        assert_eq!(
+            worker_width(0, 96, 144, false),
+            96,
+            "no cap needed below n_cu"
+        );
+        assert_eq!(
+            worker_width(0, 384, 144, true),
+            384,
+            "global queue uses every worker"
+        );
+        assert_eq!(
+            worker_width(192, 384, 144, false),
+            192,
+            "explicit --cpu-threads wins"
+        );
+        assert_eq!(worker_width(512, 384, 144, false), 512, "even above n_cu");
+        assert_eq!(worker_width(0, 8, 0, false), 1, "never zero workers");
+    }
+
     /// `cu_work` keeps one row per program rather than collapsing them.
     #[test]
     fn cu_work_is_per_program() {
@@ -1690,7 +1746,12 @@ impl CpuEngine {
         // pool whose prefill was narrowed to 8. Fixing that needs the idle worker to stop polling,
         // which is the real prerequisite for per-phase widths.
         let wants_logical = model.blob.progs.iter().any(dense_row_decode);
-        let threads = threads.max(if wants_logical { logical_w } else { physical_w });
+        let threads = worker_width(
+            opts.threads,
+            threads.max(if wants_logical { logical_w } else { physical_w }),
+            n_cu,
+            crate::config::RuntimeConfig::get().cpu.gq_opt_in,
+        );
         tracing::info!(
             threads,
             ?isa,

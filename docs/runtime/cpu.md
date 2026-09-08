@@ -15,9 +15,10 @@ target/release/plowrt serve --assets /path/to/bundle \
 ```
 
 `--executors` controls the reference interpreter. Use `--cpu-threads` for the
-persistent CPU kernel workers. Zero selects the existing model-dependent width:
-physical cores for MoE; logical CPUs for dense decode. An explicit count overrides
-that choice. Each loaded model owns a pool; budget threads across concurrently
+persistent CPU kernel workers. Zero selects the model-dependent width — physical
+cores for MoE, logical CPUs for dense decode — then caps it at the packet's `--n-cu`,
+because a worker past that owns no work in any program and only costs its spin. An
+explicit count overrides both. Each loaded model owns a pool; budget threads across concurrently
 served models. A CPU-only build does not probe or link CUDA/HSA drivers.
 
 ## Compiling a bundle
@@ -43,8 +44,9 @@ past the decode program's instruction count. `rtx6000pro` is what the bundles in
 take "the `slice`-th of `nblk` shares", and the worker pool maps whatever thread
 count it has onto those executors: a worker owns several when threads are fewer,
 and tail workers own none when threads are more. **One bundle therefore serves any
-core count**, and `--cpu-threads` is free to differ from `--n-cu` — 96 executors on
-192 threads is a normal configuration. Compile once at a width that divides the
+core count**, and `--cpu-threads` need not match `--n-cu`. Fewer threads than
+executors is the normal and cheap direction; more is not, since the surplus workers
+own nothing, so the automatic width caps itself at `--n-cu`. Compile once at a width that divides the
 largest machine you intend to serve; the emitter caps `--n-cu` at 256, because the
 per-domain slice count is a nine-bit field. Leaving it at `0` takes the `--gpu`
 spec's SM/CU count, which is why an explicit value is usually the better choice
@@ -67,7 +69,7 @@ the CLI wins over the environment. `plowrt serve --help` prints them under the
 
 | flag | env | default | effect |
 | --- | --- | --- | --- |
-| `--cpu-threads N` | `PLOW_CPU_THREADS` | `0` | Persistent workers. `0` selects the model-dependent width: physical cores for MoE, logical CPUs for dense decode. Need not equal `--n-cu`. |
+| `--cpu-threads N` | `PLOW_CPU_THREADS` | `0` | Persistent workers. `0` selects the model-dependent width (physical cores for MoE, logical CPUs for dense decode), capped at the packet's `--n-cu`. May be set above `--n-cu`, but the surplus workers own nothing and cost their spin — measured **8.3x** on decode at 240 idle workers. |
 | `--cpu-numa MODE` | `PLOW_CPU_NUMA` | `auto` | `auto` interleaves large tensors across the allowed nodes (best effort); `off` keeps the OS policy, including an external `numactl`; a list such as `0,1` requires successful placement and rejects unavailable nodes. |
 | `--cpu-isa TIER` | `PLOW_CPU_ISA` | `auto` | Kernel tier ceiling: `scalar`, `avx512`, `amx`. For A/B, and for hosts without AMX. Never activates above what cpuid and OS state permit. |
 | `--cpu-huge-pages=B` | `PLOW_CPU_HUGE_PAGES` | unset | Override transparent-huge-page *advice*: by default ordinary pages for interleaved tensors, huge-page advice for single-node or OS placement. Changes advice, not the system THP setting. |

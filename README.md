@@ -233,8 +233,9 @@ CKPT="$HOME/models/gemma-4-12B-it"
 
 `--n-cu` sets the packet's *virtual* executor count, not a thread count: the
 worker pool maps any number of threads onto it, so one bundle serves any core
-count and `--cpu-threads` is free to differ. Compile once at a width that divides
-the largest machine you intend to serve (the emitter caps it at 256).
+count. Fewer threads than executors is fine; more is wasteful, so the automatic
+worker width caps itself at `--n-cu`. Compile once at a width that divides the
+largest machine you intend to serve (the emitter caps it at 256).
 
 Runtime knobs are all `--cpu-*` (`--cpu-threads`, `--cpu-numa`, `--cpu-isa`,
 `--cpu-spin-us`, …), each with a `PLOW_CPU_*` env twin — full table in
