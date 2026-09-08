@@ -3456,9 +3456,9 @@ records it under `l2_placement`), but .../interp_prefill_gq.elf was built WITHOU
 -DPLOW_L2_PLACE_DISPATCH. A placed program's `seg` is an L2 domain, not a wave class, so this
 object would run every packet on the wrong domain — plausible output, inverted locality, no
 error. Fix EITHER half: rebuild the objects with scripts/build_gfx942.sh PLOW_L2HIER_PF=1, which
-puts -DPLOW_L2_PLACE_DISPATCH on the prefill AND flash rows; build_gfx950.sh already passes it
-under PLOW_L2_PLACE=1, or re-emit the blob with no PLOW_L2_PLACE_PREFILL=1, which is the AMD
-default and leaves decode placement on.
+puts -DPLOW_L2_PLACE_DISPATCH on the prefill rows (the flash rows already carry it);
+build_gfx950.sh passes it on both under PLOW_L2_PLACE=1, or re-emit the blob with no
+PLOW_L2_PLACE_PREFILL=1, which is the AMD default and leaves decode placement on.
 ```
 
 The reverse direction — an unplaced blob against objects that DO carry the axis — is legal and
@@ -3523,8 +3523,11 @@ decode-placed vs decode+prefill-placed.
 | 8192 / 4 | 7686.4 | 7467.9 | **-2.8%** | 23.41 | 23.83 | 50.34 | 50.26 |
 | 32768 / 1 | 10162.7 | 9749.6 | **-4.1%** | 5.47 | 5.65 | 24.53 | 24.90 |
 
-TPOT moves by at most 0.5% in either direction, which is the negative control this arm should
-produce: the decode programs are identical in both blobs. **The 512/4 cell is not a result** — it
+TPOT moves by at most 0.5% in either direction on the eight two-round cells, which is the
+negative control this arm should produce: the decode programs are identical in both blobs. (The
+32768 row is a single round of three repeats per arm, not a palindromic pair, and its +1.5% TPOT
+is inside that cell's own run-to-run spread — the decode-placed arm measured 24.10 ms on
+`hsaco-tiered` and 24.53 ms here on an object set built from the same source.) **The 512/4 cell is not a result** — it
 is bimodal in BOTH arms across rounds (527.7 / 467.6 control, 527.9 / 466.2 candidate), so the
 paired medians land on different modes; it is a concurrency-4 scheduling bistability that predates
 this change. The 2048/4 loss IS reproducible (1196/1201 vs 1237/1239).
