@@ -375,3 +375,43 @@ lifecycle checks pass. Retained cache returns to 4030 MiB. Results are
 `plow-bf16-b8-scan3-*`, with hashes in the `bf16_batch8` section of
 `prefix-scan3-qualification.json`. This qualifies serving and memory behavior at batch 8;
 the fresh matched BF16 performance grid remains outstanding.
+
+## Packed-prefix prototype: rejected pending admission and terminal-row fixes
+
+The explicit BF16 batch-8 packed-prefix prototype is not enabled by default or included
+in the runtime changes on this branch. It packs up to eight requests per launch. All
+39 preflight prompts and expected cache counts match ordinary execution, but one output
+differs. Natural cold/warm outputs agree within the prototype; only 8 of 12 match the
+ordinary baseline. Cold 16K pressure completes two requests before six decode streams
+fail with nonfatal allocation OOM. A short recovery request succeeds; lifecycle checks
+were not reached. These results reject promotion.
+
+Single-wave screening shows 1K/concurrency-8 throughput rising from 42.0 to 66.3 output
+tokens/s. At 16K/concurrency-8, throughput rises from 11.84 to 13.91, but median TTFT
+worsens from 10.39 to 15.60 seconds. This is neither a full comparison nor an all-metrics
+improvement. Raw results remain under `plow-bf16-b8-packed-prefix2-*` and
+`bf16-b8-packed2-preflight-diagnostic.json` in the campaign directory.
+
+The `prefix_logits` example isolates the numerical difference using two natural prompts
+(1055 and 16415 tokens), fresh engines, 64 output steps, and all 262144 vocabulary logits.
+Candidate modes consume the ordinary run's selected tokens at every subsequent step:
+
+| Comparison | Result across 128 full-vocabulary snapshots |
+|---|---|
+| Full-prompt prefill vs isolated prefill ending before the final token, then decode | Three argmax differences; maximum absolute logit difference 0.84375. |
+| Isolated split prefill vs packed prefill, both using decode for the final token | Bit-exact. |
+| Full-prompt prefill vs packed prefill followed by an ordinary GEMM terminal row | Bit-exact. |
+
+For these prompts, the final-token GEMM/GEMV choice explains the observed divergence;
+packing adds no further differences. This single-request diagnostic does not qualify
+multi-request numerical behavior or memory admission. A terminal GEMM row is a verified
+correction path, but its serving integration and performance remain untested. The harness,
+source patch, build logs, output arrays and SHA256 records are preserved in
+`prefix-logits-*`, `prefix-logits/`, and `packed-prefix2-numerics-qualification.json`.
+
+Run the harness with `nix develop -c cargo run -p plowrt --example prefix_logits
+--features cuda,hsa,hub -- <assets> <mode> <cases.json> <new-output-directory> [reference]`.
+Cases contain `messages`, `prompt_tokens`, and `steps`. Run `ordinary` first, then pass
+its output directory to `split`, `packed`, or `packed-tail`. Use prefix reuse and disable
+multistep; packed modes also require compatible packed-prefix runtime support and assets.
+The rejected prototype's patch is preserved externally as `packed-prefix2-source.patch`.
