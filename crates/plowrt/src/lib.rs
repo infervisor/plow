@@ -27,6 +27,7 @@ pub mod disasm;
 pub mod exec;
 pub mod memory;
 pub mod obs;
+pub mod opaudit;
 pub mod orch;
 pub mod sched;
 pub mod serve;

@@ -106,6 +106,12 @@ hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 
 [dev-dependencies]
 plow-asset = { workspace = true, features = ["test-util"] }
+# `tests/op_audit_families.rs` emits one miniature blob per model family and runs
+# the operator audit over it. Emission is host-only (`arch: ""`, config.json with
+# no weights), so this adds no build requirement, and the dependency is acyclic:
+# `devgen` depends on packet/costmodel/kernelcaps/tunedb/hwspec/plow-asset, never
+# on `plowrt`.
+devgen = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

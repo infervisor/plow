@@ -401,6 +401,33 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         no_analysis: bool,
     },
+
+    /// Classify every opcode a compiled blob uses by how it learns a row's
+    /// request identity, and report whether the program can be executed as one
+    /// packed token batch.
+    ///
+    /// Static and offline, like `disasm`: the blob is a file. The four classes
+    /// are §3 of `plans/unified-token-batch.md`, reproduced in
+    /// `docs/arch/17-operator-row-identity-classes.md`.
+    ///
+    /// An opcode with no classification is class C and is REFUSED, because on
+    /// AMD the interpreter's dispatch `default:` writes nothing and does not
+    /// trap — an unclassified operator is a silent-wrong-answer hazard, not an
+    /// inconvenience.
+    OpAudit {
+        /// `model.pkt`, or an asset directory containing one. Omit with
+        /// `--table` to print the whole-ISA table instead.
+        blob: Option<PathBuf>,
+        /// Print every opcode in the ISA with its static class, with no blob.
+        #[arg(long, default_value_t = false)]
+        table: bool,
+        /// Restrict to one program: a prefill bucket `T`, or `1` for decode.
+        #[arg(long)]
+        program: Option<u32>,
+        /// `text` (default) or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[tokio::main]
@@ -547,6 +574,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_analysis,
             },
         ),
+        Cmd::OpAudit {
+            blob,
+            table,
+            program,
+            format,
+        } => op_audit_cmd(blob, table, program, format),
         Cmd::Devices {
             tp,
             hidden,
@@ -2088,6 +2121,58 @@ fn devices(
          packets. To actually run them: plowrt amd-bench --tp N --blob <a packet \n\
          compiled with plowc --num-gpus N>."
     );
+    Ok(())
+}
+
+/// `plowrt op-audit` — classify a blob's opcodes by row identity.
+///
+/// The exit status is the verdict: `0` when every program can be executed as one
+/// packed token batch, `1` when any opcode is refused. That makes the audit
+/// usable as a gate in the enablement of a (family, backend) pair, which is what
+/// the plan asks of it — not just as something to read.
+fn op_audit_cmd(
+    blob_path: Option<PathBuf>,
+    table: bool,
+    program: Option<u32>,
+    format: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::asset::devblob::DevBlob;
+
+    if table {
+        let rows = plowrt::opaudit::table();
+        match format.as_str() {
+            "json" => println!("{}", serde_json::to_string_pretty(&rows)?),
+            "text" => print!("{}", plowrt::opaudit::table_text(&rows)),
+            other => return Err(format!("--format wants text|json, got `{other}`").into()),
+        }
+        return Ok(());
+    }
+
+    let blob_path = blob_path.ok_or("op-audit wants a blob path, or --table")?;
+    // Same convention as `disasm`: a directory means the `model.pkt` in it.
+    let p = blob_path.as_path();
+    let file = if p.is_dir() {
+        p.join("model.pkt")
+    } else {
+        p.to_path_buf()
+    };
+    let buf = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    let magic: Option<&[u8; 8]> = buf.get(..8).and_then(|s| s.try_into().ok());
+    if !magic.is_some_and(packet::devbuild::is_blob_magic) {
+        return Err(format!("{}: not a PLOWDEV blob", file.display()).into());
+    }
+    // Static inspection, so an L2-placed blob must be readable — see `disasm_cmd`.
+    let blob = DevBlob::parse_l2(&buf, true)?;
+    let rep = plowrt::opaudit::audit(&blob, &file.display().to_string(), program);
+
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&rep)?),
+        "text" => print!("{}", plowrt::opaudit::text(&rep)),
+        other => return Err(format!("--format wants text|json, got `{other}`").into()),
+    }
+    if !rep.packable {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

@@ -2587,6 +2587,7 @@ dependencies = [
  "clap",
  "costmodel",
  "crossbeam-utils",
+ "devgen",
  "futures",
  "hf-hub",
  "http-body-util",
