@@ -1189,9 +1189,12 @@ impl EmitConfig {
         match &self.tunedb {
             Some(s) if s.is_empty() => None,
             Some(s) => Some(s.clone()),
+            // Derived from the SAME checkout the build identity is fingerprinted against
+            // (`kernelcaps::source_root`), because reading one checkout's store while keying
+            // records to another checkout's digest is two bugs that look like one.
             None => Some(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../tuning")
+                kernelcaps::source_root()
+                    .join("tuning")
                     .to_string_lossy()
                     .into_owned(),
             ),

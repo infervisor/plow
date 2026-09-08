@@ -55,6 +55,59 @@ pub use targets::{dense_gemm_inventory, dense_gemm_tuning_build, prefill_recipe,
 
 use std::collections::BTreeMap;
 
+/// The checkout whose interpreter sources describe the object being compiled for.
+///
+/// # Why this is not `env!("CARGO_MANIFEST_DIR")`
+///
+/// `CARGO_MANIFEST_DIR` names the tree the BINARY WAS COMPILED FROM, which is only the
+/// tree it is compiling *in* by coincidence. With one `CARGO_TARGET_DIR` shared across git
+/// worktrees — the arrangement several agents use on this branch — whichever worktree last
+/// rebuilt `plowc` bakes ITS path into the binary, and every later run from a different
+/// checkout then fingerprints a tree nobody is compiling.
+///
+/// That failure is silent and total. `dense_gemm_tuning_build` hashes the preprocessed
+/// interpreter, so two checkouts that differ by one line under `runtime/amd/` produce two
+/// build digests; a campaign publishes under the digest of the tree it was told about
+/// (`plowc tune --root`) while tile selection looks up the digest of the tree the binary was
+/// built from. Every record then reads STALE no matter how many campaigns run, and
+/// `plowc tune status` — which only ever consulted `--root` — reports the store as current.
+/// The same mistake sends `EmitConfig::tunedb_root` at a different checkout's `tuning/`, so
+/// the compiler cannot even see the records the campaign just wrote.
+///
+/// Resolution order:
+/// 1. `PLOW_SOURCE_ROOT`, for callers that know better than any heuristic.
+/// 2. The nearest enclosing checkout of the current directory, identified by the
+///    interpreter source itself rather than by a VCS directory: a worktree has no `.git`
+///    directory, and the file that matters is the one that gets hashed.
+/// 3. `CARGO_MANIFEST_DIR/../..`, the historical answer, for a binary invoked from
+///    somewhere that is not a checkout at all.
+pub fn source_root() -> std::path::PathBuf {
+    if let Ok(explicit) = std::env::var("PLOW_SOURCE_ROOT") {
+        if !explicit.is_empty() {
+            return std::path::PathBuf::from(explicit);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut dir = cwd.as_path();
+        loop {
+            if is_checkout(dir) {
+                return dir.to_path_buf();
+            }
+            match dir.parent() {
+                Some(p) => dir = p,
+                None => break,
+            }
+        }
+    }
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// Whether `dir` is a checkout of this repository, judged by the sources the build identity
+/// is actually hashed from.
+fn is_checkout(dir: &std::path::Path) -> bool {
+    dir.join("runtime/amd/interp.hip").is_file() && dir.join("Cargo.toml").is_file()
+}
+
 /// The set of kernels one build of the runtime can execute.
 ///
 /// A registry describes *a build*, not the source tree: the same
@@ -350,6 +403,29 @@ mod tests {
             reg.candidates(&op, &h100(), ProfileId::PrefillDense)
                 .is_empty(),
             "an opcode with no dispatch arm must never be a candidate"
+        );
+    }
+
+    /// The resolver must find the checkout it is RUN in, not the one it was BUILT in.
+    ///
+    /// `cargo test` runs with the current directory set to the crate root, so this asserts the
+    /// walk-up finds the enclosing checkout — which is the whole mechanism. Pinning
+    /// `is_checkout` on the interpreter source is deliberate: a git worktree has no `.git`
+    /// directory, and worktrees are exactly the configuration this exists to survive.
+    #[test]
+    fn the_source_root_is_the_enclosing_checkout() {
+        let root = super::source_root();
+        assert!(
+            super::is_checkout(&root),
+            "resolved {} is not a checkout",
+            root.display()
+        );
+        // Whatever it resolved to must be the same tree this test's own sources live in.
+        let built_from = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            built_from.canonicalize().unwrap(),
+            "the walk-up disagreed with the tree the test was compiled from"
         );
     }
 

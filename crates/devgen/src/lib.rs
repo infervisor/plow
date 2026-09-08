@@ -909,8 +909,8 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
             None => return GemmMeasurements { by_case },
             Some(s) => s,
         };
-        let store = tunedb::TuneStore::new(std::path::PathBuf::from(root));
-        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let store = tunedb::TuneStore::new(std::path::PathBuf::from(root.clone()));
+        let source_root = kernelcaps::source_root();
         let Ok(build) = kernelcaps::dense_gemm_tuning_build(&source_root, amd_target::active().1)
         else {
             return GemmMeasurements { by_case };
@@ -950,8 +950,15 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
         // identical bytes, so silence reads as success. A wholly stale campaign is a
         // re-measure request and has to say so.
         if stale > 0 {
+            // NAME THE INPUTS, not just the verdict. A digest alone is unfalsifiable: it
+            // cannot distinguish "the source really changed" from "this binary is
+            // fingerprinting a different checkout than the campaign published against",
+            // and the second is what a shared CARGO_TARGET_DIR across worktrees produces.
+            // Three agents chased the first reading of this line while the second was true.
             eprintln!(
-                "  tunedb {}: {stale} record(s) skipped as STALE against the probed build {}{}",
+                "  tunedb {}: {stale} record(s) skipped as STALE against the probed build {}{}\n\
+                 \x20   probed source root : {}\n\
+                 \x20   tuning store       : {}",
                 cell,
                 want.interpreter,
                 if by_case.is_empty() {
@@ -959,7 +966,9 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
                      analytical model. Re-run the campaign or this compile is unmeasured."
                 } else {
                     ""
-                }
+                },
+                source_root.display(),
+                root,
             );
         }
         GemmMeasurements { by_case }
@@ -1374,7 +1383,7 @@ fn amd_gemm_inventory(isa: hwspec::IsaLevel) -> &'static kernelcaps::Inventory {
         _ => &CDNA4,
     };
     cell.get_or_init(|| {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = kernelcaps::source_root();
         match kernelcaps::dense_gemm_inventory(&root, isa) {
             Ok(inv) => inv,
             Err(e) => {
