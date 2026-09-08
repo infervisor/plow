@@ -113,6 +113,44 @@ pub trait EngineDevice: Send + Sync + 'static {
     }
     fn host_alloc_pinned(&self, bytes: usize) -> Result<Self::Pinned>;
 
+    /// Host→device copy whose source is ALREADY device-visible host memory.
+    ///
+    /// Distinct from [`EngineDevice::memcpy_htod`], which pins `src` per call:
+    /// on HSA, pinning an allocation the agent can already read is not merely
+    /// wasteful but INVALID (`hsa_amd_memory_lock` returns an error on a pool
+    /// allocation), so the two cannot be the same entry point.
+    ///
+    /// # Contract
+    /// `src` must live in memory the device may already read — a [`PinnedBuf`]
+    /// slab or the fine-grained pool. A stack or `Vec` source faults the device.
+    fn memcpy_htod_pinned(&self, dptr: u64, src: &[u8]) -> Result<()>;
+
+    /// Device→host copy whose destination is already device-visible. The mirror
+    /// of [`EngineDevice::memcpy_htod_pinned`], same contract on `dst`.
+    fn memcpy_dtoh_pinned(&self, dst: &mut [u8], dptr: u64) -> Result<()>;
+
+    /// Many host→device copies under ONE completion wait. `pairs` is `(dst, src)`.
+    ///
+    /// The host→device twin of [`EngineDevice::memcpy_dtod_batch`], and it
+    /// exists for a measured reason rather than symmetry. A mixed/token-batch
+    /// step uploads SEVEN descriptor slices — ids, pos, kvlen, decode_slot,
+    /// prefill spans, parked, counters — and four of them are one word per row,
+    /// so at concurrency 8 they move 32 bytes each. Issued through
+    /// [`EngineDevice::memcpy_htod_pinned`] that is seven completion-signal
+    /// lifecycles and seven blocked waits per token, none of which overlaps the
+    /// launch behind it.
+    ///
+    /// The default is the loop, so a backend that cannot batch is still
+    /// CORRECT. A backend that can issue N copies against a single completion
+    /// signal (HSA) or N stream-ordered async copies behind one sync (CUDA)
+    /// should override it.
+    fn memcpy_htod_pinned_batch(&self, pairs: &[(u64, &[u8])]) -> Result<()> {
+        for &(dptr, src) in pairs {
+            self.memcpy_htod_pinned(dptr, src)?;
+        }
+        Ok(())
+    }
+
     /// Fill `n` bytes at `dptr` with `value`.
     fn memset_d8(&self, dptr: u64, value: u8, n: usize) -> Result<()>;
 

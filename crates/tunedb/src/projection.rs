@@ -163,6 +163,7 @@ pub fn select_projection<'a>(
     cell: &ProjectionCell,
     want: &Digests,
     baseline: &plow_asset::decode_objects::DecodeObject,
+    baseline_packet_sha256: &str,
     splitk_abi: Option<u32>,
     arena: u32,
 ) -> Option<&'a ProjectionMeasurement> {
@@ -177,6 +178,9 @@ pub fn select_projection<'a>(
                 && r.candidate_object.arena_bytes == arena
                 && r.state.is_selectable()
                 && r.qualification_blockers().is_empty()
+                && r.native_blocks
+                    .iter()
+                    .any(|guard| guard.packet_sha256 == baseline_packet_sha256)
                 && r.digests.stale_against(want).is_empty()
                 && r.stats.beats(&r.baseline)
         })
@@ -252,6 +256,7 @@ pub(crate) mod tests {
                 &r.cell,
                 &r.digests,
                 &r.baseline_object,
+                &r.native_blocks[0].packet_sha256,
                 Some(1),
                 82944
             )
@@ -285,6 +290,7 @@ pub(crate) mod tests {
                     &r.cell,
                     &r.digests,
                     &r.baseline_object,
+                    &r.native_blocks[0].packet_sha256,
                     Some(1),
                     82944
                 )
@@ -297,6 +303,7 @@ pub(crate) mod tests {
             &r.cell,
             &r.digests,
             &r.baseline_object,
+            &r.native_blocks[0].packet_sha256,
             None,
             82944
         )
@@ -306,13 +313,30 @@ pub(crate) mod tests {
             &r.cell,
             &r.digests,
             &r.baseline_object,
+            &r.native_blocks[0].packet_sha256,
             Some(1),
             16448
         )
         .is_none());
-        assert!(
-            select_projection(&[], &r.cell, &r.digests, &r.baseline_object, Some(1), 82944)
-                .is_none()
-        );
+        assert!(select_projection(
+            &[],
+            &r.cell,
+            &r.digests,
+            &r.baseline_object,
+            &r.native_blocks[0].packet_sha256,
+            Some(1),
+            82944
+        )
+        .is_none());
+        assert!(select_projection(
+            std::slice::from_ref(&r),
+            &r.cell,
+            &r.digests,
+            &r.baseline_object,
+            &"d".repeat(64),
+            Some(1),
+            82944
+        )
+        .is_none());
     }
 }

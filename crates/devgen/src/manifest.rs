@@ -300,6 +300,18 @@ struct Shapes {
     /// KV-split on a packet (the fold consumes the un-split l), so the two live in one
     /// bitfield: low 8 bits = ns, bit 8 = ofold.
     glm_ofold: bool,
+    /// Any `FlashMlaPrefill` (op 51) carrying a `t[7]` — the DSA per-64-query-tile UNION table
+    /// (PLOW_DSA_PF_ARM), with `i[6]` reused whole as its cap. The gathered V2 body is a BUILD
+    /// AXIS and OFF BY DEFAULT (it raised the flash object's spill 98 -> 287 for every blob),
+    /// so an object without it does not predate the arm, it cannot execute it — and the dense
+    /// arm it falls to never reads `t[7]`. The result is full causal attention where the model
+    /// was trained sparse: no trap, no NaN, a fluent answer to a different question.
+    glm_dsa_pf: bool,
+    /// Any `FlashMlaPrefill` (op 51) with `i[3]` bit 31 — a NoPE (zero-rope) MLA, which the
+    /// four-wave V2 kernel can only run if it carries the `<512, 0>` instantiation
+    /// (PLOW_MLA_PF2_NOPE_ARM). An object that predates the arm traps on the packet rather than
+    /// reading a `Qrope`/`Krope` half that does not exist.
+    mla_pf_nope: bool,
     /// Any dense `FlashMlaDecode` (op 50) carrying a `t[7]` — the DECODE q-rope fold
     /// (PLOW_GLM_FUSE_ROPE): t7 = cos table, i6 = sin handle, and `t[3]` is the RAW q_rope
     /// projection. A pre-arm object ignores both and stages `t[3]` verbatim, i.e. it feeds the
@@ -316,6 +328,15 @@ struct Shapes {
     /// A pre-arm object ignores both and stages `t[1]` verbatim, i.e. it runs the projection
     /// over an UNNORMED row and returns finite, fluent, wrong tokens. Refuse at load.
     glm_fuse_qnorm: bool,
+    /// Optional linear biases carried by the instruction stream. Plain GEMM/GEMV use `t7`;
+    /// fused QKV uses the three demoted handles in `i5/i6/i7`.
+    linear_bias: bool,
+    /// HD64 HeadNormRope using the explicit NeoX half-split pairing mode.
+    rope_half_hd64: bool,
+    /// FlashMerge carrying an attention-sink vector in `t3`.
+    attention_sinks: bool,
+    /// A GEMV instruction in a prefill program (currently the M=1 lm_head).
+    prefill_gemv: bool,
     /// Opcode names present, for the encoding-aware corrections below. Kept as names because that
     /// is what `features` keys on, and the two must not disagree.
     ops_present: BTreeSet<String>,
@@ -461,6 +482,27 @@ fn shapes(m: &Model) -> Shapes {
                     if inst.t[7] != packet::TENSOR_NONE {
                         s.glm_fuse_qnorm = true;
                     }
+                    if inst.i[5..8].iter().any(|&h| h != 0) {
+                        s.linear_bias = true;
+                    }
+                }
+                DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall | DevOp::Gemv => {
+                    if inst.t[7] != packet::TENSOR_NONE {
+                        s.linear_bias = true;
+                    }
+                    if op == DevOp::Gemv && !decode {
+                        s.prefill_gemv = true;
+                    }
+                }
+                DevOp::HeadNormRope => {
+                    if inst.i[2] == 64 && inst.i[5] == packet::dev::ROPE_PAIR_HALF {
+                        s.rope_half_hd64 = true;
+                    }
+                }
+                DevOp::FlashMerge => {
+                    if inst.t[3] != packet::TENSOR_NONE {
+                        s.attention_sinks = true;
+                    }
                 }
                 DevOp::FlashMlaPrefill => {
                     if (inst.i[6] & 0xff) > 1 && inst.t[7] == packet::TENSOR_NONE {
@@ -468,6 +510,17 @@ fn shapes(m: &Model) -> Shapes {
                     }
                     if (inst.i[6] >> 8) & 1 == 1 && inst.t[7] == packet::TENSOR_NONE {
                         s.glm_ofold = true;
+                    }
+                    // The union table IS the discriminator, exactly as the two arms above use
+                    // its absence: on op 51 `t[7]` has no other meaning (the fp8-KV scales ride
+                    // op 109, a different opcode), so its presence is the sparse arm's presence.
+                    if inst.t[7] != packet::TENSOR_NONE {
+                        s.glm_dsa_pf = true;
+                    }
+                    // i[3] is `window` with bit 31 stolen for NoPE (the same encoding the 8-wave
+                    // arm reads); a window is never that wide, so the bit is unambiguous.
+                    if inst.i[3] & 0x8000_0000 != 0 {
+                        s.mla_pf_nope = true;
                     }
                 }
                 DevOp::MoeExpertGluFp8Blk
@@ -643,6 +696,7 @@ fn precision_axes(
     f: &mut Map<String, Value>,
     s: &Shapes,
     union: &BTreeSet<Arm>,
+    progs: &[ProgramArms],
 ) -> Map<String, Value> {
     let has = |n: &str| union.iter().any(|a| a.op == n);
     let on = |k: &str| f.get(k).and_then(Value::as_bool).unwrap_or(false);
@@ -658,7 +712,33 @@ fn precision_axes(
     // ACTIVATION. `QuantFp8` exists only on the w8a8 path — it IS the activation quant, so its
     // presence is the axis, not an inference from a flag. Everything else feeds bf16 activations,
     // including w4a16 and w8a16: narrow weights, wide activations.
-    let act = if has("QuantFp8") { "fp8" } else { "bf16" };
+    //
+    // PER PHASE, because the phases can disagree and on the dense family they do: the prefill
+    // GEMMs quantize while `GemvFp8`/`GemvGluFp8` take bf16 activations and widen the weight on
+    // load. Reading the union alone let a packet whose decode is w8a16 report `act_enc: fp8`,
+    // which is the same phase-blind judgement this axis exists to replace — one level up. A
+    // packet that disagrees with itself is named `mixed` rather than resolved, as `expert_enc`
+    // does; a consumer selecting an object on this axis must look at the phase it is serving.
+    let quantizes = |kind: &str| {
+        progs
+            .iter()
+            .filter(|p| p.kind == kind)
+            .any(|p| p.arms.iter().any(|a| a.op == "QuantFp8"))
+    };
+    let phase_present = |kind: &str| progs.iter().any(|p| p.kind == kind);
+    let act = if !has("QuantFp8") {
+        "bf16"
+    } else if phase_present("prefill")
+        && phase_present("decode")
+        && quantizes("prefill") != quantizes("decode")
+    {
+        // Both phases exist and disagree. Naming the phase would need a schema change; naming
+        // the disagreement does not, and it stops the overstatement. A blob carrying only one
+        // phase cannot disagree with itself, so it keeps the plain encoding.
+        "mixed"
+    } else {
+        "fp8"
+    };
     // KV.
     let kv = if on("fp8_kv") { "fp8" } else { "bf16" };
     // EXPERTS. `moe_enc` is the runtime encoding field; absent means there are no expert ops.
@@ -715,10 +795,19 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
         "gemv_prefetch".into(),
         json!(crate::emit_config::active().gemv_prefetch),
     );
+    // PLOW_DEC_STAGE_HALVES states the decode object's GEMV staging arena so the fused
+    // QKV/GLU eligibility test stops using `hwspec`'s OCC4 re-cut. Surfaced because it makes
+    // the blob object-PAIRED: the fused bodies stage M*K halves with no global fallback.
+    f.insert(
+        "dec_stage_halves".into(),
+        json!(crate::emit_config::active().dec_stage_halves.is_some()),
+    );
     f.insert("moe_prefill_ep".into(), json!(!s.moe_prefill_ep.is_empty()));
     f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
+    f.insert("glm_dsa_pf".into(), json!(s.glm_dsa_pf));
+    f.insert("mla_pf_nope".into(), json!(s.mla_pf_nope));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
 }
@@ -769,6 +858,103 @@ fn tuning(s: &Shapes) -> Map<String, Value> {
     t
 }
 
+/// `emit_config` — the RESOLVED knob configuration that produced this blob.
+///
+/// The deliberate exception to this module's "derive from the instruction stream, never from
+/// intent" rule, and it has to be one: the point of the section is precisely to record the
+/// intent, because a rebuild cannot reconstruct it from the packet. A knob that changed nothing
+/// about this model still has to appear — "PLOW_GLM_GF was unset" is what makes the next emit's
+/// diff mean something.
+///
+/// It is a SEPARATE top-level key, outside `pairing_hash`'s `union`/`objects`/`tuning`: the
+/// knobs describe how the packet was built, not what the object must compile, and a knob that
+/// changed no arm must not invalidate an otherwise-good packet/object pair.
+///
+/// `replay` is the actionable half — the env assignments a rebuild needs, which is every knob
+/// whose value came from a flag or an env var. Defaults are omitted deliberately, because
+/// writing them down would PIN them: a default that is later promoted should reach a replayed
+/// build, and a replay that froze today's defaults would silently opt out of every such
+/// promotion. Production defaults are omitted for the same reason — they are derived from arch
+/// and capabilities, so a replay reproduces them by re-deriving them.
+/// Emit-affecting env vars read OUTSIDE [`crate::emit_config::EmitConfig`], so `build.json` can
+/// at least say they were set.
+///
+/// These are read straight from the environment in `packet::devbuild`, where there is no field to
+/// carry a value, a source and a default — several were fields once and were deliberately deleted
+/// (see `every_field_has_a_reader`'s message). So they cannot appear in `replay`. A replay from
+/// that section reproduces the blob byte-for-byte EXCEPT where one of these was set, which is a
+/// silent difference and was measured as one: `PLOW_MLA_PF_V2` on a GLM-5.3 TP4 replay.
+///
+/// Naming them is not a fix — promoting a read to a field is — but it turns "the replay does not
+/// match and nobody knows why" into "the replay does not match and here is the variable".
+///
+/// `emit_config::tests::unrecorded_env_list_is_complete` keeps this honest against the source.
+pub(crate) const UNRECORDED_ENV: &[&str] = &[
+    "PLOW_BLOCK",
+    // BOTH a field and a raw read, which is the worst case rather than a duplicate entry.
+    // `EmitConfig` declares `uniseg`, so `build.json` records a value for it under `knobs` — but
+    // `packet::devbuild`, where `uniseg` is computed, consults the ENVIRONMENT rather than the
+    // field. Set the field programmatically without the variable and the
+    // packet ignores it; the manifest still reports the field. Listing it here means the manifest
+    // carries what the builder actually saw alongside what the field claimed.
+    "PLOW_UNISEG",
+    "PLOW_CHAIN_BYPASS",
+    "PLOW_FINE_FORCE",
+    "PLOW_FUSE_XR_ATTNRES",
+    "PLOW_GQ_ORDER",
+    "PLOW_MLA_PF_V2",
+    "PLOW_MOE_DECODE_STANDALONE",
+    "PLOW_PHASE_OBJECTS",
+    "PLOW_SEG_CLASS_SLICE",
+    "PLOW_SEG_FA512",
+    "PLOW_SEG_PER_OP",
+    "PLOW_SEG_PURE_GEMM",
+    "PLOW_SEG_SLICE_ALL",
+    "PLOW_SEG_V2",
+    "PLOW_XR_WAVE_RS",
+];
+
+fn emit_config_section() -> Value {
+    let knobs = crate::emit_config::knobs_or_env();
+    let mut replay: BTreeMap<String, Value> = BTreeMap::new();
+    for k in &knobs {
+        if matches!(k.source, "cli" | "env") {
+            if let Some(env) = &k.env {
+                replay.insert(env.clone(), json!(k.value));
+            }
+        }
+    }
+    json!({
+        "note": "every knob EmitConfig declares, its resolved value, and where that value came \
+                 from (clap's own ValueSource, not inferred). `replay` is the env assignments \
+                 that reproduce this configuration; defaults are omitted so a replayed build \
+                 follows the tree's defaults rather than pinning today's.",
+        // The boundary is stated because it is not obvious and it is load-bearing: this covers
+        // the knobs `EmitConfig` DECLARES, which is what `no_raw_env_reads` keeps devgen's own
+        // emit knobs to. An emit-affecting env var read outside `EmitConfig` is invisible here
+        // exactly as it is invisible everywhere else — measured: a GLM-5.3 TP4 replay from this
+        // section reproduces the blob byte-for-byte except for `PLOW_MLA_PF_V2`, which is read
+        // in `crates/packet/src/devbuild.rs` and is not a field. Promoting such a read to a
+        // field is what makes it recordable; nothing here can record what it cannot see.
+        "covers": "knobs declared by EmitConfig; env vars read outside it are named under \
+                   `unrecorded_env`, which reports their value but cannot describe them",
+        "knob_count": knobs.len(),
+        "replay": replay,
+        // The gap the note above describes, made VISIBLE rather than merely admitted. Only vars
+        // actually present are listed, so an ordinary build emits `{}`.
+        "unrecorded_env": UNRECORDED_ENV
+            .iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), json!(v))))
+            .collect::<Map<_, _>>(),
+        "knobs": knobs.iter().map(|k| json!({
+            "id": k.id,
+            "env": k.env,
+            "value": k.value,
+            "source": k.source,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// Render the neutral facts into ONE toolchain's flags. This is the only place
 /// in the manifest pipeline that knows `-D` spellings exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -808,7 +994,7 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("prefill") {
         req.push("PLOW_NV_PREFILL=1".into());
-        if on("qwen_gdn") {
+        if s.prefill_gemv {
             req.push("PLOW_NV_PF_GEMV_HEAD=1".into());
         }
     }
@@ -1007,6 +1193,24 @@ fn backend_amd(
     if on("glm_ofold") {
         req.push("PLOW_GLM_OFOLD=1".into());
     }
+    // The DSA sparse V2 prefill arm (op 51 t[7] = union table). A BUILD AXIS that is OFF by
+    // default, so this is the strongest entry in the list after PLOW_K3: absence does not mean
+    // "older object", it means "no gathered body was compiled". The dense arm it falls back to
+    // does not read t[7] and does not trap — it runs full causal attention on a model trained
+    // sparse. plowrt additionally requires the V2 ROUTING itself (PLOW_MLA_PF_V2=1), for the
+    // same reason PLOW_GLM_OFOLD does: without it the MLA segments land on the 8-wave kernel,
+    // which has no gathered arm for op 51 at all.
+    if on("glm_dsa_pf") {
+        req.push("PLOW_DSA_PF_ARM=1".into());
+    }
+    // A NoPE (zero-rope) MLA prefill needs the `d_flash_mla_prefill_v2<512, 0>` instantiation.
+    // The arm is default-ON and costs nothing (same body at DR=0: identical VGPR/AGPR/LDS/spill,
+    // measured), so unlike PLOW_DSA_PF_ARM absence here means "object predates the arm" rather
+    // than "object chose not to pay for it" — but the remedy is the same rebuild either way, and
+    // the object traps rather than reading a rope half that is not there.
+    if on("mla_pf_nope") {
+        req.push("PLOW_MLA_PF2_NOPE_ARM=1".into());
+    }
     // The DECODE q-rope fold (op 50 t[7]). The arm is a runtime branch inside
     // `d_flash_mla_decode`, so every object built since it landed carries the marker and every
     // older one does not. Getting this wrong is silent in the worst way: an old object stages
@@ -1023,6 +1227,13 @@ fn backend_amd(
     // answers fluently and wrongly.
     if on("glm_fuse_qnorm") {
         req.push("PLOW_GLM_FUSE_QNORM=1".into());
+    }
+    // The fused decode QKV/GLU emitted against a STATED arena (PLOW_DEC_STAGE_HALVES). The
+    // object must publish the arena it was built at so plowrt can compare M*K against it —
+    // an object that predates the marker cannot be checked, and the fused bodies stage past
+    // the end of LDS rather than trapping.
+    if on("dec_stage_halves") {
+        req.push("PLOW_DEC_STAGE_HALVES=1".into());
     }
     // KIMI-K3's BLOCK ops. Not a prefill axis and not a precision one — a model axis, and the only
     // arm flag here that both buckets need. Its absence is the most completely silent failure this
@@ -1134,7 +1345,29 @@ fn analysis(progs: &[ProgramArms]) -> Value {
 /// backend that renders flags knows what it is rendering for; it is metadata,
 /// not something this module interprets.
 pub fn build(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
-    let mut v = build_inner(m, arch, lean);
+    build_with_packed_prefill(m, arch, lean, false)
+}
+
+pub fn build_for_packet(
+    m: &Model,
+    arch: &str,
+    lean: &crate::LeanReport,
+    sections: &[packet::devbuild::SectionData],
+) -> Value {
+    let packed_prefill = sections.iter().any(|section| {
+        section.kind == packet::devbuild::SECT_METADATA
+            && section.name == plow_asset::packed_prefill::SECTION
+    });
+    build_with_packed_prefill(m, arch, lean, packed_prefill)
+}
+
+fn build_with_packed_prefill(
+    m: &Model,
+    arch: &str,
+    lean: &crate::LeanReport,
+    packed_prefill: bool,
+) -> Value {
+    let mut v = build_inner(m, arch, lean, packed_prefill);
     // Stamped last: it is a hash OF the manifest's compiled-set fields, so it
     // cannot be one of them.
     let h = pairing_hash(&v);
@@ -1177,7 +1410,7 @@ fn lean_block(lean: &crate::LeanReport) -> Value {
     })
 }
 
-fn object_inventory(progs: &[ProgramArms], arch: &str) -> Value {
+fn object_inventory(progs: &[ProgramArms], arch: &str, packed_metadata: bool) -> Value {
     let phase = |kind: &str| -> BTreeSet<Arm> {
         progs
             .iter()
@@ -1186,6 +1419,14 @@ fn object_inventory(progs: &[ProgramArms], arch: &str) -> Value {
             .collect()
     };
     let prefill = phase("prefill");
+    let mut packed_prefill: BTreeSet<Arm> = progs
+        .iter()
+        .filter(|p| p.kind == "prefill" && p.packed_prefill_only)
+        .flat_map(|p| p.arms.iter().cloned())
+        .collect();
+    if packed_metadata && packed_prefill.is_empty() {
+        packed_prefill = prefill.clone();
+    }
     let decode_mla_segment = |p: &&ProgramArms| {
         p.kind == "decode"
             && p.seg.is_some()
@@ -1263,6 +1504,16 @@ fn object_inventory(progs: &[ProgramArms], arch: &str) -> Value {
     let key_factor_carry = singleton_arm("KdaChunkCarry");
     let key_factor_pair = !key_factor_wu.is_empty() && !key_factor_carry.is_empty();
     json!({
+        "packed_prefill": {
+            "required": !packed_prefill.is_empty(),
+            "topology": "packed",
+            "arms": keys(&packed_prefill),
+            "families": families(&packed_prefill),
+            "capability": {
+                "symbol": plow_asset::packed_prefill::CAPABILITY,
+                "value": plow_asset::packed_prefill::CAPABILITY_VALUE,
+            },
+        },
         "ordinary": {
             "prefill": {
                 "arms": keys(&prefill),
@@ -1429,10 +1680,10 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
     out
 }
 
-fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
+fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: bool) -> Value {
     let progs = program_arms(m);
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
-    let mut objects = object_inventory(&progs, arch);
+    let mut objects = object_inventory(&progs, arch, packed_prefill);
     let kda_intra_wave_items_required = m.progs.iter().any(|p| {
         p.stream.iter().any(|e| {
             e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0
@@ -1548,7 +1799,10 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         .any(|inst| inst.op == DevOp::AttnRes as u16 && inst.i[6] != 0);
     f.insert("attnres_decode_mwg".into(), json!(attnres_decode_mwg));
     encoding_features(&mut f, &s);
-    let axes = precision_axes(&mut f, &s, &union);
+    f.insert("linear_bias".into(), json!(s.linear_bias));
+    f.insert("rope_half_hd64".into(), json!(s.rope_half_hd64));
+    f.insert("attention_sinks".into(), json!(s.attention_sinks));
+    let axes = precision_axes(&mut f, &s, &union, &progs);
     let t = tuning(&s);
     let attention: Vec<Value> = crate::attention_decisions()
         .into_iter()
@@ -1615,6 +1869,20 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         kv_dtype.insert(format!("hd{hd}"), json!(d));
     }
 
+    // The audit reads `gv_mm_max` back out of `tuning` rather than recomputing
+    // `next_pow2(decode_batch)`: the whole finding is "the object's compiled ceiling against
+    // the program's live rows", so it has to be the SAME constant the backend section asks
+    // the object to be built with, not a second derivation that could drift from it.
+    let acfg = crate::emit_config::active();
+    let dispatch_audit = crate::dispatch_audit::section(
+        m,
+        t.get("gv_mm_max").and_then(Value::as_u64).unwrap_or(1) as u32,
+        acfg.audit_occ_floor
+            .unwrap_or(crate::dispatch_audit::DEFAULT_OCCUPANCY_FLOOR_PCT),
+        acfg.audit_gemv_waste_max
+            .unwrap_or(crate::dispatch_audit::DEFAULT_GEMV_WASTE_MAX_PCT),
+    );
+
     json!({
         "schema": 1,
         "arch": arch,
@@ -1641,6 +1909,11 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         // judgement reconstructed from the feature booleans by every consumer separately.
         "precision": axes,
         "tuning": t,
+        // Beside `tuning` because the two answer one question from opposite sides:
+        // `tuning` is what the packet's shapes DEMAND of the object, `emit_config` is what
+        // the operator ASKED FOR to get those shapes. Reproducing a measured configuration
+        // needs both, and only the first was ever written down.
+        "emit_config": emit_config_section(),
         "attention_policy": {
             "entries": attention,
             "runtime_kv_reselection": false,
@@ -1656,7 +1929,35 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         // and segment. Anything narrower and some bucket hits `default: __trap()`.
         "union": union.iter().map(Arm::key).collect::<Vec<_>>(),
         "analysis": analysis(&progs),
+        // What machine each matmul was actually handed, and how much of it the work fills.
+        // A SEPARATE top-level key on purpose: `pairing_hash` covers `union`/`objects`/
+        // `tuning` because those are what `plow_config.h` compiles, and an occupancy number
+        // must never invalidate an otherwise-good packet/object pair.
+        "dispatch_audit": dispatch_audit,
+        // WHICH PROGRAMS ARE L2-PLACED, so a regression moves in a diff of `build.json`.
+        //
+        // Placement is invisible everywhere else in this manifest: a placed and an unplaced
+        // emit of the same model produce byte-identical `build.json`, which is how the shipped
+        // Gemma-4-31B blob came to be unplaced (`PLOWDEV\x09`) with nothing recording it and
+        // every number in `docs/amd/gemma4-31b-mi300x.md` measured with `PLOW_GATE_HIER` inert.
+        // Outside `pairing_hash` deliberately, like `dispatch_audit`: placement does not change
+        // what `plow_config.h` compiles, and stamping it would invalidate every existing pair.
+        "l2_placement": l2_placement(m),
         "backends": backends(arch, &f, &s, &union, &t),
+    })
+}
+
+/// Which program kinds carry per-L2-domain queue windows (`PLOW_L2_PLACE`), and how many
+/// domains. A placed program needs objects built with `-DPLOW_L2_PLACE_DISPATCH`; plowrt
+/// refuses the mismatch, and this is where a reader sees which half moved.
+fn l2_placement(m: &Model) -> Value {
+    let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
+    let domains = m.progs.iter().map(|p| p.l2_domains).max().unwrap_or(0);
+    json!({
+        "domains": domains,
+        "decode": m.progs[dec_lo..].iter().any(|p| p.l2_domains != 0),
+        "prefill": m.progs[..dec_lo].iter().any(|p| p.l2_domains != 0),
+        "requires_object_define": "PLOW_L2_PLACE_DISPATCH",
     })
 }
 
@@ -1774,6 +2075,10 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/ordinary/decode_mla/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let packed_prefill_required = manifest
+        .pointer("/objects/packed_prefill/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let kda_intra_wave_items_required = manifest
         .pointer("/objects/lean/kda_intra_wave_items/required")
         .and_then(Value::as_bool)
@@ -1807,6 +2112,10 @@ pub fn config_header(manifest: &Value) -> String {
         if decode_mla_required { 1 } else { 0 }
     ));
     out.push_str(&format!(
+        "#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY {}\n",
+        if packed_prefill_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS {}\n",
         if kda_intra_wave_items_required { 1 } else { 0 }
     ));
@@ -1829,6 +2138,11 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",
         if moe_prefill_ep_required { 1 } else { 0 }
+    ));
+    let prefill_gemv_head = prefill_ops.contains("Gemv");
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_PF_GEMV_HEAD {0}\n#ifndef PLOW_NV_PF_GEMV_HEAD\n#define PLOW_NV_PF_GEMV_HEAD {0}\n#endif\n",
+        if prefill_gemv_head { 1 } else { 0 }
     ));
     for (key, macro_name) in [
         ("moe_stage1_body", "PLOW_OBJECT_MOE_STAGE1_BODY"),
@@ -1927,10 +2241,24 @@ pub fn config_header(manifest: &Value) -> String {
 
     // Head dims the flash family is instantiated at.
     out.push_str("\n/* --- flash head dims present --- */\n");
-    for hd in [256u32, 512] {
+    for hd in [64u32, 128, 256, 512] {
         let present = union.iter().any(|k| k.ends_with(&format!("/hd{hd}")));
         out.push_str(&format!(
             "#ifndef PLOW_HAS_FLASH_HD{hd}\n#define PLOW_HAS_FLASH_HD{hd} {}\n#endif\n",
+            if present { 1 } else { 0 }
+        ));
+    }
+    for (feature, define) in [
+        ("linear_bias", "PLOW_PACKET_LINEAR_BIAS"),
+        ("rope_half_hd64", "PLOW_PACKET_ROPE_HALF_HD64"),
+        ("attention_sinks", "PLOW_PACKET_ATTENTION_SINKS"),
+    ] {
+        let present = manifest
+            .pointer(&format!("/features/{feature}"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        out.push_str(&format!(
+            "#define {define} {}\n",
             if present { 1 } else { 0 }
         ));
     }
@@ -1962,6 +2290,9 @@ pub fn config_header(manifest: &Value) -> String {
                 "#ifndef PLOW_NV_FA_GF_FULL\n#define PLOW_NV_FA_GF_FULL {v}\n#endif\n"
             ));
         }
+    }
+    if let Some(gqa) = manifest.pointer("/shapes/gqa").and_then(Value::as_u64) {
+        out.push_str(&format!("#define PLOW_PACKET_GQA {gqa}\n"));
     }
     out
 }
@@ -2265,6 +2596,29 @@ mod tests {
         assert!(build(&m, "sm_120a")["tuning"].get("gf_full").is_none());
     }
 
+    /// PLACEMENT MUST BE VISIBLE IN THE ARTIFACT. A placed and an unplaced emit of the same
+    /// model were otherwise byte-identical here, which is how a whole document of Gemma-4-31B
+    /// numbers came to be taken with `PLOW_GATE_HIER` inert and nothing disagreeing.
+    #[test]
+    fn l2_placement_is_recorded_per_phase() {
+        let unplaced = build(&model(), "gfx942")["l2_placement"].clone();
+        assert_eq!(unplaced["domains"], 0);
+        assert_eq!(unplaced["decode"], false);
+        assert_eq!(unplaced["prefill"], false);
+        assert_eq!(unplaced["requires_object_define"], "PLOW_L2_PLACE_DISPATCH");
+
+        // The shipping gfx942 shape: decode placed, prefill not.
+        let mut m = model();
+        m.progs[1].l2_domains = 8;
+        let dec_only = build(&m, "gfx942")["l2_placement"].clone();
+        assert_eq!(dec_only["domains"], 8);
+        assert_eq!(dec_only["decode"], true);
+        assert_eq!(dec_only["prefill"], false);
+
+        m.progs[0].l2_domains = 8;
+        assert_eq!(build(&m, "gfx942")["l2_placement"]["prefill"], true);
+    }
+
     /// Per-program arm sets, keyed on (kind, bucket|batch, segment).
     #[test]
     fn programs_are_listed_per_bucket() {
@@ -2276,6 +2630,57 @@ mod tests {
         assert_eq!(p[1]["kind"], "decode");
         assert_eq!(p[1]["batch"], 8);
         assert!(p[0]["segment"].is_null());
+    }
+
+    #[test]
+    fn packed_prefill_topology_gets_a_dedicated_object_contract() {
+        let mut m = model();
+        m.progs.insert(
+            1,
+            prog(vec![
+                inst(DevOp::FlashPrefill, [0, 0, 8, 4, 0, 0, 256, 0]),
+                inst(DevOp::Gemm, [0; 8]),
+            ]),
+        );
+        m.prog_t
+            .insert(1, packet::devbuild::packed_prefill_program_t(1024));
+
+        let man = build(&m, "sm_90a");
+        let object = &man["objects"]["packed_prefill"];
+        assert_eq!(object["required"], true);
+        assert_eq!(object["topology"], "packed");
+        assert_eq!(
+            object["capability"]["symbol"],
+            plow_asset::packed_prefill::CAPABILITY
+        );
+        assert_eq!(
+            object["capability"]["value"],
+            plow_asset::packed_prefill::CAPABILITY_VALUE
+        );
+        assert_eq!(man["programs"][1]["topology"], "packed");
+        assert!(config_header(&man).contains("#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 1\n"));
+
+        let ordinary = build(&model(), "sm_90a");
+        assert_eq!(ordinary["objects"]["packed_prefill"]["required"], false);
+        assert!(config_header(&ordinary)
+            .contains("#define PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY 0\n"));
+
+        let section = packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::packed_prefill::SECTION.into(),
+            data: vec![],
+        };
+        let dense = build_for_packet(
+            &model(),
+            "sm_90a",
+            &crate::LeanReport::skipped("test: gate not run"),
+            &[section],
+        );
+        assert_eq!(dense["objects"]["packed_prefill"]["required"], true);
+        assert_eq!(
+            dense["objects"]["packed_prefill"]["arms"],
+            dense["objects"]["ordinary"]["prefill"]["arms"]
+        );
     }
 
     /// The nvcc rendering is a BACKEND of the neutral facts, and `requires` is
@@ -2291,6 +2696,7 @@ mod tests {
             .collect();
         assert!(req.contains(&"PLOW_FP8_KV=1"));
         assert!(req.contains(&"PLOW_NV_PREFILL=1"));
+        assert!(!req.contains(&"PLOW_NV_PF_GEMV_HEAD=1"));
         assert!(!req.contains(&"PLOW_NV_W8A8=1"));
         let rec: Vec<&str> = man["backends"]["nvcc"]["recommends"]
             .as_array()
@@ -2300,6 +2706,24 @@ mod tests {
             .collect();
         assert!(rec.contains(&"GV_MM_MAX=8"));
         assert!(rec.contains(&"PLOW_NV_FA_GF_FULL=8"));
+    }
+
+    #[test]
+    fn nvcc_prefill_gemv_requirement_follows_program_phase() {
+        let mut m = model();
+        m.progs[0].insts.push(inst(DevOp::Gemv, [0; 8]));
+        let man = build(&m, "sm_120a");
+        let req = man["backends"]["nvcc"]["requires"].as_array().unwrap();
+        assert!(req.iter().any(|v| v == "PLOW_NV_PF_GEMV_HEAD=1"));
+        let header = config_header(&man);
+        assert!(header.contains(
+            "#define PLOW_PACKET_REQUIRES_PF_GEMV_HEAD 1\n#ifndef PLOW_NV_PF_GEMV_HEAD\n#define PLOW_NV_PF_GEMV_HEAD 1\n#endif\n"
+        ));
+
+        let ordinary = config_header(&build(&model(), "sm_120a"));
+        assert!(ordinary.contains(
+            "#define PLOW_PACKET_REQUIRES_PF_GEMV_HEAD 0\n#ifndef PLOW_NV_PF_GEMV_HEAD\n#define PLOW_NV_PF_GEMV_HEAD 0\n#endif\n"
+        ));
     }
 
     /// The pairing hash must move when the compiled arm set moves, and must NOT
@@ -2523,6 +2947,83 @@ mod tests {
         };
         assert!(qpre_req(true).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
         assert!(!qpre_req(false).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
+    }
+
+    /// The three arms multiplexed onto `FlashMlaPrefill`'s `i[6]`/`t[7]` must ask for the
+    /// right flag, and `t[7]` is the whole discriminator between them.
+    ///
+    /// `i[6]` means three different things on op 51 and only the union table separates them:
+    /// with NO `t[7]` the low 8 bits are the causal KV-split `ns` (PLOW_MLA_PF_NS) and bit 8 is
+    /// the W_ofold epilogue (PLOW_GLM_OFOLD); WITH `t[7]` the whole word is the sparse arm's
+    /// `cap` (PLOW_DSA_PF_ARM) and neither of the other two readings applies. Get the
+    /// discriminator wrong in either direction and the manifest asks an object for the wrong
+    /// arm — which on AMD is not a load error but a silent one, since the arm that runs simply
+    /// ignores the operand it does not understand.
+    ///
+    /// The DSA row is the one with teeth: `PLOW_DSA_PF_ARM` is OFF BY DEFAULT (the gathered
+    /// instantiation raised the flash object's spill 98 -> 287 for every blob), so a missing
+    /// `requires` means a sparse blob loads happily against a stock flash object and runs FULL
+    /// CAUSAL attention on a model trained sparse.
+    #[test]
+    fn the_op51_arms_are_discriminated_by_the_union_table() {
+        let req = |i6: u32, uni: bool| -> Vec<String> {
+            let mut d = inst(DevOp::FlashMlaPrefill, [0; 8]);
+            d.i[6] = i6;
+            d.t = [packet::TENSOR_NONE; 8];
+            if uni {
+                d.t[7] = 3; // any live handle; presence is the signal, not the value
+            }
+            let m = Model {
+                n_cu: 256,
+                target: 0,
+                tensors: vec![],
+                progs: vec![prog(vec![d])],
+                kv_row_insts: vec![],
+                prog_t: vec![8192],
+                gen: vec![],
+            };
+            build(&m, "gfx950")["backends"]["gfx950"]["requires"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        let has = |r: &[String], k: &str| r.iter().any(|s| s == k);
+
+        // ns=4, no union table -> the KV-split layout, and NOT the sparse arm.
+        let ns = req(4, false);
+        assert!(has(&ns, "PLOW_MLA_PF_NS=1"), "ns packet asks for the split arm");
+        assert!(!has(&ns, "PLOW_DSA_PF_ARM=1"), "ns is not sparse");
+
+        // bit 8, no union table -> the W_ofold epilogue, and NOT the sparse arm.
+        let of = req(1 << 8, false);
+        assert!(has(&of, "PLOW_GLM_OFOLD=1"), "ofold packet asks for the fold arm");
+        assert!(!has(&of, "PLOW_DSA_PF_ARM=1"), "ofold is not sparse");
+
+        // A union table makes i[6] a `cap`: the sparse arm, and NEITHER of the other two
+        // readings. cap=4 must not be mistaken for ns=4, nor cap=256 for the ofold bit.
+        for cap in [4u32, 1 << 8, 260] {
+            let dsa = req(cap, true);
+            assert!(
+                has(&dsa, "PLOW_DSA_PF_ARM=1"),
+                "a union table requires the gathered V2 arm (cap={cap})"
+            );
+            assert!(
+                !has(&dsa, "PLOW_MLA_PF_NS=1"),
+                "cap={cap} must not be read as a KV-split count"
+            );
+            assert!(
+                !has(&dsa, "PLOW_GLM_OFOLD=1"),
+                "cap={cap} must not be read as the ofold bit"
+            );
+        }
+
+        // A plain dense packet asks for none of the three.
+        let plain = req(0, false);
+        for k in ["PLOW_MLA_PF_NS=1", "PLOW_GLM_OFOLD=1", "PLOW_DSA_PF_ARM=1"] {
+            assert!(!has(&plain, k), "a plain dense op 51 must not require {k}");
+        }
     }
 
     #[test]
@@ -2810,9 +3311,9 @@ mod tests {
         let wu = segment("KdaChunkWu");
         let carry = segment("KdaChunkCarry");
 
-        let incomplete = object_inventory(std::slice::from_ref(&wu), "gfx950");
+        let incomplete = object_inventory(std::slice::from_ref(&wu), "gfx950", false);
         assert_eq!(incomplete["lean"]["kda_key_factor_pair"]["required"], false);
-        let paired = object_inventory(&[wu, carry], "gfx950");
+        let paired = object_inventory(&[wu, carry], "gfx950", false);
         assert_eq!(paired["lean"]["kda_key_factor_pair"]["required"], true);
         assert_eq!(
             paired["lean"]["kda_key_factor_pair"]["wu_arms"][0],
@@ -2842,7 +3343,7 @@ mod tests {
             insts,
         };
         let pure = segment(2, &["FlashMlaDecode", "MlaMergeFold"]);
-        let inv = object_inventory(std::slice::from_ref(&pure), "gfx950");
+        let inv = object_inventory(std::slice::from_ref(&pure), "gfx950", false);
         assert_eq!(inv["ordinary"]["decode_mla"]["required"], true);
         let manifest = json!({"union": [], "objects": inv});
         assert!(config_header(&manifest).contains("#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS 1"));
@@ -2852,7 +3353,8 @@ mod tests {
             segment(3, &["FlashMlaDecode", "MlaMergeFold", "Gemv"]),
         ] {
             assert_eq!(
-                object_inventory(&[rejected], "gfx950")["ordinary"]["decode_mla"]["required"],
+                object_inventory(&[rejected], "gfx950", false)["ordinary"]["decode_mla"]
+                    ["required"],
                 false
             );
         }

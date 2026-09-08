@@ -75,6 +75,15 @@ pub fn build_graph(cfg: &ModelConfig, bucket: &ShapeBucket) -> Result<Graph, Bui
         ModelConfig::Qwen3(c) => qwen3::build(c),
         ModelConfig::Qwen35(c) => qwen3_5::build(c),
         ModelConfig::DeepSeek(c) => deepseek::build(c),
+        // V4 parses and validates (see `config::DeepSeekV4Config`) so the gap is
+        // a checklist derived from the checkpoint's own numbers, not a dead end
+        // at `config.json`. It still has no lowering, and a V3 MLA fallback
+        // would build a plausible wrong model out of V4 weights.
+        ModelConfig::DeepSeekV4(c) => {
+            return Err(BuildError::Config(ConfigError::Unsupported(
+                c.unimplemented(),
+            )))
+        }
         ModelConfig::Siglip(c) => siglip::build(c),
         ModelConfig::QwenVl(c) => qwen_vl::build(c),
         ModelConfig::QwenImageDit(c) => qwen_image_dit::build(c, bucket),
@@ -100,6 +109,7 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
                 ModelConfig::Kimi(_) => "kimi",
                 ModelConfig::KimiK3(_) => "kimi_k3",
                 ModelConfig::DeepSeek(_) => "deepseek",
+                ModelConfig::DeepSeekV4(_) => "deepseek_v4",
                 ModelConfig::Siglip(_) => "siglip",
                 ModelConfig::QwenVl(_) => "qwen_vl",
                 ModelConfig::QwenImageDit(_) => "qwen_image_dit",

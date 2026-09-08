@@ -121,6 +121,7 @@ const DOC: &[S] = &[
     S { op: DevOp::ZeroF32, t: &["P"], i: &["M", "N"], f: &[], j: &[] },
     S { op: DevOp::GemmSplitK, t: &["P", "A", "W"], i: &["M", "N", "K", "S"], f: &[], j: &[] },
     S { op: DevOp::CastF32Bf16, t: &["C", "P"], i: &["M", "N"], f: &[], j: &[] },
+    S { op: DevOp::RowGather, t: &["out", "x", "rows"], i: &["S", "H", "M"], f: &[], j: &[] },
     S { op: DevOp::QwenGdnConv, t: &["out", "x", "weight", "history", "active?"], i: &["C", "W", "B"], f: &[], j: &[] },
     S { op: DevOp::QwenGdnStep, t: &["out", "qkv", "a", "b", "A_log", "dt_bias", "state", "active?"], i: &["HK", "HV", "K", "V", "B", "alog_f32"], f: &["q_scale", "l2_eps"], j: &[] },
     S { op: DevOp::QwenGatedNorm, t: &["out", "core", "z", "gamma", "active?"], i: &["HV", "V", "B"], f: &["eps"], j: &[] },
@@ -141,8 +142,8 @@ const DOC: &[S] = &[
     S { op: DevOp::SoftCap, t: &["out", "x"], i: &["n"], f: &["cap"], j: &[] },
     S { op: DevOp::Gemm, t: &["C", "A", "B", "", "", "", "", "bias?"], i: &["M", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::Gemv, t: &["C", "x", "W", "rms?", "gamma?", "", "", "bias?"], i: &["M", "N", "K", "norm"], f: &["eps"], j: &[] },
-    S { op: DevOp::FlashPrefill, t: &["Opart", "mlpart", "Q", "K", "V", "O_final"], i: &["n_q", "n_kv", "n_head", "n_kv_head", "q_pos0", "window", "hd", "nsplit"], f: &["scale"], j: &["kv_stride", "kv_mask"] },
-    S { op: DevOp::FlashDecode, t: &["Opart", "mlpart", "Q", "K", "V", "kv_len"], i: &["n_batch", "n_head", "n_kv_head", "kv_stride", "window", "nsplit", "hd"], f: &["scale"], j: &[] },
+    S { op: DevOp::FlashPrefill, t: &["Opart", "mlpart", "Q", "K", "V", "O_final?"], i: &["n_q", "n_kv", "n_head", "n_kv_head", "q_pos0", "window", "hd", "nsplit"], f: &["scale"], j: &["kv_stride", "kv_mask"] },
+    S { op: DevOp::FlashDecode, t: &["Opart", "mlpart", "Q", "K", "V", "kv_len", "decode_slot?"], i: &["n_batch", "n_head", "n_kv_head", "kv_stride", "window", "nsplit", "hd"], f: &["scale"], j: &[] },
     S { op: DevOp::FlashMerge, t: &["O", "Opart", "mlpart", "sinks?"], i: &["n_batch", "n_head", "nsplit", "hd"], f: &[], j: &[] },
     S { op: DevOp::NormResidual, t: &["out", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::AddNorm, t: &["out", "resid", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
@@ -743,6 +744,7 @@ mod tests {
         let s = slots_for(DevOp::FlashPrefill);
         let names: Vec<&str> = (0..6).map(|k| s.t[k].unwrap().name).collect();
         assert_eq!(names, ["Opart", "mlpart", "Q", "K", "V", "O_final"]);
+        assert!(s.t[5].unwrap().optional);
         assert_eq!(s.i[7], Some("nsplit"));
     }
 

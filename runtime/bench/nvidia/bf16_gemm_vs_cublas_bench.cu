@@ -1,7 +1,7 @@
-/* Isolated bf16 GEMM/GEMM_GLU vs cuBLASLt, for Gemma-4-12B's real prefill shapes, on the
- * ACTUAL deployed tile config (PGM_BN=192, PGM_BN_GLU=128 — the winning bf16 config from this
- * session). Mirrors perf-data/px9-gemm-body.md's method (oracle grid, L2-cold, full-grid arm)
- * but for bf16xbf16 instead of w8a8, since no such comparison exists yet for this GPU/dtype.
+/* Isolated bf16 GEMM/GEMM_GLU vs cuBLASLt on real prefill projection shapes. The default
+ * sm_120 path uses the deployed PGM_BN/PGM_BN_GLU tile; PLOW_BENCH_WS384 exercises Hopper's
+ * production TMA/wgmma body. Hopper comparisons use bounded-error output gates, rotated cold
+ * weights, symmetric L2 eviction, alternating order, and median timing across short bursts.
  *
  * Build: nvcc -O3 -arch=sm_120a -DPGM_BN=192 -DPGM_BN_GLU=128 -I <repo>/runtime/nvidia \
  *   bf16_gemm_vs_cublas.cu -o bf16bench -lcublasLt
@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 /* Opt-in Hopper: -DPLOW_BENCH_WS384=1 -gencode arch=compute_90a,code=sm_90a -lcuda. */
 #ifdef PLOW_BENCH_M64N64
@@ -34,7 +36,9 @@
 #define PLOW_NV_SEGMENTS 1
 #define PLOW_NV_SEG_WS384 1
 #define PGM90_UNI_BN256 1
+#ifndef PGM90_TMA_STAGES
 #define PGM90_TMA_STAGES 3
+#endif
 #endif
 typedef __nv_bfloat16 bf16;
 #include "op_gemm.cuh"
@@ -75,6 +79,7 @@ static const Shape SHAPES[] = {
 #ifdef PLOW_BENCH_GEMMA_QGATE
     {"g12_q_local",4096,3840,0}, {"g12_q_full",8192,3840,0}, {"g12_gate",15360,3840,0},
     {"g31_q_local",8192,5376,0}, {"g31_q_full",16384,5376,0}, {"g31_gate",21504,5376,0},
+    {"g31_k_local",4096,5376,0}, {"g31_k_full",2048,5376,0},
 #endif
 #elif defined(PLOW_BENCH_QWEN_GEMV)
 #ifdef PLOW_BENCH_GEMV_M16
@@ -346,9 +351,10 @@ static void bench_cublas(unsigned M) {
         printf("cuBLASLt selected=%d candidates=%d workspace=%zu\n", selected, nres, heur.workspaceSize);
         CK(cudaEventDestroy(tune0)); CK(cudaEventDestroy(tune1));
 #endif
+        cudaEvent_t e0,e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+#if !defined(PLOW_BENCH_WS384) && !defined(PLOW_BENCH_QWEN_GEMV)
         for (int i=0;i<WARM;i++) run(i,0);
         CK(cudaDeviceSynchronize());
-        cudaEvent_t e0,e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
         cold_flush();
         CK(cudaEventRecord(e0));
         for (int i=0;i<ITERS;i++) run(i,0);
@@ -356,6 +362,10 @@ static void bench_cublas(unsigned M) {
         float ms=0; CK(cudaEventElapsedTime(&ms,e0,e1)); ms/=ITERS;
         double fl = 2.0*M*s.N*s.K;
         printf("%-9s %6u %8.4f %9.1f\n", s.name, M, ms, fl/(ms*1e-3)/1e12);
+#else
+        float ms = 0;
+        const double fl = 2.0*M*s.N*s.K;
+#endif
 
 #if defined(PLOW_BENCH_WS384) || defined(PLOW_BENCH_QWEN_GEMV)
         int dev; CK(cudaGetDevice(&dev));
@@ -434,11 +444,36 @@ static void bench_cublas(unsigned M) {
             if (mismatches) exit(3);
         }
 #endif
-        for (int i = 0; i < WARM; i++) run_plow(i);
-        CK(cudaDeviceSynchronize()); cold_flush(); CK(cudaEventRecord(e0));
-        for (int i = 0; i < ITERS; i++) run_plow(i);
-        CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
-        float pms; CK(cudaEventElapsedTime(&pms, e0, e1)); pms /= ITERS;
+        constexpr int compare_rounds = 6;
+        constexpr int compare_iters = 3;
+        float lt_ms[compare_rounds], plow_ms[compare_rounds];
+        auto time_body = [&](auto&& body) {
+            cold_flush();
+            CK(cudaEventRecord(e0));
+            for (int i = 0; i < compare_iters; i++) body(i);
+            CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
+            float elapsed = 0;
+            CK(cudaEventElapsedTime(&elapsed, e0, e1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            return elapsed / compare_iters;
+        };
+        for (int i = 0; i < WARM; i++) { run(i, 0); run_plow(i); }
+        CK(cudaDeviceSynchronize());
+        for (int round = 0; round < compare_rounds; round++) {
+            if ((round & 1) == 0) {
+                lt_ms[round] = time_body([&](int i) { run(i, 0); });
+                plow_ms[round] = time_body(run_plow);
+            } else {
+                plow_ms[round] = time_body(run_plow);
+                lt_ms[round] = time_body([&](int i) { run(i, 0); });
+            }
+        }
+        std::sort(lt_ms, lt_ms + compare_rounds);
+        std::sort(plow_ms, plow_ms + compare_rounds);
+        ms = 0.5f * (lt_ms[compare_rounds / 2 - 1] + lt_ms[compare_rounds / 2]);
+        const float pms = 0.5f * (plow_ms[compare_rounds / 2 - 1] + plow_ms[compare_rounds / 2]);
+        printf("%-9s %6u %8.4f %9.1f cuBLASLt rounds=%d\n", s.name, M, ms,
+               fl / (ms * 1e-3) / 1e12, compare_rounds);
         printf("%-9s %6u %8.4f %9.1f Plow speedup=%.4f cold_MiB=%.1f\n", s.name, M, pms,
                fl / (pms * 1e-3) / 1e12, ms / pms, (double)nrep * wn * sizeof(bf16) / (1024 * 1024));
 #ifdef PLOW_BENCH_QWEN_GEMV

@@ -153,7 +153,7 @@ pub enum DevOp {
     /// requires the LDS-staged arm and `d_rmsnorm`'s register path; the kernel re-checks both and
     /// demotes to `norm = 0` rather than reduce over an arena it never staged.
     Gemv = 10,
-    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=O_final` ·
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=O_final?` ·
     /// `i0=n_q i1=n_kv i2=n_head i3=n_kv_head i4=q_pos0 i5=window i6=hd i7=nsplit` ·
     /// `f0=scale j0=kv_stride j1=kv_mask`.
     /// `window = 0` is full causal. `hd` must be 256 or 512.
@@ -169,9 +169,11 @@ pub enum DevOp {
     /// `crate::slots`' drift test; see that module for why the table is checked
     /// against these comments rather than generated from them.
     FlashPrefill = 11,
-    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32)` ·
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32) t6=decode_slot(i32)?` ·
     /// `i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window i5=nsplit i6=hd` ·
-    /// `f0=scale`.
+    /// `f0=scale`. For ordinary BF16, `decode_slot[b]` selects the physical KV slot for
+    /// compact row `b`; when absent, physical slot and compact row are identical. Packed
+    /// extension forms retain their extension-specific operands.
     FlashDecode = 12,
     /// `t0=O t1=Opart t2=mlpart t3=sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
     ///
@@ -1802,15 +1804,29 @@ pub enum DevOp {
     /// `t0=part(f32[T*k][H]) t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx(u32)
     /// t7=row_gate(f32)` · `i0=H i1=I i2=n_exp`.
     MoeDownMxPf = 153,
+    /// `t0=out(bf16 [S][H]) t1=x(bf16 [M][H]) t2=rows(u32 [S])` · `i0=S i1=H i2=M`, computing
+    /// `out[s][h] = x[rows[s]][h]`.
+    ///
+    /// The first stage of the unified token batch's terminal segment: it selects the compact
+    /// set of hidden rows whose next-token distributions the step owes, so the final norm, LM
+    /// head and selection stage run at `M = S` instead of the packed row count.
+    ///
+    /// NOT [`DevOp::Embed`]. `Embed` gathers rows of the EMBEDDING TABLE by token id; this
+    /// gathers rows of a hidden activation by packed row index. Different element types,
+    /// different bounds, and there is no other generic hidden-row gather in the ISA.
+    ///
+    /// `rows[s] >= M` traps on every backend. A clamped index is not a degraded answer, it is
+    /// another request's hidden row, and the wrong next token reads as fluent output.
+    RowGather = 154,
     /// Gemma-4 E-series per-layer input block, fused and in place on `x`: `g = gelu_tanh(Wg . x)`,
     /// `a = g * ple[t][col0..col0+P)`, `x = (x + RMSNorm(Wp . a) * gamma_post) * layer_scalar`, and
     /// optionally the next layer's input norm `hn = RMSNorm(x) * gamma_next` (t5/t6). `ple` is
     /// the combined per-layer input table, already carrying HF's 1/sqrt(2) (the emitter applies it
     /// on the Residual that forms the table); `Wp` is the checkpoint weight verbatim. See
-    /// `dev_isa.h` op 154.
+    /// `dev_isa.h` op 155.
     /// `t0=x t1=Wg t2=Wp t3=gamma_post t4=ple t5=hn_out? t6=gamma_next?` ·
     /// `i0=T i1=H i2=P i3=col0 i4=stride` · `f0=eps f1=layer_scalar`.
-    PerLayerInput = 154,
+    PerLayerInput = 155,
 }
 
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
@@ -1980,6 +1996,7 @@ impl DevOp {
         DevOp::MoeDownMx,
         DevOp::MoeGluMxPf,
         DevOp::MoeDownMxPf,
+        DevOp::RowGather,
         DevOp::PerLayerInput,
     ];
 
@@ -2155,6 +2172,7 @@ impl DevOp {
             DevOp::MoeDownMx => "PLOW_DOP_MOE_DOWN_MX",
             DevOp::MoeGluMxPf => "PLOW_DOP_MOE_GLU_MX_PF",
             DevOp::MoeDownMxPf => "PLOW_DOP_MOE_DOWN_MX_PF",
+            DevOp::RowGather => "PLOW_DOP_ROW_GATHER",
             DevOp::PerLayerInput => "PLOW_DOP_PER_LAYER_INPUT",
         }
     }
@@ -2195,8 +2213,9 @@ impl DevOp {
     /// 147 -> 150 for `MoeGluMx` .. `MoeDownMxPf` (GPT-OSS flat MXFP4 MoE): main took
     /// 147-149 for `ZeroF32`/`GemmSplitK`/`CastF32Bf16` while this branch was out, the same
     /// collision-at-merge as 111 -> 113, resolved the same way (renumber the later merge).
-    /// 154 -> 155 for `PerLayerInput = 154` (Gemma-4 E-series per-layer inputs).
-    pub const COUNT: u16 = 155;
+    /// 154 -> 155 for `RowGather = 154` (the unified token batch's terminal row selection).
+    /// 155 -> 156 for `PerLayerInput = 155` (Gemma-4 E-series per-layer inputs).
+    pub const COUNT: u16 = 156;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -2497,6 +2516,63 @@ pub struct PrefillSpan {
 
 pub const PREFILL_SPAN_RESET_STATE: u32 = 1;
 
+/// [`TokenBatch::version`] this build implements. A descriptor carrying anything else is
+/// refused at load; it is not reinterpreted.
+pub const TOKEN_BATCH_VERSION: u32 = 1;
+
+/// Device descriptor for one unified token batch — mirrors `PlowTokenBatch` in
+/// `runtime/common/dev_isa.h`.
+///
+/// Three counts, everywhere, backend- and model-independent. A backend may CAP them; nothing
+/// may redefine them:
+///
+/// * `row_capacity` — compiled/padded allocation capacity (the launched `T`).
+/// * `real_rows` — `M`, the scheduled input tokens this step.
+/// * `sample_rows` — `S`, the hidden rows whose next-token distributions are needed.
+///   **`S = 0` means no output segment**, not the legacy `n_batch == 0 means one row`.
+///
+/// [`PrefillSpan`] is reused verbatim, `state_slot` and `program` included. What differs from
+/// the packed-prefill descriptor is COVERAGE: spans cover exactly `[0, real_rows)` with no
+/// decode prefix, and padding rows belong to no span.
+///
+/// `active[row] != 0` means the row is LIVE — the ISA's existing `active[B]` polarity (ops
+/// 136-145), which is the opposite of [`DevProgram::prefill_parked`]. The two are never
+/// consulted for the same row; the polarity is spelled out because getting it backwards writes
+/// KV for padding and does not trap.
+///
+/// The pointers are **device** addresses. The explicit `_pad0`/`_pad1` are not decoration: this
+/// struct is memcpy'd to the device, and an implicit gap would ship whatever the constructing
+/// stack frame held, which is how a `TokenBody` field gap made emitted packets non-reproducible
+/// in release for months.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct TokenBatch {
+    /// [`TOKEN_BATCH_VERSION`].
+    pub version: u32,
+    /// Compiled/padded allocation capacity (launched `T`).
+    pub row_capacity: u32,
+    /// `M`: live rows, dense in `[0, M)`.
+    pub real_rows: u32,
+    /// `S`: selected hidden rows; `0` = no output segment.
+    pub sample_rows: u32,
+    /// `R`: spans covering exactly `[0, M)`.
+    pub n_spans: u32,
+    /// Reserved; must be zero in version 1.
+    pub flags: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    /// Device `[n_spans]` [`PrefillSpan`], monotone `row0`, dense cover of `[0, M)`.
+    pub spans: u64,
+    /// Device `[row_capacity]` token ids; padding reads 0.
+    pub input_ids: u64,
+    /// Device `[row_capacity]` absolute positions within the owning request.
+    pub positions: u64,
+    /// Device `[row_capacity]` park mask; `1` = live row.
+    pub active: u64,
+    /// Device `[sample_rows]` indices into the body's final hidden tensor.
+    pub sample_rows_idx: u64,
+}
+
 /// Everything the interpreter needs, passed once as the kernel's args. The
 /// pointers are **device** addresses, so this is only meaningful as the kernarg
 /// block handed to `plow_interp_*`.
@@ -2569,6 +2645,14 @@ pub struct DevProgram {
     pub n_prefill_spans: u32,
     /// Launched compiled row count `T`, including parked padding after the dense real spans.
     pub n_prefill_rows: u32,
+    /// Device [`TokenBatch`] descriptor, or `0` for every pre-existing path.
+    ///
+    /// Appended after `n_prefill_rows`, which already ends 8-byte aligned, so every existing
+    /// field keeps its offset and the ABI-lock test sees only the size grow, 168 -> 176. That
+    /// growth is deliberate: `AmdEngine::load` derives its kernarg-segment check from
+    /// `size_of::<DevProgram>()`, so an object built before this field is refused BY NAME
+    /// instead of loading and reading its grid dimensions eight bytes off.
+    pub token_batch: u64,
 }
 
 /// One packet boundary, timestamped by the interpreter.
@@ -2600,4 +2684,7 @@ const _: () = assert!(size_of::<DevInst64>() == 64);
 const _: () = assert!(size_of::<StreamEnt>() == 24);
 const _: () = assert!(size_of::<PrefillSpan>() == 32);
 const _: () = assert!(size_of::<TraceRec>() == 40);
-const _: () = assert!(size_of::<DevProgram>() == 168);
+const _: () = assert!(size_of::<DevProgram>() == 176);
+const _: () = assert!(size_of::<TokenBatch>() == 72);
+// No implicit padding: the u32 header is 32 bytes, already 8-aligned for the pointer block.
+const _: () = assert!(std::mem::offset_of!(TokenBatch, spans) == 32);

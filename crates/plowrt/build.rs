@@ -34,6 +34,14 @@ size_t plow_cpu_prepack_bf16_b_bytes(uint32_t n, uint32_t k) { (void)n; (void)k;
 int plow_cpu_prepack_bf16_b(void* dst, const void* src, uint32_t n, uint32_t k) {
     (void)dst; (void)src; (void)n; (void)k; return -1;
 }
+int plow_token_batch_validate_host(const PlowTokenBatch* tb) { (void)tb; return PLOW_TB_E_NULL; }
+int plow_token_row_host(const PlowTokenBatch* tb, uint32_t row, PlowTokenRowFlat* out) {
+    (void)tb; (void)row; (void)out; return PLOW_TB_E_NULL;
+}
+int plow_token_sample_row_host(const PlowTokenBatch* tb, uint32_t s, uint32_t* out) {
+    (void)tb; (void)s; (void)out; return PLOW_TB_E_NULL;
+}
+uint32_t plow_token_batch_descriptor_version(void) { return PLOW_TOKEN_BATCH_VERSION; }
 "#;
 
     const ABI_PROBE: &str = r#"
@@ -56,6 +64,10 @@ int plow_cpu_abi_isa_scalar(void) { return PLOW_CPU_ISA_SCALAR; }
 int plow_cpu_abi_isa_avx512(void) { return PLOW_CPU_ISA_AVX512; }
 int plow_cpu_abi_isa_amx(void) { return PLOW_CPU_ISA_AMX; }
 int plow_cpu_abi_dop_table(void) { return PLOW_CPU_DOP_TABLE; }
+size_t plow_cpu_abi_sizeof_token_row(void) { return sizeof(PlowTokenRowFlat); }
+size_t plow_cpu_abi_sizeof_token_batch(void) { return sizeof(PlowTokenBatch); }
+size_t plow_cpu_abi_offsetof_token_row_active(void) { return offsetof(PlowTokenRowFlat, active); }
+int plow_cpu_abi_tb_span_none(void) { return (int)PLOW_TB_SPAN_NONE; }
 "#;
 
     fn c_files(dir: &Path) -> Vec<PathBuf> {

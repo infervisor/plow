@@ -134,9 +134,13 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_UNISEG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub uniseg: bool,
 
-    /// Emit the packet ABI for packed cross-request prefill.
-    #[arg(long = "emit-packed-prefill", env = "PLOW_EMIT_PACKED_PREFILL", default_value_t = false, action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
-    pub emit_packed_prefill: bool,
+    /// Emit the packet ABI for packed cross-request prefill. Unset lets plowc
+    /// select it from the target and packet capabilities.
+    #[arg(long = "emit-packed-prefill", env = "PLOW_EMIT_PACKED_PREFILL", action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, default_missing_value = "true")]
+    pub emit_packed_prefill: Option<bool>,
+
+    #[arg(skip)]
+    pub packed_prefill_default: bool,
 
     /// Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs in their own gfx950 segment.
     /// Default on; `=0` is the rollback to the interpreter-resident pair.
@@ -163,13 +167,14 @@ pub struct EmitConfig {
     /// rung that covers the live sequences instead of being committed to one
     /// `PLOW_DECODE_BATCH` at emit.
     ///
-    /// Unset (the default) is BYTE-IDENTICAL to today's blob: [`EmitConfig::decode_rungs`]
-    /// then returns the single `decode_batch` rung and the emitter takes the exact code
-    /// path it always took. Set, the WIDEST rung sizes every per-slot tensor (the KV
-    /// cache above all), because a sequence keeps its slot across a rung change and the
-    /// per-slot stride must not move with `B`.
+    /// Supported serving emitters default an unset ladder to `1,2,4,8,16`.
+    /// Set it to `1` for a single B1 program. The widest rung sizes every
+    /// per-slot tensor because a sequence keeps its slot across rung changes.
     #[arg(long = "emit-decode-batch-ladder", env = "PLOW_DECODE_BATCH_LADDER")]
     pub decode_ladder: Option<String>,
+
+    #[arg(skip)]
+    pub decode_ladder_default: bool,
 
     /// Bind prebuilt CUDA objects in the output directory to complete decode programs.
     #[arg(long = "emit-decode-objects")]
@@ -190,6 +195,10 @@ pub struct EmitConfig {
     /// AMD: emit prefill (tiled) opcodes into the decode bucket.
     #[arg(long, env = "PLOW_DECODE_TILED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub decode_tiled: bool,
+
+    /// Apply requested L2 placement to prefill as well as decode.
+    #[arg(long, env = "PLOW_L2_PLACE_PREFILL", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub l2_place_prefill: bool,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Fusion (generic, cross-model)
@@ -500,6 +509,22 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMV_WALK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemv_walk: bool,
 
+    /// LDS halves the DECODE object's GEMV staging arena actually has, overriding
+    /// [`crate::gm_lds_halves`] for the fused-QKV / fused-GLU eligibility test only.
+    ///
+    /// `hwspec`'s gfx942 `decode_gemm_tile` is the `PLOW_OCC4` / `PLOW_DEC_SQUEEZE` re-cut
+    /// (128x256x32, 15,360 halves). A DEFAULT `scripts/build_gfx942.sh` decode object is built
+    /// at 192x256x64 and its arena is 32,256 halves, so at `hidden = 5376` the emitter refuses
+    /// the fusions from T=3 up while the object could stage T=6. That is what the fusion audit
+    /// recorded as "DecodeB4: fused QKV/GLU emitter eligibility fails the conservative
+    /// shared-memory capacity bound" — 220 packets per token that need not exist.
+    ///
+    /// PAIRED WITH THE OBJECT, and checked rather than asserted: the decode object exports its
+    /// arena as `plow_dec_stage_halves`, and `AmdEngine::load` refuses a blob whose fused
+    /// staging exceeds it. Unset ⇒ byte-identical emission.
+    #[arg(long, env = "PLOW_DEC_STAGE_HALVES")]
+    pub dec_stage_halves: Option<u32>,
+
     /// Fold graph-adjacent materialized Residual inputs into AttnRes. Bit-identical and
     /// model-independent. DEFAULT ON; set `PLOW_FUSE_RESIDUAL_INPUT=0` to roll back.
     #[arg(long, env = "PLOW_FUSE_RESIDUAL_INPUT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -557,6 +582,49 @@ pub struct EmitConfig {
     /// Causal KV-split factor for the V2 MLA prefill flash (2..=8; unset/1 = unsplit).
     #[arg(long, env = "PLOW_GLM_PF_NS")]
     pub glm_pf_ns: Option<u32>,
+
+    /// Add the sub-128 prefill rungs (32, 64) on AMD. DEFAULT OFF, and it earned that.
+    ///
+    /// It shipped on by default and was withdrawn on measurement. What it buys is a 29.5% /
+    /// 11.3% reduction in emitted workgroup-packets at t=32 / t=64 against the 128 rung —
+    /// sublinear, because `GM_BM=192` makes `ceil(t/192) == 1` for every rung at or below 192,
+    /// so the dense GEMM does not shrink at all and only flash, norms and rope do. Nothing has
+    /// ever priced that in wall-clock, and two serving campaigns measured it at zero.
+    ///
+    /// What it COSTS was measured: +940 tile lookups that are all analytical and stay that way
+    /// (16 distinct GEMM shapes, `{32,64} × {2048,4096,5376,8192,16384,21504}`), +30.9% blob
+    /// size, and 14 extra dispatch-audit findings — `GemmSmall` at 13.8-47.4% occupancy, the
+    /// worst in the blob.
+    ///
+    /// And it caps the DECODE ladder at 16. Decode and prefill rungs share one width-ordered
+    /// space (`packet::devbuild::decode_rung_lo` separates them by width and the blob carries no
+    /// field distinguishing them), so a 32 prefill bucket collides with a 32 decode rung and the
+    /// emit refuses. With the floor off the decode ceiling is 64; with it on, 16. That is the
+    /// concrete reason this is off rather than deleted: the rungs are still one flag away for
+    /// anyone who wants to measure them, but they do not get to block decode concurrency by
+    /// default.
+    #[arg(long = "pf-floor", env = "PLOW_PF_FLOOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub pf_floor: bool,
+
+    /// CAP on the dense-GQA prefill `FlashPrefill` KV split (`dense_flash_split`). Unset = the
+    /// CU-fill heuristic, unchanged.
+    ///
+    /// `=1` is the interesting value and the reason this exists: it is the unified token batch's
+    /// precondition. That route is qualified only at `nsplit == 1`, and the heuristic gives
+    /// `ceil(n_cu / (ceil(t/256) * heads))` — on gfx942/Gemma-4-31B that is 10, 10, 10, 5, 3, 2,
+    /// 1, 1 across buckets 32..8192, so the route can execute exactly the two WIDEST buckets and
+    /// every prompt at or under 2048 falls back.
+    ///
+    /// The split is there to FILL THE MACHINE: at `t=128` one q-tile times 32 heads is 32 work
+    /// items against 304 CUs, and `ns=10` takes that to 320. Capping it at 1 gives that fill up
+    /// — in an ISOLATED prefill. The falsifiable claim this knob exists to test is that a token
+    /// batch does not need it, because the step is filled by the other spans and the decode rows
+    /// sharing it rather than by splitting one prompt's attention.
+    ///
+    /// Emit-time only, and it moves emitted bytes: `ns == 1` also switches the flash to its own
+    /// bf16 epilogue and drops the `FlashMerge` entirely (see [`dense_flash_split`]).
+    #[arg(long, env = "PLOW_DENSE_PF_NS")]
+    pub dense_pf_ns: Option<u32>,
 
     /// Widen prefill norm/residual dispatch across CUs. DEFAULT ON (`=0` restores the
     /// single-workgroup emit for A/B). Bit-identical either way.
@@ -771,6 +839,26 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMM_WIDE_C8", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemm_wide_c8: bool,
 
+    /// Occupancy floor for the emit-time dispatch audit, in percent. A matmul that fills
+    /// less of its own CU set than this is named at emit. Default
+    /// `dispatch_audit::DEFAULT_OCCUPANCY_FLOOR_PCT`.
+    #[arg(long, env = "PLOW_AUDIT_OCC_FLOOR")]
+    pub audit_occ_floor: Option<u32>,
+
+    /// Ceiling on the fraction of GEMV row work a compiled `GV_MM_MAX` may spend on dead
+    /// rows, in percent. Default `dispatch_audit::DEFAULT_GEMV_WASTE_MAX_PCT`.
+    #[arg(long, env = "PLOW_AUDIT_GEMV_WASTE_MAX")]
+    pub audit_gemv_waste_max: Option<u32>,
+
+    /// Refuse to emit when the dispatch audit finds anything, instead of warning.
+    ///
+    /// Default off, and deliberately: the audit reports a PERFORMANCE shortfall, never a
+    /// wrong answer, so refusing by default would block correct blobs on a threshold that is
+    /// a judgement call. `=1` is for the build that has already been tuned and must not
+    /// regress — CI, or a campaign re-emitting a configuration it measured.
+    #[arg(long, env = "PLOW_AUDIT_STRICT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub audit_strict: bool,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / never-ship (hidden from --help)
     // ──────────────────────────────────────────────────────────────────────────
@@ -830,16 +918,19 @@ impl EmitConfig {
             mx4_head: env_str("PLOW_MX4_HEAD"),
             mx4_prefill: env_str("PLOW_MX4_PREFILL"),
             uniseg: env_bool("PLOW_UNISEG"),
-            emit_packed_prefill: env_bool("PLOW_EMIT_PACKED_PREFILL"),
+            emit_packed_prefill: env_bool_opt("PLOW_EMIT_PACKED_PREFILL"),
+            packed_prefill_default: false,
             // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
             // value; direct legacy callers must name the feature explicitly.
             decode_mla_segments: env_bool("PLOW_SEG_DECODE_MLA"),
             decode_grouped_moe_segments: env_bool_opt("PLOW_SEG_DECODE_GROUPED_MOE"),
             decode_batch: env_u32("PLOW_DECODE_BATCH").unwrap_or(1),
             decode_ladder: env_str("PLOW_DECODE_BATCH_LADDER"),
+            decode_ladder_default: false,
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
+            l2_place_prefill: env_bool_opt("PLOW_L2_PLACE_PREFILL").unwrap_or(true),
             fuse_argmax: env_bool("PLOW_FUSE_ARGMAX"),
             no_fuse_qkv: env_bool("PLOW_NO_FUSE_QKV"),
             fuse_qkv_fp8: env_bool("PLOW_FUSE_QKV_FP8"),
@@ -925,6 +1016,7 @@ impl EmitConfig {
             k3_seq_rows: std::env::var_os("PLOW_K3_SEQ_ROWS").is_some(),
             gemv_mm: env_u32("PLOW_GEMV_MM"),
             gemv_walk: env_bool("PLOW_GEMV_WALK"),
+            dec_stage_halves: env_u32("PLOW_DEC_STAGE_HALVES"),
             fuse_residual_input: env_opt_out("PLOW_FUSE_RESIDUAL_INPUT"),
             k3_fuse_arnorm: env_opt_out("PLOW_K3_FUSE_ARNORM"),
             // GLM-5.2 / gfx942 campaign knobs. `env_opt_out` is NOT `!env_bool`: the
@@ -939,6 +1031,8 @@ impl EmitConfig {
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
+            dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
+            pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
             glm_place_pf: env_bool("PLOW_GLM_PLACE_PF"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),
@@ -988,6 +1082,9 @@ impl EmitConfig {
                 .filter(|s| !s.is_empty()),
             glm_wgfit: env_opt_out("PLOW_GLM_WGFIT"),
             tunedb: std::env::var("PLOW_TUNEDB").ok(), // preserves "" for "disable tuning"
+            audit_occ_floor: env_u32("PLOW_AUDIT_OCC_FLOOR"),
+            audit_gemv_waste_max: env_u32("PLOW_AUDIT_GEMV_WASTE_MAX"),
+            audit_strict: env_bool("PLOW_AUDIT_STRICT"),
             tune_dump: env_bool("PLOW_TUNE_DUMP"),
             gemm_wide_c8: env_opt_out("PLOW_GEMM_WIDE_C8"),
             skip_coverage: env_bool("PLOW_SKIP_COVERAGE"),
@@ -1096,11 +1193,16 @@ impl EmitConfig {
         self.fp8 || self.w8a8 || self.w8a16
     }
 
+    pub fn packed_prefill_on(&self) -> bool {
+        self.emit_packed_prefill
+            .unwrap_or(self.packed_prefill_default)
+    }
+
     /// The decode widths this emit builds programs for, ASCENDING.
     ///
-    /// Without `PLOW_DECODE_BATCH_LADDER` this is exactly `[decode_batch]`, which is
-    /// what makes an unset ladder byte-identical: the emitter runs its one-decode-program
-    /// loop once, at the same `B`, with the same builder settings.
+    /// Without `PLOW_DECODE_BATCH_LADDER` this is exactly `[decode_batch]`.
+    /// [`super::apply_production_defaults`] resolves an unset ladder before
+    /// production emission; direct configuration tests retain this fallback.
     ///
     /// With it, the list is parsed, clamped to `1..=`[`packet::devbuild::DECODE_RUNG_MAX`],
     /// sorted and deduped. `decode_batch` is IGNORED when a ladder is given — two records
@@ -1140,9 +1242,12 @@ impl EmitConfig {
         match &self.tunedb {
             Some(s) if s.is_empty() => None,
             Some(s) => Some(s.clone()),
+            // Derived from the SAME checkout the build identity is fingerprinted against
+            // (`kernelcaps::source_root`), because reading one checkout's store while keying
+            // records to another checkout's digest is two bugs that look like one.
             None => Some(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../tuning")
+                kernelcaps::source_root()
+                    .join("tuning")
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -1181,6 +1286,177 @@ pub fn install(mut cfg: EmitConfig) {
     INSTALLED.store(ptr, std::sync::atomic::Ordering::Release);
 }
 
+/// The resolved value of one emit knob, and where that value came from.
+///
+/// ## Why this exists
+///
+/// Only GEMM tiles were ever measured and persisted
+/// (`tuning/amd/gfx942/mi300x/kernel_measurement.jsonl`, keyed by a digest that goes stale on
+/// ANY `runtime/amd` edit). The ~140 emit knobs above are env reads recorded NOWHERE:
+/// `build.json` records the tuning source and the precision axes, but not the knob values that
+/// produced the blob, so the only durable record of a winning configuration was prose in a
+/// markdown file. `--preset` sets the bucket grid and nothing here.
+///
+/// That is what a future auto-tuner has to write into, and what a rebuild has to read back to
+/// reproduce a measured configuration. The recording is the load-bearing half.
+///
+/// ## Provenance is taken from clap, not inferred
+///
+/// [`clap::parser::ValueSource`] already distinguishes a flag, an env var and a default, and
+/// `plowc` is the only thing that resolves all three. Inferring it instead — "the env var is
+/// set, so it must be the source" — is wrong the moment a flag overrides an env var, and it is
+/// exactly the class of drift the manifest exists to eliminate. So the recorder takes the
+/// `ArgMatches` when there is one, and falls back to probing the environment only on the
+/// `from_env` path, where by construction there is no command line to lose to.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Knob {
+    /// The clap arg id, which is the struct field name.
+    pub id: String,
+    /// The env var that sets it, absent for the four `#[arg(skip)]` / CLI-only fields.
+    pub env: Option<String>,
+    /// The resolved value, rendered as the string that would set it again.
+    pub value: String,
+    /// `"cli"`, `"env"`, `"default"`, or `"production_default"` — the last being
+    /// `apply_production_defaults`, which is this tree's only real third source (`--preset`
+    /// is the bucket grid and never reaches an emit knob).
+    pub source: &'static str,
+}
+
+/// The recorded configuration: the knobs as parsed, whether that parse was clap's (and so
+/// carries real provenance), and the emitter's own later overrides.
+///
+/// The three are kept apart because they arrive in an order nothing guarantees.
+/// `apply_production_defaults` runs BEFORE `install`, `plowc` records BEFORE either, and the
+/// manifest reads LAST; folding an override into the knob list as it arrives would lose it to
+/// the next re-record. Keeping overrides separate and applying them at read time makes the
+/// result independent of that order.
+#[derive(Default)]
+struct Record {
+    knobs: Option<Vec<Knob>>,
+    /// True when `knobs` came from an `ArgMatches`. An env-probed record is refreshed on every
+    /// read, because a test process emits many blobs under different environments and a stale
+    /// snapshot would describe the wrong one; a clap record is never refreshed, because there
+    /// is exactly one command line per process and re-probing would downgrade `"cli"` to
+    /// `"env"` or `"default"`.
+    from_clap: bool,
+    /// `id -> value` set by the emitter after parsing.
+    overrides: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(not(test))]
+static RECORD: std::sync::Mutex<Record> = std::sync::Mutex::new(Record {
+    knobs: None,
+    from_clap: false,
+    overrides: std::collections::BTreeMap::new(),
+});
+#[cfg(test)]
+thread_local! {
+    static TEST_RECORD: std::cell::RefCell<Record> =
+        std::cell::RefCell::new(Record::default());
+}
+
+fn with_record<T>(f: impl FnOnce(&mut Record) -> T) -> T {
+    #[cfg(not(test))]
+    return f(&mut RECORD.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(test)]
+    return TEST_RECORD.with_borrow_mut(f);
+}
+
+/// Render an arg's declared default, which is what clap resolved to when the source is
+/// `DefaultValue` and `get_raw` has nothing to hand back.
+fn declared_default(arg: &clap::Arg) -> String {
+    arg.get_default_values()
+        .iter()
+        .map(|v| v.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Every knob `EmitConfig` declares, with the value and provenance of this emit.
+///
+/// `matches` is `plowc`'s parse. Pass `None` from the `from_env` path: provenance there is
+/// exactly "set in the environment or not", because that path has no command line to lose to.
+pub fn record_knobs(matches: Option<&clap::ArgMatches>) {
+    use clap::Args;
+    let cmd = EmitConfig::augment_args(clap::Command::new("plowc"));
+    let mut out: Vec<Knob> = Vec::new();
+    for arg in cmd.get_arguments() {
+        let id = arg.get_id().as_str().to_string();
+        let env = arg.get_env().map(|e| e.to_string_lossy().into_owned());
+        let (value, source) = match matches {
+            Some(m) => {
+                let source = match m.value_source(&id) {
+                    Some(clap::parser::ValueSource::CommandLine) => "cli",
+                    Some(clap::parser::ValueSource::EnvVariable) => "env",
+                    _ => "default",
+                };
+                let raw = m.get_raw(&id).map(|vals| {
+                    vals.map(|v| v.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                });
+                (raw.unwrap_or_else(|| declared_default(arg)), source)
+            }
+            None => match env.as_deref().and_then(|e| std::env::var(e).ok()) {
+                Some(v) => (v, "env"),
+                None => (declared_default(arg), "default"),
+            },
+        };
+        out.push(Knob {
+            id,
+            env,
+            value,
+            source,
+        });
+    }
+    // Sorted by id so the section diffs cleanly wherever a new field lands in the struct, and
+    // independently of whether `serde_json` resolved with `preserve_order` in this build (it
+    // does for `plowc`, through `egglog`; it does not for a bare `cargo test -p devgen`).
+    out.sort();
+    with_record(|r| {
+        r.knobs = Some(out);
+        r.from_clap = matches.is_some();
+    });
+}
+
+/// Overwrite one knob's recorded value with what the emitter itself decided.
+///
+/// `apply_production_defaults` runs after parsing and can set knobs the user did not — the
+/// decode ladder on sm_90a, the packed-prefill contract; `effective_uniseg` does the same for
+/// `PLOW_UNISEG` on sm_120. Recording the parsed value in those cases would describe a
+/// configuration that is not the one that emitted the blob, which is the single failure this
+/// record exists to prevent.
+///
+/// These are excluded from `replay`: they are derived from arch and capabilities, so a replay
+/// re-derives them, and pinning them would freeze a decision that should follow the target.
+pub fn note_production_default(id: &str, value: String) {
+    with_record(|r| {
+        r.overrides.insert(id.to_string(), value);
+    });
+}
+
+/// The resolved knobs for this emit, sorted by id.
+///
+/// The manifest must carry a config section on EVERY path that writes a `build.json`, not only
+/// the `plowc` one — a blob emitted through `devgen`'s legacy entry points is exactly as hard to
+/// reproduce. The env probe lives here because `no_raw_env_reads` reserves
+/// `std::env::var("PLOW_…")` to this file, and rightly.
+pub fn knobs_or_env() -> Vec<Knob> {
+    if !with_record(|r| r.from_clap) {
+        record_knobs(None);
+    }
+    with_record(|r| {
+        let mut knobs = r.knobs.clone().unwrap_or_default();
+        for k in &mut knobs {
+            if let Some(v) = r.overrides.get(&k.id) {
+                k.value = v.clone();
+                k.source = "production_default";
+            }
+        }
+        knobs
+    })
+}
+
 /// Access the active emit config.
 ///
 /// Returns the explicitly [`install`]ed config if one exists. Otherwise, lazily
@@ -1199,6 +1475,57 @@ pub fn active() -> &'static EmitConfig {
 
 #[cfg(test)]
 mod tests {
+    /// [`crate::manifest::UNRECORDED_ENV`] names every emit-affecting env var read outside `EmitConfig`.
+    ///
+    /// Read out of the SOURCE, not maintained by hand, because the failure mode is silent: a new
+    /// `env::var("PLOW_...")` in the packet builder changes emitted bytes and, unlisted, leaves
+    /// `build.json` claiming a replay that does not reproduce. Diagnostics-only reads (`*_DUMP`,
+    /// `*_REPORT`, `*_QUIET`, `PLOW_ROOT`) are excluded by name — they do not move bytes.
+    #[test]
+    fn unrecorded_env_list_is_complete() {
+        let root = kernelcaps::source_root();
+        let mut found: Vec<String> = Vec::new();
+        for rel in ["crates/packet/src/devbuild.rs"] {
+            let Ok(src) = std::fs::read_to_string(root.join(rel)) else {
+                eprintln!("skipped: {rel} not readable from {}", root.display());
+                return;
+            };
+            // The name must follow the call's OPEN PAREN, not merely appear near it. A
+            // 200-byte window instead swept up `PLOW_UNISEG` from a doc comment three lines
+            // below an unrelated `env::var` and reported a knob that is a declared field.
+            for (i, _) in src.match_indices("env::var") {
+                let rest = &src[i + "env::var".len()..];
+                let rest = rest.strip_prefix("_os").unwrap_or(rest);
+                let Some(rest) = rest.strip_prefix('(') else {
+                    continue;
+                };
+                let rest = rest.trim_start();
+                let Some(rest) = rest.strip_prefix('"') else {
+                    continue;
+                };
+                let Some(end) = rest.find('"') else { continue };
+                let name = &rest[..end];
+                if name.starts_with("PLOW_") {
+                    found.push(name.to_string());
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        let diagnostic = |k: &str| {
+            k.ends_with("_DUMP") || k.ends_with("_REPORT") || k.ends_with("_QUIET") || k == "PLOW_ROOT"
+        };
+        let missing: Vec<&String> = found
+            .iter()
+            .filter(|k| !diagnostic(k) && !crate::manifest::UNRECORDED_ENV.contains(&k.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these emit-affecting env vars are read outside EmitConfig but not listed in \
+             UNRECORDED_ENV, so build.json will not record them: {missing:?}"
+        );
+    }
+
     use super::EmitConfig;
     use clap::Parser;
 
@@ -1449,6 +1776,48 @@ mod tests {
 
         std::env::set_var("PLOW_FUSE_RESIDUAL_INPUT", "0");
         assert!(!EmitConfig::from_env().fuse_residual_input);
+    }
+
+    /// The default tuning store follows the checkout `plowc` is RUN in, not the one it was
+    /// BUILT in.
+    ///
+    /// The regression this pins is the one 27d596fc fixed everywhere else: with a
+    /// `CARGO_TARGET_DIR` shared across worktrees, `env!("CARGO_MANIFEST_DIR")` names whichever
+    /// worktree last rebuilt the binary. Tile selection keys records on
+    /// `kernelcaps::source_root`, so a `tunedb_root` that disagreed would read a different
+    /// checkout's `tuning/` than the digest it looks records up by — every record reads STALE
+    /// and no campaign can fix it. `PLOW_SOURCE_ROOT` is `source_root`'s first resolution step,
+    /// so pointing it somewhere neither checkout is the only way to tell the two answers apart.
+    #[test]
+    fn the_default_tunedb_root_follows_the_probed_source_root() {
+        let _guard = crate::test_env::env_guard();
+        let elsewhere = std::env::temp_dir().join("plow-tunedb-root-guard");
+        let _scope = crate::test_env::EnvScope::set(&[(
+            "PLOW_SOURCE_ROOT",
+            elsewhere.to_str().expect("temp dir is utf-8"),
+        )]);
+        std::env::remove_var("PLOW_TUNEDB");
+
+        let cfg = EmitConfig::from_env();
+        assert_eq!(
+            cfg.tunedb_root().map(std::path::PathBuf::from),
+            Some(kernelcaps::source_root().join("tuning")),
+        );
+        assert_eq!(
+            cfg.tunedb_root().map(std::path::PathBuf::from),
+            Some(elsewhere.join("tuning")),
+            "the default store must come from the probed source root, not from \
+             CARGO_MANIFEST_DIR"
+        );
+
+        // An explicit `--tuning-db` still wins, and `=\"\"` still disables tuning.
+        std::env::set_var("PLOW_TUNEDB", "/somewhere/else");
+        assert_eq!(
+            EmitConfig::from_env().tunedb_root().as_deref(),
+            Some("/somewhere/else")
+        );
+        std::env::set_var("PLOW_TUNEDB", "");
+        assert_eq!(EmitConfig::from_env().tunedb_root(), None);
     }
 
     #[test]

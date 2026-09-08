@@ -18,6 +18,16 @@ name = "plowrt"
 path = "src/lib.rs"
 
 [dependencies]
+# Renders the CHECKPOINT'S OWN `chat_template.jinja`. Without it every model
+# family needs a hand-written Rust prompt builder, and a family that matches no
+# builder is served another model's markers as literal text. `loop_controls` is
+# required, not optional: GLM's template uses `{% break %}`.
+minijinja = { version = "2", default-features = false, features = ["builtins", "loop_controls", "macros", "multi_template"] }
+# `strftime_now`, which HF chat templates call to stamp the current date into
+# the system prompt. gpt-oss calls it unguarded (its render fails without it),
+# and Llama-3.2 and Muse-Glimmer degrade to a stale or missing date. Already in
+# the workspace lock via egglog with the same features, so it adds no build.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 plow-asset = { workspace = true }
 packet = { workspace = true }
 hwspec = { workspace = true }
@@ -109,6 +119,13 @@ cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 
 [dev-dependencies]
+plow-asset = { workspace = true, features = ["test-util"] }
+# `tests/op_audit_families.rs` emits one miniature blob per model family and runs
+# the operator audit over it. Emission is host-only (`arch: ""`, config.json with
+# no weights), so this adds no build requirement, and the dependency is acyclic:
+# `devgen` depends on packet/costmodel/kernelcaps/tunedb/hwspec/plow-asset, never
+# on `plowrt`.
+devgen = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
@@ -119,6 +136,13 @@ http-body-util = "0.1"
 [[example]]
 name = "h2d_bench"
 required-features = ["cuda"]
+
+# Reads the cu -> L2-domain recovery and the placement decision out of
+# `exec::cpu::engine` rather than copying them, so it needs that engine
+# compiled. Undeclared, it broke `--features hsa` builds of the workspace.
+[[example]]
+name = "l2_probe"
+required-features = ["cpu"]
 
 [[example]]
 name = "reload_bench"

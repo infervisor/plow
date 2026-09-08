@@ -105,11 +105,59 @@ __device__ __forceinline__ uint2 kda_chunk_desc(const uint2* chunks, unsigned ch
 
 __device__ __forceinline__ float kda_sigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
-/* softplus(x) = log1p(exp(x)), evaluated in the numerically safe branch. [fla] uses
- * `tl.log(1 + tl.exp(x))` guarded to `x` for large x; matching that guard matters because the
- * unbounded gate branch feeds an exp() straight after. */
+/* softplus(x) = log1p(exp(x)), for the UNBOUNDED gate branch (`PLOW_KDA_GATE_SOFTPLUS`), whose
+ * result goes straight into `exp(-exp(A_log) * softplus(s))` -- a factor applied to a PERSISTENT
+ * recurrent state once per token.
+ *
+ * THREE REGIONS. [fla] writes `tl.log(1 + tl.exp(x))` guarded to `x` for large x; the guard is
+ * kept, and so is the middle region verbatim. The TAIL is not, and the reason is not rounding:
+ *
+ *   x > 20    softplus(x) == x to fp32. [fla]'s guard, unchanged.
+ *   x < -8    `1.0f + e` ABSORBS. fp32 has 24 significant bits, so `1.0f + e` rounds to exactly
+ *             1.0f for every e < 2^-25 -- i.e. for every x <= -16.6355 -- and the formulation
+ *             returns EXACTLY ZERO. The derived per-step decay is then exp(-A*0) = 1: the gate
+ *             stops forgetting altogether, and over a persistent recurrence that is not a
+ *             perturbed output, it is a missing operation. Measured against an f64 reference at
+ *             the checkpoint-maximum A = exp(A_log) = 11.776 (docs/kimi-k3-kda.md 3.1), a channel
+ *             at s = -17 should retain 0.9381 of its state after 131072 steps and instead retains
+ *             1.0000; at 2^20 steps (K3's max_position_embeddings) 0.5998 vs 1.0000. Just ABOVE
+ *             the absorption point the same expression is wrong the other way: `1 + e` quantizes
+ *             to `1 + 2^-23`, so the decay per step is 2x too large.
+ *             The tail is therefore evaluated as the series log(1+e) = e - e^2/2 + O(e^3), whose
+ *             relative error below -8 is < 4e-8 (e^2/3 <= 2^-24 there) -- BETTER than the
+ *             `1 + e` form at the switch point, so the join has no step of its own. MEASURED
+ *             (`scripts/kx.sh kda_gate --isa`, and the object diff): +14 instructions in
+ *             `d_kda_gate` (538 -> 552) and +56 across all of interp_decode_k3.elf, no register,
+ *             LDS, occupancy or spill change. `log1pf(expf(x))` -- op_qwen_gdn.h's form -- is
+ *             correct here too and costs 525 whole-probe instructions against this body's 203.
+ *   otherwise [fla]'s expression, bit-for-bit.
+ *
+ * BIT-COMPATIBILITY WITH [fla] WAS ALREADY NOT ON THE TABLE: this body uses `__logf`/`__expf`,
+ * the fast intrinsics, where Triton's `tl.log`/`tl.exp` are the precise libdevice calls, so the
+ * middle region does not match either. What the guard preserves is the FORMULA, and it still
+ * does. `PLOW_KDA_SOFTPLUS_FLA_COMPAT=1` restores the previous expression exactly.
+ *
+ * SCOPE: the only KDA checkpoint that exists (Kimi-K3) sets `gate_lower_bound = -5.0` and so
+ * takes `PLOW_KDA_GATE_LOWER_BOUND`, which never calls this function; devgen selects the mode
+ * from `gate_lower_bound.is_some()`. This branch serves a checkpoint without that field.
+ *
+ * NOT FIXED HERE, and deliberately: `exp(A_log) * softplus(s)` is evaluated as a product of two
+ * separately-rounded fp32 intermediates, so extreme finite parameters (A_log = 100, s = -100,
+ * whose mathematical product is ~1) still overflow or underflow one factor. The measured K3
+ * range is exp(A_log) in [0.471, 11.776]; the contract this body asserts is |A_log| <= 80 with
+ * the product finite, not the general case, and closing it costs the 190-instruction nested
+ * precise gate for parameters no checkpoint ships. */
+#ifndef PLOW_KDA_SOFTPLUS_FLA_COMPAT
+#define PLOW_KDA_SOFTPLUS_FLA_COMPAT 0
+#endif
 __device__ __forceinline__ float kda_softplus(float x) {
+#if PLOW_KDA_SOFTPLUS_FLA_COMPAT
     return x > 20.0f ? x : __logf(1.0f + __expf(x));
+#else
+    if (x > 20.0f) return x;
+    const float e = __expf(x);
+    return x < -8.0f ? e * (1.0f - 0.5f * e) : __logf(1.0f + e);
+#endif
 }
 
 /* BT64 chunk-local gate prefix. `chunks[c] = {row0, n_rows}` and n_rows is in [1, 64].

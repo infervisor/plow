@@ -73,7 +73,9 @@ int main(int argc, char** argv) {
     if (fread(fixture, 1, fn, ff) != (size_t)fn) return 1;
     fclose(ff);
     P = fixture;
-    if (rd_u32() != 0x4d4c4131u) { fprintf(stderr, "bad fixture magic\n"); return 1; }
+    /* "MLA2": the case header grew an 8th word (`nope`). Bumped with the layout so a
+     * stale fixture is refused here instead of mis-slicing every array after it. */
+    if (rd_u32() != 0x4d4c4132u) { fprintf(stderr, "bad fixture magic (want MLA2)\n"); return 1; }
     const uint32_t n_cases = rd_u32();
 
     H = plow_hsa_init();
@@ -147,7 +149,9 @@ int main(int argc, char** argv) {
     for (uint32_t ci = 0; ci < n_cases; ci++) {
         const uint32_t n_head = rd_u32(), DK = rd_u32(), DR = rd_u32(), Vd = rd_u32();
         const uint32_t ctx = rd_u32(), nsplit = rd_u32(), top_k = rd_u32();
+        const uint32_t nope = rd_u32();
         const float scale = rd_f32();
+        (void)nope; /* the decode phase runs the roped arm on zeroed tables either way */
         const unsigned B = 1;
         const int32_t* hIdx = NULL;
         if (top_k > 0) { hIdx = (const int32_t*)P; P += (size_t)top_k * 4; }
@@ -262,9 +266,11 @@ int main(int argc, char** argv) {
      * Second pass over the same fixture bytes: the stream is a fixed layout, so
      * re-reading it from the top is cheaper than retaining every case.
      * ==================================================================== */
-    plow_hsa_kernel kpf, kgpf, kpfm;
+    plow_hsa_kernel kpf, kgpf, kpfm, kpfv, kpfvn;
     if (plow_hsa_get_kernel(H, 0, "mla_flash_prefill_512", &kpf) ||
         plow_hsa_get_kernel(H, 0, "mla_gather_prefill_512", &kgpf) ||
+        plow_hsa_get_kernel(H, 0, "mla_flash_prefill_v2_512", &kpfv) ||
+        plow_hsa_get_kernel(H, 0, "mla_flash_prefill_v2_nope_512", &kpfvn) ||
         plow_hsa_get_kernel(H, 0, "mla_flash_prefill_mfma_512", &kpfm)) {
         fprintf(stderr, "prefill sym: %s\n", plow_hsa_last_error());
         return 1;
@@ -290,6 +296,7 @@ int main(int argc, char** argv) {
     for (uint32_t ci = 0; ci < n_cases; ci++) {
         const uint32_t n_head = rd_u32(), DK = rd_u32(), DR = rd_u32(), Vd = rd_u32();
         const uint32_t ctx = rd_u32(), nsplit_fx = rd_u32(), top_k = rd_u32();
+        const uint32_t nope = rd_u32();
         const float scale = rd_f32();
         (void)nsplit_fx; /* prefill is nsplit=1 by construction; the oracle run is too */
         const unsigned B = 1;
@@ -374,16 +381,52 @@ int main(int argc, char** argv) {
              * arm keeps the scalar body because its top_k set is per query row. */
             void *dOpM = NULL, *dMlM = NULL;
             float *hOpM = NULL, *hMlM = NULL;
+            /* The V2 (full-column-wave) body on the SAME operands — the shipped MLA prefill
+             * for GLM/DeepSeek, and until now the only prefill kernel here with no bf16
+             * coverage at all. Its (m, l) are NOT comparable elementwise: under
+             * FA_MLA_PF2_DEFER `m` is an exponent frame rather than the running max, so the
+             * check below is on the NORMALIZED output, the only thing that is frame-free.
+             * Four waves, hence the explicit 256 against PLOW_WG_THREADS. */
+            void *dOpV = NULL, *dMlV = NULL;
+            float *hOpV = NULL, *hMlV = NULL;
+            /* NoPE (zero-rope) V2. Only on a `nope` case, where the fixture's rope tables are
+             * identically zero -- so the SAME f64 golden that validates every other case is the
+             * golden for this one, and the roped V2 above becomes a bit-exact control. */
+            void *dOpVN = NULL, *dMlVN = NULL;
+            float *hOpVN = NULL, *hMlVN = NULL;
             if (top_k == 0) {
                 dOpM = dev(nop_t * 4);
                 dMlM = dev(nml_t * 4);
+                dOpV = dev(nop_t * 4);
+                dMlV = dev(nml_t * 4);
                 struct __attribute__((packed)) {
                     void *op, *ml; const void *qa, *qr, *ckv, *kr, *len;
                     unsigned n_batch, n_tok, n_head, kv_stride, window; float scale;
-                } a = {dOpM, dMlM, dQa, dQr, dCkv, dKr, dLen, B, T, n_head, ctx, 0, scale};
+                } a = {dOpM, dMlM, dQa, dQr, dCkv, dKr, dLen, B, T, n_head, ctx, 0, scale},
+                  v = {dOpV, dMlV, dQa, dQr, dCkv, dKr, dLen, B, T, n_head, ctx, 0, scale};
                 if (plow_hsa_launch(H, 0, &kpfm, cus * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1,
                                     1, 0, &a, sizeof(a)) != 0) {
                     fprintf(stderr, "mfma prefill launch: %s\n", plow_hsa_last_error()); fails++;
+                }
+                if (plow_hsa_launch(H, 0, &kpfv, cus * 256u, 1, 1, 256u, 1, 1, 0, &v,
+                                    sizeof(v)) != 0) {
+                    fprintf(stderr, "v2 prefill launch: %s\n", plow_hsa_last_error()); fails++;
+                }
+                if (nope) {
+                    dOpVN = dev(nop_t * 4);
+                    dMlVN = dev(nml_t * 4);
+                    /* NULL rope pointers, deliberately: the DR=0 body must not touch them. A
+                     * staging path that still read the rope half would fault here rather than
+                     * quietly load zeros from a live buffer and pass the numeric check. */
+                    struct __attribute__((packed)) {
+                        void *op, *ml; const void *qa, *ckv, *len;
+                        unsigned n_batch, n_tok, n_head, kv_stride, window; float scale;
+                    } vn = {dOpVN, dMlVN, dQa, dCkv, dLen, B, T, n_head, ctx, 0, scale};
+                    if (plow_hsa_launch(H, 0, &kpfvn, cus * 256u, 1, 1, 256u, 1, 1, 0, &vn,
+                                        sizeof(vn)) != 0) {
+                        fprintf(stderr, "v2 nope prefill launch: %s\n", plow_hsa_last_error());
+                        fails++;
+                    }
                 }
             }
             plow_hsa_wait(H, 0);
@@ -396,8 +439,19 @@ int main(int argc, char** argv) {
                 hMlM = plow_hsa_alloc_host(H, nml_t * 4);
                 plow_hsa_copy_d2h(H, 0, hOpM, dOpM, nop_t * 4);
                 plow_hsa_copy_d2h(H, 0, hMlM, dMlM, nml_t * 4);
+                hOpV = plow_hsa_alloc_host(H, nop_t * 4);
+                hMlV = plow_hsa_alloc_host(H, nml_t * 4);
+                plow_hsa_copy_d2h(H, 0, hOpV, dOpV, nop_t * 4);
+                plow_hsa_copy_d2h(H, 0, hMlV, dMlV, nml_t * 4);
+                if (dOpVN) {
+                    hOpVN = plow_hsa_alloc_host(H, nop_t * 4);
+                    hMlVN = plow_hsa_alloc_host(H, nml_t * 4);
+                    plow_hsa_copy_d2h(H, 0, hOpVN, dOpVN, nop_t * 4);
+                    plow_hsa_copy_d2h(H, 0, hMlVN, dMlVN, nml_t * 4);
+                }
             }
-            float mfma_err = 0.0f;
+            float mfma_err = 0.0f, v2_err = 0.0f, nope_err = 0.0f;
+            unsigned long nope_ne = 0; /* bits where the zero-rope body != the roped one */
 
             /* ORACLE: one decode launch per query row, at that row's causal context. */
             const size_t nop1 = (size_t)n_head * DK, nml1 = (size_t)n_head * 2;
@@ -455,6 +509,52 @@ int main(int argc, char** argv) {
                         const float e = (mag > 0.0f) ? dif / mag : dif;
                         if (e > mfma_err) mfma_err = e;
                     }
+                    for (unsigned hh = 0; hh < n_head; hh++) {
+                        const float lr = hMl1[hh * 2 + 1];
+                        const float lv = hMlV[((size_t)t * n_head + hh) * 2 + 1];
+                        const float* orow = hOp1 + (size_t)hh * DK;
+                        const float* vrow = hOpV + ((size_t)t * n_head + hh) * DK;
+                        float mag = 0.0f, dif = 0.0f;
+                        for (unsigned d = 0; d < DK; d++) {
+                            const float rv = (lr > 0.0f) ? orow[d] / lr : 0.0f;
+                            const float vv = (lv > 0.0f) ? vrow[d] / lv : 0.0f;
+                            const float av = rv < 0 ? -rv : rv;
+                            const float dv = (rv - vv) < 0 ? (vv - rv) : (rv - vv);
+                            if (av > mag) mag = av;
+                            if (dv > dif) dif = dv;
+                        }
+                        const float e = (mag > 0.0f) ? dif / mag : dif;
+                        if (e > v2_err) v2_err = e;
+                        /* ---- the ZERO-ROPE body, on the same row ----
+                         * Two independent claims, both required:
+                         *   (a) vs the DECODE ORACLE, normalized -- the same chain that ties
+                         *       every other case back to the f64 CPU golden. This is the claim
+                         *       that the DR=0 body computes MLA, not merely that it agrees with
+                         *       something.
+                         *   (b) vs the ROPED body, BIT-EXACT. On a nope case the rope tables are
+                         *       identically zero, so the two extra k-tiles the <512,64> body
+                         *       contracts contribute 0*k = 0 into an f32 MFMA accumulator, which
+                         *       is exact. Any bit of difference means an `if constexpr (DR > 0)`
+                         *       guard removed work that was not dead, or the DR=0 slab addressed
+                         *       a row differently. memcmp, not a tolerance. */
+                        if (hOpVN) {
+                            const float lvn = hMlVN[((size_t)t * n_head + hh) * 2 + 1];
+                            const float* nrow = hOpVN + ((size_t)t * n_head + hh) * DK;
+                            float nmag = 0.0f, ndif = 0.0f;
+                            for (unsigned d = 0; d < DK; d++) {
+                                const float rv = (lr > 0.0f) ? orow[d] / lr : 0.0f;
+                                const float nv = (lvn > 0.0f) ? nrow[d] / lvn : 0.0f;
+                                const float av = rv < 0 ? -rv : rv;
+                                const float dv = (rv - nv) < 0 ? (nv - rv) : (rv - nv);
+                                if (av > nmag) nmag = av;
+                                if (dv > ndif) ndif = dv;
+                                if (nrow[d] != vrow[d]) nope_ne++;
+                            }
+                            if (lvn != lv) nope_ne++;
+                            const float ne = (nmag > 0.0f) ? ndif / nmag : ndif;
+                            if (ne > nope_err) nope_err = ne;
+                        }
+                    }
                 }
             }
             char label[96];
@@ -469,11 +569,25 @@ int main(int argc, char** argv) {
                        "  \\_ tiled MFMA", mbad ? "FAIL" : "PASS", mfma_err,
                        (double)MLA_PF_MFMA_TOL);
                 if (mbad) fails++;
+                const int vbad = !(v2_err <= MLA_PF_MFMA_TOL);
+                printf("  %-42s %s  (max rel err %.2e vs decode, tol %.0e)\n",
+                       "  \\_ V2", vbad ? "FAIL" : "PASS", v2_err, (double)MLA_PF_MFMA_TOL);
+                if (vbad) fails++;
+                if (hOpVN) {
+                    const int nbad = !(nope_err <= MLA_PF_MFMA_TOL) || nope_ne != 0;
+                    printf("  %-42s %s  (max rel err %.2e vs decode, tol %.0e; "
+                           "%lu float(s) differ from the roped body, want 0)\n",
+                           "  \\_ V2 NoPE <512,0>", nbad ? "FAIL" : "PASS", nope_err,
+                           (double)MLA_PF_MFMA_TOL, nope_ne);
+                    if (nbad) fails++;
+                }
             }
 
             plow_hsa_free(H, dQa); plow_hsa_free(H, dQr); plow_hsa_free(H, dLen);
             plow_hsa_free(H, dOp); plow_hsa_free(H, dMl);
             if (dOpM) { plow_hsa_free(H, dOpM); plow_hsa_free(H, dMlM); }
+            if (dOpV) { plow_hsa_free(H, dOpV); plow_hsa_free(H, dMlV); }
+            if (dOpVN) { plow_hsa_free(H, dOpVN); plow_hsa_free(H, dMlVN); }
             plow_hsa_free(H, dOp1); plow_hsa_free(H, dMl1); plow_hsa_free(H, dLen1);
         }
         plow_hsa_free(H, dCkv); plow_hsa_free(H, dKr);
@@ -640,6 +754,154 @@ int main(int argc, char** argv) {
             plow_hsa_free(H, dO3); plow_hsa_free(H, dM3);
         }
 #undef RND
+    }
+
+    /* ====================================================================
+     * MLA MERGE+FOLD (d_mla_merge_fold) vs a DOUBLE-PRECISION CPU golden.
+     *
+     * This body had a BENCH (runtime/tests/decode_bench_gfx942.c) and NO ORACLE, which is
+     * how a 7.7x scalar fallback survived at V<128 without anyone noticing: nothing here
+     * ever checked what it computed, only how fast it computed it.
+     *
+     * It is also the largest single line in a GLM decode token, and it fuses two steps that
+     * used to be separate ops -- the nsplit online-softmax merge and the W_uv fold -- so a
+     * fault in either half is invisible to any test of the flash kernels alone.
+     *
+     * THE SHAPES ARE THE DISPATCH TABLE, not a sample. `exec_mla_merge_fold` picks VT from V
+     * and the workgroup budget, and each row below is one arm of that pick:
+     *   V=32,64,96  -> <512,32>, the arm the V<128 branch now routes to (this is the new
+     *                  coverage; before, these V fell into <512,256>'s scalar `else`)
+     *   V=128       -> <512,128>, Kimi-K3's v_head_dim
+     *   V=256       -> <512,256>, GLM-5.2's
+     * and V=128 is ALSO run through <512,32> to pin the property the V<128 branch relies on:
+     * a V that is a whole multiple of VT gets full tiles and the same answer.
+     *
+     * nsplit is swept 1 and 8 because the merge half is only exercised above 1, and the
+     * kernel has a separate MS=8 blocked path that only a multiple of 8 reaches.
+     *
+     * The golden accumulates in DOUBLE while the kernel accumulates in f32 over 512 terms,
+     * so this is a tolerance and not a memcmp -- but a LOOSE tolerance would pass the scalar
+     * fallback too (it is slow, not wrong), so the point of this phase is the SHAPE coverage:
+     * a routing bug shows up as a wrong tile count or an unwritten output column, which is a
+     * gross error, not a rounding one. Both are caught here. ==================== */
+    printf("\nMLA MERGE+FOLD (device vs f64 CPU golden, over the VT dispatch table):\n");
+    {
+        plow_hsa_kernel kf32, kf128, kf256;
+        if (plow_hsa_get_kernel(H, 0, "mla_merge_fold_512_v32", &kf32) ||
+            plow_hsa_get_kernel(H, 0, "mla_merge_fold_512_v128", &kf128) ||
+            plow_hsa_get_kernel(H, 0, "mla_merge_fold_512_v256", &kf256)) {
+            fprintf(stderr, "merge_fold sym: %s\n", plow_hsa_last_error());
+            return 1;
+        }
+        static const unsigned FV[]  = { 32,  64,  96, 128, 128, 256 };
+        static const char* FVT[]    = {"32","32","32","32","128","256"};
+        static const unsigned FNS[] = {  1,   8,   4,   8,   8,    8  };
+        const unsigned DKf = 512, nb = 2, nh = 8;
+        uint32_t rs = 1234567u;
+        for (unsigned c = 0; c < sizeof(FV) / sizeof(FV[0]); c++) {
+            const unsigned V = FV[c], ns = FNS[c];
+            const size_t nrow = (size_t)nb * nh;
+            const size_t nop = nrow * ns * DKf, nml = nrow * ns * 2;
+            const size_t nw = (size_t)nh * DKf * V, no = nrow * V;
+
+            float* hOp = plow_hsa_alloc_host(H, nop * 4);
+            float* hMl = plow_hsa_alloc_host(H, nml * 4);
+            bf16* hW = plow_hsa_alloc_host(H, nw * 2);
+            /* Partials as a real flash epilogue leaves them: UNNORMALIZED o, with (m, l) per
+             * split. Some splits are dead (m = -inf, l = 0) because the causal bound makes
+             * them so, and the merge must weigh those exactly 0 rather than divide by them. */
+            for (size_t i = 0; i < nop; i++)
+                hOp[i] = ((float)(int)((rnd_u32(&rs) >> 8) & 0xffffu) - 32768.0f) / 8192.0f;
+            for (size_t r = 0; r < nrow; r++) {
+                for (unsigned sp = 0; sp < ns; sp++) {
+                    const int dead = (ns > 1) && (sp == ns - 1);
+                    hMl[(r * ns + sp) * 2 + 0] =
+                        dead ? -INFINITY
+                             : ((float)(int)((rnd_u32(&rs) >> 12) & 0x7ffu) - 1024.0f) / 256.0f;
+                    hMl[(r * ns + sp) * 2 + 1] =
+                        dead ? 0.0f : 1.0f + (float)((rnd_u32(&rs) >> 16) & 0xffu) / 64.0f;
+                }
+            }
+            for (size_t i = 0; i < nw; i++) {
+                const float w = ((float)(int)((rnd_u32(&rs) >> 8) & 0xffffu) - 32768.0f) / 65536.0f;
+                uint32_t u; memcpy(&u, &w, 4);
+                hW[i] = (bf16)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+            }
+
+            void* dOp = dev(nop * 4); plow_hsa_copy_h2d(H, 0, dOp, hOp, nop * 4);
+            void* dMl = dev(nml * 4); plow_hsa_copy_h2d(H, 0, dMl, hMl, nml * 4);
+            void* dW = dev(nw * 2);   plow_hsa_copy_h2d(H, 0, dW, hW, nw * 2);
+            void* dO = dev(no * 2);
+
+            struct __attribute__((packed)) {
+                void* o; const void *op, *ml, *w; unsigned n_batch, n_head, V, nsplit;
+            } a = {dO, dOp, dMl, dW, nb, nh, V, ns};
+            plow_hsa_kernel* k = (V == 256) ? &kf256
+                               : (c == 4)   ? &kf128   /* the V=128 row that uses <512,128> */
+                                            : &kf32;
+            if (plow_hsa_launch(H, 0, k, cus * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0,
+                                &a, sizeof(a)) != 0) {
+                fprintf(stderr, "merge_fold launch: %s\n", plow_hsa_last_error()); fails++;
+            }
+            plow_hsa_wait(H, 0);
+            bf16* hO = plow_hsa_alloc_host(H, no * 2);
+            plow_hsa_copy_d2h(H, 0, hO, dO, no * 2);
+
+            /* f64 golden: the same two steps in the same order, at double width. */
+            double err = 0.0, mag = 0.0;
+            for (size_t r = 0; r < nrow; r++) {
+                const unsigned h = (unsigned)(r % nh);
+                double gm = -INFINITY;
+                for (unsigned sp = 0; sp < ns; sp++) {
+                    const double m = hMl[(r * ns + sp) * 2];
+                    if (hMl[(r * ns + sp) * 2 + 1] > 0.0f && m > gm) gm = m;
+                }
+                double gl = 0.0;
+                for (unsigned sp = 0; sp < ns; sp++) {
+                    const double m = hMl[(r * ns + sp) * 2], l = hMl[(r * ns + sp) * 2 + 1];
+                    /* exp2, NOT exp: FA_EXP is __builtin_amdgcn_exp2f, so every flash
+                     * epilogue in this tree stores `m` already in log2 space. The two agree
+                     * exactly at nsplit==1 (the weight is exp(0)=exp2(0)=1), which is why a
+                     * golden that gets this wrong passes the unsplit case and fails every
+                     * split one -- the shape of the first run of this phase. */
+                    if (l > 0.0) gl += l * exp2(m - gm);
+                }
+                const double inv = gl > 0.0 ? 1.0 / gl : 0.0;
+                double* olat = (double*)malloc(DKf * sizeof(double));
+                for (unsigned d = 0; d < DKf; d++) {
+                    double acc = 0.0;
+                    for (unsigned sp = 0; sp < ns; sp++) {
+                        const double m = hMl[(r * ns + sp) * 2];
+                        const double w = (m == -INFINITY) ? 0.0 : exp2(m - gm);
+                        acc += (double)hOp[(r * ns + sp) * DKf + d] * w;
+                    }
+                    olat[d] = acc * inv;
+                }
+                for (unsigned v = 0; v < V; v++) {
+                    double acc = 0.0;
+                    for (unsigned d = 0; d < DKf; d++) {
+                        const uint32_t wb = (uint32_t)hW[(size_t)(h * DKf + d) * V + v] << 16;
+                        float wf; memcpy(&wf, &wb, 4);
+                        acc += olat[d] * (double)wf;
+                    }
+                    const uint32_t ob = (uint32_t)hO[r * V + v] << 16;
+                    float of; memcpy(&of, &ob, 4);
+                    const double d0 = fabs(acc - (double)of);
+                    if (fabs(acc) > mag) mag = fabs(acc);
+                    if (d0 > err) err = d0;
+                }
+                free(olat);
+            }
+            const double rel = mag > 0.0 ? err / mag : err;
+            /* bf16 output, f32 accumulation over 512 terms against an f64 golden. */
+            const int bad = !(rel <= 2e-2);
+            printf("  V=%-4u nsplit=%-2u VT=%-4s               %s  (max rel err %.2e, tol 2e-02)\n",
+                   V, ns, FVT[c], bad ? "FAIL" : "PASS", rel);
+            if (bad) fails++;
+
+            plow_hsa_free(H, dOp); plow_hsa_free(H, dMl);
+            plow_hsa_free(H, dW); plow_hsa_free(H, dO);
+        }
     }
 
     printf("\n%s (%d failure%s)\n", fails ? "MLA FAILED" : "MLA CORRECT", fails,

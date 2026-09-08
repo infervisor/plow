@@ -268,6 +268,7 @@ const EMITTER_SRC: &[&str] = &[
     "kda.rs",
     "k3.rs",
     "mla/kimi_k3.rs",
+    "qwen35.rs",
 ];
 
 /// Arms gfx950 dispatches that NOTHING emits, each with why that is deliberate.
@@ -299,6 +300,16 @@ const GFX950_UNEMITTED: &[(&str, &str)] = &[
         "PLOW_DOP_O_UV_FOLD",
         "SUPERSEDED by MlaMergeFold(60), which fuses FlashMerge<512> + O_UV_FOLD into one packet \
           (mla.rs:1595 states the substitution). The arm stays for the unfused A/B.",
+    ),
+    (
+        "PLOW_DOP_ROW_GATHER",
+        "Terminal row selection for the unified token batch (docs/arch/17-unified-token-batch.md). \
+          The ISA, the ABI, the planner and the arms landed once for every backend; the emitter \
+          that builds a body/output segment pair is Phase 2, per (family, backend) pair. Until \
+          then nothing routes it, and `token_batch::Capabilities::can_run_output` is what stops a \
+          tail being claimed as reachable — the arm's presence is `plow_row_gather_1`, which says \
+          the route CAN FIRE, not that anything fires it. Not a precision arm: it traps on an \
+          out-of-range row rather than gathering the wrong one.",
     ),
     (
         "PLOW_DOP_ROWRMS",

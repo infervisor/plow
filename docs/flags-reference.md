@@ -240,8 +240,8 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | `PLOW_UNISEG` | `--uniseg` | false | Single-segment programs. Required for sm_120 prefill interpreter. WARNING: do NOT set on gfx950 — silently breaks AMD assets. |
 | `PLOW_SEG_DECODE_MLA` | `--emit-decode-mla-segments` | true | Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs in their own gfx950 segment. Default on; `=0` is the rollback to the interpreter-resident pair. |
 | `PLOW_SEG_DECODE_GROUPED_MOE` | `--emit-decode-grouped-moe-segments` | unset | Isolate adjacent grouped MXFP4 GLU+DOWN decode pairs into ordered raw launches. Unset = decide from qualified per-geometry route measurements (`moe_decode_measurement.jsonl`, both routes, current digests); missing evidence keeps the interpreter route. `PLOW_MOE_DECODE_STANDALONE=1` remains the packet-level override. |
-| `PLOW_DECODE_BATCH` | `--emit-decode-batch` | 1 | Batched decode dispatch width (sequences per launch). |
-| `PLOW_DECODE_BATCH_LADDER` | `--emit-decode-batch-ladder` | unset | DECODE BATCH LADDER: a comma list of decode widths emitted as SEPARATE programs in ONE blob (e.g. `1,2,4,8,16`), so the runtime picks the smallest rung that covers the live sequences instead of being committed to one `PLOW_DECODE_BATCH` at emit.  Unset (the default) is BYTE-IDENTICAL to today's blob: [`EmitConfig::decode_rungs`] then returns the single `decode_batch` rung and the emitter takes the exact code path it always took. Set, the WIDEST rung sizes every per-slot tensor (the KV cache above all), because a sequence keeps its slot across a rung change and the per-slot stride must not move with `B`. |
+| `PLOW_DECODE_BATCH` | `--emit-decode-batch` | 1 | Single-program decode width used by emitters without a production ladder and when no ladder is selected. |
+| `PLOW_DECODE_BATCH_LADDER` | `--emit-decode-batch-ladder` | up to `1,2,4,8,16` on qualified serving emitters | Decode widths emitted as separate programs in one blob. The runtime selects the smallest rung covering the highest live slot; multistep retains the same selection. Set `1` to emit only B1. The widest rung sizes per-slot state. Dense automatic ladders shrink to fit the target memory estimate at the full compiled context, with 2 GiB headroom; an explicit ladder is preserved. Live KV still grows on demand at runtime. |
 | — | `--emit-decode-objects DIR` | unset | Bind packet-selected CUDA objects from `DIR` to every decode program, including a single-program B1 packet. Packet metadata selects them at load; there is no runtime route flag. |
 | — | `--emit-decode-projection-tuning` | false | Apply measured per-projection bindings. Requires decode objects, SM90a, TP1, and a supported dense emitter. |
 | `PLOW_MAX_CHUNK` | `--emit-max-chunk` | unset | Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket ladder and the runtime PLOW_PF_INTERLEAVE ceiling. |
@@ -393,6 +393,20 @@ the 2026-09-04 audit that removed the rejected experiment knobs are in
 | env | flag | default | effect |
 |---|---|---|---|
 | `PLOW_TUNEDB` | `--tunedb` | unset | Tuning database root directory. |
+| `PLOW_AUDIT_OCC_FLOOR` | `--audit-occ-floor` | 50 | Dispatch-audit occupancy floor, percent. A matmul filling less of its own CU set than this is named at emit. |
+| `PLOW_AUDIT_GEMV_WASTE_MAX` | `--audit-gemv-waste-max` | 25 | Percent of GEMV row work a compiled `GV_MM_MAX` may spend on dead rows before it is a finding. |
+| `PLOW_AUDIT_STRICT` | `--audit-strict` | false | Promote dispatch-audit findings from a `WARN` to a refusal (exit 1). For a build already tuned — a campaign re-emitting a measured configuration, or CI. |
+| — | `--replay-knobs <build.json>` | unset | Replay a previous emit's knobs from its `build.json` `emit_config.replay`. Applied before parsing, so an explicit flag still wins. |
+
+These three read the `dispatch_audit` section and the replay flag reads `emit_config`; both are
+`build.json` sections documented in
+[docs/arch/15-dispatch-audit-and-knob-manifest.md](arch/15-dispatch-audit-and-knob-manifest.md),
+which also explains the compiled-ceiling bug class they exist to catch.
+
+`PLOW_AUDIT_STRICT` is read a second time, with the same meaning, by the object-side contract in
+`scripts/asm_audit.py --contract` (`scripts/build_gfx942.sh`), where it promotes the LDS-crossbar
+and 2-byte-LDS advisories to build failures. `PLOW_AUDIT_JOBS` (default 8) sets its disassembly
+concurrency. See [docs/arch/16-object-contract.md](arch/16-object-contract.md).
 
 #### Diagnostics (hidden from `--help`; never serve)
 
@@ -421,6 +435,11 @@ Raw `std::env::var` reads owned by `packet::devbuild` / `plowc` (see the module 
   (+91.7 ms / +3.6 ms / +22.6 ms TTFT) segmentation experiments kept for their builder tests
   and the pending AQL-replay design; never set them for a served packet.
 - `PLOW_GEMM_JSONL=<path>` — appends raw per-tile GEMM samples (tuning-harness diagnostic).
+- `PLOW_MLA_PF_V2` — read in `crates/packet/src/devbuild.rs`, and it CHANGES THE PACKET. Being
+  outside `EmitConfig` it is absent from `build.json`'s `emit_config` section, so it is the one
+  knob a `--replay-knobs` rebuild has to be given by hand: a GLM-5.3 TP4 replay reproduces the
+  blob byte-for-byte only with `PLOW_MLA_PF_V2=1` also set. Promoting it to an `EmitConfig`
+  field is what would make it recordable.
 - **Known-wrong escape hatches** (garbage tokens by design — never serve):
   `PLOW_CHAIN_BYPASS=<op[,op…]>` splices opcodes out of the chain; the hidden `EmitConfig`
   diagnostics above (`PLOW_SKIP_COVERAGE`, `PLOW_K3_ABLATE`, `PLOW_K3_SEQ_ROWS`,
@@ -476,7 +495,12 @@ a free cross-product with w8a16 — the kernels instantiate exactly those two. T
 activation encoding is *derived* and reported in the manifest as
 `precision.act_enc`, read off **`QuantFp8`'s presence** rather than inferred from
 the weight flag (that inference is what once let a w8a16 packet reach a w8a8-only
-object).
+object). It is read **per phase**: on the dense family the prefill GEMMs quantize
+while `GemvFp8`/`GemvGluFp8` take bf16 activations, so a dense W8A8 packet reports
+`act_enc: "mixed"`, not `"fp8"`. Reading the arm union alone reported `fp8` and
+overstated the decode half — the same phase-blind judgement the axis exists to
+replace. A consumer selecting an object on this axis must look at the phase it is
+serving.
 
 For a checkpoint that is already quantized — GLM-5.2-FP8, say — **no precision
 flag is needed at all**: the encoding is read from `quantization_config`. Two
@@ -762,13 +786,42 @@ values cost.
 
 ---
 
+## CPU runtime knobs (`plowrt --cpu-*`)
+
+Only present in a build carrying the `cpu` feature. Every one is a CLI flag with an
+environment twin, and the CLI wins. Full prose, plus how to compile a CPU-loadable
+bundle in the first place, in [CPU execution](runtime/cpu.md).
+
+| flag | env | default | effect |
+|---|---|---|---|
+| `--cpu-threads N` | `PLOW_CPU_THREADS` | 0 | Persistent kernel workers. `0` = model-dependent width (physical cores for MoE, logical CPUs for dense decode). Independent of the packet's `--n-cu`: the pool maps any thread count onto the virtual executors, so one bundle serves any core count. |
+| `--cpu-numa MODE` | `PLOW_CPU_NUMA` | `auto` | `auto` interleaves large tensors across allowed nodes (best effort); `off` keeps OS/`numactl` policy; `0,1` requires successful binding and rejects unavailable nodes. Topology honours cpusets and `taskset`. |
+| `--cpu-isa TIER` | `PLOW_CPU_ISA` | `auto` | Tier ceiling `scalar` / `avx512` / `amx`. Never activates above what cpuid and OS register state permit, so this only ever narrows. |
+| `--cpu-huge-pages=B` | `PLOW_CPU_HUGE_PAGES` | unset | Override THP *advice* (default: ordinary pages when interleaved, huge-page advice for single-node/OS placement). Advice only — not the system THP setting. |
+| `--cpu-spin-us N` | `PLOW_CPU_SPIN_US` | 2000 | Spin budget (µs) before a blocked worker yields and parks. Decode packets are 100–500 µs apart; parking every gap measured **+17% TPOT** at 50 µs vs 1000. |
+| `--cpu-prefill-chunk N` | `PLOW_CPU_PF_CHUNK` | 0 (off) | Largest prefill chunk (rows) a tick may run while other slots decode. Measured **negative at concurrency ≥ 4** — the threads are throughput-bound, not stall-bound — so it stays off. |
+| `--cpu-mxfp4-dir DIR` | `PLOW_MXFP4_DIR` | unset | MXFP4 weight twin (`mxfp4/<name>` + `_scale` E8M0 rows; `perf-data/tools/quantize_mxfp4.py`). |
+| `--fp8-dir DIR` | `PLOW_FP8_DIR` | unset | fp8 weight twin. Runtime-wide, but this is how a CPU bundle gets W8A16/W8A8 weights. |
+| `--cpu-global-queue=B` | `PLOW_CPU_GQ` | off | Global op-major work queue (windowed per segment and L2 domain, with stealing) instead of static per-cu streams. **~2x slower** on the EPYC 9654; kept for A/B. |
+| `--cpu-l2-place=B` | `PLOW_CPU_L2_PLACE` | off | Place executors by the packet's L2 locality domains instead of `cu % nodes`. **1.5x slower**, never faster ([report](../perf-data/cpu-numa-placement/epyc9654-avx512/README.md)). Inert without domains in the blob; a balance guard declines a losing plan even when on. |
+
+The last two are off because they were *measured* worse, not because they are
+unfinished — neither changes what is computed, so both are safe to flip for an A/B
+on another host.
+
+Compile-side, there is no CPU emit target: `plowc` emits for a device target and the
+CPU interprets that packet. Use an **NVIDIA** `--gpu` (a gfx942/gfx950 packet is
+rejected at load), and set `--n-cu` explicitly — it is the virtual executor count,
+capped at 256, and need not match any thread count.
+
 ## Serving / runtime knobs (`plowrt` env)
 
 | var | default | effect |
 |---|---|---|
-| `PLOW_PF_BATCH=1` | off | Cross-request prefill policy. CUDA packs waiting chunks into one launch (+27% saturated multi-user throughput; inert on fp8-KV and ignored under `PLOW_VMM_PREFIX=1`). AMD TP co-packs compatible, already-initialized non-final chunks only when the packet was emitted with `PLOW_EMIT_PACKED_PREFILL=1`, the optional family objects were built, and `PLOW_PACKED_PREFILL_ROUTE=1`; unsupported programs and single-rank engines retain fair isolated scheduling. |
-| `PLOW_PF_INTERLEAVE=N` | 2048 | **CUDA + AMD TP chunked-prefill quantum — the default path, not a `PLOW_PF_BATCH` knob.** Once any slot is decoding, a tick admits at most `N` prefill rows, then runs decode. AMD selects an existing packet rung at or below `N`; compatible pending spans may share that rung when packed prefill is fully enabled. `0` = uncapped. It can only clamp below the emitted ladder. |
-| `PLOW_PF_CHUNK=C` | 0 (off) | **Experimental, CUDA + AMD TP serving** per-request prefill chunk-row cap. AMD selects only compiled packet rungs at or below `C` (for example, K3 8192 with `C=4096` plans 4096+4096); compatible chunks may co-pack when all packed-prefill prerequisites are enabled. The ~10% B=8 regression was measured on CUDA; AMD remains unmeasured. Off preserves the existing plan. |
+| `PLOW_FUSION=1` / `--fusion` | off | AMD TP1 dense BF16 runtime prefill/decode fusion. Derives schedules from ordinary prefill/decode programs at model load and packs current rows per launch. Requires the normal gfx942 `interp_mixed_gq.elf`; unsupported programs or objects fall back with a warning. No fusion compiler flags or asset metadata. `--fusion=false` disables it. Multistep decode remains a separate setting. |
+| `PLOW_PF_BATCH=1` | off | Cross-request prefill policy. CUDA packs waiting chunks into one launch; prefix reuse can force isolated prefill. AMD TP1 and TP co-pack compatible initialized, non-final dense chunks into a larger compiled rung. Routed objects must carry the dense consumer marker; unsupported programs use isolated scheduling. Initial admission, final sampling and prefix snapshots remain isolated. See the Gemma MI300X qualification for measured results. |
+| `PLOW_PF_INTERLEAVE=N` | 2048 | **CUDA + AMD TP1/TP chunked-prefill quantum — the default path, not a `PLOW_PF_BATCH` knob.** Once any slot is decoding, a tick admits at most `N` prefill rows, then runs decode. AMD selects an existing packet rung at or below `N`; compatible pending spans may share that rung when packed prefill is fully enabled. `0` = uncapped. It can only clamp below the emitted ladder. |
+| `PLOW_PF_CHUNK=C` | 0 (off) | Per-request prefill chunk-row cap for CUDA and AMD TP1/TP. AMD selects compiled packet rungs at or below `C`; compatible initialized middle chunks can share a larger rung with `PLOW_PF_BATCH=1`. Gemma 4 31B BF16 on MI300X is qualified at 512 rows; performance depends on the workload. Off preserves the existing plan. **On AMD this is a PRECONDITION for co-packing, not a companion knob:** unset, every prompt up to the widest bucket plans as one chunk, the final chunk is always isolated, and two widest-rung chunks cannot share one rung — so `PLOW_PF_BATCH=1` packs nothing at any prompt length. A prompt needs `> 2C` rows before a middle chunk survives to meet a second cursor. |
 | `PLOW_PF_CHUNK_COST=R` | 512 | cost of ONE prefill launch in padded-row equivalents (`rows + R × launches`). A launch re-streams every layer's weights: measured `ttft_ms = 0.112·rows + 60.1·chunks`, i.e. **60 ms ≈ 537 rows**. `0` = pure-minimum-padding. |
 | `PLOW_PF_COVER=1` | off | restore the covering-bucket prefill policy (exact-parity A/B vs the cost-aware default). |
 | `PLOW_PF_DEFER_DECODE=1` | off | **CUDA + AMD TP throughput mode — trades streaming latency for aggregate tok/s.** While pending prefill remains, skips decode so later decode ticks run at full batch. A completed prefill may emit its first token, but no request advances decode until admitted prefill drains. The 8×127k **+7.1% out tok/s** result was measured on CUDA; AMD is unmeasured. Wrong as an interactive default. |
@@ -776,7 +829,7 @@ values cost.
 | `PLOW_PF_NO_CHUNK=1` | off | restore whole-prompt-per-tick (disable chunked prefill). |
 | `PLOW_PF_NO_INTERLEAVE=1` | off | restore a prefill-only tick (disable prefill/decode interleave). |
 | `PLOW_VMM_PREFIX=1` | off | VMM-backed KV prefix cache — a new request attaches blocks a previous one built. Only FULL-attention layers are VMM-backed; reuse is block-granular. 12B: warm TTFT 3.6× (4k) → **23.8× (128k)**; cold ~0.2–1.5% above 8k. Incompatible with `PLOW_PF_BATCH=1`. |
-| `PLOW_VMM_LIVE=1` / `--vmm-live` | off | Grow packet-described full-attention KV backing with the live frontier, without prefix reuse. Packet metadata supplies geometry; incompatible decode modes force single-step. |
+| `PLOW_VMM_LIVE=1` / `--vmm-live` | packet-selected for packed prefill with full-attention KV | Grow packet-described full-attention KV backing with the live frontier, without prefix reuse. Explicit enable remains available for legacy packets. Multistep maps the selected rung's full write frontier. Model admission counts startup backing and the retained block pool; virtual context capacity is not charged as resident memory. |
 | `PLOW_VMM_LIVE_RINGS=1` / `--vmm-live-rings` | off | Retain sliding-ring backing on first use. Requires live KV. Sub-granularity logical slots share aligned physical mappings while preserving the packet's logical batch stride. |
 | `PLOW_VMM_BLOCK_MIB=M` | 2 | VMM sharing block size. 2 MiB ≈ 4096 tokens at hd256 bf16. Raise (e.g. 64) for 128k-dedup work. |
 | `PLOW_VMM_CACHE_MIB=M` | 0 | cap on retained (unreferenced) VMM blocks; `0` = no cache. |
@@ -786,7 +839,7 @@ values cost.
 | `PLOW_GLOBAL_QUEUE=0` | on | force the static per-block-stream scheduler (AMD runtime read; build-time A/B otherwise). |
 | `PLOW_STATIC` / `PLOW_STATIC_DECODE` / `PLOW_STATIC_PREFILL` | off | force the static scheduler for both phases / decode only / prefill only. |
 | `PLOW_SEG_WINDOW` | on | AMD segment enqueue/drain windowing (A/B; `=0` off). |
-| `PLOW_MULTISTEP=K` / `--multistep K` | 8 (K∈[2,64]) | bounded device multi-step decode (K steps/launch); needs the dynamic-kvrow decode cubin + sampler. `0`/`1` opts out. Packet-selected decode objects/roles, context packets, recurrent decode, cuBLASLt segments, and live VMM force single-step and log the decision. |
+| `PLOW_MULTISTEP=K` / `--multistep K` | 8 (K∈[2,64]) | Bounded multi-step decode. CUDA can execute up to K steps per host synchronization; AMD dispatches and drains each step, captures tokens on device, then reads the capture once per quantum. CUDA device-loop execution needs dynamic KV-row addressing and the sampler object. It uses the packet's smallest eligible decode rung and supports live VMM. Each quantum is capped by remaining output and context budgets and the mux's batch-dependent limit: 4 steps for 1–2 live requests, 2 for 3–8, and 1 above 8. Disabling mux multistep also selects individual steps. Requests with stochastic sampling, repetition penalties, or logit bias use individual steps; unmodified greedy requests stream up to K tokens after each device quantum. `0`/`1` opts out. Decode objects/roles, context packets, recurrent decode, and cuBLASLt segments force single-step and log the decision. |
 | `PLOW_LAUNCH_ROWS=N` | `LAUNCH_ROWS` | override the prefill pad/launch-rows tradeoff. |
 | `PLOW_PREFETCH=N` | 256 | checkpoint prefetch depth in tensors. `PLOW_PREFETCH_THREADS=N` (16) sets prefetch threads/rank; `0` disables prefetch. |
 | `PLOW_WEIGHT_SLAB` | on | single-allocation weight slab; `=0` turns it off (both backends). |
@@ -811,8 +864,8 @@ used to derive the fail-closed result.
 | `PLOW_HSACO_LOWRUNG=dir:max[,dir:max…]` | unset | AMD decode-object tiers. The runtime selects the narrowest tier whose `max` covers the occupied decode rung, pairing-checks each tier at that width, and falls back to the primary HSACO inventory above it. A single legacy `dir` uses `PLOW_LOWRUNG_MAX` (default 2). |
 | `PLOW_STATE_CLEAR_DEVICE=1` | off | AMD admission experiment: clear slot-major recurrent state with one device kernel per rank instead of host-staged SDMA fills. Requires rebuilt decode objects carrying `plow_state_clear`. |
 | `PLOW_EMIT_DECODE_CUBLASLT=1` | off | Compiler option that marks eligible isolated BF16 decode projections with the packet `CUBLASLT` segment role. PlowRT validates and executes the declared roles; there is no runtime enable or opt-out flag. |
-| `PLOW_EMIT_PACKED_PREFILL=1` | off | Emit the packed-prefill packet ABI. On AMD this splits descriptor-consuming MLA norm/cache, MLA flash, and serial-KDA ops into pure topological segments in prefill programs only. Decode ladder programs remain single-launch. This compiler option is separate from the runtime scheduling policy. |
-| `PLOW_PACKED_PREFILL_ROUTE=1` | off | Load the optional lean packed-family HSACO objects and permit exact-family routing after metadata is staged. Missing/wrong markers and mixed segments refuse. Live AMD co-packing also requires `PLOW_PF_BATCH=1`, TP, an emitted `PLOW_EMIT_PACKED_PREFILL=1` packet, and objects built with `PLOW_HSACO_PACKED_PREFILL_CONSUMERS=ON`; otherwise the mux uses isolated prefill. |
+| `PLOW_EMIT_PACKED_PREFILL` / `--emit-packed-prefill` | on for qualified Hopper TP1 BF16 dense packets | Emit the packed-prefill request ABI and dedicated packet-paired objects. Packed prefill uses one attention split across buckets so packing and chunk length do not change the softmax reduction. This trades short-prompt split parallelism for stable request numerics. The runtime activates it from metadata and falls back to ordinary prefill when prefix reuse is active. `false` is the rollback. On AMD it emits a SECOND, family-segmented copy of every prefill bucket (a `packed_prefill_program_t` sibling the runtime resolves only while staging a packed binding); unset, the packet is byte-identical. Implemented for the Kimi-K3 and GLM emitters. Without it an MLA blob's norm ops share a segment with the Gemms and `PLOW_PACKED_PREFILL_ROUTE=1` refuses every rung. |
+| `PLOW_PACKED_PREFILL_ROUTE=1` | off | Load optional lean packed-family HSACO objects (`interp_packed_mla_norm`, `interp_packed_mla_flash`, `interp_packed_kda`) and permit exact-family routing after metadata is staged. Missing/wrong markers and mixed segments refuse. Dense AMD packing uses the normal span-aware objects with `PLOW_PF_BATCH=1` and needs neither this route nor `PLOW_EMIT_PACKED_PREFILL`; an **MLA** blob needs BOTH, plus objects from a `PLOW_PACKED_PREFILL_CONSUMERS=1` build (gfx942) / `PLOW_HSACO_PACKED_PREFILL_CONSUMERS=ON` (cmake). The runtime says at load which of the three preconditions is missing — see `report_packed_prefill_route`. |
 
 By default, a cold-prefill slot yields after emitting its first token so ready
 decode rows can join the next tick. Admission and decode-rung policy use the

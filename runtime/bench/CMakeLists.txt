@@ -510,6 +510,36 @@ if(PLOW_ROCM)
     target_link_libraries(kda_state_resident_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
     add_dependencies(kda_state_resident_gfx942_test kda_state_resident_gfx942_elf)
 
+    # f64 oracle gate for the Qwen3.5 Gated DeltaNet bodies (runtime/amd/op_qwen_gdn.h). The
+    # family is compiled OUT of every shipping object (PLOW_QWEN_GDN defaults to 0) because
+    # nothing routes to it until a chunked prefill adapter exists, so this target is the only
+    # thing that keeps the bodies compiling and correct in the meantime.
+    set(QWEN_GDN_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/qwen_gdn_gfx942_test.hip)
+    set(QWEN_GDN_ELF ${CMAKE_CURRENT_BINARY_DIR}/qwen_gdn_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${QWEN_GDN_ELF}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+                "$ENV{PLOW_HIPCC}" "$ENV{PLOW_BUNDLER}" gfx942
+                ${QWEN_GDN_ELF} k_step 256 2
+                -DQGDN_DEVICE=1 -DPLOW_LEAN_OBJECT=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${QWEN_GDN_SRC}
+        DEPENDS ${QWEN_GDN_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_qwen_gdn.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+        VERBATIM)
+    add_custom_target(qwen_gdn_gfx942_elf DEPENDS ${QWEN_GDN_ELF})
+    set_source_files_properties(${QWEN_GDN_SRC}
+        PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x c++")
+    add_executable(qwen_gdn_gfx942_test ${QWEN_GDN_SRC})
+    target_compile_features(qwen_gdn_gfx942_test PRIVATE cxx_std_17)
+    target_include_directories(qwen_gdn_gfx942_test PRIVATE "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(qwen_gdn_gfx942_test PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(qwen_gdn_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(qwen_gdn_gfx942_test qwen_gdn_gfx942_elf)
+
     # Standalone gfx942 grouped A8W4 experiment. It is intentionally a raw code object plus a
     # module-loading host oracle: no production packet or interpreter arm is changed.
     set(PLOW_A8W4_HIPCC "${PLOW_MLA_HIPCC}")
@@ -603,6 +633,11 @@ if(PLOW_ROCM)
         PROPERTIES LABELS "gpu;gfx942" RUN_SERIAL TRUE)
     add_test(NAME kda_state_resident_gfx942_oracle
         COMMAND kda_state_resident_gfx942_test ${KDA_STATE_RESIDENT_ELF})
+    # Registered now that the file also carries the packed-row identity gate: it is the
+    # acceptance evidence for the unified token batch's class-B recurrent decode path, so it
+    # has to be reachable by `ctest -L gfx942` rather than only by hand.
+    add_test(NAME qwen_gdn_gfx942_oracle
+        COMMAND qwen_gdn_gfx942_test ${QWEN_GDN_ELF})
     add_test(NAME kda_journal_gfx942_oracle
         COMMAND kda_journal_gfx942_test ${KDA_JOURNAL_ELF})
     add_test(NAME k3_dspark_mla_gfx942_oracle
@@ -613,6 +648,7 @@ if(PLOW_ROCM)
         COMMAND moe_prefill_w4a16_bridge_gfx942_test ${MOE_W4A16_ELF})
     set_tests_properties(
         kda_state_resident_gfx942_oracle
+        qwen_gdn_gfx942_oracle
         kda_journal_gfx942_oracle
         k3_dspark_mla_gfx942_oracle
         moe_prefill_a8w4_gfx942_oracle

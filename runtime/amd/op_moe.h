@@ -158,6 +158,19 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
  * K3's 896 routed experts — plausible output, wrong model. The pair form below is the only entry
  * point that can express it, so the epilogue calls THAT and never `moe_act` directly. */
 #define PLOW_MOE_ACT_SITU      2u
+/* DeepSeek-V4's CLAMPED SwiGLU (`Expert.forward`, model.py:601-611):
+ *
+ *     up   = clamp(up, -L, +L)        BOTH sides
+ *     gate = min(gate, L)             UPPER ONLY
+ *     out  = silu(gate) * up          L = swiglu_limit = 10.0
+ *
+ * A pair form for the same reason situ is, and it is NOT plow's existing act 3. Act 3 is
+ * GPT-OSS's `swiglu_oai`: `A(g) = min(g,L)*sigmoid(alpha*min(g,L))`, `B(u) = clamp(u,±L) + 1`.
+ * At alpha = 1 the gate halves agree exactly; the `+1` on the up branch does not, and it is a
+ * bias on every one of V4's 256 routed experts plus the shared one -- plausible output, wrong
+ * model. So this is a fourth code, not act 3 with alpha = 1. The limit rides `lbeta` (f1), the
+ * same slot swiglu_oai's `limit` uses.  [DSV4-ACT] */
+#define PLOW_MOE_ACT_SWIGLU_CLAMP 4u
 
 /* THE FAST SPELLINGS WERE TRIED HERE AND MEASURED SLOWER. DO NOT RE-DERIVE THEM.
  *
@@ -186,6 +199,9 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
  * The `-w` build hides no warning here: `expf` is the OCML symbol and it is deliberate. */
 __device__ __forceinline__ float moe_act(float x, unsigned act) {
     if (act == PLOW_MOE_ACT_SILU) return x / (1.0f + expf(-x)); /* silu (SwiGLU — GLM) */
+    /* POISON, same argument as situ's below: act 4 clamps the UP branch too, so a gate-only
+     * caller reaching here would leave `up` unclamped and be wrong in the tail. */
+    if (act == PLOW_MOE_ACT_SWIGLU_CLAMP) return __builtin_nanf("");
     /* POISON, on purpose. `situ` cannot be expressed by a gate-only transform, so any caller that
      * reaches here with it is a GLU epilogue that has not been converted to `moe_glu` — and the
      * default `else` below would hand it gelu_tanh(g)*u, which is finite, plausible, and the wrong
@@ -201,6 +217,10 @@ __device__ __forceinline__ float moe_act(float x, unsigned act) {
  * identity and this is byte-identical to the `moe_act(g, act) * u` it replaces. */
 __device__ __forceinline__ float moe_glu(float g, float u, unsigned act, float beta, float lbeta) {
     if (act == PLOW_MOE_ACT_SITU) return k3_situ_gate(g, beta) * k3_situ_up(u, lbeta);
+    if (act == PLOW_MOE_ACT_SWIGLU_CLAMP) {
+        const float gc = fminf(g, lbeta); /* upper clamp only -- model.py:607 */
+        return (gc / (1.0f + expf(-gc))) * fminf(fmaxf(u, -lbeta), lbeta);
+    }
     return moe_act(g, act) * u;
 }
 
@@ -378,11 +398,30 @@ __device__ __forceinline__ void moe_group_mask(unsigned long long* keys, const f
 __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const float* bias,
                                   unsigned n_exp, unsigned k, unsigned flags, float route_scale,
                                   unsigned slice, unsigned nblk, float* lds,
-                                  unsigned n_group = 0, unsigned topk_group = 0) {
+                                  unsigned n_group = 0, unsigned topk_group = 0,
+                                  const int32_t* tid2eid = nullptr, int token_id = 0) {
     (void)nblk;
     if (slice != 0) return; /* emitted on 1 CU; guard is belt-and-braces */
     const bool sigmoid = (flags & 1u) != 0;
     const bool norm_topk = (flags & 2u) != 0;
+    /* DeepSeek-V4 arms. All three default off, so every GLM / DeepSeek-V3 / Qwen / Mixtral /
+     * Kimi packet is byte-identical to before them.  [DSV4-ROUTE]
+     *   bit 2  SQRTSOFTPLUS  score = sqrt(softplus(logit)) (model.py:576, config
+     *                        `scoring_func: "sqrtsoftplus"`). A third transform beside sigmoid
+     *                        and softmax: non-negative like sigmoid but UNBOUNDED above. The
+     *                        absolute scale is discarded by norm_topk, but the relative
+     *                        weighting and the ordering under +bias are not.
+     *   bit 3  F32 LOGIT     `logit` is f32, not bf16. V4 computes the router logit in fp32
+     *                        end to end (model.py:570 upcasts the bf16 gate weight); rounding
+     *                        it to bf16 before the transform can flip the selection ranking,
+     *                        which is the same argument GemvF32 exists for (dev.rs:1697-1712).
+     *   bit 4  HASH          layers 0..num_hash_layers-1 have NO scoring stage at all:
+     *                        indices = tid2eid[token_id] (model.py:562,578), a [vocab][k]
+     *                        lookup. The GATE still comes from the score path, so the logit
+     *                        GEMV still runs and everything after selection is unchanged. */
+    const bool sqrtsp = (flags & 4u) != 0;
+    const bool f32log = (flags & 8u) != 0;
+    const bool hashsel = (flags & 16u) != 0;
     const unsigned tid = threadIdx.x;
     /* Bound k HERE, before anything uses it. The rank pass below writes `wl[rank]` for every
      * rank < k, so a k past the bound overruns the `wl` carve — the clamp used to sit after that
@@ -396,11 +435,22 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
     unsigned long long* keys = (unsigned long long*)(lds + ((n_exp + 3u) & ~3u));
     unsigned* wl = (unsigned*)(keys + n_exp);
 
-    if (sigmoid) { /* the hot GLM/DS path — parallel, per-expert independent */
+    const float* lf32 = (const float*)logit;
+    if (sqrtsp) { /* V4: sqrt(softplus(l)), per-expert independent like the sigmoid path.
+                   * softplus written as log1p(exp(-|l|)) + max(l,0), which is the exact
+                   * function and cannot overflow -- exp(l) does, at l > 88. PyTorch's own
+                   * threshold=20 linear tail differs from this by less than an f32 ulp at
+                   * every l where it fires. */
+        for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) {
+            const float l = f32log ? lf32[e] : bf2f(logit[e]);
+            lds[e] = sqrtf(log1pf(expf(-fabsf(l))) + fmaxf(l, 0.0f));
+        }
+    } else if (sigmoid) { /* the hot GLM/DS path — parallel, per-expert independent */
         for (unsigned e = tid; e < n_exp; e += PLOW_THREADS)
-            lds[e] = 1.0f / (1.0f + expf(-bf2f(logit[e])));
+            lds[e] = 1.0f / (1.0f + expf(-(f32log ? lf32[e] : bf2f(logit[e]))));
     } else {       /* softmax needs a global max+sum; keep it exactly serial on thread 0 (rare) */
-        for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) lds[e] = bf2f(logit[e]);
+        for (unsigned e = tid; e < n_exp; e += PLOW_THREADS)
+            lds[e] = f32log ? lf32[e] : bf2f(logit[e]);
         __syncthreads();
         if (tid == 0) {
             float m = -1e30f;
@@ -423,6 +473,15 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
      * unchanged — so the 8-of-256 SET, ORDER, and GATES are BYTE-IDENTICAL. Measured (gfx950 standalone):
      * 11.6 -> 7.6 us (1.52x). The scan is LDS-bandwidth bound (unroll 32 keeps ~8 ds_read_b64 in flight);
      * the sigmoid's 256 expf is the bit-exact-locked floor. */
+    /* HASH: the selection is a table lookup, so the whole key-pack + rank machinery below is
+     * skipped. `hashsel` comes from the packet's flags word and is workgroup-uniform, so the
+     * barriers inside the skipped branch are not a divergence hazard. The tail is untouched:
+     * it still reads the UNBIASED score at lds[wl[j]] and still norms and scales, which is
+     * exactly what model.py:582-586 does for a hash layer. */
+    if (hashsel) {
+        if (tid < k) wl[tid] = (unsigned)tid2eid[(size_t)token_id * k + tid];
+        __syncthreads();
+    } else {
     for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) {
         unsigned sb;
         float sc = lds[e] + (bias ? bias[e] : 0.0f); /* biased score = SELECTION key only */
@@ -531,6 +590,7 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
     }
     __syncthreads();
 #endif
+    } /* !hashsel */
 
     if (tid == 0) {
         float gate[PLOW_MOE_MAX_TOPK]; /* k is already bounded at the top of the function */
@@ -922,7 +982,16 @@ __device__ __forceinline__ void wave_dot_mxfp4_lg2(const bf16* x, const unsigned
  * compiles to a readfirstlane waterfall, which is the cost this arm exists to remove. The `live`
  * guard is what the descriptor's bounds check was doing. */
 #ifndef PLOW_MOE_DEC_LG_RG
-#define PLOW_MOE_DEC_LG_RG 4
+/* 0 = ADAPT the map to the actual contraction (default); 2 or 4 pins one, the A/B control.
+ *
+ * The map covers K <= (64/RG)*16, so RG=4 reaches K<=256 and RG=2 reaches K<=512: a wider RG
+ * wastes lanes on a short K, a narrower one cannot reach a long one. `I_moe` is a PER-RANK
+ * quantity, so the right map differs between TP degrees of the SAME model — GLM-5.3 routes
+ * DOWN at I_moe=256 on TP8 and 512 on TP4. Pinning RG=4 made this arm, worth -7.6% TPOT
+ * where it fires, SILENTLY INACTIVE at TP4: the guard failed and it fell through to the
+ * per-row walk with no diagnostic. Measured on GLM-5.3 TP4: TPOT 36.81 -> 35.61 ms (-3.3%),
+ * TTFT unmoved (344.6 -> 344.7) — the correct negative control for a decode-only axis. */
+#define PLOW_MOE_DEC_LG_RG 0
 #endif
 /* UNR=6 = 24 rows in flight, swept on the ISA in the shipped 108-VGPR object (per OUTPUT ROW,
  * `_Z25d_moe_expert_down_fp8_blk...`; the shipped wave-per-row body is the first line):
@@ -973,6 +1042,32 @@ __device__ __forceinline__ void moe_down_lg_fp8_blk(const bf16* x, const unsigne
         o[u] = a;
     }
 }
+
+/* The H-row loop over one lane-group map, factored so the RG=4 and RG=2 arms share it. */
+template <unsigned RG, unsigned UNR>
+__device__ __forceinline__ void moe_down_lg_rows(
+    const bf16* fu_slot, const unsigned char* Wd, const float* Sd, float* part_slot, float gate,
+    unsigned H, unsigned I_moe, unsigned KB, unsigned lane, unsigned wave, unsigned slice,
+    unsigned wstride)
+{
+    constexpr unsigned LPG = PLOW_WAVE / RG;
+    const unsigned per = RG * UNR;
+    const unsigned ng = (H + per - 1u) / per;
+    const unsigned sub = lane % LPG, grp = lane / LPG;
+    for (unsigned f = slice * PLOW_WAVES + wave; f < ng; f += wstride) {
+        const unsigned h0 = f * per;
+        float o[UNR];
+        moe_down_lg_fp8_blk<RG, UNR>(fu_slot, Wd, Sd, h0, H, I_moe, KB, lane, o);
+        if (sub == 0u) {
+#pragma unroll
+            for (unsigned u = 0; u < UNR; u++) {
+                const unsigned h = h0 + u * RG + grp;
+                if (h < H) part_slot[h] = gate * o[u];
+            }
+        }
+    }
+}
+
 
 /* ONE quantized-expert dot, encoding selected at runtime. PLOW_MOE_ENC_* as on ops 85/86.
  * `srow_f` is the block-fp8 scale row (f32), `srow_b` the MXFP4 E8M0 row; the caller passes
@@ -1124,25 +1219,18 @@ __device__ void d_moe_expert_down_fp8_blk(float* part, const bf16* fu, const uns
 #if PLOW_MOE_DEC_LG && !PLOW_MOE_DEC_ABL
     /* OPT-IN — narrow-K lane-group arm. GLM-5.2 TP8 lands here (I_moe = 256 = LPG*16 at RG=4);
      * anything wider falls through to the shipped per-row walk below. See `moe_down_lg_fp8_blk`. */
-    {
-        constexpr unsigned RG = PLOW_MOE_DEC_LG_RG, UNR = PLOW_MOE_DEC_LG_UNR;
-        constexpr unsigned LPG = PLOW_WAVE / RG;
-        if (enc == PLOW_MOE_ENC_FP8BLK && I_moe <= LPG * 16u && (I_moe & 15u) == 0u) {
-            const unsigned per = RG * UNR;
-            const unsigned ng = (H + per - 1u) / per;
-            const unsigned sub = lane % LPG, grp = lane / LPG;
-            for (unsigned f = slice * PLOW_WAVES + wave; f < ng; f += wstride) {
-                const unsigned h0 = f * per;
-                float o[UNR];
-                moe_down_lg_fp8_blk<RG, UNR>(fu_slot, Wd, Sd, h0, H, I_moe, KB, lane, o);
-                if (sub == 0u) {
-#pragma unroll
-                    for (unsigned u = 0; u < UNR; u++) {
-                        const unsigned h = h0 + u * RG + grp;
-                        if (h < H) part_slot[h] = gate * o[u];
-                    }
-                }
-            }
+    if (enc == PLOW_MOE_ENC_FP8BLK && (I_moe & 15u) == 0u) {
+        constexpr unsigned UNR = PLOW_MOE_DEC_LG_UNR, PIN = PLOW_MOE_DEC_LG_RG;
+        /* Narrowest map that still reaches this K, so a short contraction keeps every lane busy
+         * and a long one is still covered. PIN != 0 reproduces the old fixed behaviour for A/B. */
+        if ((PIN == 0u || PIN == 4u) && I_moe <= (PLOW_WAVE / 4u) * 16u) {
+            moe_down_lg_rows<4, UNR>(fu_slot, Wd, Sd, part_slot, gate, H, I_moe, KB, lane, wave,
+                                     slice, wstride);
+            return;
+        }
+        if ((PIN == 0u || PIN == 2u) && I_moe <= (PLOW_WAVE / 2u) * 16u) {
+            moe_down_lg_rows<2, UNR>(fu_slot, Wd, Sd, part_slot, gate, H, I_moe, KB, lane, wave,
+                                     slice, wstride);
             return;
         }
     }
@@ -2034,6 +2122,19 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
                                      ,
                                      double* acc = nullptr, unsigned acc_n = 0
 #endif
+                                     ,
+                                     /* DSV4 hash routing: `token_ids[tok]` is the row's input
+                                      * token id, the LUT's first index. Null on every other
+                                      * model and unread unless flags bit 4 is set.
+                                      *
+                                      * LAST, AFTER the conditionally-compiled accumulator args,
+                                      * not beside `topk_group`: every existing call site passes
+                                      * those positionally inside the same `#if`, so a parameter
+                                      * inserted ahead of them silently rebinds `(double*)TEN(2)`
+                                      * to `tid2eid` in a PLOW_MOE_PF_DET build. That is a
+                                      * compile error here only because the types differ. */
+                                     const int32_t* tid2eid = nullptr,
+                                     const int32_t* token_ids = nullptr
                                      ) {
 #if PLOW_MOE_PF_ATOMIC
     /* PLOW_MOE_PF_ATOMIC: zero the [T,H] f32 accumulator op 86 will atomically add into. This
@@ -2064,8 +2165,15 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
 #endif
     for (unsigned tok = slice; tok < T; tok += nblk) {
         /* slice=0 so the callee's single-workgroup guard passes; this workgroup owns `tok`. */
-        d_moe_router_topk(table + (size_t)tok * k * 8, logit + (size_t)tok * n_exp, bias, n_exp, k,
-                          flags, route_scale, 0, 1, lds, n_group, topk_group);
+        /* The f32-logit arm changes the ELEMENT WIDTH, so the per-token row advance has to be
+         * taken in the right units -- `logit + tok*n_exp` on a bf16 pointer lands halfway into
+         * the row for an f32 tensor. */
+        const bf16* lrow = (flags & 8u)
+                               ? (const bf16*)((const float*)logit + (size_t)tok * n_exp)
+                               : logit + (size_t)tok * n_exp;
+        d_moe_router_topk(table + (size_t)tok * k * 8, lrow, bias, n_exp, k, flags, route_scale,
+                          0, 1, lds, n_group, topk_group, tid2eid,
+                          token_ids ? token_ids[tok] : 0);
         __syncthreads(); /* the callee reuses `lds` for scores/keys on the next token */
     }
 }

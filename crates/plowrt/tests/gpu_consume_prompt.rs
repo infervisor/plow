@@ -358,3 +358,86 @@ fn serialized_tma_slot_parity(all_slots_live: bool, lazy_rings: bool) {
         }
     }
 }
+
+#[test]
+fn packed_prefill_chunk_sizes_preserve_full_logits() {
+    let _env = common::env_guard();
+    if std::env::var("PLOW_GPU_TEST").as_deref() != Ok("1") {
+        return;
+    }
+    let assets = PathBuf::from(std::env::var("PLOW_GPU_ASSETS").expect("PLOW_GPU_ASSETS"));
+    assert!(
+        !assets.join("block.json").exists(),
+        "requires full-model assets"
+    );
+    let tokenizer = plowrt::text::tokenizer::load_tokenizer(&assets);
+    let prompt = tokenizer.encode(&format!(
+        "{}The capital of France is",
+        "A short sentence. ".repeat(260)
+    ));
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut e = GpuEngine::load(be, &assets, &assets.join("checkpoint")).unwrap();
+    assert!(e.pf_batch_enabled() && e.batch() >= 4);
+    let raw = std::fs::read(assets.join("model.pkt")).unwrap();
+    let blob = plowrt::asset::devblob::DevBlob::parse(&raw).unwrap();
+    let live = plowrt::memory::vmm::LiveKvLayout::manifest(&blob, &raw)
+        .unwrap()
+        .unwrap();
+    let mut kv_reference: Vec<Vec<u8>> = Vec::new();
+    let mut references = Vec::new();
+    let mut teacher = vec![*prompt.last().unwrap()];
+    let mut output = Vec::new();
+    for (case, chunk, slots) in [
+        ("large", 1024, vec![0]),
+        ("small", 128, vec![0]),
+        ("packed", 128, vec![0, 3]),
+    ] {
+        for slot in 0..e.batch() {
+            e.begin_slot(slot, prompt.len() + 10).unwrap();
+        }
+        let chunk = chunk.min(e.pf_max_rows() / slots.len());
+        for start in (0..prompt.len() - 1).step_by(chunk) {
+            let len = chunk.min(prompt.len() - 1 - start);
+            let reqs: Vec<_> = slots
+                .iter()
+                .map(|&slot| plowrt::exec::gpu::PfBatchReq {
+                    slot,
+                    prompt: &prompt,
+                    c0: start,
+                    len,
+                })
+                .collect();
+            e.prefill_batched(&reqs).unwrap();
+        }
+        for (ci, cache) in live.caches.iter().enumerate() {
+            let name = &blob.tensors[cache.pair[0] as usize].name;
+            let mut raw = vec![0; cache.hd as usize * 64 * 2];
+            e.read_tensor_range(name, 0, &mut raw).unwrap();
+            if case == "large" {
+                kv_reference.push(raw);
+            } else {
+                assert!(
+                    raw == kv_reference[ci],
+                    "{case}: {name} first 64 KV rows differ"
+                );
+            }
+        }
+        for step in 0..9 {
+            let feeds: Vec<_> = slots.iter().map(|&slot| (slot, teacher[step])).collect();
+            e.step_slots(&feeds, &mut output).unwrap();
+            if case == "large" {
+                teacher.push(output[0]);
+                references.push(snapshot(&mut e, 0, output[0]));
+            } else {
+                for (ri, &slot) in slots.iter().enumerate() {
+                    compare_snapshot(
+                        snapshot(&mut e, slot, output[ri]),
+                        &references[step],
+                        &format!("{case} slot={slot} step={step}"),
+                    );
+                }
+            }
+        }
+        eprintln!("packed full model: case={case} slots={slots:?}, 9 teacher-forced full-logit rows and {} KV samples exact", live.caches.len());
+    }
+}

@@ -304,6 +304,20 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
     } else {
         assert!(mla_nope, "qk_rope_head_dim=0 requires mla_use_nope=true");
     }
+    // NO `require_mla_geometry` HERE, and the reason is a property of this tree rather than of
+    // the check. THE CONFIG PARSE IS THE WRONG PLACE, on every MLA path, because devgen's tests
+    // are built on FAITHFUL MINIATURES: `golden_blob.rs::write_kimi_config` is a 4-layer
+    // kimi_k2 at hidden 256 / kv_lora 32 / qk_rope 16 whose job is quantization-axis naming
+    // across two emitter families, and `kimi_k3.rs::k3_json` is the same idea at kv_lora 32 /
+    // v_head 16. They describe models the kernels could not serve, which is FINE because they
+    // are never served — no blob they emit is ever loaded onto a device.
+    //
+    // So the geometry gate belongs where every other capability gate in this audit ended up:
+    // plowrt's LOAD path, which is exactly the boundary between "a blob was emitted" and "a
+    // blob will be executed". `require_mla_geometry` (crates/devgen/src/lib.rs) is written and
+    // tested for that use; what is missing is the wiring, because `kv_lora` currently reaches
+    // the manifest only through `BlockDims`, not through the feature scan that builds
+    // `requires`. See docs/amd/mla-arm-coverage-gfx942.md, hole 3.
     GlmCfg {
         layers: g("num_hidden_layers"),
         hidden: g("hidden_size"),
@@ -1472,8 +1486,12 @@ struct GlmLW {
     dwt: u32,
     dst: u32,
     // DSA lightning indexer (TENSOR_NONE except on 'full' layers with the DSA gate on).
-    iwqb: u32, // indexer.wq_b.weight [HI*DI, QL] bf16 — no shipped checkpoint quantizes it
-    iwk: u32,  // indexer.wk.weight [DI, H] bf16 — ditto (matches the reference's always-bf16 wk)
+    // DECLARED bf16, which is what plow's indexer ops read. A block-fp8 checkpoint stores both
+    // as F8_E4M3 with a `weight_scale_inv` grid (verified on GLM-5.3-FP8); the LOADER upcasts
+    // them at bind (`plowrt::asset::dsa_indexer`), so the bf16 declaration below holds for
+    // either checkpoint and nothing here needs to know which one it is.
+    iwqb: u32, // indexer.wq_b.weight [HI*DI, QL]
+    iwk: u32,  // indexer.wk.weight [DI, H] (the reference computes this projection in bf16)
     iknw: u32, // indexer.k_norm.weight [DI] bf16
     iknb: u32, // indexer.k_norm.bias   [DI] bf16
     iwp: u32,  // indexer.weights_proj.weight [HI, H] bf16
@@ -2475,17 +2493,30 @@ pub(crate) fn declare_glm_rows_batched(
             } else {
                 TENSOR_NONE
             },
-            // DSA indexer q/k weights: PLAIN BF16, not fp8 — no shipped GLM-5.3-Flash checkpoint
-            // carries a `.weight_scale_inv` for either (confirmed against the real checkpoint),
-            // matching the reference's own policy of always computing these two projections in
-            // BF16 regardless of the model's block-fp8 `quantization_config`
-            // (`nvidia/attention.py`'s `wk_weights_proj` is built with `quant_config=None`
-            // unconditionally, and even loads a checkpoint's fp8 `wk` upcast to bf16). Neither has
-            // a `.weight_scale_inv` to declare.
+            // DSA indexer q/k weights: DECLARED bf16 whatever the checkpoint holds, matching the
+            // reference's own policy of computing these two projections in BF16 regardless of the
+            // model's block-fp8 `quantization_config` (`nvidia/attention.py`'s `wk_weights_proj`
+            // is built with `quant_config=None` unconditionally, and dequantises a checkpoint's
+            // fp8 `wk` into it at load). GLM-5.3-Flash carries no `.weight_scale_inv` for either
+            // and binds straight through; GLM-5.3-FP8 carries one for BOTH and is upcast at bind
+            // (`plowrt::asset::dsa_indexer`). No scale grid is declared on this side in either
+            // case — nothing downstream of the bind reads one.
             // k_norm weight/bias + weights_proj are bf16 too. REPLICATED across TP ranks (the
             // indexer is tiny and its idx is head-shared). Only bound on 'full' layers with the
             // DSA gate on.
             iwqb: if full {
+                // The bf16 byte count below is a CLAIM ABOUT THE CHECKPOINT, and on a
+                // block-fp8 GLM it is false on disk: GLM-5.3-FP8 stores `indexer.wq_b.weight`
+                // as F8_E4M3 [4096,2048] with a [32,16] `weight_scale_inv`, and
+                // `indexer.wk.weight` as F8_E4M3 [128,6144] with [1,48]. It is still the RIGHT
+                // declaration — plow's indexer ops read bf16 and the reference computes both
+                // projections in bf16 whatever the checkpoint holds ("FP8 wk weights are
+                // upcasted to BF16 during loading to maintain fusion") — so the claim is made
+                // true at bind rather than weakened here: `plowrt::asset::dsa_indexer`
+                // dequantises the two by their scale grid, and refuses before the upload if it
+                // cannot. That is where it belongs, and not here: the emit does not read
+                // checkpoint headers, and the MoE encoding is not a proxy for the indexer's
+                // dtype — these emits are legitimate whenever the indexer really is bf16.
                 t(
                     b,
                     "self_attn.indexer.wq_b.weight",
@@ -3676,9 +3707,10 @@ fn emit_glm_dsa_decode_select(
         "DSA indexer with a batched decode program (rows={rows}): IndexSelect and the indexer \
          scratch are single-row. Emit the ladder blob with PLOW_GLM_DSA=0 or max-ctx <= 65536."
     );
-    // The DSA lightning indexer has NO MXFP4 path: `wq_b`/`wk`/`weights_proj` are all bf16 (no
-    // shipped checkpoint quantizes any of the three — see the field doc comments on
-    // `GlmLW::iwqb`/`iwk`), and none of the three ops takes an encoding. Under MXFP4 the indexer
+    // The DSA lightning indexer has NO MXFP4 path: plow reads `wq_b`/`wk`/`weights_proj` as bf16
+    // and none of the three ops takes an encoding. (A block-fp8 checkpoint does quantize wq_b and
+    // wk on disk; the loader dequantises both into the declared bf16 -- `plowrt::asset::dsa_indexer`.)
+    // Under MXFP4 the indexer
     // would therefore be a bf16 island inside an otherwise fp4 packet — and worse, the
     // `weights_proj` GEMV would go through the encoding-aware helper and reach GEMV_MXFP4 with a
     // NULL E8M0 scale. Refuse the combination rather than emit either. GLM-5.2 is the only arch with
@@ -3694,9 +3726,9 @@ fn emit_glm_dsa_decode_select(
     let full = dsa && w.iwqb != TENSOR_NONE; // 'full' indexer layer (weights bound only there)
     let itk = c.index_topk.min(ctx);
     let (hi, di) = (c.index_heads, c.index_dim);
-    // Plain BF16, not GemvFp8Blk — see emit_glm_dsa_prefill_select's identical note on why
-    // wq_b/wk are unquantized in every shipped checkpoint (no `.weight_scale_inv`) and in the
-    // reference's own always-bf16 policy for these two projections.
+    // Plain BF16, not GemvFp8Blk — see emit_glm_dsa_prefill_select's identical note. plow reads
+    // both projections as bf16, following the reference's policy of computing them in bf16; a
+    // block-fp8 checkpoint stores them quantized and that combination is refused at binding.
     let gemv_blk =
         |b: &mut Builder, out: u32, x: u32, wt: u32, nn: u32, k: u32, deps: &[u32]| -> u32 {
             b.emit(DevOp::Gemv, all.to_vec(), deps, |d| {
@@ -6977,8 +7009,33 @@ fn glm_emit_full(
     // T-row emitters throughout; the lm_head tail samples the LAST row (see `emit_glm_tail`).
     let mut progs = Vec::new();
     let mut prog_t = Vec::new();
-    for &t in &pf {
+    // THE PACKED-PREFILL SIBLING TOPOLOGY, and why it is a second pass rather than a flag on the
+    // first. `PLOW_PACKED_PREFILL_ROUTE=1` can only route a segment whose operator family is PURE
+    // (exec/amd.rs `packed_family_segments_cover`), and GLM's ordinary prefill program is not:
+    // its RmsNorm/HeadNormRope sit in the same segment as the Gemms and the MoE chain. Splitting
+    // them THERE would change the shipped packet for every serve. So under
+    // `PLOW_EMIT_PACKED_PREFILL=1` the same buckets are emitted a SECOND time with the family
+    // split on, tagged `packed_prefill_program_t`, and the runtime resolves an ordinary rung to
+    // its packed sibling only while a packed binding is being staged. Flag unset ⇒ the blob is
+    // byte-identical to one from before this existed, which is the property that bounds the risk.
+    //
+    // This mirrors what `mla/kimi_k3.rs` already does for K3; GLM simply never had it, which is
+    // why `PLOW_PACKED_PREFILL_ROUTE=1` on a GLM blob loaded three family objects and then
+    // refused every rung with "MLA consumer is in a mixed segment".
+    let pf_plan: Vec<(u32, bool)> = pf
+        .iter()
+        .map(|&t| (t, false))
+        .chain(
+            (crate::emit_is_amd() && emit_config::active().packed_prefill_on())
+                .then_some(&pf)
+                .into_iter()
+                .flatten()
+                .map(|&t| (t, true)),
+        )
+        .collect();
+    for &(t, packed_segments) in &pf_plan {
         let mut pb = Builder::new(n_cu);
+        pb.set_packed_prefill_segments(packed_segments);
         pb.set_lean_moe_stage2_segments(
             crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
         );
@@ -7053,7 +7110,11 @@ fn glm_emit_full(
         }
         emit_glm_tail(&mut pb, &c, &tn, cur, &dep, t, false, &mut pxgate);
         progs.push(pb.finish());
-        prog_t.push(t);
+        prog_t.push(if packed_segments {
+            packet::devbuild::packed_prefill_program_t(t)
+        } else {
+            t
+        });
     }
 
     // The decode-rung separation `decode_rung_lo` depends on: every rung strictly below every
@@ -7862,6 +7923,7 @@ fn write_mla_manifest(m: &Model, out: &str, target: &str, enc: MoeEnc, lean: &cr
         return; // legacy CLI path: output unchanged
     }
     let mut man = crate::manifest::build(m, target, lean);
+    crate::report_dispatch_audit(&man);
     // The MXFP4 exception list, stated in the artifact a comparison reads rather than left to a
     // code comment. "all-MXFP4" with one derived 4M-value tensor in bf16 is a fact a dtype
     // comparison has to be able to quote; a number nobody can reconcile with the claimed encoding is

@@ -114,7 +114,21 @@
  * `out[g*2S+r] = x[g*2S+r] + x[g*2S+S+r]`, `out[g*2S+S+r] = x[g*2S+r] - x[g*2S+S+r]`,
  * for every group `g` of the `groups` blocks of width `2*stride`. Standard radix-2
  * FWHT butterfly; NOT a novel derivation — verify against the reference if this is ever
- * touched. `lds` must be exactly 128 floats and is fully overwritten each call. */
+ * touched.
+ *
+ * `lds` MUST HOLD `blockDim.x` FLOATS, NOT 128. `lane` is the caller's raw `threadIdx.x` at
+ * every call site (`d_dsa_pool_compress`, `d_dsa_q_quant`, `d_compress_pool`), so the store
+ * below covers `lds[0 .. blockDim.x)` — all 512 slots at PLOW_THREADS — even though only the
+ * first 128 carry transform data. The threads past 128 are along for the ride: they store,
+ * reload and discard, and suppressing their store would only leave the slots they then read
+ * uninitialized.
+ *
+ * An earlier version of this line said "exactly 128 floats", which is the width of the
+ * TRANSFORM and not of the buffer. Nothing has ever been miscompiled by it — the interpreter
+ * passes `sm->raw`, which is far larger, and `compress_pool_gfx942_test.hip` already allocates
+ * `CMP_LDS = 512` — but a standalone caller that believed it would corrupt 384 floats past its
+ * allocation. `d_compress_pool`'s own doc comment states the real requirement
+ * (`max(d, PLOW_THREADS)`); this one now agrees with it. */
 __device__ __forceinline__ float dsa_hadamard128_stage(float x, unsigned lane, unsigned stride,
                                                         float* __restrict__ lds) {
     lds[lane] = x;
@@ -228,14 +242,16 @@ __device__ void d_dsa_pool_compress(uint8_t* __restrict__ compressed_k,
          * is a silent, plausible, wrong compressed cache. */
         const float ax = active ? fabsf(x) : 0.0f;
         const float absmax = fmaxf(block_max(ax, part), 1e-4f);
-        const float scale = exp2f(ceilf(log2f(absmax / PLOW_FP8_E4M3_MAX)));
+        float scale, inv_scale;
+        plow_round_scale(absmax, PLOW_FP8_E4M3_MAX, &scale, &inv_scale);
 
         if (active) {
             /* wpool, NOT pool: the growing-cache slot (see the DECODE-MODE WRITE ADDRESS
              * note above). slot_k/slot_score above deliberately keep using `pool` — those
              * index the staging window (the decode ring, or a prefill chunk's local
              * pools), not the output cache, and are unaffected by pool_idx. */
-            compressed_k[(size_t)wpool * head_dim + d] = quant_fp8(x / scale);
+            compressed_k[(size_t)wpool * head_dim + d] =
+                quant_fp8(PLOW_QUANT_SCALE_DIV(x, scale, inv_scale));
             if (d == 0) compressed_scale[wpool] = scale;
         }
     }
@@ -335,10 +351,12 @@ __device__ void d_dsa_q_quant(uint8_t* __restrict__ q_fp8, float* __restrict__ q
 
         const float ax = active ? fabsf(x) : 0.0f;
         const float absmax = fmaxf(block_max(ax, part), 1e-4f);
-        const float scale = exp2f(ceilf(log2f(absmax / PLOW_FP8_E4M3_MAX)));
+        float scale, inv_scale;
+        plow_round_scale(absmax, PLOW_FP8_E4M3_MAX, &scale, &inv_scale);
 
         if (active) {
-            q_fp8[(size_t)row * head_dim + d] = quant_fp8(x / scale);
+            q_fp8[(size_t)row * head_dim + d] =
+                quant_fp8(PLOW_QUANT_SCALE_DIV(x, scale, inv_scale));
             if (d == 0) q_scale[row] = scale;
         }
     }

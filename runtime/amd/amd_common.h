@@ -1065,6 +1065,66 @@ __device__ __forceinline__ float wave_max(float v) {
  * largest element uses the full e4m3 range; the reciprocal is what the write multiplies by. */
 #define PLOW_FP8_E4M3_MAX 448.0f
 
+/* PLOW_QUANT_SCALE_EXP — how the power-of-two ("ROUND_SCALE=True") quantization scale is built.
+ *
+ * The reference is `fast_round_scale`: `exp2(ceil(log2(amax / top)))`, and the shipped arm is a
+ * literal transliteration of it — `log2f` (35 instructions in the audit's probe), `ceilf`,
+ * `exp2f` (28) — followed by one IEEE divide per quantized element.
+ *
+ *   0  SHIPPED.
+ *   1  the exponent directly: `frexpf` gives `v = m * 2^e` with m in [0.5, 1), so
+ *      `ceil(log2 v) = e` unless v is an exact power of two (m == 0.5), where it is `e - 1`.
+ *      Both the scale and its exact reciprocal are then one `v_ldexp_f32` each, and the
+ *      per-element divide becomes a multiply that is BIT-IDENTICAL to it (multiplying by an
+ *      exactly representable power of two is exact, and every reachable scale here has one:
+ *      the amax floors put the exponent in [-126, -22]).
+ *
+ * ARM 1 IS NOT A REFACTOR — IT CHANGES VALUES, and only in one direction: `log2f` is not
+ * correctly rounded, so for a v just above a power of two the f32 result can land exactly on the
+ * integer and `ceilf` then returns one exponent too LOW, giving a scale that is half what the
+ * exact ceiling would give. Arm 1 returns the exact ceiling and therefore disagrees with the
+ * shipped arm on that boundary. Which is "right" is a compatibility question about the vendor
+ * kernel, not an accuracy one, so arm 1 is default-off. Boundary cases — exact powers of two,
+ * one ULP either side of them, the 1e-4 and 6*2^-126 amax floors, the FP8 e4m3 448 maximum — are
+ * enumerated in `runtime/tests/quant_scale_gfx942_test.hip`. */
+#ifndef PLOW_QUANT_SCALE_EXP
+#define PLOW_QUANT_SCALE_EXP 0
+#endif
+#if PLOW_QUANT_SCALE_EXP != 0 && PLOW_QUANT_SCALE_EXP != 1
+#error "PLOW_QUANT_SCALE_EXP must be 0 or 1"
+#endif
+
+/* The power-of-two scale for `amax`, and its reciprocal. `top` is the format maximum (448 for
+ * e4m3, 6 for e2m1). `amax` is caller-floored to a positive normal, which is what lets arm 1 skip
+ * every zero/subnormal/nonfinite guard `frexpf` would otherwise need.
+ *
+ * ARM 0 LEAVES `*inv_scale` UNWRITTEN. It is not `1.0f / s`: at the two `op_dsa_pool.h` sites the
+ * scale is used for exactly ONE divide per thread, so materializing a reciprocal there would ADD
+ * a divide rather than remove one. `PLOW_QUANT_SCALE_DIV` below is what selects the form, and
+ * arm 0's ISA is asserted bit-identical to the pre-arm source. */
+__device__ __forceinline__ void plow_round_scale(float amax, float top, float* scale,
+                                                 float* inv_scale) {
+#if PLOW_QUANT_SCALE_EXP
+    int e;
+    const float m = frexpf(amax / top, &e);
+    const int k = (m == 0.5f) ? e - 1 : e;
+    *scale = ldexpf(1.0f, k);
+    *inv_scale = ldexpf(1.0f, -k);
+#else
+    *scale = exp2f(ceilf(log2f(amax / top)));
+    (void)inv_scale;
+#endif
+}
+
+/* Divide by a `plow_round_scale` scale. Arm 1's multiply is BIT-IDENTICAL to arm 0's divide for
+ * every scale this codebase can produce — `inv` is an exactly representable power of two there,
+ * and `x * 2^-k` and `x / 2^k` are then the same correctly rounded value. */
+#if PLOW_QUANT_SCALE_EXP
+#define PLOW_QUANT_SCALE_DIV(x, scale, inv) ((x) * (inv))
+#else
+#define PLOW_QUANT_SCALE_DIV(x, scale, inv) ((x) / (scale))
+#endif
+
 /* One e4m3 OCP byte -> f32, portable (identical on CDNA3/CDNA4 — `plow_fp8_ocp_to_bf16` is the
  * exact software table both archs already share for anything that must be bit-faithful, see
  * amd_arch.h). Exact: e4m3 has 3 mantissa bits, bf16/f32 have more, so no rounding either step. */
@@ -1135,25 +1195,117 @@ __device__ __forceinline__ float dequant_fp8(unsigned char b) {
 #define RN_REG 16
 #define RN_VEC (RN_REG / 8) /* 16 halves = 2 x bf16v8 */
 
+/* Debug-build assertion on a reduced sum-of-squares. The CONTRACT and the measured margins that
+ * justify leaving it off are documented at the top of op_norm.h; this lives here for the same
+ * reason RN_REG does -- op_gemm.h's fused-norm GEMV reduces the same sum and is included FIRST.
+ * `PLOW_NORM_RANGE_CHECK=1` arms it; `PLOW_NORM_SS_MAX` is the ceiling (default FLT_MAX, the
+ * real overflow point; lower it to bound the observed range from above -- a build at 1e12f that
+ * serves a campaign without trapping proves EVERY row of EVERY layer stayed 26 orders below
+ * overflow, which no post-hoc activation dump can show because the act buffers alias across
+ * layers). Off by default and then an identity, so no shipped object carries an instruction
+ * from it. The predicate is written negated so NaN and +inf both trap.
+ *
+ * A TRAP HERE HANGS, IT DOES NOT ABORT: the trapping workgroup dies and the rest of the persistent
+ * interpreter spins on its counter forever. Verified (a build capped below the measured maximum
+ * stops making progress and needs a manual kill). Every other `__builtin_trap` in this tree
+ * behaves the same way; "the campaign stopped advancing" is the signal. */
+#ifndef PLOW_NORM_RANGE_CHECK
+#define PLOW_NORM_RANGE_CHECK 0
+#endif
+#ifndef PLOW_NORM_SS_MAX
+#define PLOW_NORM_SS_MAX 3.4028234663852886e38f
+#endif
+__device__ __forceinline__ float rn_ss(float ss) {
+#if PLOW_NORM_RANGE_CHECK
+    if (!(ss >= 0.0f && ss <= PLOW_NORM_SS_MAX)) __builtin_trap();
+#endif
+    return ss;
+}
+
 __device__ __forceinline__ float wave_sum(float v) {
 #pragma unroll
     for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, PLOW_WAVE);
     return v;
 }
 
+/* DPP/SWIZZLE HALF-WAVE REDUCTIONS. `__shfl_xor` has ONE lowering on gfx9 —
+ * `ds_bpermute_b32`, an LDS crossbar op — so each butterfly step is an LDS round trip with its
+ * own `s_waitcnt lgkmcnt`. Measured in the shipped 4-wave flash object, ONE KV tile of
+ * `d_flash_prefill<256>` is 1651 instructions of which 160 are ds_bpermute (16 accumulator rows
+ * x 5 steps x {max, sum}) and 163 are s_waitcnt: at 1 wave/SIMD there is no co-resident wave to
+ * hide any of that latency, and it is the largest single term in the softmax.
+ *
+ * DPP is a VALU operand modifier — no LDS, no waitcnt — and covers the xor-1/2/4/8 steps:
+ *   quad_perm[1,0,3,2] = lane^1, quad_perm[2,3,0,1] = lane^2, and once a quad (resp. octet)
+ *   holds a single value, ROW_HALF_MIRROR (lane^7) acts as lane^4 and ROW_MIRROR (lane^15) acts
+ *   as lane^8. Only the final xor-16 crosses a DPP row, and `ds_swizzle_b32` in bit-mask mode
+ *   does it in one LDS op with no address register.
+ *
+ * ORDER IS LOAD-BEARING FOR THE SUM AND FREE FOR THE MAX. f32 addition is not associative, so
+ * `half_wave_sum` keeps the original 16,8,4,2,1 tree exactly — xor-16/8/4 stay LDS (swizzle),
+ * only the last two steps become DPP. `fmaxf` is associative and commutative and exact, so
+ * `half_wave_max` runs ascending 1,2,4,8,16 and needs just one LDS op. Both are therefore
+ * BIT-IDENTICAL to the shfl form: 160 ds_bpermute per tile become 16 + 48 = 64 ds_swizzle.
+ *
+ * BOUND_CTRL:0 (a DPP source in an inactive lane reads as zero) rather than an identity `old`,
+ * which costs a materializing v_mov per step. Every call site reduces with a FULL wave — the K3
+ * ones sit under `if (wave == 0)` and give their out-of-range lanes the identity explicitly —
+ * and the ds_bpermute form reads undefined data from an inactive lane anyway, so neither form
+ * is defined for a partially-active reduction. */
+#ifndef PLOW_WAVE_RED_DPP
+#define PLOW_WAVE_RED_DPP 0
+#endif
+#if PLOW_WAVE_RED_DPP
+#define PLOW_DPP_XOR1 0xb1 /* quad_perm [1,0,3,2] */
+#define PLOW_DPP_XOR2 0x4e /* quad_perm [2,3,0,1] */
+#define PLOW_DPP_XOR4 0x141 /* row_half_mirror (lane^7; == lane^4 once quads are uniform)  */
+#define PLOW_DPP_XOR8 0x140 /* row_mirror      (lane^15; == lane^8 once octets are uniform) */
+/* ds_swizzle bit-mask mode, per group of 32 lanes: src = ((lane & and) | or) ^ xor. */
+#define PLOW_SWZ_XOR(x) ((((x) & 31) << 10) | 31)
+
+/* CTRL/PAT are template parameters: both builtins take a compile-time immediate. */
+template <int CTRL>
+__device__ __forceinline__ float plow_dpp_f32(float v, float ident) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(__float_as_int(ident), __float_as_int(v),
+                                                      CTRL, 0xf, 0xf, true));
+}
+template <int PAT>
+__device__ __forceinline__ float plow_swz_f32(float v) {
+    return __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), PAT));
+}
+#endif
+
 /* Reduce across the 32 lanes of a HALF-wave. The MFMA 32x32 accumulator layout
  * puts one output row entirely inside one half-wave (lanes 0-31 or 32-63), so a
  * row-wise softmax reduction must stop at 32 — going to 64 would fold two
  * different rows together. */
 __device__ __forceinline__ float half_wave_max(float v) {
+#if PLOW_WAVE_RED_DPP
+    v = fmaxf(v, plow_dpp_f32<PLOW_DPP_XOR1>(v, -INFINITY));
+    v = fmaxf(v, plow_dpp_f32<PLOW_DPP_XOR2>(v, -INFINITY));
+    v = fmaxf(v, plow_dpp_f32<PLOW_DPP_XOR4>(v, -INFINITY));
+    v = fmaxf(v, plow_dpp_f32<PLOW_DPP_XOR8>(v, -INFINITY));
+    v = fmaxf(v, plow_swz_f32<PLOW_SWZ_XOR(16)>(v));
+    return v;
+#else
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off, PLOW_WAVE));
     return v;
+#endif
 }
 __device__ __forceinline__ float half_wave_sum(float v) {
+#if PLOW_WAVE_RED_DPP
+    v += plow_swz_f32<PLOW_SWZ_XOR(16)>(v);
+    v += plow_swz_f32<PLOW_SWZ_XOR(8)>(v);
+    v += plow_swz_f32<PLOW_SWZ_XOR(4)>(v);
+    v += plow_dpp_f32<PLOW_DPP_XOR2>(v, 0.0f);
+    v += plow_dpp_f32<PLOW_DPP_XOR1>(v, 0.0f);
+    return v;
+#else
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, PLOW_WAVE);
     return v;
+#endif
 }
 
 /* ONE spelling of the logistic for the whole K3 family. `situ`'s gate branch and the MLA OUTPUT

@@ -69,6 +69,24 @@ struct Case {
     ctx: u32,
     nsplit: u32,
     top_k: u32, // 0 = dense (attend to all ctx); >0 = gathered (attend to a selected set) [DSA §3.5]
+    /// NoPE (zero-rope) MLA: this model carries no positional encoding, so the score is the
+    /// latent dot product alone.
+    ///
+    /// The fixture LAYOUT does not change — DR stays 64 and the rope arrays are still written —
+    /// only their CONTENTS become identically zero. That is deliberate and it is what makes this
+    /// a real oracle rather than a self-consistency check:
+    ///
+    ///   * the f64/CPU golden below sums `qrope·krope` over a pair of zero vectors, so the
+    ///     golden it produces IS the NoPE golden, computed by the same reference code path that
+    ///     validates every other case;
+    ///   * the device `<512, 0>` body is handed NULL rope pointers and must reproduce it — so
+    ///     the zero-rope arm is checked against the reference, not against its own twin;
+    ///   * and the device `<512, 64>` body, run on the same zeroed tables, must agree with the
+    ///     `<512, 0>` body BIT-EXACTLY. Adding `0 * k` into an f32 MFMA accumulator is exact, so
+    ///     the two differ only in the two k-tiles that contribute nothing. That second check is
+    ///     memcmp, not a tolerance, and it is what pins the `if constexpr (DR > 0)` guards: if a
+    ///     guard deleted work that was NOT dead, the two would diverge.
+    nope: bool,
 }
 
 const DK: usize = 512; // kv_lora_rank (latent width)
@@ -165,25 +183,35 @@ fn main() {
     // GF=8 head fusion at 1/2/3 head-groups, and a non-multiple ctx so the KV tail-tile is
     // exercised. ctx up to 4096 so the O(ctx) latent loop is a real long-context decode.
     let cases = [
-        Case { n_head: 8, ctx: 4096, nsplit: 1, top_k: 0 },
-        Case { n_head: 8, ctx: 4096, nsplit: 8, top_k: 0 },
-        Case { n_head: 16, ctx: 4096, nsplit: 4, top_k: 0 },
-        Case { n_head: 8, ctx: 4093, nsplit: 4, top_k: 0 },
-        Case { n_head: 24, ctx: 2000, nsplit: 8, top_k: 0 },
+        Case { n_head: 8, ctx: 4096, nsplit: 1, top_k: 0, nope: false },
+        Case { n_head: 8, ctx: 4096, nsplit: 8, top_k: 0, nope: false },
+        Case { n_head: 16, ctx: 4096, nsplit: 4, top_k: 0, nope: false },
+        Case { n_head: 8, ctx: 4093, nsplit: 4, top_k: 0, nope: false },
+        Case { n_head: 24, ctx: 2000, nsplit: 8, top_k: 0, nope: false },
         // GLM-5.2 real head count (64 => the head-packed MFMA 2-M-tile path); dense + gather.
-        Case { n_head: 64, ctx: 4096, nsplit: 1, top_k: 0 },
-        Case { n_head: 64, ctx: 4096, nsplit: 8, top_k: 0 },
-        Case { n_head: 64, ctx: 2000, nsplit: 8, top_k: 0 },
+        Case { n_head: 64, ctx: 4096, nsplit: 1, top_k: 0, nope: false },
+        Case { n_head: 64, ctx: 4096, nsplit: 8, top_k: 0, nope: false },
+        Case { n_head: 64, ctx: 2000, nsplit: 8, top_k: 0, nope: false },
         // Sparse DSA compose: gathered MLA over a selected top_k subset of the 4k context.
-        Case { n_head: 8, ctx: 4096, nsplit: 1, top_k: 2048 },
-        Case { n_head: 16, ctx: 4096, nsplit: 4, top_k: 512 },
-        Case { n_head: 8, ctx: 4096, nsplit: 8, top_k: 300 },
-        Case { n_head: 64, ctx: 4096, nsplit: 4, top_k: 2048 },
+        Case { n_head: 8, ctx: 4096, nsplit: 1, top_k: 2048, nope: false },
+        Case { n_head: 16, ctx: 4096, nsplit: 4, top_k: 512, nope: false },
+        Case { n_head: 8, ctx: 4096, nsplit: 8, top_k: 300, nope: false },
+        Case { n_head: 64, ctx: 4096, nsplit: 4, top_k: 2048, nope: false },
+        // NoPE (zero-rope) MLA — the geometry the `<512, 0>` V2 prefill arm exists for, and
+        // which before it fell all the way to the scalar decode body. Dense and ns=1 so the
+        // prefill phase can normalize against the decode oracle, at the head counts that pick
+        // different arms: 8 is the GATHER pack width and the DSA head gate, 64 is GLM's real
+        // count and the head-packed MFMA 2-M-tile path. A ragged ctx (4093) is included
+        // because the zero-rope slab is DK wide rather than DK+DR, so the staging loop's tail
+        // lands on a different thread than in the roped layout.
+        Case { n_head: 8, ctx: 4096, nsplit: 1, top_k: 0, nope: true },
+        Case { n_head: 64, ctx: 4096, nsplit: 1, top_k: 0, nope: true },
+        Case { n_head: 16, ctx: 4093, nsplit: 1, top_k: 0, nope: true },
     ];
     let scale: f32 = 0.08838835; // 1/sqrt(128) — the DeepSeek qk_head_dim scale
 
     let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(&0x4d4c4131u32.to_le_bytes()); // "MLA1"
+    out.extend_from_slice(&0x4d4c4132u32.to_le_bytes()); // "MLA2" — 8-word case header (adds `nope`)
     out.extend_from_slice(&(cases.len() as u32).to_le_bytes());
 
     for (ci, c) in cases.iter().enumerate() {
@@ -207,7 +235,13 @@ fn main() {
         let mut krope_bf = vec![0u16; ctx * DR];
         for t in 0..ctx {
             for d in 0..DR {
-                let v = rnd(cs ^ (0x02 << 40) ^ ((t as u64) << 12) ^ d as u64, Q_AMP);
+                // NoPE: identically zero, so the golden's rope term vanishes and the fixture
+                // describes a model with no positional encoding. See `Case::nope`.
+                let v = if c.nope {
+                    0.0
+                } else {
+                    rnd(cs ^ (0x02 << 40) ^ ((t as u64) << 12) ^ d as u64, Q_AMP)
+                };
                 let b = f2bf(v);
                 krope_bf[t * DR + d] = b;
                 krope[t * DR + d] = bf2f(b);
@@ -228,7 +262,11 @@ fn main() {
         let mut qrope_bf = vec![0u16; nh * DR];
         for h in 0..nh {
             for d in 0..DR {
-                let v = rnd(cs ^ (0x04 << 40) ^ ((h as u64) << 20) ^ d as u64, 0.10);
+                let v = if c.nope {
+                    0.0
+                } else {
+                    rnd(cs ^ (0x04 << 40) ^ ((h as u64) << 20) ^ d as u64, 0.10)
+                };
                 let b = f2bf(v);
                 qrope_bf[h * DR + d] = b;
                 qrope[h * DR + d] = bf2f(b);
@@ -309,7 +347,21 @@ fn main() {
         }
 
         // --- serialize the case ---
-        for x in [c.n_head, DK as u32, DR as u32, V as u32, c.ctx, c.nsplit, c.top_k] {
+        // `nope` is an 8th header word, and the magic below is bumped with it: a harness reading
+        // the old 7-word layout would take this field as the start of the scale and mis-slice
+        // every array that follows, which is exactly the kind of silent fixture drift the magic
+        // exists to stop. The rope arrays are still WRITTEN for a nope case (zeroed), so the
+        // buffer plumbing on the host side is identical for both kinds.
+        for x in [
+            c.n_head,
+            DK as u32,
+            DR as u32,
+            V as u32,
+            c.ctx,
+            c.nsplit,
+            c.top_k,
+            u32::from(c.nope),
+        ] {
             out.extend_from_slice(&x.to_le_bytes());
         }
         out.extend_from_slice(&scale.to_le_bytes());

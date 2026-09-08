@@ -12,7 +12,10 @@
 use std::mem::{offset_of, size_of};
 use std::process::Command;
 
-use packet::dev::{DevInst64, DevProgram, StreamEnt, TraceRec, Wait, CTR_STRIDE, TENSOR_NONE16};
+use packet::dev::{
+    DevInst64, DevProgram, PrefillSpan, StreamEnt, TokenBatch, TraceRec, Wait, CTR_STRIDE,
+    TENSOR_NONE16, TOKEN_BATCH_VERSION,
+};
 use packet::devbuild::{
     BlobHeader, BlobProgHeader, BlobSectionEntry, BlobTensor, BLOB_MAGIC, BLOB_MAGIC_V7, INIT_NONE,
     NAME_LEN, SECT_NAME_LEN,
@@ -46,6 +49,23 @@ int main(void) {{
     printf("DevProgram.trace %zu\n", offsetof(PlowProgram, trace));
     printf("DevProgram.prefill_spans %zu\n", offsetof(PlowProgram, prefill_spans));
     printf("DevProgram.n_prefill_rows %zu\n", offsetof(PlowProgram, n_prefill_rows));
+    printf("DevProgram.token_batch %zu\n", offsetof(PlowProgram, token_batch));
+    /* The unified token-batch descriptor. It is memcpy'd to the device, so its size and every
+     * offset are the ABI; an implicit padding gap would ship stack garbage. */
+    printf("TokenBatch.size %zu\n", sizeof(PlowTokenBatch));
+    printf("TokenBatch.version %zu\n", offsetof(PlowTokenBatch, version));
+    printf("TokenBatch.row_capacity %zu\n", offsetof(PlowTokenBatch, row_capacity));
+    printf("TokenBatch.real_rows %zu\n", offsetof(PlowTokenBatch, real_rows));
+    printf("TokenBatch.sample_rows %zu\n", offsetof(PlowTokenBatch, sample_rows));
+    printf("TokenBatch.n_spans %zu\n", offsetof(PlowTokenBatch, n_spans));
+    printf("TokenBatch.flags %zu\n", offsetof(PlowTokenBatch, flags));
+    printf("TokenBatch.spans %zu\n", offsetof(PlowTokenBatch, spans));
+    printf("TokenBatch.input_ids %zu\n", offsetof(PlowTokenBatch, input_ids));
+    printf("TokenBatch.positions %zu\n", offsetof(PlowTokenBatch, positions));
+    printf("TokenBatch.active %zu\n", offsetof(PlowTokenBatch, active));
+    printf("TokenBatch.sample_rows_idx %zu\n", offsetof(PlowTokenBatch, sample_rows_idx));
+    printf("TOKEN_BATCH_VERSION %u\n", (unsigned)PLOW_TOKEN_BATCH_VERSION);
+    printf("PrefillSpan.size %zu\n", sizeof(PlowPrefillSpan));
     printf("TraceRec.size %zu\n", sizeof(PlowTraceRec));
     printf("TraceRec.cu %zu\n", offsetof(PlowTraceRec, cu));
     printf("TraceRec.pc %zu\n", offsetof(PlowTraceRec, pc));
@@ -174,6 +194,52 @@ fn rust_and_c_agree_on_the_device_isa() {
         offset_of!(DevProgram, n_prefill_rows),
         get("DevProgram.n_prefill_rows"),
         "DevProgram.n_prefill_rows"
+    );
+    // The appended token-batch pointer. Its OFFSET is what proves the field landed after every
+    // existing one; its presence is what makes `size_of::<DevProgram>()` refuse a stale object.
+    assert_eq!(
+        offset_of!(DevProgram, token_batch),
+        get("DevProgram.token_batch"),
+        "DevProgram.token_batch"
+    );
+    assert_eq!(
+        size_of::<TokenBatch>(),
+        get("TokenBatch.size"),
+        "PlowTokenBatch size"
+    );
+    assert_eq!(
+        size_of::<PrefillSpan>(),
+        get("PrefillSpan.size"),
+        "PlowPrefillSpan size (the token batch reuses it verbatim)"
+    );
+    for (name, rust) in [
+        ("TokenBatch.version", offset_of!(TokenBatch, version)),
+        (
+            "TokenBatch.row_capacity",
+            offset_of!(TokenBatch, row_capacity),
+        ),
+        ("TokenBatch.real_rows", offset_of!(TokenBatch, real_rows)),
+        (
+            "TokenBatch.sample_rows",
+            offset_of!(TokenBatch, sample_rows),
+        ),
+        ("TokenBatch.n_spans", offset_of!(TokenBatch, n_spans)),
+        ("TokenBatch.flags", offset_of!(TokenBatch, flags)),
+        ("TokenBatch.spans", offset_of!(TokenBatch, spans)),
+        ("TokenBatch.input_ids", offset_of!(TokenBatch, input_ids)),
+        ("TokenBatch.positions", offset_of!(TokenBatch, positions)),
+        ("TokenBatch.active", offset_of!(TokenBatch, active)),
+        (
+            "TokenBatch.sample_rows_idx",
+            offset_of!(TokenBatch, sample_rows_idx),
+        ),
+    ] {
+        assert_eq!(rust, get(name), "{name}");
+    }
+    assert_eq!(
+        TOKEN_BATCH_VERSION as usize,
+        get("TOKEN_BATCH_VERSION"),
+        "PLOW_TOKEN_BATCH_VERSION"
     );
     assert_eq!(
         size_of::<TraceRec>(),

@@ -208,7 +208,7 @@ pub(crate) struct Cfg {
     pub(crate) moe_inter: u32, // 704 per-expert intermediate
     // Gemma-4 E-series (E2B/E4B): per-layer input embeddings (`hidden_size_per_layer_input`, 0 =
     // none) and KV sharing (`num_kv_shared_layers` trailing layers reuse the KV of the last
-    // non-shared layer of their type; 0 = none). See `dev_isa.h` op 154.
+    // non-shared layer of their type; 0 = none). See `dev_isa.h` op 155.
     pub(crate) ple: u32,
     pub(crate) kv_shared: u32,
 }

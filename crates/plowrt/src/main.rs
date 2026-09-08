@@ -401,6 +401,33 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         no_analysis: bool,
     },
+
+    /// Classify every opcode a compiled blob uses by how it learns a row's
+    /// request identity, and report whether the program can be executed as one
+    /// packed token batch.
+    ///
+    /// Static and offline, like `disasm`: the blob is a file. The four classes
+    /// are §3 of `plans/unified-token-batch.md`, reproduced in
+    /// `docs/arch/17-unified-token-batch.md (Part III)`.
+    ///
+    /// An opcode with no classification is class C and is REFUSED, because on
+    /// AMD the interpreter's dispatch `default:` writes nothing and does not
+    /// trap — an unclassified operator is a silent-wrong-answer hazard, not an
+    /// inconvenience.
+    OpAudit {
+        /// `model.pkt`, or an asset directory containing one. Omit with
+        /// `--table` to print the whole-ISA table instead.
+        blob: Option<PathBuf>,
+        /// Print every opcode in the ISA with its static class, with no blob.
+        #[arg(long, default_value_t = false)]
+        table: bool,
+        /// Restrict to one program: a prefill bucket `T`, or `1` for decode.
+        #[arg(long)]
+        program: Option<u32>,
+        /// `text` (default) or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[tokio::main]
@@ -409,7 +436,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let filter_str = format!("{filter}");
-    if matches!(&cli.cmd, Cmd::Bench { .. }) {
+    // `op-audit --format json` writes a document to stdout; the startup banner
+    // would land inside it. Same reason `bench` logs to stderr.
+    if matches!(&cli.cmd, Cmd::Bench { .. } | Cmd::OpAudit { .. }) {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -547,6 +576,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 no_analysis,
             },
         ),
+        Cmd::OpAudit {
+            blob,
+            table,
+            program,
+            format,
+        } => op_audit_cmd(blob, table, program, format),
         Cmd::Devices {
             tp,
             hidden,
@@ -1226,6 +1261,11 @@ fn amd_bench(
         if !eng.weights_bound() {
             println!("  (synthetic diagnostic only — not a performance result)");
         }
+        // THE FOURTH EXIT. `trace_dump_1`'s own comment names `--batched` as a path that
+        // returned before a dump; it stayed that way, so `PLOW_TRACE_RAW` was silent for the
+        // batched decode step — the one shape a concurrency-4 residue attribution needs. The
+        // buffer holds the LAST launch, which here is a steady-state timed step.
+        trace_dump_1(&eng, "")?;
         return Ok(());
     }
 
@@ -1249,6 +1289,22 @@ fn amd_bench(
         // ask whether TP's own geometry (K3's 12 local KDA heads at BV=8, against
         // the 96-head BV=16 shape every block gate validates) changed the answer.
         let dump = |e: &AmdEngine, tag: &str| -> Result<(), Box<dyn std::error::Error>> {
+            // PLOW_DUMP_ACT, same contract as the TP closure below. It used to exist only
+            // there, so every single-GPU model on this box — Gemma-4 among them — silently
+            // dumped nothing and the caller saw an empty range report rather than an error.
+            if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
+                for one in spec.split(',').filter(|s| !s.is_empty()) {
+                    if let Some((name, path)) = one.split_once(':') {
+                        let n = e
+                            .tensor_bytes(name)
+                            .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
+                            as usize;
+                        let mut buf = vec![0u8; n];
+                        e.read_tensor(name, &mut buf)?;
+                        std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
+                    }
+                }
+            }
             let Some(dir) = &dump_logits else {
                 return Ok(());
             };
@@ -2070,6 +2126,58 @@ fn devices(
     Ok(())
 }
 
+/// `plowrt op-audit` — classify a blob's opcodes by row identity.
+///
+/// The exit status is the verdict: `0` when every program can be executed as one
+/// packed token batch, `1` when any opcode is refused. That makes the audit
+/// usable as a gate in the enablement of a (family, backend) pair, which is what
+/// the plan asks of it — not just as something to read.
+fn op_audit_cmd(
+    blob_path: Option<PathBuf>,
+    table: bool,
+    program: Option<u32>,
+    format: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::asset::devblob::DevBlob;
+
+    if table {
+        let rows = plowrt::opaudit::table();
+        match format.as_str() {
+            "json" => println!("{}", serde_json::to_string_pretty(&rows)?),
+            "text" => print!("{}", plowrt::opaudit::table_text(&rows)),
+            other => return Err(format!("--format wants text|json, got `{other}`").into()),
+        }
+        return Ok(());
+    }
+
+    let blob_path = blob_path.ok_or("op-audit wants a blob path, or --table")?;
+    // Same convention as `disasm`: a directory means the `model.pkt` in it.
+    let p = blob_path.as_path();
+    let file = if p.is_dir() {
+        p.join("model.pkt")
+    } else {
+        p.to_path_buf()
+    };
+    let buf = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    let magic: Option<&[u8; 8]> = buf.get(..8).and_then(|s| s.try_into().ok());
+    if !magic.is_some_and(packet::devbuild::is_blob_magic) {
+        return Err(format!("{}: not a PLOWDEV blob", file.display()).into());
+    }
+    // Static inspection, so an L2-placed blob must be readable — see `disasm_cmd`.
+    let blob = DevBlob::parse_l2(&buf, true)?;
+    let rep = plowrt::opaudit::audit(&blob, &file.display().to_string(), program);
+
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&rep)?),
+        "text" => print!("{}", plowrt::opaudit::text(&rep)),
+        other => return Err(format!("--format wants text|json, got `{other}`").into()),
+    }
+    if !rep.packable {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// `plowrt disasm` — read a device blob and render it.
 ///
 /// No device, no features, no driver. The heavy lifting is in
@@ -2418,6 +2526,32 @@ async fn bringup_runtime(
         {
             tracing::info!(dir = %dir.display(), %target, "loaded model bundle for CPU engine");
         } else {
+            // A DEVICE BLOB WITH NO DEVICE IS A REFUSAL, NOT A WARNING.
+            //
+            // This warned and carried on, and the CPU reference interpreter
+            // then served the bundle: its logits are a stand-in, the chat path
+            // falls back to a bare `role:\ncontent` flatten, and stops are
+            // matched on a newline byte. The result is fluent, fast, wrong, and
+            // indistinguishable from a working server unless someone reads the
+            // log — which is exactly how a GLM-5.3 serve here came up on the
+            // CPU backend and answered correctly at fictional speed.
+            //
+            // A bundle with NO blob is a genuine CPU-reference asset and still
+            // warns, because for that one the CPU path is the intended path.
+            let has_blob = plowrt::asset::devblob::DevBlob::find_in_dir(dir)
+                .ok()
+                .flatten()
+                .is_some();
+            if has_blob {
+                return Err(format!(
+                    "{}: this bundle carries a compiled device blob for {target}, but no \
+                     matching GPU driver was found. Serving it would fall back to the CPU \
+                     reference interpreter, which produces fluent WRONG output at fictional \
+                     speed. Refusing to start.",
+                    dir.display()
+                )
+                .into());
+            }
             tracing::warn!(
                 dir = %dir.display(), %target,
                 "loaded model bundle — no matching GPU driver; \

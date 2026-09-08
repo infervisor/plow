@@ -217,7 +217,7 @@ G_K(g_norm_residual_norm) {
     }
 }
 
-/* Op 154 (dev_isa.h): Gemma-4 E-series per-layer input block, in place on x.
+/* Op 155 (dev_isa.h): Gemma-4 E-series per-layer input block, in place on x.
  * t0=x t1=Wg[P][H] t2=Wp[H][P] t3=gamma_post[H] t4=ple[T][stride] t5=hn_out? t6=gamma_next?
  * i0=T i1=H i2=P i3=col0 i4=stride  f0=eps f1=layer_scalar.
  * bf16 rounding follows the HF module boundaries (gate out, act, product, projection out). */

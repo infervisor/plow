@@ -1314,7 +1314,7 @@ void op_flash_merge(const thread Inst& in, device const ulong* tab, uint slice, 
 
 // ---- dispatch ------------------------------------------------------------------------------------------
 // Returns false for an opcode this interpreter does not implement (the host reports the fault).
-// Op 154: Gemma-4 E-series per-layer input block, in place on x (dev_isa.h). One threadgroup per
+// Op 155: Gemma-4 E-series per-layer input block, in place on x (dev_isa.h). One threadgroup per
 // row: 32 simdgroups compute the P gate dots (lanes strided over H), the products land in `tile`,
 // every thread then owns H/NT rows of the projection, and the two norms reduce through `red`.
 // Needs P + H <= TILE_FLOATS (E4B: 256 + 2560).
@@ -1786,7 +1786,7 @@ bool exec_op(const thread Inst& in, device const ulong* tab, uint slice, uint nb
         case 18: op_argmax_fin(in, tab, slice, lid); return true;
         case 21: op_add_norm(in, tab, slice, nblk, red, lid, sg, lane); return true;
         case 23: op_norm_residual_norm(in, tab, slice, nblk, red, lid, sg, lane); return true;
-        case 154: op_per_layer_input(in, tab, slice, nblk, tile, red, lid, sg, lane); return true;
+        case 155: op_per_layer_input(in, tab, slice, nblk, tile, red, lid, sg, lane); return true;
         case 83: op_moe_router_topk_pf(in, tab, slice, nblk, sg, lane); return true;
         case 84: op_moe_align_pf(in, tab, slice, lid); return true;
         case 87: op_moe_combine_pf(in, tab, slice, nblk, lid); return true;

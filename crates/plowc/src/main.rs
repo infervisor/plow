@@ -10,10 +10,10 @@
 //! ("egglog fusion analysis … fusions_found=662") was read as a compiler pass
 //! reporting its work, and quoted as such.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use devgen::emit_config::EmitConfig;
 #[cfg(feature = "tuner")]
 use plowc::tune::{self, TuneAction, TuneOptions};
@@ -53,6 +53,15 @@ struct Cli {
     /// Overrides --batch and --seq when provided.
     #[arg(long, value_enum)]
     preset: Option<Preset>,
+
+    /// Replay the emit knobs recorded in a previous `build.json`.
+    ///
+    /// Reads that manifest's `emit_config.replay` and applies it to the environment before
+    /// parsing, so an explicitly given flag still wins over the recorded value. Only knobs the
+    /// recorded build actually set are applied; its defaults are left to this tree's defaults
+    /// on purpose, so a replay picks up a promoted default rather than pinning an old one.
+    #[arg(long, value_name = "BUILD_JSON")]
+    replay_knobs: Option<PathBuf>,
 
     /// GPU spec name or short alias (e.g. `rtx6000pro`, `h100`, `mi350`).
     /// Run with `--list-gpus` to see all recognized names.
@@ -136,9 +145,8 @@ struct Cli {
     #[arg(long)]
     block: Option<String>,
 
-    /// devblob+cubin: also build segmented prefill cubins (_pfseg, _pfgemm).
-    /// Implies NOT setting PLOW_UNISEG=1, so the emitted programs carry
-    /// wave-class segments the SegPf runtime dispatches per-class.
+    /// devblob+cubin: force segmented prefill cubins (_pfseg, _pfgemm).
+    /// Segmented packet manifests select these objects automatically.
     #[arg(long)]
     segmented: bool,
 
@@ -573,9 +581,85 @@ fn parse_unit_shares(spec: &str) -> Result<Vec<(costmodel::UnitKind, f64)>, Stri
     Ok(out)
 }
 
+/// Apply `--replay-knobs <build.json>`'s recorded configuration to the environment.
+///
+/// The read half of the emit-knob record. `build.json` now carries every knob `EmitConfig`
+/// declares along with where its value came from, and `emit_config.replay` is the subset a
+/// rebuild has to be told: the knobs that came from a flag or an env var. Applying them as env
+/// vars — rather than synthesizing a command line — is what keeps an explicit flag in THIS
+/// invocation winning, because that is already clap's precedence.
+///
+/// `set_var` only where the variable is not already set, so an operator who exported a knob to
+/// override one recorded value is not silently overwritten by the file.
+fn apply_replay_knobs() -> Result<(), String> {
+    let mut args = std::env::args_os().skip(1);
+    let mut path: Option<std::ffi::OsString> = None;
+    while let Some(a) = args.next() {
+        let a = a.to_string_lossy().into_owned();
+        if a == "--replay-knobs" {
+            path = args.next();
+        } else if let Some(v) = a.strip_prefix("--replay-knobs=") {
+            path = Some(v.into());
+        }
+    }
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let man: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+    )
+    .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+    let replay = man
+        .get("emit_config")
+        .and_then(|c| c.get("replay"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} has no `emit_config.replay` section. It was written by a plowc that predates \
+                 the emit-knob record — re-emit that blob with this build to produce one, or set \
+                 the knobs directly.",
+                path.display()
+            )
+        })?;
+    let mut applied = Vec::new();
+    for (k, v) in replay {
+        let Some(v) = v.as_str() else { continue };
+        if std::env::var_os(k).is_none() {
+            std::env::set_var(k, v);
+            applied.push(format!("{k}={v}"));
+        }
+    }
+    eprintln!(
+        "  replaying {} knob(s) from {}: {}",
+        applied.len(),
+        path.display(),
+        applied.join(" ")
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     init_logging();
-    let mut cli = Cli::parse();
+    // `get_matches` rather than `parse` ONLY so the emit-knob record in `build.json` can say
+    // where each value came from. `ArgMatches` is the sole thing that knows a flag beat an env
+    // var; `Cli::parse()` collapses the three sources into a value and throws the answer away,
+    // and reconstructing it afterwards ("the env var is set, so it must be the source") is
+    // wrong exactly when a flag overrode one. Parsing is otherwise unchanged — `from_arg_matches`
+    // over the same matches is what `parse` does internally.
+    // BEFORE `get_matches`, and it has to be: clap reads the `env =` fallbacks during parsing,
+    // so a replay applied afterwards would be recorded and then ignored. Scanned off `args_os`
+    // rather than parsed twice — a second full parse would emit its own errors and `--help`.
+    if let Err(e) = apply_replay_knobs() {
+        eprintln!("--replay-knobs: {e}");
+        return ExitCode::FAILURE;
+    }
+    let matches = Cli::command().get_matches();
+    let mut cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    devgen::emit_config::record_knobs(Some(&matches));
 
     // An Apple target has no `sm_*`/`gfx*` object: the Metal interpreter compiles its MSL at
     // load and executes the same single-segment (uniseg) packet shape as sm_120. Resolve the
@@ -594,13 +678,22 @@ fn main() -> ExitCode {
     // that was missing. Defaulting it here moves the decision to the only place that knows the
     // arch. `deny_uniseg` still wins downstream for targets that must read `seg` (AMD).
     // Opt out with PLOW_UNISEG=0.
-    if (cli.arch.starts_with("sm_120") || cli.arch == "metal3")
-        && std::env::var_os("PLOW_UNISEG").is_none()
-    {
-        // The real gate is `packet::devbuild::Builder`'s own `std::env::var("PLOW_UNISEG")` read,
-        // not this struct field — set both so the emitted manifest and the diagnostic agree.
-        std::env::set_var("PLOW_UNISEG", "1");
-        cli.emit_cfg.uniseg = true;
+    cli.emit_cfg.uniseg = effective_uniseg(
+        &cli.arch,
+        cli.emit_cfg.uniseg,
+        cli.segmented,
+        std::env::var_os("PLOW_UNISEG").is_some(),
+    );
+    // Builder still consumes this legacy switch directly. Keep it synchronized
+    // with the parsed emit config until that input is carried in BuilderConfig.
+    std::env::set_var("PLOW_UNISEG", if cli.emit_cfg.uniseg { "1" } else { "0" });
+    // `effective_uniseg` defaults it ON for sm_120 regardless of what was parsed, so the
+    // recorded value has to follow the override rather than the command line.
+    if matches.value_source("uniseg") != Some(clap::parser::ValueSource::CommandLine) {
+        devgen::emit_config::note_production_default(
+            "uniseg",
+            if cli.emit_cfg.uniseg { "true" } else { "false" }.into(),
+        );
     }
     // `--unit-shares` on an Apple target is the heterogeneous prefill ROW split (devgen `hetero.rs`):
     // the ANE/CPU shares become row percentages of every prefill bucket. `--row-split` wins if given.
@@ -1371,13 +1464,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             l2_layout,
             gpu: cli.gpu.clone(),
             arch: cli.arch.clone(),
-            emit_cfg: Some({
-                let mut cfg = cli.emit_cfg.clone();
-                if cli.segmented {
-                    cfg.uniseg = false;
-                }
-                cfg
-            }),
+            emit_cfg: Some(cli.emit_cfg.clone()),
             whole_graph_fusions,
         },
         verify,
@@ -1482,7 +1569,7 @@ fn build_cubin_from_manifest(
         return Err(format!(
             "--emit devblob+cubin needs a CUDA toolkit: {} not found. The packet and \
              {} were written successfully — build the object separately (see \
-             runtime/CMakeLists.txt, -DPLOW_SM120_CUBIN=ON) or use --emit devblob, \
+             runtime/CMakeLists.txt) or use --emit devblob, \
              which needs no toolkit.",
             nvcc.display(),
             mpath.display()
@@ -1499,19 +1586,13 @@ fn build_cubin_from_manifest(
     }
 
     // The manifest is arch-agnostic on purpose; picking the backend is this
-    // function's job. Only nvcc/sm_1xx is wired — hipcc → .hsaco (runtime/amd/)
-    // is the same shape and is deliberately left for a follow-up.
+    // function's job. hipcc → .hsaco (runtime/amd/) is the same shape and is
+    // deliberately left for a follow-up.
     let flags = man
         .get("backends")
         .and_then(|b| b.get("nvcc"))
         .ok_or_else(|| format!("{}: no nvcc backend section", mpath.display()))?;
-    if !arch.starts_with("sm_") {
-        return Err(format!(
-            "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
-             need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
-        )
-        .into());
-    }
+    let arch_option = cubin_arch_option(arch)?;
     let list = |k: &str| -> Vec<String> {
         flags
             .get(k)
@@ -1530,7 +1611,7 @@ fn build_cubin_from_manifest(
     // table appends verbatim. PLOW_NV_FA_GF_FULL has its own cache variable (it
     // must reach every decode-family object from one place — that was bug #2),
     // so route it there rather than into the raw-append bucket.
-    let mut args: Vec<String> = vec!["-DPLOW_SM120_CUBIN=ON".into()];
+    let mut args: Vec<String> = vec![arch_option.into()];
     if !req.iter().any(|d| d.starts_with("PLOW_NV_GEMMA")) {
         args.push("-DPLOW_CUBIN_GEMMA=OFF".into());
     }
@@ -1541,7 +1622,13 @@ fn build_cubin_from_manifest(
         args.push("-DPLOW_FP8_KV=ON".into());
         args.push("-DPLOW_SM120_CUBIN_FP8KV=ON".into());
     }
-    if segmented {
+    if req.iter().any(|d| d.starts_with("PLOW_NV_PF_GEMV_HEAD")) {
+        args.push("-DPLOW_NV_PF_GEMV_HEAD=ON".into());
+    }
+    if let Some(option) = packed_prefill_cubin_option(&man) {
+        args.push(option.into());
+    }
+    if segmented || manifest_requires_segmented_prefill(&man) {
         args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
     let mut extra = Vec::new();
@@ -1557,6 +1644,15 @@ fn build_cubin_from_manifest(
     args.push(format!("-DPLOW_CUBIN_ARCH={arch}"));
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
+    let config = pkt.with_file_name("plow_config.h");
+    if !config.is_file() {
+        return Err(format!(
+            "--emit devblob+cubin: packet config {} was not emitted",
+            config.display()
+        )
+        .into());
+    }
+    args.push(cubin_config_option(&config));
     let build_dir = out_dir.join(".cubin-build");
     let runtime_dir = repo_runtime_dir()?;
     args.push(format!("-DPLOW_CUBIN_DIR={}", out_dir.display()));
@@ -1582,6 +1678,58 @@ fn build_cubin_from_manifest(
     }
     info!(out = %out_dir.display(), "interpreter object built");
     Ok(())
+}
+
+fn effective_uniseg(arch: &str, configured: bool, segmented: bool, env_present: bool) -> bool {
+    if segmented {
+        false
+    } else if (arch.starts_with("sm_120") || arch == "metal3") && !env_present {
+        true
+    } else {
+        configured
+    }
+}
+
+fn cubin_config_option(config: &Path) -> String {
+    format!("-DPLOW_CUBIN_CONFIG={}", config.display())
+}
+
+fn packed_prefill_cubin_option(manifest: &serde_json::Value) -> Option<&'static str> {
+    manifest
+        .pointer("/objects/packed_prefill/required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        .then_some("-DPLOW_CUBIN_PACKED_PREFILL=ON")
+}
+
+fn manifest_requires_segmented_prefill(manifest: &serde_json::Value) -> bool {
+    manifest
+        .get("programs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|programs| {
+            programs.iter().any(|program| {
+                program.get("kind").and_then(serde_json::Value::as_str) == Some("prefill")
+                    && program
+                        .get("segment")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|segment| segment > 0)
+            })
+        })
+}
+
+fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
+    match arch {
+        "sm_90a" => Ok("-DPLOW_SM90A_CUBIN=ON"),
+        "sm_120a" => Ok("-DPLOW_SM120_CUBIN=ON"),
+        _ if !arch.starts_with("sm_") => Err(format!(
+            "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
+             need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
+        )),
+        _ => Err(format!(
+            "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
+             supported CUDA architectures are sm_90a and sm_120a."
+        )),
+    }
 }
 
 fn which_cmake() -> Option<PathBuf> {
@@ -2213,6 +2361,20 @@ mod cli_tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn mixed_fusion_has_no_compiler_options() {
+        for (flag, value) in [
+            ("--mixed-rows", "512:3"),
+            ("--mixed-object", "/tmp/mixed.hsaco"),
+        ] {
+            let error = Cli::try_parse_from([
+                "plowc", "--hf-dir", "/tmp/x", "--emit", "devblob", flag, value,
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
     fn parse(extra: &[&str]) -> Cli {
         let mut argv = vec!["plowc", "--hf-dir", "/tmp/x", "--emit", "devblob"];
         argv.extend_from_slice(extra);
@@ -2228,6 +2390,71 @@ mod cli_tests {
         )
         .unwrap_err();
         assert!(err.contains("FP8 lowering"));
+    }
+
+    #[test]
+    fn cubin_build_selects_the_interpreter_for_the_target_arch() {
+        assert_eq!(
+            cubin_arch_option("sm_90a").unwrap(),
+            "-DPLOW_SM90A_CUBIN=ON"
+        );
+        assert_eq!(
+            cubin_arch_option("sm_120a").unwrap(),
+            "-DPLOW_SM120_CUBIN=ON"
+        );
+        assert!(cubin_arch_option("sm_100a")
+            .unwrap_err()
+            .contains("no served interpreter"));
+        assert!(cubin_arch_option("gfx950")
+            .unwrap_err()
+            .contains("hipcc/.hsaco"));
+    }
+
+    #[test]
+    fn cubin_build_config_is_the_packet_sibling() {
+        let pkt = Path::new("/tmp/model-assets/model.pkt");
+        assert_eq!(
+            cubin_config_option(&pkt.with_file_name("plow_config.h")),
+            "-DPLOW_CUBIN_CONFIG=/tmp/model-assets/plow_config.h"
+        );
+    }
+
+    #[test]
+    fn cubin_build_adds_packed_object_only_for_packed_topology() {
+        let packed = serde_json::json!({
+            "objects": { "packed_prefill": { "required": true } }
+        });
+        assert_eq!(
+            packed_prefill_cubin_option(&packed),
+            Some("-DPLOW_CUBIN_PACKED_PREFILL=ON")
+        );
+        assert_eq!(packed_prefill_cubin_option(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn segmented_prefill_objects_follow_the_packet_manifest() {
+        let segmented = serde_json::json!({
+            "programs": [
+                {"kind": "prefill", "segment": 0},
+                {"kind": "prefill", "segment": 1},
+                {"kind": "decode", "segment": 2}
+            ]
+        });
+        assert!(manifest_requires_segmented_prefill(&segmented));
+        assert!(!manifest_requires_segmented_prefill(&serde_json::json!({
+            "programs": [
+                {"kind": "prefill", "segment": 0},
+                {"kind": "decode", "segment": 1}
+            ]
+        })));
+    }
+
+    #[test]
+    fn uniseg_cli_state_reaches_the_legacy_builder_switch() {
+        assert!(effective_uniseg("sm_90a", true, false, false));
+        assert!(!effective_uniseg("sm_90a", true, true, false));
+        assert!(effective_uniseg("sm_120a", false, false, false));
+        assert!(!effective_uniseg("sm_120a", false, false, true));
     }
 
     /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be

@@ -26,6 +26,10 @@ mod bucket;
 #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(dead_code))]
 pub(crate) mod checkpoint;
 pub mod devblob;
+/// The DSA lightning indexer's fp8 -> bf16 upcast. Gated with `checkpoint` for the same
+/// reason `shard` is: it is a rule about how a checkpoint tensor becomes a bound one.
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+pub mod dsa_indexer;
 /// Megatron weight sharding. Gated with `checkpoint` — it is the rule for which
 /// slice of a checkpoint tensor a rank binds, and useless without one.
 #[cfg(any(feature = "cuda", feature = "hsa"))]
@@ -42,6 +46,10 @@ pub struct ModelBundle {
     /// The model's tokenizer — a real HF `tokenizer.json` when present
     /// (feature `hf-tokenizer`), else the byte fallback.
     tokenizer: Arc<dyn Tokenize>,
+    /// The checkpoint's own `chat_template.jinja`, compiled once. `None` when
+    /// the assets ship no template, in which case the built-in per-family
+    /// prompt builders serve instead.
+    chat_template: Option<Arc<crate::serve::template::ChatTemplate>>,
 }
 
 impl ModelBundle {
@@ -62,12 +70,21 @@ impl ModelBundle {
         // Load the model's tokenizer from `tokenizer.json` (byte fallback if
         // absent / feature off). Loaded once at startup, shared per request.
         let tokenizer = load_tokenizer(&dir);
+        let chat_template = crate::serve::template::ChatTemplate::load(&dir);
+        match &chat_template {
+            Some(t) => tracing::info!(source = %t.source, "chat template loaded from the assets"),
+            None => tracing::info!(
+                dir = %dir.display(),
+                "no chat_template.jinja in the assets — using the built-in prompt builders"
+            ),
+        }
 
         Ok(ModelBundle {
             dir,
             manifest,
             buckets,
             tokenizer,
+            chat_template,
         })
     }
 
@@ -79,6 +96,11 @@ impl ModelBundle {
     /// The model's tokenizer (real HF tokenizer when available, else bytes).
     pub fn tokenizer(&self) -> &Arc<dyn Tokenize> {
         &self.tokenizer
+    }
+
+    /// The checkpoint's compiled chat template, when it ships one.
+    pub fn chat_template(&self) -> Option<&Arc<crate::serve::template::ChatTemplate>> {
+        self.chat_template.as_ref()
     }
 
     /// Look up the compiled bucket serving `(phase, batch, seq)`.

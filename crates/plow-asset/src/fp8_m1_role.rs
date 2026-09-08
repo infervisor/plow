@@ -81,21 +81,19 @@ fn dependency_ancestors(dependencies: &[BTreeSet<usize>], pc: usize) -> Vec<bool
     ancestors
 }
 
-pub fn validate(packet: &Packet<'_>, program: usize, pc: usize) -> Result<()> {
-    require(
-        !packet.tp
-            && packet.n_cu > 0
-            && packet.n_cu <= u16::MAX as u32
-            && packet.programs.len() == packet.prefill_count + 1
-            && program == packet.prefill_count,
-        "one M1 decode program required",
-    )?;
-    let g = packet.programs.get(program).ok_or("program index")?;
-    require(
-        g.rows == 1 && !g.packed_prefill_only && g.l2_domains == 0,
-        "decode geometry",
-    )?;
+fn validate_pc(
+    packet: &Packet<'_>,
+    g: &Program<'_>,
+    deps: &[BTreeSet<usize>],
+    pc: usize,
+) -> Result<()> {
     let d = g.insts.get(pc).ok_or("instruction index")?;
+    let pc_ancestors = dependency_ancestors(deps, pc);
+    let mut pc_descendants = vec![false; deps.len()];
+    pc_descendants[pc] = true;
+    for j in pc + 1..deps.len() {
+        pc_descendants[j] = deps[j].iter().any(|&parent| pc_descendants[parent]);
+    }
     // The first numerical record covers only this shape; unknown cells retain baseline.
     require(
         d.op == DevOp::GemmFp8 as u16
@@ -169,29 +167,6 @@ pub fn validate(packet: &Packet<'_>, program: usize, pc: usize) -> Result<()> {
             )?;
         }
     }
-    let mut stream = g.stream.to_vec();
-    let mut queue = g.gq_stream.to_vec();
-    for e in stream.iter_mut().chain(&mut queue) {
-        e.seg = 0;
-    }
-    let windows = [0, queue.len() as u32];
-    let normalized = Program {
-        stream: &stream,
-        gq_stream: &queue,
-        gq_seg_ofs: &windows,
-        ..*g
-    };
-    let deps = crate::splitk::dependencies(&normalized)?;
-    require(
-        g.gq_stream.windows(2).all(|w| w[0].inst <= w[1].inst),
-        "reordered instruction windows",
-    )?;
-    let pc_ancestors = dependency_ancestors(&deps, pc);
-    let mut pc_descendants = vec![false; deps.len()];
-    pc_descendants[pc] = true;
-    for j in pc + 1..deps.len() {
-        pc_descendants[j] = deps[j].iter().any(|&parent| pc_descendants[parent]);
-    }
     let mut quant = None;
     for (j, inst) in g.insts.iter().enumerate() {
         if inst.op == DevOp::QuantFp8 as u16
@@ -263,7 +238,7 @@ pub fn validate(packet: &Packet<'_>, program: usize, pc: usize) -> Result<()> {
         }
     }
     let nw = norm_writer.ok_or("missing BF16 quantizer-input producer")?;
-    let quant_ancestors = dependency_ancestors(&deps, q);
+    let quant_ancestors = dependency_ancestors(deps, q);
     require(
         quant_ancestors[nw]
             && matches!(
@@ -305,6 +280,48 @@ pub fn validate(packet: &Packet<'_>, program: usize, pc: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn validate_all(packet: &Packet<'_>, program: usize, pcs: &[usize]) -> Result<()> {
+    require(
+        !packet.tp
+            && packet.n_cu > 0
+            && packet.n_cu <= u16::MAX as u32
+            && packet.programs.len() == packet.prefill_count + 1
+            && program == packet.prefill_count,
+        "one M1 decode program required",
+    )?;
+    let g = packet.programs.get(program).ok_or("program index")?;
+    require(
+        g.rows == 1 && !g.packed_prefill_only && g.l2_domains == 0,
+        "decode geometry",
+    )?;
+    let mut stream = g.stream.to_vec();
+    let mut queue = g.gq_stream.to_vec();
+    for e in stream.iter_mut().chain(&mut queue) {
+        e.seg = 0;
+    }
+    let windows = [0, queue.len() as u32];
+    let normalized = Program {
+        stream: &stream,
+        gq_stream: &queue,
+        gq_seg_ofs: &windows,
+        ..*g
+    };
+    let deps = crate::splitk::dependencies(&normalized)?;
+    require(
+        g.gq_stream.windows(2).all(|w| w[0].inst <= w[1].inst),
+        "reordered instruction windows",
+    )?;
+    require(!pcs.is_empty(), "missing selected instruction")?;
+    for &pc in pcs {
+        validate_pc(packet, g, &deps, pc)?;
+    }
+    Ok(())
+}
+
+pub fn validate(packet: &Packet<'_>, program: usize, pc: usize) -> Result<()> {
+    validate_all(packet, program, &[pc])
 }
 
 #[cfg(test)]

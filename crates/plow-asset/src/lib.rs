@@ -672,10 +672,12 @@ pub mod decode_objects;
 pub mod cubin;
 pub mod decode_coverage;
 
+pub mod aux_program;
 pub mod program;
 pub mod splitk;
 
 pub mod live_kv;
+pub mod mixed_step;
 
 pub mod fp8_m1_role;
 
@@ -684,3 +686,4 @@ pub mod segment_roles;
 pub mod packed_prefill;
 
 pub mod hetero;
+pub mod token_batch;
