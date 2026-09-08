@@ -1072,6 +1072,20 @@ __device__ __forceinline__ CStream as_konst(const PlowStreamEnt* p) {
 __device__ __forceinline__ unsigned token_batch_rows(unsigned capacity, const PlowProgram* prog) {
     return plow_tb_rows(prog, capacity);
 }
+
+/* The largest M this object's compiled GEMV may be handed.
+ *
+ * `PLOW_GEMV_MAXM` (16) is the range of the GEMV PATH; `PLOW_GEMV_MM` is the row bucket THIS
+ * object was compiled for, and without `PLOW_GEMV_WALK` it is a hard capacity — see the
+ * `plow_gemv_walk_1` note in op_gemm.h. With the walk the same object serves any M in
+ * ceil(M/MM) row blocks, which is exactly what makes MAXM the right bound there. */
+__device__ __forceinline__ unsigned plow_gemv_row_cap(void) {
+#if PLOW_GEMV_WALK
+    return (unsigned)PLOW_GEMV_MAXM;
+#else
+    return (unsigned)PLOW_GEMV_MM;
+#endif
+}
 #endif
 
 #if PLOW_MIXED_STEP
@@ -2145,7 +2159,14 @@ __device__ __forceinline__ void exec_gemm(CInst in, CTens T,
      * reduction orders; record that rather than requiring unjustified universal bit identity." */
     (void)decode;
     if (!m) return;
-    if (m <= (unsigned)PLOW_GEMV_MAXM)
+    /* PLOW_GEMV_MM IS A CAPACITY, NOT A PREFERENCE. Without PLOW_GEMV_WALK, `gemv_rows<MM>`
+     * writes rows 0..MM-1 and leaves the rest exactly as it found them — fluent output off
+     * stale rows, rms error sqrt((T-1)/T), and no fault anywhere. PLOW_GEMV_MAXM is the range
+     * of the GEMV PATH (16), not of this object's compiled bucket. Selecting on MAXM was safe
+     * only while the decode ladder stopped at 4; a `1,2,4,8` ladder makes `dcap = 7` and a
+     * pure-ish token batch of 5..7 live rows reachable. The mixed arm below never had this
+     * because it loops in MM-sized bands. */
+    if (m <= plow_gemv_row_cap())
         d_gemv(out, x, (const bf16*)TEN(2), nullptr, nullptr, m, in->i[1], in->i[2], 0, 0.0f,
                slice, nblk, lds);
     else
@@ -2183,7 +2204,12 @@ __device__ __forceinline__ void exec_mixed_gemm_glu(
         const auto* x = (const bf16*)T[in->t[1]];
         const auto* wg = (const bf16*)T[in->t[2]];
         const auto* wu = (const bf16*)T[in->t[5]];
-        if (rows <= (unsigned)PLOW_GEMV_MAXM)
+        /* Same capacity rule as `exec_gemm`'s arm, plus `d_gemv_glu`'s OWN precondition
+         * (`M*K <= GM_LDS_HALVES`): the fused GLU stages x on-chip, so the arena bounds the
+         * row block independently of the GEMV bucket. The mixed arm below applies both; this
+         * one applied neither. */
+        const unsigned cap = min(plow_gemv_row_cap(), (unsigned)PLOW_GM_ARENA / k);
+        if (rows <= cap)
             d_gemv_glu(out, x, wg, wu, rows, n, k, in->i[5], slice, nblk, lds, 0.0f, 0.0f);
         else
             d_gemm_glu(out, x, wg, wu, rows, n, k, in->i[5], slice, nblk, lds);
