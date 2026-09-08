@@ -190,7 +190,7 @@ impl Recorder {
 
 fn pool(threads: usize, n_cu: u32, exec: Arc<dyn Exec>) -> WorkerPool {
     let topo = Topology::detect();
-    WorkerPool::spawn(&topo, threads, &NumaMode::Off, 20, n_cu, exec)
+    WorkerPool::spawn(&topo, threads, &NumaMode::Off, 20, n_cu, None, exec)
 }
 
 fn run_once(p: &WorkerPool, prog: &Arc<LoadedProgram>, pool: &Arc<CounterPool>, seg: u32, rec: &Recorder) {
@@ -263,6 +263,44 @@ fn threads_fewer_than_cus_does_not_deadlock() {
         assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
     }
     assert_eq!(rec.violations.load(Ordering::Relaxed), 0);
+}
+
+/// A locality plan moves WHERE a cu runs, never WHAT runs: every slice still executes exactly
+/// once and no dependency inverts, at any thread count. The plans are supplied directly so the
+/// check does not depend on how many NUMA nodes the test host happens to have — an out-of-range
+/// node index in a plan has to fold safely rather than drop the cu.
+#[test]
+fn a_locality_plan_changes_placement_but_not_execution() {
+    let ops = diamond_ops();
+    let (prog, ctrs) = build(&ops, 16, 1, 0);
+    let prog = Arc::new(prog);
+    let ctr = Arc::new(CounterPool::from_counters(&ctrs));
+    let plans: [(Vec<u32>, u32); 3] = [
+        (vec![0; 16], 2),                             // every cu onto one node
+        ((0..16).map(|cu| cu % 2).collect(), 2),      // interleaved groups
+        ((0..16).map(|cu| cu / 2).collect(), 8),      // blocked, more groups than nodes
+    ];
+    for (plan, domains) in plans {
+        for threads in [1usize, 3, 16] {
+            let rec = Arc::new(Recorder::new(&ops, Duration::ZERO));
+            let topo = Topology::detect();
+            let p = WorkerPool::spawn(
+                &topo,
+                threads,
+                &NumaMode::Off,
+                20,
+                16,
+                Some((&plan, domains)),
+                rec.clone(),
+            );
+            for _ in 0..20 {
+                rec.reset();
+                run_once(&p, &prog, &ctr, 0, &rec);
+                assert_eq!(rec.count.load(Ordering::Relaxed), total_slices(&ops));
+            }
+            assert_eq!(rec.violations.load(Ordering::Relaxed), 0, "threads={threads}");
+        }
+    }
 }
 
 #[test]

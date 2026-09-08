@@ -71,6 +71,33 @@ and `taskset`. A permitted SMT sibling remains usable when its lower-numbered
 sibling is excluded. Worker placement alternates nodes at each core position,
 then places SMT siblings. Worker metadata uses the same placement list.
 
+### Executor placement
+
+The packet fixes how work is *divided* — `n_cu` virtual executors, each kernel
+computing the `slice`-th of `nblk` shares — but not where those executors run.
+A pool of any width covers them: a worker owns several cus when there are fewer
+threads than cus, and tail workers own none when there are more. One blob
+therefore serves any core count, and `n_cu` never has to match it. Compile once
+at a width that divides the largest core count you intend to serve; the emitter
+caps `n_cu` at 256, because the per-domain slice count is a nine-bit field.
+
+Executors are then assigned to nodes from the packet's L2 locality domains when
+the blob carries them (`PLOW_L2_PLACE`), so cus that feed each other share a
+node. Domains are read back from the per-entry domain bits, which makes the
+recovery independent of the emitter's workgroup-to-domain map. The domain is a
+relative hint, never a node id: the mapping onto real nodes happens at load,
+where the host topology is known, which is what keeps one blob portable across
+hosts with different node counts. Each worker's first global-queue claim follows
+the same assignment instead of its bare node index.
+
+Placement falls back to the previous `cu % nodes` round-robin whenever the blob
+expresses no usable locality: no `PLOW_L2_PLACE`, the legacy layout that encoded
+the domain in `seg`, a single node or domain, placed programs that disagree, or
+domains that do not divide evenly over the nodes. The last case is deliberate —
+spreading over every node is the larger measured effect, so an uneven split is
+not traded for locality. An unplaced program alongside a placed one is
+indifferent to the choice and simply follows it.
+
 | Setting | Workers | Large model tensors |
 | --- | --- | --- |
 | `auto` | All allowed CPU nodes | Bind on one node, interleave across multiple nodes; report failure and retain OS policy |
@@ -88,11 +115,15 @@ scratch is first touched after pinning to its worker CPU. No memory-policy sysca
 or tensor allocation is added to a kernel invocation.
 
 This is a shared-memory engine with interleaved tensors, not NUMA tensor parallelism.
-It does not replicate weights or KV by socket, change packet ownership, or use
-remote-node work stealing. Those require model-level measurements and a matching
-compiler/runtime ownership design. Interleave requests balanced page placement;
-allocation fallback can still concentrate physical pages on fewer nodes. It does
-not guarantee local access or a multi-socket inference speedup.
+It does not replicate weights or KV by socket, nor use remote-node work stealing
+outside the global queue's own stealing. Those require model-level measurements and
+a matching compiler/runtime ownership design. Executor placement follows the packet's
+locality domains, but the packet still carries no host topology and the compiler emits
+none: a blob is never built for a particular node count. Interleave requests balanced
+page placement; allocation fallback can still concentrate physical pages on fewer
+nodes. Domain-following placement is a locality hint acted on at load, not a guarantee
+of local access or of a multi-socket inference speedup; it is not yet measured against
+the round-robin on a placed blob.
 
 ## Verification on EPYC 9654
 

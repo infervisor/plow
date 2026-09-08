@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::time::Instant;
 
-use packet::dev::{DevInst64, DevOp, StreamEnt, TENSOR_NONE16};
+use packet::dev::{DevInst64, DevOp, StreamEnt, SE_DOMAIN_MASK, SE_DOMAIN_SHIFT, TENSOR_NONE16};
 
 use crate::asset::checkpoint::Checkpoint;
 use crate::asset::devblob::{DevBlob, DevProg};
@@ -1109,6 +1109,164 @@ fn dense_row_decode(p: &DevProg) -> bool {
     })
 }
 
+/// cu -> L2 locality domain, plus the domain count, recovered from the bits the emitter tags onto
+/// every stream entry (`SE_DOMAIN_MASK`). `L2Layout::domain_of` is a pure function of the workgroup
+/// index and one layout serves a whole build, so each cu's entries all carry the same value and the
+/// placed programs agree; both are checked rather than assumed.
+///
+/// `None` keeps placement on the topology-only round-robin, which is the right answer whenever the
+/// blob expresses no locality: no `PLOW_L2_PLACE` at compile time, the legacy layout that encoded
+/// the domain in `seg` rather than in flags (every domain bit reads zero), a single domain, or
+/// placed programs that disagree. The domain is a RELATIVE hint about which slices share producers
+/// — never a node id — so the mapping onto real NUMA nodes happens here, at load, where the host
+/// topology is known. That is what keeps one blob portable across hosts with different node counts.
+fn cu_domains(progs: &[DevProg], n_cu: u32) -> Option<(Vec<u32>, u32)> {
+    let mut dom = vec![u32::MAX; n_cu as usize];
+    let mut domains = 0u32;
+    for p in progs.iter().filter(|p| p.l2_domains != 0) {
+        if domains != 0 && domains != p.l2_domains {
+            return None;
+        }
+        // `validate_cpu_blob` has already sized these, but this stays total for any caller.
+        if p.stream_ofs.len() < n_cu as usize || p.stream_len.len() < n_cu as usize {
+            return None;
+        }
+        domains = p.l2_domains;
+        for (cu, slot) in dom.iter_mut().enumerate() {
+            let start = p.stream_ofs[cu] as usize;
+            for e in &p.stream[start..start + p.stream_len[cu] as usize] {
+                let d = ((e.flags & SE_DOMAIN_MASK) >> SE_DOMAIN_SHIFT) as u32;
+                if d >= domains {
+                    return None;
+                }
+                if *slot == u32::MAX {
+                    *slot = d;
+                } else if *slot != d {
+                    return None;
+                }
+            }
+        }
+    }
+    if domains < 2 || dom.iter().all(|&d| d == u32::MAX) {
+        return None;
+    }
+    // A cu no placed program gave work to carries no hint; spread those so they stay balanced.
+    for (cu, d) in dom.iter_mut().enumerate() {
+        if *d == u32::MAX {
+            *d = cu as u32 % domains;
+        }
+    }
+    Some((dom, domains))
+}
+
+/// Node position for every cu, from the packet's locality domains.
+///
+/// Applied only when the domains divide evenly over the nodes: same-domain cus then share a node
+/// AND every node keeps an identical share of the cus. Spreading work over all nodes is the larger,
+/// measured effect (the release report puts distributed placement at 2.3-2.6x node-0-only at 24
+/// workers), so an uneven split is not worth trading for locality — `None` falls back to the
+/// round-robin, which is exactly balanced by construction.
+fn node_plan(cu_dom: &[u32], domains: u32, nodes: usize) -> Option<Vec<u32>> {
+    if nodes < 2 || (domains as usize) < nodes || !(domains as usize).is_multiple_of(nodes) {
+        return None;
+    }
+    let per = domains as usize / nodes;
+    Some(cu_dom.iter().map(|&d| (d as usize / per) as u32).collect())
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn prog(n_cu: u32, l2_domains: u32, dom_of: impl Fn(u32) -> u32) -> DevProg {
+        let (mut stream, mut ofs, mut len) = (Vec::new(), Vec::new(), Vec::new());
+        for cu in 0..n_cu {
+            ofs.push(stream.len() as u32);
+            len.push(2);
+            for _ in 0..2 {
+                stream.push(StreamEnt {
+                    flags: (dom_of(cu) as u16) << SE_DOMAIN_SHIFT,
+                    ..Default::default()
+                });
+            }
+        }
+        DevProg {
+            t: 1,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts: Vec::new(),
+            stream,
+            stream_ofs: ofs,
+            stream_len: len,
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains,
+        }
+    }
+
+    /// Both hardware maps the emitter can have used: AMD CDNA round-robin and NVIDIA blocked.
+    /// The recovery reads the tagged bits, so it does not need to know which.
+    #[test]
+    fn recovers_either_hardware_domain_map() {
+        for map in [(|cu: u32| cu % 8) as fn(u32) -> u32, |cu: u32| cu / 8] {
+            let (dom, domains) = cu_domains(&[prog(64, 8, map)], 64).expect("placed blob");
+            assert_eq!(domains, 8);
+            assert_eq!(dom, (0..64).map(map).collect::<Vec<_>>());
+        }
+    }
+
+    /// A blob that expresses no locality must leave placement alone. The legacy layout that put
+    /// the domain in `seg` reads as all-zero domain bits, which is the `l2_domains == 0` case.
+    #[test]
+    fn unplaced_or_single_domain_blob_has_no_plan() {
+        assert!(cu_domains(&[prog(64, 0, |cu| cu % 8)], 64).is_none());
+        assert!(cu_domains(&[prog(64, 1, |_| 0)], 64).is_none());
+        assert!(cu_domains(&[], 64).is_none());
+    }
+
+    /// One layout serves a whole build, so placed programs must agree; a blob that disagrees has
+    /// no single map to honour. An unplaced program alongside a placed one is fine -- it expresses
+    /// no locality, so it is indifferent to where its cus land.
+    #[test]
+    fn disagreeing_programs_have_no_plan() {
+        let progs = vec![prog(64, 8, |cu| cu % 8), prog(64, 8, |cu| cu / 8)];
+        assert!(cu_domains(&progs, 64).is_none());
+        let mixed = vec![prog(64, 8, |cu| cu % 8), prog(64, 0, |_| 0)];
+        assert!(cu_domains(&mixed, 64).is_some());
+    }
+
+    #[test]
+    fn domain_beyond_the_declared_count_is_rejected() {
+        assert!(cu_domains(&[prog(64, 4, |cu| cu % 8)], 64).is_none());
+    }
+
+    /// Same-domain cus share a node, and every node keeps an equal share.
+    #[test]
+    fn node_plan_groups_domains_onto_nodes() {
+        let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
+        let plan = node_plan(&dom, domains, 2).expect("8 domains divide over 2 nodes");
+        for cu in 0..64u32 {
+            assert_eq!(plan[cu as usize], dom[cu as usize] / 4);
+        }
+        for node in 0..2u32 {
+            assert_eq!(plan.iter().filter(|&&p| p == node).count(), 32);
+        }
+    }
+
+    /// Spreading over every node is the larger measured effect, so a split that would leave the
+    /// nodes uneven -- or that has fewer domains than nodes -- declines rather than trade it away.
+    #[test]
+    fn node_plan_declines_when_it_cannot_stay_balanced() {
+        let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
+        assert!(node_plan(&dom, domains, 3).is_none(), "8 domains, 3 nodes");
+        assert!(node_plan(&dom, domains, 1).is_none(), "single node");
+        assert!(node_plan(&dom, domains, 16).is_none(), "domains < nodes");
+        assert!(node_plan(&dom, domains, 8).is_some(), "one domain per node");
+    }
+}
+
 fn loaded(
     p: &DevProg,
     n_cu: u32,
@@ -1372,7 +1530,33 @@ impl CpuEngine {
         let exec = Arc::new(KernelExec::new(&model, threads, |w| {
             placement[w % placement.len()].1
         })?);
-        let pool = WorkerPool::spawn(&topo, threads, &opts.numa, opts.spin_us, n_cu, exec);
+        // The packet's locality hint, mapped onto this host's nodes. Absent for an unplaced blob,
+        // one node, or domains that do not divide over the nodes: placement stays cu % nodes.
+        let cu_dom = cu_domains(&model.blob.progs, n_cu);
+        let plan = cu_dom
+            .as_ref()
+            .and_then(|(d, n)| node_plan(d, *n, nodes.len()).map(|p| (p, *n)));
+        match &plan {
+            Some((_, domains)) => tracing::info!(
+                domains,
+                nodes = nodes.len(),
+                "CPU NUMA placement follows the packet's L2 locality domains"
+            ),
+            None => tracing::debug!(
+                nodes = nodes.len(),
+                l2_domains = cu_dom.as_ref().map(|(_, n)| *n).unwrap_or(0),
+                "CPU NUMA placement is round-robin; no usable packet locality plan"
+            ),
+        }
+        let pool = WorkerPool::spawn(
+            &topo,
+            threads,
+            &opts.numa,
+            opts.spin_us,
+            n_cu,
+            plan.as_ref().map(|(p, n)| (p.as_slice(), *n)),
+            exec,
+        );
         let progs: Vec<Arc<LoadedProgram>> = model
             .blob
             .progs
