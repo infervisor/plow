@@ -96,6 +96,7 @@ Correctness gate (`bringup_gate.sh`, four fixed greedy prompts, temperature 0):
 | 8 | 4096 | 4 | 1550.5 / 3159.8 | 86.96 | 40.52 |
 | 4 | 128 | 1 | 326.1 / 332.8 | 142.00 | 6.97 |
 | 4 | 1024 | 1 | 17156.4 / 17164.3 | 142.87 | 3.63 |
+| 4 | 4096 | 4 | 58942.2 / 119921.4 | 867.28 | 3.32 |
 
 ### Why TP4 is not viable
 
@@ -108,7 +109,10 @@ Not a tuning gap — a capacity wall. Per-rank checkpoint upload:
 
 At TP4 roughly 10 GiB is left for KV, activations, the co-resident MoE staging
 buffers and every scratch allocation, and TPOT degrades 4.9x while TTFT at 1024
-input degrades 64x (267 ms → 17.2 s). Both TP arms compiled the same KV
+input degrades 64x (267 ms → 17.2 s). The 4096/concurrency-4 cell is where it
+stops being a slowdown and becomes a different regime: TTFT mean 58.9 s, p99
+119.9 s, TPOT 867 ms — a 10x TPOT gap over the same cell at TP8, and 3.32
+aggregate output tok/s against 40.52. Both TP arms compiled the same KV
 geometry (`n_kvrow=156`, `max_ctx=18432`), so this is not a KV-budget
 difference. The 4.9x TPOT gap is also larger than the 2x expert-bytes-per-rank
 increase TP4 implies, so residency pressure — not arithmetic — dominates.
