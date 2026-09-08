@@ -219,7 +219,11 @@ __device__ void d_embed(bf16* __restrict__ out, const bf16* __restrict__ table,
  * `rows[s] >= live` TRAPS. A clamped index is not a degraded answer: it is another request's
  * hidden row, and the token it produces is fluent and wrong. This interpreter's dispatch
  * `default:` already writes nothing and does not trap, so every check that CAN be explicit
- * here should be. */
+ * here should be.
+ *
+ * `noinline` PINS what the compiler already does. It changed no counted instruction when it
+ * was added, but plow_exec's register pressure IS this object's spill budget (see the note in
+ * the body), and an inlining decision that flips later would move that budget silently. */
 __device__ __attribute__((noinline)) void d_row_gather(bf16* __restrict__ out,
                              const bf16* __restrict__ x,
                              const unsigned* __restrict__ rows, unsigned n_sample,
