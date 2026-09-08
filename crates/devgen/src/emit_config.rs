@@ -583,6 +583,29 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GLM_PF_NS")]
     pub glm_pf_ns: Option<u32>,
 
+    /// Add the sub-128 prefill rungs (32, 64) on AMD. DEFAULT OFF, and it earned that.
+    ///
+    /// It shipped on by default and was withdrawn on measurement. What it buys is a 29.5% /
+    /// 11.3% reduction in emitted workgroup-packets at t=32 / t=64 against the 128 rung —
+    /// sublinear, because `GM_BM=192` makes `ceil(t/192) == 1` for every rung at or below 192,
+    /// so the dense GEMM does not shrink at all and only flash, norms and rope do. Nothing has
+    /// ever priced that in wall-clock, and two serving campaigns measured it at zero.
+    ///
+    /// What it COSTS was measured: +940 tile lookups that are all analytical and stay that way
+    /// (16 distinct GEMM shapes, `{32,64} × {2048,4096,5376,8192,16384,21504}`), +30.9% blob
+    /// size, and 14 extra dispatch-audit findings — `GemmSmall` at 13.8-47.4% occupancy, the
+    /// worst in the blob.
+    ///
+    /// And it caps the DECODE ladder at 16. Decode and prefill rungs share one width-ordered
+    /// space (`packet::devbuild::decode_rung_lo` separates them by width and the blob carries no
+    /// field distinguishing them), so a 32 prefill bucket collides with a 32 decode rung and the
+    /// emit refuses. With the floor off the decode ceiling is 64; with it on, 16. That is the
+    /// concrete reason this is off rather than deleted: the rungs are still one flag away for
+    /// anyone who wants to measure them, but they do not get to block decode concurrency by
+    /// default.
+    #[arg(long = "pf-floor", env = "PLOW_PF_FLOOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub pf_floor: bool,
+
     /// CAP on the dense-GQA prefill `FlashPrefill` KV split (`dense_flash_split`). Unset = the
     /// CU-fill heuristic, unchanged.
     ///
@@ -1004,6 +1027,7 @@ impl EmitConfig {
             glm_ofold: env_bool("PLOW_GLM_OFOLD"),
             glm_pf_ns: env_u32("PLOW_GLM_PF_NS"),
             dense_pf_ns: env_u32("PLOW_DENSE_PF_NS"),
+            pf_floor: env_bool("PLOW_PF_FLOOR"),
             glm_pf_wide: env_opt_out("PLOW_GLM_PF_WIDE"),
             glm_place_pf: env_bool("PLOW_GLM_PLACE_PF"),
             glm_xr_band: env_u32("PLOW_GLM_XR_BAND"),

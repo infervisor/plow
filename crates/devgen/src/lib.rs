@@ -7621,26 +7621,12 @@ fn emit_dense_gqa(
     const LADDER_BM: u32 = 128;
     const LADDER_BN: u32 = 128;
     let cap = ctx.min(max_chunk(c.window));
-    // SUB-128 RUNGS ON AMD (32, 64). Ragged-M shrinks a chunk's ROW OPERANDS to the real count,
-    // but the GRID is still sized at `T`: `rebase_chunk_rows` says the padded workgroups "still
-    // run the interpreter and still signal their successor counters". So a 40-token prompt on
-    // the 128 rung still dispatches and drains the full grid — the math is skipped, the dispatch
-    // and the counter DAG are not. It also declines any row field that is not exactly `T`, and
-    // those ops keep the full width.
-    //
-    // The saving is REAL BUT SUBLINEAR, and the reason is worth writing down: emitted
-    // workgroup-packets are 150737 at t=32 and 189681 at t=64 against 213809 at t=128 — 29.5%
-    // and 11.3% fewer, where a row-proportional model would have predicted 75% and 50%. The
-    // dense GEMM row tile is `GM_BM=192` (`hwspec` gfx942 geometry), so `ceil(t/192) = 1` for
-    // every rung at or below 192 and the GEMM does not shrink at all. What shrinks is the
-    // per-row work: flash, norms and rope. Do not add rungs below 32 expecting more.
-    //
-    // Under the unified token batch the rung floor is additionally the granularity at which a
-    // partial prompt can join a step, so 128 sets how coarsely prefill and decode rows mix.
-    //
-    // NVIDIA keeps the shipped ladder — its rung POSITIONS are what `PLOW_PF_LADDER=wave` above
-    // measures, and moving the floor underneath that comparison would confound it.
-    let floor: &[u32] = if amd { &[32, 64] } else { &[] };
+    // SUB-128 PREFILL RUNGS (32, 64), AMD only and OFF BY DEFAULT — see `PLOW_PF_FLOOR`, which
+    // carries the measurement that withdrew them. The short version: sublinear saving because
+    // `GM_BM=192` means the GEMM does not shrink below t=192 at all, zero in two serving
+    // campaigns, and they cap the decode ladder at 16 because prefill and decode rungs share one
+    // width-ordered space.
+    let floor: &[u32] = if amd && ecfg.pf_floor { &[32, 64] } else { &[] };
     let shipped: Vec<u32> = floor
         .iter()
         .copied()
