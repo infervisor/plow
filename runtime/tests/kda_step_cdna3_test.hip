@@ -66,6 +66,17 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_step(KArgs* a) {
                        a->D, a->BV, a->flags, a->scale, blockIdx.x, gridDim.x, lds,
                        (size_t)a->bstride, nullptr);
 }
+/* The masked twin of k_step: same body, `parked` supplied. `k_step` passes nullptr, so nothing
+ * in this file exercised the per-row mask on the BATCHED-DECODE axis until the identity gate in
+ * main() needed it. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_step_masked(KArgs* a) {
+    __shared__ float lds[4 * 128 + 2 * PLOW_WAVES];
+    d_kda_state_step_g((bf16*)a->o, (const bf16*)a->q, (const bf16*)a->k, (const bf16*)a->v,
+                       (const bf16*)a->g_raw, (const bf16*)a->beta_raw, (const float*)a->a_log,
+                       (const float*)a->dt_bias, a->gate_mode, a->lb, (float*)a->state, a->T, a->H,
+                       a->D, a->BV, a->flags, a->scale, blockIdx.x, gridDim.x, lds,
+                       (size_t)a->bstride, (const unsigned*)a->parked);
+}
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_step_packed(KArgs* a) {
     __shared__ float lds[4 * 128 + 2 * PLOW_WAVES];
     PlowProgram prog{};
@@ -283,6 +294,8 @@ int main(int argc, char** argv) {
                   fintra_cached, fwu, fcarry;
     hipFunction_t fprepare_packed, fintra_packed, fwu_packed, fcarry_packed;
     HC(hipModuleGetFunction(&fstep, M, "k_step"));
+    hipFunction_t fstep_masked;
+    HC(hipModuleGetFunction(&fstep_masked, M, "k_step_masked"));
     HC(hipModuleGetFunction(&fstep_packed, M, "k_step_packed"));
     HC(hipModuleGetFunction(&fnorm, M, "k_norm"));
     HC(hipModuleGetFunction(&fprefix, M, "k_prefix"));
@@ -1098,6 +1111,129 @@ int main(int argc, char** argv) {
         printf("  %-18s gated-norm rms rel %.3e (bar 1e-2)\n", nm, yrms);
         return fmax(fmax(srms / 1e-4, orms / 1e-2), yrms / 1e-2);
     };
+
+    /* ============================================================================================
+     * PACKED-ROW IDENTITY on the BATCHED-DECODE axis — plans/unified-token-batch.md §5.4 and the
+     * §9 "Recurrent" gate row.
+     *
+     * `run_mode("batched decode", ...)` above scores three rows against f64 at one fixed T with
+     * NO mask (`k_step` passes `parked = nullptr`). Neither half of what the unified token batch
+     * needs is visible there: whether a row's bytes depend on how many rows share the launch, and
+     * whether a parked row's state is genuinely frozen. §9 asks for bit-identity against isolated
+     * per-request execution, so that is what this checks — `memcmp`, not a tolerance.
+     *
+     * Two rounds over six rows with the mask changing between them (`parked`, so 1 = SKIP — the
+     * opposite polarity to the GDN family's `active`, which is itself worth exercising):
+     *
+     *     row      0  1  2  3  4  5
+     *     round 0  .  A  A  .  A  .
+     *     round 1  A  .  A  A  .  .
+     *
+     * Row 2 carries state through both rounds, rows 1 and 4 have theirs frozen by a park after
+     * using it, rows 0 and 3 resume from a state a round stale (state-slot reuse), and row 5 is
+     * never live, so its state must come back exactly as uploaded and its output must still hold
+     * the poison. The isolated arm does not SUBMIT a parked row at all.
+     * ========================================================================================== */
+    {
+        const unsigned T = 6, BV = 16, PAD = 5;
+        const size_t rqkv = (size_t)H * D, rb = H, rst = (size_t)H * D * D;
+        std::vector<bf16> q(T * rqkv), k(q.size()), v(q.size()), graw(q.size()), braw(T * rb);
+        std::vector<float> alog(H), dtb(H * D);
+        for (auto& x : q) x = f2b(((float)rand() / RAND_MAX - .5f) * 2.f);
+        for (auto& x : k) x = f2b(((float)rand() / RAND_MAX - .5f) * 2.f);
+        for (auto& x : v) x = f2b(((float)rand() / RAND_MAX - .5f) * 2.f);
+        for (auto& x : graw) x = f2b(((float)rand() / RAND_MAX - .5f) * 4.f);
+        for (auto& x : braw) x = f2b(((float)rand() / RAND_MAX - .5f) * 4.f);
+        for (auto& x : alog) x = logf(0.5f + (float)rand() / RAND_MAX * 11.5f);
+        for (auto& x : dtb) x = -7.f + (float)rand() / RAND_MAX * 6.f;
+        std::vector<float> S0((size_t)T * rst);
+        for (auto& x : S0) x = ((float)rand() / RAND_MAX - .5f) * .5f;
+        std::vector<unsigned> p0{1, 0, 0, 1, 0, 1}, p1{0, 1, 0, 0, 1, 1};
+        auto upload = [&](const void* src, size_t bytes) {
+            void* d = nullptr;
+            HC2(hipMalloc(&d, bytes));
+            HC2(hipMemcpy(d, src, bytes, hipMemcpyHostToDevice));
+            return d;
+        };
+
+        void* dq = upload(q.data(), q.size() * 2);
+        void* dk = upload(k.data(), k.size() * 2);
+        void* dv = upload(v.data(), v.size() * 2);
+        void* dg = upload(graw.data(), graw.size() * 2);
+        void* db = upload(braw.data(), braw.size() * 2);
+        void* dal = upload(alog.data(), alog.size() * 4);
+        void* ddt = upload(dtb.data(), dtb.size() * 4);
+        void* dsp = upload(S0.data(), S0.size() * 4);
+        void* dsi = upload(S0.data(), S0.size() * 4);
+        void* dpk[2] = {upload(p0.data(), p0.size() * 4), upload(p1.data(), p1.size() * 4)};
+        const std::vector<unsigned>* ph[2] = {&p0, &p1};
+        void *dop, *doi;
+        HC(hipMalloc(&dop, (size_t)T * rqkv * 2));
+        HC(hipMalloc(&doi, (size_t)T * rqkv * 2));
+        HC(hipMemset(dop, 0xa5, (size_t)T * rqkv * 2));
+        HC(hipMemset(doi, 0xa5, (size_t)T * rqkv * 2));
+
+        KArgs a{};
+        a.q = (unsigned long long)(size_t)dq; a.k = (unsigned long long)(size_t)dk;
+        a.v = (unsigned long long)(size_t)dv; a.g_raw = (unsigned long long)(size_t)dg;
+        a.beta_raw = (unsigned long long)(size_t)db;
+        a.a_log = (unsigned long long)(size_t)dal;
+        a.dt_bias = (unsigned long long)(size_t)ddt;
+        a.H = H; a.D = D; a.BV = BV;
+        a.flags = 1u; a.gate_mode = 1u; a.lb = -5.0f;
+        a.scale = (float)(1.0 / sqrt(128.0)); a.eps = 1e-5f;
+        a.bstride = (unsigned long long)H * D * D;
+        void* d_a; HC(hipMalloc(&d_a, sizeof a));
+        void* args[] = {&d_a};
+        auto go = [&]() {
+            HC2(hipMemcpy(d_a, &a, sizeof a, hipMemcpyHostToDevice));
+            HC2(hipModuleLaunchKernel(fstep_masked, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0,
+                                      args, nullptr));
+            HC2(hipDeviceSynchronize());
+        };
+        for (unsigned r = 0; r < 2; r++) {
+            a.T = T; a.parked = (unsigned long long)(size_t)dpk[r];
+            a.q = (unsigned long long)(size_t)dq; a.k = (unsigned long long)(size_t)dk;
+            a.v = (unsigned long long)(size_t)dv; a.g_raw = (unsigned long long)(size_t)dg;
+            a.beta_raw = (unsigned long long)(size_t)db;
+            a.state = (unsigned long long)(size_t)dsp; a.o = (unsigned long long)(size_t)dop;
+            go();
+        }
+        for (unsigned r = 0; r < 2; r++)
+            for (unsigned row = 0; row < T; row++) {
+                if ((*ph[r])[row]) continue;
+                a.T = 1;
+                a.parked = (unsigned long long)(size_t)dpk[r] + (unsigned long long)row * 4;
+                a.q = (unsigned long long)(size_t)dq + (unsigned long long)row * rqkv * 2;
+                a.k = (unsigned long long)(size_t)dk + (unsigned long long)row * rqkv * 2;
+                a.v = (unsigned long long)(size_t)dv + (unsigned long long)row * rqkv * 2;
+                a.g_raw = (unsigned long long)(size_t)dg + (unsigned long long)row * rqkv * 2;
+                a.beta_raw = (unsigned long long)(size_t)db + (unsigned long long)row * rb * 2;
+                a.state = (unsigned long long)(size_t)dsi + (unsigned long long)row * rst * 4;
+                a.o = (unsigned long long)(size_t)doi + (unsigned long long)row * rqkv * 2;
+                go();
+            }
+        std::vector<bf16> op((size_t)T * rqkv), oi(op.size());
+        std::vector<float> sp(S0.size()), si(S0.size());
+        HC(hipMemcpy(op.data(), dop, op.size() * 2, hipMemcpyDeviceToHost));
+        HC(hipMemcpy(oi.data(), doi, oi.size() * 2, hipMemcpyDeviceToHost));
+        HC(hipMemcpy(sp.data(), dsp, sp.size() * 4, hipMemcpyDeviceToHost));
+        HC(hipMemcpy(si.data(), dsi, si.size() * 4, hipMemcpyDeviceToHost));
+        const bool same_o = memcmp(op.data(), oi.data(), op.size() * 2) == 0;
+        const bool same_s = memcmp(sp.data(), si.data(), sp.size() * 4) == 0;
+        bool frozen = memcmp(sp.data() + (size_t)PAD * rst, S0.data() + (size_t)PAD * rst,
+                             rst * 4) == 0;
+        for (size_t i = (size_t)PAD * rqkv; i < (size_t)(PAD + 1) * rqkv; i++)
+            frozen &= op[i] == (bf16)0xa5a5;
+        printf("  packed-row identity (parked {1,0,0,1,0,1} then {0,1,0,0,1,1}):\n");
+        printf("  %-26s packed==isolated %-3s   padding frozen %-3s\n", "kda_state_step_g out",
+               same_o ? "YES" : "no", frozen ? "YES" : "no");
+        printf("  %-26s packed==isolated %-3s\n", "kda_state_step_g state",
+               same_s ? "YES" : "no");
+        worst = fmax(worst, (same_o && same_s && frozen) ? 0.0 : 2.0);
+        for (void* d : {dq, dk, dv, dg, db, dal, ddt, dsp, dsi, dpk[0], dpk[1], dop, doi, d_a})
+            HC2(hipFree(d));
+    }
 
     worst = fmax(worst, run_mode("prefill (serial)", 5, 8, false));
     worst = fmax(worst, run_mode("batched decode", 3, 16, true));
