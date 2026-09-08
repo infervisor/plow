@@ -55,6 +55,10 @@ pub(crate) struct GlmCfg {
     ///
     /// `cfg_glm` now REFUSES rather than defaulting, and [`GlmCfg::rope_theta`] is the only reader.
     rope_theta: Option<f64>,
+    /// The RoPE frequency-scaling scheme, materialised into the cos/sin tables.
+    /// `RopeScale::None` for GLM / a plain MLA checkpoint; `YarnDeepSeek` for the
+    /// DeepSeek/Kimi family, whose `mscale` handling `require_mla_rope` validates.
+    rope_scale: packet::rope::RopeScale,
     /// The namespace this checkpoint's weights live under, `.`-terminated — `model.` for GLM /
     /// DeepSeek / Kimi-K2.7, `language_model.model.` for a multimodal wrapper like Kimi-K3.
     ///
@@ -309,12 +313,63 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         .as_f64()
         .or_else(|| rp["rope_theta"].as_f64());
     let mla_nope = v["mla_use_nope"].as_bool().unwrap_or(false);
+    // DeepSeek-family YaRN. `rope_scaling.type` is the DeepSeek spelling, `rope_type` the HF one;
+    // both appear in the wild and mean the same key. `attn_mscale` is the factor this family folds
+    // into softmax_scale — `yarn_get_mscale(factor, mscale_all_dim)`, applied TWICE
+    // (`softmax_scale = softmax_scale * mscale * mscale` in modeling_deepseek.py) — and is 1.0
+    // when the config carries no `mscale_all_dim`, which is what makes the fold a no-op for every
+    // checkpoint that does not use it.
+    let rsc = &v["rope_scaling"];
+    let rsc_type = rsc["type"].as_str().or_else(|| rsc["rope_type"].as_str());
+    let (rope_scale, attn_mscale) = if rsc.is_object() && rsc_type == Some("yarn") {
+        let f = |k: &str, d: f64| rsc[k].as_f64().unwrap_or(d);
+        let factor = rsc["factor"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{model}: rope_scaling.factor"));
+        let orig = rsc["original_max_position_embeddings"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{model}: rope_scaling.original_max_position_embeddings"));
+        let mscale = f("mscale", 1.0);
+        let mscale_all_dim = f("mscale_all_dim", 1.0);
+        // The table factor is the RATIO of the two (see RopeScale::YarnDeepSeek). Only the equal
+        // case is representable — the ratio is then exactly 1.0 and needs no field. An unequal
+        // pair would need a per-table factor the ABI-locked GenTensor has no room for, so it is
+        // refused rather than silently rounded to one of the two.
+        assert!(
+            (mscale - mscale_all_dim).abs() < 1e-12,
+            "{model}: rope_scaling.mscale ({mscale}) != mscale_all_dim ({mscale_all_dim}). The \
+             RoPE table factor is yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, \
+             mscale_all_dim), which is only representable in GenTensor when the two are equal \
+             (ratio 1.0). Add a per-table attention factor to the GenTensor ABI before accepting \
+             this checkpoint."
+        );
+        let m = if factor > 1.0 {
+            0.1 * mscale_all_dim * factor.ln() + 1.0
+        } else {
+            1.0
+        };
+        (
+            packet::rope::RopeScale::YarnDeepSeek {
+                factor,
+                beta_fast: f("beta_fast", 32.0),
+                beta_slow: f("beta_slow", 1.0),
+                orig,
+                truncate: rsc["truncate"].as_bool().unwrap_or(true),
+            },
+            m * m,
+        )
+    } else {
+        (packet::rope::RopeScale::None, 1.0)
+    };
     if qk_head != g("qk_nope_head_dim") || g("qk_rope_head_dim") != 0 {
         crate::require_mla_rope(
             rope_theta,
             mla_nope,
             rp["rope_type"].as_str(),
-            v["rope_scaling"].as_object().is_some(),
+            // A scheme this parse RESOLVED is no longer an unhandled one. The gate still fires
+            // for llama3/linear and for any yarn shape the branch above refused.
+            v["rope_scaling"].as_object().is_some()
+                && rope_scale == packet::rope::RopeScale::None,
             model,
         );
     } else {
@@ -353,7 +408,11 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         dense_inter: g("intermediate_size"),
         first_k_dense: g("first_k_dense_replace"),
         route_scale: v["routed_scaling_factor"].as_f64().unwrap() as f32,
-        attn_scale: (qk_head as f32).powf(-0.5),
+        // 1/sqrt(qk_head_dim), times the DeepSeek-family YaRN softmax fold
+        // (`yarn_get_mscale(factor, mscale_all_dim)^2`, 1.0 for every other checkpoint).
+        // This is the half of the family's mscale that does NOT belong in the tables.
+        attn_scale: (qk_head as f64).powf(-0.5) as f32 * attn_mscale as f32,
+        rope_scale,
         rope_theta,
         // Flat checkpoint: GLM / DeepSeek / a text-only Kimi-K2.7 export all ship
         // `model.layers.…` at the root. A nested (multimodal) variant carries its own
@@ -1756,7 +1815,7 @@ pub(crate) fn declare_glm_rows_batched(
     // for a rotation the model does not have.
     let (cos, sin) = if c.qk_rope > 0 {
         let [cos_t, sin_t] =
-            GenTensor::rope_pair(ctx, c.qk_rope, c.rope_theta(), 1.0, RopeScale::None);
+            GenTensor::rope_pair(ctx, c.qk_rope, c.rope_theta(), 1.0, c.rope_scale);
         (
             b.tensor_gen("in.cos", cos_t.byte_len(), cos_t),
             b.tensor_gen("in.sin", sin_t.byte_len(), sin_t),
