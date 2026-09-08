@@ -2179,7 +2179,7 @@ costs something even on the ticks that never use it**.
 > resident executable are the other candidates. The experiment that would settle
 > the remainder is to arm fusion with the `split_terminal_prefill` call disabled
 > and re-run the concurrency-1 cell. See
-> [operator row-identity classes §7.2](../arch/17-operator-row-identity-classes.md#72-is-v1s-concurrency-1-cost-explained-by-the-object-swap).
+> [operator row-identity classes §7.2](../arch/17-unified-token-batch.md).
 
 **Therefore fusion should not be defaulted on as it stands.** The shape of the
 result — a real win in one corner, a real loss in the rest, and a fixed cost on
@@ -3582,7 +3582,7 @@ The lane is deliberately independent of plow: vLLM does not read plow's tuning
 store, so the tile-store problem blocking plow-side absolutes cannot touch it.
 
 Results, manifests and greedy captures:
-`docs/amd/gemma4-31b-vllm028-control-20260908.json`.
+the vLLM 0.28 control recorded in this document.
 
 ### The two recipes
 
@@ -3720,8 +3720,8 @@ python3 scripts/gemma4_greedy_quality.py capture --url http://127.0.0.1:$PORT \
   --label vllm028-$ARM --out quality8-$ARM.jsonl \
   --tokenizer build-gemma31/checkpoint/tokenizer.json \
   --corpus docs/amd/deepseek-v4-mi300x.md docs/amd/model-op-coverage.md \
-           docs/amd/norm-and-recurrent-numerics.md docs/amd/kimi-k3-mi325x-recipe.md \
-           docs/amd/qwen35-gdn-mi300x.md docs/amd/token-batch-recurrent-and-window.md \
+           docs/amd/norm-and-recurrent-numerics.md docs/amd/kimi-k3-mi325x.md \
+           docs/amd/qwen35-gdn-mi300x.md docs/amd/gemma4-31b-mi300x.md \
   --lengths 128 512 2048 8192 --per-length 8 --max-tokens 64 --mode chat
 python3 scripts/gemma4_greedy_quality.py compare --left quality8-fp8.jsonl \
   --right quality8-bf16.jsonl --tokenizer build-gemma31/checkpoint/tokenizer.json \
@@ -3769,3 +3769,1340 @@ first divergence sits at token 16-32 across lengths.
 * **plow FP8 vs plow BF16 greedy agreement** — not re-measured. This lane is the
   vLLM control and does not start plow, so the 0.520 quoted above is the
   previously published figure carried forward, not a same-session number.
+
+---
+
+# Appendix A: The unified token batch, serving: gfx942 / MI300X, Gemma-4 31B
+
+*Folded in from `docs/amd/token-batch-serving-mi300x.md`. Section numbers below are this part's own.*
+Status 2026-09-08. **The route serves.** It produces tokens end to end on a real checkpoint,
+its packed output is character-identical to the same prompts run one at a time, and it has been
+measured against mixed step v1 (`--fusion`) and against neither, on one blob, with the arms
+interleaved.
+
+This is the serving half of `plans/unified-token-batch.md`. The contract, the ABI, the opcode
+and the operator classification are [17-unified-token-batch.md](../arch/17-unified-token-batch.md);
+the AMD device arms are [17-unified-token-batch.md Part II](../arch/17-unified-token-batch.md);
+the windowed/recurrent axes are Appendix B below.
+Those three describe a route that was **armed and could not fire**. This one describes what it
+took to make it fire, and what it is worth.
+
+---
+
+## 1. Which model, and which phase
+
+**Gemma-4 31B, BF16, dense GQA with per-layer sliding-window attention (1024 on 50 of its 60
+layers) and a logit softcap of 30.** That makes this a **Phase 3 enablement — the plan's
+"windowed attention + softcap tail" item — not a Phase 2 one.** The distinction is the plan's
+own (§8), and it is worth stating precisely rather than claiming the cheaper phase:
+
+| Phase 2 asks for | This model |
+|---|---|
+| dense causal GQA, one class-C conversion | dense GQA, **windowed** on 50 of 60 layers |
+| no softcap | `SoftCap` (cap 30) in the tail |
+| Llama 3 / Qwen 3 | Gemma-4 |
+
+Phase 2's own record says a dense-GQA checkpoint does not exist on this host and that Gemma "was
+**not** substituted — it is Phase 3 by the plan's own table". That was right when it was written.
+What changed is that the landed arms turn out to cover the Phase 3 windowed axis already:
+
+* `d_flash_prefill`'s `TB` arm rebinds `q_pos0` per span and derives the window bound from the
+  rebound base at all four sites that can disagree — the workgroup-uniform `win_lo`, the
+  `kv_lo = (win_lo/BKV)*BKV` tile carve, the `kv0 + BKV <= win_lo` tile skip and the per-element
+  `(qg - kg) < window` mask. The KV ring is preserved: K/V loads use `(kv & kv_mask)`.
+* `d_flash_decode`'s `TB` arm takes `len` from `spans[b].kv_len`, so `first = len - window` is
+  per request.
+* `d_headnorm_rope` writes at `(position & kv_mask)` with `position` from the descriptor, so the
+  ring wrap on a windowed layer is the row's own.
+* `SoftCap` is dispatched under `PLOW_RUNTIME_ROWS`, which on this axis is the descriptor's live
+  row count.
+* Tied and untied heads are a tensor-handle choice with no second code path.
+
+So the answer to "do the landed arms cover Gemma" is **yes, for the body**. What they do *not*
+cover is the other half of that Phase 3 bullet: **"SoftCap stage in the terminal segment"**.
+There is no terminal segment on this route (§4 below). The `SoftCap` packet is correct over a
+runtime row count, and this route samples rows of the body rather than of a compact tail, so the
+softcap it applies is the body's — right answer, different mechanism from the one the plan
+describes.
+
+**Coverage note.** `runtime/tests/token_batch_dense_gfx942_test.hip` — the 31 Phase-2 gates —
+runs at `HD=128`, `window = 0` and `PLOW_KV_MASK_NONE`. The window and ring code in the `TB` path
+was correct by construction and **had no test**. This model exercises both on every step: 50
+windowed layers at `hd=256` with a 16384-entry KV ring. The identity result in §3 is that
+coverage.
+
+---
+
+## 2. What it took
+
+Three things stood between an armed route and a token, and none of them was the device.
+
+### 2.1 The span table had to cover `[0, M)`
+
+`plow_asset::mixed_step::plan_into` put decode rows in a **band** ahead of the spans.
+`runtime/common/mixed_step.h` requires that band (it traps when `spans[0].row0 == 0`);
+`runtime/amd/token_batch.h` requires its absence. Both are right; they are different contracts
+over one array, which is exactly the drift §4.3 exists to stop.
+
+The planner now takes an explicit `SpanCover`. `DecodeBand` is v1's shape, kept verbatim because
+v1 is the only route that served before this and the comparison depends on it. `PrefixFree` is
+§4.3's: every row belongs to a span, decode spans included, tiling `[0, M)` from zero.
+
+### 2.2 A completing prompt had to be able to sample without a second pass
+
+This is the part that is not bookkeeping. Under `PrefixFree`, a prefill span that **completes its
+prompt** is split: its final token leads the batch as a length-one span, its body follows as an
+ordinary span, **both on the same physical slot in the same step**.
+
+That is legal because of the order inside one launch. The step's single RoPE/cache stage
+(`HeadNormRope`) writes every row's K/V — body rows at positions `f..p-1`, the terminal row at
+`p` — before any attention instruction runs, because the synthesized program is a strict linear
+chain. The terminal row then attends over `[0, p+1)`: its own complete prompt, written by the
+same launch that is reading it.
+
+The leading run of length-one spans is what `plow_tb_decode_spans` reads as the attention
+partition and what `PLOW_SAMPLE_ROWS` reads as the selection stage's row count, so putting the
+terminal rows there is what makes them sampled. `validate_token_batch_rows` refuses any plan
+where the device's count of that run would differ from the host's count of the rows it intends
+to deliver.
+
+The consequence is the one the plan asks for in §1 and §6.5: **this route does not arm
+`split_terminal_prefill`, and `finish_prefill_batch` never runs on it.** Fusion peels the
+prompt's last row into its own one-row chunk and replays it through `step_batch` — an ordinary
+decode-shaped transformer pass, on the TTFT critical path, **once per request, whether or not
+the fusion ever fires**. Measured over the identity corpus: fusion ran **33** of those passes
+and the token batch ran **0**; over a campaign round, 100 against 0.
+
+### 2.3 `converted_c` had to name the conversions that exist
+
+It was empty, so `Capabilities::refuse_program` refused every real program. It now names **two**
+class-C conversions, not the one §8's Phase 2 bullet lists:
+
+| opcode | why it is class C | converted where |
+|---|---|---|
+| `FlashPrefill` | `i4 = q_pos0` plus the causal and window bounds built on it | `d_flash_prefill`'s `TB` arm resolves each work item to its span |
+| `HeadNormRope` | `i3 = out_row0`, host-patched per chunk; every row's write address is `out_row0 + t` | `runtime/amd/op_norm.h` takes slot and absolute KV position from the descriptor |
+
+`HeadNormRope` **is** the dense path's KV cache write — there is no separate write opcode. A
+route that converted only `q_pos0` would put one request's K/V into another request's cache and
+would not trap. The audit runs at load, per bucket, and refuses by capability name.
+
+`RowGather` is deliberately **absent** from `descriptor_aware`, so `can_run_output()` keeps
+saying no: the object has the arm, this route emits no terminal segment, and "armed" and "can
+fire" are different claims.
+
+### 2.4 Serving
+
+`MixedAmdStep` gained a `StepRoute` rather than a copy. The two routes share the synthesized
+program, the staging layout and the launch; they differ in the object
+(`interp_tokbatch_gq.elf`), the kernel symbol (`plow_interp_tokbatch_<arch>_gq`, deliberately not
+the mixed one so a stale object cannot answer the lookup), the span contract, and which buckets
+they may execute. `SeqEngine` gained a token-batch surface whose defaults decline, so no other
+backend changes, and the mux has an arm ahead of the mixed one.
+
+The arm does **not** require a decode row — a step of prefill spans alone is legal, which is what
+lets a prompt's first generated token come out of the launch that consumed the prompt. It does
+require **two participants** (`feeds + pack >= 2`) on top of the correctness floor of at least one
+sampled row; §5.3 is the measurement that put that rule there, and `--amd-token-batch-solo` turns
+it off so it stays falsifiable.
+
+---
+
+## 3. Identity: is the output row for row the same?
+
+Corpus: 8 **distinct** prompts per (length, concurrency), each a different pseudo-random sequence
+of one-token words, at 128/512/2048/8192 input tokens and concurrency 1/4/8, greedy, 32 output
+tokens. Distinctness is the point — `bench_packed_serve.py` repeats one word, so every row of a
+packed step carries the same token and a row that picked up its neighbour's state is invisible.
+
+**Two comparisons, and they answer different questions.**
+
+**(1) Packed against isolated — the mapping gate.** Concurrency 4 and 8 against concurrency 1, on
+the same arm, over the same 32 prompts. Both cells run the same kernels on the same bucket, so
+any difference is a row that took another request's KV, position or hidden state.
+
+| arm | packed == isolated | fails on |
+|---|---|---|
+| ordinary (unfused) | **32/32** | — |
+| **unified token batch** | **32/32** | — |
+| mixed step v1 (`--fusion`) | 27/32 | 128/6, 512/2, 2048/{2,3,6} |
+
+The unified route is the **more faithful** of the two packed routes, not the less: v1 fails this
+gate on five prompts and on two of them emits a degenerate repeated token where the reference
+emits varied text. Those five are what a packed step is supposed to be tested for, and nothing
+in tree was testing for them, because `bench_packed_serve.py`'s corpus repeats one word.
+
+**(2) Against the ordinary (unfused) route.** This one also moves the prefill bucket, so a
+difference here is not necessarily a mapping error.
+
+| arm | c1 | c4 | c8 | total |
+|---|---|---|---|---|
+| **unified token batch** | 30/32 | 30/32 | 30/32 | **90/96** |
+| mixed step v1 | **32/32** | 28/32 | 29/32 | 89/96 |
+
+Reported per concurrency because the two arms fail differently and an aggregate hides it. **v1
+is exact at concurrency 1 and the unified route is not**, which is the honest form of the
+comparison: v1's divergences are concurrency-dependent (it only diverges when it packs), the
+unified route's are the *same two prompts with the same text at every concurrency* — a fixed
+structural difference, not a packing one.
+
+Both of the unified route's misses begin at generated token 0 or 1, i.e. at the prefill's
+sampled row. They are token flips, not low-order bits.
+
+### Why the two prompts diverge, attributed
+
+Two things differ from the ordinary route at 2048 input, and the c1 cell cannot separate them on
+its own: the terminal-span split, and the prefill BUCKET (the route's `nsplit == 1` restriction
+puts a 2048-token prompt on the 4096 rung where the ordinary route uses the 2048 rung).
+`--amd-token-batch-rows` pins the rung, which holds the split fixed and moves only the reduction
+order:
+
+```
+tb @ rung 4096  vs  tb @ rung 8192   IDENTICAL          <- the bucket is not the cause
+tb @ rung 4096  vs  ordinary         2048/1/{2,3}
+tb @ rung 8192  vs  ordinary         2048/1/{2,3}       <- same two, on either rung
+ordinary @ chunk 8192 vs @ chunk 1024   2048/1/{2,3,6}  <- no packing anywhere
+```
+
+So it is the **terminal-span split**: the route runs a completing prompt as a 2047-row body span
+plus a 1-row terminal span where the ordinary route runs one 2048-row chunk. That is a different
+row partition of the same tokens, and the last line says the ordinary route's own answer moves
+the same way — on a superset of the same prompts — when its chunk changes.
+
+Cross-tabulated over four row partitions of the same eight prompts:
+
+| prompt | 1×2048 rows | 2×1024 rows | 2047+1 on rung 4096 | 2047+1 on rung 8192 |
+|---|---|---|---|---|
+| seeds 0,1,4,5,7 | A | A | A | A |
+| seed 2 | A | B | B | B |
+| seed 3 | A | B | C | C |
+| seed 6 | A | B | A | A |
+
+**5 of 8 are identical under every partition.** On seed 2 the token batch lands on the answer
+the ordinary route itself produces at a different chunk; on seed 6 the token batch agrees with
+the unchunked reference where re-chunking does not. These are random one-token-word sequences
+with no signal — exactly the input on which a near-tie flips — and the plan anticipates this
+("Changing M may select different kernels and reduction orders; record that rather than
+requiring unjustified universal bit identity"). The honest form of that record is this table,
+not the aggregate count.
+
+### The pass that is not run
+
+| arm | token-batch launches | terminal-prefill decode passes |
+|---|---|---|
+| ordinary | 0 | 0 |
+| mixed step v1 | 0 | **33** (identity corpus), **100** per campaign round |
+| unified token batch | 99 / 219 / 227 | **0** |
+
+`split_terminal_prefill` + `finish_prefill_batch` is one extra decode-shaped model pass per
+request, on the TTFT critical path, whenever fusion is armed. The unified route runs none: it
+consumes the prompt's last token in the same step and samples it there. That is the commit's
+central claim, and it lands.
+
+---
+
+## 4. What this route still does not have
+
+* **No terminal segment.** `RowGather` (opcode 154) has an arm in this object and is not used.
+  The route samples the body's leading rows, which works because the planner puts every sampled
+  row there. The plan's §6.2 compact tail — gather, then the model's own final norm, head and
+  selection at `M = S` — is not emitted, and until it is, `S` is bounded by the synthesized
+  program's `dcap` (`min(batch - 1, T - 1)`), not by the sample capacity.
+* **Only buckets with `nsplit == 1` and a fused flash epilogue.** The device arm traps otherwise,
+  and correctly: a split KV partition moves with the span boundary, and
+  `exec_mixed_prefill_merge` still resolves rows through the decode prefix this contract removes.
+  On this blob that is buckets 4096 and 8192. Every rung from 32 to 2048 splits its attention
+  (`nsplit` 10, 8, 10, 5, 3, 2 going up), so **the token batch cannot use any of them**, and the
+  sub-128 rungs in particular are invisible to it. See §6.
+* **No TP.** `AmdServe::token_batch_rows` returns `None` for `Ranks::Tp`, as v1 does.
+* **No prefix cache, no `decode_only`, no non-chunked prefill.** Same gates as v1.
+* **One route or the other.** The engine refuses to load the token batch beside fusion; arming
+  both would double the resident executables to measure neither.
+
+---
+
+## 5. Measured
+
+### 5.1 Provenance
+
+Everything below is **one blob and one object set**, with the three arms interleaved and their
+order rotated between rounds, because a sibling measured 4% between-arm drift from server-process
+drift alone. Per-cell figures are the median over rounds of the median over 3 repeats after 1
+warmup; `±` is the round-to-round range as a percentage of the median, so a delta inside it
+should be read as noise.
+
+| | |
+|---|---|
+| model | Gemma-4 31B, BF16, dense windowed GQA + softcap, TP1 |
+| blob | `build-utb/assets`, `model.pkt` sha256 `6b0cfabc34c061bf…`, max_ctx 32768, `PLOW_MAX_CHUNK=8192` |
+| prefill rungs | 32, 64, 128, 512, 1024, 2048, 4096, 8192 |
+| decode ladder | 1, 2, 4, 8 (8 KV slots — which is what makes concurrency 8 a cell at all) |
+| tiles | **2220 of 3160 dense-GEMM tiles chosen by measurement; 940 fell back to the analytical model.** The 940 are exactly the shapes the new 32/64 rungs introduce — the same emit without the sub-128 floor reports "all 2220 chosen BY MEASUREMENT". Compare arms against each other, not against this document's absolutes. |
+| objects | `build-utb/hsaco`, 47 objects, `PLOW_DECODE_BATCH=8 PLOW_DECODE_TIERS=1,2,4` |
+| serving | `PLOW_PF_CHUNK=8192 PLOW_MULTISTEP=4`, one leased MI300X, 64 output tokens |
+
+`interp_mixed_gq.elf` was verified **byte-identical** before and after the token-batch device
+change in this branch, so the fusion arm is the object it always was.
+
+### 5.2 The three arms
+
+Deltas are signed so that **positive is better** in every table.
+
+**Output tokens/s**
+
+| in | c | off | fusion | token batch | fusion vs off | tb vs off | **tb vs fusion** |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 1 | 40.80 ±1.1 | 40.77 ±0.8 | 39.95 ±1.5 | −0.1% | −2.1% | **−2.0%** |
+| 128 | 4 | 88.21 ±1.8 | 92.20 ±0.5 | 96.00 ±1.5 | +4.5% | +8.8% | **+4.1%** |
+| 128 | 8 | 93.48 ±0.9 | 107.67 ±0.1 | 110.05 ±0.1 | +15.2% | +17.7% | **+2.2%** |
+| 512 | 1 | 38.30 ±0.1 | 38.28 ±0.4 | 36.88 ±0.5 | −0.1% | −3.7% | **−3.6%** |
+| 512 | 4 | 79.50 ±1.4 | 79.36 ±1.2 | 82.27 ±3.9 | −0.2% | +3.5% | **+3.7%** |
+| 512 | 8 | 83.31 ±0.1 | 86.80 ±0.0 | 90.28 ±0.8 | +4.2% | +8.4% | **+4.0%** |
+| 2048 | 1 | 32.39 ±0.3 | 32.32 ±0.3 | 29.01 ±0.2 | −0.2% | −10.4% | **−10.2%** |
+| 2048 | 4 | 58.02 ±1.0 | 49.79 ±0.1 | 49.57 ±0.2 | −14.2% | −14.6% | **−0.4%** |
+| 2048 | 8 | 60.01 ±0.3 | 50.14 ±0.4 | 52.87 ±0.0 | −16.5% | −11.9% | **+5.4%** |
+| 8192 | 1 | 19.66 ±0.0 | 19.63 ±0.2 | 19.63 ±0.2 | −0.1% | −0.1% | **+0.0%** |
+| 8192 | 4 | 23.03 ±0.0 | 18.91 ±0.1 | 18.73 ±0.5 | −17.9% | −18.7% | **−1.0%** |
+| 8192 | 8 | 22.08 ±0.0 | 18.03 ±0.2 | 18.52 ±0.6 | −18.3% | −16.1% | **+2.7%** |
+
+**TTFT (ms)**
+
+| in | c | off | fusion | token batch | fusion vs off | tb vs off | **tb vs fusion** |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 1 | 106.7 ±14.2 | 104.2 ±10.0 | 140.5 ±17.6 | +2.4% | −31.7% | **−34.9%** |
+| 128 | 4 | 327.5 ±14.7 | 425.9 ±4.0 | 261.5 ±28.8 | −30.0% | +20.2% | **+38.6%** |
+| 128 | 8 | 631.7 ±8.1 | 609.6 ±0.2 | 430.4 ±0.6 | +3.5% | +31.9% | **+29.4%** |
+| 512 | 1 | 174.4 ±0.4 | 174.5 ±0.5 | 240.4 ±3.0 | −0.1% | −37.9% | **−37.7%** |
+| 512 | 4 | 513.3 ±7.2 | 854.4 ±5.0 | 739.3 ±15.7 | −66.5% | −44.0% | **+13.5%** |
+| 512 | 8 | 983.7 ±0.1 | 1019.1 ±0.0 | 1113.7 ±30.4 | −3.6% | −13.2% | **−9.3%** |
+| 2048 | 1 | 464.0 ±0.1 | 468.2 ±2.0 | 694.3 ±1.1 | −0.9% | −49.6% | **−48.3%** |
+| 2048 | 4 | 1233.8 ±3.9 | 1606.6 ±0.1 | 1715.5 ±6.2 | −30.2% | −39.0% | **−6.8%** |
+| 2048 | 8 | 2276.6 ±1.1 | 3143.2 ±1.3 | 3170.1 ±3.3 | −38.1% | −39.2% | **−0.9%** |
+| 8192 | 1 | 1718.4 ±0.1 | 1719.4 ±0.1 | 1721.7 ±0.2 | −0.1% | −0.2% | **−0.1%** |
+| 8192 | 4 | 5166.3 ±0.0 | 6387.0 ±0.2 | 6451.9 ±0.4 | −23.6% | −24.9% | **−1.0%** |
+| 8192 | 8 | 9910.4 ±0.0 | 12648.7 ±0.4 | 12803.1 ±0.9 | −27.6% | −29.2% | **−1.2%** |
+
+TPOT p50 is within ±2.5% of fusion everywhere except 512/8 (+4.7%), 2048/8 (+3.1%) and 8192/8
+(+5.5%), all in the token batch's favour; against `off` it tracks fusion.
+
+**Read it as three regimes.**
+
+1. **Short prompts, concurrency ≥ 4 — the token batch wins outright.** 128 and 512 tokens: it
+   beats fusion by +2.2 to +4.1% throughput and beats *both* other arms on TTFT at 128
+   (+20.2% against off, +38.6% against fusion at c4). This is the cell fusion was adopted for,
+   and the token batch is better in it.
+2. **Long prompts — both packed routes lose to running neither**, by 12–19%, and the token
+   batch's margin over fusion is small but consistently positive at concurrency 8 (+5.4% at
+   2048, +2.7% at 8192). Whatever is wrong at 2048+ is wrong for packing in general, not for
+   this route in particular.
+3. **Concurrency 1 — the token batch loses and fusion does not.** §5.3.
+
+**Why the long-prompt cells lose, mechanically.** The route only loads buckets whose
+`FlashPrefill` has `nsplit == 1` — on this blob, 4096 and 8192; every rung from 32 to 2048 splits
+its attention (`nsplit` 10, 10, 10, 5, 3, 2 going up). With decode in flight the interleave cap
+is 2048 rows, so both arms take 2048-row chunks — but the ordinary route runs them on the 2048
+rung and the token batch is forced onto the 4096 rung. The grid is sized at `T`, not at the live
+row count: `rebase_chunk_rows` says the padded workgroups "still run the interpreter and still
+signal their successor counters". So the token batch drains twice the workgroups per op per
+layer, and gets half the KV-split parallelism on top. **This is the same tax the sub-128 prefill
+floor was added to remove at the bottom of the ladder, paid at the top.**
+
+### 5.3 Concurrency 1: what the route was doing wrong
+
+At concurrency 1 the route fired on a **solo** prompt: no decode rows to fuse with, nothing to
+pack, and the `nsplit == 1` restriction putting a 512-token prompt on the 4096 rung instead of
+the 512 one. Cost: −2.1 / −3.7 / −10.4% throughput and up to −49.6% TTFT, for no packing.
+
+There is nothing on the other side of that trade. The **ordinary** route already samples a
+completing prompt's last row inside its own prefill program with no extra pass; the
+`split_terminal_prefill` tax is fusion's alone. So admission now requires **two participants**
+(`feeds + pack >= 2`) on top of the correctness floor of one sampled row.
+
+Measured, concurrency 1, three servers simultaneously on separate GPUs (solo-firing, gated, and
+the ordinary route as the anchor). The gated arm ran **0** token-batch launches, which is the
+rule working: with one request there is one participant.
+
+| input | solo tok/s | gated | ordinary | **gated vs solo** | gated vs ordinary |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 40.02 | 40.64 | 41.03 | **+1.5%** | −0.9% |
+| 512 | 37.35 | 38.85 | 38.93 | **+4.0%** | −0.2% |
+| 2048 | 29.39 | 32.90 | 32.92 | **+11.9%** | −0.1% |
+| 4096 | 22.59 | 27.33 | 27.37 | **+21.0%** | −0.2% |
+| 7168 | 15.76 | 20.90 | 20.86 | **+32.6%** | +0.2% |
+
+| input | solo TTFT ms | gated | ordinary | **gated vs solo** | gated vs ordinary |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 136.8 | 122.5 | 107.2 | **+10.5%** | −14.2% |
+| 512 | 233.2 | 178.3 | 171.6 | **+23.6%** | −3.9% |
+| 2048 | 683.0 | 461.6 | 458.8 | **+32.4%** | −0.6% |
+| 4096 | 1325.7 | 847.6 | 841.6 | **+36.1%** | −0.7% |
+| 7168 | 2541.6 | 1556.2 | 1559.3 | **+38.8%** | +0.2% |
+
+The rule recovers the whole loss: gated is the ordinary route to within ±0.9% throughput at every
+length. The one residue is TTFT at 128 tokens, −14.2% — 15 ms absolute, on an arm that fires
+zero times, so it is either the standing cost of a second HSA executable resident on the agent or
+noise at that scale; it is not the route running.
+
+**A correction to the audit's expectation.** `docs/arch/17-unified-token-batch.md (Part III)` §7.2
+predicted fusion would cost 2.9–5.5% at concurrency 1 from the extra decode-shaped pass. On this
+blob it costs **0.1–0.2% throughput and 0.1–2.4% TTFT** — the pass is real (100 of them per
+campaign round) and it is not measurable here. The mechanism was right; the magnitude was from a
+different configuration. That removes concurrency 1 as a place where this route can beat fusion:
+there is nothing left to win there, only something to avoid losing.
+
+
+---
+
+## 6. `nsplit == 1`: the restriction, and what removing it costs
+
+### 6.1 Why it binds
+
+`dense_flash_split` gives `nsplit = ceil(n_cu / (ceil(t/256) * heads))`. On gfx942 with
+`n_cu = 304` and 32 heads that is:
+
+| bucket | 32 | 64 | 128 | 512 | 1024 | 2048 | 4096 | 8192 |
+|---|---|---|---|---|---|---|---|---|
+| `nsplit` | 10 | 10 | 10 | 5 | 3 | 2 | **1** | **1** |
+
+The route is qualified only at `nsplit == 1`, so it **loads only the 4096 and 8192 rungs**. It
+does not fall back for shorter prompts — it runs them on the 4096 rung. Measured directly:
+2048-token prompts at concurrency 1 produced 8 launches, all `rows=4096 decode=0 prefill=1
+completed=1`, and **zero** declines; even 40-token prompts run `rows=4096`.
+
+That has two consequences, and they are the two biggest facts in this document.
+
+* **The sub-128 prefill floor (rungs 32 and 64) is invisible to this route.** It cannot select
+  any rung below 4096, so the floor can only reach it through the ordinary path it falls back
+  to. Whatever the floor is worth, it is not worth it *here*.
+* **Every sub-4096 cell pays a rung-width tax.** The grid is sized at `T`, not at the live row
+  count — `rebase_chunk_rows` says the padded workgroups "still run the interpreter and still
+  signal their successor counters" — so a 2048-row chunk on the 4096 rung drains twice the
+  workgroups per op per layer, and gets half the KV-split parallelism on top. This is the same
+  tax the sub-128 floor was added to remove at the bottom of the ladder, paid at the top.
+
+### 6.2 Removing it: `PLOW_DENSE_PF_NS=1`
+
+The knob caps the heuristic (it can only remove splits, never over-split past the
+`Opart`/`mlpart` capacity `max_splits` sizes from the same formula). At `=1` every bucket
+qualifies, and `ns == 1` additionally switches the flash to its own bf16 epilogue and drops
+`FlashMerge` entirely — verified on this blob, bucket 128: **60 `FlashMerge` packets stock, 0
+capped**.
+
+That is not free, and the emitted-packet count does not show why. The split exists to **fill the
+machine**: at `t = 128`, one q-tile × 32 heads is 32 work items against 304 CUs, and `ns = 10`
+takes that to 320. Capping at 1 gives that up for an *isolated* prefill. The falsifiable claim is
+that a **token batch does not need it**, because the step is filled by the other spans and the
+decode rows sharing it rather than by splitting one prompt's attention.
+
+Six arms — `{stock, capped}` blob × `{ordinary, fusion, token batch}` — with the three arms of a
+wave served **simultaneously, one per leased GPU**, so any host disturbance lands on all three in
+the same wall-clock window rather than on whichever arm happened to be running. `capped.ordinary`
+against `stock.ordinary` is printed beside the route's own delta precisely so that a cap that is
+a straight win on its own does not get attributed to the route.
+
+### 6.3 The answer: the cap does not help the route
+
+**It does what it was supposed to do mechanically, and it buys nothing.**
+
+The route does start selecting the rungs it could not reach: on the capped blob its launches are
+`rows=512` and `rows=1024` where on the stock blob every launch — including for 40-token prompts
+— was `rows=4096`. So the restriction is real, the cap removes it, and the route uses what the
+cap gives it.
+
+Two rounds, blob order rotated between them, three arms per wave served simultaneously on
+separate GPUs. 64 output tokens, 3 repeats after 1 warmup, medians.
+
+**Output tokens/s**
+
+| in | c | stock .off | stock .fusion | stock .tb | capped .off | capped .fusion | capped .tb | **capped.tb vs stock.tb** | capped.tb vs stock.fusion | *capped.off vs stock.off* |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 1 | 40.52 | 40.87 | 40.31 | 40.50 | 41.13 | 40.24 | **−0.2%** | −1.5% | *−0.1%* |
+| 128 | 4 | 87.03 | 94.86 | 97.22 | 88.32 | 94.78 | 97.20 | **−0.0%** | +2.5% | *+1.5%* |
+| 128 | 8 | 92.83 | 108.42 | 110.08 | 93.17 | 108.62 | 109.93 | **−0.1%** | +1.4% | *+0.4%* |
+| 512 | 1 | 37.82 | 38.37 | 36.94 | 37.86 | 38.47 | 36.78 | **−0.4%** | −4.1% | *+0.1%* |
+| 512 | 4 | 78.92 | 79.95 | 82.25 | 80.14 | 79.14 | 81.32 | **−1.1%** | +1.7% | *+1.5%* |
+| 512 | 8 | 82.74 | 87.29 | 89.81 | 83.36 | 87.43 | 90.31 | **+0.6%** | +3.5% | *+0.8%* |
+| 2048 | 1 | 31.95 | 32.46 | 28.96 | 32.45 | 32.77 | 28.99 | **+0.1%** | −10.7% | *+1.6%* |
+| 2048 | 4 | 57.58 | 49.85 | 49.76 | 59.13 | 50.37 | 49.84 | **+0.1%** | −0.0% | *+2.7%* |
+| 2048 | 8 | 59.44 | 50.34 | 52.67 | 60.88 | 50.60 | 52.84 | **+0.3%** | +5.0% | *+2.4%* |
+| 4096 | 1 | 26.54 | 26.95 | 22.42 | 26.64 | 26.99 | 22.42 | **−0.0%** | −16.8% | *+0.4%* |
+| 4096 | 4 | 39.03 | 32.97 | 30.66 | 39.97 | 33.06 | 30.64 | **−0.1%** | −7.1% | *+2.4%* |
+| 4096 | 8 | 38.74 | 32.28 | 32.53 | 39.77 | 32.34 | 32.47 | **−0.2%** | +0.6% | *+2.7%* |
+| 7168 | 1 | 20.31 | 20.58 | 15.69 | 20.33 | 20.56 | 15.69 | **+0.0%** | −23.8% | *+0.1%* |
+| 7168 | 4 | 24.71 | 21.13 | 18.85 | 25.40 | 21.14 | 18.84 | **−0.1%** | −10.9% | *+2.8%* |
+| 7168 | 8 | 23.71 | 20.36 | 19.74 | 24.48 | 20.37 | 19.80 | **+0.3%** | −2.8% | *+3.2%* |
+
+**TTFT (ms)** — the cap's effect on the route is again nothing, and on the ordinary route it is
+consistently positive:
+
+| in | c | stock .off | stock .tb | capped .off | capped .tb | **capped.tb vs stock.tb** | *capped.off vs stock.off* |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 4 | 360.4 | 255.9 | 320.6 | 224.2 | **+12.4%** | *+11.1%* |
+| 512 | 4 | 522.5 | 628.9 | 478.2 | 683.2 | **−8.6%** | *+8.5%* |
+| 2048 | 4 | 1237.3 | 1821.0 | 1162.3 | 1870.0 | **−2.7%** | *+6.1%* |
+| 4096 | 4 | 2473.3 | 3660.2 | 2395.0 | 3663.8 | **−0.1%** | *+3.2%* |
+| 7168 | 4 | 4721.5 | 7198.7 | 4579.9 | 7204.9 | **−0.1%** | *+3.0%* |
+| 7168 | 8 | 9059.7 | 12657.5 | 8704.0 | 12667.1 | **−0.1%** | *+3.9%* |
+
+**TPOT p50** moves by less than 1.2% for the route in every cell, and by −0.3% to +1.9% for the
+ordinary route. No arm buys throughput with per-token latency here.
+
+Round-to-round spread on the capped blob is **≤ 0.9%** in every cell (the three arms of a wave
+were served simultaneously on separate GPUs, which is why it is that tight), so a delta inside
+±1% is nothing.
+
+**Three readings, in order of how much they change what to do next.**
+
+1. **`capped.token-batch` vs `stock.token-batch` is flat: −2.4% to +1.5% throughput.** Giving the
+   route the right rung does not pay. The falsifiable claim — that a token batch does not need
+   the KV split because the step is filled by the other spans — is **not supported**: the route
+   neither gains from getting the narrower rung nor loses from giving up the split. Whatever
+   binds it is not the rung.
+2. **It refutes my own §6.1 explanation.** I attributed the long-prompt regression to the
+   rung-width tax. It is not that: with the cap the route runs the natural rung and still loses
+   — `capped.token-batch` 18.83 tok/s against `capped.ordinary` 25.39 at 7168/4, −26%. The
+   long-prompt regression is unexplained and is the open question this campaign leaves.
+3. **`capped.ordinary` vs `stock.ordinary` is a small straight win: +0.1 to +3.1% throughput,
+   +0.5 to +18.1% TTFT.** That is the cap on its own, with no packing anywhere, and it is
+   *larger* than anything the cap does for the route. It is a separate and possibly more
+   interesting finding than the one this campaign was run for, and it must not be attributed to
+   the token batch — which is exactly why the fifth arm was measured.
+
+---
+
+## 7. Recommendation
+
+**Do not default it globally. Default it in place of `--fusion` for the (gfx942, dense windowed
+GQA BF16, TP1) pair, with the two-participant admission rule on, and leave both packed routes off
+by default as fusion already is.**
+
+Scoped to the cells actually measured — 128/512/2048/4096/7168 input, concurrency 1/4/8, one blob,
+one object set, two rounds:
+
+| workload | best arm | token batch vs the next best |
+|---|---|---|
+| ≤512 input, concurrency ≥ 4 | **unified token batch** | +4.2 to +18.6% tokens/s over the ordinary route; +1.4 to +3.5% over fusion; +28 to +40% TTFT over fusion at 128 |
+| 2048 input, concurrency 8 | **ordinary** | token batch is +5.0% over fusion but −11.4% under ordinary |
+| ≥2048 input, concurrency 4; ≥4096 anywhere | **ordinary** | both packed routes lose 11–24%; the token batch loses more than fusion above 2048 |
+| concurrency 1 | **ordinary** | with the two-participant rule the route does not fire and is the ordinary route to within ±0.9% |
+
+Three claims support "in place of `--fusion`" rather than "as well as", in the regime where a
+packed route is worth arming at all:
+
+1. **It beats fusion in every cell where either is worth arming.** +1.4 to +3.5% throughput and
+   +28 to +40% TTFT at 128/512 with concurrency ≥ 4, and it does not have fusion's concurrency-1
+   tax to carry.
+2. **It is more faithful.** Packed output equals isolated output 32/32; fusion is 27/32, and two
+   of its five misses replace varied reference text with a degenerate repeated token.
+3. **It deletes a per-request cost rather than inheriting it.** 140 extra decode-shaped passes
+   per campaign round on fusion, 0 on this route.
+
+What it is **not** yet, and why the default stays scoped:
+
+* **One (backend, family) pair, one arch, one blob.** gfx942, Gemma-4 31B, BF16, TP1, batch 8. TP
+  returns `None`; no MoE, MLA, DSA, recurrent or FP8 family has been near this route. FP8 was
+  asked for and is not measured here.
+* **The long-prompt regression is unexplained.** ~~It is not the rung width — §6.3's cap
+  experiment refutes that directly — and it is not the split-K, since capping `nsplit` moves the
+  route by less than 1.1%. Both packed routes lose at ≥2048, so it is a property of packing
+  prefill with decode at long context rather than of this route; the token batch simply loses more
+  of it above 2048.~~ **ANSWERED in §9, and this bullet is kept only so the reasoning that led
+  there is legible.** It was not a property of packing: the synthesizer collapsed `GemmWide` and
+  `GemmC5` onto plain `Gemm`, and `interp_tokbatch` compiled plain `Gemm` at the 64x128 tile. One
+  build constant takes the ≥2048 loss from 11–24% to 3–14%; §9 has the attribution, the grid and
+  the identity re-gate.
+* **The terminal segment is still not emitted.** `S` is capped by the synthesized program's
+  `dcap = min(batch - 1, T - 1)` = 7, and the campaign shows the route running *at* that ceiling
+  (`decode=6 prefill=1`, `decode=3 prefill=4 completed=4`). A compact `RowGather` tail with its
+  own sample capacity would raise it, and is what the plan's §6.2 asks for.
+* **940 of 3160 dense-GEMM tiles on this blob are analytical, not measured** — exactly the shapes
+  the 32/64 rungs add. Every arm shares that, so the comparison holds; the absolutes do not
+  transfer.
+
+One finding that belongs to nobody on this list: **capping `nsplit` to 1 is a small straight win
+for the ORDINARY route** — +0.1 to +3.2% throughput and +0.2 to +11.1% TTFT, rising with input
+length — while doing nothing measurable for the token batch. That is a separate question from
+this route and should be pursued as one.
+
+---
+
+## 9. The long-prompt regression, found and largely removed
+
+§7 left this as "the next work item and it is worth more than anything else on this list". It was
+one line of the build and one line of the synthesizer, and both were about the **dense GEMM tile**.
+
+### 9.1 Two hypotheses, refuted first
+
+**"The terminal one-row span costs a full 128-row `FlashPrefill` q-tile."** `plan_into` under
+`SpanCover::PrefixFree` does emit a span with `n_rows: 1, kv_row0: L-1, kv_len: L` for a
+completing prompt, and `d_flash_prefill`'s TB arm does bill
+`ceil(n_rows / FA_QT) * n_head * nsplit` with `FA_QT = 128`. It is still wrong, twice over:
+
+* **In the source.** `runtime/amd/interp.hip` partitions the span table between the two attention
+  operators. `exec_flash_decode`'s arm takes `plow_tb_span_range(tbv, 0, plow_tb_decode_spans(tbv))`
+  and `exec_flash_prefill`'s takes the complement, where `plow_tb_decode_spans` is *the leading run
+  of `n_rows == 1` spans*. The terminal row is inside that run — that is what
+  `validate_token_batch_rows` pins — so it is served by **FlashDecode**, one work item per
+  head-group per split, not by a q-tile. No 128x row ever exists.
+* **In the numbers already recorded.** Fusion has no terminal split at all (it replays the token
+  through `split_terminal_prefill`) and loses the *same* 14–18% at ≥2048 in §5.2. And with
+  `--amd-token-batch-solo` the route loses 10.7 / 16.8 / 23.8% at 2048 / 4096 / 7168 at
+  **concurrency 1**, where there is one prompt, no decode row, and nothing packed with anything.
+  A cost that appears with no packing is not a cost of packing.
+
+**"It is the rung width / the KV split."** Already refuted in §6.3 and not revisited.
+
+### 9.2 The cause
+
+`exec/mixed_program.rs` ended its GEMM arm with `inst.op = DevOp::Gemm as u16` — collapsing
+`GemmSmall`, `GemmMed`, **`GemmWide` (128x256)** and **`GemmC5` (192x256)** onto plain `Gemm`. And
+`scripts/build_gfx942.sh` compiled `interp_tokbatch`'s plain `Gemm` at `-DGM_BM=64 -DGM_BN=128`.
+
+So **every dense projection of every prefill chunk on this route ran the 64x128 tile** — the
+slowest rung in `op_gemm.h`'s own inventory, measured in that file at **332–458 TF/s against
+192x256's 1033–1236 on exactly the Gemma-31B shapes** (`g31b gate/up N21504 K5376 M2048`:
+332 vs 1033). The ordinary route emits the rung plowc chose per shape and runs it in
+`interp_prefill`.
+
+That predicts, and it is what §5 measured: a cost proportional to the dense-GEMM share of the
+step, hence **invisible at 128 input and −25% at 7168**; **shared with fusion**, which is the same
+object shape; and **paid at concurrency 1 by the token batch alone**, because fusion needs a decode
+row to fire and this route does not.
+
+`GM_BN` cannot move: at four waves `GM_WN` is 2 and the fused-GLU epilogue's
+`static_assert(!GLU || SN == 2)` pins `BN` to 128. `GM_BM` is free, and **raising it is free**:
+64, 192 and 256 all compile to 446 vgpr / 190 agpr / 64,544 B LDS / 0 spill, because
+`PLOW_GM_ARENA` under `PLOW_MIXED_STEP` is *already* sized at `GM_C5_*` (192x256x64) —
+"the mixed object's small default tile does not bound the other GEMM opcodes". The object was
+paying for a 192x256 arena and running 64x128 inside it.
+
+### 9.3 The attribution measurement
+
+Four arms, four leased MI300X, served simultaneously; `--amd-token-batch-solo` so the route fires
+on a **solo prompt** and the cell contains no packing, no decode interleave and no terminal span
+beside a decode row. 64 output tokens, 3 repeats after 1 warmup, medians.
+
+**Output tokens/s**
+
+| in | c | ordinary | tb `GM_BM=64` | tb `192` | tb `256` |
+|---:|---:|---:|---:|---:|---:|
+| 2048 | 1 | 33.12 | 29.59 (−10.7%) | 30.86 (−6.8%) | 31.33 (**−5.4%**) |
+| 4096 | 1 | 27.56 | 22.72 (−17.6%) | 24.20 (−12.2%) | 25.56 (**−7.3%**) |
+| 7168 | 1 | 21.03 | 15.82 (−24.8%) | 18.46 (−12.2%) | 19.66 (**−6.5%**) |
+
+**TTFT ms** — 7168: 1537 ordinary, 2533 at `GM_BM=64` (+64.8%), 1904 at 192, **1737 at 256
+(+13.0%)**. **TPOT p50** moves by at most 3.7% across all four arms at every length: decode is
+untouched, which is what says the whole thing is a prefill cost.
+
+One tile constant recovers **73% of the throughput loss and 80% of the TTFT loss** at 7168.
+
+### 9.4 The grid, with the tile fixed
+
+Same protocol as §5, two rounds with the arm→GPU assignment rotated between them; the
+two-participant admission rule on, so concurrency 1 does not fire. `tb-before` is `GM_BM=64`,
+`tb-after` is `GM_BM=256`. Round 2 (rotated) shown; round 1 agrees within the round spread.
+
+**Output tokens/s**
+
+| in | c | ordinary | fusion | tb-before | tb-after | tb-after vs ordinary | tb-after vs fusion |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 1 | 40.78 | 39.83 | 41.08 | 41.16 | **+0.9%** | +3.3% |
+| 128 | 4 | 87.01 | 90.88 | 97.43 | 94.41 | **+8.5%** | +3.9% |
+| 128 | 8 | 92.99 | 105.42 | 108.00 | 109.63 | **+17.9%** | +4.0% |
+| 512 | 1 | 38.05 | 37.09 | 38.16 | 38.42 | **+1.0%** | +3.6% |
+| 512 | 4 | 78.47 | 77.34 | 83.18 | 85.95 | **+9.5%** | +11.1% |
+| 512 | 8 | 83.04 | 84.73 | 89.27 | 93.12 | **+12.1%** | +9.9% |
+| 2048 | 1 | 32.12 | 31.18 | 31.97 | 32.50 | **+1.2%** | +4.2% |
+| 2048 | 4 | 58.00 | 48.49 | 48.76 | 55.13 | **−5.0%** | +13.7% |
+| 2048 | 8 | 60.02 | 49.01 | 51.70 | 58.15 | **−3.1%** | +18.6% |
+| 4096 | 1 | 26.94 | 26.06 | 26.66 | 27.16 | **+0.8%** | +4.2% |
+| 4096 | 4 | 39.49 | 32.24 | 29.55 | 35.43 | **−10.3%** | +9.9% |
+| 4096 | 8 | 39.24 | 31.51 | 31.25 | 36.79 | **−6.2%** | +16.8% |
+| 7168 | 1 | 20.63 | 20.10 | 20.45 | 20.75 | **+0.6%** | +3.2% |
+| 7168 | 4 | 24.96 | 20.72 | 17.90 | 21.56 | **−13.6%** | +4.1% |
+| 7168 | 8 | 24.08 | 19.95 | 18.81 | 22.27 | **−7.5%** | +11.6% |
+
+**TTFT ms**
+
+| in | c | ordinary | fusion | tb-before | tb-after |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 4 | 352 | 424 | 222 | **221** |
+| 128 | 8 | 658 | 622 | 493 | **465** |
+| 512 | 8 | 991 | 1043 | 1302 | **823** |
+| 2048 | 8 | 2283 | 3227 | 3201 | **2609** |
+| 4096 | 8 | 4616 | 6264 | 6990 | **5430** |
+| 7168 | 4 | 4661 | 5853 | 7637 | **6073** |
+| 7168 | 8 | 8901 | 11344 | 13448 | **10725** |
+
+**TPOT p50** never regresses against `tb-before` or fusion at any long cell: 7168/8 is 179.1 ms
+against fusion's 210.1 and `tb-before`'s 202.7 (ordinary 166.9). **No throughput here is bought
+with per-token latency** — at ≥2048 the token batch is the *best* TPOT of the two packed arms, and
+at ≤512 it is the best of all three.
+
+**Identity survives the tile.** Reduction order inside the GEMM changed, so this was re-gated:
+eight DISTINCT pseudo-random 2048-word prompts, packed at concurrency 4 and 8 against the same
+prompts run one at a time on the same server — **packed == isolated 16/16**.
+
+### 9.5 What is left, and the second half of the fix
+
+`tb-after` is now better than fusion in **every** cell and better than the ordinary route at every
+length up to 512 and at every concurrency-1 cell; it still loses 3–14% to the ordinary route at
+≥2048 with concurrency ≥ 4. The remaining gap has the same shape as the one just closed: `BN` is
+still 128 where the ordinary route runs 256.
+
+The second half is therefore to stop collapsing the opcode at all, and it is implemented behind
+`--amd-token-batch-wide-tiles` (`PLOW_TOKEN_BATCH_WIDE`), **off by default**:
+
+* `exec_gemm_wide` / `exec_gemm_c5` take live `M` from `PLOW_RUNTIME_ROWS`, the same split
+  `exec_gemm` already makes — without it a wide packet on this route would run the compiled
+  bucket width over rows nobody wrote.
+* The object says so with a new marker, `plow_token_batch_wide_gemm_1`, which the loader requires
+  before the synthesizer is allowed to keep the opcode; `Capabilities::amd_dense_gqa` gains the two
+  opcodes as class A. An object built before this change refuses the knob instead of writing
+  nothing, which is the failure mode the audit exists for.
+* Only the token-batch route asks for it. The mixed route splits every projection into a decode
+  GEMV band and a prefill GEMM band, and the wide arms have no band split.
+
+Measured (same protocol, four arms simultaneously, `hsaco` identical across the two token-batch
+arms so only the knob differs):
+
+| in | c | ordinary | fusion | tb-after | tb-after **+wide** | wide vs tb-after |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 4 | 57.85 | 48.97 | 54.27 (−6.2%) | 56.25 (**−2.8%**) | +3.6% |
+| 2048 | 8 | 60.11 | 49.31 | 57.52 (−4.3%) | 59.74 (**−0.6%**) | +3.9% |
+| 4096 | 4 | 39.23 | 32.17 | 34.75 (−11.4%) | 35.39 (**−9.8%**) | +1.8% |
+| 4096 | 8 | 38.87 | 31.50 | 35.97 (−7.5%) | 36.72 (**−5.5%**) | +2.1% |
+| 7168 | 4 | 24.85 | 20.68 | 21.10 (−15.1%) | 21.57 (**−13.2%**) | +2.2% |
+| 7168 | 8 | 23.93 | 19.95 | 22.28 (−6.9%) | 22.73 (**−5.0%**) | +2.0% |
+
+A further **+1.8 to +3.9% in every cell**, largest at 2048 where `GemmWide` is the rung plowc
+actually chose. It is consistent and it is small beside the tile constant, which is why it ships as
+a knob and the tile ships as the default. Re-gating identity under it, and reaching `GemmC5`'s
+192x256 — which the arena already holds — are the remaining work.
+
+The cross-GPU noise floor for this protocol was measured in the same session and is **≤1%**: the
+round that ran the wide arm before the capability was declared had it silently fall back to the
+ordinary route, so two of its four arms were the same configuration on different cards; they
+differed by +0.2 to +1.0% across all six cells.
+
+**§7's fourth bullet is now answered and should be read as history.** The long-prompt regression
+was neither a property of packing nor of this route: it was one compiled GEMM tile, shared by both
+packed routes, and it is now 3–14% instead of 11–24%.
+
+---
+
+## 8. Reproducing
+
+```bash
+PLOW_L2_PLACE=0 PLOW_AMD=1 PLOW_MAX_CHUNK=8192 \
+  target-utb/release/plowc --hf-dir build-gemma31/checkpoint \
+  --gpu MI300X --arch gfx942 --num-gpus 1 --max-ctx 32768 --out build-utb/assets
+
+PLOW_DECODE_BATCH=8 PLOW_DECODE_TIERS=1,2,4 scripts/build_gfx942.sh build-utb/hsaco
+
+PLOW_TOKEN_BATCH=1 PLOW_PF_CHUNK=8192 PLOW_MULTISTEP=4 \
+  nix develop /app/plow --command scripts/glm53_serve_inner.sh \
+  build-utb/assets 21708 build-utb/hsaco target-utb/release
+```
+
+Knobs this work added, all opt-in and all through `RuntimeConfig`:
+
+| flag | env | what |
+|---|---|---|
+| `--token-batch` | `PLOW_TOKEN_BATCH` | arm the route (mutually exclusive with `--fusion`) |
+| `--amd-token-batch-solo` | `PLOW_TOKEN_BATCH_SOLO` | admit a step with one participant; §5.3 is why it is off, and §9.3 is why it is kept |
+| `--amd-token-batch-rows` | `PLOW_TOKEN_BATCH_ROWS` | pin the prefill rung, for attribution (§3) |
+| `--amd-token-batch-wide-tiles` | `PLOW_TOKEN_BATCH_WIDE` | keep `GemmWide`/`GemmC5` through synthesis (§9.5) |
+| — | `TB_GM_BM` / `TB_GM_BN` | `scripts/build_gfx942.sh`: the token-batch object's GEMM tile, for the A/B in §9.3 |
+
+The identity and attribution corpora are `ident.py` / `attrib.sh` in this campaign's scratch;
+they differ from `bench_packed_serve.py` in one way that matters — **every request gets a
+different pseudo-random word sequence**, so a row that picked up its neighbour's state produces
+different text. With one repeated word, as the shipped bench corpus uses, it does not.
+
+The route logs one line at load with `armed` and `fires` as separate fields:
+
+```
+route="unified-token-batch/dense-gqa" object=.../interp_tokbatch_gq.elf
+kernel=plow_interp_tokbatch_gfx942_gq armed=true fires=true reason="-"
+```
+
+`armed=true fires=false` names the capability that is missing. A route that reports one
+`enabled` flag is how three campaigns on this branch measured "no effect" from something that
+never fired.
+
+---
+
+# Appendix B: Unified token batch, Phase 3: the recurrent axis and the windowed-attention axis
+
+*Folded in from `docs/amd/gemma4-31b-mi300x.md`. Section numbers below are this part's own.*
+Status 2026-09-08, gfx942 / MI300X, ROCm 7.14.0 (nix toolchain). Two of the six Phase 3 items of
+[`plans/unified-token-batch.md`](../../plans/unified-token-batch.md), taken independently as that
+section says they may be. Everything below is a body-level or host-level result. **No serving
+claim is made and none is implied**: no Qwen3.5 or Kimi-K3 checkpoint is on this host, and the
+Gemma-4 blob was not re-emitted.
+
+## The descriptor this work assumes
+
+Phase 1a/1b (`PlowTokenBatch`, the `PlowProgram` pointer, `RowGather`, the shared row resolver) is
+in flight elsewhere and is **not** on this branch. Rather than guess at its final field names, both
+axes were built against the metadata the ISA already carries, which §4.1 of the plan explicitly
+tells the token-batch contract to reuse:
+
+| Plan field (§4.1) | What this work consumed |
+|---|---|
+| `spans[R]` | `PlowPrefillSpan` (`runtime/common/dev_isa.h`): `row0`, `n_rows`, `slot`, `flags`, `kv_row0`, `kv_len`, `state_slot`, `program`. 32 bytes, unchanged. |
+| `positions[M]` | `span->kv_row0 + local_row`, exactly as `plow_mixed_row` and `plow_packed_prefill_position` already derive it. There is no separate position array on this path. |
+| `active[M]` (park mask) | **Two existing conventions, not one** — see the polarity note below. `PlowProgram::prefill_parked` for the packed-prefill row axis; the per-op tensor operand (`active` for the GDN family, `parked` for KDA) for the decode slot axis. |
+| `real_rows = M` | `PlowProgram::n_prefill_rows` via `mixed_rows()`. |
+| `sample_rows = S` | Not consumed. The compact terminal segment does not exist yet; see "What is blocked" below. |
+
+Nothing in `runtime/common/dev_isa.h`, `crates/packet/`, `runtime/common/mixed_step.h`,
+`crates/plow-asset/`, the `PlowProgram` Rust mirror or the ABI-lock test was modified. When the
+`PlowTokenBatch` descriptor lands, the consumers added here need it to expose the same five
+quantities per row; the audit and the two device gates are written against the *quantities*, not
+against the struct.
+
+### The polarity note, and why it matters
+
+§1 of the plan says the GDN family's `active[B]` is "the ISA's existing name for 'this row is
+padding; write nothing'" and to "extend that convention rather than inventing a second one." A
+second one already exists, and both are load-bearing:
+
+| Family | Tensor | Sense | Filled by |
+|---|---|---|---|
+| Qwen3.5 GDN (ops 136-142) | `in.active`, `i32[batch]` | **1 = run** | `GpuEngine::upload_active_slots` (CUDA only) |
+| Kimi-K3 KDA (ops 111, 112, 120, 125) | `in.parked`, `u32[T]` | **nonzero = skip** | `AmdEngine::upload_parked` |
+| Packed-prefill rows (all families) | `PlowProgram::prefill_parked` | **nonzero = skip** | `stage_packed_prefill` |
+
+The KDA sense was chosen deliberately (`crates/devgen/src/kda.rs`): an unwritten or zeroed tensor
+means *every row participates*, so a caller that has never heard of the mask cannot silently drop
+rows. That is a better default than `active`'s, and it is why the two device gates below run the
+same schedule through both — a descriptor that fills only one of them will pass one gate and fail
+the other.
+
+## Axis A — recurrent
+
+### A1. Packed-vs-isolated bit identity, GDN (`runtime/tests/qwen_gdn_gfx942_test.hip`)
+
+The ten GDN arms already honour `active` and the existing f64 oracle already parks a slot. What
+neither could see is a **mapping** property rather than an arithmetic one: whether a decode row
+produces the same *bytes* alone as it does packed beside other requests' rows. §9 asks for
+bit-identity; a 4e-3 tolerance would pass a body that leaked one request's row into another's.
+
+Two rounds over six slots, mask changing between them:
+
+```
+slot     0  1  2  3  4  5
+round 0  .  A  A  .  A  .
+round 1  A  .  A  A  .  .
+```
+
+Slot 2 carries state through both; 1 and 4 have theirs frozen by a park after use; 0 and 3 resume
+from a state a round stale (state-slot reuse); 5 is never live and must still hold the 0xa5 poison.
+The isolated arm does not *submit* a parked row — that is what "isolated per-request execution"
+means, and it is why a body that writes through a zero mask fails rather than being compared with
+itself.
+
+```
+  gdn_conv out               packed==isolated YES   padding frozen YES
+  gdn_conv history           packed==isolated YES   padding frozen YES
+  gdn_step out               packed==isolated YES   padding frozen YES
+  gdn_step state             packed==isolated YES   padding frozen YES
+  gated_norm                 packed==isolated YES   padding frozen YES
+  q_gate_split q             packed==isolated YES   padding frozen YES
+  q_gate_split gate          packed==isolated YES   padding frozen YES
+  sigmoid_gate               packed==isolated YES   padding frozen YES
+  qwen_rmsnorm               packed==isolated YES   padding frozen YES
+  headnorm_rope flat         packed==isolated YES   padding frozen YES
+  headnorm_rope ring         packed==isolated YES   padding frozen YES
+```
+
+Identical at `PLOW_QWEN_GDN_VROWS` 1, 2, 4 and 8. VROWS is the knob that changes the row-to-wave
+mapping, so it is the arm most likely to make a row's result depend on how many rows share the
+launch; it does not.
+
+**Negative control**: deleting the `active` guard from `d_qwen_rmsnorm` alone (one line, separate
+include tree, same toolchain) turns exactly that row into `no / no`, every other row stays `YES`.
+
+The file is now registered with `ctest` under the `gpu;gfx942` label. It built under CMake before
+but had no `add_test`, unlike its KDA sibling.
+
+### A2. Packed-vs-isolated bit identity, KDA (`runtime/tests/kda_step_cdna3_test.hip`)
+
+The same schedule on the batched-decode axis of `d_kda_state_step_g`, at K3 geometry (H=96, D=128,
+BV=16), through `parked` instead of `active`. Output and the whole f32 state are both
+`packed==isolated YES`, padding frozen `YES`.
+
+Before this, that file's `k_step` entry passed `parked = nullptr`, so **nothing in tree exercised
+the per-row mask on the decode axis**. The `parked` fixtures further down belong to the packed-
+*prefill* span path, which is a different axis: its rows are tokens of a span, not slots.
+
+**Negative control**: passing `nullptr` for `parked` turns all three checks into `no` — and every
+*other* line of that file still passes, including both f64 modes and both packed-span sections.
+This gate is the only thing in tree that sees it.
+
+### A3. The D-class span limit: refused, not truncated
+
+`crates/plowrt/src/exec/amd_packed.rs::recurrent_span_limit` is §3's D class made executable,
+restricted to the operator family where the plan says it binds. It runs once at load, into
+`AmdProg::packed_recurrent_spans`.
+
+| Opcodes | Class | Disposition |
+|---|---|---|
+| `KdaChunkPrepare/Intra/Wu/Carry`, `KdaConv3`, `KdaStateStep`, `KdaStateStepG` | D, per-span arm present (`d_kda_*_packed_bt64`, `d_kda_conv3_packed`, `d_kda_state_step_packed`) | unbounded |
+| `KdaGate`, `KdaGatedNorm` | A over the packed row axis | unbounded |
+| `KdaDecodeFused` | D, single-sequence, no per-span arm | **1 span** |
+| `KdaConv`, `KdaConvStateStepG`, `Mamba2Scan`, `QwenGdnConvPrefill`, `QwenGdnQkvPrep`, `QwenGdnGatePrep`, `QwenGdnPrefill` | D, no per-span arm at all | **refused, named** |
+| `QwenGdnConv/Step`, `QwenGatedNorm`, `QwenQGateSplit`, `QwenSigmoidGate`, `QwenRmsNorm`, `QwenHeadNormRope` | B on the *slot* axis | **refused, named** — a packed-prefill row is a token of a span, so binding these to a span table is a category error, not a missing arm |
+
+**The hole this closes.** `check_packed_prefill_program` was a series of *"if this program needs
+that family, check its objects and its shape"* — dense, MLA, KDA. A family none of the three
+recognised fell straight through to `Ok`, and the route then staged a span table for a program with
+no arm that reads one. On AMD that is not a slow path: the interpreter's dispatch `default:` is
+`/* PLOW_DOP_NOP */`, which writes nothing and does not trap, so every span after the first would
+run against the previous request's state and the run would complete fluently. §3's rule — "an
+opcode with no classification is treated as C and refused" — is now applied here as a default-deny.
+
+**Refused, not truncated.** `stage_packed_prefill` compares the plan's span count against the limit
+and errors, naming both. Executing the first `limit` spans of a larger plan is a silently *short*
+answer: the dropped requests keep their cursors and the caller commits their KV frontiers on the
+strength of a launch that never covered them.
+
+**And selected, not refused, at admission.** A refusal alone would be a liveness bug, so §7's half
+is wired too: `SeqEngine::packed_prefill_span_limit` (default `u32::MAX`, so no other backend
+changes) reaches the AMD mux arm, and `PrefillPack::limit_spans` caps the pack *while it is still
+a candidate list* — before any cursor moves, before any frontier is committed. A request whose span
+is dropped there is simply not admitted this tick, exactly as when the row budget runs out; that is
+selection, and it is a different operation from truncating a plan that has already been staged.
+Under TP the group takes the **minimum** across ranks, with a rank that refuses the program
+contributing 0, so a disagreeing group admits no packed span rather than a plan one rank cannot
+execute.
+
+Kimi-K3 is the only recurrent family that reaches this route today and every KDA operator its
+packed programs carry has a per-span arm, so its limit is `u32::MAX` and nothing about it moves.
+
+### What Axis A does NOT deliver
+
+* **No serving.** `plowc` still refuses a Qwen3.5 emit for an AMD target by name
+  (`qwen35_amd_emit`); `PLOW_QWEN_GDN` is still 0 in every shipping object; there is no Qwen3.5
+  checkpoint on this host. See [qwen35-gdn-mi300x.md](qwen35-gdn-mi300x.md).
+* **No batched variable-length recurrent prefill.** That is the plan's §10 work item and it stays
+  open. What landed is the *limit* being enforced and named instead of assumed.
+* **`KdaConv` (88) and `KdaStateStep` (102) still carry no mask operand.** `d_kda_state_step_t`
+  honours `parked`, but op 102's dispatch passes `nullptr` because all eight tensor slots are used
+  and the opcode predates the mask; `KdaConv`'s dispatch hard-codes `bstride = 0` for the same
+  reason. Neither is reachable from a K3 emit (devgen emits 111/112), and both are now refused on
+  the packed route by name — but a *decode* packet built with either and `B > 1` would still be
+  silently wrong. Closing that needs an `i[]`/`j[]` demotion like op 112's, in the shared operand
+  contract, which this work does not own.
+
+## Axis B — windowed attention and the softcap tail
+
+### B1. The window bound, scored (`runtime/tests/mixed_flash_window_gfx942_test.hip`, new file)
+
+`mixed_flash_prefill_gfx942_test.hip` fills V with a constant 1.0 and checks output *placement*.
+It is blind to the window by construction — softmax over any subset of identical value rows is 1.0,
+so its `window = 64` could be 0 or 3 and every assertion would still pass. **Nothing in tree scored
+a windowed `d_flash_prefill` at a non-zero `q_pos0` against arithmetic**, and Gemma-4-31B runs 50 of
+its 60 layers windowed at 1024.
+
+`d_flash_prefill` derives every row's absolute position as `q_pos0 + row`, and the window bound
+from it, at four places that can disagree: the workgroup-uniform `win_lo`, the
+`kv_lo = (win_lo/BKV)*BKV` tile carve and its split partition, and the per-element
+`(qg - kg) < window` mask. Under packing `q_pos0` is not the packet immediate — the emitter writes
+`i[4] = 0` — but `span->kv_row0`, substituted per span by the loop in `interp.hip`. **So the
+per-span window bound already exists**; the open question was whether it is right at the
+boundaries.
+
+21 checks, all passing, rms 1.8e-3..2.2e-3 against a 4e-3 bar (the bf16 quantum — the bound is
+exact and what remains is the storage format):
+
+* HD=256 single span: window 0; window inside the prefix; window straddling the chunk start;
+  window wider than the whole cache (must degenerate to causal); `win_lo` not BKV-aligned; 1-row
+  and 3-row final chunks; a 64-row ring the span wraps.
+* `nsplit` 3 and 4 with `d_flash_merge`, windowed and unwindowed.
+* HD=128, the Llama/Qwen shape.
+* Three spans at different slots, prefixes (0, 96, 200) and lengths (24, 9, 31) — §9's "different
+  live KV lengths" — scored, and byte-identical to the same three run one at a time.
+
+**Two negative controls**, each a one-token edit to a copy:
+
+| Injected fault | Result |
+|---|---|
+| pass `0u` for the window | 14 of 21 FAIL at rms 0.27..0.96. The seven that stay green are exactly the ones that should: the three window=0 cases, the window-wider-than-KV case, and the three identity checks, which do not depend on the window being *applied*, only on it being applied equally. |
+| pass `spans[0].kv_row0` for every span's `q_pos0` — §3's class-C hazard written out literally | all six packed-span checks FAIL, including all three byte-identity ones. |
+
+The span loop in the test kernel is a **transcription** of `PLOW_AMD_FLASH_PREFILL` (offsets
+included) because the macro lives inside `exec_flash_prefill` and cannot be called from a test. If
+the two ever disagree, the transcription is the bug — keep them together. **No file the Phase 2
+dense-GQA lane owns was modified**: neither `runtime/amd/op_attention.h` nor `runtime/amd/interp.hip`.
+
+### B2. The softcap tail and tied/untied heads — read, not changed
+
+Traced end to end and found already correct on the route that exists, so nothing was written:
+
+* **`DevOp::SoftCap` exists** (op 7, `t0=out t1=x`, `i0=n`, `f0=cap`, `cap*tanh(x/cap)`) and the
+  AMD arm is already row-count aware:
+  `d_softcap(..., (i0/i1) * PLOW_RUNTIME_ROWS(i1), ...)` under `PLOW_MIXED_STEP`.
+* The emitter (`crates/devgen/src/lib.rs`) emits it only when `c.softcap > 0` — Gemma's cap 30 —
+  because `d_softcap` divides by `cap` and would produce NaN at 0. Llama/Qwen skip the packet
+  entirely, which is the "softcap absent" half of §9's Head row.
+* `crates/plowrt/src/exec/mixed_program.rs` rewrites the packet for the mixed program
+  (`i[0] *= dcap; i[1] = dcap`) and `plow-asset` validates that rewrite. Emitted alone, `i[1]` is 0
+  and the mixed arm would trap — it is the *rewrite* that makes the packet legal, not the emit.
+* **Tied and untied are covered by construction, not by an arm**: `head_w = if c.tied { n.emb }
+  else { n.head }` picks a *tensor handle*, and the mixed rewrite only touches immediates
+  (`i[0] = dcap`, `i[4] = 0` on the head GEMV). There is no second code path to gate.
+
+### What Axis B is blocked on
+
+**The compact terminal segment does not exist on this branch.** There is no `RowGather` opcode
+anywhere in `crates/` or `runtime/` (Phase 1c). Consequently the mixed route's `S` is *the decode
+rows*: `mixed_program.rs` rewrites the prefill head from `(M=1, a_row0 = t-1)` to
+`(M=dcap, a_row0 = 0)`, and `PLOW_SAMPLE_ROWS` resolves to the decode-row count. A prompt that
+finishes inside the step — request C of §6.1, the plan's stated acceptance case — gets **no sample
+row**. That is the `split_terminal_prefill` / `finish_prefill_batch` defect §1 names, and it is
+Phase 1c's to remove, not this axis's. "SoftCap stage in the terminal segment" cannot be
+demonstrated until the segment exists; what is demonstrated is that the SoftCap packet is already
+correct over a runtime row count.
+
+## Reproducing
+
+```
+nix develop /app/plow --command \
+  $PLOW_HIPCC --offload-arch=gfx942 -O3 -w -DQGDN_DEVICE --genco \
+    runtime/tests/qwen_gdn_gfx942_test.hip -o /tmp/qgdn.co -Iruntime/amd -Iruntime/common
+g++ -O2 -w -x c++ -D__HIP_PLATFORM_AMD__=1 -I/opt/rocm-7.2.4/include \
+    runtime/tests/qwen_gdn_gfx942_test.hip -o /tmp/qgdn -L/opt/rocm-7.2.4/lib -lamdhip64
+perf-data/tools/gpulease -n 1 qgdn /tmp/qgdn /tmp/qgdn.co
+
+
+$PLOW_HIPCC --offload-arch=gfx942 -O3 -Iruntime/amd -Iruntime/common -c \
+    runtime/tests/mixed_flash_window_gfx942_test.hip -o /tmp/mixed_window.o
+c++ /tmp/mixed_window.o -L$ROCM_PATH/lib -Wl,-rpath,$ROCM_PATH/lib -lamdhip64 -o /tmp/mixed_window
+perf-data/tools/gpulease -n 1 mixed-flash-window /tmp/mixed_window
+
+CARGO_TARGET_DIR=/app/plow/target-glm53 cargo test --release -p plowrt --features hsa \
+    --lib exec::amd_packed
+```
+
+No shipping code object changes: the only files touched under `runtime/` are `tests/` and
+`bench/CMakeLists.txt`, so `scripts/asm_audit.py --contract` sees the same 45 objects it did before.
+
+## What the plan got wrong or under-specified
+
+1. **"The ISA's existing `active[B]` convention" is two conventions with opposite polarity** (§1,
+   §5.4). `active` (1 = run, GDN, CUDA host path) and `parked` (nonzero = skip, KDA, AMD host path)
+   are both live, on disjoint host paths, and the KDA one has the better default. A descriptor that
+   fills "the mask" has to know which family it is filling for.
+2. **§5.2's class-C conversion of `FlashPrefill` is already done, by a different mechanism than the
+   plan describes.** The plan says `i4=q_pos0` "must become a per-span base, or the packet must be
+   launched per span". The second is what shipped, and the emitter has additionally made `i[4]`
+   *dead*: it writes 0 unconditionally, and the span table is the sole carrier of position on the
+   packed path. The plan's framing suggests the immediate is still meaningful; it is not.
+3. **§9's Recurrent row asks for "the one-prefill-span limit enforced by admission"**, but on this
+   branch the KDA family already has per-span arms, so its limit is unbounded and the interesting
+   enforcement is not a *cap* but a *default-deny* for families with no per-span arm at all. The
+   plan does not distinguish "D-class, so one span" from "D-class with a per-span arm, so
+   unlimited" from "no arm at all, so refuse", and all three exist.
+4. **§6.2's `RowGather` is a hard prerequisite for the softcap half of the windowed axis**, though
+   Phase 3 is described as "independent of the others". The window bound is independent; "SoftCap
+   stage in the terminal segment" is not, because there is no terminal segment.
+5. **§3's operator table lists `QwenGdnPrefill` as the D-class example but not the seven
+   decode-shaped GDN ops**, which need a different refusal for a different reason (wrong row axis,
+   not missing state axis). The audit needs both categories.
+
+---
+
+# Appendix C: AMD instruction-cost arms — measuring the 2026-09-08 static audit's candidates
+
+*Folded in from `docs/amd/instruction-cost-arms-20260908.md`. Section numbers below are this part's own.*
+Follow-up to [the GPU kernel static and instruction-cost audit](../../plans/gpu-kernel-static-audit-20260908.md),
+"Costly instructions and repeated work". Four of that table's candidates are AMD-side; this is
+what each one measured, what landed, and what deliberately did not.
+
+**The default build is unchanged, byte for byte.** All 45 gfx942 objects built from this branch
+are `cmp`-identical to the ones built from its parent with the same command, and the object
+contract holds over all 45. Every arm below is default-off.
+
+## Result in one table
+
+| # | Candidate | Body (kx, model geometry) | Numerical price | Landed |
+|---|---|---|---|---|
+| 1 | mHC Sinkhorn divide → reciprocal | **1.48x** (IEEE rcp) / **1.65x** (`v_rcp_f32`) | ≤ 2.1e-7 abs vs the shipped arm; **no further from f64 truth** (0.97–1.12x its error) | `PLOW_HC_SINKHORN_RCP`, default 0 |
+| 2 | DeltaNet per-head work hoisted off V rows | **1.47x** at batch 1, **1.74x** at batch 4 (VROWS=4); VROWS=8 **loses 20%** at batch 1 | bit-identical output | `PLOW_QWEN_GDN_VROWS`, default 1 |
+| 3 | Quantization scale from the exponent | **1.05x** / **1.07x** | differs from the shipped arm at 37–38 of 130 power-of-two boundary cases | `PLOW_QUANT_SCALE_EXP`, default 0 |
+| 4 | Hadamard helper's LDS extent | — | — | comment corrected; no live bug |
+| 5 | Runtime integer divide/modulo in addressing | — | — | **nothing to do** — measured null |
+
+## The thing that shapes every number below
+
+**No blob on this box exercises three of these four bodies.** `plowrt disasm
+build-glm53/tp4-long/model.pkt` is 1865 instructions over 33 opcodes and contains **no**
+`HyperConnPre`, **no** `HyperConnPost` and **no** DSA-pool or compress op — GLM-5.3 `tp4-long` is
+MLA + MoE. `PLOW_QWEN_GDN` is 0 in `scripts/build_gfx942.sh`, so op 137 is not compiled into any
+shipped object at all.
+
+So "measure the model" has no target for candidates 1, 2 and 3, and saying so is the result. What
+IS measurable, and was measured, is the other half of the model question: **does touching these
+bodies perturb the shipped megakernel?** The answer is no, and it is byte-exact — see
+[Object A/B](#object-ab) — which is a stronger statement than a served-latency null would be.
+
+## Candidate 1 — mHC Sinkhorn divide → reciprocal
+
+`runtime/amd/op_hyperconn.h`, `PLOW_HC_SINKHORN_RCP` (0 shipped / 1 IEEE reciprocal / 2 `v_rcp_f32`).
+
+### ISA evidence
+
+The audit asked whether the production ISA already reuses the common denominator. **It does not.**
+gfx942 static counts for a probe kernel wrapping `d_hyperconn_pre` at n=4, `sinkhorn_repeat=20`:
+
+| | HEAD | RCP=0 | RCP=1 | RCP=2 |
+|---|---:|---:|---:|---:|
+| total instructions | 1932 | 1932 | 1396 | 1300 |
+| `v_div_scale_f32` | 146 | 146 | 50 | 18 |
+| `v_div_fmas_f32` | 73 | 73 | 25 | 9 |
+| `v_div_fixup_f32` | 73 | 73 | 25 | 9 |
+| `v_rcp_f32_e32` | 73 | 73 | 25 | 33 |
+| `v_exp_f32_e32` | 24 | 24 | 24 | 24 |
+| spill (`scratch_*`) | 0 | 0 | 0 | 0 |
+
+73 divide expansions, none shared. The 73 decompose exactly as the source predicts: 16 (initial
+softmax) + 16 (first column pass) + 32 (ONE rolled Sinkhorn iteration) + 8 (the pre/post sigmoids)
++ 1 (the `block_sum` mean) — and the rolled iteration runs 19 times, which is where the audit's
+**640 divides per token** comes from. RCP=1 removes 48 of the 73 static ones.
+
+**Arm 0's disassembly is byte-identical to HEAD's**, addresses and encodings included.
+
+### Body measurement — `scripts/kx.sh mhc_sinkhorn`
+
+hidden = 6144, n = 4, `sinkhorn_repeat` = 20, grid = `rows.min(n_cu)` per `emit_glm53_hc_pre`.
+
+| shape | geom | base µs | A/A | RCP=1 | RCP=2 |
+|---|---|---:|---:|---:|---:|
+| decode T=1 | 1wg | 34.81 | 1.000 | **1.635** | **1.897** |
+| pf304 | 1wg | 34.81 | 1.001 | 1.633 | 1.895 |
+| pf2048 | 1wg | 243.05 | 1.000 | 1.637 | 1.898 |
+| decode T=1 | model | 34.87 | 1.000 | **1.634** | **1.897** |
+| pf304 | model | 41.43 | 1.000 | **1.477** | **1.648** |
+| pf2048 | model | 289.36 | 1.000 | 1.478 | 1.647 |
+
+The two geometries disagree by 16 points at prefill, as they usually do here — 1.63x standalone
+reads as 1.48x once 304 workgroups compete. The model column is the claim.
+
+### Numerical price — `runtime/tests/hyperconn_sinkhorn_gfx942_test.hip`
+
+An f64 oracle of vLLM's `mhc_pre_torch` Sinkhorn (not a transliteration of the kernel), over three
+logit spreads so the loop actually iterates rather than starting at its own fixed point.
+
+| spread | arm | max err vs f64 | vs arm 0 | ratio to arm 0 |
+|---|---|---:|---:|---:|
+| 0.05 | 0 | 9.19e-08 | — | 1.00 |
+| 0.05 | 1 | 1.03e-07 | 1.04e-07 | 1.12 |
+| 0.05 | 2 | 1.03e-07 | 8.94e-08 | 1.12 |
+| 1.50 | 0 | 1.32e-06 | — | 1.00 |
+| 1.50 | 1 | 1.28e-06 | 2.09e-07 | 0.97 |
+| 1.50 | 2 | 1.34e-06 | 1.79e-07 | 1.01 |
+| 8.00 | 0 | 5.43e-06 | — | 1.00 |
+| 8.00 | 1 | 5.34e-06 | 1.79e-07 | 0.98 |
+| 8.00 | 2 | 5.40e-06 | 1.79e-07 | 0.99 |
+
+The reciprocal arms are **no further from the truth than the divide they replace** (0.97–1.12x),
+and their absolute disagreement with the shipped arm is ≤ 2.1e-7 on entries bounded by 1 — one to
+two ULP. Note the shipped arm's own 5.4e-6 at spread 8: 20 passes of far-from-1 denominators in
+f32 dominate anything these arms add.
+
+**Landed default-off anyway.** It changes bits, and this branch's standing policy (the
+`PLOW_GEMV_MFMA4` precedent) is that a rounding change is a flag with its price written down, not
+a default — the more so for a body that no packet on this box executes, so nothing here can be
+defended by a served number.
+
+## Candidate 2 — DeltaNet per-head work hoisted off the V rows
+
+`runtime/amd/op_qwen_gdn.h`, `PLOW_QWEN_GDN_VROWS` (1 shipped, N = V rows per wave). The AMD port
+of NVIDIA's `PLOW_NV_GDN_STEP_VROWS8`.
+
+Everything above the state loop — 2·PL bf16 loads of q and k, two `wave_sum`s over them, two
+`sqrtf` plus two divides, `expf(-expf(a_log)·softplus(dt))`, and `sigmoid(b)` — depends on
+(slot, head) and not on the V row. At vdim = 128 the shipped mapping recomputes it **128 times per
+head**.
+
+### ISA evidence
+
+VROWS=1 is byte-identical to HEAD. Static totals barely move (2832 → 2934 for the four-rung
+dispatch) and the per-mnemonic counts do not move at all: the saving is entirely dynamic, and so
+is the loss. Nothing spills at any VROWS.
+
+### Body measurement — `scripts/kx.sh gdn_vrows`
+
+hk=16, hv=48, kdim=128, vdim=128, grid 304 (`b.all()`).
+
+| shape | geom | base µs | A/A | VROWS=2 | VROWS=4 | VROWS=8 |
+|---|---|---:|---:|---:|---:|---:|
+| batch1 | 1wg | 6.19 | 1.000 | 1.089 | 1.472 | **0.919** |
+| batch4 | 1wg | 21.86 | 1.000 | 1.332 | 1.817 | 1.667 |
+| batch1 | model | 6.53 | 1.000 | 1.096 | **1.468** | **0.803** |
+| batch4 | model | 23.24 | 0.998 | 1.328 | **1.735** | 1.486 |
+
+**VROWS=8 — the NVIDIA arm's own choice — is a 20% REGRESSION at batch 1**, and it is a regression
+for a reason that has nothing to do with instruction counts. batch 1 is 6144 rows over 304
+workgroups × 8 waves = 2432 waves, i.e. 2.5 rows per wave before any tiling; VROWS=8 leaves 768
+tiles and 68% of the waves idle. A 64-lane wave and an 8-wave workgroup are not a 32-lane warp,
+and the tile that is right on one is not right on the other. **VROWS=4 is the AMD answer**, and it
+wins at both batches and both geometries.
+
+### Numerical price
+
+None: bit-identical bf16 output, 6144/6144 and 24576/24576 exact under kx's device-side gate. The
+f32 recurrence state is scored by the f64 oracle in `runtime/tests/qwen_gdn_gfx942_test.hip`
+instead, where VROWS 1/2/4/8 all land inside the shipped arm's own run-to-run band (max rel
+1.007e-7 .. 1.167e-7 over five runs of VROWS=1 — that test is not bit-reproducible run to run,
+which is a property of the test and not of these arms).
+
+### What did NOT land, and why
+
+**VROWS=4 is not the default even though it is a bit-identical 1.47–1.74x win.** Op 137 is
+compiled out of every shipped gfx942 object (`PLOW_QWEN_GDN=0`), so there is no served token to
+defend the change with and nothing to gain by making it. The moment a Qwen3-Next blob exists on
+this box, re-run `scripts/kx.sh gdn_vrows` at that blob's real batch and promote VROWS=4 if the
+model column agrees — the measurement is already set up for it.
+
+## Candidate 3 — quantization scale from the exponent
+
+`runtime/amd/amd_common.h` (`plow_round_scale`, `PLOW_QUANT_SCALE_DIV`), used by
+`op_dsa_pool.h`'s two sites and `op_compress.h`'s fake quant. `PLOW_QUANT_SCALE_EXP` (0 shipped,
+1 exponent-based).
+
+Arm 1 takes the exponent out of `frexpf` and rebuilds the scale with `ldexpf` — and gets the
+**exact** reciprocal for free, turning the per-element IEEE divide into a multiply.
+
+### ISA evidence, including the part that says "do not bother"
+
+Arm 0 is byte-identical to HEAD. Arm 1 removes one `v_log_f32`, one `v_exp_f32` and one divide
+expansion per site — and the **whole-kernel total goes UP** at three of four sites:
+
+| kernel | arm 0 | arm 1 |
+|---|---:|---:|
+| `k_q_quant` | 371 | 383 |
+| `k_pool_compress` | 569 | 581 |
+| `k_compress_fp8` | 957 | 968 |
+| `k_compress_fp4` | 1453 | **1417** |
+
+The audit's cost table put `log2f` at 35 instructions and `exp2f` at 28; those are whole-probe
+numbers, and in these bodies the compiler lowers each to a single `v_log_f32_e32` /
+`v_exp_f32_e32` plus a short range fixup. The scale CONSTRUCTION is a wash. What is not a wash is
+invisible to a static count: `cmp_fake_quant_block` divides `qblk` (64, or 32) elements by one
+loop-invariant scale on ONE thread, and the loop is rolled, so that divide is counted once and
+executed 64 times.
+
+### Body measurement — `scripts/kx.sh quant_scale`
+
+| shape | geom | base µs | A/A | arm 1 |
+|---|---|---:|---:|---:|
+| csa (d=512, qblk=64, fp8) | 1wg | 30.19 | 1.000 | 1.063 |
+| indexer (d=128, qblk=32, fp4) | 1wg | 9.73 | 1.001 | 1.101 |
+| csa | model | 34.96 | 1.000 | **1.054** |
+| indexer | model | 14.58 | 1.000 | **1.065** |
+
+5–7%, from the dynamic divide the static count could not see. The output was bit-identical on
+kx's input (155648/155648 and 38912/38912 exact) — which is **not** a claim that the arms agree.
+
+### Numerical price — `runtime/tests/quant_scale_gfx942_test.hip`
+
+They do not agree, and the boundary is exactly where the audit said to look:
+
+| top | arm 0 ≠ exact ceiling | arm 1 ≠ exact ceiling | arm 0 ≠ arm 1 | `scale*inv ≠ 1` | nonfinite |
+|---|---:|---:|---:|---:|---:|
+| 448 (e4m3) | **37 / 130** | 0 / 130 | 38 / 130 | 0 | 0 |
+| 6 (e2m1) | **38 / 130** | 0 / 130 | 39 / 130 | 0 | 0 |
+
+Every disagreement is the same shape: for `amax/top` **one ULP above a power of two**, `log2f`
+rounds to the integer, `ceilf` returns the exponent below, and the shipped arm produces a scale a
+**factor of two too small**. Arm 1 returns the exact ceiling everywhere, its reciprocal is exact
+everywhere (which is what makes the multiply bit-identical to the divide), and neither arm
+produces a nonfinite scale on any input including subnormal backstops below both amax floors.
+
+**This is a finding about the shipped kernel, not only about the arm** — but it is not obviously a
+bug. The reference (`fast_round_scale`, kernel.py:36-37) computes the same expression in f32, so
+the shipped arm is plausibly bit-compatible with the vendor kernel and arm 1 would DIVERGE from
+it. Promoting arm 1 needs a comparison against the vendor kernel's own output on those boundary
+values, which needs a V4/GLM-5.3-Flash checkpoint this box does not have. Default-off, price
+written down.
+
+`compress_pool_gfx942_test.hip` (11 cases, bf16 round trips, fp8 and fp4, prefill and decode
+boundaries) and `dsv4_ops_gfx942_test.hip` both PASS with the shipped arm after the refactor.
+
+## Candidate 4 — the Hadamard helper's LDS extent
+
+`dsa_hadamard128_stage` (`runtime/amd/op_dsa_pool.h`) documented "`lds` must be exactly 128 floats"
+while writing `lds[threadIdx.x]` for **all** `blockDim.x` threads — 512 at `PLOW_THREADS`.
+
+**No live bug.** All three call sites pass a buffer that is large enough: the interpreter passes
+`sm->raw`, and the one standalone caller, `compress_pool_gfx942_test.hip`, already allocates
+`CMP_LDS = 512`. `d_compress_pool`'s own doc comment already stated the real requirement
+(`max(d, PLOW_THREADS)`).
+
+So the **comment** was fixed, not the write extent. Suppressing the stores past 128 would only
+leave the slots those same threads then read uninitialized, for a result that is discarded — a
+change with a cost and no benefit. The corrected comment states `blockDim.x`, says why the threads
+past 128 store at all, and records that a standalone caller believing the old line would have
+corrupted 384 floats past its allocation.
+
+## Candidate 5 — runtime integer divide/modulo in addressing: a measured null
+
+The audit said "check generated ISA first; do not turn compile-time shifts into a proposed
+optimization." Checked, on the **shipped** GLM-5.3 objects, counting `v_rcp_iflag_f32*` (the gfx942
+tell for an unsigned runtime division) and locating each one inside its smallest enclosing loop:
+
+| object | insn | runtime divides | not in any loop | innermost ≤ 64 insn | 65..256 | > 256 |
+|---|---:|---:|---:|---:|---:|---:|
+| `interp_decode_k3` | 231,243 | 197 | 126 | **0** | 5 | 66 |
+| `interp_prefill_fp8kv_k3_moe_a4w4` | 125,946 | 165 | 108 | **0** | 3 | 54 |
+| `interp_flash` | 24,182 | 20 | 15 | **0** | 0 | 5 |
+
+**Not one runtime integer divide sits in an innermost loop** anywhere in the shipped GLM-5.3
+object set. Two thirds are not inside a loop at all; the rest sit in the op-level grid-stride
+loops, where an ~11-instruction divide amortizes over hundreds of instructions of real work. The
+constant power-of-two divisors the audit anticipated have indeed already become shifts. There is
+no hot runtime divisor to specialize, and no work was done here beyond establishing that.
+
+## Object A/B
+
+Built twice with the same command, once from this branch and once from its parent:
+
+```
+scripts/build_gfx942.sh <out>
+```
+
+* **45 / 45 objects `cmp`-identical.**
+* `PASS  contract held over 45 object(s)` on both, and the two contract tables (VGPR / AGPR /
+  SGPR / LDS / occupancy / ISA-counted spill, every row) are `diff`-identical.
+
+That is the whole model-side claim for the defaults, and it is exact rather than statistical: no
+served token can behave differently, because there is no different instruction to execute.
+
+Getting there took one revision worth recording. The first version of candidate 1 routed **arm 0**
+through a `__forceinline__` helper. It produced the same opcode histogram, the same VGPR count and
+the same contract row — and still moved **7 register assignments** inside the outlined
+`d_hyperconn_pre` of all 14 K3 objects, because adding an inline function to a translation unit
+shifts a register-allocator tie-break. The standalone probe could not see it; only the object A/B
+could. Arm 0 now keeps the shipped expression character for character under `#if`, at the cost of
+twenty duplicated lines, and the objects are identical. **Equivalent-but-different codegen is not
+what a default is allowed to be here.**
+
+## Reproducing
+
+```bash
+GPU_LEASE_TIMEOUT=21600 perf-data/tools/gpulease -n 1 kx scripts/kx.sh mhc_sinkhorn --isa
+GPU_LEASE_TIMEOUT=21600 perf-data/tools/gpulease -n 1 kx scripts/kx.sh gdn_vrows
+GPU_LEASE_TIMEOUT=21600 perf-data/tools/gpulease -n 1 kx scripts/kx.sh quant_scale
+
+runtime/tests/hyperconn_sinkhorn_gfx942_test.hip   # arms 0/1/2 vs an f64 mHC Sinkhorn oracle
+runtime/tests/quant_scale_gfx942_test.hip          # 260 power-of-two / floor / subnormal cases
+runtime/tests/qwen_gdn_gfx942_test.hip             # -DPLOW_QWEN_GDN_VROWS=N, f64 oracle
+runtime/tests/compress_pool_gfx942_test.hip        # the quant path end to end, unchanged
+runtime/tests/dsv4_ops_gfx942_test.hip             # the mHC head_only arm, unchanged
+
+nix develop --command scripts/build_gfx942.sh /tmp/objs
+```
