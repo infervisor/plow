@@ -67,10 +67,10 @@ pub struct RuntimeConfig {
     #[arg(long = "fusion", env = "PLOW_FUSION", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub fusion: bool,
 
-    /// Serve every scheduled token of a step from one unified token batch
-    /// (`plans/unified-token-batch.md`). Opt-in per (backend, family) pair until that pair is
-    /// measured; mutually exclusive with `--fusion`, which is the route it replaces.
-    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Select unified token batching when the backend, model and object support it.
+    /// Unsupported configurations use ordinary execution; --fusion takes precedence.
+    /// Disable with --token-batch=false or PLOW_TOKEN_BATCH=0.
+    #[arg(long = "token-batch", env = "PLOW_TOKEN_BATCH", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub token_batch: bool,
 
     /// Override whether freed slabs remain in the process reuse pool.
@@ -278,7 +278,7 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub vmm_block_mib: u32,
 
-    /// Cap on retained (unreferenced) VMM blocks. 0 = no cache.
+    /// Soft cap on VMM prefix blocks and boundary snapshots in MiB. 0 = OOM-driven eviction only.
     #[arg(
         long = "vmm-cache-mib",
         env = "PLOW_VMM_CACHE_MIB",
@@ -1026,6 +1026,24 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn token_batch_defaults_on_with_explicit_rollback() {
+        use clap::{Args, FromArgMatches};
+        let command = super::RuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "token_batch")
+            .unwrap();
+        assert_eq!(arg.get_default_values(), ["true"]);
+        for (flag, enabled) in [("--token-batch", true), ("--token-batch=false", false)] {
+            let matches = command.clone().try_get_matches_from(["test", flag]).unwrap();
+            assert_eq!(
+                super::RuntimeConfig::from_arg_matches(&matches).unwrap().token_batch,
+                enabled
+            );
+        }
+    }
+
     #[test]
     fn fusion_is_an_opt_in_runtime_flag() {
         use clap::{Args, FromArgMatches};

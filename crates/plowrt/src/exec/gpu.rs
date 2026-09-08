@@ -438,11 +438,7 @@ struct VmmServe {
     full_scale: Vec<(usize, usize)>,
     /// Sliding ring rows (`min(max_ctx, KV_RING)`), a power of two.
     ring: u64,
-    /// Fixed snapshot region: rings (`n_slide × 2 × kvh_slide × window × hd ×
-    /// elem_slide`) plus, for fp8 rings, their scale rows (`n_slide × 2 ×
-    /// kvh_slide × window × 4`). The variable full-scale region
-    /// (`vmm_full_scale_bytes`) is appended past this.
-    snap_bytes: u64,
+    snap_row_bytes: u64,
 }
 
 /// `kv.{l}.k` / `kv.{l}.v` → `(layer, 0|1)`.
@@ -1648,6 +1644,7 @@ pub struct GpuEngine {
     /// Per-slot rows served from the prefix cache by the current sequence's
     /// attach (0 = cold). Feeds per-request `usage.cached_tokens`.
     vmm_attached: Vec<u32>,
+    vmm_active: Vec<bool>,
     /// Per-slot token ids whose KV rows the slot currently holds (prompt,
     /// then every decode-fed token) — `seq_tokens[b].len() == pos[b]` when
     /// consistent. Lets `begin_slot` publish the finished sequence's
@@ -2500,6 +2497,16 @@ impl GpuEngine {
     /// server startup, never on the request path.
     pub fn load(be: Arc<CudaBackend>, assets_dir: &Path, checkpoint_dir: &Path) -> Result<Self> {
         let t0 = std::time::Instant::now();
+        if crate::config::RuntimeConfig::get().token_batch {
+            tracing::info!(
+                route = "unified-token-batch",
+                backend = "cuda",
+                ready = false,
+                fires = false,
+                reason = "CUDA token-batch executor unavailable; using ordinary execution",
+                "token-batch route status"
+            );
+        }
         let load_prof = load_profile();
         let mut load_tim = load_prof.then(|| LoadTiming::new(t0));
         if load_prof {
@@ -4260,6 +4267,7 @@ impl GpuEngine {
             batch,
             pos: vec![0; batch],
             vmm_attached: vec![0; batch],
+            vmm_active: vec![false; batch],
             seq_tokens: vec![Vec::new(); batch],
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
@@ -4421,7 +4429,7 @@ impl GpuEngine {
             slide_scale: Vec::new(),
             full_scale: Vec::new(),
             ring: 0,
-            snap_bytes: 0,
+            snap_row_bytes: 0,
         })
     }
 
@@ -4554,15 +4562,14 @@ impl GpuEngine {
                 }
             }
         }
-        // Fixed snapshot region: ring rows, then (fp8 rings) their scale rows.
-        let slide_rows = slide.len() as u64 * 2 * geo.kvh_slide as u64 * geo.window as u64;
-        let snap_bytes = (slide_rows * hd_b
+        // Per-row snapshot cost of sliding KV and optional fp8 scales.
+        let slide_rows = slide.len() as u64 * 2 * geo.kvh_slide as u64;
+        let snap_row_bytes = slide_rows * hd_b
             + if geo.elem_slide == 1 {
                 slide_rows * 4
             } else {
                 0
-            })
-        .max(4);
+            };
 
         // Default sharing block = the driver granularity (2 MiB measured):
         // the finest match unit VMM can map, e.g. 4096 tokens at hd256 bf16 —
@@ -4599,7 +4606,7 @@ impl GpuEngine {
                 slide_scale,
                 full_scale,
                 ring,
-                snap_bytes,
+                snap_row_bytes,
             }),
             Err(e) => {
                 tracing::warn!(error = %e, "vmm off: pool bringup failed");
@@ -4751,10 +4758,9 @@ impl GpuEngine {
     fn vmm_slide_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
         let v = self.vmm.as_ref().expect("vmm_slide_copy without vmm");
         let g = v.kv.geometry();
-        let w = g.window as u64;
+        let w = g.window.min(p_a) as u64;
         let hd_b = (g.hd_slide * g.elem_slide) as u64;
         let ring = v.ring;
-        debug_assert!(p_a as u64 >= w, "boundary below the sliding window");
         let mut off = buf;
         for &(ik, iv, stride) in &v.slide {
             for idx in [ik, iv] {
@@ -4792,7 +4798,7 @@ impl GpuEngine {
     fn vmm_scale_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
         let v = self.vmm.as_ref().expect("vmm_scale_copy without vmm");
         let g = v.kv.geometry();
-        let w = g.window as u64;
+        let w = g.window.min(p_a) as u64;
         let ring = v.ring;
         let mut off = buf;
         let mut blit = |dev: u64, snap: u64, bytes: u64| -> Result<()> {
@@ -4838,8 +4844,39 @@ impl GpuEngine {
         v.full_scale.len() as u64 * 2 * g.kvh_full as u64 * p_a as u64 * 4
     }
 
+    fn vmm_snap_bytes(&self, rows: u32) -> u64 {
+        let v = self.vmm.as_ref().expect("prefix snapshot without VMM");
+        let g = v.kv.geometry();
+        let partial = u64::from(rows % v.kv.block_rows());
+        (v.snap_row_bytes * u64::from(g.window.min(rows))
+            + self.vmm_full_scale_bytes(rows)
+            + v.tensor_tracks.len() as u64 * u64::from(g.kvh_full)
+                * partial * u64::from(g.hd_full * g.elem)).max(4)
+    }
+
+    fn vmm_partial_copy(&self, b: usize, rows: u32, mut buf: u64, to_snap: bool) -> Result<()> {
+        let v = self.vmm.as_ref().unwrap();
+        let g = v.kv.geometry();
+        let partial = rows % v.kv.block_rows();
+        if partial == 0 { return Ok(()); }
+        let row_bytes = u64::from(g.hd_full * g.elem);
+        let bytes = u64::from(partial) * row_bytes;
+        let row0 = u64::from(rows - partial);
+        for &(index, _, _) in &v.tensor_tracks {
+            for h in 0..u64::from(g.kvh_full) {
+                let dev = self.devp[index].base
+                    + ((b as u64 * u64::from(g.kvh_full) + h) * u64::from(g.max_ctx) + row0)
+                        * row_bytes;
+                if to_snap { self.be.memcpy_dtod(buf, dev, bytes)?; }
+                else { self.be.memcpy_dtod(dev, buf, bytes)?; }
+                buf += bytes;
+            }
+        }
+        Ok(())
+    }
+
     /// Copy the whole boundary snapshot for slot `b` at boundary `p_a`:
-    /// rings, then fp8 ring scales, then fp8 full-layer scale prefixes.
+    /// rings, fp8 ring scales, fp8 full-layer scale prefixes, partial full-KV.
     /// `to_snap` picks the direction (publish writes, attach restores).
     fn vmm_snap_copy(&self, b: usize, p_a: u32, buf: u64, to_snap: bool) -> Result<()> {
         self.vmm_slide_copy(b, p_a, buf, to_snap)?;
@@ -4849,17 +4886,19 @@ impl GpuEngine {
             let rings = v.slide.len() as u64
                 * 2
                 * g.kvh_slide as u64
-                * g.window as u64
+                * g.window.min(p_a) as u64
                 * (g.hd_slide * g.elem_slide) as u64;
             self.vmm_scale_copy(b, p_a, buf + rings, to_snap)?;
         }
+        let partial = buf + v.snap_row_bytes * u64::from(v.kv.geometry().window.min(p_a))
+            + self.vmm_full_scale_bytes(p_a);
+        self.vmm_partial_copy(b, p_a, partial, to_snap)?;
         Ok(())
     }
 
     /// Consult the prefix cache for slot `b`'s prompt and attach a published
     /// prefix: multi-map the shared full-layer blocks, restore the sliding
-    /// windows from the boundary snapshot, and advance the prefill frontier
-    /// so the tail (< one sharing block) is recomputed by normal prefill.
+    /// windows and private partial block, then advance the prefill frontier.
     fn vmm_attach(&mut self, b: usize, prompt: &[u32]) -> Result<()> {
         let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) else {
             return Ok(());
@@ -4869,10 +4908,14 @@ impl GpuEngine {
         };
         debug_assert_eq!(
             a.snap_bytes,
-            self.vmm.as_ref().unwrap().snap_bytes + self.vmm_full_scale_bytes(a.rows),
+            self.vmm_snap_bytes(a.rows),
             "boundary snapshot layout drift"
         );
+        if a.rows % v.kv.block_rows() != 0 {
+            v.kv.ensure_rows(b, a.rows + 1)?;
+        }
         self.vmm_snap_copy(b, a.rows, a.snap_va, false)?;
+        self.vmm.as_ref().unwrap().kv.finish_attach(b);
         self.pos[b] = a.rows;
         self.vmm_attached[b] = a.rows;
         // Seed the row-token record with the attached prefix — the tail is
@@ -4883,7 +4926,7 @@ impl GpuEngine {
             slot = b,
             rows = a.rows,
             prompt = prompt.len(),
-            "vmm: prefix attached (full-layer KV shared, zero copy)"
+            "vmm: prefix attached (whole KV blocks shared, boundary restored)"
         );
         Ok(())
     }
@@ -5004,6 +5047,7 @@ impl GpuEngine {
         self.pos[b] = 0;
         self.vmm_attached[b] = 0;
         if let Some(v) = &self.vmm {
+            self.vmm_active[b] = true;
             self.seq_tokens[b].clear();
             self.seq_tokens[b].reserve(total);
             v.kv.begin_seq(b);
@@ -5012,10 +5056,22 @@ impl GpuEngine {
         Ok(())
     }
 
-    /// Publish slot `b`'s current sequence up to its last whole block —
+    pub fn retire_slot(&mut self, b: usize, cache_output: bool) {
+        if !self.vmm_active[b] {
+            return;
+        }
+        if cache_output {
+            self.vmm_tail_publish(b);
+        }
+        self.vmm.as_ref().unwrap().kv.release_prefix(b);
+        self.seq_tokens[b].clear();
+        self.vmm_active[b] = false;
+    }
+
+    /// Publish slot `b`'s current sequence up to its last 32-token boundary —
     /// prompt AND generated rows — into the prefix cache. Skips (never
     /// fails serving) when the row-token record is inconsistent, the
-    /// sequence is shorter than a block, or the sliding rings no longer
+    /// sequence is shorter than 32 tokens, or the sliding rings no longer
     /// hold the boundary's window rows (`rows - p_a > ring - window`:
     /// wrapped past, unrecoverable).
     fn vmm_tail_publish(&self, b: usize) {
@@ -5028,16 +5084,15 @@ impl GpuEngine {
             return;
         }
         let g = v.kv.geometry();
-        let bt = v.kv.block_rows();
-        let p_a = (rows / bt) * bt;
-        if p_a < g.window.max(bt) {
+        let p_a = (rows / 32) * 32;
+        if p_a == 0 {
             return;
         }
         if !v.slide.is_empty() && rows - p_a > v.ring as u32 - g.window {
             return;
         }
-        let snap_bytes = v.snap_bytes + self.vmm_full_scale_bytes(p_a);
-        if let Err(e) = v.kv.publish(b, toks, snap_bytes, |dst| {
+        let snap_bytes = self.vmm_snap_bytes(p_a);
+        if let Err(e) = v.kv.publish_at(b, toks, p_a, snap_bytes, |dst| {
             self.vmm_snap_copy(b, p_a, dst, true)
         }) {
             tracing::debug!(error = %e, slot = b, "vmm: tail publish skipped");
@@ -6449,11 +6504,10 @@ impl GpuEngine {
             self.seq_tokens[b].extend_from_slice(prompt);
         }
         if let Some(v) = self.vmm.as_ref().filter(|v| v.kv.prefix_reuse()) {
-            let bt = v.kv.block_rows();
-            let p_a = (n as u32 / bt) * bt;
-            if p_a >= v.kv.geometry().window.max(bt) {
-                let snap_bytes = v.snap_bytes + self.vmm_full_scale_bytes(p_a);
-                if let Err(e) = v.kv.publish(b, prompt, snap_bytes, |dst| {
+            let p_a = (n as u32 / 32) * 32;
+            if p_a > 0 {
+                let snap_bytes = self.vmm_snap_bytes(p_a);
+                if let Err(e) = v.kv.publish_at(b, prompt, p_a, snap_bytes, |dst| {
                     self.vmm_snap_copy(b, p_a, dst, true)
                 }) {
                     tracing::warn!(error = %e, slot = b, "vmm: publish failed (serving continues)");

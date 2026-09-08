@@ -1277,6 +1277,7 @@ fn run_one_tick(
         #[cfg(feature = "cuda")]
         #[allow(irrefutable_let_patterns)]
         if let crate::serve::engine::ServeEngine::Cuda(e) = &mut *guard {
+            let result = (|| {
             let stop = Arc::clone(e.stop_ids());
             let cap = e.batch();
 
@@ -1894,6 +1895,13 @@ fn run_one_tick(
                 tick_fault,
                 decode_progress,
             );
+            })();
+            for (slot, request) in result.0.iter().enumerate().take(e.batch()) {
+                if request.is_none() {
+                    e.retire_slot(slot, result.5.is_none());
+                }
+            }
+            return result;
         }
 
         // gfx950: B independent sequence slots, one decode dispatch for all of
@@ -2276,6 +2284,7 @@ fn run_one_tick(
                                 decode = feeds.len(),
                                 prefill = pack.len(),
                                 completed = finished.len(),
+                                fires = true,
                                 "AMD token batch"
                             );
                             // Delivery is by LOGICAL REQUEST, in sample order: the decode
@@ -4009,6 +4018,8 @@ mod tests {
                 cached_tokens: 0,
                 kv: None,
                 arrived: Instant::now(),
+                stop_tail: String::new(),
+                stop_pending: String::new(),
             }),
             rx,
         )

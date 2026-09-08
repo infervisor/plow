@@ -11349,17 +11349,6 @@ impl AmdEngine {
             "decode scalar tensors"
         );
 
-        // UNIFIED TOKEN BATCH (plans/unified-token-batch.md §8 Phase 2), dense GQA.
-        //
-        // Probed at load whether or not it will be used, and logged ONCE with `armed` and
-        // `fires` as SEPARATE fields. They are separate claims: an object carrying the arms is
-        // armed; a step that ran with a descriptor covering more than one request has fired.
-        // A route that reports only "enabled" is how three campaigns on this branch measured
-        // "no effect" from something that never fired, and only `fires` licenses a measurement.
-        //
-        // The refusal is by CAPABILITY NAME, never a fallback: AMD's dispatch `default:` writes
-        // nothing and does not trap, so serving a token-batch packet against an object without
-        // the arms is a silent wrong answer, not a slow path.
         let mixed_step = if crate::config::RuntimeConfig::get().fusion && tp.is_none() && batch > 1
         {
             match amd_mixed_step::MixedAmdStep::load(
@@ -11387,11 +11376,23 @@ impl AmdEngine {
         // name and leaves the ordinary route in place; it never falls back to a token-batch
         // packet on an object without the arms, because AMD's dispatch `default:` writes
         // nothing and does not trap.
-        let token_batch_step = if crate::config::RuntimeConfig::get().token_batch
-            && !crate::config::RuntimeConfig::get().fusion
-            && tp.is_none()
-            && batch > 1
-        {
+        let cfg = crate::config::RuntimeConfig::get();
+        let mut token_batch_refusal = if !cfg.token_batch {
+            Some(amd_token_batch::TokenBatchRefusal::NotRequested.to_string())
+        } else if cfg.fusion {
+            Some("explicit fusion takes precedence".to_owned())
+        } else if tp.is_some() {
+            Some("token batching does not support tensor parallelism".to_owned())
+        } else if batch <= 1 {
+            Some("token batching requires multiple slots".to_owned())
+        } else if cfg.nv.prefix_cache {
+            Some("token batching does not support prefix-cache mode".to_owned())
+        } else if arch != "gfx942" {
+            Some(format!("token batching is not qualified for {arch}"))
+        } else {
+            None
+        };
+        let token_batch_step = if token_batch_refusal.is_none() {
             match amd_mixed_step::MixedAmdStep::load(
                 &be,
                 &blob,
@@ -11402,17 +11403,14 @@ impl AmdEngine {
             ) {
                 Ok(step) => Some(step),
                 Err(error) => {
-                    tracing::warn!(%error, "token-batch route unavailable; using ordinary execution");
+                    token_batch_refusal = Some(error.to_string());
                     None
                 }
             }
         } else {
             None
         };
-        // ARMED IS NOT FIRES, logged as two fields of one line. An object carrying the arms is
-        // armed; a step that ran with a descriptor covering more than one request has fired.
-        // Three campaigns on this branch measured "no effect" from something that never fired,
-        // which is why the two claims are never collapsed into one `enabled`.
+        // Loading an executor does not establish that the scheduler ever dispatched it.
         {
             let cap = amd_token_batch::probe_token_batch(
                 hsaco_dir,
@@ -11420,17 +11418,11 @@ impl AmdEngine {
                 |p| std::fs::read(p),
                 elf_symbol_u32,
             );
-            // The planner now emits spans covering [0, M) with no decode band, so the shape
-            // question is settled; what is left is whether THIS blob has a bucket the route
-            // can execute and whether the route was asked for at all.
-            let fires = if token_batch_step.is_some() {
-                amd_token_batch::admit_token_batch(0, 1, true)
-            } else if !crate::config::RuntimeConfig::get().token_batch {
-                Err(amd_token_batch::TokenBatchRefusal::NotRequested)
-            } else {
-                Err(amd_token_batch::TokenBatchRefusal::NoLegalBucket)
-            };
-            amd_token_batch::log_route_once(&cap, fires);
+            amd_token_batch::log_route(
+                &cap,
+                token_batch_step.is_some(),
+                token_batch_refusal.as_deref(),
+            );
         }
         let engine = AmdEngine {
             mixed_step,

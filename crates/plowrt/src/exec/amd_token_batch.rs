@@ -11,7 +11,6 @@
 //! separate fields of one log line rather than one word that flatters both.
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 
 /// The `extern "C" __device__` markers `runtime/amd/interp.hip` emits under
 /// `PLOW_TOKEN_BATCH=1`. Each says a different thing on purpose, so a partially built object is
@@ -104,8 +103,7 @@ impl std::fmt::Display for TokenBatchRefusal {
             ),
             Self::NotRequested => write!(
                 f,
-                "not requested: the route is opt-in per (backend, family) pair until that pair \
-                 is measured — pass --token-batch or PLOW_TOKEN_BATCH=1"
+                "disabled by --token-batch=false or PLOW_TOKEN_BATCH=0"
             ),
             Self::NoLegalBucket => write!(
                 f,
@@ -193,28 +191,18 @@ pub(super) fn admit_token_batch(
     Ok(())
 }
 
-static LOG_ONCE: Once = Once::new();
-
-/// One line, once, at load. `armed` and `fires` are separate claims and are logged as such —
-/// "three campaigns here measured no effect from something that never fired", and a route that
-/// reports only `enabled` is exactly how that happens again.
-pub(super) fn log_route_once(cap: &TokenBatchCapability, fires: Result<(), TokenBatchRefusal>) {
-    LOG_ONCE.call_once(|| {
-        let reason = cap
-            .refusal
-            .as_ref()
-            .map(|r| r.to_string())
-            .or_else(|| fires.as_ref().err().map(|r| r.to_string()));
-        tracing::info!(
-            route = "unified-token-batch/dense-gqa",
-            object = %cap.object.display(),
-            kernel = %cap.kernel,
-            armed = cap.armed,
-            fires = cap.armed && fires.is_ok(),
-            reason = reason.as_deref().unwrap_or("-"),
-            "amd: token-batch route status"
-        );
-    });
+pub(super) fn log_route(cap: &TokenBatchCapability, ready: bool, reason: Option<&str>) {
+    let refusal = cap.refusal.as_ref().map(|r| r.to_string());
+    tracing::info!(
+        route = "unified-token-batch/dense-gqa",
+        object = %cap.object.display(),
+        kernel = %cap.kernel,
+        armed = cap.armed,
+        ready,
+        fires = false,
+        reason = reason.or(refusal.as_deref()).unwrap_or("-"),
+        "amd: token-batch route status"
+    );
 }
 
 #[cfg(test)]
