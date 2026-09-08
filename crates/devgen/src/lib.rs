@@ -6670,6 +6670,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             model_type.as_str(),
             "kimi_k2"
                 | "kimi"
+                | "kimi_k25"
                 | "deepseek_v3"
                 | "deepseek_v2"
                 | "nemotron_h"
@@ -6763,9 +6764,16 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // (NOT rewrite/kimi.rs). model_type "kimi_k2"/"kimi" => Kimi tag; "deepseek_v3"/"deepseek_v2" =>
     // DeepSeek tag. Only the block-extraction (`--block`) device path is wired in M3; a full-model
     // Kimi device emit (the glm_main analogue) is a later milestone.
+    // `kimi_k25` is Kimi-K2.7-Code's multimodal wrapper (KimiK25ForConditionalGeneration)
+    // over a `kimi_k2` text tower. It is claimed HERE for the same reason `kimi_k3` is
+    // claimed above: it nests its geometry under `text_config`, which `cfg_from`
+    // (crates/devgen/src/config.rs) treats as "Gemma-4 multimodal" unconditionally, so an
+    // unclaimed checkpoint died on Gemma's `layer_types` unwrap — an error naming the
+    // wrong field of the wrong architecture. `cfg_glm` reads the nested geometry and the
+    // `language_model.model.` weight prefix off the same probe.
     if matches!(
         model_type.as_str(),
-        "kimi_k2" | "kimi" | "deepseek_v3" | "deepseek_v2"
+        "kimi_k2" | "kimi" | "kimi_k25" | "deepseek_v3" | "deepseek_v2"
     ) {
         let mla_arch = if model_type.starts_with("kimi") {
             MlaArch::Kimi

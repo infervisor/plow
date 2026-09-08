@@ -259,7 +259,23 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
             .unwrap();
     let glm53 = root["model_type"].as_str() == Some("glm5_next");
-    let v = if glm53 { &root["text_config"] } else { &root };
+    // Multimodal wrappers nest the text geometry under `text_config` AND move every
+    // tensor under their own prefix. The two travel together — reading the nested
+    // geometry while binding flat `model.` names yields MISSING WEIGHT on tensor one
+    // — so one match decides both. `kimi_k25` is Kimi-K2.7-Code
+    // (KimiK25ForConditionalGeneration): its text tower is `text_config` with
+    // model_type "kimi_k2", and its checkpoint ships `language_model.model.layers.…`,
+    // not the flat `model.layers.…` a text-only K2.7 export would carry.
+    let wrapper = match root["model_type"].as_str() {
+        Some("glm5_next") => Some("model.language_model."),
+        Some("kimi_k25") => Some("language_model.model."),
+        _ => None,
+    };
+    let v = if wrapper.is_some() {
+        &root["text_config"]
+    } else {
+        &root
+    };
     let g = |k: &str| {
         v[k].as_u64()
             .unwrap_or_else(|| panic!("config.json missing {k}")) as u32
@@ -339,14 +355,10 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         route_scale: v["routed_scaling_factor"].as_f64().unwrap() as f32,
         attn_scale: (qk_head as f32).powf(-0.5),
         rope_theta,
-        // Flat checkpoint: GLM / DeepSeek / Kimi-K2.7 all ship `model.layers.…` at the root.
-        // A nested (multimodal) variant sets this from its own wrapper, and nothing else changes.
-        prefix: if glm53 {
-            "model.language_model."
-        } else {
-            "model."
-        }
-        .to_string(),
+        // Flat checkpoint: GLM / DeepSeek / a text-only Kimi-K2.7 export all ship
+        // `model.layers.…` at the root. A nested (multimodal) variant carries its own
+        // wrapper prefix, decided with the `text_config` probe above.
+        prefix: wrapper.unwrap_or("model.").to_string(),
         tp: 1,
         ep: emit_config::active().glm_ep,
         group: emit_config::active().glm_group,
