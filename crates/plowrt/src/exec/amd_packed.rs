@@ -336,6 +336,85 @@ pub(super) fn validate_rows(
 mod tests {
     use super::*;
 
+    fn tb_span(row0: u32, n_rows: u32, slot: u32, kv_row0: u32) -> PrefillSpan {
+        PrefillSpan {
+            row0,
+            n_rows,
+            slot,
+            flags: u32::from(kv_row0 == 0) * PREFILL_SPAN_RESET_STATE,
+            kv_row0,
+            kv_len: kv_row0 + n_rows,
+            state_slot: slot,
+            program: 3,
+        }
+    }
+
+    fn parked(real: usize, capacity: usize) -> Vec<u32> {
+        let mut mask = vec![0u32; capacity];
+        mask[real..].fill(1);
+        mask
+    }
+
+    /// The shape the route actually stages: decode spans of length one, then the terminal row
+    /// of a completing prompt, then that prompt's body — two spans on one slot, contiguous in
+    /// KV, covering `[0, M)` from zero.
+    #[test]
+    fn a_terminal_and_body_pair_on_one_slot_is_the_legal_prefix_free_shape() {
+        let spans = [
+            tb_span(0, 1, 0, 100),
+            tb_span(1, 1, 2, 119),
+            tb_span(2, 49, 2, 70),
+            tb_span(51, 80, 3, 0),
+        ];
+        let rows = validate_token_batch_rows(3, 256, 4, 2, &spans, &parked(131, 256)).unwrap();
+        assert_eq!((rows.n_spans, rows.real_rows), (4, 131));
+    }
+
+    /// `validate_rows` — the decode-band validator — must keep REFUSING that shape, or the two
+    /// contracts have quietly become one and `plow_mixed_prefill_span` will resolve a row from
+    /// a table that has no decode prefix.
+    #[test]
+    fn the_decode_band_validator_still_refuses_a_prefix_free_table() {
+        let spans = [tb_span(0, 1, 0, 100), tb_span(1, 1, 2, 119), tb_span(2, 49, 2, 70)];
+        let err = validate_rows(3, 0, 256, 4, &spans, &parked(51, 256)).unwrap_err();
+        assert!(err.contains("more than one span"), "{err}");
+    }
+
+    /// The device counts the leading run of length-one spans; the host counts the rows it will
+    /// deliver. A two-token prompt completed in one step makes those disagree, and a
+    /// disagreement about who owns a sampled id is refused rather than delivered.
+    #[test]
+    fn a_length_one_body_behind_the_leading_run_is_refused_by_name() {
+        let spans = [tb_span(0, 1, 1, 1), tb_span(1, 1, 1, 0)];
+        let err = validate_token_batch_rows(3, 64, 4, 1, &spans, &parked(2, 64)).unwrap_err();
+        assert!(err.contains("leading row"), "{err}");
+    }
+
+    #[test]
+    fn a_gap_an_overlap_and_a_third_span_on_one_slot_all_refuse() {
+        // Gap: the second span does not start where the first ended.
+        let gap = [tb_span(0, 1, 0, 5), tb_span(2, 3, 1, 0)];
+        assert!(validate_token_batch_rows(3, 64, 4, 1, &gap, &parked(4, 64)).is_err());
+        // kv_row0 + n_rows != kv_len.
+        let mut bad = tb_span(0, 4, 0, 0);
+        bad.kv_len = 9;
+        assert!(validate_token_batch_rows(3, 64, 4, 0, &[bad], &parked(4, 64)).is_err());
+        // Three spans on one slot is never a terminal/body pair.
+        let three = [tb_span(0, 1, 1, 9), tb_span(1, 1, 1, 8), tb_span(2, 1, 1, 7)];
+        assert!(validate_token_batch_rows(3, 64, 4, 3, &three, &parked(3, 64)).is_err());
+    }
+
+    /// Padding is inert and outside every span; an unparked pad row would be a live row nobody
+    /// planned.
+    #[test]
+    fn the_parked_mask_must_be_exactly_the_padded_suffix() {
+        let spans = [tb_span(0, 1, 0, 100), tb_span(1, 3, 1, 0)];
+        assert!(validate_token_batch_rows(3, 64, 4, 1, &spans, &parked(4, 64)).is_ok());
+        let mut wrong = parked(4, 64);
+        wrong[10] = 0;
+        assert!(validate_token_batch_rows(3, 64, 4, 1, &spans, &wrong).is_err());
+    }
+
     #[test]
     fn the_packed_kda_operator_group_carries_as_many_spans_as_fit() {
         // Every one of these has a `d_kda_*_packed_bt64` arm that walks `prog->prefill_spans`

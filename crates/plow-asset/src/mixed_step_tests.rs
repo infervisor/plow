@@ -760,3 +760,161 @@ fn manifest_requires_exactly_one_object_per_declared_backend() {
     ));
     manifest(variant).validate().unwrap();
 }
+
+// ================================================================================================
+// Unified token batch: SpanCover::PrefixFree
+// ================================================================================================
+
+fn tb_plan(
+    decode: &[DecodeRequest],
+    prefill: &[PrefillRequest<'_>],
+    frontiers: &[u32],
+    rows: u32,
+    max_ctx: u32,
+) -> Result<Plan> {
+    let active = decode.len() + prefill.len();
+    let mut out = Plan::with_capacity(rows as usize, decode.len() + prefill.len() * 2, active);
+    // `with_capacity` sizes the span vector from its second argument, and PrefixFree needs the
+    // decode-slot vector to hold every LEADING row, not just the decode ones.
+    out.decode_slots = Vec::with_capacity(active);
+    out.commits = Vec::with_capacity(active);
+    plan_into_cover(
+        decode,
+        prefill,
+        frontiers,
+        rows,
+        max_ctx,
+        7,
+        SpanCover::PrefixFree,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// §4.4: "Spans cover exactly `[0, M)` with no overlaps, gaps or zero-length entries."
+/// `runtime/amd/token_batch.h`'s `plow_tb_view` traps on any violation, so the planner is the
+/// only place this can be got right.
+#[test]
+fn prefix_free_spans_tile_the_batch_with_no_decode_prefix() {
+    // §6.1's worked example: two ongoing decodes, a prompt that finishes, an intermediate chunk.
+    let decode = [
+        DecodeRequest { slot: 0, state_slot: 0, token: 11 },
+        DecodeRequest { slot: 1, state_slot: 1, token: 22 },
+    ];
+    let c: Vec<u32> = (0..50).collect();
+    let d: Vec<u32> = (0..80).collect();
+    let prefill = [
+        PrefillRequest { slot: 2, state_slot: 2, start: 70, tokens: &c, prompt_len: 120 },
+        PrefillRequest { slot: 3, state_slot: 3, start: 0, tokens: &d, prompt_len: 400 },
+    ];
+    let frontiers = [100, 900, 70, 0];
+    let plan = tb_plan(&decode, &prefill, &frontiers, 256, 4096).unwrap();
+
+    assert_eq!(plan.cover, SpanCover::PrefixFree);
+    assert_eq!(plan.real_rows, 132, "M = 2 decodes + 50 + 80");
+    // Three sampled rows: the two decodes and the prompt that completes. The intermediate
+    // chunk contributes tokens to M and ZERO to S.
+    assert_eq!(plan.decode_rows, 3);
+
+    // Dense cover of [0, M) from zero — the property the decode band cannot express.
+    let mut expect = 0;
+    for span in &plan.prefill_spans {
+        assert_eq!(span.row0, expect, "spans must tile from 0");
+        assert!(span.n_rows > 0);
+        assert_eq!(span.kv_row0 + span.n_rows, span.kv_len);
+        expect += span.n_rows;
+    }
+    assert_eq!(expect, plan.real_rows);
+    assert_eq!(plan.prefill_spans[0].row0, 0, "there is no decode prefix");
+
+    // The leading run of length-one spans is exactly S. `plow_tb_decode_spans` reads that run
+    // as the attention partition AND, through PLOW_SAMPLE_ROWS, as the selection row count.
+    let leading = plan.prefill_spans.iter().take_while(|s| s.n_rows == 1).count();
+    assert_eq!(leading as u32, plan.decode_rows);
+
+    // The completing prompt's terminal token leads the batch at its own absolute position, and
+    // its body follows: two spans, one slot, contiguous in KV.
+    let terminal = plan.prefill_spans[2];
+    assert_eq!((terminal.slot, terminal.kv_row0, terminal.kv_len), (2, 119, 120));
+    let body = plan
+        .prefill_spans
+        .iter()
+        .find(|s| s.slot == 2 && s.n_rows > 1)
+        .expect("body span");
+    assert_eq!((body.kv_row0, body.kv_len), (70, 119));
+    assert_eq!(plan.rows[terminal.row0 as usize].token, c[49]);
+    assert_eq!(plan.rows[terminal.row0 as usize].position, 119);
+
+    // The intermediate chunk samples nothing and its span is not in the leading run.
+    let intermediate = plan.prefill_spans.last().unwrap();
+    assert_eq!((intermediate.slot, intermediate.n_rows, intermediate.kv_len), (3, 80, 80));
+
+    // Commit is per REQUEST: the completing prompt advances once, to prompt_len.
+    assert_eq!(plan.commits.len(), 4);
+    assert!(plan.commits.contains(&Commit { slot: 2, expect: 70, after: 120 }));
+    assert!(plan.commits.contains(&Commit { slot: 0, expect: 100, after: 101 }));
+}
+
+/// A one-token prompt is one span with one selected row, and no empty body span — a zero-length
+/// entry would trap in `plow_tb_view`.
+#[test]
+fn a_one_token_prompt_is_one_length_one_span() {
+    let tokens = [5u32];
+    let prefill = [PrefillRequest { slot: 0, state_slot: 0, start: 0, tokens: &tokens, prompt_len: 1 }];
+    let plan = tb_plan(&[], &prefill, &[0], 8, 64).unwrap();
+    assert_eq!(plan.prefill_spans.len(), 1);
+    assert_eq!(plan.prefill_spans[0].n_rows, 1);
+    assert_eq!(plan.prefill_spans[0].kv_row0, 0);
+    assert_ne!(plan.prefill_spans[0].flags & PREFILL_SPAN_RESET_STATE, 0);
+    assert_eq!(plan.decode_rows, 1);
+    assert_eq!(plan.real_rows, 1);
+}
+
+/// An intermediate chunk contributes tokens to M and nothing to S, and the plan is legal with
+/// no sampled row at all — `S = 0` means no output segment, and it is the adapter's job to
+/// refuse the step rather than let argmax read zero as one.
+#[test]
+fn an_intermediate_chunk_alone_samples_nothing() {
+    let tokens: Vec<u32> = (0..64).collect();
+    let prefill = [PrefillRequest { slot: 0, state_slot: 0, start: 0, tokens: &tokens, prompt_len: 512 }];
+    let plan = tb_plan(&[], &prefill, &[0], 128, 4096).unwrap();
+    assert_eq!(plan.decode_rows, 0);
+    assert_eq!(plan.real_rows, 64);
+    assert_eq!(plan.prefill_spans.len(), 1);
+    assert_eq!(plan.prefill_spans[0].n_rows, 64);
+}
+
+/// Mixed step v1's shape is untouched: the same requests under `DecodeBand` still put the
+/// decode rows in a band ahead of the spans and hold the prompt's last token back.
+#[test]
+fn the_decode_band_contract_is_unchanged_by_the_new_mode() {
+    let decode = [DecodeRequest { slot: 0, state_slot: 0, token: 11 }];
+    let tokens: Vec<u32> = (0..50).collect();
+    let prefill = [PrefillRequest { slot: 1, state_slot: 1, start: 70, tokens: &tokens, prompt_len: 120 }];
+    let frontiers = [100, 70];
+    let band = plan(&decode, &prefill, &frontiers, 128, 4096, 7).unwrap();
+    assert_eq!(band.cover, SpanCover::DecodeBand);
+    assert_eq!(band.decode_rows, 1);
+    assert_eq!(band.prefill_spans.len(), 1);
+    assert_eq!(band.prefill_spans[0].row0, 1, "spans start AFTER the decode band");
+    assert_eq!(band.prefill_spans[0].n_rows, 50, "no terminal split");
+    // The commit list reproduces exactly what the per-span commit used to do.
+    assert_eq!(band.commits.len(), 2);
+    assert!(band.commits.contains(&Commit { slot: 1, expect: 70, after: 120 }));
+}
+
+/// Padding belongs to nobody: it is parked, and a live row is never invented for it.
+#[test]
+fn prefix_free_padding_is_parked_and_outside_every_span() {
+    let decode = [DecodeRequest { slot: 0, state_slot: 0, token: 11 }];
+    let frontiers = [10, 0];
+    let tokens: Vec<u32> = (0..4).collect();
+    let prefill = [PrefillRequest { slot: 1, state_slot: 1, start: 0, tokens: &tokens, prompt_len: 4 }];
+    let plan = tb_plan(&decode, &prefill, &frontiers, 32, 4096).unwrap();
+    assert_eq!(plan.real_rows, 5);
+    assert!(plan.parked[..5].iter().all(|&v| v == 0));
+    assert!(plan.parked[5..].iter().all(|&v| v == 1));
+    assert_eq!(plan.parked.len(), 32);
+    let covered: u32 = plan.prefill_spans.iter().map(|s| s.n_rows).sum();
+    assert_eq!(covered, plan.real_rows);
+}

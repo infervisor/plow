@@ -2177,11 +2177,31 @@ fn run_one_tick(
                     }
                     let pack =
                         amd_mixed_prefill_pack(list, capacity, nv.pf_batch, e.prefill_turn(), b);
-                    if pack.len() == take {
+                    if pack.len() != take {
+                        continue;
+                    }
+                    // `amd_mixed_prefill_pack` may cut a member's take to fit the budget, so
+                    // which prompts actually FINISH here is only known now. `S = 0` means no
+                    // output segment, and this route has no way to run a body without one:
+                    // skip such a pack rather than stage a step the engine must refuse. The
+                    // common shape is an 8192-token prompt against an 8192-row bucket, where
+                    // one row is spent on the selection stage and the body cannot reach the
+                    // prompt's end.
+                    let completing = pack
+                        .iter()
+                        .filter(|&&(slot, take)| {
+                            let frontier = e.prefill_frontier(slot).unwrap_or(0) as u32;
+                            slots[slot].as_ref().is_some_and(|s| {
+                                frontier.saturating_add(take) == s.prompt_ids.len() as u32
+                            })
+                        })
+                        .count();
+                    if feeds.len() + completing > 0 {
                         chosen = Some((rows, pack));
                         break;
                     }
                 }
+                let mut fell_through = false;
                 if let Some((rows, pack)) = chosen {
                     let mut tokens = std::mem::take(&mut obs.host.slot_tokens);
                     let started = Instant::now();
@@ -2272,6 +2292,15 @@ fn run_one_tick(
                                 }
                             }
                         }
+                        // A REFUSAL IS NOT A FAULT. `RuntimeError::Rejected` from this route
+                        // is decided before anything reaches the device and leaves host state
+                        // as it was, so the tick falls through to the ordinary path — the same
+                        // "selection, not truncation" rule the D-class span limit follows. A
+                        // device error is a different thing and still retires the slots.
+                        Err(crate::RuntimeError::Rejected(reason)) => {
+                            tracing::debug!(%reason, "AMD token batch declined this tick");
+                            fell_through = true;
+                        }
                         Err(err) => {
                             note_fault(&mut tick_fault, &err);
                             let msg = err.to_string();
@@ -2291,7 +2320,9 @@ fn run_one_tick(
                         }
                     }
                     obs.host.slot_tokens = tokens;
-                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
+                    if !fell_through {
+                        return (slots, bufs, obs, tokens_this_tick, true, tick_fault, None);
+                    }
                 }
             }
             if has_decode

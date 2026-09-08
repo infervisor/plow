@@ -691,3 +691,60 @@ fn program_roles_are_derived_from_the_instruction_stream() {
     .unwrap_err();
     assert!(err.contains("more than one"), "{err}");
 }
+
+/// `converted_c` is what turns "the object has an arm" into "the arm reads `positions[]`".
+/// The dense family has TWO conversions, not the one the plan's Phase 2 bullet names, and a
+/// route that declared only `FlashPrefill` would be a silent wrong answer: `HeadNormRope` IS
+/// the dense path's KV cache write, and its `i3 = out_row0` puts one request's K/V into
+/// another request's cache without trapping.
+#[test]
+fn the_amd_dense_gqa_pair_declares_both_of_its_class_c_conversions() {
+    let caps = Capabilities::amd_dense_gqa("gfx942", 4096, 3);
+    assert_eq!(
+        caps.converted_c,
+        vec![DevOp::FlashPrefill as u16, DevOp::HeadNormRope as u16]
+    );
+    // The opcode set a synthesized mixed/token-batch body actually contains.
+    let program = [
+        DevOp::Embed,
+        DevOp::RmsNorm,
+        DevOp::HeadNormRope,
+        DevOp::Gemm,
+        DevOp::GemmGlu,
+        DevOp::FlashDecode,
+        DevOp::FlashPrefill,
+        DevOp::FlashMerge,
+        DevOp::NormResidual,
+        DevOp::SoftCap,
+        DevOp::Argmax,
+        DevOp::ArgmaxFin,
+    ];
+    let audit = caps
+        .refuse_program(program.iter().map(|&op| op as u16))
+        .expect("the dense-GQA body is admitted");
+    assert!(audit.iter().all(|entry| entry.admitted()));
+    assert_eq!(audit.iter().filter(|e| e.converted).count(), 2);
+}
+
+/// Dropping either conversion refuses the program BY NAME rather than serving it.
+#[test]
+fn dropping_a_conversion_refuses_the_program_naming_the_opcode() {
+    for missing in [DevOp::FlashPrefill, DevOp::HeadNormRope] {
+        let mut caps = Capabilities::amd_dense_gqa("gfx942", 4096, 3);
+        caps.converted_c.retain(|&op| op != missing as u16);
+        let err = caps
+            .refuse_program([missing as u16].into_iter())
+            .expect_err("an unconverted class-C opcode is refused");
+        assert!(err.capability.contains("gfx942"), "{err}");
+        assert!(err.detail.contains("class C"), "{err}");
+    }
+}
+
+/// The object HAS a `RowGather` arm, but this route emits no terminal segment. "Armed" and
+/// "can fire" are different claims and only the second licenses a measurement of one.
+#[test]
+fn the_dense_gqa_pair_does_not_claim_an_output_segment() {
+    let caps = Capabilities::amd_dense_gqa("gfx942", 4096, 3);
+    let err = caps.can_run_output().expect_err("no terminal segment is emitted");
+    assert!(err.capability.contains(ROW_GATHER_CAPABILITY), "{err}");
+}
