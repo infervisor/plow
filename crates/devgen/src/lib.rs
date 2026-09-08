@@ -2449,6 +2449,41 @@ fn declare(
 /// changing it repartitions every prefill program (a measurement, not a correctness fix).
 const Q_TILE_ROWS: u32 = 8 * 32;
 
+/// `nsplit` for a dense-GQA `FlashPrefill` packet, and whether the flash writes its own bf16
+/// epilogue instead of leaving a `FlashMerge` to combine partials.
+///
+/// Extracted from `emit_phase` so the unified token-batch route's precondition is a TEST rather
+/// than a device trap. That route (`plans/unified-token-batch.md` §8 Phase 2,
+/// `docs/arch/17-unified-token-batch-dense-gqa.md`) schedules attention as one flat work list
+/// over every span's query tiles, and that schedule is bit-identical to an isolated per-request
+/// run only while the KV partition does not move with a span boundary — i.e. only at
+/// `nsplit == 1`. `runtime/amd/interp.hip` traps a `FlashPrefill` packet with `i7 != 1` rather
+/// than silently re-approximating, so an emitter change that reintroduced a split under packing
+/// would turn every packed prefill into a hard stop. `packing_pins_an_unsplit_fused_flash`
+/// catches that here instead.
+///
+/// When `nsplit == 1` there is nothing for `d_flash_merge` to combine: flash_prefill normalizes
+/// in its own epilogue and writes the final bf16 straight to `n.at`, and the merge op is not
+/// emitted at all. Prefill-only — decode always keeps `ns > 1`.
+fn dense_flash_split(
+    gemv_family: bool,
+    packed_prefill: bool,
+    n_cu: u32,
+    heads: u32,
+    t: u32,
+) -> (u32, bool) {
+    let ns = if gemv_family {
+        n_cu.div_ceil(heads).max(1)
+    } else if packed_prefill {
+        // Request packing must not change the softmax reduction with the bucket.
+        1
+    } else {
+        n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
+            .max(1)
+    };
+    (ns, !gemv_family && ns == 1)
+}
+
 /// The q-tile height `d_flash_prefill` ACTUALLY uses: `PLOW_WAVES * FA_BQ`, with `PLOW_WAVES = 4`.
 ///
 /// `FlashPrefill` is wave-class 4 (`Builder::wave_class` in `crates/packet/src/devbuild.rs`), so
@@ -3368,19 +3403,14 @@ fn emit_phase(
     // recorded above d_norm_residual_norm in runtime/amd/op_norm.h. Read that before widening
     // this. At decode batch B the row axis already gives it B workgroups for free.
     let elem = |n: u32| -> Vec<u32> { (0..n.div_ceil(512 * 8).max(1).min(n_cu)).collect() };
-    let ns = if gemv_family {
-        n_cu.div_ceil(heads).max(1)
-    } else if emit_config::active().packed_prefill_on() {
-        // Request packing must not change the softmax reduction with the bucket.
-        1
-    } else {
-        n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
-            .max(1)
-    };
-    // When nsplit==1 there is nothing for d_flash_merge to combine: flash_prefill normalizes
-    // in its own epilogue and writes the final bf16 straight to n.at, and the merge op is not
-    // emitted at all. Prefill-only (decode always keeps ns>1).
-    let fused = !gemv_family && ns == 1;
+    let (ns, fused_epilogue) = dense_flash_split(
+        gemv_family,
+        emit_config::active().packed_prefill_on(),
+        n_cu,
+        heads,
+        t,
+    );
+    let fused = fused_epilogue;
 
     let escale = c.emb_scale;
     // Block mode: no token embedding — `act.x` is uploaded by the harness (the
@@ -8249,5 +8279,9 @@ mod chunk_default_tests;
 #[cfg(test)]
 #[path = "lib_tests/emit_capabilities.rs"]
 mod emit_capabilities_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/token_batch_contract.rs"]
+mod token_batch_contract_tests;
 
 pub mod fp8_m1_role;
