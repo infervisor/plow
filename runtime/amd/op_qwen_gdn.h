@@ -77,9 +77,39 @@ __device__ void d_qwen_gdn_conv(bf16* out, const bf16* in, const bf16* weight, b
     }
 }
 
+/* PLOW_QWEN_GDN_VROWS — how many V rows of one head a wave owns.
+ *
+ * Everything above `projection` below is a property of the (slot, head) PAIR, not of the V row:
+ * the q/k loads, the two `wave_sum` reductions over them, `sqrtf`+divide twice, the nested
+ * `expf(-expf(al) * softplus(dt))` and the `beta` sigmoid. At vdim = 128 the shipped one-row-
+ * per-wave mapping recomputes all of it 128 times per head. VROWS > 1 gives a wave a strip of
+ * consecutive V rows so that work happens once per strip — the same restructuring
+ * `PLOW_NV_GDN_STEP_VROWS8` already carries on the NVIDIA arm, ported rather than reinvented.
+ *
+ * ARITHMETIC-PRESERVING BY CONSTRUCTION, and that is why it is checkable: every row's arithmetic
+ * is unchanged and independent (the recurrence runs along kdim within a row, never across rows),
+ * `q[j] *= qs` / `k[j] *= ks` produce the same products wherever they are hoisted to, and each
+ * state column still has exactly one writer. Only the row-to-wave mapping moves. `kx gdn_vrows`
+ * DEMANDS bit-identity of the bf16 output rather than assuming it, and gets it at VROWS 2/4/8;
+ * the f32 state is scored against the f64 oracle instead, where all four arms sit inside the
+ * shipped arm's own run-to-run band.
+ *
+ * IT IS NOT FREE: it divides the launch's wave count by VROWS. At the Qwen3-Next decode shape
+ * (hv=48, vdim=128, batch=1) 6144 rows over 304 workgroups x 8 waves is 2.5 rows per wave
+ * already, so VROWS=4 leaves 37% of the waves with nothing to do and VROWS=8 leaves 68%. That
+ * tradeoff is the measurement, not a detail — see `runtime/bench/amd/kx/exp_gdn_vrows.hip` and
+ * the numbers in `docs/amd/instruction-cost-arms-20260908.md`. Default 1 = the shipped mapping. */
+#ifndef PLOW_QWEN_GDN_VROWS
+#define PLOW_QWEN_GDN_VROWS 1
+#endif
+#if PLOW_QWEN_GDN_VROWS < 1
+#error "PLOW_QWEN_GDN_VROWS must be >= 1"
+#endif
+
 /* ---- op 137: the decode recurrence ----
- * `PL` is the per-lane key depth, `kdim / PLOW_WAVE`. A WAVE owns one V row of the V-first state,
- * so no two waves write the same state column and no barrier is needed.
+ * `PL` is the per-lane key depth, `kdim / PLOW_WAVE`. A WAVE owns one V row of the V-first state
+ * (or, at PLOW_QWEN_GDN_VROWS > 1, a strip of them within ONE head), so no two waves write the
+ * same state column and no barrier is needed.
  *
  * State layout is [slot][hv][vdim][kdim] f32 — V-FIRST, exactly as the NVIDIA arm and as
  * op_kda.h's carry. With vdim == kdim a transposed state has the right byte count and the right
@@ -93,10 +123,19 @@ __device__ void d_qwen_gdn_step_t(bf16* out, const bf16* qkv, const bf16* a, con
     const unsigned lane = threadIdx.x & (PLOW_WAVE - 1u), wave = threadIdx.x >> 6;
     const unsigned waves = blockDim.x >> 6;
     const unsigned packed = 2 * hk * kdim + hv * vdim;
+#if PLOW_QWEN_GDN_VROWS > 1
+    const unsigned tiles = (vdim + PLOW_QWEN_GDN_VROWS - 1u) / PLOW_QWEN_GDN_VROWS;
+    for (unsigned tile = slice * waves + wave; tile < batch * hv * tiles; tile += nblk * waves) {
+        const unsigned slot = tile / (hv * tiles);
+        if (active && active[slot] <= 0) continue;
+        const unsigned head = tile / tiles % hv, qhead = head / (hv / hk);
+        const unsigned first_v = (tile % tiles) * PLOW_QWEN_GDN_VROWS;
+#else
     for (unsigned row = slice * waves + wave; row < batch * hv * vdim; row += nblk * waves) {
         const unsigned slot = row / (hv * vdim);
         if (active && active[slot] <= 0) continue;
         const unsigned head = row / vdim % hv, vcol = row % vdim, qhead = head / (hv / hk);
+#endif
         const bf16* x = qkv + (size_t)slot * packed;
         float q[PL], k[PL], h[PL], qq = 0.0f, kk = 0.0f;
 #pragma unroll
@@ -114,25 +153,42 @@ __device__ void d_qwen_gdn_step_t(bf16* out, const bf16* qkv, const bf16* a, con
         const float al = alog_f32 ? ((const float*)a_log)[head] : bf2f(((const bf16*)a_log)[head]);
         const float decay = expf(-expf(al) * qwen_softplus(dt));
         const float beta = qwen_beta(b[gate]);
-        float projection = 0.0f;
+#if PLOW_QWEN_GDN_VROWS > 1
 #pragma unroll
         for (unsigned j = 0; j < PL; j++) {
             q[j] *= qs;
             k[j] *= ks;
-            h[j] = state[(size_t)row * kdim + lane + PLOW_WAVE * j] * decay;
-            projection += h[j] * k[j];
         }
-        const float value = bf2f(x[2 * hk * kdim + head * vdim + vcol]);
-        const float delta = (value - wave_sum(projection)) * beta;
-        float result = 0.0f;
+/* `unroll 1`: the strip loop carries `state` traffic and two `wave_sum`s per row, so unrolling it
+ * buys nothing and multiplies the code size of an already register-tight body. */
+#pragma unroll 1
+        for (unsigned vcol = first_v; vcol < vdim && vcol < first_v + PLOW_QWEN_GDN_VROWS; vcol++) {
+            const unsigned row = ((slot * hv + head) * vdim) + vcol;
+#endif
+            float projection = 0.0f;
 #pragma unroll
-        for (unsigned j = 0; j < PL; j++) {
-            h[j] = fmaf(delta, k[j], h[j]);
-            state[(size_t)row * kdim + lane + PLOW_WAVE * j] = h[j];
-            result += h[j] * q[j];
+            for (unsigned j = 0; j < PL; j++) {
+#if PLOW_QWEN_GDN_VROWS == 1
+                q[j] *= qs;
+                k[j] *= ks;
+#endif
+                h[j] = state[(size_t)row * kdim + lane + PLOW_WAVE * j] * decay;
+                projection += h[j] * k[j];
+            }
+            const float value = bf2f(x[2 * hk * kdim + head * vdim + vcol]);
+            const float delta = (value - wave_sum(projection)) * beta;
+            float result = 0.0f;
+#pragma unroll
+            for (unsigned j = 0; j < PL; j++) {
+                h[j] = fmaf(delta, k[j], h[j]);
+                state[(size_t)row * kdim + lane + PLOW_WAVE * j] = h[j];
+                result += h[j] * q[j];
+            }
+            result = wave_sum(result);
+            if (lane == 0) out[row] = f2bf(result);
+#if PLOW_QWEN_GDN_VROWS > 1
         }
-        result = wave_sum(result);
-        if (lane == 0) out[row] = f2bf(result);
+#endif
     }
 }
 
