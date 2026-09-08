@@ -1124,6 +1124,25 @@ one() {  # <stem> <axes...>
 }
 export -f one; export HIPCC ARCH R INC BUN
 
+# test_kernels.elf is STARTED HERE, alongside the row batch, and waited on after it.
+# It shares no input with the rows and nothing between here and the wait consumes it, so
+# the only thing its old position bought was serialisation: measured 29.7 s of a 79.4 s
+# build at JOBS=48, against a 30.1 s critical path for the whole parallel batch. See the
+# body below the wait for what it is and why it must be rebuilt with the interpreter.
+if [ -z "${PLOW_ROWS_ONLY:-}" ]; then
+  (
+    if "$HIPCC" --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" \
+          -o tk.co $INC > test_kernels.log 2>&1; then
+      "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
+          --input=tk.co --output=test_kernels.elf
+      rm -f tk.co test_kernels.log
+    else
+      exit 1
+    fi
+  ) &
+  TK_PID=$!
+fi
+
 # Both scheduler twins: which one a packet needs is decided by the packet
 # (gq_seg_ofs), not by this build, and plowrt opens the twin by literal name.
 printf '%s\n' "${ROWS[@]}" | while IFS='|' read -r stem axes; do
@@ -1178,15 +1197,13 @@ done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s a <<< "{}"; one "$s" $a'
 #
 # Skipped under PLOW_ROWS_ONLY, which is for iterating on one interpreter family and does not
 # want the extra minute.
-if [ -z "${PLOW_ROWS_ONLY:-}" ]; then
-  if "$HIPCC" --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" \
-        -o tk.co $INC > test_kernels.log 2>&1; then
-    "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
-        --input=tk.co --output=test_kernels.elf
-    rm -f tk.co test_kernels.log
+# Started above, alongside the row batch. `wait` on a specific PID returns that job's
+# exit status, so a test_kernels failure still fails the build here rather than earlier.
+if [ -n "${TK_PID:-}" ]; then
+  if wait "$TK_PID"; then
     echo "ok    test_kernels"
   else
-    echo "FAIL  test_kernels"; tail -20 test_kernels.log; exit 1
+    echo "FAIL  test_kernels"; [ -f test_kernels.log ] && tail -20 test_kernels.log; exit 1
   fi
 fi
 
