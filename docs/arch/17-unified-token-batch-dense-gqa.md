@@ -1,8 +1,20 @@
 # Unified token batch: dense GQA on AMD
 
-Status: the device route is implemented, built and gated on gfx942. It is **armed and does not
-fire**: no dense-GQA checkpoint exists on this host and the shared planner still hands the device
-a decode band ahead of the span table. Nothing here is a performance claim.
+Status: the device route is implemented, built and gated on gfx942.
+
+**Superseded on both counts as of 2026-09-08.** The planner no longer hands the device a decode
+band (`mixed_step::SpanCover::PrefixFree`), the route is wired into serving, and it fires on
+Gemma-4 31B — which is windowed + softcap dense GQA, so it is a **Phase 3** enablement of these
+Phase 2 arms rather than the Phase 2 target this document was scoped around. What it took, what
+it is measured to be worth, and the two limits it carries are in
+[../amd/token-batch-serving-mi300x.md](../amd/token-batch-serving-mi300x.md). §8 below is kept
+as written, because what it records about the state of the tree at the time is still the reason
+the work was shaped this way.
+
+One correction this document owes its own §5: the 31 gates run at `HD=128`, `window = 0` and
+`PLOW_KV_MASK_NONE`, so **the window and KV-ring code in the `TB` arms had no coverage**. They
+were correct — Gemma-4 31B runs 50 of 60 layers windowed at 1024 with a 16384-entry ring and its
+packed output is identical to its isolated output — but that was luck until it was measured.
 
 This is the AMD half of Phase 2 of `plans/unified-token-batch.md` — the first (family, backend)
 pair, chosen because dense causal GQA is class-A work plus **one** class-C conversion, so it

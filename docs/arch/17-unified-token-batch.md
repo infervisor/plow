@@ -267,11 +267,23 @@ Recorded because the plan is a design, not a proof.
 
 Everything past the shared foundation. In particular:
 
-* **No descriptor-aware math arms anywhere.** No interpreter reads `PlowProgram::token_batch`
-  yet. `FlashPrefill`'s `q_pos0` is still class C and unconverted on every target, which is why
-  `Capabilities::converted_c` starts empty and every real program is refused.
-* **No serving-path integration.** No `ServeEngine` capability query, no mux arm, no admission
-  policy. `TokenBatchStaging` is reachable but nothing calls it in a serve loop.
+* **No descriptor-aware math arms anywhere in the SHARED contract.** No interpreter reads
+  `PlowProgram::token_batch` — `runtime/amd/token_batch.h` still synthesises its view from the
+  packed-prefill tail (`PLOW_TOKEN_BATCH_DESC` defaults to `0`), so the descriptor's
+  `positions[]` cross-check is present and dead. The AMD dense-GQA arms themselves landed
+  separately; see [17-unified-token-batch-dense-gqa.md](17-unified-token-batch-dense-gqa.md).
+* **`Capabilities::converted_c` is no longer empty.** `Capabilities::amd_dense_gqa` declares the
+  two conversions that family actually has — `FlashPrefill`'s `q_pos0` and `HeadNormRope`'s
+  `i3 = out_row0`, which is the dense path's KV cache write — and `refuse_program` runs at load,
+  per prefill bucket, naming the capability it refuses on.
+* **The route serves on (gfx942, Gemma-4 31B).** `ServeEngine` carries a token-batch surface
+  whose defaults decline, `serve/mux.rs` has an arm ahead of the mixed one, and
+  `mixed_step::SpanCover::PrefixFree` gives it a span table covering `[0, M)`. Measurement,
+  limits and the identity result are in
+  [docs/amd/token-batch-serving-mi300x.md](../amd/token-batch-serving-mi300x.md).
+  Still absent there: the compact terminal segment. `RowGather` has an arm and is unused — the
+  route samples rows of the BODY, which works only because the planner puts every sampled row at
+  the front of the batch.
 * **No blob/manifest section.** `ProgramRole` and the capability check exist; a `token_batch`
   asset section binding body and output payloads does not.
 * **NVIDIA and CPU objects are not rebuilt** against the new `PlowProgram` here — no `nvcc` on
