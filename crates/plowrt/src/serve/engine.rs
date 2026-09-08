@@ -51,6 +51,13 @@ pub trait SeqEngine {
     fn prefill_turn(&self) -> usize;
     fn advance_prefill_turn(&mut self, slot: usize);
     fn prefill_prog_t(&self, prog: usize) -> Option<u32>;
+    /// The most request spans one packed-prefill launch of `prog` may carry, bounded by its
+    /// recurrent (D-class) operators. `u32::MAX` = unbounded. See
+    /// `plans/unified-token-batch.md` §5.4 and `exec::amd_packed::recurrent_span_limit`.
+    /// The default is for backends with no packed-prefill route of their own.
+    fn packed_prefill_span_limit(&self, _prog: usize) -> u32 {
+        u32::MAX
+    }
     fn packable_prefill_span(&self, slot: usize, max_rows: u32)
         -> Option<packet::dev::PrefillSpan>;
     fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> crate::Result<()>;
@@ -940,6 +947,16 @@ mod amd_serve {
             match &self.ranks {
                 Ranks::One(e) => e.prefill_prog_t(prog),
                 Ranks::Tp(g) => g.prefill_prog_t(prog),
+            }
+        }
+
+        /// §5.4's D-class span limit for `prog`. Under TP the ranks carry the same program, so
+        /// the group's answer is the minimum -- a rank that refuses the program contributes 0
+        /// and no span is admitted, which is the right answer for a collective step.
+        pub fn packed_prefill_span_limit(&self, prog: usize) -> u32 {
+            match &self.ranks {
+                Ranks::One(e) => e.packed_prefill_span_limit(prog).unwrap_or(0),
+                Ranks::Tp(g) => g.packed_prefill_span_limit(prog),
             }
         }
 
@@ -2560,6 +2577,9 @@ impl SeqEngine for AmdServe {
     }
     fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
         AmdServe::prefill_prog_t(self, prog)
+    }
+    fn packed_prefill_span_limit(&self, prog: usize) -> u32 {
+        AmdServe::packed_prefill_span_limit(self, prog)
     }
     fn packable_prefill_span(
         &self,

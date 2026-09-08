@@ -131,9 +131,17 @@ opcode with no classification is treated as C and refused" — is now applied he
 **Refused, not truncated.** `stage_packed_prefill` compares the plan's span count against the limit
 and errors, naming both. Executing the first `limit` spans of a larger plan is a silently *short*
 answer: the dropped requests keep their cursors and the caller commits their KV frontiers on the
-strength of a launch that never covered them. `AmdEngine::packed_prefill_span_limit` exposes the
-same number so a scheduler can pick a legal plan before touching cursors (§7) — the half that keeps
-the refusal from becoming a liveness bug.
+strength of a launch that never covered them.
+
+**And selected, not refused, at admission.** A refusal alone would be a liveness bug, so §7's half
+is wired too: `SeqEngine::packed_prefill_span_limit` (default `u32::MAX`, so no other backend
+changes) reaches the AMD mux arm, and `PrefillPack::limit_spans` caps the pack *while it is still
+a candidate list* — before any cursor moves, before any frontier is committed. A request whose span
+is dropped there is simply not admitted this tick, exactly as when the row budget runs out; that is
+selection, and it is a different operation from truncating a plan that has already been staged.
+Under TP the group takes the **minimum** across ranks, with a rank that refuses the program
+contributing 0, so a disagreeing group admits no packed span rather than a plan one rank cannot
+execute.
 
 Kimi-K3 is the only recurrent family that reaches this route today and every KDA operator its
 packed programs carry has a per-span arm, so its limit is `u32::MAX` and nothing about it moves.

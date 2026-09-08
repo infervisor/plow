@@ -2268,6 +2268,7 @@ fn run_one_tick(
                     e.prefill_turn(),
                     b.min(slots.len()),
                     |program| e.prefill_prog_t(program as usize),
+                    |program| e.packed_prefill_span_limit(program as usize),
                 );
                 if packed.len() >= 2 {
                     let pk_t = packlog::on().then(Instant::now);
@@ -2943,17 +2944,23 @@ fn amd_prefill_pack(
     start: usize,
     cap: usize,
     program_rows: impl Fn(u32) -> Option<u32>,
+    program_span_limit: impl Fn(u32) -> u32,
 ) -> Vec<packet::dev::PrefillSpan> {
-    crate::sched::prefill::admit(
+    let mut pack = crate::sched::prefill::admit(
         candidates,
         row_budget,
         start,
         cap,
         crate::sched::prefill::SpanPolicy::Whole,
         program_rows,
-    )
-    .spans()
-    .to_vec()
+    );
+    // The D-class limit (plans/unified-token-batch.md §5.4) consulted BEFORE cursors move, so
+    // the tick offers a legal plan rather than one `stage_packed_prefill` will refuse. The
+    // refusal there stays as the backstop; this is what keeps it from being a liveness bug.
+    if let Some(program) = pack.spans().first().map(|span| span.program) {
+        pack.limit_spans(program_span_limit(program) as usize);
+    }
+    pack.spans().to_vec()
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu"))]
@@ -3933,6 +3940,7 @@ mod tests {
             2,
             4,
             |_| Some(7),
+            |_| u32::MAX,
         );
         assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [2, 3]);
         assert_eq!(pack.iter().map(|s| s.row0).collect::<Vec<_>>(), [0, 3]);
@@ -3946,6 +3954,7 @@ mod tests {
             0,
             3,
             |_| Some(3),
+            |_| u32::MAX,
         );
         assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [1, 2]);
         assert_eq!(pack.iter().map(|s| s.row0).collect::<Vec<_>>(), [0, 2]);
@@ -3957,9 +3966,34 @@ mod tests {
             0,
             3,
             |_| Some(4),
+            |_| u32::MAX,
         );
         assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [0, 2]);
         assert_eq!(pack.iter().map(|s| s.n_rows).sum::<u32>(), 4);
+
+        // §5.4's D-class limit reaches admission: the same candidates, capped to one span. It
+        // is the FIRST span in rotation order that survives, so the request that loses its span
+        // is simply not admitted this tick -- and `packed.len() >= 2` at the call site then
+        // routes the tick to the isolated prefill path instead of staging a plan the engine
+        // would refuse.
+        let pack = amd_prefill_pack(
+            [span(0, 3, 7), span(1, 3, 7), span(2, 1, 7)],
+            8,
+            0,
+            3,
+            |_| Some(4),
+            |_| 1,
+        );
+        assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [0]);
+        assert!(amd_prefill_pack(
+            [span(0, 3, 7), span(1, 3, 7)],
+            8,
+            0,
+            3,
+            |_| Some(4),
+            |_| 0,
+        )
+        .is_empty());
     }
 
     #[cfg(feature = "hsa")]
@@ -3994,11 +4028,12 @@ mod tests {
                 0,
                 4,
                 |_| Some(8),
+                |_| u32::MAX,
             ),
             []
         );
-        assert_eq!(amd_prefill_pack([valid], 0, 0, 4, |_| Some(8)), []);
-        assert_eq!(amd_prefill_pack([valid], 8, 0, 4, |_| None), []);
+        assert_eq!(amd_prefill_pack([valid], 0, 0, 4, |_| Some(8), |_| u32::MAX), []);
+        assert_eq!(amd_prefill_pack([valid], 8, 0, 4, |_| None, |_| u32::MAX), []);
     }
 
     #[cfg(feature = "hsa")]

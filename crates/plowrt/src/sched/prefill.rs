@@ -47,6 +47,18 @@ impl PrefillPack {
     pub fn last_slot(&self) -> Option<usize> {
         self.spans().last().map(|span| span.slot as usize)
     }
+
+    /// Keep at most `max` spans (plans/unified-token-batch.md §5.4, §7).
+    ///
+    /// SELECTION, NOT TRUNCATION, and the difference is where it happens. This runs while the
+    /// pack is still a candidate list -- before any cursor moves, before any frontier is
+    /// committed -- so a request whose span is dropped is simply not admitted this tick, exactly
+    /// as it is not admitted when the row budget runs out. Truncating a plan that has already
+    /// been staged is the silently-short answer §9 forbids; that case is refused at
+    /// `stage_packed_prefill` instead.
+    pub fn limit_spans(&mut self, max: usize) {
+        self.len = self.len.min(max);
+    }
 }
 
 /// Rotate candidates by physical slot, select one compatible packet program,
@@ -148,6 +160,32 @@ mod tests {
             state_slot: slot,
             program,
         }
+    }
+
+    #[test]
+    fn limit_spans_keeps_the_rotation_prefix_and_is_idempotent() {
+        // The D-class cap (plans/unified-token-batch.md §5.4) applied to a legal 3-span pack.
+        // The kept spans must be the FIRST ones in rotation order, unchanged, so the requests
+        // that lose their span are simply the ones not admitted this tick.
+        let mut pack = admit(
+            [span(0, 0, 4, 7), span(1, 8, 4, 7), span(2, 16, 4, 7)],
+            64,
+            0,
+            3,
+            SpanPolicy::Whole,
+            |_| Some(64),
+        );
+        let all: Vec<_> = pack.spans().to_vec();
+        assert_eq!(all.len(), 3);
+        pack.limit_spans(u32::MAX as usize);
+        assert_eq!(pack.spans(), all.as_slice());
+        pack.limit_spans(1);
+        assert_eq!(pack.spans(), &all[..1]);
+        assert_eq!(pack.dense_rows(), 4);
+        pack.limit_spans(1);
+        assert_eq!(pack.spans(), &all[..1]);
+        pack.limit_spans(0);
+        assert!(pack.spans().is_empty());
     }
 
     #[test]
