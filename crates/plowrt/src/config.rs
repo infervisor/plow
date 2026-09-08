@@ -94,6 +94,21 @@ pub struct RuntimeConfig {
     )]
     pub drain_timeout_ms: Option<u64>,
 
+    /// Directories under which `POST /v1/models/load` may take an assets dir.
+    /// Repeatable; `PLOW_MODELS_ROOT` takes a `:`-separated list.
+    ///
+    /// This is a security boundary, not ergonomics: loading a bundle loads and
+    /// EXECUTES its cubins/hsaco, so an unconstrained path in a request body is
+    /// arbitrary code execution. Unset = only the assets dirs the process was
+    /// started with (their parents) are reachable.
+    #[arg(
+        long = "models-root",
+        env = "PLOW_MODELS_ROOT",
+        value_delimiter = ':',
+        global = true
+    )]
+    pub models_root: Vec<String>,
+
     /// Speculative next-model preload after an S1 switch. --no-preload disables.
     #[arg(long = "preload", env = "PLOW_PRELOAD", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub preload: bool,

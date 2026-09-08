@@ -2563,6 +2563,20 @@ async fn bringup_runtime(
 
     let state = Arc::new(AppState::with_trace(registry, execset, trace));
 
+    // Where a control-plane load may take an assets dir from. Explicit
+    // `--models-root` entries, plus the parents of the dirs this process was
+    // started with — so the common case (serve two of the bundles that already
+    // live side by side) needs no extra flag, while an arbitrary path in a
+    // request body stays refused. `serve::admin` canonicalizes both sides
+    // before the prefix test.
+    let mut roots: Vec<PathBuf> = RuntimeConfig::get()
+        .models_root
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    roots.extend(assets.iter().filter_map(|a| a.parent().map(std::path::Path::to_path_buf)));
+    state.install_models_roots(roots);
+
     // GPU-managed models: any bundle whose assets dir carries a PLOWDEV
     // device blob goes under the S1 model manager — it plans each model's
     // VRAM footprint from the blob header, loads the registration-order

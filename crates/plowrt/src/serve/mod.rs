@@ -1,5 +1,6 @@
 //! §G OpenAI-compatible API server.
 
+pub mod admin;
 pub mod bench;
 pub mod chat;
 pub mod completion;
@@ -329,6 +330,9 @@ pub struct AppState {
     /// at startup when any bundle is GPU-managed; `None` on CPU-only serves.
     #[cfg(feature = "cuda")]
     manager: std::sync::OnceLock<Arc<manager::ModelManager>>,
+    /// Directories a control-plane `load` may take an assets dir from. Set
+    /// once at startup; empty means no assets dir may be named by request.
+    models_roots: std::sync::OnceLock<Vec<std::path::PathBuf>>,
     /// Operator-set residency overrides, slug → state. Absent = [`Residency::Auto`].
     /// Only the control plane writes here; the manager and the request path read it.
     residency: RwLock<FxHashMap<String, Residency>>,
@@ -382,6 +386,7 @@ impl AppState {
             vmm_stats: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "cuda")]
             manager: std::sync::OnceLock::new(),
+            models_roots: std::sync::OnceLock::new(),
             residency: RwLock::new(FxHashMap::default()),
             record_trace,
             trace: Mutex::new(Timeline::new()),
@@ -436,6 +441,22 @@ impl AppState {
     #[cfg(feature = "cuda")]
     pub fn manager(&self) -> Option<&Arc<manager::ModelManager>> {
         self.manager.get()
+    }
+
+    /// Install the assets-dir allow-list for control-plane loads (once, at
+    /// startup). Paths are canonicalized here so the prefix test at request
+    /// time compares two real paths.
+    pub fn install_models_roots(&self, roots: impl IntoIterator<Item = std::path::PathBuf>) {
+        let roots: Vec<std::path::PathBuf> = roots
+            .into_iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+        let _ = self.models_roots.set(roots);
+    }
+
+    /// The assets-dir allow-list. Empty until `install_models_roots`.
+    pub fn models_roots(&self) -> &[std::path::PathBuf] {
+        self.models_roots.get().map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Residency state of `slug` (defaults to [`Residency::Auto`]).
@@ -656,6 +677,13 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
+        // Control plane. Privileged: `load` executes the cubins in the dir it
+        // is given and `unload` terminates other clients' generations, and the
+        // server authenticates nobody — so where these are mounted IS the
+        // access control. See `serve::admin`.
+        .route("/v1/models/load", post(admin::load))
+        .route("/v1/models/unload", post(admin::unload))
+        .route("/v1/models/status", get(admin::status))
         // BOTH spellings. vLLM serves `/health`, and every k8s probe and
         // benchmark harness copied from vLLM asks for it; plowrt served only
         // `/healthz`, so all of them got a 404 from a healthy server.

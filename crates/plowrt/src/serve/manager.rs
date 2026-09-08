@@ -378,6 +378,11 @@ impl ModelManager {
         self.models.read().iter().map(|m| m.slug.clone()).collect()
     }
 
+    /// Device free/total bytes, for capacity reporting on the control plane.
+    pub fn device_mem_info(&self) -> Result<(u64, u64)> {
+        self.be.mem_info()
+    }
+
     /// The parsed plan for `slug` (tests / capacity reporting).
     pub fn plan(&self, slug: &str) -> Option<BlobPlan> {
         self.models.read().iter().find(|m| m.slug == slug).map(|m| m.plan)
