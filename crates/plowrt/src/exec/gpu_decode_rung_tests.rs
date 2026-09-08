@@ -500,6 +500,21 @@ fn gpu_decode_rungs_match_widest_full_logits() {
                 eprintln!("candidate={candidate} phase={phase} step={step} slots={slots:?} rung={selected}: full logits exact");
             }
         }
+        if candidate {
+            for slot in 0..batch - 1 {
+                e.retire_slot(slot, true);
+                if let Some(vmm) = &e.vmm {
+                    assert_eq!(e.pos[slot], 0);
+                    assert_eq!(vmm.kv.mapped_rows(slot), 0);
+                }
+            }
+        }
+        let slot = batch - 1;
+        for step in 0..4 {
+            e.step_slots(&[(slot, tokens[slot])], &mut decoded).unwrap();
+            tokens[slot] = decoded[0];
+            compare(&mut e, slot, tokens[slot], format!("retired lower slots step={step}"));
+        }
         eprintln!("candidate={candidate}: {checked} full-logit snapshots");
     }
 }

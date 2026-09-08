@@ -14,7 +14,7 @@ rollback. This is capability-gated selection, not production qualification of ev
 | Failed AMD kernel lookup | Module now owned by the cleanup guard before lookup. |
 | Startup observability | `armed` and `ready` are separate; `fires=false` until a successful device dispatch. |
 | Post-dispatch validation | Invalid token IDs or failed frontier commit are device errors; no ordinary-path retry. |
-| Host verification | CUDA + HSA library suite: 586 passed, 14 ignored, zero failures. |
+| Host verification | CUDA + HSA library suite: 588 passed, 14 ignored, zero failures. |
 | Shared contract and CPU integration | 18 asset-contract tests, 5 C/Rust resolver checks and 4 compact-tail tests passed. |
 | H100 default/fallback smoke | FP8 server starts with `token_batch=true`, explicitly reports CUDA executor unavailable, and generates through ordinary execution. |
 | AMD device correctness/performance | Not tested on this host. |
@@ -304,3 +304,28 @@ The small changes and the 1K/C1 regression do not justify promotion without stro
 and broader layout qualification. The branch retains the tested per-head copy implementation.
 Experimental binaries, source patches and results remain under `prefix-2d*` and
 `plow-fp8-2d*` in the campaign directory for follow-up.
+
+## Reclaiming retired prefix KV
+
+The FP8 batch-16 pressure run exposed OOM after earlier requests had finished. Retirement
+released cache holds but retained each slot's long KV mappings and saved position. Only
+12 of 16 distinct cold 16K requests completed; two decode streams and two prefills failed.
+The CUDA context remained usable, and a subsequent short request completed.
+
+Retirement now publishes the valid output prefix, resets the position, and releases the
+slot's mappings. Existing decode backstops remap idle row zero before launch. Background
+pre-mapping hints carry a slot generation checked under the allocation lock, so an old hint
+cannot recreate a retired or reused window. Allocation retries also preserve successfully
+mapped heads of a partially completed block instead of trying to map them again.
+
+The same FP8 batch-16 workload now completes all 16 cold requests, 16 exact isolated replays,
+and short recovery. All 12 previously successful cold completions remain exact. Retained
+cache ends at 3310 MiB against the 4096 MiB cap. All 12 natural cold/warm completions, all
+15 matched preflight completions and their cache-hit counts are unchanged. API ragged parity,
+limits, slot reuse, prefill/decode disconnects, context rejection and recovery pass.
+
+Host tests: 588 passed, 14 ignored. The full-logit GPU gate now retires lower slots only in
+the candidate while the highest slot continues decoding against a non-retired reference:
+122 FP8 batch-16 and 78 BF16 batch-8 snapshots are bit-exact. BF16 batch-8 API serving and
+pressure qualification remain pending. Raw failure and corrected results are
+`plow-fp8-b16-c1024-*`, `plow-fp8-b16-reclaim-*`, and `prefix-reclaim-qualification.json`.

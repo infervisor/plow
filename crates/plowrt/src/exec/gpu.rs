@@ -5158,7 +5158,10 @@ impl GpuEngine {
         if cache_output {
             self.vmm_tail_publish(b);
         }
-        self.vmm.as_ref().unwrap().kv.release_prefix(b);
+        self.pos[b] = 0;
+        self.vmm_attached[b] = 0;
+        // Decode's backstop maps row zero before any inactive-row write.
+        self.vmm.as_ref().unwrap().kv.begin_seq(b);
         self.seq_tokens[b].clear();
         self.vmm_active[b] = false;
     }

@@ -40,7 +40,7 @@
 //! refcount 0 and boundary snapshots freed with their node. Short-prefix
 //! snapshots use a second-chance policy and stay pinned during restoration.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -659,6 +659,7 @@ struct Shared {
     inner: Mutex<Inner>,
     /// Per-seq mapped-row frontier, readable lock-free on the decode path.
     frontier: Vec<AtomicU32>,
+    generation: Vec<AtomicU64>,
 }
 
 /// The VMM-backed KV pool + prefix cache. One per engine; owns the VA
@@ -667,7 +668,7 @@ struct Shared {
 pub struct VmmKv {
     prefix_reuse: bool,
     shared: Arc<Shared>,
-    premap_tx: Option<std::sync::mpsc::Sender<(u32, u32)>>,
+    premap_tx: Option<std::sync::mpsc::Sender<(u32, u32, u64)>>,
     premap_join: Option<std::thread::JoinHandle<()>>,
     /// Pre-creator thread ([`Self::enable_block_pool`]): stop flag + join.
     precreate: Option<(
@@ -773,24 +774,25 @@ impl VmmKv {
                 stats: VmmStats::default(),
             }),
             frontier: (0..batch).map(|_| AtomicU32::new(0)).collect(),
+            generation: (0..batch).map(|_| AtomicU64::new(0)).collect(),
         });
 
         // Pre-mapper: keeps the NEXT block mapped ahead of decode growth so
         // the 2048-token boundary never stalls a step (plan verdict §4 —
         // ~6.8 ms if synchronous, free when overlapped). `advise` feeds it;
         // `ensure_rows` in the step path is the correctness backstop.
-        let (tx, rx) = std::sync::mpsc::channel::<(u32, u32)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(u32, u32, u64)>();
         let premap_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
             .name("vmm-premap".into())
             .spawn(move || {
-                while let Ok((seq, pos)) = rx.recv() {
+                while let Ok((seq, pos, generation)) = rx.recv() {
                     let s = &premap_shared;
                     let target = ((pos / s.block_rows) + 2)
                         .saturating_mul(s.block_rows)
                         .min(s.geo.max_ctx);
                     if s.frontier[seq as usize].load(Ordering::Acquire) < target {
-                        if let Err(e) = ensure_rows(s, seq as usize, target) {
+                        if let Err(e) = ensure_rows(s, seq as usize, target, Some(generation)) {
                             // Non-fatal here: the synchronous backstop in the
                             // step path surfaces the real error.
                             tracing::warn!(error = %e, seq, target, "vmm pre-map failed");
@@ -905,14 +907,15 @@ impl VmmKv {
     /// `seq` across every full-layer track and head. OOM evicts cache LRU
     /// nodes before failing.
     pub fn ensure_rows(&self, seq: usize, rows: u32) -> Result<()> {
-        ensure_rows(&self.shared, seq, rows)
+        ensure_rows(&self.shared, seq, rows, None)
     }
 
     /// Decode-growth hint: ask the pre-mapper to keep the next block mapped
     /// beyond `pos`. Never blocks; drops silently after shutdown.
     pub fn advise(&self, seq: usize, pos: u32) {
         if let Some(tx) = &self.premap_tx {
-            let _ = tx.send((seq as u32, pos));
+            let generation = self.shared.generation[seq].load(Ordering::Acquire);
+            let _ = tx.send((seq as u32, pos, generation));
         }
     }
 
@@ -922,6 +925,7 @@ impl VmmKv {
     pub fn begin_seq(&self, seq: usize) {
         let s = &self.shared;
         let mut inner = s.inner.lock();
+        s.generation[seq].fetch_add(1, Ordering::Release);
         release_prefix_hold(&mut inner, seq);
         release_window(s, &mut inner, seq);
         trim_cache(s, &mut inner);
@@ -1373,17 +1377,25 @@ fn slot_va(s: &Shared, track: &Track, seq: usize, head: u32, k: u32) -> u64 {
         + k as u64 * s.block_bytes
 }
 
-fn ensure_rows(s: &Shared, seq: usize, rows: u32) -> Result<()> {
+fn ensure_rows(s: &Shared, seq: usize, rows: u32, generation: Option<u64>) -> Result<()> {
     let rows = rows.min(s.geo.max_ctx);
     if s.frontier[seq].load(Ordering::Acquire) >= rows {
         return Ok(());
     }
     let mut inner = s.inner.lock();
+    // A queued hint must not recreate a retired or reused sequence's mappings.
+    if generation.is_some_and(|g| g != s.generation[seq].load(Ordering::Acquire)) {
+        return Ok(());
+    }
     let target = rows.div_ceil(s.block_rows);
     let kvh = s.geo.kvh_full;
     for k in inner.seq_blocks[seq]..target {
         for t in 0..inner.tracks.len() {
             for h in 0..kvh {
+                let slot = slot_index(s, seq, h, k);
+                if inner.tracks[t].slots[slot].is_some() {
+                    continue;
+                }
                 let id = create_block(s, &mut inner)?;
                 let va = slot_va(s, &inner.tracks[t], seq, h, k);
                 let handle = inner.blocks[id as usize].handle;
@@ -1396,8 +1408,6 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32) -> Result<()> {
                     deref_block(s, &mut inner, id);
                     return Err(error);
                 }
-                let slot = slot_index(s, seq, h, k);
-                debug_assert!(inner.tracks[t].slots[slot].is_none());
                 inner.tracks[t].slots[slot] = Some(id);
             }
         }
@@ -2410,6 +2420,43 @@ mod tests {
         // Idempotent below the frontier.
         p.ensure_rows(0, 10).unwrap();
         assert_eq!(ops.creates.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn stale_premap_hint_cannot_recreate_a_released_window() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        p.ensure_rows(0, 20).unwrap();
+        let generation = p.shared.generation[0].load(Ordering::Acquire);
+        p.begin_seq(0);
+        assert_eq!(p.mapped_rows(0), 0);
+        assert_eq!(p.stats().blocks_live, 0);
+        ensure_rows(&p.shared, 0, 32, Some(generation)).unwrap();
+        assert_eq!(p.mapped_rows(0), 0);
+        assert_eq!(p.stats().blocks_live, 0);
+        p.ensure_rows(0, 1).unwrap();
+        ensure_rows(&p.shared, 0, 32, Some(generation)).unwrap();
+        assert_eq!(p.mapped_rows(0), 8);
+        let generation = p.shared.generation[0].load(Ordering::Acquire);
+        ensure_rows(&p.shared, 0, 16, Some(generation)).unwrap();
+        assert_eq!(p.mapped_rows(0), 16);
+    }
+
+    #[test]
+    fn incomplete_mapping_column_can_be_retried_without_remapping_live_heads() {
+        let ops = Arc::new(MockVmm::default());
+        let p = uniform_pool(ops.clone());
+        ops.fail_maps.store(2, Ordering::SeqCst);
+        assert!(p.ensure_rows(0, 1).is_err());
+        assert_eq!(p.mapped_rows(0), 0);
+        assert_eq!(p.stats().blocks_live, 1);
+        p.ensure_rows(0, 1).unwrap();
+        assert_eq!(p.mapped_rows(0), 8);
+        assert_eq!(p.stats().blocks_live, 4);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 4);
+        p.begin_seq(0);
+        assert_eq!(p.stats().blocks_live, 0);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), ops.unmaps.load(Ordering::SeqCst));
     }
 
     #[test]
