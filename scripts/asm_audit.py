@@ -252,6 +252,7 @@ HD_REQUIRED = [128, 256, 512]
 # the extra instantiation outlines K3's hot MLA prefill body out of the interpreter), so an
 # fp8kv object legitimately has none.
 HD_GPTOSS = 64
+MERGE_HD_PREFIX = "plow_flash_merge_hd_"
 ARM_SYM = re.compile(r"^_Z\d+(d_flash_[a-z_0-9]*)I(.+?)Ev")
 ARM_HD = re.compile(r"^Li(\d+)E")
 
@@ -339,6 +340,21 @@ class ObjectFacts:
         self.geom = {k[len(GEOM_PREFIX):]: v for k, v in self.globals.items()
                      if k.startswith(GEOM_PREFIX)}
         self.arms = arms_of(self.table)
+        # `exec_flash_merge` is __forceinline__ and `d_flash_merge<D>` inlines into it, so a
+        # decode object emits no symbol for the family and `arms_of` cannot see it — which
+        # silently turned the head-dim check into its "carries no instantiation" branch and
+        # lost exactly the coverage it exists to assert. `plow_flash_merge_hd_<D>`
+        # (interp.hip) states what the chain compiled and survives any inlining decision.
+        # Applied HERE rather than in the check so `--bless` persists the same facts the
+        # check reads; a check-only fallback blesses a baseline that then disagrees with it.
+        if "d_flash_merge" not in self.arms:
+            marked = sorted(
+                int(k[len(MERGE_HD_PREFIX):])
+                for k, v in self.globals.items()
+                if k.startswith(MERGE_HD_PREFIX) and v == 1
+            )
+            if marked:
+                self.arms["d_flash_merge"] = marked
         # The kernel the object exists for. Its note carries the resource numbers the cliff
         # check prints; the OUTLINED bodies (plow_exec, d_gemm_glu, d_flash_prefill<D>) carry
         # NO note at all, which is why their spill is invisible to `.vgpr_spill_count`.

@@ -1165,6 +1165,21 @@ __device__ __forceinline__ void exec_flash_prefill(CInst in, CTens T, unsigned s
  *
  * `n_batch` is a parameter, not `in->i[0]`, because PLOW_RUNTIME_ROWS is a dispatch-scope macro
  * (it reads `prog_meta`) and is not in scope this high in the file. */
+/* HEAD-DIM COVERAGE MARKERS for the flash merge.
+ *
+ * `exec_flash_merge` is `__forceinline__` and `d_flash_merge<D>` inlines into it, so this
+ * object emits NO `d_flash_merge` symbol and scripts/asm_audit.py's arm check — the one that
+ * catches a missing head-dim arm, on AMD where a missing arm writes nothing rather than
+ * trapping — lost its subject on every decode object when the two hand-copied merge chains
+ * were unified. These say what the chain below actually compiled, the same way the geometry
+ * markers say what a `-D` compiled, and they survive any inlining decision. */
+extern "C" __device__ unsigned plow_flash_merge_hd_128 = 1;
+extern "C" __device__ unsigned plow_flash_merge_hd_256 = 1;
+extern "C" __device__ unsigned plow_flash_merge_hd_512 = 1;
+#if !PLOW_FP8_KV
+extern "C" __device__ unsigned plow_flash_merge_hd_64 = 1;
+#endif
+
 __device__ __forceinline__ void exec_flash_merge(CInst in, CTens T, unsigned n_batch,
                                                  unsigned slice, unsigned nblk) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
