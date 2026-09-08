@@ -257,9 +257,9 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub multistep: u32,
 
-    /// VMM-backed KV prefix cache. Warm TTFT 3.6×(4k)→23.8×(128k).
-    #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
-    pub vmm_prefix: bool,
+    /// VMM prefix reuse. Automatically enabled for eligible Hopper hybrid BF16-KV packets.
+    #[arg(long = "vmm-prefix", env = "PLOW_VMM_PREFIX", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub vmm_prefix: Option<bool>,
 
     /// Grow packet-described full KV backing with the live frontier, without prefix reuse.
     #[arg(long = "vmm-live", env = "PLOW_VMM_LIVE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
@@ -282,7 +282,7 @@ pub struct NvidiaRuntimeConfig {
     #[arg(
         long = "vmm-cache-mib",
         env = "PLOW_VMM_CACHE_MIB",
-        default_value_t = 0,
+        default_value_t = 4096,
         global = true
     )]
     pub vmm_cache_mib: u32,
@@ -876,9 +876,14 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn nv_live_kv_enabled(&self, packed_prefill: bool, full_cache: bool) -> bool {
+    pub(crate) fn nv_live_kv_enabled(
+        &self,
+        packed_prefill: bool,
+        full_cache: bool,
+        prefix: bool,
+    ) -> bool {
         self.nv_vmm_live()
-            || (packed_prefill && full_cache && !self.nv_vmm_prefix() && !self.nv.prefix_cache)
+            || (packed_prefill && full_cache && !prefix && !self.nv.prefix_cache)
     }
 
     #[cfg(feature = "cuda")]
@@ -891,12 +896,12 @@ impl RuntimeConfig {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn nv_vmm_prefix(&self) -> bool {
-        select_compat(
-            self.nv.vmm_prefix,
-            Self::env_bool("PLOW_VMM_PREFIX"),
-            !Self::is_initialized(),
-        )
+    pub(crate) fn nv_vmm_prefix(&self) -> Option<bool> {
+        if Self::is_initialized() {
+            self.nv.vmm_prefix
+        } else {
+            Self::env_bool("PLOW_VMM_PREFIX").or(self.nv.vmm_prefix)
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -1079,6 +1084,34 @@ mod tests {
     }
 
     #[test]
+    fn prefix_cache_defaults_to_auto_with_a_bounded_budget_and_explicit_overrides() {
+        use clap::{Args, FromArgMatches};
+        let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
+        let prefix = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "vmm_prefix")
+            .unwrap();
+        assert!(prefix.get_default_values().is_empty());
+        let budget = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "vmm_cache_mib")
+            .unwrap();
+        assert_eq!(budget.get_default_values(), ["4096"]);
+        for (flag, expected) in [("--vmm-prefix", true), ("--vmm-prefix=false", false)] {
+            let matches = command
+                .clone()
+                .try_get_matches_from(["test", flag])
+                .unwrap();
+            assert_eq!(
+                super::NvidiaRuntimeConfig::from_arg_matches(&matches)
+                    .unwrap()
+                    .vmm_prefix,
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn live_kv_defaults_off_and_can_be_enabled_without_prefix_reuse() {
         use clap::{Args, FromArgMatches};
         let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
@@ -1097,7 +1130,8 @@ mod tests {
             .unwrap();
         let config = super::NvidiaRuntimeConfig::from_arg_matches(&matches).unwrap();
         assert!(config.vmm_live);
-        assert!(!config.vmm_prefix && !config.prefix_cache);
+        assert_eq!(config.vmm_prefix, Some(false));
+        assert!(!config.prefix_cache);
         assert!(!config.vmm_live_rings);
         let command = super::NvidiaRuntimeConfig::augment_args(clap::Command::new("test"));
         let arg = command

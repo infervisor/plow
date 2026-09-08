@@ -238,6 +238,17 @@ impl ServeEngine {
         }
     }
 
+    pub fn prefix_cache_enabled(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.vmm_prefix_enabled(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.prefix_cache_enabled(),
+            #[cfg(feature = "cpu")]
+            ServeEngine::Cpu(_) => false,
+        }
+    }
+
     /// The checkpoint's stop-token set.
     pub fn stop_ids(&self) -> &Arc<Vec<u32>> {
         match self {
@@ -953,6 +964,10 @@ mod amd_serve {
 
         pub fn overlap_capability(&self) -> AmdOverlapCapability {
             derive_overlap_capability(&self.overlap_evidence())
+        }
+
+        pub(super) fn prefix_cache_enabled(&self) -> bool {
+            self.prefix_cache
         }
 
         /// Sequence slots one decode dispatch advances. The mux sizes its slot

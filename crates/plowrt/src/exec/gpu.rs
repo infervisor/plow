@@ -2589,7 +2589,24 @@ impl GpuEngine {
                 .map_err(RuntimeError::Rejected)?;
         }
         let config = RuntimeConfig::get();
-        let packed_prefill = if config.nv_vmm_prefix() || config.nv.prefix_cache {
+        let prefix_layout = crate::memory::vmm::VmmOps::granularity(be.as_ref())
+            .ok()
+            .and_then(|granularity| {
+                Self::select_vmm_prefix_layout(
+                    &blob,
+                    checkpoint_dir,
+                    config,
+                    be.compute_capability(),
+                    granularity,
+                )
+            });
+        let prefix_requested = config.nv_vmm_prefix() == Some(true) || prefix_layout.is_some();
+        tracing::info!(
+            requested = ?config.nv_vmm_prefix(),
+            selected = prefix_layout.is_some(),
+            "VMM prefix cache selection"
+        );
+        let packed_prefill = if prefix_requested || config.nv.prefix_cache {
             if packed_prefill_metadata.is_some() {
                 tracing::info!("packed prefill disabled because prefix reuse is active");
             }
@@ -2669,7 +2686,7 @@ impl GpuEngine {
         let mut select_decode_rungs = single_bound_decode || validate_decode_ladder(&blob)?;
         if recurrent.is_some() {
             let config = RuntimeConfig::get();
-            if config.nv_vmm_prefix() || config.nv.prefix_cache {
+            if prefix_requested || config.nv.prefix_cache {
                 return Err(RuntimeError::Rejected(
                     "recurrent state does not support prefix caching".into(),
                 ));
@@ -2864,7 +2881,7 @@ impl GpuEngine {
             );
         }
 
-        // ---- VMM prefix sharing (PLOW_VMM_PREFIX=1; default off) ----
+        // ---- VMM allocation and prefix sharing ----
         let vmm = {
             let run = || {
                 let config = RuntimeConfig::get();
@@ -2873,6 +2890,7 @@ impl GpuEngine {
                     live_kv_manifest.as_ref().is_some_and(|manifest| {
                         manifest.caches.iter().any(|cache| cache.window == 0)
                     }),
+                    prefix_requested,
                 );
                 if live && !config.nv_vmm_live() {
                     tracing::info!("live KV allocation enabled by packet metadata");
@@ -2884,14 +2902,14 @@ impl GpuEngine {
                     ));
                 }
                 if live {
-                    if config.nv_vmm_prefix() || config.nv.prefix_cache {
+                    if prefix_requested || config.nv.prefix_cache {
                         return Err(RuntimeError::Rejected(
                             "live KV allocation requires prefix caching off".into(),
                         ));
                     }
                     Self::vmm_live_bringup(&be, &blob, rings, live_kv_manifest.as_ref()).map(Some)
                 } else {
-                    Ok(Self::vmm_bringup(&be, &blob, checkpoint_dir))
+                    Ok(Self::vmm_bringup(&be, &blob, prefix_layout))
                 }
             };
             if let Some(tm) = load_tim.as_mut() {
@@ -4442,8 +4460,56 @@ impl GpuEngine {
         })
     }
 
-    fn vmm_prefix_enabled(&self) -> bool {
+    pub(crate) fn vmm_prefix_enabled(&self) -> bool {
         self.vmm.as_ref().is_some_and(|v| v.kv.prefix_reuse())
+    }
+
+    pub(crate) fn select_vmm_prefix_layout(
+        blob: &DevBlob,
+        checkpoint_dir: &Path,
+        config: &RuntimeConfig,
+        capability: (u32, u32),
+        granularity: u64,
+    ) -> Option<VmmPrefixLayout> {
+        let requested = config.nv_vmm_prefix();
+        if requested == Some(false)
+            || (requested.is_none()
+                && (capability != (9, 0)
+                    || config.nv.pf_batch
+                    || config.nv_vmm_live()
+                    || config.nv_vmm_live_rings()
+                    || config.nv.prefix_cache
+                    || blob.tp.is_some()
+                    || blob.sections.iter().any(|section| {
+                        matches!(
+                            section.name.as_str(),
+                            plow_asset::mixed_step::SECTION
+                                | plow_asset::decode_objects::SECTION
+                                | plow_asset::decode_context::SECTION
+                        )
+                    })))
+        {
+            return None;
+        }
+        let layout = Self::vmm_prefix_layout(blob, checkpoint_dir)?;
+        if requested.is_none()
+            && (layout.geo.elem != 2
+                || layout.geo.elem_slide != 2
+                || layout.geo.hd_full != 512
+                || layout.geo.hd_slide != 256
+                || layout.geo.window != 1024
+                || layout.slide.is_empty()
+                || recurrent_state_layout(&blob.tensors, layout.geo.batch as usize)
+                    .ok()?
+                    .is_some())
+        {
+            return None;
+        }
+        layout
+            .geo
+            .block_bytes(granularity, u64::from(config.nv_vmm_block_mib()) << 20)
+            .ok()?;
+        Some(layout)
     }
 
     pub(crate) fn vmm_prefix_layout(
@@ -4581,19 +4647,11 @@ impl GpuEngine {
         })
     }
 
-    /// Bring up VMM prefix sharing when `--vmm-prefix` / `PLOW_VMM_PREFIX=1`
-    /// and the model's KV geometry (from the checkpoint's `config.json`)
-    /// validates against the blob's declared tensor sizes. Any mismatch logs
-    /// and falls back to the cudaMalloc path — never fails the load.
     fn vmm_bringup(
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
-        checkpoint_dir: &Path,
+        layout: Option<VmmPrefixLayout>,
     ) -> Option<VmmServe> {
-        let on = crate::config::RuntimeConfig::get().nv_vmm_prefix();
-        if !on {
-            return None;
-        }
         let VmmPrefixLayout {
             geo,
             slide,
@@ -4601,7 +4659,7 @@ impl GpuEngine {
             full_scale,
             ring,
             snap_row_bytes,
-        } = Self::vmm_prefix_layout(blob, checkpoint_dir)?;
+        } = layout?;
 
         // Default sharing block = the driver granularity (2 MiB measured):
         // the finest match unit VMM can map, e.g. 4096 tokens at hd256 bf16 —
@@ -7880,7 +7938,7 @@ mod prefill_patch_tests {
         assert_eq!(std::env::var("TEST_PACKED_PREFILL_GPU").as_deref(), Ok("1"));
         let config = crate::config::RuntimeConfig::get();
         assert!(!config.nv.pf_batch);
-        assert!(!config.nv_vmm_prefix());
+        assert_ne!(config.nv_vmm_prefix(), Some(true));
         let assets = std::path::PathBuf::from(std::env::var("TEST_PACKED_PREFILL_ASSETS").unwrap());
         let bytes = std::fs::read(assets.join("model.pkt")).unwrap();
         let blob = DevBlob::parse(&bytes).unwrap();
@@ -8246,6 +8304,124 @@ mod profile_tests {
         assert_eq!(selected.image, ordinary);
         assert_eq!(selected.source, "ordinary.cubin");
         assert!(rejected[0].contains("mixed-step auxiliary object"));
+    }
+}
+
+#[cfg(test)]
+mod prefix_selection_tests {
+    use super::*;
+    use crate::asset::devblob::{DevProg, DevSection, DevTensor};
+
+    #[test]
+    fn automatic_prefix_selection_requires_compatible_execution_and_valid_kv_layout() {
+        let dir =
+            std::env::temp_dir().join(format!("plow-prefix-selection-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "layer_types": ["sliding_attention", "full_attention"],
+                "num_key_value_heads": 2, "num_global_key_value_heads": 1,
+                "head_dim": 256, "global_head_dim": 512, "sliding_window": 1024,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let tensor = |name: &str, bytes| DevTensor {
+            name: name.into(),
+            bytes,
+            init: None,
+        };
+        let mut blob = DevBlob {
+            n_cu: 132,
+            flags: 0,
+            target: 0,
+            tensors: vec![
+                tensor("in.pos", 4096 * 4),
+                tensor("kv.0.k", 2 << 20),
+                tensor("kv.0.v", 2 << 20),
+                tensor("kv.1.k", 4 << 20),
+                tensor("kv.1.v", 4 << 20),
+            ],
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            sections: Vec::new(),
+            gen: Vec::new(),
+            tp: None,
+            progs: vec![DevProg {
+                t: 1,
+                packed_prefill_only: false,
+                n_counter: 0,
+                insts: Vec::new(),
+                stream: Vec::new(),
+                stream_ofs: Vec::new(),
+                stream_len: Vec::new(),
+                waits: Vec::new(),
+                succs: Vec::new(),
+                gq_stream: Vec::new(),
+                gq_seg_ofs: vec![0, 0],
+                l2_domains: 0,
+            }],
+        };
+        let mut cfg = RuntimeConfig::get().clone();
+        cfg.nv.vmm_prefix = None;
+        cfg.nv.vmm_live = false;
+        cfg.nv.vmm_live_rings = false;
+        cfg.nv.prefix_cache = false;
+        cfg.nv.pf_batch = false;
+        let selected = |blob: &DevBlob, cfg: &RuntimeConfig, cc, gran| {
+            GpuEngine::select_vmm_prefix_layout(blob, &dir, cfg, cc, gran).is_some()
+        };
+        assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
+        assert!(!selected(&blob, &cfg, (12, 0), 2 << 20));
+        assert!(!selected(&blob, &cfg, (9, 0), 16 << 20));
+        cfg.nv.pf_batch = true;
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        cfg.nv.pf_batch = false;
+        cfg.nv.vmm_live = true;
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        assert!(cfg.nv_live_kv_enabled(true, true, false));
+        cfg.nv.vmm_live = false;
+        cfg.nv.vmm_prefix = Some(false);
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        cfg.nv.vmm_prefix = Some(true);
+        assert!(selected(&blob, &cfg, (12, 0), 2 << 20));
+        cfg.nv.vmm_prefix = None;
+        for name in [
+            plow_asset::mixed_step::SECTION,
+            plow_asset::decode_objects::SECTION,
+            plow_asset::decode_context::SECTION,
+        ] {
+            blob.sections.push(DevSection {
+                kind: packet::devbuild::SECT_METADATA,
+                name: name.into(),
+                offset: 0,
+                size: 0,
+            });
+            assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+            blob.sections.pop();
+        }
+        blob.tensors.push(tensor("state.qwen.0.gdn", 64));
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        blob.tensors.pop();
+        blob.tensors[3].bytes /= 2;
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        blob.tensors[4].bytes /= 2;
+        blob.tensors.push(tensor("kv.1.k_scale", 4096 * 4));
+        blob.tensors.push(tensor("kv.1.v_scale", 4096 * 4));
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        cfg.nv.vmm_prefix = Some(true);
+        assert!(selected(&blob, &cfg, (9, 0), 2 << 20));
+        let mut geometry: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        geometry["num_key_value_heads"] = 0.into();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&geometry).unwrap(),
+        )
+        .unwrap();
+        assert!(!selected(&blob, &cfg, (9, 0), 2 << 20));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

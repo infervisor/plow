@@ -14,7 +14,7 @@ rollback. This is capability-gated selection, not production qualification of ev
 | Failed AMD kernel lookup | Module now owned by the cleanup guard before lookup. |
 | Startup observability | `armed` and `ready` are separate; `fires=false` until a successful device dispatch. |
 | Post-dispatch validation | Invalid token IDs or failed frontier commit are device errors; no ordinary-path retry. |
-| Host verification | CUDA + HSA library suite: 584 passed, 14 ignored, zero failures. |
+| Host verification | CUDA + HSA library suite: 586 passed, 14 ignored, zero failures. |
 | Shared contract and CPU integration | 18 asset-contract tests, 5 C/Rust resolver checks and 4 compact-tail tests passed. |
 | H100 default/fallback smoke | FP8 server starts with `token_batch=true`, explicitly reports CUDA executor unavailable, and generates through ordinary execution. |
 | AMD device correctness/performance | Not tested on this host. |
@@ -83,8 +83,8 @@ The same FP8 server passes isolated-versus-concurrent ragged request parity, exa
 limits, slot reuse, disconnects during prefill and decode, context rejection, and recovery.
 Retained cache remains under the cap after these checks.
 The 1K concurrency-1 TTFT still exceeds the earlier vLLM BF16 screen's 33.1 ms.
-The full concurrency matrix and production qualification remain pending. Prefix caching
-remains opt-in.
+At this stage, the full concurrency matrix and production qualification were pending,
+and prefix caching remained opt-in. Later qualification is recorded below.
 
 BF16 startup initially failed because the planner counted all 10 GiB of virtual full-KV
 as resident. Planning now uses the same validated prefix layout as runtime bringup and
@@ -139,8 +139,8 @@ The new FP8 runtime also passes ragged request parity, output limits, slot reuse
 prefill/decode disconnects, context rejection and recovery. Raw results and executable
 hashes are in `plow-fp8-cache-rung-*` and `plow-fp8-cache-rung-provenance.json`.
 Default multi-step decoding delivers text in bursts of four chunks; chunk-gap tails and
-cached TTFT remain performance targets. No full-matrix win or production-ready default
-prefix selection is established.
+cached TTFT remain performance targets. These measurements alone establish neither a
+full-matrix win nor production readiness.
 
 Prefill profiling attributes most warm TTFT to the GEMM-class segments: 282.5 ms at
 1K and 1680.6 ms at 16K. The ordinary Hopper W8A8 segmented GEMM object capped registers
@@ -237,3 +237,37 @@ Latest host and FP8 device checks: `/tmp/plow-cache-rung-library-tests.log` (584
 14 ignored) and `/tmp/plow-fp8-rung-gpu.log`. Queue artifacts: `plow-bf16-cache-rung-*`.
 CPU integration log: `/tmp/plow-token-batch-cpu-integration-tests.log`.
 The compact-tail fixture needed the new optional worker-pinning argument before it could run.
+
+## Automatic prefix-cache qualification
+
+Prefix reuse now defaults on for validated Hopper (CC9.0) hybrid BF16-KV packets with
+HD256 sliding attention, HD512 full attention and window1024. Both Gemma BF16 and FP8
+weights qualify. The default retained-cache budget is4096MiB, including boundary snapshots;
+it is a soft cap while entries are pinned. Explicit `--vmm-prefix=false` disables reuse,
+while explicit true retains the broader supported-layout policy. Automatic selection
+excludes TP, recurrent state, mixed/prepared decode, and explicit packed-prefill/live-KV
+modes. Packed-prefill metadata alone yields to prefix reuse; `--pf-batch=true` retains the
+packed route. Combined CUDA packed-prefill/prefix execution remains outstanding.
+
+The planner and runtime use the same eligibility decision. Cold-prefill benchmarking checks
+the actual loaded cache state. Host coverage includes selection, geometry rejection and
+explicit overrides:586CUDA/HSA library tests pass,14ignored;9CPUintegration tests pass.
+
+The frozen `bin/plowrt-prefix-auto` starts both batch-4 models without cache flags and logs
+`requested=None selected=true`. Each precision passes six natural cold/warm pairs at1K/4K/16K:
+all12completions match the preceding cold baseline, including exact warm/cold agreement.
+Four distinct16K cold prompts then complete concurrently, reproduce exactly on isolated
+replay, and are followed by successful short-request recovery. Output counts and finish
+reasons are checked. FP8 also preserves all9pressure completions from the explicit-cache
+baseline. Retained cache after pressure is3310MiB FP8 and2510MiB BF16, below4096MiB.
+BF16 GPU memory was observed at78880MiB during pressure. Both precisions pass API ragged
+parity, exact output limits, slot reuse, disconnects during prefill/decode, context rejection
+and recovery. An explicit-false FP8 restart generates identical repeated completions with
+zero cached tokens. These are correctness checks; CPU builds overlapped and their timings
+are not performance evidence.
+
+Raw results are `plow-{bf16,fp8}-auto-*`, `plow-fp8-auto-off-*`, and
+`prefix-auto-qualification.json` under the campaign directory. This qualifies the tested
+H100 batch-4 configuration and default policy; it does not qualify larger batch assets,
+other GPU families, or the missing CUDA token-batch executor. The matched performance grid
+above still loses throughput to vLLM in every cell.

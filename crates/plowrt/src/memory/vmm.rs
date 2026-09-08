@@ -177,7 +177,13 @@ impl VmmGeometry {
             true => u("sliding_window").unwrap_or(0),
             false => u("sliding_window")?,
         };
-        if full_layers.is_empty() || kvh_full == 0 || hd_full == 0 {
+        if full_layers.is_empty()
+            || kvh_full == 0
+            || hd_full == 0
+            || batch == 0
+            || max_ctx == 0
+            || (!slide_layers.is_empty() && (kvh_slide == 0 || hd_slide == 0 || window == 0))
+        {
             return None;
         }
         Some(VmmGeometry {
