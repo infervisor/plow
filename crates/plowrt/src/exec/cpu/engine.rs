@@ -1120,7 +1120,7 @@ fn dense_row_decode(p: &DevProg) -> bool {
 /// placed programs that disagree. The domain is a RELATIVE hint about which slices share producers
 /// — never a node id — so the mapping onto real NUMA nodes happens here, at load, where the host
 /// topology is known. That is what keeps one blob portable across hosts with different node counts.
-fn cu_domains(progs: &[DevProg], n_cu: u32) -> Option<(Vec<u32>, u32)> {
+pub fn cu_domains(progs: &[DevProg], n_cu: u32) -> Option<(Vec<u32>, u32)> {
     let mut dom = vec![u32::MAX; n_cu as usize];
     let mut domains = 0u32;
     for p in progs.iter().filter(|p| p.l2_domains != 0) {
@@ -1159,39 +1159,64 @@ fn cu_domains(progs: &[DevProg], n_cu: u32) -> Option<(Vec<u32>, u32)> {
     Some((dom, domains))
 }
 
-/// Stream entries each cu runs, summed over the programs — the work unit the static walk executes.
-fn cu_work(progs: &[DevProg], n_cu: u32) -> Vec<u64> {
-    let mut w = vec![0u64; n_cu as usize];
-    for p in progs {
-        for (cu, slot) in w.iter_mut().enumerate() {
-            *slot += *p.stream_len.get(cu).unwrap_or(&0) as u64;
-        }
+/// Stream entries each cu runs, ONE VECTOR PER PROGRAM — the work unit the static walk executes.
+///
+/// Kept per program rather than summed because programs are ALTERNATIVES: a prefill bucket or the
+/// decode program is chosen per dispatch, and their loads never overlap. Summing them lets a plan
+/// that ruins one program hide behind another that leans the other way — two programs at 200/2 and
+/// 2/200 across a pair of nodes total 202/202 and look perfectly balanced, while each one on its
+/// own is a 100x spread.
+pub fn cu_work(progs: &[DevProg], n_cu: u32) -> Vec<Vec<u64>> {
+    progs
+        .iter()
+        .map(|p| {
+            (0..n_cu as usize)
+                .map(|cu| *p.stream_len.get(cu).unwrap_or(&0) as u64)
+                .collect()
+        })
+        .collect()
+}
+
+/// Busiest node under `plan` and under the `cu % nodes` round-robin, for one program's work.
+fn peak_loads(plan: &[u32], work: &[u64], nodes: usize) -> (u64, u64) {
+    let (mut placed, mut rr) = (vec![0u64; nodes], vec![0u64; nodes]);
+    for (cu, &w) in work.iter().enumerate().take(plan.len()) {
+        placed[plan[cu] as usize % nodes] += w;
+        rr[cu % nodes] += w;
     }
-    w
+    (
+        placed.into_iter().max().unwrap_or(0),
+        rr.into_iter().max().unwrap_or(0),
+    )
 }
 
 /// Node position for every cu, from the packet's locality domains.
 ///
 /// Requires the domains to divide over the nodes AND the resulting split to leave no node busier
-/// than the round-robin would. That second test is the one that matters, and it is measured, not
-/// assumed: a domain is a GPU L2 partition, and nothing makes its slices equal in COST. The blocked
-/// map (`cu / sms_per_partition`) is the worst case — low-numbered cus carry every op that is
-/// sliced narrowly, so grouping them puts a third of the packet on one node. On a real H100-mapped
-/// Gemma-4 blob that is a 3.0-4.1x work spread across nodes against round-robin's 1.04-1.12x, and
-/// it measured 1.5x slower end to end. The makespan is set by the busiest node, so comparing peaks
-/// is the right test; `None` falls back to the round-robin.
-fn node_plan(cu_dom: &[u32], domains: u32, nodes: usize, work: &[u64]) -> Option<Vec<u32>> {
+/// than the round-robin would, in EVERY program. That second test is the one that matters, and it
+/// is measured, not assumed: a domain is a GPU L2 partition, and nothing makes its slices equal in
+/// COST. The blocked map (`cu / sms_per_partition`) is the worst case — low-numbered cus carry every
+/// op that is sliced narrowly, so grouping them puts a third of the packet on one node. On a real
+/// H100-mapped Gemma-4 blob that is a 3.0-4.1x work spread across nodes against round-robin's
+/// 1.04-1.12x, and it measured 1.5x slower end to end. The makespan is set by the busiest node, so
+/// comparing peaks is the right test; `None` falls back to the round-robin.
+pub fn node_plan(
+    cu_dom: &[u32],
+    domains: u32,
+    nodes: usize,
+    work: &[Vec<u64>],
+) -> Option<Vec<u32>> {
     if nodes < 2 || (domains as usize) < nodes || !(domains as usize).is_multiple_of(nodes) {
         return None;
     }
     let per = domains as usize / nodes;
     let plan: Vec<u32> = cu_dom.iter().map(|&d| (d as usize / per) as u32).collect();
-    let (mut placed, mut rr) = (vec![0u64; nodes], vec![0u64; nodes]);
-    for (cu, &w) in work.iter().enumerate().take(plan.len()) {
-        placed[plan[cu] as usize] += w;
-        rr[cu % nodes] += w;
-    }
-    (placed.iter().max() <= rr.iter().max()).then_some(plan)
+    work.iter()
+        .all(|w| {
+            let (placed, rr) = peak_loads(&plan, w, nodes);
+            placed <= rr
+        })
+        .then_some(plan)
 }
 
 #[cfg(test)]
@@ -1266,7 +1291,7 @@ mod placement_tests {
     #[test]
     fn node_plan_groups_domains_onto_nodes() {
         let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
-        let flat = vec![1u64; 64];
+        let flat = vec![vec![1u64; 64]];
         let plan = node_plan(&dom, domains, 2, &flat).expect("8 domains divide over 2 nodes");
         for cu in 0..64u32 {
             assert_eq!(plan[cu as usize], dom[cu as usize] / 4);
@@ -1283,7 +1308,7 @@ mod placement_tests {
     #[test]
     fn an_amd_map_matching_the_node_count_reproduces_the_round_robin() {
         let (dom, domains) = cu_domains(&[prog(304, 8, |cu| cu % 8)], 304).unwrap();
-        let flat = vec![1u64; 304];
+        let flat = vec![vec![1u64; 304]];
         let same = node_plan(&dom, domains, 8, &flat).unwrap();
         assert!(
             (0..304).all(|cu| same[cu] == cu as u32 % 8),
@@ -1301,7 +1326,7 @@ mod placement_tests {
     #[test]
     fn node_plan_declines_when_it_cannot_stay_balanced() {
         let (dom, domains) = cu_domains(&[prog(64, 8, |cu| cu % 8)], 64).unwrap();
-        let flat = vec![1u64; 64];
+        let flat = vec![vec![1u64; 64]];
         assert!(
             node_plan(&dom, domains, 3, &flat).is_none(),
             "8 domains, 3 nodes"
@@ -1325,18 +1350,61 @@ mod placement_tests {
     fn node_plan_declines_a_plan_that_makes_the_busiest_node_worse() {
         // 132 cus, blocked over 8 domains of 18: domain 7 gets 6 cus, and low cus carry more work.
         let (dom, domains) = cu_domains(&[prog(132, 8, |cu| (cu / 18).min(7))], 132).unwrap();
-        let skewed: Vec<u64> = (0..132).map(|cu| 132 - cu as u64).collect();
+        let skewed = vec![(0..132).map(|cu| 132 - cu as u64).collect::<Vec<u64>>()];
         assert!(
             node_plan(&dom, domains, 8, &skewed).is_none(),
             "declines the skew"
         );
         // The same domains with flat per-cu cost still balance, so the guard is not blanket-off.
-        let flat = vec![1u64; 132];
+        let flat = vec![vec![1u64; 132]];
         let n = node_plan(&dom, domains, 8, &flat);
         assert!(
             n.is_none(),
             "18/18/../6 cus per node is already worse than round-robin"
         );
+    }
+
+    /// Programs are ALTERNATIVES, so the balance test has to hold for each separately. Two that
+    /// lean opposite ways sum to a perfectly balanced total while each on its own is ruinous —
+    /// summing first would approve exactly the placement the guard exists to reject.
+    #[test]
+    fn a_program_cannot_hide_its_imbalance_behind_another() {
+        // 4 cus, 2 domains, 2 nodes: cus 0,1 -> node 0 and cus 2,3 -> node 1 under the plan,
+        // against round-robin's 0,2 -> node 0 and 1,3 -> node 1.
+        let (dom, domains) = cu_domains(&[prog(4, 2, |cu| cu / 2)], 4).unwrap();
+        let a = vec![100u64, 100, 1, 1]; // plan 200/2, round-robin 101/101
+        let b = vec![1u64, 1, 100, 100]; // plan 2/200, round-robin 101/101
+        for one in [&a, &b] {
+            assert!(
+                node_plan(&dom, domains, 2, std::slice::from_ref(one)).is_none(),
+                "each program alone is a 200-vs-2 split and must be declined"
+            );
+        }
+        assert!(
+            node_plan(&dom, domains, 2, &[a.clone(), b.clone()]).is_none(),
+            "and together too: their sum balances, but neither program ever runs as the sum"
+        );
+        // The hole this closes, made explicit: summing first yields a flat 101 per cu, which the
+        // peak test then waves through. That was the earlier `cu_work`, and it is why the work is
+        // now carried one row per program.
+        let summed: Vec<u64> = (0..4).map(|i| a[i] + b[i]).collect();
+        assert!(summed.iter().all(|&x| x == 101));
+        assert!(
+            node_plan(&dom, domains, 2, &[summed]).is_some(),
+            "the summed view approves the very placement each program rejects"
+        );
+        // Sanity that this shape is otherwise acceptable, so the rejection is the imbalance.
+        let flat = vec![vec![1u64; 4]];
+        assert!(node_plan(&dom, domains, 2, &flat).is_some());
+    }
+
+    /// `cu_work` keeps one row per program rather than collapsing them.
+    #[test]
+    fn cu_work_is_per_program() {
+        let progs = vec![prog(4, 2, |cu| cu / 2), prog(4, 2, |cu| cu / 2)];
+        let w = cu_work(&progs, 4);
+        assert_eq!(w.len(), 2, "one row per program, not one summed row");
+        assert!(w.iter().all(|r| r.len() == 4 && r.iter().all(|&x| x == 2)));
     }
 }
 

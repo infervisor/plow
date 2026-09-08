@@ -99,7 +99,11 @@ Gemma-4-31B that is a 3.0-4.1x work spread across nodes against round-robin's
 The mechanism is kept, tested, and A/B-able because it costs nothing when off and
 a host with balanced domains has not been measured. When it is on, `node_plan`
 still declines any plan that would leave a node busier than the round-robin
-would, which is what rejects the case above; it also declines when the blob
+would in ANY ONE PROGRAM, which is what rejects the case above. The per-program
+test is the load-bearing part: programs are alternatives — a prefill bucket or
+the decode program per dispatch — so a plan has to be safe for each separately,
+and testing their summed work instead would let one program's ruin hide behind
+another that leans the other way. It also declines when the blob
 carries no domains, when the legacy layout encoded the domain in `seg`, on a
 single node or domain, when placed programs disagree, and when the domains do not
 divide evenly over the nodes. Under the AMD round-robin map the plan reduces to

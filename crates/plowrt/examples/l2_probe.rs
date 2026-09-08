@@ -1,15 +1,22 @@
-//! What locality a devblob carries, and how it lands on this host's NUMA nodes.
+//! What locality a devblob carries, and what the runtime actually does with it.
 //!
 //! `cargo run --example l2_probe -- model.pkt [nodes]`
 //!
-//! Reports each program's declared L2 domain count and the cu -> domain map recovered from the
-//! per-entry domain bits, then the node split `exec::cpu::engine::node_plan` would choose. Use it
-//! to tell a placed blob from an unplaced one before attributing a measurement to placement.
+//! Reports each program's declared L2 domain count, the cu -> domain map recovered from the
+//! per-entry domain bits, the candidate node split, and then the decision the runtime reaches on
+//! it. Candidate and accepted are separate lines on purpose: a mapping can divide cleanly over the
+//! nodes and still be refused for leaving a node busier than `cu % nodes` would, which is the
+//! common outcome. Use it to tell a placed blob from an unplaced one, and an accepted plan from a
+//! merely well-formed one, before attributing a measurement to placement.
+//!
+//! Domain recovery and the decision come from `exec::cpu::engine` itself rather than a copy here,
+//! so this can never drift from what the engine does.
 
 use std::collections::BTreeMap;
 
 use packet::dev::{SE_DOMAIN_MASK, SE_DOMAIN_SHIFT};
 use plowrt::asset::devblob::DevBlob;
+use plowrt::exec::cpu::engine::{cu_domains, cu_work, node_plan};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -17,14 +24,9 @@ fn main() {
     let nodes: usize = args.next().map_or(8, |a| a.parse().expect("nodes"));
     let buf = std::fs::read(&path).expect("read blob");
     let blob = DevBlob::parse_l2(&buf, true).expect("parse blob");
-    println!(
-        "n_cu={} progs={} nodes={nodes}",
-        blob.n_cu,
-        blob.progs.len()
-    );
+    let n_cu = blob.n_cu;
+    println!("n_cu={n_cu} progs={} nodes={nodes}", blob.progs.len());
 
-    let mut cu_dom: Vec<u32> = vec![u32::MAX; blob.n_cu as usize];
-    let mut domains = 0u32;
     for (pi, p) in blob.progs.iter().enumerate() {
         let mut seen: BTreeMap<u32, usize> = BTreeMap::new();
         for e in &p.stream {
@@ -40,66 +42,58 @@ fn main() {
             p.gq_seg_ofs.len().saturating_sub(1),
             seen.keys().collect::<Vec<_>>()
         );
-        if p.l2_domains == 0 {
-            continue;
-        }
-        domains = p.l2_domains;
-        for (cu, slot) in cu_dom.iter_mut().enumerate() {
-            let start = p.stream_ofs[cu] as usize;
-            for e in &p.stream[start..start + p.stream_len[cu] as usize] {
-                let d = ((e.flags & SE_DOMAIN_MASK) >> SE_DOMAIN_SHIFT) as u32;
-                if *slot != u32::MAX && *slot != d {
-                    println!("  !! cu {cu} carries domains {slot} and {d}");
-                }
-                *slot = d;
-            }
-        }
-    }
-    if domains == 0 {
-        println!("UNPLACED: no program declares L2 domains; placement stays cu % nodes");
-        return;
     }
 
+    let Some((cu_dom, domains)) = cu_domains(&blob.progs, n_cu) else {
+        println!("\nUNPLACED: no usable domain map; placement stays cu % nodes");
+        return;
+    };
     let mut per_domain = vec![0usize; domains as usize];
-    for &d in cu_dom.iter().filter(|&&d| d != u32::MAX) {
+    for &d in &cu_dom {
         per_domain[d as usize] += 1;
     }
-    println!("cus per domain: {per_domain:?}");
-    let head: Vec<u32> = cu_dom.iter().take(16).copied().collect();
-    println!("cu -> domain (first 16): {head:?}");
+    println!("\ncus per domain: {per_domain:?}");
+    println!(
+        "cu -> domain (first 16): {:?}",
+        cu_dom.iter().take(16).collect::<Vec<_>>()
+    );
 
     if !(domains as usize >= nodes && (domains as usize).is_multiple_of(nodes)) {
-        println!("PLACED but {domains} domains do not divide over {nodes} nodes: falls back to cu % nodes");
+        println!("CANDIDATE: none — {domains} domains do not divide over {nodes} nodes");
+        println!("ACCEPTED:  no, placement stays cu % nodes");
         return;
     }
     let per = domains as usize / nodes;
     let mut cus_per_node = vec![0usize; nodes];
-    for &d in cu_dom.iter().filter(|&&d| d != u32::MAX) {
+    for &d in &cu_dom {
         cus_per_node[d as usize / per] += 1;
     }
-    println!("PLACED: {domains} domains / {nodes} nodes = {per} per node, cus per node: {cus_per_node:?}");
+    println!("CANDIDATE: {domains} domains / {nodes} nodes = {per} per node, cus per node: {cus_per_node:?}");
 
-    // What each node actually has to RUN. Stream entries per cu is the work unit the static
-    // walk executes, and the makespan is set by the busiest node, so this is the number that
-    // decides whether a locality plan costs more than it can buy.
+    // What each node actually has to RUN, per program — programs are alternatives, so each one's
+    // own busiest node is its own makespan and the guard has to hold for every one separately.
+    let work = cu_work(&blob.progs, n_cu);
+    let accepted = node_plan(&cu_dom, domains, nodes, &work).is_some();
     println!("\nwork per node (stream entries), busiest node sets the makespan:");
-    for (pi, p) in blob.progs.iter().enumerate() {
-        let (mut placed, mut rr) = (vec![0usize; nodes], vec![0usize; nodes]);
-        for cu in 0..blob.n_cu as usize {
-            let n = p.stream_len[cu] as usize;
-            if cu_dom[cu] != u32::MAX {
-                placed[cu_dom[cu] as usize / per] += n;
-            }
+    for (pi, (p, w)) in blob.progs.iter().zip(&work).enumerate() {
+        let (mut placed, mut rr) = (vec![0u64; nodes], vec![0u64; nodes]);
+        for (cu, &n) in w.iter().enumerate() {
+            placed[cu_dom[cu] as usize / per] += n;
             rr[cu % nodes] += n;
         }
-        let ratio =
-            |v: &[usize]| *v.iter().max().unwrap() as f64 / *v.iter().min().unwrap().max(&1) as f64;
+        let (pmax, rmax) = (*placed.iter().max().unwrap(), *rr.iter().max().unwrap());
         println!(
-            "  prog[{pi}] T={:<5} placed max/min {:.2}x {placed:?}\n              {:11} round-robin max/min {:.2}x {rr:?}",
+            "  prog[{pi}] T={:<5} peak placed {pmax} vs round-robin {rmax}  {}\n    placed      {placed:?}\n    round-robin {rr:?}",
             p.t,
-            ratio(&placed),
-            "",
-            ratio(&rr)
+            if pmax <= rmax { "ok" } else { "WORSE — declines the plan" }
         );
     }
+    println!(
+        "\nACCEPTED:  {}",
+        if accepted {
+            "yes — the runtime places by domain (with --cpu-l2-place, which is off by default)"
+        } else {
+            "no — the guard refuses it; placement stays cu % nodes even with --cpu-l2-place"
+        }
+    );
 }

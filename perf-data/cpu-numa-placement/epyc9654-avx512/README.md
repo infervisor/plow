@@ -34,6 +34,13 @@ quantity the makespan follows (`cargo run --example l2_probe -- model.pkt 8`):
 The busiest-node ratio (1.06–1.30x) sets the sign but under-predicts the size of the
 end-to-end loss, so the balance metric is a guard, not a model of the cost.
 
+The guard applies that test **per program**, not to their sum. Programs are
+alternatives — a prefill bucket or the decode program is chosen per dispatch — so each
+one's own busiest node is its own makespan. Summing first is unsound: two programs at
+200/2 and 2/200 across a pair of nodes total 202/202 and look perfectly balanced,
+while each on its own is a 100x spread. `node_plan` takes one work row per program and
+requires every row to hold.
+
 ## Measured
 
 Interleaved A/B (`place=1`, `place=0`, repeated) on one blob, so drift and page-cache
@@ -86,12 +93,18 @@ PLOW_L2_PLACE=1 cargo run --release -p plowc --bin plowc -- \
   --out target/l2-place-on
 ```
 
-Inspect what it carries, and what each node would run under either mapping:
+Inspect what it carries, what each node would run under either mapping, and whether
+the runtime accepts the plan (it reports `CANDIDATE` and `ACCEPTED` separately, and
+calls the engine's own `cu_domains`/`node_plan` so it cannot drift from the decision
+the runtime actually makes):
 
 ```sh
 cargo run --release -p plowrt --no-default-features --features cpu \
   --example l2_probe -- target/l2-place-on/model.pkt 8
 ```
+
+On this blob it prints `ACCEPTED: no` — every one of the four programs has a busier
+peak node under the plan than under the round-robin.
 
 A/B the two placements:
 
