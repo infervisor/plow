@@ -2116,3 +2116,275 @@ mode above was an unchanged number.
   `plan_chunks_cfg` sorts and dedups before planning, so the cover is provably unchanged and
   this is a log-line defect, not a behaviour one — but it is inconsistent with
   `prefill_rungs()`, which does filter, and it will confuse the next reader. Left alone.
+
+
+---
+
+## GLM-5.3 TP4 on MI300X: DSA sparse attention now loads — and must not be shipped
+
+Measured 2026-09-08 on 8x MI300X (gfx942), ROCm 7.14 from the flake, `plowc`/`plowrt` built in
+the worktree so the tuning digest matches the objects (`tile_source: measured`, 2472/2472 on
+both arms). Both blobs `--max-ctx 69632`, `PLOW_DECODE_BATCH_LADDER=1`, ladder
+`full:128,512,2048,8192`, and **`PLOW_GLM_FUSE_ROPE` off in BOTH** — the armed DSA gate refuses
+it (the q-rope fold and the gather arm both want `t[7]`), so the dense control gives it up too
+and the A/B measures sparse attention rather than a lost fold. Driver:
+`scripts/glm53_dsa_run.sh`.
+
+## Answer in one line
+
+The missing fp8 upcast was real and is fixed — a DSA blob now loads, serves and answers
+coherently — but it was **not the only thing missing**: sparse decode is **+58 to +63 ms/token**
+against dense and it **loses the needle the moment the selection stops being the identity**
+(5/27 vs 27/27). The sparse attention *kernel* is 3.7x cheaper than dense exactly as predicted;
+everything else about the arm is broken.
+
+## 1. What the loader now does
+
+`plowrt::asset::dsa_indexer` dequantises the DSA lightning indexer's two projections from
+block-fp8 into the bf16 the blob declares, at bind:
+
+    out[n][k] = bf16( f32(fp8[n][k]) * scale[n/128][k/128] )
+
+for `self_attn.indexer.wq_b.weight` (F8_E4M3 `[4096,2048]`, scale F32 `[32,16]`) and
+`self_attn.indexer.wk.weight` (F8_E4M3 `[128,6144]`, scale F32 `[1,48]`). This is the reference's
+own policy — vLLM builds the fused `wk_weights_proj` with `quant_config=None` unconditionally and
+dequantises a checkpoint's fp8 `wk` into it at load, "to maintain fusion" — and it is a shim for
+those two names only. Every other block-fp8 tensor still reaches the kernel as fp8 and is
+dequantised per 128-K block in the accumulator.
+
+Two design points worth keeping:
+
+* **The scale grid is REQUIRED to be `[ceil(N/128), ceil(K/128)]`, not derived from its own
+  shape.** Deriving would accept a `[64,64]`-quantised checkpoint and index it as `[128,128]`:
+  same byte count, plausible magnitudes, and an indexer that picks the wrong KV rows. Measured,
+  that mistake differs on 98.8% of elements at rms 0.024 against a tensor whose own rms is
+  0.050 — and no serving smoke test can catch it, because sparse attention is *supposed* to
+  change the tokens.
+* **`scrub = false` on the push.** `is_fp8_e4m3` is true for the source name, so the obvious
+  code reuses the upload ring's 0x80 scrub and silently rewrites every bf16 whose high byte is
+  `-0.0`'s.
+
+Cost at load: `named tensors` gather goes 3.3–3.9 s → 4.2–5.1 s per rank (≈+1 s), and the
+per-rank named-tensor slab grows 12.96 → 13.33 GiB (43 indexer layers x 8 MiB of `wq_b` that
+stays fp8 in the reference). Total engine load 57.5 s (dense) → 59.7 s (DSA).
+
+`preflight_weights` then moves *every* checkpoint-weight resolution ahead of the first DMA. The
+old failure was a `slice_for` byte-count error **after ~200 GiB had been uploaded**; the
+safetensors index answers the same question at t=0 for no page faults. It mirrors the upload
+loop's rules rather than restating them (`is_checkpoint_weight`, `fp8/` twin routing,
+two-spelling lookup, the derived `_res_score.weight` exemption); only the row-parallel gather
+keeps its late failure, because measuring it means doing it.
+
+## 2. The dequantisation is bit-identical to the reference
+
+`scripts/glm53_dsa_verify.py` compares the loader's own output against torch's
+`(fp8.float() * scale).bfloat16()` — the Rust half is an `#[ignore]`d test in the module that
+writes raw bf16, the Python half reads the safetensors and grades it.
+
+| tensor | shape | rms(ref) | max abs err | rms err | differing |
+|---|---|---:|---:|---:|---:|
+| `layers.0…indexer.wk.weight` | 128 x 6144 | 0.06637 | 0 | 0 | 0 / 786 432 |
+| `layers.0…indexer.wq_b.weight` | 4096 x 2048 | 0.05041 | 0 | 0 | 0 / 8 388 608 |
+| `layers.1…indexer.wk.weight` | 128 x 6144 | 0.03008 | 0 | 0 | 0 / 786 432 |
+| `layers.1…indexer.wq_b.weight` | 4096 x 2048 | 0.03964 | 0 | 0 | 0 / 8 388 608 |
+
+**18.3M elements, bit-identical, four tensors.** An exact match is the right bar and not a lucky
+one: e4m3 carries three mantissa bits and bf16 has seven, so the decode is exact and the only
+rounding in the whole path is the scale multiply and one round-to-nearest-even narrowing — the
+same two steps torch takes, in the same order. Negative controls on the same tensor: reading the
+grid with its axes swapped differs on 8 287 300 / 8 388 608 elements (rms 0.024), and reading it
+as a 64-wide block differs on 8 300 048 (rms 0.018). The check has teeth.
+
+*(Aside, harmless: `GLM-5.3-plow-lite` stores each indexer tensor TWICE — once in the raw shard
+and once in `zz-derived-*` — byte-identical in all four cases, verified by sha256.)*
+
+## 3. It serves
+
+    AMD engine ready arch=gfx942 n_cu=304 max_ctx=69632 n_kvrow=177
+    AMD serve engine ready n_gpu=4 batch=1 decode_rungs=[1]
+    "The capital of France is Paris."   (coherent, drift-free)
+
+21 `indexer.wq_b.weight` tensors bound (the `full` indexer layers). `max_ctx` must exceed the
+emit-time crossover — `GlmCfg::dsa` arms on `ctx > 65536`, and **that is the emit-time
+`max_ctx`, not the live context**, so the sparse path runs at *every* live length including
+those below `index_topk` where the selection is the identity. 131072 does not fit at TP4
+(`HSA_STATUS_ERROR_OUT_OF_RESOURCES` on a 2.25 GiB pool allocate); 69632 does, which leaves a
+4 096-token window between the crossover and the capacity ceiling.
+
+## 4. TPOT: sparse decode is 2.5x SLOWER, at every context
+
+vLLM `bench serve` through the OpenAI surface, 4 prompts, 64 output tokens, concurrency 1.
+
+| context | dense TPOT | DSA TPOT | delta | dense TTFT | DSA TTFT |
+|---:|---:|---:|---:|---:|---:|
+| 4 096 | 40.82 ms | 103.52 ms | **+62.70 (+154%)** | 1 392 ms | 9 694 ms (+596%) |
+| 16 384 | 41.79 ms | 103.56 ms | **+61.77 (+148%)** | 4 977 ms | 20 892 ms (+320%) |
+| 32 768 | 44.10 ms | 102.95 ms | **+58.85 (+133%)** | 13 233 ms | 41 458 ms (+213%) |
+| 65 536 | 50.39 ms | 102.87 ms | **+52.48 (+104%)** | 39 433 ms | 90 486 ms (+129%) |
+
+Confirmed decode-only through `plowrt amd-bench --ctx 32768 --steps 32 --tp 4`, no HTTP and no
+prefill: **110.44 ms/token sparse against 42.65 ms/token dense**, all four ranks token-identical
+on every step in both arms.
+
+**The dense control is not a straw man**: 40.8–50.4 ms reproduces the shipped baseline
+(§"Long context", 38.2–40.5 ms at 4k–32k) despite the lost q-rope fold and the doubled
+`max_ctx`, so the regression belongs to the DSA gate and to nothing else in the emit.
+
+**DSA TPOT is FLAT** — 103.5 / 103.6 / 103.0 / 102.9 across a 16x context range — while dense
+grows 40.8 → 50.4. The gap therefore closes at 1.92e-4 ms per token of context, which puts the
+break-even near **338k context**. The KV ceiling at TP4 is ~70k. On this hardware, in this
+configuration, the crossover does not exist.
+
+**TTFT regresses too, and that one is structural rather than mysterious.** `PLOW_GLM_DSA_PF` is
+off (no `plow_dsa_pf_arm` in `build-glm53/hsaco`, so the marker check would refuse it), so
+prefill attention stays dense — but the `full` layers still run the whole indexer chain over
+every prefill token to populate the `kidx` cache. That is the indexer's O(T·S) cost with none of
+the gathered arm's O(T·top_k) saving: pure overhead, 3x to 7x on TTFT.
+
+## 5. Where the 68 ms goes — and the good news inside it
+
+`plowrt amd-bench --trace-raw`, one decode step at ctx 32768, TP4, folded per opcode into stall
+(`t_ready - t_arrive`) and body (`t_end - t_ready`) — aggregated over workgroups, so these are
+serialized sums against a 40.9 ms (dense) / 86.9 ms (DSA) wall.
+
+| op | wg/pkt | dense span | DSA span | note |
+|---|---:|---:|---:|---|
+| `FLASH_MLA_DECODE` | 256 | 2 325.9 ms | — | dense attention |
+| `FLASH_GATHER_DECODE` | 64 | — | 634.2 ms | **sparse attention, 3.7x cheaper** |
+| `INDEX_SCORE` | **304** | — | 308.8 ms | the indexer's own score |
+| `INDEX_SELECT` | 32 | — | 116.8 ms | top-k |
+| `DENSE_GLU_FP8_BLK` | 304 | 68.3 ms | **12 411.3 ms** | body 42.9 vs 43.8 ms — **all stall** |
+| `GEMV` | ~230 | 3 556.5 ms | 5 084.5 ms | |
+| `MLA_MERGE_FOLD` | 128 | 736.6 ms | 1 529.4 ms | |
+| **total serialized** | | **12 277.4 ms** | **26 201.8 ms** | stall 3 920 → 18 266 |
+
+Read the first three rows together: **the arithmetic trade is exactly what was promised.**
+Sparse attention costs 634 ms where dense costs 2 326 ms, and the indexer that buys that saving
+costs 426 ms. Net −1 266 ms of serialized span, in the right direction, at the right magnitude
+for the −2.65 ms/token estimate.
+
+Then read the fourth row. `DENSE_GLU_FP8_BLK` does the *same 43 ms of work* in both arms and
+spends **12 367 ms waiting** in the sparse one against 25 ms in the dense one — 13.5 ms per
+workgroup, on 3 packets x 304 workgroups. Stall across the whole chain goes 3 920 → 18 266 ms;
+body goes 8 357 → 7 936 ms, i.e. **the DSA arm does LESS work and takes twice as long.**
+
+The shape of it points at the dispatch, not the kernels. `INDEX_SCORE` runs on all **304**
+workgroups, and the DSA arm inserts 21 of them (one per `full` layer) into a stream whose other
+full-grid op is `DENSE_GLU_FP8_BLK`. In a persistent-workgroup interpreter a full-grid packet
+starts when its slowest workgroup arrives, so 21 extra full-grid rendezvous per token land as
+stall on whatever full-grid op comes next. Overlap itself is unchanged (serialized/wall is 300x
+in both arms) — there is simply 14 s more aggregate waiting to overlap.
+
+## 6. Quality: it loses the needle, and the boundary is exactly `index_topk`
+
+Character identity is the wrong gate here — sparse attention changes the arithmetic by design —
+so: `scripts/glm53_needle_probe.py` (paired retrieval) and `scripts/glm53_greedy_agree.py`.
+
+**Needle retrieval, 3 needles x 3 depths x 3 lengths, paired:**
+
+| context | dense | DSA |
+|---:|---:|---:|
+| 4 096 | 9/9 | 4/9 |
+| 16 384 | 9/9 | 1/9 |
+| 32 768 | 9/9 | **0/9** |
+| **total** | **27/27** | **5/27** |
+
+Paired: both correct 5, **dense-only 22, DSA-only 0**, neither 0. Twenty-two discordant pairs all
+in one direction is not a model limit at depth — the dense arm at identical settings retrieves
+every cell — and McNemar on 22/0 needs no table.
+
+**And the boundary is not gradual.** Sweeping the prompt length across `index_topk = 2048`, at
+depth 0.5:
+
+| achieved prompt tokens | DSA result |
+|---:|---|
+| 601 / 1 035 / 1 717 | 3/3, clean: `" 7429-BLUE. The code is 7429-BLUE."` |
+| 1 903 | 3/3, clean |
+| **2 089** | degraded: `" 742 The engine keeps one. 742 The engine keeps"` |
+| 2 275 / 2 523 / 2 771 | degraded, same signature |
+
+Below `top_k` the selection is the identity and **everything works**: the upcast weights, the
+indexer GEMMs, `k_norm`, `INDEX_SCORE`, the `kidx` cache and `FLASH_GATHER_DECODE` are all
+exercised on that path and produce clean, correct text. The failure begins at the first length
+where the selection actually has to *choose*, when it is dropping at most 41 rows out of 2 089.
+Dropping 2% of the context cannot cost the needle. **The selection is picking wrong rows** (or
+the index it produces is not the index the gather consumes) — that is where the next person
+should look, and it is upstream of anything in this change.
+
+Greedy agreement (dense baseline vs DSA candidate, `/v1/completions`, temperature 0,
+`ignore_eos`, 128 tokens, 4 seeds):
+
+| context | identical | first divergence (char) |
+|---:|---:|---:|
+| 1 024 | 0/4 | 90 |
+| 4 096 | 0/4 | 6 |
+| 16 384 | 0/4 | 5 |
+
+Consistent with the same boundary: below `top_k` the two arms track for ~90 characters (the
+gathered kernel accumulates in a different order, so bit-identity was never expected); above it
+they separate at the fifth character.
+
+## 7. What still blocks making DSA a default
+
+1. **Selection correctness — the blocker.** 22/0 discordant needle pairs, with the onset pinned
+   to the exact length where selection stops being the identity. Nothing else matters until this
+   is understood. Suspects, in order: the `iidx` → `FLASH_GATHER_DECODE` `t[7]` index mapping,
+   `INDEX_SELECT`'s histogram top-k at `select_width` vs `index_topk`, and the `kidx` cache's
+   position addressing. Note plow's DSA decode arm appears never to have been qualified against
+   real weights — it could not be, since no blob could load one.
+2. **21 full-grid rendezvous per token.** +14 s of aggregate stall for −1.3 s of aggregate body.
+   The kernels are fine; the dispatch shape is not. `INDEX_SCORE` at 304 workgroups is the thing
+   to look at.
+3. **The gate arms on emit-time `max_ctx`, not live context.** A blob emitted for 69 632 runs the
+   indexer at 601 tokens, where the selection is provably a no-op. A live gate would make the
+   arm free below `top_k` and would also make (1) far easier to bisect.
+4. **No sparse prefill on the shipped objects.** `build-glm53/hsaco` carries no
+   `plow_dsa_pf_arm`, so `PLOW_GLM_DSA_PF` cannot be armed against it — and without it the
+   indexer runs over every prefill token for no benefit at all, which is 3x–7x of the TTFT
+   regression. Rebuild the flash object with `PLOW_DSA_PF=1` before measuring prefill again.
+5. **Capacity.** 128k does not fit at TP4, so the only servable window above the 64k crossover is
+   64k–70k. TP8 or a KV-format lever would be needed to reach a context where the dense/sparse
+   trade could even be argued — and per §4 the extrapolated crossover is ~338k regardless.
+6. **`PLOW_GLM_FUSE_ROPE` is mutually exclusive with the gate.** Not a blocker on its own, but a
+   real DSA default would give up a fold the dense arm keeps, so the honest comparison for
+   shipping is DSA against dense *with* the fold — a bigger gap than the table in §4.
+
+## Reproducing
+
+```bash
+# loader verification — no GPU
+PLOW_DSA_VERIFY_CKPT=/workspace/models/GLM-5.3-plow-lite PLOW_DSA_VERIFY_OUT=/tmp/dsa \
+  nix develop /app/plow --command cargo test --release -p plowrt --features hsa \
+    --lib -- --ignored --nocapture dsa_indexer
+build-gemma31/vllm-python scripts/glm53_dsa_verify.py \
+  --ckpt /workspace/models/GLM-5.3-plow-lite --dir /tmp/dsa
+
+# blobs — no GPU. `dense` is the control: same knobs, PLOW_GLM_DSA=0.
+scripts/glm53_dsa_run.sh emit dsa   69632
+scripts/glm53_dsa_run.sh emit dense 69632
+
+# decode-only timing + packet traces for both arms, one 4-GPU lease
+scripts/glm53_dsa_run.sh attrib 32768 32
+
+# serve + quality (one arm at a time; each takes its own lease)
+scripts/glm53_dsa_run.sh serve dsa 20700
+python3 scripts/glm53_needle_probe.py --url http://127.0.0.1:20700 --arm dsa \
+  --out build-glm53/qual/needle-dsa.json --lens 4096,16384,32768 --depths 0.1,0.5,0.9
+python3 scripts/glm53_greedy_probe.py --url http://127.0.0.1:20700 --arm dsa \
+  --out build-glm53/qual/greedy-dsa.json --lens 1024,4096,16384
+python3 scripts/glm53_greedy_agree.py --baseline build-glm53/qual/greedy-dense.json \
+                                      --candidate build-glm53/qual/greedy-dsa.json
+```
+
+## Caveats
+
+* Both arms give up `PLOW_GLM_FUSE_ROPE`, which the shipped dense config keeps. This makes the
+  A/B honest about *sparse attention* and optimistic about *shipping DSA* — see §7.6.
+* The needle grader is substring containment, and it is crude on purpose. One DSA cell was scored
+  OK on the string `" 742 742942 742"`, which contains `7429` by accident; the neighbouring cells
+  in the same sweep show the same degraded signature and were scored MISS. Read the totals, not
+  a single cell.
+* Sibling agents held cards on this host for parts of the campaign. Every delta reported here is
+  1.3x or larger, so contention is not a plausible explanation for any of them.
+* The `attrib` traces are one decode step each. They locate where time is spent; they are not a
+  distribution.

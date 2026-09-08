@@ -1234,7 +1234,20 @@ mod tests {
             if path.file_name().is_some_and(|n| n == "config.rs") {
                 continue;
             }
-            for (i, line) in text.lines().enumerate() {
+            // A `#[cfg(test)] mod tests` reads the environment to locate FIXTURES, not to
+            // configure the runtime: `PLOW_DSA_VERIFY_CKPT` points an `#[ignore]`d test at a
+            // 200 GiB checkpoint and has no business in `--help`. The rule this guard enforces
+            // is about knobs a SERVE honours, so it stops at the test module.
+            //
+            // Both lines are required, and the attribute alone is not enough: a bare
+            // `#[cfg(test)]` on a single item would otherwise blind the scan for the rest of
+            // the file. Test modules are last and are spelled this way throughout the crate.
+            let lines: Vec<&str> = text.lines().collect();
+            let cut = lines
+                .windows(2)
+                .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests"))
+                .unwrap_or(lines.len());
+            for (i, line) in lines[..cut].iter().enumerate() {
                 for pat in ["std::env::var(\"", "std::env::var_os(\""] {
                     let Some(pos) = line.find(pat) else { continue };
                     let rest = &line[pos + pat.len()..];
