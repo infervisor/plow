@@ -1512,6 +1512,18 @@ fn amd_rung_specs(build_label: &str, isa: hwspec::IsaLevel) -> Vec<kernelcaps::K
     use kernelcaps::{KernelSpec, QuantScheme};
     let mut out = Vec::with_capacity(GFX950_RUNGS.len() * 3);
     for (bf16, fp8, mx, bm, bn, bk) in GFX950_RUNGS {
+        // The SATURATING rung is the one rung whose geometry is a `-D` of the object rather
+        // than a header constant, so it is the one that differs per part: CDNA3's 64 KiB
+        // workgroup cannot hold 256x256x64 (73,728 B single-buffered), and the object is
+        // therefore built GM_BM=192 GM_BN=256. Naming gfx950's 256x256 here handed gfx942 an
+        // inventory whose top rung does not fit the part, and the store disagreed with it —
+        // a timing filed against the real 192x256x64 `Gemm` selected a tile this table said
+        // was 256 wide. `hwspec` already declares the per-ISA answer; take it from there
+        // rather than restating it, which is the drift `kernelcaps` exists to prevent.
+        let (bm, bn, bk) = match (bf16, isa.geometry()) {
+            (DevOp::Gemm, Some(g)) => (g.gemm_tile.bm as i64, g.gemm_tile.bn as i64, g.gemm_tile.bk as i64),
+            _ => (bm, bn, bk),
+        };
         for (op, quant, mma) in [
             (bf16, QuantScheme::None, MmaDtype::Bf16),
             (fp8, QuantScheme::W8A8, MmaDtype::Fp8),

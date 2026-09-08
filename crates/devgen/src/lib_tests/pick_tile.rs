@@ -268,11 +268,21 @@ fn amd_tile_selection_follows_the_target_hwspec() {
     // Gemma-4 31B gate/up at a real prefill length.
     let (m, n, k, n_cu) = (4096u32, 21504u32, 5376u32, 304u32);
 
+    // Per ISA, because the saturating rung is the one whose geometry is a `-D` of the object:
+    // gfx942 builds it GM_BM=192 GM_BN=256 to fit 64 KiB, gfx950 at 256x256. Reading the
+    // gfx950 table for both made this assertion report a tile gfx942 does not carry, so a
+    // legal CDNA3 answer (192x256x64, 56 KiB) failed as if it were 256x256x64 at 72 KiB.
     let dims = |op: DevOp| -> Option<(i64, i64, i64)> {
+        let isa = amd_target::active().1;
         GFX950_RUNGS
             .iter()
             .find(|r| r.0 == op || r.1 == op || r.2 == op)
-            .map(|r| (r.3, r.4, r.5))
+            .map(|r| match (r.0, isa.geometry()) {
+                (DevOp::Gemm, Some(g)) => {
+                    (g.gemm_tile.bm as i64, g.gemm_tile.bn as i64, g.gemm_tile.bk as i64)
+                }
+                _ => (r.3, r.4, r.5),
+            })
     };
 
     set_amd_target("MI300X");
