@@ -90,7 +90,7 @@ __global__ __launch_bounds__(PLOW_WG_WAVES * 64, 1) void tb_flash_prefill_packed
     d_flash_prefill<TB_HD, false, TB_HD, /*TB=*/true>(
         Opart, mlpart, O, Q, K, V, poison_n_q, poison_n_kv, TB_HEADS, TB_KVHEADS, poison_pos0,
         /*window=*/0u, scale, TB_KVSTRIDE, PLOW_KV_MASK_NONE, nsplit, blockIdx.x, gridDim.x, lds,
-        nullptr, nullptr, &tb);
+        nullptr, nullptr, tb);
 #endif
 }
 
@@ -117,7 +117,7 @@ __global__ __launch_bounds__(PLOW_WG_WAVES * 64, 1) void tb_flash_decode_packed(
         Opart, mlpart, Q, K, V, /*kv_len=*/nullptr, n_batch, TB_HEADS, TB_KVHEADS, TB_KVSTRIDE,
         /*window=*/0u, scale, nsplit, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0.0f, 0, nullptr, nullptr,
-        nullptr, &tb);
+        nullptr, tb);
 #endif
 }
 

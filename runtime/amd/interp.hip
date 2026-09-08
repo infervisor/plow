@@ -28,6 +28,43 @@ extern "C" __device__ unsigned plow_mixed_dynamic_rows_1 = 1;
 extern "C" __device__ unsigned plow_mixed_block = 256;
 #endif
 
+/* PLOW_TOKEN_BATCH — the unified token-batch route for dense GQA
+ * (plans/unified-token-batch.md §8 Phase 2). DEFAULT 0: every shipped object is unchanged.
+ *
+ * It REPLACES the mixed step's phase-band dispatch rather than sitting beside it. The mixed
+ * object splits every projection into a GEMV over the decode band and a GEMM over the prefill
+ * band; this route runs ONE matmul over the combined M (§5.1), routes attention through the
+ * per-span forms in op_attention.h, and takes every row count from the descriptor's live
+ * `real_rows` instead of the compiled capacity.
+ *
+ * It is built ON the mixed object's shape (4 waves, its LDS arena, its bf16-only inventory)
+ * because that object is already qualified for exactly the dense BF16 family this phase
+ * enables — so the axis requires PLOW_MIXED_STEP and overrides its dispatch, rather than
+ * duplicating a second object contract.
+ *
+ * WHY THE MARKERS. AMD's dispatch `default:` writes nothing and does not trap, so an object
+ * built without an arm a packet needs is a SILENT WRONG ANSWER, not a crash. These four names
+ * are what `AmdEngine` reads out of `.symtab` before the object reaches a device, and they say
+ * different things on purpose:
+ *   plow_token_batch_1              the object was compiled with this axis at all
+ *   plow_token_batch_dense_gqa_1    the dense-GQA operator set is present and armed
+ *   plow_token_batch_combined_m_1   projections run at combined M (no phase band)
+ *   plow_token_batch_span_attn_1    FlashPrefill/FlashDecode read their bounds from spans
+ * "Armed" is not "fires": a step only fires the route when it is launched with a descriptor
+ * carrying more than one span, and that is logged separately by the host. */
+#ifndef PLOW_TOKEN_BATCH
+#define PLOW_TOKEN_BATCH 0
+#endif
+#if PLOW_TOKEN_BATCH
+#if !PLOW_MIXED_STEP
+#error "PLOW_TOKEN_BATCH is built on the mixed object's shape; set PLOW_MIXED_STEP=1"
+#endif
+extern "C" __device__ unsigned plow_token_batch_1 = 1;
+extern "C" __device__ unsigned plow_token_batch_dense_gqa_1 = 1;
+extern "C" __device__ unsigned plow_token_batch_combined_m_1 = 1;
+extern "C" __device__ unsigned plow_token_batch_span_attn_1 = 1;
+#endif
+
 #ifdef PLOW_CONFIG
 #include PLOW_CONFIG
 #endif
@@ -183,6 +220,16 @@ extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #include "op_qwen_gdn.h"
 #endif
 #include "op_moe.h"
+#if PLOW_TOKEN_BATCH
+/* Placed here, not at the axis definition: PLOW_FP8 and friends are resolved by the op headers
+ * above, and `#if UNDEFINED` is 0 — a guard written before they exist reads as satisfied and
+ * proves nothing. §8 Phase 2 is dense BF16 GQA; every other encoding is Phase 3. */
+#if PLOW_FP8 || PLOW_FP8_KV || PLOW_MXFP4 || PLOW_MLA_PREFILL || PLOW_MOE_PREFILL || PLOW_K3 || \
+    PLOW_QWEN_GDN
+#error "the token-batch route is qualified for the dense BF16 GQA family only (§8 Phase 2)"
+#endif
+#endif
+
 /* Every geometry/schedule knob's COMPILED value, as a marker symbol. Last, so each macro has
  * already resolved. See geom_contract.h: a `-D` that did not take is invisible otherwise. */
 #include "geom_contract.h"
@@ -1018,6 +1065,15 @@ __device__ __forceinline__ CStream as_konst(const PlowStreamEnt* p) {
     return (CStream)(const PLOW_KONST void*)p;
 }
 
+#if PLOW_TOKEN_BATCH
+/* Live rows this step. `capacity` is what the packet was COMPILED for; the descriptor says how
+ * many of those rows are real. The mixed step's `mixed_rows` cannot be reused: it derives the
+ * decode band from `spans[0].row0`, and on this route spans cover [0, M) with no prefix. */
+__device__ __forceinline__ unsigned token_batch_rows(unsigned capacity, const PlowProgram* prog) {
+    return plow_tb_rows(prog, capacity);
+}
+#endif
+
 #if PLOW_MIXED_STEP
 __device__ __forceinline__ unsigned mixed_rows(unsigned capacity, const PlowProgram* prog) {
     const unsigned decode = plow_mixed_prefill_span(prog, 0)->row0;
@@ -1048,6 +1104,24 @@ __device__ __forceinline__ void exec_flash_prefill(CInst in, CTens T, unsigned s
 #else
 #define PLOW_DENSE_SPAN plow_packed_prefill_span
 #endif
+#if PLOW_TOKEN_BATCH
+/* THE CLASS-C ARM. One launch, one flat work list over every prefill span's query tiles, every
+ * bound read from the row's own span (op_attention.h's TB body). The packet's `i0`/`i1`/`i4`
+ * — n_q, n_kv and q_pos0 — are passed as ZERO on purpose: on this route they are structurally
+ * unreachable, and passing them would leave a reader unable to tell whether they still mattered.
+ * runtime/tests/token_batch_dense_gfx942_test.hip gate 3 measures that they do not. */
+#define PLOW_AMD_FLASH_PREFILL(HD)                                                         \
+    do {                                                                                  \
+        const PlowTokenBatchView tbv_ = plow_tb_view(mixed);                              \
+        const PlowTokenBatchView pf_ =                                                    \
+            plow_tb_span_range(tbv_, plow_tb_decode_spans(tbv_), tbv_.n_spans);           \
+        d_flash_prefill<HD, false, HD, /*TB=*/true>(                                      \
+            (float*)TEN(0), (float*)TEN(1), (bf16*)TEN(5), (const bf16*)TEN(2),           \
+            (const bf16*)TEN(3), (const bf16*)TEN(4), 0u, 0u, in->i[2], in->i[3], 0u,     \
+            in->i[5], in->fj[0].f, in->fj[1].u, in->fj[2].u, in->i[7], slice, nblk, lds,  \
+            nullptr, nullptr, pf_);                                                       \
+    } while (0)
+#else
 #define PLOW_AMD_FLASH_PREFILL(HD)                                                         \
     do {                                                                                  \
         for (unsigned si = 0; si < mixed->n_prefill_spans; ++si) {                       \
@@ -1065,7 +1139,16 @@ __device__ __forceinline__ void exec_flash_prefill(CInst in, CTens T, unsigned s
         }                                                                                 \
     } while (0)
 #endif
-#if PLOW_MIXED_STEP
+#endif
+#if PLOW_TOKEN_BATCH
+    /* The route's own admission check, at the packet. `i7` is nsplit and it must be 1: the
+     * flat schedule is bit-identical to an isolated run only while the KV partition does not
+     * move with the span boundary (see the harness's gate-1 note), so a split packet on this
+     * route TRAPS rather than quietly changing the arithmetic under packing. */
+    if (!plow_tb_enabled(mixed) || in->i[0] != plow_tb_view(mixed).row_capacity ||
+        in->i[7] != 1u || TEN(5) == nullptr)
+        __builtin_trap();
+#elif PLOW_MIXED_STEP
     if (!plow_mixed_step_enabled(mixed) || in->i[0] != mixed->n_prefill_rows ||
         !in->i[7] || ((in->i[7] == 1u) != (TEN(5) != nullptr))) __builtin_trap();
 #elif PLOW_PACKED_PREFILL_DENSE_CONSUMERS
@@ -1287,7 +1370,12 @@ __device__ __forceinline__ void exec_flash_prefill_fp8(CInst in, CTens T, unsign
 
 __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
                                                   unsigned slice, unsigned nblk, float* lds,
-                                                  unsigned rows = 0) {
+                                                  unsigned rows = 0
+#if PLOW_TOKEN_BATCH
+                                                  ,
+                                                  const PlowProgram* tbprog = nullptr
+#endif
+                                                  ) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
 #define IEN(k) (in->i[k] == PLOW_TENSOR_NONE ? nullptr : T[in->i[k]])
     const unsigned n_batch_runtime = rows ? rows : in->i[0];
@@ -1335,6 +1423,26 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
         return;
     }
     const unsigned hd = in->i[6];
+#if PLOW_TOKEN_BATCH
+    /* CLASS B (§3): the per-row indirection already exists; the descriptor fills it. Slot and
+     * post-step KV length come from the row's span, so `t5` (kv_len) and `t6` (decode_slot) are
+     * not required and `t6` stays free for the fp8-KV scale it means on the dense emit path.
+     * The span table is narrowed to the DECODE partition here and to its complement in the
+     * flash-prefill arm; both call plow_tb_decode_spans, so the two cannot disagree. */
+#define PLOW_AMD_FLASH_DECODE(DD)                                                               \
+    do {                                                                                        \
+        const PlowTokenBatchView tbv_ = plow_tb_view(tbprog);                                   \
+        const PlowTokenBatchView dec_ =                                                         \
+            plow_tb_span_range(tbv_, 0u, plow_tb_decode_spans(tbv_));                           \
+        if (n_batch_runtime > dec_.n_spans) __builtin_trap();                                   \
+        d_flash_decode<DD, PLOW_FA_GF(DD), false, false, /*SLOTMAP=*/false, /*TB=*/true>(       \
+            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),           \
+            (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],       \
+            in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds, nullptr,     \
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0.0f, 0, nullptr,    \
+            nullptr, nullptr, dec_);                                                            \
+    } while (0)
+#else
 #define PLOW_AMD_FLASH_DECODE(DD)                                                               \
     do {                                                                                        \
         if (TEN(6))                                                                             \
@@ -1349,6 +1457,7 @@ __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
                 (const bf16*)TEN(4), (const int*)TEN(5), n_batch_runtime, in->i[1], in->i[2],         \
                 in->i[3], in->i[4], in->fj[0].f, in->i[5], in->i[7], slice, nblk, lds);         \
     } while (0)
+#endif
     if (hd == 128) PLOW_AMD_FLASH_DECODE(128);
     else if (hd == 256) PLOW_AMD_FLASH_DECODE(256);
     else if (hd == 512) PLOW_AMD_FLASH_DECODE(512);
@@ -2021,7 +2130,28 @@ __device__ __forceinline__ void exec_gemm(CInst in, CTens T,
     unsigned m = rows ? rows : in->i[0];
     auto* out = (bf16*)TEN(0) + (size_t)in->i[5] * in->i[1];
     const auto* x = (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2];
-#if PLOW_MIXED_STEP
+#if PLOW_TOKEN_BATCH
+    /* COMBINED M (§5.1). One logical matmul over every live row, decode and prefill alike —
+     * the phase-band split below is exactly what §8 Phase 2 exits on the absence of. Kernel
+     * SELECTION still reads the total live row count, which is what "select a small-M or tiled
+     * kernel from the total live row count, N, K and encoding" asks for; what it must not do is
+     * loop over phase bands. `decode` is unread here and stays a parameter only so the two
+     * routes share one call site.
+     *
+     * This is not free of consequence and the plan says so: at fixed M the result is identical
+     * row for row (harness gate 5, bit-exact against a per-span GEMM), but a decode row now
+     * reduces over K in the GEMM's order rather than the GEMV's, so pure-decode numerics are
+     * not bit-identical to the legacy route. §9: "Changing M may select different kernels and
+     * reduction orders; record that rather than requiring unjustified universal bit identity." */
+    (void)decode;
+    if (!m) return;
+    if (m <= (unsigned)PLOW_GEMV_MAXM)
+        d_gemv(out, x, (const bf16*)TEN(2), nullptr, nullptr, m, in->i[1], in->i[2], 0, 0.0f,
+               slice, nblk, lds);
+    else
+        d_gemm(out, x, (const bf16*)TEN(2), m, in->i[1], in->i[2], slice, nblk, lds);
+    return;
+#elif PLOW_MIXED_STEP
     if (!decode || decode > m) __builtin_trap();
     for (unsigned row = 0; row < decode; row += PLOW_GEMV_MM) {
         const unsigned count = min(decode - row, (unsigned)PLOW_GEMV_MM);
@@ -2042,6 +2172,24 @@ __device__ __forceinline__ void exec_gemm(CInst in, CTens T,
 #if PLOW_MIXED_STEP
 __device__ __forceinline__ void exec_mixed_gemm_glu(
     CInst in, CTens T, unsigned slice, unsigned nblk, bf16* lds, const PlowProgram* prog) {
+#if PLOW_TOKEN_BATCH
+    /* COMBINED M, the fused-GLU twin of exec_gemm's arm above. Same rule, same reason. */
+    {
+        const unsigned rows = token_batch_rows(in->i[0], prog);
+        const unsigned k = in->i[2], n = in->i[1];
+        if (!k || k > PLOW_GM_ARENA) __builtin_trap();
+        if (!rows) return;
+        auto* out = (bf16*)T[in->t[0]];
+        const auto* x = (const bf16*)T[in->t[1]];
+        const auto* wg = (const bf16*)T[in->t[2]];
+        const auto* wu = (const bf16*)T[in->t[5]];
+        if (rows <= (unsigned)PLOW_GEMV_MAXM)
+            d_gemv_glu(out, x, wg, wu, rows, n, k, in->i[5], slice, nblk, lds, 0.0f, 0.0f);
+        else
+            d_gemm_glu(out, x, wg, wu, rows, n, k, in->i[5], slice, nblk, lds);
+        return;
+    }
+#else
     const unsigned rows = mixed_rows(in->i[0], prog);
     const unsigned decode = plow_mixed_prefill_span(prog, 0)->row0;
     const unsigned k = in->i[2], n = in->i[1];
@@ -2059,6 +2207,7 @@ __device__ __forceinline__ void exec_mixed_gemm_glu(
     }
     d_gemm_glu(out + (size_t)decode * n, x + (size_t)decode * k, wg, wu,
                rows - decode, n, k, in->i[5], slice, nblk, lds);
+#endif
 }
 #endif
 __device__ __forceinline__ void exec_gemm_norm(CInst in, CTens T,
@@ -2480,7 +2629,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #else
 #define PLOW_PACKED_NORM_ARGS
 #endif
-#if PLOW_MIXED_STEP
+#if PLOW_TOKEN_BATCH
+/* Every class-A row count on this route is the descriptor's LIVE `real_rows`, never the
+ * compiled capacity, and there is no decode band to carve out. */
+#define PLOW_HEADNORM_ARGS , prog_meta, (const int*)TEN(6)
+#define PLOW_RUNTIME_ROWS(capacity) token_batch_rows((capacity), prog_meta)
+#define PLOW_SAMPLE_ROWS(capacity) token_batch_rows((capacity) ? (capacity) : 1u, prog_meta)
+#define PLOW_RUNTIME_DECODE_ROWS 0u
+#elif PLOW_MIXED_STEP
 #define PLOW_HEADNORM_ARGS , prog_meta, (const int*)TEN(6)
 #define PLOW_RUNTIME_ROWS(capacity) mixed_rows((capacity), prog_meta)
 #define PLOW_SAMPLE_ROWS(capacity) mixed_rows((capacity) ? (capacity) : 1u, prog_meta)
@@ -3966,7 +4122,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #else
 #if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_DECODE
         case PLOW_DOP_FLASH_DECODE:
-            exec_flash_decode(in, T, slice, nblk, sm->fd, PLOW_RUNTIME_ROWS(in->i[0]));
+            exec_flash_decode(in, T, slice, nblk, sm->fd, PLOW_RUNTIME_ROWS(in->i[0])
+#if PLOW_TOKEN_BATCH
+                              , prog_meta
+#endif
+            );
             break;
 #endif
 #endif
@@ -4926,7 +5086,16 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
 #endif
 #define PLOW_GQ_CAT2(a, b) a##b
 #define PLOW_GQ_CAT(a, b) PLOW_GQ_CAT2(a, b)
-#if PLOW_MIXED_STEP
+#if PLOW_TOKEN_BATCH
+/* DISTINCT FROM THE MIXED SYMBOL ON PURPOSE. The two objects have the same shape and the same
+ * kernarg, and different dispatch: mixed splits every projection into a decode GEMV band and a
+ * prefill GEMM band, the token batch runs one matmul over the combined M and takes attention
+ * bounds from spans. If they shared a name, an `interp_mixed_gq.elf` left in an assets
+ * directory would answer a token-batch lookup and serve the OLD dispatch against a descriptor
+ * that has no decode prefix — a silent wrong answer, which is the one failure mode this route
+ * is built to make impossible. Symbol resolution refuses it instead. */
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_tokbatch_, PLOW_ARCH_SUFFIX)
+#elif PLOW_MIXED_STEP
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_mixed_, PLOW_ARCH_SUFFIX)
 #elif defined(PLOW_BUCKET_DECODE_MLA)
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_decode_mla_, PLOW_ARCH_SUFFIX)

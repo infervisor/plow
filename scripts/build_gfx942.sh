@@ -1043,6 +1043,12 @@ ROWS=(
   "interp_decode|$AX_DECODE"
   "interp_flash|$AX_FLASH"
   "interp_mixed|-DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=64 -DGM_BN=128 -DFA_DC=256 -DFA_DBUF=1"
+  # UNIFIED TOKEN BATCH, dense GQA (plans/unified-token-batch.md §8 Phase 2). The mixed object's
+  # exact shape plus PLOW_TOKEN_BATCH=1, which REPLACES its phase-band projections with one
+  # matmul over the combined M and its per-span attention loop with a flat query-tile schedule.
+  # A separate row, not a define on the one above: the two routes are different dispatch and
+  # `interp_mixed` stays byte-for-byte the qualified object it is today.
+  "interp_tokbatch|-DPLOW_TOKEN_BATCH=1 -DPLOW_MIXED_STEP=1 -DPLOW_BUCKET_DECODE=0 -DPLOW_WG_WAVES=4 -DPLOW_GEMV_MM=4 -DGM_BM=64 -DGM_BN=128 -DFA_DC=256 -DFA_DBUF=1"
   "interp_prefill_fp8|$AX_PREFILL $AX_FP8"
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"
@@ -1242,7 +1248,7 @@ for row in "${ROWS[@]}"; do
     # that only has 512 -- so adding them fails every 4-wave row for no reason.
     [ "$l" -le 65536 ] || { echo "  OVER LDS: $l > 65536"; fail=1; }
     case "$stem" in
-      interp_flash*|interp_mixed*|interp_packed_mla_flash*) [ "$v" -le 512 ] || { echo "  OVER REG: $v > 512"; fail=1; } ;;
+      interp_flash*|interp_mixed*|interp_tokbatch*|interp_packed_mla_flash*) [ "$v" -le 512 ] || { echo "  OVER REG: $v > 512"; fail=1; } ;;
       *)             [ "$v" -le 256 ] || { echo "  OVER REG: $v > 256"; fail=1; } ;;
     esac
     case "$stem" in
@@ -1273,6 +1279,24 @@ for row in "${ROWS[@]}"; do
         }
         grep -qE "OBJECT .* plow_gemv_mm_cap_4$" <<<"$symbols" || {
           echo "  MISSING MIXED SMALL-M CAPACITY: expected plow_gemv_mm_cap_4"
+          fail=1
+        }
+        ;;
+      interp_tokbatch*)
+        # The four capability markers exec/amd.rs reads out of .symtab before the object reaches
+        # a device. AMD's dispatch `default:` writes nothing and does not trap, so an object
+        # missing an arm a packet needs is a silent wrong answer; a name costs nothing here and
+        # a device round trip everywhere else.
+        for m in plow_token_batch_1 plow_token_batch_dense_gqa_1 \
+                 plow_token_batch_combined_m_1 plow_token_batch_span_attn_1; do
+          grep -qE "OBJECT .* $m\$" <<<"$symbols" || {
+            echo "  MISSING TOKEN-BATCH MARKER: expected $m"
+            fail=1
+          }
+        done
+        # The route is built ON the mixed object, so it must still answer for that contract.
+        grep -qE "OBJECT .* plow_mixed_step_bf16_1$" <<<"$symbols" || {
+          echo "  MISSING MIXED BF16 CONSUMERS on the token-batch row"
           fail=1
         }
         ;;

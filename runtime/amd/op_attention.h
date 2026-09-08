@@ -260,7 +260,10 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                                 const float* __restrict__ v_scale = nullptr
 #if PLOW_TOKEN_BATCH
                                 ,
-                                const PlowTokenBatchView* tb = nullptr
+                                /* BY VALUE. Taking its address put the six-word view in scratch
+                                 * (43 static scratch ops in the interpreter entry, measured);
+                                 * by value it stays in registers and the object reports zero. */
+                                PlowTokenBatchView tb = {}
 #endif
                                 ) {
     constexpr int NK = D / MFMA_K;    /* QK^T k-steps                       */
@@ -340,11 +343,11 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     unsigned tb_n_spans = 0u;
     if constexpr (TB) {
         static_assert(!FP8KV, "token-batch flash prefill is qualified for bf16 KV only");
-        if (!tb) plow_tb_trap();
-        tb_n_spans = tb->n_spans;
+        if (!tb.spans) plow_tb_trap();
+        tb_n_spans = tb.n_spans;
         n_work = 0u;
         for (unsigned i = 0; i < tb_n_spans; ++i) {
-            const PlowPrefillSpan* s = tb->spans + i;
+            const PlowPrefillSpan* s = tb.spans + i;
             n_work += ((s->n_rows + FA_QT - 1u) / FA_QT) * n_head * nsplit;
         }
     }
@@ -359,12 +362,12 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
              * the KV loop it precedes, and it is what removes the per-span launch. */
             unsigned si = 0u, base = 0u;
             for (; si < tb_n_spans; ++si) {
-                const unsigned n = ((tb->spans[si].n_rows + FA_QT - 1u) / FA_QT) * n_head * nsplit;
+                const unsigned n = ((tb.spans[si].n_rows + FA_QT - 1u) / FA_QT) * n_head * nsplit;
                 if (w_span < base + n) break;
                 base += n;
             }
             if (si >= tb_n_spans) plow_tb_trap();
-            const PlowPrefillSpan* sp_span = tb->spans + si;
+            const PlowPrefillSpan* sp_span = tb.spans + si;
             w_span -= base;
             q_tiles_w = (sp_span->n_rows + FA_QT - 1u) / FA_QT;
             n_q_w = sp_span->n_rows;
@@ -1248,7 +1251,7 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                                const int* __restrict__ decode_slot = nullptr
 #if PLOW_TOKEN_BATCH
                                ,
-                               const PlowTokenBatchView* tb = nullptr
+                               PlowTokenBatchView tb = {} /* by value; see d_flash_prefill */
 #endif
                                ) {
     /* A work item carries GF CONSECUTIVE query heads. They share a KV head as long as GF divides
@@ -1284,8 +1287,8 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         unsigned tb_len = 0u;
         if constexpr (TB) {
             static_assert(!SLOTMAP, "the token batch IS the slot map; do not stack the two");
-            if (!tb || b >= tb->n_spans) plow_tb_trap();
-            const PlowPrefillSpan* sp_row = tb->spans + b;
+            if (!tb.spans || b >= tb.n_spans) plow_tb_trap();
+            const PlowPrefillSpan* sp_row = tb.spans + b;
             /* A decode contribution is ONE row, and — spans being contiguous and decode-first
              * (§4.1) — it is row b. Anything else means the interpreter handed this operator a
              * span partition it does not own, which must trap, not attend at the wrong length. */

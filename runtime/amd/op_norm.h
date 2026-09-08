@@ -20,6 +20,8 @@
 #ifndef PLOW_OP_NORM_H
 #define PLOW_OP_NORM_H
 
+#include "token_batch.h"
+
 #include "amd_common.h"
 #include "packed_prefill.h"
 #include "mixed_step.h"
@@ -422,7 +424,10 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
                                 float eps, unsigned out_row0, unsigned out_stride, unsigned kv_mask,
                                 unsigned skip_norm, unsigned slice,
                                 unsigned nblk, unsigned n_batch_kv = 0
-#if PLOW_MIXED_STEP
+#if PLOW_TOKEN_BATCH
+                                , const PlowProgram* mixed = nullptr,
+                                const int* decode_slots = nullptr
+#elif PLOW_MIXED_STEP
                                 , const PlowProgram* mixed = nullptr,
                                 const int* decode_slots = nullptr
 #elif PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS || PLOW_PACKED_PREFILL_DENSE_CONSUMERS
@@ -453,7 +458,23 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
 
     for (unsigned w = slice * PLOW_WAVES + wave_in_blk; w < total; w += nblk * PLOW_WAVES) {
         const unsigned t = w / nhead, hh = w % nhead;
-#if PLOW_MIXED_STEP
+#if PLOW_TOKEN_BATCH
+        /* SECOND CLASS-C SITE OF THE DENSE FAMILY, and §8 Phase 2's bullet list does not name
+         * it: `out_row0` is a packet scalar (host-patched per chunk in exec/kvrow.rs) from which
+         * every row's KV WRITE address is derived as `out_row0 + t`. Under packing that puts one
+         * request's K/V rows into another's cache — the same hazard as `q_pos0`, in the operator
+         * that WRITES rather than reads. §5.2 states the rule ("Cache writers use the span's
+         * physical slot and absolute KV position ... never addresses derived from packed row
+         * indices"); this is that rule. A parked or past-`real_rows` row writes nothing. */
+        PlowTokenBatchRow trow = {nullptr, 0u, 0u, 0u, 0u, 0u};
+        if (mixed) {
+            const PlowTokenBatchView tv = plow_tb_view(mixed);
+            trow = plow_tb_row(tv, t);
+            if (!trow.active) continue;
+        }
+        const unsigned position =
+            (mixed && trow.active) ? trow.position : (pg ? (unsigned)pg[t] : out_row0 + t);
+#elif PLOW_MIXED_STEP
         PlowMixedRow mrow = {nullptr, 0u, 0u, 0u, 0u};
         if (out_stride && mixed) {
             mrow = plow_mixed_row(mixed, decode_slots, pos, t);
@@ -486,7 +507,12 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
          * legacy formula gets right. n_batch_kv == 0 keeps the legacy path byte-identical, so
          * every prefill packet and B=1 decode are unchanged. */
         const size_t obase =
-#if PLOW_MIXED_STEP
+#if PLOW_TOKEN_BATCH
+            out_stride && mixed
+                ? (((size_t)trow.slot * nhead + hh) * out_stride +
+                   (position & kv_mask)) * hd
+                :
+#elif PLOW_MIXED_STEP
             out_stride && mixed
                 ? (((size_t)mrow.slot * nhead + hh) * out_stride +
                    (position & kv_mask)) * hd

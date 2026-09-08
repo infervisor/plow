@@ -202,12 +202,46 @@ PLOW_TB_INLINE PlowTokenBatchRow plow_tb_row(const PlowTokenBatchView& v, unsign
     return out;
 }
 
-/* Live rows this step. Class-A operators need exactly this and nothing else (§5.1). */
+/* THE ATTENTION PARTITION, defined exactly once.
+ *
+ * §4.1 forbids the HOST PLAN from classifying a span as decode because its length is one — a
+ * final prefill chunk can also have length one. It explicitly allows the other thing: "Kernel
+ * selection derives query geometry from span lengths." This is that, and only that: which of
+ * two attention kernels covers a span, on a route where both are numerically the same function.
+ * A one-row span at frontier p attends over [0, p+1) with its query at p whichever kernel runs
+ * it, so a final chunk of length one landing here is CORRECT, not merely tolerated.
+ *
+ * Spans are decode-first ordered (§4.1), so the partition is a prefix and both consumers agree
+ * on it by construction. ndec == 0 (pure prefill) and ndec == n_spans (pure decode) are both
+ * legal and both write nothing on the other side — which is how this route serves an
+ * intermediate pure-prefill step that the mixed-step resolver refuses outright. */
+PLOW_TB_INLINE unsigned plow_tb_decode_spans(const PlowTokenBatchView& v) {
+    unsigned n = 0;
+    while (n < v.n_spans && v.spans[n].n_rows == 1u) ++n;
+    return n;
+}
+
+/* A contiguous slice of the span table, for a consumer that owns only part of the partition.
+ * `real_rows`/`row_capacity` are carried through unchanged: they describe the BATCH, not the
+ * slice, and a consumer that needs the batch extent still gets it. */
+PLOW_TB_INLINE PlowTokenBatchView plow_tb_span_range(const PlowTokenBatchView& v, unsigned lo,
+                                                     unsigned hi) {
+    if (lo > hi || hi > v.n_spans) plow_tb_trap();
+    PlowTokenBatchView o = v;
+    o.spans = v.spans + lo;
+    o.n_spans = hi - lo;
+    return o;
+}
+
+/* Live rows for a packet compiled at `capacity`. Class-A operators over the whole batch need
+ * exactly this and nothing else (§5.1); an attention-partition packet compiled at the decode
+ * capacity gets the live decode-span count. Any other capacity is a mis-planned batch. */
 PLOW_TB_INLINE unsigned plow_tb_rows(const PlowProgram* prog, unsigned capacity) {
     const PlowTokenBatchView v = plow_tb_view(prog);
-    /* The packet was compiled for `capacity` rows; the descriptor says how many are live. */
-    if (capacity != v.row_capacity) plow_tb_trap();
-    return v.real_rows;
+    if (capacity == v.row_capacity) return v.real_rows;
+    const unsigned ndec = plow_tb_decode_spans(v);
+    if (capacity < ndec || capacity >= v.row_capacity) plow_tb_trap();
+    return ndec;
 }
 
 #undef PLOW_TB_INLINE
