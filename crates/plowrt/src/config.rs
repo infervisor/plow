@@ -370,7 +370,16 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "step-time", env = "PLOW_STEP_TIME", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub step_time: bool,
 
-    /// L2-domain placement dispatch.
+    /// Accept an L2-placed blob on a backend that cannot VERIFY the interpreter honours the
+    /// dispatch axis. NVIDIA only, and deliberately still `false`.
+    ///
+    /// AMD does not read this: `AmdEngine::load` parses with `l2_dispatch_ok = true` and then
+    /// checks each code object for `plow_l2_place_dispatch_1`, which is strictly stronger than
+    /// an operator assertion — a placed blob against an unplaced object is refused by
+    /// inspection. Defaulting this to `true` would therefore buy AMD nothing and would remove
+    /// the ONLY guard on the CUDA path, where nothing inspects the cubin. `plowc` places
+    /// gfx942/gfx950 blobs by default and no other arch, so an NVIDIA blob is placed only when
+    /// someone asked for it, and this flag is how they say the cubin can take it.
     #[arg(long = "l2-place-dispatch", env = "PLOW_L2_PLACE_DISPATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub l2_place_dispatch: bool,
 

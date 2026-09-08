@@ -4798,6 +4798,38 @@ const L2_DISPATCH_SYM: &str = "plow_l2_place_dispatch_1";
 const GATE_HIER_SYM: &str = "plow_gate_hier_1";
 const MOE_GEMMA_PF_SYM: &str = "plow_moe_gemma_pf_arms_1";
 
+/// The two halves of L2 placement never disagree silently, and the message names BOTH of them
+/// plus the two ways out — the emit-side flag and the object-side flag are different names
+/// living in different files, and a reader who only knows one of them cannot act on "lacks
+/// `plow_l2_place_dispatch_1`".
+fn l2_pairing_refusal(path: &Path, phase: Phase) -> String {
+    let (which, place_off, objects_on) = match phase {
+        Phase::Decode => (
+            "decode",
+            "PLOW_L2_PLACE=0 at emit, which throws the decode win away with it",
+            "scripts/build_gfx942.sh PLOW_L2HIER=1 or scripts/build_gfx950.sh PLOW_L2_PLACE=1 \
+             — both are the default",
+        ),
+        Phase::Prefill | Phase::Flash => (
+            "prefill",
+            "no PLOW_L2_PLACE_PREFILL=1, which is the AMD default and leaves decode \
+             placement on",
+            "scripts/build_gfx942.sh PLOW_L2HIER_PF=1, which puts -DPLOW_L2_PLACE_DISPATCH on \
+             the prefill rows (the flash rows already carry it); build_gfx950.sh passes it on \
+             both under PLOW_L2_PLACE=1",
+        ),
+    };
+    format!(
+        "L2 PLACEMENT PAIRING: this blob's {which} programs are L2-placed (PLOW_L2_PLACE; \
+         `build.json` records it under `l2_placement`), but {} was built WITHOUT \
+         -DPLOW_L2_PLACE_DISPATCH. A placed program's `seg` is an L2 domain, not a wave class, \
+         so this object would run every packet on the wrong domain — plausible output, inverted \
+         locality, no error. Fix EITHER half: rebuild the objects with {objects_on}, or re-emit \
+         the blob with {place_off}.",
+        path.display()
+    )
+}
+
 fn check_gate_hier_object(syms: &[&str], path: &Path, phase: Phase, sched: Sched) -> Result<()> {
     if !syms.contains(&GATE_HIER_SYM) {
         return Ok(());
@@ -4810,6 +4842,87 @@ fn check_gate_hier_object(syms: &[&str], path: &Path, phase: Phase, sched: Sched
         )));
     }
     Ok(())
+}
+
+/// What the two-level gate will actually do on this pairing.
+///
+/// ARMED and FIRING are different claims and only the second licenses a measurement. `armed`
+/// is a property of the OBJECT alone (`plow_gate_hier_1`); the interpreter additionally
+/// requires the BLOB to be L2-placed (`hier_base != 0`, which this engine derives from
+/// `l2_domains`) and the stream entry to carry a per-domain slice count above 1
+/// (`PLOW_SE_NPER`, set at emit only under placement). An armed object on an unplaced blob
+/// compiles the hierarchy and never takes it — which is how every published Gemma-4-31B number
+/// on this branch came to be measured with the feature inert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GateHierStatus {
+    armed: bool,
+    firing: bool,
+    domains: u32,
+    rendezvous: usize,
+    entries: usize,
+}
+
+impl GateHierStatus {
+    /// The interpreter's own precondition, evaluated on the decode programs
+    /// (`runtime/amd/interp.hip`, `h_on`).
+    fn of(progs: &[DevProg], dec_lo: usize, armed: bool) -> Self {
+        let dec = &progs[dec_lo.min(progs.len())..];
+        let domains = dec.iter().map(|p| p.l2_domains).max().unwrap_or(0);
+        let mut rendezvous = 0usize;
+        let mut entries = 0usize;
+        for p in dec {
+            for e in &p.gq_stream {
+                entries += 1;
+                let nper = (e.flags & packet::dev::SE_NPER_MASK) >> packet::dev::SE_NPER_SHIFT;
+                if nper > 1 && e.flags & (packet::dev::SE_FINE | SE_XCTR) == 0 {
+                    rendezvous += 1;
+                }
+            }
+        }
+        Self {
+            armed,
+            firing: armed && domains != 0 && rendezvous != 0,
+            domains,
+            rendezvous,
+            entries,
+        }
+    }
+
+    fn verdict(&self) -> &'static str {
+        match (self.armed, self.domains != 0, self.firing) {
+            (true, true, true) => "FIRING — one L2 writeback+invalidate per XCD per packet",
+            (true, true, false) => {
+                "inert: the blob is L2-placed but no decode packet has more than one slice \
+                 on a domain, so there is nobody to rendezvous with"
+            }
+            (true, false, _) => {
+                "ARMED BUT INERT — the decode object carries PLOW_GATE_HIER and this blob is \
+                 NOT L2-placed, which is its runtime precondition. Re-emit with \
+                 PLOW_L2_PLACE=1 (the gfx942 default) to get the win"
+            }
+            (false, true, _) => {
+                "off: the blob is L2-placed but the decode object was built without \
+                 -DPLOW_GATE_HIER (scripts/build_gfx942.sh PLOW_L2HIER=1)"
+            }
+            (false, false, _) => "off: neither the decode object nor the blob asks for it",
+        }
+    }
+}
+
+/// Said once per rank, at load, because "compiled in" is not "running": the whole reason this
+/// feature was measurable-but-unmeasured for a release cycle is that nothing printed the
+/// difference.
+fn log_gate_hier_status(progs: &[DevProg], dec_lo: usize, armed: bool) {
+    let st = GateHierStatus::of(progs, dec_lo, armed);
+    tracing::info!(
+        armed = st.armed,
+        firing = st.firing,
+        l2_domains = st.domains,
+        rendezvous_entries = st.rendezvous,
+        decode_queue_entries = st.entries,
+        "L2 hierarchical gate: {}",
+        st.verdict()
+    );
 }
 
 /// Every opcode behind `#if PLOW_MOE_GEMMA` in `runtime/amd/interp.hip`.
@@ -5183,8 +5296,8 @@ fn check_mla_v2_sv_raw_symbols(syms: &[&str], path: &Path, needs_l2: bool) -> Re
     }
     if needs_l2 && !syms.contains(&L2_DISPATCH_SYM) {
         return Err(RuntimeError::Device(format!(
-            "raw MLA V2 object {} lacks `{L2_DISPATCH_SYM}` for an L2-placed packet",
-            path.display()
+            "raw MLA V2: {}",
+            l2_pairing_refusal(path, Phase::Flash)
         )));
     }
     Ok(())
@@ -8297,6 +8410,11 @@ impl AmdEngine {
             .clone()
             .filter(|d| !d.is_empty());
         let mut dense_prefill_object = false;
+        // ARMED-ness of the decode object, for the one status line at the end of load.
+        // Every decode object opened must carry it, low rungs included: a ladder whose
+        // rungs disagree runs the hierarchy on some ticks and not others.
+        let mut decode_objects = 0usize;
+        let mut decode_objects_gate_hier = 0usize;
         let mut dense_flash_object = false;
         type LK = (HsaKernel, bool);
         let mut load_one_in = |phase: Phase,
@@ -8364,6 +8482,10 @@ impl AmdEngine {
                 prefill_moe_align_bm64 = syms.contains(&"plow_moe_align_bm64_1");
             }
             check_gate_hier_object(&syms, &path, phase, sched)?;
+            if phase == Phase::Decode {
+                decode_objects += 1;
+                decode_objects_gate_hier += usize::from(syms.contains(&GATE_HIER_SYM));
+            }
             let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
             let dense = syms.contains(&"plow_packed_prefill_dense_consumers_1");
             match phase {
@@ -8553,14 +8675,7 @@ impl AmdEngine {
                 Phase::Prefill | Phase::Flash => prefill_l2_placed,
             };
             if phase_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
-                return Err(RuntimeError::Device(format!(
-                    "{}: blob uses L2-domain packet placement (PLOW_L2_PLACE) but this object was \
-                     built WITHOUT -DPLOW_L2_PLACE_DISPATCH — its `seg` would be read as a \
-                     wave class and every packet would land on the wrong domain. Rebuild the \
-                     objects (scripts/build_gfx942.sh passes it by default), or recompile the \
-                     model with PLOW_L2_PLACE=0.",
-                    path.display()
-                )));
+                return Err(RuntimeError::Device(l2_pairing_refusal(&path, phase)));
             }
             // Whether this object's KV ENCODING matches the packet's. Both directions — the axis
             // is a swap, so each object is missing an arm the other has.
@@ -8760,9 +8875,9 @@ impl AmdEngine {
                 check_compiled_opcode_marker_set(&syms, &path, [DevOp::XReduceTwoShot])?;
             }
             if prefill_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
-                return Err(RuntimeError::Device(format!(
-                    "{} lacks `{L2_DISPATCH_SYM}` for an L2-placed packet",
-                    path.display()
+                return Err(RuntimeError::Device(l2_pairing_refusal(
+                    &path,
+                    Phase::Prefill,
                 )));
             }
             check_packet_pairing_stamp(&image, blob_path, &path)?;
@@ -10737,6 +10852,11 @@ impl AmdEngine {
         // widths, `[0, dec_lo)` the prefill bucket ladder. Same value the per-phase object
         // requirements were split at above — one rule, computed once.
         let dec_lo = dec_ix;
+        log_gate_hier_status(
+            &blob.progs,
+            dec_lo,
+            decode_objects != 0 && decode_objects_gate_hier == decode_objects,
+        );
         // Packet trace (`PLOW_TRACE_RAW=<path>`). Zeroed once at allocation so
         // an entry the run never reaches reads as a zero record rather than as
         // whatever the allocator handed back; every executed slot is rewritten
@@ -15413,6 +15533,91 @@ mod tests {
                 .to_string();
             assert!(message.contains(GATE_HIER_SYM));
             assert!(message.contains(L2_DISPATCH_SYM));
+        }
+    }
+
+    /// One decode program whose queue entries carry `nper` slices per domain, or none.
+    fn gate_hier_probe(l2_domains: u32, nper: u16) -> DevProg {
+        DevProg {
+            t: 1,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts: vec![DevInst64 {
+                op: DevOp::Nop as u16,
+                blocks: 1,
+                ..Default::default()
+            }],
+            stream: Vec::new(),
+            stream_ofs: vec![0],
+            stream_len: vec![0],
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: (0..4)
+                .map(|_| packet::dev::StreamEnt {
+                    inst: 0,
+                    seg: 0,
+                    flags: nper << packet::dev::SE_NPER_SHIFT,
+                    ..Default::default()
+                })
+                .collect(),
+            gq_seg_ofs: vec![0, 4],
+            l2_domains,
+        }
+    }
+
+    /// ARMED IS NOT FIRING. The object flag alone licenses nothing: `interp.hip` takes the
+    /// hierarchy only when the blob is placed AND a packet has more than one slice on a domain.
+    #[test]
+    fn gate_hier_status_separates_armed_from_firing() {
+        let placed = [gate_hier_probe(8, 38)];
+        let unplaced = [gate_hier_probe(0, 0)];
+
+        let firing = GateHierStatus::of(&placed, 0, true);
+        assert!(firing.armed && firing.firing);
+        assert_eq!(
+            (firing.domains, firing.rendezvous, firing.entries),
+            (8, 4, 4)
+        );
+        assert!(firing.verdict().contains("FIRING"));
+
+        // The shipped-but-inert pairing this whole campaign exists to make visible.
+        let inert = GateHierStatus::of(&unplaced, 0, true);
+        assert!(inert.armed && !inert.firing);
+        assert!(inert.verdict().contains("ARMED BUT INERT"));
+        assert!(inert.verdict().contains("PLOW_L2_PLACE=1"));
+
+        // Placed blob, object without the gate: legal, and the placement half still runs.
+        let no_gate = GateHierStatus::of(&placed, 0, false);
+        assert!(!no_gate.armed && !no_gate.firing);
+        assert!(no_gate.verdict().contains("PLOW_L2HIER=1"));
+
+        // A single slice per (packet, domain) has nobody to rendezvous with; the emitter
+        // leaves `nper` at 0 and the interpreter reads that as "no hierarchy".
+        let alone = GateHierStatus::of(&[gate_hier_probe(8, 0)], 0, true);
+        assert!(alone.armed && !alone.firing);
+        assert_eq!(alone.rendezvous, 0);
+
+        assert!(!GateHierStatus::of(&unplaced, 0, false).firing);
+    }
+
+    /// The refusal has to name BOTH halves and the two ways out — the emit-side flag and the
+    /// object-side flag are different names in different files.
+    #[test]
+    fn l2_pairing_refusal_names_both_halves_and_the_fix() {
+        let decode = l2_pairing_refusal(Path::new("interp_decode_gq.elf"), Phase::Decode);
+        assert!(decode.contains("interp_decode_gq.elf"));
+        assert!(decode.contains("PLOW_L2_PLACE_DISPATCH"));
+        assert!(decode.contains("PLOW_L2_PLACE=0"));
+        assert!(decode.contains("PLOW_L2HIER=1"));
+
+        for phase in [Phase::Prefill, Phase::Flash] {
+            let prefill = l2_pairing_refusal(Path::new("interp_prefill_gq.elf"), phase);
+            assert!(prefill.contains("interp_prefill_gq.elf"));
+            assert!(prefill.contains("PLOW_L2_PLACE_DISPATCH"));
+            // The prefill half has its OWN two flags; naming the decode ones would send the
+            // reader to a build that does not move this object.
+            assert!(prefill.contains("PLOW_L2HIER_PF=1"));
+            assert!(prefill.contains("PLOW_L2_PLACE_PREFILL=1"));
         }
     }
 

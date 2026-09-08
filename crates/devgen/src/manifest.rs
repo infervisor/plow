@@ -1889,7 +1889,30 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
         // `tuning` because those are what `plow_config.h` compiles, and an occupancy number
         // must never invalidate an otherwise-good packet/object pair.
         "dispatch_audit": dispatch_audit,
+        // WHICH PROGRAMS ARE L2-PLACED, so a regression moves in a diff of `build.json`.
+        //
+        // Placement is invisible everywhere else in this manifest: a placed and an unplaced
+        // emit of the same model produce byte-identical `build.json`, which is how the shipped
+        // Gemma-4-31B blob came to be unplaced (`PLOWDEV\x09`) with nothing recording it and
+        // every number in `docs/amd/gemma4-31b-mi300x.md` measured with `PLOW_GATE_HIER` inert.
+        // Outside `pairing_hash` deliberately, like `dispatch_audit`: placement does not change
+        // what `plow_config.h` compiles, and stamping it would invalidate every existing pair.
+        "l2_placement": l2_placement(m),
         "backends": backends(arch, &f, &s, &union, &t),
+    })
+}
+
+/// Which program kinds carry per-L2-domain queue windows (`PLOW_L2_PLACE`), and how many
+/// domains. A placed program needs objects built with `-DPLOW_L2_PLACE_DISPATCH`; plowrt
+/// refuses the mismatch, and this is where a reader sees which half moved.
+fn l2_placement(m: &Model) -> Value {
+    let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
+    let domains = m.progs.iter().map(|p| p.l2_domains).max().unwrap_or(0);
+    json!({
+        "domains": domains,
+        "decode": m.progs[dec_lo..].iter().any(|p| p.l2_domains != 0),
+        "prefill": m.progs[..dec_lo].iter().any(|p| p.l2_domains != 0),
+        "requires_object_define": "PLOW_L2_PLACE_DISPATCH",
     })
 }
 
@@ -2526,6 +2549,29 @@ mod tests {
             gen: vec![],
         };
         assert!(build(&m, "sm_120a")["tuning"].get("gf_full").is_none());
+    }
+
+    /// PLACEMENT MUST BE VISIBLE IN THE ARTIFACT. A placed and an unplaced emit of the same
+    /// model were otherwise byte-identical here, which is how a whole document of Gemma-4-31B
+    /// numbers came to be taken with `PLOW_GATE_HIER` inert and nothing disagreeing.
+    #[test]
+    fn l2_placement_is_recorded_per_phase() {
+        let unplaced = build(&model(), "gfx942")["l2_placement"].clone();
+        assert_eq!(unplaced["domains"], 0);
+        assert_eq!(unplaced["decode"], false);
+        assert_eq!(unplaced["prefill"], false);
+        assert_eq!(unplaced["requires_object_define"], "PLOW_L2_PLACE_DISPATCH");
+
+        // The shipping gfx942 shape: decode placed, prefill not.
+        let mut m = model();
+        m.progs[1].l2_domains = 8;
+        let dec_only = build(&m, "gfx942")["l2_placement"].clone();
+        assert_eq!(dec_only["domains"], 8);
+        assert_eq!(dec_only["decode"], true);
+        assert_eq!(dec_only["prefill"], false);
+
+        m.progs[0].l2_domains = 8;
+        assert_eq!(build(&m, "gfx942")["l2_placement"]["prefill"], true);
     }
 
     /// Per-program arm sets, keyed on (kind, bucket|batch, segment).
